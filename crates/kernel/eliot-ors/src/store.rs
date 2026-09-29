@@ -8070,8 +8070,7 @@ impl RedbRecoveryStore {
             return Ok(None);
         };
         existing.validate()?;
-        if existing.send_claim_protocol_version
-            == crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+        if existing.send_claim_protocol_version == crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
             && !(target == crate::HostRequestState::Admitted
                 && matches!(
                     existing.state,
@@ -8183,19 +8182,17 @@ impl RedbRecoveryStore {
             crate::HostRequestState::Admitted | crate::HostRequestState::Routed => {
                 match parent.attempt.as_ref().map(|attempt| attempt.phase) {
                     None
-                    | Some(crate::HostRequestAttemptPhase::DeferredNoEffect)
-                    | Some(crate::HostRequestAttemptPhase::DefinitelyNotSent) => {
-                        crate::HostRequestState::Cancelled
-                    }
+                    | Some(
+                        crate::HostRequestAttemptPhase::DeferredNoEffect
+                        | crate::HostRequestAttemptPhase::DefinitelyNotSent,
+                    ) => crate::HostRequestState::Cancelled,
                     Some(
                         crate::HostRequestAttemptPhase::Claimed
                         | crate::HostRequestAttemptPhase::DispatchStarted
                         | crate::HostRequestAttemptPhase::DeliveryOutcomeUnknown
                         | crate::HostRequestAttemptPhase::DeliveredToAuthenticatedHost
                         | crate::HostRequestAttemptPhase::ResponseReceived,
-                    ) => {
-                        crate::HostRequestState::Unknown
-                    }
+                    ) => crate::HostRequestState::Unknown,
                 }
             }
         };
@@ -8268,9 +8265,7 @@ impl RedbRecoveryStore {
                 request_digest: request_digest.to_owned(),
             });
         }
-        if existing.send_claim_protocol_version
-            == crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
-        {
+        if existing.send_claim_protocol_version == crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION {
             return Err(OrsError::InvalidTransition);
         }
 
@@ -8369,8 +8364,7 @@ impl RedbRecoveryStore {
             });
         }
         attempt.validate(&existing.fence_digest)?;
-        if existing.send_claim_protocol_version
-            == crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+        if existing.send_claim_protocol_version == crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
             && attempt.channel_binding_sha256.as_deref()
                 != existing.transport_channel_binding_sha256.as_deref()
         {
@@ -8379,9 +8373,7 @@ impl RedbRecoveryStore {
                 request_digest: request_digest.to_owned(),
             });
         }
-        if existing.send_claim_protocol_version
-            == crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
-        {
+        if existing.send_claim_protocol_version == crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION {
             let now_unix_ms = current_unix_ms_u64()?;
             let Some(claim_expires_at_unix_ms) = attempt.claim_expires_at_unix_ms else {
                 return Err(OrsError::InvalidField {
@@ -8418,7 +8410,9 @@ impl RedbRecoveryStore {
                 fenced.state,
                 crate::HostRequestState::Unknown | crate::HostRequestState::Reconciling
             ) {
-                fenced.state = fenced.state.transition_to(crate::HostRequestState::Unknown)?;
+                fenced.state = fenced
+                    .state
+                    .transition_to(crate::HostRequestState::Unknown)?;
             }
             if fenced == existing {
                 write.commit().map_err(storage)?;
@@ -8589,14 +8583,15 @@ impl RedbRecoveryStore {
         crate::model::validate_digest(request_digest, "host_request_request_digest")?;
         let key = format!("{}::{}", operation_id.as_str(), request_digest);
         let write = self.database.begin_write().map_err(storage)?;
-        let Some(mut record) = ({
+        let existing: Option<crate::HostRequestRecord> = {
             let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
             table
                 .get(key.as_str())
                 .map_err(storage)?
                 .map(|value| decode(value.value()))
                 .transpose()?
-        }) else {
+        };
+        let Some(mut record) = existing else {
             return Ok(None);
         };
         record.validate()?;
@@ -8606,9 +8601,7 @@ impl RedbRecoveryStore {
                 request_digest: request_digest.to_owned(),
             });
         }
-        if record.send_claim_protocol_version
-            != crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
-        {
+        if record.send_claim_protocol_version != crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION {
             return Err(OrsError::InvalidTransition);
         }
         let Some(current) = record.attempt.as_ref() else {
@@ -8687,14 +8680,15 @@ impl RedbRecoveryStore {
         crate::model::validate_digest(request_digest, "host_request_request_digest")?;
         let key = format!("{}::{}", operation_id.as_str(), request_digest);
         let write = self.database.begin_write().map_err(storage)?;
-        let Some(mut record) = ({
+        let existing: Option<crate::HostRequestRecord> = {
             let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
             table
                 .get(key.as_str())
                 .map_err(storage)?
                 .map(|value| decode(value.value()))
                 .transpose()?
-        }) else {
+        };
+        let Some(mut record) = existing else {
             return Ok(None);
         };
         record.validate()?;
@@ -8704,9 +8698,7 @@ impl RedbRecoveryStore {
                 request_digest: request_digest.to_owned(),
             });
         }
-        if record.send_claim_protocol_version
-            != crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
-        {
+        if record.send_claim_protocol_version != crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION {
             return Err(OrsError::InvalidTransition);
         }
         let Some(mut current) = record.attempt.clone() else {
@@ -8778,14 +8770,15 @@ impl RedbRecoveryStore {
         crate::model::validate_digest(request_digest, "host_request_request_digest")?;
         let key = format!("{}::{}", operation_id.as_str(), request_digest);
         let write = self.database.begin_write().map_err(storage)?;
-        let Some(mut record) = ({
+        let existing: Option<crate::HostRequestRecord> = {
             let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
             table
                 .get(key.as_str())
                 .map_err(storage)?
                 .map(|value| decode(value.value()))
                 .transpose()?
-        }) else {
+        };
+        let Some(mut record) = existing else {
             return Ok(None);
         };
         record.validate()?;
@@ -8795,9 +8788,7 @@ impl RedbRecoveryStore {
                 request_digest: request_digest.to_owned(),
             });
         }
-        if record.send_claim_protocol_version
-            != crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
-        {
+        if record.send_claim_protocol_version != crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION {
             return Err(OrsError::InvalidTransition);
         }
         let Some(mut current) = record.attempt.clone() else {
@@ -8823,12 +8814,10 @@ impl RedbRecoveryStore {
                         observation.no_send_proof
                             == Some(crate::HostRequestNoSendProof::RequestRejectedBeforeWrite)
                     }
-                    crate::HostRequestAttemptPhase::DispatchStarted => {
-                        observation.no_send_proof
-                            == Some(
-                                crate::HostRequestNoSendProof::AuthenticatedTransportPreflightRejected,
-                            )
-                    }
+                    crate::HostRequestAttemptPhase::DispatchStarted => observation.no_send_proof
+                        == Some(
+                            crate::HostRequestNoSendProof::AuthenticatedTransportPreflightRejected,
+                        ),
                     _ => false,
                 };
                 if !proof_matches_phase {
@@ -8873,12 +8862,16 @@ impl RedbRecoveryStore {
                     record.state,
                     crate::HostRequestState::Unknown | crate::HostRequestState::Reconciling
                 ) {
-                    record.state = record.state.transition_to(crate::HostRequestState::Unknown)?;
+                    record.state = record
+                        .state
+                        .transition_to(crate::HostRequestState::Unknown)?;
                 }
             }
             crate::HostRequestTransportBoundary::DeliveredToAuthenticatedHost => {
                 if record.state == crate::HostRequestState::Routed {
-                    record.state = record.state.transition_to(crate::HostRequestState::Submitted)?;
+                    record.state = record
+                        .state
+                        .transition_to(crate::HostRequestState::Submitted)?;
                 }
             }
             crate::HostRequestTransportBoundary::DispatchStarted => {
@@ -8928,9 +8921,7 @@ impl RedbRecoveryStore {
                 request_digest: request_digest.to_owned(),
             });
         }
-        if record.send_claim_protocol_version
-            != crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
-        {
+        if record.send_claim_protocol_version != crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION {
             return Err(OrsError::InvalidTransition);
         }
         let Some(mut current) = record.attempt.clone() else {
@@ -8958,8 +8949,7 @@ impl RedbRecoveryStore {
                 .transport_observations
                 .last()
                 .is_some_and(|observation| {
-                    observation.boundary
-                        == crate::HostRequestTransportBoundary::ResponseReceived
+                    observation.boundary == crate::HostRequestTransportBoundary::ResponseReceived
                         && observation.response_commitment_sha256.as_deref()
                             == Some(evidence.result_commitment_sha256.as_str())
                 });
@@ -8968,17 +8958,16 @@ impl RedbRecoveryStore {
             crate::HostRequestAttemptPhase::DispatchStarted
                 | crate::HostRequestAttemptPhase::DeliveryOutcomeUnknown
                 | crate::HostRequestAttemptPhase::DeliveredToAuthenticatedHost
-        ) && current
-            .transport_observations
-            .last()
-            .is_some_and(|observation| {
+        ) && current.transport_observations.last().is_some_and(
+            |observation| {
                 matches!(
                     observation.boundary,
                     crate::HostRequestTransportBoundary::DispatchStarted
                         | crate::HostRequestTransportBoundary::DeliveryOutcomeUnknown
                         | crate::HostRequestTransportBoundary::DeliveredToAuthenticatedHost
                 )
-            });
+            },
+        );
         if current.transport_observations.is_empty()
             || (!response_was_already_observed && !unresolved_transport_claim)
         {
@@ -8990,7 +8979,9 @@ impl RedbRecoveryStore {
             record.state,
             crate::HostRequestState::Unknown | crate::HostRequestState::Reconciling
         ) {
-            record.state = record.state.transition_to(crate::HostRequestState::Unknown)?;
+            record.state = record
+                .state
+                .transition_to(crate::HostRequestState::Unknown)?;
         }
         record.attempt = Some(current);
         record.validate()?;
@@ -9028,9 +9019,7 @@ impl RedbRecoveryStore {
             return Ok(None);
         };
         record.validate()?;
-        if record.send_claim_protocol_version
-            == crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
-        {
+        if record.send_claim_protocol_version == crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION {
             return Err(OrsError::InvalidTransition);
         }
         let Some(mut current) = record.attempt.clone() else {
@@ -9084,7 +9073,7 @@ impl RedbRecoveryStore {
     ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
         crate::model::validate_digest(request_digest, "host_request_request_digest")?;
         crate::model::validate_digest(result_digest, "host_request_result_digest")?;
-        validate_result_response(result_response)?;
+        crate::model::validate_result_response(result_response)?;
         let result_body_bytes = canonical_json_bytes(result_response)
             .map_err(|error| OrsError::Encoding(error.to_string()))?;
         let result_body_digest = crate::model::sha256_hex(&result_body_bytes);
@@ -9113,9 +9102,7 @@ impl RedbRecoveryStore {
                 request_digest: request_digest.to_owned(),
             });
         }
-        if record.send_claim_protocol_version
-            != crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
-        {
+        if record.send_claim_protocol_version != crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION {
             return Err(OrsError::InvalidTransition);
         }
         let Some(mut current) = record.attempt.clone() else {
@@ -9123,13 +9110,11 @@ impl RedbRecoveryStore {
         };
         current.validate(&record.fence_digest)?;
         attempt.validate(&record.fence_digest)?;
-        if !current.same_claim(attempt)
-        {
+        if !current.same_claim(attempt) {
             return Err(OrsError::InvalidTransition);
         }
         if let Some(evidence) = owner_readback {
-            if record.send_claim_protocol_version
-                != crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+            if record.send_claim_protocol_version != crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
             {
                 return Err(OrsError::InvalidTransition);
             }
@@ -9140,15 +9125,18 @@ impl RedbRecoveryStore {
                     | crate::HostRequestAttemptPhase::DeliveryOutcomeUnknown
                     | crate::HostRequestAttemptPhase::DeliveredToAuthenticatedHost
                     | crate::HostRequestAttemptPhase::ResponseReceived
-            ) && current.transport_observations.last().is_some_and(|observation| {
-                matches!(
-                    observation.boundary,
-                    crate::HostRequestTransportBoundary::DispatchStarted
-                        | crate::HostRequestTransportBoundary::DeliveryOutcomeUnknown
-                        | crate::HostRequestTransportBoundary::DeliveredToAuthenticatedHost
-                        | crate::HostRequestTransportBoundary::ResponseReceived
-                )
-            });
+            ) && current
+                .transport_observations
+                .last()
+                .is_some_and(|observation| {
+                    matches!(
+                        observation.boundary,
+                        crate::HostRequestTransportBoundary::DispatchStarted
+                            | crate::HostRequestTransportBoundary::DeliveryOutcomeUnknown
+                            | crate::HostRequestTransportBoundary::DeliveredToAuthenticatedHost
+                            | crate::HostRequestTransportBoundary::ResponseReceived
+                    )
+                });
             if current.transport_observations.is_empty() || !unresolved_transport_claim {
                 return Err(OrsError::InvalidTransition);
             }
@@ -9273,9 +9261,7 @@ impl RedbRecoveryStore {
             return Ok(None);
         };
         existing.validate()?;
-        if existing.send_claim_protocol_version
-            == crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
-        {
+        if existing.send_claim_protocol_version == crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION {
             return Err(OrsError::InvalidTransition);
         }
         if existing.state == crate::HostRequestState::ResultReceived {
@@ -22449,16 +22435,13 @@ impl RedbRecoveryStore {
                                 | crate::HostRequestAttemptPhase::ResponseReceived
                         )
                     });
-                    let legacy_admitted_without_claim =
-                        record.send_claim_protocol_version == 0
-                            && record.connection_ref.as_str()
-                                == "USER_AUTOMATION_RUNTIME_OPERATION"
-                            && record.attempt.is_none()
-                            && matches!(
-                                record.state,
-                                crate::HostRequestState::Admitted
-                                    | crate::HostRequestState::Routed
-                            );
+                    let legacy_admitted_without_claim = record.send_claim_protocol_version == 0
+                        && record.connection_ref.as_str() == "USER_AUTOMATION_RUNTIME_OPERATION"
+                        && record.attempt.is_none()
+                        && matches!(
+                            record.state,
+                            crate::HostRequestState::Admitted | crate::HostRequestState::Routed
+                        );
                     if !active_attempt && !legacy_admitted_without_claim {
                         continue;
                     }
