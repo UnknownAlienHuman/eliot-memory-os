@@ -3160,11 +3160,24 @@ impl KernelStoreGateway {
         if owner.current_configuration_state == UserAutomationConfigurationState::Active {
             Self::require_run_now_active_evidence(owner, &execution, &evidence)?;
         }
+        // The schedule normalization envelope the revision names is owner
+        // evidence over the compiled occurrence set. This boundary reads the
+        // committed occurrence through the Store write receipt above, which
+        // carries no calendar normalization envelope, and nothing in the
+        // repository publishes or retains one yet: the owner that compiles an
+        // expression has no accepted write path yet (#2806). The run-now route
+        // therefore supplies none, and the preflight binding refuses the
+        // revision with `ReceiptBinding` rather than admitting a schedule whose
+        // occurrence set is only self-asserted. That is the fail-closed
+        // behaviour the versioned contract requires; it is not a fallback and
+        // the route recovers the moment the owner envelope is readable here.
+        let normalization_receipts: Vec<eliot_receipts::ReceiptEnvelope> = Vec::new();
         UserAutomationPreflightProjection::assemble(&UserAutomationPreflightAssembly {
             revision: &owner.revision,
             configuration_state: owner.current_configuration_state,
             config_snapshot: &config_snapshot,
             source_receipt: &source_receipt,
+            normalization_receipts: &normalization_receipts,
             execution: &execution,
             invocation,
             request_metadata: &sealed.context,

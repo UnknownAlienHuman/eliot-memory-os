@@ -90,6 +90,20 @@ fn valid_revision(
             start_at: "2026-09-21T00:00:00Z".to_owned(),
             end_at: None,
             next_occurrences: vec!["2026-09-21T00:00:00Z".to_owned()],
+            // This fixture carries a retired shape-only occurrence key, so the
+            // owning calendar adapter has not issued a normalization binding
+            // for it. Empty evidence can never satisfy the required binding, so
+            // the revision stays refused instead of becoming admitted.
+            normalization_receipt: Box::new(
+                eliot_kernel_core::user_automation::ScheduleNormalizationReceipt {
+                    receipt_id: String::new(),
+                    normalizer_authority: String::new(),
+                    source_digest: String::new(),
+                    zone_database_revision:
+                        eliot_kernel_core::user_automation::PINNED_ZONE_DATABASE_REVISION.to_owned(),
+                    occurrences_digest: String::new(),
+                },
+            ),
         },
         mode: UserAutomationExecutionMode::DeterministicProcess,
         task: AutomationTaskBinding {
