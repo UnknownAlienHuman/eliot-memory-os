@@ -145,11 +145,11 @@ def _consume_block_comment(data: bytes, index: int, out: list[str]) -> int:
         if data[index] == 0x0A:
             out.append("\n")
             index += 1
-        elif data[index:].startswith(b"/*"):
+        elif data.startswith(b"/*", index):
             depth += 1
             out.append("  ")
             index += 2
-        elif data[index:].startswith(b"*/") and depth > 0:
+        elif data.startswith(b"*/", index) and depth > 0:
             depth -= 1
             out.append("  ")
             index += 2
@@ -246,7 +246,7 @@ def _consume_char_or_lifetime(data: bytes, index: int, out: list[str]) -> int:
     return index + 1
 
 
-def _strip_core(text: str) -> tuple[str, bool]:
+def _strip_core(text: str, literal_spans: list[tuple[int, int]] | None = None) -> tuple[str, bool]:
     """Faithful port of the accepted stripper; bool reports unclosed input."""
     data = text.encode("utf-8")
     out: list[str] = []
@@ -254,31 +254,35 @@ def _strip_core(text: str) -> tuple[str, bool]:
     size = len(data)
     unclosed = False
     while index < size:
-        rest = data[index:]
-        if rest.startswith(b"//"):
+        if data.startswith(b"//", index):
             while index < size and data[index] != 0x0A:
                 out.append(" ")
                 index += 1
-        elif rest.startswith(b"/*"):
+        elif data.startswith(b"/*", index):
             index = _consume_block_comment(data, index, out)
             if index >= size:
                 unclosed = True
-        elif rest.startswith(b'"'):
+        elif data.startswith(b'"', index):
+            start = index
             next_index = _consume_string(data, index, out)
+            if literal_spans is not None:
+                literal_spans.append((start, next_index))
             if next_index < 0:
                 index = -next_index - 1
                 unclosed = True
             else:
                 index = next_index
-        elif _raw_prefix_len(rest) is not None:
-            hashes = _raw_prefix_len(rest)
+        elif (hashes := _raw_prefix_len(data, index)) is not None:
+            start = index
             next_index = _consume_raw_string(data, index, out, hashes)
+            if literal_spans is not None:
+                literal_spans.append((start, next_index))
             if next_index < 0:
                 index = -next_index - 1
                 unclosed = True
             else:
                 index = next_index
-        elif rest[0] == 0x27:
+        elif data[index] == 0x27:
             index = _consume_char_or_lifetime(data, index, out)
         else:
             out.append(chr(data[index]))
@@ -305,13 +309,15 @@ def _strip_core_cached(text: str) -> tuple[str, bool]:
     return _strip_core(text)
 
 
-def _raw_prefix_len(rest: bytes) -> int | None:
-    if not rest.startswith(b"r"):
+def _raw_prefix_len(data: bytes, offset: int = 0) -> int | None:
+    # Offset-based lookahead avoids a full suffix copy at every source byte.
+    # The default offset preserves the existing comment-stripper interface.
+    if not data.startswith(b"r", offset):
         return None
     hashes = 0
-    while 1 + hashes < len(rest) and rest[1 + hashes] == 0x23:
+    while offset + 1 + hashes < len(data) and data[offset + 1 + hashes] == 0x23:
         hashes += 1
-    if 1 + hashes < len(rest) and rest[1 + hashes] == 0x22:
+    if offset + 1 + hashes < len(data) and data[offset + 1 + hashes] == 0x22:
         return hashes
     return None
 
@@ -840,21 +846,198 @@ def enum_region_text(relative: str, declaration: str, end_marker: str) -> str:
     return region[:end]
 
 
-def string_switch_owner_files() -> list[str]:
-    """Non-test files matching on V1 spelling string literals as ownership logic.
+# The Researcher coordinate ladder shares the word "symbol" with CueKind,
+# but owns an Option<u8> precision rank, not a Cue decoder. Only the exact
+# scalar table below is adjudicated; neither its file nor future functions in
+# that file are allowlisted. The table is re-derived from its canonical enum.
+_COORDINATE_SOURCE = "crates/research/eliot-researcher/src/evidence_portfolio.rs"
+_COORDINATE_OWNER = "crates/research/eliot-research-exchange-api/src/lib.rs"
 
-    String literals are the evidence here, so this scan strips comments only
-    (the full code stripper would erase them). The named legacy decoders that
-    legitimately branch on historical spellings are returned, not hidden.
-    """
-    arm = re.compile(r'"(?:%s)"\s*=>' % "|".join(V1_SPELLINGS))
-    out: list[str] = []
-    for rel in candidate_files("match"):
-        if "/tests/" in rel or "/testdata/" in rel or rel.endswith("_test.rs"):
+
+def _rust_string_value(token: bytes) -> str:
+    """Decode a closed string token, not Rust-looking text inside that token."""
+    hashes = _raw_prefix_len(token)
+    if hashes is not None:
+        closer = b'"' + b"#" * hashes
+        if len(token) < hashes * 2 + 3 or not token.endswith(closer):
+            raise ValueError("unclosed raw string")
+        return token[hashes + 2 : -len(closer)].decode("utf-8")
+    if len(token) < 2 or token[:1] != b'"' or token[-1:] != b'"':
+        raise ValueError("unclosed string")
+    source = token[1:-1].decode("utf-8")
+    output: list[str] = []
+    index = 0
+    simple = {"n": "\n", "r": "\r", "t": "\t", "0": "\0", '"': '"', "'": "'", "\\": "\\"}
+    while index < len(source):
+        cell = source[index]
+        index += 1
+        if cell != "\\":
+            output.append(cell)
             continue
-        if arm.search(strip_comments_only(read_text(rel))):
-            out.append(rel)
-    return out
+        if index == len(source):
+            raise ValueError("unclosed escape")
+        escape = source[index]
+        index += 1
+        if escape in simple:
+            output.append(simple[escape])
+        elif escape in "\r\n":
+            while index < len(source) and source[index] in " \t\r\n":
+                index += 1
+        elif escape == "x":
+            digits = source[index : index + 2]
+            if not re.fullmatch(r"[0-7][0-9a-fA-F]", digits):
+                raise ValueError("unresolved hexadecimal escape")
+            output.append(chr(int(digits, 16)))
+            index += 2
+        elif escape == "u" and source[index : index + 1] == "{":
+            close = source.find("}", index + 1)
+            digits = source[index + 1 : close].replace("_", "")
+            if close < 0 or not re.fullmatch(r"[0-9a-fA-F]{1,6}", digits):
+                raise ValueError("unresolved Unicode escape")
+            value = int(digits, 16)
+            if value > 0x10FFFF or 0xD800 <= value <= 0xDFFF:
+                raise ValueError("invalid Unicode scalar")
+            output.append(chr(value))
+            index = close + 1
+        else:
+            raise ValueError("unresolved string escape")
+    return "".join(output)
+
+
+def string_switch_offsets(text: str) -> tuple[str, list[tuple[int, int]], list[int]]:
+    """Real V1 literal-pattern sites, in original UTF-8 byte coordinates.
+
+    The canonical stripper records only outer literal spans. A sample such as
+    r##"match x { "symbol" => Owner::Symbol }"## is one inert literal, never
+    a match arm. Guard/alternative patterns remain candidates, not proof of a
+    non-Cue owner. Unclosed or undecodable syntax raises instead of proving zero.
+    """
+    spans: list[tuple[int, int]] = []
+    code, _ = _strip_core(text, literal_spans=spans)
+    data = text.encode("utf-8")
+    if any(end < 0 or end > len(data) for _, end in spans):
+        raise ValueError("unclosed string in switch scan")
+    if not re.search(r"\bmatch\b", code):
+        return code, spans, []
+    offsets: list[int] = []
+    for start, end in spans:
+        # Only a pattern tail can make this literal an ownership candidate.
+        # All braces/arrows inside other strings have already been erased.
+        if not re.match(r"\s*(?:(?:\|\s*)*=>|if\b[^{};]*=>)", code[end:]):
+            continue
+        if _rust_string_value(data[start:end]) in V1_SPELLINGS:
+            offsets.append(start)
+    return code, spans, offsets
+
+
+def _top_level_block(code: str, pattern: str) -> tuple[int, int] | None:
+    matches = list(re.finditer(pattern, code))
+    if len(matches) != 1:
+        return None
+    start = matches[0].start()
+    if code[:start].count("{") != code[:start].count("}"):
+        return None
+    end = _declaration_span_end(_stripped_bytes(code), start)
+    return (start, end) if end > start + 4 else None
+
+
+def _coordinate_rank_span(
+    text: str, code: str, spans: list[tuple[int, int]], owner_source: str
+) -> tuple[int, int] | None:
+    """Adjudicate one pure rank table against its current unit-enum owner.
+
+    Unknown owner syntax, changed ranks, extra logic, nested/duplicate functions
+    or a changed serialization vocabulary do not qualify for this disposition.
+    """
+    owner_spans: list[tuple[int, int]] = []
+    owner_code, _ = _strip_core(owner_source, literal_spans=owner_spans)
+    owner = _top_level_block(owner_code, r"\benum\s+AnchorPrecision\b")
+    function = _top_level_block(code, r"\bfn\s+coordinate_rank\b")
+    if owner is None or function is None:
+        return None
+    owner_start, owner_end = owner
+    # The accepted owner uses Serde's snake_case unit-enum vocabulary. A field
+    # attribute, explicit discriminant or alternative naming requires review.
+    attribute = re.search(
+        r"#\s*\[\s*serde\s*\(\s*rename_all\s*=\s*\)\s*\]\s*pub\s*$",
+        owner_code[:owner_start],
+    )
+    if attribute is None:
+        return None
+    values = [
+        _rust_string_value(owner_source.encode("utf-8")[left:right])
+        for left, right in owner_spans if attribute.start() <= left < right <= owner_start
+    ]
+    if values != ["snake_case"]:
+        return None
+    body = owner_code[owner_code.index("{", owner_start) + 1 : owner_end - 1]
+    if not re.fullmatch(r"\s*(?:[A-Z][A-Za-z0-9_]*\s*,\s*)+", body):
+        return None
+    variants = [value.strip() for value in body.split(",") if value.strip()]
+    if (len(variants) != len(set(variants)) or len(variants) > 256
+            or any(not re.fullmatch(r"[A-Z][a-z0-9]*(?:[A-Z][a-z0-9]+)*", value) for value in variants)):
+        return None
+    spellings = [re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", value).lower() for value in variants]
+    expected = "fncoordinate_rank(name:&str)->Option<u8>{matchname{" + "".join(
+        json.dumps(spelling) + f"=>Some({rank})," for rank, spelling in enumerate(spellings)
+    ) + "_=>None,}}"
+    start, end = function
+    cursor = start
+    parts: list[str] = []
+    data = text.encode("utf-8")
+    for left, right in spans:
+        if left < start or right > end:
+            continue
+        parts.append(re.sub(r"\s+", "", code[cursor:left]))
+        parts.append(json.dumps(_rust_string_value(data[left:right])))
+        cursor = right
+    parts.append(re.sub(r"\s+", "", code[cursor:end]))
+    return function if "".join(parts) == expected else None
+
+
+def unclassified_string_switch_offsets(
+    relative: str, text: str, owner_source: str = ""
+) -> list[int]:
+    """All candidate offsets except a structurally proved unrelated rank table."""
+    code, spans, offsets = string_switch_offsets(text)
+    unrelated = (
+        _coordinate_rank_span(text, code, spans, owner_source)
+        if offsets and relative == _COORDINATE_SOURCE else None
+    )
+    if unrelated is None:
+        return offsets
+    start, end = unrelated
+    return [offset for offset in offsets if not start <= offset < end]
+
+
+@functools.lru_cache(maxsize=None)
+def _string_switch_scan() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    owners: list[str] = []
+    unresolved: list[str] = []
+    for relative in candidate_files("match"):
+        if "/tests/" in relative or "/testdata/" in relative or relative.endswith("_test.rs"):
+            continue
+        try:
+            owner_source = read_text(_COORDINATE_OWNER) if relative == _COORDINATE_SOURCE else ""
+            if unclassified_string_switch_offsets(relative, read_text(relative), owner_source):
+                owners.append(relative)
+        except (ValueError, OSError):
+            # Includes the legitimate legacy owner's file: a file-level allowed
+            # entry must not conceal an incomplete lexical scan of that file.
+            unresolved.append(relative)
+    return tuple(owners), tuple(unresolved)
+
+
+def string_switch_owner_files() -> list[str]:
+    """Legacy/unknown candidates; an unrelated symbol spelling is not an owner."""
+    owners, _ = _string_switch_scan()
+    return list(owners)
+
+
+def string_switch_unresolved_files() -> list[str]:
+    """Unprovable lexical/owner inputs, never a successful zero-owner result."""
+    _, unresolved = _string_switch_scan()
+    return list(unresolved)
 
 
 def manifest() -> dict:
@@ -907,11 +1090,11 @@ def strip_comments_only(text: str) -> str:
                 if data[index] == 0x0A:
                     out.append("\n")
                     index += 1
-                elif data[index:].startswith(b"/*"):
+                elif data.startswith(b"/*", index):
                     depth += 1
                     out.append("  ")
                     index += 2
-                elif data[index:].startswith(b"*/"):
+                elif data.startswith(b"*/", index):
                     depth = max(0, depth - 1)
                     out.append("  ")
                     index += 2
@@ -1336,6 +1519,8 @@ def main() -> int:
             f"string-switch-owner-drift: expected {list(ALLOWED_STRING_SWITCH_OWNERS)}, "
             f"found {string_switch_owner_files()}"
         )
+    if string_switch_unresolved_files():
+        findings.append(f"string-switch-scan-incomplete: {string_switch_unresolved_files()}")
     if deprecated_suppression_violations():
         findings.append(
             f"current-kind-deprecation-suppression: {deprecated_suppression_violations()}"
