@@ -195,6 +195,16 @@ impl KernelContextReadClient {
             | NamedReadOperation::GetCapabilityEvidenceState => {
                 Self::check_reconstruction_capability(request)
             }
+            // Issue #2857: the closure read both `GovernorContextInputs::reconstruct`
+            // and `GovernorEpistemicComposition::check_heads` open with. The store
+            // catalogue declares this operation scope-bound with no parameters, so
+            // exactly that shape is admitted here. Without this arm the one
+            // existing read client refused the closure read of the existing
+            // Governor owners as `UnknownOperation`, so no route could ever have
+            // reached either composition.
+            NamedReadOperation::GetScopeRevisionView => {
+                Self::check_scope_revision_view_capability(request)
+            }
             NamedReadOperation::GetExperienceBankRange
             | NamedReadOperation::GetAgentFeedbackRange => {
                 Self::check_experience_range_capability(request)
@@ -267,6 +277,40 @@ impl KernelContextReadClient {
             }
             _ => Err(StoreError::UnknownOperation),
         }
+    }
+
+    /// Checks the closed `GetScopeRevisionView` read before any transport
+    /// (issue #2857).
+    ///
+    /// The store catalogue declares this operation scope-bound with no
+    /// parameters, and both owner handlers address their scope through the
+    /// typed `scope_id` request field, so exactly that shape is admitted here.
+    /// `ExactFence` is required because the answer becomes the exact-fence
+    /// dependency closure every reconstruction role read is asserted against,
+    /// and a generation change must surface as a mismatch rather than a
+    /// previous generation's heads. Nothing else is admitted: a scope-free or
+    /// parameter-carrying request fails closed before transport.
+    fn check_scope_revision_view_capability(request: &NamedReadRequest) -> Result<(), StoreError> {
+        if request.scope_id.is_none() {
+            return Err(StoreError::InvalidField {
+                field: "scope_id",
+                reason: "GetScopeRevisionView requires an exact scope",
+            });
+        }
+        if request.consistency != ReadConsistency::ExactFence {
+            return Err(StoreError::InvalidField {
+                field: "operation.consistency",
+                reason: "GetScopeRevisionView requires ExactFence",
+            });
+        }
+        if !request.parameters.is_empty() {
+            return Err(StoreError::InvalidField {
+                field: "operation.parameters",
+                reason: "GetScopeRevisionView is parameter-free",
+            });
+        }
+        request.validate()?;
+        Ok(())
     }
 
     /// Checks the closed `GetOrderingHeads` read before any transport
