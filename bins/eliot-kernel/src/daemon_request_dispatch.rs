@@ -7467,6 +7467,8 @@ impl KernelComposition {
                 return Ok(serde_json::json!({
                     "kind": "wasm_dispatch_in_progress",
                     "value": {
+                        "claim_id": bundle.material.claim_id,
+                        "operation_id": bundle.material.operation_id,
                         "recovery_reference": recovery_reference,
                     },
                 }));
@@ -7477,6 +7479,8 @@ impl KernelComposition {
                 return Ok(serde_json::json!({
                     "kind": "wasm_dispatch_result_reconciliation",
                     "value": {
+                        "claim_id": bundle.material.claim_id,
+                        "operation_id": bundle.material.operation_id,
                         "recovery_reference": recovery_reference,
                     },
                 }));
