@@ -250,6 +250,8 @@ mod tests {
             ],
             notifications: serde_json::from_value(serde_json::json!({
                 "rows": [],
+                "unresolved_critical": [],
+                "failed_delivery": [],
                 "metrics": {
                     "total": 0,
                     "unresolved": 0,
