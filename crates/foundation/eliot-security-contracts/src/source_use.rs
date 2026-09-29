@@ -138,6 +138,17 @@ pub fn authorize_source_use(
         // summary or a compile step that re-created a tainted value from text
         // and then re-declared a weaker input taint is refused here, whatever
         // it claims and whatever a detector said about it.
+        //
+        // A derivation that carries its own `declassification_receipt_ref` is
+        // outside this comparison, exactly as `TransformationLineage::validate`
+        // already treats it: the receipt is the owner's proof that a verified
+        // transformation removed the taint, and re-deriving it here would need
+        // the `DeclassificationReceipt` bytes this record does not carry. Such a
+        // derivation may carry its own lower taint, but it does not lower the
+        // propagated taint below, which stays the maximum over the sources.
+        if derivation.declassification_receipt_ref.is_some() {
+            continue;
+        }
         let resolved = resolved_input_taint(derivation, &assurance_taint, &produced_taint);
         if derivation.input_taint < resolved {
             return Err(SecurityContractError::TaintLaundering);
@@ -148,6 +159,17 @@ pub fn authorize_source_use(
     // and over every recorded derivation output, so dropping a source from a
     // derivation's `input_refs` cannot lower it: the dropped source is still in
     // the evidence set, and a dropped origin is a taint escape, not a cleaning.
+    //
+    // This is deliberately the maximum over the SOURCES and not over the
+    // derivations alone, so a declassified derivation cannot buy an authority
+    // surface for the source it consumed. `DeclassificationReceipt` is the
+    // owner's proof about a transformation's output, not a statement that its
+    // input source was never untrusted; lowering the authority ceiling below a
+    // tainted source is a quarantine/release decision, and those stay with the
+    // Governor (#1760 W5) rather than with this gate. The cost is that a fully
+    // declassified lineage over a tainted source is refused on an authority
+    // surface until that source is released; a false refusal is recoverable and
+    // a false admission is not.
     let propagated_taint = propagated_taint(current_assurances, derivations);
 
     // Instruction/data separation. This branch reads the recomputed taint and

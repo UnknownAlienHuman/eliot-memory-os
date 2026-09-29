@@ -1413,6 +1413,7 @@ dependencies = [
  "eliot-process",
  "eliot-process-executor",
  "eliot-protocol",
+ "eliot-security-contracts",
  "serde",
  "serde_json",
  "thiserror",
