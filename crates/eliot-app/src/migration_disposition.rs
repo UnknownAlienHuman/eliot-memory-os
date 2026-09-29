@@ -29,12 +29,39 @@ pub const MIGRATION_MAPPING_INCOMPLETE: &str = "MIGRATION_MAPPING_INCOMPLETE";
 /// Origin commit the `source_hash` values below were measured at.
 pub const MIGRATION_LEDGER_PIN_COMMIT: &str = "f8811c6f497b19155bd62dea463ae86a3ae35c9c";
 
+/// Marker prefix carried by `target_object` while no replacement owns the
+/// object (`I19.16`: missing mappings block retirement for the affected
+/// scope). A resolved row must name its concrete replacement owner instead.
+pub const MIGRATION_UNRESOLVED_TARGET_MARKER: &str = "UNRESOLVED";
+
+/// Placeholder `target_hash` while no replacement owns the object. A
+/// resolved row must carry the well-formed hash of its replacement instead.
+pub const MIGRATION_UNRESOLVED_HASH: &str = "unresolved";
+
+/// Marker phrase carried by `rollback_boundary` while the no-return
+/// boundary is not reached (`I19.10`: rollback plan tested; `I19.16`:
+/// after the no-return boundary, rollback is a forward repair, not
+/// resurrection of the old truth). A resolved row must name the reached
+/// boundary instead of this phrase.
+pub const MIGRATION_BOUNDARY_NOT_REACHED_MARKER: &str = "not reached";
+
+/// Ledger object for the `eliot-governor` binary entry: the active
+/// Governor route. The startup guard fails closed unless this row is
+/// present, so the route executes only with its identified replacement
+/// owner inventoried (`I20.11`: one governed transition path).
+pub const MIGRATION_GOVERNOR_ENTRY_OBJECT: &str = "eliot-app::main";
+
 /// Per-object migration disposition (`I19.16` `MigrationDisposition`).
 ///
 /// Exactly one row exists per active source object; the startup guard
 /// [`migration_ledger_guard`] enforces uniqueness, complete fields,
-/// well-formed hashes, and that every `UNRESOLVED` row carries the
-/// [`MIGRATION_MAPPING_INCOMPLETE`] blocking code.
+/// well-formed hashes, marker consistency between disposition and proof
+/// fields (an `UNRESOLVED` row carries the unresolved markers and the
+/// [`MIGRATION_MAPPING_INCOMPLETE`] blocking code; a resolved row carries
+/// a concrete replacement owner, a well-formed replacement hash, a real
+/// cutover receipt, and a reached boundary), and presence of the Governor
+/// entry row. A disposition therefore never resolves without its
+/// replacement proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MigrationDisposition {
     /// Crate-qualified object name, e.g. `eliot-engine::admission`.
@@ -1921,9 +1948,15 @@ pub const MIGRATION_LEDGER: &[MigrationDisposition] = &[
 
 /// Fail-closed startup check over [`MIGRATION_LEDGER`]: the ledger must
 /// be non-empty, name each source object once, carry complete fields and
-/// well-formed hashes, and every `UNRESOLVED` row must carry the
-/// [`MIGRATION_MAPPING_INCOMPLETE`] blocking code so retirement stays
-/// blocked for exactly the affected scope. Any violation aborts startup.
+/// well-formed hashes, and prove per-row resolvability: every `UNRESOLVED`
+/// row carries the unresolved target markers and the
+/// [`MIGRATION_MAPPING_INCOMPLETE`] blocking code with the not-reached
+/// boundary stated, while every resolved row names a concrete replacement
+/// owner with a well-formed replacement hash, a real cutover receipt, and
+/// a reached boundary — so no path retires without a built replacement and
+/// its proof. The ledger must also inventory the Governor entry object, so
+/// the active Governor route executes only through its identified
+/// replacement owner. Any violation aborts startup.
 pub fn migration_ledger_guard() -> Result<(), String> {
     if MIGRATION_LEDGER_PIN_COMMIT.len() != 40
         || !MIGRATION_LEDGER_PIN_COMMIT
@@ -1972,10 +2005,49 @@ pub fn migration_ledger_guard() -> Result<(), String> {
                 row.cutover_receipt,
             ));
         }
-        if !unresolved && row.target_hash == "unresolved" {
+        let target_unresolved = row
+            .target_object
+            .starts_with(MIGRATION_UNRESOLVED_TARGET_MARKER);
+        if unresolved != target_unresolved {
             return Err(format!(
-                "migration ledger row {} is resolved but names no target hash",
+                "migration ledger row {} carries disposition {} but target {}; unresolved rows must name the unresolved owner area and resolved rows must name the replacement owner",
                 row.source_object,
+                row.disposition.as_str(),
+                row.target_object,
+            ));
+        }
+        if unresolved {
+            if row.target_hash != MIGRATION_UNRESOLVED_HASH {
+                return Err(format!(
+                    "migration ledger row {} is unresolved but names target hash {}; unresolved rows must carry the unresolved placeholder",
+                    row.source_object, row.target_hash,
+                ));
+            }
+        } else {
+            if row.target_hash.len() != 64
+                || !row.target_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(format!(
+                    "migration ledger row {} is resolved but names no well-formed target hash",
+                    row.source_object,
+                ));
+            }
+            if row.cutover_receipt == MIGRATION_UNRESOLVED_HASH {
+                return Err(format!(
+                    "migration ledger row {} is resolved but carries a placeholder cutover receipt; no path retires without replacement proof",
+                    row.source_object,
+                ));
+            }
+        }
+        let boundary_open = row
+            .rollback_boundary
+            .contains(MIGRATION_BOUNDARY_NOT_REACHED_MARKER);
+        if unresolved != boundary_open {
+            return Err(format!(
+                "migration ledger row {} carries disposition {} but rollback boundary {}; unresolved rows must state the not-reached boundary and resolved rows must name the reached boundary",
+                row.source_object,
+                row.disposition.as_str(),
+                row.rollback_boundary,
             ));
         }
         for prior in &MIGRATION_LEDGER[..index] {
@@ -1986,6 +2058,15 @@ pub fn migration_ledger_guard() -> Result<(), String> {
                 ));
             }
         }
+    }
+    if !MIGRATION_LEDGER
+        .iter()
+        .any(|row| row.source_object == MIGRATION_GOVERNOR_ENTRY_OBJECT)
+    {
+        return Err(format!(
+            "migration ledger names no {} row; the active Governor route has no identified replacement owner",
+            MIGRATION_GOVERNOR_ENTRY_OBJECT,
+        ));
     }
     Ok(())
 }
