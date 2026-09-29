@@ -1280,8 +1280,8 @@ struct StoreReserveInner {
 /// the full protected capacity available for admitted
 /// cancellation/recovery/fencing records and vice versa. Partition selection
 /// is typed: normal acquisition resolves only normal counters from its
-/// NormalWorkClass value and protected acquisition only protected counters
-/// from its ControlOperationClass value, so a normal-only path cannot name a
+/// `NormalWorkClass` value and protected acquisition only protected counters
+/// from its `ControlOperationClass` value, so a normal-only path cannot name a
 /// protected counter. Acquisition is
 /// non-blocking and atomic; release is explicit and exactly-once via
 /// [`StorePermit::release`], with drop as the backstop returning exactly the
