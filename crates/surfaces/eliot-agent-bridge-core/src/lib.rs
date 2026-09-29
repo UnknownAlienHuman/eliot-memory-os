@@ -1133,9 +1133,9 @@ pub struct RecoveryProjectionSummary {
     pub disposition: RecoveryDisposition,
 }
 
-/// A single checked record from the recovery window. Event records contain
-/// receipt metadata and digest references only; they never synthesize an
-/// `EventEnvelope` from those fields.
+/// A single checked record from the recovery window. Event records publish
+/// receipt metadata and digest references; retained source bytes stay private
+/// to the recovery adapter and are not serialized into this page.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "record", rename_all = "snake_case")]
 pub enum RecoveryProjectionRecord {
@@ -1157,8 +1157,8 @@ pub enum RecoveryProjectionObligation {
 }
 
 /// One imported event receipt and its current bridge-local obligation state.
-/// The receipt is still digest-only and is never converted into an event
-/// envelope.
+/// The public receipt is digest-only; a checked small source, when available,
+/// remains private to the recovery adapter.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryProjectionEvent {
@@ -2125,14 +2125,138 @@ pub const RECOVERY_PARTIAL_STREAM_LIST_TRUNCATED: &str = "stream-list-truncated"
 /// was refused without applying half a page.
 pub const RECOVERY_UNAVAILABLE_FOREIGN_PAGE: &str = "foreign-page-refused";
 
+/// A small source and normalization projection checked against the immutable
+/// transport hash and the owner's deterministic redaction representation.
+/// Larger content remains with its retained source owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveredSourceKind {
+    AdmittedInline,
+    Redacted,
+}
+
+/// Why the retained source cannot be carried inside a bounded recovery page.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveredSourceUnavailable {
+    RequiresSourceHandle,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct RecoveredSourceProjection {
+    kind: RecoveredSourceKind,
+    source_utf8: String,
+    normalized_utf8: String,
+    transport_hash: String,
+    redaction_reason: Option<String>,
+    redacted_classes: Vec<String>,
+}
+
+impl fmt::Debug for RecoveredSourceProjection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RecoveredSourceProjection")
+            .field("kind", &self.kind)
+            .field("transport_hash", &self.transport_hash)
+            .field("source_bytes", &self.source_utf8.len())
+            .field("normalized_bytes", &self.normalized_utf8.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl RecoveredSourceProjection {
+    #[allow(clippy::result_large_err)]
+    pub fn checked(
+        kind: RecoveredSourceKind,
+        source_utf8: String,
+        normalized_utf8: String,
+        transport_hash: String,
+        redaction_reason: Option<String>,
+        redacted_classes: Vec<String>,
+    ) -> Result<Self, BridgeError> {
+        if source_utf8.is_empty()
+            || normalized_utf8.is_empty()
+            || source_utf8.len() > 4096
+            || normalized_utf8.len() > 4096
+            || transport_hash.len() != 64
+            || !transport_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(BridgeError::InvalidContract {
+                field: "recovered_source",
+                reason: "inline source exceeds its bound or lacks a transport hash",
+            });
+        }
+        let valid = match kind {
+            RecoveredSourceKind::AdmittedInline => {
+                redaction_reason.is_none()
+                    && redacted_classes.is_empty()
+                    && normalized_utf8 == source_utf8
+                    && format!("{:x}", Sha256::digest(source_utf8.as_bytes())) == transport_hash
+            }
+            RecoveredSourceKind::Redacted => {
+                let ordered = redacted_classes.windows(2).all(|pair| pair[0] < pair[1]);
+                let classes_valid = !redacted_classes.is_empty()
+                    && redacted_classes.len() <= 16
+                    && ordered
+                    && redacted_classes.iter().all(|class| {
+                        !class.is_empty()
+                            && class.len() <= 1024
+                            && !class.chars().any(char::is_control)
+                    });
+                let reason_valid = matches!(
+                    redaction_reason.as_deref(),
+                    Some("FORBIDDEN_CONTENT_DETECTED" | "DECLARED_OUT_OF_SCOPE")
+                );
+                let classes = redacted_classes.join(",");
+                classes_valid
+                    && reason_valid
+                    && source_utf8
+                        == format!(
+                            "redacted/bridge-event-v1:hash={transport_hash}:classes={classes}"
+                        )
+                    && normalized_utf8
+                        == format!(
+                            "redacted/bridge-event-normalized-v1:hash={transport_hash}:classes={classes}:reason={}",
+                            redaction_reason.as_deref().unwrap_or_default()
+                        )
+            }
+        };
+        if !valid {
+            return Err(BridgeError::InvalidContract {
+                field: "recovered_source",
+                reason: "inline source does not match its retained owner representation",
+            });
+        }
+        Ok(Self {
+            kind,
+            source_utf8,
+            normalized_utf8,
+            transport_hash,
+            redaction_reason,
+            redacted_classes,
+        })
+    }
+
+    pub fn kind(&self) -> RecoveredSourceKind {
+        self.kind
+    }
+
+    pub fn source_utf8(&self) -> &str {
+        &self.source_utf8
+    }
+
+    pub fn normalized_utf8(&self) -> &str {
+        &self.normalized_utf8
+    }
+}
+
 /// One checked retained-event receipt fact restored from an owner page.
 ///
-/// Digest-only by construction: owner pages carry metadata, not the
-/// original event payload, so this fact never fabricates an
-/// [`EventEnvelope`]. Raw/redacted/normalized linkage is re-established
-/// only through the retained source/artifact owner; the bridge keeps the
-/// digest, producer, and phase legs separate instead of merging them into a
-/// synthetic envelope.
+/// The public projection is digest-only. An optional checked small source is
+/// retained for the recovery adapter but omitted from serialized projection
+/// pages; metadata never fabricates an [`EventEnvelope`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RecoveredEventFact {
     stream_id: String,
@@ -2143,6 +2267,10 @@ pub struct RecoveredEventFact {
     producer_id: String,
     producer_generation: u64,
     staging_connection: String,
+    #[serde(skip_serializing)]
+    source_projection: Option<RecoveredSourceProjection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_unavailable: Option<RecoveredSourceUnavailable>,
 }
 
 impl RecoveredEventFact {
@@ -2195,7 +2323,91 @@ impl RecoveredEventFact {
             producer_id,
             producer_generation,
             staging_connection,
+            source_projection: None,
+            source_unavailable: None,
         })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn with_source_projection(
+        mut self,
+        projection: RecoveredSourceProjection,
+    ) -> Result<Self, BridgeError> {
+        if self.source_unavailable.is_some() {
+            return Err(BridgeError::InvalidContract {
+                field: "recovered_event.source_projection",
+                reason: "inline source conflicts with source unavailability",
+            });
+        }
+        if projection.transport_hash != self.envelope_digest {
+            return Err(BridgeError::InvalidContract {
+                field: "recovered_event.source_projection",
+                reason: "source projection hash differs from the event identity digest",
+            });
+        }
+        if projection.kind == RecoveredSourceKind::AdmittedInline {
+            let envelope: EventEnvelope =
+                serde_json::from_str(&projection.source_utf8).map_err(|_| {
+                    BridgeError::InvalidContract {
+                        field: "recovered_event.source_projection",
+                        reason: "admitted inline source is not an event envelope",
+                    }
+                })?;
+            envelope
+                .validate()
+                .map_err(|_| BridgeError::InvalidContract {
+                    field: "recovered_event.source_projection",
+                    reason: "admitted inline event envelope is invalid",
+                })?;
+            envelope
+                .require_known_payload_type()
+                .map_err(|_| BridgeError::InvalidContract {
+                    field: "recovered_event.source_projection",
+                    reason: "admitted inline event payload is unknown",
+                })?;
+            if envelope.stream_id != self.stream_id
+                || envelope.event_id != self.event_id
+                || envelope.sequence != self.sequence
+                || envelope.producer_id != self.producer_id
+                || envelope.producer_generation.value() != self.producer_generation
+                || eliot_contracts::canonical_json_bytes(&envelope).map_err(|_| {
+                    BridgeError::InvalidContract {
+                        field: "recovered_event.source_projection",
+                        reason: "admitted inline event cannot be canonically encoded",
+                    }
+                })? != projection.source_utf8.as_bytes()
+            {
+                return Err(BridgeError::InvalidContract {
+                    field: "recovered_event.source_projection",
+                    reason: "admitted inline source differs from the retained event identity",
+                });
+            }
+        }
+        self.source_projection = Some(projection);
+        Ok(self)
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn with_source_unavailable(
+        mut self,
+        reason: RecoveredSourceUnavailable,
+    ) -> Result<Self, BridgeError> {
+        if self.source_projection.is_some() {
+            return Err(BridgeError::InvalidContract {
+                field: "recovered_event.source_unavailable",
+                reason: "source unavailability conflicts with an inline source",
+            });
+        }
+        self.source_unavailable = Some(reason);
+        Ok(self)
+    }
+
+    pub fn source_projection(&self) -> Option<&RecoveredSourceProjection> {
+        self.source_projection.as_ref()
+    }
+
+    pub fn source_unavailable(&self) -> Option<RecoveredSourceUnavailable> {
+        self.source_unavailable
     }
 
     pub fn stream_id(&self) -> &str {
@@ -3111,11 +3323,12 @@ impl RecoveryWindowFacts {
 ///
 /// A keyed continuation names the declared window, one stream scope, the
 /// predecessor sequence the next page must advance past, and explicit
-/// event/gap budgets. A resume selector deliberately omits the volatile
-/// window key so the existing authenticated owner scope can find the same
-/// persisted window after process restart. Every form carries the expected
-/// live authority (generation plus presenting connection), so each call
-/// rechecks the #2729 rights against the current attach.
+/// event/gap budgets. A fresh-process resume omits the window key so the
+/// authenticated owner scope can find its persisted window; a cached-core
+/// resume pins the previously admitted key across reconnect. Every form
+/// carries the expected live authority (generation plus presenting
+/// connection), so each call rechecks the #2729 rights against the current
+/// attach.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryReadRequest {
     window_key: Option<String>,
@@ -3344,6 +3557,21 @@ impl RecoveryReadRequest {
             expected_generation,
             expected_connection,
         })
+    }
+
+    /// Constructs a resume read pinned to the previously admitted window.
+    /// The key narrows the owner lookup but does not replace current attach
+    /// authorization or carry a continuation proof.
+    #[allow(clippy::result_large_err)]
+    pub fn checked_resume_for_window(
+        window_key: String,
+        expected_generation: u64,
+        expected_connection: String,
+    ) -> Result<Self, BridgeError> {
+        validate_text(&window_key, "recovery_read.window_key")?;
+        let mut request = Self::checked_resume(expected_generation, expected_connection)?;
+        request.window_key = Some(window_key);
+        Ok(request)
     }
 
     pub fn window_key(&self) -> Option<&str> {
@@ -3676,6 +3904,7 @@ struct RecoveryWindow {
     window_key: String,
     expires_at_ms: u64,
     live_generation: u64,
+    presenting_connection: ConnectionId,
     import_revision: u64,
     stream_order: Vec<String>,
     streams: BTreeMap<String, RecoveryStreamProgress>,
@@ -3820,6 +4049,14 @@ impl RecoveryWindow {
         }
         let generation = binding.activation_generation.get();
         let connection = binding.connection_id.as_str().to_owned();
+        if self.live_generation != generation || self.presenting_connection != binding.connection_id
+        {
+            return RecoveryReadRequest::checked_resume_for_window(
+                self.window_key.clone(),
+                generation,
+                connection,
+            );
+        }
         if let Some(next) = self.stream_order.iter().find(|stream_id| {
             self.streams
                 .get(*stream_id)
@@ -3897,6 +4134,9 @@ pub struct AgentBridgeCore {
     replay: ReplayLedger,
     acknowledged_phases: BTreeMap<EventIdentityKey, AckPhase>,
     pending_deliveries: BTreeMap<EventIdentityKey, PendingDelivery>,
+    /// Phase-qualified sequences beyond the contiguous local cursor. Owner
+    /// receipts remain authoritative; a later receipt cannot bridge a hole.
+    acknowledged_out_of_order: BTreeMap<String, BTreeSet<u64>>,
     cursors: BTreeMap<String, u64>,
     host_journal: Vec<HostEventEnvelope>,
     attempt_transitions: Vec<AttemptTransition>,
@@ -3926,6 +4166,7 @@ impl AgentBridgeCore {
             replay: ReplayLedger::new(),
             acknowledged_phases: BTreeMap::new(),
             pending_deliveries: BTreeMap::new(),
+            acknowledged_out_of_order: BTreeMap::new(),
             cursors: BTreeMap::new(),
             host_journal: Vec::new(),
             attempt_transitions: Vec::new(),
@@ -4005,6 +4246,7 @@ impl AgentBridgeCore {
         self.active = Some(active);
         self.replay = ReplayLedger::new();
         self.acknowledged_phases.clear();
+        self.acknowledged_out_of_order.clear();
         self.cursors.clear();
         self.host_journal.clear();
         self.attempt_transitions.clear();
@@ -4123,19 +4365,12 @@ impl AgentBridgeCore {
             let connection = active.binding.connection_id.as_str().to_owned();
             let request = match active.recovery.as_ref() {
                 Some(window) => window.next_request(&active.binding)?,
-                None if active.reconciliation_required => {
-                    if active.blind_interval.is_none() {
-                        return Err(BridgeError::InvalidTransition(
-                            "an unreconciled attach requires its declared blind interval",
-                        ));
-                    }
-                    RecoveryReadRequest::checked_resume(generation, connection)?
-                }
-                None => {
+                None if active.reconciliation_required && active.blind_interval.is_none() => {
                     return Err(BridgeError::InvalidTransition(
-                        "no declared recovery window; reconcile_external opens the walk",
+                        "an unreconciled attach requires its declared blind interval",
                     ));
                 }
+                None => RecoveryReadRequest::checked_resume(generation, connection)?,
             };
             (active.binding.clone(), request)
         };
@@ -4363,8 +4598,27 @@ impl AgentBridgeCore {
         if facts.live_generation != binding.activation_generation {
             return Err(BridgeError::StaleAuthority);
         }
-        let (new_window, window) =
-            Self::stage_recovery_window(recovery, facts, allow_refresh_candidate)?;
+        if facts.window_status != RecoveryWindowStatus::Active
+            && (!facts.stream_facts.is_empty()
+                || !facts.unscoped_gaps.is_empty()
+                || facts.stream_list_proof.is_some()
+                || facts.stream_list_continuation.is_some()
+                || facts.unscoped_gaps_proof.is_some()
+                || facts.unscoped_gaps_continuation.is_some()
+                || facts.stream_list_complete
+                || facts.unscoped_gaps_complete)
+        {
+            return Err(BridgeError::InvalidContract {
+                field: "recovery_window.terminal_status",
+                reason: "moved or expired windows carry identity only, with no page facts or proofs",
+            });
+        }
+        let (new_window, window) = Self::stage_recovery_window(
+            recovery,
+            facts,
+            allow_refresh_candidate,
+            response_selector,
+        )?;
         Self::validate_recovery_request_proof(
             window,
             new_window,
@@ -4375,7 +4629,10 @@ impl AgentBridgeCore {
         let previous_incomplete_reason = window.incomplete_reason;
         let facts_changed =
             Self::apply_recovery_window_facts(window, new_window, response_selector, facts)?;
-        let mut changed = new_window || facts_changed;
+        let presentation_changed = facts.window_status == RecoveryWindowStatus::Active
+            && (window.live_generation != facts.live_generation.get()
+                || window.presenting_connection != facts.presenting_connection);
+        let mut changed = new_window || facts_changed || presentation_changed;
         Self::validate_recovery_gap_total(
             window,
             facts.window_status == RecoveryWindowStatus::Active,
@@ -4383,6 +4640,10 @@ impl AgentBridgeCore {
         let incomplete_reason = match facts.window_status {
             RecoveryWindowStatus::Active => {
                 Self::validate_recovery_window_totals(window)?;
+                window.live_generation = facts.live_generation.get();
+                window
+                    .presenting_connection
+                    .clone_from(&facts.presenting_connection);
                 None
             }
             RecoveryWindowStatus::Moved => Some(RECOVERY_PARTIAL_WINDOW_MOVED),
@@ -4441,32 +4702,45 @@ impl AgentBridgeCore {
         recovery: &'a mut Option<RecoveryWindow>,
         facts: &RecoveryWindowFacts,
         allow_refresh_candidate: bool,
+        response_selector: RecoveryResponseSelector,
     ) -> Result<(bool, &'a mut RecoveryWindow), BridgeError> {
-        let same_generation = recovery
-            .as_ref()
-            .is_some_and(|window| window.live_generation == facts.live_generation.get());
-        let refresh_candidate = same_generation
-            && recovery
-                .as_ref()
-                .is_some_and(|window| window.window_key != facts.window_key);
-        if refresh_candidate && !allow_refresh_candidate {
+        let existing = recovery.as_ref();
+        let same_key = existing.is_some_and(|window| window.window_key == facts.window_key);
+        if same_key
+            && existing.is_some_and(|window| {
+                window.expires_at_ms != facts.expires_at_ms
+                    || window.stream_list_total != facts.stream_list_total
+                    || window.unscoped_gap_total != facts.unscoped_gap_total
+            })
+        {
             return Err(BridgeError::StaleAuthority);
         }
-        if same_generation && !refresh_candidate {
-            let window = recovery.as_ref().ok_or(BridgeError::NotAttached)?;
-            if window.expires_at_ms != facts.expires_at_ms
-                || window.stream_list_total != facts.stream_list_total
-                || window.unscoped_gap_total != facts.unscoped_gap_total
+        let new_window = match existing {
+            None => true,
+            Some(_) if same_key => false,
+            Some(_)
+                if response_selector == RecoveryResponseSelector::Open
+                    && allow_refresh_candidate =>
             {
-                return Err(BridgeError::StaleAuthority);
+                true
             }
+            Some(_) => return Err(BridgeError::StaleAuthority),
+        };
+        let keyed = matches!(
+            response_selector,
+            RecoveryResponseSelector::Streams
+                | RecoveryResponseSelector::Stream
+                | RecoveryResponseSelector::UnscopedGaps
+        );
+        if new_window && keyed {
+            return Err(BridgeError::StaleAuthority);
         }
-        let new_window = !same_generation || refresh_candidate;
         if new_window {
             *recovery = Some(RecoveryWindow {
                 window_key: facts.window_key.clone(),
                 expires_at_ms: facts.expires_at_ms,
                 live_generation: facts.live_generation.get(),
+                presenting_connection: facts.presenting_connection.clone(),
                 import_revision: 0,
                 stream_order: Vec::new(),
                 streams: BTreeMap::new(),
@@ -4476,9 +4750,9 @@ impl AgentBridgeCore {
                 stream_list_proof: facts.stream_list_proof.clone(),
                 unscoped_gaps_proof: facts.unscoped_gaps_proof.clone(),
                 unproven_scope_present: false,
-                stream_list_complete: true,
+                stream_list_complete: false,
                 stream_list_continuation: None,
-                unscoped_gaps_complete: true,
+                unscoped_gaps_complete: false,
                 unscoped_gaps_continuation: None,
                 incomplete_reason: None,
             });
@@ -4501,6 +4775,11 @@ impl AgentBridgeCore {
             RecoveryResponseSelector::Open | RecoveryResponseSelector::Resume
         );
         let resume_existing = response_selector == RecoveryResponseSelector::Resume && !new_window;
+        if facts.window_status != RecoveryWindowStatus::Active {
+            let changed = !window.unproven_scope_present && facts.unproven_scope_present;
+            window.unproven_scope_present |= facts.unproven_scope_present;
+            return Ok(changed);
+        }
         let mut changed = !window.unproven_scope_present && facts.unproven_scope_present;
         window.unproven_scope_present |= facts.unproven_scope_present;
         if resume_existing {
@@ -4749,7 +5028,9 @@ impl AgentBridgeCore {
         gap.validate()
             .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
         let binding = self.binding()?.clone();
-        self.forwarder()?.forward_gap(&binding, gap)?;
+        self.forwarder()?
+            .forward_gap(&binding, gap)
+            .map_err(BridgeError::from_forwarding_failure)?;
         Ok(())
     }
 
@@ -5034,16 +5315,14 @@ impl AgentBridgeCore {
                 .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
         }
 
-        let cursor_advanced = phase_reaches(required_phase, ack.phase);
-        if cursor_advanced {
+        let phase_qualified = phase_reaches(required_phase, ack.phase);
+        let mut cursor_advanced = false;
+        if phase_qualified {
             self.replay = completed_probe;
             self.pending_deliveries.remove(&replay_key);
             self.acknowledged_phases
                 .insert(replay_key.clone(), ack.phase);
-            self.cursors
-                .entry(event.stream_id.clone())
-                .and_modify(|cursor| *cursor = (*cursor).max(event.sequence))
-                .or_insert(event.sequence);
+            cursor_advanced = self.advance_contiguous_cursor(&event.stream_id, event.sequence);
         } else {
             self.pending_deliveries.insert(
                 replay_key,
@@ -5059,6 +5338,32 @@ impl AgentBridgeCore {
             disposition: ack.disposition,
             cursor_advanced,
         })
+    }
+
+    /// Retains a later qualified receipt without publishing a cursor across
+    /// a missing sequence. A subsequent receipt can close the hole and advance
+    /// through every already-qualified successor in one local transition.
+    fn advance_contiguous_cursor(&mut self, stream_id: &str, sequence: u64) -> bool {
+        let mut frontier = self.cursors.get(stream_id).copied().unwrap_or(0);
+        let ready = self
+            .acknowledged_out_of_order
+            .entry(stream_id.to_owned())
+            .or_default();
+        if sequence > frontier {
+            ready.insert(sequence);
+        }
+        let previous = frontier;
+        while let Some(next) = frontier.checked_add(1) {
+            if !ready.remove(&next) {
+                break;
+            }
+            frontier = next;
+        }
+        if frontier != previous {
+            self.cursors.insert(stream_id.to_owned(), frontier);
+            return true;
+        }
+        false
     }
 
     fn forward_best_effort(

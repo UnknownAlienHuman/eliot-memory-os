@@ -7045,6 +7045,8 @@ fn is_credential_unknown_reason(value: &str) -> bool {
             | "credential-final-marker-without-target"
             | "credential-csprng"
             | "credential-envelope"
+            | "credential-write"
+            | "credential-target-prewrite-race"
             | "credential-write-mismatch"
             | "credential-envelope-digest"
             | "credential-final-marker"

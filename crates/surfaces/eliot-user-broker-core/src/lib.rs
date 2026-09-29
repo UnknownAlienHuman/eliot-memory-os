@@ -25,7 +25,7 @@ use eliot_process::{
     OperationId, ProcessExecutionView, ProcessLifecycle, ProcessStartReceipt, ProcessTreeId,
     ResourceLimits, SecretRef, SessionId,
 };
-use eliot_protocol::ProtocolVersion;
+use eliot_protocol::{ProtocolVersion, RequestIdentity};
 use eliot_receipts::ProofCeiling;
 use eliot_security_contracts::EffectCeiling;
 use serde::{Deserialize, Serialize};
@@ -38,6 +38,14 @@ pub const OPERATOR_ROLE: &str = "human_operator";
 pub const OPERATOR_CAPABILITIES: [&str; 2] = ["controlboard.read", "operator.command"];
 pub const OPERATOR_HANDOFF_TTL_MS: u64 = 5_000;
 pub const OPERATOR_PIPE_NAME: &str = r"\\.\pipe\eliot\operator\one-shot";
+/// Current durable identity-row shape. Version 1 rows remain spent-ID
+/// tombstones because they did not retain the original `RequestIdentity`.
+pub const ISSUED_OPERATION_IDENTITY_VERSION: u16 = 2;
+const LEGACY_ISSUED_OPERATION_IDENTITY_VERSION: u16 = 1;
+
+fn legacy_issued_operation_identity_version() -> u16 {
+    LEGACY_ISSUED_OPERATION_IDENTITY_VERSION
+}
 
 /// Upper bound for the one-shot standard-input bytes one admitted launch may
 /// carry.
@@ -1073,6 +1081,10 @@ pub struct OperationPermit {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IssuedOperationIdentity {
+    /// Explicit row schema version. Missing on pre-#74 snapshots and read as
+    /// version 1, whose identity is reserved but cannot be replayed.
+    #[serde(default = "legacy_issued_operation_identity_version")]
+    pub schema_version: u16,
     /// Closed Kernel operation selector this identity was minted for.
     pub operation: String,
     /// Lowercase SHA-256 of the canonical payload bytes the identity binds.
@@ -1085,10 +1097,24 @@ pub struct IssuedOperationIdentity {
     pub cancellation_id: String,
     /// Absolute transport deadline the identity was minted with.
     pub deadline_unix_ms: u64,
+    /// Exact registration generation that admitted this request identity.
+    /// Both values are absent only for a registration request issued before a
+    /// registration exists, or on an explicit legacy row.
+    #[serde(default)]
+    pub registration_digest: Option<String>,
+    #[serde(default)]
+    pub user_broker_epoch: Option<u64>,
+    /// Original typed Kernel identity. It is never reconstructed against a
+    /// later fence; a missing value is a legacy/local-operation tombstone.
+    #[serde(default)]
+    pub request_identity: Option<RequestIdentity>,
     /// Observation instant the identity was minted at.
     pub issued_at_ms: u64,
     /// Caller request id when a launch caller link owned this issuance.
     pub caller_request_id: Option<String>,
+    /// Caller launch idempotency key, distinct from the transport key above.
+    #[serde(default)]
+    pub caller_idempotency_key: Option<String>,
 }
 
 impl IssuedOperationIdentity {
@@ -1110,20 +1136,119 @@ impl IssuedOperationIdentity {
         if let Some(caller) = self.caller_request_id.as_deref() {
             text(caller, "operation_identity.caller_request_id")?;
         }
+        if let Some(caller_key) = self.caller_idempotency_key.as_deref() {
+            text(caller_key, "operation_identity.caller_idempotency_key")?;
+        }
+        match (self.registration_digest.as_deref(), self.user_broker_epoch) {
+            (Some(digest), Some(epoch)) if epoch > 0 => {
+                hex_digest(digest, "operation_identity.registration_digest")?;
+            }
+            (None, None) => {}
+            _ => return Err(BrokerError::InvalidField("operation_identity.registration")),
+        }
+        let kernel_request = matches!(
+            self.operation.as_str(),
+            "eliot.user-broker.register"
+                | "eliot.user-broker.heartbeat"
+                | "eliot.user-broker.authorize-launch"
+                | "eliot.user-broker.fence"
+        );
+        let broker_control = matches!(
+            self.operation.as_str(),
+            "eliot.user-broker.cancel" | "eliot.user-broker.reconcile"
+        );
+        let is_authorize_launch = self.operation == "eliot.user-broker.authorize-launch";
+        match self.schema_version {
+            LEGACY_ISSUED_OPERATION_IDENTITY_VERSION
+                if (kernel_request || broker_control)
+                    && self.request_identity.is_none()
+                    && self.registration_digest.is_none()
+                    && self.user_broker_epoch.is_none()
+                    && self.caller_idempotency_key.is_none()
+                    && self.caller_request_id.is_some() == is_authorize_launch => {}
+            ISSUED_OPERATION_IDENTITY_VERSION if kernel_request => {
+                self.validate_kernel_request_identity(is_authorize_launch)?;
+            }
+            ISSUED_OPERATION_IDENTITY_VERSION if broker_control => {
+                if self.request_identity.is_some()
+                    || self.registration_digest.is_none()
+                    || self.user_broker_epoch.is_none()
+                    || self.caller_request_id.is_some()
+                    || self.caller_idempotency_key.is_some()
+                {
+                    return Err(BrokerError::InvalidField(
+                        "operation_identity.control_binding",
+                    ));
+                }
+            }
+            _ => {
+                return Err(BrokerError::InvalidField(
+                    "operation_identity.schema_version",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_kernel_request_identity(
+        &self,
+        is_authorize_launch: bool,
+    ) -> Result<(), BrokerError> {
+        if self.operation != "eliot.user-broker.register"
+            && (self.registration_digest.is_none() || self.user_broker_epoch.is_none())
+        {
+            return Err(BrokerError::InvalidField("operation_identity.registration"));
+        }
+        let request_identity = self
+            .request_identity
+            .as_ref()
+            .ok_or(BrokerError::InvalidField(
+                "operation_identity.request_identity",
+            ))?;
+        request_identity
+            .validate()
+            .map_err(|_| BrokerError::InvalidField("operation_identity.request_identity"))?;
+        let issued_at = i64::try_from(self.issued_at_ms)
+            .map_err(|_| BrokerError::InvalidField("operation_identity.clock"))?;
+        if request_identity.request.metadata.request_id.as_str() != self.request_id
+            || request_identity.idempotency_key != self.idempotency_key
+            || request_identity.cancellation_id != self.cancellation_id
+            || request_identity.deadline_unix_ms != self.deadline_unix_ms
+            || request_identity.request.metadata.state_fence != request_identity.request.state_fence
+            || request_identity.request.metadata.product_id.as_str() != "eliot-user-broker"
+            || request_identity.request.metadata.source_id.as_str() != "user-broker-transport"
+            || request_identity.request.metadata.session_id.is_some()
+            || request_identity.request.metadata.task_id.is_some()
+            || request_identity.request.metadata.clock.valid_time_ms != Some(issued_at)
+            || request_identity.request.metadata.clock.known_time_ms != Some(issued_at)
+        {
+            return Err(BrokerError::InvalidField(
+                "operation_identity.request_identity_binding",
+            ));
+        }
+        if self.caller_request_id.is_some() != self.caller_idempotency_key.is_some()
+            || (is_authorize_launch && self.caller_request_id.is_none())
+            || (!is_authorize_launch && self.caller_request_id.is_some())
+        {
+            return Err(BrokerError::InvalidField(
+                "operation_identity.caller_binding",
+            ));
+        }
         Ok(())
     }
 }
 
 /// Live per-operation identity ledger supplied by the composition.
 ///
-/// The broker core never mints an identity: it only projects whatever the
-/// composed issuer holds into the durable snapshot, so the identity ledger
-/// and the durable registration state are written in one atomic publication.
+/// The broker core never mints a Kernel request identity: it only projects
+/// whatever the composed issuer holds into the durable snapshot, so the
+/// identity ledger and the durable registration state are written in one
+/// atomic publication. A broken ledger is an error; it must not erase
+/// recovered identities from the next snapshot.
 pub trait IssuedOperationIdentityLedger: Send {
     /// Returns every operation identity this process has issued, in a
-    /// deterministic order. A poisoned ledger returns an empty projection and
-    /// the caller fails closed on the next issuance.
-    fn issued_operation_identities(&self) -> Vec<IssuedOperationIdentity>;
+    /// deterministic order, or an error when the projection is unavailable.
+    fn issued_operation_identities(&self) -> Result<Vec<IssuedOperationIdentity>, String>;
 }
 
 /// Durable restart cursor owned by the injected registration provider.
@@ -2577,11 +2702,15 @@ impl UserBroker {
         }
         let namespace = operation.namespace();
         let identity = IssuedOperationIdentity {
+            schema_version: ISSUED_OPERATION_IDENTITY_VERSION,
             operation: operation.selector().to_owned(),
             // The registration lease is the control operation's deadline: a
             // cancellation or reconciliation is authorized no longer than the
             // lease that admitted it.
             deadline_unix_ms: current.expires_at,
+            registration_digest: Some(current.registration_digest.clone()),
+            user_broker_epoch: Some(current.user_broker_epoch),
+            request_identity: None,
             request_id: format!("ub-ctl-{namespace}-{}", &canonical_digest[..32]),
             idempotency_key: format!("ub-ctl/{namespace}/{canonical_digest}"),
             cancellation_id: format!("ub-ctl-end-{namespace}-{}", &canonical_digest[..32]),
@@ -2590,6 +2719,7 @@ impl UserBroker {
             // and a reconcile identity, so a single-valued caller link would
             // make the second one look like a conflicting reuse.
             caller_request_id: None,
+            caller_idempotency_key: None,
             canonical_digest,
         };
         identity.validate()?;
@@ -2895,7 +3025,9 @@ impl UserBroker {
                 self.registration = Some(desired);
                 let reconciled = match self.durable.as_mut() {
                     Some(durable) => match durable.load() {
-                        Ok(Some(snapshot)) => snapshot == self.snapshot(),
+                        Ok(Some(snapshot)) => {
+                            matches!(self.snapshot(), Ok(expected) if expected == snapshot)
+                        }
                         Ok(None) | Err(_) => false,
                     },
                     None => false,
@@ -3042,8 +3174,8 @@ impl UserBroker {
         Ok(durable.clone())
     }
 
-    fn snapshot(&self) -> BrokerSnapshot {
-        BrokerSnapshot {
+    fn snapshot(&self) -> Result<BrokerSnapshot, BrokerError> {
+        Ok(BrokerSnapshot {
             registration: self.registration.clone(),
             user_broker_epoch: self.broker_epoch,
             operation_cursors: self
@@ -3051,11 +3183,11 @@ impl UserBroker {
                 .values()
                 .map(|record| record.cursor.clone())
                 .collect(),
-            operation_identities: self.projected_operation_identities(),
+            operation_identities: self.projected_operation_identities()?,
             retired_operations: self.retired_operations.values().cloned().collect(),
             predecessor_registration: self.predecessor_registration.clone(),
             cutover_receipt: self.cutover_receipt.clone(),
-        }
+        })
     }
 
     /// Projects the durable identity ledger: everything recovered from the
@@ -3066,18 +3198,29 @@ impl UserBroker {
     /// carries byte-identical transport fields, so the live row is the same
     /// row. The recovered row is still kept when the composed ledger does not
     /// carry it, so attaching no ledger never erases durable history.
-    fn projected_operation_identities(&self) -> Vec<IssuedOperationIdentity> {
+    fn projected_operation_identities(&self) -> Result<Vec<IssuedOperationIdentity>, BrokerError> {
         let mut projected = self.issued_operations.clone();
         if let Some(ledger) = self.identity_ledger.as_ref() {
-            for identity in ledger.issued_operation_identities() {
-                projected.insert(identity.request_id.clone(), identity);
+            for identity in ledger.issued_operation_identities().map_err(|error| {
+                BrokerError::Provider(format!("operation identity ledger unavailable: {error}"))
+            })? {
+                identity.validate()?;
+                if let Some(retained) = projected.get(&identity.request_id) {
+                    if retained != &identity {
+                        return Err(BrokerError::InvalidField(
+                            "operation_identity.duplicate_request_id_binding",
+                        ));
+                    }
+                } else {
+                    projected.insert(identity.request_id.clone(), identity);
+                }
             }
         }
-        projected.into_values().collect()
+        Ok(projected.into_values().collect())
     }
 
     fn persist(&mut self) -> Result<(), BrokerError> {
-        let snapshot = self.snapshot();
+        let snapshot = self.snapshot()?;
         self.durable
             .as_mut()
             .ok_or(BrokerError::PlanGap(RequiredProvider::DurableRegistration))?
@@ -4015,6 +4158,141 @@ struct BootstrapTicketState {
     consumed: bool,
 }
 
+/// Physical User Broker secret boundary for one `OpenCode` route
+/// (issue #2898, step 3).
+///
+/// The broker — and only the broker process that owns the physical launch —
+/// implements this: it resolves the introduction's opaque [`SecretRef`] to its
+/// short-lived bytes. The registry hands the resolved value to exactly one
+/// approved consumer, the bound `OpenCode` process, and never places the raw
+/// bytes in a durable registration, command line, log, route profile, model
+/// context or ordinary non-secret launch map.
+pub trait OpenCodeSecretBoundary {
+    /// Resolution failure. Carries no secret material.
+    type Error: std::error::Error + Send + 'static;
+
+    /// Resolves one opaque handle to the current short-lived secret bytes.
+    fn resolve_secret(&self, handle: &SecretRef) -> Result<Box<str>, Self::Error>;
+}
+
+/// The User Broker's current `OpenCode` bridge introductions and their
+/// generation/revocation state (issue #2898, steps 3 and 14).
+///
+/// Installing a new introduction retires the previous one's revocation id
+/// and its credential handle *together*, so restart/rotation mints a new
+/// generation and the old material stops resolving the moment the new one is
+/// installed. A revoked introduction is refused even while it is still
+/// installed and inside its window; [`OpenCodeBridgeIntroductionRegistry::revoke`]
+/// and [`OpenCodeBridgeIntroductionRegistry::clear`] cover logout, listener
+/// death and bridge restart.
+#[derive(Clone, Debug, Default)]
+pub struct OpenCodeBridgeIntroductionRegistry {
+    current: Option<OpenCodeBridgeIntroduction>,
+    retired_revocation_ids: BTreeSet<String>,
+    retired_credentials: BTreeSet<(String, String)>,
+}
+
+impl OpenCodeBridgeIntroductionRegistry {
+    /// Creates an empty registry: no route is introduced until
+    /// [`OpenCodeBridgeIntroductionRegistry::install`] runs.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Installs the current introduction, retiring the replaced entry.
+    ///
+    /// The replaced introduction's revocation id and its credential handle are
+    /// retired in the same step, so the old generation can neither be admitted
+    /// nor have its secret resolved after the rotation. Revoking by
+    /// `revocation_id` is a *name* match, so it is performed only against the
+    /// introduction this registry actually held — a caller-supplied id that
+    /// was never installed is never "revoked" on the basis of its name.
+    pub fn install(&mut self, introduction: OpenCodeBridgeIntroduction) {
+        if let Some(previous) = self.current.replace(introduction) {
+            self.retire(&previous);
+        }
+    }
+
+    /// Retires the current introduction's material without installing a
+    /// replacement (logout, listener death, bridge restart).
+    pub fn clear(&mut self) {
+        if let Some(previous) = self.current.take() {
+            self.retire(&previous);
+        }
+    }
+
+    /// Retires one named introduction. An id this registry never installed
+    /// has no material to retire and is recorded as already retired, so a
+    /// later install of that same generation still fails closed.
+    pub fn revoke(&mut self, revocation_id: &str) {
+        // The named introduction is taken only when it is the one this
+        // registry actually holds, so a revocation never retires material by
+        // name alone.
+        if let Some(previous) = self.current.as_ref()
+            && previous.revocation_id == revocation_id
+        {
+            if let Some(previous) = self.current.take() {
+                self.retire(&previous);
+            }
+            return;
+        }
+        self.retired_revocation_ids.insert(revocation_id.to_owned());
+    }
+
+    /// Returns the current introduction, or `None` when the route is not
+    /// presently introduced (fail closed).
+    #[must_use]
+    pub fn current(&self) -> Option<&OpenCodeBridgeIntroduction> {
+        self.current.as_ref()
+    }
+
+    /// Returns whether one revocation id is retired.
+    #[must_use]
+    pub fn is_revoked(&self, revocation_id: &str) -> bool {
+        self.retired_revocation_ids.contains(revocation_id)
+            || self
+                .current
+                .as_ref()
+                .is_some_and(|introduction| introduction.revocation_id == revocation_id)
+    }
+
+    /// Resolves the current introduction's credential handle through the
+    /// broker's own secret boundary.
+    ///
+    /// Refuses when the route is unintroduced or the handle belongs to a
+    /// retired generation, so a rotated credential never resolves even if a
+    /// stale introduction is still in hand. The returned bytes go only to the
+    /// exact approved `OpenCode` process.
+    pub fn resolve_current_credential<S>(&self, boundary: &S) -> Result<Box<str>, BrokerError>
+    where
+        S: OpenCodeSecretBoundary<Error = BrokerError>,
+    {
+        let introduction = self
+            .current
+            .as_ref()
+            .ok_or(BrokerError::RegistrationNotAdmitted)?;
+        let key = (
+            introduction.credential.provider().to_owned(),
+            introduction.credential.key().to_owned(),
+        );
+        if self.retired_credentials.contains(&key) {
+            return Err(BrokerError::StaleLease);
+        }
+        boundary.resolve_secret(&introduction.credential)
+    }
+
+    /// Retires the introduction's revocation id and its credential handle.
+    fn retire(&mut self, introduction: &OpenCodeBridgeIntroduction) {
+        self.retired_revocation_ids
+            .insert(introduction.revocation_id.clone());
+        self.retired_credentials.insert((
+            introduction.credential.provider().to_owned(),
+            introduction.credential.key().to_owned(),
+        ));
+    }
+}
+
 /// One-shot User Broker bootstrap authority for the `OpenCode` bridge route.
 ///
 /// Mirrors [`OperatorHandoffAuthority`]: owner-issued, generation-bound,
@@ -4034,6 +4312,7 @@ pub struct OpenCodeBootstrapAuthority {
     bridge_generation: u64,
     interactive_session_id: String,
     process_binding: OpenCodeProcessBinding,
+    credential: SecretRef,
     tickets: BTreeMap<String, BootstrapTicketState>,
 }
 
@@ -4073,6 +4352,7 @@ impl OpenCodeBootstrapAuthority {
             bridge_generation: introduction.bridge_generation.get(),
             interactive_session_id: introduction.interactive_session_id.clone(),
             process_binding: introduction.process_binding.clone(),
+            credential: introduction.credential.clone(),
             tickets: BTreeMap::new(),
         })
     }
@@ -4135,6 +4415,49 @@ impl OpenCodeBootstrapAuthority {
         ticket: &OpenCodeBootstrapTicket,
         now: u64,
     ) -> Result<OpenCodeBootstrapGrant, BrokerError> {
+        self.redeem_once(ticket, now)
+    }
+
+    /// Redeems one ticket exactly once and yields the current HTTP endpoint
+    /// plus the one-use request credential (issue #2898, step 4).
+    ///
+    /// The credential is resolved through the broker's own secret boundary
+    /// only *after* the ticket is consumed exactly once, so the protected
+    /// named-pipe transport has already authenticated the peer SID, process,
+    /// image and generation against the bound [`OpenCodeProcessBinding`]
+    /// before any protected byte is disclosed. A replayed, mismatched or
+    /// expired ticket never reaches the boundary. The yielded credential is
+    /// the current generation's short-lived secret and travels on the
+    /// protected channel only; it is never written to a durable registration,
+    /// command line, log, route profile or non-secret launch map.
+    pub fn consume_with_credential<S>(
+        &mut self,
+        ticket: &OpenCodeBootstrapTicket,
+        now: u64,
+        boundary: &S,
+    ) -> Result<OpenCodeOneUseIntroduction, BrokerError>
+    where
+        S: OpenCodeSecretBoundary<Error = BrokerError>,
+    {
+        let grant = self.redeem_once(ticket, now)?;
+        let credential = boundary.resolve_secret(&self.credential)?;
+        Ok(OpenCodeOneUseIntroduction {
+            introduction_digest: grant.introduction_digest,
+            endpoint: grant.endpoint,
+            server_identity: grant.server_identity,
+            process_binding: grant.process_binding,
+            credential,
+        })
+    }
+
+    /// Performs the exactly-once redemption and returns the bound grant. The
+    /// ticket is validated against the issued row, marked consumed, and only
+    /// then are the bound facts released.
+    fn redeem_once(
+        &mut self,
+        ticket: &OpenCodeBootstrapTicket,
+        now: u64,
+    ) -> Result<OpenCodeBootstrapGrant, BrokerError> {
         ticket.validate()?;
         {
             let state = self
@@ -4157,6 +4480,28 @@ impl OpenCodeBootstrapAuthority {
             process_binding: self.process_binding.clone(),
         })
     }
+}
+
+/// The one-use client introduction released by exactly-once bootstrap
+/// redemption (issue #2898, step 4).
+///
+/// The first protected contact yields the current HTTP endpoint and the
+/// current generation's request credential, released only after the pipe
+/// transport authenticated the peer against the bound
+/// [`OpenCodeProcessBinding`]. The credential is a short-lived generation
+/// value: rotation replaces it, and the previous one is revoked.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenCodeOneUseIntroduction {
+    /// Introduction digest this grant belongs to.
+    pub introduction_digest: String,
+    /// Current pinned loopback endpoint.
+    pub endpoint: String,
+    /// Owner-minted server identity digest of that bridge incarnation.
+    pub server_identity: String,
+    /// Exact approved `OpenCode` process the peer was authenticated as.
+    pub process_binding: OpenCodeProcessBinding,
+    /// The current short-lived request credential. Never logged or persisted.
+    pub credential: Box<str>,
 }
 
 // ---------------------------------------------------------------------------
@@ -6171,7 +6516,9 @@ mod tests {
                 .values()
                 .map(|record| record.cursor.clone())
                 .collect(),
-            operation_identities: broker.projected_operation_identities(),
+            operation_identities: broker
+                .projected_operation_identities()
+                .expect("identity projection"),
             retired_operations: broker.retired_operations.values().cloned().collect(),
             predecessor_registration: broker.predecessor_registration.clone(),
             cutover_receipt: broker.cutover_receipt.clone(),
@@ -6280,7 +6627,7 @@ mod tests {
         assert!(decoded.authority_epoch.is_same_authority(&test_epoch(7)));
 
         // Wrong-lineage cursor with equal sequence must fail closed.
-        let mut snapshot = broker.snapshot();
+        let mut snapshot = broker.snapshot().expect("snapshot");
         let mut wrong = snapshot.operation_cursors.first().expect("cursor").clone();
         wrong.authority_epoch = test_epoch_b(7);
         assert!(

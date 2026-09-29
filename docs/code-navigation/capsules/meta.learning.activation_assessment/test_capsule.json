@@ -134,20 +134,20 @@
     "test_stu": 62906,
     "nonzero": true
   },
-  "bound_contract_digest": "9751d1087f2570c8dd6be3589c2c4478f26a3dabe1341ff48e5e9336ea0b9d42",
+  "bound_contract_digest": "d2a80d6f0e1d53414bb042300518a4bcd9a088a1410ad909a0cb5eb32940d70b",
   "source_provenance": {
     "input_digests": {
       "workspace_manifest": {
         "path": "Cargo.toml",
-        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
       },
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
-        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
       },
       "architecture_boundaries": {
         "path": "config/architecture-boundaries.toml",
-        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
       },
       "logical_block_config": {
         "path": "docs/code-navigation/logical-blocks.toml",
@@ -159,19 +159,19 @@
       },
       "module_manifest": {
         "path": "crates/meta/eliot-learning-activation-assessment/module.toml",
-        "sha256": "cb17dc215f11a71de9aae9dcbc8eee95c271658f645bf8a3447980364f06736f"
+        "sha256": "ff3076cb7592c7aee1b6c75fced78ee22376f7e8c4a97fc4bb07ba737171c0fc"
       },
       "selected_source": {
         "path_count": 8,
-        "sha256": "3a1e2b8467e4fc56b555de2bffbc9bf7aab236b29d19d018620ab85e180f06e6"
+        "sha256": "5a040a0cb231441aad520db580b9a822fa7cbe1c42ca18c1cd63afb99d12fe1e"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "b5cf7eaf5327dce657939ae1990e9de3056cc3d7fd87a8d749bc82dab90c92eb",
+  "artifact_digest": "577d8cf0c8e3bdf46307cbf1bf97901569e895d258d68f3378ef4a42a848e675",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "b5cf7eaf5327dce6"
+    "value": "577d8cf0c8e3bdf4"
   }
 }

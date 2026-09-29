@@ -115,6 +115,15 @@ impl<B: JournalBackend> HostStateJournalService<B> {
         self.journal.query_epoch_retirement(query)
     }
 
+    /// Reads one exact committed wake-cancellation batch from this Host journal.
+    pub fn query_wake_cancellation_batch(
+        &self,
+        query: &crate::WakeCancellationBatchQuery,
+    ) -> Result<crate::WakeCancellationBatchObservation, crate::WakeCancellationBatchQueryError>
+    {
+        self.journal.query_wake_cancellation_batch(query)
+    }
+
     pub fn reconcile_reactive_context(
         &self,
         request: ReactiveContextReconcileRequest,

@@ -15,6 +15,25 @@
 //! cutover. Launch/readiness/effect authority have no representation here by
 //! construction (see case 958/10).
 //!
+//! # Durable intent and result
+//!
+//! [`HostStatePreparationJournal`] is the production [`PreparationJournal`]
+//! sink. It writes the owner's [`BackupPreparationRecord`] into the same
+//! `HostStateJournalService` this crate's other durable records use, through the
+//! same single-writer reconcile choke, and it is constructed by
+//! `HostComposition::prepare_backup_destination` from the composition's own
+//! journal rather than supplied by a caller. Intent and result therefore survive
+//! a process restart and a Host restart, which is what makes A4's repeated-request
+//! rule real rather than only as durable as an in-memory map.
+//!
+//! The record is the owner's (#961, `c8b6bf64`), not a second registry and not a
+//! reuse of an unrelated record: `Pending` is written before the root is created
+//! and proves only that the operation was admitted, and `Prepared` is written
+//! after the root exists and its identity was pinned and is the sole proof that
+//! this operation created that exact directory. Nothing here reads a `Pending`
+//! record as proof that a root does or does not exist, and nothing treats it as
+//! permission to prepare a second destination.
+//!
 //! The created directory is **not** an installation allocated through the
 //! installation authority: `ApprovedGenerationRegistry` exposes no public
 //! mutation seam (every mutator is `pub(crate)`), so the created root has no
@@ -78,7 +97,7 @@
 //! bypasses the delegated port can reach the effect step with a fabricated
 //! source root and staging parent. Narrowing that port means making it
 //! crate-private, which the declared 958 suite calls directly, and the
-//! authenticated-caller control itself is owned by #954
+//! authenticated-caller control itself has no Host-side port
 //! ([`BackupCallerAuth::authenticate`] fails closed against it). The module
 //! holds no registry writer, no archive import, no store-recovery rewrite and
 //! no cutover arm, so the closed [`PreparationClass`] set plus those absences
@@ -145,6 +164,10 @@ use crate::backup_config_projection::{
     ApprovedBuildBinding, AuditFenceNote, BackupConfigProjection, BackupConfigRequest,
     ProjectionError, bind_approved_build, hash_field, project_backup_config_owner_bound,
 };
+use eliot_host_state::{
+    BackupPreparationRecord, BackupPreparationState, HostState, HostStateRecord,
+    IdempotencyIdentity, ProductionHostStateJournal, RecordFence,
+};
 use eliot_installation::{
     ActivationCommitFence, ApprovedGeneration, ApprovedGenerationRegistry,
     RedbInstallationRegistry, RuntimeStateRoots,
@@ -206,6 +229,22 @@ pub const MAX_CLEANUP_SWEEP_OPERATIONS: usize = 256;
 pub const CLEANUP_SWEEP_BUDGET: Duration = Duration::from_secs(30);
 /// Domain separator for owner-evidence-bound destination identities.
 pub const DESTINATION_ID_DOMAIN: &str = "eliot.backup.destination.v1";
+
+/// Stable marker recorded in [`BackupPreparationRecord::source_archive`] when an
+/// isolated preparation admitted no source archive.
+///
+/// The owner's record carries a mandatory source-archive field, and this
+/// preparation genuinely binds no archive: it creates a fenced empty root and
+/// stops (see the module documentation), and the restore that would consume an
+/// archive is a separate owner with its own admission. The field is therefore
+/// filled with an explicit, static, truthful **absence** marker rather than an
+/// invented archive identity, which would let a reader believe a specific
+/// archive had been proved. This is the same "record the absence" treatment the
+/// owner-issued configuration projection already applies to the owner lease
+/// reference and the purge-ledger revision, and the marker is part of the
+/// record's exact-binding transition, so it cannot vary between one
+/// preparation's admission and its result.
+pub const PREPARATION_NO_SOURCE_ARCHIVE: &str = "eliot.backup.preparation.no-source-archive.v1";
 
 /// Errors for isolated destination preparation (issue #958).
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
@@ -349,14 +388,23 @@ impl PreparationError {
 // `OwnerEvidence::approved_binding` (mapping adapter covered by the inner bind
 // and outer delegate records), `BackupCallerAuth::{check_shapes, authenticate}`
 // (the former surfaces through `authenticate_for_owner`; the latter is the
-// pending-#954 always-refuse stub with no production path),
+// always-refuse stub with no production path),
 // `conflict_field`/`admission_digest`/`derive_*`/`hash_path`/`capture_identity`
 // /`reject_reparse`/`reverify_recorded_destination`/`protected_path_to_preparation`
 // /`projection_to_preparation`/`intent_json`/`result_json`/`destination_from_result`
 // /`owner_identity_evidence`/`reject_audit_note`
 // (private steps whose outcome surfaces with its exact category at the owning
-// boundary). No record asserts destination readiness, source retirement, or
-// activation: `destination_epoch` is preparation scope, never authority.
+// boundary). The durable sink adds only the same shape of step:
+// `HostStatePreparationJournal::{snapshot, record_fence, retained, append}` and
+// `preparation_handle`/`preparation_mutation`/`preparation_state_spelling` are
+// private steps whose outcome surfaces with its exact category at the owning
+// boundary; `HostStatePreparationJournal::{record_intent, record_result, load,
+// list_operations}` are the `PreparationJournal` port itself, whose refusals
+// propagate through the existing `record_intent`/`record_result` phase records
+// of `prepare_isolated_destination`, and `load`/`list_operations` are read-only
+// projections that observe no phase. No record asserts destination readiness,
+// source retirement, or activation: `destination_epoch` is preparation scope,
+// never authority.
 
 /// Operation tokens for preparation diagnostics (stable, static only).
 const OP_PREPARE: &str = "prepare";
@@ -368,6 +416,8 @@ const OP_OWNER_EVIDENCE: &str = "owner_evidence";
 const OP_SOURCE_ROOT: &str = "source_root";
 const OP_STAGING_LEASE: &str = "staging_lease";
 const OP_CALLER_AUTH: &str = "caller_auth";
+/// The durable Host-state journal sink this module writes intent/result through.
+const OP_JOURNAL_SINK: &str = "journal_sink";
 
 /// Notes the facade's actual Event Log seam status (typed-unavailable).
 fn backup_prepare_note_event_log_unavailable() {
@@ -693,21 +743,55 @@ pub struct CleanupReport {
 
 /// Durable intent/result sink port (issue #958).
 ///
-/// **This trait has no production implementor.** The only implementation in the
-/// repository is the in-memory `MemJournal` in
-/// `bins/eliot-host/tests/backup_preparation.rs`, and the blanket
-/// `impl<J: PreparationJournal> DelegatedPreparation<J>` is a bound, not an
-/// implementation. `HostComposition` does not implement it, so intent/result
-/// persistence survives neither a process restart nor a Host restart today.
+/// **The production sink is [`HostStatePreparationJournal`].** It writes the
+/// owner's [`BackupPreparationRecord`] through the same `HostStateRecord`
+/// variant, the same `HostStateJournalService`, the same single-writer
+/// reconcile choke every other Host journal write uses, and the same
+/// `backup_preparations` projection — one record store, one writer, no second
+/// registry. `HostComposition::prepare_backup_destination` constructs it from
+/// its own `ProductionHostStateJournal`, so the composition port no longer
+/// accepts a caller-supplied sink and the durable path is the only production
+/// one. The in-memory `MemJournal` in
+/// `bins/eliot-host/tests/backup_preparation.rs` remains a second
+/// implementation of the same port for the declared suite.
 ///
-/// A durable implementation is possible over `HostStateJournal::append` and
-/// `HostStateJournal::snapshot`, but it requires a **new** `HostStateRecord`
-/// variant in `crates/kernel/eliot-host-state`, which is outside issue #958's
-/// declared Exclusive mutable scope; that owner correction is the exact blocker.
-/// It is no longer the reason an unknown can be reported as absent:
-/// [`ReconcileDisposition::AdmittedWithoutResult`] now keeps a recorded intent
-/// out of [`ReconcileDisposition::Absent`] on every path, so a restart loses the
-/// destination only, never the fact that the operation was admitted.
+/// A4's semantics — a repeated request returns the same verified destination or
+/// a typed conflict, never a second installation, and reconciliation preserves
+/// an unknown rather than retrying it — are implemented once, above this port,
+/// and are therefore exactly as durable as the sink bound to it.
+///
+/// The owner's record variant was delivered by #961 (`c8b6bf64`, PR #3893) and
+/// is deliberately not a stand-in for anything else: a preparation record is
+/// distinguishable from a `CutoverIntentRecord` because a preparation creates a
+/// fenced destination and stops, while a cutover activates an approved
+/// installation generation. Nothing here reuses an unrelated record's semantics
+/// (a preparation intent is never written as a `ReactiveContext` or
+/// `Observation` record), and the installation registry is not used as a
+/// substitute: an unactivated destination is not an approved generation.
+///
+/// # What `Pending` and `Prepared` mean here
+///
+/// The sink writes `Pending` **before** the destination root is created and
+/// `Prepared` **after** the root exists and its OS identity was pinned. A
+/// `Pending` frame therefore proves only that the operation was admitted, which
+/// is what I5.6's `ACCEPTED_PENDING` means and what I5.27 requires: a committed
+/// canonical intent never proves an external effect occurred. It cannot
+/// distinguish "the root was never created" from "created but not pinned", does
+/// not try, and is never treated as permission to prepare a second destination
+/// under the same operation identity. `Prepared` is the sole proof that this
+/// operation — and no other — created that exact directory, and it is the only
+/// state [`cleanup_preparations`] will remove; a `Pending` root is reconciled
+/// and preserved, never deleted by path name.
+///
+/// # Cancellation
+///
+/// `Prepared` is terminal in the owner's transition law, so a durable
+/// preparation cannot be moved back to a cancelled state. [`cancel_preparation`]
+/// over this sink therefore refuses with a typed [`PreparationError`] naming
+/// that boundary, and preserves the prepared root for the owner-governed
+/// [`cleanup_preparations`] sweep. The cancel envelope's in-memory evidence
+/// shape is unchanged; what is refused is writing a second terminal outcome for
+/// an operation the owner has already settled.
 ///
 /// Synchronous narrow port: record intent before effects, result after;
 /// load-before-act for idempotency.
@@ -731,6 +815,443 @@ pub trait PreparationJournal {
     ) -> Result<Option<(serde_json::Value, Option<serde_json::Value>)>, PreparationError>;
     /// Lists known operation ids for sweeps.
     fn list_operations(&self) -> Result<Vec<String>, PreparationError>;
+}
+
+/// Durable [`PreparationJournal`] over the owner's Host state journal.
+///
+/// This is the production sink for issue #958's A4. It holds a borrow of the
+/// composition's own [`ProductionHostStateJournal`] and writes the owner's
+/// [`BackupPreparationRecord`] through `crate::journal_append::append_reconciled`
+/// — the single reconcile-decision choke every `ProductionHostStateJournal`
+/// write in this crate already goes through, so an unknown append outcome is
+/// reconciled under one policy rather than forked here.
+///
+/// It adds no storage, no writer and no lifecycle of its own: the record type,
+/// its state law, its fence, its idempotency keying and its `backup_preparations`
+/// projection are all the Host journal owner's. Two things are decided here
+/// rather than delegated, and both are decisions about *this* operation's
+/// effect identity, which the durable record is the only place to express:
+///
+/// - the per-outcome journal mutation identity `<operation>:<state>`, so the
+///   admission and its result are two mutations and a retry of the *same*
+///   outcome replays byte-identically;
+/// - the transition from the retained `Pending` frame to the `Prepared` frame,
+///   which is built by **carrying the retained record's own binding forward**
+///   and changing only the state and the pinned identity. The owner-issued
+///   authority generation, class, source installation, proposed destination,
+///   admission digest and destination identity are therefore read back from the
+///   durable record, never reconstructed from the presented request, and the
+///   owner's own `backup_preparation_transition` independently re-checks that
+///   the successor agrees with the frame it replaces.
+///
+/// # Reads
+///
+/// [`PreparationJournal::load`] projects a retained record back into the same
+/// JSON shape the in-memory sink stores, from the fields the record actually
+/// retains. It does not invent the fields the record does not carry (the
+/// presented `source_root`, `staging_parent`, build/profile names, nonce and
+/// state fence), so `conflict_field` is documented to skip absent recorded
+/// fields rather than blame one. The admission digest - which is what actually
+/// decides a repeated request - is retained in full, and a repeat is compared
+/// against that **recorded** value, never against a freshly recomputed one.
+pub struct HostStatePreparationJournal<'a> {
+    journal: &'a ProductionHostStateJournal,
+}
+
+impl<'a> HostStatePreparationJournal<'a> {
+    /// Binds the composition's own Host state journal as the durable sink.
+    pub fn new(journal: &'a ProductionHostStateJournal) -> Self {
+        Self { journal }
+    }
+
+    /// Reads the journal snapshot this sink projects and appends through.
+    fn snapshot(&self) -> Result<HostState, PreparationError> {
+        self.journal
+            .snapshot()
+            .map_err(|error| PreparationError::JournalFault(error.to_string()))
+    }
+
+    /// Returns the fence every preparation record is written under.
+    ///
+    /// Taken from the **current owner-issued activation record's own fence**,
+    /// never from a caller or from a presented value: `RecordFence` requires
+    /// every record in one activation generation to carry the same identity, and
+    /// the reducer re-establishes that binding against the activation
+    /// projection on append. Using the activation record's fence verbatim is
+    /// what makes the binding agree by construction instead of by a second
+    /// caller-supplied copy.
+    ///
+    /// A journal with no current activation is refused rather than given an
+    /// invented one: there is no activation generation to bind a durable record
+    /// to, and absence of proof is never proof of absence.
+    fn record_fence(&self) -> Result<RecordFence, PreparationError> {
+        let state = self.snapshot()?;
+        state
+            .activation
+            .as_ref()
+            .map(|activation| activation.fence.clone())
+            .ok_or_else(|| {
+                note_prepare_error(
+                    OP_JOURNAL_SINK,
+                    "record_fence",
+                    PreparationError::InvalidRequest {
+                        field: "activation_fence",
+                        reason: "no current activation record; a durable preparation cannot be \
+                                 bound to an activation generation"
+                            .to_owned(),
+                    },
+                    0,
+                )
+            })
+    }
+
+    /// Returns the retained record for one admitted preparation operation, if any.
+    ///
+    /// The `backup_preparations` projection is indexed by the admitted
+    /// preparation operation identity, so this is the owner's own key: there is
+    /// no second lookup index here and no way to address a preparation by any
+    /// other name.
+    fn retained(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<BackupPreparationRecord>, PreparationError> {
+        Ok(self
+            .snapshot()?
+            .backup_preparations
+            .into_iter()
+            .find(|record| record.preparation_operation.as_str() == operation_id))
+    }
+
+    /// Appends one record through the composition's single journal write choke.
+    ///
+    /// The owner error is preserved as this module's own journal-fault variant
+    /// rather than being collapsed further: it is the narrow port's declared
+    /// sink-fault type, and it carries the owner's message, never a caller value.
+    fn append(&self, record: BackupPreparationRecord) -> Result<(), PreparationError> {
+        crate::journal_append::append_reconciled(
+            self.journal,
+            HostStateRecord::BackupPreparation(record),
+        )
+        .map(|_receipt| ())
+        .map_err(|error| {
+            note_prepare_error(
+                OP_JOURNAL_SINK,
+                "append",
+                PreparationError::JournalFault(error.to_string()),
+                0,
+            )
+        })
+    }
+}
+
+/// Builds one validated handle, or the typed refusal that replaces an
+/// unbuildable one.
+///
+/// The owner's record validates every handle it carries, so a value that cannot
+/// become a handle is refused here with the module's own typed
+/// [`PreparationError::InvalidRequest`] naming the field, rather than being
+/// substituted with a placeholder that would put an invented identity into a
+/// durable record.
+fn preparation_handle(
+    value: &str,
+    field: &'static str,
+) -> Result<PlatformHandle, PreparationError> {
+    PlatformHandle::new(value.to_owned()).map_err(|_| PreparationError::InvalidRequest {
+        field,
+        reason: "value is not a valid journal handle".to_owned(),
+    })
+}
+
+/// Stable wire spelling of one preparation state, used to derive the per-outcome
+/// journal mutation identity. Kept in lockstep with
+/// [`BackupPreparationState`]'s `SCREAMING_SNAKE_CASE` serde.
+const fn preparation_state_spelling(state: BackupPreparationState) -> &'static str {
+    match state {
+        BackupPreparationState::Pending => "pending",
+        BackupPreparationState::Prepared => "prepared",
+    }
+}
+
+/// Builds one journal mutation identity for a single outcome of a preparation.
+///
+/// One identity per outcome, because the journal keys `applied_operations` on it:
+/// reusing one for the admission and its result would be a checksum conflict
+/// rather than a second mutation. Replaying the *same* outcome reuses the same
+/// identity and therefore reproduces byte for byte. The base is the admitted
+/// operation identity, never a presented string, and the key is the canonical
+/// admission digest - the I5.27 `canonical_request_hash` for this operation.
+fn preparation_mutation(
+    operation_id: &str,
+    state: BackupPreparationState,
+    admission_digest: &str,
+) -> Result<IdempotencyIdentity, PreparationError> {
+    let mutation = format!("{operation_id}:{}", preparation_state_spelling(state));
+    Ok(IdempotencyIdentity {
+        operation_id: preparation_handle(&mutation, "preparation_operation")?,
+        idempotency_key: preparation_handle(admission_digest, "admission_digest")?,
+    })
+}
+
+impl PreparationJournal for HostStatePreparationJournal<'_> {
+    /// Writes the durable `Pending` admission, before any destination effect.
+    ///
+    /// The admitted binding is read back out of the intent this module itself
+    /// produced, so the record carries the operation's own owner-issued
+    /// authority generation, configuration projection digest and destination
+    /// lineage marker rather than anything reconstructed at the sink.
+    fn record_intent(
+        &mut self,
+        operation_id: &str,
+        intent: &serde_json::Value,
+    ) -> Result<(), PreparationError> {
+        let admission: DestinationAdmission =
+            serde_json::from_value(intent.get("admission").cloned().ok_or(
+                PreparationError::InvalidRequest {
+                    field: "admission",
+                    reason: "intent frame carries no admission".to_owned(),
+                },
+            )?)
+            .map_err(|_| PreparationError::InvalidRequest {
+                field: "admission",
+                reason: "intent admission is not a decodable admission".to_owned(),
+            })?;
+        let root = intent
+            .get("root")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(PreparationError::InvalidRequest {
+                field: "root",
+                reason: "intent frame carries no proposed destination".to_owned(),
+            })?;
+        let destination_id = intent
+            .get("destination_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(PreparationError::InvalidRequest {
+                field: "destination_id",
+                reason: "intent frame carries no owner-issued destination identity".to_owned(),
+            })?;
+        let destination_epoch = intent
+            .get("destination_epoch")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(PreparationError::InvalidRequest {
+                field: "destination_epoch",
+                reason: "intent frame carries no destination lineage marker".to_owned(),
+            })?;
+        let admission_digest = intent
+            .get("admission_digest")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(PreparationError::InvalidRequest {
+                field: "admission_digest",
+                reason: "intent frame carries no admission digest".to_owned(),
+            })?;
+        let record = BackupPreparationRecord {
+            fence: self.record_fence()?,
+            operation: preparation_mutation(
+                operation_id,
+                BackupPreparationState::Pending,
+                admission_digest,
+            )?,
+            preparation_operation: preparation_handle(operation_id, "preparation_operation")?,
+            class: preparation_handle(admission.class.as_str(), "class")?,
+            source_installation: preparation_handle(
+                &admission.source_installation_id,
+                "source_installation",
+            )?,
+            // See `PREPARATION_NO_SOURCE_ARCHIVE`: preparation binds no archive,
+            // and the absence is recorded explicitly rather than filled with an
+            // invented identity.
+            source_archive: preparation_handle(PREPARATION_NO_SOURCE_ARCHIVE, "source_archive")?,
+            admission_digest: preparation_handle(admission_digest, "admission_digest")?,
+            // The proposed destination, recorded before any effect. It is a
+            // name, not ownership: only a `Prepared` frame's pinned identity
+            // authorises deleting anything at this path.
+            destination_root: preparation_handle(root, "destination_root")?,
+            destination_id: preparation_handle(destination_id, "destination_id")?,
+            config_projection_digest: preparation_handle(
+                &admission.config_projection_digest,
+                "config_projection_digest",
+            )?,
+            authority_generation: admission.authority_generation,
+            destination_epoch,
+            // `Pending` proves admission only, so it must not claim an effect.
+            destination_root_identity: None,
+            // The evidence an unsettled admission retains: the canonical request
+            // hash it was admitted under and the owner-issued destination
+            // identity it proposed. Both are digests, so no path or caller text
+            // enters the evidence list, and the frame is never evidence-free.
+            retained_evidence_refs: vec![
+                preparation_handle(admission_digest, "admission_digest")?,
+                preparation_handle(destination_id, "destination_id")?,
+            ],
+            state: BackupPreparationState::Pending,
+        };
+        self.append(record)
+    }
+
+    /// Writes the durable `Prepared` result, after the root exists and is pinned.
+    ///
+    /// The frame is built by carrying the **retained** `Pending` record's own
+    /// binding forward and changing only the state and the pinned identity. That
+    /// is what makes the result a successor of the exact admission rather than a
+    /// fresh claim: the owner-issued authority generation and the rest of the
+    /// binding are read from the durable record, and the owner's
+    /// `backup_preparation_transition` re-checks the agreement. A result whose
+    /// own values disagree with the retained frame is refused here as a typed
+    /// conflict before any append, so a mismatched result never reaches the
+    /// journal as a re-scoped preparation.
+    ///
+    /// The receipt is read back through `destination_from_result`, the same
+    /// reader the in-memory path reconciles through, rather than decoded
+    /// structurally: `result_json` renders `root` and `root_identity` as plain
+    /// strings, so a structural decode of [`PreparedDestination`] would reject
+    /// the module's own result frame. Both sinks therefore accept exactly the
+    /// frames this module produces.
+    fn record_result(
+        &mut self,
+        operation_id: &str,
+        result: &serde_json::Value,
+    ) -> Result<(), PreparationError> {
+        let Some(retained) = self.retained(operation_id)? else {
+            return Err(PreparationError::UnknownState {
+                operation: operation_id.to_owned(),
+                reason: "no durable admission for this operation; a result may not be recorded \
+                         before its intent"
+                    .to_owned(),
+            });
+        };
+        if retained.state == BackupPreparationState::Prepared {
+            // `Prepared` is terminal in the owner's transition law. The cancel
+            // envelope reaches this port too, and a durable preparation has no
+            // cancelled state to move to, so the outcome is refused and the
+            // prepared root stays durable for the owner-governed cleanup sweep.
+            return Err(PreparationError::UnknownState {
+                operation: operation_id.to_owned(),
+                reason: "the durable preparation result is already terminal; cancellation is not \
+                         a state of this record and the prepared destination is preserved"
+                    .to_owned(),
+            });
+        }
+        let Some(destination) = destination_from_result(operation_id, result) else {
+            return Err(PreparationError::InvalidRequest {
+                field: "result",
+                reason: "result frame is not a readable prepared destination".to_owned(),
+            });
+        };
+        let pinned = destination.root_identity.identity.as_str();
+        // The result must describe the very root and identity the durable
+        // admission proposed, or it is not this operation's result. Every
+        // comparison is against the RETAINED value, never a recomputation.
+        if destination.root.to_string_lossy() != retained.destination_root.as_str()
+            || destination.destination_id != retained.destination_id.as_str()
+            || destination.admission_digest != retained.admission_digest.as_str()
+            || destination.config_projection_digest != retained.config_projection_digest.as_str()
+            || destination.destination_epoch != retained.destination_epoch
+        {
+            return Err(PreparationError::ConflictField {
+                field: "destination",
+            });
+        }
+        let record = BackupPreparationRecord {
+            fence: retained.fence.clone(),
+            operation: preparation_mutation(
+                operation_id,
+                BackupPreparationState::Prepared,
+                retained.admission_digest.as_str(),
+            )?,
+            preparation_operation: retained.preparation_operation.clone(),
+            class: retained.class.clone(),
+            source_installation: retained.source_installation.clone(),
+            source_archive: retained.source_archive.clone(),
+            admission_digest: retained.admission_digest.clone(),
+            destination_root: retained.destination_root.clone(),
+            destination_id: retained.destination_id.clone(),
+            config_projection_digest: retained.config_projection_digest.clone(),
+            authority_generation: retained.authority_generation,
+            destination_epoch: retained.destination_epoch,
+            destination_root_identity: Some(preparation_handle(
+                pinned,
+                "destination_root_identity",
+            )?),
+            // A `Prepared` result necessarily carries evidence a `Pending`
+            // cannot: that this operation created the root and pinned its
+            // identity. The list is digests and handles only, and the owner's
+            // transition law deliberately does not require it to equal the
+            // admission's.
+            retained_evidence_refs: vec![
+                retained.admission_digest.clone(),
+                retained.destination_id.clone(),
+                preparation_handle(pinned, "destination_root_identity")?,
+            ],
+            state: BackupPreparationState::Prepared,
+        };
+        self.append(record)
+    }
+
+    /// Projects one retained record back into the `(intent, result)` JSON shape
+    /// the preparation lifecycle reads.
+    ///
+    /// The intent is reconstructed from exactly the admission fields the
+    /// durable record retains. The result exists only for a `Prepared` record,
+    /// because a `Pending` record has no recorded outcome and reporting one would
+    /// be the fabrication this module exists to prevent.
+    fn load(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<(serde_json::Value, Option<serde_json::Value>)>, PreparationError> {
+        let Some(record) = self.retained(operation_id)? else {
+            return Ok(None);
+        };
+        // `audit_fence_note` is never carried: a caller-authored forensic note
+        // is refused before it can reach a receipt on this path, and the durable
+        // record deliberately has nowhere to put one. Projecting `None` states
+        // that absence truthfully rather than dropping the field.
+        let intent = serde_json::json!({
+            "version": PREPARATION_VERSION,
+            "operation_id": operation_id,
+            "admission_digest": record.admission_digest,
+            "admission": {
+                "class": record.class,
+                "source_installation_id": record.source_installation,
+                "authority_generation": record.authority_generation,
+                "config_projection_digest": record.config_projection_digest,
+            },
+            "root": record.destination_root,
+            "destination_id": record.destination_id,
+            "destination_epoch": record.destination_epoch,
+        });
+        let result = match (record.state, &record.destination_root_identity) {
+            (BackupPreparationState::Prepared, Some(identity)) => Some(serde_json::json!({
+                "version": PREPARATION_VERSION,
+                "operation_id": operation_id,
+                "root": record.destination_root,
+                "root_identity": identity,
+                "destination_id": record.destination_id,
+                "destination_epoch": record.destination_epoch,
+                "admission_digest": record.admission_digest,
+                "config_projection_digest": record.config_projection_digest,
+                "audit_fence_note": serde_json::Value::Null,
+            })),
+            // Unreachable: the owner's record validation makes these two states
+            // impossible together. Treated as no recorded result rather than
+            // trusted, so a corrupted projection cannot invent a receipt.
+            (BackupPreparationState::Prepared, None) | (BackupPreparationState::Pending, _) => None,
+        };
+        Ok(Some((intent, result)))
+    }
+
+    /// Lists the operation identities the durable projection owns.
+    ///
+    /// This is the journal's own key set, which is what makes the cleanup sweep's
+    /// "owned" test real: a caller can narrow the set but never extend it, and a
+    /// requested id this journal does not own is refused by
+    /// [`cleanup_preparations`] rather than deleted.
+    fn list_operations(&self) -> Result<Vec<String>, PreparationError> {
+        Ok(self
+            .snapshot()?
+            .backup_preparations
+            .iter()
+            .map(|record| record.preparation_operation.as_str().to_owned())
+            .collect())
+    }
 }
 
 fn check_identity(value: &str, field: &'static str) -> Result<(), PreparationError> {
@@ -764,6 +1285,15 @@ fn check_digest(value: &str, field: &'static str) -> Result<(), PreparationError
 /// publish unverified disposition claims under a forensic label. I5.13 keeps the
 /// `HostStateAuditFence` optional, so refusing it is a complete answer rather
 /// than a gap, and no note-size bound is needed because no note is ever carried.
+///
+/// This is the strongest of the two refusals A1's optional audit fence admits.
+/// The note's own typed non-authoritative ceiling is enforced where a note is
+/// admissible at all
+/// (`crate::backup_config_projection::AuditFenceNote::validate`, refusing
+/// `ProjectionError::ActiveAuthorityInAuditFence`); refusing every note here is
+/// stronger still, because no owner corroborates the note's lineage in the
+/// first place, so a lease/grant/current-state assertion is unreachable rather
+/// than merely bounded.
 fn reject_audit_note(note: Option<&String>) -> Result<(), PreparationError> {
     if note.is_some() {
         return Err(PreparationError::OwnerEvidenceUnavailable {
@@ -1224,13 +1754,32 @@ fn admit_staging_parent(admission: &DestinationAdmission) -> Result<PathBuf, Pre
     verify_staging_parent_lease(&admission.operation_id, parent)
 }
 
-fn intent_json(admission: &DestinationAdmission, digest: &str, root: &Path) -> serde_json::Value {
+/// Builds the durable intent frame for one admitted preparation.
+///
+/// `destination_id` and `destination_epoch` are carried here because the
+/// durable sink writes them into [`BackupPreparationRecord`], and the owner's
+/// record requires both: the identity as a digest and the lineage marker as a
+/// non-zero value. Neither is recoverable from the proposed root alone - the
+/// epoch is not encoded in the path name - so re-deriving them at the sink from
+/// what the sink holds would mean recomputing an owner-issued value instead of
+/// recording the one this operation was admitted under. They are the exact
+/// values `prepare_isolated_destination` just derived from owner evidence and
+/// passes to the record, not a second derivation.
+fn intent_json(
+    admission: &DestinationAdmission,
+    digest: &str,
+    root: &Path,
+    destination_id: &str,
+    destination_epoch: u64,
+) -> serde_json::Value {
     serde_json::json!({
         "version": PREPARATION_VERSION,
         "operation_id": admission.operation_id,
         "admission_digest": digest,
         "admission": admission,
         "root": root.to_string_lossy(),
+        "destination_id": destination_id,
+        "destination_epoch": destination_epoch,
     })
 }
 
@@ -1240,6 +1789,18 @@ fn intent_json(admission: &DestinationAdmission, digest: &str, root: &Path) -> s
 /// The compared list mirrors the v3 [`admission_digest`] hashed set exactly.
 /// `source_root` was missing here while being the field that decides which
 /// installation is the live source, so a conflict could never name it.
+///
+/// A field the recorded intent does not carry is **skipped**, not reported as a
+/// difference. [`HostStatePreparationJournal`] reconstructs the recorded
+/// admission from the durable [`BackupPreparationRecord`], which retains the
+/// owner-issued binding but not every presented field; comparing an absent
+/// recorded value against a present current one would name the first
+/// non-retained field for *every* conflict, blaming a field that did not
+/// change. Skipping keeps the diagnostic honest: the fields this can name are
+/// exactly the ones both sides hold, and a conflict only in non-retained fields
+/// falls through to the `"admission"` digest-level name. The refusal itself is
+/// unaffected - it is raised from the admission digest comparison, not from
+/// this naming.
 fn conflict_field(intent: &serde_json::Value, admission: &DestinationAdmission) -> &'static str {
     let recorded = intent.get("admission");
     let current = serde_json::to_value(admission).unwrap_or(serde_json::Value::Null);
@@ -1258,6 +1819,11 @@ fn conflict_field(intent: &serde_json::Value, admission: &DestinationAdmission) 
         "authority_nonce",
         "state_fence_digest",
     ] {
+        // Absent from the recorded admission: this sink cannot compare it, so
+        // it must not be named.
+        if recorded.and_then(|value| value.get(field)).is_none() {
+            continue;
+        }
         if recorded.and_then(|value| value.get(field)) != current.get(field) {
             return field;
         }
@@ -1437,10 +2003,17 @@ pub fn prepare_isolated_destination<J: PreparationJournal>(
             generation,
         ));
     }
+    let destination_epoch = derive_destination_epoch(&admission.operation_id, &identity_evidence);
     journal
         .record_intent(
             &admission.operation_id,
-            &intent_json(admission, &digest, &root),
+            &intent_json(
+                admission,
+                &digest,
+                &root,
+                &destination_id,
+                destination_epoch,
+            ),
         )
         .map_err(|error| note_prepare_error(OP_PREPARE, "record_intent", error, generation))?;
     std::fs::create_dir(&root)
@@ -1456,7 +2029,7 @@ pub fn prepare_isolated_destination<J: PreparationJournal>(
         root: root.clone(),
         root_identity: identity,
         destination_id,
-        destination_epoch: derive_destination_epoch(&admission.operation_id, &identity_evidence),
+        destination_epoch,
         admission_digest: digest,
         config_projection_digest: admission.config_projection_digest.clone(),
         audit_fence_note: admission.audit_fence_note.clone(),
@@ -1870,10 +2443,12 @@ pub fn resolve_owner_source_root(roots: &RuntimeStateRoots) -> Result<PathBuf, P
 /// profile token or the preparation is refused. A presented owner lease
 /// reference, purge-ledger revision or forensic audit note is **refused**,
 /// because no owner reachable from Host issues or corroborates any of them —
-/// lease issuance and purge-ledger authority belong to #954 and to the
-/// purge-ledger owner respectively. The presented `authority_generation` is
-/// read nowhere on this path: this lane grants it nothing, and the admission
-/// carries the owner-issued one instead.
+/// lease-reference issuance and purge-ledger authority belong to a Host lease
+/// issuer and to the ORS purge-ledger owner respectively, and #954 (merged,
+/// `5e71386a`) supplies neither: its `BackupAdmissionRef` is a per-operation
+/// admission reference, not a standing owner lease. The presented
+/// `authority_generation` is read nowhere on this path: this lane grants it
+/// nothing, and the admission carries the owner-issued one instead.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PresentedPreparationRequest {
     /// Operation identity (bounded text, unique per preparation).
@@ -1937,7 +2512,11 @@ pub struct PresentedPreparationRequest {
     /// Presenting one is **refused** by the owner-bound configuration projection:
     /// nothing here compares its digest or observed dispositions to Host state,
     /// so it is never bound into a projection digest nor rendered into a
-    /// prepared-destination receipt. I5.13 keeps that fence optional.
+    /// prepared-destination receipt. I5.13 keeps that fence optional, and this
+    /// refusal is stronger than the note's own typed non-authoritative ceiling
+    /// (`crate::backup_config_projection::AuditFenceNote::validate`): a
+    /// lease/grant/current-state assertion is unreachable here rather than
+    /// merely refused when asserted.
     pub audit_fence_note: Option<AuditFenceNote>,
     /// Opaque caller-presented entropy text.
     ///
@@ -1959,8 +2538,8 @@ pub struct PresentedPreparationRequest {
 /// owner-bound preparation lifecycle. [`OwnerEvidence`] has all-private fields
 /// and only [`OwnerEvidence::inspect`] can build one, so this port cannot be
 /// entered without a real protected root and a committed registry behind it.
-/// The caller-role half of authentication stays with #954
-/// ([`BackupCallerAuth::authenticate`], a real fail-closed refusal), while the
+/// The caller-role half of authentication has no Host-side port and stays a
+/// real fail-closed refusal ([`BackupCallerAuth::authenticate`]), while the
 /// source-identity half is proved by
 /// [`BackupCallerAuth::authenticate_for_owner`] at the composition port. Every
 /// owner or presented-evidence failure maps to a typed [`PreparationError`]
@@ -2150,6 +2729,15 @@ fn projection_to_preparation(error: ProjectionError) -> PreparationError {
         },
         ProjectionError::OwnerEvidenceUnavailable { field, obligation } => {
             PreparationError::OwnerEvidenceUnavailable { field, obligation }
+        }
+        ProjectionError::ActiveAuthorityInAuditFence { field } => {
+            PreparationError::InvalidRequest {
+                field,
+                reason: "forensic audit note asserts restored active authority; a \
+                         HostStateAuditFence is forensic only and never a lease, grant, or \
+                         current-state assertion"
+                    .to_owned(),
+            }
         }
     }
 }
@@ -2404,6 +2992,23 @@ impl OwnerEvidence {
     /// `build_digests` subset check, both of which compare against owner-issued
     /// values. Nothing downstream may cite the `manifest_digest` comparison as
     /// an owner proof for a production preparation.
+    ///
+    /// The arm cannot be made a real presented-vs-owner comparison from this
+    /// lane, and the reason is scope rather than design.
+    /// [`PresentedPreparationRequest`] is the presented contract surface and it
+    /// carries no config/policy/module manifest digest field, so there is no
+    /// presented value to compare: feeding the owner value in as the presented
+    /// side is precisely the self-comparison above. Adding the field is the
+    /// correct fix, but `bins/eliot-host/tests/backup_preparation.rs` — outside
+    /// this issue's Exclusive mutable scope — constructs
+    /// [`PresentedPreparationRequest`] as an exhaustive struct literal, so a
+    /// field added here would not compile that suite. Until the presented
+    /// surface carries a configuration digest, T2's config-digest arm is
+    /// refused-as-evidence rather than claimed: the two owner comparisons that
+    /// ARE real on this path are the numeric `generation` arm (presented
+    /// `approved_generation` against the owner-issued authority generation) and
+    /// the `build_digests` subset arm (each presented digest against the
+    /// owner-issued approved artifact set).
     pub fn project_backup_configuration(
         &self,
         request: &PresentedPreparationRequest,
@@ -2494,9 +3099,14 @@ pub fn verify_staging_parent_lease(
 ///
 /// Shape carries the owner-issued caller lease digest and the caller fence
 /// digest so refusals and (later) admissions bind them into the audit trail.
-/// Caller authentication itself is pending #954 role-bound control: until
-/// the #954 owner port lands, [`BackupCallerAuth::authenticate`] fails
-/// closed and no destination effect is reachable through delegation.
+/// Caller authentication itself has no Host-side verification to run against:
+/// [`BackupCallerAuth::authenticate`] fails closed, and no destination effect
+/// is reachable through it. #954 is not the open item — it merged
+/// (`5e71386a`, PR #2572) and defines the role/operation contract in
+/// `crates/foundation/eliot-protocol/src/backup.rs`, but that contract carries
+/// no caller credential or token this contour can verify a lease or fence
+/// digest against, and its own doc states that a payload value never grants a
+/// role.
 ///
 /// The live source-identity proof is
 /// [`BackupCallerAuth::authenticate_for_owner`], which
@@ -2522,23 +3132,32 @@ impl BackupCallerAuth {
 
     /// Authenticates the caller against owner-issued control evidence.
     ///
-    /// Fail-closed pending the #954 caller-control port: there is currently
-    /// no owner-issued caller token to verify against, so every caller is
-    /// refused here before any destination effect. This is a real refusal, not
-    /// a placeholder for a passing check: no destination can be prepared
-    /// through the authenticated-caller path until #954 supplies the
-    /// verification, and no code path relaxes it. The #954 implementation
-    /// fills this method without changing its signature or callers.
+    /// Fail-closed because there is no owner-issued caller token to verify
+    /// against: no installation record, approved generation, commit fence,
+    /// owner lease or host-state record reachable from this contour carries a
+    /// caller credential, so every caller is refused here before any
+    /// destination effect. This is a real refusal, not a placeholder for a
+    /// passing check: no destination can be prepared through the
+    /// authenticated-caller path until such an owner exists, and no code path
+    /// relaxes it. The implementation that fills it must not change this
+    /// method's signature or callers.
+    ///
+    /// #954 is NOT the missing owner. It merged (`5e71386a`, PR #2572) and
+    /// supplies the role/operation *contract* in
+    /// `crates/foundation/eliot-protocol/src/backup.rs`; what it does not
+    /// supply is a credential this contour can verify, and its own doc states
+    /// that validators always compare a presented value against a separately
+    /// passed role argument because a payload value never grants a role.
     ///
     /// The owner-issued source-identity proof that does exist today is
     /// [`BackupCallerAuth::authenticate_for_owner`]; this method covers the
-    /// caller-role/credential half that #954 owns.
+    /// caller-role/credential half, which no owner issues.
     pub fn authenticate(&self) -> Result<(), PreparationError> {
         Err(PreparationError::InvalidRequest {
             field: "caller_auth",
-            reason:
-                "authenticated caller control pending #954; unauthenticated preparation refused"
-                    .to_owned(),
+            reason: "no owner-issued caller credential exists on this contour; unauthenticated \
+                     preparation refused"
+                .to_owned(),
         })
     }
 
@@ -2549,8 +3168,9 @@ impl BackupCallerAuth {
     /// the launch installation and the presented source to equal it. The
     /// lease/fence digests stay shape-checked audit-trail evidence: no owner
     /// digest scheme binds them yet, so they grant nothing here.
-    /// Caller-channel (control-plane principal) authentication awaits the
-    /// #954 role-bound port and is reported as backlog, not assumed.
+    /// Caller-channel (control-plane principal) authentication has no owner on
+    /// this contour and is reported as backlog, not assumed; see
+    /// [`BackupCallerAuth::authenticate`].
     pub fn authenticate_for_owner(
         &self,
         lease: &HostOwnerLease,

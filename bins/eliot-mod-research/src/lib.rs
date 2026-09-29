@@ -45,8 +45,9 @@ pub use evidence::{
     RedactionReceipt, StreamOmission, StreamRecord, sha256_hex,
 };
 pub use execution::{
-    BOUND_RUN_DEADLINE, ProviderBridge, ProviderExecution, ProviderOutcome, RequestPortError,
-    ResearchRequestPort, build_submit_binding,
+    BOUND_RUN_DEADLINE, CancellationOutcome, EvidenceObservation, Obligation, ProviderBridge,
+    ProviderExecution, ProviderOutcome, RequestPortError, ResearchRequestPort,
+    UndischargedObligation, build_submit_binding,
 };
 pub use kernel_client::{ResearchKernelClient, ResearchKernelClientError};
 pub use protocol::{
@@ -56,6 +57,13 @@ pub use protocol::{
 
 /// Stable gap code emitted when no governed provider execution is available.
 pub const RESEARCH_SOURCE_UNAVAILABLE: &str = "RESEARCH_SOURCE_UNAVAILABLE";
+
+/// Shared "the readback was never reached" observation.
+///
+/// A static rather than a promoted temporary because the enum carries drop
+/// glue in one variant, and because every such failure must report the same
+/// not-attempted state rather than a per-call value.
+static EVIDENCE_NOT_ATTEMPTED: EvidenceObservation = EvidenceObservation::NotAttempted;
 
 /// Length of a lowercase SHA-256 hex digest binding one bridge executable.
 const SHA256_HEX_LEN: usize = 64;
@@ -80,6 +88,24 @@ pub enum BridgeError {
     ProtocolViolation {
         /// Stable reason for the refusal; provider bodies are never included.
         reason: &'static str,
+        /// The immutable raw evidence already materialized when the wire was
+        /// found malformed.
+        ///
+        /// A wire refusal is a statement about the protocol, not about the
+        /// process: the provider's stdout/stderr/exit/lineage were observed
+        /// before its output was decoded, and they are retained here rather
+        /// than replaced by an absence record. `None` only for a refusal raised
+        /// before the executor was contacted, where no provider output existed
+        /// to retain.
+        evidence: Option<Box<RawProviderEvidence>>,
+        /// The provider's observed process disposition, kept separate from the
+        /// protocol's validity.
+        ///
+        /// A provider can exit cleanly and still answer with a wire this
+        /// bridge does not accept. Collapsing those two facts would let a
+        /// process that genuinely completed be reported as though nothing ran.
+        /// `None` when no terminal process state was observed.
+        disposition: Option<ProviderOutcome>,
     },
     #[error("research provider execution failed: {reason}")]
     ProviderFailed {
@@ -95,20 +121,33 @@ pub enum BridgeError {
         "research provider execution exceeded the deadline; cancellation was attempted and the outcome is unconfirmed: reconcile by operation identity before any retry"
     )]
     TimedOut {
-        /// The retained cancellation receipt fragment. It is always present on
-        /// this variant: a timeout that proved nothing about cancellation is
-        /// reported as cancellation-unconfirmed, never as a clean stop.
+        /// What the deadline arm's cancellation attempt produced.
+        ///
+        /// The receipt is the only proof a cancellation was attempted and what
+        /// it achieved, so it is retained whenever the executor answered. An
+        /// unanswered cancellation is its own state, not the same as never
+        /// having tried and not a clean stop.
         ///
         /// Boxed so the typed error stays small enough to return by value from
         /// every call site without an allocation on the success path.
-        cancellation: Box<CancellationEvidence>,
-        /// Immutable raw evidence read back from the executor's captured
-        /// streams after the deadline overrun, so a provider's real
-        /// stdout/stderr survive a timeout instead of being replaced by an
-        /// absence record. Preserved for the same reason as
-        /// [`BridgeError::UnknownOutcome`]: the bytes are the only custody of
-        /// what the provider actually wrote.
-        evidence: Option<Box<RawProviderEvidence>>,
+        cancellation: Box<CancellationOutcome>,
+        /// What the post-deadline stream readback produced.
+        ///
+        /// `Observed` carries the provider's real stdout/stderr; `Unobserved`
+        /// means the readback was attempted and did not answer, and
+        /// `NotAttempted` that it was never reached. Neither of those two is
+        /// ever rendered as the digest or byte count of an actually empty
+        /// stream, so missing evidence and empty evidence stay different.
+        evidence: Box<EvidenceObservation>,
+        /// Bounded secondary obligations this timeout could not discharge.
+        ///
+        /// The deadline is the one primary cause. A cancellation or a stream
+        /// readback that failed while the deadline was being reported is
+        /// recorded here as its own typed refusal rather than replacing the
+        /// timeout, discarding a receipt already obtained, or multiplying the
+        /// terminal event. At most two obligations exist, so this is bounded by
+        /// construction. Empty when both follow-up attempts succeeded.
+        undischarged: Vec<UndischargedObligation>,
     },
     #[error(
         "research provider outcome is unknown: reconcile by operation identity before any retry"
@@ -181,27 +220,95 @@ impl BridgeError {
         }
     }
 
-    /// Returns the retained cancellation receipt fragment, when one exists.
+    /// Returns the retained cancellation receipt fragment, when the executor
+    /// answered the cancellation.
+    ///
+    /// A timeout whose cancellation was never answered returns `None` here, and
+    /// that is exactly what distinguishes it: the receipt is absent because no
+    /// receipt exists, not because no cancellation was attempted. The
+    /// attempt itself stays visible through [`BridgeError::cancellation_state`].
     #[must_use]
-    pub const fn cancellation(&self) -> Option<&CancellationEvidence> {
+    pub fn cancellation(&self) -> Option<&CancellationEvidence> {
+        match self {
+            Self::TimedOut { cancellation, .. } => cancellation.receipt(),
+            _ => None,
+        }
+    }
+
+    /// Returns what this failure's cancellation attempt actually produced,
+    /// including an attempt the executor never answered.
+    ///
+    /// This is the only accessor that distinguishes "no cancellation was
+    /// attempted" from "a cancellation was attempted and proved nothing".
+    #[must_use]
+    pub const fn cancellation_state(&self) -> Option<&CancellationOutcome> {
         match self {
             Self::TimedOut { cancellation, .. } => Some(cancellation),
             _ => None,
         }
     }
 
+    /// Returns the bounded secondary obligations the primary cause could not
+    /// discharge.
+    ///
+    /// A deadline overrun records an unanswered cancellation or an unanswered
+    /// stream readback here rather than letting either replace the timeout.
+    /// Transport failures on other variants have no such obligation, so this is
+    /// empty for them.
+    #[must_use]
+    pub fn undischarged(&self) -> &[UndischargedObligation] {
+        match self {
+            Self::TimedOut { undischarged, .. } => undischarged,
+            _ => &[],
+        }
+    }
+
     /// Returns the immutable raw evidence, when it was materialized before the
     /// failure was classified.
     ///
-    /// A deadline overrun reads the executor's captured streams back before it
-    /// classifies, so a timed-out provider's real stdout/stderr/exit/lineage are
-    /// retained on exactly the same footing as an unclassifiable terminal state.
+    /// A deadline overrun and a malformed provider wire both read the
+    /// executor's captured streams back before they classify, so a timed-out or
+    /// unanswerable provider's real stdout/stderr/exit/lineage are retained on
+    /// exactly the same footing as an unclassifiable terminal state. `None` here
+    /// never means "the provider produced nothing": the stream's own absence
+    /// state is carried by [`BridgeError::evidence_observation`], and an absent
+    /// record is rendered as an explicit gap rather than as an empty capture.
     #[must_use]
     pub fn evidence(&self) -> Option<&RawProviderEvidence> {
         match self {
-            Self::UnknownOutcome { evidence } | Self::TimedOut { evidence, .. } => {
+            Self::UnknownOutcome { evidence } | Self::ProtocolViolation { evidence, .. } => {
                 evidence.as_deref()
             }
+            Self::TimedOut { evidence, .. } => evidence.observed(),
+            _ => None,
+        }
+    }
+
+    /// Returns how this failure's stream readback resolved, so a consumer can
+    /// tell a not-attempted readback from one that was attempted and never
+    /// answered.
+    ///
+    /// Variants that never read streams back report
+    /// [`EvidenceObservation::NotAttempted`]: the readback was genuinely not
+    /// reached, which is an honest statement rather than an empty stream.
+    #[must_use]
+    pub const fn evidence_observation(&self) -> &EvidenceObservation {
+        match self {
+            Self::TimedOut { evidence, .. } => evidence,
+            _ => &EVIDENCE_NOT_ATTEMPTED,
+        }
+    }
+
+    /// Returns the provider's observed process disposition when this failure
+    /// carries one separately from protocol validity.
+    ///
+    /// A provider that exited cleanly and answered with a wire this bridge does
+    /// not accept is both a completed process and a protocol violation; only
+    /// this accessor keeps the two facts from collapsing into one.
+    #[must_use]
+    pub const fn process_disposition(&self) -> Option<ProviderOutcome> {
+        match self {
+            Self::ProtocolViolation { disposition, .. } => *disposition,
             _ => None,
         }
     }
@@ -325,7 +432,9 @@ impl ResearchBridge for GovernedResearchBridge {
                 ExternalKnowledgeFailure::ProviderFailed { reason }
             }
             BridgeError::NotAdmitted { reason } => ExternalKnowledgeFailure::NotAdmitted { reason },
-            BridgeError::ProtocolViolation { reason } => {
+            // Only the reason is projected; the retained evidence and the
+            // provider's observed process disposition stay with this error.
+            BridgeError::ProtocolViolation { reason, .. } => {
                 ExternalKnowledgeFailure::ProtocolViolation { reason }
             }
             BridgeError::EvidenceIncomplete { reason } => {
@@ -373,6 +482,22 @@ struct SubmittedState {
     failure: Option<TerminalFailure>,
     /// Whether an unknown outcome was reconciled since.
     reconciled: bool,
+    /// The provider's observed process disposition, kept separate from the
+    /// failure's protocol classification.
+    ///
+    /// A provider can complete its process and still answer with a wire this
+    /// bridge refuses. `outcome` above is the submitted-state classification of
+    /// the attempt; this is the physical disposition that was actually observed,
+    /// so neither fact has to be inferred from the other.
+    observed_disposition: Option<ProviderOutcome>,
+    /// The exact operation identity this attempt bound, retained whether or not
+    /// the start response was received.
+    ///
+    /// A start-response loss leaves an operation that may exist in the executor
+    /// registry. Naming it here is what makes that attempt resolvable by its
+    /// stable identity instead of being reported as an attempt that never
+    /// happened — and it is explicitly not permission to mint a new one.
+    operation_id: Option<String>,
 }
 
 /// Cloneable terminal classification of one failed provider attempt.
@@ -394,6 +519,28 @@ pub struct TerminalFailure {
     pub evidence: Option<RawProviderEvidence>,
     /// Cancellation receipt fragment, when a cancellation was issued.
     pub cancellation: Option<CancellationEvidence>,
+    /// How this failure's stream readback resolved.
+    ///
+    /// Retained so a consumer can tell a stream that was never read back from
+    /// one whose readback was attempted and never answered, and from one that
+    /// really was observed empty. [`TerminalFailure::evidence`] alone cannot
+    /// carry that distinction, and rendering a missing readback as an empty
+    /// capture would be exactly the false observation these repairs remove.
+    pub evidence_observation: EvidenceObservation,
+    /// Whether a cancellation was actually issued.
+    ///
+    /// `true` for a cancellation the executor never answered. This is what
+    /// keeps an attempted-but-unconfirmed cancellation distinguishable from one
+    /// that was never tried: [`TerminalFailure::cancellation`] is empty in both
+    /// cases, and only this flag tells them apart.
+    pub cancellation_attempted: bool,
+    /// Which bounded follow-up obligations the primary cause could not
+    /// discharge, in attempt order.
+    ///
+    /// Each names the obligation only; the typed refusals stay on the
+    /// `BridgeError` this record was projected from. Empty when the failure was
+    /// not a deadline overrun, or when every follow-up attempt succeeded.
+    pub undischarged: Vec<Obligation>,
 }
 
 impl TerminalFailure {
@@ -414,6 +561,19 @@ impl TerminalFailure {
             outcome,
             evidence: error.evidence().cloned(),
             cancellation: error.cancellation().cloned(),
+            evidence_observation: error.evidence_observation().clone(),
+            // An unresolved cancellation is still an attempt: it is reported as
+            // attempted with no receipt, never as a cancellation that never
+            // happened.
+            cancellation_attempted: matches!(
+                error.cancellation_state(),
+                Some(CancellationOutcome::Confirmed(_) | CancellationOutcome::Unresolved)
+            ),
+            undischarged: error
+                .undischarged()
+                .iter()
+                .map(|obligation| obligation.obligation)
+                .collect(),
         }
     }
 
@@ -455,6 +615,13 @@ impl TerminalFailure {
             outcome,
             evidence: None,
             cancellation: cancellation.cloned(),
+            // This path is reached only when `execute` returned `Ok`, so no
+            // stream readback was ever attempted and no cancellation was issued
+            // on this bridge's own path. Both are therefore their honest
+            // not-attempted states, never an empty observation.
+            evidence_observation: EvidenceObservation::NotAttempted,
+            cancellation_attempted: false,
+            undischarged: Vec::new(),
         }
     }
 }
@@ -746,6 +913,45 @@ impl AdmittedResearchBridge {
             .and_then(|state| state.provider_job_ref.as_ref())
     }
 
+    /// Returns the exact operation identity this attempt bound, when one was
+    /// sealed.
+    ///
+    /// A start-response loss leaves an operation that may exist in the executor
+    /// registry, and this is the identity that names it. It is custody, not a
+    /// retry permit: the phase has already moved to submitted, so no fresh
+    /// admission is implied by reading it.
+    #[must_use]
+    pub fn last_operation_id(&self) -> Option<&str> {
+        self.submitted()
+            .and_then(|state| state.operation_id.as_deref())
+    }
+
+    /// Returns the provider's observed process disposition, kept separate from
+    /// the protocol's validity.
+    ///
+    /// A provider whose process completed cleanly while answering with a
+    /// malformed wire reports `Completed` here and `Refused` from
+    /// [`AdmittedResearchBridge::last_outcome`]. Neither fact is derived from
+    /// the other.
+    #[must_use]
+    pub fn last_observed_disposition(&self) -> Option<ProviderOutcome> {
+        self.submitted()
+            .and_then(|state| state.observed_disposition)
+    }
+
+    /// Returns how this attempt's stream readback resolved.
+    ///
+    /// This is the accessor the final receipt uses to tell an observed stream
+    /// from one that was never read back or whose readback never answered.
+    /// Reporting an empty capture for any of those would be a false
+    /// observation, so the receipt renders the gap explicitly instead.
+    #[must_use]
+    pub fn last_evidence_observation(&self) -> Option<&EvidenceObservation> {
+        self.submitted()
+            .and_then(|state| state.failure.as_ref())
+            .map(|failure| &failure.evidence_observation)
+    }
+
     /// Reconciles an unknown or timed-out outcome by operation identity.
     ///
     /// # Errors
@@ -785,6 +991,10 @@ impl ResearchBridge for AdmittedResearchBridge {
         }
         match self.runner.execute(&self.admission, request) {
             Ok(execution) => {
+                // The provider-local disposition is retained before it is
+                // mapped into the submitted-state classification, so the two
+                // remain separately readable.
+                let observed = execution.outcome;
                 let outcome = match execution.outcome {
                     ProviderOutcome::Completed => SubmittedOutcome::Completed,
                     ProviderOutcome::Crashed => SubmittedOutcome::Crashed,
@@ -805,6 +1015,8 @@ impl ResearchBridge for AdmittedResearchBridge {
                     }),
                     failure: None,
                     reconciled: false,
+                    observed_disposition: Some(observed),
+                    operation_id: Some(execution.job_id.clone()),
                 }));
                 Ok(job_id)
             }
@@ -825,11 +1037,15 @@ impl ResearchBridge for AdmittedResearchBridge {
                     | BridgeError::ProviderUnavailable
                     | BridgeError::InvalidBridgeIdentity { .. } => return Err(error),
                 };
-                // The evidence and the cancellation receipt materialized
-                // immediately before the failure are retained here. The
-                // previous arm set `evidence: None`, which threw away the
-                // stderr/exit/lineage record for exactly the two terminal
-                // cases that most need it.
+                // The evidence, the cancellation receipt and the bound
+                // operation identity are all retained here. The previous arm set
+                // `evidence: None`, which threw away the stderr/exit/lineage
+                // record for exactly the two terminal cases that most need it,
+                // and it left a start-response loss looking like an attempt that
+                // was never made. The submission record and the operation
+                // identity come from the runner, which sealed them before the
+                // executor handoff, so a possibly-started operation stays
+                // addressable by its stable identity.
                 self.phase = BridgePhase::Submitted(Box::new(SubmittedState {
                     outcome: terminal,
                     evidence: error.evidence().cloned(),
@@ -838,6 +1054,8 @@ impl ResearchBridge for AdmittedResearchBridge {
                     submission: self.runner.last_submission(),
                     failure: Some(TerminalFailure::from_error(&error)),
                     reconciled: false,
+                    observed_disposition: error.process_disposition(),
+                    operation_id: self.runner.last_bound_operation(),
                 }));
                 Err(error)
             }
@@ -901,7 +1119,9 @@ impl ResearchBridge for AdmittedResearchBridge {
                 ExternalKnowledgeFailure::ProviderFailed { reason }
             }
             BridgeError::NotAdmitted { reason } => ExternalKnowledgeFailure::NotAdmitted { reason },
-            BridgeError::ProtocolViolation { reason } => {
+            // Only the reason is projected; the retained evidence and the
+            // provider's observed process disposition stay with this error.
+            BridgeError::ProtocolViolation { reason, .. } => {
                 ExternalKnowledgeFailure::ProtocolViolation { reason }
             }
             BridgeError::EvidenceIncomplete { reason } => {
@@ -1310,6 +1530,7 @@ pub(crate) mod support {
             "research-evidence-bundle/v1",
             "gen-24-slice-a",
             test_operation_id(),
+            "cancel-24-slice-a",
             DIGEST_A,
             DIGEST_B,
             COVERAGE_GOAL,
@@ -1571,20 +1792,28 @@ mod tests {
             CoverageGapKind::PolicyOrDisclosureDenied
         );
         assert_eq!(
-            BridgeError::ProtocolViolation { reason: "x" }.coverage_gap_kind(),
+            BridgeError::ProtocolViolation {
+                reason: "x",
+                evidence: None,
+                disposition: None,
+            }
+            .coverage_gap_kind(),
             CoverageGapKind::StaleSourceOrIndex
         );
         assert_eq!(
             BridgeError::TimedOut {
-                cancellation: Box::new(super::evidence::CancellationEvidence {
-                    operation_id: "op-24-slice-a".to_owned(),
-                    request_digest: super::support::DIGEST_A.to_owned(),
-                    status: "Requested".to_owned(),
-                    lifecycle: "Running".to_owned(),
-                    no_effect_proven: false,
-                    descendants_complete: false,
-                }),
-                evidence: None,
+                cancellation: Box::new(super::execution::CancellationOutcome::Confirmed(Box::new(
+                    super::evidence::CancellationEvidence {
+                        operation_id: "op-24-slice-a".to_owned(),
+                        request_digest: super::support::DIGEST_A.to_owned(),
+                        status: "Requested".to_owned(),
+                        lifecycle: "Running".to_owned(),
+                        no_effect_proven: false,
+                        descendants_complete: false,
+                    },
+                ))),
+                evidence: Box::new(super::execution::EvidenceObservation::NotAttempted),
+                undischarged: Vec::new(),
             }
             .coverage_gap_kind(),
             CoverageGapKind::Timeout

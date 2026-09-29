@@ -31,6 +31,20 @@ use thiserror::Error;
 use crate::process_stream_recovery::ProcessStreamObservation;
 use crate::reservation_model::ReservationRecord;
 use crate::{CONTRACT_VERSION, MAX_INLINE_RECOVERY_BYTES, MAX_RECOVERY_PAGE};
+
+/// `HostRequest` rows written with this send-claim protocol persist a durable
+/// pre-transport fence and typed custody evidence. Zero remains the legacy
+/// wire value and is classified conservatively during restart recovery.
+pub const HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION: u16 = 1;
+
+/// This issue allows one original send attempt plus one proven-not-sent retry.
+pub const MAX_HOST_REQUEST_SEND_ATTEMPTS: usize = 2;
+
+/// Maximum active claim lifetime for one authenticated `UserAutomation` send.
+/// This follows the Host Control Endpoint's existing 30-second queue-response
+/// timeout; expiry moves an uncertain claim to reconciliation and never frees
+/// it for another send.
+pub const HOST_REQUEST_SEND_CLAIM_LEASE_MS: u64 = 30_000;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A validated opaque label that carries no semantic authority.
@@ -70,6 +84,170 @@ pub type OrderingScope = OpaqueLabel;
 pub type RecoveryOwner = OpaqueLabel;
 /// Operation/checkpoint identity preserved without creating an authority owner.
 pub type OperationIdentity = OpaqueLabel;
+
+/// Current explicit version of the authenticated bridge event owner namespace.
+///
+/// The version is fixed by the ORS contract and is included in the canonical
+/// namespace digest; callers cannot select an older or weaker encoding.
+pub const BRIDGE_EVENT_OWNER_NAMESPACE_VERSION: u16 = 3;
+
+/// Authenticated semantic scope retained for a bridge event owner.
+///
+/// `UnboundObservation` is a task-free, owner-issued observation scope. It is
+/// not a caller-selected task, and the `producer_id` on
+/// [`BridgeEventOwnerNamespace`] still identifies the admitted producer
+/// occurrence. Neither variant is authentication evidence by itself: Kernel
+/// must derive it from its retained owner state and ORS must compare the whole
+/// value against the expected stored owner revision.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BridgeEventOwnerScope {
+    /// A semantic application Session, optionally narrowed to one Attempt.
+    ApplicationSession {
+        session_id: OpaqueLabel,
+        attempt_id: Option<OpaqueLabel>,
+    },
+    /// An explicitly unbound observation scope with no task or Attempt claim.
+    UnboundObservation { observation_scope_id: OpaqueLabel },
+}
+
+/// Resource name and store-issued incarnation within a bridge owner namespace.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BridgeEventOwnerResource {
+    /// A durable event stream. Its incarnation is assigned by ORS on first
+    /// binding and changes only through the store's checked owner transition.
+    Stream {
+        local_stream: OpaqueLabel,
+        incarnation: u64,
+    },
+    /// A connection-level coverage gap for which no stream is known.
+    UnscopedGap { local_gap_id: OpaqueLabel },
+}
+
+/// Typed, versioned identity for one authenticated bridge event owner.
+///
+/// This is an identity value, not a capability. The installation, principal,
+/// producer, semantic scope, authority lineage and stream incarnation must
+/// come from Kernel-owned admission state. Connection ID and producer
+/// generation remain observation metadata and are deliberately absent here.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeEventOwnerNamespace {
+    /// Stable authenticated installation identity from the Host binding.
+    pub installation_id: OpaqueLabel,
+    /// Authority lineage retained by the admission owner.
+    pub authority_lineage: OpaqueLabel,
+    /// Authenticated semantic principal; never an operating-system user name.
+    pub principal: OpaqueLabel,
+    /// Admitted producer identity for this stream or unscoped gap.
+    pub producer_id: OpaqueLabel,
+    /// Application-session or explicit owner-issued unbound observation scope.
+    pub owner_scope: BridgeEventOwnerScope,
+    /// Local resource identity and store-assigned incarnation, when applicable.
+    pub resource: BridgeEventOwnerResource,
+}
+
+impl BridgeEventOwnerNamespace {
+    /// Checks identity component shape without authenticating the source.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_bridge_event_owner_component(&self.installation_id, "installation_id")?;
+        validate_bridge_event_owner_component(&self.authority_lineage, "authority_lineage")?;
+        validate_bridge_event_owner_component(&self.principal, "principal")?;
+        validate_bridge_event_owner_component(&self.producer_id, "producer_id")?;
+        match &self.owner_scope {
+            BridgeEventOwnerScope::ApplicationSession {
+                session_id,
+                attempt_id,
+            } => {
+                validate_bridge_event_owner_component(session_id, "session_id")?;
+                if let Some(attempt_id) = attempt_id {
+                    validate_bridge_event_owner_component(attempt_id, "attempt_id")?;
+                }
+            }
+            BridgeEventOwnerScope::UnboundObservation {
+                observation_scope_id,
+            } => {
+                validate_bridge_event_owner_component(
+                    observation_scope_id,
+                    "observation_scope_id",
+                )?;
+            }
+        }
+        match &self.resource {
+            BridgeEventOwnerResource::Stream {
+                local_stream,
+                incarnation,
+            } => {
+                validate_bridge_event_owner_component(local_stream, "local_stream")?;
+                if *incarnation == 0 {
+                    return Err(OrsError::InvalidField {
+                        field: "stream_incarnation",
+                        reason: "bridge stream incarnation is store-assigned and nonzero",
+                    });
+                }
+            }
+            BridgeEventOwnerResource::UnscopedGap { local_gap_id } => {
+                validate_bridge_event_owner_component(local_gap_id, "local_gap_id")?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the canonical SHA-256 namespace digest for this exact owner.
+    ///
+    /// Canonical JSON keeps labels unambiguous without delimiter-based key
+    /// construction. The fixed domain includes namespace version 3. This
+    /// digest selects a candidate row only; the store must still compare every
+    /// field and the expected owner revision in the same write transaction.
+    pub fn namespace_digest(&self) -> Result<String, OrsError> {
+        self.validate()?;
+        let bytes = canonical_json_bytes(&BridgeEventOwnerNamespacePreimage {
+            domain: "eliot.bridge-event-owner",
+            version: BRIDGE_EVENT_OWNER_NAMESPACE_VERSION,
+            installation_id: self.installation_id.as_str(),
+            authority_lineage: self.authority_lineage.as_str(),
+            principal: self.principal.as_str(),
+            producer_id: self.producer_id.as_str(),
+            owner_scope: &self.owner_scope,
+            resource: &self.resource,
+        })
+        .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        Ok(sha256_hex(&bytes))
+    }
+}
+
+#[derive(Serialize)]
+struct BridgeEventOwnerNamespacePreimage<'a> {
+    domain: &'static str,
+    version: u16,
+    installation_id: &'a str,
+    authority_lineage: &'a str,
+    principal: &'a str,
+    producer_id: &'a str,
+    owner_scope: &'a BridgeEventOwnerScope,
+    resource: &'a BridgeEventOwnerResource,
+}
+
+fn validate_bridge_event_owner_component(
+    label: &OpaqueLabel,
+    field: &'static str,
+) -> Result<(), OrsError> {
+    validate_text(label.as_str(), field)?;
+    if label.as_str().contains("::") {
+        return Err(OrsError::InvalidField {
+            field,
+            reason: "owner identity components must not contain the key separator",
+        });
+    }
+    if label.as_str() == "-" {
+        return Err(OrsError::InvalidField {
+            field,
+            reason: "owner identity components must not equal the unbound marker",
+        });
+    }
+    Ok(())
+}
 
 /// Operation reserved by ORS for one authenticated supervision-lease revision.
 ///
@@ -4263,6 +4441,14 @@ pub enum OrsError {
     AuthoritySnapshotUnavailable,
     #[error("operational projection exceeds its declared bound")]
     ProjectionLimitExceeded,
+    /// A `HostRequest` exhausted its original send attempt and its one
+    /// proven-not-sent same-identity retry; its existing claim remains retained.
+    #[error("HostRequest send-attempt bound is exhausted; reconcile the retained operation")]
+    HostRequestAttemptLimitExceeded,
+    /// A durable send claim expired before transport dispatch. The exact
+    /// operation remains in reconciliation and is never reissued by expiry.
+    #[error("HostRequest send claim expired before transport dispatch")]
+    HostRequestAttemptExpired,
     /// The process-stream recovery family moved while a backup continuation
     /// held it frozen (issue #2884).
     ///
@@ -4719,6 +4905,77 @@ impl UnknownCommitRecord {
 /// contract instead of by a second copy of the same string.
 pub const BACKUP_VERIFICATION_RESULT_RECORD_TYPE: &str = "backup_verification_result";
 
+/// Durable REFERENCE to the immutable archive handle one verification resolved
+/// through the accepted artifact/publication owner (issue #2862 instruction 1).
+///
+/// It is a reference, not a request and not a second artifact identity: it is
+/// the durable projection of `eliot_protocol::backup::BackupArtifactHandle`
+/// into this store's own owner-text spelling, exactly as
+/// [`BackupVerifyRequestIdentity::archive_owner_contract`] already is for the
+/// handle's contract identity. A path, a URL and an inline `bundle_hex` are
+/// none of them: none of the three can be produced here, and the issue forbids
+/// inventing an in-memory handle to make a route green.
+///
+/// It is DIGEST-BOUND in [`BackupVerifyIdentityPreimage`], which is what makes
+/// "the same operation identity presented with a different retained handle" an
+/// I5.27 identity conflict rather than a second answer — acceptance clause 3's
+/// `handle` term. `content_sha256` is the handle's own recorded content digest
+/// and is NOT recomputed here: a stored row proves which handle was bound, and
+/// proving the handle still resolves to those bytes is the artifact owner's
+/// question, not ORS's.
+///
+/// `None` is the owner's own answer on a path where no artifact owner resolved
+/// a handle — the same absence `capture_receipt` and `target_compatibility`
+/// already record, and never a placeholder.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupVerifyArchiveHandleRef {
+    /// Owner-issued identity of the retained artifact.
+    pub artifact_id: String,
+    /// Exact owner contract identity of the retained artifact, in this store's
+    /// own owner-text spelling (the same spelling as
+    /// [`BackupVerifyRequestIdentity::archive_owner_contract`]).
+    pub owner_contract: String,
+    /// Owner revision of the retained content.
+    pub source_revision: String,
+    /// Canonical content digest recorded by the owner on the handle.
+    pub content_sha256: String,
+    /// Exact byte length recorded by the owner on the handle; nonzero.
+    pub byte_length: u64,
+}
+
+impl BackupVerifyArchiveHandleRef {
+    /// Validates the bounded handle reference.
+    ///
+    /// Deliberately shape-only, like every other owner answer on this record:
+    /// ORS stores the owner's handle and interprets no archive, class or
+    /// provenance meaning. `byte_length` is required nonzero because the
+    /// protocol's own handle bounds it the same way, and a zero-length artifact
+    /// is not a retained archive.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_text(&self.artifact_id, "backup_verify_artifact_artifact_id")?;
+        validate_text(
+            &self.owner_contract,
+            "backup_verify_artifact_owner_contract",
+        )?;
+        validate_text(
+            &self.source_revision,
+            "backup_verify_artifact_source_revision",
+        )?;
+        validate_digest(
+            &self.content_sha256,
+            "backup_verify_artifact_content_sha256",
+        )?;
+        if self.byte_length == 0 {
+            return Err(OrsError::InvalidField {
+                field: "backup_verify_artifact_byte_length",
+                reason: "must be non-zero",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Outcome of staging one durable backup-verification result.
 ///
 /// The disposition names what the durable row says about the request, never a
@@ -4924,6 +5181,116 @@ pub(crate) fn classify_backup_verification_two_value_key(
     LegacyTwoValueRelationBackupVerificationClass::Unreadable
 }
 
+/// What a durable key holds when the row there was written under the PRE-#2862
+/// fence-bound verify profile, which carried NO owner-evidence commitments
+/// (#2862).
+///
+/// This is a SEPARATE type from
+/// [`LegacyTwoValueRelationBackupVerificationClass`] and from
+/// [`LegacyUnscopedBackupVerificationClass`] on purpose. The pre-#2883 class is
+/// about a row keyed by CALLER TEXT; the pre-#2863 class is about the two-value
+/// archived-fence vocabulary; and this one is about a correctly scoped,
+/// isolated, fully replayable row that simply predates the retained-handle,
+/// capture-receipt and validity-attestation references. Collapsing any two of
+/// them would lose a fact the route branches on: which legacy answer it is
+/// refusing, and therefore what the caller must do next.
+///
+/// Three-valued for the same reason both siblings are: only the first may lead
+/// to a new row. `Unreadable` means bytes are present that decode as neither
+/// shape, which is an unreadable durable row and must fail CLOSED rather than
+/// read as "absent" and be staged over.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LegacyFenceBoundBackupVerificationClass {
+    /// No bytes at all under the probed `v2` key. The pre-#2862 key is free, and
+    /// the current profile's own key was already found empty by the caller, so
+    /// nothing is quarantined here.
+    Absent,
+    /// Bytes are present and decode as a `v2`-profile row: a properly scoped,
+    /// isolated, replayable structural-candidate verification result with no
+    /// owner-evidence reference of any kind. It is LEGACY UNQUALIFIED EVIDENCE:
+    /// replayable as a legacy answer by its own owner, never upgraded, never
+    /// reinterpreted as provenance-bound, and never a source of a current-profile
+    /// answer. A code upgrade does not and cannot make it provenance-bound —
+    /// there is no receipt or attestation in it to read one from.
+    LegacyUnqualified,
+    /// Bytes are present and decode as neither the current record nor the `v2`
+    /// shape. The durable row is unreadable, so no verification result may be
+    /// answered at all.
+    Unreadable,
+}
+
+/// PRE-#2862 `v2`-profile row shape, read only far enough to recognise it.
+///
+/// It is deliberately NOT a full second copy of the old record, for the same
+/// reason its two siblings are not: its only job is to recognise a shape the
+/// current record cannot decode, and a partial shape cannot drift into a second
+/// source of truth for old fields. It is a partial copy for a second, sharper
+/// reason too: a `v2` row's three owner-evidence fields are ABSENT from it, and
+/// naming them here would create a second claim about what such a row carried.
+///
+/// The discriminator is the NESTED `identity.profile_version == 2` together
+/// with the `v2` idempotency namespace. The version is read from `identity`
+/// rather than from a flat field because that is where
+/// [`BackupVerifyRequestIdentity`] has carried it since #2883 and where the `v2`
+/// profile put it; a flat read would be a guess about a shape this struct does
+/// not model, and a guess that silently never matches is the fail-WRONG answer
+/// the probe exists to avoid.
+///
+/// Unknown fields are TOLERATED on purpose. The `v2` row carried more fields
+/// than these, and denying them would reject a genuine legacy row and turn it
+/// into `Unreadable` — reporting corruption for evidence that is intact and
+/// merely old.
+#[derive(Deserialize)]
+struct LegacyFenceBoundBackupVerificationRow {
+    /// The nested request identity, read only far enough to pin the row to the
+    /// pre-#2862 profile.
+    identity: LegacyFenceBoundBackupVerificationIdentity,
+}
+
+/// Nested identity terms of one pre-#2862 row. See
+/// [`LegacyFenceBoundBackupVerificationRow`].
+#[derive(Deserialize)]
+struct LegacyFenceBoundBackupVerificationIdentity {
+    /// The `v2` profile version the row was written under.
+    profile_version: u16,
+    /// The `v2` row's idempotency namespace, which pins the row to the old
+    /// profile independently of the version number.
+    idempotency_namespace: String,
+}
+
+/// Returns whether stored bytes are a pre-#2862 fence-bound scoped row.
+///
+/// It is the recogniser half of
+/// [`classify_backup_verification_fence_bound_key`], which is its only caller,
+/// so there is exactly one place that decides this legacy shape.
+fn is_legacy_fence_bound_backup_verification_row(bytes: &str) -> bool {
+    let Ok(row) = serde_json::from_str::<LegacyFenceBoundBackupVerificationRow>(bytes) else {
+        return false;
+    };
+    row.identity.profile_version == 2
+        && row.identity.idempotency_namespace
+            == PRE_OWNER_EVIDENCE_BACKUP_VERIFY_IDEMPOTENCY_NAMESPACE
+}
+
+/// Classifies stored bytes at a probed pre-#2862 key as absent, a recognised
+/// legacy fence-bound row, or bytes that are neither shape (#2862).
+///
+/// A current-contract row cannot appear at a `v2` key, and a `v2` row cannot
+/// decode as a current record — its three owner-evidence fields are absent and
+/// the current shape requires them — so this classifier is disjoint from the
+/// current one by construction rather than by convention.
+pub(crate) fn classify_backup_verification_fence_bound_key(
+    bytes: &str,
+) -> LegacyFenceBoundBackupVerificationClass {
+    if serde_json::from_str::<BackupVerificationResultRecord>(bytes).is_ok() {
+        return LegacyFenceBoundBackupVerificationClass::Unreadable;
+    }
+    if is_legacy_fence_bound_backup_verification_row(bytes) {
+        return LegacyFenceBoundBackupVerificationClass::LegacyUnqualified;
+    }
+    LegacyFenceBoundBackupVerificationClass::Unreadable
+}
+
 /// Returns whether stored bytes are a pre-#2883 unscoped row occupying `raw_key`.
 ///
 /// It is the recogniser half of [`classify_backup_verification_key`], which is its
@@ -5091,6 +5458,28 @@ pub struct BackupVerificationResultRecord {
     /// answer on a path where no retained-artifact owner issues one; an absent
     /// receipt is never replaced by a placeholder identity.
     pub capture_receipt: Option<String>,
+    /// #2862: the retained immutable archive handle this answer was produced
+    /// against, retained BOTH flat here and nested in
+    /// [`Self::identity::archive_handle`](BackupVerifyRequestIdentity::archive_handle)
+    /// and cross-checked in [`Self::validate`], for the same reason the other
+    /// four duplicated fields are: without the check a bit-rotted row could
+    /// project a handle the accepted request identity never vouched for.
+    ///
+    /// `None` on every row this owner writes today, because no production
+    /// artifact/publication owner resolves a handle on this path. That absence
+    /// is the owner's own answer and is never a placeholder.
+    pub archive_handle: Option<BackupVerifyArchiveHandleRef>,
+    /// #2862: canonical digest of the owner-issued capture receipt this answer
+    /// relied on, cross-checked against the nested identity. `None` wherever
+    /// `capture_receipt` is `None`: a free-text receipt identity and the
+    /// receipt's own recorded digest are two different values, and the digest is
+    /// the one that is digest-bound and therefore conflict-detecting.
+    pub capture_receipt_digest: Option<String>,
+    /// #2862: canonical digest of the verifier-issued archive validity
+    /// attestation this answer relied on, cross-checked against the nested
+    /// identity. `None` on every row this owner writes today, because no
+    /// `BackupRole::Verifier` session issues one on this product.
+    pub validity_attestation_digest: Option<String>,
     /// Digest over the exact reply body this operation projects. A replay
     /// recomputes it, so a row that cannot rebuild the answer it claims to hold
     /// fails closed instead of projecting one it never produced.
@@ -5182,14 +5571,21 @@ impl BackupVerificationResultRecord {
     /// declared counts and carry no presence flag, because a real count of zero
     /// is a real answer and an absent one is not representable.
     ///
-    /// Four fields are retained BOTH flat on the row and inside the nested
-    /// identity, and all four are cross-checked here. `request_digest` against
+    /// Seven fields are retained BOTH flat on the row and inside the nested
+    /// identity, and all seven are cross-checked here. `request_digest` against
     /// `identity.identity_digest` existed from the start; `archive_sha256`
     /// against `identity.archive_sha256`, `class` against
     /// `identity.evidenced_class`, and `capture_receipt` against
     /// `identity.capture_receipt` are checked for the same reason and were the
-    /// gap this closes. Without them a bit-rotted row could carry
-    /// `identity.archive_sha256 = X` next to `archive_sha256 = Y`, pass every
+    /// gap this closes. #2862 added the fourth group the same way:
+    /// `archive_handle` against `identity.archive_handle`, and
+    /// `capture_receipt_digest` / `validity_attestation_digest` against their
+    /// identity siblings, because those three are the owner-evidence references
+    /// a provenance-qualified answer would rest on and a row that carried a
+    /// different reference flat than nested would project one the accepted
+    /// request identity never vouched for. Without these checks a bit-rotted row
+    /// could carry `identity.archive_sha256 = X` next to `archive_sha256 = Y`,
+    /// pass every
     /// other check, pass the reconciliation archive comparison — which reads the
     /// IDENTITY side — and then project `integrity_sha256 = Y`, a digest the
     /// accepted request identity never vouched for. These checks strictly
@@ -5201,7 +5597,7 @@ impl BackupVerificationResultRecord {
     /// would hide the shape of each comparison. They share one reason string
     /// naming the field pair, declared before the first of them.
     pub fn validate(&self) -> Result<(), OrsError> {
-        /// One shared reason string for all four drift checks, naming the
+        /// One shared reason string for every drift check, naming the
         /// relationship rather than the values so no stored value can leak.
         const DRIFT: &str = "flat field must equal the same field in the nested request identity";
         if self.contract_version != CONTRACT_VERSION {
@@ -5231,6 +5627,39 @@ impl BackupVerificationResultRecord {
                 field: "backup_verification_capture_receipt",
                 reason: DRIFT,
             });
+        }
+        // #2862: the three owner-evidence references are duplicated for the same
+        // reason as the four above, and the check is against the ORIGINAL
+        // RECORDED value in the nested identity — never a recomputation over
+        // what the flat field happens to hold. `archive_handle` compares by
+        // `PartialEq` on the whole reference, so a row cannot carry one handle
+        // flat and a different one nested.
+        if self.archive_handle != self.identity.archive_handle {
+            return Err(OrsError::InvalidField {
+                field: "backup_verification_archive_handle",
+                reason: DRIFT,
+            });
+        }
+        if self.capture_receipt_digest != self.identity.capture_receipt_digest {
+            return Err(OrsError::InvalidField {
+                field: "backup_verification_capture_receipt_digest",
+                reason: DRIFT,
+            });
+        }
+        if self.validity_attestation_digest != self.identity.validity_attestation_digest {
+            return Err(OrsError::InvalidField {
+                field: "backup_verification_validity_attestation_digest",
+                reason: DRIFT,
+            });
+        }
+        if let Some(handle) = &self.archive_handle {
+            handle.validate()?;
+        }
+        if let Some(digest) = &self.capture_receipt_digest {
+            validate_digest(digest, "backup_verification_capture_receipt_digest")?;
+        }
+        if let Some(digest) = &self.validity_attestation_digest {
+            validate_digest(digest, "backup_verification_validity_attestation_digest")?;
         }
         validate_digest(&self.request_digest, "backup_verification_request_digest")?;
         validate_digest(&self.archive_sha256, "backup_verification_archive_sha256")?;
@@ -5295,7 +5724,7 @@ pub const BACKUP_VERIFY_PROFILE_ID: &str = "eliot.kernel.backup-verify.read-only
 /// two versions can never share a key; what the old version does not get is a
 /// read path. Retention and any migration of old rows belong to the ORS
 /// operational retention owner, not here.
-pub const BACKUP_VERIFY_PROFILE_VERSION: u16 = 2;
+pub const BACKUP_VERIFY_PROFILE_VERSION: u16 = 3;
 /// I5.27 `idempotency_namespace` the PRE-#2863 (`v1`) verify profile used, and
 /// the ONLY thing #2863 changed about the durable key preimage.
 ///
@@ -5316,6 +5745,38 @@ pub const BACKUP_VERIFY_PROFILE_VERSION: u16 = 2;
 /// [`LegacyTwoValueRelationBackupVerificationClass`] for the three-valued answer.
 pub const LEGACY_BACKUP_VERIFY_IDEMPOTENCY_NAMESPACE: &str =
     "eliot.kernel.backup-verify.read-only/v1";
+/// I5.27 `idempotency_namespace` the PRE-#2862 (`v2`) verify profile used.
+///
+/// #2862 bumped [`BACKUP_VERIFY_PROFILE_VERSION`] to 3 because the identity
+/// gained the three OWNER-EVIDENCE commitments — the retained
+/// [`BackupVerifyArchiveHandleRef`], the capture-receipt digest and the
+/// validity-attestation digest — and the stored answer gained the same three
+/// references. Those three are in [`BackupVerifyIdentityPreimage`], so the
+/// canonical request hash of an otherwise identical request MOVED: a `v2` row is
+/// therefore not the same operation as the `v3` row a caller now produces, and
+/// reusing one key for the other is exactly the silent reinterpretation I5.27
+/// forbids. A bump is a new namespace by construction, so the two versions can
+/// never share a key.
+///
+/// A new namespace alone is not enough, for the same reason #2863 stated: a `v2`
+/// row simply becomes unreachable, and an unreachable row read as "absent" is the
+/// fail-OPEN outcome — the caller would re-run a key that already holds a stored
+/// answer and stage a second row beside it. This constant is what lets the route
+/// ADDRESS the row a pre-#2862 install actually wrote, so it can be recognised
+/// and reported as legacy UNQUALIFIED evidence instead. See
+/// [`BackupVerifyRequestIdentity::legacy_fence_bound_namespace_digest`] and
+/// [`LegacyFenceBoundBackupVerificationClass`].
+///
+/// The migration rule is exactly the one #2863 already established, and it is
+/// deliberately a QUARANTINE rather than a conversion: nothing here re-keys,
+/// rewrites, upgrades, backfills or projects a `v2` row. A `v2` row stays the
+/// exact historical structural-candidate result it was — it does not become
+/// provenance-bound by a code upgrade, because ORS never reads its level as
+/// anything but what its own owner recorded. A caller that wants the stronger
+/// level submits a NEW explicit verification operation, which is a new
+/// `operation_id` and therefore a different legacy key that reads `Absent`.
+pub const PRE_OWNER_EVIDENCE_BACKUP_VERIFY_IDEMPOTENCY_NAMESPACE: &str =
+    "eliot.kernel.backup-verify.read-only/v2";
 /// Retention/collision window this durable table is now a member of (I5.27
 /// `retention_and_collision_window`).
 ///
@@ -5642,6 +6103,32 @@ pub struct BackupVerifyRequestIdentity {
     /// Owner-issued publication receipt identity, explicitly absent when the owner
     /// issued none. Absence is the owner's own answer, never a placeholder.
     pub capture_receipt: Option<String>,
+    /// #2862: the retained immutable archive handle this verification resolved
+    /// through the accepted artifact/publication owner, or `None` when no such
+    /// owner resolved one on this path.
+    ///
+    /// It is DIGEST-BOUND (it is in [`BackupVerifyIdentityPreimage`]) so a
+    /// different handle under one operation identity is the I5.27 conflict
+    /// acceptance clause 3 names, not a second answer. It is an ANSWER, never a
+    /// key component: a handle is a content reference, and a caller-movable key
+    /// component would be a caller-movable durable namespace. See
+    /// [`BackupVerifyArchiveHandleRef`].
+    pub archive_handle: Option<BackupVerifyArchiveHandleRef>,
+    /// #2862: canonical digest of the owner-issued `BackupCaptureReceipt` that
+    /// proves the retained capture, or `None` when the capture owner issued
+    /// none. DIGEST-BOUND for the same reason.
+    ///
+    /// It is the RECORDED digest of the owner's own receipt, not a digest ORS
+    /// recomputed: the receipt is the capture owner's contract and ORS never
+    /// parses one. It is a reference, and reference equality is what makes
+    /// "a receipt for another archive, class, source, fence or owner" a
+    /// conflict on this key instead of a silently accepted answer.
+    pub capture_receipt_digest: Option<String>,
+    /// #2862: canonical digest of the verifier-issued
+    /// `BackupArchiveValidityAttestation` for this archive, or `None` when no
+    /// `BackupRole::Verifier` session issued one. DIGEST-BOUND for the same
+    /// reason, and it is the RECORDED digest, never a recomputed one.
+    pub validity_attestation_digest: Option<String>,
     /// I5.27 `retention_and_collision_window`: the named ORS operational
     /// retention/export contract this durable row is a member of.
     pub retention_and_collision_window: String,
@@ -5869,6 +6356,48 @@ impl BackupVerifyRequestIdentity {
         Ok(sha256_hex(&bytes))
     }
 
+    /// Computes the durable key a PRE-#2862 install would have written for this
+    /// same operation (#2862).
+    ///
+    /// It is the same construction as
+    /// [`Self::legacy_two_value_namespace_digest`] and changes exactly ONE
+    /// preimage entry: `idempotency_namespace`, forced to
+    /// [`PRE_OWNER_EVIDENCE_BACKUP_VERIFY_IDEMPOTENCY_NAMESPACE`]. That is sound
+    /// because #2862 changed no KEY component: `domain_separator`,
+    /// `canonical_encoding_version`, `semantic_command_kind`, `principal`, the
+    /// authority LINEAGE, `operation_id` and `retention_and_collision_window`
+    /// are byte-identical across the two profile versions. The three terms #2862
+    /// added (`archive_handle`, `capture_receipt_digest`,
+    /// `validity_attestation_digest`) are ANSWERS and reach neither the key nor
+    /// this reconstruction — which is the whole point: a row stored under `v2`
+    /// carries no owner-evidence commitment at all, and reconstructing its key
+    /// from a `v3` request is a reconstruction of a DIFFERENT request's key for
+    /// the eight components the two profiles share.
+    ///
+    /// It exists so the route can ask a scoped question about a `v2` row rather
+    /// than letting the version bump quietly turn it into "absent". What it may
+    /// be used for is bounded: it locates a row to be CLASSIFIED as legacy
+    /// unqualified evidence. Nothing here re-keys, rewrites, upgrades or projects
+    /// a legacy row, and a caller that wants the owner-evidence level submits a
+    /// NEW operation id, which is a different key that reads `Absent`.
+    pub fn legacy_fence_bound_namespace_digest(&self) -> Result<String, OrsError> {
+        let preimage = serde_json::json!({
+            "authority_lineage_id": self.authority_epoch.lineage_id.as_str(),
+            "canonical_encoding_version": self.canonical_encoding_version,
+            "domain_separator": self.domain_separator.as_str(),
+            "idempotency_namespace": PRE_OWNER_EVIDENCE_BACKUP_VERIFY_IDEMPOTENCY_NAMESPACE,
+            "operation_id": self.operation_id.as_str(),
+            "principal": self.principal.as_str(),
+            "retention_and_collision_window": self.retention_and_collision_window.as_str(),
+            "semantic_command_kind": self.semantic_command_kind.as_str(),
+        });
+        let bytes = canonical_json_bytes(&preimage).map_err(|_| OrsError::InvalidField {
+            field: "backup_verify_legacy_fence_bound_namespace",
+            reason: "canonical legacy namespace bytes are not serializable",
+        })?;
+        Ok(sha256_hex(&bytes))
+    }
+
     /// Validates the profile pins, the owner/authenticated text shapes, the
     /// digest shapes and the self-consistent digest.
     ///
@@ -5973,6 +6502,18 @@ impl BackupVerifyRequestIdentity {
         if let Some(receipt) = &self.capture_receipt {
             validate_text(receipt, "backup_verify_identity_capture_receipt")?;
         }
+        // #2862: the three owner-evidence commitments. Each is shape-checked and
+        // each is DIGEST-BOUND, so a present value cannot be edited in place
+        // without moving `identity_digest` and failing the check below.
+        if let Some(handle) = &self.archive_handle {
+            handle.validate()?;
+        }
+        if let Some(digest) = &self.capture_receipt_digest {
+            validate_digest(digest, "backup_verify_identity_capture_receipt_digest")?;
+        }
+        if let Some(digest) = &self.validity_attestation_digest {
+            validate_digest(digest, "backup_verify_identity_validity_attestation_digest")?;
+        }
         if self.identity_digest != self.compute_digest()? {
             return Err(OrsError::InvalidField {
                 field: "backup_verify_identity_identity_digest",
@@ -6024,6 +6565,13 @@ struct BackupVerifyIdentityPreimage<'a> {
     archived_fence_digest: &'a str,
     evidenced_class: &'a str,
     capture_receipt: &'a Option<String>,
+    /// #2862: the three OWNER-EVIDENCE commitments. All three are digest-bound,
+    /// which is what makes a changed handle, a changed capture receipt and a
+    /// changed validity attestation each an I5.27 identity conflict under one
+    /// operation identity rather than a second answer.
+    archive_handle: &'a Option<BackupVerifyArchiveHandleRef>,
+    capture_receipt_digest: &'a Option<String>,
+    validity_attestation_digest: &'a Option<String>,
     retention_and_collision_window: &'a str,
 }
 
@@ -6052,6 +6600,9 @@ impl<'a> From<&'a BackupVerifyRequestIdentity> for BackupVerifyIdentityPreimage<
             archived_fence_digest: identity.archived_fence_digest.as_str(),
             evidenced_class: identity.evidenced_class.as_str(),
             capture_receipt: &identity.capture_receipt,
+            archive_handle: &identity.archive_handle,
+            capture_receipt_digest: &identity.capture_receipt_digest,
+            validity_attestation_digest: &identity.validity_attestation_digest,
             retention_and_collision_window: identity.retention_and_collision_window.as_str(),
         }
     }
@@ -6098,18 +6649,40 @@ pub enum HostRequestState {
 /// Durable owner for one daemon attempt at an admitted host request.
 ///
 /// The attempt is stored on the same ORS row as the operation and its State
-/// Fence. A replacement owner cannot overwrite it: the store moves the row to
-/// `Unknown` and retains this binding for reconciliation.
+/// Fence. A competing v1 claimant receives the durable winner unchanged. An
+/// expired possible-effect claim moves the row to `Unknown` while retaining
+/// this owner binding for reconciliation.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostRequestAttempt {
     pub attempt_id: OpaqueLabel,
     pub generation: u64,
+    /// Absolute lease expiry for this claim, present only in the v1 custody
+    /// protocol. Expiry is reconciliation evidence, never permission to resend.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claim_expires_at_unix_ms: Option<u64>,
     pub fence_digest: String,
     pub owner_connection_ref: OpaqueLabel,
     pub owner_launch_nonce: OpaqueLabel,
     pub owner_session_epoch: u64,
     pub phase: HostRequestAttemptPhase,
+    /// Authenticated Host channel committed at claim acquisition. Legacy
+    /// protocol-zero attempts have no channel binding.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_binding_sha256: Option<String>,
+    /// Bounded, append-only custody observations for this exact claim.
+    ///
+    /// Empty only on a legacy row or a freshly claimed attempt. ORS owns the
+    /// monotonic append sequence; callers cannot replace earlier evidence.
+    #[serde(default)]
+    pub transport_observations: Vec<HostRequestTransportObservation>,
+    /// Cross-restart exact owner readback, authenticated on its own channel.
+    /// This is separate from the original send-channel observation history.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_readback: Option<HostRequestOwnerReadbackEvidence>,
 }
 
 /// The exact parent attempt observed when one durable cancellation operation
@@ -6160,17 +6733,352 @@ impl HostRequestCancellationTarget {
     }
 }
 
-/// Durable execution phase for a daemon attempt.
+/// Durable transport custody of a daemon attempt.
+///
+/// These values live in the existing attempt slot so they remain bound to the
+/// exact claim without a parallel queue or process-local status. `Claimed` is
+/// the pre-dispatch state; the remaining variants are owner-observed transport
+/// boundaries and never derive from error prose.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum HostRequestAttemptPhase {
-    /// Claim was persisted before dispatch; effects may have been issued.
+    /// Claim was persisted, but no transport boundary has been observed yet.
     Claimed,
-    /// The owner explicitly deferred before producing any effect.
+    /// The owner durably fenced the attempt before entering the transport.
+    /// A restart treats this as possible delivery, never as no-effect proof.
+    DispatchStarted,
+    /// The exact request was proven not to have been sent.
+    DefinitelyNotSent,
+    /// The transport could not determine whether the request reached the Host.
+    DeliveryOutcomeUnknown,
+    /// The request was delivered over the authenticated Host channel.
+    DeliveredToAuthenticatedHost,
+    /// A complete response was received; its result body may still be unretained.
+    ResponseReceived,
+    /// Compatibility disposition for an older explicit no-effect deferral.
     DeferredNoEffect,
 }
 
+/// Typed transport-custody state exposed to the request owner.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HostRequestTransportCustody {
+    /// The authenticated Host transport proves no request bytes were sent.
+    DefinitelyNotSent,
+    /// The transport crossed an uncertainty boundary without a delivery proof.
+    DeliveryOutcomeUnknown,
+    /// The request bytes were delivered to the authenticated Host owner.
+    DeliveredToAuthenticatedHost,
+    /// A complete, identity-validated response was received from the Host.
+    ResponseReceived,
+}
+
+/// Last durable transport boundary retained under one exact `HostRequest` claim.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HostRequestTransportBoundary {
+    /// The durable pre-send fence was written before calling the transport.
+    DispatchStarted,
+    /// A typed local/transport proof establishes that no request bytes were sent.
+    DefinitelyNotSent,
+    /// The transport owner could not determine whether the request was sent.
+    DeliveryOutcomeUnknown,
+    /// The authenticated Host channel reported a complete frame write.
+    DeliveredToAuthenticatedHost,
+    /// An identity-validated Host response or exact owner readback was received.
+    ResponseReceived,
+}
+
+/// Closed source class for a typed no-send proof. Free-form error text is not
+/// retained or interpreted as transport custody.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HostRequestNoSendProof {
+    /// Request/frame validation failed before the named-pipe write boundary.
+    RequestRejectedBeforeWrite,
+    /// The authenticated transport rejected peer/frame preflight before write.
+    AuthenticatedTransportPreflightRejected,
+}
+
+/// Existing named-pipe delivery observation, transcribed without upgrading it
+/// to an application commit receipt.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HostRequestDeliveryReceipt {
+    /// IPC `DeliveryOutcome::Delivered`: the complete frame was written.
+    Delivered,
+    /// IPC `DeliveryOutcome::UnknownOutcome`: bytes may have reached the peer.
+    UnknownOutcome,
+}
+
+/// Provenance of a response commitment retained for this operation.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HostRequestResponseSource {
+    /// Response came from the in-flight authenticated transport exchange.
+    AuthenticatedTransport,
+}
+
+/// One immutable, identity-bound transport observation retained on its claim.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRequestTransportObservation {
+    /// Parent ORS operation this observation belongs to.
+    pub operation_id: OperationIdentity,
+    /// Exact parent request digest this observation belongs to.
+    pub request_digest: String,
+    /// Exact attempt identity this observation belongs to.
+    pub attempt_id: OpaqueLabel,
+    /// Exact attempt generation this observation belongs to.
+    pub attempt_generation: u64,
+    /// Last source-backed boundary observed by the authenticated client.
+    pub boundary: HostRequestTransportBoundary,
+    /// Digest of the existing authenticated Host channel binding.
+    pub channel_binding_sha256: String,
+    /// Digest of the exact typed transport request carrier sent on that
+    /// authenticated channel. Every observation in this claim repeats it.
+    pub transport_request_sha256: String,
+    /// Exact retained `HostRequest` operation commitment.
+    pub request_commitment_sha256: String,
+    /// Exact retained `HostRequest` payload commitment from the admitted row.
+    pub payload_commitment_sha256: String,
+    /// Present only when the named-pipe send boundary returned an outcome.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_receipt: Option<HostRequestDeliveryReceipt>,
+    /// Present only when a complete response body was identity-validated.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_commitment_sha256: Option<String>,
+    /// Source that supplied the response commitment.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_source: Option<HostRequestResponseSource>,
+    /// Present only for a typed proof that the write did not occur.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_send_proof: Option<HostRequestNoSendProof>,
+}
+
+impl HostRequestTransportObservation {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exact observation identity and custody fields are validated as one boundary"
+    )]
+    pub(crate) fn validate_for(
+        &self,
+        record: &HostRequestRecord,
+        attempt: &HostRequestAttempt,
+    ) -> Result<(), OrsError> {
+        if self.operation_id != record.operation_id
+            || self.request_digest != record.request_digest
+            || self.attempt_id != attempt.attempt_id
+            || self.attempt_generation != attempt.generation
+        {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: record.operation_id.as_str().to_owned(),
+                request_digest: record.request_digest.clone(),
+            });
+        }
+        validate_digest(
+            &self.channel_binding_sha256,
+            "host_request_transport_channel_binding_sha256",
+        )?;
+        validate_digest(
+            &self.transport_request_sha256,
+            "host_request_transport_request_sha256",
+        )?;
+        validate_digest(
+            &self.request_commitment_sha256,
+            "host_request_transport_request_commitment_sha256",
+        )?;
+        validate_digest(
+            &self.payload_commitment_sha256,
+            "host_request_transport_payload_commitment_sha256",
+        )?;
+        if self.request_commitment_sha256 != record.request_digest
+            || self.payload_commitment_sha256 != record.payload_digest
+            || record.transport_channel_binding_sha256.as_deref()
+                != Some(self.channel_binding_sha256.as_str())
+            || attempt.channel_binding_sha256.as_deref()
+                != Some(self.channel_binding_sha256.as_str())
+            || attempt.transport_observations.first().is_some_and(|first| {
+                first.channel_binding_sha256 != self.channel_binding_sha256
+                    || first.transport_request_sha256 != self.transport_request_sha256
+            })
+        {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: record.operation_id.as_str().to_owned(),
+                request_digest: record.request_digest.clone(),
+            });
+        }
+        match self.boundary {
+            HostRequestTransportBoundary::DispatchStarted => {
+                if self.delivery_receipt.is_some()
+                    || self.response_commitment_sha256.is_some()
+                    || self.response_source.is_some()
+                    || self.no_send_proof.is_some()
+                {
+                    return Err(OrsError::InvalidField {
+                        field: "host_request_transport_observation",
+                        reason: "dispatch-started evidence cannot carry a send result or response",
+                    });
+                }
+            }
+            HostRequestTransportBoundary::DefinitelyNotSent => {
+                if self.no_send_proof.is_none()
+                    || self.delivery_receipt.is_some()
+                    || self.response_commitment_sha256.is_some()
+                    || self.response_source.is_some()
+                {
+                    return Err(OrsError::InvalidField {
+                        field: "host_request_transport_observation",
+                        reason: "no-send evidence requires a typed proof and no send/response receipt",
+                    });
+                }
+            }
+            HostRequestTransportBoundary::DeliveryOutcomeUnknown => {
+                if self.delivery_receipt != Some(HostRequestDeliveryReceipt::UnknownOutcome)
+                    || self.response_commitment_sha256.is_some()
+                    || self.response_source.is_some()
+                    || self.no_send_proof.is_some()
+                {
+                    return Err(OrsError::InvalidField {
+                        field: "host_request_transport_observation",
+                        reason: "unknown delivery requires the matching typed IPC outcome only",
+                    });
+                }
+            }
+            HostRequestTransportBoundary::DeliveredToAuthenticatedHost => {
+                if self.delivery_receipt != Some(HostRequestDeliveryReceipt::Delivered)
+                    || self.response_commitment_sha256.is_some()
+                    || self.response_source.is_some()
+                    || self.no_send_proof.is_some()
+                {
+                    return Err(OrsError::InvalidField {
+                        field: "host_request_transport_observation",
+                        reason: "delivery requires the matching typed IPC outcome only",
+                    });
+                }
+            }
+            HostRequestTransportBoundary::ResponseReceived => {
+                let Some(response_commitment) = self.response_commitment_sha256.as_deref() else {
+                    return Err(OrsError::InvalidField {
+                        field: "host_request_transport_response_commitment",
+                        reason: "response observation requires its exact response commitment",
+                    });
+                };
+                validate_digest(
+                    response_commitment,
+                    "host_request_transport_response_commitment_sha256",
+                )?;
+                if self.response_source != Some(HostRequestResponseSource::AuthenticatedTransport)
+                    || self.no_send_proof.is_some()
+                {
+                    return Err(OrsError::InvalidField {
+                        field: "host_request_transport_observation",
+                        reason: "response observation requires authenticated transport source and no no-send proof",
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Exact authenticated Host owner receipt retained for cross-restart
+/// reconciliation. This evidence does not replace or rewrite the original
+/// transport channel observations.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRequestOwnerReadbackEvidence {
+    /// Original ORS operation identity being reconciled.
+    pub operation_id: OperationIdentity,
+    /// Original ORS request commitment being reconciled.
+    pub request_digest: String,
+    /// Original exact admitted payload commitment.
+    pub payload_digest: String,
+    /// Original send attempt being reconciled.
+    pub attempt_id: OpaqueLabel,
+    /// Original send attempt generation being reconciled.
+    pub attempt_generation: u64,
+    /// New authenticated channel that returned the exact owner receipt.
+    pub readback_channel_binding_sha256: String,
+    /// Canonical commitment of the exact owner record and journal receipt.
+    pub owner_receipt_commitment_sha256: String,
+    /// Canonical commitment of the exact result projected to the caller.
+    pub result_commitment_sha256: String,
+}
+
+impl HostRequestOwnerReadbackEvidence {
+    pub(crate) fn validate_for(
+        &self,
+        record: &HostRequestRecord,
+        attempt: &HostRequestAttempt,
+    ) -> Result<(), OrsError> {
+        if self.operation_id != record.operation_id
+            || self.request_digest != record.request_digest
+            || self.payload_digest != record.payload_digest
+            || self.attempt_id != attempt.attempt_id
+            || self.attempt_generation != attempt.generation
+        {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: record.operation_id.as_str().to_owned(),
+                request_digest: record.request_digest.clone(),
+            });
+        }
+        for (digest, field) in [
+            (
+                self.readback_channel_binding_sha256.as_str(),
+                "host_request_owner_readback_channel_binding_sha256",
+            ),
+            (
+                self.owner_receipt_commitment_sha256.as_str(),
+                "host_request_owner_receipt_commitment_sha256",
+            ),
+            (
+                self.result_commitment_sha256.as_str(),
+                "host_request_owner_readback_result_commitment_sha256",
+            ),
+        ] {
+            validate_digest(digest, field)?;
+        }
+        Ok(())
+    }
+}
+
+impl HostRequestAttemptPhase {
+    /// Returns the durable custody observation, if this phase carries one.
+    pub const fn transport_custody(self) -> Option<HostRequestTransportCustody> {
+        match self {
+            Self::Claimed | Self::DispatchStarted | Self::DeliveryOutcomeUnknown => {
+                Some(HostRequestTransportCustody::DeliveryOutcomeUnknown)
+            }
+            Self::DefinitelyNotSent | Self::DeferredNoEffect => {
+                Some(HostRequestTransportCustody::DefinitelyNotSent)
+            }
+            Self::DeliveredToAuthenticatedHost => {
+                Some(HostRequestTransportCustody::DeliveredToAuthenticatedHost)
+            }
+            Self::ResponseReceived => Some(HostRequestTransportCustody::ResponseReceived),
+        }
+    }
+}
+
 impl HostRequestAttempt {
+    /// Compares one attempt's immutable claim identity, excluding the mutable
+    /// transport-custody phase.
+    pub(crate) fn same_claim(&self, other: &Self) -> bool {
+        self.attempt_id == other.attempt_id
+            && self.generation == other.generation
+            && self.claim_expires_at_unix_ms == other.claim_expires_at_unix_ms
+            && self.fence_digest == other.fence_digest
+            && self.owner_connection_ref == other.owner_connection_ref
+            && self.owner_launch_nonce == other.owner_launch_nonce
+            && self.owner_session_epoch == other.owner_session_epoch
+            && self.channel_binding_sha256 == other.channel_binding_sha256
+    }
+
     pub(crate) fn validate(&self, fence_digest: &str) -> Result<(), OrsError> {
         validate_text(self.attempt_id.as_str(), "host_request_attempt_id")?;
         validate_text(
@@ -6187,7 +7095,19 @@ impl HostRequestAttempt {
                 reason: "generation and session epoch must be non-zero",
             });
         }
+        if self.claim_expires_at_unix_ms == Some(0) {
+            return Err(OrsError::InvalidField {
+                field: "host_request_attempt_claim_expiry",
+                reason: "claim expiry must be greater than zero",
+            });
+        }
         validate_digest(&self.fence_digest, "host_request_attempt_fence_digest")?;
+        if let Some(channel_binding_sha256) = &self.channel_binding_sha256 {
+            validate_digest(
+                channel_binding_sha256,
+                "host_request_attempt_channel_binding_sha256",
+            )?;
+        }
         if self.fence_digest != fence_digest {
             return Err(OrsError::FenceMismatch);
         }
@@ -6431,8 +7351,20 @@ pub struct HostRequestRetainedLineage {
     pub policy_fence: Option<PolicyFence>,
     /// References to origin-authentication evidence; presence is not itself
     /// authentication because the referenced evidence must be verified by its
-    /// owner.
+    /// owner. A reference never qualifies the record: only
+    /// [`Self::semantic_receipt_ref`] does, and only for
+    /// [`HostRequestRetainedResultClass::CanonicalWriteReceipt`].
     pub origin_evidence_refs: Option<Vec<String>>,
+    /// Exact admitted semantic receipt this record repeats. `Some` only for
+    /// [`HostRequestRetainedResultClass::CanonicalWriteReceipt`], so a retained
+    /// read, candidate or delivery row can never be read back as an admitted
+    /// semantic record.
+    pub semantic_receipt_ref: Option<String>,
+    /// Which kind of record these retained bytes are. `Unclassified` for rows
+    /// written before the field existed: an explicit unknown that ORS never
+    /// upgrades.
+    #[serde(default = "unclassified_retained_result_class")]
+    pub result_class: HostRequestRetainedResultClass,
     /// Maximum receipt interpretation, not a semantic truth/admission status.
     pub proof_ceiling: Option<ProofCeiling>,
     /// Influence is fail-closed when omitted.
@@ -6440,6 +7372,37 @@ pub struct HostRequestRetainedLineage {
     pub influence_state: InfluenceState,
     /// Instruction/data taint. `None` means unknown, not cleared.
     pub instruction_taint: Option<InstructionTaint>,
+}
+
+/// The distinct result classes a retained host-request result can actually be.
+///
+/// Field for field the same classes the wire carrier admits, mirrored rather
+/// than redefined because `eliot-ors` holds no edge to the wire crate. The
+/// meaning is identical, and `eliot-ors` interprets no field of it: a stored
+/// row keeps the class its producer claimed, and the only check is that a
+/// class is not stronger than the receipt the row carries.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HostRequestRetainedResultClass {
+    /// A stored row that predates the class field, or a producer that named
+    /// none. Unknown provenance; never an admitted class.
+    Unclassified,
+    /// A read of already-retained canonical evidence, served with its actual
+    /// revision and provenance. It creates no new semantic record.
+    ExistingEvidenceRead,
+    /// Newly produced model or untrusted output. Candidate only.
+    NewCandidate,
+    /// A verifier or reconciliation observation about a completion.
+    VerifierObservation,
+    /// A canonical `WriteReceipt`-backed semantic record.
+    CanonicalWriteReceipt,
+    /// A retained response or delivery record for an already-completed
+    /// operation. It records that bytes were sent; it admits nothing.
+    RetainedDeliveryRecord,
+}
+
+const fn unclassified_retained_result_class() -> HostRequestRetainedResultClass {
+    HostRequestRetainedResultClass::Unclassified
 }
 
 impl HostRequestRetainedLineage {
@@ -6556,6 +7519,43 @@ impl HostRequestRetainedLineage {
                     })?;
             }
         }
+        self.validate_class()?;
+        Ok(())
+    }
+
+    /// Refuses a retained class the row's own evidence does not support.
+    ///
+    /// One-directional, exactly like the wire contract: this can only withhold
+    /// a class the record cannot prove and never mints one. `output_digest`,
+    /// the origin references and the proof ceiling are deliberately not
+    /// consulted — a matching digest proves byte identity and a reference
+    /// proves that some evidence exists, and neither is the admitted semantic
+    /// receipt (I15.19, I15.6).
+    fn validate_class(&self) -> Result<(), OrsError> {
+        let unsupported = |reason: &'static str| OrsError::InvalidField {
+            field: "host_request_retained_lineage_result_class",
+            reason,
+        };
+        if self.result_class == HostRequestRetainedResultClass::CanonicalWriteReceipt
+            && self.semantic_receipt_ref.is_none()
+        {
+            return Err(unsupported(
+                "a canonical write receipt result requires its exact admitted semantic receipt",
+            ));
+        }
+        if self.result_class != HostRequestRetainedResultClass::CanonicalWriteReceipt
+            && self.semantic_receipt_ref.is_some()
+        {
+            return Err(unsupported(
+                "only a canonical write receipt result may carry a semantic receipt reference",
+            ));
+        }
+        if let Some(receipt) = &self.semantic_receipt_ref {
+            validate_text(
+                receipt,
+                "host_request_retained_lineage_semantic_receipt_ref",
+            )?;
+        }
         Ok(())
     }
 }
@@ -6589,6 +7589,16 @@ fn validate_unique_texts(values: &[String], field: &'static str) -> Result<(), O
 #[serde(deny_unknown_fields)]
 pub struct HostRequestRecord {
     pub contract_version: u16,
+    /// Send-claim protocol version. Zero denotes rows written before the
+    /// durable pre-send fence existed and is reconciled conservatively.
+    #[serde(default)]
+    pub send_claim_protocol_version: u16,
+    /// Authenticated Host channel receipt committed with a versioned
+    /// `UserAutomation` transport operation before its send claim. Legacy rows
+    /// omit it.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport_channel_binding_sha256: Option<String>,
     pub operation_id: OperationIdentity,
     pub kind: HostRequestKind,
     pub request_id: OpaqueLabel,
@@ -6623,6 +7633,11 @@ pub struct HostRequestRecord {
     /// replacement cannot free ownership by losing its local queue entry.
     #[serde(default)]
     pub attempt: Option<HostRequestAttempt>,
+    /// Retired definitely-not-sent attempts retained for same-operation retry.
+    /// The current issue contract permits at most one retry, so the original
+    /// and its single successor remain a bounded pair.
+    #[serde(default)]
+    pub attempt_history: Vec<HostRequestAttempt>,
     /// Set exactly once by ORS when this Cancellation operation is first
     /// applied to its parent. It binds retries to the same parent digest and
     /// attempt observation, so replay cannot cancel a later attempt.
@@ -6719,6 +7734,7 @@ impl HostRequestRecord {
             && self.authority_epoch == other.authority_epoch
             && self.generation == other.generation
             && self.deadline_unix_ms == other.deadline_unix_ms
+            && self.transport_channel_binding_sha256 == other.transport_channel_binding_sha256
     }
 
     /// Validates identity shape and state/result coherence.
@@ -6741,6 +7757,29 @@ impl HostRequestRecord {
             return Err(OrsError::InvalidField {
                 field: "host_request_epoch",
                 reason: "must be non-zero",
+            });
+        }
+        if !matches!(
+            self.send_claim_protocol_version,
+            0 | HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+        ) {
+            return Err(OrsError::InvalidField {
+                field: "host_request_send_claim_protocol_version",
+                reason: "unsupported send-claim protocol version",
+            });
+        }
+        if self.send_claim_protocol_version == HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+            && self.attempt_history.len() >= MAX_HOST_REQUEST_SEND_ATTEMPTS
+        {
+            return Err(OrsError::InvalidField {
+                field: "host_request_attempt_history",
+                reason: "at most one same-operation retry is retained",
+            });
+        }
+        if self.send_claim_protocol_version == 0 && !self.attempt_history.is_empty() {
+            return Err(OrsError::InvalidField {
+                field: "host_request_attempt_history",
+                reason: "legacy rows cannot carry current-protocol retry history",
             });
         }
         if self.deadline_unix_ms == 0 {
@@ -6812,6 +7851,10 @@ impl HostRequestRecord {
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the retained request and cancellation identities share one validation boundary"
+    )]
     fn validate_identity_and_cancellation_binding(&self) -> Result<(), OrsError> {
         if self.contract_version != CONTRACT_VERSION {
             return Err(OrsError::UnsupportedContractVersion(self.contract_version));
@@ -6838,8 +7881,155 @@ impl HostRequestRecord {
         }
         validate_digest(&self.request_digest, "host_request_request_digest")?;
         validate_digest(&self.payload_digest, "host_request_payload_digest")?;
+        match (
+            self.send_claim_protocol_version,
+            self.transport_channel_binding_sha256.as_deref(),
+        ) {
+            (HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION, Some(digest)) => {
+                validate_digest(digest, "host_request_transport_channel_binding_sha256")?;
+            }
+            (HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION, None) => {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_transport_channel_binding_sha256",
+                    reason: "versioned send rows require the authenticated channel committed at staging",
+                });
+            }
+            (0, Some(_)) => {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_transport_channel_binding_sha256",
+                    reason: "legacy rows do not carry versioned transport channel custody",
+                });
+            }
+            _ => {}
+        }
+        for (index, attempt) in self.attempt_history.iter().enumerate() {
+            attempt.validate(&self.fence_digest)?;
+            if self.send_claim_protocol_version == HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+                && attempt.claim_expires_at_unix_ms.is_none()
+            {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_attempt_claim_expiry",
+                    reason: "versioned send attempts require their retained claim expiry",
+                });
+            }
+            if self.send_claim_protocol_version == 0 && attempt.claim_expires_at_unix_ms.is_some() {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_attempt_claim_expiry",
+                    reason: "legacy send attempts do not carry claim expiry",
+                });
+            }
+            if self.send_claim_protocol_version == HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+                && attempt.channel_binding_sha256.is_none()
+            {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_attempt_channel_binding_sha256",
+                    reason: "versioned send attempts require the authenticated channel committed at claim time",
+                });
+            }
+            if self.send_claim_protocol_version == 0 && attempt.channel_binding_sha256.is_some() {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_attempt_channel_binding_sha256",
+                    reason: "legacy send attempts do not carry versioned channel custody",
+                });
+            }
+            if self.send_claim_protocol_version == HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+                && index == 0
+                && attempt.generation != 1
+            {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_attempt_history",
+                    reason: "first retained send attempt must use generation one",
+                });
+            }
+            if self.send_claim_protocol_version == HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+                && attempt.phase != HostRequestAttemptPhase::DefinitelyNotSent
+                && attempt.phase != HostRequestAttemptPhase::DeferredNoEffect
+            {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_attempt_history",
+                    reason: "retired attempts require retained no-send proof",
+                });
+            }
+            if self.send_claim_protocol_version == HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+                && index > 0
+                && attempt.generation
+                    != self.attempt_history[index - 1]
+                        .generation
+                        .checked_add(1)
+                        .ok_or(OrsError::InvalidTransition)?
+            {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_attempt_history",
+                    reason: "attempt history generations must be contiguous",
+                });
+            }
+            self.validate_attempt_observations(attempt)?;
+        }
+        if self.send_claim_protocol_version == HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+            && !self.attempt_history.is_empty()
+            && self.attempt.is_none()
+        {
+            return Err(OrsError::InvalidField {
+                field: "host_request_attempt_history",
+                reason: "retired attempts require the current retained attempt",
+            });
+        }
         if let Some(attempt) = &self.attempt {
             attempt.validate(&self.fence_digest)?;
+            if self.send_claim_protocol_version == HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+                && attempt.claim_expires_at_unix_ms.is_none()
+            {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_attempt_claim_expiry",
+                    reason: "versioned send attempts require their retained claim expiry",
+                });
+            }
+            if self.send_claim_protocol_version == 0 && attempt.claim_expires_at_unix_ms.is_some() {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_attempt_claim_expiry",
+                    reason: "legacy send attempts do not carry claim expiry",
+                });
+            }
+            if self.send_claim_protocol_version == HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+                && attempt.channel_binding_sha256.is_none()
+            {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_attempt_channel_binding_sha256",
+                    reason: "versioned send attempts require the authenticated channel committed at claim time",
+                });
+            }
+            if self.send_claim_protocol_version == 0 && attempt.channel_binding_sha256.is_some() {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_attempt_channel_binding_sha256",
+                    reason: "legacy send attempts do not carry versioned channel custody",
+                });
+            }
+            if self.send_claim_protocol_version == HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION {
+                let expected_generation = match self.attempt_history.last() {
+                    Some(previous) => previous
+                        .generation
+                        .checked_add(1)
+                        .ok_or(OrsError::InvalidTransition)?,
+                    None => 1,
+                };
+                if attempt.generation != expected_generation {
+                    return Err(OrsError::InvalidField {
+                        field: "host_request_attempt_generation",
+                        reason: "active attempt must follow the retained attempt history",
+                    });
+                }
+                if self
+                    .attempt_history
+                    .iter()
+                    .any(|previous| previous.attempt_id == attempt.attempt_id)
+                {
+                    return Err(OrsError::InvalidField {
+                        field: "host_request_attempt_id",
+                        reason: "attempt identity must be unique within its retained history",
+                    });
+                }
+            }
+            self.validate_attempt_observations(attempt)?;
         }
         if let Some(target) = &self.cancellation_target {
             if self.kind != HostRequestKind::Cancellation
@@ -6853,6 +8043,166 @@ impl HostRequestRecord {
                 });
             }
             target.validate()?;
+        }
+        Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the monotonic observation sequence and original commitments validate together"
+    )]
+    fn validate_attempt_observations(&self, attempt: &HostRequestAttempt) -> Result<(), OrsError> {
+        if self.send_claim_protocol_version == 0 && !attempt.transport_observations.is_empty() {
+            return Err(OrsError::InvalidField {
+                field: "host_request_transport_observations",
+                reason: "legacy send-claim rows cannot carry current protocol observations",
+            });
+        }
+        if attempt.transport_observations.len() > 3 {
+            return Err(OrsError::InvalidField {
+                field: "host_request_transport_observations",
+                reason: "bounded transport custody history exceeded",
+            });
+        }
+        for observation in &attempt.transport_observations {
+            observation.validate_for(self, attempt)?;
+        }
+        if let Some(readback) = &attempt.owner_readback {
+            readback.validate_for(self, attempt)?;
+            if attempt.phase != HostRequestAttemptPhase::ResponseReceived
+                || attempt.transport_observations.is_empty()
+                || !matches!(
+                    attempt
+                        .transport_observations
+                        .last()
+                        .map(|item| item.boundary),
+                    Some(
+                        HostRequestTransportBoundary::DispatchStarted
+                            | HostRequestTransportBoundary::DeliveryOutcomeUnknown
+                            | HostRequestTransportBoundary::DeliveredToAuthenticatedHost
+                            | HostRequestTransportBoundary::ResponseReceived
+                    )
+                )
+            {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_owner_readback",
+                    reason: "owner readback must resolve the exact active transport attempt",
+                });
+            }
+        }
+        if let Some(first) = attempt.transport_observations.first() {
+            for observation in attempt.transport_observations.iter().skip(1) {
+                if observation.request_commitment_sha256 != first.request_commitment_sha256
+                    || observation.payload_commitment_sha256 != first.payload_commitment_sha256
+                    || observation.channel_binding_sha256 != first.channel_binding_sha256
+                {
+                    return Err(OrsError::InvalidField {
+                        field: "host_request_transport_observations",
+                        reason: "later custody evidence changed the admitted request/payload or changed channel without an explicit owner readback",
+                    });
+                }
+            }
+        }
+        let boundaries = attempt
+            .transport_observations
+            .iter()
+            .map(|observation| observation.boundary)
+            .collect::<Vec<_>>();
+        let legal = matches!(
+            boundaries.as_slice(),
+            [] | [HostRequestTransportBoundary::DispatchStarted
+                | HostRequestTransportBoundary::DefinitelyNotSent]
+                | [
+                    HostRequestTransportBoundary::DispatchStarted,
+                    HostRequestTransportBoundary::DefinitelyNotSent
+                        | HostRequestTransportBoundary::DeliveryOutcomeUnknown
+                        | HostRequestTransportBoundary::DeliveredToAuthenticatedHost
+                        | HostRequestTransportBoundary::ResponseReceived
+                ]
+                | [
+                    HostRequestTransportBoundary::DispatchStarted,
+                    HostRequestTransportBoundary::DeliveryOutcomeUnknown
+                        | HostRequestTransportBoundary::DeliveredToAuthenticatedHost,
+                    HostRequestTransportBoundary::ResponseReceived
+                ]
+        );
+        if !legal {
+            return Err(OrsError::InvalidField {
+                field: "host_request_transport_observations",
+                reason: "transport observations do not follow an allowed monotonic boundary sequence",
+            });
+        }
+        let last_boundary = boundaries.last().copied();
+        let phase_matches = match attempt.phase {
+            HostRequestAttemptPhase::Claimed => last_boundary.is_none(),
+            HostRequestAttemptPhase::DispatchStarted => {
+                last_boundary == Some(HostRequestTransportBoundary::DispatchStarted)
+            }
+            HostRequestAttemptPhase::DefinitelyNotSent => {
+                last_boundary == Some(HostRequestTransportBoundary::DefinitelyNotSent)
+            }
+            HostRequestAttemptPhase::DeferredNoEffect => boundaries.is_empty(),
+            HostRequestAttemptPhase::DeliveryOutcomeUnknown => {
+                last_boundary == Some(HostRequestTransportBoundary::DeliveryOutcomeUnknown)
+            }
+            HostRequestAttemptPhase::DeliveredToAuthenticatedHost => {
+                last_boundary == Some(HostRequestTransportBoundary::DeliveredToAuthenticatedHost)
+            }
+            HostRequestAttemptPhase::ResponseReceived => {
+                if attempt.owner_readback.is_some() {
+                    matches!(
+                        last_boundary,
+                        Some(
+                            HostRequestTransportBoundary::DispatchStarted
+                                | HostRequestTransportBoundary::DeliveryOutcomeUnknown
+                                | HostRequestTransportBoundary::DeliveredToAuthenticatedHost
+                                | HostRequestTransportBoundary::ResponseReceived
+                        )
+                    )
+                } else {
+                    last_boundary == Some(HostRequestTransportBoundary::ResponseReceived)
+                }
+            }
+        };
+        if !phase_matches {
+            return Err(OrsError::InvalidField {
+                field: "host_request_transport_observations",
+                reason: "last retained boundary must match the attempt custody phase",
+            });
+        }
+        if let (Some(result_digest), Some(observation)) = (
+            self.result_digest.as_deref(),
+            attempt.transport_observations.last(),
+        ) && observation.boundary == HostRequestTransportBoundary::ResponseReceived
+            && observation.response_commitment_sha256.as_deref() != Some(result_digest)
+        {
+            return Err(OrsError::InvalidField {
+                field: "host_request_transport_response_commitment",
+                reason: "retained result must equal the original response observation",
+            });
+        }
+        if let (Some(result_digest), Some(readback)) = (
+            self.result_digest.as_deref(),
+            attempt.owner_readback.as_ref(),
+        ) && readback.result_commitment_sha256 != result_digest
+        {
+            return Err(OrsError::InvalidField {
+                field: "host_request_owner_readback_result_commitment",
+                reason: "retained result must equal the original owner readback commitment",
+            });
+        }
+        if let (Some(readback), Some(response_observation)) = (
+            attempt.owner_readback.as_ref(),
+            attempt.transport_observations.last().filter(|observation| {
+                observation.boundary == HostRequestTransportBoundary::ResponseReceived
+            }),
+        ) && response_observation.response_commitment_sha256.as_deref()
+            != Some(readback.result_commitment_sha256.as_str())
+        {
+            return Err(OrsError::InvalidField {
+                field: "host_request_owner_readback_result_commitment",
+                reason: "owner readback must confirm the exact observed response commitment",
+            });
         }
         Ok(())
     }
@@ -6939,7 +8289,7 @@ pub(crate) fn validate_digest(value: &str, field: &'static str) -> Result<(), Or
 /// wire-crate edge to durable state.
 pub const MAX_HOST_REQUEST_RESULT_RESPONSE_BYTES: usize = 256 * 1024;
 
-fn validate_result_response(body: &Value) -> Result<(), OrsError> {
+pub(crate) fn validate_result_response(body: &Value) -> Result<(), OrsError> {
     if !body.is_object() {
         return Err(OrsError::InvalidField {
             field: "host_request_result_response",

@@ -31,9 +31,9 @@
   },
   "source_token_estimate": {
     "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
-    "source_stu": 252410,
-    "test_stu": 41340,
-    "selected_file_count": 32,
+    "source_stu": 284089,
+    "test_stu": 42252,
+    "selected_file_count": 33,
     "inline_cfg_test_modules": 6,
     "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
   },
@@ -41,30 +41,30 @@
     "selected_source": [
       {
         "path": "crates/agent/eliot-agent-coordinator/src/core.rs",
-        "bytes": 133207,
-        "sha256": "67f6f5add96ec5af6ac9828b9cc46f1308c402f542e066d8fd71a44b7d1e3ed9",
-        "stu": 44403,
+        "bytes": 164474,
+        "sha256": "f51dbff78dbdb0bd5670075ffd78335d52282a106200adf07c6c75e033369bed",
+        "stu": 54825,
         "inline_cfg_test": true
       },
       {
         "path": "crates/agent/eliot-agent-coordinator/src/core/admission_normalization_tests.rs",
-        "bytes": 16433,
-        "sha256": "867f51052f30a92d25b0b24f4f9a16765f32f76aa51cc4be3ca84fd86ca30dd1",
-        "stu": 5478,
+        "bytes": 20271,
+        "sha256": "0b561f32de61030c1209b8c50702cfa17bda2f7fb01e6c5df044877a4d8b40a1",
+        "stu": 6757,
         "inline_cfg_test": false
       },
       {
         "path": "crates/agent/eliot-agent-coordinator/src/lib.rs",
-        "bytes": 2377,
-        "sha256": "3adbbbc53ee5633ac7c15b3daf3f5918c9d51b7a8f5599db812f6af72e6d2646",
-        "stu": 793,
+        "bytes": 2433,
+        "sha256": "f00afafbabd3d6a14ae99ab7e09f5b32b42a6fdc1c8cab3868e54f4a521642c8",
+        "stu": 811,
         "inline_cfg_test": true
       },
       {
         "path": "crates/agent/eliot-agent-coordinator/src/model.rs",
-        "bytes": 37618,
-        "sha256": "83144837068d8629742556b0bc702379bca6ead31310cef39992094ec5b11a01",
-        "stu": 12540,
+        "bytes": 68090,
+        "sha256": "f9294290756a6f3e6d2b385aad204b741c5165d6eedbb2a7280ef765a40df8fe",
+        "stu": 22697,
         "inline_cfg_test": false
       },
       {
@@ -103,10 +103,17 @@
         "inline_cfg_test": false
       },
       {
+        "path": "crates/agent/eliot-agent-coordinator/src/runtime_profile.rs",
+        "bytes": 17958,
+        "sha256": "2b5801de496c3af85615c36b2436206d2f498e897718c23498ca4ccf8a9a6c29",
+        "stu": 5986,
+        "inline_cfg_test": false
+      },
+      {
         "path": "crates/agent/eliot-agent-coordinator/src/swarm_admission_bind.rs",
-        "bytes": 31968,
-        "sha256": "360ffd45beea1456630514948254278095e61051d74be337e6f7f45b98288e8c",
-        "stu": 10656,
+        "bytes": 40825,
+        "sha256": "009e501ae2731502f818f725eba5c4c397a91f216cbab55138ac16e6ad535e81",
+        "stu": 13609,
         "inline_cfg_test": false
       },
       {
@@ -181,9 +188,9 @@
       },
       {
         "path": "crates/agent/eliot-agent-coordinator/src/tests.rs",
-        "bytes": 161260,
-        "sha256": "be31f0b6a80ea05152556b78463935cff4278559ab18072ba61df519e2c02bf8",
-        "stu": 53754,
+        "bytes": 163850,
+        "sha256": "0ba9b6c6e04dc0051b613a726ef6f0bb8c2a382e27ab0aa66bcacf60ad383167",
+        "stu": 54617,
         "inline_cfg_test": false
       }
     ],
@@ -206,8 +213,8 @@
       },
       {
         "path": "crates/agent/eliot-agent-coordinator/tests/coordinator.rs",
-        "bytes": 21837,
-        "sha256": "a5396b94430a200832f79310b397f8091648e18246aa05111a0f4c56a5443608",
+        "bytes": 24574,
+        "sha256": "ec2f255b35494a2d41781003b76b44aab57c5f6b4fa789c45d361573e646bf43",
         "test_attributes": 7,
         "inline_cfg_test": false,
         "classes": []
@@ -291,7 +298,7 @@
         "classes": []
       }
     ],
-    "source_selection_digest": "fdb5a883aa0fa58e5138fac02b77e659c837b4730982e821701eeb0a095a9bea"
+    "source_selection_digest": "70930d56a3fb522088efa387328b3f5cdd6e591a7868514e2d6a6a3846c87813"
   },
   "one_hop_providers": [
     "eliot-agent-api",
@@ -305,7 +312,8 @@
     "eliot-swarm",
     "serde",
     "serde_json",
-    "thiserror"
+    "thiserror",
+    "toml"
   ],
   "one_hop_consumers": [
     "bins/eliotd",
@@ -354,20 +362,20 @@
     "qualification": "UNVALIDATED (I2.16, I0.5)",
     "reference_capsule_handle": "I2.20"
   },
-  "bound_contract_digest": "5443082466fa3d7465f74f93df941b0d14926dec84621d1d1ccccf02fc3662f5",
+  "bound_contract_digest": "dc442bda7dcdb5e16aca313ac2a6227204a4f13b3eed26624fa4ec9f599db2f5",
   "source_provenance": {
     "input_digests": {
       "workspace_manifest": {
         "path": "Cargo.toml",
-        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
       },
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
-        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
       },
       "architecture_boundaries": {
         "path": "config/architecture-boundaries.toml",
-        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
       },
       "logical_block_config": {
         "path": "docs/code-navigation/logical-blocks.toml",
@@ -375,20 +383,20 @@
       },
       "package_manifest": {
         "path": "crates/agent/eliot-agent-coordinator/Cargo.toml",
-        "sha256": "921b160225db77224743727a2db941861aa3e9602f96f72d3372fe8bed9b99b1"
+        "sha256": "a1dd2793d85ddee7c919c210ff42b27d64450c82084cfef1db865a7e6dbf24b7"
       },
       "module_manifest": null,
       "selected_source": {
-        "path_count": 32,
-        "sha256": "fdb5a883aa0fa58e5138fac02b77e659c837b4730982e821701eeb0a095a9bea"
+        "path_count": 33,
+        "sha256": "70930d56a3fb522088efa387328b3f5cdd6e591a7868514e2d6a6a3846c87813"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "b2b6d3ee4e27e171856da890231b0da0c1924f1bcc05ab4c1224a83da1507f50",
+  "artifact_digest": "221e0868af0c8481265ffda599b751d752091bafa953bb15513cf77ab0b6fa18",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "b2b6d3ee4e27e171"
+    "value": "221e0868af0c8481"
   }
 }

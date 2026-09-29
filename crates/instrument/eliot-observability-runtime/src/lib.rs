@@ -31,6 +31,7 @@ pub mod config;
 pub mod crash;
 pub mod critical_path;
 pub mod event_log;
+pub mod hot_path_counter;
 pub mod metric_groups;
 pub mod metrics;
 pub mod otlp;
@@ -48,6 +49,12 @@ pub use critical_path::{
     CriticalEventState, CriticalPath, CriticalPathOutcome, SinkStatus, UnavailableReason,
 };
 pub use event_log::{EventLogOutcome, EventLogReport, SystemServiceEvent};
+pub use hot_path_counter::{
+    HOT_PATH_MISSING_COVERAGE_METRIC, HOT_PATH_MONOTONIC_DOMAIN, HOT_PATH_STAGE_RECORDS_METRIC,
+    HotPathAllocationCoverage, HotPathAllocationEvent, HotPathAllocationObservation,
+    HotPathCacheOutcome, HotPathCollectionState, HotPathMonotonicClock, HotPathObservedWait,
+    HotPathRecordOutcome, HotPathRecordSink, HotPathResourceCounters, hot_path_clock,
+};
 pub use metric_groups::{
     AuditSinkOutcome, BinaryIdentity, ExecutionPathMetrics, FinishOutcome, LABEL_KEY_COUNT,
     LabelKey, LifecycleOutcome, LocalPortOutcome, LocalPortPhase, MetricDefinition, MetricGroup,

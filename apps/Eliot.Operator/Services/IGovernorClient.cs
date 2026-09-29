@@ -5,6 +5,12 @@ namespace Eliot.Operator.Services;
 
 public interface IGovernorClient
 {
+    /// The broker-granted role and exact capability set of the live binding,
+    /// or null when no binding is established. Views and mutations gate on
+    /// this grant: a binding that withholds a capability withholds its views
+    /// and refuses its mutations instead of executing them.
+    OperatorRoleBinding? GrantedBinding { get; }
+
     Task<OperatorSnapshot> SnapshotAsync(
         string? projectId = null,
         string? taskId = null,

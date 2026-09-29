@@ -1532,6 +1532,138 @@ function Convert-ExcludedDispositionDecisionProjectionToJson([object]$Projection
     ConvertTo-Json -InputObject $Projection -Depth 16 -Compress
 }
 
+function Get-ExcludedDispositionRequiredEvidenceElements {
+    # Issue #1811 (item A4): the release owner's own evidence requirement for an
+    # intentionally admitted separate package. It is declared here rather than
+    # copied from the gate receipt, so a gate that dropped or renamed an element
+    # cannot admit a row this seam holds no evidence for; the gate's own declared
+    # set is compared against it instead. The set is the I15.9 production-artifact
+    # evidence (provenance/source identity, independent lock, toolchain, license,
+    # advisory, SBOM, artifact, test/canary, owner, rollback) plus the I15.17
+    # build trust class and dedicated cache namespace, and the use class the
+    # release build consumes the package under.
+    @(
+        'source_identity',
+        'independent_lock',
+        'build_fingerprint',
+        'license',
+        'advisory',
+        'sbom',
+        'artifact_hash',
+        'artifact_signature',
+        'test_canary',
+        'owner',
+        'rollback',
+        'trust_class',
+        'cache_namespace',
+        'admitted_use'
+    )
+}
+
+function Resolve-ExcludedDispositionAdmittedEvidence([object]$Receipt, [string]$TrustClass, [string]$Phase) {
+    # Issue #1811 (items A4/W4/W5): the one admitted route for an intentionally
+    # consumed separate package. A package is admitted here only when this seam
+    # independently holds, for that exact package, a complete and current
+    # evidence set: every element of the release owner's own requirement is bound
+    # to a non-empty value, the inventory row is the matching evidence-qualified
+    # row with a production-capable disposition, and the build trust class and
+    # cache namespace are the release build's own. Anything else - a well-formed
+    # row, a matching package name, a claimed evidence set, or a package absent
+    # from the admitted set entirely - is refused, and every resolved consumer
+    # edge must land on an admitted package.
+    $required = @(Get-ExcludedDispositionRequiredEvidenceElements)
+    $admission = $Receipt.admission
+    $evidenceState = [string]$admission.evidence_qualified_state
+    $denyMarker = [string]$admission.deny_marker
+    if ([string]::IsNullOrWhiteSpace($evidenceState) -or $evidenceState -ceq $denyMarker) {
+        throw "retained excluded-disposition gate receipt declares no admitted supply-chain state separate from its deny marker ($Phase)"
+    }
+    $gateElements = @($admission.required_evidence_elements | ForEach-Object { [string]$_ })
+    $notRequiredByGate = @($required | Where-Object { $gateElements -cnotcontains $_ })
+    if ($notRequiredByGate.Count -ne 0) {
+        throw "retained excluded-disposition gate receipt does not require $($notRequiredByGate -join ', ') before admitting a separate package ($Phase)"
+    }
+    $denominatorByPath = @{}
+    foreach ($package in @($Receipt.denominator.packages)) {
+        $denominatorByPath[[string]$package.path] = $package
+    }
+    $nonProductionDispositions = @('UNKNOWN', 'REPLACE', 'RETIRE')
+    $admitted = @()
+    foreach ($row in @($admission.qualified)) {
+        if ([string]$row.decision -cne 'admitted') {
+            continue
+        }
+        $path = [string]$row.path
+        $name = [string]$row.package
+        $denominatorRow = $denominatorByPath[$path]
+        if ($null -eq $denominatorRow) {
+            throw "retained excluded-disposition gate receipt admits a package with no discovered denominator row ($Phase): $name ($path)"
+        }
+        if ([string]$denominatorRow.package -cne $name) {
+            throw "retained excluded-disposition gate receipt admits $name at $path but the discovered denominator row names a different package ($Phase)"
+        }
+        if ([string]$denominatorRow.supply_chain_admission -cne $evidenceState) {
+            throw "retained excluded-disposition gate receipt admits $name but its inventory row declares supply_chain_admission '$([string]$denominatorRow.supply_chain_admission)' ($Phase)"
+        }
+        if ($nonProductionDispositions -ccontains [string]$denominatorRow.disposition) {
+            throw "retained excluded-disposition gate receipt admits $name with disposition $([string]$denominatorRow.disposition), which is never a production input ($Phase)"
+        }
+        if ([string]::IsNullOrWhiteSpace([string]$denominatorRow.evidence_reference) -or
+            [string]$denominatorRow.evidence_reference -ceq $denyMarker) {
+            throw "retained excluded-disposition gate receipt admits $name without a named evidence record ($Phase)"
+        }
+        $bound = $row.evidence
+        $unbound = @()
+        $bindings = [ordered]@{}
+        foreach ($element in $required) {
+            $property = if ($null -eq $bound) { $null } else { $bound.PSObject.Properties[$element] }
+            $value = if ($null -eq $property) { '' } else { [string]$property.Value }
+            if ([string]::IsNullOrWhiteSpace($value)) {
+                $unbound += $element
+            }
+            else {
+                $bindings[$element] = $value
+            }
+        }
+        if ($unbound.Count -ne 0) {
+            throw "retained excluded-disposition gate receipt admits $name without a bound value for evidence $($unbound -join ', ') ($Phase)"
+        }
+        if ($bindings['admitted_use'] -cne 'production') {
+            throw "retained excluded-disposition gate receipt admits $name for the non-production use '$([string]$bindings['admitted_use'])' ($Phase)"
+        }
+        if ($bindings['trust_class'] -cne $TrustClass) {
+            throw "retained excluded-disposition gate receipt admits $name at build trust class '$([string]$bindings['trust_class'])' while this release build runs at $TrustClass; I15.17 forbids crossing a trust boundary by path or name equality ($Phase)"
+        }
+        if ($bindings['cache_namespace'] -ceq [string]$Receipt.cache_namespace) {
+            throw "retained excluded-disposition gate receipt admits $name with the release build's own cache namespace, which is not an isolated separate-package namespace ($Phase)"
+        }
+        $admitted += [ordered]@{
+            path = $path
+            package = $name
+            disposition = [string]$denominatorRow.disposition
+            owner = [string]$denominatorRow.owner
+            evidence_reference = [string]$denominatorRow.evidence_reference
+            package_bytes_sha256 = [string]$denominatorRow.package_bytes_sha256
+            trust_class = [string]$bindings['trust_class']
+            cache_namespace = [string]$bindings['cache_namespace']
+            evidence = $bindings
+        }
+    }
+    # Issue #1811 (item W4): a resolved consumer edge onto a separately rooted
+    # package is an admitted source/build/package input, so it is rejected before
+    # execution unless it lands on a package this seam admitted above.
+    foreach ($edge in @($Receipt.consumer_edges)) {
+        $target = $admitted | Where-Object { [string]$_.path -ceq [string]$edge.package_path } | Select-Object -First 1
+        if ($null -eq $target) {
+            throw "retained excluded-disposition gate receipt carries a consumer edge onto a package this release seam did not admit ($Phase): $([string]$edge.source) $([string]$edge.kind) -> $([string]$edge.package)"
+        }
+        if ([string]$target.package -cne [string]$edge.package) {
+            throw "retained excluded-disposition gate receipt carries a consumer edge naming $([string]$edge.package) onto an admitted $([string]$target.package) ($Phase): $([string]$edge.source)"
+        }
+    }
+    return @($admitted)
+}
+
 function Get-ExcludedDispositionManifestProjection([object]$ManifestBinding) {
     [ordered]@{
         denominator_packages = @(
@@ -1591,29 +1723,25 @@ function Test-ExcludedDispositions([string]$Repo, [string]$SourceCommit) {
         @($receipt.denominator.packages).Count -ne [int]$receipt.denominator.standalone_package_count) {
         throw 'retained excluded-disposition gate receipt does not record the pinned standalone-package denominator'
     }
-    # Issue #1811 (item A4): retain the exact decision rows and edge set in the
-    # release binding. Their presence is not proof that the evidence was
-    # authenticated; until an independent evidence validator exists, this
-    # release owner fails closed on every nonempty admission or consumer set.
+    # Issue #1811 (items A4/W4/W5): retain the exact decision rows and edge set in
+    # the release binding, and admit an intentionally consumed separate package
+    # only through the one evidence-qualified route this seam verifies itself. The
+    # admitted set is derived here from the receipt's evidence bindings, not copied
+    # from the gate's own claim: a row is admitted only when its complete,
+    # matching, isolated evidence set is held for that exact package.
     $declaredAdmissionStates = @($receipt.admission.declared_states | ForEach-Object { [string]$_ })
     $decisionProjection = Get-ExcludedDispositionDecisionProjection $receipt
-    $admittedSeparatePackages = @($decisionProjection.admitted_packages)
     $qualifiedRows = @($decisionProjection.qualified_rows)
     $consumerEdges = @($decisionProjection.consumer_edges)
     $lockedStandalonePackages = @($decisionProjection.locked_standalone_packages)
     if ($declaredAdmissionStates -notcontains [string]$receipt.admission_policy) {
         throw "retained excluded-disposition gate receipt declares an admission policy outside the inventory's declared admission states ($($declaredAdmissionStates -join ', ')): $([string]$receipt.admission_policy)"
     }
-    if ($admittedSeparatePackages.Count -ne 0) {
-        throw "retained excluded-disposition gate receipt admits $($admittedSeparatePackages.Count) separate package(s) ($($admittedSeparatePackages -join ', ')) that this seam cannot authenticate; the release policy admits none"
-    }
-    if ($qualifiedRows.Count -ne 0) {
-        throw "retained excluded-disposition gate receipt carries $($qualifiedRows.Count) evidence-qualified row(s), but this seam has no independent evidence authenticator"
-    }
-    if ($consumerEdges.Count -ne 0) {
-        throw "retained excluded-disposition gate receipt carries $($consumerEdges.Count) consumer edge(s), but this seam cannot authenticate a separate-package admission"
-    }
+    $admittedEvidence = @(Resolve-ExcludedDispositionAdmittedEvidence $receipt ([string]$receipt.trust_class) 'pre-build')
+    $admittedSeparatePackages = @($admittedEvidence | ForEach-Object { [string]$_.package } | Sort-Object -CaseSensitive)
     if ($lockedStandalonePackages.Count -ne 0) {
+        # Issue #1811 (item W5): a separate package's artifact never enters the
+        # root workspace's closure; root-lock membership is refused outright.
         throw "retained excluded-disposition gate receipt carries $($lockedStandalonePackages.Count) inventoried package(s) in the root Cargo.lock"
     }
     [ordered]@{
@@ -1627,6 +1755,7 @@ function Test-ExcludedDispositions([string]$Repo, [string]$SourceCommit) {
         admission_policy = [string]$receipt.admission_policy
         admission_states = $declaredAdmissionStates
         admitted_separate_packages = $admittedSeparatePackages
+        admitted_separate_evidence = $admittedEvidence
         qualified_rows = $qualifiedRows
         consumer_edges = $consumerEdges
         locked_standalone_packages = $lockedStandalonePackages
@@ -1636,7 +1765,7 @@ function Test-ExcludedDispositions([string]$Repo, [string]$SourceCommit) {
         standalone_package_count = [int]$receipt.denominator.standalone_package_count
         consumer_count = $consumerEdges.Count
         locked_standalone_count = $lockedStandalonePackages.Count
-        evidence_reference = "per-package admission decision: $(@($receipt.admission.denied_packages).Count) denied, $($admittedSeparatePackages.Count) admitted; exact rows and edges retained"
+        evidence_reference = "per-package admission decision: $(@($receipt.admission.denied_packages).Count) denied, $($admittedSeparatePackages.Count) admitted; exact rows, bound evidence and edges retained"
     }
 }
 
@@ -1658,11 +1787,10 @@ function Assert-ExcludedDispositionReceipt([string]$Repo, [string]$SourceCommit,
         throw "final staged input manifest does not match the retained excluded-disposition gate receipt (see EXCLUDED_DISPOSITIONS output above)"
     }
     $recheck = Get-Content -LiteralPath $recheckPath -Raw | ConvertFrom-Json
-    # Issue #1811 (item A4): compare the complete decision projection, including
+    # Issue #1811 (items A4/W6): compare the complete decision projection, including
     # every per-package evidence row and consumer edge. This is exact binding
     # to the gate output; it does not promote unverified evidence to admission.
     $recheckProjection = Get-ExcludedDispositionDecisionProjection $recheck
-    $recheckAdmitted = @($recheckProjection.admitted_packages)
     $recheckProjectionJson = Convert-ExcludedDispositionDecisionProjectionToJson $recheckProjection
     $bindingProjectionJson = Convert-ExcludedDispositionDecisionProjectionToJson (Get-ExcludedDispositionManifestProjection $Binding)
     if ([string]$recheck.cache_namespace -cne [string]$Binding.cache_namespace -or
@@ -1674,12 +1802,26 @@ function Assert-ExcludedDispositionReceipt([string]$Repo, [string]$SourceCommit,
         -not [string]::Equals($recheckProjectionJson, $bindingProjectionJson, [System.StringComparison]::Ordinal)) {
         throw 'final staged input manifest re-check does not bind the release excluded-disposition receipt'
     }
+    # Issue #1811 (items A4/AUD1): the admitted route is re-derived here from the
+    # recheck receipt's own evidence bindings rather than assumed empty, and must
+    # equal the evidence the pre-build binding admitted. A changed binding,
+    # package byte, source, lock, toolchain, trust class or evidence value
+    # therefore invalidates an admission instead of being carried into the
+    # published manifest.
+    $recheckAdmittedEvidence = @(Resolve-ExcludedDispositionAdmittedEvidence $recheck ([string]$Binding.trust_class) 'final-recheck')
+    $recheckAdmittedEvidenceJson = ConvertTo-Json -InputObject @($recheckAdmittedEvidence) -Depth 16 -Compress
+    $bindingAdmittedEvidenceJson = ConvertTo-Json -InputObject @($Binding.admitted_separate_evidence) -Depth 16 -Compress
+    if (-not [string]::Equals($recheckAdmittedEvidenceJson, $bindingAdmittedEvidenceJson, [System.StringComparison]::Ordinal)) {
+        throw 'final staged input manifest re-check does not bind the admitted separate-package evidence to the release receipt'
+    }
+    $recheckAdmitted = @($recheckAdmittedEvidence | ForEach-Object { [string]$_.package } | Sort-Object -CaseSensitive)
     [ordered]@{
         recheck_path = '.eliot/excluded-dispositions/gate-recheck-receipt.json'
         recheck_sha256 = (Get-FileHash -LiteralPath $recheckPath -Algorithm SHA256).Hash.ToLowerInvariant()
         cache_namespace = [string]$recheck.cache_namespace
         admission_policy = [string]$recheck.admission_policy
         admitted_separate_packages = $recheckAdmitted
+        admitted_separate_evidence = $recheckAdmittedEvidence
         qualified_rows = @($recheckProjection.qualified_rows)
         consumer_edges = @($recheckProjection.consumer_edges)
         locked_standalone_packages = @($recheckProjection.locked_standalone_packages)
@@ -4274,6 +4416,7 @@ This bundle is intentionally unsigned. Before public distribution:
             denominator_packages = @($dispositionReceipt.denominator_packages)
             denied_packages = @($dispositionReceipt.denied_packages)
             admitted_separate_packages = @($dispositionReceipt.admitted_separate_packages)
+            admitted_separate_evidence = @($dispositionReceipt.admitted_separate_evidence)
             qualified_rows = @($dispositionReceipt.qualified_rows)
             consumer_edges = @($dispositionReceipt.consumer_edges)
             locked_standalone_packages = @($dispositionReceipt.locked_standalone_packages)

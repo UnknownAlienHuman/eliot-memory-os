@@ -24,7 +24,7 @@
   },
   "source_token_estimate": {
     "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
-    "source_stu": 24019,
+    "source_stu": 28969,
     "test_stu": 62906,
     "selected_file_count": 8,
     "inline_cfg_test_modules": 0,
@@ -34,9 +34,9 @@
     "selected_source": [
       {
         "path": "crates/meta/eliot-learning-activation-assessment/src/assessment.rs",
-        "bytes": 27145,
-        "sha256": "61e4e33b34204286ad6076cdccc862c91433c849dc04f69798d6ae01536d0e18",
-        "stu": 9049,
+        "bytes": 41914,
+        "sha256": "21839c979595652dc5ad268f79e5972c4f4d08a3476caabb153926d3479a44c6",
+        "stu": 13972,
         "inline_cfg_test": false
       },
       {
@@ -62,9 +62,9 @@
       },
       {
         "path": "crates/meta/eliot-learning-activation-assessment/src/lib.rs",
-        "bytes": 1605,
-        "sha256": "8d7598545df491492095e16267df027c003b596a11af2b38a432340d1d1cc9e2",
-        "stu": 535,
+        "bytes": 1685,
+        "sha256": "9afa9e8e09026514f077825c040eb0db08b22f9ce46f28f994eba103fe6c900b",
+        "stu": 562,
         "inline_cfg_test": false
       },
       {
@@ -97,7 +97,7 @@
         ]
       }
     ],
-    "source_selection_digest": "3a1e2b8467e4fc56b555de2bffbc9bf7aab236b29d19d018620ab85e180f06e6"
+    "source_selection_digest": "5a040a0cb231441aad520db580b9a822fa7cbe1c42ca18c1cd63afb99d12fe1e"
   },
   "one_hop_providers": [
     "eliot-contracts",
@@ -138,20 +138,20 @@
     "qualification": "UNVALIDATED (I2.16, I0.5)",
     "reference_capsule_handle": "I2.20"
   },
-  "bound_contract_digest": "9751d1087f2570c8dd6be3589c2c4478f26a3dabe1341ff48e5e9336ea0b9d42",
+  "bound_contract_digest": "d2a80d6f0e1d53414bb042300518a4bcd9a088a1410ad909a0cb5eb32940d70b",
   "source_provenance": {
     "input_digests": {
       "workspace_manifest": {
         "path": "Cargo.toml",
-        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
       },
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
-        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
       },
       "architecture_boundaries": {
         "path": "config/architecture-boundaries.toml",
-        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
       },
       "logical_block_config": {
         "path": "docs/code-navigation/logical-blocks.toml",
@@ -163,19 +163,19 @@
       },
       "module_manifest": {
         "path": "crates/meta/eliot-learning-activation-assessment/module.toml",
-        "sha256": "cb17dc215f11a71de9aae9dcbc8eee95c271658f645bf8a3447980364f06736f"
+        "sha256": "ff3076cb7592c7aee1b6c75fced78ee22376f7e8c4a97fc4bb07ba737171c0fc"
       },
       "selected_source": {
         "path_count": 8,
-        "sha256": "3a1e2b8467e4fc56b555de2bffbc9bf7aab236b29d19d018620ab85e180f06e6"
+        "sha256": "5a040a0cb231441aad520db580b9a822fa7cbe1c42ca18c1cd63afb99d12fe1e"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "5f404de1113d4677d971bcadb5d273778d5db1809e9d36e467cf2a1a387c79ab",
+  "artifact_digest": "07e562d29be7bea047ac109ed8e0646343ae24323c92382f24165fe9b8eb8fe2",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "5f404de1113d4677"
+    "value": "07e562d29be7bea0"
   }
 }

@@ -143,7 +143,8 @@
         "eliot-evidence",
         "eliot-receipts",
         "eliot-agent-contracts",
-        "eliot-protocol"
+        "eliot-protocol",
+        "eliot-observation-contracts"
       ]
     },
     "runtime_owner_and_bundle": {
@@ -242,15 +243,15 @@
     "input_digests": {
       "workspace_manifest": {
         "path": "Cargo.toml",
-        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
       },
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
-        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
       },
       "architecture_boundaries": {
         "path": "config/architecture-boundaries.toml",
-        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
       },
       "logical_block_config": {
         "path": "docs/code-navigation/logical-blocks.toml",
@@ -262,19 +263,19 @@
       },
       "module_manifest": {
         "path": "crates/smart/eliot-context-contracts/module.toml",
-        "sha256": "aa1ce78c1ad58c950bd65cfeaf76594f11ca836e97c6892a84ae154b2b7247e7"
+        "sha256": "c10b80229e5f2151bce52bfea8e34a4ebc437116026da21eed46f35d6922e35f"
       },
       "selected_source": {
-        "path_count": 25,
-        "sha256": "fdbca3a90e0688468003bd88e232551d9a2e60583f3652f27367816ba2015464"
+        "path_count": 26,
+        "sha256": "0cf02685f0af9e85c6f2a225b08d9c629edcfe2712a6db801e88aa56708deb3a"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "fbfbbb3ffd6797d91067ff7837b282a955228ce8d45d3f8f609992346926b5fe",
+  "artifact_digest": "1bf91771fe164915a60888521e119c549bc1c3429a985344d56ef5dea5400844",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "fbfbbb3ffd6797d9"
+    "value": "1bf91771fe164915"
   }
 }

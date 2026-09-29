@@ -240,15 +240,15 @@
     "input_digests": {
       "workspace_manifest": {
         "path": "Cargo.toml",
-        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
       },
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
-        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
       },
       "architecture_boundaries": {
         "path": "config/architecture-boundaries.toml",
-        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
       },
       "logical_block_config": {
         "path": "docs/code-navigation/logical-blocks.toml",
@@ -260,7 +260,7 @@
       },
       "module_manifest": {
         "path": "crates/smart/eliot-dreamer-memory-revision/module.toml",
-        "sha256": "baf20127f891efefdd4564e69b97ef24ff413bfe48e03b0e71c06f79fe90ffca"
+        "sha256": "3635af76cf9689d10bca82b5fc0a96d75c9415ecc784709be87e0e6c1b466998"
       },
       "selected_source": {
         "path_count": 1,
@@ -270,9 +270,9 @@
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "04461809fa20b5953a00ef4bd141decb493b8bf3719db3bbb60585fbecb7c5f8",
+  "artifact_digest": "f64cb518c8e42c799623fbcaa9a1d2e39b2650f195f642ee891e4de8c9bad071",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "04461809fa20b595"
+    "value": "f64cb518c8e42c79"
   }
 }

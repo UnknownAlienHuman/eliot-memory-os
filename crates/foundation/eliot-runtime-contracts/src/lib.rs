@@ -20,6 +20,8 @@ mod activation_lifecycle;
 mod control_reserve;
 mod hot_artifact_map;
 mod hot_path;
+mod hot_path_manifest_file;
+mod hot_path_operation;
 mod hot_path_profile;
 mod i14_backpressure;
 mod installation_activation;
@@ -56,6 +58,20 @@ pub use hot_path::{
     RegisteredQueueSettings, RunningBuildRegistration, bind_hot_path_manifest_set,
     captured_query_operation_map, hot_path_bound_status, hot_path_contract_identity,
     hot_spine_membership, optional_call_is_invocable,
+};
+pub use hot_path_manifest_file::{
+    AdmittedHotPathManifest, HOT_PATH_MANIFEST_FILE_NAME, HOT_PATH_MANIFEST_SCHEMA,
+    HotPathManifestFileError, HotPathOperationDeclarationError, admit_hot_path_manifest,
+    hot_path_manifest_path,
+};
+pub use hot_path_operation::{
+    HOT_PATH_OPERATION_MAX_STAGE_RECORDS, HOT_PATH_STAGE_MAX_WAIT_COMPONENTS,
+    HotPathCategoryApplicability, HotPathEvidenceAssembly, HotPathJoinKey,
+    HotPathMetricApplicability, HotPathObservationCoverage, HotPathOperationError,
+    HotPathOperationResult, HotPathPopulationCensus, HotPathRequiredStages, HotPathStageRecord,
+    HotPathStageSet, HotPathWaitComponent, allocations_are_complete, attempt_labels,
+    check_observation_coverage, correlate_operation, derive_degradation_rate,
+    derive_qualification_status, is_degraded, resolve_operation_evidence,
 };
 pub use hot_path_profile::{
     HOT_PATH_PROFILE_MAX_CLOCK_DOMAINS, HOT_PATH_PROFILE_MAX_EVIDENCE_REFS,

@@ -1618,6 +1618,38 @@ async fn run_loop(
                 // Finish uses a separate queue and attempt type; start it on the
                 // same cadence without sharing the local-read completion branch.
                 maybe_start_finish_poll(&kernel, &composition, &mut finish_flight);
+                // Issue #2567: the solo delegate slice rides the same cadence
+                // on its own bounded poll. At most one queued intake drives
+                // per tick, an empty queue idles without owner IO, and a busy
+                // live slot waits without overlap. The composition lock is
+                // only try-locked here and never held across an await, so a
+                // contended composition skips the tick instead of blocking
+                // the loop; the drive itself is synchronous and bounded.
+                if let Ok(guard) = composition.try_lock() {
+                    match guard.solo_poll_queue(&kernel) {
+                        Ok(eliotd::solo_agent_driver::SoloPollOutcome::Drove {
+                            operation_id,
+                            dispatch_id,
+                        }) => {
+                            tracing::info!(
+                                target: "eliotd::diagnostics",
+                                event = "eliotd.solo_drive_retained",
+                                operation_id
+                                    = %eliotd::diagnostics::sanitize_identity(&operation_id),
+                                dispatch_id
+                                    = %eliotd::diagnostics::sanitize_identity(&dispatch_id),
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                target: "eliotd::diagnostics",
+                                event = "eliotd.solo_poll_refused",
+                                detail = %error,
+                            );
+                        }
+                    }
+                }
                 // #1688 (I14.22): the idle trigger rides this cadence branch
                 // because it is the one place that observes the activation
                 // flight, so the `idle` gate the evaluator consumes is a real

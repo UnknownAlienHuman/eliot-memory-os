@@ -19,13 +19,19 @@ the map's own shape:
    source that no longer exists. This is the check that refuses the stale
    `crates/smart/eliot-system-experience` row corrected on 2026-09-28.
 2. One current base (W4). `current_main_commit` is the base the dispositions
-   were re-read on and `[topology_donor_authority].dispositions_base` restates
-   it for the topology authority; a map whose two bases disagree is refused.
-   `authority_base` is left alone: it is the #816 metadata-authority origin,
-   shared with `cognitive-wave-01.toml`, `cognitive-edge-map.toml` and
-   `cognitive-crate-decisions.toml`, and is pinned by the executable #816
-   contract, so it is a different identity from the current base and this gate
-   never rewrites or reconciles it.
+   were re-read on, and `[topology_donor_authority].dispositions_base` and
+   `[topology_donor_authority].authority_base` name the same base with it: the
+   donor dispositions and the topology donor authority are one decision and
+   they are read on one base, so a map whose three base fields disagree is
+   refused. All three are then checked against the repository itself, never
+   against a copy of one of the three: the declared base must be a real commit
+   on the current history, and no path that a disposition claims about may have
+   changed between that base and the current base. That second condition is
+   what makes the check load-bearing rather than a self-consistency assertion,
+   and it is why a triple that is internally consistent but stale fails. The
+   currency test is deliberately tied to the content the map claims about
+   rather than to the moving `main` tip, so it discriminates staleness without
+   becoming a gate that no commit could ever satisfy.
 3. Authority scope, never a runtime owner (A5). `[topology_donor_authority]`
    must keep its donor-and-owner reconciliation ceiling with runtime completion
    false, the workstream rule that keeps prototype and donor presence from
@@ -44,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import subprocess
 import tomllib
 from pathlib import Path
 
@@ -90,33 +97,143 @@ def is_tree_path(path: str) -> bool:
     return "/" in path and not path.startswith(NON_TREE_PREFIXES)
 
 
-def single_base_failures(data: dict) -> list[str]:
+def git_output(root: Path, *args: str) -> str | None:
+    """One line of `git` output, or None when git cannot answer."""
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip()
+
+
+def current_repository_base(root: Path) -> str | None:
+    """The one current base of this repository, derived from git itself.
+
+    `WORKFLOW.md` makes `main` the current product source and documentation
+    authority and names `refs/heads/main` / `origin/main` as the authority
+    ref, so the authority ref is resolved first and the local branch second.
+    Returning None means the base could not be established; the caller then
+    fails closed, because an unprovable base is not a passing base.
+    """
+    for ref in ("origin/main", "main"):
+        resolved = git_output(root, "rev-parse", "--verify", f"{ref}^{{commit}}")
+        if resolved and SHA1.match(resolved):
+            return resolved
+    return None
+
+
+def claim_paths(data: dict) -> list[str]:
+    """Every in-tree path a disposition or observed disposition is claimed about."""
+    paths: list[str] = []
+    for key in ("donor", "topology_donor"):
+        for row in data.get(key, []):
+            if not isinstance(row, dict):
+                continue
+            path = text_of(row.get("path"))
+            if is_tree_path(path):
+                paths.append(path)
+    return sorted(set(paths))
+
+
+def drifted_claim_paths(root: Path, base: str, current: str, paths: list[str]) -> list[str]:
+    """Claim-bearing paths whose content changed between `base` and `current`.
+
+    This is the independent staleness discriminator. It is computed from git
+    history, never from the map, so a map that restates one stale commit in all
+    three base fields is still caught: a disposition re-read before a path it
+    describes changed is not a current disposition.
+    """
+    drifted: list[str] = []
+    for path in paths:
+        touching = git_output(
+            root, "rev-list", "--count", f"{base}..{current}", "--", path
+        )
+        if touching and touching != "0":
+            drifted.append(path)
+    return drifted
+
+
+def single_base_failures(root: Path, data: dict) -> list[str]:
+    """W4: the donor dispositions and the topology donor authority are on one
+    CURRENT base.
+
+    Every expectation here is derived from the repository, not from this map.
+    Comparing the three base fields only against one another would prove that
+    three copies of the same caller-supplied value agree, which passes a triple
+    that is internally consistent and arbitrarily stale. Instead this function
+    requires the declared base to be a real commit on the current history, and
+    requires that no path any disposition claims about has changed since that
+    base was read. The second condition is what makes an internally consistent
+    but stale map fail, and tying the check to claimed content rather than to
+    the moving `main` tip is what keeps it a real check without making it a
+    gate that can never be green.
+    """
     failures: list[str] = []
-    current = text_of(data.get("current_main_commit"))
     authority = data.get("topology_donor_authority")
     if not isinstance(authority, dict):
         return ["[topology_donor_authority] table is missing"]
-    dispositions_base = text_of(authority.get("dispositions_base"))
-    if not SHA1.match(current):
+
+    bases = (
+        ("current_main_commit", text_of(data.get("current_main_commit"))),
+        (
+            "[topology_donor_authority].dispositions_base",
+            text_of(authority.get("dispositions_base")),
+        ),
+        (
+            "[topology_donor_authority].authority_base",
+            text_of(authority.get("authority_base")),
+        ),
+    )
+    for label, value in bases:
+        if not SHA1.match(value):
+            failures.append(f"{label} must be one exact 40-hex base commit, got {value!r}")
+    if failures:
+        return failures
+
+    # Three independently authored fields must name one base, not two.
+    declared = {value for _, value in bases}
+    if len(declared) != 1:
         failures.append(
-            "current_main_commit must be one exact 40-hex base commit, got "
-            f"{current!r}"
+            "the donor dispositions and the topology donor authority are on more "
+            "than one base: "
+            + ", ".join(f"{label}={value}" for label, value in bases)
         )
-    if not SHA1.match(dispositions_base):
+        return failures
+    base = declared.pop()
+
+    current = current_repository_base(root)
+    if current is None:
         failures.append(
-            "[topology_donor_authority].dispositions_base must restate that same "
-            f"base, got {dispositions_base!r}"
+            "the current base could not be derived from this repository: neither "
+            "origin/main nor main resolves to a 40-hex commit, so no base in this "
+            "map can be shown to be current"
         )
-    elif dispositions_base != current:
+        return failures
+
+    if git_output(root, "merge-base", "--is-ancestor", base, current) is None:
         failures.append(
-            "donor dispositions and the topology donor authority are on two bases: "
-            f"current_main_commit={current} vs dispositions_base={dispositions_base}"
+            f"the declared base {base} is not a commit on the current history "
+            f"(it is not an ancestor of {current}); a base that is not a real "
+            "ancestor of the current base cannot be the base these dispositions "
+            "were re-read on"
         )
-    origin = text_of(authority.get("authority_base"))
-    if not SHA1.match(origin):
+        return failures
+
+    drifted = drifted_claim_paths(root, base, current, claim_paths(data))
+    if drifted:
+        behind = git_output(root, "rev-list", "--count", f"{base}..{current}") or "?"
         failures.append(
-            "[topology_donor_authority].authority_base must be one exact 40-hex "
-            f"#816 authority origin, got {origin!r}"
+            f"the map is stale on its own declared base {base}: these claimed paths "
+            f"changed in the {behind} commit(s) between that base and the current "
+            f"base {current}, so the dispositions were not re-read against current "
+            "source: " + ", ".join(drifted)
         )
     return failures
 
@@ -232,7 +349,7 @@ def main() -> int:
 
     data = load_toml(root, MAP_REL)
     failures: list[str] = []
-    failures.extend(single_base_failures(data))
+    failures.extend(single_base_failures(root, data))
     failures.extend(authority_scope_failures(data))
 
     donor_rows = [row for row in data.get("donor", []) if isinstance(row, dict)]
@@ -281,6 +398,8 @@ def main() -> int:
     print(
         f"DONOR_DISPOSITIONS: PASS donors={donors} topology_donors={topology} "
         f"base={text_of(data.get('current_main_commit'))} "
+        f"current_base={current_repository_base(root)} "
+        f"authority_base={text_of((data.get('topology_donor_authority') or {}).get('authority_base'))} "
         f"ceiling={AUTHORITY_CEILING} runtime_completion=false"
     )
     return 0

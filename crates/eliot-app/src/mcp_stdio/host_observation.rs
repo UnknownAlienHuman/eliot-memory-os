@@ -12,12 +12,16 @@
 //! against the *owner's live* current session, so a stale or foreign
 //! generation, a duplicated or reordered event, and an unattributable lineage
 //! each close nothing current. The observed side is never taken from the
-//! joining caller's keys: comparing two caller-supplied generation fields
-//! proves only that the caller agrees with itself. Correlation attribution
-//! rides the owner's journal session binding: the owner nominates the
-//! candidate event from its live journal and the join verifies it there
-//! verbatim (see `super::bridge_join`). UI-only screenshots and free text are
-//! not machine authority and never enter the observation.
+//! joining caller's keys, and the expected side is never taken from them
+//! either: both the live generation and the expected route digest come from the
+//! event owner's own attach binding and its own observed route fingerprint
+//! ([`HostOwnerBinding`]). Comparing two caller-supplied fields, or
+//! recomputing a fresh digest over what the join already holds, would only
+//! prove that the caller agrees with itself. Correlation attribution rides the
+//! owner's journal session binding: the owner nominates the candidate event
+//! from its live journal and the join verifies it there verbatim (see
+//! `super::bridge_join`). UI-only screenshots and free text are not machine
+//! authority and never enter the observation.
 
 use eliot_agent_bridge_core::{HostEventEnvelope, HostEventKind, ProviderObservationLineage};
 
@@ -25,29 +29,18 @@ use super::correlation::{
     HostObservationEvidence, HostTerminalObservation, HostTerminalState, sha256_hex,
 };
 
-/// Generation triple the live event owner states for the joined route.
-#[allow(
-    dead_code,
-    reason = "owner seam: carried only by the bridge join's host-event keys (#2899)"
-)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct HostGeneration {
-    /// Installation identity.
-    pub(crate) installation_id: String,
-    /// Session generation.
-    pub(crate) session_generation: String,
-    /// Process generation.
-    pub(crate) process_generation: String,
-}
-
 /// Exact join keys the event owner attests for one candidate host event.
 ///
-/// The keys carry only the *expected* side of the join. There is deliberately
-/// no observed-generation field: a pair of caller-supplied generations can only
-/// prove that the caller agrees with itself. The observed side is derived from
-/// the candidate's own owner-validated lineage and compared against the live
-/// attach binding the join reads from the owner itself
-/// ([`normalize_terminal_observation`]).
+/// The keys carry only the *expected* side of the join, and even that is
+/// restricted to what the owner itself attests about the correlation: the
+/// host integration identity and the correlation digest the owner joined the
+/// event to, plus an applicable deadline. There is deliberately no
+/// observed-generation field and no expected-route field here: a pair of
+/// caller-supplied generations or route digests can only prove that the caller
+/// agrees with itself, and a fresh digest recomputed over what the join already
+/// holds is not a recorded value. Both of those are read from the event owner
+/// itself ([`HostOwnerBinding`]), and the observed side is derived from the
+/// candidate's own owner-validated lineage.
 #[allow(
     dead_code,
     reason = "owner seam: attested only by the bridge-owning join caller (#2899)"
@@ -56,14 +49,35 @@ pub(crate) struct HostGeneration {
 pub(crate) struct HostEventJoinKeys {
     /// Host integration identity that produced the observation.
     pub(crate) integration_id: String,
-    /// Generation the live owner states for the joined route.
-    pub(crate) current_generation: HostGeneration,
     /// Owner-attested correlation digest the event is joined to.
     pub(crate) correlation_digest: String,
-    /// Expected digest of the route fingerprint the event arrived on.
-    pub(crate) expected_route_digest: String,
     /// Applicable observation deadline admitted by the owner, when one exists.
     pub(crate) deadline_unix_ms: Option<u64>,
+}
+
+/// Live generation the event owner itself states for the joined route.
+///
+/// Every field is read from the owner's own live attach binding and its own
+/// journal, never from the joining caller. This is the *expected* side of the
+/// generation join; the *observed* side comes from the candidate event's own
+/// owner-validated lineage, and the two are compared as values. An event whose
+/// own session is not the owner's live session is stale and closes nothing; a
+/// lineage that attributes no session is unattributable, which is a different
+/// outcome and is never relabeled as a host fault.
+#[allow(
+    dead_code,
+    reason = "owner seam: read by the bridge join from the live owner attach binding (#2899)"
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostOwnerBinding {
+    /// Installation identity the owner's live attach binding names.
+    pub(crate) installation_id: String,
+    /// Session the owner's live attach binding names.
+    pub(crate) session_id: String,
+    /// Authority generation the owner's live attach binding names.
+    pub(crate) activation_generation: String,
+    /// Digest of the route fingerprint the owner itself observed.
+    pub(crate) route_digest: String,
 }
 
 /// Why a candidate host event was rejected for correlation.
@@ -133,10 +147,13 @@ impl std::error::Error for HostObservationReject {}
 /// joins the event's *own* observed generation against the owner's live
 /// current session: the observed side is read from the closed, versioned
 /// normalized observation the envelope carries (never from caller input and
-/// never from the wire's generic JSON), the expected side is supplied by the
-/// owner itself. Non-terminal kinds, foreign routes, unattributable lineage,
-/// and stale generations are rejected: missing or mismatched telemetry is
-/// never relabeled as a host fault.
+/// never from the wire's generic JSON), the expected side is the owner's own
+/// live attach binding and its own observed route fingerprint
+/// ([`HostOwnerBinding`]). The evidence records that owner-sourced generation
+/// verbatim, so a correlation never carries a generation the join caller
+/// asserted. Non-terminal kinds, foreign routes, unattributable lineage, and
+/// stale generations are rejected: missing or mismatched telemetry is never
+/// relabeled as a host fault.
 #[allow(
     dead_code,
     reason = "owner seam: invoked by the bridge-owning process with live journal events; the facade observes no host events itself (#2899)"
@@ -144,7 +161,7 @@ impl std::error::Error for HostObservationReject {}
 pub(crate) fn normalize_terminal_observation(
     event: &HostEventEnvelope,
     keys: &HostEventJoinKeys,
-    current_session: &str,
+    owner: &HostOwnerBinding,
 ) -> Result<HostTerminalObservation, HostObservationReject> {
     event
         .validate()
@@ -161,9 +178,9 @@ pub(crate) fn normalize_terminal_observation(
         .canonical_json()
         .map_err(|error| HostObservationReject::InvalidEnvelope(error.to_string()))?;
     let route_digest = sha256_hex(route_json.as_bytes());
-    if route_digest != keys.expected_route_digest {
+    if route_digest != owner.route_digest {
         return Err(HostObservationReject::RouteMismatch {
-            expected: keys.expected_route_digest.clone(),
+            expected: owner.route_digest.clone(),
             observed: route_digest,
         });
     }
@@ -187,10 +204,10 @@ pub(crate) fn normalize_terminal_observation(
     let Some(observed_session) = observed_session else {
         return Err(HostObservationReject::SessionLineageUnattributable);
     };
-    if observed_session.as_str() != current_session {
+    if observed_session.as_str() != owner.session_id {
         return Err(HostObservationReject::StaleGeneration {
             observed: observed_session.as_str().to_owned(),
-            current: current_session.to_owned(),
+            current: owner.session_id.clone(),
         });
     }
     let event_json = serde_json::to_string(event)
@@ -199,9 +216,9 @@ pub(crate) fn normalize_terminal_observation(
         state,
         evidence: Box::new(HostObservationEvidence {
             integration_id: keys.integration_id.clone(),
-            installation_id: keys.current_generation.installation_id.clone(),
-            session_generation: keys.current_generation.session_generation.clone(),
-            process_generation: keys.current_generation.process_generation.clone(),
+            installation_id: owner.installation_id.clone(),
+            session_generation: owner.session_id.clone(),
+            process_generation: owner.activation_generation.clone(),
             correlation_digest: keys.correlation_digest.clone(),
             route_digest,
             event_id: event.event_id.as_str().to_owned(),

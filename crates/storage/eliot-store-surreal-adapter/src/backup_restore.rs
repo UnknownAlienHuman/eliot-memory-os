@@ -72,7 +72,7 @@
 //! obligation. Releasing the guard is never provider cancellation and never
 //! durable settlement.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Mutex, OnceLock};
 
 use eliot_store_api::{
@@ -1634,14 +1634,21 @@ pub fn validate_reference_closure(batch: &CanonicalRestoreBatch) -> Result<(), S
     Ok(())
 }
 
-/// Resolves every reference edge this batch claims to have closed, against the
-/// member set that is actually *present*.
+/// Resolves every reference edge this batch carries, against the member set that
+/// is actually *present*.
 ///
-/// `dispositions[i]` is the disposition of `batch.members[i]` at this exact
-/// point: the planned set before an apply commit, the observed set at receipt
-/// time. This is the typed half of the closure, and it is deliberately not a
+/// `dispositions_by_member` maps each member's own deterministic destination
+/// identity — [`member_reference`] over the admitted archive member digest — to
+/// the disposition observed for *that* member at this exact point: the planned
+/// set before an apply commit, the set re-read from the destination at receipt
+/// time. Dispositions are therefore looked up by identity, never by position, so
+/// no member's edge can be examined against another member's disposition and a
+/// replay carrying a changed member set cannot borrow a disposition it was never
+/// recorded with. A member with no entry is not a target and not an exempt edge.
+///
+/// This is the typed half of the closure, and it is deliberately not a
 /// digest-membership test over the batch's own declarations. A reference edge
-/// resolves only against a member that
+/// names its target only when some member of this batch
 ///
 /// 1. carries the referenced content digest **under the same residency domain**
 ///    as the referring member. Equal bytes under a different obligation domain
@@ -1650,11 +1657,15 @@ pub fn validate_reference_closure(batch: &CanonicalRestoreBatch) -> Result<(), S
 /// 2. is itself importable — a `Record` or `Blob` member rather than another
 ///    reference edge — so a reference chain is refused instead of followed.
 ///
-/// Only an edge the batch actually claims to have closed — a `Rejected` edge,
-/// which is what an importable batch records for a reference — carries that
-/// obligation. A purge-suppressed or still-unresolved member set makes nothing
-/// servable, so its edges are accounted as suppressed or unresolved rather than
-/// demanded to resolve: a suppressed archive cannot fail to be closed.
+/// **Every** reference member of the batch is examined, whatever its
+/// disposition. An edge whose `reference_digest` names no member of the batch is
+/// dangling in the archive itself, and no disposition of the referring member
+/// can make it closed: a suppressed, unresolved or rejected edge all fail the
+/// naming test, and a batch can never report a closed graph for a reference that
+/// resolves to nothing. Only an edge the batch additionally claims to have
+/// *closed* — a `Rejected` edge, which is what an importable batch records for a
+/// reference — must additionally land on a member the destination actually
+/// serves.
 ///
 /// A member that is not present is not a target, so a batch cannot close a graph
 /// it never imported. A cross-batch target, an object an authorized earlier
@@ -1665,17 +1676,19 @@ pub fn validate_reference_closure(batch: &CanonicalRestoreBatch) -> Result<(), S
 /// its own.
 fn validate_reference_closure_against(
     batch: &CanonicalRestoreBatch,
-    dispositions: &[MemberDisposition],
+    dispositions_by_member: &BTreeMap<String, MemberDisposition>,
 ) -> Result<(), StoreError> {
-    if dispositions.len() != batch.members.len() {
+    if dispositions_by_member.len() != batch.members.len() {
         return Err(StoreError::InvalidReceipt);
     }
-    for (member, disposition) in batch.members.iter().zip(dispositions) {
-        if member.member_type != SnapshotMemberType::Reference
-            || *disposition != MemberDisposition::Rejected
-        {
+    for member in &batch.members {
+        if member.member_type != SnapshotMemberType::Reference {
             continue;
         }
+        let member_ref = member_reference(&batch.archive_member_digest, &member.logical_identity());
+        let disposition = dispositions_by_member
+            .get(&member_ref)
+            .ok_or(StoreError::InvalidReceipt)?;
         let reference = member
             .reference_digest
             .as_deref()
@@ -1683,21 +1696,59 @@ fn validate_reference_closure_against(
                 field: "restore.reference_digest",
                 reason: "reference member requires a reference digest",
             })?;
-        let resolved_target =
-            batch
-                .members
-                .iter()
-                .zip(dispositions)
-                .any(|(target, target_disposition)| {
-                    *target_disposition == MemberDisposition::Restored
-                        && target.content_digest == reference
-                        && target.residency.domain == member.residency.domain
-                });
-        if !resolved_target {
+        // The target must be named by this batch under the referring member's own
+        // obligation domain. This holds for every disposition: an edge naming
+        // nothing in the batch is refused rather than excused.
+        let named_target = batch.members.iter().any(|target| {
+            target.content_digest == reference && target.residency.domain == member.residency.domain
+        });
+        if !named_target {
             return Err(StoreError::IdentityConflict);
+        }
+        // A `Rejected` edge is the batch's own claim that it closed the graph, so
+        // the named member must additionally be served by the destination.
+        if *disposition == MemberDisposition::Rejected {
+            let served = batch.members.iter().any(|target| {
+                if target.content_digest != reference
+                    || target.residency.domain != member.residency.domain
+                {
+                    return false;
+                }
+                let target_ref =
+                    member_reference(&batch.archive_member_digest, &target.logical_identity());
+                dispositions_by_member.get(&target_ref) == Some(&MemberDisposition::Restored)
+            });
+            if !served {
+                return Err(StoreError::IdentityConflict);
+            }
         }
     }
     Ok(())
+}
+
+/// Keys a planned per-member disposition set by each member's own destination
+/// identity.
+///
+/// The planned set is derived by iterating the batch's own members, so each entry
+/// is that member's disposition under its own [`member_reference`] key. The guard
+/// then looks dispositions up by identity, which is the same key the durable
+/// readback path binds by, so one member's disposition can never be read as
+/// another's.
+fn dispositions_by_member(
+    batch: &CanonicalRestoreBatch,
+    dispositions: &[MemberDisposition],
+) -> BTreeMap<String, MemberDisposition> {
+    batch
+        .members
+        .iter()
+        .zip(dispositions)
+        .map(|(member, disposition)| {
+            (
+                member_reference(&batch.archive_member_digest, &member.logical_identity()),
+                *disposition,
+            )
+        })
+        .collect()
 }
 
 /// Reports whether archive content is suppressed by the current purge policy.
@@ -2762,10 +2813,70 @@ fn expected_head_digests(
     Ok((revision_digests, ordering_digests))
 }
 
+/// Binds a durable record's per-member rows to this batch's members by each
+/// member's own deterministic destination identity.
+///
+/// The binding key is [`member_reference`] — the admitted archive member digest
+/// plus the member's domain-qualified logical identity — so a disposition
+/// recorded for one member can never be read as the disposition of a different
+/// one. A same-identity replay that carries a *different* member set names
+/// members this operation never recorded, which is an identity conflict: changed
+/// input conflicts, and only a byte-identical member set reconciles to the
+/// original receipt.
+///
+/// Identity is what makes the downstream per-member lookup sound. A positional or
+/// length-only coupling would let a replay place a reference edge at an index
+/// whose durable disposition is `Restored`, where the closure guard skips it, and
+/// report a closed graph that was never closed. Here both sides must be distinct,
+/// fully covered and equal, so each batch member has exactly one durable row and
+/// no row is left over.
+fn recorded_members_by_identity<'record>(
+    batch: &CanonicalRestoreBatch,
+    document: &'record RestoreRecordDocument,
+) -> Result<Vec<&'record RestoreMemberRecord>, StoreError> {
+    let durable: BTreeSet<&str> = document
+        .members
+        .iter()
+        .map(|row| row.member_ref.as_str())
+        .collect();
+    // A record names one member identity once; a repeat cannot be attributed to
+    // a single member, so it is not a record this batch can be read back from.
+    if durable.len() != document.members.len() {
+        return Err(StoreError::InvalidReceipt);
+    }
+    let claimed: BTreeSet<String> = batch
+        .members
+        .iter()
+        .map(|member| member_reference(&batch.archive_member_digest, &member.logical_identity()))
+        .collect();
+    if claimed.len() != batch.members.len() {
+        return Err(StoreError::IdentityConflict);
+    }
+    if !claimed
+        .iter()
+        .all(|member_ref| durable.contains(member_ref.as_str()))
+    {
+        return Err(StoreError::IdentityConflict);
+    }
+    batch
+        .members
+        .iter()
+        .map(|member| {
+            let member_ref =
+                member_reference(&batch.archive_member_digest, &member.logical_identity());
+            document
+                .members
+                .iter()
+                .find(|row| row.member_ref == member_ref)
+                .ok_or(StoreError::IdentityConflict)
+        })
+        .collect()
+}
+
 /// Verifies that a durable record belongs to exactly this batch: same
 /// operation identity and canonical request hash, destination, source identity,
-/// member digest, schema, purge policy, expected state and denominator. Any
-/// divergence is an identity conflict, never a silent overwrite.
+/// member digest, schema, purge policy, expected state, denominator and member
+/// set. Any divergence is an identity conflict, never a silent overwrite.
 #[allow(clippy::too_many_arguments)]
 fn check_record_binding(
     document: &RestoreRecordDocument,
@@ -2796,6 +2907,11 @@ fn check_record_binding(
     {
         return Err(StoreError::IdentityConflict);
     }
+    // The denominator above is a count; the member *set* is bound here, by
+    // identity. A same-operation replay that carries a different member set is
+    // changed input, so it conflicts here rather than reconciling to a receipt
+    // computed over a member list this operation never recorded.
+    recorded_members_by_identity(batch, document)?;
     Ok(())
 }
 
@@ -3759,7 +3875,8 @@ impl SurrealStoreAdapter {
         // member this batch actually imports, in the same obligation domain.
         // Unverified derived data cannot grant completion, so a dangling edge
         // refuses the batch rather than being committed and reported.
-        validate_reference_closure_against(batch, &dispositions)?;
+        let planned_by_member = dispositions_by_member(batch, &dispositions);
+        validate_reference_closure_against(batch, &planned_by_member)?;
         let denominator = denominator_of(&dispositions);
         denominator.validate()?;
         let (completeness, mutation) = planned_outcome(&dispositions);
@@ -3933,28 +4050,32 @@ impl SurrealStoreAdapter {
         document: &RestoreRecordDocument,
         batch: &CanonicalRestoreBatch,
     ) -> Result<RestoreValidationReceipt, StoreError> {
-        let first = document.members.first().ok_or(StoreError::InvalidReceipt)?;
+        // The rows are bound to this batch's members by identity, never by
+        // position: a same-operation replay that carries a different member set
+        // conflicts here, and every disposition below is read from the row this
+        // very member was recorded with. They come back in batch member order,
+        // which is the order the planned-set consumers below are indexed in.
+        let recorded = recorded_members_by_identity(batch, document)?;
+        let first = recorded.first().ok_or(StoreError::InvalidReceipt)?;
         let domains = RestoreDomains {
             residency: first.residency_domain.clone(),
             privacy: first.privacy_domain.clone(),
             retention: first.retention_domain.clone(),
         };
-        if document.members.len() != batch.members.len() {
-            return Err(StoreError::InvalidReceipt);
-        }
-        let mut dispositions = Vec::with_capacity(document.members.len());
-        let mut evidence = Vec::with_capacity(document.members.len());
-        for member in &document.members {
+        let mut dispositions = Vec::with_capacity(recorded.len());
+        let mut dispositions_by_member: BTreeMap<String, MemberDisposition> = BTreeMap::new();
+        let mut evidence = Vec::with_capacity(recorded.len());
+        for row in &recorded {
             // Only a claim that names a closed class, a record address *and* the
             // content digest this operation committed can be looked up in the
             // destination. A metadata-only record written before canonical import
             // named none of them, so it stays bookkeeping evidence: it is re-read
             // as `Unresolved` rather than being certified as imported data.
             let observed = match (
-                member.disposition,
-                member.imported_class.as_deref(),
-                member.imported_record_id.as_deref(),
-                member.imported_digest.as_deref(),
+                row.disposition,
+                row.imported_class.as_deref(),
+                row.imported_record_id.as_deref(),
+                row.imported_digest.as_deref(),
             ) {
                 (
                     MemberDisposition::Restored,
@@ -3978,19 +4099,24 @@ impl SurrealStoreAdapter {
                 }
                 _ => None,
             };
-            dispositions.push(match observed {
+            let disposition = match observed {
                 Some(_) => MemberDisposition::Restored,
-                None => match member.disposition {
+                None => match row.disposition {
                     MemberDisposition::Suppressed => MemberDisposition::Suppressed,
                     MemberDisposition::Rejected => MemberDisposition::Rejected,
                     MemberDisposition::Restored | MemberDisposition::Unresolved => {
                         MemberDisposition::Unresolved
                     }
                 },
-            });
+            };
+            dispositions.push(disposition);
+            // The closure guard reads dispositions by the member identity the row
+            // was recorded under, so a disposition observed for one member can
+            // never be examined against another member's reference edge.
+            dispositions_by_member.insert(row.member_ref.clone(), disposition);
             evidence.push(observed);
         }
-        validate_reference_closure_against(batch, &dispositions)?;
+        validate_reference_closure_against(batch, &dispositions_by_member)?;
         let denominator = denominator_of(&dispositions);
         denominator.validate()?;
         let members = member_records(

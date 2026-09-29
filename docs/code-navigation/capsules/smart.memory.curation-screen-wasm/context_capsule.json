@@ -113,20 +113,20 @@
     "qualification": "UNVALIDATED (I2.16, I0.5)",
     "reference_capsule_handle": "I2.20"
   },
-  "bound_contract_digest": "a755591c20184fe826970adbedf60d3b3ec838b938448ac8fc2030e918818244",
+  "bound_contract_digest": "900c1cf048bb8caf409651000c07b24207372c571345a974c0b0b04ffcab0a00",
   "source_provenance": {
     "input_digests": {
       "workspace_manifest": {
         "path": "Cargo.toml",
-        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
       },
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
-        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
       },
       "architecture_boundaries": {
         "path": "config/architecture-boundaries.toml",
-        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
       },
       "logical_block_config": {
         "path": "docs/code-navigation/logical-blocks.toml",
@@ -138,7 +138,7 @@
       },
       "module_manifest": {
         "path": "crates/smart/eliot-memory-curation-screen-wasm/module.toml",
-        "sha256": "d60d21f60e902258ae74ca02ed908e174f368723d6088e4ef0a1fc5d0dac51f6"
+        "sha256": "bfc7a3d93ff4d5f8642124952c033423d9cc9e10f674348aa7e05781547c6754"
       },
       "selected_source": {
         "path_count": 5,
@@ -146,15 +146,15 @@
       },
       "excluded_disposition": {
         "path": "workstreams/security/standalone-crate-dispositions.toml",
-        "sha256": "4a5ce7ef7ee19bd18e4d106dbcd3218c7d950e461ea8b9d039ab854bffb3884d"
+        "sha256": "04d115fdfe75f09939a58b70945c4a8b6e2ca0dce37fdc9e9055ca7472d68015"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "4372c6565d92ee069e1de351b73eab77c85554a37be54039bb8e3e15e76f40bd",
+  "artifact_digest": "c38aba1c9af87515ce4e9b7b5ef2e8a24cab03ab9511413203a22d04e6bac657",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "4372c6565d92ee06"
+    "value": "c38aba1c9af87515"
   }
 }

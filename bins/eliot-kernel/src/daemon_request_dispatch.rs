@@ -3701,7 +3701,8 @@ impl KernelComposition {
                 }
                 &request.context.state_fence
             }
-            UserAutomationHostExecutionOperation::CancelPendingWakes { request } => {
+            UserAutomationHostExecutionOperation::CancelPendingWakes { request }
+            | UserAutomationHostExecutionOperation::ReadCancellationBatch { request } => {
                 if let Err(error) = request.validate() {
                     return Ok(Self::user_automation_runtime_error_response(
                         UserAutomationRuntimeError::Rejected(error.to_string()),
@@ -3745,7 +3746,8 @@ impl KernelComposition {
                         .await,
                 )
             }
-            UserAutomationHostExecutionOperation::CancelPendingWakes { request } => {
+            UserAutomationHostExecutionOperation::CancelPendingWakes { request }
+            | UserAutomationHostExecutionOperation::ReadCancellationBatch { request } => {
                 Self::user_automation_owner_check(
                     self.revalidate_user_automation_cancellation(session, request)
                         .await,
@@ -3804,7 +3806,8 @@ impl KernelComposition {
                         .await,
                 )
             }
-            UserAutomationHostExecutionOperation::CancelPendingWakes { request } => {
+            UserAutomationHostExecutionOperation::CancelPendingWakes { request }
+            | UserAutomationHostExecutionOperation::ReadCancellationBatch { request } => {
                 Self::user_automation_owner_check(
                     self.revalidate_user_automation_cancellation(session, request)
                         .await,
@@ -3857,6 +3860,19 @@ impl KernelComposition {
                         "value": {
                             "outcome": "cancelled",
                             "wake_ids": wake_ids,
+                        },
+                        "recovery": null,
+                    })),
+                    Err(error) => Ok(Self::user_automation_runtime_error_response(error)),
+                }
+            }
+            UserAutomationHostExecutionOperation::ReadCancellationBatch { request } => {
+                match Box::pin(client.read_cancellation_batch(request)).await {
+                    Ok(readback) => Ok(serde_json::json!({
+                        "status": "known",
+                        "value": {
+                            "outcome": "cancellation_batch_readback",
+                            "readback": readback,
                         },
                         "recovery": null,
                     })),
@@ -3922,16 +3938,20 @@ impl KernelComposition {
         match eliot_kernel_service::KernelStoreGateway::validate_user_automation_request(&request) {
             Ok(()) => {}
             Err(eliot_kernel_service::UserAutomationExecutionError::Contract(error)) => {
-                return Ok(Self::user_automation_precommit_refusal_response(
-                    &request, &error,
-                ));
+                return Self::bind_user_automation_operator_response(
+                    &request,
+                    &Self::user_automation_precommit_refusal_response(&request, &error),
+                );
             }
             Err(_) => {
-                return Ok(Self::user_automation_runtime_error_response(
-                    UserAutomationRuntimeError::UnknownOutcome(
-                        "user_automation_request_validation_outcome_unavailable".to_owned(),
+                return Self::bind_user_automation_operator_response(
+                    &request,
+                    &Self::user_automation_runtime_error_response(
+                        UserAutomationRuntimeError::UnknownOutcome(
+                            "user_automation_request_validation_outcome_unavailable".to_owned(),
+                        ),
                     ),
-                ));
+                );
             }
         }
         let transition = match self
@@ -3939,30 +3959,11 @@ impl KernelComposition {
             .await
         {
             Ok(transition) => transition,
-            Err(response) => return Ok(response),
+            Err(response) => {
+                return Self::bind_user_automation_operator_response(&request, &response);
+            }
         };
-        // The Human inspect surface shows the deterministic schedule
-        // projection before activation: the same normalized occurrence set the
-        // trigger contract uses, compiled here into the immutable
-        // revision-bound occurrence identities. A schedule the compiler cannot
-        // compile fails closed instead of projecting a guessed occurrence.
-        let Ok(occurrences) = Self::user_automation_inspection_occurrences(&transition) else {
-            // F-LOG-KERNEL-1 (#897 W5): correlated subordinate phase
-            // observation only; `execute_daemon_request_observed` owns
-            // the single designated terminal for this failed operation.
-            observe_daemon_request(
-                "kernel.daemon_user_automation_occurrence_projection",
-                "unknown",
-            );
-            return Ok(Self::user_automation_runtime_error_response(
-                UserAutomationRuntimeError::UnknownOutcome(
-                    "user_automation_occurrence_projection_requires_reconciliation".to_owned(),
-                ),
-            ));
-        };
-        let recovery = transition.recovery();
-        let known = transition.is_known();
-        if !known {
+        if !transition.is_known() {
             // F-LOG-KERNEL-1 (#897 T19): the store transition reports an
             // unknown wake/execution outcome after possible work. The
             // response body carries `"status": "unknown"` below; this record
@@ -3970,25 +3971,41 @@ impl KernelComposition {
             // only; the response value is unchanged.
             observe_daemon_request("kernel.daemon_response_unknown", "unknown");
         }
-        Ok(serde_json::json!({
-            "status": if known { "known" } else { "unknown" },
-            "value": {
-                "identity": transition.identity,
-                "state_fence": transition.state_fence,
-                "configuration": transition.configuration,
-                "wake": transition.wake,
-                "horizon": transition.horizon,
-                // The one post-commit orchestration record of this parent
-                // operation: the runtime obligations retained durably before any
-                // owner effect was issued, each with its original owner
-                // operation identity and its durable disposition. It is absent
-                // exactly when the operation owns no runtime obligation.
-                "orchestration": transition.orchestration,
-                "execution": transition.execution,
-                "occurrences": occurrences,
-            },
-            "recovery": recovery,
-        }))
+        let Ok(envelope) =
+            eliot_kernel_service::UserAutomationOperatorResultEnvelope::from_transition(
+                &request, transition,
+            )
+        else {
+            // F-LOG-KERNEL-1 (#897 W5): correlated subordinate phase
+            // observation only; `execute_daemon_request_observed` owns
+            // the single designated terminal for this failed operation.
+            observe_daemon_request(
+                "kernel.daemon_user_automation_occurrence_projection",
+                "unknown",
+            );
+            return Self::bind_user_automation_operator_response(
+                &request,
+                &Self::user_automation_runtime_error_response(
+                    UserAutomationRuntimeError::UnknownOutcome(
+                        "user_automation_occurrence_projection_requires_reconciliation".to_owned(),
+                    ),
+                ),
+            );
+        };
+        serde_json::to_value(envelope).map_err(|_| TransportError::SessionFenced)
+    }
+
+    #[cfg(windows)]
+    fn bind_user_automation_operator_response(
+        request: &eliot_kernel_service::UserAutomationServiceRequest,
+        response: &serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let envelope =
+            eliot_kernel_service::UserAutomationOperatorResultEnvelope::bind_internal_response(
+                request, response,
+            )
+            .map_err(|_| TransportError::SessionFenced)?;
+        serde_json::to_value(envelope).map_err(|_| TransportError::SessionFenced)
     }
 
     #[cfg(windows)]
@@ -4227,83 +4244,6 @@ impl KernelComposition {
             return Err(UserAutomationRuntimeError::IdentityConflict);
         }
         Ok(Some(UserAutomationHostExecutionClient::new(transport)?))
-    }
-
-    /// Compiles the deterministic next-occurrence projection of every revision
-    /// a read operation returned.
-    ///
-    /// A mutation answer carries no schedule projection, so it yields an empty
-    /// list rather than re-deriving a revision the caller did not ask for.
-    #[cfg(windows)]
-    fn user_automation_inspection_occurrences(
-        transition: &eliot_kernel_service::UserAutomationOperatorTransition,
-    ) -> Result<Vec<serde_json::Value>, UserAutomationRuntimeError> {
-        use eliot_kernel_service::UserAutomationReadResult;
-        let eliot_kernel_service::UserAutomationConfigurationPhase::Read { result } =
-            &transition.configuration
-        else {
-            return Ok(Vec::new());
-        };
-        let revisions: Vec<&eliot_kernel_core::UserAutomationRevision> = match result.as_ref() {
-            UserAutomationReadResult::List { revisions } => revisions.iter().collect(),
-            UserAutomationReadResult::Status { revision, .. }
-            | UserAutomationReadResult::InspectLastFailure { revision, .. } => vec![revision],
-            UserAutomationReadResult::History { .. } => Vec::new(),
-        };
-        let mut projections = Vec::with_capacity(revisions.len());
-        for revision in revisions {
-            let identities = revision
-                .compile_occurrence_identities()
-                .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
-            // Each compiled identity is projected together with the
-            // deterministic successor the same revision compiler resolves. The
-            // Human surface therefore sees the whole next-occurrence chain,
-            // including the terminal occurrence whose successor is `None`,
-            // instead of an unlabelled list it would have to re-derive.
-            let mut occurrences = Vec::with_capacity(identities.len());
-            for identity in &identities {
-                let occurrence_key = match &identity.trigger {
-                    eliot_kernel_core::user_automation::UserAutomationTrigger::Scheduled {
-                        occurrence_key,
-                    } => occurrence_key.as_str(),
-                    eliot_kernel_core::user_automation::UserAutomationTrigger::Manual {
-                        ..
-                    } => {
-                        return Err(UserAutomationRuntimeError::Rejected(
-                            "compiled UserAutomation occurrence is not a calendar occurrence"
-                                .to_owned(),
-                        ));
-                    }
-                };
-                let next_occurrence = revision
-                    .next_occurrence_after(occurrence_key)
-                    .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
-                occurrences.push(serde_json::json!({
-                    "identity": identity,
-                    "next_occurrence": next_occurrence,
-                }));
-            }
-            projections.push(
-                serde_json::to_value(serde_json::json!({
-                    "automation_id": revision.automation_id,
-                    "revision": revision.revision,
-                    "kind": revision.schedule.kind,
-                    "expression": revision.schedule.expression,
-                    "calendar": revision.schedule.calendar,
-                    "timezone": revision.schedule.timezone,
-                    "dst_fold": revision.schedule.dst_fold,
-                    "dst_gap": revision.schedule.dst_gap,
-                    "configuration_state": revision.configuration_state,
-                    "occurrences": occurrences,
-                }))
-                .map_err(|error| {
-                    UserAutomationRuntimeError::Rejected(format!(
-                        "UserAutomation occurrence projection encoding failed: {error}"
-                    ))
-                })?,
-            );
-        }
-        Ok(projections)
     }
 
     #[cfg(windows)]
@@ -6520,23 +6460,36 @@ impl KernelComposition {
         // 1. Store-side execution generation. `KernelStoreGateway::apply_reserved`
         //    ends in the Store's `ReservedWrite` wire operation. On the store
         //    side `SurrealStoreAdapter::apply_reserved_write`
-        //    (`crates/storage/eliot-store-surreal-adapter/src/apply.rs:744`)
-        //    takes the `execution_handle()` `None` arm at `:749` and returns
+        //    (`crates/storage/eliot-store-surreal-adapter/src/apply.rs:780`)
+        //    takes the `execution_handle()` `None` arm at `:785` and returns
         //    `StoreError::UnknownOperation` before any provider I/O. The two
         //    methods that can install a generation,
         //    `SurrealStoreAdapter::install_concurrent_execution`
         //    (`crates/storage/eliot-store-surreal-adapter/src/lib.rs:269`) and
         //    `install_serial_execution` (`:296`), have no non-test caller
         //    anywhere in the workspace; the only production construction path,
-        //    `StoreComposition::new` (`bins/eliot-store-surreal/src/lib.rs:310`),
-        //    builds the adapter at `:349` and never installs one. Routing live
+        //    `StoreComposition::new` (`bins/eliot-store-surreal/src/lib.rs`),
+        //    builds the adapter there and never installs one. Routing live
         //    writes through `apply_reserved` today would therefore refuse
         //    every production canonical write.
         // 2. Store-side capability advertisement. `CAPABILITY_RESERVED_WRITE`
         //    (`crates/storage/eliot-store-api/src/wire.rs:49`) is mapped to the
         //    `ReservedWrite` operation at `wire.rs:353`, but is absent from the
         //    advertised `CAPABILITIES` array at `wire.rs:85`, so the handshake
-        //    never admits the capability this wire would select.
+        //    never admits the capability this wire would select. The Kernel
+        //    consumes that same static array on its own side: the session
+        //    hello it sends declares
+        //    `allowed_capabilities: CAPABILITIES`
+        //    (`crates/kernel/eliot-kernel-service/src/store_client.rs:1290`),
+        //    so a `ReservedWrite` request this Kernel submits would sit outside
+        //    the admitted set for the session even against a fully installed
+        //    Store generation. The honest dynamic advertisement already exists
+        //    on the adapter
+        //    (`SurrealStoreAdapter::reserved_write_capability`,
+        //    `crates/storage/eliot-store-surreal-adapter/src/lib.rs:324`) and
+        //    correctly returns `None` until a concurrent generation owns the
+        //    adapter, but it has no non-test caller, so the Kernel can never
+        //    learn a reserved-write Store is present.
         // 3. No production source for the observed ordering-head digest.
         //    `ReservationSeed::heads` requires
         //    `ObservedHead::expected_head_digest`
@@ -6551,21 +6504,25 @@ impl KernelComposition {
         // 4. ORS canonical-evidence binding. `reserve_for_transition` reaches
         //    `RedbRecoveryStore::stage_and_reserve`, whose
         //    `self.evidence.verify_ordering_heads(&request.scopes)?`
-        //    (`crates/kernel/eliot-ors/src/store.rs:26165`) fails closed while the
-        //    bound provider is `RejectUnboundEvidence` (`store.rs:2686`). This
-        //    composition opens its production ORS with `RedbRecoveryStore::open`
+        //    (`crates/kernel/eliot-ors/src/store.rs:28006`) fails closed while the
+        //    bound provider is `RejectUnboundEvidence` (`store.rs:2777`, whose
+        //    `verify_ordering_heads` at `store.rs:2780` returns
+        //    `OrsError::CanonicalEvidence` at `store.rs:2784`). This composition
+        //    opens its production ORS with `RedbRecoveryStore::open`
         //    (`bins/eliot-kernel/src/composition_bootstrap.rs:197`, `:247`,
-        //    `:355`), which binds that rejecting provider; the only
-        //    `open_with_evidence` (`store.rs:20970`) call site is the
-        //    `#[cfg(test)]` `new_with_adapters` at `composition_bootstrap.rs:997`.
-        //    So even a correct seed would be refused by ORS before it could
-        //    reserve. No production `CanonicalEvidenceProvider` implementation
-        //    exists: the only ones are in `eliot-ors` test support and test files.
+        //    `:355`), whose production default binds that rejecting provider at
+        //    `store.rs:21803`; the only `open_with_evidence` (`store.rs:21813`)
+        //    call site is the `new_with_adapters` path at
+        //    `composition_bootstrap.rs:997`/`:1007`, which production composition
+        //    never takes. So even a correct seed would be refused by ORS before it
+        //    could reserve. No production `CanonicalEvidenceProvider`
+        //    implementation exists: the only ones are `eliot_ors` test support
+        //    and test files.
         //
-        // Facts 1-3 live in the storage/store-bridge owners, which is what this
-        // issue's `## Scope and owner` ("Kernel / ORS `redb` owner") excludes.
-        // Facts 3-4 are the write-side half of the Kernel's own gap and are not
-        // closed by this delivery either. Nothing here works around any of the
+        // Facts 1-2 and 4 live in the storage/store-bridge and ORS owners, which
+        // is what this issue's `## Scope and owner` ("Kernel / ORS `redb` owner")
+        // excludes. Fact 3 is the write-side half of the Kernel's own gap and is
+        // not closed by this delivery either. Nothing here works around any of the
         // four, and there is no configuration switch, second route or
         // `attach_*` probe that manufactures one call.
         //
@@ -7263,6 +7220,13 @@ impl KernelComposition {
             closure_refs: None,
             policy_fence: None,
             origin_evidence_refs: None,
+            // This leg read already-retained canonical evidence through the
+            // named-read gateway. Under I1.8 that is a read with its actual
+            // revision and provenance, not a newly generated record, so it
+            // declares the read class and carries NO semantic receipt: it did
+            // not commit anything and admits nothing about the content.
+            semantic_receipt_ref: None,
+            result_class: eliot_protocol::HostRequestResultClass::ExistingEvidenceRead,
             proof_ceiling: None,
             influence_state: eliot_security_contracts::InfluenceState::Unknown,
             instruction_taint: None,

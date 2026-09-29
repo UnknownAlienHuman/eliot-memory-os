@@ -154,6 +154,14 @@ pub enum EvidenceTier {
 
 /// Expiry-scoped capability evidence bound to one exact fingerprint and its
 /// explicit fingerprint invalidation dependencies.
+///
+/// Discovery-only and qualified-probe records are issued shape-checked by
+/// [`CapabilityEvidence::new`]. Production-observation records are never
+/// issued there: a caller-selected production tier would prove nothing was
+/// observed. They are projected only by the checked owner projection
+/// [`AttemptRouteOutcome::project_production_observation`], which witnesses a
+/// positively observed production attempt and derives the bound receipt by
+/// exact readback.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapabilityEvidence {
     fingerprint: String,
@@ -164,10 +172,21 @@ pub struct CapabilityEvidence {
     evidence_links: Vec<String>,
     invalidation_dependencies: Vec<HostFingerprint>,
     invalidated: bool,
+    /// True only when projected by the checked owner projection from a
+    /// positively observed production attempt. [`CapabilityEvidence::new`]
+    /// always leaves this false, so caller-minted records can never satisfy
+    /// the production admission path.
+    production_observed: bool,
 }
 
 impl CapabilityEvidence {
-    /// Issues capability evidence, validating every field fail-closed.
+    /// Issues discovery-only or qualified-probe capability evidence,
+    /// validating every field fail-closed.
+    ///
+    /// `EvidenceTier::ProductionObservation` is rejected here: the production
+    /// admission path needs a private checked owner projection, not a
+    /// caller-selected tier label. Use
+    /// [`AttemptRouteOutcome::project_production_observation`].
     pub fn new(
         fingerprint: &HostFingerprint,
         tier: EvidenceTier,
@@ -177,6 +196,9 @@ impl CapabilityEvidence {
         evidence_links: Vec<String>,
         invalidation_dependencies: Vec<HostFingerprint>,
     ) -> Result<Self, ConformanceError> {
+        if tier == EvidenceTier::ProductionObservation {
+            return Err(ConformanceError::InvalidInput);
+        }
         let evidence = Self {
             fingerprint: fingerprint.canonical(),
             tier,
@@ -186,6 +208,7 @@ impl CapabilityEvidence {
             evidence_links,
             invalidation_dependencies,
             invalidated: false,
+            production_observed: false,
         };
         evidence.validate()?;
         Ok(evidence)
@@ -313,6 +336,9 @@ pub fn admit_coverage(
     let live_for_scope = |tier: EvidenceTier| {
         evidence.iter().any(|item| {
             item.tier() == tier
+                // A caller-selected production label proves nothing was
+                // observed; only the owner projection witnesses production.
+                && (tier != EvidenceTier::ProductionObservation || item.production_observed)
                 && item.fingerprint() == active.canonical()
                 && item.scope() == required_scope
                 && item.is_live(now_unix_ms)
@@ -354,6 +380,9 @@ pub fn admit_coverage_for_claim(
     let live_for_claim = |tier: EvidenceTier| {
         evidence.iter().any(|item| {
             item.tier() == tier
+                // A caller-selected production label proves nothing was
+                // observed; only the owner projection witnesses production.
+                && (tier != EvidenceTier::ProductionObservation || item.production_observed)
                 && item.fingerprint() == active_canonical
                 && item.scope() == required_scope
                 && item.proof_ceiling() == required_proof_ceiling
@@ -478,9 +507,11 @@ fn verified_on_fingerprint(
     let probe = qualified
         .iter()
         .any(|item| item.tier() == EvidenceTier::ConformanceProbe);
+    // A caller-selected production label proves nothing was observed; only
+    // the owner projection witnesses production (I7.22).
     let observation = qualified
         .iter()
-        .any(|item| item.tier() == EvidenceTier::ProductionObservation);
+        .any(|item| item.tier() == EvidenceTier::ProductionObservation && item.production_observed);
     if !probe || !observation {
         return Err(ConformanceError::CandidateOnlyWhereVerifiedRequired);
     }
@@ -488,7 +519,9 @@ fn verified_on_fingerprint(
         .iter()
         .any(|item| item.tier() == EvidenceTier::ConformanceProbe && item.is_live(now_unix_ms));
     let live_observation = qualified.iter().any(|item| {
-        item.tier() == EvidenceTier::ProductionObservation && item.is_live(now_unix_ms)
+        item.tier() == EvidenceTier::ProductionObservation
+            && item.production_observed
+            && item.is_live(now_unix_ms)
     });
     if live_probe && live_observation {
         return Ok(());
@@ -625,6 +658,70 @@ pub fn reconcile_attempt_route(
         invalidated_count,
         quarantined,
     })
+}
+
+/// Owner bound on projected production-observation lifetime: one day in
+/// milliseconds. Projected evidence additionally never outlives its
+/// corroborating probe, so production confirmation stays bounded by both the
+/// owner clock and the probe it confirms.
+const MAX_PRODUCTION_OBSERVATION_TTL_MS: u64 = 86_400_000;
+
+impl AttemptRouteOutcome {
+    /// Projects production-observation evidence from a positively observed
+    /// production attempt (I7.22 "confirm the same capability on the exact
+    /// active fingerprint").
+    ///
+    /// This is the sole owner of [`EvidenceTier::ProductionObservation`]:
+    /// [`CapabilityEvidence::new`] rejects that tier because a
+    /// caller-selected label proves nothing was observed. Only a matched
+    /// reconciliation finding — the owner-observed record that the attempt's
+    /// actual route equalled its requested route — witnesses production.
+    ///
+    /// The bound receipt is derived by exact readback, never by copying
+    /// caller-selected tier, expiry, or proof strings: the fingerprint comes
+    /// from the exact active fingerprint, the scope and proof ceiling from
+    /// the live corroborating probe for the same capability, and the expiry
+    /// from the owner clock bounded by [`MAX_PRODUCTION_OBSERVATION_TTL_MS`]
+    /// and the probe's own expiry. `observed_span` names the observed
+    /// production run captured for this attempt.
+    pub fn project_production_observation(
+        &self,
+        probe: &CapabilityEvidence,
+        active: &HostFingerprint,
+        observed_span: &str,
+        now_unix_ms: u64,
+    ) -> Result<CapabilityEvidence, ConformanceError> {
+        if self.finding != RouteFinding::Matched {
+            return Err(ConformanceError::InvalidInput);
+        }
+        active.validate()?;
+        if !is_token(observed_span) {
+            return Err(ConformanceError::InvalidInput);
+        }
+        let active_canonical = active.canonical();
+        if probe.tier() != EvidenceTier::ConformanceProbe
+            || probe.fingerprint() != active_canonical
+            || !probe.is_live(now_unix_ms)
+        {
+            return Err(ConformanceError::CandidateOnlyWhereVerifiedRequired);
+        }
+        let owner_bounded = now_unix_ms
+            .checked_add(MAX_PRODUCTION_OBSERVATION_TTL_MS)
+            .ok_or(ConformanceError::InvalidInput)?;
+        let evidence = CapabilityEvidence {
+            fingerprint: active_canonical,
+            tier: EvidenceTier::ProductionObservation,
+            scope: probe.scope().to_owned(),
+            proof_ceiling: probe.proof_ceiling().to_owned(),
+            expires_unix_ms: owner_bounded.min(probe.expires_unix_ms),
+            evidence_links: vec![observed_span.to_owned()],
+            invalidation_dependencies: probe.invalidation_dependencies().to_vec(),
+            invalidated: false,
+            production_observed: true,
+        };
+        evidence.validate()?;
+        Ok(evidence)
+    }
 }
 
 /// Quarantine registry for route-mismatched fingerprints.

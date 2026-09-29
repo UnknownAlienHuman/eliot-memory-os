@@ -901,6 +901,19 @@ public enum UserAutomationOutcomeClass
     OwnerScheduleOutcomeUnknown,
 
     /// <summary>
+    /// The owner reports a current versioned transition bound to the submitted
+    /// operation. The Operator has no independent current-fence comparand, and
+    /// the schedule fields remain inspection data without normalization proof.
+    /// </summary>
+    OwnerBoundTransitionScheduleUnverified,
+
+    /// <summary>The owner reports non-retention, but no independent current-fence comparison is available.</summary>
+    OwnerReportedNotRetainedFenceUnverified,
+
+    /// <summary>The owner reports a commit with a ledger read owed, but the current fence is not independently compared.</summary>
+    OwnerReportedCommitFenceUnverifiedLedgerReadOwed,
+
+    /// <summary>
     /// The answer does not prove schedule normalization provenance. A decodable
     /// projection may be displayed for inspection, but is always unverified.
     /// </summary>
@@ -934,6 +947,93 @@ public sealed record UserAutomationOutcome(
     UserAutomationScheduleReceipt? Receipt);
 
 /// <summary>
+/// Identity retained by the Operator for the exact request whose response is
+/// being decoded. The transport correlation is deliberately a separate,
+/// optional field: this client does not expose its JSON-RPC identifier, so it
+/// remains null rather than being inferred from the operation key.
+/// </summary>
+public sealed record UserAutomationResultValidationContext
+{
+    // A reviewed decoder change must explicitly acknowledge the Rust result schema.
+    private const string SupportedUserAutomationResultSchemaSha256 = "97e2c5cdde5475940818fd97844dd08a293777941f0e2f9769936c370cb5b9c9";
+
+    private UserAutomationResultValidationContext(
+        string expectedOperationId,
+        string expectedIdempotencyKey,
+        string expectedResultWireId,
+        int supportedResultWireVersion,
+        string? transportCorrelationId)
+    {
+        ExpectedOperationId = expectedOperationId;
+        ExpectedIdempotencyKey = expectedIdempotencyKey;
+        ExpectedResultWireId = expectedResultWireId;
+        SupportedResultWireVersion = supportedResultWireVersion;
+        TransportCorrelationId = transportCorrelationId;
+    }
+
+    public string ExpectedOperationId { get; }
+
+    public string ExpectedIdempotencyKey { get; }
+
+    /// <summary>The versioned result contract this decoder admits.</summary>
+    public string ExpectedResultWireId { get; }
+
+    public int SupportedResultWireVersion { get; }
+
+    /// <summary>
+    /// The transport may expose a separate JSON-RPC correlation identifier in
+    /// a future client. It is null while the client hides that identifier and
+    /// is never substituted for the semantic operation identity.
+    /// </summary>
+    public string? TransportCorrelationId { get; }
+
+    /// <summary>
+    /// Creates validation context from the same request value that is sent or
+    /// retained for recovery. It preserves the exact retry key; the retained
+    /// request reader deliberately does not rederive it through today's
+    /// serializer. A newly minted request has already derived its key in
+    /// <see cref="UserAutomationOperatorRequest.Create"/>.
+    /// </summary>
+    public static UserAutomationResultValidationContext FromRequest(
+        UserAutomationOperatorRequest request,
+        string? transportCorrelationId = null)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        request.Validate();
+        if (transportCorrelationId is not null
+            && (string.IsNullOrWhiteSpace(transportCorrelationId)
+                || transportCorrelationId.Length > 256
+                || transportCorrelationId.Any(char.IsControl)))
+        {
+            throw new ArgumentException("transport correlation identifier is malformed", nameof(transportCorrelationId));
+        }
+
+        return new UserAutomationResultValidationContext(
+            $"user-automation-operation:{request.IdempotencyKey}",
+            request.IdempotencyKey,
+            OperatorScheduleContract.USER_AUTOMATION_RESULT_WIRE_ID,
+            OperatorScheduleContract.USER_AUTOMATION_RESULT_WIRE_VERSION,
+            transportCorrelationId);
+    }
+
+    /// <summary>Rejects a context that does not name the current closed wire contract.</summary>
+    public bool IsValid() =>
+        string.Equals(
+            ExpectedOperationId,
+            $"user-automation-operation:{ExpectedIdempotencyKey}",
+            StringComparison.Ordinal)
+        && string.Equals(
+            ExpectedResultWireId,
+            OperatorScheduleContract.USER_AUTOMATION_RESULT_WIRE_ID,
+            StringComparison.Ordinal)
+        && SupportedResultWireVersion == OperatorScheduleContract.USER_AUTOMATION_RESULT_WIRE_VERSION
+        && string.Equals(
+            OperatorScheduleContract.USER_AUTOMATION_RESULT_SCHEMA_SHA256,
+            SupportedUserAutomationResultSchemaSha256,
+            StringComparison.Ordinal);
+}
+
+/// <summary>
 /// Decodes one owner answer into a typed, actionable outcome.
 /// </summary>
 /// <remarks>
@@ -953,7 +1053,7 @@ public sealed record UserAutomationOutcome(
 /// </remarks>
 public static class UserAutomationOutcomeClassifier
 {
-    private const int MaxTypedEnvelopeChars = 8_192;
+    private const int MaxTypedEnvelopeChars = OperatorProtocol.MaxLineChars;
     private const int MaxIdentityChars = 256;
     // The Kernel's bounded idempotency key is prefixed in operation_id.
     private const int MaxOperationIdChars = 320;
@@ -966,18 +1066,20 @@ public static class UserAutomationOutcomeClassifier
     private const string OptionalOrchestrationMember = "orchestration";
     private const int MaxRefusalFieldChars = 256;
     private const int MaxRecoveryReasonChars = 1_024;
-    private const int MaxScheduleScanDepth = 6;
-    private const int MaxScheduleScannedObjects = 64;
     // Bound summary text; the retained response remains available separately.
     private const int MaxDescribedOccurrences = 8;
     /// <summary>Decodes one owner answer for one typed operation identity.</summary>
     public static UserAutomationOutcome Read(
         string action,
         JsonElement answer,
-        string expectedIdempotencyKey)
+        UserAutomationResultValidationContext context)
     {
         ArgumentNullException.ThrowIfNull(action);
-        ArgumentException.ThrowIfNullOrWhiteSpace(expectedIdempotencyKey);
+        ArgumentNullException.ThrowIfNull(context);
+        if (!context.IsValid())
+        {
+            return UnverifiedOwnerAnswer(action, "the submitted result-validation context is unsupported");
+        }
         if (answer.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null)
         {
             return OwnerAbsent(action, "the owner route returned no result payload.");
@@ -986,6 +1088,13 @@ public static class UserAutomationOutcomeClassifier
         if (answer.ValueKind != JsonValueKind.Object)
         {
             return UnverifiedOwnerAnswer(action, "the owner answer is not one JSON object");
+        }
+
+        if (!HasCurrentResultEnvelope(answer, context))
+        {
+            return UnverifiedOwnerAnswer(
+                action,
+                "the owner answer is missing the supported versioned result envelope or its operation/fence binding");
         }
 
         if (answer.TryGetProperty("status", out _))
@@ -997,7 +1106,7 @@ public static class UserAutomationOutcomeClassifier
 
             if (string.Equals(statusText, "unknown", StringComparison.Ordinal))
             {
-                return ReadUnknownEnvelope(action, answer, expectedIdempotencyKey);
+                return ReadUnknownEnvelope(action, answer, context);
             }
 
             if (string.Equals(statusText, "known", StringComparison.Ordinal))
@@ -1008,7 +1117,7 @@ public static class UserAutomationOutcomeClassifier
                 // travels with it: a JSON-RPC-correlated body is transport
                 // evidence, not the Store operation identity it must answer
                 // (#2972).
-                return ReadKnownEnvelope(action, answer, expectedIdempotencyKey);
+                return ReadKnownEnvelope(action, answer, context);
             }
 
             return UnverifiedOwnerAnswer(
@@ -1052,16 +1161,52 @@ public static class UserAutomationOutcomeClassifier
     private static UserAutomationOutcome ReadKnownEnvelope(
         string action,
         JsonElement answer,
-        string expectedIdempotencyKey)
+        UserAutomationResultValidationContext context)
     {
-        if (!HasExactProperties(answer, "status", "value", "recovery")
-            || !TryReadBoundedText(answer, "status", 32, out var status)
+        if (!TryReadBoundedText(answer, "status", 32, out var status)
             || !string.Equals(status, "known", StringComparison.Ordinal)
             || !TryGetObject(answer, "value", out var value)
             || !answer.TryGetProperty("recovery", out var recovery)
-            || recovery.ValueKind != JsonValueKind.Null)
+            || recovery.ValueKind is not (JsonValueKind.Null or JsonValueKind.Object))
         {
             return UnverifiedOwnerAnswer(action, "the known owner transition is not a closed, settled typed shape");
+        }
+
+        if (HasExactProperties(value, "accepted", "outcome", "reason")
+            && value.TryGetProperty("accepted", out var notRetainedAccepted)
+            && notRetainedAccepted.ValueKind == JsonValueKind.False
+            && TryReadBoundedText(value, "outcome", 64, out var notRetainedOutcome)
+            && string.Equals(notRetainedOutcome, "not_retained", StringComparison.Ordinal)
+            && TryReadBoundedText(value, "reason", MaxRecoveryReasonChars, out var notRetainedReason)
+            && recovery.ValueKind == JsonValueKind.Null)
+        {
+            return new UserAutomationOutcome(
+                UserAutomationOutcomeClass.OwnerReportedNotRetainedFenceUnverified,
+                $"UserAutomation {action}: owner reports not retained; current fence unverified",
+                $"The owner reports that this operation was not retained: {notRetainedReason}. The Operator has no independent submitted/current State Fence comparand for this result, so this remains an owner-reported value and does not authorize a new submission.",
+                RefusalKind: null,
+                RefusalText: null,
+                Receipt: null);
+        }
+
+        if (HasExactProperties(value, "accepted", "outcome", "reason")
+            && value.TryGetProperty("accepted", out var settledAccepted)
+            && settledAccepted.ValueKind == JsonValueKind.True
+            && TryReadBoundedText(value, "outcome", 64, out var settledOutcome)
+            && string.Equals(settledOutcome, "outcome_settled", StringComparison.Ordinal)
+            && TryReadBoundedText(value, "reason", MaxRecoveryReasonChars, out var settledReason)
+            && HasExactProperties(recovery, "kind", "reason")
+            && TryReadBoundedText(recovery, "kind", 64, out var settledRecoveryKind)
+            && string.Equals(settledRecoveryKind, "ledger_read_owed", StringComparison.Ordinal)
+            && TryReadBoundedText(recovery, "reason", MaxRecoveryReasonChars, out var ledgerReadReason))
+        {
+            return new UserAutomationOutcome(
+                UserAutomationOutcomeClass.OwnerReportedCommitFenceUnverifiedLedgerReadOwed,
+                $"UserAutomation {action}: owner reports commit; current fence unverified and ledger read owed",
+                $"The owner reports a canonical commit ({settledReason}) and a separate ledger read remains owed ({ledgerReadReason}). The Operator has no independent submitted/current State Fence comparand for this result, so keep it under the same identity and reconcile before another submission.",
+                RefusalKind: null,
+                RefusalText: null,
+                Receipt: null);
         }
 
         // A pre-Store runtime-channel rejection uses this separate closed
@@ -1071,7 +1216,8 @@ public static class UserAutomationOutcomeClassifier
             && accepted.ValueKind == JsonValueKind.False
             && TryReadBoundedText(value, "outcome", 64, out var outcome)
             && string.Equals(outcome, "rejected", StringComparison.Ordinal)
-            && TryReadBoundedText(value, "reason", MaxRecoveryReasonChars, out var reason))
+            && TryReadBoundedText(value, "reason", MaxRecoveryReasonChars, out var reason)
+            && recovery.ValueKind == JsonValueKind.Null)
         {
             return new UserAutomationOutcome(
                 UserAutomationOutcomeClass.OwnerRefused,
@@ -1089,7 +1235,8 @@ public static class UserAutomationOutcomeClassifier
             && value.TryGetProperty("accepted", out var identityAccepted)
             && identityAccepted.ValueKind == JsonValueKind.False
             && TryReadBoundedText(value, "outcome", 64, out var identityOutcome)
-            && string.Equals(identityOutcome, "identity_conflict", StringComparison.Ordinal))
+            && string.Equals(identityOutcome, "identity_conflict", StringComparison.Ordinal)
+            && recovery.ValueKind == JsonValueKind.Null)
         {
             return new UserAutomationOutcome(
                 UserAutomationOutcomeClass.OwnerRefused,
@@ -1109,10 +1256,15 @@ public static class UserAutomationOutcomeClassifier
         // submitted request before any schedule projection is scanned or any
         // answer is described, and a nested projection never compensates for a
         // foreign parent result.
-        if (!TryGetObject(value, "identity", out var identity)
+        if (recovery.ValueKind != JsonValueKind.Null
+            || !HasExactProperties(value, OperatorScheduleContract.USER_AUTOMATION_TRANSITION_VALUE_MEMBERS)
+            || !TryGetObject(value, "transition", out var transition)
+            || !HasCurrentTransitionShape(transition)
+            || !HasCurrentInspectionProjection(value)
+            || !TryGetObject(transition, "identity", out var identity)
             || !MatchesOperationIdentity(
                 identity,
-                expectedIdempotencyKey,
+                context,
                 CanonicalRequestHashMember))
         {
             return UnverifiedOwnerAnswer(
@@ -1123,26 +1275,24 @@ public static class UserAutomationOutcomeClassifier
         // The State Fence context is read through the same closed helper the
         // typed refusal path uses, so both result paths accept one fence shape
         // and neither infers a lineage, generation or revision from names.
-        if (!TryGetObject(value, "state_fence", out var stateFence)
-            || !IsClosedStateFence(stateFence))
+        if (!TryGetObject(transition, "state_fence", out var stateFence)
+            || !IsClosedStateFence(stateFence)
+            || !TryGetObject(answer, "state_fence", out var envelopeFence)
+            || !SameSerializedFence(stateFence, envelopeFence))
         {
             return UnverifiedOwnerAnswer(
                 action,
                 "the known owner transition does not carry a closed State Fence for this request");
         }
 
-        if (!HasUserAutomationTransitionProperties(value))
-        {
-            return UnverifiedOwnerAnswer(action, "the known owner result has an unsupported value shape");
-        }
-
         var projection = FindScheduleProjection(answer);
         if (projection is not null)
         {
             return new UserAutomationOutcome(
-                UserAutomationOutcomeClass.UnverifiedOwnerAnswer,
+                UserAutomationOutcomeClass.OwnerBoundTransitionScheduleUnverified,
                 $"UserAutomation {action} answered — schedule normalization unverified",
-                "The owner returned a settled transition. "
+                "The owner reports a known transition under its reported State Fence. "
+                + "The Operator has no independent submitted/current-fence comparand. "
                 + DescribeUnverifiedScheduleProjection(projection),
                 RefusalKind: null,
                 RefusalText: null,
@@ -1150,9 +1300,10 @@ public static class UserAutomationOutcomeClassifier
         }
 
         return new UserAutomationOutcome(
-            UserAutomationOutcomeClass.UnverifiedOwnerAnswer,
+            UserAutomationOutcomeClass.OwnerBoundTransitionScheduleUnverified,
             $"UserAutomation {action} answered — schedule not verified",
-            "the owner answered this typed operation but this answer carries no decodable "
+            "The owner reports a known transition under its reported State Fence, but the Operator has no independent submitted/current-fence comparand. "
+            + "This answer carries no decodable "
             + $"{OperatorScheduleContract.NORMALIZED_OCCURRENCE_ENCODING} occurrence projection, "
             + "so the Operator does not report the schedule as normalized",
             RefusalKind: null,
@@ -1163,10 +1314,9 @@ public static class UserAutomationOutcomeClassifier
     private static UserAutomationOutcome ReadUnknownEnvelope(
         string action,
         JsonElement answer,
-        string expectedIdempotencyKey)
+        UserAutomationResultValidationContext context)
     {
-        if (!HasExactProperties(answer, "status", "value", "recovery")
-            || !TryReadBoundedText(answer, "status", 32, out var status)
+        if (!TryReadBoundedText(answer, "status", 32, out var status)
             || !string.Equals(status, "unknown", StringComparison.Ordinal)
             || !TryGetObject(answer, "value", out var value)
             || !TryGetObject(answer, "recovery", out var recovery))
@@ -1181,7 +1331,7 @@ public static class UserAutomationOutcomeClassifier
             {
                 return UnverifiedOwnerAnswer(action, "the typed refusal envelope exceeds its size bound");
             }
-            return ReadAttemptRefusal(action, value, recovery, expectedIdempotencyKey);
+            return ReadAttemptRefusal(action, value, recovery, context, answer);
         }
 
         if (HasExactProperties(value, "outcome")
@@ -1220,7 +1370,7 @@ public static class UserAutomationOutcomeClassifier
                 Receipt: null);
         }
 
-        if (HasUserAutomationTransitionProperties(value)
+        if (HasUserAutomationTransitionProperties(value, context, answer)
             && HasExactProperties(recovery, "kind", "reason")
             && TryReadBoundedText(recovery, "kind", 64, out var transitionRecoveryKind)
             && (string.Equals(transitionRecoveryKind, "unknown_outcome", StringComparison.Ordinal)
@@ -1251,63 +1401,843 @@ public static class UserAutomationOutcomeClassifier
     }
 
     /// <summary>
-    /// The closed current UserAutomation transition value members, in owner
-    /// order. <c>orchestration</c> is the one post-commit runtime-obligation
-    /// record the owner began projecting when the durable runtime handoff
-    /// landed (#2806/#2969); a current transition carries it.
+    /// Admits only the current transition nested in the versioned result
+    /// wrapper. No wire version is inferred from a familiar member census.
     /// </summary>
-    private static readonly string[] UserAutomationTransitionMembers =
-    [
-        "identity",
-        "state_fence",
-        "configuration",
-        "wake",
-        "horizon",
-        OptionalOrchestrationMember,
-        "execution",
-        "occurrences",
-    ];
+    private static bool HasUserAutomationTransitionProperties(
+        JsonElement value,
+        UserAutomationResultValidationContext context,
+        JsonElement answer) =>
+        HasExactProperties(value, OperatorScheduleContract.USER_AUTOMATION_TRANSITION_VALUE_MEMBERS)
+        && TryGetObject(value, "transition", out var transition)
+        && HasCurrentTransitionShape(transition)
+        && HasCurrentInspectionProjection(value)
+        && TryGetObject(transition, "identity", out var identity)
+        && MatchesOperationIdentity(identity, context, CanonicalRequestHashMember)
+        && TryGetObject(transition, "state_fence", out var stateFence)
+        && IsClosedStateFence(stateFence)
+        && TryGetObject(answer, "state_fence", out var envelopeFence)
+        && SameSerializedFence(stateFence, envelopeFence);
 
-    /// <summary>
-    /// The same closed set as an answer from before that record existed. It
-    /// stays readable as bounded diagnostic evidence for an older owner, and
-    /// nothing here infers a current owner version from its property names
-    /// (#2972).
-    /// </summary>
-    private static readonly string[] LegacyUserAutomationTransitionMembers =
-    [
-        "identity",
-        "state_fence",
-        "configuration",
-        "wake",
-        "horizon",
-        "execution",
-        "occurrences",
-    ];
+    private static bool HasCurrentResultEnvelope(
+        JsonElement answer,
+        UserAutomationResultValidationContext context)
+    {
+        if (!HasExactProperties(answer, OperatorScheduleContract.USER_AUTOMATION_RESULT_ENVELOPE_MEMBERS)
+            || !TryReadBoundedText(answer, "wire_id", 128, out var wireId)
+            || !string.Equals(wireId, context.ExpectedResultWireId, StringComparison.Ordinal)
+            || !answer.TryGetProperty("wire_version", out var wireVersion)
+            || wireVersion.ValueKind != JsonValueKind.Number
+            || !wireVersion.TryGetInt32(out var version)
+            || version != context.SupportedResultWireVersion
+            || !TryGetObject(answer, "correlation", out var correlation)
+            || !HasExactProperties(correlation, OperatorScheduleContract.USER_AUTOMATION_RESULT_CORRELATION_MEMBERS)
+            || !MatchesResultCorrelation(correlation, context)
+            || !TryGetObject(answer, "state_fence", out var stateFence)
+            || !IsClosedStateFence(stateFence))
+        {
+            return false;
+        }
 
-    /// <summary>
-    /// Admits the closed transition shape and its exact optional semantics: the
-    /// owner projects the orchestration record as <c>null</c> exactly when the
-    /// operation owns no runtime obligation, and an answer from before that
-    /// record existed omits it and is admitted by the legacy census instead. A
-    /// missing record is therefore a complete answer about an obligation that
-    /// never existed rather than a corrupt shape, while any other value kind is
-    /// neither and is refused.
-    /// </summary>
-    private static bool HasUserAutomationTransitionProperties(JsonElement value) =>
-        (HasExactProperties(value, UserAutomationTransitionMembers)
-            && HasCurrentOrchestrationRecord(value))
-        || HasExactProperties(value, LegacyUserAutomationTransitionMembers);
+        return true;
+    }
 
-    private static bool HasCurrentOrchestrationRecord(JsonElement value) =>
-        value.TryGetProperty(OptionalOrchestrationMember, out var orchestration)
-        && orchestration.ValueKind is JsonValueKind.Null or JsonValueKind.Object;
+    private static bool MatchesResultCorrelation(
+        JsonElement correlation,
+        UserAutomationResultValidationContext context) =>
+        TryReadBoundedText(correlation, "operation_id", MaxOperationIdChars, out var operationId)
+        && string.Equals(operationId, context.ExpectedOperationId, StringComparison.Ordinal)
+        && TryReadBoundedText(correlation, "idempotency_key", MaxIdentityChars, out var idempotencyKey)
+        && string.Equals(idempotencyKey, context.ExpectedIdempotencyKey, StringComparison.Ordinal);
+
+    private static bool HasCurrentTransitionShape(JsonElement transition) =>
+        HasAllowedAndRequiredProperties(
+            transition,
+            OperatorScheduleContract.USER_AUTOMATION_TRANSITION_MEMBERS,
+            OperatorScheduleContract.USER_AUTOMATION_TRANSITION_REQUIRED_MEMBERS)
+        && TryReadBoundedText(transition, "wire_id", 128, out var wireId)
+        && string.Equals(wireId, OperatorScheduleContract.USER_AUTOMATION_TRANSITION_WIRE_ID, StringComparison.Ordinal)
+        && transition.TryGetProperty("wire_version", out var versionValue)
+        && versionValue.ValueKind == JsonValueKind.Number
+        && versionValue.TryGetInt32(out var version)
+        && version == OperatorScheduleContract.USER_AUTOMATION_TRANSITION_WIRE_VERSION
+        && TryGetObject(transition, "identity", out var identity)
+        && HasExactProperties(identity, "operation_id", "canonical_request_hash", "idempotency_key")
+        && TryReadBoundedText(identity, "operation_id", MaxOperationIdChars, out _)
+        && TryReadBoundedText(identity, "canonical_request_hash", 64, out var canonicalHash)
+        && IsLowerHexSha256(canonicalHash)
+        && TryReadBoundedText(identity, "idempotency_key", MaxIdentityChars, out _)
+        && TryGetObject(transition, "state_fence", out var stateFence)
+        && IsClosedStateFence(stateFence)
+        && TryGetObject(transition, "configuration", out var configuration)
+        && HasCurrentConfigurationPhase(configuration)
+        && TryGetObject(transition, "wake", out var wake)
+        && HasCurrentWakePhase(wake)
+        && TryGetObject(transition, "execution", out var execution)
+        && HasCurrentExecutionPhase(execution)
+        && OptionalRecordIsAbsentOrObject(transition, "horizon")
+        && (!transition.TryGetProperty("horizon", out var horizon) || HasCurrentHorizonPhase(horizon))
+        && OptionalRecordIsAbsentOrObject(transition, OptionalOrchestrationMember)
+        && (!transition.TryGetProperty(OptionalOrchestrationMember, out var orchestration)
+            || HasCurrentOrchestrationRecord(orchestration));
+
+    // Rust serializes both Option records with skip_serializing_if=None. An
+    // absent member means None; explicit null is outside the current wire.
+    private static bool OptionalRecordIsAbsentOrObject(JsonElement value, string propertyName) =>
+        !value.TryGetProperty(propertyName, out var optional)
+        || optional.ValueKind == JsonValueKind.Object;
+
+    private static bool HasCurrentConfigurationPhase(JsonElement phase)
+    {
+        if (!TryReadClosedValue(
+                phase,
+                "kind",
+                OperatorScheduleContract.USER_AUTOMATION_CONFIGURATION_PHASE_KINDS,
+                out var kind))
+        {
+            return false;
+        }
+
+        return kind switch
+        {
+            "read" => HasExactProperties(phase, "kind", "result")
+                && TryGetObject(phase, "result", out var readResult)
+                && HasCurrentReadResult(readResult),
+            "committed" or "replayed" => HasExactProperties(phase, "kind", "receipt", "result")
+                && TryGetObject(phase, "receipt", out var receipt)
+                && HasCurrentWriteReceipt(receipt)
+                && TryGetObject(phase, "result", out var mutationResult)
+                && HasCurrentMutationResult(mutationResult),
+            _ => false
+        };
+    }
+
+    private static bool HasCurrentReadResult(JsonElement result)
+    {
+        if (!TryReadClosedValue(
+                result,
+                "kind",
+                OperatorScheduleContract.USER_AUTOMATION_READ_RESULT_KINDS,
+                out var kind))
+        {
+            return false;
+        }
+
+        return kind switch
+        {
+            "list" => HasExactProperties(result, "kind", "revisions")
+                && HasObjectArray(result, "revisions")
+                && HasCurrentRevisionArray(result.GetProperty("revisions")),
+            "status" => HasExactProperties(result, "kind", "revision", "execution")
+                && TryGetObject(result, "revision", out var statusRevision)
+                && HasCurrentRevision(statusRevision)
+                && TryGetObject(result, "execution", out var statusExecution)
+                && HasCurrentExecutionProjection(statusExecution),
+            "history" => HasExactProperties(result, "kind", "automation_id", "execution")
+                && TryReadBoundedText(result, "automation_id", MaxIdentityChars, out _)
+                && TryGetObject(result, "execution", out var historyExecution)
+                && HasCurrentExecutionProjection(historyExecution),
+            "inspect_last_failure" => HasExactProperties(result, "kind", "automation_id", "revision", "failure")
+                && TryReadBoundedText(result, "automation_id", MaxIdentityChars, out _)
+                && TryGetObject(result, "revision", out var failureRevision)
+                && HasCurrentRevision(failureRevision)
+                && result.TryGetProperty("failure", out var failure)
+                && (failure.ValueKind == JsonValueKind.Null || HasCurrentFailureProjection(failure)),
+            _ => false
+        };
+    }
+
+    private static bool HasCurrentRevisionArray(JsonElement revisions)
+    {
+        foreach (var revision in revisions.EnumerateArray())
+        {
+            if (!HasCurrentRevision(revision)) return false;
+        }
+        return true;
+    }
+
+    private static bool HasCurrentRevision(JsonElement revision) =>
+        HasExactProperties(revision, OperatorScheduleContract.USER_AUTOMATION_REVISION_MEMBERS)
+        && TryReadBoundedText(revision, "automation_id", MaxIdentityChars, out _)
+        && TryReadBoundedText(revision, "revision", MaxIdentityChars, out _)
+        && HasOptionalBoundedText(revision, "supersedes", MaxIdentityChars)
+        && TryReadBoundedText(revision, "owner_principal", OperatorScheduleContract.MAX_TEXT_BYTES, out _)
+        && TryGetObject(revision, "work_scope", out var workScope)
+        && HasExactProperties(workScope, OperatorScheduleContract.USER_AUTOMATION_WORK_SCOPE_MEMBERS)
+        && TryReadBoundedText(workScope, "scope_id", MaxIdentityChars, out _)
+        && TryReadBoundedText(workScope, "product_id", MaxIdentityChars, out _)
+        && TryReadBoundedText(workScope, "workdir_ref", OperatorScheduleContract.MAX_TEXT_BYTES, out _)
+        && TryReadBoundedText(revision, "natural_language_intent", OperatorScheduleContract.MAX_TEXT_BYTES, out _)
+        && TryGetObject(revision, "schedule", out var schedule)
+        && HasCurrentNormalizedSchedule(schedule)
+        && TryReadClosedValue(revision, "mode", OperatorScheduleContract.USER_AUTOMATION_EXECUTION_MODES, out _)
+        && TryGetObject(revision, "task", out var task)
+        && HasExactProperties(task, OperatorScheduleContract.USER_AUTOMATION_TASK_BINDING_MEMBERS)
+        && TryReadBoundedText(task, "qualified_ref", OperatorScheduleContract.MAX_TEXT_BYTES, out _)
+        && TryReadClosedValue(task, "kind", OperatorScheduleContract.USER_AUTOMATION_TASK_KINDS, out _)
+        && TryGetObject(task, "capability_profile", out var capabilityProfile)
+        && HasExactProperties(capabilityProfile, OperatorScheduleContract.USER_AUTOMATION_CAPABILITY_PROFILE_MEMBERS)
+        && IsBooleanProperty(capabilityProfile, "model_access")
+        && IsBooleanProperty(capabilityProfile, "provider_access")
+        && IsBooleanProperty(capabilityProfile, "automation_scheduling")
+        && HasBoundedStringArray(revision, "portable_skill_package_revision_refs", OperatorScheduleContract.MAX_TEXT_BYTES)
+        && HasBoundedArrayLength(revision, "portable_skill_package_revision_refs", OperatorScheduleContract.MAX_REFERENCES)
+        && TryReadBoundedText(revision, "workdir_ref", OperatorScheduleContract.MAX_TEXT_BYTES, out _)
+        && TryGetObject(revision, "route_cost_policy", out var routeCost)
+        && HasExactProperties(routeCost, OperatorScheduleContract.USER_AUTOMATION_ROUTE_COST_POLICY_MEMBERS)
+        && TryReadBoundedText(routeCost, "route_ref", OperatorScheduleContract.MAX_TEXT_BYTES, out _)
+        && IsPositiveUInt64Property(routeCost, "max_cost_units")
+        && IsPositiveUInt64Property(routeCost, "max_duration_ms")
+        && IsNullOrPositiveUInt64Property(routeCost, "policy_revision")
+        && TryGetObject(revision, "provider_policy", out var providerPolicy)
+        && HasCurrentProviderPolicy(providerPolicy)
+        && TryGetObject(revision, "delivery_target", out var deliveryTarget)
+        && HasExactProperties(deliveryTarget, OperatorScheduleContract.USER_AUTOMATION_DELIVERY_TARGET_MEMBERS)
+        && TryReadBoundedText(deliveryTarget, "target_ref", OperatorScheduleContract.MAX_TEXT_BYTES, out _)
+        && HasClosedStringArray(deliveryTarget, "channels", OperatorScheduleContract.USER_AUTOMATION_DELIVERY_CHANNELS)
+        && HasBoundedStringArray(deliveryTarget, "recipient_refs", OperatorScheduleContract.MAX_TEXT_BYTES)
+        && TryReadBoundedText(revision, "preflight_contract_revision", OperatorScheduleContract.MAX_TEXT_BYTES, out _)
+        && TryGetObject(revision, "resource_ceiling", out var resourceCeiling)
+        && HasExactProperties(resourceCeiling, OperatorScheduleContract.USER_AUTOMATION_RESOURCE_CEILING_MEMBERS)
+        && IsPositiveUInt64Property(resourceCeiling, "max_runtime_ms")
+        && IsPositiveUInt64Property(resourceCeiling, "max_output_bytes")
+        && IsUnsignedIntegerProperty(resourceCeiling, "max_child_count")
+        && TryReadClosedValue(revision, "overlap_policy", OperatorScheduleContract.USER_AUTOMATION_OVERLAP_POLICIES, out _)
+        && TryGetObject(revision, "recursion_policy", out var recursionPolicy)
+        && HasExactProperties(recursionPolicy, OperatorScheduleContract.USER_AUTOMATION_RECURSION_POLICY_MEMBERS)
+        && IsBooleanProperty(recursionPolicy, "allow_child_automation")
+        && IsUnsignedIntegerProperty(recursionPolicy, "max_child_depth")
+        && TryReadClosedValue(revision, "configuration_state", OperatorScheduleContract.USER_AUTOMATION_CONFIGURATION_STATES, out _)
+        && TryReadClosedValue(revision, "work_class", OperatorScheduleContract.USER_AUTOMATION_WORK_CLASSES, out _)
+        && HasBoundedStringArray(revision, "current_execution_refs", OperatorScheduleContract.MAX_TEXT_BYTES)
+        && HasBoundedArrayLength(revision, "current_execution_refs", OperatorScheduleContract.MAX_REFERENCES)
+        && TryReadBoundedText(revision, "execution_history_query_ref", OperatorScheduleContract.MAX_TEXT_BYTES, out _);
+
+    private static bool HasCurrentNormalizedSchedule(JsonElement schedule) =>
+        HasExactProperties(schedule, OperatorScheduleContract.USER_AUTOMATION_NORMALIZED_SCHEDULE_MEMBERS)
+        && TryReadClosedValue(schedule, "kind", OperatorScheduleContract.USER_AUTOMATION_SCHEDULE_KINDS, out _)
+        && TryReadBoundedText(schedule, "expression", OperatorScheduleContract.MAX_TEXT_BYTES, out _)
+        && TryReadBoundedText(schedule, "calendar", OperatorScheduleContract.MAX_TEXT_BYTES, out _)
+        && TryReadBoundedText(schedule, "timezone", OperatorScheduleContract.MAX_ZONE_IDENTITY_BYTES, out _)
+        && TryReadClosedValue(schedule, "dst_fold", OperatorScheduleContract.USER_AUTOMATION_DST_FOLD_POLICIES, out _)
+        && TryReadClosedValue(schedule, "dst_gap", OperatorScheduleContract.USER_AUTOMATION_DST_GAP_POLICIES, out _)
+        && TryReadBoundedText(schedule, "start_at", OperatorScheduleContract.UTC_INSTANT_BYTES, out _)
+        && HasOptionalBoundedText(schedule, "end_at", OperatorScheduleContract.UTC_INSTANT_BYTES)
+        && HasBoundedStringArray(schedule, "next_occurrences", OperatorScheduleContract.MAX_OCCURRENCE_KEY_BYTES)
+        && HasBoundedArrayLength(schedule, "next_occurrences", OperatorScheduleContract.MAX_REFERENCES, requireNonEmpty: true);
+
+    private static bool HasCurrentProviderPolicy(JsonElement policy)
+    {
+        if (!TryReadClosedValue(policy, "kind", OperatorScheduleContract.USER_AUTOMATION_PROVIDER_POLICY_KINDS, out var kind))
+        {
+            return false;
+        }
+        return kind switch
+        {
+            "deterministic_only" => HasExactProperties(policy, "kind"),
+            "allowed" => HasExactProperties(policy, "kind", "fingerprints")
+                && HasObjectArray(policy, "fingerprints")
+                && HasCurrentProviderFingerprints(policy.GetProperty("fingerprints")),
+            _ => false
+        };
+    }
+
+    private static bool HasCurrentProviderFingerprints(JsonElement fingerprints)
+    {
+        foreach (var fingerprint in fingerprints.EnumerateArray())
+        {
+            if (!HasExactProperties(fingerprint, OperatorScheduleContract.USER_AUTOMATION_PROVIDER_FINGERPRINT_MEMBERS)
+                || !TryReadBoundedText(fingerprint, "provider", OperatorScheduleContract.MAX_TEXT_BYTES, out _)
+                || !TryReadBoundedText(fingerprint, "model", OperatorScheduleContract.MAX_TEXT_BYTES, out _)
+                || !TryReadBoundedText(fingerprint, "adapter", OperatorScheduleContract.MAX_TEXT_BYTES, out _)
+                || !TryReadBoundedText(fingerprint, "fingerprint", OperatorScheduleContract.MAX_TEXT_BYTES, out _))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static bool HasCurrentWriteReceipt(JsonElement receipt) =>
+        HasExactProperties(receipt, OperatorScheduleContract.USER_AUTOMATION_WRITE_RECEIPT_MEMBERS)
+        && TryReadBoundedText(receipt, "operation_id", MaxOperationIdChars, out _)
+        && TryReadBoundedText(receipt, "idempotency_key", OperatorScheduleContract.MAX_TEXT_BYTES, out _)
+        && TryReadBoundedText(receipt, "canonical_request_hash", 64, out var requestHash)
+        && IsLowerHexSha256(requestHash)
+        && TryReadClosedValue(receipt, "transition_class", OperatorScheduleContract.USER_AUTOMATION_TRANSITION_CLASSES, out _)
+        && TryReadClosedValue(receipt, "status", OperatorScheduleContract.USER_AUTOMATION_WRITE_RECEIPT_STATUS_VALUES, out _)
+        && HasOptionalBoundedText(receipt, "commit_id", OperatorScheduleContract.MAX_TEXT_BYTES)
+        && TryGetObject(receipt, "state_fence", out var receiptFence)
+        && IsClosedStateFence(receiptFence)
+        && HasObjectArray(receipt, "ordering_sequences")
+        && HasObjectArray(receipt, "revision_before_after")
+        && HasBoundedStringArray(receipt, "applied_command_ids", OperatorScheduleContract.MAX_TEXT_BYTES)
+        && HasBoundedStringArray(receipt, "emitted_event_ids", OperatorScheduleContract.MAX_TEXT_BYTES)
+        && HasBoundedStringArray(receipt, "projection_refs", OperatorScheduleContract.MAX_TEXT_BYTES)
+        && HasBoundedStringArray(receipt, "outbox_refs", OperatorScheduleContract.MAX_TEXT_BYTES)
+        && TryReadBoundedText(receipt, "operation_manifest_digest", OperatorScheduleContract.MAX_TEXT_BYTES, out _)
+        && TryReadBoundedText(receipt, "admission_digest", 64, out var admissionDigest)
+        && IsLowerHexSha256(admissionDigest)
+        && TryReadBoundedText(receipt, "mutation_plan_digest", 64, out var mutationDigest)
+        && IsLowerHexSha256(mutationDigest)
+        && HasBoundedStringArray(receipt, "semantic_source_revisions", OperatorScheduleContract.MAX_TEXT_BYTES)
+        && TryGetObject(receipt, "policy_config_schema_versions", out var policySchema)
+        && HasExactProperties(policySchema, OperatorScheduleContract.USER_AUTOMATION_POLICY_SCHEMA_MEMBERS)
+        && HasOptionalClosedValue(receipt, "error_code", OperatorScheduleContract.USER_AUTOMATION_ERROR_CODE_VALUES)
+        && TryReadClosedValue(receipt, "resubmission", OperatorScheduleContract.USER_AUTOMATION_RESUBMISSION_VALUES, out _)
+        && HasOptionalBoundedText(receipt, "committed_at", OperatorScheduleContract.MAX_TEXT_BYTES)
+        && OptionalRecordIsAbsentOrObject(receipt, "envelope");
+
+    private static bool HasCurrentWakeIntent(JsonElement intent) =>
+        HasExactProperties(intent, OperatorScheduleContract.USER_AUTOMATION_WAKE_INTENT_MEMBERS)
+        && TryReadBoundedText(intent, "wake_id", OperatorScheduleContract.MAX_TEXT_BYTES, out _)
+        && TryReadBoundedText(intent, "reason", OperatorScheduleContract.MAX_TEXT_BYTES, out _)
+        && TryGetObject(intent, "state_fence", out var fence)
+        && IsClosedStateFence(fence)
+        && TryReadClosedValue(intent, "state", OperatorScheduleContract.USER_AUTOMATION_WAKE_INTENT_STATE_VALUES, out _);
+
+    private static bool HasCurrentWakeReadback(JsonElement readback) =>
+        HasExactProperties(readback, OperatorScheduleContract.USER_AUTOMATION_WAKE_READBACK_MEMBERS)
+        && TryGetObject(readback, "intent", out var intent)
+        && HasCurrentWakeIntent(intent)
+        && TryReadBoundedText(readback, "operation_id", MaxOperationIdChars, out _)
+        && TryReadBoundedText(readback, "idempotency_key", OperatorScheduleContract.MAX_TEXT_BYTES, out _)
+        && TryReadBoundedText(readback, "record_checksum", 64, out var checksum)
+        && IsLowerHexSha256(checksum);
+
+    private static bool HasCurrentInvocation(JsonElement invocation) =>
+        HasAllowedAndRequiredProperties(
+            invocation,
+            OperatorScheduleContract.USER_AUTOMATION_INVOCATION_MEMBERS,
+            OperatorScheduleContract.USER_AUTOMATION_INVOCATION_REQUIRED_MEMBERS)
+        && TryReadBoundedText(invocation, "automation_id", MaxIdentityChars, out _)
+        && TryReadBoundedText(invocation, "automation_revision", MaxIdentityChars, out _)
+        && TryGetObject(invocation, "trigger", out var trigger)
+        && HasCurrentTrigger(trigger)
+        && TryReadClosedValue(invocation, "mode", OperatorScheduleContract.USER_AUTOMATION_EXECUTION_MODES, out _)
+        && TryReadBoundedText(invocation, "principal_ref", OperatorScheduleContract.MAX_TEXT_BYTES, out _)
+        && TryReadBoundedText(invocation, "work_scope_ref", OperatorScheduleContract.MAX_TEXT_BYTES, out _)
+        && TryReadBoundedText(invocation, "workdir_ref", OperatorScheduleContract.MAX_TEXT_BYTES, out _)
+        && TryReadClosedValue(invocation, "trigger_origin", OperatorScheduleContract.USER_AUTOMATION_TRIGGER_ORIGINS, out _)
+        && IsUnsignedIntegerProperty(invocation, "child_depth")
+        && OptionalRecordIsAbsentOrObject(invocation, "provenance");
+
+    private static bool HasCurrentTrigger(JsonElement trigger)
+    {
+        if (!TryReadClosedValue(trigger, "kind", OperatorScheduleContract.USER_AUTOMATION_TRIGGER_KINDS, out var kind))
+        {
+            return false;
+        }
+        return kind switch
+        {
+            "scheduled" => HasExactProperties(trigger, "kind", "occurrence_key")
+                && TryReadBoundedText(trigger, "occurrence_key", OperatorScheduleContract.MAX_OCCURRENCE_KEY_BYTES, out _),
+            "manual" => HasExactProperties(trigger, "kind", "nonce")
+                && TryReadBoundedText(trigger, "nonce", OperatorScheduleContract.MAX_TEXT_BYTES, out _),
+            _ => false
+        };
+    }
+
+    private static bool HasCurrentExecutionReference(JsonElement execution) =>
+        HasExactProperties(execution, OperatorScheduleContract.USER_AUTOMATION_EXECUTION_REFERENCE_MEMBERS)
+        && TryReadBoundedText(execution, "occurrence_id", MaxIdentityChars, out _)
+        && TryReadBoundedText(execution, "durable_job_ref", OperatorScheduleContract.MAX_TEXT_BYTES, out _)
+        && TryReadClosedValue(execution, "state", OperatorScheduleContract.USER_AUTOMATION_EXECUTION_STATE_VALUES, out _);
+
+    private static bool HasCurrentExecutionProjection(JsonElement projection) =>
+        HasExactProperties(projection, OperatorScheduleContract.USER_AUTOMATION_EXECUTION_PROJECTION_MEMBERS)
+        && HasObjectArray(projection, "current_execution_refs")
+        && HasCurrentExecutionReferences(projection.GetProperty("current_execution_refs"))
+        && HasObjectArray(projection, "unresolved_reconciliation_refs")
+        && HasCurrentReconciliationReferences(projection.GetProperty("unresolved_reconciliation_refs"))
+        && TryReadBoundedText(projection, "history_query_ref", OperatorScheduleContract.MAX_TEXT_BYTES, out _);
+
+    private static bool HasCurrentExecutionReferences(JsonElement references)
+    {
+        foreach (var reference in references.EnumerateArray())
+        {
+            if (!HasCurrentExecutionReference(reference)) return false;
+        }
+        return true;
+    }
+
+    private static bool HasCurrentReconciliationReferences(JsonElement references)
+    {
+        foreach (var reference in references.EnumerateArray())
+        {
+            if (!HasExactProperties(reference, OperatorScheduleContract.USER_AUTOMATION_RECONCILIATION_REFERENCE_MEMBERS)
+                || !TryReadBoundedText(reference, "occurrence_id", OperatorScheduleContract.MAX_TEXT_BYTES, out _)
+                || !TryReadBoundedText(reference, "operation_ref", OperatorScheduleContract.MAX_TEXT_BYTES, out _)
+                || !TryReadClosedValue(reference, "cause", OperatorScheduleContract.USER_AUTOMATION_RECONCILIATION_CAUSES, out _)
+                || !TryReadBoundedText(reference, "read_revision", OperatorScheduleContract.MAX_TEXT_BYTES, out _)
+                || !HasOptionalBoundedText(reference, "denominator_query_ref", OperatorScheduleContract.MAX_TEXT_BYTES))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static bool HasCurrentFailureProjection(JsonElement failure) =>
+        HasExactProperties(failure, OperatorScheduleContract.USER_AUTOMATION_FAILURE_PROJECTION_MEMBERS)
+        && TryReadBoundedText(failure, "failure_fingerprint", 64, out var fingerprint)
+        && IsLowerHexSha256(fingerprint)
+        && TryGetObject(failure, "reason", out var reason)
+        && HasCurrentFailureReason(reason)
+        && TryGetObject(failure, "notification", out _);
+
+    private static bool HasCurrentFailureReason(JsonElement reason)
+    {
+        if (!TryReadClosedValue(reason, "kind", OperatorScheduleContract.USER_AUTOMATION_FAILURE_REASON_KINDS, out var kind))
+        {
+            return false;
+        }
+        return kind == "canonical_blocked_config"
+            ? HasExactProperties(reason, "kind", "class")
+                && TryReadBoundedText(reason, "class", OperatorScheduleContract.MAX_TEXT_BYTES, out _)
+            : HasExactProperties(reason, "kind");
+    }
+
+    private static bool HasCurrentMutationResult(JsonElement result)
+    {
+        if (!TryReadClosedValue(
+                result,
+                "kind",
+                OperatorScheduleContract.USER_AUTOMATION_MUTATION_RESULT_KINDS,
+                out var kind))
+        {
+            return false;
+        }
+
+        return kind switch
+        {
+            "revision" => HasExactProperties(result, "kind", "revision", "cancelled_wake_ids")
+                && TryGetObject(result, "revision", out var changedRevision)
+                && HasCurrentRevision(changedRevision)
+                && HasBoundedStringArray(result, "cancelled_wake_ids", OperatorScheduleContract.MAX_TEXT_BYTES),
+            "run_now" => HasExactProperties(result, "kind", "invocation", "wake_intent")
+                && TryGetObject(result, "invocation", out var invocation)
+                && HasCurrentInvocation(invocation)
+                && TryGetObject(result, "wake_intent", out var wakeIntent)
+                && HasCurrentWakeIntent(wakeIntent),
+            _ => false
+        };
+    }
+
+    private static bool HasCurrentWakePhase(JsonElement phase)
+    {
+        if (!TryReadClosedValue(phase, "kind", OperatorScheduleContract.USER_AUTOMATION_WAKE_PHASE_KINDS, out var kind))
+        {
+            return false;
+        }
+
+        return kind switch
+        {
+            "not_applicable" => HasExactProperties(phase, "kind", "reason")
+                && TryReadBoundedText(phase, "reason", MaxRecoveryReasonChars, out _),
+            "published" => HasExactProperties(phase, "kind", "readback")
+                && TryGetObject(phase, "readback", out var readback)
+                && HasCurrentWakeReadback(readback),
+            "cancelled" => HasExactProperties(phase, "kind", "cancelled_wake_ids")
+                && HasBoundedStringArray(phase, "cancelled_wake_ids", OperatorScheduleContract.MAX_TEXT_BYTES),
+            "unknown_outcome" or "unavailable" => HasExactProperties(phase, "kind", "reason")
+                && TryReadBoundedText(phase, "reason", MaxRecoveryReasonChars, out _),
+            _ => false
+        };
+    }
+
+    private static bool HasCurrentExecutionPhase(JsonElement phase)
+    {
+        if (!TryReadClosedValue(
+                phase,
+                "kind",
+                OperatorScheduleContract.USER_AUTOMATION_EXECUTION_PHASE_KINDS,
+                out var kind))
+        {
+            return false;
+        }
+
+        return kind switch
+        {
+            "not_applicable" => HasExactProperties(phase, "kind", "reason")
+                && TryReadBoundedText(phase, "reason", MaxRecoveryReasonChars, out _),
+            "admitted" => HasExactProperties(phase, "kind", "execution")
+                && TryGetObject(phase, "execution", out var execution)
+                && HasCurrentExecutionReference(execution),
+            "deferred" => HasExactProperties(phase, "kind", "reason")
+                && TryReadClosedValue(phase, "reason", OperatorScheduleContract.USER_AUTOMATION_DEFER_REASONS, out _),
+            "blocked_config" => HasExactProperties(phase, "kind", "failure_fingerprint")
+                && TryReadBoundedText(phase, "failure_fingerprint", 64, out _),
+            "unknown_outcome" or "unavailable" => HasExactProperties(phase, "kind", "reason")
+                && TryReadBoundedText(phase, "reason", MaxRecoveryReasonChars, out _),
+            _ => false
+        };
+    }
+
+    private static bool HasCurrentHorizonPhase(JsonElement phase)
+    {
+        if (!HasAllowedAndRequiredProperties(
+                phase,
+                OperatorScheduleContract.USER_AUTOMATION_HORIZON_PHASE_MEMBERS,
+                OperatorScheduleContract.USER_AUTOMATION_HORIZON_PHASE_MEMBERS)
+            || !TryReadClosedValue(phase, "trigger", OperatorScheduleContract.USER_AUTOMATION_HORIZON_TRIGGER_VALUES, out _)
+            || !TryReadBoundedText(phase, "automation_id", MaxIdentityChars, out _)
+            || !TryReadBoundedText(phase, "automation_revision", MaxIdentityChars, out _)
+            || !TryReadBoundedText(phase, "revision_digest", 64, out var revisionDigest)
+            || !IsLowerHexSha256(revisionDigest)
+            || !HasBoundedStringArray(phase, "requested_occurrence_ids", OperatorScheduleContract.MAX_TEXT_BYTES)
+            || !HasBoundedStringArray(phase, "remaining_occurrence_ids", OperatorScheduleContract.MAX_TEXT_BYTES)
+            || !TryReadBoundedText(phase, "retry_handle", MaxIdentityChars, out _)
+            || !TryGetObject(phase, "outcome", out var outcome)
+            || !TryReadClosedValue(outcome, "kind", OperatorScheduleContract.USER_AUTOMATION_HORIZON_OUTCOME_KINDS, out var kind))
+        {
+            return false;
+        }
+
+        return kind switch
+        {
+            "published" => HasExactProperties(outcome, "kind", "publication_operation_id")
+                && TryReadBoundedText(outcome, "publication_operation_id", MaxOperationIdChars, out _),
+            "partial" => HasExactProperties(outcome, "kind", "publication_operation_id", "reason")
+                && TryReadBoundedText(outcome, "publication_operation_id", MaxOperationIdChars, out _)
+                && TryReadBoundedText(outcome, "reason", MaxRecoveryReasonChars, out _),
+            "unavailable" or "unknown_outcome" => HasExactProperties(outcome, "kind", "reason")
+                && TryReadBoundedText(outcome, "reason", MaxRecoveryReasonChars, out _),
+            _ => false
+        };
+    }
+
+    private static bool HasCurrentOrchestrationRecord(JsonElement record)
+    {
+        if (!HasAllowedAndRequiredProperties(
+                record,
+                OperatorScheduleContract.USER_AUTOMATION_ORCHESTRATION_RECORD_MEMBERS,
+                OperatorScheduleContract.USER_AUTOMATION_ORCHESTRATION_RECORD_MEMBERS)
+            || !TryGetObject(record, "parent", out var parent)
+            || !HasExactProperties(parent, "operation_id", "canonical_request_hash", "idempotency_key")
+            || !TryReadBoundedText(parent, "operation_id", MaxOperationIdChars, out _)
+            || !TryReadBoundedText(parent, "canonical_request_hash", 64, out var parentHash)
+            || !IsLowerHexSha256(parentHash)
+            || !TryReadBoundedText(parent, "idempotency_key", MaxIdentityChars, out _)
+            || !TryGetObject(record, "state_fence", out var stateFence)
+            || !IsClosedStateFence(stateFence)
+            || !TryReadBoundedText(record, "automation_id", MaxIdentityChars, out _)
+            || !TryReadBoundedText(record, "automation_revision", MaxIdentityChars, out _)
+            || !TryReadBoundedText(record, "revision_digest", 64, out var revisionDigest)
+            || !IsLowerHexSha256(revisionDigest)
+            || !TryReadBoundedText(record, "committed_receipt_digest", 64, out var receiptDigest)
+            || !IsLowerHexSha256(receiptDigest)
+            || !HasObjectArray(record, "obligations"))
+        {
+            return false;
+        }
+
+        foreach (var obligation in record.GetProperty("obligations").EnumerateArray())
+        {
+            if (!HasAllowedAndRequiredProperties(
+                    obligation,
+                    OperatorScheduleContract.USER_AUTOMATION_RUNTIME_OBLIGATION_MEMBERS,
+                    OperatorScheduleContract.USER_AUTOMATION_RUNTIME_OBLIGATION_MEMBERS)
+                || !TryReadClosedValue(obligation, "kind", OperatorScheduleContract.USER_AUTOMATION_RUNTIME_OBLIGATION_KINDS, out _)
+                || !TryReadBoundedText(obligation, "owner_operation_id", MaxOperationIdChars, out _)
+                || !TryReadBoundedText(obligation, "request_digest", 64, out var requestDigest)
+                || !IsLowerHexSha256(requestDigest)
+                || !HasBoundedStringArray(obligation, "subject_ids", OperatorScheduleContract.MAX_TEXT_BYTES)
+                || !obligation.TryGetProperty("wake_enumeration_receipt", out var enumerationReceipt)
+                || enumerationReceipt.ValueKind is not (JsonValueKind.Null or JsonValueKind.Object)
+                || !TryGetObject(obligation, "disposition", out var disposition)
+                || !HasCurrentObligationDisposition(disposition))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static bool HasCurrentObligationDisposition(JsonElement disposition)
+    {
+        if (!TryReadClosedValue(
+                disposition,
+                "kind",
+                OperatorScheduleContract.USER_AUTOMATION_RUNTIME_OBLIGATION_DISPOSITION_KINDS,
+                out var kind))
+        {
+            return false;
+        }
+
+        return kind switch
+        {
+            "retained" => HasExactProperties(disposition, "kind"),
+            "reconciling" or "unavailable" => HasExactProperties(disposition, "kind", "reason")
+                && TryReadBoundedText(disposition, "reason", MaxRecoveryReasonChars, out _),
+            "answered" => HasExactProperties(disposition, "kind", "answer")
+                && TryGetObject(disposition, "answer", out var answer)
+                && HasCurrentObligationAnswer(answer),
+            _ => false
+        };
+    }
+
+    private static bool HasCurrentObligationAnswer(JsonElement answer)
+    {
+        if (!TryReadClosedValue(
+                answer,
+                "kind",
+                OperatorScheduleContract.USER_AUTOMATION_RUNTIME_OBLIGATION_ANSWER_KINDS,
+                out var kind))
+        {
+            return false;
+        }
+
+        return kind switch
+        {
+            "wake_horizon_publication" => HasExactProperties(answer, "kind", "publication_request", "acknowledgement")
+                && answer.TryGetProperty("publication_request", out var publicationRequest)
+                && (publicationRequest.ValueKind == JsonValueKind.Null || publicationRequest.ValueKind == JsonValueKind.Object)
+                && TryGetObject(answer, "acknowledgement", out _),
+            "wake_cancellation" => HasExactProperties(answer, "kind", "cancelled_wake_ids", "enumeration_receipt")
+                && HasBoundedStringArray(answer, "cancelled_wake_ids", OperatorScheduleContract.MAX_TEXT_BYTES)
+                && answer.TryGetProperty("enumeration_receipt", out var enumerationReceipt)
+                && (enumerationReceipt.ValueKind == JsonValueKind.Null || enumerationReceipt.ValueKind == JsonValueKind.Object),
+            "wake_target_enumeration_receipt" => HasExactProperties(answer, "kind", "receipt")
+                && TryGetObject(answer, "receipt", out _),
+            _ => false
+        };
+    }
+
+    private static bool TryReadClosedValue(
+        JsonElement parent,
+        string memberName,
+        string[] allowedValues,
+        out string value) =>
+        TryReadBoundedText(parent, memberName, 64, out value)
+        && Array.IndexOf(allowedValues, value) >= 0;
+
+    private static bool HasObjectArray(JsonElement parent, string memberName)
+    {
+        if (!parent.TryGetProperty(memberName, out var array) || array.ValueKind != JsonValueKind.Array)
+        {
+            return false;
+        }
+        foreach (var item in array.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.Object) return false;
+        }
+        return true;
+    }
+
+    private static bool HasBoundedStringArray(JsonElement parent, string memberName, int maximumLength)
+    {
+        if (!parent.TryGetProperty(memberName, out var array) || array.ValueKind != JsonValueKind.Array)
+        {
+            return false;
+        }
+        foreach (var item in array.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.String
+                || string.IsNullOrWhiteSpace(item.GetString())
+                || item.GetString()!.Length > maximumLength
+                || item.GetString()!.Any(char.IsControl))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static bool HasClosedStringArray(JsonElement parent, string memberName, string[] allowedValues)
+    {
+        if (!parent.TryGetProperty(memberName, out var array) || array.ValueKind != JsonValueKind.Array)
+        {
+            return false;
+        }
+        foreach (var item in array.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.String
+                || string.IsNullOrWhiteSpace(item.GetString())
+                || item.GetString()!.Any(char.IsControl)
+                || Array.IndexOf(allowedValues, item.GetString()) < 0)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static bool HasBoundedArrayLength(
+        JsonElement parent,
+        string memberName,
+        int maximumLength,
+        bool requireNonEmpty = false) =>
+        parent.TryGetProperty(memberName, out var array)
+        && array.ValueKind == JsonValueKind.Array
+        && array.GetArrayLength() <= maximumLength
+        && (!requireNonEmpty || array.GetArrayLength() > 0);
+
+    private static bool HasOptionalBoundedText(JsonElement value, string propertyName, int maximumLength) =>
+        value.TryGetProperty(propertyName, out var member)
+        && (member.ValueKind == JsonValueKind.Null
+            || (member.ValueKind == JsonValueKind.String
+                && !string.IsNullOrWhiteSpace(member.GetString())
+                && member.GetString()!.Length <= maximumLength
+                && !member.GetString()!.Any(char.IsControl)));
+
+    private static bool HasOptionalClosedValue(JsonElement value, string propertyName, string[] allowedValues) =>
+        value.TryGetProperty(propertyName, out var member)
+        && (member.ValueKind == JsonValueKind.Null
+            || (member.ValueKind == JsonValueKind.String
+                && Array.IndexOf(allowedValues, member.GetString()) >= 0));
+
+    private static bool IsBooleanProperty(JsonElement value, string propertyName) =>
+        value.TryGetProperty(propertyName, out var member)
+        && member.ValueKind is JsonValueKind.True or JsonValueKind.False;
+
+    private static bool IsUnsignedIntegerProperty(JsonElement value, string propertyName) =>
+        value.TryGetProperty(propertyName, out var member)
+        && member.ValueKind == JsonValueKind.Number
+        && member.TryGetUInt32(out _);
+
+    private static bool IsPositiveUInt64Property(JsonElement value, string propertyName) =>
+        value.TryGetProperty(propertyName, out var member)
+        && IsPositiveUInt64(member);
+
+    private static bool IsNullOrPositiveUInt64Property(JsonElement value, string propertyName) =>
+        value.TryGetProperty(propertyName, out var member)
+        && (member.ValueKind == JsonValueKind.Null || IsPositiveUInt64(member));
+
+
+    private static bool IsLowerHexSha256(string value) =>
+        value.Length == 64
+        && value.All(character => (character >= '0' && character <= '9')
+            || (character >= 'a' && character <= 'f'));
+
+    private static bool HasCurrentInspectionProjection(JsonElement transitionValue)
+    {
+        if (!transitionValue.TryGetProperty("occurrences", out var projectionArray)
+            || projectionArray.ValueKind != JsonValueKind.Array)
+        {
+            return false;
+        }
+
+        foreach (var projection in projectionArray.EnumerateArray())
+        {
+            if (!HasAllowedAndRequiredProperties(
+                    projection,
+                    OperatorScheduleContract.USER_AUTOMATION_SCHEDULE_PROJECTION_MEMBERS,
+                    OperatorScheduleContract.USER_AUTOMATION_SCHEDULE_PROJECTION_REQUIRED_MEMBERS)
+                || !TryReadBoundedText(projection, "automation_id", MaxIdentityChars, out var automationId)
+                || !TryReadBoundedText(projection, "revision", MaxIdentityChars, out var revision)
+                || !TryReadClosedValue(projection, "kind", OperatorScheduleContract.USER_AUTOMATION_SCHEDULE_KINDS, out _)
+                || !TryReadBoundedText(projection, "expression", OperatorScheduleContract.MAX_TEXT_BYTES, out _)
+                || !TryReadBoundedText(projection, "calendar", OperatorScheduleContract.MAX_TEXT_BYTES, out _)
+                || !TryReadBoundedText(projection, "timezone", OperatorScheduleContract.MAX_ZONE_IDENTITY_BYTES, out _)
+                || !TryReadClosedValue(projection, "dst_fold", OperatorScheduleContract.USER_AUTOMATION_DST_FOLD_POLICIES, out _)
+                || !TryReadClosedValue(projection, "dst_gap", OperatorScheduleContract.USER_AUTOMATION_DST_GAP_POLICIES, out _)
+                || !TryReadBoundedText(projection, "start_at", OperatorScheduleContract.UTC_INSTANT_BYTES, out _)
+                || !TryReadClosedValue(projection, "configuration_state", OperatorScheduleContract.USER_AUTOMATION_CONFIGURATION_STATES, out _)
+                || !projection.TryGetProperty("next_occurrences", out var normalizedOccurrences)
+                || normalizedOccurrences.ValueKind != JsonValueKind.Array
+                || normalizedOccurrences.GetArrayLength() == 0
+                || normalizedOccurrences.GetArrayLength() > OperatorScheduleContract.MAX_REFERENCES
+                || !projection.TryGetProperty("occurrences", out var occurrenceProjections)
+                || occurrenceProjections.ValueKind != JsonValueKind.Array
+                || occurrenceProjections.GetArrayLength() != normalizedOccurrences.GetArrayLength())
+            {
+                return false;
+            }
+
+            if (projection.TryGetProperty("end_at", out var endAt)
+                && (endAt.ValueKind != JsonValueKind.String
+                    || string.IsNullOrWhiteSpace(endAt.GetString())
+                    || endAt.GetString()!.Length > OperatorScheduleContract.UTC_INSTANT_BYTES
+                    || endAt.GetString()!.Any(char.IsControl)))
+            {
+                return false;
+            }
+
+            var occurrenceKeys = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var normalizedOccurrence in normalizedOccurrences.EnumerateArray())
+            {
+                if (normalizedOccurrence.ValueKind != JsonValueKind.String)
+                {
+                    return false;
+                }
+                var occurrenceKey = normalizedOccurrence.GetString();
+                if (string.IsNullOrWhiteSpace(occurrenceKey)
+                    || occurrenceKey.Length > OperatorScheduleContract.MAX_OCCURRENCE_KEY_BYTES
+                    || occurrenceKey.Any(char.IsControl)
+                    || !occurrenceKeys.Add(occurrenceKey))
+                {
+                    return false;
+                }
+            }
+
+            var seenOccurrenceIds = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var occurrence in occurrenceProjections.EnumerateArray())
+            {
+                if (!HasAllowedAndRequiredProperties(
+                        occurrence,
+                        OperatorScheduleContract.USER_AUTOMATION_OCCURRENCE_PROJECTION_MEMBERS,
+                        OperatorScheduleContract.USER_AUTOMATION_OCCURRENCE_PROJECTION_REQUIRED_MEMBERS)
+                    || !TryGetObject(occurrence, "identity", out var identity)
+                    || !HasExactProperties(identity, OperatorScheduleContract.USER_AUTOMATION_OCCURRENCE_IDENTITY_MEMBERS)
+                    || !TryReadBoundedText(identity, "automation_id", MaxIdentityChars, out var identityAutomationId)
+                    || !string.Equals(identityAutomationId, automationId, StringComparison.Ordinal)
+                    || !TryReadBoundedText(identity, "revision", MaxIdentityChars, out var identityRevision)
+                    || !string.Equals(identityRevision, revision, StringComparison.Ordinal)
+                    || !TryReadBoundedText(identity, "occurrence_id", MaxIdentityChars, out var occurrenceId)
+                    || !seenOccurrenceIds.Add(occurrenceId)
+                    || !TryGetObject(identity, "trigger", out var trigger)
+                    || !HasExactProperties(trigger, "kind", "occurrence_key")
+                    || !TryReadClosedValue(trigger, "kind", OperatorScheduleContract.USER_AUTOMATION_TRIGGER_KINDS, out var triggerKind)
+                    || !string.Equals(triggerKind, "scheduled", StringComparison.Ordinal)
+                    || !TryReadBoundedText(trigger, "occurrence_key", OperatorScheduleContract.MAX_OCCURRENCE_KEY_BYTES, out var triggerOccurrenceKey)
+                    || !occurrenceKeys.Contains(triggerOccurrenceKey))
+                {
+                    return false;
+                }
+
+                if (occurrence.TryGetProperty("next_occurrence", out var nextOccurrence)
+                    && (nextOccurrence.ValueKind != JsonValueKind.String
+                        || !occurrenceKeys.Contains(nextOccurrence.GetString() ?? string.Empty)))
+                {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    private static bool HasAllowedAndRequiredProperties(
+        JsonElement value,
+        string[] allowedNames,
+        string[] requiredNames)
+    {
+        if (value.ValueKind != JsonValueKind.Object)
+        {
+            return false;
+        }
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var property in value.EnumerateObject())
+        {
+            if (!allowedNames.Contains(property.Name, StringComparer.Ordinal)
+                || !names.Add(property.Name))
+            {
+                return false;
+            }
+        }
+        return requiredNames.All(names.Contains);
+    }
+
+    private static bool SameSerializedFence(JsonElement left, JsonElement right) =>
+        string.Equals(left.GetRawText(), right.GetRawText(), StringComparison.Ordinal);
 
     private static UserAutomationOutcome ReadAttemptRefusal(
         string action,
         JsonElement value,
         JsonElement recovery,
-        string expectedIdempotencyKey)
+        UserAutomationResultValidationContext context,
+        JsonElement answer)
     {
         if (!HasExactProperties(
                 value,
@@ -1324,9 +2254,11 @@ public static class UserAutomationOutcomeClassifier
             || !schemaVersion.TryGetInt32(out var version)
             || version != 1
             || !TryGetObject(value, "operation", out var operation)
-            || !MatchesOperationIdentity(operation, expectedIdempotencyKey, RequestIdMember)
+            || !MatchesOperationIdentity(operation, context, RequestIdMember)
             || !TryGetObject(value, "state_fence", out var stateFence)
             || !IsClosedStateFence(stateFence)
+            || !TryGetObject(answer, "state_fence", out var envelopeFence)
+            || !SameSerializedFence(stateFence, envelopeFence)
             || !TryReadBoundedText(value, "attempt_state", 64, out var attemptState)
             || !string.Equals(attemptState, "store_not_called", StringComparison.Ordinal)
             || !HasExactProperties(recovery, "kind", "reason")
@@ -1392,7 +2324,7 @@ public static class UserAutomationOutcomeClassifier
     /// </summary>
     private static bool MatchesOperationIdentity(
         JsonElement operation,
-        string expectedIdempotencyKey,
+        UserAutomationResultValidationContext context,
         string ownerMintedMemberName)
     {
         if (!HasExactProperties(operation, "operation_id", ownerMintedMemberName, "idempotency_key")
@@ -1410,10 +2342,10 @@ public static class UserAutomationOutcomeClassifier
         // identities the Operator does hold are exact: the pending operation ID
         // is the request idempotency key, and Kernel prefixes that key when it
         // returns its operation ID.
-        return string.Equals(idempotencyKey, expectedIdempotencyKey, StringComparison.Ordinal)
+        return string.Equals(idempotencyKey, context.ExpectedIdempotencyKey, StringComparison.Ordinal)
             && string.Equals(
                 operationId,
-                $"user-automation-operation:{expectedIdempotencyKey}",
+                context.ExpectedOperationId,
                 StringComparison.Ordinal);
     }
 
@@ -1627,34 +2559,15 @@ public static class UserAutomationOutcomeClassifier
     /// </summary>
     private static UserAutomationScheduleReceipt? FindScheduleProjection(JsonElement answer)
     {
-        var seen = 0;
-        return ScanForScheduleProjection(answer, 0, ref seen);
-    }
-
-    private static UserAutomationScheduleReceipt? ScanForScheduleProjection(
-        JsonElement element,
-        int depth,
-        ref int seen)
-    {
-        if (depth > MaxScheduleScanDepth || seen > MaxScheduleScannedObjects) return null;
-        if (element.ValueKind == JsonValueKind.Object)
+        if (!TryGetObject(answer, "value", out var value)
+            || !value.TryGetProperty("occurrences", out var projections)
+            || projections.ValueKind != JsonValueKind.Array)
         {
-            seen++;
-            if (TryReadScheduleProjection(element, out var projection)) return projection;
-            foreach (var property in element.EnumerateObject())
-            {
-                var found = ScanForScheduleProjection(property.Value, depth + 1, ref seen);
-                if (found is not null) return found;
-            }
             return null;
         }
-        if (element.ValueKind == JsonValueKind.Array)
+        foreach (var projection in projections.EnumerateArray())
         {
-            foreach (var item in element.EnumerateArray())
-            {
-                var found = ScanForScheduleProjection(item, depth + 1, ref seen);
-                if (found is not null) return found;
-            }
+            if (TryReadScheduleProjection(projection, out var receipt)) return receipt;
         }
         return null;
     }

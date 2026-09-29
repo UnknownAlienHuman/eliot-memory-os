@@ -39,11 +39,13 @@
 //! A [`QualityAssessmentCandidate`] freezes exactly what was assessed (which
 //! frozen inputs, which scope and fence, which denominators were available)
 //! for Governor/Human review. Echoed input digests travel by role in
-//! [`RoleDigests`]: content and coverage digests are unique independently, so
-//! distinct owner projections that legitimately share a coverage digest are
-//! both consumable while a repeated digest inside one role is refused. The
-//! candidate carries no findings, no verdict, no score, and no completeness
-//! posture. Equivalent-retry intervention input fails closed with
+//! [`RoleDigests`]: content digests are unique inside one closure, while an
+//! owner coverage envelope is shared evidence that distinct projections
+//! legitimately repeat, so coverage digests are not unique. A repeated
+//! content digest is refused; a repeated coverage digest is resolved against
+//! supplied owner coverage at [`recheck_candidate`] instead. The candidate
+//! carries no findings, no verdict, no score, and no completeness posture.
+//! Equivalent-retry intervention input fails closed with
 //! [`QualityError::MechanismReviewRequired`] instead of opening another
 //! identical assessment.
 //!
@@ -415,25 +417,29 @@ pub enum AssessmentSection {
 
 /// Frozen input digests of one closure, projected by role.
 ///
-/// Uniqueness is per role, never across roles: a repeated digest inside one
-/// role is refused by [`QualityAssessmentCandidate::validate`] with
-/// [`QualityError::InvalidField`], while two owner projections that share a
-/// coverage digest are both consumable.
+/// The roles hold digests over two different owner fields, so they are never
+/// compared against each other. Content digests are unique: a repeat inside
+/// one closure re-cites the same owner body. Coverage digests are not unique:
+/// an owner coverage envelope is shared evidence that several projections
+/// legitimately repeat, and refusing the repeat would refuse the owner's own
+/// immutable projections. Whether a repeated coverage digest names real
+/// assessed material is settled by [`recheck_candidate`], which resolves every
+/// echoed coverage digest against supplied owner coverage evidence, never by
+/// the candidate's own list.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RoleDigests {
     /// Digests over the assessed owner bodies, in assessment order.
     pub content: Vec<String>,
     /// Digests over the assessed owner bodies' coverage envelopes, in
-    /// assessment order.
+    /// assessment order; a shared owner coverage envelope may repeat.
     pub coverage: Vec<String>,
 }
 
-/// Require one role's echoed digests to be well-formed and unique.
+/// Require the echoed content digests to be well-formed and unique.
 ///
-/// A duplicate within one role is a genuine repeated owner input and fails
-/// closed; the same value in the other role is a different input and passes.
-fn unique_role_digests(role: &[String], field: &'static str) -> Result<(), QualityError> {
+/// A repeated content digest re-cites one owner body and fails closed.
+fn unique_content_digests(role: &[String], field: &'static str) -> Result<(), QualityError> {
     let mut seen = BTreeSet::new();
     for echoed in role {
         digest(echoed, field)?;
@@ -443,6 +449,17 @@ fn unique_role_digests(role: &[String], field: &'static str) -> Result<(), Quali
                 reason: "duplicate digest",
             });
         }
+    }
+    Ok(())
+}
+
+/// Require every echoed coverage digest to be well-formed.
+///
+/// No uniqueness is imposed: an owner coverage envelope is shared evidence
+/// that distinct owner projections legitimately repeat.
+fn coverage_digest_shapes(role: &[String], field: &'static str) -> Result<(), QualityError> {
+    for echoed in role {
+        digest(echoed, field)?;
     }
     Ok(())
 }
@@ -534,14 +551,18 @@ impl QualityAssessmentCandidate {
                 field: "candidate.input_digests",
             });
         }
-        // Uniqueness is per role: two owner projections that legitimately
-        // share a coverage digest are both consumable, while a repeated
-        // digest inside one role is a genuinely re-cited owner input.
-        unique_role_digests(
+        // Content digests are unique inside one closure: a repeat re-cites one
+        // owner body. Coverage digests are deliberately not unique, because an
+        // owner coverage envelope is shared evidence several projections
+        // legitimately repeat; refusing that repeat is what refused the
+        // owner's own immutable projections. A repeated coverage digest that
+        // names no supplied owner is caught at recheck, where it is resolved
+        // against real owner coverage evidence rather than this list.
+        unique_content_digests(
             &self.input_digests.content,
             "candidate.input_digests.content",
         )?;
-        unique_role_digests(
+        coverage_digest_shapes(
             &self.input_digests.coverage,
             "candidate.input_digests.coverage",
         )?;
@@ -799,9 +820,11 @@ pub struct ExperienceProjections<'a> {
 
 /// Mutable digest and handle closure folded by one self-quality assessment.
 ///
-/// Content and coverage digests stay in separate roles: two owner projections
-/// may share a coverage digest, while a repeated digest inside one role is a
-/// genuinely re-cited owner input.
+/// Content and coverage digests stay in separate roles. Content digests stay
+/// unique because a repeat re-cites one owner body. Coverage digests may repeat
+/// because each owner projection contributes the digest of its coverage
+/// envelope, and the owner may legitimately share one coverage envelope across
+/// projections.
 struct SelfQualityFold {
     /// Digests over the assessed owner bodies, in assessment order.
     content: Vec<String>,
@@ -1011,8 +1034,10 @@ pub fn assess_self_quality(
         scope,
         fence,
         // Each owner projection contributes one content digest and one
-        // coverage digest, kept in separate roles: two projections may share
-        // a coverage digest, and one flat list would refuse the owner's own.
+        // coverage digest, kept in separate roles. Content digests stay
+        // unique; coverage digests may repeat, because the owner may share one
+        // coverage envelope across projections and a flat uniqueness rule
+        // would refuse the owner's own immutable projections.
         RoleDigests {
             content: fold.content,
             coverage: fold.coverage,
@@ -1422,7 +1447,9 @@ fn check_echoed(
 /// them: a content digest resolves only against supplied owner bodies, a
 /// coverage digest only against supplied coverage envelopes. Folding both
 /// roles into one set would let a coverage digest stand in for a content
-/// digest that no supplied owner actually carries.
+/// digest that no supplied owner actually carries. Coverage digests are
+/// resolved as a set, so a coverage envelope the owner legitimately shared
+/// across several projections resolves for every echo of it.
 pub fn recheck_candidate(
     candidate: &QualityAssessmentCandidate,
     snapshot: &OwnerSnapshot<'_>,

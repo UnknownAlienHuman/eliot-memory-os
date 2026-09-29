@@ -12,6 +12,15 @@ functional_cell = "sim-core"
 lifecycle_owner = "go39-1916"
 source_layer = "C1"
 proof_entrypoint = "cargo test -p eliot-sim-core"
+# I2.10 classification of this cell, read into the generated ModuleContractKit
+# by scripts/code_navigation_lib/capsules.py (`[package.metadata.eliot]
+# .execution_contour` / `.runtime_class`). Both are explicit declarations of
+# this cell, not values derived from the crate, bundle, source-layer or
+# runtime-layer name (I2.10:3). See crates/eliot-sim-core/module.toml for the
+# selection rationale, the rejected alternatives and the evidence that the
+# production runtime never requires this cell.
+execution_contour = "DEVELOPMENT_ONLY"
+runtime_class = "DEVELOPMENT_TOOL"
 workspace_admission = "admitted via #1916 root workspace membership as the pure deterministic simulation boundary owner; dependency-minimal pure state-transition crate with no runtime, store, model, or process authority"
 
 [lib]

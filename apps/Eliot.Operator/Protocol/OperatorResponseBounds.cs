@@ -212,6 +212,89 @@ public sealed record OperatorProjectionBinding(
         $"state_fence={StateFence} read_consistency={ReadConsistency.Token()}";
 }
 
+/// One owner-issued degraded capability the current page carries. The
+/// classification reads ONLY the closed record vocabulary the Governor
+/// emits (`crates/eliot-app/src/mcp_stdio/operator.rs`):
+/// `operator_incident_record` issues kind `incident` under authority
+/// `governor_incident_service` with the lowercase `IncidentStatus`
+/// (`crates/eliot-types/src/safety.rs`: open/acknowledged/mitigated/closed)
+/// and a `"{Severity:?} / {Kind:?}"` summary;
+/// `operator_backup_record` issues kind `backup_inventory` under authority
+/// `governor_backup_service` with the lowercase `BackupStatus`. Anything else
+/// is not a degraded signal, and a closed incident is history, not degraded.
+/// `Severe` separates a degraded backend (degraded/blocking/critical
+/// incident severity, failed/partial backup) from an operational notice
+/// (info/warning incident, backup with warnings): both stay visible and
+/// neither keeps the green banner.
+public sealed record OperatorDegradedSignal(
+    string Kind,
+    string Summary,
+    bool Severe);
+
+/// Classifies the degraded backend capabilities one decoded page already
+/// carries, so the UI shows them as degraded (I11.9) instead of keeping the
+/// green connected banner. This is a classification of what the owner sent,
+/// never a health verdict the client invents.
+public static class OperatorDegradedSignals
+{
+    public const string IncidentKind = "incident";
+    public const string IncidentAuthority = "governor_incident_service";
+    public const string ClosedIncidentStatus = "closed";
+    public const string BackupKind = "backup_inventory";
+    public const string BackupAuthority = "governor_backup_service";
+
+    private static readonly string[] DegradedBackupStatuses =
+    [
+        "failed",
+        "partial",
+        "succeeded_with_warnings"
+    ];
+
+    /// Owner-issued `IncidentSeverity` Debug names that describe a degraded
+    /// backend rather than an informational note. They lead the incident
+    /// summary as `"{Severity:?} / ..."`, so the match anchors on the
+    /// severity position, never on kind text.
+    private static readonly string[] DegradedSeverityPrefixes =
+    [
+        "Degraded / ",
+        "Blocking / ",
+        "Critical / "
+    ];
+
+    public static IReadOnlyList<OperatorDegradedSignal> FromRecords(
+        IEnumerable<OperatorRecordView> records)
+    {
+        ArgumentNullException.ThrowIfNull(records);
+        var signals = new List<OperatorDegradedSignal>();
+        foreach (var record in records)
+        {
+            if (record is null) continue;
+            if (string.Equals(record.RecordKind, IncidentKind, StringComparison.Ordinal)
+                && string.Equals(record.Authority, IncidentAuthority, StringComparison.Ordinal)
+                && !string.Equals(record.Status, ClosedIncidentStatus, StringComparison.Ordinal))
+            {
+                // Severity is owner-issued in the record summary
+                // (`"{Severity:?} / {Kind:?}"`); the record title is the human
+                // summary shown in the banner.
+                signals.Add(new OperatorDegradedSignal(IncidentKind, record.Title, IsDegradedSeverity(record.Summary)));
+            }
+            else if (string.Equals(record.RecordKind, BackupKind, StringComparison.Ordinal)
+                && string.Equals(record.Authority, BackupAuthority, StringComparison.Ordinal)
+                && DegradedBackupStatuses.Contains(record.Status, StringComparer.Ordinal))
+            {
+                var failed = string.Equals(record.Status, "failed", StringComparison.Ordinal)
+                    || string.Equals(record.Status, "partial", StringComparison.Ordinal);
+                signals.Add(new OperatorDegradedSignal(BackupKind, record.Title, failed));
+            }
+        }
+        return signals;
+    }
+
+    public static bool IsDegradedSeverity(string summary) =>
+        DegradedSeverityPrefixes.Any(prefix =>
+            summary.StartsWith(prefix, StringComparison.Ordinal));
+}
+
 /// Refuses a decoded projection page whose retained containers exceed their
 /// independent caps. The page is bounded, not clipped: an over-limit page is
 /// rejected whole, because a partially retained page is a projection that

@@ -91,6 +91,8 @@ public sealed class MainViewModel : INotifyPropertyChanged
     private string _statusMessage = "Waiting for the active ELIOT runtime.";
     private OperatorBannerSeverity _statusSeverity = OperatorBannerSeverity.Informational;
     private bool _pendingJournalUnavailable;
+    private OperatorRoleBinding? _roleBinding;
+    private string _bindingSummary = "Session binding not yet established.";
 
     public MainViewModel(
         IGovernorClient client,
@@ -202,6 +204,24 @@ public sealed class MainViewModel : INotifyPropertyChanged
     public string StatusTitle { get => _statusTitle; private set => Set(ref _statusTitle, value); }
     public string StatusMessage { get => _statusMessage; private set => Set(ref _statusMessage, value); }
     public OperatorBannerSeverity StatusSeverity { get => _statusSeverity; private set => Set(ref _statusSeverity, value); }
+    /// The broker-granted role of the live binding, or null before the first
+    /// established binding. Views render under this grant (I11.3 role
+    /// authority, I11.8 session binding); it names the grant, never a secret.
+    public string? GrantedRole => _roleBinding?.Role;
+    /// Human-readable grant description: role, capability set, and — after a
+    /// page loads — the runtime and auth generation it was redeemed against.
+    /// A withheld command capability is stated here, so a disabled action is
+    /// never unexplained.
+    public string BindingSummary { get => _bindingSummary; private set => Set(ref _bindingSummary, value); }
+    /// A null (never-established) binding is unknown, not denied: the
+    /// transport authenticates every request, so reads proceed until the
+    /// broker proves otherwise. A KNOWN binding that withholds the read
+    /// capability withholds its views.
+    public bool CanReadProjection => _roleBinding is null || _roleBinding.GrantsReads;
+    /// Same rule for effects: unknown proceeds to owner authentication, a
+    /// known grant without `operator.command` refuses before anything is
+    /// journaled or sent.
+    public bool CanIssueCommands => _roleBinding is null || _roleBinding.GrantsCommands;
     public int ItemCount => Records.Count;
     public bool CanLoadMore => !IsBusy && _nextCursor is not null;
 
@@ -598,7 +618,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 var read = await _client.UserAutomationAsync(
                     readRequest,
                     _requestCancellation?.Token ?? CancellationToken.None);
-                ShowUserAutomationResult(action, read, readRequest.IdempotencyKey);
+                ShowUserAutomationResult(action, read, readRequest);
             }
             catch (Exception error)
             {
@@ -618,6 +638,15 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 "Command not sent",
                 "The user-local pending-operation journal is unavailable; recover it before sending another mutation.",
                 OperatorBannerSeverity.Error);
+            IsBusy = false;
+            NotifyCounts();
+            return;
+        }
+        // Effects need the command grant; reads already returned above and
+        // execute inside existing authority (I11.4). The refusal lands before
+        // the retry-stable identity is minted or journaled.
+        if (!RequireCommandCapability($"user_automation:{action}"))
+        {
             IsBusy = false;
             NotifyCounts();
             return;
@@ -668,7 +697,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
             var answer = await _client.UserAutomationAsync(
                 request,
                 _requestCancellation?.Token ?? CancellationToken.None);
-            ShowUserAutomationResult(action, answer, request.IdempotencyKey);
+            ShowUserAutomationResult(action, answer, request);
             // A typed attempt refusal can prove that this attempt stopped before
             // Store, but it does not settle an earlier attempt of the same
             // retained identity. Preserve an already-unknown phase; a first
@@ -769,10 +798,11 @@ public sealed class MainViewModel : INotifyPropertyChanged
     private void ShowUserAutomationResult(
         string action,
         JsonElement answer,
-        string expectedIdempotencyKey)
+        UserAutomationOperatorRequest request)
     {
         ResultPayloadText = OperatorProjectionGuard.BoundRetainedResult(answer) ?? string.Empty;
-        var outcome = UserAutomationOutcomeClassifier.Read(action, answer, expectedIdempotencyKey);
+        var validationContext = UserAutomationResultValidationContext.FromRequest(request);
+        var outcome = UserAutomationOutcomeClassifier.Read(action, answer, validationContext);
         ResultSummary = outcome.Detail;
         SetBanner(
             outcome.Title,
@@ -892,6 +922,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
             }
 
             ValidateScope();
+            if (!RequireReadCapability()) return;
             var projectId = NullIfBlank(ProjectId);
             var taskId = NullIfBlank(TaskId);
             JsonElement? queryParameters = IsQueryPage
@@ -937,14 +968,47 @@ public sealed class MainViewModel : INotifyPropertyChanged
             // The retained result payload is bounded as a whole. An oversized
             // payload is refused, never clipped into a valid-looking object.
             ResultPayloadText = OperatorProjectionGuard.BoundRetainedResult(page.ResultPayload) ?? string.Empty;
+            // Owner-issued degraded capabilities are shown as degraded (I11.9):
+            // a page carrying open incidents or concerning backups never keeps
+            // the green connected banner.
+            var degraded = OperatorDegradedSignals.FromRecords(page.Records);
+            var incidentCount = degraded.Count(signal => signal.Kind == OperatorDegradedSignals.IncidentKind);
+            var backupCount = degraded.Count - incidentCount;
             var totalQualifier = page.TotalIsExact ? string.Empty : "at least ";
             ResultSummary = $"Showing {Records.Count} of {totalQualifier}{page.TotalMatching}; page generated {page.GeneratedAt.LocalDateTime:g}.";
-            SetBanner(
-                "Connected",
-                rotated
-                    ? $"Runtime {page.RuntimeId}; auth generation {page.AuthGeneration}; typed {page.Projection} projection. Runtime rotated: dependent state was invalidated before use."
-                    : $"Runtime {page.RuntimeId}; auth generation {page.AuthGeneration}; typed {page.Projection} projection.",
-                OperatorBannerSeverity.Success);
+            if (degraded.Count > 0)
+            {
+                ResultSummary += $" {incidentCount} open incident(s), {backupCount} backup concern(s) — see the degraded banner.";
+            }
+            RefreshRoleBinding();
+            UpdateBindingSummary(page);
+            if (degraded.Count == 0)
+            {
+                SetBanner(
+                    "Connected",
+                    rotated
+                        ? $"Runtime {page.RuntimeId}; auth generation {page.AuthGeneration}; typed {page.Projection} projection. Runtime rotated: dependent state was invalidated before use."
+                        : $"Runtime {page.RuntimeId}; auth generation {page.AuthGeneration}; typed {page.Projection} projection.",
+                    OperatorBannerSeverity.Success);
+            }
+            else
+            {
+                const int maxShownSignals = 3;
+                var shown = degraded
+                    .Take(maxShownSignals)
+                    .Select(signal => $"{signal.Kind}: {ClipSignalSummary(signal.Summary)}");
+                var detail = string.Join(" · ", shown);
+                if (degraded.Count > maxShownSignals)
+                {
+                    detail += $" · +{degraded.Count - maxShownSignals} more in the projection";
+                }
+                var severe = degraded.Any(signal => signal.Severe);
+                SetBanner(
+                    severe ? "Degraded backend capability" : "Operational notices need attention",
+                    $"Runtime {page.RuntimeId} reports {incidentCount} open incident(s) and {backupCount} backup concern(s): {detail}. " +
+                    "Full evidence and recovery references stay expandable on each record.",
+                    OperatorBannerSeverity.Warning);
+            }
         }
         catch (OperationCanceledException)
         {
@@ -981,6 +1045,15 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 "Command not sent",
                 "The user-local pending-operation journal is unavailable; recover it before sending another mutation.",
                 OperatorBannerSeverity.Error);
+            IsBusy = false;
+            NotifyCounts();
+            return;
+        }
+        // The granted binding withholds what it withholds: a mutation the
+        // role cannot lawfully execute is refused before an identity is
+        // minted or journaled, never after.
+        if (!RequireCommandCapability(action))
+        {
             IsBusy = false;
             NotifyCounts();
             return;
@@ -1464,6 +1537,89 @@ public sealed class MainViewModel : INotifyPropertyChanged
             throw new InvalidOperationException($"{CurrentPage.Title} requires a canonical project/task scope.");
         }
     }
+
+    /// Pulls the broker-granted role binding off the live transport. The
+    /// grant is the exact set the broker redeemed this binding for
+    /// (I11.8); views and mutations gate on it, never on a constant.
+    private void RefreshRoleBinding()
+    {
+        var binding = _client.GrantedBinding;
+        if (RoleBindingEquals(_roleBinding, binding)) return;
+        _roleBinding = binding;
+        OnPropertyChanged(nameof(GrantedRole));
+        OnPropertyChanged(nameof(CanReadProjection));
+        OnPropertyChanged(nameof(CanIssueCommands));
+        UpdateBindingSummary(null);
+    }
+
+    private static bool RoleBindingEquals(OperatorRoleBinding? left, OperatorRoleBinding? right)
+    {
+        if (left is null || right is null) return left is null && right is null;
+        return string.Equals(left.Role, right.Role, StringComparison.Ordinal)
+            && left.Capabilities.SequenceEqual(right.Capabilities, StringComparer.Ordinal);
+    }
+
+    private void UpdateBindingSummary(OperatorProjectionPage? page)
+    {
+        if (_roleBinding is null)
+        {
+            BindingSummary = "Session binding not yet established; the transport authenticates every request.";
+            return;
+        }
+        var summary = $"Role {_roleBinding.Role} · capabilities ({_roleBinding.Capabilities.Count}): {string.Join(", ", _roleBinding.Capabilities)}";
+        if (!_roleBinding.GrantsCommands)
+        {
+            summary += "; commands withheld: this role was not granted 'operator.command'";
+        }
+        if (page is not null)
+        {
+            summary += $" · runtime {page.RuntimeId} · auth generation {page.AuthGeneration}";
+        }
+        BindingSummary = summary;
+    }
+
+    /// Refuses a read the granted binding withholds, before any query is
+    /// sent. Stale rows are cleared first so no view outlives the grant it
+    /// came from; nothing is fabricated in their place.
+    private bool RequireReadCapability()
+    {
+        RefreshRoleBinding();
+        if (CanReadProjection) return true;
+        Records.Clear();
+        SelectedRecord = null;
+        SelectedAction = null;
+        _nextCursor = null;
+        _graphSelectedRef = null;
+        _taskContext = null;
+        ResultPayloadText = string.Empty;
+        ResultSummary = "Projection unavailable for this role; no total is available.";
+        SetBanner(
+            "Projection unavailable for this role",
+            $"Role '{_roleBinding?.Role}' was not granted '{OperatorCapabilityNames.ControlboardRead}'; no query was sent.",
+            OperatorBannerSeverity.Warning);
+        return false;
+    }
+
+    /// Refuses an effect the granted binding withholds, before anything is
+    /// journaled or sent (I11.3: the UI never offers a principal an action it
+    /// cannot lawfully execute). A retained pending operation keeps its phase:
+    /// a refused reconciliation says nothing about the earlier attempt.
+    private bool RequireCommandCapability(string action)
+    {
+        RefreshRoleBinding();
+        if (CanIssueCommands) return true;
+        SetBanner(
+            "Command withheld for this role",
+            $"{action}: role '{_roleBinding?.Role}' was not granted '{OperatorCapabilityNames.OperatorCommand}'; nothing was journaled and nothing was sent.",
+            OperatorBannerSeverity.Warning);
+        return false;
+    }
+
+    /// Bounds one owner-issued signal summary for the status banner. Banner
+    /// text is presentation: the full record stays in the projection with its
+    /// evidence and recovery fields expandable.
+    private static string ClipSignalSummary(string value) =>
+        value.Length <= 200 ? value : $"{value[..200]}…";
 
     private void SetBanner(string title, string message, OperatorBannerSeverity severity)
     {

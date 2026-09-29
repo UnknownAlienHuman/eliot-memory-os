@@ -422,6 +422,11 @@ function Get-RuntimeRedactedText {
         $redacted = [regex]::Replace($redacted, '(?i)runtime_[a-z_]*(pass|secret|token|key)[a-z_]*\s*=\s*("[^"]*"|''[^'']*''|\S+)', '[redacted-runtime-secret]')
         $redacted = [regex]::Replace($redacted, '(?i)(frame|payload|memory|command|argv|environment|environ|protocol|source|model|user)\s*\{[^}]{0,4096}\}', '$1 [redacted-runtime-secret]')
         $redacted = [regex]::Replace($redacted, '(?i)(frame|payload|memory|command|argv|environment|environ|protocol|source|model|user|trace|commit|branch|tag|repo|repository)\s*[:=]\s*("[^"]*"|''[^'']*''|\S+)', '$1=[redacted-runtime-secret]')
+        # Space-separated flag values ('--model "x y"', '-token z') carry the same
+        # payloads as the key=value forms above. The flag run must start cleanly so
+        # hyphenated prose is left alone, and the fixed internal argv keys
+        # (--component/--pipe/--session) are not in this set and still survive.
+        $redacted = [regex]::Replace($redacted, '(?i)(?<![\w-])(--?)(password|passwd|secret|token|api[_-]?key|connectionstring|governorconfig|ELIOT_GOVERNOR_CONFIG|frame|payload|memory|command|argv|environment|environ|protocol|source|model|user|trace|commit|branch|tag|repo|repository)\s+("[^"]*"|''[^'']*''|\S+)', '${1}${2}=[redacted-runtime-secret]')
         $redacted = [regex]::Replace($redacted, '(?i)([A-Za-z]:\\(?:[^\\/:*?"<>|\s]+\\)*private(?:\\[^\\/:*?"<>|\s]*)*|/(?:[^\\/:*?"<>|\s]+/)*private(?:/[^\\/:*?"<>|\s]*)*)', '[redacted-private-path]')
         $redacted = [regex]::Replace($redacted, '(?i)[A-Za-z]:\\Users\\[^\\/:*?"<>|]+', '[redacted-user-path]')
     } catch {

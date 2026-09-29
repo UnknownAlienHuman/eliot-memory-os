@@ -56,7 +56,7 @@
 //! | 3 | `MAX_TEXT` | contracts per-field `check_text` bounds + bundle ceilings | one coarse global bound cannot express per-field limits | DELETED (#1143 work item 4) |
 //! | 4 | `MAX_ITEMS` | contracts per-collection bounds (64: draft items/unknowns) | one coarse global bound cannot express per-collection limits | DELETED (#1143 work item 4) |
 //! | 5 | `MAX_SOURCES` | contracts lineage bounds (128) | one coarse global bound cannot express per-lineage limits | DELETED (#1143 work item 4) |
-//! | 6 | `DreamerError` | contracts `ContractViolation` + candidate-validation `DreamDraftValidationError` | error-mapping fixture; expires at LEGACY-DELETE | DELETE-PROPOSED after pipeline uses owner errors |
+//! | 6 | `DreamerError` (bound-error variants deleted) | contracts `ContractViolation` + candidate-validation `DreamDraftValidationError` | error-mapping fixture; expires at LEGACY-DELETE | DELETE-PROPOSED after pipeline uses owner errors |
 //! | 7 | `JobClass` (facade deleted; canonical re-export) | contracts `job::JobClass` (9 closed classes) | canonical `snake_case` wire vocabulary asserted live (see D-DRM-1..3) | RE-EXPORTED (contract-unification turn) |
 //! | 8 | `Requester` (4 variants) | contracts `job::{Requester, RequesterOrigin}` (origin + principal/session binding) | second requester-binding vocabulary; zero call sites | DELETED (#1143 work item 4) |
 //! | 9 | `CandidateKind` (17 variants) | contracts `curation::CurationKind` + kind families + 13 typed handler cells (classification/relation/episode/concept/procedure/failure/structure-repair/reconsolidation/accessibility/memory-repair + rival-model/probe-plan + clarification) | kind-mapping fixture; expires after curation + handlers admit every kind | DELETE-PROPOSED after handler migration |
@@ -175,16 +175,18 @@ use thiserror::Error;
 /// `CandidateArtifact`, `DreamPacket`) bind to owner vocabulary directly.
 pub use eliot_dreamer_contracts::{DreamJobInput, JobClass, ModelDraft};
 
+/// Candidate-only failure vocabulary.
+///
+/// `InvalidText`, `TooMany`, `MissingLineage` and `InvalidFence` were the
+/// facade's own text, collection, lineage and fence bound owners. They are
+/// deleted in #1143 work item 4 because the bounds they reported
+/// (`MAX_TEXT`/`MAX_ITEMS`/`MAX_SOURCES` and the facade intake validation)
+/// were already deleted, leaving them unconstructible, and because
+/// `eliot_dreamer_contracts::ContractViolation` (per-field `check_text`,
+/// per-collection ceilings, lineage bounds) and the canonical `StateFence`
+/// are the only bound owners. The divergence is no longer expressible.
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum DreamerError {
-    #[error("{field} must be non-blank, control-free, and at most {maximum} bytes")]
-    InvalidText { field: &'static str, maximum: usize },
-    #[error("{field} exceeds the bounded item limit of {maximum}")]
-    TooMany { field: &'static str, maximum: usize },
-    #[error("{field} must contain at least one source handle")]
-    MissingLineage { field: &'static str },
-    #[error("dream job state fence is invalid")]
-    InvalidFence,
     #[error("draft evidence is outside the job state fence")]
     FenceMismatch,
     #[error("model output cannot assert canonical epistemic state")]

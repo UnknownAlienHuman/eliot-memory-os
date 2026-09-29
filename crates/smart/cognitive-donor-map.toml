@@ -1,6 +1,6 @@
 schema_version = 3
 map_id = "cognitive-donor-map-2026-08-28-rev6"
-current_main_commit = "e5384f544b518167111ccdcd9e7c49ce559ea1a0"
+current_main_commit = "212db3dbf423c3517737f3a2a1ed3c1e8dfd72a1"
 superseded_prototype_branch_commit = "b35e4a489d45d81f172ef7d5b44bea165438cb1c"
 rule = "Reuse requires one current causal owner, current documentation fit, a pure or reconstructible boundary, exact donor anchors, an independent proof path and an explicit rejected-overgeneralization."
 source_status = "STATIC_REVIEW_ONLY"
@@ -32,12 +32,41 @@ extraction_proof = "Context assembly rendering via crates/smart/eliot-context-as
 path = "crates/smart/eliot-cues"
 disposition = "SPLIT_AND_RETAIN_AS_TEMPORARY_FACADE"
 targets = ["eliot-cue-contracts", "eliot-cue-normalizer", "eliot-cue-binding", "eliot-cue-index", "eliot-cue-activation"]
-# GAP(#40): rebuildable snapshot construction has no admitted contract cell yet;
-# CueSnapshot/CueRuntime stay in this facade until a snapshot cell is proposed.
-# No snapshot target name is listed here; inventing one would fake the boundary.
+# Measured 2026-09-28 on origin/main@212db3db: the GAP(#40) claim that
+# "rebuildable snapshot construction has no admitted contract cell yet" and
+# that "CueSnapshot/CueRuntime stay in this facade" was false in the tree.
+# `eliot-cue-index` (cell `smart.cue.index`, package description "Build and
+# validate one immutable rebuildable CueSnapshot from admitted binding
+# projections and typed activation edges") is already named in `targets` on
+# this very row and owns `build_cue_snapshot`/`rebuild_cue_snapshot` in
+# crates/smart/eliot-cue-index/src/build.rs. Production Governor code calls it
+# directly (crates/governor/eliot-governor/src/cue_composition.rs:228 and
+# :555), and this facade's `adapt_rebuild_snapshot`
+# (crates/smart/eliot-cues/src/legacy_adapter.rs:412) delegates to exactly that
+# owner once. `CueSnapshot` validation/migration/invalidation and
+# `CueRuntime` evaluation are listed among this facade's own removed
+# duplicates (crates/smart/eliot-cues/src/lib.rs:64-65), so they no longer
+# live here. What remains open is governance metadata, not a missing cell:
+# eliot-cue-index still declares `prototype = true` and
+# `workspace_admission = "pending_agent_implementation_and_proof"`, so no
+# workspace/runtime admission is inferred from that cell's existence.
 rationale = "Retain deterministic matching, bounded spreading and trace shape; split canonical normalization, binding proposals, admitted projection construction and hot evaluation."
 rejected_overgeneralization = "Destructive canonical-path lowercasing, candidate bindings bypassing Governor admission, session delivery state in the pure evaluator, or graph-edge minimums for exact firing."
 
+# RE-READ(#40) 2026-09-28 on origin/main@212db3db: `eliot-dreamer-core` and
+# `eliot-cues` are the only claimed paths that changed since 569bf807 (two
+# #1143 work-item-4 commits: e47a5eda deleted the four unconstructible
+# `DreamerError::{InvalidText,TooMany,MissingLineage,InvalidFence}` bound-error
+# variants; edcdaa64 collapsed ten copies of the legacy-text admissibility rule
+# into one crate-private owner in `eliot-cues` and removed two zero-caller
+# `AdviceGate` read accessors in `eliot-dreamer-core`). Re-read on current
+# source, so the `eliot-dreamer-core` disposition below is unchanged: the
+# package is still present, so it may not carry a `RETIRED_*` class; it still
+# declares zero external production Cargo reverse-dependents (only the root
+# `Cargo.toml` member line and its own manifest name it) and zero
+# `eliot_dreamer_core::` imports outside itself, and all 26 `targets` below
+# exist in `crates/smart/`. The #1143 ledger in that crate's module doc
+# remains the sufficiency record for the split.
 [[donor]]
 path = "crates/smart/eliot-dreamer-core"
 disposition = "SPLIT_AND_RETAIN_AS_TEMPORARY_FACADE"
@@ -94,17 +123,30 @@ rejected_overgeneralization = "Effective indexes, old READY labels or empty crat
 # Issue #816 makes the legacy split explicit without changing or deleting any
 # donor.  `observed_disposition` describes the current map; it is not runtime
 # completion evidence and does not turn a donor into an implementation owner.
-# `current_main_commit` above is the ONE current base on which both the
-# `[[donor]]` dispositions and the `[topology_donor_authority]` rows below were
-# re-read against current source; `dispositions_base` restates that same base
-# for the authority table, and a map whose two bases disagree is refused.
+# `current_main_commit` above, `[topology_donor_authority].dispositions_base`
+# and `[topology_donor_authority].authority_base` are ONE base, not three
+# identities. The donor dispositions and the topology donor authority are one
+# decision, so they are read against one base: this file's three base fields
+# must all equal the repository's current base, which
+# `scripts/verify-cognitive-donor-dispositions-816.py` resolves from git
+# (`origin/main`, else `main`) rather than comparing the three against a copy of
+# one another. A triple that is internally consistent but stale is refused for
+# the same reason, so the field cannot be satisfied by restating a stale commit.
+#
+# That makes `authority_base` a base, not a distinct #816 origin. The #816
+# origin commit 9e3562df010fb0c0aa9bceebb7db2245cf181ca1 remains the shared
+# authority origin recorded by `cognitive-wave-01.toml`,
+# `cognitive-edge-map.toml` and `cognitive-crate-decisions.toml`, and is still
+# pinned as such by `scripts/tests/test_cognitive_topology_contract.py`; this
+# file no longer names it as a second base for its own rows, because a
+# disposition is only current on the base it was actually re-read against.
 [topology_donor_authority]
 issue = 816
 schema_version = 1
-authority_base = "9e3562df010fb0c0aa9bceebb7db2245cf181ca1"
+authority_base = "212db3dbf423c3517737f3a2a1ed3c1e8dfd72a1"
 proof_ceiling = "DONOR_AND_OWNER_RECONCILIATION_ONLY"
 runtime_completion = false
-dispositions_base = "e5384f544b518167111ccdcd9e7c49ce559ea1a0"
+dispositions_base = "212db3dbf423c3517737f3a2a1ed3c1e8dfd72a1"
 
 [[topology_donor]]
 path = "crates/smart/eliot-context"

@@ -88,11 +88,6 @@ where
                     execution,
                 })
             }
-            UserAutomationHostExecutionOperation::CancelPendingWakes { .. } => {
-                // Cancellation receipts bind a server-authenticated channel,
-                // so this convenience path cannot authorize the effect.
-                Err(UserAutomationRuntimeError::IdentityConflict)
-            }
             UserAutomationHostExecutionOperation::ReadPendingWake { request } => {
                 let readback = self.wake.read_pending_wake(request).await?;
                 Ok(UserAutomationHostExecutionResponse::WakeRead {
@@ -101,10 +96,12 @@ where
                     readback,
                 })
             }
-            // Batch enumeration receipts bind the authenticated Host channel.
-            // This convenience dispatch has no server-authored session, so it
-            // must not issue a receipt from caller-carried channel fields.
-            UserAutomationHostExecutionOperation::EnumeratePendingWakes { .. } => {
+            // Cancellation, enumeration, and exact batch readback bind a
+            // server-authenticated channel. This convenience dispatch has no
+            // server-authored session and cannot authorize any of them.
+            UserAutomationHostExecutionOperation::CancelPendingWakes { .. }
+            | UserAutomationHostExecutionOperation::EnumeratePendingWakes { .. }
+            | UserAutomationHostExecutionOperation::ReadCancellationBatch { .. } => {
                 Err(UserAutomationRuntimeError::IdentityConflict)
             }
         }
@@ -174,6 +171,21 @@ where
                     state_fence,
                     receipt: Box::new(receipt),
                 })
+            }
+            UserAutomationHostExecutionOperation::ReadCancellationBatch { request } => {
+                let channel_binding_sha256 = session.authenticated_channel_binding_digest()?;
+                let readback = self
+                    .wake
+                    .read_cancellation_batch_authenticated(request, channel_binding_sha256.clone())
+                    .await?;
+                Ok(
+                    UserAutomationHostExecutionResponse::WakeCancellationBatchReadback {
+                        request_sha256,
+                        state_fence,
+                        authenticated_channel_binding_sha256: channel_binding_sha256,
+                        readback: Box::new(readback),
+                    },
+                )
             }
         }
     }

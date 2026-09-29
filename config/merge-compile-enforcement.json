@@ -1,0 +1,9 @@
+{
+  "$comment": "Retained expected merge-enforcement rule for issue #3004 (Implementation sequence section 11, step 5). The required context is the OBSERVED check-run name (check 'merge-compile', app 'github-actions'), never the workflow display name. Compared against live state by scripts/verify-branch-protection.py.",
+  "branch": "main",
+  "required_contexts": ["merge-compile"],
+  "strict": true,
+  "enforce_admins": true,
+  "allowed_bypass_actors": [],
+  "break_glass": "none configured; any future break-glass owner path must be recorded here before it is granted"
+}

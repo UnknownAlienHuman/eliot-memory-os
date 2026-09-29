@@ -39,7 +39,7 @@
       "value": null
     },
     "forbidden_pattern_hits": [],
-    "inline_cfg_test_modules": 6
+    "inline_cfg_test_modules": 5
   },
   "unit_property_model_tests": {
     "declared_proof_surface": {
@@ -83,8 +83,8 @@
       },
       {
         "path": "crates/kernel/eliot-ors/tests/kernel_route_fixture.rs",
-        "bytes": 6093,
-        "sha256": "d098f2b4ffd18e0813fda7adb99516fd7e4a28d6f9be19e3e2e5269ebf4df797",
+        "bytes": 6176,
+        "sha256": "d0d71473dc5b25739872fe1e071b9c7558cedf7d459b80586838994e5cd78cac",
         "test_attributes": 3,
         "inline_cfg_test": false,
         "classes": [
@@ -104,7 +104,7 @@
         ]
       }
     ],
-    "test_attribute_count": 119
+    "test_attribute_count": 114
   },
   "parser_or_golden_corpus": [],
   "fake_port_contract_tests": [],
@@ -171,24 +171,24 @@
   },
   "expected_nonzero_test_count": {
     "method": "count of #[test]/#[tokio::test] attributes in the selected test slice",
-    "test_attribute_count": 119,
-    "test_stu": 24233,
+    "test_attribute_count": 114,
+    "test_stu": 24261,
     "nonzero": true
   },
-  "bound_contract_digest": "a0bef8572ee87228bc0d64e2e51b983660b7c9e3cb8723195d42e319d628153e",
+  "bound_contract_digest": "f44a488d4723dfcc81532b5999a221f5f029953bfbb633b0caa240e419fe3ead",
   "source_provenance": {
     "input_digests": {
       "workspace_manifest": {
         "path": "Cargo.toml",
-        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
       },
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
-        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
       },
       "architecture_boundaries": {
         "path": "config/architecture-boundaries.toml",
-        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
       },
       "logical_block_config": {
         "path": "docs/code-navigation/logical-blocks.toml",
@@ -196,20 +196,20 @@
       },
       "package_manifest": {
         "path": "crates/kernel/eliot-ors/Cargo.toml",
-        "sha256": "ff06bbf312d777ea88ac76f537ec6c57bab19c3a28a86a7f430ec39a99b0d9a9"
+        "sha256": "564afdef1066fc8be240f2842a49ec90e6a48cbf7fb2ad04a5a770d243206372"
       },
       "module_manifest": null,
       "selected_source": {
-        "path_count": 26,
-        "sha256": "a39de6e13a6d3808b8414fdbd302ad1aeed88b8432bf4308b7992de914a934b7"
+        "path_count": 28,
+        "sha256": "d5e1960189cbd69b830420dfe12f2740ba4f5853439995eb64a85e1b7ece7c9d"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "5bd0216ef6c657b84a085122978f719f3f04d304d0970f52aeb9eee4b85e7b3e",
+  "artifact_digest": "aaed054a7bc0df6580707ed1869107da505ad8dba158c7b95e868a3e8a889050",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "5bd0216ef6c657b8"
+    "value": "aaed054a7bc0df65"
   }
 }

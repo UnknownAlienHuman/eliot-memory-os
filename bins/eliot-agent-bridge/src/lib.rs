@@ -18,7 +18,8 @@ use eliot_agent_bridge_core::{
     HostEventEnvelope, McpForwardingPort, OutstandingDeliveryView, ProviderFailure,
     ProviderReadiness, ReconciliationConsumedFrontier, ReconciliationPortOutcome,
     ReconciliationPortResult, ReconciliationReceiptRef, ReconnectRequest, RecoveredEventFact,
-    RecoveredGapFact, RecoveredPendingView, RecoveredStreamFacts, RecoveryCandidateStreamFacts,
+    RecoveredGapFact, RecoveredPendingView, RecoveredSourceKind, RecoveredSourceProjection,
+    RecoveredSourceUnavailable, RecoveredStreamFacts, RecoveryCandidateStreamFacts,
     RecoveryDirective, RecoveryProjectionPage, RecoveryReadRequest, RecoveryResponseSelector,
     RecoveryStreamCut, RecoveryUnscopedGapCursor, RecoveryView, RecoveryWindowStatus,
     TerminalReductionInputs, TransportEdge,
@@ -42,11 +43,11 @@ pub use eliot_agent_bridge_core::{
 };
 use eliot_contracts::{
     BRIDGE_RECOVERY_PAGE_COMMITMENT_VERSION, BRIDGE_RECOVERY_RESUME_SELECTOR_VERSION,
-    BRIDGE_RECOVERY_SELECTOR_VERSION, BridgeEventCapacityDimension, BridgeEventCapacityPressure,
-    BridgeEventLocalPhase, BridgeRecoveryPageCommitment, BridgeRecoverySelector,
-    BridgeRecoveryUnresolvedFrontier, BridgeRecoveryWindowDisposition, BridgeTransportBackpressure,
-    ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence,
-    canonical_json_bytes, sha256_hex,
+    BRIDGE_RECOVERY_RESUME_WINDOW_SELECTOR_VERSION, BRIDGE_RECOVERY_SELECTOR_VERSION,
+    BridgeEventCapacityDimension, BridgeEventCapacityPressure, BridgeEventLocalPhase,
+    BridgeRecoveryPageCommitment, BridgeRecoverySelector, BridgeRecoveryUnresolvedFrontier,
+    BridgeRecoveryWindowDisposition, BridgeTransportBackpressure, ClockReading, ProductId,
+    RequestId, RequestMetadata, SourceId, StateFence, canonical_json_bytes, sha256_hex,
 };
 use eliot_mcp::{HostInvocationOutcome, ResponseKind};
 use eliot_protocol::{
@@ -103,9 +104,9 @@ pub use transport_profile::{
 use understanding_bootstrap::validate_task_inputs_match_surface;
 pub use understanding_bootstrap::{
     AuthoritativeSelection, BootDelta, BootstrapContext, BootstrapError, BootstrapSession,
-    BootstrapTaskInputs, CurrentAssessment, GovernanceEvidence, ReadinessDisposition, ScopeLevel,
-    SelectedTask, TaskCandidate, TaskSelectionDisposition, TaskSelectionView,
-    UnderstandingBootstrap, get_understanding_bootstrap,
+    BootstrapTaskInputs, CurrentAssessment, GovernanceEvidence, ReadinessDisposition,
+    RoutePayloadMeasurement, ScopeLevel, SelectedTask, TaskCandidate, TaskSelectionDisposition,
+    TaskSelectionView, UnderstandingBootstrap, get_understanding_bootstrap, measure_route_payload,
 };
 
 fn decode_declaration_bytes(bytes: &[u8]) -> Result<AgentBridgeClientDeclaration, String> {
@@ -1280,10 +1281,14 @@ fn decode_recovery_gap(
 /// Running decode budget: array lengths are enforced before any fact is
 /// built, so a hostile or corrupt answer cannot force unbounded
 /// materialization.
+#[derive(Default)]
 struct RecoveryDecodeBudget {
     events: usize,
     gaps: usize,
+    source_bytes: usize,
 }
+
+const MAX_RECOVERY_TOTAL_SOURCE_BYTES: usize = 128 * 1024;
 
 struct RecoveryReplyCoverage {
     unproven_scope_present: bool,
@@ -1459,21 +1464,31 @@ fn decode_recovery_window_expiry(
 /// Binds the v2 owner window identity legs to this live response before its
 /// facts can become an import candidate. The source revision remains part of
 /// the ORS page commitment; generation and connection must also match the
-/// separately authenticated Kernel presentation.
+/// separately authenticated Kernel presentation while the window is active.
 fn validate_recovery_window_identity_v2(
     reconciliation: &serde_json::Value,
+    disposition: BridgeRecoveryWindowDisposition,
     live_generation: u64,
     connection_echo: &str,
 ) -> Result<(), ProviderFailure> {
-    recovery_sequence(reconciliation, "window_source_revision")?;
+    let source_revision = recovery_sequence(reconciliation, "window_source_revision")?;
     let window_generation = recovery_sequence(reconciliation, "window_live_generation")?;
-    if window_generation != live_generation {
+    let window_connection = recovery_text(reconciliation, "window_presenting_connection")?;
+    if source_revision == 0 || window_generation == 0 {
+        return Err(event_shape_failure(
+            "reconciliation refused: window source revision and generation must be nonzero",
+        ));
+    }
+    if disposition == BridgeRecoveryWindowDisposition::Active
+        && window_generation != live_generation
+    {
         return Err(event_shape_failure(
             "reconciliation refused: v2 window generation differs from the live attach",
         ));
     }
-    let window_connection = recovery_text(reconciliation, "window_presenting_connection")?;
-    if window_connection != connection_echo {
+    if disposition == BridgeRecoveryWindowDisposition::Active
+        && window_connection != connection_echo
+    {
         return Err(event_shape_failure(
             "reconciliation refused: v2 window connection differs from the presenting attach",
         ));
@@ -1481,8 +1496,9 @@ fn validate_recovery_window_identity_v2(
     Ok(())
 }
 
-/// Enforces the v2 owner identity requirement and keeps legacy moved/expired
-/// windows as refresh denials instead of importing guessed completeness.
+/// Enforces the v2/v3 owner identity requirement and keeps legacy
+/// moved/expired windows as refresh denials instead of importing guessed
+/// completeness.
 fn decode_recovery_window_identity_version(
     reconciliation: &serde_json::Value,
     identity_version: u64,
@@ -1508,13 +1524,85 @@ fn decode_recovery_window_identity_version(
              refresh required, external reconciliation gate remains closed",
         ));
     }
-    if identity_version != 2 {
+    if !matches!(identity_version, 2 | 3) {
         return Err(event_shape_failure(
             "reconciliation refused: unsupported owner window identity version",
         ));
     }
-    validate_recovery_window_identity_v2(reconciliation, live_generation, connection_echo)?;
+    validate_recovery_window_identity_v2(
+        reconciliation,
+        disposition,
+        live_generation,
+        connection_echo,
+    )?;
     Ok(None)
+}
+
+/// A moved or expired selector may return its exact committed window identity
+/// after reconnect, but it cannot carry page facts or an acknowledgement that
+/// advances the retained consumed frontier.
+fn ensure_non_active_recovery_reply_has_no_facts_or_acknowledgement(
+    value: &serde_json::Value,
+    reconciliation: &serde_json::Value,
+    window_status: RecoveryWindowStatus,
+    unresolved: &BridgeRecoveryUnresolvedFrontier,
+) -> Result<(), ProviderFailure> {
+    if window_status == RecoveryWindowStatus::Active {
+        return Ok(());
+    }
+    let streams = reconciliation
+        .get("streams")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| event_shape_failure("reconciliation refused: stream list absent"))?;
+    let unscoped_gaps = reconciliation
+        .get("unscoped_gaps")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| event_shape_failure("reconciliation refused: unscoped gaps absent"))?;
+    if !streams.is_empty() || !unscoped_gaps.is_empty() {
+        return Err(event_shape_failure(
+            "reconciliation refused: moved or expired window cannot carry recovery facts",
+        ));
+    }
+    for field in [
+        "stream_list_continuation",
+        "stream_list_proof",
+        "unscoped_gaps_continuation",
+        "unscoped_gaps_proof",
+    ] {
+        if reconciliation
+            .get(field)
+            .is_some_and(|value| !value.is_null())
+        {
+            return Err(event_shape_failure(
+                "reconciliation refused: moved or expired window cannot carry continuation cursors or proofs",
+            ));
+        }
+    }
+    if reconciliation
+        .get("stream_list_complete")
+        .and_then(serde_json::Value::as_bool)
+        != Some(false)
+        || reconciliation
+            .get("unscoped_gaps_complete")
+            .and_then(serde_json::Value::as_bool)
+            != Some(false)
+        || !unresolved.stream_list_pending
+        || !unresolved.unscoped_gaps_pending
+        || !unresolved.stream_pages_pending
+    {
+        return Err(event_shape_failure(
+            "reconciliation refused: moved or expired window cannot claim completed coverage",
+        ));
+    }
+    if value
+        .get("acknowledgement")
+        .is_some_and(|receipt| !receipt.is_null())
+    {
+        return Err(event_shape_failure(
+            "reconciliation refused: moved or expired window cannot confirm a consumed frontier",
+        ));
+    }
+    Ok(())
 }
 
 /// Decodes one owner stream page whole: identities, records, cursors, and
@@ -1655,8 +1743,9 @@ fn decode_stream_snapshot(
 }
 
 /// Decodes the page item array into checked event facts within the
-/// negotiated per-page and total budgets. No envelope is fabricated here:
-/// digest-only legs travel as named digests for the owner-redelivery path.
+/// negotiated per-page and total budgets. A small owner-retained source may
+/// accompany a fact only after its original hash and exact event identity
+/// have been checked; no envelope is inferred from metadata.
 fn decode_page_events(
     stream_id: &str,
     expected_producer: &str,
@@ -1716,21 +1805,139 @@ fn decode_page_events(
             ));
         }
         let staging_connection = recovery_text(item, "staging_connection")?;
-        events.push(
-            RecoveredEventFact::checked(
-                stream_id.to_owned(),
-                event_id,
-                sequence,
-                phase,
-                envelope_digest,
-                producer_id,
-                producer_generation,
-                staging_connection,
-            )
-            .map_err(|_| event_shape_failure("reconciliation refused: malformed page event leg"))?,
-        );
+        let mut fact = RecoveredEventFact::checked(
+            stream_id.to_owned(),
+            event_id,
+            sequence,
+            phase,
+            envelope_digest,
+            producer_id,
+            producer_generation,
+            staging_connection,
+        )
+        .map_err(|_| event_shape_failure("reconciliation refused: malformed page event leg"))?;
+        let (source, source_unavailable) = decode_recovered_source_projection(item, budget)?;
+        if let Some(source) = source {
+            fact = fact.with_source_projection(source).map_err(|_| {
+                event_shape_failure("reconciliation refused: retained source differs from event")
+            })?;
+        }
+        if source_unavailable {
+            fact = fact
+                .with_source_unavailable(RecoveredSourceUnavailable::RequiresSourceHandle)
+                .map_err(|_| {
+                    event_shape_failure("reconciliation refused: conflicting source availability")
+                })?;
+        }
+        events.push(fact);
     }
     Ok(events)
+}
+
+/// Decodes an optional small source from the persistent owner. Missing
+/// source is explicit, because large content still needs an immutable
+/// source/artifact handle and cannot be treated as a restored envelope.
+fn decode_recovered_source_projection(
+    item: &serde_json::Value,
+    budget: &mut RecoveryDecodeBudget,
+) -> Result<(Option<RecoveredSourceProjection>, bool), ProviderFailure> {
+    let projection = match item.get("source_projection") {
+        None | Some(serde_json::Value::Null) => {
+            let unavailable = match item.get("source_projection_unavailable") {
+                None | Some(serde_json::Value::Null) => false,
+                Some(serde_json::Value::String(value)) if value == "requires_source_handle" => true,
+                _ => {
+                    return Err(event_shape_failure(
+                        "reconciliation refused: malformed source unavailability",
+                    ));
+                }
+            };
+            return Ok((None, unavailable));
+        }
+        Some(value) => value,
+    };
+    if !matches!(
+        item.get("source_projection_unavailable"),
+        None | Some(serde_json::Value::Null)
+    ) {
+        return Err(event_shape_failure(
+            "reconciliation refused: source and unavailability conflict",
+        ));
+    }
+    let kind = match projection.get("kind").and_then(serde_json::Value::as_str) {
+        Some("admitted_inline") => RecoveredSourceKind::AdmittedInline,
+        Some("redacted") => RecoveredSourceKind::Redacted,
+        _ => {
+            return Err(event_shape_failure(
+                "reconciliation refused: unknown source kind",
+            ));
+        }
+    };
+    let source_utf8 = projection
+        .get("source_utf8")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| event_shape_failure("reconciliation refused: missing retained source"))?;
+    let normalized_utf8 = projection
+        .get("normalized_utf8")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| event_shape_failure("reconciliation refused: missing normalized source"))?;
+    if source_utf8.len() > 4096
+        || normalized_utf8.len() > 4096
+        || budget
+            .source_bytes
+            .saturating_add(source_utf8.len())
+            .saturating_add(normalized_utf8.len())
+            > MAX_RECOVERY_TOTAL_SOURCE_BYTES
+    {
+        return Err(event_shape_failure(
+            "reconciliation refused: retained source exceeds the decode budget",
+        ));
+    }
+    budget.source_bytes = budget
+        .source_bytes
+        .saturating_add(source_utf8.len())
+        .saturating_add(normalized_utf8.len());
+    let transport_hash = recovery_digest(projection, "transport_hash")?;
+    let redaction_reason = match projection.get("redaction_reason") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(value)) => Some(value.clone()),
+        _ => {
+            return Err(event_shape_failure(
+                "reconciliation refused: malformed redaction reason",
+            ));
+        }
+    };
+    let redacted_classes = projection
+        .get("redacted_classes")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| event_shape_failure("reconciliation refused: missing redaction classes"))?;
+    if redacted_classes.len() > 16 {
+        return Err(event_shape_failure(
+            "reconciliation refused: redaction class count exceeds the owner cap",
+        ));
+    }
+    let redacted_classes = redacted_classes
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| value.len() <= MAX_RECOVERY_TEXT_BYTES)
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    event_shape_failure("reconciliation refused: malformed redaction class")
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    RecoveredSourceProjection::checked(
+        kind,
+        source_utf8.to_owned(),
+        normalized_utf8.to_owned(),
+        transport_hash,
+        redaction_reason,
+        redacted_classes,
+    )
+    .map(|source| (Some(source), false))
+    .map_err(|_| event_shape_failure("reconciliation refused: invalid retained source projection"))
 }
 
 /// Decodes the stream-scoped gap array within the negotiated gap budget.
@@ -1890,6 +2097,42 @@ fn decode_reconciliation_identity<'a>(
     })
 }
 
+/// Checks owner window identity and the no-facts rule for terminal replies.
+fn validate_recovery_window_identity_and_reply_shape(
+    value: &serde_json::Value,
+    reconciliation: &serde_json::Value,
+    identity: &DecodedReconciliationIdentity<'_>,
+    disposition: BridgeRecoveryWindowDisposition,
+    window_status: RecoveryWindowStatus,
+    unresolved: &BridgeRecoveryUnresolvedFrontier,
+    expected: Option<&RecoveryReadRequest>,
+) -> Result<Option<ReconciliationPortOutcome>, ProviderFailure> {
+    let legacy_denial = decode_recovery_window_identity_version(
+        reconciliation,
+        identity.window_identity_version,
+        disposition,
+        identity.live_generation,
+        identity.connection_echo,
+    )?;
+    ensure_non_active_recovery_reply_has_no_facts_or_acknowledgement(
+        value,
+        reconciliation,
+        window_status,
+        unresolved,
+    )?;
+    if let Some(legacy_denial) = legacy_denial {
+        check_expected_continuation(reconciliation, &[], expected)?;
+        return Ok(Some(legacy_denial));
+    }
+    Ok(None)
+}
+
+fn reconciliation_receipt_ref(key: &str) -> Result<ReconciliationReceiptRef, ProviderFailure> {
+    ReconciliationReceiptRef::new(format!("bridge-event-reconcile:{key}")).map_err(|_| {
+        event_shape_failure("reconciliation refused: owner key does not form a receipt reference")
+    })
+}
+
 /// Decodes the owner's reconciliation answer into a port outcome, refusing any
 /// answer that does not belong to the presenting attach. The continuation
 /// checks live in [`check_expected_continuation`]: a required stream scope must
@@ -1928,17 +2171,19 @@ fn decode_reconciliation_outcome(
         disposition,
         &unresolved,
     )?;
-    if let Some(legacy_denial) = decode_recovery_window_identity_version(
+    if let Some(legacy_denial) = validate_recovery_window_identity_and_reply_shape(
+        value,
         reconciliation,
-        identity.window_identity_version,
+        &identity,
         disposition,
-        identity.live_generation,
-        identity.connection_echo,
+        window_status,
+        &unresolved,
+        expected,
     )? {
         return Ok(legacy_denial);
     }
 
-    let mut budget = RecoveryDecodeBudget { events: 0, gaps: 0 };
+    let mut budget = RecoveryDecodeBudget::default();
     let stream_facts = decode_reconciliation_streams(
         reconciliation,
         identity.live_generation,
@@ -1950,14 +2195,9 @@ fn decode_reconciliation_outcome(
     let key = verify_reconcile_key(reconciliation)?;
     decode_handoff_maintenance_pressure(reconciliation)?;
     let handoffs_reconciled = decode_handoffs_reconciled(reconciliation)?;
-    check_recovery_page_ordinals(reconciliation, expected)?;
     check_expected_continuation(reconciliation, &stream_facts, expected)?;
-    let receipt_ref = ReconciliationReceiptRef::new(format!("bridge-event-reconcile:{key}"))
-        .map_err(|_| {
-            event_shape_failure(
-                "reconciliation refused: owner key does not form a receipt reference",
-            )
-        })?;
+    check_recovery_page_ordinals(reconciliation, expected, window_status)?;
+    let receipt_ref = reconciliation_receipt_ref(&key)?;
     let presenting_connection = ConnectionId::new(identity.connection_echo).map_err(|_| {
         event_shape_failure("reconciliation refused: connection echo is not a valid identity")
     })?;
@@ -1997,7 +2237,11 @@ fn decode_reconciliation_outcome(
             "reconciliation refused: live attach binding does not seal the owner answer",
         )
     })?
-    .with_consumed_frontiers(consumed_frontiers);
+    .with_consumed_frontiers(if window_status == RecoveryWindowStatus::Active {
+        consumed_frontiers
+    } else {
+        Vec::new()
+    });
     Ok(ReconciliationPortOutcome::Reconciled(
         if expected.is_some() {
             result.as_pure_recovery_read()
@@ -2129,8 +2373,14 @@ fn recovery_scope_value(
     request: &RecoveryReadRequest,
 ) -> Result<BridgeRecoverySelector, ProviderFailure> {
     if request.is_resume() {
-        return Ok(BridgeRecoverySelector::Resume {
-            version: BRIDGE_RECOVERY_RESUME_SELECTOR_VERSION,
+        return Ok(match request.window_key() {
+            Some(window_key) => BridgeRecoverySelector::ResumeWindow {
+                version: BRIDGE_RECOVERY_RESUME_WINDOW_SELECTOR_VERSION,
+                window_key: window_key.to_owned(),
+            },
+            None => BridgeRecoverySelector::Resume {
+                version: BRIDGE_RECOVERY_RESUME_SELECTOR_VERSION,
+            },
         });
     }
     let window_key = request.window_key().ok_or_else(|| {
@@ -2381,11 +2631,15 @@ fn check_finite_page_end(
 fn check_recovery_page_ordinals(
     reconciliation: &serde_json::Value,
     expected: Option<&RecoveryReadRequest>,
+    window_status: RecoveryWindowStatus,
 ) -> Result<(), ProviderFailure> {
     let streams = reconciliation
         .get("streams")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| event_shape_failure("reconciliation refused: stream list absent"))?;
+    if window_status != RecoveryWindowStatus::Active {
+        return Ok(());
+    }
     let list_predecessor = expected
         .and_then(RecoveryReadRequest::stream_list_scope)
         .map(|(after, _)| after.parse::<u64>())
@@ -3127,6 +3381,35 @@ impl KernelMcpForwardingPort {
                 })
         })
     }
+
+    fn validate_reconciliation_window_response(
+        &mut self,
+        value: &serde_json::Value,
+    ) -> Result<RecoveryWindowStatus, ProviderFailure> {
+        let window_status = match value
+            .get("reconciliation")
+            .ok_or_else(event_transport_failure)
+            .and_then(|reconciliation| {
+                decode_recovery_window_state(reconciliation).map(|(_, status)| status)
+            }) {
+            Ok(status) => status,
+            Err(error) => {
+                self.mark_consumed_offer_disposition(ConsumedOfferDisposition::OutcomeUnknown);
+                return Err(error);
+            }
+        };
+        if window_status != RecoveryWindowStatus::Active
+            && value
+                .get("acknowledgement")
+                .is_some_and(|receipt| !receipt.is_null())
+        {
+            self.mark_consumed_offer_disposition(ConsumedOfferDisposition::OutcomeUnknown);
+            return Err(event_shape_failure(
+                "reconciliation refused: moved or expired window cannot confirm a consumed frontier",
+            ));
+        }
+        Ok(window_status)
+    }
 }
 
 impl McpForwardingPort for KernelMcpForwardingPort {
@@ -3331,6 +3614,7 @@ impl McpForwardingPort for KernelMcpForwardingPort {
                 }
             };
         }
+        let window_status = self.validate_reconciliation_window_response(&value)?;
         match has_unresolved_handoff_mutation(&value) {
             Ok(true) => {
                 return match self.retain_acknowledgement_receipt(&value, false) {
@@ -3352,7 +3636,9 @@ impl McpForwardingPort for KernelMcpForwardingPort {
                 return Err(error);
             }
         }
-        if let Err(error) = self.retain_acknowledgement_receipt(&value, false) {
+        if window_status == RecoveryWindowStatus::Active
+            && let Err(error) = self.retain_acknowledgement_receipt(&value, false)
+        {
             self.mark_consumed_offer_disposition(ConsumedOfferDisposition::OutcomeUnknown);
             return Err(error);
         }
@@ -3377,10 +3663,12 @@ impl McpForwardingPort for KernelMcpForwardingPort {
     /// rights, including after a reconnect, and possession of the token
     /// alone authorizes nothing. The reply decodes through the same
     /// validating path as the full read, additionally requiring the
-    /// selected scope, predecessor, and next continuation to match. A Resume
-    /// selector carries no window identity: ORS resolves the unique persisted
-    /// owner-scoped window and its returned key is accepted only through the
-    /// page commitment and reconciliation-key checks.
+    /// selected scope, predecessor, and next continuation to match. A fresh-
+    /// process Resume omits the window key so ORS resolves the unique window
+    /// for the authenticated owner. A cached-core `ResumeWindow` constrains that
+    /// lookup to its previously admitted key, without a continuation proof or
+    /// authority; the returned key still passes the page-commitment and
+    /// reconciliation-key checks.
     fn reconcile_continue(
         &mut self,
         binding: &AttachBinding,
@@ -3944,6 +4232,33 @@ impl BootstrapSnapshot {
     }
 }
 
+/// Attaches the route-profiled payload measurement to one sealed bootstrap.
+///
+/// Renders the composed default output exactly as the wire frame would and
+/// binds the exact UTF-8 byte observation to the owner-selected route profile
+/// ([`measure_route_payload`]), naming the inline expansion handles behind
+/// which omitted material stays reachable. Runs on every sealed delivery, so
+/// each bootstrap the agent receives carries its own live-path measurement.
+/// Measurement never blocks delivery: if rendering fails, the bootstrap keeps
+/// `payload_measurement: None` and the frame bound below still refuses any
+/// oversize emission instead of truncating it.
+fn attach_route_payload_measurement(bootstrap: &mut UnderstandingBootstrap) {
+    let Ok(rendered) = serde_json::to_string(&*bootstrap) else {
+        return;
+    };
+    let mut omitted_behind_handles = Vec::with_capacity(2);
+    omitted_behind_handles.push(bootstrap.next_safe_expansion.clone());
+    if let Some(delta) = &bootstrap.boot_delta {
+        omitted_behind_handles.push(delta.expansion_handle.clone());
+    }
+    let route_profile_ref = bootstrap.route_profile_ref.clone();
+    bootstrap.payload_measurement = Some(measure_route_payload(
+        &route_profile_ref,
+        &rendered,
+        omitted_behind_handles,
+    ));
+}
+
 impl BridgeRunner {
     pub fn new(
         profile: Profile,
@@ -4449,7 +4764,7 @@ impl BridgeRunner {
     /// the live attach fence.
     pub fn note_owner_snapshot(
         &mut self,
-        context: BootstrapContext,
+        mut context: BootstrapContext,
         tasks: BootstrapTaskInputs,
     ) -> Result<(), BootstrapError> {
         if context.onboarding_disposition == ReadinessDisposition::ReadyMaterial {
@@ -4458,6 +4773,16 @@ impl BridgeRunner {
                 detail: "material readiness cannot be projected while the retained context carries only an opaque fence reference".to_owned(),
             });
         }
+        // The host-supplied path never carries frozen rendering identities:
+        // a client can name them in request JSON (bypassing the constructor),
+        // so they are cleared here before validation and retention. Only the
+        // compiled-surface intake re-applies the exact owner values below.
+        context.serializer_id.clear();
+        context.serializer_version.clear();
+        context.serializer_options_digest.clear();
+        context.tokenizer_id.clear();
+        context.tokenizer_version.clear();
+        context.tokenizer_hash.clear();
         get_understanding_bootstrap(&context, &tasks, CurrentAssessment::NotOnboarded)?;
         let binding = self.attach_view().map(|view| view.binding().clone());
         if let Some(seal) = &binding {
@@ -4571,7 +4896,38 @@ impl BridgeRunner {
             next_safe_expansion,
             boot_delta,
         )?;
-        self.note_owner_snapshot(context, tasks)
+        self.note_owner_snapshot(context, tasks)?;
+        // The generic note path clears frozen rendering identities (host
+        // clients can name them in request JSON); re-apply the exact values
+        // the compiled owner surface carried, already validated by
+        // `from_compiled_surface` above.
+        if let Some(snapshot) = self.bootstrap_snapshot.as_mut() {
+            snapshot
+                .context
+                .serializer_id
+                .clone_from(&surface.serializer_id);
+            snapshot
+                .context
+                .serializer_version
+                .clone_from(&surface.serializer_version);
+            snapshot
+                .context
+                .serializer_options_digest
+                .clone_from(&surface.serializer_options_digest);
+            snapshot
+                .context
+                .tokenizer_id
+                .clone_from(&surface.tokenizer_id);
+            snapshot
+                .context
+                .tokenizer_version
+                .clone_from(&surface.tokenizer_version);
+            snapshot
+                .context
+                .tokenizer_hash
+                .clone_from(&surface.tokenizer_hash);
+        }
+        Ok(())
     }
     /// Task inputs retained by the noted owner snapshot for auto-boot.
     ///
@@ -4616,9 +4972,10 @@ impl BridgeRunner {
                 detail: "noted bootstrap seal disagrees with the live attach binding".to_owned(),
             });
         };
-        let bootstrap =
+        let mut bootstrap =
             get_understanding_bootstrap(&snapshot.context, tasks, requested_assessment)?;
         BootstrapSnapshot::selection_matches_sealed_task(&bootstrap, &sealed)?;
+        attach_route_payload_measurement(&mut bootstrap);
         Ok(bootstrap)
     }
     /// Previews the one-time bootstrap without marking it delivered. A
@@ -4634,7 +4991,12 @@ impl BridgeRunner {
             get_understanding_bootstrap(&snapshot.context, tasks, requested_assessment).ok()?;
         BootstrapSnapshot::selection_matches_sealed_task(&preview, &sealed).ok()?;
         let mut session = self.bootstrap_session;
-        session.take_auto_boot(&snapshot.context, tasks, requested_assessment)
+        session
+            .take_auto_boot(&snapshot.context, tasks, requested_assessment)
+            .map(|mut bootstrap| {
+                attach_route_payload_measurement(&mut bootstrap);
+                bootstrap
+            })
     }
     /// Takes the once-per-session auto-boot for the first successful response.
     ///
@@ -4658,6 +5020,10 @@ impl BridgeRunner {
         BootstrapSnapshot::selection_matches_sealed_task(&preview, &sealed).ok()?;
         self.bootstrap_session
             .take_auto_boot(&snapshot.context, tasks, requested_assessment)
+            .map(|mut bootstrap| {
+                attach_route_payload_measurement(&mut bootstrap);
+                bootstrap
+            })
     }
     /// Read-only view of durable in-flight deliveries for bounded Stop accounting.
     ///

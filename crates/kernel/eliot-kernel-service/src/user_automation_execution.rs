@@ -668,6 +668,176 @@ impl UserAutomationWakeCancellation {
         }
         Ok(())
     }
+
+    /// Computes the exact Host batch identity from the ordered owner-issued
+    /// targets. The Host adapter uses the same function before append and
+    /// during readback, so a caller cannot substitute another target set.
+    pub fn host_batch_operation_identity(
+        &self,
+    ) -> Result<(String, String), UserAutomationExecutionError> {
+        self.validate()?;
+        if self.targets.is_empty() {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "cancellation has no owner-issued targets",
+            ));
+        }
+        let members: Vec<(&str, &str)> = self
+            .targets
+            .iter()
+            .map(|target| (target.wake_id.as_str(), target.record_checksum.as_str()))
+            .collect();
+        let bytes = serde_json::to_vec(&(
+            "eliot.user_automation.wake-cancellation-batch.v1",
+            self.identity.operation_id.as_str(),
+            self.identity.idempotency_key.as_str(),
+            members,
+        ))
+        .map_err(|_| {
+            UserAutomationExecutionError::RuntimeResponseMismatch(
+                "cancellation batch identity encoding",
+            )
+        })?;
+        let digest = sha256_hex(&bytes);
+        Ok((
+            format!("ua-wake-cancel-batch:{digest}"),
+            format!("ua-wake-cancel-batch-key:{digest}"),
+        ))
+    }
+
+    /// Canonical commitment retained by the Host batch record for this exact
+    /// typed request, including its owner-issued target and enumeration proof.
+    pub fn request_commitment_sha256(&self) -> Result<String, UserAutomationExecutionError> {
+        self.validate()?;
+        canonical_json_bytes(self)
+            .map(|bytes| sha256_hex(&bytes))
+            .map_err(|_| {
+                UserAutomationExecutionError::RuntimeResponseMismatch(
+                    "cancellation request commitment encoding",
+                )
+            })
+    }
+}
+
+/// Exact result read back from the Host journal for one original cancellation
+/// request. This is distinct from a current-wake lookup: it proves the named
+/// batch operation and request commitment were durably committed.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationWakeCancellationReadback {
+    /// Host batch operation identity selected by the original request.
+    pub batch_operation_id: String,
+    /// Host batch idempotency key selected by the original request.
+    pub batch_idempotency_key: String,
+    /// Canonical commitment of the exact typed cancellation request.
+    pub request_commitment_sha256: String,
+    /// Checksum of the retained Host cancellation-batch record.
+    pub record_checksum: String,
+    /// Sequence of the committed journal append.
+    pub journal_sequence: u64,
+    /// Transaction identity of the committed journal append.
+    pub journal_transaction_id: String,
+    /// Ordered exact wake identities in the committed cancellation batch.
+    pub cancelled_wake_ids: Vec<String>,
+}
+
+impl UserAutomationWakeCancellationReadback {
+    /// Validates the exact operation, request bytes, and ordered targets.
+    pub fn validate_for(
+        &self,
+        request: &UserAutomationWakeCancellation,
+    ) -> Result<(), UserAutomationExecutionError> {
+        request.validate()?;
+        let (expected_operation, expected_key) = request.host_batch_operation_identity()?;
+        let expected_commitment = request.request_commitment_sha256()?;
+        request.validate_cancelled_wake_ids(&self.cancelled_wake_ids)?;
+        for (value, field) in [
+            (
+                &self.batch_operation_id,
+                "cancellation_readback.batch_operation_id",
+            ),
+            (
+                &self.batch_idempotency_key,
+                "cancellation_readback.batch_idempotency_key",
+            ),
+            (
+                &self.journal_transaction_id,
+                "cancellation_readback.journal_transaction_id",
+            ),
+        ] {
+            validate_text(value, field)?;
+        }
+        validate_digest(
+            &self.request_commitment_sha256,
+            "cancellation_readback.request_commitment_sha256",
+        )?;
+        validate_digest(
+            &self.record_checksum,
+            "cancellation_readback.record_checksum",
+        )?;
+        if self.journal_sequence == 0
+            || self.batch_operation_id != expected_operation
+            || self.batch_idempotency_key != expected_key
+            || self.request_commitment_sha256 != expected_commitment
+        {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "cancellation owner readback does not match the original request",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Computes the commitment of the exact Host batch and append receipt.
+    pub fn owner_receipt_commitment_sha256(&self) -> Result<String, UserAutomationExecutionError> {
+        canonical_json_bytes(&(
+            "eliot.user_automation.wake-cancellation-owner-receipt.v1",
+            &self.batch_operation_id,
+            &self.batch_idempotency_key,
+            &self.request_commitment_sha256,
+            &self.record_checksum,
+            self.journal_sequence,
+            &self.journal_transaction_id,
+            &self.cancelled_wake_ids,
+        ))
+        .map(|bytes| sha256_hex(&bytes))
+        .map_err(|_| {
+            UserAutomationExecutionError::RuntimeResponseMismatch(
+                "cancellation owner receipt commitment encoding",
+            )
+        })
+    }
+}
+
+/// Exact cancellation-batch result carried over a newly authenticated Host
+/// channel. The channel digest is separate from the retained batch commitment:
+/// it authenticates this readback connection without rewriting the original
+/// send attempt's channel evidence.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAutomationAuthenticatedWakeCancellationReadback {
+    /// Server-authenticated channel used to query the Host journal.
+    pub authenticated_channel_binding_sha256: String,
+    /// Exact retained batch and journal append evidence.
+    pub readback: Box<UserAutomationWakeCancellationReadback>,
+}
+
+impl UserAutomationAuthenticatedWakeCancellationReadback {
+    /// Validates the readback result and its independent authenticated channel.
+    pub fn validate_for(
+        &self,
+        request: &UserAutomationWakeCancellation,
+        authenticated_channel_binding_sha256: &str,
+    ) -> Result<(), UserAutomationExecutionError> {
+        validate_digest(
+            &self.authenticated_channel_binding_sha256,
+            "cancellation_readback.authenticated_channel_binding_sha256",
+        )?;
+        if self.authenticated_channel_binding_sha256 != authenticated_channel_binding_sha256 {
+            return Err(UserAutomationExecutionError::RuntimeResponseMismatch(
+                "cancellation readback channel binding",
+            ));
+        }
+        self.readback.validate_for(request)
+    }
 }
 
 /// Exact authenticated lookup for one persisted UserAutomation wake.
@@ -2622,6 +2792,19 @@ pub trait UserAutomationRuntimePort: Send + Sync {
         request: UserAutomationWakeCancellation,
     ) -> Result<Vec<String>, UserAutomationRuntimeError>;
 
+    /// Cancels wakes through a transport that durably reports each boundary.
+    /// The default refuses; callers must not fall back to the plain method for
+    /// an operation whose retained row uses the versioned send-claim protocol.
+    async fn cancel_pending_wakes_observed(
+        &self,
+        _request: UserAutomationWakeCancellation,
+        _observer: &dyn super::user_automation_execution_client::UserAutomationHostExecutionObserver,
+    ) -> Result<Vec<String>, UserAutomationRuntimeError> {
+        Err(UserAutomationRuntimeError::Unavailable(
+            "UserAutomation cancellation transport has no custody observer".to_owned(),
+        ))
+    }
+
     /// Writes immutable failure history and calls the existing authenticated
     /// `deliver_user_automation_failure` notification route.
     async fn deliver_user_automation_failure(
@@ -2776,6 +2959,22 @@ pub trait UserAutomationWakePort: Send + Sync {
         ))
     }
 
+    /// Reconciles one exact horizon publication with its schedule owner after
+    /// an unknown handoff. An implementation must return only the owner's
+    /// retained acknowledgement for this immutable revision, fence, and
+    /// occurrence denominator; an absent or inconclusive lookup is an error,
+    /// never proof that publication did not occur. Until the Host publisher
+    /// exists, this interface reports typed unavailability and cannot turn a
+    /// retained horizon into a possible-effect or published claim.
+    async fn read_wake_horizon_publication(
+        &self,
+        _request: impl Into<Box<UserAutomationWakeHorizonPublication>>,
+    ) -> Result<UserAutomationWakePublication, UserAutomationRuntimeError> {
+        Err(UserAutomationRuntimeError::Unavailable(
+            "exact owner wake-horizon publication readback is unavailable".to_owned(),
+        ))
+    }
+
     /// Reads one exact persisted Pending wake from the existing owner.
     /// Implementations without a readback path fail closed.
     async fn read_pending_wake(
@@ -2784,6 +2983,32 @@ pub trait UserAutomationWakePort: Send + Sync {
     ) -> Result<UserAutomationWakeReadback, UserAutomationRuntimeError> {
         Err(UserAutomationRuntimeError::Unavailable(
             "UserAutomation wake readback is unavailable".to_owned(),
+        ))
+    }
+
+    /// Reads the exact committed Host cancellation batch for restart recovery.
+    /// Implementations without the named authenticated journal query fail
+    /// closed; current wake-row absence is not a substitute.
+    async fn read_cancellation_batch(
+        &self,
+        _request: impl Into<Box<UserAutomationWakeCancellation>>,
+    ) -> Result<UserAutomationAuthenticatedWakeCancellationReadback, UserAutomationRuntimeError>
+    {
+        Err(UserAutomationRuntimeError::Unavailable(
+            "exact Host wake-cancellation batch readback is unavailable".to_owned(),
+        ))
+    }
+
+    /// Host-side query path after the execution endpoint validates its
+    /// server-authenticated session. Owner adapters receive the authenticated
+    /// channel digest rather than trusting a caller-carried value.
+    async fn read_cancellation_batch_authenticated(
+        &self,
+        _request: impl Into<Box<UserAutomationWakeCancellation>>,
+        _authenticated_channel_binding_sha256: String,
+    ) -> Result<UserAutomationWakeCancellationReadback, UserAutomationRuntimeError> {
+        Err(UserAutomationRuntimeError::Unavailable(
+            "authenticated exact Host wake-cancellation query is unavailable".to_owned(),
         ))
     }
 
@@ -2816,6 +3041,18 @@ pub trait UserAutomationWakePort: Send + Sync {
         &self,
         request: impl Into<Box<UserAutomationWakeCancellation>>,
     ) -> Result<Vec<String>, UserAutomationRuntimeError>;
+
+    /// Cancellation leg that is admissible for versioned send-claim rows.
+    /// Adapters without source-backed transport custody fail closed.
+    async fn cancel_pending_wakes_observed(
+        &self,
+        _request: impl Into<Box<UserAutomationWakeCancellation>>,
+        _observer: &dyn super::user_automation_execution_client::UserAutomationHostExecutionObserver,
+    ) -> Result<Vec<String>, UserAutomationRuntimeError> {
+        Err(UserAutomationRuntimeError::Unavailable(
+            "wake owner has no observed cancellation transport".to_owned(),
+        ))
+    }
 }
 
 /// Existing canonical Store owner used to persist immutable failure history.
@@ -2907,6 +3144,28 @@ where
                 "wake owner returned a conflicting answer after cancellation was issued: {error}"
             ))
         })?;
+        Ok(cancelled)
+    }
+
+    async fn cancel_pending_wakes_observed(
+        &self,
+        request: UserAutomationWakeCancellation,
+        observer: &dyn super::user_automation_execution_client::UserAutomationHostExecutionObserver,
+    ) -> Result<Vec<String>, UserAutomationRuntimeError> {
+        request
+            .validate()
+            .map_err(|error| UserAutomationRuntimeError::Rejected(error.to_string()))?;
+        let cancelled = self
+            .wake
+            .cancel_pending_wakes_observed(request.clone(), observer)
+            .await?;
+        request
+            .validate_cancelled_wake_ids(&cancelled)
+            .map_err(|error| {
+                UserAutomationRuntimeError::UnknownOutcome(format!(
+                    "wake owner returned a conflicting answer after observed cancellation: {error}"
+                ))
+            })?;
         Ok(cancelled)
     }
 
@@ -3228,6 +3487,43 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
             targets,
             enumeration_receipt,
             runtime,
+            None,
+        )
+        .await
+    }
+
+    /// Remove cancellation routed through the durable transport-custody
+    /// observer. Versioned send-claim rows use this method exclusively.
+    pub async fn remove_and_cancel_with_targets_observed<R: UserAutomationRuntimePort + ?Sized>(
+        &self,
+        request: UserAutomationServiceRequest,
+        targets: Vec<UserAutomationWakeCancellationTarget>,
+        enumeration_receipt: UserAutomationWakeEnumerationReceipt,
+        runtime: &R,
+        observer: &dyn super::user_automation_execution_client::UserAutomationHostExecutionObserver,
+    ) -> Result<UserAutomationRemovalResult, UserAutomationExecutionError> {
+        let (automation_id, automation_revision) = match &request.intent.operation {
+            eliot_kernel_core::UserAutomationOperation::Remove {
+                automation_id,
+                automation_revision,
+            } => (automation_id.clone(), automation_revision.clone()),
+            _ => {
+                return Err(UserAutomationExecutionError::OperationMismatch(
+                    "remove-and-cancel requires remove",
+                ));
+            }
+        };
+        self.cancel_affected_wakes_with_targets(
+            request,
+            CancellingCommit::CommittedRevision {
+                automation_id,
+                automation_revision,
+                expected_state: UserAutomationConfigurationState::Retired,
+            },
+            targets,
+            enumeration_receipt,
+            runtime,
+            Some(observer),
         )
         .await
     }
@@ -3271,6 +3567,43 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
             targets,
             enumeration_receipt,
             runtime,
+            None,
+        )
+        .await
+    }
+
+    /// Pause cancellation routed through the durable transport-custody
+    /// observer. Versioned send-claim rows use this method exclusively.
+    pub async fn pause_and_cancel_with_targets_observed<R: UserAutomationRuntimePort + ?Sized>(
+        &self,
+        request: UserAutomationServiceRequest,
+        targets: Vec<UserAutomationWakeCancellationTarget>,
+        enumeration_receipt: UserAutomationWakeEnumerationReceipt,
+        runtime: &R,
+        observer: &dyn super::user_automation_execution_client::UserAutomationHostExecutionObserver,
+    ) -> Result<UserAutomationRemovalResult, UserAutomationExecutionError> {
+        let (automation_id, automation_revision) = match &request.intent.operation {
+            eliot_kernel_core::UserAutomationOperation::Pause {
+                automation_id,
+                automation_revision,
+            } => (automation_id.clone(), automation_revision.clone()),
+            _ => {
+                return Err(UserAutomationExecutionError::OperationMismatch(
+                    "pause-and-cancel requires pause",
+                ));
+            }
+        };
+        self.cancel_affected_wakes_with_targets(
+            request,
+            CancellingCommit::CommittedRevision {
+                automation_id,
+                automation_revision,
+                expected_state: UserAutomationConfigurationState::Paused,
+            },
+            targets,
+            enumeration_receipt,
+            runtime,
+            Some(observer),
         )
         .await
     }
@@ -3309,6 +3642,39 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
             targets,
             enumeration_receipt,
             runtime,
+            None,
+        )
+        .await
+    }
+
+    /// Superseding-edit cancellation routed through the durable
+    /// transport-custody observer. Versioned send-claim rows use this method.
+    pub async fn edit_and_cancel_with_targets_observed<R: UserAutomationRuntimePort + ?Sized>(
+        &self,
+        request: UserAutomationServiceRequest,
+        superseded: UserAutomationRevision,
+        targets: Vec<UserAutomationWakeCancellationTarget>,
+        enumeration_receipt: UserAutomationWakeEnumerationReceipt,
+        runtime: &R,
+        observer: &dyn super::user_automation_execution_client::UserAutomationHostExecutionObserver,
+    ) -> Result<UserAutomationRemovalResult, UserAutomationExecutionError> {
+        if !matches!(
+            &request.intent.operation,
+            eliot_kernel_core::UserAutomationOperation::Edit { .. }
+        ) {
+            return Err(UserAutomationExecutionError::OperationMismatch(
+                "edit-and-cancel requires edit",
+            ));
+        }
+        self.cancel_affected_wakes_with_targets(
+            request,
+            CancellingCommit::SupersededPredecessor {
+                superseded: Box::new(superseded),
+            },
+            targets,
+            enumeration_receipt,
+            runtime,
+            Some(observer),
         )
         .await
     }
@@ -3329,6 +3695,9 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
         targets: Vec<UserAutomationWakeCancellationTarget>,
         enumeration_receipt: UserAutomationWakeEnumerationReceipt,
         runtime: &R,
+        observer: Option<
+            &dyn super::user_automation_execution_client::UserAutomationHostExecutionObserver,
+        >,
     ) -> Result<UserAutomationRemovalResult, UserAutomationExecutionError> {
         // Wake cancellation acts on the same complete, fail-closed owner view as
         // execution admission (issue #2808). Every cancellation join is a
@@ -3374,9 +3743,14 @@ impl<'a, P: UserAutomationStorePort + ?Sized> UserAutomationService<'a, P> {
             enumeration_receipt: Some(Box::new(enumeration_receipt)),
         };
         cancellation.validate()?;
-        let cancelled_wake_ids = runtime
-            .cancel_pending_wakes(cancellation.clone())
-            .await
+        let cancelled_wake_ids = match observer {
+            Some(observer) => {
+                runtime
+                    .cancel_pending_wakes_observed(cancellation.clone(), observer)
+                    .await
+            }
+            None => runtime.cancel_pending_wakes(cancellation.clone()).await,
+        }
             .map_err(|error| match error {
                 UserAutomationRuntimeError::IdentityConflict => {
                     UserAutomationRuntimeError::UnknownOutcome(

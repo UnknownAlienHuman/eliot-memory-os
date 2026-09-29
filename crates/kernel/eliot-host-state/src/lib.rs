@@ -33,18 +33,19 @@ pub use error::{BackendError, JournalError, ReconcileOutcome};
 pub use journal::{
     AppendDisposition, AppendReceipt, EpochRetirementObservation, EpochRetirementQuery,
     EpochRetirementQueryError, HostStateJournal, JOURNAL_MAGIC, JOURNAL_VERSION,
+    WakeCancellationBatchObservation, WakeCancellationBatchQuery, WakeCancellationBatchQueryError,
     readonly_project_host_state, record_checksum,
 };
 pub use legacy::{LegacyHostStateImporter, LegacyHostStateSnapshot};
 pub use model::{
-    ActivationState, AppliedOperation, CanonicalStoreWriteRefusal, CleanMarker,
-    CutoverIntentRecord, CutoverIntentState, DependencyLifecycleBudget, DependencyRecord,
-    DependencyResourceBudget, DependencyState, DrainCommitRecord, DrainRecord, DrainState,
-    EliotActivationRecord, EpochEvidence, EpochRetirementRecord, FailureRecoveryDirective,
-    HostInstallationEpoch, HostKernelStoreLineage, HostObservationRecord, HostState,
-    HostStateRecord, IdempotencyIdentity, ImmutableProcessManifest, JournalManifest,
-    KernelJobBinding, KernelReadinessObservationRecord, KernelRecord, LifecycleTimestamps,
-    ManagedDependencyRecord, NonceState, OneTimeNonceState,
+    ActivationState, AppliedOperation, BackupPreparationRecord, BackupPreparationState,
+    CanonicalStoreWriteRefusal, CleanMarker, CutoverIntentRecord, CutoverIntentState,
+    DependencyLifecycleBudget, DependencyRecord, DependencyResourceBudget, DependencyState,
+    DrainCommitRecord, DrainRecord, DrainState, EliotActivationRecord, EpochEvidence,
+    EpochRetirementRecord, FailureRecoveryDirective, HostInstallationEpoch, HostKernelStoreLineage,
+    HostObservationRecord, HostState, HostStateRecord, IdempotencyIdentity,
+    ImmutableProcessManifest, JournalManifest, KernelJobBinding, KernelReadinessObservationRecord,
+    KernelRecord, LifecycleTimestamps, ManagedDependencyRecord, NonceState, OneTimeNonceState,
     PREDECESSOR_RETIREMENT_RELATION_CONTRACT, PredecessorRetirementRelation,
     PriorKernelDisposition, PriorKernelSource, ReadinessApprovedContour, ReadinessEvidence,
     RecordFence, RecoveryLineageEvidence, RecoveryLineageReason, ServiceSafetyClass,

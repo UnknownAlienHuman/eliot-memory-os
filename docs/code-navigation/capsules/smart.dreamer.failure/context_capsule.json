@@ -24,9 +24,9 @@
   },
   "source_token_estimate": {
     "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
-    "source_stu": 16105,
+    "source_stu": 58155,
     "test_stu": 29196,
-    "selected_file_count": 6,
+    "selected_file_count": 8,
     "inline_cfg_test_modules": 0,
     "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
   },
@@ -41,9 +41,23 @@
       },
       {
         "path": "crates/smart/eliot-dreamer-failure/src/lib.rs",
-        "bytes": 807,
-        "sha256": "c3f4549dd8f596224216abc4c614d975ff78f530d1c181dc626cd4015ceb837d",
-        "stu": 269,
+        "bytes": 2875,
+        "sha256": "7b04034e4e4a01c6cc47b448bf23302e47b8c550f70a1cd439783a6fb12b95a2",
+        "stu": 959,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-failure/src/negative_memory.rs",
+        "bytes": 68030,
+        "sha256": "2909306619b2a589f837283926cf9a08813ed8f5e83a821c4aea33dbf120270e",
+        "stu": 22677,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/smart/eliot-dreamer-failure/src/negative_memory_match.rs",
+        "bytes": 56053,
+        "sha256": "6ddc561ebf9722443cac4c72e5a49189613e704c920ce6323b91ca5e4cb63d93",
+        "stu": 18685,
         "inline_cfg_test": false
       },
       {
@@ -83,7 +97,7 @@
         ]
       }
     ],
-    "source_selection_digest": "85f3c3a76be21934fcc7dcb894504bb76f0093c8e3f14ea86375a51a262a4e10"
+    "source_selection_digest": "c826f29243e2f4b21a6463cd21208c653367d7062a88616b8d6e6eac60cb5997"
   },
   "one_hop_providers": [
     "eliot-dreamer-contracts",
@@ -92,7 +106,9 @@
     "serde",
     "serde_json"
   ],
-  "one_hop_consumers": [],
+  "one_hop_consumers": [
+    "crates/governor/eliot-governor"
+  ],
   "architecture_implementation_refs": [
     {
       "block": "smart-memory-context",
@@ -120,20 +136,20 @@
     "qualification": "UNVALIDATED (I2.16, I0.5)",
     "reference_capsule_handle": "I2.20"
   },
-  "bound_contract_digest": "b53aa7eecc214a0efe4a5633489b9a661e9035e25289f70d519c8b01819bedda",
+  "bound_contract_digest": "9d35772678b8128be35b0099bd7d9da5b4ad7faf9f80363faf07579535efe701",
   "source_provenance": {
     "input_digests": {
       "workspace_manifest": {
         "path": "Cargo.toml",
-        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
       },
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
-        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
       },
       "architecture_boundaries": {
         "path": "config/architecture-boundaries.toml",
-        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
       },
       "logical_block_config": {
         "path": "docs/code-navigation/logical-blocks.toml",
@@ -145,19 +161,19 @@
       },
       "module_manifest": {
         "path": "crates/smart/eliot-dreamer-failure/module.toml",
-        "sha256": "415f0ed2e94993962238312150e2adc7f93d3ce76cc9d106f2989a5c0b2e6dcb"
+        "sha256": "5db2b5ed45c94fee7f670095a92aa9d9aec6cb6a19bd9ce99a8328efa50e1a39"
       },
       "selected_source": {
-        "path_count": 6,
-        "sha256": "85f3c3a76be21934fcc7dcb894504bb76f0093c8e3f14ea86375a51a262a4e10"
+        "path_count": 8,
+        "sha256": "c826f29243e2f4b21a6463cd21208c653367d7062a88616b8d6e6eac60cb5997"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "695451866cc1e49adf1042714a6be880e545e97aa1ff47a967850f536fbbef39",
+  "artifact_digest": "559b3a9e1ddd762a270a0f3a7b7e20f95bd2634c49d73e837cbb4f5a8dd5af5c",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "695451866cc1e49a"
+    "value": "559b3a9e1ddd762a"
   }
 }

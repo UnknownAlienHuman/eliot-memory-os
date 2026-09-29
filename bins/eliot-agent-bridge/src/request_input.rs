@@ -21,8 +21,8 @@
 //!
 //! Accepted baseline: controller-accepted v1 preparation profile at PR #2314
 //! merge `52941612f53450da3b0cd5f06f82067b6421b02a`. Post-acceptance change
-//! in this file is exactly two envelope arms in `check_operation_shape` and
-//! nothing else: `dry_run_invoke | dry_run_cancel` (merge resolution
+//! in this file add exact operation-shape arms in `check_operation_shape`:
+//! `dry_run_invoke | dry_run_cancel` (merge resolution
 //! `f44fdded`, 2293 dry-run lane) and `bootstrap` (commit `4056d007`, 1938
 //! bootstrap lane), each tracking an owner-driven `Request` variant addition
 //! in `main.rs`. Every numeric limit, the oversize disposition, the redaction
@@ -37,6 +37,9 @@
 //! `reactive_snapshot`), tracking the owner-driven reactive `Request`
 //! variants in `main.rs`; the key allowlist grows with their payload members
 //! and limits, dispositions, and redaction stay unchanged.
+//! Issue #2561 adds the closed `forward_gap` envelope carrying the existing
+//! typed `CoverageGap`; all record, string, array, scalar, and nesting bounds
+//! remain unchanged.
 //!
 //! Time bounds (`idle_timeout_ms`, `lifetime_timeout_ms`) are declared here so
 //! the profile is complete, but they are NOT enforced on blocking stdin by
@@ -602,10 +605,11 @@ fn field_between_backticks(message: &str) -> String {
 ///
 /// Derived read-only from `bins/eliot-agent-bridge/src/main.rs` `Request`;
 /// this table moves with that enum when its owner changes the operation set.
-const GLOBAL_ENVELOPE_KEYS: [&str; 24] = [
+const GLOBAL_ENVELOPE_KEYS: [&str; 25] = [
     "op",
     "request",
     "event",
+    "gap",
     "expected_connection_id",
     "new_connection_id",
     "session_id",
@@ -635,7 +639,8 @@ const GLOBAL_ENVELOPE_KEYS: [&str; 24] = [
 /// `recover_next_page`, `reactive_snapshot`) would silently
 /// ignore extra members, so the exact key set is enforced here per operation:
 /// attach/invoke/cancel carry exactly `request`; forward_hook/forward_event
-/// carry exactly `event`; reconnect carries exactly its seven authority-claim
+/// carry exactly `event`; forward_gap carries exactly the typed `gap`;
+/// reconnect carries exactly its seven authority-claim
 /// members; detach carries exactly its six bearer-claim members (the reconnect
 /// set minus `new_connection_id`); `reactive_admit` carries exactly its five
 /// caller-supplied admission members; `reactive_record_use` carries exactly
@@ -745,6 +750,7 @@ fn check_operation_shape(operation: &str, keys: &[String]) -> Result<(), DecodeR
         "attach" | "invoke" | "cancel" => &["op", "request"],
         "dry_run_invoke" | "dry_run_cancel" => &["op", "request"],
         "forward_hook" | "forward_event" => &["op", "event"],
+        "forward_gap" => &["op", "gap"],
         "reconcile_external" | "recover_next_page" | "status" | "stop" | "reactive_snapshot" => {
             &["op"]
         }

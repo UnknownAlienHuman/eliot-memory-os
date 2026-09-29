@@ -3821,8 +3821,17 @@ pub const HOST_REQUEST_RESULT_BODY_WIRE_ID: &str = "eliot.protocol.host-request-
 /// Kernel binds into the sealed trace manifest. Stored version-1/2/3 rows
 /// predate execution evidence and still decode (the field defaults to `None`);
 /// a sealed manifest enumerates the absent evidence as missing parts instead.
-pub const HOST_REQUEST_RESULT_BODY_WIRE_VERSION: u16 = 4;
+///
+/// Version 5 names the result class inside the result lineage (issue #1809):
+/// which kind of record these exact bytes are, so a consumer can tell an
+/// existing evidence read from a newly produced candidate instead of
+/// inferring it from the word "result". Stored version-2/3/4 rows predate the
+/// class and still decode (the field defaults to
+/// [`HostRequestResultClass::Unclassified`], which is never an admitted claim).
+pub const HOST_REQUEST_RESULT_BODY_WIRE_VERSION: u16 = 5;
 const HOST_REQUEST_RESULT_BODY_V2_READBACK_WIRE_VERSION: u16 = 2;
+const HOST_REQUEST_RESULT_BODY_V3_READBACK_WIRE_VERSION: u16 = 3;
+const HOST_REQUEST_RESULT_BODY_V4_READBACK_WIRE_VERSION: u16 = 4;
 /// Stable wire identity for a Kernel-issued local-read attempt capability.
 pub const LOCAL_READ_ATTEMPT_WIRE_ID: &str = "eliot.protocol.local-read-attempt";
 /// Current local-read attempt capability wire version.
@@ -3987,9 +3996,23 @@ pub struct HostRequestResultLineage {
     #[serde(default)]
     pub policy_fence: Option<PolicyFence>,
     /// References to origin-authentication evidence; presence is not itself
-    /// authentication because the referenced evidence must be verified by its owner.
+    /// authentication because the referenced evidence must be verified by its
+    /// owner (I15.19). A reference never qualifies this result: only
+    /// [`Self::semantic_receipt_ref`] does, and only for
+    /// [`HostRequestResultClass::CanonicalWriteReceipt`].
     #[serde(default)]
     pub origin_evidence_refs: Option<Vec<String>>,
+    /// Exact admitted semantic receipt this record repeats, and only for
+    /// [`HostRequestResultClass::CanonicalWriteReceipt`]. `None` for every
+    /// other class, which is why a read, a candidate or a delivery record can
+    /// never be presented as an admitted semantic record.
+    #[serde(default)]
+    pub semantic_receipt_ref: Option<String>,
+    /// Which kind of record these exact bytes are (issue #1809 item 1).
+    /// `Unclassified` for a stored row written before the field existed;
+    /// unknown, never an admitted class.
+    #[serde(default = "unclassified_result_class")]
+    pub result_class: HostRequestResultClass,
     /// Maximum receipt interpretation, not a semantic truth/admission status.
     #[serde(default)]
     pub proof_ceiling: Option<ProofCeiling>,
@@ -3999,6 +4022,48 @@ pub struct HostRequestResultLineage {
     /// Instruction/data taint. `None` means unknown, not cleared.
     #[serde(default)]
     pub instruction_taint: Option<InstructionTaint>,
+}
+
+/// The distinct result classes a host-request result can actually be, and the
+/// only ones this contract admits (issue #1809 item 1).
+///
+/// The class is a claim about the record's provenance, checked against the
+/// evidence the lineage itself carries — never against the transport that
+/// delivered it. A matching content hash, an authenticated daemon, or an
+/// origin reference proves byte identity or process identity, never semantic
+/// truth, so none of them can move a record into
+/// [`Self::CanonicalWriteReceipt`]: that class requires
+/// [`HostRequestResultLineage::semantic_receipt_ref`], the exact admitted
+/// semantic receipt (I1.8, I15.6, I15.12).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HostRequestResultClass {
+    /// A stored row that predates this field, or a producer that named no
+    /// class. Unknown provenance; it is not a read, a candidate, a verdict, or
+    /// an admitted record.
+    Unclassified,
+    /// A read of already-retained canonical evidence, served with its actual
+    /// revision and provenance. It creates no new semantic record (I1.8 read
+    /// path).
+    ExistingEvidenceRead,
+    /// Newly produced model or untrusted output. Candidate only: it stays
+    /// candidate without an explicit governed promotion (I15.6, I15.12).
+    NewCandidate,
+    /// A verifier or reconciliation observation about a completion. It is an
+    /// observation, not an admission of the observed content (I1.8 external
+    /// effect path).
+    VerifierObservation,
+    /// A canonical `WriteReceipt`-backed semantic record. The only class that
+    /// may carry a semantic receipt reference.
+    CanonicalWriteReceipt,
+    /// A retained response or delivery record for an already-completed
+    /// operation. It records that bytes were produced or sent; it admits
+    /// nothing about the content.
+    RetainedDeliveryRecord,
+}
+
+const fn unclassified_result_class() -> HostRequestResultClass {
+    HostRequestResultClass::Unclassified
 }
 
 /// Exact source revision observed by a local read, without depending on the
@@ -4016,6 +4081,39 @@ pub struct HostRequestResultSourceRevision {
 
 const fn unknown_result_influence() -> InfluenceState {
     InfluenceState::Unknown
+}
+
+/// Validates the source revisions a lineage claims, if it claims any.
+///
+/// Each key must be a bounded non-empty string, unique across the set so one
+/// revision cannot be listed twice, and carry a non-zero revision with its own
+/// valid state fence, so a result cannot present a stale or self-contradicting
+/// source position as its origin.
+fn validate_source_revisions(
+    revisions: &[HostRequestResultSourceRevision],
+) -> Result<(), ProtocolError> {
+    let mut revision_keys = std::collections::BTreeSet::new();
+    for revision in revisions {
+        bounded_text(
+            &revision.key,
+            "host_request_result_body.lineage.source_revisions.key",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        if !revision_keys.insert(&revision.key) {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request_result_body.lineage.source_revisions",
+                reason: "source revision keys must be unique",
+            });
+        }
+        if revision.revision == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request_result_body.lineage.source_revisions.revision",
+                reason: "source revision must be non-zero",
+            });
+        }
+        revision.state_fence.validate()?;
+    }
+    Ok(())
 }
 
 impl HostRequestResultLineage {
@@ -4083,27 +4181,7 @@ impl HostRequestResultLineage {
             }
         }
         if let Some(revisions) = &self.source_revisions {
-            let mut revision_keys = std::collections::BTreeSet::new();
-            for revision in revisions {
-                bounded_text(
-                    &revision.key,
-                    "host_request_result_body.lineage.source_revisions.key",
-                    MAX_HOST_REQUEST_TEXT_BYTES,
-                )?;
-                if !revision_keys.insert(&revision.key) {
-                    return Err(ProtocolError::InvalidField {
-                        field: "host_request_result_body.lineage.source_revisions",
-                        reason: "source revision keys must be unique",
-                    });
-                }
-                if revision.revision == 0 {
-                    return Err(ProtocolError::InvalidField {
-                        field: "host_request_result_body.lineage.source_revisions.revision",
-                        reason: "source revision must be non-zero",
-                    });
-                }
-                revision.state_fence.validate()?;
-            }
+            validate_source_revisions(revisions)?;
         }
         if let Some(policy_fence) = &self.policy_fence {
             bounded_text(
@@ -4123,6 +4201,53 @@ impl HostRequestResultLineage {
                     })?;
             }
         }
+        self.validate_class()?;
+        Ok(())
+    }
+
+    /// Refuses a class the lineage's own evidence does not support.
+    ///
+    /// The check is deliberately one-directional. It can only withhold a class
+    /// the record cannot prove; it never mints one, and it never reads the
+    /// transport, the producer identity or a content hash as a substitute for
+    /// the admitted semantic receipt (I15.19, I15.6). An origin reference, a
+    /// proof ceiling and a retained digest are deliberately NOT accepted here:
+    /// none of them is an admission, so accepting any of them would upgrade the
+    /// record to a stronger claim than its owner actually proved.
+    fn validate_class(&self) -> Result<(), ProtocolError> {
+        let unsupported = |reason: &'static str| ProtocolError::InvalidField {
+            field: "host_request_result_body.lineage.result_class",
+            reason,
+        };
+        // Only an admitted semantic record may claim the admitted class, and
+        // only by naming the exact receipt that admitted it. Everything else
+        // is refused, so a candidate cannot be relabelled by adding an origin
+        // reference or by arriving over an authenticated transport.
+        if self.result_class == HostRequestResultClass::CanonicalWriteReceipt
+            && self.semantic_receipt_ref.is_none()
+        {
+            return Err(unsupported(
+                "a canonical write receipt result requires its exact admitted semantic receipt",
+            ));
+        }
+        // The inverse direction: a non-canonical class must not carry the
+        // receipt that would make it one. Otherwise a read or a delivery record
+        // could be presented as admitted by adding a receipt to a lineage that
+        // never earned it.
+        if self.result_class != HostRequestResultClass::CanonicalWriteReceipt
+            && self.semantic_receipt_ref.is_some()
+        {
+            return Err(unsupported(
+                "only a canonical write receipt result may carry a semantic receipt reference",
+            ));
+        }
+        if let Some(receipt) = &self.semantic_receipt_ref {
+            bounded_text(
+                receipt,
+                "host_request_result_body.lineage.semantic_receipt_ref",
+                MAX_HOST_REQUEST_TEXT_BYTES,
+            )?;
+        }
         Ok(())
     }
 }
@@ -4133,16 +4258,28 @@ impl HostRequestResultBody {
 
     /// Validates the closed body shape and exact response/lineage digest binding.
     ///
-    /// Version 2 is accepted only as a retained readback with no lineage. It is
-    /// never accepted by submission validation. Version 1 remains decodable
-    /// for compatibility, but is not shape-validated by this method.
+    /// Versions 3 and 4 are accepted only as a retained readback, never by
+    /// submission validation, and only under the explicit limitation they carry:
+    /// they predate the result class, so their lineage decodes as
+    /// [`HostRequestResultClass::Unclassified`] — an explicit unknown, never an
+    /// admitted class. Version 2 is accepted only as a retained readback with
+    /// no lineage at all. Version 1 remains decodable for compatibility, but is
+    /// not shape-validated by this method.
     pub fn validate(&self) -> Result<(), ProtocolError> {
         let version_is_current = self.wire_version == Self::CONTRACT_VERSION;
+        // Every lineage-bearing predecessor is readable, and every predecessor
+        // decodes its undeclared class as `Unclassified` through the field
+        // default. The limitation is stated, not defaulted to allowed.
         let version_is_legacy_readback = self.wire_version
             == HOST_REQUEST_RESULT_BODY_V2_READBACK_WIRE_VERSION
             && self.lineage.is_none();
+        let version_is_classless_readback = matches!(
+            self.wire_version,
+            HOST_REQUEST_RESULT_BODY_V3_READBACK_WIRE_VERSION
+                | HOST_REQUEST_RESULT_BODY_V4_READBACK_WIRE_VERSION
+        ) && self.lineage.is_some();
         if self.wire_id != HOST_REQUEST_RESULT_BODY_WIRE_ID
-            || (!version_is_current && !version_is_legacy_readback)
+            || !(version_is_current || version_is_legacy_readback || version_is_classless_readback)
         {
             return Err(ProtocolError::InvalidField {
                 field: "host_request_result_body.wire",

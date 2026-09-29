@@ -29,7 +29,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 #[path = "persistence_codec.rs"]
-mod persistence_codec;
+pub(crate) mod persistence_codec;
 use persistence_codec::{
     LegacyGrantClosureRecord, LegacyGrantClosureState, decode, decode_legacy_grant_closure_record,
     decode_named, encode, is_current_grant_closure_shape,
@@ -74,26 +74,27 @@ use crate::{
     GenerationTransition, GenerationTransitionReceipt, GrantClosureCommit,
     GrantClosureCommitReceipt, GrantClosureFenceReceipt, GrantClosureFenceRequest,
     GrantClosureProjection, GrantClosureState, HostRequestRecord, HostRequestState, JobCheckpoint,
-    KernelAuthoritySnapshot, LegacyTwoValueRelationBackupVerificationClass,
-    LegacyUnscopedBackupVerificationClass, NativeWorkerClaimAdmission, NativeWorkerClaimRecord,
-    NativeWorkerClaimStageOutcome, NativeWorkerClaimState, OpaqueLabel, OperationIdentity,
-    OperationalCurrentRecoveryCursor, OperationalCurrentRecoveryEntry,
-    OperationalCurrentRecoveryPage, OperationalMutationReceipt, OperationalPhase,
-    OperationalRecordContext, OperationalRecordInput, OrsError, OrsSnapshotReceipt,
-    OrsSnapshotRequest, PendingOperationPage, ProcessEvidenceReadback, ProcessEvidenceRecord,
-    ProcessStartReplayAbort, ProcessStartReplayRecord, ProcessStartReplayState,
-    ProcessStreamRecoveryFence, ProcessStreamRecoveryLoadError, ProcessStreamRecoveryProjection,
-    ProcessStreamRecoveryRevalidation, ProcessStreamRecoveryStatusProjection,
-    ProcessStreamRecoveryWriteOutcome, ProcessStreamRetirementProof, ProcessStreamSourceResolver,
-    RecoveredAuthoritySnapshot, RecoveryCursor, RecoveryInboxDisposition, RecoveryInboxItem,
-    RecoveryInboxReceipt, RecoveryInboxRecoveryCursor, RecoveryInboxRecoveryEntry,
-    RecoveryInboxRecoveryPage, RecoveryInventorySnapshot, RecoveryInventorySource, RecoveryPage,
-    RecoveryPayload, RecoveryPayloadEnvelope, RecoveryProblem, RecoveryProblemKind,
-    RecoveryProblemRecoveryCursor, RecoveryProblemRecoveryPage, RecoveryWriteBinding,
-    ReservationRecord, ReservationRequest, ReservationState, ReservedScope, RetryState,
-    RootTransitionCommit, RootTransitionCommitProjection, ScopeTerminalReceipt, ScopeTerminalView,
-    SessionBindingReceipt, SessionDetach, StageReceipt, StagedOperation, StateFenceSnapshot,
-    StreamRecoveryActivation, StreamRecoveryReconciliationState, SupervisionLeaseCommitTicket,
+    KernelAuthoritySnapshot, LegacyFenceBoundBackupVerificationClass,
+    LegacyTwoValueRelationBackupVerificationClass, LegacyUnscopedBackupVerificationClass,
+    NativeWorkerClaimAdmission, NativeWorkerClaimRecord, NativeWorkerClaimStageOutcome,
+    NativeWorkerClaimState, OpaqueLabel, OperationIdentity, OperationalCurrentRecoveryCursor,
+    OperationalCurrentRecoveryEntry, OperationalCurrentRecoveryPage, OperationalMutationReceipt,
+    OperationalPhase, OperationalRecordContext, OperationalRecordInput, OrsError,
+    OrsSnapshotReceipt, OrsSnapshotRequest, PendingOperationPage, ProcessEvidenceReadback,
+    ProcessEvidenceRecord, ProcessStartReplayAbort, ProcessStartReplayRecord,
+    ProcessStartReplayState, ProcessStreamRecoveryFence, ProcessStreamRecoveryLoadError,
+    ProcessStreamRecoveryProjection, ProcessStreamRecoveryRevalidation,
+    ProcessStreamRecoveryStatusProjection, ProcessStreamRecoveryWriteOutcome,
+    ProcessStreamRetirementProof, ProcessStreamSourceResolver, RecoveredAuthoritySnapshot,
+    RecoveryCursor, RecoveryInboxDisposition, RecoveryInboxItem, RecoveryInboxReceipt,
+    RecoveryInboxRecoveryCursor, RecoveryInboxRecoveryEntry, RecoveryInboxRecoveryPage,
+    RecoveryInventorySnapshot, RecoveryInventorySource, RecoveryPage, RecoveryPayload,
+    RecoveryPayloadEnvelope, RecoveryProblem, RecoveryProblemKind, RecoveryProblemRecoveryCursor,
+    RecoveryProblemRecoveryPage, RecoveryWriteBinding, ReservationRecord, ReservationRequest,
+    ReservationState, ReservedScope, RetryState, RootTransitionCommit,
+    RootTransitionCommitProjection, ScopeTerminalReceipt, ScopeTerminalView, SessionBindingReceipt,
+    SessionDetach, StageReceipt, StagedOperation, StateFenceSnapshot, StreamRecoveryActivation,
+    StreamRecoveryReconciliationState, SupervisionLeaseCommitTicket,
     SupervisionLeasePrepareRequest, SupervisionLeaseProjection, SupervisionLeaseReceipt,
     SupervisionLeaseReceiptInput, SupervisionLeaseRecord, SupervisionLeaseSnapshot,
     SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
@@ -234,6 +235,27 @@ const SCAN_DISCLOSURE_RECORDS: TableDefinition<&str, &str> =
 /// admitted write attempt.
 const BACKUP_VERIFICATION_RESULTS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_backup_verification_results_v1");
+/// Durable purge-ledger rows (issue #960; I5.13:44, A12.08, A13.7).
+///
+/// One row per applied purge, keyed by the ledger entry's `purge_id`, holding
+/// the accepted entry verbatim plus the ledger-wide revision the owner
+/// allocated for it. The published revision is NOT derived from this table at
+/// read time: it is allocated in the same write transaction that inserts the
+/// row, from the durable counter in [`META`], so a purge can neither become
+/// durable without consuming exactly one revision nor consume a revision
+/// without becoming durable. This is one more table in the existing ORS table
+/// family, owned by the same `RedbRecoveryStore` and written through the same
+/// `persistence_codec`; it is not a second ledger or a second table owner.
+const PURGE_LEDGER: TableDefinition<&str, &str> = TableDefinition::new("ors_purge_ledger_v1");
+/// Durable `backup.verify` → owner-observed purge-ledger revision bindings.
+///
+/// Keyed by the verification operation's own `record_key`, so a binding can
+/// only ever be read back for the exact operation that produced it. Written in
+/// the SAME write transaction that reads the purge-ledger counter and stages the
+/// verification row, so the revision it carries is the one the owner held at that
+/// instant and cannot be presented, retried or recomputed by the caller.
+const PURGE_LEDGER_REVISION_BINDINGS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_purge_ledger_revision_bindings_v1");
 const CUTOVER_OWNERSHIP: TableDefinition<&str, &str> =
     TableDefinition::new("ors_cutover_ownership_v1");
 const HOST_REQUESTS: TableDefinition<&str, &str> = TableDefinition::new("ors_host_requests_v1");
@@ -336,11 +358,62 @@ const BRIDGE_RECOVERY_PROOF_SENTINEL: &str =
 const MAX_BRIDGE_RECOVERY_WINDOWS: usize = 64;
 const MAX_BRIDGE_RECOVERY_CUTS: usize = 4096;
 const MAX_BRIDGE_RECOVERY_REPLY_BYTES: usize = 256 * 1024;
+/// Recovery decodes at most one existing I7.2 maximum frame per operation.
+/// A maximum raw event plus its normalized projection fits below this input
+/// ceiling. Serialized page items consume a separate part of the combined
+/// request/response work budget; the full response remains separately capped
+/// at 256 KiB.
+const MAX_BRIDGE_RECOVERY_DECODED_BYTES: usize = 4 * 1024 * 1024;
+const MAX_BRIDGE_RECOVERY_CALL_BYTES: usize =
+    MAX_BRIDGE_RECOVERY_DECODED_BYTES + MAX_BRIDGE_RECOVERY_REPLY_BYTES;
+const MAX_BRIDGE_RECOVERY_INLINE_SOURCE_BYTES: usize = 4096;
+/// One recovery call's finite work bound, derived from the existing bounded
+/// owner, position, handoff, replay-commitment, projection, event, and gap
+/// tables plus their maximum page sizes. The 4 MiB aggregate byte ceiling is
+/// the effective limit for decoded persisted rows; this also counts bounded
+/// reference lookups and serialized page items that do not decode a row.
+const MAX_BRIDGE_RECOVERY_WORK_ITEMS: usize = (4 * MAX_BRIDGE_STREAM_OWNERS)
+    + (MAX_BRIDGE_STREAM_OWNERS * (MAX_BRIDGE_EVENT_GAPS_PER_STREAM + 1))
+    + (3 * MAX_BRIDGE_RECOVERY_WINDOWS)
+    + (2 * MAX_BRIDGE_RECOVERY_CUTS)
+    + (MAX_BRIDGE_RECOVERY_STREAMS_PER_PAGE
+        * ((3 * MAX_BRIDGE_POSITION_LIVE_PER_NAMESPACE)
+            + (2 * MAX_BRIDGE_EVENT_REPLAY_COMMITMENTS_PER_STREAM)
+            + MAX_BRIDGE_EVENT_HANDOFFS
+            + MAX_BRIDGE_EVENT_PROJECTIONS
+            + (4 * MAX_BRIDGE_EVENT_GAPS_PER_STREAM)
+            + (4 * MAX_BRIDGE_EVENT_PAGE)
+            + 1
+            + 24))
+    + 8;
 const BRIDGE_RECOVERY_WINDOW_TTL_MS: u64 = 5 * 60 * 1000;
+const BRIDGE_RECOVERY_EXPIRY_EVIDENCE_META_KEY: &str = "bridge_recovery_expiry_evidence_v1";
+const MAX_BRIDGE_RECOVERY_EXPIRY_EVIDENCE: usize = MAX_BRIDGE_RECOVERY_WINDOWS;
+/// ASSUMPTION for #2732: exact expiry is retained for one additional existing
+/// window TTL; after that finite horizon, Resume reports unavailable evidence.
+/// With a monotonic effective clock, every still-retained natural expiry at
+/// time `t` expired in `(t - TTL, t]`, so its source window was still live at
+/// `t - TTL`; at most the existing 64 live windows can supply those rows.
+/// Explicit early retirement also retains a bounded Moved row, so it can push
+/// the combined set over that natural-expiry bound; overflow aborts Open
+/// atomically without deleting the source row. The byte cap is derived from 64 rows, three
+/// 1,024-byte owner components conservatively escaped at six JSON bytes per
+/// input byte, two digests, bounded integer fields, and per-row JSON overhead.
+const MAX_BRIDGE_RECOVERY_EXPIRY_EVIDENCE_BYTES: usize = MAX_BRIDGE_RECOVERY_EXPIRY_EVIDENCE
+    * (3 * 6 * 1_024 + 2 * 64 + 16 * 20 + 1_024)
+    + MAX_BRIDGE_RECOVERY_EXPIRY_EVIDENCE;
 const BRIDGE_OWNER_LIST_INDEX_SCHEMA_KEY: &str = "bridge_owner_list_index_schema";
 const BRIDGE_OWNER_LIST_INDEX_SCHEMA_V2: &str = "v2";
 const BRIDGE_OWNER_LIST_SEQUENCE_KEY: &str = "bridge_owner_list_sequence";
 const BRIDGE_RECOVERY_WINDOW_SEQUENCE_KEY: &str = "bridge_recovery_window_sequence";
+/// Durable counter of the owner-applied purge ledger (issue #960; I5.13:44).
+///
+/// Read and advanced only inside the write transaction that applies a purge,
+/// so it counts applied purges and nothing else. `I5.13:44` binds this value
+/// in a `full_recovery` receipt and `A13.7` requires a restore to compare an
+/// archive against it before any effect. An absent counter means no purge was
+/// ever applied, which is revision zero and not an unknown answer.
+const PURGE_LEDGER_REVISION_KEY: &str = "purge_ledger_revision";
 const BRIDGE_RECOVERY_SOURCE_REVISION_KEY_PREFIX: &str = "bridge_recovery_source_revision::";
 const BRIDGE_RECOVERY_LEGACY_UNPROVEN_KEY: &str = "bridge_recovery_legacy_unproven_v1";
 /// Stored phase of a durably staged bridge event. The stage entry is the
@@ -600,10 +673,11 @@ const BRIDGE_EVENT_DISPOSITION_RETIRED: &str = "retired";
 /// The admission itself is the OWNER's (issue #1934): `admitted_source` and
 /// `admitted_scope` bind the exact source digest and the scope the owner
 /// evaluated, and `admitted_policy_revision` names the privacy policy
-/// revision the verdict was made under. A row whose verdict was reached
-/// without those three bindings is not verbatim-admissible, so legacy rows
-/// that predate the privacy fields keep validating while every row written by
-/// the current stage entry carries the bound authorization.
+/// revision the verdict was made under. Without those bindings, source bytes
+/// are never retained verbatim. A current redacted row may instead preserve
+/// the transport hash and explicit redaction receipt while leaving all owner
+/// authorization fields absent; legacy rows that predate the privacy fields
+/// keep validating under their existing rules.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BridgeEventRow {
@@ -638,19 +712,21 @@ struct BridgeEventRow {
     redaction_marker: String,
     #[serde(default)]
     redaction_version: u16,
-    /// Exact digest of the source bytes the privacy owner evaluated
-    /// (issue #1934). Empty only on rows written before owner authorization
-    /// existed; a verbatim-admissible row written by the current stage entry
-    /// always carries the transport hash here.
+    /// Exact digest of source bytes the privacy owner evaluated (issue #1934).
+    /// Empty when no owner authorization was supplied; such a current row is
+    /// allowed only in the redacted form and never retains source bytes.
     #[serde(default)]
     admitted_source: String,
     /// Scope the privacy owner evaluated these bytes under (issue #1934):
-    /// the admitted owner namespace. Empty on legacy rows only.
+    /// the admitted owner namespace. Empty when no owner authorization was
+    /// supplied; the independent stream owner binding remains in
+    /// `owner_namespace`.
     #[serde(default)]
     admitted_scope: String,
     /// Privacy policy revision the owner verdict was made under (issue
-    /// #1934). Zero on legacy rows only; a changed revision under the same
-    /// event identity is a policy change, never a duplicate.
+    /// #1934). Zero when no owner authorization was supplied; a changed
+    /// revision under the same event identity is a policy change, never a
+    /// duplicate.
     #[serde(default)]
     admitted_policy_revision: u64,
     /// Ingest provenance reconstructible after restart (issue #1934, I7.23):
@@ -777,14 +853,12 @@ impl BridgeEventRow {
     /// privacy fields (empty transport hash on an admissible row) validate as
     /// legacy rows against the envelope identity digest.
     ///
-    /// Issue #1934 binds the OWNER authorization itself: a verbatim-admissible
-    /// row written by the current stage entry must name the source the owner
-    /// evaluated, the scope it evaluated it under, and the policy revision it
-    /// decided at, with the source equal to the row's own transport hash. A
-    /// row that claims verbatim admissibility with any of those unbound is
-    /// rejected instead of read as owner-authorized. The binding is kept on
-    /// redacted rows too, so a later owner decision is always attributable to
-    /// the bytes, scope, and policy revision it was made about.
+    /// Issue #1934 binds any owner authorization itself: an owner-authorized
+    /// row must name the source, scope, and policy revision, with the source
+    /// equal to the row's own transport hash. A row with no owner verdict may
+    /// be stored only as a deterministic redacted receipt with all three
+    /// authorization fields absent. The independent stream-owner binding is
+    /// still required for owner-checked staging.
     fn validate_privacy(&self) -> Result<(), OrsError> {
         self.validate_privacy_authorization()?;
         if !self.redacted {
@@ -871,6 +945,12 @@ impl BridgeEventRow {
     fn validate_privacy_authorization(&self) -> Result<(), OrsError> {
         let bound = [self.admitted_source.as_str(), self.admitted_scope.as_str()];
         if bound.iter().all(|field| field.is_empty()) && self.admitted_policy_revision == 0 {
+            if !self.transport_hash.is_empty() && !self.redacted {
+                return Err(OrsError::InvalidField {
+                    field: "admitted_source",
+                    reason: "bridge event without a privacy owner verdict must be redacted",
+                });
+            }
             return Ok(());
         }
         if bound.iter().any(|field| field.is_empty()) || self.admitted_policy_revision == 0 {
@@ -962,7 +1042,9 @@ struct BridgeEventProjectionRow {
     /// Redaction classes of the bound record's receipt; empty exactly when
     /// `record_redacted` is false.
     record_redacted_classes: Vec<String>,
-    /// Scope the privacy owner evaluated the source bytes under.
+    /// Scope the privacy owner evaluated the source bytes under. Empty only
+    /// for an explicit redacted receipt created when no owner verdict was
+    /// supplied; that state carries no admitted scope or policy claim.
     admitted_scope: String,
     /// Privacy policy revision the owner's verdict was made under.
     admitted_policy_revision: u64,
@@ -987,12 +1069,25 @@ impl BridgeEventProjectionRow {
             crate::model::validate_digest(&self.owner_namespace, "owner_namespace")?;
         }
         crate::model::validate_digest(&self.record_transport_hash, "record_transport_hash")?;
-        crate::model::validate_digest(&self.admitted_scope, "admitted_scope")?;
-        if self.admitted_policy_revision == 0 {
-            return Err(OrsError::InvalidField {
-                field: "admitted_policy_revision",
-                reason: "bridge event projection binds a nonzero privacy policy revision",
-            });
+        if self.admitted_scope.is_empty() && self.admitted_policy_revision == 0 {
+            if !self.record_redacted
+                || (self.record_redaction_reason == BRIDGE_EVENT_REDACTION_REASON_OUT_OF_SCOPE
+                    && (self.record_redacted_classes.len() != 1
+                        || self.record_redacted_classes[0] != "privacy_authorization_absent"))
+            {
+                return Err(OrsError::InvalidField {
+                    field: "admitted_scope",
+                    reason: "an absent owner verdict binds only an explicit redacted receipt",
+                });
+            }
+        } else {
+            crate::model::validate_digest(&self.admitted_scope, "admitted_scope")?;
+            if self.admitted_policy_revision == 0 {
+                return Err(OrsError::InvalidField {
+                    field: "admitted_policy_revision",
+                    reason: "bridge event projection binds a nonzero privacy policy revision",
+                });
+            }
         }
         crate::model::validate_text(&self.staging_connection, "staging_connection")?;
         self.validate_record_disposition()?;
@@ -1727,7 +1822,7 @@ fn bridge_owner_component(value: &str, field: &'static str) -> Result<(), OrsErr
 /// denominator. Neither is ever inferred from a returned length, so a
 /// truncated page can be reported as a fraction of a declared whole instead
 /// of looking complete because it happened to be shorter than a limit.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BridgeEventRecoveryWindowRow {
     version: u16,
@@ -1747,6 +1842,14 @@ struct BridgeEventRecoveryWindowRow {
     live_generation: u64,
     #[serde(default)]
     presenting_connection: String,
+    /// The authenticated presenter currently allowed to continue the window.
+    /// Versions 1 and 2 have no separate presentation; their issuer fields
+    /// are also their current presentation. Version 3 can rebind these fields
+    /// without changing the immutable window key or cuts.
+    #[serde(default)]
+    current_live_generation: Option<u64>,
+    #[serde(default)]
+    current_presenting_connection: Option<String>,
     owner_cutoff: u64,
     stream_list_total: u64,
     unscoped_gap_total: u64,
@@ -1758,7 +1861,7 @@ struct BridgeEventRecoveryWindowRow {
 
 impl BridgeEventRecoveryWindowRow {
     fn validate(&self) -> Result<(), OrsError> {
-        if !matches!(self.version, 1 | 2) {
+        if !matches!(self.version, 1..=3) {
             return Err(OrsError::InvalidField {
                 field: "recovery_window.version",
                 reason: "recovery window row carries a supported version",
@@ -1775,13 +1878,45 @@ impl BridgeEventRecoveryWindowRow {
             1 if self.source_revision == 0
                 && self.window_sequence == 0
                 && self.live_generation == 0
-                && self.presenting_connection.is_empty() => {}
+                && self.presenting_connection.is_empty()
+                && self.current_live_generation.is_none()
+                && self.current_presenting_connection.is_none() => {}
             2 if self.source_revision > 0
                 && self.window_sequence > 0
                 && self.live_generation > 0
-                && !self.presenting_connection.is_empty() =>
+                && !self.presenting_connection.is_empty()
+                && self.current_live_generation.is_none()
+                && self.current_presenting_connection.is_none() =>
             {
                 bridge_owner_component(&self.presenting_connection, "owner_connection")?;
+                if self.window_key != Self::key_for(self) {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "bridge_event_recovery_window",
+                        reason:
+                            "window key does not commit its immutable owner and source identity"
+                                .to_owned(),
+                    });
+                }
+            }
+            3 if self.source_revision > 0
+                && self.window_sequence > 0
+                && self.live_generation > 0
+                && !self.presenting_connection.is_empty()
+                && self
+                    .current_live_generation
+                    .is_some_and(|generation| generation > 0)
+                && self.current_presenting_connection.is_some() =>
+            {
+                bridge_owner_component(&self.presenting_connection, "owner_connection")?;
+                bridge_owner_component(
+                    self.current_presenting_connection.as_deref().ok_or(
+                        OrsError::InvalidField {
+                            field: "recovery_window.current_presenting_connection",
+                            reason: "v3 windows retain their current presenter",
+                        },
+                    )?,
+                    "owner_connection",
+                )?;
                 if self.window_key != Self::key_for(self) {
                     return Err(OrsError::IntegrityProblem {
                         record_type: "bridge_event_recovery_window",
@@ -1847,10 +1982,147 @@ impl BridgeEventRecoveryWindowRow {
         );
         crate::model::sha256_hex(material.as_bytes())
     }
+
+    fn current_live_generation(&self) -> Option<u64> {
+        match self.version {
+            2 => Some(self.live_generation),
+            3 => self.current_live_generation,
+            _ => None,
+        }
+    }
+
+    fn current_presenting_connection(&self) -> Option<&str> {
+        match self.version {
+            2 => Some(&self.presenting_connection),
+            3 => self.current_presenting_connection.as_deref(),
+            _ => None,
+        }
+    }
+
+    fn current_presentation_matches(&self, generation: u64, connection: &str) -> bool {
+        self.current_live_generation() == Some(generation)
+            && self.current_presenting_connection() == Some(connection)
+    }
 }
 
 impl persistence_codec::PersistedValue for BridgeEventRecoveryWindowRow {
     const RECORD_TYPE: &'static str = "bridge_event_recovery_window";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+/// Bounded owner-scoped evidence for one expired or explicitly moved window
+/// after cleanup. The continuation secret is deliberately absent; the stored
+/// disposition and immutable row preserve the original no-facts status shape.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BridgeEventRecoveryExpiryEvidence {
+    version: u16,
+    window: BridgeEventRecoveryWindowRow,
+    evidence_until_ms: u64,
+    #[serde(default = "bridge_recovery_expiry_disposition")]
+    disposition: BridgeRecoveryWindowDisposition,
+}
+
+fn bridge_recovery_expiry_disposition() -> BridgeRecoveryWindowDisposition {
+    BridgeRecoveryWindowDisposition::Expired
+}
+
+impl BridgeEventRecoveryExpiryEvidence {
+    fn validate(&self) -> Result<(), OrsError> {
+        if self.version != 1
+            || self.window.continuation_secret.is_some()
+            || self.disposition == BridgeRecoveryWindowDisposition::Active
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_recovery_expiry_evidence",
+                reason: "expiry evidence version or secret-retention rule is invalid".to_owned(),
+            });
+        }
+        self.window.validate()?;
+        if self.window.owner_scope_digest
+            != RedbRecoveryStore::bridge_owner_scope_digest(
+                &self.window.authority_lineage,
+                &self.window.principal,
+            )?
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_recovery_expiry_evidence",
+                reason: "expiry evidence scope digest does not bind its full owner identity"
+                    .to_owned(),
+            });
+        }
+        let expected_until = self
+            .window
+            .expires_at_ms
+            .checked_add(BRIDGE_RECOVERY_WINDOW_TTL_MS)
+            .ok_or(OrsError::IntegrityProblem {
+                record_type: "bridge_recovery_expiry_evidence",
+                reason: "expiry evidence retention horizon overflows its timestamp".to_owned(),
+            })?;
+        if self
+            .window
+            .stream_list_continuation
+            .as_ref()
+            .is_some_and(|cursor| cursor.len() > 20 || cursor.parse::<u64>().is_err())
+            || self.evidence_until_ms != expected_until
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_recovery_expiry_evidence",
+                reason: "expiry evidence cursor or retention horizon is invalid".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// One bounded metadata value holds terminal evidence for at most one TTL.
+/// Natural expirations alone fit the 64-row active-window cap over that
+/// horizon; explicit early refreshes can add pressure, so overflow fails the
+/// write rather than evicting evidence or deleting its source row. Rows are
+/// sorted by window key so duplicates are detected rather than guessed.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BridgeEventRecoveryExpiryEvidenceSet {
+    version: u16,
+    rows: Vec<BridgeEventRecoveryExpiryEvidence>,
+}
+
+impl BridgeEventRecoveryExpiryEvidenceSet {
+    fn empty() -> Self {
+        Self {
+            version: 1,
+            rows: Vec::new(),
+        }
+    }
+
+    fn validate(&self) -> Result<(), OrsError> {
+        if self.version != 1 || self.rows.len() > MAX_BRIDGE_RECOVERY_EXPIRY_EVIDENCE {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_recovery_expiry_evidence_set",
+                reason: "expiry evidence set version or row bound is invalid".to_owned(),
+            });
+        }
+        let mut previous_key: Option<&str> = None;
+        for row in &self.rows {
+            row.validate()?;
+            let key = row.window.window_key.as_str();
+            if previous_key.is_some_and(|previous| previous >= key) {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_recovery_expiry_evidence_set",
+                    reason: "expiry evidence keys are duplicate or unsorted".to_owned(),
+                });
+            }
+            previous_key = Some(key);
+        }
+        Ok(())
+    }
+}
+
+impl persistence_codec::PersistedValue for BridgeEventRecoveryExpiryEvidenceSet {
+    const RECORD_TYPE: &'static str = "bridge_recovery_expiry_evidence_set";
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()
@@ -1973,6 +2245,9 @@ impl persistence_codec::PersistedValue for BridgeEventRecoveryRevisionRow {
 enum BridgeRecoveryScopeSelector {
     Open,
     Resume,
+    ResumeWindow {
+        window_key: String,
+    },
     Streams {
         window_key: String,
         after_stream: u64,
@@ -2011,6 +2286,70 @@ struct BridgeRecoveryPageBudget {
     gap_offset: usize,
     gap_limit: usize,
     gap_byte_limit: usize,
+}
+
+#[derive(Default)]
+struct BridgeRecoveryReadBudget {
+    decoded_bytes: usize,
+    serialized_item_bytes: usize,
+    work_items: usize,
+}
+
+impl BridgeRecoveryReadBudget {
+    fn charge(&mut self, key: &[u8], value: &[u8]) -> Result<(), OrsError> {
+        self.charge_work_item()?;
+        let bytes = key
+            .len()
+            .checked_add(value.len())
+            .ok_or(OrsError::ProjectionLimitExceeded)?;
+        let decoded_bytes = self
+            .decoded_bytes
+            .checked_add(bytes)
+            .ok_or(OrsError::ProjectionLimitExceeded)?;
+        let call_bytes = decoded_bytes
+            .checked_add(self.serialized_item_bytes)
+            .ok_or(OrsError::ProjectionLimitExceeded)?;
+        if decoded_bytes > MAX_BRIDGE_RECOVERY_DECODED_BYTES
+            || call_bytes > MAX_BRIDGE_RECOVERY_CALL_BYTES
+        {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        self.decoded_bytes = decoded_bytes;
+        Ok(())
+    }
+
+    fn charge_output(&mut self, bytes: usize) -> Result<(), OrsError> {
+        self.charge_work_item()?;
+        let serialized_item_bytes = self
+            .serialized_item_bytes
+            .checked_add(bytes)
+            .ok_or(OrsError::ProjectionLimitExceeded)?;
+        let call_bytes = self
+            .decoded_bytes
+            .checked_add(serialized_item_bytes)
+            .ok_or(OrsError::ProjectionLimitExceeded)?;
+        if call_bytes > MAX_BRIDGE_RECOVERY_CALL_BYTES {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        self.serialized_item_bytes = serialized_item_bytes;
+        Ok(())
+    }
+
+    fn charge_reference(&mut self) -> Result<(), OrsError> {
+        self.charge_work_item()
+    }
+
+    fn charge_work_item(&mut self) -> Result<(), OrsError> {
+        let work_items = self
+            .work_items
+            .checked_add(1)
+            .ok_or(OrsError::ProjectionLimitExceeded)?;
+        if work_items > MAX_BRIDGE_RECOVERY_WORK_ITEMS {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        self.work_items = work_items;
+        Ok(())
+    }
 }
 
 /// One authenticated bridge-stream owner binding (issue #2729).
@@ -2239,19 +2578,21 @@ struct BridgeEventPrivacyAuthorization {
 ///
 /// Carries the enforced disclosure decision (verbatim admitted, or redacted
 /// with its reason/classes), the immutable transport hash of the original
-/// bytes, the owner authorization binding the decision was made under, and
-/// the bytes to stage (verbatim originals or the deterministic redacted
-/// projection). Built only by the stage entry from the owner's presented
-/// authorization plus the conservative deny scan over the same bytes.
+/// bytes, optional owner authorization binding, and the bytes to stage
+/// (verbatim originals or the deterministic redacted projection). Without an
+/// owner verdict, only the redacted form can be staged.
 struct BridgeEventPrivacyStaging {
     denied: bool,
     /// Closed wire redaction reason when `denied`; empty otherwise.
     reason: String,
     classes: Vec<String>,
     transport_hash: String,
+    /// Empty when the actual privacy owner did not provide a verdict; this
+    /// path can retain only the deterministic redacted representation.
+    admitted_source: String,
     /// Scope the privacy owner evaluated the source bytes under (issue
     /// #1934): the admitted owner namespace, persisted with the row so the
-    /// decision stays attributable.
+    /// decision stays attributable. Empty when no owner verdict was supplied.
     scope: String,
     /// Privacy policy revision the owner's verdict was made under (issue
     /// #1934).
@@ -2305,9 +2646,9 @@ fn bridge_event_outcome(
     };
     let redaction = if row.redacted {
         json!({
-            "transport_hash": row.transport_hash,
+            "transport_hash": row.transport_hash.as_str(),
             "reason": row.redaction_reason,
-            "redacted_classes": row.redacted_classes,
+            "redacted_classes": &row.redacted_classes,
             "marker": row.redaction_marker,
             "normalizer_version": format!("ors-bridge-ingest-v{}", row.redaction_version),
         })
@@ -3276,13 +3617,49 @@ pub trait OperationalRecoveryStore: Send + Sync {
         request_digest: &str,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
     /// Atomically records a daemon attempt before returning the executable
-    /// claim. A different owner closes the row as `Unknown` while retaining
-    /// the prior attempt for reconciliation.
+    /// claim. A competing v1 caller observes the durable winner unchanged;
+    /// legacy ownership conflicts retain their conservative `Unknown` fence.
     fn claim_host_request_attempt(
         &self,
         operation_id: &crate::OperationIdentity,
         request_digest: &str,
         attempt: &crate::HostRequestAttempt,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
+    /// Expires an active v1 claim under its exact retained identity. Expiry
+    /// moves possible-effect work to `Unknown`; it never grants another send.
+    fn reconcile_expired_host_request_claim(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
+    /// Durably fences the exact claim before any transport write is attempted.
+    /// A restart that finds this phase must reconcile; it is never no-effect
+    /// evidence.
+    fn begin_host_request_transport_dispatch(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+        observation: &crate::HostRequestTransportObservation,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
+    /// Persists one authenticated transport-custody observation under the
+    /// exact active claim.
+    fn observe_host_request_transport_custody(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+        observation: &crate::HostRequestTransportObservation,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
+    /// Retains a separate authenticated owner readback under the exact send
+    /// claim. This channel is independent from the original transport channel.
+    fn record_host_request_owner_readback(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+        evidence: &crate::HostRequestOwnerReadbackEvidence,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
     /// Records a no-effect deferral for the exact active daemon attempt.
     fn defer_host_request_attempt(
@@ -3323,6 +3700,17 @@ pub trait OperationalRecoveryStore: Send + Sync {
         result_response: &serde_json::Value,
         result_evidence: Option<&crate::HostRequestEffectEvidence>,
         result_lineage: Option<&crate::HostRequestRetainedLineage>,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
+    /// Atomically stores an exact owner result and terminalizes the same
+    /// claimed attempt that durably recorded `ResponseReceived`.
+    fn persist_claimed_host_request_result(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+        result_digest: &str,
+        result_response: &serde_json::Value,
+        owner_readback: Option<&crate::HostRequestOwnerReadbackEvidence>,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
     /// Loads one host-request operation by exact operation/request identity.
     fn load_host_request(
@@ -5083,6 +5471,114 @@ impl RedbRecoveryStore {
         Ok(Some(resolved))
     }
 
+    /// Applies one accepted purge-ledger entry and returns the ledger-wide
+    /// revision this purge consumed (issue #960; I5.13:44, A12.08).
+    ///
+    /// This is the only place the purge ledger advances. The revision is read
+    /// from, and committed with, the row inside one exclusive write
+    /// transaction, so exactly one revision is consumed per applied purge and
+    /// the published revision can never run ahead of, or behind, the ledger it
+    /// describes.
+    ///
+    /// Idempotent by construction. Replaying the exact entry the ledger
+    /// already holds returns that entry's durable revision and consumes
+    /// nothing, so a retried purge cannot double-count; the same `purge_id`
+    /// with a different entry is a conflict and never overwrites the row the
+    /// owner already holds. The entry is validated with the ledger contract's
+    /// own `validate()` before anything becomes durable.
+    pub fn apply_purge_ledger_entry(
+        &self,
+        entry: &eliot_security_contracts::PurgeLedgerEntry,
+    ) -> Result<u64, OrsError> {
+        crate::model::validate_text(&entry.purge_id, "purge_ledger_purge_id")?;
+        // The ENTRY is what the ledger contract validates, and it is validated
+        // before anything becomes durable. The revision is deliberately not
+        // part of that call: it is owner-allocated below, and the candidate
+        // cannot carry the allocated value before the transaction has read the
+        // counter.
+        let mut applied = crate::PurgeLedgerRecord {
+            contract_version: crate::CONTRACT_VERSION,
+            applied_revision: 0,
+            entry: entry.clone(),
+        };
+        applied.validate_entry()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing = {
+            let table = write.open_table(PURGE_LEDGER).map_err(storage)?;
+            table
+                .get(entry.purge_id.as_str())
+                .map_err(storage)?
+                .map(|value| value.value().to_owned())
+        };
+        if let Some(bytes) = existing {
+            let stored: crate::PurgeLedgerRecord = decode(&bytes)?;
+            stored.validate()?;
+            if !stored.same_applied_purge(&applied) {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: crate::PURGE_LEDGER_RECORD_TYPE,
+                    reason: "purge_id is already applied with a different ledger entry".to_owned(),
+                });
+            }
+            write.commit().map_err(storage)?;
+            return Ok(stored.applied_revision);
+        }
+        applied.applied_revision =
+            Self::purge_ledger_revision_in(&write.open_table(META).map_err(storage)?)?
+                .checked_add(1)
+                .ok_or(OrsError::ProjectionLimitExceeded)?;
+        applied.validate()?;
+        {
+            let mut table = write.open_table(PURGE_LEDGER).map_err(storage)?;
+            let payload = encode(&applied)?;
+            table
+                .insert(entry.purge_id.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        let revision = applied.applied_revision;
+        {
+            let mut meta = write.open_table(META).map_err(storage)?;
+            meta.insert(PURGE_LEDGER_REVISION_KEY, revision.to_string().as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(revision)
+    }
+
+    /// Returns the authoritative purge-ledger revision this owner has applied
+    /// (issue #960; I5.13:44, A13.7).
+    ///
+    /// This is the owner-issued fact a backup receipt binds and a restore
+    /// compares against. It is read from the durable counter the applying
+    /// transaction committed with each ledger row — never from an archive
+    /// under check, and never recomputed over a caller-supplied entry list.
+    /// Zero means no purge was ever applied, which is an answer rather than an
+    /// absence.
+    pub fn purge_ledger_revision(&self) -> Result<u64, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        Self::purge_ledger_revision_in(&read.open_table(META).map_err(storage)?)
+    }
+
+    /// Reads the durable purge-ledger counter out of an open [`META`] table.
+    ///
+    /// One reader serves both the applying transaction and the answering read,
+    /// so a revision is never produced by two rules that could disagree. An
+    /// absent counter is revision zero; a counter that is not an unsigned
+    /// integer is an integrity failure rather than a number to guess at.
+    fn purge_ledger_revision_in(
+        meta: &impl ReadableTable<&'static str, &'static str>,
+    ) -> Result<u64, OrsError> {
+        let Some(value) = meta.get(PURGE_LEDGER_REVISION_KEY).map_err(storage)? else {
+            return Ok(0);
+        };
+        value
+            .value()
+            .parse::<u64>()
+            .map_err(|_| OrsError::IntegrityProblem {
+                record_type: crate::PURGE_LEDGER_RECORD_TYPE,
+                reason: "purge-ledger revision is not an unsigned integer".to_owned(),
+            })
+    }
+
     /// Stages one scan disclosure record as `Prepared` (issue #2900).
     ///
     /// The stage is the atomic durable step: an exact replay of the same
@@ -5499,7 +5995,162 @@ impl RedbRecoveryStore {
         Ok(crate::classify_backup_verification_two_value_key(&bytes))
     }
 
+    /// Classifies the PRE-#2862 `v2` durable key for this operation
+    /// (issue #2862).
+    ///
+    /// #2862 bumped the verify profile to `v3`, which is a new
+    /// `idempotency_namespace` and therefore a different key, because the
+    /// identity gained the retained-handle, capture-receipt-digest and
+    /// validity-attestation-digest commitments and those are in the canonical
+    /// request hash. A new namespace alone is not enough: a `v2` row simply
+    /// becomes unreachable, and the caller would read that as `Absent` and stage
+    /// a SECOND row for an operation that already has a stored answer — the
+    /// fail-open outcome. So the route addresses the `v2` key explicitly,
+    /// through
+    /// [`BackupVerifyRequestIdentity::legacy_fence_bound_namespace_digest`], and
+    /// asks this question about it.
+    ///
+    /// The three classes must be honoured differently, which is what makes the
+    /// probe fail CLOSED. `Absent` means the `v2` key is free and nothing is
+    /// quarantined. `LegacyUnqualified` means intact pre-#2862 evidence: a
+    /// correctly scoped, isolated, replayable STRUCTURAL-CANDIDATE result that
+    /// carries no retained handle, no capture receipt digest and no validity
+    /// attestation digest at all. It must never be upgraded, re-keyed,
+    /// backfilled or projected as a current-profile answer, and a code upgrade
+    /// does not make it provenance-bound — there is nothing in it to read that
+    /// from. `Unreadable` means bytes that are neither shape, for which NO
+    /// verification result may be answered at all.
+    ///
+    /// Nothing is migrated, re-keyed, backfilled or returned. The `v2` row keeps
+    /// its own key and its own bytes, and a NEW explicit verification operation
+    /// — a new `operation_id`, hence a different `v2` key that reads `Absent` —
+    /// is what produces a row under the current profile.
+    pub fn legacy_fence_bound_backup_verification_class(
+        &self,
+        legacy_record_key: &str,
+    ) -> Result<LegacyFenceBoundBackupVerificationClass, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read
+            .open_table(BACKUP_VERIFICATION_RESULTS)
+            .map_err(storage)?;
+        let Some(bytes) = table
+            .get(legacy_record_key)
+            .map_err(storage)?
+            .map(|value| value.value().to_owned())
+        else {
+            return Ok(LegacyFenceBoundBackupVerificationClass::Absent);
+        };
+        Ok(crate::classify_backup_verification_fence_bound_key(&bytes))
+    }
+
+    /// Records the owner-observed purge-ledger revision against one staged
+    /// `backup.verify` operation, inside the transaction that stages it.
+    ///
+    /// This is the production call site of the owner-issued revision. It runs
+    /// in the same write transaction as the verification row, so the revision
+    /// cannot be a value the route presented, retried or recomputed, and it
+    /// cannot be a revision the owner advanced after this answer was produced.
+    ///
+    /// A replay of the same operation is idempotent: an existing binding for the
+    /// same key is left exactly as the first stage recorded it, so the replayed
+    /// answer keeps the purge state that was actually observed instead of
+    /// silently moving to a later one. A binding that is BEHIND the current
+    /// counter is ordinary — it is an earlier operation's answer — while one
+    /// AHEAD of the counter is an integrity failure rather than an answer,
+    /// because a revision the ledger never reached cannot have been observed.
+    fn bind_purge_ledger_revision(
+        write: &redb::WriteTransaction,
+        record_key: &str,
+    ) -> Result<(), OrsError> {
+        let observed = Self::purge_ledger_revision_in(&write.open_table(META).map_err(storage)?)?;
+        let existing = {
+            let table = write
+                .open_table(PURGE_LEDGER_REVISION_BINDINGS)
+                .map_err(storage)?;
+            table
+                .get(record_key)
+                .map_err(storage)?
+                .map(|value| value.value().to_owned())
+        };
+        if let Some(bytes) = existing {
+            let stored: crate::PurgeLedgerRevisionBinding = decode(&bytes)?;
+            stored.validate()?;
+            if stored.record_key != record_key {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: crate::PURGE_LEDGER_REVISION_BINDING_RECORD_TYPE,
+                    reason: "table key does not match the binding's own record key".to_owned(),
+                });
+            }
+            if stored.observed_revision > observed {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: crate::PURGE_LEDGER_REVISION_BINDING_RECORD_TYPE,
+                    reason: "a recorded purge-ledger revision is ahead of the owner's own counter"
+                        .to_owned(),
+                });
+            }
+            return Ok(());
+        }
+        let binding = crate::PurgeLedgerRevisionBinding {
+            contract_version: crate::CONTRACT_VERSION,
+            record_key: record_key.to_owned(),
+            observed_revision: observed,
+        };
+        binding.validate()?;
+        let payload = encode(&binding)?;
+        let mut table = write
+            .open_table(PURGE_LEDGER_REVISION_BINDINGS)
+            .map_err(storage)?;
+        table
+            .insert(record_key, payload.as_str())
+            .map_err(storage)?;
+        Ok(())
+    }
+
+    /// Returns the owner-observed purge-ledger revision bound to one
+    /// `backup.verify` operation, or `None` when this owner never staged that
+    /// operation.
+    ///
+    /// The value is the revision that was authoritative when the result was
+    /// staged, read back from ORS's own durable binding. It is deliberately not
+    /// the current revision: a replay after a later purge must report the state
+    /// the answer was actually produced under, and
+    /// [`Self::purge_ledger_revision`] is the separate query for the current
+    /// one. `None` is the absence of an operation, not an unknown purge state.
+    pub fn backup_verification_purge_ledger_revision(
+        &self,
+        record_key: &str,
+    ) -> Result<Option<u64>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read
+            .open_table(PURGE_LEDGER_REVISION_BINDINGS)
+            .map_err(storage)?;
+        let Some(bytes) = table
+            .get(record_key)
+            .map_err(storage)?
+            .map(|value| value.value().to_owned())
+        else {
+            return Ok(None);
+        };
+        let binding: crate::PurgeLedgerRevisionBinding = decode(&bytes)?;
+        binding.validate()?;
+        if binding.record_key != record_key {
+            return Err(OrsError::IntegrityProblem {
+                record_type: crate::PURGE_LEDGER_REVISION_BINDING_RECORD_TYPE,
+                reason: "table key does not match the binding's own record key".to_owned(),
+            });
+        }
+        Ok(Some(binding.observed_revision))
+    }
+
     /// Stages one durable `backup.verify` result under its scoped namespace key.
+    ///
+    /// A newly stored row is committed together with ORS's own binding of the
+    /// operation to the purge-ledger revision that was authoritative at that
+    /// instant, so the answer records the purge state it was produced under
+    /// rather than leaving the purge axis of target compatibility absent. The
+    /// binding is read back with
+    /// [`Self::backup_verification_purge_ledger_revision`]; the current
+    /// owner-issued revision is [`Self::purge_ledger_revision`].
     ///
     /// Persist-before-answer: the row is committed before the route answers, so a
     /// lost response reconciles to this same persisted result instead of
@@ -5565,6 +6216,7 @@ impl RedbRecoveryStore {
                     .insert(key.as_str(), payload.as_str())
                     .map_err(storage)?;
                 drop(table);
+                Self::bind_purge_ledger_revision(&write, key.as_str())?;
                 write.commit().map_err(storage)?;
                 return Ok(BackupVerificationDisposition::Stored);
             };
@@ -6021,11 +6673,23 @@ impl RedbRecoveryStore {
         let write = self.database.begin_write().map_err(storage)?;
         Self::ensure_no_host_request_legacy_presence_in(&write, record)?;
         let outcome = {
-            let links = write
-                .open_table(HOST_REQUEST_LOGICAL_KEYS)
-                .map_err(storage)?;
-            if let Some(link_value) = links.get(logical_key.as_str()).map_err(storage)? {
-                let link = Self::decode_host_request_logical_link(link_value.value())?;
+            // The lookup handle is scoped so it drops before the fresh-stage
+            // helper re-opens HOST_REQUEST_LOGICAL_KEYS in this same write
+            // transaction (redb 4.1.0 returns TableAlreadyOpen while the first
+            // handle is alive; issue #2571 AUD2). The decoded link moves out;
+            // both fresh-stage entries still claim through
+            // stage_host_request_logical_link_in and commit atomically below.
+            let staged_link: Option<HostRequestLogicalLink> = {
+                let links = write
+                    .open_table(HOST_REQUEST_LOGICAL_KEYS)
+                    .map_err(storage)?;
+                links
+                    .get(logical_key.as_str())
+                    .map_err(storage)?
+                    .map(|link_value| Self::decode_host_request_logical_link(link_value.value()))
+                    .transpose()?
+            };
+            if let Some(link) = staged_link {
                 let winner = {
                     let operations = write.open_table(HOST_REQUESTS).map_err(storage)?;
                     let row_key =
@@ -8118,6 +8782,15 @@ impl RedbRecoveryStore {
             return Ok(None);
         };
         existing.validate()?;
+        if existing.send_claim_protocol_version == crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+            && !(target == crate::HostRequestState::Admitted
+                && matches!(
+                    existing.state,
+                    crate::HostRequestState::Requested | crate::HostRequestState::Admitted
+                ))
+        {
+            return Err(OrsError::InvalidTransition);
+        }
         if existing.state == target {
             let replay_matches = match (&existing.result_digest, result_digest) {
                 (Some(current), Some(replayed)) => current.as_str() == replayed,
@@ -8220,12 +8893,18 @@ impl RedbRecoveryStore {
             | crate::HostRequestState::PossiblyEffected => crate::HostRequestState::Unknown,
             crate::HostRequestState::Admitted | crate::HostRequestState::Routed => {
                 match parent.attempt.as_ref().map(|attempt| attempt.phase) {
-                    None | Some(crate::HostRequestAttemptPhase::DeferredNoEffect) => {
-                        crate::HostRequestState::Cancelled
-                    }
-                    Some(crate::HostRequestAttemptPhase::Claimed) => {
-                        crate::HostRequestState::Unknown
-                    }
+                    None
+                    | Some(
+                        crate::HostRequestAttemptPhase::DeferredNoEffect
+                        | crate::HostRequestAttemptPhase::DefinitelyNotSent,
+                    ) => crate::HostRequestState::Cancelled,
+                    Some(
+                        crate::HostRequestAttemptPhase::Claimed
+                        | crate::HostRequestAttemptPhase::DispatchStarted
+                        | crate::HostRequestAttemptPhase::DeliveryOutcomeUnknown
+                        | crate::HostRequestAttemptPhase::DeliveredToAuthenticatedHost
+                        | crate::HostRequestAttemptPhase::ResponseReceived,
+                    ) => crate::HostRequestState::Unknown,
                 }
             }
         };
@@ -8298,6 +8977,9 @@ impl RedbRecoveryStore {
                 request_digest: request_digest.to_owned(),
             });
         }
+        if existing.send_claim_protocol_version == crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION {
+            return Err(OrsError::InvalidTransition);
+        }
 
         let mut cancellation: crate::HostRequestRecord = {
             let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
@@ -8360,9 +9042,14 @@ impl RedbRecoveryStore {
     }
 
     /// Persists the daemon attempt and `Routed` phase before exposing a claim.
-    /// Exact same-owner polls recover the original attempt. A different owner
-    /// fences the operation as `Unknown` and leaves the original attempt in
-    /// place so a replacement cannot silently acquire writer ownership.
+    /// Exact same-owner polls recover the original attempt. A competing v1
+    /// caller observes that durable winner without changing its state, so the
+    /// winner can persist the transport boundary; legacy ownership conflicts
+    /// keep their conservative `Unknown` fence.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exclusive claim and retained loser disposition share one atomic transaction"
+    )]
     pub fn claim_host_request_attempt(
         &self,
         operation_id: &crate::OperationIdentity,
@@ -8393,60 +9080,199 @@ impl RedbRecoveryStore {
             });
         }
         attempt.validate(&existing.fence_digest)?;
-        let next = match existing.attempt.as_ref() {
-            None if matches!(
-                existing.state,
-                crate::HostRequestState::Admitted | crate::HostRequestState::Routed
-            ) && existing.result_digest.is_none()
-                && existing.result_response.is_none() =>
+        if existing.send_claim_protocol_version == crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+            && attempt.channel_binding_sha256.as_deref()
+                != existing.transport_channel_binding_sha256.as_deref()
+        {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+        if existing.send_claim_protocol_version == crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION {
+            let now_unix_ms = current_unix_ms_u64()?;
+            let Some(claim_expires_at_unix_ms) = attempt.claim_expires_at_unix_ms else {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_attempt_claim_expiry",
+                    reason: "versioned claims require an explicit expiry",
+                });
+            };
+            let latest_allowed_expiry = now_unix_ms
+                .checked_add(crate::HOST_REQUEST_SEND_CLAIM_LEASE_MS)
+                .ok_or(OrsError::InvalidTransition)?;
+            if claim_expires_at_unix_ms <= now_unix_ms
+                || claim_expires_at_unix_ms > latest_allowed_expiry
             {
-                let mut next = existing.clone();
-                next.state = crate::HostRequestState::Routed;
-                next.attempt = Some(attempt.clone());
-                next
+                return Err(OrsError::InvalidField {
+                    field: "host_request_attempt_claim_expiry",
+                    reason: "claim expiry must be in the future and within the bounded lease",
+                });
             }
-            Some(current) if current.phase == crate::HostRequestAttemptPhase::DeferredNoEffect => {
-                let next_generation = current
-                    .generation
-                    .checked_add(1)
-                    .ok_or(OrsError::InvalidTransition)?;
-                if existing.state != crate::HostRequestState::Routed
-                    || attempt.generation != next_generation
-                    || existing.result_digest.is_some()
-                    || existing.result_response.is_some()
+        }
+        if existing.send_claim_protocol_version == 0
+            && existing.connection_ref.as_str() == "USER_AUTOMATION_RUNTIME_OPERATION"
+            && matches!(
+                existing.state,
+                crate::HostRequestState::Admitted
+                    | crate::HostRequestState::Routed
+                    | crate::HostRequestState::Submitted
+                    | crate::HostRequestState::PossiblyEffected
+                    | crate::HostRequestState::Unknown
+                    | crate::HostRequestState::Reconciling
+            )
+        {
+            let mut fenced = existing.clone();
+            if !matches!(
+                fenced.state,
+                crate::HostRequestState::Unknown | crate::HostRequestState::Reconciling
+            ) {
+                fenced.state = fenced
+                    .state
+                    .transition_to(crate::HostRequestState::Unknown)?;
+            }
+            if fenced == existing {
+                write.commit().map_err(storage)?;
+                return Ok(Some(existing));
+            }
+            fenced.validate()?;
+            let payload = encode(&fenced)?;
+            {
+                let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+                table
+                    .insert(key.as_str(), payload.as_str())
+                    .map_err(storage)?;
+            }
+            write.commit().map_err(storage)?;
+            return Ok(Some(fenced));
+        }
+        let next = if existing.send_claim_protocol_version == 0 {
+            // Preserve the pre-#2970 claim contract for generic HostRequest
+            // routes. Only the UserAutomation runtime channel opts into the
+            // new durable transport-custody protocol.
+            match existing.attempt.as_ref() {
+                None if matches!(
+                    existing.state,
+                    crate::HostRequestState::Admitted | crate::HostRequestState::Routed
+                ) && existing.result_digest.is_none()
+                    && existing.result_response.is_none() =>
+                {
+                    let mut next = existing.clone();
+                    next.state = crate::HostRequestState::Routed;
+                    next.attempt = Some(attempt.clone());
+                    next
+                }
+                Some(current)
+                    if current.phase == crate::HostRequestAttemptPhase::DeferredNoEffect =>
+                {
+                    let next_generation = current
+                        .generation
+                        .checked_add(1)
+                        .ok_or(OrsError::InvalidTransition)?;
+                    if existing.state != crate::HostRequestState::Routed
+                        || attempt.generation != next_generation
+                        || existing.result_digest.is_some()
+                        || existing.result_response.is_some()
+                    {
+                        return Err(OrsError::InvalidTransition);
+                    }
+                    let mut next = existing.clone();
+                    next.attempt = Some(attempt.clone());
+                    next
+                }
+                Some(current)
+                    if current.owner_connection_ref == attempt.owner_connection_ref
+                        && current.owner_launch_nonce == attempt.owner_launch_nonce
+                        && current.owner_session_epoch == attempt.owner_session_epoch
+                        && current.fence_digest == attempt.fence_digest
+                        && current.phase == crate::HostRequestAttemptPhase::Claimed =>
+                {
+                    write.commit().map_err(storage)?;
+                    return Ok(Some(existing));
+                }
+                Some(_)
+                    if matches!(
+                        existing.state,
+                        crate::HostRequestState::Admitted
+                            | crate::HostRequestState::Routed
+                            | crate::HostRequestState::Submitted
+                            | crate::HostRequestState::PossiblyEffected
+                    ) =>
+                {
+                    let mut next = existing.clone();
+                    next.state = crate::HostRequestState::Unknown;
+                    next
+                }
+                _ => {
+                    write.commit().map_err(storage)?;
+                    return Ok(Some(existing));
+                }
+            }
+        } else {
+            match existing.attempt.as_ref() {
+                None if existing.state == crate::HostRequestState::Admitted
+                    && existing.attempt_history.is_empty()
+                    && attempt.generation == 1
+                    && existing.result_digest.is_none()
+                    && existing.result_response.is_none() =>
+                {
+                    let mut next = existing.clone();
+                    next.state = crate::HostRequestState::Routed;
+                    next.attempt = Some(attempt.clone());
+                    next
+                }
+                Some(current)
+                    if current.phase == crate::HostRequestAttemptPhase::DefinitelyNotSent
+                        && existing.state == crate::HostRequestState::Routed
+                        && existing.attempt_history.is_empty() =>
+                {
+                    let next_generation = current
+                        .generation
+                        .checked_add(1)
+                        .ok_or(OrsError::InvalidTransition)?;
+                    if attempt.generation != next_generation
+                        || existing.result_digest.is_some()
+                        || existing.result_response.is_some()
+                    {
+                        return Err(OrsError::InvalidTransition);
+                    }
+                    let mut next = existing.clone();
+                    next.attempt_history.push(current.clone());
+                    next.attempt = Some(attempt.clone());
+                    next
+                }
+                Some(current)
+                    if current.phase == crate::HostRequestAttemptPhase::DefinitelyNotSent
+                        && existing.state == crate::HostRequestState::Routed
+                        && !existing.attempt_history.is_empty() =>
+                {
+                    let mut next = existing.clone();
+                    next.state = next.state.transition_to(crate::HostRequestState::Unknown)?;
+                    next.validate()?;
+                    let payload = encode(&next)?;
+                    {
+                        let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+                        table
+                            .insert(key.as_str(), payload.as_str())
+                            .map_err(storage)?;
+                    }
+                    write.commit().map_err(storage)?;
+                    return Err(OrsError::HostRequestAttemptLimitExceeded);
+                }
+                Some(current)
+                    if current.same_claim(attempt)
+                        && current.phase == crate::HostRequestAttemptPhase::Claimed =>
                 {
                     return Err(OrsError::InvalidTransition);
                 }
-                let mut next = existing.clone();
-                next.attempt = Some(attempt.clone());
-                next
-            }
-            Some(current)
-                if current.owner_connection_ref == attempt.owner_connection_ref
-                    && current.owner_launch_nonce == attempt.owner_launch_nonce
-                    && current.owner_session_epoch == attempt.owner_session_epoch
-                    && current.fence_digest == attempt.fence_digest
-                    && current.phase == crate::HostRequestAttemptPhase::Claimed =>
-            {
-                write.commit().map_err(storage)?;
-                return Ok(Some(existing));
-            }
-            Some(_)
-                if matches!(
-                    existing.state,
-                    crate::HostRequestState::Admitted
-                        | crate::HostRequestState::Routed
-                        | crate::HostRequestState::Submitted
-                        | crate::HostRequestState::PossiblyEffected
-                ) =>
-            {
-                let mut next = existing.clone();
-                next.state = crate::HostRequestState::Unknown;
-                next
-            }
-            _ => {
-                write.commit().map_err(storage)?;
-                return Ok(Some(existing));
+                // The durable v1 attempt is the winner. A competing caller
+                // only observes that claim; it must not rewrite the winner's
+                // Routed/Submitted state before the owner can persist its
+                // transport boundary. The gateway compares the returned
+                // attempt with the caller's attempt and refuses the loser.
+                _ => {
+                    write.commit().map_err(storage)?;
+                    return Ok(Some(existing));
+                }
             }
         };
         next.validate()?;
@@ -8459,6 +9285,435 @@ impl RedbRecoveryStore {
         }
         write.commit().map_err(storage)?;
         Ok(Some(next))
+    }
+
+    /// Moves one expired v1 send claim to reconciliation while retaining the
+    /// exact attempt and its owner identity. Expiry is never evidence that the
+    /// owner received no bytes and never makes the operation claimable again.
+    pub fn reconcile_expired_host_request_claim(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        crate::model::validate_digest(request_digest, "host_request_request_digest")?;
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing: Option<crate::HostRequestRecord> = {
+            let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let Some(mut record) = existing else {
+            return Ok(None);
+        };
+        record.validate()?;
+        if record.operation_id != *operation_id || record.request_digest != request_digest {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+        if record.send_claim_protocol_version != crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION {
+            return Err(OrsError::InvalidTransition);
+        }
+        let Some(current) = record.attempt.as_ref() else {
+            write.commit().map_err(storage)?;
+            return Ok(Some(record));
+        };
+        current.validate(&record.fence_digest)?;
+        attempt.validate(&record.fence_digest)?;
+        if !current.same_claim(attempt) {
+            write.commit().map_err(storage)?;
+            return Ok(Some(record));
+        }
+        let Some(claim_expires_at_unix_ms) = current.claim_expires_at_unix_ms else {
+            return Err(OrsError::InvalidField {
+                field: "host_request_attempt_claim_expiry",
+                reason: "versioned claims require an explicit expiry",
+            });
+        };
+        if claim_expires_at_unix_ms > current_unix_ms_u64()?
+            || matches!(
+                current.phase,
+                crate::HostRequestAttemptPhase::DefinitelyNotSent
+                    | crate::HostRequestAttemptPhase::DeferredNoEffect
+            )
+            || matches!(
+                record.state,
+                crate::HostRequestState::ResultReceived
+                    | crate::HostRequestState::Cancelled
+                    | crate::HostRequestState::Expired
+                    | crate::HostRequestState::Conflicted
+                    | crate::HostRequestState::Terminal
+            )
+        {
+            write.commit().map_err(storage)?;
+            return Ok(Some(record));
+        }
+        if matches!(
+            record.state,
+            crate::HostRequestState::Unknown | crate::HostRequestState::Reconciling
+        ) {
+            write.commit().map_err(storage)?;
+            return Ok(Some(record));
+        }
+        if matches!(
+            record.state,
+            crate::HostRequestState::Routed
+                | crate::HostRequestState::Submitted
+                | crate::HostRequestState::PossiblyEffected
+        ) {
+            record.state = record
+                .state
+                .transition_to(crate::HostRequestState::Unknown)?;
+            record.validate()?;
+            let payload = encode(&record)?;
+            {
+                let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+                table
+                    .insert(key.as_str(), payload.as_str())
+                    .map_err(storage)?;
+            }
+        }
+        write.commit().map_err(storage)?;
+        Ok(Some(record))
+    }
+
+    /// Commits the dispatch fence under the exact current claim before the
+    /// authenticated transport is entered. This is intentionally not
+    /// idempotent: a repeated claim cannot reopen a send after a crash.
+    pub fn begin_host_request_transport_dispatch(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+        observation: &crate::HostRequestTransportObservation,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        crate::model::validate_digest(request_digest, "host_request_request_digest")?;
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing: Option<crate::HostRequestRecord> = {
+            let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let Some(mut record) = existing else {
+            return Ok(None);
+        };
+        record.validate()?;
+        if record.operation_id != *operation_id || record.request_digest != request_digest {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+        if record.send_claim_protocol_version != crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION {
+            return Err(OrsError::InvalidTransition);
+        }
+        let Some(mut current) = record.attempt.clone() else {
+            return Err(OrsError::InvalidTransition);
+        };
+        current.validate(&record.fence_digest)?;
+        attempt.validate(&record.fence_digest)?;
+        if !current.same_claim(attempt) {
+            return Err(OrsError::InvalidTransition);
+        }
+        let claim_expiry = current
+            .claim_expires_at_unix_ms
+            .ok_or(OrsError::InvalidTransition)?;
+        if claim_expiry <= current_unix_ms_u64()? {
+            if matches!(
+                record.state,
+                crate::HostRequestState::Routed
+                    | crate::HostRequestState::Submitted
+                    | crate::HostRequestState::PossiblyEffected
+            ) {
+                record.state = record
+                    .state
+                    .transition_to(crate::HostRequestState::Unknown)?;
+                record.validate()?;
+                let payload = encode(&record)?;
+                {
+                    let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+                    table
+                        .insert(key.as_str(), payload.as_str())
+                        .map_err(storage)?;
+                }
+            }
+            write.commit().map_err(storage)?;
+            return Err(OrsError::HostRequestAttemptExpired);
+        }
+        if current.phase != crate::HostRequestAttemptPhase::Claimed
+            || !current.transport_observations.is_empty()
+            || record.state != crate::HostRequestState::Routed
+            || observation.boundary != crate::HostRequestTransportBoundary::DispatchStarted
+        {
+            return Err(OrsError::InvalidTransition);
+        }
+        observation.validate_for(&record, &current)?;
+        current.transport_observations.push(observation.clone());
+        current.phase = crate::HostRequestAttemptPhase::DispatchStarted;
+        record.attempt = Some(current);
+        record.validate()?;
+        let payload = encode(&record)?;
+        {
+            let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(Some(record))
+    }
+
+    /// Appends one monotonic typed transport observation to the exact active
+    /// claim. The observation is validated and retained in the same redb
+    /// transaction as its phase/state projection.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the observed custody boundary and claim state commit atomically"
+    )]
+    pub fn observe_host_request_transport_custody(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+        observation: &crate::HostRequestTransportObservation,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        crate::model::validate_digest(request_digest, "host_request_request_digest")?;
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing: Option<crate::HostRequestRecord> = {
+            let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let Some(mut record) = existing else {
+            return Ok(None);
+        };
+        record.validate()?;
+        if record.operation_id != *operation_id || record.request_digest != request_digest {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+        if record.send_claim_protocol_version != crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION {
+            return Err(OrsError::InvalidTransition);
+        }
+        let Some(mut current) = record.attempt.clone() else {
+            return Err(OrsError::InvalidTransition);
+        };
+        current.validate(&record.fence_digest)?;
+        attempt.validate(&record.fence_digest)?;
+        if !current.same_claim(attempt) {
+            return Err(OrsError::InvalidTransition);
+        }
+        observation.validate_for(&record, &current)?;
+        if current.transport_observations.last() == Some(observation) {
+            write.commit().map_err(storage)?;
+            return Ok(Some(record));
+        }
+        let next_phase = match observation.boundary {
+            crate::HostRequestTransportBoundary::DispatchStarted => {
+                return Err(OrsError::InvalidTransition);
+            }
+            crate::HostRequestTransportBoundary::DefinitelyNotSent => {
+                let proof_matches_phase = match current.phase {
+                    crate::HostRequestAttemptPhase::Claimed => {
+                        observation.no_send_proof
+                            == Some(crate::HostRequestNoSendProof::RequestRejectedBeforeWrite)
+                    }
+                    crate::HostRequestAttemptPhase::DispatchStarted => observation.no_send_proof
+                        == Some(
+                            crate::HostRequestNoSendProof::AuthenticatedTransportPreflightRejected,
+                        ),
+                    _ => false,
+                };
+                if !proof_matches_phase {
+                    return Err(OrsError::InvalidTransition);
+                }
+                crate::HostRequestAttemptPhase::DefinitelyNotSent
+            }
+            crate::HostRequestTransportBoundary::DeliveryOutcomeUnknown => {
+                if current.phase != crate::HostRequestAttemptPhase::DispatchStarted {
+                    return Err(OrsError::InvalidTransition);
+                }
+                crate::HostRequestAttemptPhase::DeliveryOutcomeUnknown
+            }
+            crate::HostRequestTransportBoundary::DeliveredToAuthenticatedHost => {
+                if current.phase != crate::HostRequestAttemptPhase::DispatchStarted {
+                    return Err(OrsError::InvalidTransition);
+                }
+                crate::HostRequestAttemptPhase::DeliveredToAuthenticatedHost
+            }
+            crate::HostRequestTransportBoundary::ResponseReceived => {
+                if !matches!(
+                    current.phase,
+                    crate::HostRequestAttemptPhase::DispatchStarted
+                        | crate::HostRequestAttemptPhase::DeliveryOutcomeUnknown
+                        | crate::HostRequestAttemptPhase::DeliveredToAuthenticatedHost
+                ) {
+                    return Err(OrsError::InvalidTransition);
+                }
+                crate::HostRequestAttemptPhase::ResponseReceived
+            }
+        };
+        if current.transport_observations.len() >= 3 {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        current.transport_observations.push(observation.clone());
+        current.phase = next_phase;
+        match observation.boundary {
+            crate::HostRequestTransportBoundary::DefinitelyNotSent => {}
+            crate::HostRequestTransportBoundary::DeliveryOutcomeUnknown
+            | crate::HostRequestTransportBoundary::ResponseReceived => {
+                if !matches!(
+                    record.state,
+                    crate::HostRequestState::Unknown | crate::HostRequestState::Reconciling
+                ) {
+                    record.state = record
+                        .state
+                        .transition_to(crate::HostRequestState::Unknown)?;
+                }
+            }
+            crate::HostRequestTransportBoundary::DeliveredToAuthenticatedHost => {
+                if record.state == crate::HostRequestState::Routed {
+                    record.state = record
+                        .state
+                        .transition_to(crate::HostRequestState::Submitted)?;
+                }
+            }
+            crate::HostRequestTransportBoundary::DispatchStarted => {
+                return Err(OrsError::InvalidTransition);
+            }
+        }
+        record.attempt = Some(current);
+        record.validate()?;
+        let payload = encode(&record)?;
+        {
+            let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(Some(record))
+    }
+
+    /// Retains one exact authenticated owner readback without changing the
+    /// original transport channel observations. The readback can resolve only
+    /// the active claim whose request and payload commitments it repeats.
+    pub fn record_host_request_owner_readback(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+        evidence: &crate::HostRequestOwnerReadbackEvidence,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        crate::model::validate_digest(request_digest, "host_request_request_digest")?;
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        let write = self.database.begin_write().map_err(storage)?;
+        let Some(mut record) = ({
+            let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode::<crate::HostRequestRecord>(value.value()))
+                .transpose()?
+        }) else {
+            return Ok(None);
+        };
+        record.validate()?;
+        if record.operation_id != *operation_id || record.request_digest != request_digest {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+        if record.send_claim_protocol_version != crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION {
+            return Err(OrsError::InvalidTransition);
+        }
+        let Some(mut current) = record.attempt.clone() else {
+            return Err(OrsError::InvalidTransition);
+        };
+        current.validate(&record.fence_digest)?;
+        attempt.validate(&record.fence_digest)?;
+        if !current.same_claim(attempt) {
+            return Err(OrsError::InvalidTransition);
+        }
+        evidence.validate_for(&record, &current)?;
+        if let Some(existing) = &current.owner_readback {
+            if existing == evidence {
+                write.commit().map_err(storage)?;
+                return Ok(Some(record));
+            }
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+        let response_was_already_observed = current.phase
+            == crate::HostRequestAttemptPhase::ResponseReceived
+            && current
+                .transport_observations
+                .last()
+                .is_some_and(|observation| {
+                    observation.boundary == crate::HostRequestTransportBoundary::ResponseReceived
+                        && observation.response_commitment_sha256.as_deref()
+                            == Some(evidence.result_commitment_sha256.as_str())
+                });
+        let unresolved_transport_claim = matches!(
+            current.phase,
+            crate::HostRequestAttemptPhase::DispatchStarted
+                | crate::HostRequestAttemptPhase::DeliveryOutcomeUnknown
+                | crate::HostRequestAttemptPhase::DeliveredToAuthenticatedHost
+        ) && current.transport_observations.last().is_some_and(
+            |observation| {
+                matches!(
+                    observation.boundary,
+                    crate::HostRequestTransportBoundary::DispatchStarted
+                        | crate::HostRequestTransportBoundary::DeliveryOutcomeUnknown
+                        | crate::HostRequestTransportBoundary::DeliveredToAuthenticatedHost
+                )
+            },
+        );
+        if current.transport_observations.is_empty()
+            || (!response_was_already_observed && !unresolved_transport_claim)
+        {
+            return Err(OrsError::InvalidTransition);
+        }
+        current.owner_readback = Some(evidence.clone());
+        current.phase = crate::HostRequestAttemptPhase::ResponseReceived;
+        if !matches!(
+            record.state,
+            crate::HostRequestState::Unknown | crate::HostRequestState::Reconciling
+        ) {
+            record.state = record
+                .state
+                .transition_to(crate::HostRequestState::Unknown)?;
+        }
+        record.attempt = Some(current);
+        record.validate()?;
+        let payload = encode(&record)?;
+        {
+            let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(Some(record))
     }
 
     /// Records the daemon owner's explicit no-effect deferral for the exact
@@ -8477,13 +9732,16 @@ impl RedbRecoveryStore {
             table
                 .get(key.as_str())
                 .map_err(storage)?
-                .map(|value| decode(value.value()))
+                .map(|value| decode::<crate::HostRequestRecord>(value.value()))
                 .transpose()?
         };
         let Some(mut record) = existing else {
             return Ok(None);
         };
         record.validate()?;
+        if record.send_claim_protocol_version == crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION {
+            return Err(OrsError::InvalidTransition);
+        }
         let Some(mut current) = record.attempt.clone() else {
             return Err(OrsError::InvalidTransition);
         };
@@ -8507,6 +9765,172 @@ impl RedbRecoveryStore {
         current.phase = crate::HostRequestAttemptPhase::DeferredNoEffect;
         record.attempt = Some(current);
         record.state = crate::HostRequestState::Routed;
+        record.validate()?;
+        let payload = encode(&record)?;
+        {
+            let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(Some(record))
+    }
+
+    /// Atomically terminalizes one exact send claim with the result whose
+    /// commitment was durably observed through the authenticated transport or
+    /// exact owner readback. When `owner_readback` is present, both that
+    /// evidence and the terminal response are retained in this same redb
+    /// transaction.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exact owner result and claim terminalization commit atomically"
+    )]
+    pub fn persist_claimed_host_request_result(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+        result_digest: &str,
+        result_response: &serde_json::Value,
+        owner_readback: Option<&crate::HostRequestOwnerReadbackEvidence>,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        crate::model::validate_digest(request_digest, "host_request_request_digest")?;
+        crate::model::validate_digest(result_digest, "host_request_result_digest")?;
+        crate::model::validate_result_response(result_response)?;
+        let result_body_bytes = canonical_json_bytes(result_response)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        let result_body_digest = crate::model::sha256_hex(&result_body_bytes);
+        if result_body_digest != result_digest {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        let write = self.database.begin_write().map_err(storage)?;
+        let Some(mut record) = ({
+            let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode::<crate::HostRequestRecord>(value.value()))
+                .transpose()?
+        }) else {
+            return Ok(None);
+        };
+        record.validate()?;
+        if record.operation_id != *operation_id || record.request_digest != request_digest {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+        if record.send_claim_protocol_version != crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION {
+            return Err(OrsError::InvalidTransition);
+        }
+        let Some(mut current) = record.attempt.clone() else {
+            return Err(OrsError::InvalidTransition);
+        };
+        current.validate(&record.fence_digest)?;
+        attempt.validate(&record.fence_digest)?;
+        if !current.same_claim(attempt) {
+            return Err(OrsError::InvalidTransition);
+        }
+        if let Some(evidence) = owner_readback {
+            if record.send_claim_protocol_version != crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+            {
+                return Err(OrsError::InvalidTransition);
+            }
+            evidence.validate_for(&record, &current)?;
+            let unresolved_transport_claim = matches!(
+                current.phase,
+                crate::HostRequestAttemptPhase::DispatchStarted
+                    | crate::HostRequestAttemptPhase::DeliveryOutcomeUnknown
+                    | crate::HostRequestAttemptPhase::DeliveredToAuthenticatedHost
+                    | crate::HostRequestAttemptPhase::ResponseReceived
+            ) && current
+                .transport_observations
+                .last()
+                .is_some_and(|observation| {
+                    matches!(
+                        observation.boundary,
+                        crate::HostRequestTransportBoundary::DispatchStarted
+                            | crate::HostRequestTransportBoundary::DeliveryOutcomeUnknown
+                            | crate::HostRequestTransportBoundary::DeliveredToAuthenticatedHost
+                            | crate::HostRequestTransportBoundary::ResponseReceived
+                    )
+                });
+            if current.transport_observations.is_empty() || !unresolved_transport_claim {
+                return Err(OrsError::InvalidTransition);
+            }
+            if let Some(existing) = &current.owner_readback {
+                if existing != evidence {
+                    return Err(OrsError::HostRequestIdentityConflict {
+                        operation_id: operation_id.as_str().to_owned(),
+                        request_digest: request_digest.to_owned(),
+                    });
+                }
+            } else {
+                current.owner_readback = Some(evidence.clone());
+            }
+            current.phase = crate::HostRequestAttemptPhase::ResponseReceived;
+        }
+        if current.phase != crate::HostRequestAttemptPhase::ResponseReceived {
+            return Err(OrsError::InvalidTransition);
+        }
+        let observed_result_digest = current
+            .owner_readback
+            .as_ref()
+            .map(|readback| readback.result_commitment_sha256.as_str())
+            .or_else(|| {
+                current
+                    .transport_observations
+                    .last()
+                    .filter(|observation| {
+                        observation.boundary
+                            == crate::HostRequestTransportBoundary::ResponseReceived
+                    })
+                    .and_then(|observation| observation.response_commitment_sha256.as_deref())
+            });
+        if observed_result_digest != Some(result_digest)
+            || observed_result_digest != Some(result_body_digest.as_str())
+        {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+        if record.state == crate::HostRequestState::ResultReceived {
+            if record.result_digest.as_deref() == Some(result_digest)
+                && record.result_response.as_ref() == Some(result_response)
+            {
+                write.commit().map_err(storage)?;
+                return Ok(Some(record));
+            }
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+        if !matches!(
+            record.state,
+            crate::HostRequestState::Submitted
+                | crate::HostRequestState::PossiblyEffected
+                | crate::HostRequestState::Unknown
+                | crate::HostRequestState::Reconciling
+        ) {
+            return Err(OrsError::InvalidTransition);
+        }
+        record.attempt = Some(current);
+        record.state = record
+            .state
+            .transition_to(crate::HostRequestState::ResultReceived)?;
+        record.result_digest = Some(result_digest.to_owned());
+        record.result_response = Some(result_response.clone());
+        if record.commit_order == 0 {
+            record.commit_order = Self::next_operational_order(&write)?;
+        }
         record.validate()?;
         let payload = encode(&record)?;
         {
@@ -8554,13 +9978,16 @@ impl RedbRecoveryStore {
             table
                 .get(key.as_str())
                 .map_err(storage)?
-                .map(|value| decode(value.value()))
+                .map(|value| decode::<crate::HostRequestRecord>(value.value()))
                 .transpose()?
         };
         let Some(existing) = existing else {
             return Ok(None);
         };
         existing.validate()?;
+        if existing.send_claim_protocol_version == crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION {
+            return Err(OrsError::InvalidTransition);
+        }
         if existing.state == crate::HostRequestState::ResultReceived {
             let same_digest = existing.result_digest.as_deref() == Some(result_digest);
             let same_body = existing.result_response.as_ref() == Some(result_response);
@@ -8759,19 +10186,20 @@ impl RedbRecoveryStore {
             .flatten();
         let (scan_hit, scan_classes) = Self::privacy_deny_scan(envelope_bytes);
         let (redacted, classes, reason) = match grant {
+            Some(_) if scan_hit => {
+                // The stage entry applies this same scan-hit precedence to
+                // both admitted and rejected owner verdicts. Keeping the
+                // decision projection identical ensures forbidden content
+                // receives its durable redaction receipt instead of being
+                // rejected as a privacy-decision mismatch.
+                (
+                    true,
+                    scan_classes,
+                    BRIDGE_EVENT_REDACTION_REASON_FORBIDDEN.to_owned(),
+                )
+            }
             Some(grant) if grant.verdict == BRIDGE_EVENT_PRIVACY_ADMISSION => {
-                if scan_hit {
-                    // The conservative detector found denied content in
-                    // bytes the owner admitted: redaction wins, on the
-                    // detected-content reason.
-                    (
-                        true,
-                        scan_classes,
-                        BRIDGE_EVENT_REDACTION_REASON_FORBIDDEN.to_owned(),
-                    )
-                } else {
-                    (false, Vec::new(), String::new())
-                }
+                (false, Vec::new(), String::new())
             }
             // An owner rejection withholds the original bytes as outside its
             // privacy scope. With no matching token the class names the
@@ -9034,21 +10462,19 @@ impl RedbRecoveryStore {
     /// Resolves the I7.23 disclosure staging for one stage call (issue
     /// #1934).
     ///
-    /// The verdict is the OWNER's: the presented privacy authorization must
-    /// carry a verdict over exactly the canonical envelope bytes about to be
-    /// persisted, name the scope and the policy revision it was decided
-    /// under, and — where this owner is about to bind an owner namespace —
-    /// equal that namespace. Only an admitted verdict over a clean deny scan
-    /// stages the original bytes verbatim. An owner rejection, an absent or
-    /// unbound authorization, and a conservative scan hit all resolve to the
-    /// deterministic redacted projection plus its redaction receipt — the
-    /// scan can deny, and its silence can never allow. A mismatch fails
-    /// closed instead of persisting a disputed form.
+    /// A presented owner verdict must bind exactly the canonical envelope
+    /// bytes, its scope, and policy revision; where this owner is binding a
+    /// stream namespace, the verdict's scope must equal that namespace. Only
+    /// an admitted verdict over a clean deny scan stages original bytes.
+    /// Rejection, absent authorization, and a deny-scan hit stage the
+    /// deterministic redacted projection plus its receipt. The scan can deny,
+    /// and its silence can never allow. A mismatch fails closed instead of
+    /// persisting a disputed form.
     ///
-    /// `enforced_scope` is the namespace this owner is binding; the legacy
-    /// ownerless entry passes `None` and accepts the owner's own scope
-    /// verbatim (it binds no namespace of its own to compare against), so
-    /// the owner's binding is still persisted on the row either way.
+    /// `enforced_scope` is the namespace this owner is binding. The legacy
+    /// ownerless entry passes `None`; when a verdict exists, its own scope is
+    /// retained. With no verdict, all owner-authorization fields remain
+    /// absent and only the redaction receipt is persisted.
     fn bridge_event_privacy_staging(
         staged: &serde_json::Value,
         envelope_bytes: &[u8],
@@ -9060,43 +10486,62 @@ impl RedbRecoveryStore {
         let grant = Self::presented_privacy_authorization(
             staged.get("privacy_authorization"),
             &transport_hash,
-        )?
-        .ok_or(OrsError::InvalidField {
-            field: "privacy_authorization",
-            reason: "bridge event persistence requires a privacy owner verdict bound to these bytes",
-        })?;
-        if enforced_scope.is_some_and(|scope| grant.scope != scope) {
-            return Err(OrsError::InvalidField {
-                field: "privacy_authorization",
-                reason: "bridge event privacy owner verdict must bind the admitted scope",
-            });
-        }
+        )?;
         let (scan_hit, scan_classes) = Self::privacy_deny_scan(envelope_bytes);
-        let admitted = grant.verdict == BRIDGE_EVENT_PRIVACY_ADMISSION;
-        let denied = !admitted || scan_hit;
-        let (classes, reason) = if denied && !scan_classes.is_empty() {
-            // The conservative detector found denied content in the bytes:
-            // redact on the detected-content reason regardless of whether the
-            // owner also withheld them.
-            (
+        let (denied, classes, reason, admitted_source, scope, policy_revision) = match grant {
+            Some(grant) => {
+                if enforced_scope.is_some_and(|scope| grant.scope != scope) {
+                    return Err(OrsError::InvalidField {
+                        field: "privacy_authorization",
+                        reason: "bridge event privacy owner verdict must bind the admitted scope",
+                    });
+                }
+                let denied = grant.verdict != BRIDGE_EVENT_PRIVACY_ADMISSION || scan_hit;
+                let (classes, reason) = if denied && !scan_classes.is_empty() {
+                    // The conservative detector found denied content in the
+                    // bytes: redaction wins over an owner rejection.
+                    (
+                        scan_classes,
+                        BRIDGE_EVENT_REDACTION_REASON_FORBIDDEN.to_owned(),
+                    )
+                } else if denied {
+                    // An owner rejection withholds bytes outside its scope.
+                    (
+                        vec![
+                            grant
+                                .declared_class
+                                .unwrap_or_else(|| "declared_out_of_scope".to_owned()),
+                        ],
+                        BRIDGE_EVENT_REDACTION_REASON_OUT_OF_SCOPE.to_owned(),
+                    )
+                } else {
+                    (Vec::new(), String::new())
+                };
+                (
+                    denied,
+                    classes,
+                    reason,
+                    transport_hash.clone(),
+                    grant.scope,
+                    grant.policy_revision,
+                )
+            }
+            None if scan_hit => (
+                true,
                 scan_classes,
                 BRIDGE_EVENT_REDACTION_REASON_FORBIDDEN.to_owned(),
-            )
-        } else if denied {
-            // The owner withheld the original bytes as outside its privacy
-            // scope. The class names the withheld scope; it is a scope label,
-            // never a claim about matched content.
-            (
-                vec![
-                    grant
-                        .declared_class
-                        .clone()
-                        .unwrap_or_else(|| "declared_out_of_scope".to_owned()),
-                ],
+                String::new(),
+                String::new(),
+                0,
+            ),
+            None => (
+                true,
+                vec!["privacy_authorization_absent".to_owned()],
                 BRIDGE_EVENT_REDACTION_REASON_OUT_OF_SCOPE.to_owned(),
-            )
-        } else {
-            (Vec::new(), String::new())
+                String::new(),
+                String::new(),
+                0,
+            ),
         };
         if denied != presented_redacted
             || (denied && (classes != presented_classes || presented_reason != reason))
@@ -9129,8 +10574,9 @@ impl RedbRecoveryStore {
             reason,
             classes,
             transport_hash,
-            scope: grant.scope,
-            policy_revision: grant.policy_revision,
+            admitted_source,
+            scope,
+            policy_revision,
             stored_bytes,
             normalized_bytes,
         })
@@ -9357,6 +10803,7 @@ impl RedbRecoveryStore {
                     || row.authority_epoch != authority_epoch
                     || row.redacted != staging.denied
                     || row.transport_hash != staging.transport_hash
+                    || row.admitted_source != staging.admitted_source
                     || row.admitted_scope != staging.scope
                     || row.admitted_policy_revision != staging.policy_revision
                     || !Self::bridge_event_provenance_matches(&row, &provenance)
@@ -9400,11 +10847,10 @@ impl RedbRecoveryStore {
                     } else {
                         0
                     },
-                    // The owner's authorization binding travels with the
-                    // decision even on this ownerless entry, so the persisted
-                    // verdict stays attributable to the exact bytes, the
-                    // scope, and the policy revision it was made about.
-                    admitted_source: staging.transport_hash.clone(),
+                    // No owner verdict is synthesized. If one was absent,
+                    // the staged redaction receipt keeps these authorization
+                    // fields empty; verbatim persistence is never allowed.
+                    admitted_source: staging.admitted_source.clone(),
                     admitted_scope: staging.scope.clone(),
                     admitted_policy_revision: staging.policy_revision,
                     // No provenance was presented on this entry: the row
@@ -10311,6 +11757,28 @@ impl RedbRecoveryStore {
             })
     }
 
+    fn bridge_owner_list_cutoff_for_recovery_in(
+        write: &redb::WriteTransaction,
+        read_budget: &mut BridgeRecoveryReadBudget,
+    ) -> Result<u64, OrsError> {
+        let meta = write.open_table(META).map_err(storage)?;
+        let Some(value) = meta.get(BRIDGE_OWNER_LIST_SEQUENCE_KEY).map_err(storage)? else {
+            read_budget.charge_reference()?;
+            return Ok(0);
+        };
+        read_budget.charge(
+            BRIDGE_OWNER_LIST_SEQUENCE_KEY.as_bytes(),
+            value.value().as_bytes(),
+        )?;
+        value
+            .value()
+            .parse::<u64>()
+            .map_err(|_| OrsError::IntegrityProblem {
+                record_type: "bridge_owner_list_sequence",
+                reason: "owner-list sequence is not an unsigned integer".to_owned(),
+            })
+    }
+
     /// Counts the two enumeration denominators the window declares at open
     /// time: how many stream owners and how many bounded unscoped-gap rows the
     /// window's finite cutoff covers under its exact authenticated owner scope.
@@ -10328,6 +11796,7 @@ impl RedbRecoveryStore {
         write: &redb::WriteTransaction,
         scope: &str,
         owner_cutoff: u64,
+        read_budget: &mut BridgeRecoveryReadBudget,
     ) -> Result<(u64, u64), OrsError> {
         crate::model::validate_digest(scope, "owner_scope_digest")?;
         let mut stream_list_total = 0_u64;
@@ -10350,6 +11819,7 @@ impl RedbRecoveryStore {
                     .take(MAX_BRIDGE_STREAM_OWNERS.saturating_add(1))
                 {
                     let (key, value) = entry.map_err(storage)?;
+                    read_budget.charge(key.value().as_bytes(), value.value().as_bytes())?;
                     let sequence = key
                         .value()
                         .strip_prefix(prefix.as_str())
@@ -10380,6 +11850,7 @@ impl RedbRecoveryStore {
                     let Some(owner_value) = owners.get(namespace.as_str()).map_err(storage)? else {
                         return Err(OrsError::RecoveryOwnerMismatch);
                     };
+                    read_budget.charge(namespace.as_bytes(), owner_value.value().as_bytes())?;
                     let owner: BridgeStreamOwnerRow = decode(owner_value.value())?;
                     owner.validate()?;
                     if owner.namespace != namespace
@@ -10417,6 +11888,7 @@ impl RedbRecoveryStore {
                 .map_err(storage)?
             {
                 let (key, value) = entry.map_err(storage)?;
+                read_budget.charge(key.value().as_bytes(), value.value().as_bytes())?;
                 let gap: BridgeEventGapRow = decode(value.value())?;
                 gap.validate()?;
                 if gap.owner_namespace != namespace
@@ -10454,6 +11926,7 @@ impl RedbRecoveryStore {
         write: &redb::WriteTransaction,
         lineage: &str,
         principal: &str,
+        read_budget: &mut BridgeRecoveryReadBudget,
     ) -> Result<Vec<BridgeEventRecoveryWindowRow>, OrsError> {
         let scope = Self::bridge_owner_scope_digest(lineage, principal)?;
         let windows = write
@@ -10465,6 +11938,7 @@ impl RedbRecoveryStore {
         let mut matches = Vec::new();
         for entry in windows.iter().map_err(storage)? {
             let (key, value) = entry.map_err(storage)?;
+            read_budget.charge(key.value().as_bytes(), value.value().as_bytes())?;
             let row: BridgeEventRecoveryWindowRow = decode(value.value())?;
             row.validate()?;
             if row.window_key != key.value()
@@ -10491,6 +11965,188 @@ impl RedbRecoveryStore {
         Ok(matches)
     }
 
+    fn bridge_recovery_expiry_evidence_set_in(
+        write: &redb::WriteTransaction,
+        read_budget: &mut BridgeRecoveryReadBudget,
+    ) -> Result<BridgeEventRecoveryExpiryEvidenceSet, OrsError> {
+        let encoded = {
+            let meta = write.open_table(META).map_err(storage)?;
+            let Some(value) = meta
+                .get(BRIDGE_RECOVERY_EXPIRY_EVIDENCE_META_KEY)
+                .map_err(storage)?
+            else {
+                return Ok(BridgeEventRecoveryExpiryEvidenceSet::empty());
+            };
+            if value.value().len() > MAX_BRIDGE_RECOVERY_EXPIRY_EVIDENCE_BYTES {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_recovery_expiry_evidence_set",
+                    reason: "expiry evidence metadata exceeds its encoded byte bound".to_owned(),
+                });
+            }
+            read_budget.charge(
+                BRIDGE_RECOVERY_EXPIRY_EVIDENCE_META_KEY.as_bytes(),
+                value.value().as_bytes(),
+            )?;
+            value.value().to_owned()
+        };
+        decode(&encoded)
+    }
+
+    fn save_bridge_recovery_expiry_evidence_set_in(
+        write: &redb::WriteTransaction,
+        set: &BridgeEventRecoveryExpiryEvidenceSet,
+    ) -> Result<(), OrsError> {
+        set.validate()?;
+        let encoded = encode(set)?;
+        if encoded.len() > MAX_BRIDGE_RECOVERY_EXPIRY_EVIDENCE_BYTES {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        let mut meta = write.open_table(META).map_err(storage)?;
+        if set.rows.is_empty() {
+            meta.remove(BRIDGE_RECOVERY_EXPIRY_EVIDENCE_META_KEY)
+                .map_err(storage)?;
+            return Ok(());
+        }
+        meta.insert(BRIDGE_RECOVERY_EXPIRY_EVIDENCE_META_KEY, encoded.as_str())
+            .map_err(storage)?;
+        Ok(())
+    }
+
+    fn retain_bridge_recovery_expiry_evidence_in(
+        write: &redb::WriteTransaction,
+        terminal_windows: &[BridgeEventRecoveryWindowRow],
+        disposition: BridgeRecoveryWindowDisposition,
+        now_ms: u64,
+        read_budget: &mut BridgeRecoveryReadBudget,
+    ) -> Result<(), OrsError> {
+        if disposition == BridgeRecoveryWindowDisposition::Active {
+            return Err(OrsError::InvalidField {
+                field: "recovery_window.disposition",
+                reason: "terminal evidence records only moved or expired windows",
+            });
+        }
+        let mut set = Self::bridge_recovery_expiry_evidence_set_in(write, read_budget)?;
+        set.rows.retain(|entry| entry.evidence_until_ms > now_ms);
+        for window in terminal_windows {
+            if disposition == BridgeRecoveryWindowDisposition::Expired
+                && window.expires_at_ms > now_ms
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_recovery_expiry_evidence",
+                    reason: "cleanup selected a window before its natural expiry".to_owned(),
+                });
+            }
+            // The original row was validated by the cleanup scan. Preserve its
+            // exact public expiry shape and immutable identity, but never keep
+            // the selector-signing secret in post-expiry evidence.
+            let mut window = window.clone();
+            window.continuation_secret = None;
+            let evidence_until_ms = window
+                .expires_at_ms
+                .checked_add(BRIDGE_RECOVERY_WINDOW_TTL_MS)
+                .ok_or(OrsError::IntegrityProblem {
+                    record_type: "bridge_recovery_expiry_evidence",
+                    reason: "expiry evidence retention horizon overflows its timestamp".to_owned(),
+                })?;
+            if evidence_until_ms <= now_ms {
+                continue;
+            }
+            let evidence = BridgeEventRecoveryExpiryEvidence {
+                version: 1,
+                evidence_until_ms,
+                window,
+                disposition,
+            };
+            evidence.validate()?;
+            match set.rows.binary_search_by(|existing| {
+                existing.window.window_key.cmp(&evidence.window.window_key)
+            }) {
+                Ok(index) if set.rows[index] == evidence => {}
+                Ok(_) => {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "bridge_recovery_expiry_evidence_set",
+                        reason: "one window key resolves to conflicting expiry evidence".to_owned(),
+                    });
+                }
+                Err(index) => set.rows.insert(index, evidence),
+            }
+        }
+        if set.rows.len() > MAX_BRIDGE_RECOVERY_EXPIRY_EVIDENCE {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        Self::save_bridge_recovery_expiry_evidence_set_in(write, &set)
+    }
+
+    fn bridge_recovery_expiry_evidence_for_owner_in(
+        write: &redb::WriteTransaction,
+        lineage: &str,
+        principal: &str,
+        window_key: Option<&str>,
+        now_ms: u64,
+        read_budget: &mut BridgeRecoveryReadBudget,
+    ) -> Result<Option<BridgeEventRecoveryExpiryEvidence>, OrsError> {
+        let scope = Self::bridge_owner_scope_digest(lineage, principal)?;
+        let set = Self::bridge_recovery_expiry_evidence_set_in(write, read_budget)?;
+        let mut matches = Vec::new();
+        for evidence in set.rows {
+            let window = &evidence.window;
+            if evidence.disposition == BridgeRecoveryWindowDisposition::Expired
+                && evidence.evidence_until_ms > now_ms
+                && window.expires_at_ms > now_ms
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_recovery_expiry_evidence",
+                    reason: "expiry evidence was recorded before the window naturally expired"
+                        .to_owned(),
+                });
+            }
+            if window_key.is_some_and(|key| window.window_key != key) {
+                continue;
+            }
+            if window.owner_scope_digest != scope {
+                continue;
+            }
+            if window.authority_lineage != lineage || window.principal != principal {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_recovery_expiry_evidence",
+                    reason: "scope digest resolves to a different retained owner identity"
+                        .to_owned(),
+                });
+            }
+            if evidence.evidence_until_ms > now_ms {
+                matches.push(evidence);
+            }
+        }
+        if let Some(key) = window_key {
+            if matches.len() > 1 {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_recovery_expiry_evidence_set",
+                    reason: "one terminal window key has multiple evidence rows".to_owned(),
+                });
+            }
+            if let Some(evidence) = matches.pop() {
+                if evidence.window.window_key != key {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "bridge_recovery_expiry_evidence_set",
+                        reason: "terminal evidence key differs from requested key".to_owned(),
+                    });
+                }
+                return Ok(Some(evidence));
+            }
+            return Ok(None);
+        }
+        if matches.is_empty() {
+            return Ok(None);
+        }
+        // Keyless Resume cannot identify which historical window it means.
+        // A single retained terminal row can answer; multiple rows require
+        // the exact keyed ResumeWindow selector instead of guessing by age.
+        if matches.len() > 1 {
+            return Err(OrsError::RecoveryOwnerMismatch);
+        }
+        Ok(matches.pop())
+    }
+
     /// Explicit Open refresh retires one authenticated window and only its
     /// own bounded cut rows. The old key cannot be continued after this
     /// transaction; v1 cuts are validated for safe deletion but never used
@@ -10498,10 +12154,23 @@ impl RedbRecoveryStore {
     fn retire_bridge_recovery_window_in(
         write: &redb::WriteTransaction,
         window: &BridgeEventRecoveryWindowRow,
+        now_ms: u64,
+        read_budget: &mut BridgeRecoveryReadBudget,
     ) -> Result<(), OrsError> {
-        if !matches!(window.version, 1 | 2) {
+        if !matches!(window.version, 1..=3) {
             return Err(OrsError::RecoveryOwnerMismatch);
         }
+        Self::retain_bridge_recovery_expiry_evidence_in(
+            write,
+            std::slice::from_ref(window),
+            if window.expires_at_ms <= now_ms {
+                BridgeRecoveryWindowDisposition::Expired
+            } else {
+                BridgeRecoveryWindowDisposition::Moved
+            },
+            now_ms,
+            read_budget,
+        )?;
         {
             let mut windows = write
                 .open_table(BRIDGE_EVENT_RECOVERY_WINDOWS)
@@ -10509,6 +12178,7 @@ impl RedbRecoveryStore {
             let Some(value) = windows.get(window.window_key.as_str()).map_err(storage)? else {
                 return Err(OrsError::RecoveryOwnerMismatch);
             };
+            read_budget.charge(window.window_key.as_bytes(), value.value().as_bytes())?;
             let stored: BridgeEventRecoveryWindowRow = decode(value.value())?;
             stored.validate()?;
             if stored.version != window.version
@@ -10516,11 +12186,14 @@ impl RedbRecoveryStore {
                 || stored.authority_lineage != window.authority_lineage
                 || stored.principal != window.principal
                 || stored.owner_scope_digest != window.owner_scope_digest
-                || (stored.version == 2
+                || (stored.version >= 2
                     && (stored.source_revision != window.source_revision
                         || stored.window_sequence != window.window_sequence
                         || stored.live_generation != window.live_generation
-                        || stored.presenting_connection != window.presenting_connection))
+                        || stored.presenting_connection != window.presenting_connection
+                        || stored.current_live_generation != window.current_live_generation
+                        || stored.current_presenting_connection
+                            != window.current_presenting_connection))
             {
                 return Err(OrsError::IntegrityProblem {
                     record_type: "bridge_event_recovery_window",
@@ -10546,6 +12219,7 @@ impl RedbRecoveryStore {
                 if !key.value().starts_with(prefix.as_str()) {
                     continue;
                 }
+                read_budget.charge(key.value().as_bytes(), value.value().as_bytes())?;
                 let cut: BridgeEventRecoveryCutRow = decode(value.value())?;
                 cut.validate()?;
                 if cut.window_key != window.window_key
@@ -10581,16 +12255,19 @@ impl RedbRecoveryStore {
     fn bridge_recovery_source_revision_in(
         write: &redb::WriteTransaction,
         scope: &str,
+        read_budget: &mut BridgeRecoveryReadBudget,
     ) -> Result<u64, OrsError> {
         crate::model::validate_digest(scope, "owner_scope_digest")?;
         let key = Self::bridge_recovery_source_revision_key(scope);
         let meta = write.open_table(META).map_err(storage)?;
         let Some(value) = meta.get(key.as_str()).map_err(storage)? else {
+            read_budget.charge_reference()?;
             return Err(OrsError::IntegrityProblem {
                 record_type: "bridge_recovery_source_revision",
                 reason: "persisted window has no source revision".to_owned(),
             });
         };
+        read_budget.charge(key.as_bytes(), value.value().as_bytes())?;
         value
             .value()
             .parse::<u64>()
@@ -10605,18 +12282,29 @@ impl RedbRecoveryStore {
     fn initialize_bridge_recovery_source_revision_in(
         write: &redb::WriteTransaction,
         scope: &str,
+        read_budget: &mut BridgeRecoveryReadBudget,
     ) -> Result<u64, OrsError> {
-        match Self::bridge_recovery_source_revision_in(write, scope) {
+        match Self::bridge_recovery_source_revision_in(write, scope, read_budget) {
             Ok(revision) => Ok(revision),
             Err(OrsError::IntegrityProblem {
                 record_type: "bridge_recovery_source_revision",
                 ..
             }) => {
                 let key = Self::bridge_recovery_source_revision_key(scope);
-                let mut meta = write.open_table(META).map_err(storage)?;
-                if meta.get(key.as_str()).map_err(storage)?.is_some() {
-                    return Self::bridge_recovery_source_revision_in(write, scope);
+                let already_present = {
+                    let meta = write.open_table(META).map_err(storage)?;
+                    if let Some(value) = meta.get(key.as_str()).map_err(storage)? {
+                        read_budget.charge(key.as_bytes(), value.value().as_bytes())?;
+                        true
+                    } else {
+                        read_budget.charge_reference()?;
+                        false
+                    }
+                };
+                if already_present {
+                    return Self::bridge_recovery_source_revision_in(write, scope, read_budget);
                 }
+                let mut meta = write.open_table(META).map_err(storage)?;
                 meta.insert(key.as_str(), "1").map_err(storage)?;
                 Ok(1)
             }
@@ -10627,16 +12315,19 @@ impl RedbRecoveryStore {
     fn bridge_recovery_source_revision_for(
         read: &redb::ReadTransaction,
         scope: &str,
+        read_budget: &mut BridgeRecoveryReadBudget,
     ) -> Result<u64, OrsError> {
         crate::model::validate_digest(scope, "owner_scope_digest")?;
         let key = Self::bridge_recovery_source_revision_key(scope);
         let meta = read.open_table(META).map_err(storage)?;
         let Some(value) = meta.get(key.as_str()).map_err(storage)? else {
+            read_budget.charge_reference()?;
             return Err(OrsError::IntegrityProblem {
                 record_type: "bridge_recovery_source_revision",
                 reason: "v2 window has no persisted source revision".to_owned(),
             });
         };
+        read_budget.charge(key.as_bytes(), value.value().as_bytes())?;
         value
             .value()
             .parse::<u64>()
@@ -10658,8 +12349,9 @@ impl RedbRecoveryStore {
         principal: &str,
         live_generation: u64,
         presenting_connection: &str,
+        now_ms: u64,
+        read_budget: &mut BridgeRecoveryReadBudget,
     ) -> Result<BridgeEventRecoveryWindowRow, OrsError> {
-        let now_ms = current_unix_ms_u64()?;
         let scope = Self::bridge_owner_scope_digest(lineage, principal)?;
         let expired = {
             let windows = write
@@ -10671,6 +12363,7 @@ impl RedbRecoveryStore {
             let mut expired = Vec::new();
             for entry in windows.iter().map_err(storage)? {
                 let (key, value) = entry.map_err(storage)?;
+                read_budget.charge(key.value().as_bytes(), value.value().as_bytes())?;
                 let row: BridgeEventRecoveryWindowRow = decode(value.value())?;
                 row.validate()?;
                 if row.window_key != key.value() {
@@ -10680,21 +12373,36 @@ impl RedbRecoveryStore {
                     });
                 }
                 if row.expires_at_ms <= now_ms {
-                    expired.push(row.window_key);
+                    expired.push(row);
                 }
             }
             expired
         };
+        // Evidence retention and window/cut cleanup share this transaction.
+        // If the bounded set cannot retain a natural expiry, Open fails
+        // without deleting its source row. Prune elapsed evidence even when
+        // this Open has no expired live rows to clean up.
+        Self::retain_bridge_recovery_expiry_evidence_in(
+            write,
+            &expired,
+            BridgeRecoveryWindowDisposition::Expired,
+            now_ms,
+            read_budget,
+        )?;
         if !expired.is_empty() {
+            let expired_keys: Vec<String> = expired
+                .iter()
+                .map(|window| window.window_key.clone())
+                .collect();
             {
                 let mut windows = write
                     .open_table(BRIDGE_EVENT_RECOVERY_WINDOWS)
                     .map_err(storage)?;
-                for key in &expired {
+                for key in &expired_keys {
                     windows.remove(key.as_str()).map_err(storage)?;
                 }
             }
-            let prefixes: Vec<String> = expired.iter().map(|key| format!("{key}::")).collect();
+            let prefixes: Vec<String> = expired_keys.iter().map(|key| format!("{key}::")).collect();
             let cut_keys = {
                 let cuts = write
                     .open_table(BRIDGE_EVENT_RECOVERY_CUTS)
@@ -10705,6 +12413,7 @@ impl RedbRecoveryStore {
                 let mut keys = Vec::new();
                 for entry in cuts.iter().map_err(storage)? {
                     let (key, _) = entry.map_err(storage)?;
+                    read_budget.charge_reference()?;
                     if prefixes
                         .iter()
                         .any(|prefix| key.value().starts_with(prefix))
@@ -10721,27 +12430,30 @@ impl RedbRecoveryStore {
                 cuts.remove(key.as_str()).map_err(storage)?;
             }
         }
-        let existing = Self::bridge_recovery_windows_for_owner_in(write, lineage, principal)?;
+        let existing =
+            Self::bridge_recovery_windows_for_owner_in(write, lineage, principal, read_budget)?;
         if existing.len() > 1 {
             return Err(OrsError::RecoveryOwnerMismatch);
         }
         let reusable = existing.into_iter().find(|row| row.expires_at_ms > now_ms);
         if let Some(window) = &reusable {
-            if window.version != 2
+            if !matches!(window.version, 2 | 3)
                 || window.continuation_secret.is_none()
-                || window.live_generation != live_generation
-                || window.presenting_connection != presenting_connection
+                || !window.current_presentation_matches(live_generation, presenting_connection)
             {
                 return Err(OrsError::RecoveryOwnerMismatch);
             }
-            if window.source_revision != Self::bridge_recovery_source_revision_in(write, &scope)? {
+            if window.source_revision
+                != Self::bridge_recovery_source_revision_in(write, &scope, read_budget)?
+            {
                 return Err(OrsError::RecoveryOwnerMismatch);
             }
         }
         if let Some(window) = reusable {
             return Ok(window);
         }
-        let source_revision = Self::initialize_bridge_recovery_source_revision_in(write, &scope)?;
+        let source_revision =
+            Self::initialize_bridge_recovery_source_revision_in(write, &scope, read_budget)?;
         {
             let windows = write
                 .open_table(BRIDGE_EVENT_RECOVERY_WINDOWS)
@@ -10752,33 +12464,37 @@ impl RedbRecoveryStore {
         }
         let sequence = {
             let meta = write.open_table(META).map_err(storage)?;
-            match meta
+            if let Some(value) = meta
                 .get(BRIDGE_RECOVERY_WINDOW_SEQUENCE_KEY)
                 .map_err(storage)?
             {
-                Some(value) => {
-                    value
-                        .value()
-                        .parse::<u64>()
-                        .map_err(|_| OrsError::IntegrityProblem {
-                            record_type: "bridge_recovery_window_sequence",
-                            reason: "window sequence is not an unsigned integer".to_owned(),
-                        })?
-                }
-                None => 0,
+                read_budget.charge(
+                    BRIDGE_RECOVERY_WINDOW_SEQUENCE_KEY.as_bytes(),
+                    value.value().as_bytes(),
+                )?;
+                value
+                    .value()
+                    .parse::<u64>()
+                    .map_err(|_| OrsError::IntegrityProblem {
+                        record_type: "bridge_recovery_window_sequence",
+                        reason: "window sequence is not an unsigned integer".to_owned(),
+                    })?
+            } else {
+                read_budget.charge_reference()?;
+                0
             }
         }
         .checked_add(1)
         .ok_or(OrsError::ProjectionLimitExceeded)?;
-        let cutoff = Self::bridge_owner_list_cutoff_in(write)?;
+        let cutoff = Self::bridge_owner_list_cutoff_for_recovery_in(write, read_budget)?;
         // The denominators are part of the window's identity, so the window
         // key itself commits to them: a continuation cannot be replayed
         // against a window whose declared whole has silently changed.
         let (stream_list_total, unscoped_gap_total) =
-            Self::bridge_recovery_window_denominators_in(write, &scope, cutoff)?;
+            Self::bridge_recovery_window_denominators_in(write, &scope, cutoff, read_budget)?;
         let expires_at_ms = now_ms.saturating_add(BRIDGE_RECOVERY_WINDOW_TTL_MS);
         let mut row = BridgeEventRecoveryWindowRow {
-            version: 2,
+            version: 3,
             window_key: String::new(),
             continuation_secret: Some(format!(
                 "{}{}",
@@ -10792,6 +12508,8 @@ impl RedbRecoveryStore {
             window_sequence: sequence,
             live_generation,
             presenting_connection: presenting_connection.to_owned(),
+            current_live_generation: Some(live_generation),
+            current_presenting_connection: Some(presenting_connection.to_owned()),
             owner_cutoff: cutoff,
             stream_list_total,
             unscoped_gap_total,
@@ -10824,6 +12542,7 @@ impl RedbRecoveryStore {
         window_key: &str,
         lineage: &str,
         principal: &str,
+        read_budget: &mut BridgeRecoveryReadBudget,
     ) -> Result<Option<BridgeEventRecoveryWindowRow>, OrsError> {
         crate::model::validate_digest(window_key, "window_key")?;
         let windows = database
@@ -10832,6 +12551,7 @@ impl RedbRecoveryStore {
         let Some(value) = windows.get(window_key).map_err(storage)? else {
             return Ok(None);
         };
+        read_budget.charge(window_key.as_bytes(), value.value().as_bytes())?;
         let row: BridgeEventRecoveryWindowRow = decode(value.value())?;
         row.validate()?;
         if row.window_key != window_key
@@ -10855,6 +12575,7 @@ impl RedbRecoveryStore {
         window_key: &str,
         lineage: &str,
         principal: &str,
+        read_budget: &mut BridgeRecoveryReadBudget,
     ) -> Result<Option<BridgeEventRecoveryWindowRow>, OrsError> {
         crate::model::validate_digest(window_key, "window_key")?;
         let windows = write
@@ -10863,6 +12584,7 @@ impl RedbRecoveryStore {
         let Some(value) = windows.get(window_key).map_err(storage)? else {
             return Ok(None);
         };
+        read_budget.charge(window_key.as_bytes(), value.value().as_bytes())?;
         let row: BridgeEventRecoveryWindowRow = decode(value.value())?;
         row.validate()?;
         if row.window_key != window_key
@@ -10899,6 +12621,7 @@ impl RedbRecoveryStore {
         database: &redb::ReadTransaction,
         window_key: &str,
         namespace: &str,
+        read_budget: &mut BridgeRecoveryReadBudget,
     ) -> Result<Option<BridgeEventRecoveryCutRow>, OrsError> {
         crate::model::validate_digest(window_key, "window_key")?;
         crate::model::validate_digest(namespace, "owner_namespace")?;
@@ -10909,6 +12632,7 @@ impl RedbRecoveryStore {
         let Some(value) = cuts.get(key.as_str()).map_err(storage)? else {
             return Ok(None);
         };
+        read_budget.charge(key.as_bytes(), value.value().as_bytes())?;
         let row: BridgeEventRecoveryCutRow = decode(value.value())?;
         row.validate()?;
         if row.window_key != window_key || row.namespace != namespace {
@@ -10924,6 +12648,7 @@ impl RedbRecoveryStore {
         write: &redb::WriteTransaction,
         window_key: &str,
         namespace: &str,
+        read_budget: &mut BridgeRecoveryReadBudget,
     ) -> Result<Option<BridgeEventRecoveryCutRow>, OrsError> {
         crate::model::validate_digest(window_key, "window_key")?;
         crate::model::validate_digest(namespace, "owner_namespace")?;
@@ -10934,6 +12659,7 @@ impl RedbRecoveryStore {
         let Some(value) = cuts.get(key.as_str()).map_err(storage)? else {
             return Ok(None);
         };
+        read_budget.charge(key.as_bytes(), value.value().as_bytes())?;
         let row: BridgeEventRecoveryCutRow = decode(value.value())?;
         row.validate()?;
         if row.window_key != window_key || row.namespace != namespace {
@@ -10970,6 +12696,11 @@ impl RedbRecoveryStore {
         };
         match selector {
             BridgeRecoverySelector::Resume { .. } => Ok(BridgeRecoveryScopeSelector::Resume),
+            BridgeRecoverySelector::ResumeWindow { window_key, .. } => {
+                Ok(BridgeRecoveryScopeSelector::ResumeWindow {
+                    window_key: window_key.clone(),
+                })
+            }
             BridgeRecoverySelector::Streams {
                 window_key,
                 after_stream,
@@ -11063,7 +12794,9 @@ impl RedbRecoveryStore {
         selector: &BridgeRecoverySelector,
     ) -> Result<(), OrsError> {
         let provided = match selector {
-            BridgeRecoverySelector::Resume { .. } => return Err(OrsError::RecoveryOwnerMismatch),
+            BridgeRecoverySelector::Resume { .. } | BridgeRecoverySelector::ResumeWindow { .. } => {
+                return Err(OrsError::RecoveryOwnerMismatch);
+            }
             BridgeRecoverySelector::Streams {
                 continuation_proof, ..
             }
@@ -11163,9 +12896,10 @@ impl RedbRecoveryStore {
         write: &redb::WriteTransaction,
         window_key: &str,
         owner: &BridgeStreamOwnerRow,
+        read_budget: &mut BridgeRecoveryReadBudget,
     ) -> Result<BridgeEventRecoveryCutRow, OrsError> {
         if let Some(existing) =
-            Self::load_bridge_recovery_cut_in(write, window_key, &owner.namespace)?
+            Self::load_bridge_recovery_cut_in(write, window_key, &owner.namespace, read_budget)?
         {
             if existing.owner_kind != owner.kind
                 || existing.local_stream != owner.local_stream
@@ -11182,6 +12916,7 @@ impl RedbRecoveryStore {
                 let cursors = write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
                 match cursors.get(owner.namespace.as_str()).map_err(storage)? {
                     Some(value) => {
+                        read_budget.charge(owner.namespace.as_bytes(), value.value().as_bytes())?;
                         let cursor: BridgeEventCursorRow = decode(value.value())?;
                         cursor.validate()?;
                         if cursor.owner_namespace != owner.namespace
@@ -11216,6 +12951,7 @@ impl RedbRecoveryStore {
                 .map_err(storage)?
             {
                 let (key, value) = entry.map_err(storage)?;
+                read_budget.charge(key.value().as_bytes(), value.value().as_bytes())?;
                 let gap: BridgeEventGapRow = decode(value.value())?;
                 gap.validate()?;
                 if gap.owner_namespace != owner.namespace
@@ -11238,7 +12974,8 @@ impl RedbRecoveryStore {
         } else {
             compacted.saturating_add(1).min(upper_sequence)
         };
-        let expected_revision = Self::bridge_recovery_revision_for_in(write, &owner.namespace)?;
+        let expected_revision =
+            Self::bridge_recovery_revision_for_in_budgeted(write, &owner.namespace, read_budget)?;
         let cut = BridgeEventRecoveryCutRow {
             version: 1,
             window_key: window_key.to_owned(),
@@ -11280,6 +13017,7 @@ impl RedbRecoveryStore {
         offset: usize,
         limit: usize,
         byte_limit: usize,
+        read_budget: &mut BridgeRecoveryReadBudget,
     ) -> Result<(Vec<serde_json::Value>, Option<u64>), OrsError> {
         crate::model::validate_digest(namespace, "owner_namespace")?;
         if offset > MAX_BRIDGE_EVENT_GAPS_PER_STREAM {
@@ -11295,6 +13033,7 @@ impl RedbRecoveryStore {
                 .map_err(storage)?
             {
                 let (key, value) = entry.map_err(storage)?;
+                read_budget.charge(key.value().as_bytes(), value.value().as_bytes())?;
                 let row: BridgeEventGapRow = decode(value.value())?;
                 row.validate()?;
                 if row.owner_namespace != namespace
@@ -11333,12 +13072,62 @@ impl RedbRecoveryStore {
                 }
                 break;
             }
+            read_budget.charge_output(item_bytes)?;
             page_bytes = page_bytes.saturating_add(item_bytes);
             page.push(item);
         }
         let page_end = start.saturating_add(page.len());
         let continuation = (page_end < rows.len()).then_some(page_end as u64);
         Ok((page, continuation))
+    }
+
+    fn bridge_recovery_source_projection(
+        owner: &BridgeStreamOwnerRow,
+        row: &BridgeEventRow,
+        projection: &BridgeEventProjectionRow,
+    ) -> (serde_json::Value, serde_json::Value) {
+        // The recorded admission fields describe the staging decision; they
+        // are not a current recovery-time redisclosure grant. Until that
+        // owner grant is carried here, only source-free deterministic redacted
+        // markers can be inlined. Raw bytes require an admitted source handle.
+        let disclose = row.redacted && row.owner_namespace == owner.namespace;
+        let source = std::str::from_utf8(&row.envelope_bytes).ok();
+        let normalized = std::str::from_utf8(&projection.normalized_envelope).ok();
+        let within_inline_limit = source
+            .is_some_and(|value| value.len() <= MAX_BRIDGE_RECOVERY_INLINE_SOURCE_BYTES)
+            && normalized
+                .is_some_and(|value| value.len() <= MAX_BRIDGE_RECOVERY_INLINE_SOURCE_BYTES);
+        if !disclose || !within_inline_limit {
+            return (
+                serde_json::Value::Null,
+                serde_json::Value::String("requires_source_handle".to_owned()),
+            );
+        }
+        let Some(source_utf8) = source else {
+            return (
+                serde_json::Value::Null,
+                serde_json::Value::String("requires_source_handle".to_owned()),
+            );
+        };
+        let Some(normalized_utf8) = normalized else {
+            return (
+                serde_json::Value::Null,
+                serde_json::Value::String("requires_source_handle".to_owned()),
+            );
+        };
+        let projection = json!({
+            "kind": if row.redacted { "redacted" } else { "admitted_inline" },
+            "source_utf8": source_utf8,
+            "normalized_utf8": normalized_utf8,
+            "transport_hash": row.transport_hash,
+            "redaction_reason": if row.redacted {
+                serde_json::Value::String(row.redaction_reason.clone())
+            } else {
+                serde_json::Value::Null
+            },
+            "redacted_classes": row.redacted_classes,
+        });
+        (projection, serde_json::Value::Null)
     }
 
     #[allow(
@@ -11352,6 +13141,7 @@ impl RedbRecoveryStore {
         owner_list_position: u64,
         after_sequence: u64,
         budget: BridgeRecoveryPageBudget,
+        read_budget: &mut BridgeRecoveryReadBudget,
     ) -> Result<(serde_json::Value, bool), OrsError> {
         let BridgeRecoveryPageBudget {
             event_limit,
@@ -11381,6 +13171,7 @@ impl RedbRecoveryStore {
                 .take(event_limit.saturating_add(1))
             {
                 let (key, value) = entry.map_err(storage)?;
+                read_budget.charge(key.value().as_bytes(), value.value().as_bytes())?;
                 let (namespace, sequence) = Self::parse_bridge_position_key(key.value())?;
                 if namespace != owner.namespace
                     || sequence <= after_sequence
@@ -11405,6 +13196,9 @@ impl RedbRecoveryStore {
         let mut included_sequences = Vec::with_capacity(indexed.len());
         {
             let records = database.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
+            let projections = database
+                .open_table(BRIDGE_EVENT_PROJECTIONS)
+                .map_err(storage)?;
             for (sequence, event_id) in &indexed {
                 let key = format!("{}::{event_id}", owner.namespace);
                 let Some(value) = records.get(key.as_str()).map_err(storage)? else {
@@ -11413,6 +13207,7 @@ impl RedbRecoveryStore {
                         reason: "declared retained position has no live event record".to_owned(),
                     });
                 };
+                read_budget.charge(key.as_bytes(), value.value().as_bytes())?;
                 let row: BridgeEventRow = decode(value.value())?;
                 row.validate()?;
                 if row.owner_namespace != owner.namespace
@@ -11425,6 +13220,24 @@ impl RedbRecoveryStore {
                         reason: "position index and retained event identity disagree".to_owned(),
                     });
                 }
+                let Some(projection_value) = projections.get(key.as_str()).map_err(storage)? else {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "bridge_event_projection",
+                        reason: "retained event has no related normalized projection".to_owned(),
+                    });
+                };
+                read_budget.charge(key.as_bytes(), projection_value.value().as_bytes())?;
+                let projection: BridgeEventProjectionRow = decode(projection_value.value())?;
+                projection.validate()?;
+                if !projection.binds_record(&row) {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "bridge_event_projection",
+                        reason: "retained normalized projection does not bind its event record"
+                            .to_owned(),
+                    });
+                }
+                let (source_projection, source_projection_unavailable) =
+                    Self::bridge_recovery_source_projection(owner, &row, &projection);
                 let item = json!({
                     "event_id": row.event_id,
                     "sequence": row.sequence,
@@ -11435,6 +13248,8 @@ impl RedbRecoveryStore {
                     "producer_generation": row.producer_generation,
                     "staging_connection": row.staging_connection,
                     "covered_by_durable_cursor": row.sequence <= cut.durable_cursor,
+                    "source_projection": source_projection,
+                    "source_projection_unavailable": source_projection_unavailable,
                 });
                 let item_bytes = serde_json::to_vec(&item)
                     .map_err(|_| OrsError::ProjectionLimitExceeded)?
@@ -11446,6 +13261,7 @@ impl RedbRecoveryStore {
                     has_more_events = true;
                     break;
                 }
+                read_budget.charge_output(item_bytes)?;
                 item_bytes_total = item_bytes_total.saturating_add(item_bytes);
                 included_sequences.push(*sequence);
                 items.push(item);
@@ -11462,6 +13278,7 @@ impl RedbRecoveryStore {
             gap_offset,
             gap_limit,
             gap_byte_limit,
+            read_budget,
         )?;
         let last_event_sequence = included_sequences.last().copied().unwrap_or(after_sequence);
         let suffix_covered_by_gap = gaps.iter().any(|gap| {
@@ -11540,6 +13357,7 @@ impl RedbRecoveryStore {
         owner_kind: &str,
         after_sequence: u64,
         limit: usize,
+        read_budget: &mut BridgeRecoveryReadBudget,
     ) -> Result<BridgeRecoveryOwnerPage, OrsError> {
         let mut rows = Vec::with_capacity(limit);
         if after_sequence >= window.owner_cutoff {
@@ -11571,6 +13389,7 @@ impl RedbRecoveryStore {
                 .take(limit.saturating_add(1))
             {
                 let (key, value) = entry.map_err(storage)?;
+                read_budget.charge(key.value().as_bytes(), value.value().as_bytes())?;
                 let sequence = key
                     .value()
                     .strip_prefix(prefix.as_str())
@@ -11589,6 +13408,7 @@ impl RedbRecoveryStore {
                 let Some(value) = owners.get(namespace.as_str()).map_err(storage)? else {
                     return Err(OrsError::RecoveryOwnerMismatch);
                 };
+                read_budget.charge(namespace.as_bytes(), value.value().as_bytes())?;
                 let row: BridgeStreamOwnerRow = decode(value.value())?;
                 row.validate()?;
                 if row.namespace != namespace
@@ -11786,6 +13606,7 @@ impl RedbRecoveryStore {
         write: &redb::WriteTransaction,
         window: &BridgeEventRecoveryWindowRow,
         stream_id: &str,
+        read_budget: &mut BridgeRecoveryReadBudget,
     ) -> Result<(BridgeStreamOwnerRow, u64), OrsError> {
         let prefix = Self::bridge_owner_list_index_prefix(
             &window.owner_scope_digest,
@@ -11807,6 +13628,7 @@ impl RedbRecoveryStore {
             .take(MAX_BRIDGE_STREAM_OWNERS.saturating_add(1))
         {
             let (key, value) = entry.map_err(storage)?;
+            read_budget.charge(key.value().as_bytes(), value.value().as_bytes())?;
             let sequence = key
                 .value()
                 .strip_prefix(prefix.as_str())
@@ -11822,6 +13644,7 @@ impl RedbRecoveryStore {
             let Some(owner_value) = owners.get(namespace.as_str()).map_err(storage)? else {
                 return Err(OrsError::RecoveryOwnerMismatch);
             };
+            read_budget.charge(namespace.as_bytes(), owner_value.value().as_bytes())?;
             let row: BridgeStreamOwnerRow = decode(owner_value.value())?;
             row.validate()?;
             if row.namespace != namespace
@@ -11846,6 +13669,7 @@ impl RedbRecoveryStore {
         window: &BridgeEventRecoveryWindowRow,
         owner_kind: &str,
         namespace: &str,
+        read_budget: &mut BridgeRecoveryReadBudget,
     ) -> Result<u64, OrsError> {
         let prefix = Self::bridge_owner_list_index_prefix(&window.owner_scope_digest, owner_kind);
         let end = Self::bridge_owner_list_index_key(
@@ -11862,6 +13686,7 @@ impl RedbRecoveryStore {
             .take(MAX_BRIDGE_STREAM_OWNERS.saturating_add(1))
         {
             let (key, value) = entry.map_err(storage)?;
+            read_budget.charge(key.value().as_bytes(), value.value().as_bytes())?;
             let candidate = Self::decode_bridge_owner_index_namespace(value.value())?;
             if candidate == namespace {
                 return key
@@ -11881,6 +13706,7 @@ impl RedbRecoveryStore {
         read: &redb::ReadTransaction,
         window: &BridgeEventRecoveryWindowRow,
         after_sequence: u64,
+        read_budget: &mut BridgeRecoveryReadBudget,
     ) -> Result<Option<(BridgeStreamOwnerRow, u64)>, OrsError> {
         if after_sequence >= window.owner_cutoff {
             return Ok(None);
@@ -11910,6 +13736,7 @@ impl RedbRecoveryStore {
             return Ok(None);
         };
         let (key, value) = entry.map_err(storage)?;
+        read_budget.charge(key.value().as_bytes(), value.value().as_bytes())?;
         let sequence = key
             .value()
             .strip_prefix(prefix.as_str())
@@ -11922,6 +13749,7 @@ impl RedbRecoveryStore {
         let Some(owner_value) = owners.get(namespace.as_str()).map_err(storage)? else {
             return Err(OrsError::RecoveryOwnerMismatch);
         };
+        read_budget.charge(namespace.as_bytes(), owner_value.value().as_bytes())?;
         let owner: BridgeStreamOwnerRow = decode(owner_value.value())?;
         owner.validate()?;
         if owner.namespace != namespace
@@ -11938,12 +13766,22 @@ impl RedbRecoveryStore {
     fn bridge_recovery_unproven_scope_present(
         read: &redb::ReadTransaction,
         _window: &BridgeEventRecoveryWindowRow,
+        read_budget: &mut BridgeRecoveryReadBudget,
     ) -> Result<bool, OrsError> {
         let meta = read.open_table(META).map_err(storage)?;
-        let marker = meta
+        let marker = match meta
             .get(BRIDGE_RECOVERY_LEGACY_UNPROVEN_KEY)
             .map_err(storage)?
-            .map(|value| value.value().to_owned());
+        {
+            Some(value) => {
+                read_budget.charge(
+                    BRIDGE_RECOVERY_LEGACY_UNPROVEN_KEY.as_bytes(),
+                    value.value().as_bytes(),
+                )?;
+                Some(value.value().to_owned())
+            }
+            None => None,
+        };
         match marker.as_deref() {
             Some("false") => Ok(false),
             Some("true") | None => Ok(true),
@@ -11978,7 +13816,12 @@ impl RedbRecoveryStore {
             stream_pages_pending: true,
             unproven_scope_present,
         };
-        let mut stream_pages = streams.to_vec();
+        let terminal = disposition != BridgeRecoveryWindowDisposition::Active;
+        let mut stream_pages = if terminal {
+            Vec::new()
+        } else {
+            streams.to_vec()
+        };
         for page in &mut stream_pages {
             let object = page
                 .as_object_mut()
@@ -11998,7 +13841,9 @@ impl RedbRecoveryStore {
             "window_disposition_reason": disposition.reason(),
             "selected_scope": selected_scope,
             "stream_list_complete": false,
-            "stream_list_continuation": window.stream_list_continuation,
+            "stream_list_continuation": if terminal { serde_json::Value::Null } else {
+                window.stream_list_continuation.clone().map_or(serde_json::Value::Null, serde_json::Value::String)
+            },
             "stream_list_proof": serde_json::Value::Null,
             "stream_list_total": window.stream_list_total,
             "unscoped_gaps_complete": false,
@@ -12008,10 +13853,24 @@ impl RedbRecoveryStore {
             "unscoped_gap_capacity": serde_json::Value::Null,
             "unresolved_frontier": unresolved,
             "streams": stream_pages,
-            "unscoped_gaps": unscoped_gaps,
+            "unscoped_gaps": if terminal { &[] } else { unscoped_gaps },
             "unproven_scope_present": unproven_scope_present,
         });
-        if window.version == 2 {
+        if window.version >= 2 {
+            let current_live_generation =
+                window
+                    .current_live_generation()
+                    .ok_or(OrsError::IntegrityProblem {
+                        record_type: "bridge_event_recovery_window",
+                        reason: "terminal window has no current generation".to_owned(),
+                    })?;
+            let current_presenting_connection =
+                window
+                    .current_presenting_connection()
+                    .ok_or(OrsError::IntegrityProblem {
+                        record_type: "bridge_event_recovery_window",
+                        reason: "terminal window has no current presenter".to_owned(),
+                    })?;
             let object = response
                 .as_object_mut()
                 .ok_or(OrsError::ProjectionLimitExceeded)?;
@@ -12021,11 +13880,11 @@ impl RedbRecoveryStore {
             );
             object.insert(
                 "window_live_generation".to_owned(),
-                serde_json::Value::from(window.live_generation),
+                serde_json::Value::from(current_live_generation),
             );
             object.insert(
                 "window_presenting_connection".to_owned(),
-                serde_json::Value::String(window.presenting_connection.clone()),
+                serde_json::Value::String(current_presenting_connection.to_owned()),
             );
         }
         Self::bridge_recovery_seal_reply(
@@ -12169,15 +14028,42 @@ impl RedbRecoveryStore {
         }
     }
 
+    fn bridge_recovery_revision_for_in_budgeted(
+        write: &redb::WriteTransaction,
+        namespace: &str,
+        read_budget: &mut BridgeRecoveryReadBudget,
+    ) -> Result<u64, OrsError> {
+        let revisions = write
+            .open_table(BRIDGE_EVENT_RECOVERY_REVISIONS)
+            .map_err(storage)?;
+        if let Some(value) = revisions.get(namespace).map_err(storage)? {
+            read_budget.charge(namespace.as_bytes(), value.value().as_bytes())?;
+            let row: BridgeEventRecoveryRevisionRow = decode(value.value())?;
+            row.validate()?;
+            if row.namespace != namespace {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_event_recovery_revision",
+                    reason: "recovery revision identity does not match its key".to_owned(),
+                });
+            }
+            Ok(row.revision)
+        } else {
+            read_budget.charge_reference()?;
+            Ok(1)
+        }
+    }
+
     fn bridge_recovery_revision_for(
         read: &redb::ReadTransaction,
         namespace: &str,
+        read_budget: &mut BridgeRecoveryReadBudget,
     ) -> Result<u64, OrsError> {
         let revisions = read
             .open_table(BRIDGE_EVENT_RECOVERY_REVISIONS)
             .map_err(storage)?;
         match revisions.get(namespace).map_err(storage)? {
             Some(value) => {
+                read_budget.charge(namespace.as_bytes(), value.value().as_bytes())?;
                 let row: BridgeEventRecoveryRevisionRow = decode(value.value())?;
                 row.validate()?;
                 if row.namespace != namespace {
@@ -13797,6 +15683,7 @@ impl RedbRecoveryStore {
                 } else {
                     0
                 }
+            || row.admitted_source != staging.admitted_source
             || row.admitted_scope != staging.scope
             || row.admitted_policy_revision != staging.policy_revision
             || !Self::bridge_event_provenance_matches(row, provenance)
@@ -14050,12 +15937,10 @@ impl RedbRecoveryStore {
             } else {
                 0
             },
-            // The owner authorization travels with the decision: the exact
-            // source bytes, the scope the owner evaluated them in, and the
-            // privacy policy revision it decided at. A later replay under a
-            // different scope or revision is a different verdict, not a
-            // duplicate (see [`Self::replay_bridge_event_outcome_checked`]).
-            admitted_source: staging.transport_hash.clone(),
+            // No owner verdict is synthesized. If one was absent, the staged
+            // redaction receipt keeps these authorization fields empty;
+            // verbatim persistence is never allowed.
+            admitted_source: staging.admitted_source.clone(),
             admitted_scope: staging.scope.clone(),
             admitted_policy_revision: staging.policy_revision,
             // The ingest provenance travels with the row in the same
@@ -16283,11 +18168,16 @@ impl RedbRecoveryStore {
             .and_then(|selector| serde_json::to_value(selector).ok())
             .unwrap_or(serde_json::Value::Null);
         let now_ms = current_unix_ms_u64()?;
+        let mut read_budget = BridgeRecoveryReadBudget::default();
         let write = self.database.begin_write().map_err(storage)?;
-        let (mut window, opening) = match &selector {
+        let (mut window, mut opening) = match &selector {
             BridgeRecoveryScopeSelector::Open => {
-                let matches =
-                    Self::bridge_recovery_windows_for_owner_in(&write, &lineage, &principal)?;
+                let matches = Self::bridge_recovery_windows_for_owner_in(
+                    &write,
+                    &lineage,
+                    &principal,
+                    &mut read_budget,
+                )?;
                 let mut active = matches
                     .into_iter()
                     .filter(|window| window.expires_at_ms > now_ms);
@@ -16297,18 +18187,29 @@ impl RedbRecoveryStore {
                 }
                 if let Some(window) = first_active {
                     if window.version == 1 {
-                        Self::retire_bridge_recovery_window_in(&write, &window)?;
+                        Self::retire_bridge_recovery_window_in(
+                            &write,
+                            &window,
+                            now_ms,
+                            &mut read_budget,
+                        )?;
                     } else {
-                        let incompatible = window.live_generation != live_generation
-                            || window.presenting_connection != presenting_connection
+                        let incompatible = !window
+                            .current_presentation_matches(live_generation, &presenting_connection)
                             || window.continuation_secret.is_none()
                             || window.source_revision
                                 != Self::bridge_recovery_source_revision_in(
                                     &write,
                                     &window.owner_scope_digest,
+                                    &mut read_budget,
                                 )?;
                         if incompatible {
-                            Self::retire_bridge_recovery_window_in(&write, &window)?;
+                            Self::retire_bridge_recovery_window_in(
+                                &write,
+                                &window,
+                                now_ms,
+                                &mut read_budget,
+                            )?;
                         }
                     }
                 }
@@ -16319,36 +18220,87 @@ impl RedbRecoveryStore {
                         &principal,
                         live_generation,
                         &presenting_connection,
+                        now_ms,
+                        &mut read_budget,
                     )?,
                     true,
                 )
             }
             BridgeRecoveryScopeSelector::Resume => {
-                let mut matches =
-                    Self::bridge_recovery_windows_for_owner_in(&write, &lineage, &principal)?;
+                let mut matches = Self::bridge_recovery_windows_for_owner_in(
+                    &write,
+                    &lineage,
+                    &principal,
+                    &mut read_budget,
+                )?;
+                if matches.is_empty() {
+                    if let Some(evidence) = Self::bridge_recovery_expiry_evidence_for_owner_in(
+                        &write,
+                        &lineage,
+                        &principal,
+                        None,
+                        now_ms,
+                        &mut read_budget,
+                    )? {
+                        drop(write);
+                        return Self::bridge_recovery_typed_reply(
+                            &evidence.window,
+                            evidence.disposition,
+                            recovery_scope,
+                            &selected_scope,
+                            None,
+                            &[],
+                            &[],
+                        );
+                    }
+                    return Err(OrsError::RecoveryOwnerMismatch);
+                }
                 if matches.len() != 1 {
                     return Err(OrsError::RecoveryOwnerMismatch);
                 }
                 (matches.remove(0), false)
             }
-            BridgeRecoveryScopeSelector::Streams { window_key, .. }
+            BridgeRecoveryScopeSelector::ResumeWindow { window_key }
+            | BridgeRecoveryScopeSelector::Streams { window_key, .. }
             | BridgeRecoveryScopeSelector::Stream { window_key, .. }
-            | BridgeRecoveryScopeSelector::UnscopedGaps { window_key, .. } => (
-                Self::load_bridge_recovery_window_in(&write, window_key, &lineage, &principal)?
-                    .ok_or(OrsError::RecoveryOwnerMismatch)?,
-                false,
-            ),
+            | BridgeRecoveryScopeSelector::UnscopedGaps { window_key, .. } => {
+                let Some(window) = Self::load_bridge_recovery_window_in(
+                    &write,
+                    window_key,
+                    &lineage,
+                    &principal,
+                    &mut read_budget,
+                )?
+                else {
+                    if let Some(evidence) = Self::bridge_recovery_expiry_evidence_for_owner_in(
+                        &write,
+                        &lineage,
+                        &principal,
+                        Some(window_key),
+                        now_ms,
+                        &mut read_budget,
+                    )? {
+                        drop(write);
+                        return Self::bridge_recovery_typed_reply(
+                            &evidence.window,
+                            evidence.disposition,
+                            recovery_scope,
+                            &selected_scope,
+                            None,
+                            &[],
+                            &[],
+                        );
+                    }
+                    return Err(OrsError::RecoveryOwnerMismatch);
+                };
+                (window, false)
+            }
         };
-        if window.version == 1 {
-            let disposition = if window.expires_at_ms <= now_ms {
-                BridgeRecoveryWindowDisposition::Expired
-            } else {
-                BridgeRecoveryWindowDisposition::Moved
-            };
+        if window.expires_at_ms <= now_ms {
             drop(write);
             return Self::bridge_recovery_typed_reply(
                 &window,
-                disposition,
+                BridgeRecoveryWindowDisposition::Expired,
                 recovery_scope,
                 &selected_scope,
                 None,
@@ -16356,11 +18308,29 @@ impl RedbRecoveryStore {
                 &[],
             );
         }
-        if window.version != 2
-            || window.live_generation != live_generation
-            || window.presenting_connection != presenting_connection
-        {
-            return Err(OrsError::RecoveryOwnerMismatch);
+        if window.version == 1 {
+            drop(write);
+            return Self::bridge_recovery_typed_reply(
+                &window,
+                BridgeRecoveryWindowDisposition::Moved,
+                recovery_scope,
+                &selected_scope,
+                None,
+                &[],
+                &[],
+            );
+        }
+        if !matches!(window.version, 2 | 3) {
+            drop(write);
+            return Self::bridge_recovery_typed_reply(
+                &window,
+                BridgeRecoveryWindowDisposition::Moved,
+                recovery_scope,
+                &selected_scope,
+                None,
+                &[],
+                &[],
+            );
         }
         if matches!(
             selector,
@@ -16374,11 +18344,15 @@ impl RedbRecoveryStore {
             // the only persisted signing authority and no cursor ledger exists.
             Self::verify_bridge_recovery_selector_proof(&window, recovery_scope)?;
         }
-        if window.expires_at_ms <= now_ms {
+        let is_resume = matches!(
+            selector,
+            BridgeRecoveryScopeSelector::Resume | BridgeRecoveryScopeSelector::ResumeWindow { .. }
+        );
+        if is_resume && window.continuation_secret.is_none() {
             drop(write);
             return Self::bridge_recovery_typed_reply(
                 &window,
-                BridgeRecoveryWindowDisposition::Expired,
+                BridgeRecoveryWindowDisposition::Moved,
                 recovery_scope,
                 &selected_scope,
                 None,
@@ -16386,8 +18360,11 @@ impl RedbRecoveryStore {
                 &[],
             );
         }
-        if matches!(selector, BridgeRecoveryScopeSelector::Resume)
-            && window.continuation_secret.is_none()
+        if Self::bridge_recovery_source_revision_in(
+            &write,
+            &window.owner_scope_digest,
+            &mut read_budget,
+        )? != window.source_revision
         {
             drop(write);
             return Self::bridge_recovery_typed_reply(
@@ -16400,32 +18377,44 @@ impl RedbRecoveryStore {
                 &[],
             );
         }
-        if Self::bridge_recovery_source_revision_in(&write, &window.owner_scope_digest)?
-            != window.source_revision
-        {
-            drop(write);
-            return Self::bridge_recovery_typed_reply(
-                &window,
-                BridgeRecoveryWindowDisposition::Moved,
-                recovery_scope,
-                &selected_scope,
-                None,
-                &[],
-                &[],
-            );
+        if !window.current_presentation_matches(live_generation, &presenting_connection) {
+            if is_resume {
+                // Rebinding changes only the current authenticated presenter.
+                // The issuer fields remain in the stable v2 key preimage, and
+                // cuts plus selector secret remain intact so a lost Resume
+                // reply can be retried idempotently.
+                window.version = 3;
+                window.current_live_generation = Some(live_generation);
+                window.current_presenting_connection = Some(presenting_connection.clone());
+                opening = true;
+            } else {
+                drop(write);
+                return Self::bridge_recovery_typed_reply(
+                    &window,
+                    BridgeRecoveryWindowDisposition::Moved,
+                    recovery_scope,
+                    &selected_scope,
+                    None,
+                    &[],
+                    &[],
+                );
+            }
         }
 
         let mut stream_owners: Vec<(BridgeStreamOwnerRow, u64)> = Vec::new();
         let mut requested_stream: Option<(u64, u64, u64, usize, usize, usize)> = None;
         let mut requested_gap: Option<(usize, usize)> = None;
         match &selector {
-            BridgeRecoveryScopeSelector::Open | BridgeRecoveryScopeSelector::Resume => {
+            BridgeRecoveryScopeSelector::Open
+            | BridgeRecoveryScopeSelector::Resume
+            | BridgeRecoveryScopeSelector::ResumeWindow { .. } => {
                 let page = Self::bridge_recovery_owner_page_in(
                     &write,
                     &window,
                     BRIDGE_STREAM_OWNER_KIND_STREAM,
                     0,
                     MAX_BRIDGE_RECOVERY_STREAMS_PER_PAGE,
+                    &mut read_budget,
                 )?;
                 stream_owners = page.owners;
                 window.stream_list_continuation = page.continuation;
@@ -16442,6 +18431,7 @@ impl RedbRecoveryStore {
                     BRIDGE_STREAM_OWNER_KIND_STREAM,
                     *after_stream,
                     *stream_limit,
+                    &mut read_budget,
                 )?;
                 stream_owners = page.owners;
                 window.stream_list_continuation = page.continuation;
@@ -16460,12 +18450,17 @@ impl RedbRecoveryStore {
                 gap_limit,
                 ..
             } => {
-                let (owner, position) =
-                    Self::bridge_recovery_owner_by_stream_in(&write, &window, stream_id)?;
+                let (owner, position) = Self::bridge_recovery_owner_by_stream_in(
+                    &write,
+                    &window,
+                    stream_id,
+                    &mut read_budget,
+                )?;
                 let cut = Self::load_bridge_recovery_cut_in(
                     &write,
                     &window.window_key,
                     &owner.namespace,
+                    &mut read_budget,
                 )?
                 .ok_or(OrsError::RecoveryOwnerMismatch)?;
                 // The continuation must bind the SAME walk: the same finite
@@ -16505,6 +18500,7 @@ impl RedbRecoveryStore {
                 let Some(value) = owners.get(after_gap_scope.as_str()).map_err(storage)? else {
                     return Err(OrsError::RecoveryOwnerMismatch);
                 };
+                read_budget.charge(after_gap_scope.as_bytes(), value.value().as_bytes())?;
                 let owner: BridgeStreamOwnerRow = decode(value.value())?;
                 owner.validate()?;
                 if owner.kind != BRIDGE_STREAM_OWNER_KIND_UNSCOPED_GAP
@@ -16518,8 +18514,14 @@ impl RedbRecoveryStore {
                     &window,
                     BRIDGE_STREAM_OWNER_KIND_UNSCOPED_GAP,
                     &owner.namespace,
+                    &mut read_budget,
                 )?;
-                let _ = Self::create_bridge_recovery_cut_in(&write, &window.window_key, &owner)?;
+                let _ = Self::create_bridge_recovery_cut_in(
+                    &write,
+                    &window.window_key,
+                    &owner,
+                    &mut read_budget,
+                )?;
             }
         }
 
@@ -16532,12 +18534,14 @@ impl RedbRecoveryStore {
                     .get(after_gap_scope.as_str())
                     .map_err(storage)?
                     .ok_or(OrsError::RecoveryOwnerMismatch)?;
+                read_budget.charge(after_gap_scope.as_bytes(), value.value().as_bytes())?;
                 let owner: BridgeStreamOwnerRow = decode(value.value())?;
                 let position = Self::bridge_recovery_owner_sequence_in(
                     &write,
                     &window,
                     BRIDGE_STREAM_OWNER_KIND_UNSCOPED_GAP,
                     &owner.namespace,
+                    &mut read_budget,
                 )?;
                 Some((owner, position))
             }
@@ -16547,25 +18551,54 @@ impl RedbRecoveryStore {
                 BRIDGE_STREAM_OWNER_KIND_UNSCOPED_GAP,
                 0,
                 1,
+                &mut read_budget,
             )?
             .owners
             .into_iter()
             .next(),
         };
         if let Some((owner, _)) = &gap_owner_for_page {
-            if matches!(selector, BridgeRecoveryScopeSelector::Resume) {
-                Self::load_bridge_recovery_cut_in(&write, &window.window_key, &owner.namespace)?
-                    .ok_or(OrsError::RecoveryOwnerMismatch)?;
+            if matches!(
+                selector,
+                BridgeRecoveryScopeSelector::Resume
+                    | BridgeRecoveryScopeSelector::ResumeWindow { .. }
+            ) {
+                Self::load_bridge_recovery_cut_in(
+                    &write,
+                    &window.window_key,
+                    &owner.namespace,
+                    &mut read_budget,
+                )?
+                .ok_or(OrsError::RecoveryOwnerMismatch)?;
             } else {
-                let _ = Self::create_bridge_recovery_cut_in(&write, &window.window_key, owner)?;
+                let _ = Self::create_bridge_recovery_cut_in(
+                    &write,
+                    &window.window_key,
+                    owner,
+                    &mut read_budget,
+                )?;
             }
         }
         for (owner, _) in &stream_owners {
-            if matches!(selector, BridgeRecoveryScopeSelector::Resume) {
-                Self::load_bridge_recovery_cut_in(&write, &window.window_key, &owner.namespace)?
-                    .ok_or(OrsError::RecoveryOwnerMismatch)?;
+            if matches!(
+                selector,
+                BridgeRecoveryScopeSelector::Resume
+                    | BridgeRecoveryScopeSelector::ResumeWindow { .. }
+            ) {
+                Self::load_bridge_recovery_cut_in(
+                    &write,
+                    &window.window_key,
+                    &owner.namespace,
+                    &mut read_budget,
+                )?
+                .ok_or(OrsError::RecoveryOwnerMismatch)?;
             } else {
-                let _ = Self::create_bridge_recovery_cut_in(&write, &window.window_key, owner)?;
+                let _ = Self::create_bridge_recovery_cut_in(
+                    &write,
+                    &window.window_key,
+                    owner,
+                    &mut read_budget,
+                )?;
             }
         }
         if opening {
@@ -16578,8 +18611,13 @@ impl RedbRecoveryStore {
         // this one immutable read snapshot; revision checks reject movement
         // between the write and this snapshot.
         let read = self.database.begin_read().map_err(storage)?;
-        let Some(mut read_window) =
-            Self::load_bridge_recovery_window(&read, &window.window_key, &lineage, &principal)?
+        let Some(mut read_window) = Self::load_bridge_recovery_window(
+            &read,
+            &window.window_key,
+            &lineage,
+            &principal,
+            &mut read_budget,
+        )?
         else {
             return Err(OrsError::RecoveryOwnerMismatch);
         };
@@ -16594,12 +18632,14 @@ impl RedbRecoveryStore {
                 &[],
             );
         }
-        if read_window.version != 2
+        if !matches!(read_window.version, 2 | 3)
             || read_window.source_revision
                 != Self::bridge_recovery_source_revision_for(
                     &read,
                     &read_window.owner_scope_digest,
+                    &mut read_budget,
                 )?
+            || !read_window.current_presentation_matches(live_generation, &presenting_connection)
         {
             return Self::bridge_recovery_typed_reply(
                 &read_window,
@@ -16613,7 +18653,9 @@ impl RedbRecoveryStore {
         }
         if matches!(
             selector,
-            BridgeRecoveryScopeSelector::Resume | BridgeRecoveryScopeSelector::Streams { .. }
+            BridgeRecoveryScopeSelector::Resume
+                | BridgeRecoveryScopeSelector::ResumeWindow { .. }
+                | BridgeRecoveryScopeSelector::Streams { .. }
         ) {
             // Resume re-derives the deterministic first outer page, while a
             // Streams reply projects only that selector's page frontier. Both
@@ -16665,6 +18707,7 @@ impl RedbRecoveryStore {
             else {
                 return Err(OrsError::RecoveryOwnerMismatch);
             };
+            read_budget.charge(listed_owner.namespace.as_bytes(), value.value().as_bytes())?;
             let owner: BridgeStreamOwnerRow = decode(value.value())?;
             owner.validate()?;
             if owner.namespace != listed_owner.namespace
@@ -16674,10 +18717,15 @@ impl RedbRecoveryStore {
             {
                 return Err(OrsError::RecoveryOwnerMismatch);
             }
-            let cut =
-                Self::load_bridge_recovery_cut(&read, &read_window.window_key, &owner.namespace)?
-                    .ok_or(OrsError::RecoveryOwnerMismatch)?;
-            if Self::bridge_recovery_revision_for(&read, &owner.namespace)? != cut.expected_revision
+            let cut = Self::load_bridge_recovery_cut(
+                &read,
+                &read_window.window_key,
+                &owner.namespace,
+                &mut read_budget,
+            )?
+            .ok_or(OrsError::RecoveryOwnerMismatch)?;
+            if Self::bridge_recovery_revision_for(&read, &owner.namespace, &mut read_budget)?
+                != cut.expected_revision
                 || cut.owner_revision != owner.revision
                 || cut.owner_incarnation != owner.incarnation
             {
@@ -16721,6 +18769,7 @@ impl RedbRecoveryStore {
                     gap_limit,
                     gap_byte_limit,
                 },
+                &mut read_budget,
             )?;
             let event_continuation = page
                 .get("pending_first_page")
@@ -16762,7 +18811,8 @@ impl RedbRecoveryStore {
             // The rows and accounting are validated facts even when the
             // suffix itself cannot be proven; preserve them beside the
             // unresolved frontier in a typed Moved answer.
-            page["capacity"] = Self::bridge_capacity_accounting_for(&read, &owner)?;
+            page["capacity"] =
+                Self::bridge_capacity_accounting_for(&read, &owner, &mut read_budget)?;
             page["stream_proof"] = json!(stream_proof);
             stream_pages.push(page);
             if !suffix_proven {
@@ -16781,6 +18831,10 @@ impl RedbRecoveryStore {
             else {
                 return Err(OrsError::RecoveryOwnerMismatch);
             };
+            read_budget.charge(
+                listed_gap_owner.namespace.as_bytes(),
+                value.value().as_bytes(),
+            )?;
             let owner: BridgeStreamOwnerRow = decode(value.value())?;
             owner.validate()?;
             if owner.namespace != listed_gap_owner.namespace
@@ -16790,10 +18844,15 @@ impl RedbRecoveryStore {
             {
                 return Err(OrsError::RecoveryOwnerMismatch);
             }
-            let cut =
-                Self::load_bridge_recovery_cut(&read, &read_window.window_key, &owner.namespace)?
-                    .ok_or(OrsError::RecoveryOwnerMismatch)?;
-            if Self::bridge_recovery_revision_for(&read, &owner.namespace)? == cut.expected_revision
+            let cut = Self::load_bridge_recovery_cut(
+                &read,
+                &read_window.window_key,
+                &owner.namespace,
+                &mut read_budget,
+            )?
+            .ok_or(OrsError::RecoveryOwnerMismatch)?;
+            if Self::bridge_recovery_revision_for(&read, &owner.namespace, &mut read_budget)?
+                == cut.expected_revision
             {
                 let (offset, limit) =
                     requested_gap.unwrap_or((0, MAX_BRIDGE_EVENT_GAPS_PER_STREAM));
@@ -16803,6 +18862,7 @@ impl RedbRecoveryStore {
                     offset,
                     limit,
                     10 * 1024,
+                    &mut read_budget,
                 )?;
                 for (index, gap) in page.iter_mut().enumerate() {
                     let object = gap
@@ -16825,7 +18885,12 @@ impl RedbRecoveryStore {
                 if let Some(next_offset) = next_offset {
                     unscoped_gap_cursor = Some((owner.namespace.clone(), next_offset));
                 } else if let Some((next_owner, _next_position)) =
-                    Self::bridge_recovery_next_gap_owner(&read, &read_window, *position)?
+                    Self::bridge_recovery_next_gap_owner(
+                        &read,
+                        &read_window,
+                        *position,
+                        &mut read_budget,
+                    )?
                 {
                     unscoped_gap_cursor = Some((next_owner.namespace, 0));
                 }
@@ -16836,9 +18901,12 @@ impl RedbRecoveryStore {
         }
 
         let unproven_scope_present =
-            Self::bridge_recovery_unproven_scope_present(&read, &read_window)?;
-        if Self::bridge_recovery_source_revision_for(&read, &read_window.owner_scope_digest)?
-            != read_window.source_revision
+            Self::bridge_recovery_unproven_scope_present(&read, &read_window, &mut read_budget)?;
+        if Self::bridge_recovery_source_revision_for(
+            &read,
+            &read_window.owner_scope_digest,
+            &mut read_budget,
+        )? != read_window.source_revision
         {
             moved = true;
         }
@@ -16909,7 +18977,9 @@ impl RedbRecoveryStore {
             unproven_scope_present,
         };
         let unscoped_gap_capacity = match &gap_owner_for_page {
-            Some((owner, _)) => Self::bridge_unscoped_gap_capacity_accounting_for(&read, owner)?,
+            Some((owner, _)) => {
+                Self::bridge_unscoped_gap_capacity_accounting_for(&read, owner, &mut read_budget)?
+            }
             None => serde_json::Value::Null,
         };
         let response = json!({
@@ -16917,8 +18987,8 @@ impl RedbRecoveryStore {
             "window_identity_version": read_window.version,
             "expires_at_ms": read_window.expires_at_ms,
             "window_source_revision": read_window.source_revision,
-            "window_live_generation": read_window.live_generation,
-            "window_presenting_connection": read_window.presenting_connection,
+            "window_live_generation": live_generation,
+            "window_presenting_connection": presenting_connection,
             "window_status": "active",
             "window_disposition": BridgeRecoveryWindowDisposition::Active,
             "window_disposition_reason": BridgeRecoveryWindowDisposition::Active.reason(),
@@ -16964,6 +19034,7 @@ impl RedbRecoveryStore {
         sequence: u64,
         compacted_boundary: u64,
         cursor_stream_id: Option<&str>,
+        read_budget: &mut BridgeRecoveryReadBudget,
     ) -> Result<(u64, u64), OrsError> {
         let namespace = owner.namespace.as_str();
         let record_key = format!("{namespace}::{}", position.event_id);
@@ -16973,9 +19044,12 @@ impl RedbRecoveryStore {
             .map_err(storage)?;
         let record = records.get(record_key.as_str()).map_err(storage)?;
         let commitment = commitments.get(record_key.as_str()).map_err(storage)?;
+        read_budget.charge_reference()?;
+        read_budget.charge_reference()?;
         match (record, commitment) {
             (Some(record), None) => Ok((1, (record_key.len() + record.value().len()) as u64)),
             (None, Some(commitment)) => {
+                read_budget.charge(record_key.as_bytes(), commitment.value().as_bytes())?;
                 let row: BridgeEventReplayCommitment = decode(commitment.value())?;
                 row.validate()?;
                 if row.owner_namespace != namespace
@@ -17012,16 +19086,19 @@ impl RedbRecoveryStore {
     fn bridge_position_accounting_for(
         read: &redb::ReadTransaction,
         owner: &BridgeStreamOwnerRow,
+        read_budget: &mut BridgeRecoveryReadBudget,
     ) -> Result<(u64, u64, u64, u64), OrsError> {
         let namespace = owner.namespace.as_str();
         let stored = read.open_table(BRIDGE_EVENT_POSITIONS).map_err(storage)?;
         let cursor = {
             let cursors = read.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
-            cursors
-                .get(namespace)
-                .map_err(storage)?
-                .map(|value| decode::<BridgeEventCursorRow>(value.value()))
-                .transpose()?
+            match cursors.get(namespace).map_err(storage)? {
+                Some(value) => {
+                    read_budget.charge(namespace.as_bytes(), value.value().as_bytes())?;
+                    Some(decode::<BridgeEventCursorRow>(value.value())?)
+                }
+                None => None,
+            }
         };
         let prefix = format!("{namespace}::");
         let prefix_end = format!("{prefix}\u{10ffff}");
@@ -17066,6 +19143,7 @@ impl RedbRecoveryStore {
             if value.value().len() > MAX_BRIDGE_POSITION_RECORD_BYTES {
                 return Err(OrsError::ProjectionLimitExceeded);
             }
+            read_budget.charge(key.as_bytes(), value.value().as_bytes())?;
             let position: BridgeEventPosition = decode(value.value())?;
             position.validate()?;
             if !event_ids.insert(position.event_id.clone()) {
@@ -17086,6 +19164,7 @@ impl RedbRecoveryStore {
                 sequence,
                 compacted_boundary,
                 cursor_stream_id,
+                read_budget,
             )?;
             if pending_events + event_count > MAX_BRIDGE_EVENT_RECORDS as u64 {
                 return Err(OrsError::ProjectionLimitExceeded);
@@ -17107,6 +19186,7 @@ impl RedbRecoveryStore {
     fn bridge_gap_accounting_for(
         read: &redb::ReadTransaction,
         namespace: &str,
+        read_budget: &mut BridgeRecoveryReadBudget,
     ) -> Result<(u64, u64), OrsError> {
         let stored = read.open_table(BRIDGE_EVENT_GAPS).map_err(storage)?;
         let prefix = format!("{namespace}::");
@@ -17118,6 +19198,7 @@ impl RedbRecoveryStore {
             .map_err(storage)?
         {
             let (key, value) = entry.map_err(storage)?;
+            read_budget.charge(key.value().as_bytes(), value.value().as_bytes())?;
             let row: BridgeEventGapRow = decode(value.value())?;
             row.validate()?;
             let key = key.value();
@@ -17151,6 +19232,7 @@ impl RedbRecoveryStore {
     fn bridge_handoff_accounting_for(
         read: &redb::ReadTransaction,
         owner: &BridgeStreamOwnerRow,
+        read_budget: &mut BridgeRecoveryReadBudget,
     ) -> Result<(u64, u64), OrsError> {
         let namespace = owner.namespace.as_str();
         let handoffs = read.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
@@ -17163,6 +19245,7 @@ impl RedbRecoveryStore {
             .map_err(storage)?
         {
             let (key, value) = entry.map_err(storage)?;
+            read_budget.charge(key.value().as_bytes(), value.value().as_bytes())?;
             let row: BridgeEventHandoffRow = decode(value.value())?;
             row.validate()?;
             let key = key.value();
@@ -17198,6 +19281,7 @@ impl RedbRecoveryStore {
     fn bridge_commitment_accounting_for(
         read: &redb::ReadTransaction,
         owner: &BridgeStreamOwnerRow,
+        read_budget: &mut BridgeRecoveryReadBudget,
     ) -> Result<(u64, u64), OrsError> {
         let namespace = owner.namespace.as_str();
         let retained = read
@@ -17212,6 +19296,7 @@ impl RedbRecoveryStore {
             .map_err(storage)?
         {
             let (key, value) = entry.map_err(storage)?;
+            read_budget.charge(key.value().as_bytes(), value.value().as_bytes())?;
             let commitment: BridgeEventReplayCommitment = decode(value.value())?;
             commitment.validate()?;
             if commitment.owner_namespace != namespace
@@ -17235,6 +19320,7 @@ impl RedbRecoveryStore {
     fn bridge_projection_accounting_for(
         read: &redb::ReadTransaction,
         owner: &BridgeStreamOwnerRow,
+        read_budget: &mut BridgeRecoveryReadBudget,
     ) -> Result<(u64, u64), OrsError> {
         let namespace = owner.namespace.as_str();
         let projections = read.open_table(BRIDGE_EVENT_PROJECTIONS).map_err(storage)?;
@@ -17247,6 +19333,7 @@ impl RedbRecoveryStore {
             .map_err(storage)?
         {
             let (key, value) = entry.map_err(storage)?;
+            read_budget.charge(key.value().as_bytes(), value.value().as_bytes())?;
             let row: BridgeEventProjectionRow = decode(value.value())?;
             row.validate()?;
             let key = key.value();
@@ -17284,18 +19371,20 @@ impl RedbRecoveryStore {
     fn bridge_unscoped_gap_capacity_accounting_for(
         read: &redb::ReadTransaction,
         owner: &BridgeStreamOwnerRow,
+        read_budget: &mut BridgeRecoveryReadBudget,
     ) -> Result<serde_json::Value, OrsError> {
         owner.validate()?;
         if owner.kind != BRIDGE_STREAM_OWNER_KIND_UNSCOPED_GAP {
             return Err(OrsError::RecoveryOwnerMismatch);
         }
         let namespace = owner.namespace.as_str();
-        let (gaps, gap_bytes) = Self::bridge_gap_accounting_for(read, namespace)?;
+        let (gaps, gap_bytes) = Self::bridge_gap_accounting_for(read, namespace, read_budget)?;
         let owner_bytes = {
             let owners = read.open_table(BRIDGE_STREAM_OWNERS).map_err(storage)?;
             let Some(value) = owners.get(namespace).map_err(storage)? else {
                 return Err(OrsError::RecoveryOwnerMismatch);
             };
+            read_budget.charge(namespace.as_bytes(), value.value().as_bytes())?;
             let stored: BridgeStreamOwnerRow = decode(value.value())?;
             stored.validate()?;
             if stored.namespace != owner.namespace
@@ -17345,19 +19434,24 @@ impl RedbRecoveryStore {
     fn bridge_capacity_accounting_for(
         read: &redb::ReadTransaction,
         owner: &BridgeStreamOwnerRow,
+        read_budget: &mut BridgeRecoveryReadBudget,
     ) -> Result<serde_json::Value, OrsError> {
         let namespace = owner.namespace.as_str();
         crate::model::validate_digest(namespace, "owner_namespace")?;
         let (positions, position_bytes, pending_events, pending_event_bytes) =
-            Self::bridge_position_accounting_for(read, owner)?;
-        let (handoffs_count, handoff_bytes) = Self::bridge_handoff_accounting_for(read, owner)?;
-        let (commitments, commitment_bytes) = Self::bridge_commitment_accounting_for(read, owner)?;
-        let (projections, projection_bytes) = Self::bridge_projection_accounting_for(read, owner)?;
-        let (gaps, gap_bytes) = Self::bridge_gap_accounting_for(read, namespace)?;
+            Self::bridge_position_accounting_for(read, owner, read_budget)?;
+        let (handoffs_count, handoff_bytes) =
+            Self::bridge_handoff_accounting_for(read, owner, read_budget)?;
+        let (commitments, commitment_bytes) =
+            Self::bridge_commitment_accounting_for(read, owner, read_budget)?;
+        let (projections, projection_bytes) =
+            Self::bridge_projection_accounting_for(read, owner, read_budget)?;
+        let (gaps, gap_bytes) = Self::bridge_gap_accounting_for(read, namespace, read_budget)?;
         let cursor_bytes = {
             let cursors = read.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
             match cursors.get(namespace).map_err(storage)? {
                 Some(value) => {
+                    read_budget.charge(namespace.as_bytes(), value.value().as_bytes())?;
                     let (stable_bytes, _) =
                         Self::bridge_cursor_stable_and_scan_bytes(value.value())?;
                     u64::try_from(namespace.len())
@@ -17372,10 +19466,13 @@ impl RedbRecoveryStore {
         // event rows above, so this view has no second position-table scan.
         let owner_bytes = {
             let owners = read.open_table(BRIDGE_STREAM_OWNERS).map_err(storage)?;
-            owners
-                .get(namespace)
-                .map_err(storage)?
-                .map_or(0, |value| (namespace.len() + value.value().len()) as u64)
+            match owners.get(namespace).map_err(storage)? {
+                Some(value) => {
+                    read_budget.charge(namespace.as_bytes(), value.value().as_bytes())?;
+                    (namespace.len() + value.value().len()) as u64
+                }
+                None => 0,
+            }
         };
         let total_bytes = pending_event_bytes
             .saturating_add(projection_bytes)
@@ -22371,16 +24468,17 @@ impl RedbRecoveryStore {
     /// Converts a host request whose claimed owner vanished with the process
     /// into the durable unknown-outcome state (issue #1853, I14.21, I1.4).
     ///
-    /// A non-terminal row holding a `Claimed` attempt is a daemon that was
-    /// killed after it claimed writer ownership and may have issued effects. The
-    /// restart path must not leave it looking live, must not free the retained
-    /// attempt so a replacement can silently acquire ownership, and must not
-    /// retry: it advances the row to `Unknown` through the existing
+    /// A non-terminal row holding any active transport phase may have issued
+    /// effects. Legacy `Admitted`/`Routed` rows with no attempt are also
+    /// uncertain because earlier send code could cross the transport before
+    /// persisting the new claim marker. Restart must not leave these rows
+    /// looking live, free their retained attempt, or retry: it advances them to
+    /// `Unknown` through the existing
     /// [`crate::HostRequestState::transition_to`] edge, so exactly one result or
     /// `UNKNOWN_OUTCOME` can still be bound later from reconciliation evidence.
     /// The attempt is retained in place and its generation is untouched.
     ///
-    /// A `Reconciling` row keeps its retained `Claimed` attempt and still has a
+    /// A `Reconciling` row keeps its retained attempt and still has a
     /// legal edge to `Unknown`, so it is a candidate too: the interrupted
     /// reconciliation cannot be resumed across a restart, and the owning route
     /// re-advances the row to `Reconciling` when the next reconciliation
@@ -22391,7 +24489,9 @@ impl RedbRecoveryStore {
     /// over data the sweep itself holds would let recovery invent authority.
     /// Identity-index rows share `HOST_REQUESTS` and are told apart by the
     /// same `request_digest` marker the reuse check uses, so only real
-    /// operation rows are candidates.
+    /// operation rows are candidates. The legacy no-claim Admitted/Routed
+    /// fallback is restricted to the `UserAutomation` runtime channel: generic
+    /// protocol-v0 `HostRequest` rows retain their pre-protocol restart behavior.
     fn recover_interrupted_host_requests(&self) -> Result<(), OrsError> {
         loop {
             let write = self.database.begin_write().map_err(storage)?;
@@ -22415,14 +24515,28 @@ impl RedbRecoveryStore {
                     if record.state.is_terminal() {
                         continue;
                     }
-                    let claimed = record.attempt.as_ref().is_some_and(|attempt| {
-                        attempt.phase == crate::HostRequestAttemptPhase::Claimed
+                    let active_attempt = record.attempt.as_ref().is_some_and(|attempt| {
+                        matches!(
+                            attempt.phase,
+                            crate::HostRequestAttemptPhase::Claimed
+                                | crate::HostRequestAttemptPhase::DispatchStarted
+                                | crate::HostRequestAttemptPhase::DeliveryOutcomeUnknown
+                                | crate::HostRequestAttemptPhase::DeliveredToAuthenticatedHost
+                                | crate::HostRequestAttemptPhase::ResponseReceived
+                        )
                     });
-                    if !claimed {
+                    let legacy_admitted_without_claim = record.send_claim_protocol_version == 0
+                        && record.connection_ref.as_str() == "USER_AUTOMATION_RUNTIME_OPERATION"
+                        && record.attempt.is_none()
+                        && matches!(
+                            record.state,
+                            crate::HostRequestState::Admitted | crate::HostRequestState::Routed
+                        );
+                    if !active_attempt && !legacy_admitted_without_claim {
                         continue;
                     }
                     // A row already advanced to `Unknown`/`Reconciling` keeps
-                    // its retained `Claimed` attempt, so it still looks like a
+                    // its retained active attempt, so it still looks like a
                     // candidate. The owner's own transition table decides
                     // whether the row can still move forward; re-using it here
                     // keeps the sweep idempotent across its own pages without
@@ -28875,6 +30989,68 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         RedbRecoveryStore::claim_host_request_attempt(self, operation_id, request_digest, attempt)
     }
 
+    fn reconcile_expired_host_request_claim(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        RedbRecoveryStore::reconcile_expired_host_request_claim(
+            self,
+            operation_id,
+            request_digest,
+            attempt,
+        )
+    }
+
+    fn begin_host_request_transport_dispatch(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+        observation: &crate::HostRequestTransportObservation,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        RedbRecoveryStore::begin_host_request_transport_dispatch(
+            self,
+            operation_id,
+            request_digest,
+            attempt,
+            observation,
+        )
+    }
+
+    fn observe_host_request_transport_custody(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+        observation: &crate::HostRequestTransportObservation,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        RedbRecoveryStore::observe_host_request_transport_custody(
+            self,
+            operation_id,
+            request_digest,
+            attempt,
+            observation,
+        )
+    }
+
+    fn record_host_request_owner_readback(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+        evidence: &crate::HostRequestOwnerReadbackEvidence,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        RedbRecoveryStore::record_host_request_owner_readback(
+            self,
+            operation_id,
+            request_digest,
+            attempt,
+            evidence,
+        )
+    }
+
     fn defer_host_request_attempt(
         &self,
         operation_id: &crate::OperationIdentity,
@@ -28901,6 +31077,26 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             result_response,
             result_evidence,
             result_lineage,
+        )
+    }
+
+    fn persist_claimed_host_request_result(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+        result_digest: &str,
+        result_response: &serde_json::Value,
+        owner_readback: Option<&crate::HostRequestOwnerReadbackEvidence>,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        RedbRecoveryStore::persist_claimed_host_request_result(
+            self,
+            operation_id,
+            request_digest,
+            attempt,
+            result_digest,
+            result_response,
+            owner_readback,
         )
     }
 
@@ -29455,6 +31651,67 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
             .claim_host_request_attempt(operation_id, request_digest, attempt)
     }
 
+    /// Reconciles an expired active send claim under its retained identity.
+    pub fn reconcile_expired_host_request_claim(
+        &self,
+        operation_id: &OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+    ) -> Result<Option<HostRequestRecord>, OrsError> {
+        self.store
+            .reconcile_expired_host_request_claim(operation_id, request_digest, attempt)
+    }
+
+    /// Durably fences the exact claim before entering the authenticated
+    /// transport.
+    pub fn begin_host_request_transport_dispatch(
+        &self,
+        operation_id: &OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+        observation: &crate::HostRequestTransportObservation,
+    ) -> Result<Option<HostRequestRecord>, OrsError> {
+        self.store.begin_host_request_transport_dispatch(
+            operation_id,
+            request_digest,
+            attempt,
+            observation,
+        )
+    }
+
+    /// Persists one typed custody observation for the exact active claim.
+    pub fn observe_host_request_transport_custody(
+        &self,
+        operation_id: &OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+        observation: &crate::HostRequestTransportObservation,
+    ) -> Result<Option<HostRequestRecord>, OrsError> {
+        self.store.observe_host_request_transport_custody(
+            operation_id,
+            request_digest,
+            attempt,
+            observation,
+        )
+    }
+
+    /// Retains an authenticated cross-restart owner readback independently
+    /// from the original transport channel observations.
+    pub fn record_host_request_owner_readback(
+        &self,
+        operation_id: &OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+        evidence: &crate::HostRequestOwnerReadbackEvidence,
+    ) -> Result<Option<HostRequestRecord>, OrsError> {
+        self.store.record_host_request_owner_readback(
+            operation_id,
+            request_digest,
+            attempt,
+            evidence,
+        )
+    }
+
     /// Records the exact current attempt's no-effect deferral.
     pub fn defer_host_request_attempt(
         &self,
@@ -29483,6 +31740,27 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
             result_response,
             result_evidence,
             result_lineage,
+        )
+    }
+
+    /// Atomically persists the exact response for the claim whose retained
+    /// custody evidence already contains the same response commitment.
+    pub fn persist_claimed_host_request_result(
+        &self,
+        operation_id: &OperationIdentity,
+        request_digest: &str,
+        attempt: &crate::HostRequestAttempt,
+        result_digest: &str,
+        result_response: &serde_json::Value,
+        owner_readback: Option<&crate::HostRequestOwnerReadbackEvidence>,
+    ) -> Result<Option<HostRequestRecord>, OrsError> {
+        self.store.persist_claimed_host_request_result(
+            operation_id,
+            request_digest,
+            attempt,
+            result_digest,
+            result_response,
+            owner_readback,
         )
     }
 
@@ -30385,6 +32663,8 @@ mod host_request_result_tests {
         let label = |value: &str| OpaqueLabel::new(value.to_owned()).expect("valid test label");
         crate::HostRequestRecord {
             contract_version: crate::CONTRACT_VERSION,
+            send_claim_protocol_version: 0,
+            transport_channel_binding_sha256: None,
             operation_id: OperationIdentity::new(operation.to_owned()).expect("valid operation"),
             kind: HostRequestKind::Invocation,
             request_id: label("req-1"),
@@ -30405,6 +32685,7 @@ mod host_request_result_tests {
             deadline_unix_ms: 9_999_999,
             state: HostRequestState::Requested,
             attempt: None,
+            attempt_history: Vec::new(),
             cancellation_target: None,
             result_digest: None,
             result_response: None,

@@ -24,10 +24,13 @@
 //!
 //! No expected set is ever taken from the joining caller. Event identity,
 //! position, and content are compared against the retained owner journal;
-//! generation is compared against the owner's live attach binding; and a later
-//! event is compared against the evidence the correlation itself already
-//! accepted. Comparing two values the caller supplied could only prove that the
-//! caller agrees with itself.
+//! the live generation and the expected route fingerprint are read from the
+//! owner's own attach binding and the owner's own observed route; the
+//! nominated correlation is compared against the digest this correlation
+//! recorded; and a later event is compared against the evidence read back out
+//! of the correlation's own retained revisions. Comparing two values the
+//! caller supplied, or recomputing a fresh digest over what the join already
+//! holds, could only prove that the caller agrees with itself.
 //!
 //! Everything this seam retains is bounded and owned elsewhere. The expected
 //! sets are the owner's journal, capped by the owner's
@@ -40,16 +43,18 @@
 //! terminal host fact is produced without an owner journal entry behind it.
 
 use eliot_agent_bridge_core::{
-    AgentBridgeCore, HostEventEnvelope, TransportEdge, TransportEdgeKind,
+    AgentBridgeCore, HostEventEnvelope, RouteFingerprint, TransportEdge, TransportEdgeKind,
 };
 
 use super::correlation::{
-    Assessment, AssessmentInputs, AssessmentRevision, CanonicalDisposition, CoverageIndeterminacy,
-    CoverageProof, EliotEmissionObservation, HostObservationEvidence, HostTerminalObservation,
+    Assessment, AssessmentInputs, AssessmentLog, AssessmentRevision, CanonicalDisposition,
+    CoverageIndeterminacy, CoverageProof, EliotEmissionObservation, HostTerminalObservation,
     ObservationWindow, OwnerValidatedOperationBinding, PartialObservation, assess_correlation,
+    sha256_hex,
 };
 use super::host_observation::{
-    HostEventJoinKeys, HostObservationReject, check_event_replay, normalize_terminal_observation,
+    HostEventJoinKeys, HostObservationReject, HostOwnerBinding, check_event_replay,
+    normalize_terminal_observation,
 };
 
 /// Submits one host event through the existing admitted event route.
@@ -205,6 +210,10 @@ pub(crate) fn read_host_coverage(bridge: &AgentBridgeCore) -> BridgeHostCoverage
 pub(crate) enum ReconcileError {
     /// The event owner is unattached; no journal exists to verify against.
     OwnerUnattached,
+    /// The event owner has observed no route fingerprint, so the candidate's
+    /// route cannot be checked against anything the owner recorded and it
+    /// closes nothing current.
+    OwnerRouteUnproven,
     /// The nominated event is absent from the live owner journal.
     NominatedEventNotJournaled {
         /// Nominated event identity.
@@ -230,6 +239,15 @@ pub(crate) enum ReconcileError {
         /// Conflicting event identity.
         event_id: String,
     },
+    /// The nominated correlation digest is not the digest this correlation
+    /// recorded, so the event joins a different logical correlation and closes
+    /// nothing here.
+    CorrelationMismatch {
+        /// Correlation digest the joining caller named.
+        claimed: String,
+        /// Correlation digest this correlation actually recorded.
+        recorded: String,
+    },
     /// The candidate failed host-observation normalization.
     HostRejected(HostObservationReject),
 }
@@ -239,6 +257,9 @@ impl std::fmt::Display for ReconcileError {
         match self {
             Self::OwnerUnattached => formatter
                 .write_str("event owner is unattached; cannot verify the nominated host event"),
+            Self::OwnerRouteUnproven => formatter.write_str(
+                "event owner recorded no route fingerprint; the nominated host event closes nothing",
+            ),
             Self::NominatedEventNotJournaled { event_id } => write!(
                 formatter,
                 "nominated host event {event_id} is absent from the owner journal"
@@ -256,6 +277,10 @@ impl std::fmt::Display for ReconcileError {
                 "host event {event_id} was already accepted for this correlation with \
                  different content"
             ),
+            Self::CorrelationMismatch { claimed, recorded } => write!(
+                formatter,
+                "nominated correlation {claimed} is not this correlation {recorded}"
+            ),
             Self::HostRejected(reason) => {
                 write!(formatter, "host event rejected for correlation: {reason}")
             }
@@ -268,10 +293,12 @@ impl std::error::Error for ReconcileError {
         match self {
             Self::HostRejected(reason) => Some(reason),
             Self::OwnerUnattached
+            | Self::OwnerRouteUnproven
             | Self::NominatedEventNotJournaled { .. }
             | Self::OutOfDeclaredOrder { .. }
             | Self::JournalContentConflict { .. }
-            | Self::PriorEvidenceConflict { .. } => None,
+            | Self::PriorEvidenceConflict { .. }
+            | Self::CorrelationMismatch { .. } => None,
         }
     }
 }
@@ -284,13 +311,14 @@ pub(crate) struct TerminalReconcileRequest<'a> {
     pub(crate) candidate: &'a HostEventEnvelope,
     /// Exact join keys the owner attests for the candidate.
     pub(crate) keys: &'a HostEventJoinKeys,
-    /// Host observation already accepted for this same correlation, taken
-    /// from the correlation's own retained revision chain.
+    /// This correlation's own append-only assessment chain.
     ///
-    /// This is the independent expected set for a later event: the join
-    /// compares a new candidate against the recorded evidence rather than
-    /// against a fresh recomputation of the same inputs.
-    pub(crate) prior_host_evidence: Option<&'a HostObservationEvidence>,
+    /// This is the independent expected set for a later event: the join reads
+    /// the evidence already accepted back out of the correlation's own
+    /// retained revisions and compares the new candidate against that record.
+    /// It is not a caller-supplied expected set — accepting a caller-presented
+    /// `None` would let one correlation close once per event.
+    pub(crate) assessments: &'a AssessmentLog,
     /// Owner-validated operation binding, when a tool owner minted one.
     pub(crate) operation_binding: Option<&'a OwnerValidatedOperationBinding>,
     /// Canonical disposition from canonical evidence only.
@@ -303,22 +331,28 @@ pub(crate) struct TerminalReconcileRequest<'a> {
 
 /// Reconciles one nominated terminal host event against an emission.
 ///
-/// The candidate is joined on exact identity first, then exact generation, then
-/// exact content, then against the evidence this correlation already accepted:
+/// The candidate is joined on exact correlation identity first, then exact event
+/// identity, then exact generation, then exact content, then against the
+/// evidence this correlation already accepted:
 ///
+/// 0. **exact correlation** — the nominated correlation digest must be the
+///    digest this correlation recorded, so an event named against a different
+///    logical correlation closes nothing here;
 /// 1. **exact identity** — the event identity must be present in the live
 ///    owner journal, and that identity must be bound to exactly the sequence
 ///    and cursor the candidate claims. An event that is absent, or that sits at
 ///    a different position than it claims, closes nothing;
-/// 2. **exact content** — every journaled entry under that identity must equal
+/// 2. **exact generation** — the candidate's own owner-validated lineage must
+///    name the session in the owner's own live attach binding, and its route
+///    fingerprint must be the one the owner itself observed, so a restart or
+///    session rotation cannot relabel an old observation as current;
+/// 3. **exact content** — every journaled entry under that identity must equal
 ///    the candidate field for field. One differing entry is a same-identity
 ///    content conflict and is refused, never overwritten; byte-equal repeats
 ///    are an exact replay and stay idempotent;
-/// 3. **exact generation** — the candidate's own owner-validated lineage must
-///    name the owner's live current session, so a restart or session rotation
-///    cannot relabel an old observation as current;
 /// 4. **prior accepted evidence** — the same event identity may not reappear
-///    for this correlation with any changed content.
+///    for this correlation with any changed content, compared against the
+///    evidence read back out of this correlation's own retained revisions.
 ///
 /// Only then is the event assessed, with the owner's live coverage
 /// denominator. Stale, foreign, duplicated, reordered, and out-of-order host
@@ -330,21 +364,26 @@ pub(crate) fn reconcile_terminal_event(
     let Some(inputs) = bridge.terminal_reduction_inputs() else {
         return Err(ReconcileError::OwnerUnattached);
     };
+    let recorded_digest = request.emission.identity.identity_digest.as_str();
+    if request.keys.correlation_digest != recorded_digest {
+        return Err(ReconcileError::CorrelationMismatch {
+            claimed: request.keys.correlation_digest.clone(),
+            recorded: recorded_digest.to_owned(),
+        });
+    }
     let journaled = journal_binding(inputs.history(), request.candidate)?;
-    let current_session = bridge
-        .attach_view()
-        .map(|view| view.binding().session_id().as_str().to_owned())
-        .ok_or(ReconcileError::OwnerUnattached)?;
-    let host = normalize_terminal_observation(journaled, request.keys, &current_session)
+    let owner = owner_binding(bridge, inputs.fingerprint())?;
+    let host = normalize_terminal_observation(journaled, request.keys, &owner)
         .map_err(ReconcileError::HostRejected)?;
     // An exact replay is idempotent: identical evidence re-derives the
     // identical assessment, so the correlation still closes exactly once, and a
     // different event identity is a new observation of the same correlation.
     // Neither rewrites a prior revision by itself. Only the same identity with
     // changed content — a different generation, route, cursor, or digest — is
-    // refused.
+    // refused. The expected set is this correlation's own retained record, not
+    // anything the joining caller presents.
     if let (Some(prior), HostTerminalObservation::Observed { evidence, .. }) =
-        (request.prior_host_evidence, &host)
+        (request.assessments.latest_host_evidence(), &host)
         && check_event_replay(prior, evidence.as_ref()).is_err()
     {
         return Err(ReconcileError::PriorEvidenceConflict {
@@ -372,6 +411,34 @@ pub(crate) fn reconcile_terminal_event(
         ui_confirmed_stale: request.ui_confirmed_stale,
     };
     Ok(assess_correlation(&assessment_inputs))
+}
+
+/// Reads the live generation this join compares against, from the owner only.
+///
+/// The expected side of the generation join is the owner's own live attach
+/// binding and the route fingerprint the owner itself observed, so the
+/// comparison is a value against a value: the event's own owner-validated
+/// lineage against the owner's own record. A route the owner has not observed
+/// proves nothing, so the candidate closes nothing rather than being compared
+/// against a digest the join computed over its own inputs.
+fn owner_binding(
+    bridge: &AgentBridgeCore,
+    observed_route: Option<&RouteFingerprint>,
+) -> Result<HostOwnerBinding, ReconcileError> {
+    let binding = bridge
+        .attach_view()
+        .map(|view| view.binding().clone())
+        .ok_or(ReconcileError::OwnerUnattached)?;
+    let route = observed_route.ok_or(ReconcileError::OwnerRouteUnproven)?;
+    let route_json = route.canonical_json().map_err(|error| {
+        ReconcileError::HostRejected(HostObservationReject::InvalidEnvelope(error.to_string()))
+    })?;
+    Ok(HostOwnerBinding {
+        installation_id: binding.principal_id().as_str().to_owned(),
+        session_id: binding.session_id().as_str().to_owned(),
+        activation_generation: binding.activation_generation().to_string(),
+        route_digest: sha256_hex(route_json.as_bytes()),
+    })
 }
 
 /// Joins one nominated candidate onto the owner's declared observation order.

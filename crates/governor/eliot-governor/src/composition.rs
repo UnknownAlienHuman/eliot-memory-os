@@ -5770,6 +5770,31 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         privacy_class: PrivacyClass,
         governing_source_generation: u64,
     ) -> Result<ColdStartSurfaceView, CompositionError> {
+        self.cold_start_owner_readback_for_lease(
+            lineage_candidate_ref,
+            workspace_instance_candidate_ref,
+            privacy_class,
+            governing_source_generation,
+        )
+        .map(|(_, surface)| surface)
+    }
+
+    /// Returns the exact retained lease and terminal surface from one
+    /// Governor-owned lookup (issue #1746 W5; #8 W1).
+    ///
+    /// Unlike the surface-only projection, this readback retains the lease's
+    /// compiler epoch and terminal state so an attach boundary can compare the
+    /// complete owner lease, not only the fields projected into
+    /// `ColdStartSurfaceView`. The lookup is read-only and preserves the same
+    /// current-fence, `WorkScope`, receipt and key checks as
+    /// [`Self::cold_start_surface_for_lease`].
+    pub fn cold_start_owner_readback_for_lease(
+        &self,
+        lineage_candidate_ref: &str,
+        workspace_instance_candidate_ref: &str,
+        privacy_class: PrivacyClass,
+        governing_source_generation: u64,
+    ) -> Result<(eliot_workscope::OnboardingLease, ColdStartSurfaceView), CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
         }
@@ -5828,45 +5853,48 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let surface = receipt
             .surface(&lease)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        Ok(ColdStartSurfaceView {
-            receipt_ref: surface.receipt_ref,
-            lease_ref: receipt.lease_ref.clone(),
-            principal_ref: receipt.principal_ref.clone(),
-            session_ref: receipt.session_ref.clone(),
-            scope: receipt.scope.clone(),
-            scope_descriptor_revision: receipt.scope_descriptor_revision,
-            instance: receipt.instance.clone(),
-            lineage: receipt.lineage.clone(),
-            scope_resolution: receipt.scope_resolution,
-            task_binding: receipt.task_binding.clone(),
-            state_fence: receipt.state_fence.clone(),
-            governing_source_set_ref: receipt.governing_source_set_ref.clone(),
-            governing_source_generation: receipt.governing_source_generation,
-            governance_profile_ref: receipt.governance_profile_ref.clone(),
-            limiting_integration_evidence: receipt.limiting_integration_evidence.clone(),
-            route_profile_ref: receipt.route_profile_ref.clone(),
-            serializer_id: receipt.serializer_id.clone(),
-            serializer_version: receipt.serializer_version.clone(),
-            serializer_options_digest: receipt.serializer_options_digest.clone(),
-            tokenizer_id: receipt.tokenizer_id.clone(),
-            tokenizer_version: receipt.tokenizer_version.clone(),
-            tokenizer_hash: receipt.tokenizer_hash.clone(),
-            readiness: cold_start_readiness_token(surface.readiness).to_owned(),
-            smallest_missing_question: surface.smallest_missing_question,
-            lease_deadline: surface.lease_deadline,
-            receipt_revision: receipt.receipt_revision,
-            proof_readiness: receipt.proof_readiness,
-            missing_inputs: receipt.missing_inputs.clone(),
-            next_safe_action: receipt.next_safe_action.clone(),
-            discovered_source_refs: receipt.discovered_source_refs.clone(),
-            admitted_source_refs: receipt.admitted_source_refs.clone(),
-            conflicting_source_refs: receipt.conflicting_source_refs.clone(),
-            unavailable_source_refs: receipt.unavailable_source_refs.clone(),
-            scan_receipt_ref: receipt.scan_receipt_ref.clone(),
-            workspace_instance_ref: receipt.instance.instance_ref.clone(),
-            projection_source_ref: receipt.projection_source_ref.clone(),
-            projection_generation: receipt.projection_generation,
-        })
+        Ok((
+            lease.clone(),
+            ColdStartSurfaceView {
+                receipt_ref: surface.receipt_ref,
+                lease_ref: receipt.lease_ref.clone(),
+                principal_ref: receipt.principal_ref.clone(),
+                session_ref: receipt.session_ref.clone(),
+                scope: receipt.scope.clone(),
+                scope_descriptor_revision: receipt.scope_descriptor_revision,
+                instance: receipt.instance.clone(),
+                lineage: receipt.lineage.clone(),
+                scope_resolution: receipt.scope_resolution,
+                task_binding: receipt.task_binding.clone(),
+                state_fence: receipt.state_fence.clone(),
+                governing_source_set_ref: receipt.governing_source_set_ref.clone(),
+                governing_source_generation: receipt.governing_source_generation,
+                governance_profile_ref: receipt.governance_profile_ref.clone(),
+                limiting_integration_evidence: receipt.limiting_integration_evidence.clone(),
+                route_profile_ref: receipt.route_profile_ref.clone(),
+                serializer_id: receipt.serializer_id.clone(),
+                serializer_version: receipt.serializer_version.clone(),
+                serializer_options_digest: receipt.serializer_options_digest.clone(),
+                tokenizer_id: receipt.tokenizer_id.clone(),
+                tokenizer_version: receipt.tokenizer_version.clone(),
+                tokenizer_hash: receipt.tokenizer_hash.clone(),
+                readiness: cold_start_readiness_token(surface.readiness).to_owned(),
+                smallest_missing_question: surface.smallest_missing_question,
+                lease_deadline: surface.lease_deadline,
+                receipt_revision: receipt.receipt_revision,
+                proof_readiness: receipt.proof_readiness,
+                missing_inputs: receipt.missing_inputs.clone(),
+                next_safe_action: receipt.next_safe_action.clone(),
+                discovered_source_refs: receipt.discovered_source_refs.clone(),
+                admitted_source_refs: receipt.admitted_source_refs.clone(),
+                conflicting_source_refs: receipt.conflicting_source_refs.clone(),
+                unavailable_source_refs: receipt.unavailable_source_refs.clone(),
+                scan_receipt_ref: receipt.scan_receipt_ref.clone(),
+                workspace_instance_ref: receipt.instance.instance_ref.clone(),
+                projection_source_ref: receipt.projection_source_ref.clone(),
+                projection_generation: receipt.projection_generation,
+            },
+        ))
     }
 
     /// Applies one Canonical-admitted transition through the sole retained
@@ -6216,6 +6244,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// correlates by `operation_id` / `canonical_request_hash` / `state_fence`.
     /// The admitted capability cell and Module Catalog revision are required
     /// caller-supplied owner inputs; this method does not infer either value.
+    /// The supplied revision must equal the live `module_registry` revision at
+    /// publish: a binding is compiled against the current catalog, never a
+    /// stale one (Implements #22 W1). A catalog change makes the binding
+    /// stale; it needs a new admission, never a local repair.
     /// All parameters are required; blank or malformed input fails closed.
     #[allow(
         clippy::too_many_arguments,
@@ -6298,6 +6330,17 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             route_ref,
             work_scope_id,
         )?;
+        // Catalog-revision pin (Implements #22 W1): the binding is compiled
+        // against the admitted Module Catalog revision, so the supplied
+        // revision must equal the live `module_registry` revision at publish.
+        // A stale revision fails closed as `Recovery`; the owner advances the
+        // revision through a new admission, never a local repair here.
+        if module_catalog_revision != self.owners.module_registry.revision() {
+            return Err(CompositionError::Recovery(
+                "native binding catalog revision is not the live Module Catalog revision"
+                    .to_owned(),
+            ));
+        }
         let mut binding = NativeWorkerExecutableBinding {
             claim_id: claim_id.to_owned(),
             registration_id: registration_id.to_owned(),
@@ -10644,7 +10687,7 @@ mod tests {
                 vec!["intro-1".to_owned()],
                 vec!["grant-1".to_owned()],
                 1,
-                7,
+                1,
                 eliot_store_api::EffectClass::ReversibleMutation,
                 vec!["cred-1".to_owned()],
                 vec!["res-1".to_owned()],

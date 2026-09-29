@@ -119,20 +119,20 @@
     "qualification": "UNVALIDATED (I2.16, I0.5)",
     "reference_capsule_handle": "I2.20"
   },
-  "bound_contract_digest": "785cf2369abf24c48c750384dfa5e7ee035db887686db7f7ee2619e3e164c5a4",
+  "bound_contract_digest": "609a370cd49cea67714f702a74f0c6e94efac7f24948c60a297070708a36a156",
   "source_provenance": {
     "input_digests": {
       "workspace_manifest": {
         "path": "Cargo.toml",
-        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
       },
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
-        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
       },
       "architecture_boundaries": {
         "path": "config/architecture-boundaries.toml",
-        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
       },
       "logical_block_config": {
         "path": "docs/code-navigation/logical-blocks.toml",
@@ -144,7 +144,7 @@
       },
       "module_manifest": {
         "path": "crates/smart/eliot-dreamer-claim-grounding/module.toml",
-        "sha256": "e14770c5f195190cc95b92480bdc194c5db4b7679b2caf5bec16e138fa6e5904"
+        "sha256": "b54351d6a1b8821804cbeca19d4494c19cd11bd2787acfd938c8e6e3fe871211"
       },
       "selected_source": {
         "path_count": 6,
@@ -154,9 +154,9 @@
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "aa9f85f76c827024dd064bcc0a7a9c5a10c6776432609d2f7b112b49700fb7c9",
+  "artifact_digest": "9ef322f92c943486fd7f36b1f1e5812499961f385a1e67e97fbc88f193eec2d0",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "aa9f85f76c827024"
+    "value": "9ef322f92c943486"
   }
 }

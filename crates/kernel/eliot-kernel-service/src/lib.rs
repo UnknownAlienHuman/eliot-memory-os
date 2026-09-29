@@ -35,6 +35,7 @@ mod lifecycle_admission;
 mod lifecycle_persist;
 #[cfg(test)]
 mod lifecycle_persist_tests;
+mod maintenance_trigger_delivery;
 mod notification_state;
 #[cfg(test)]
 mod notification_state_tests;
@@ -111,6 +112,19 @@ pub use lifecycle_persist::{
     LifecyclePersistError, LifecyclePersistRequest, LifecyclePersistResponse,
     LifecycleServiceContext, LinkAuditBinding, PersistedHop, PersistedMutation,
     build_persist_transitions, handle_lifecycle_persist_request,
+};
+pub use maintenance_trigger_delivery::{
+    AuthenticatedMaintenanceTriggerSession, MAX_MAINTENANCE_TRIGGER_CLAIM_LEASE_MS,
+    MaintenanceTriggerClaimRequest, MaintenanceTriggerDeliveryError,
+    MaintenanceTriggerDeliveryLedger, MaintenanceTriggerDeliveryRow,
+    MaintenanceTriggerRecoveryCounts, MaintenanceTriggerServiceContext,
+    handle_maintenance_trigger_ack, handle_maintenance_trigger_claim,
+    handle_maintenance_trigger_decision, handle_maintenance_trigger_expiry,
+    handle_maintenance_trigger_gap, handle_maintenance_trigger_intake,
+    handle_maintenance_trigger_mark_ambiguous, handle_maintenance_trigger_pending_page,
+    handle_maintenance_trigger_release_expired, handle_maintenance_trigger_replacement_pending_set,
+    handle_maintenance_trigger_revocation, handle_maintenance_trigger_supersession,
+    recover_maintenance_trigger_commit, replay_maintenance_trigger_after_crash,
 };
 pub use notification_state::{
     AuthenticatedNotificationSession, NotificationMetrics, NotificationServiceContext,
@@ -239,7 +253,8 @@ pub use user_automation::{
     UserAutomationStorePort, UserAutomationStoreRequest, UserAutomationStoreResponse,
 };
 pub use user_automation_execution::{
-    USER_AUTOMATION_WAKE_ENUMERATION_RECEIPT_VERSION, UserAutomationDueWakeRejection,
+    USER_AUTOMATION_WAKE_ENUMERATION_RECEIPT_VERSION,
+    UserAutomationAuthenticatedWakeCancellationReadback, UserAutomationDueWakeRejection,
     UserAutomationDueWakeRejectionCause, UserAutomationDueWakeResolution,
     UserAutomationDurableJobPort, UserAutomationExecutionError, UserAutomationExecutionOutcome,
     UserAutomationExecutionRequest, UserAutomationFailureHistory, UserAutomationFailureHistoryPort,
@@ -247,13 +262,14 @@ pub use user_automation_execution::{
     UserAutomationNotificationDelivery, UserAutomationNotificationPort,
     UserAutomationRemovalResult, UserAutomationRuntimeAdmission, UserAutomationRuntimeComposition,
     UserAutomationRuntimeError, UserAutomationRuntimePort, UserAutomationWakeCancellation,
-    UserAutomationWakeCancellationTarget, UserAutomationWakeEnumerationCoverage,
-    UserAutomationWakeEnumerationReceipt, UserAutomationWakeEnumerationRequest,
-    UserAutomationWakeHorizonEntry, UserAutomationWakeHorizonPublication,
-    UserAutomationWakeOccurrenceDisposition, UserAutomationWakeOwnerEvidence,
-    UserAutomationWakePort, UserAutomationWakePublication, UserAutomationWakeReadRequest,
-    UserAutomationWakeReadback, advance_wake_horizon, compile_wake_horizon, horizon_retry_handle,
-    refuse_consumed_wake, resolve_due_wake, wake_occurrence_denominator_digest,
+    UserAutomationWakeCancellationReadback, UserAutomationWakeCancellationTarget,
+    UserAutomationWakeEnumerationCoverage, UserAutomationWakeEnumerationReceipt,
+    UserAutomationWakeEnumerationRequest, UserAutomationWakeHorizonEntry,
+    UserAutomationWakeHorizonPublication, UserAutomationWakeOccurrenceDisposition,
+    UserAutomationWakeOwnerEvidence, UserAutomationWakePort, UserAutomationWakePublication,
+    UserAutomationWakeReadRequest, UserAutomationWakeReadback, advance_wake_horizon,
+    compile_wake_horizon, horizon_retry_handle, refuse_consumed_wake, resolve_due_wake,
+    wake_occurrence_denominator_digest,
 };
 #[cfg(windows)]
 pub use user_automation_execution_client::AuthenticatedUserAutomationHostExecutionTransport;
@@ -263,10 +279,11 @@ pub use user_automation_execution_client::{
     USER_AUTOMATION_KERNEL_MODULE_ID, USER_AUTOMATION_KERNEL_OPERATION,
     USER_AUTOMATION_KERNEL_PRINCIPAL_BINDING, USER_AUTOMATION_KERNEL_PRIVACY_CLASS,
     UserAutomationHostChannelBinding, UserAutomationHostExecutionClient,
-    UserAutomationHostExecutionFailure, UserAutomationHostExecutionOperation,
-    UserAutomationHostExecutionRequest, UserAutomationHostExecutionResponse,
-    UserAutomationHostExecutionSession, UserAutomationHostExecutionTransport,
-    UserAutomationHostOwnerBinding, decode_user_automation_host_execution_open_frame,
+    UserAutomationHostExecutionFailure, UserAutomationHostExecutionObserver,
+    UserAutomationHostExecutionOperation, UserAutomationHostExecutionRequest,
+    UserAutomationHostExecutionResponse, UserAutomationHostExecutionSession,
+    UserAutomationHostExecutionTransport, UserAutomationHostOwnerBinding,
+    decode_user_automation_host_execution_open_frame,
     decode_user_automation_host_execution_open_response_frame,
     decode_user_automation_host_execution_request_frame,
     decode_user_automation_host_execution_response_frame,
@@ -287,9 +304,9 @@ pub use user_automation_orchestration::{
 pub use user_automation_runtime_handoff::{
     USER_AUTOMATION_TRANSITION_WIRE_ID, USER_AUTOMATION_TRANSITION_WIRE_VERSION,
     UserAutomationConfigurationPhase, UserAutomationExecutionPhase, UserAutomationHorizonOutcome,
-    UserAutomationHorizonPhase, UserAutomationOperatorRuntime, UserAutomationOperatorTransition,
-    UserAutomationRecoveryPhase, UserAutomationWakePhase, committed_configuration_state,
-    run_now_wake_read_request,
+    UserAutomationHorizonPhase, UserAutomationOperatorResultEnvelope,
+    UserAutomationOperatorRuntime, UserAutomationOperatorTransition, UserAutomationRecoveryPhase,
+    UserAutomationWakePhase, committed_configuration_state, run_now_wake_read_request,
 };
 pub use user_automation_store::{
     CanonicalUserAutomationStore, UserAutomationNamedReadProvenance, UserAutomationOwnerLookup,

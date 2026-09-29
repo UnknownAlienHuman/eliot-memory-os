@@ -43,6 +43,7 @@ committed as repository authority.
 | `verify-release-claim-boundary.py` | Verify the build-success claim boundary stays bound to source and build identity (issue #1855) | Static release-claim policy evidence only |
 | `migration_inventory_1860.py` | Publish required migration inventory, dispositions, impact graph, and Product Proof plan (issue #1860) | Static migration inventory evidence only |
 | `verify-dependency-policy.py` | Verify multi-ecosystem dependency admission, scanner tool pinning, inventory completeness, lockfiles, and advisory evidence | Static and advisory admission evidence only |
+| `verify-branch-protection.py` | Read back live branch protection/rulesets and compare against the retained merge-enforcement rule (#3004) | Live enforcement readback evidence only; never configures protection |
 | `crate_reachability_inventory.py` | Generate deterministic support-neutral Cargo package reachability and source-shape inventory | Reachability and source-shape evidence only |
 | `audit-work-unit-assignments.py` | Deterministic fail-closed assignment-integrity oracle over a frozen complete repository/GitHub snapshot (#818) | Assignment integrity oracle evidence only |
 | `audit-serde-boundary-closure.py` | Serde-boundary closure coordinator (#710, Slice A) | Static source/boundary evidence only |

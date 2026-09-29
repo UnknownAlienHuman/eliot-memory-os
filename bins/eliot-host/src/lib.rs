@@ -5684,32 +5684,43 @@ impl HostComposition {
     /// [`BackupCallerAuth`](crate::backup_preparation::BackupCallerAuth)
     /// owner gate (held lease covers the launch installation, presented
     /// source equals it), and the destination is prepared from inspected
-    /// owner evidence through the caller-supplied journal sink. The sink
-    /// returns alongside the destination so the caller can reconcile,
-    /// cancel, or clean up the same operation later. Durable production
-    /// journal binding awaits the Host-state owner's preparation record
-    /// variant; until then the sink stays a port. Caller-channel
-    /// authentication beyond this installation binding stays parameterized
-    /// pending role-bound control contracts.
+    /// owner evidence through this composition's own durable Host journal sink.
+    /// The sink returns alongside the destination so the caller can reconcile,
+    /// cancel, or clean up the same operation later.
+    ///
+    /// The sink is
+    /// [`HostStatePreparationJournal`](crate::backup_preparation::HostStatePreparationJournal),
+    /// built here from `self.journal`: intent and result are written as the
+    /// owner's `BackupPreparationRecord` through the same single-writer
+    /// reconcile choke every other Host journal write uses, so a repeated
+    /// request resolves the original preparation across a process or Host
+    /// restart instead of starting a second one. The port deliberately does not
+    /// accept a caller-supplied sink, which would let a caller choose how
+    /// durable this operation's admission is. Caller-channel authentication
+    /// beyond this installation binding stays parameterized pending
+    /// role-bound control contracts.
     ///
     /// # Errors
     ///
     /// Returns [`PreparationError`](crate::backup_preparation::PreparationError)
     /// when the caller gate, lease/installation binding, owner evidence,
     /// admission, or journal persistence fails closed.
-    pub fn prepare_backup_destination<J: crate::backup_preparation::PreparationJournal>(
+    pub fn prepare_backup_destination(
         &self,
-        journal: J,
         caller: &crate::backup_preparation::BackupCallerAuth,
         request: &crate::backup_preparation::PresentedPreparationRequest,
     ) -> Result<
         (
-            crate::backup_preparation::DelegatedPreparation<J>,
+            crate::backup_preparation::DelegatedPreparation<
+                crate::backup_preparation::HostStatePreparationJournal<'_>,
+            >,
             crate::backup_preparation::PreparedDestination,
         ),
         crate::backup_preparation::PreparationError,
     > {
-        use crate::backup_preparation::{DelegatedPreparation, OwnerEvidence, PreparationError};
+        use crate::backup_preparation::{
+            DelegatedPreparation, HostStatePreparationJournal, OwnerEvidence, PreparationError,
+        };
         caller.authenticate_for_owner(
             &self.owner_lease,
             self.launch_options.installation(),
@@ -5725,7 +5736,7 @@ impl HostComposition {
                 reason: "owner registry moved between inspection and preparation".to_owned(),
             });
         }
-        let mut sink = DelegatedPreparation::new(journal);
+        let mut sink = DelegatedPreparation::new(HostStatePreparationJournal::new(&self.journal));
         let prepared = sink.prepare(&evidence, request)?;
         Ok((sink, prepared))
     }
@@ -5939,14 +5950,15 @@ impl HostComposition {
     /// Returns [`PreparationError`](crate::backup_preparation::PreparationError)
     /// when the caller gate, lease/installation binding, owner evidence,
     /// admission, or journal persistence fails closed.
-    pub fn backup_dispatch_prepare<J: crate::backup_preparation::PreparationJournal>(
+    pub fn backup_dispatch_prepare(
         &self,
-        journal: J,
         caller: &crate::backup_preparation::BackupCallerAuth,
         request: &crate::backup_preparation::PresentedPreparationRequest,
     ) -> Result<
         (
-            crate::backup_preparation::DelegatedPreparation<J>,
+            crate::backup_preparation::DelegatedPreparation<
+                crate::backup_preparation::HostStatePreparationJournal<'_>,
+            >,
             crate::backup_preparation::PreparedDestination,
         ),
         crate::backup_preparation::PreparationError,
@@ -5962,7 +5974,7 @@ impl HostComposition {
         // preparation must resolve without cutover admission, cutover with
         // it, and rehearsal completion to no entry.
         Self::validate_backup_dispatch_prepare_routing(Self::register_backup_dispatch());
-        let prepared = self.prepare_backup_destination(journal, caller, request)?;
+        let prepared = self.prepare_backup_destination(caller, request)?;
         host_terminal.disarm();
         Ok(prepared)
     }
@@ -6153,8 +6165,17 @@ impl HostComposition {
         // history claim is gated by a coherence proof that does not cover the
         // observation it gates. This is the same stale-currency defect
         // `read_cutover_disposition` already closed on the status side.
-        let retirement =
-            crate::backup_cutover::resolve_cutover_retirement(self, &durable, request, None)?;
+        // The same status read model the disposition port uses, so this
+        // post-commit reconciliation names its operation through one
+        // `CutoverReadback` rather than through the whole admitted body. It
+        // takes no admission-bearing field with it.
+        let status_readback = crate::backup_cutover::CutoverReadback::from_request(request);
+        let retirement = crate::backup_cutover::resolve_cutover_retirement(
+            self,
+            &durable,
+            &status_readback,
+            None,
+        )?;
         // A failed READ is a failure, never a concurrency fact: it is propagated
         // with the same error the surrounding reads use, so it can never be
         // reported as owner movement.
@@ -6175,7 +6196,7 @@ impl HostComposition {
             }
         };
         let reconciled = reconcile_cutover_outcome(
-            request,
+            &status_readback,
             durable.pending_cutover.as_ref(),
             readback.committed_cutover_activation(),
             readback.active_generation(),
@@ -6237,8 +6258,19 @@ impl HostComposition {
         // leaf's read-failure observation stays nonterminal beneath it.
         let mut host_terminal =
             HostTerminalGuard::armed(BOUNDARY_BACKUP_CUTOVER_DISPOSITION_TERMINAL);
-        let outcome =
-            crate::backup_cutover::read_cutover_disposition(self, request, retirement_receipt)?;
+        // The status read model consumes only the six bindings a disposition
+        // projection reads, so the admitted body's envelope, admission receipt,
+        // archive digest/class, activation fence and recovery evidence are
+        // deliberately NOT passed into it: reading a historical result must
+        // not reopen execution admission. The diagnostic token names this
+        // contour and selects no branch.
+        let readback = crate::backup_cutover::CutoverReadback::from_request(request);
+        let outcome = crate::backup_cutover::read_cutover_disposition(
+            self,
+            crate::backup_cutover::READ_DISPOSITION_OP,
+            &readback,
+            retirement_receipt,
+        )?;
         host_terminal.disarm();
         Ok(outcome)
     }
@@ -7589,10 +7621,14 @@ impl HostComposition {
             None => PlatformHandle::new("0".repeat(64))
                 .map_err(|error| HostError::Platform(error.to_string()))?,
         };
-        let current_kernel =
-            self.journal.snapshot()?.kernel.clone().ok_or_else(|| {
-                HostError::ProcessContour("no active Kernel to restart".to_owned())
-            })?;
+        // One snapshot supplies both the authorizing record and the retained
+        // record-bound config approvals the shared restart gate joins them
+        // with, so the gate never mixes records from two different reads.
+        let journal_state = self.journal.snapshot()?;
+        let current_kernel = journal_state
+            .kernel
+            .ok_or_else(|| HostError::ProcessContour("no active Kernel to restart".to_owned()))?;
+        let readiness_observations = journal_state.readiness_observations;
         if current_kernel.state != KernelActivationState::Active {
             return Err(HostError::ProcessContour(
                 "Kernel is not Active; restart requires Active".to_owned(),
@@ -7605,11 +7641,12 @@ impl HostComposition {
         }
         // I1.9 A1: this explicit restart is permitted only when the valid
         // journal record binds the approved relaunch artifact and carries
-        // the full process lineage for it, the relaunch config is the
-        // approved config, and the record is owned by the current activation
-        // fence. The gate runs before termination destroys evidence, so a
-        // missing or unbound record refuses the restart as manual recovery
-        // instead of relaunching first.
+        // the full process lineage for it, the journal's own record-bound
+        // approval binds the approved config to that exact record, the
+        // relaunch config is the approved config, and the record is owned by
+        // the current activation fence. The gate runs before termination
+        // destroys evidence, so a missing or unbound record refuses the
+        // restart as manual recovery instead of relaunching first.
         let (kernel_artifact, _) = active_manifest
             .host_child_artifact_digests()
             .map_err(|e| HostError::ProcessContour(e.to_string()))?;
@@ -7621,6 +7658,7 @@ impl HostComposition {
         })?;
         require_journal_kernel_restart_record(
             &current_kernel,
+            &readiness_observations,
             kernel_artifact,
             &active_manifest.config_digest,
             &materialized_config_digest,
@@ -9162,9 +9200,11 @@ impl HostComposition {
         // The corroboration lives in the projection, not here, and the value is
         // deliberately not consumed by this caller. The observed artifact is
         // the `observe_cutover_progress` record the projection emits, and that
-        // projection resolves the disposition from BOTH owners on one
-        // coherence-bracketed read, applying the same arms in the same order
-        // `reconcile_cutover_outcome` applies to the same durable state: a
+        // projection is the SHARED status read model: it resolves the
+        // disposition from BOTH owners on one coherence-bracketed read, through
+        // the same journal-owner retirement lookup and the same
+        // `reconcile_cutover_outcome` arms the separately admitted
+        // `backup_dispatch_cutover_disposition` port projects through, so a
         // retained intent whose target is the active generation is reported
         // `RetirementPending` only when the registry's own operation-bound
         // receipt names this operation, and `Unknown` otherwise; a retained
@@ -9174,12 +9214,10 @@ impl HostComposition {
         // So a journal slot alone cannot emit `Prepared` for a state the full
         // owner read model calls ambiguous, and cannot emit a settlement claim
         // either — which is what "nothing downstream to correct" means here: no
-        // observed word overstates what its two owners proved. It does NOT mean
-        // the two paths are word-identical: the resolved retirement evidence is
-        // not an input to this read, so a cutover the retirement owner has
-        // already settled is `Reconciled` on the two-owner read model and only
-        // its recorded `Committed` word here. Nothing here needs the returned
-        // outcome, and reading it would add a gate this contour does not have.
+        // observed word overstates what its two owners proved, and one durable
+        // state is no longer described two different ways. Nothing here needs
+        // the returned outcome, and reading it would add a gate this contour
+        // does not have.
         let _retained_cutover = crate::backup_cutover::observe_retained_cutover_disposition(self);
         let active =
             self.registry.active().cloned().ok_or_else(|| {
@@ -9214,24 +9252,35 @@ impl HostComposition {
             self.readiness_gate.branch_degraded();
         }
         if kernel_requires_activation {
-            let current = self.journal.snapshot()?.kernel.ok_or_else(|| {
+            // One snapshot supplies both the authorizing record and the
+            // retained record-bound config approvals the shared restart gate
+            // joins them with, so the gate never mixes records from two
+            // different reads.
+            let journal_state = self.journal.snapshot()?;
+            let current = journal_state.kernel.ok_or_else(|| {
                 HostError::OwnerLeaseRecovery(
                     "dead Kernel branch has no durable Kernel record".to_owned(),
                 )
             })?;
+            let readiness_observations = journal_state.readiness_observations;
             // I1.9 A1: a Host-managed dependency (Kernel) restarts only when
             // the valid journal record binds this relaunch's approved
             // artifact and carries the full process lineage for it, the
-            // relaunch config is the approved config, and the record is
-            // owned by the current activation fence. The shared choke
-            // revalidates the original recorded record, refuses an artifact
-            // or config mismatch as manual recovery instead of relaunching
-            // an unapproved image or config, refuses a record without
-            // PID/Job lineage instead of reconstructing it, and refuses a
-            // stale-activation record instead of restarting from prior
-            // lineage. The snapshot above already fails a corrupt journal.
+            // journal's own record-bound approval binds the approved config
+            // to that exact record, the relaunch config is the approved
+            // config, and the record is owned by the current activation
+            // fence. The shared choke revalidates the original recorded
+            // record, refuses an artifact or config mismatch as manual
+            // recovery instead of relaunching an unapproved image or config,
+            // refuses a record without PID/Job lineage instead of
+            // reconstructing it, refuses a record whose approved config is
+            // not bound to it in the journal instead of trusting a live
+            // manifest, and refuses a stale-activation record instead of
+            // restarting from prior lineage. The snapshot above already fails
+            // a corrupt journal.
             require_journal_kernel_restart_record(
                 &current,
+                &readiness_observations,
                 kernel_artifact,
                 &active.manifest.config_digest,
                 &materialized_config_digest,

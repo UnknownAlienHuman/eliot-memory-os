@@ -9,9 +9,9 @@ use eliot_host_state::{
     ActivationState, AppendReceipt, CleanMarker, DrainCommitRecord, EliotActivationRecord,
     EpochTransition, FailureRecoveryDirective, HostInstallationEpoch, HostKernelStoreLineage,
     HostState, HostStateJournalService, HostStateRecord, JOURNAL_VERSION, JournalBackend,
-    JournalError, JournalManifest, KernelJobBinding, KernelRecord, LifecycleTimestamps,
-    PriorKernelDisposition, PriorKernelSource, ReadinessEvidence, ReconcileOutcome,
-    WakeDisposition,
+    JournalError, JournalManifest, KernelJobBinding, KernelReadinessObservationRecord,
+    KernelRecord, LifecycleTimestamps, PriorKernelDisposition, PriorKernelSource,
+    ReadinessEvidence, ReconcileOutcome, WakeDisposition, record_checksum,
 };
 #[cfg(windows)]
 use eliot_host_state::{StoreRebindRecord, StoreRebindState};
@@ -122,8 +122,9 @@ pub(super) fn terminated_prior_kernel(
 
 /// I1.9 A1 gate: permits a Host-managed Kernel restart only when the valid
 /// journal `Kernel` record carries this relaunch's approved artifact and
-/// full process lineage for that approval, the relaunch config is the
-/// approved config, and the record is owned by the current activation fence.
+/// full process lineage for that approval, the journal itself binds the
+/// approved config to that exact record, the relaunch config is the approved
+/// config, and the record is owned by the current activation fence.
 ///
 /// The record is the original journal recording: it is revalidated with the
 /// existing [`KernelRecord::validate`], never replaced by a freshly
@@ -131,23 +132,44 @@ pub(super) fn terminated_prior_kernel(
 /// the exact digest the relaunch is about to start; the required lineage is
 /// the record's own generation/Job/process binding (`kernel_generation`,
 /// `candidate_job_binding`, `process`), which must be present in that same
-/// record. The approved config bound here joins the relaunch descriptor to
-/// the active manifest: `materialized_config_digest` (the Phase-B config the
-/// relaunch will actually start) must equal `approved_config` (the active
-/// manifest's approved config digest), mirroring the Store leg's
-/// `approved_config_hash` requirement digest bind. The fence bind requires
-/// the record's `RecordFence` to equal the fence recomputed from the
-/// current Host installation epoch, activation id and activation generation,
-/// so a stale-activation record cannot authorize a restart. Absence,
-/// invalidity, an artifact or config mismatch, missing lineage, or a foreign
-/// fence refuses the restart as manual recovery instead of reconstructing or
-/// approximating state from a live PID or a directory listing.
+/// record.
+///
+/// The approved CONFIG is bound through the journal's own record-bound
+/// approval, not through two live values. I1.9 requires the journal to hold
+/// "approved artifact/config hashes"; the record that carries the approved
+/// config for one exact Kernel record is
+/// [`KernelReadinessObservationRecord`], whose `config_digest` is admitted
+/// only together with the `active_kernel_record_checksum` of the record that
+/// was active when the observation was appended. This gate therefore joins
+/// the retained observations to the retained record with the same
+/// record-checksum-to-config join the Watchdog lease load already performs:
+/// the authorizing record's journal checksum is recomputed from the journal's
+/// own record, and the ORIGINAL recorded observation — never a copy of it — is
+/// admitted through [`KernelReadinessObservationRecord::validate_against`],
+/// which runs that record's own `validate()` and refuses an observation that
+/// is not bound to this exact record, fence, Job root and authority epoch.
+/// An observation bound to a superseded record, a missing observation, an
+/// observation naming a different approved config, or a valid but unrelated
+/// current manifest therefore refuses the restart instead of authorizing it.
+///
+/// The remaining config leg joins the relaunch descriptor to the active
+/// manifest: `materialized_config_digest` (the Phase-B config the relaunch
+/// will actually start) must equal `approved_config` (the active manifest's
+/// approved config digest), mirroring the Store leg's `approved_config_hash`
+/// requirement digest bind. The fence bind requires the record's
+/// `RecordFence` to equal the fence recomputed from the current Host
+/// installation epoch, activation id and activation generation, so a
+/// stale-activation record cannot authorize a restart. Absence, invalidity, an
+/// artifact or config mismatch, missing lineage, or a foreign fence refuses
+/// the restart as manual recovery instead of reconstructing or approximating
+/// state from a live PID or a directory listing.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the restart join keeps retained approval, relaunch descriptor and owner fence explicit so no binding is inferred"
+    reason = "the restart join keeps retained approval, record-bound config approval, relaunch descriptor and owner fence explicit so no binding is inferred"
 )]
 pub(super) fn require_journal_kernel_restart_record(
     current: &KernelRecord,
+    readiness_observations: &[KernelReadinessObservationRecord],
     kernel_artifact: &PlatformHandle,
     approved_config: &PlatformHandle,
     materialized_config_digest: &PlatformHandle,
@@ -166,15 +188,21 @@ pub(super) fn require_journal_kernel_restart_record(
                 .to_owned(),
         ));
     }
-    if *approved_config != *materialized_config_digest {
-        return Err(HostError::RecoveryRequired(
-            "Kernel restart refused: relaunch config is not the approved config; manual recovery required"
-                .to_owned(),
-        ));
-    }
     if current.candidate_job_binding.is_none() || current.process.is_none() {
         return Err(HostError::RecoveryRequired(
             "Kernel restart refused: durable Kernel record carries no PID/Job lineage for the approved artifact; manual recovery required"
+                .to_owned(),
+        ));
+    }
+    if !journal_record_binds_approved_config(current, readiness_observations, approved_config) {
+        return Err(HostError::RecoveryRequired(
+            "Kernel restart refused: no valid HostStateJournal record binds the approved config to the authorizing Kernel record; manual recovery required"
+                .to_owned(),
+        ));
+    }
+    if *approved_config != *materialized_config_digest {
+        return Err(HostError::RecoveryRequired(
+            "Kernel restart refused: relaunch config is not the approved config; manual recovery required"
                 .to_owned(),
         ));
     }
@@ -185,6 +213,36 @@ pub(super) fn require_journal_kernel_restart_record(
         ));
     }
     Ok(())
+}
+
+/// Reports whether the retained journal state binds `approved_config` to
+/// `current` as one record-bound approval pair.
+///
+/// The binding is proved by the journal's own owner: the authorizing record's
+/// journal checksum is recomputed from the record the journal itself retained,
+/// and every retained observation is admitted through the existing
+/// [`KernelReadinessObservationRecord::validate_against`], which revalidates
+/// the ORIGINAL recorded observation and refuses any observation whose
+/// recorded `active_kernel_record_checksum`, fence, Job root, process or
+/// authority epoch is not this exact record's. A record without such an
+/// observation, and an observation that approves a different config, are both
+/// unbound — no checksum is recomputed over a held copy of the observation and
+/// no approval is inferred from a manifest, a live process or a directory.
+fn journal_record_binds_approved_config(
+    current: &KernelRecord,
+    readiness_observations: &[KernelReadinessObservationRecord],
+    approved_config: &PlatformHandle,
+) -> bool {
+    let Ok(authorizing_checksum) = record_checksum(&HostStateRecord::Kernel(current.clone()))
+    else {
+        return false;
+    };
+    readiness_observations.iter().any(|observation| {
+        observation
+            .validate_against(current, &authorizing_checksum)
+            .is_ok()
+            && observation.config_digest == *approved_config
+    })
 }
 
 /// The proven ingress one fresh activation generation is created for.

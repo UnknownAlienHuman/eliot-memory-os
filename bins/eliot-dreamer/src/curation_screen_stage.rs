@@ -16,6 +16,7 @@
 
 use eliot_contracts::{ReceiptId, RequestId};
 use eliot_dreamer_contracts::{ContractViolation, JobClass, ScreenBinding, ScreenState};
+use serde::{Deserialize, Serialize};
 
 use crate::admitted_material::sha_hex;
 use crate::controller::verify_admitted_binding;
@@ -80,6 +81,127 @@ pub(crate) fn screenable_targets(job: &DreamJobInput) -> Vec<String> {
     targets
 }
 
+/// Owner protection class this screen can establish for an admitted member.
+///
+/// The taxonomy is closed and deliberately smallest sufficient: the A-20
+/// screen derives a class only from material the Governor admitted WITH the
+/// job, so it can never assert a class no owner declared. The owner memory
+/// curation contract recognises a wider taxonomy
+/// (`eliot_memory_curation_contracts::ProtectionClass`); only the contested-
+/// material class is derivable from the Dreamer admission surface, and the
+/// wire spelling is stated rather than derived so it stays comparable with the
+/// owner contract.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ProtectionClass {
+    /// The owner admitted this member as contested: it is named in the job's
+    /// `conflicts_and_unknowns` declaration.
+    UnresolvedConflict,
+}
+
+/// Closed protection decision for one admitted member.
+///
+/// There is no `Unprotected` arm. The Dreamer admission surface carries no
+/// owner *clearance* input, and absence of a conflict declaration is not
+/// owner-verified evidence that nothing protects the member. Claiming
+/// clearance would fabricate the one fact A14.4 forbids inferring from
+/// popularity, so the fail-closed `Unknown` is the only non-protected verdict
+/// this screen may emit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ProtectionDecision {
+    /// The owner declared positive protection evidence for this member.
+    Protected,
+    /// No protection evidence was admitted either way; clearance is not claimed.
+    Unknown,
+}
+
+/// One member-scoped protection assessment produced by the owner screen.
+///
+/// A finding, not a verdict: it records what the admission said about this
+/// exact member and never authorizes a lifecycle transition.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CurationProtection {
+    /// Screened member this assessment names.
+    pub member_id: String,
+    /// Protection class the owner declaration supports, if any.
+    pub class: Option<ProtectionClass>,
+    /// Closed protection decision derived from that declaration.
+    pub decision: ProtectionDecision,
+    /// The exact admitted owner entry that produced the assessment, carried
+    /// verbatim so the receipt cites owner material rather than a narration.
+    pub owner_reference: Option<String>,
+}
+
+/// Per-member protection assessments for one screened admission.
+///
+/// The denominator is the screen binding's own `screened_targets` list, so the
+/// assessment covers exactly the screened operation by construction rather
+/// than by a second caller-supplied copy of it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CurationProtectionSet {
+    /// Screened members these assessments cover, in binding order.
+    pub screened_targets: Vec<String>,
+    /// One assessment per screened member, in binding order.
+    pub members: Vec<CurationProtection>,
+}
+
+/// Derives the owner protection assessment for one screened Curation
+/// admission.
+///
+/// The rule is one line and reads only admitted material: a screened member
+/// the owner also named in [`DreamJobInput::conflicts_and_unknowns`] is
+/// `Protected` under [`ProtectionClass::UnresolvedConflict`], and every other
+/// screened member is `Unknown` because the admission carried no protection
+/// evidence either way. The exact admitted entry is carried as the
+/// `owner_reference` so a receipt cites the owner's own words.
+///
+/// A14.4 is respected by construction: the rule reads no use count, no
+/// retrieval frequency, and no popularity, so low use cannot reduce a
+/// member's assessed support, frequent retrieval cannot strengthen it, and a
+/// contested minority member is recorded rather than dropped. Assessment
+/// never removes a member from the screened set — it only annotates it, so
+/// the Curation route can carry the finding instead of losing the evidence.
+///
+/// The denominator is [`ScreenBinding::screened_targets`] itself, so this
+/// needs no fetch, no ranking, and no invented state, and a screened member
+/// can never be left unassessed.
+pub(crate) fn protection_for_admitted(
+    job: &DreamJobInput,
+    screen: &ScreenBinding,
+) -> CurationProtectionSet {
+    let members = screen
+        .screened_targets
+        .iter()
+        .map(|member_id| {
+            let declared = job
+                .conflicts_and_unknowns
+                .iter()
+                .find(|entry| *entry == member_id);
+            match declared {
+                Some(reference) => CurationProtection {
+                    member_id: member_id.clone(),
+                    class: Some(ProtectionClass::UnresolvedConflict),
+                    decision: ProtectionDecision::Protected,
+                    owner_reference: Some(reference.clone()),
+                },
+                None => CurationProtection {
+                    member_id: member_id.clone(),
+                    class: None,
+                    decision: ProtectionDecision::Unknown,
+                    owner_reference: None,
+                },
+            }
+        })
+        .collect();
+    CurationProtectionSet {
+        screened_targets: screen.screened_targets.clone(),
+        members,
+    }
+}
+
 /// Derives the closed owner screen binding for one admitted job, if any.
 ///
 /// Non-Curation classes need no screen and yield `Ok(None)` with zero screen
@@ -110,6 +232,10 @@ pub(crate) fn screenable_targets(job: &DreamJobInput) -> Vec<String> {
 /// caller routes through ([`screen_admitted_targets`] here,
 /// `StructuredModelDraft::validate` in the model stage), keeping exactly one owner
 /// call per admission per stage.
+///
+/// `screened_targets` is also the denominator [`protection_for_admitted`]
+/// assesses, so the protection finding the receipt carries is bound to exactly
+/// the members this binding admitted rather than to a parallel list.
 pub(crate) fn screen_binding_for(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,

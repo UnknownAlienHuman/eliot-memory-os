@@ -39,7 +39,7 @@ use eliot_protocol::{
     AgentHostRequestFailure, EncodingProfile, FINISH_INVOKE_PAYLOAD_SCHEMA_ID, Frame, FrameKind,
     HARD_STRUCTURED_RESPONSE_BYTES, HOST_REQUEST_RESULT_BODY_WIRE_ID, HOST_REQUEST_WIRE_ID,
     HostRequestAdmissionReceipt, HostRequestEnvelope, HostRequestIdentity, HostRequestKind,
-    HostRequestResultBody, MessageType, ProtocolPayload, ProtocolVersion,
+    HostRequestResultBody, HostRequestResultClass, MessageType, ProtocolPayload, ProtocolVersion,
     REACTIVE_RESTORE_CAPABILITY, REACTIVE_RESTORE_OPERATION, REACTIVE_RESTORE_PAYLOAD_SCHEMA_ID,
     ReactiveRestoreQuery, ReactiveRestoreReply, RequestIdentity, host_request_operation_id,
     restore_correlation,
@@ -340,6 +340,45 @@ pub(crate) struct AdmittedReplyView {
     /// Exact payload commitment on full rows.
     #[serde(default)]
     pub(crate) payload_digest: Option<String>,
+    /// Retained result lineage the Kernel bound to this row's own result
+    /// (issue #1809 item 7). Carried, not interpreted: the bridge reads the
+    /// declared class so a delivery consumer can tell an existing evidence
+    /// read from a newly produced candidate, and refuses to present any other
+    /// class as an admitted record. `None` on a row that predates retained
+    /// lineage, which stays an explicit unknown rather than defaulting to
+    /// allowed.
+    #[serde(default)]
+    pub(crate) result_lineage: Option<RetainedResultLineageView>,
+}
+
+/// Tolerant read-only view of the retained result lineage the Kernel bound to
+/// one durable row (issue #1809).
+///
+/// Deliberately minimal: the bridge needs the class and the semantic receipt
+/// reference, nothing else. Every other lineage field stays owned by the
+/// Kernel/ORS record and is not copied into the bridge. The `output_digest` is
+/// NOT re-checked here — the ORS row's own `validate` already compared the
+/// originally recorded `output_digest` with the originally recorded
+/// `result_digest`, and recomputing a checksum over the bytes the bridge holds
+/// would replace that proof with a fresh one instead of checking it.
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct RetainedResultLineageView {
+    /// Which kind of record these retained bytes are. Unknown for a row whose
+    /// lineage was written before the class existed; never an admitted class.
+    #[serde(default = "unclassified_result_class")]
+    pub(crate) result_class: HostRequestResultClass,
+    /// Exact admitted semantic receipt, present only for
+    /// [`HostRequestResultClass::CanonicalWriteReceipt`].
+    #[serde(default)]
+    pub(crate) semantic_receipt_ref: Option<String>,
+}
+
+/// Missing class means the row predates the field: unknown provenance, which is
+/// exactly [`HostRequestResultClass::Unclassified`] and never an admitted
+/// class. The bridge repeats the protocol crate's own defaulting rule instead of
+/// treating an absent field as a class it may pick.
+const fn unclassified_result_class() -> HostRequestResultClass {
+    HostRequestResultClass::Unclassified
 }
 
 /// Mirror of the kernel-owned durable host-request states for outcome mapping.
@@ -721,6 +760,26 @@ impl KernelHostRequestClient {
             )
         {
             return Err(resource_source_refused());
+        }
+        // A resource preview or expansion re-discloses the exact retained bytes
+        // under a different, longer-lived surface, so the owner must have named
+        // what those bytes are. An absent lineage or an `Unclassified` one is an
+        // explicit unknown about the result's provenance, and an unknown
+        // provenance is refused here rather than expanded on the strength of a
+        // matching digest. Note what this does NOT do: it does not treat a
+        // named class as permission to disclose. Disclosure to this recipient
+        // is the disclosure owner's decision, which has no producer on this
+        // path; the check below only refuses the case where the owner recorded
+        // nothing at all.
+        match record
+            .result_lineage
+            .as_ref()
+            .map(|lineage| lineage.result_class)
+        {
+            Some(HostRequestResultClass::Unclassified) | None => {
+                return Err(resource_source_refused());
+            }
+            Some(_) => {}
         }
         Ok((facts, record))
     }
@@ -2340,6 +2399,23 @@ fn decode_record_view(
         }
         .validate()
         .ok()?;
+        // The retained class the Kernel bound to THIS row is checked against
+        // the exact result pair on the same row. A class claimed for one
+        // result must not be adopted by another, and a canonical class without
+        // its admitted receipt is refused here rather than presented to a
+        // consumer as an admitted record. The digest comparison below uses the
+        // ORIGINALLY RECORDED values on the row; nothing is recomputed.
+        if let Some(lineage) = &record.result_lineage {
+            let claimed = match lineage.result_class {
+                HostRequestResultClass::CanonicalWriteReceipt => {
+                    lineage.semantic_receipt_ref.is_some()
+                }
+                _ => lineage.semantic_receipt_ref.is_none(),
+            };
+            if !claimed {
+                return None;
+            }
+        }
     }
     Some(record)
 }
@@ -3488,6 +3564,7 @@ mod tests {
             scope_ref: None,
             capability_ref: None,
             payload_digest: None,
+            result_lineage: None,
         };
         let (request_for_outcome, _, envelope_for_outcome) = test_envelope();
         let outcome_for = |state| {
@@ -3548,6 +3625,7 @@ mod tests {
             scope_ref: None,
             capability_ref: None,
             payload_digest: None,
+            result_lineage: None,
         };
         match submit_outcome(&receipt, &received, &request, &envelope) {
             Ok(HostInvocationPortOutcome::Responded {

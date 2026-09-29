@@ -157,20 +157,20 @@
     "qualification": "UNVALIDATED (I2.16, I0.5)",
     "reference_capsule_handle": "I2.20"
   },
-  "bound_contract_digest": "b22ea7d4c6a02095a319bf91f12525a1273682ec92717fd36bdb8bee3d58133d",
+  "bound_contract_digest": "9b2698ec5202c920f55bc7f7689115a41f3903f3bcd2876d34e09d2c07d4d6ee",
   "source_provenance": {
     "input_digests": {
       "workspace_manifest": {
         "path": "Cargo.toml",
-        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
       },
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
-        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
       },
       "architecture_boundaries": {
         "path": "config/architecture-boundaries.toml",
-        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
       },
       "logical_block_config": {
         "path": "docs/code-navigation/logical-blocks.toml",
@@ -182,7 +182,7 @@
       },
       "module_manifest": {
         "path": "crates/smart/eliot-dreamer-cycle/module.toml",
-        "sha256": "c170641c359f9b27e8cef11b498be1e3fb7a4d83e50e7e131e58da6c8cef9d13"
+        "sha256": "5cc2ca3ed104b8d25421fd786680d47ce5b5ab14862eacc65ac082007bb29156"
       },
       "selected_source": {
         "path_count": 11,
@@ -192,9 +192,9 @@
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "f2a300421ba9752270a9a1d63fa884e6068475546934781a0a3b493b747736a0",
+  "artifact_digest": "873fdce7b2ba13a27c6950d8cb7668526a754e29d324042f96184562fe563bb4",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "f2a300421ba97522"
+    "value": "873fdce7b2ba13a2"
   }
 }

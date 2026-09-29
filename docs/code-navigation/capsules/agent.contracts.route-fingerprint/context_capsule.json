@@ -28,9 +28,9 @@
   },
   "source_token_estimate": {
     "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
-    "source_stu": 75318,
+    "source_stu": 95562,
     "test_stu": 16784,
-    "selected_file_count": 8,
+    "selected_file_count": 10,
     "inline_cfg_test_modules": 1,
     "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
   },
@@ -45,17 +45,31 @@
       },
       {
         "path": "crates/agent/eliot-agent-api/src/host_event.rs",
-        "bytes": 59507,
-        "sha256": "99fcd8f54a1aff0ceecb86a38a379d0c2a937d8d3a6e8b9809211d82dc08982b",
-        "stu": 19836,
+        "bytes": 61506,
+        "sha256": "93caecc33a6a88ec38560c8a0409d17c71f8fe62d469b8d37ee2e80960cd149e",
+        "stu": 20502,
         "inline_cfg_test": false
       },
       {
         "path": "crates/agent/eliot-agent-api/src/lib.rs",
-        "bytes": 103329,
-        "sha256": "7873a0ead4b9b602fe3bdf7fd58fbd3426dda42af9a2dc56b05a3a93fefdd175",
-        "stu": 34443,
+        "bytes": 106273,
+        "sha256": "51efb15b3271c3e22b74d48f2c910f16cbb8a417d63ff2f77311c4e7d0be09c5",
+        "stu": 35425,
         "inline_cfg_test": true
+      },
+      {
+        "path": "crates/agent/eliot-agent-api/src/provider_translation.rs",
+        "bytes": 34732,
+        "sha256": "507fa6a5292ff37f18e58571c246cb9084988271a34736c0366dc1e444ea05d0",
+        "stu": 11578,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/agent/eliot-agent-api/src/provider_translation/transformations.rs",
+        "bytes": 21058,
+        "sha256": "9e0d485d9b86338bd23d0497aa834f95ab0c066611ff16aaee79a01bac4bb385",
+        "stu": 7020,
+        "inline_cfg_test": false
       },
       {
         "path": "crates/agent/eliot-agent-api/src/route_receipts.rs",
@@ -109,11 +123,12 @@
         ]
       }
     ],
-    "source_selection_digest": "ec8c29a2f2a83d3cbfe2d002d55e930a9f2aa8126d9080e0241a27e9cfa12182"
+    "source_selection_digest": "53c52c5c4a56953335d184f0de87bec31abba8abd64dd0f3edfc62cae0abfdb6"
   },
   "one_hop_providers": [
     "eliot-agent-contracts",
     "eliot-contracts",
+    "eliot-observation-contracts",
     "eliot-receipts",
     "schemars",
     "serde",
@@ -170,20 +185,20 @@
     "qualification": "UNVALIDATED (I2.16, I0.5)",
     "reference_capsule_handle": "I2.20"
   },
-  "bound_contract_digest": "caa29f0c1cacb2c2cdb71d38b63b020c78ff0d4d7bd8ac54b35534c19385e4d7",
+  "bound_contract_digest": "8c477d79bfd9873899b3f772591aa645a37fe99094bb6c86a57cf8293c36ffdd",
   "source_provenance": {
     "input_digests": {
       "workspace_manifest": {
         "path": "Cargo.toml",
-        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
       },
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
-        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
       },
       "architecture_boundaries": {
         "path": "config/architecture-boundaries.toml",
-        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
       },
       "logical_block_config": {
         "path": "docs/code-navigation/logical-blocks.toml",
@@ -191,20 +206,20 @@
       },
       "package_manifest": {
         "path": "crates/agent/eliot-agent-api/Cargo.toml",
-        "sha256": "e6bf7648ebee956174c7f1bcbc1c656f5853e0e27a0c5ddbe0d05c4758714ce8"
+        "sha256": "bfc80b1bc9e2205399a7defc5abbdf81466d4ba2a8426f9d5c9d17c36a4294a2"
       },
       "module_manifest": null,
       "selected_source": {
-        "path_count": 8,
-        "sha256": "ec8c29a2f2a83d3cbfe2d002d55e930a9f2aa8126d9080e0241a27e9cfa12182"
+        "path_count": 10,
+        "sha256": "53c52c5c4a56953335d184f0de87bec31abba8abd64dd0f3edfc62cae0abfdb6"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "46d1ff48b08ca8a0bc2b917455903cd21b26ffbdc1f519f4102399048ec0112f",
+  "artifact_digest": "ce0c8b2def970e49bfb331e7ec55f6c9ffbe88222f69b032a02710e5c6e41014",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "46d1ff48b08ca8a0"
+    "value": "ce0c8b2def970e49"
   }
 }

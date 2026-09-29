@@ -92,6 +92,7 @@ mod negative_memory_activation;
 mod negative_memory_context;
 mod negative_memory_gate;
 mod observation_reconciliation;
+pub mod opencode_action_gate;
 mod operator_intent;
 mod operator_reconciliation;
 mod owner_closure_feed;
@@ -195,6 +196,11 @@ pub use migration_inventory::{
 pub use observation_reconciliation::{
     GovernorObservationReconciliation, WatchdogAdmittedEntry, WatchdogEntryAdmission,
     WatchdogEntryKind,
+};
+pub use opencode_action_gate::{
+    GovernorActionGateRefusal, GovernorActionGateRequest, GovernorActionGateVerdict,
+    MUTATION_GATE_REQUIRES_COMPLETE, MUTATION_GATE_REQUIRES_ENFORCED, decide_pre_effect,
+    decision_commitment,
 };
 pub use operator_intent::{
     OPERATOR_INTENT_CONTRACT_NAME, OPERATOR_INTENT_CONTRACT_VERSION, OperatorIntentApprovals,

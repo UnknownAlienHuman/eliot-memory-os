@@ -10,9 +10,10 @@
 //! the issuer spends is projected into the same atomic snapshot publication as
 //! the registration state, and a restarted broker re-seeds its issuer from that
 //! recovered ledger before `self_register` can mint. A restart therefore
-//! continues from the protected launch/caller identity plus a *new*
-//! registration operation and never revives a historical request id,
-//! cancellation id, or idempotency key.
+//! continues from the protected launch/caller identity plus the exact current
+//! registration. It permits replay only for an unexpired original identity
+//! under that same registration and fence; every other historical request id,
+//! cancellation id, and idempotency key stays reserved.
 
 #![forbid(unsafe_code)]
 
@@ -506,17 +507,14 @@ struct IssuedIdentityLedger {
 }
 
 impl IssuedOperationIdentityLedger for IssuedIdentityLedger {
-    fn issued_operation_identities(&self) -> Vec<IssuedOperationIdentity> {
+    fn issued_operation_identities(&self) -> Result<Vec<IssuedOperationIdentity>, String> {
         match self.issuer.lock() {
-            Ok(issuer) => issuer
+            Ok(issuer) => Ok(issuer
                 .issued_identities()
                 .into_iter()
                 .map(IssuedOperationIdentity::from)
-                .collect(),
-            // A poisoned identity lock must not silently drop the spent
-            // identities from the durable snapshot; returning the empty
-            // projection makes the next issuance fail closed instead.
-            Err(_) => Vec::new(),
+                .collect()),
+            Err(_) => Err("broker identity lock is poisoned".to_owned()),
         }
     }
 }
@@ -524,14 +522,19 @@ impl IssuedOperationIdentityLedger for IssuedIdentityLedger {
 impl From<DurableIssuedIdentity> for IssuedOperationIdentity {
     fn from(issued: DurableIssuedIdentity) -> Self {
         Self {
+            schema_version: issued.schema_version,
             operation: issued.operation,
             canonical_digest: issued.canonical_digest,
             request_id: issued.request_id,
             idempotency_key: issued.idempotency_key,
             cancellation_id: issued.cancellation_id,
             deadline_unix_ms: issued.deadline_unix_ms,
+            registration_digest: issued.registration_digest,
+            user_broker_epoch: issued.user_broker_epoch,
+            request_identity: issued.request_identity,
             issued_at_ms: issued.issued_at_ms,
             caller_request_id: issued.caller_request_id,
+            caller_idempotency_key: issued.caller_idempotency_key,
         }
     }
 }
@@ -539,14 +542,19 @@ impl From<DurableIssuedIdentity> for IssuedOperationIdentity {
 impl From<&IssuedOperationIdentity> for DurableIssuedIdentity {
     fn from(issued: &IssuedOperationIdentity) -> Self {
         Self {
+            schema_version: issued.schema_version,
             operation: issued.operation.clone(),
             canonical_digest: issued.canonical_digest.clone(),
             request_id: issued.request_id.clone(),
             idempotency_key: issued.idempotency_key.clone(),
             cancellation_id: issued.cancellation_id.clone(),
             deadline_unix_ms: issued.deadline_unix_ms,
+            registration_digest: issued.registration_digest.clone(),
+            user_broker_epoch: issued.user_broker_epoch,
+            request_identity: issued.request_identity.clone(),
             issued_at_ms: issued.issued_at_ms,
             caller_request_id: issued.caller_request_id.clone(),
+            caller_idempotency_key: issued.caller_idempotency_key.clone(),
         }
     }
 }
@@ -1187,6 +1195,40 @@ impl BrokerComposition {
         Ok(Arc::new(Mutex::new(issuer)))
     }
 
+    fn restore_identity_issuer(
+        broker: &UserBroker,
+        issuer: &IssuerHandle,
+    ) -> Result<(), CompositionError> {
+        // Re-seed spent IDs before any Kernel operation can mint. Only the
+        // exact active registration can admit an original replay identity.
+        let restored_at = now_unix_ms()?;
+        let current_registration = broker
+            .registration()
+            .filter(|registration| {
+                registration.status == RegistrationStatus::Active
+                    && restored_at < registration.expires_at
+            })
+            .cloned();
+        let mut identity = issuer.lock().map_err(|_| CompositionError::KernelLock)?;
+        if let Some(registration) = current_registration.as_ref() {
+            let epoch = serde_json::to_value(&registration.authority_epoch)
+                .map_err(|error| CompositionError::Launch(error.to_string()))?;
+            identity
+                .note_registration_binding(
+                    &registration.registration_digest,
+                    registration.user_broker_epoch,
+                    &epoch,
+                )
+                .map_err(|error| CompositionError::OperationIdentityLedger(error.to_string()))?;
+        }
+        for retained in broker.recovered_operation_identities() {
+            identity
+                .restore_issued(&DurableIssuedIdentity::from(&retained), restored_at)
+                .map_err(|error| CompositionError::OperationIdentityLedger(error.to_string()))?;
+        }
+        Ok(())
+    }
+
     fn start_with_ports(
         config: BrokerConfig,
         authority: Option<Box<dyn AuthorityPort>>,
@@ -1283,13 +1325,7 @@ impl BrokerComposition {
         // already bound to its exact operation, so replaying one is an
         // identity conflict rather than a fresh mint.  A retained row that
         // contradicts live state fails the whole composition closed.
-        let mut identity = issuer.lock().map_err(|_| CompositionError::KernelLock)?;
-        for retained in broker.recovered_operation_identities() {
-            identity
-                .restore_issued(&DurableIssuedIdentity::from(&retained))
-                .map_err(|error| CompositionError::OperationIdentityLedger(error.to_string()))?;
-        }
-        drop(identity);
+        Self::restore_identity_issuer(&broker, &issuer)?;
         let registration_digest = broker.registration_digest().map(ToOwned::to_owned);
         // The broker is its own failure domain: this process generation creates
         // one Job Object for itself and is assigned to it. Creation refuses an
@@ -1387,10 +1423,8 @@ impl BrokerComposition {
                 .broker
                 .register(declaration)
                 .map_err(CompositionError::Recovery)?;
-            let epoch = serde_json::to_value(&receipt.authority_epoch)
-                .map_err(|error| CompositionError::Launch(error.to_string()))?;
-            self.sync_authority_epoch(&epoch)?;
-            self.registration_digest = Some(receipt.registration_digest);
+            self.sync_registration_binding(&receipt)?;
+            self.registration_digest = Some(receipt.registration_digest.clone());
         }
         Ok(())
     }
@@ -1426,6 +1460,20 @@ impl BrokerComposition {
             Err(BrokerError::UnknownOutcome) => return Err(self.lost_operation_error()),
             Err(error) => return Err(CompositionError::Recovery(error)),
         };
+        let registration = self.broker.registration().cloned().ok_or_else(|| {
+            CompositionError::Launch("heartbeat lost its registration".to_owned())
+        })?;
+        if registration.status != RegistrationStatus::Active
+            || registration.registration_digest != receipt.registration_digest
+            || registration.user_broker_epoch != receipt.user_broker_epoch
+            || registration.fence_id != receipt.fence_id
+            || registration.expires_at != receipt.expires_at
+        {
+            return Err(CompositionError::Launch(
+                "heartbeat receipt differs from the current registration".to_owned(),
+            ));
+        }
+        self.sync_registration_binding(&registration)?;
         self.registration_digest = Some(receipt.registration_digest.clone());
         Ok(receipt)
     }
@@ -2276,15 +2324,24 @@ impl BrokerComposition {
         Ok(())
     }
 
-    /// Refreshes the issuer fence from a Kernel-issued registration
-    /// authority epoch, serialized as its exact JSON value. Only the
-    /// lineage-aware epoch moves; no scalar authority is copied into
-    /// broker-local state.
-    fn sync_authority_epoch(&self, epoch: &serde_json::Value) -> Result<(), CompositionError> {
+    /// Refreshes the issuer fence and retry generation from one validated
+    /// Kernel-issued registration receipt. The broker-local epoch is retained
+    /// as a distinct registration generation; only the lineage-aware epoch is
+    /// merged into the State Fence.
+    fn sync_registration_binding(
+        &self,
+        registration: &RegistrationReceipt,
+    ) -> Result<(), CompositionError> {
+        let epoch = serde_json::to_value(&registration.authority_epoch)
+            .map_err(|error| CompositionError::Launch(error.to_string()))?;
         self.identity_issuer
             .lock()
             .map_err(|_| CompositionError::KernelLock)?
-            .note_authority_epoch(epoch)
+            .note_registration_binding(
+                &registration.registration_digest,
+                registration.user_broker_epoch,
+                &epoch,
+            )
             .map_err(|error| CompositionError::Launch(error.to_string()))
     }
 }

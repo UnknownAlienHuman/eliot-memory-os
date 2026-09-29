@@ -42,6 +42,13 @@ pub(super) enum MigrationPreflight {
     Empty,
     ExactReplay,
     V1ToV2,
+    /// The durable `schema_meta` row already carries this plan's intent, so
+    /// this operation still owns the row and the DDL transaction it left
+    /// uncommitted. The intent is written in its own committed transaction
+    /// before any provider DDL work, and the DDL plus the `APPLIED` write
+    /// share one transaction, so an `APPLYING` row for these exact bytes is
+    /// proof that the DDL did not commit: the outcome is known, not guessed.
+    IntentRecorded,
 }
 
 pub(super) fn v1_identity() -> SchemaMigrationIdentity {
@@ -76,7 +83,7 @@ pub(super) fn schema_meta_record(
         generation: migration.generation_after.as_str().to_owned(),
         migrations,
         compatible_bridge_range: crate::ADAPTER_NAME.to_owned(),
-        migration_state: "APPLIED".to_owned(),
+        migration_state: schema::MIGRATION_STATE_APPLIED.to_owned(),
         migration_id: migration.migration_id.clone(),
         migration_checksum_sha256: migration.checksum_sha256.clone(),
         updated_at: updated_at.to_owned(),
@@ -98,14 +105,67 @@ pub(super) fn schema_meta_record_for_v1_to_v2(
         generation: migration.generation_after.as_str().to_owned(),
         migrations,
         compatible_bridge_range: crate::ADAPTER_NAME.to_owned(),
-        migration_state: "APPLIED".to_owned(),
+        migration_state: schema::MIGRATION_STATE_APPLIED.to_owned(),
         migration_id: migration.migration_id.clone(),
         migration_checksum_sha256: migration.checksum_sha256.clone(),
         updated_at: updated_at.to_owned(),
     }
 }
 
+/// The durable intent for one forward migration (issue #1221, W7/A8).
+///
+/// It is the same record the migration would commit, with the applied
+/// generation, the applied migration identity, the same DDL bytes digest and
+/// the same `updated_at` stamp, differing only in the state. Writing it in its
+/// own committed transaction before the DDL transaction is what makes an
+/// unknown outcome reconcilable: the DDL transaction writes
+/// [`schema::MIGRATION_STATE_APPLIED`] over exactly these fields, so an
+/// `APPLYING` row read back afterwards means the DDL never committed and the
+/// recorded identity is the exact plan that was in flight.
+pub(super) fn migration_intent_record(applied: &SchemaMetaRecord) -> SchemaMetaRecord {
+    SchemaMetaRecord {
+        generation: applied.generation.clone(),
+        migrations: applied.migrations.clone(),
+        compatible_bridge_range: applied.compatible_bridge_range.clone(),
+        migration_state: schema::MIGRATION_STATE_APPLYING.to_owned(),
+        migration_id: applied.migration_id.clone(),
+        migration_checksum_sha256: applied.migration_checksum_sha256.clone(),
+        updated_at: applied.updated_at.clone(),
+    }
+}
+
+/// The applied record an intent row commits to: identical in every field
+/// except the state, so the forward transaction's compare-and-set refuses any
+/// row that is not exactly the intent this operation recorded.
+pub(super) fn applied_record_from_intent(intent: &SchemaMetaRecord) -> SchemaMetaRecord {
+    SchemaMetaRecord {
+        generation: intent.generation.clone(),
+        migrations: intent.migrations.clone(),
+        compatible_bridge_range: intent.compatible_bridge_range.clone(),
+        migration_state: schema::MIGRATION_STATE_APPLIED.to_owned(),
+        migration_id: intent.migration_id.clone(),
+        migration_checksum_sha256: intent.migration_checksum_sha256.clone(),
+        updated_at: intent.updated_at.clone(),
+    }
+}
+
 pub(super) fn validate_schema_meta_record(record: &SchemaMetaRecord) -> Result<(), AdapterError> {
+    validate_schema_meta_record_in_state(record, schema::MIGRATION_STATE_APPLIED)
+}
+
+/// Validates a recorded `schema_meta` row against the one state it is
+/// required to hold, for the applied row and for the durable intent row
+/// (issue #1221, W7/A8).
+///
+/// Every other check is shared: the migration history, the head identity, the
+/// generation-specific identity and the bridge range are exactly the same
+/// whether the row is applied or in flight, so an intent row is validated as
+/// strictly as an applied one and cannot be a thinner record that a migration
+/// writes in order to bypass history.
+fn validate_schema_meta_record_in_state(
+    record: &SchemaMetaRecord,
+    expected_state: &str,
+) -> Result<(), AdapterError> {
     let non_blank = |value: &str| !value.trim().is_empty() && !value.chars().any(char::is_control);
     if !non_blank(&record.generation)
         || record.migrations.is_empty()
@@ -122,7 +182,7 @@ pub(super) fn validate_schema_meta_record(record: &SchemaMetaRecord) -> Result<(
             "schema metadata belongs to an incompatible adapter".to_owned(),
         ));
     }
-    if record.migration_state != "APPLIED" {
+    if record.migration_state != expected_state {
         return Err(AdapterError::PartialOutcome);
     }
     let Some(last) = record.migrations.last() else {
@@ -195,6 +255,38 @@ pub(super) fn validate_schema_meta_record(record: &SchemaMetaRecord) -> Result<(
         {
             return Err(AdapterError::PartialOutcome);
         }
+    }
+    Ok(())
+}
+
+/// Validates a durable migration intent against the exact plan presenting it.
+///
+/// The identity is compared, not restated: a row whose recorded migration id,
+/// DDL bytes digest, target generation, bridge range or predecessor is any
+/// other plan's is refused rather than adopted, so a stale or foreign intent
+/// can never be completed by this migration. The row compared is the one read
+/// back from the provider, never a record rebuilt from the plan that asked.
+pub(super) fn validate_migration_intent_record(
+    record: &SchemaMetaRecord,
+    migration: &CompiledMigration,
+) -> Result<(), AdapterError> {
+    validate_schema_meta_record_in_state(record, schema::MIGRATION_STATE_APPLYING)?;
+    if record.migration_id != migration.migration_id
+        || record.migration_checksum_sha256 != migration.checksum_sha256
+        || record.generation != migration.generation_after.as_str()
+        || record.compatible_bridge_range != migration.bridge_range
+    {
+        return Err(AdapterError::PartialOutcome);
+    }
+    // Only a plan the published graph binds to a predecessor can leave a
+    // resumable intent: a fresh-database baseline has nothing to resume, and
+    // its DDL commits with the record it creates in one transaction.
+    if migration.predecessor_generation.as_deref()
+        != crate::schema_inventory::required_predecessor_generation(&migration.migration_id)
+        || migration.predecessor_migration_id.as_deref()
+            != crate::schema_inventory::required_predecessor_migration_id(&migration.migration_id)
+    {
+        return Err(AdapterError::PartialOutcome);
     }
     Ok(())
 }

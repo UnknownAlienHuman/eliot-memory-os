@@ -102,6 +102,7 @@ pub mod skill_dispatch;
 mod skill_evidence_read;
 mod skill_lifecycle_adapters;
 mod skill_surface_adapters;
+pub mod solo_agent_driver;
 pub mod staffing_policy;
 pub mod startup_capability_bindings;
 pub mod startup_evidence_producer;
@@ -653,6 +654,18 @@ pub struct DaemonComposition {
     /// [`Self::replay_bridge_external_attach`], which reads back the exact
     /// retained binding on replay.
     external_attach: Option<Box<ExternalAttachIngressRecord>>,
+    /// Retained solo-agent driver state (issue #2567).
+    ///
+    /// Holds the bounded solo intake queue plus the single live attempt
+    /// operation: at most one unsettled solo attempt exists, so a second
+    /// drive refuses instead of overlapping ownership. Interior mutability
+    /// follows the established `skill_catalogue` pattern: the runtime poll
+    /// hook and the direct drive entry borrow `&DaemonComposition`, so the
+    /// slot cannot be reached through a `&mut` accessor. Semantics stay in
+    /// [`solo_agent_driver`](crate::solo_agent_driver); this field is only
+    /// its owner. The durable truth is the state-root projection the driver
+    /// persists before emit, never this slot.
+    solo_state: std::sync::Mutex<solo_agent_driver::SoloDriverState>,
 }
 
 /// Production B-MOD model registry port (issue #1108 W4/A2).
@@ -692,7 +705,7 @@ impl ModelRegistryPort for ProductionModelRegistryPort {
 /// [`FabricOperation::DeliverPeer`] residual instead of emitting an
 /// unverified delivery. Delivery stays with the owner; owner delegation
 /// lands with #696.
-struct ProductionPeerChannelPort;
+pub(crate) struct ProductionPeerChannelPort;
 
 impl PeerChannelPort for ProductionPeerChannelPort {
     fn deliver(&self, message: &PeerMessage) -> Result<PeerReceipt, FabricError> {
@@ -718,7 +731,7 @@ impl PeerChannelPort for ProductionPeerChannelPort {
 /// raises the typed [`FabricOperation::EnterSwarm`] residual instead of
 /// entering an unadmitted plan. Plan ownership stays with the Task
 /// Controller/Governor; owner delegation lands with #698.
-struct ProductionSwarmControlPort;
+pub(crate) struct ProductionSwarmControlPort;
 
 impl SwarmControlPort for ProductionSwarmControlPort {
     fn enter_plan(
@@ -924,6 +937,7 @@ impl DaemonComposition {
             learning_closure: eliot_governor::LearningClosureService::new(),
             governor_authority: eliot_governor::LiveGovernorAuthority::new(),
             external_attach: None,
+            solo_state: std::sync::Mutex::new(solo_agent_driver::SoloDriverState::new()),
         })
     }
 
@@ -2222,6 +2236,16 @@ impl DaemonComposition {
     /// while the Governor owner binds the receipt to its exact
     /// promoted revision and package digest. A wire receipt alone is never
     /// enough to make an installed Skill usable.
+    ///
+    /// Dependency currency is bound across both records: the stored lifecycle
+    /// view pins the dependency versions it was derived against, and the
+    /// catalogue entry carries the currently admitted set. A host, tool, or
+    /// contract version the two disagree on refuses the attempt, so a Skill
+    /// whose declared dependencies changed after the view was derived cannot
+    /// reach Material use until the view is revalidated or restored through
+    /// the governed lifecycle path. The catalogue entry itself is the current
+    /// record here, so it is never marked by this check; marking a drifted
+    /// entry stale stays with the install, reconcile, and display paths.
     #[allow(clippy::result_large_err)]
     pub fn skill_admit_material_attempt(
         &self,
@@ -2232,7 +2256,7 @@ impl DaemonComposition {
             return Err(eliot_skill::SkillError::FenceMismatch);
         }
         self.skill_reconcile_tool_basis()?;
-        {
+        let current_dependencies = {
             let catalogue = self
                 .skill_catalogue
                 .lock()
@@ -2250,6 +2274,16 @@ impl DaemonComposition {
                     reason: "unvalidated, stale, or retired Skills are blocked from Material use",
                 });
             }
+            entry.dependencies.clone()
+        };
+        if let Some(view) = self.governor.owners().skill.view(&receipt.skill_id)
+            && eliot_skill::detect_dependency_staleness(&view.dependencies, &current_dependencies)
+                .is_some()
+        {
+            return Err(eliot_skill::SkillError::InvalidField {
+                field: "view.dependencies",
+                reason: "declared host/tool/contract dependencies changed after the lifecycle view was derived; the Skill is blocked from Material use until revalidated",
+            });
         }
         self.governor.owners().skill.admit_material_attempt(receipt)
     }
@@ -2866,6 +2900,159 @@ impl DaemonComposition {
         Ok(fabric)
     }
 
+    /// Enqueues one validated solo delegate intake for the runtime poll hook
+    /// (issue #2567).
+    ///
+    /// Thin wrapper over
+    /// [`solo_agent_driver::solo_enqueue`](crate::solo_agent_driver::solo_enqueue):
+    /// the intake is validated and queued bounded; driving happens on the
+    /// runtime tick or through [`Self::solo_drive_once`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the intake validation, solo-shape, readiness, or queue-bound
+    /// rejection unchanged.
+    pub fn solo_enqueue(
+        &self,
+        intake: solo_agent_driver::SoloDelegateIntake,
+    ) -> Result<(), DaemonError> {
+        solo_agent_driver::solo_enqueue(self, intake, unix_ms())
+    }
+
+    /// Drives one admitted solo delegate intake to a retained dispatch
+    /// (issue #2567).
+    ///
+    /// Thin wrapper over
+    /// [`solo_agent_driver::drive_solo_delegate`](crate::solo_agent_driver::drive_solo_delegate):
+    /// the first production caller of the verified fabric seam for the solo
+    /// slice. The outcome is retention evidence only, never completion.
+    ///
+    /// # Errors
+    ///
+    /// Returns the readiness, intake, capability, route-gate, staffing,
+    /// fabric-chain, persistence, or live-slot rejection unchanged.
+    pub fn solo_drive_once(
+        &self,
+        kernel: &Arc<DaemonKernelClient>,
+        intake: solo_agent_driver::SoloDelegateIntake,
+    ) -> Result<solo_agent_driver::SoloDriveOutcome, DaemonError> {
+        solo_agent_driver::drive_solo_delegate(self, kernel, intake, unix_ms())
+    }
+
+    /// Drives at most one queued solo intake; the runtime poll hook
+    /// (issue #2567).
+    ///
+    /// Thin wrapper over
+    /// [`solo_agent_driver::solo_poll_queue`](crate::solo_agent_driver::solo_poll_queue).
+    /// Bounded work per tick keeps control and shutdown pollable.
+    ///
+    /// # Errors
+    ///
+    /// Returns the readiness or drive rejection unchanged.
+    pub fn solo_poll_queue(
+        &self,
+        kernel: &Arc<DaemonKernelClient>,
+    ) -> Result<solo_agent_driver::SoloPollOutcome, DaemonError> {
+        solo_agent_driver::solo_poll_queue(self, kernel)
+    }
+
+    /// Reads one solo attempt status under its durable identity
+    /// (issue #2567).
+    ///
+    /// Thin wrapper over
+    /// [`solo_agent_driver::solo_status`](crate::solo_agent_driver::solo_status).
+    ///
+    /// # Errors
+    ///
+    /// Returns the readiness or readback rejection unchanged.
+    pub fn solo_status(
+        &self,
+        operation_id: &str,
+    ) -> Result<solo_agent_driver::SoloAttemptStatus, DaemonError> {
+        solo_agent_driver::solo_status(self, operation_id)
+    }
+
+    /// Requests cancellation of one solo attempt (issue #2567).
+    ///
+    /// Thin wrapper over
+    /// [`solo_agent_driver::solo_request_cancel`](crate::solo_agent_driver::solo_request_cancel):
+    /// records the request; possible effects remain reconciling.
+    ///
+    /// # Errors
+    ///
+    /// Returns the readiness or cancellation rejection unchanged.
+    pub fn solo_request_cancel(
+        &self,
+        kernel: &Arc<DaemonKernelClient>,
+        operation_id: &str,
+    ) -> Result<solo_agent_driver::SoloAttemptStatus, DaemonError> {
+        solo_agent_driver::solo_request_cancel(self, kernel, operation_id)
+    }
+
+    /// Reconciles an observed terminal solo cancellation (issue #2567).
+    ///
+    /// Thin wrapper over
+    /// [`solo_agent_driver::solo_reconcile_cancel`](crate::solo_agent_driver::solo_reconcile_cancel).
+    ///
+    /// # Errors
+    ///
+    /// Returns the readiness or reconciliation rejection unchanged.
+    pub fn solo_reconcile_cancel(
+        &self,
+        kernel: &Arc<DaemonKernelClient>,
+        operation_id: &str,
+        terminal_evidence: &str,
+    ) -> Result<solo_agent_driver::SoloAttemptStatus, DaemonError> {
+        solo_agent_driver::solo_reconcile_cancel(self, kernel, operation_id, terminal_evidence)
+    }
+
+    /// Ingests one worker observation as the correlated candidate result
+    /// (issue #2567).
+    ///
+    /// Thin wrapper over
+    /// [`solo_agent_driver::solo_ingest_result`](crate::solo_agent_driver::solo_ingest_result):
+    /// acknowledgement first (never success), then the candidate result
+    /// (never Finish).
+    ///
+    /// # Errors
+    ///
+    /// Returns the readiness or ingestion rejection unchanged.
+    pub fn solo_ingest_result(
+        &self,
+        kernel: &Arc<DaemonKernelClient>,
+        operation_id: &str,
+        worker_id: &str,
+        result_digest: &str,
+        observed_via: &str,
+    ) -> Result<solo_agent_driver::SoloAttemptStatus, DaemonError> {
+        solo_agent_driver::solo_ingest_result(
+            self,
+            kernel,
+            operation_id,
+            worker_id,
+            result_digest,
+            observed_via,
+        )
+    }
+
+    /// Restores one solo attempt after a restart without relaunching
+    /// (issue #2567).
+    ///
+    /// Thin wrapper over
+    /// [`solo_agent_driver::solo_restore`](crate::solo_agent_driver::solo_restore).
+    ///
+    /// # Errors
+    ///
+    /// Returns the readiness, readback, restore, or reconciliation rejection
+    /// unchanged.
+    pub fn solo_restore(
+        &self,
+        kernel: &Arc<DaemonKernelClient>,
+        operation_id: &str,
+    ) -> Result<solo_agent_driver::SoloAttemptStatus, DaemonError> {
+        solo_agent_driver::solo_restore(self, kernel, operation_id)
+    }
+
     /// Resolves the session-observed owner half of one verified provider
     /// material over the live authenticated session.
     ///
@@ -3151,6 +3338,73 @@ impl DaemonComposition {
                 trigger,
             )
             .map_err(DaemonError::Composition)
+    }
+
+    /// Re-reads one compiled cold-start surface at the authenticated attach
+    /// boundary (issue #1746 W5; #8 W1).
+    ///
+    /// This is an owner readback adapter, not a second cold-start compiler:
+    /// the input must carry the Governor-issued lease and its complete prior
+    /// surface. The method checks the full lease key/epoch/deadline/terminal
+    /// state, compares the supplied fence to the Governor's current snapshot, then
+    /// asks the Governor for the exact terminal under that key. It returns the
+    /// surface only if every projected frozen field is equal to the expected
+    /// owner projection. Expiry uses the daemon's internal Unix-millisecond
+    /// clock, so the caller cannot extend a lease by supplying an older tick. A moved fence, changed receipt,
+    /// session, scope/task/source/profile revision, or projection fails closed.
+    /// The bridge activation ticket is not an input because it carries only
+    /// correlation identity.
+    ///
+    /// `caller: STITCH`. The authenticated Kernel/attach producer must supply
+    /// the actual lease/surface pair and observed fence; the current activation
+    /// route does not carry those semantic owner values. This method never
+    /// derives them from host fields or creates a replacement receipt.
+    pub fn read_cold_start_surface_for_attach(
+        &self,
+        input: &task_binding_admission::ColdStartAttachInput,
+    ) -> Result<eliot_governor::ColdStartSurfaceView, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        input.lease.validate().map_err(|error| {
+            DaemonError::Composition(CompositionError::Recovery(format!(
+                "cold-start attach lease is invalid: {error}"
+            )))
+        })?;
+        if !matches!(
+            input.lease.state,
+            eliot_workscope::OnboardingLeaseState::Ready
+                | eliot_workscope::OnboardingLeaseState::Ambiguous
+                | eliot_workscope::OnboardingLeaseState::Failed
+        ) || !input.matches_lease()
+        {
+            return Err(DaemonError::Composition(
+                CompositionError::ActivationStaleFence,
+            ));
+        }
+
+        let live_fence = self.governor.kernel_snapshot().state_fence();
+        if input.state_fence != live_fence
+            || input.expected_surface.state_fence != live_fence
+            || input.expected_surface.lease_deadline < unix_ms()
+        {
+            return Err(DaemonError::Composition(
+                CompositionError::ActivationStaleFence,
+            ));
+        }
+
+        let (current_lease, current_surface) = self.governor.cold_start_owner_readback_for_lease(
+            &input.lease.lineage_candidate_ref,
+            &input.lease.workspace_instance_candidate_ref,
+            input.lease.privacy_class,
+            input.lease.governing_source_generation,
+        )?;
+        if current_lease != input.lease || current_surface != input.expected_surface {
+            return Err(DaemonError::Composition(
+                CompositionError::ActivationStaleFence,
+            ));
+        }
+        Ok(current_surface)
     }
 
     /// Admits one explicit workspace instance as an attach to the retained

@@ -871,7 +871,7 @@ struct AgentBridgeProfile {
 /// ticket and typed result that produced it, so a stored `Resolved` projection
 /// is never treated as perpetual authority on its own.
 #[cfg(windows)]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ActivatedApplicationBinding {
     /// Application principal the activation owner resolved for this
     /// connection. Never the bridge module identity or the pipe peer identity.
@@ -4352,6 +4352,14 @@ impl KernelComposition {
             .map_err(ProcessExecutionError::Unavailable)?;
         // Issue #1837: durable audit evidence for shutdown phases.
         self.audit_observe(AuditEventDraft::shutdown_drain_requested());
+        // Issue #1839 (I16.4 quiesce): the drain request quiesces daemon
+        // admissions ahead of the stop.
+        self.audit_observe(AuditEventDraft::process_daemon_status(
+            AuditEventKind::PROCESS_QUIESCED,
+            None,
+            "ordered_safe_shutdown:drain_requested",
+            self.current_state_fence().as_ref(),
+        ));
         let drain = self.run_shutdown_drain(&coordinator).await;
         let process_result = self
             .process_gateway
@@ -4407,6 +4415,14 @@ impl KernelComposition {
                 "intentional",
                 0,
             ));
+            // Issue #1839 (I16.4 stop): the intentional terminal stopped
+            // the supervised daemon process with no pending work.
+            self.audit_observe(AuditEventDraft::process_daemon_status(
+                AuditEventKind::PROCESS_STOPPED,
+                None,
+                "intentional:pending=0",
+                self.current_state_fence().as_ref(),
+            ));
         } else {
             if pending.is_empty() {
                 pending.push(
@@ -4424,6 +4440,15 @@ impl KernelComposition {
             self.audit_observe(AuditEventDraft::shutdown_terminal_published(
                 "incomplete",
                 pending_count,
+            ));
+            // Issue #1839 (I16.4 stop): the incomplete terminal stopped the
+            // supervised daemon process with retained pending work.
+            let stop_detail = format!("incomplete:pending={pending_count}");
+            self.audit_observe(AuditEventDraft::process_daemon_status(
+                AuditEventKind::PROCESS_STOPPED,
+                None,
+                &stop_detail,
+                self.current_state_fence().as_ref(),
             ));
         }
         coordinator.observe_published_state();

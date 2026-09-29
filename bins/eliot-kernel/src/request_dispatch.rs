@@ -83,19 +83,24 @@
 //!   predecessor's durable namespace digest plus its canonical request hash — and
 //!   only after the route has proved the caller is admitted for the front door in the
 //!   same `WorkScope` and on the same authority LINEAGE, the named predecessor is the
-//!   same principal's, and the presented archive is the predecessor's archive. That
+//!   same principal's, and the capture owner re-decides the presented bytes and
+//!   re-proves that this is the same operation the named row holds
+//!   (`owner_reproves_predecessor_operation`). That
 //!   is the ONLY case `successor_of` exists for: the key cannot otherwise separate a
 //!   non-owner from the operation it wants to read. The verify payload is therefore
 //!   `{bundle_hex}` or `{bundle_hex, successor_of}`.
 //!
 //!   The succession evidence is CALLER-PRESENTED, not owner-issued, and the route
-//!   does not pretend otherwise. It is scope-guarded, the authorization checks
-//!   answer with ONE static sentence that names no class, the integrity/no-row arms
-//!   answer with the fail-closed `verification_not_recorded_reply`, and the original
-//!   operation identity is preserved on the answer. What it cannot prove is
-//!   that the owner would authorise THIS caller to reconcile THAT operation, because
-//!   no owner issues a backup-verify succession or reconciliation receipt on this
-//!   product; that owner is `backup-capture-owner (#959)`, OPEN. Nothing here invents
+//!   does not pretend otherwise. It is a POINTER, never an authorization: the pair
+//!   only selects which row is read, and the route is scope-guarded, the
+//!   authorization checks answer with ONE static sentence that names no class, the
+//!   integrity/no-row arms answer with the fail-closed
+//!   `verification_not_recorded_reply`, and the original operation identity is
+//!   preserved on the answer. What the evidence cannot do is authorize a REPEAT
+//!   reconciliation, because no owner issues a one-shot backup-verify succession or
+//!   reconciliation receipt on this product; that owner is `backup-capture-owner
+//!   (#959)`, OPEN. What it CAN do, and does, is force the owner to re-decide the
+//!   named operation: nothing here invents
 //!   a capability, a receipt type, or an owner value to paper over that.
 //! - `backup.restore-test` rehearses the shape path reachable without
 //!   owner-held state (bounded decode, exact shapes, digest shapes, lineage
@@ -131,7 +136,8 @@ use eliot_ors::{
     BACKUP_VERIFICATION_RESULT_RECORD_TYPE, BACKUP_VERIFY_PROFILE_ID,
     BACKUP_VERIFY_PROFILE_VERSION, BACKUP_VERIFY_RETENTION_WINDOW, BackupVerificationDisposition,
     BackupVerificationResultRecord, BackupVerifyRequestIdentity,
-    CONTRACT_VERSION as ORS_CONTRACT_VERSION, LegacyUnscopedBackupVerificationClass, OrsError,
+    CONTRACT_VERSION as ORS_CONTRACT_VERSION, LegacyFenceBoundBackupVerificationClass,
+    LegacyUnscopedBackupVerificationClass, OrsError,
 };
 use eliot_protocol::backup::BackupClassWire;
 use eliot_protocol::{Frame, FrameKind, MessageType, ProtocolPayload};
@@ -1103,6 +1109,17 @@ fn record_from_projection(
         receipt_count: projection.receipt_count,
         blob_count: projection.blob_count,
         capture_receipt: projection.capture_receipt.clone(),
+        // #2862: the row's three owner-evidence references are written from the
+        // ACCEPTED IDENTITY, not from the projection and never from caller text,
+        // because they are part of the request this row is the answer to. They
+        // are `None` on every row this route writes today (no artifact owner
+        // resolves a handle, no verifier session issues a receipt or an
+        // attestation), and `BackupVerificationResultRecord::validate`
+        // cross-checks all three against the nested identity on every read, so
+        // the flat copy can never drift from what the request vouched for.
+        archive_handle: identity.archive_handle.clone(),
+        capture_receipt_digest: identity.capture_receipt_digest.clone(),
+        validity_attestation_digest: identity.validity_attestation_digest.clone(),
         reply_digest,
     }
 }
@@ -1239,10 +1256,12 @@ fn backup_verify_identity(
 /// (`eliot_ors::BackupVerifyRequestIdentity::namespace_digest`), so the terms collected
 /// here address EXACTLY the row the completed identity will address.
 ///
-/// The EIGHT archive-answer terms are left empty here on purpose and that is
+/// The ELEVEN archive-answer terms are left empty here on purpose and that is
 /// load-bearing, not lazy: the archive digest, the declared owner contract, the declared
 /// source installation, the export-fence digest, the archived complete fence digest, the
-/// observed fence digest, the evidenced class and the capture receipt are not read by
+/// observed fence digest, the evidenced class, the capture receipt and the three #2862
+/// owner-evidence commitments (the retained handle, the capture-receipt digest and the
+/// validity-attestation digest) are not read by
 /// the key, and this value is never validated, projected or digested as a request — only
 /// `namespace_digest()` is ever called on it. If a future key ever grew one of them,
 /// this probe would address a key no row is stored under, find nothing, and leave the
@@ -1283,6 +1302,19 @@ fn backup_verify_admitted_identity(
         observed_fence_digest: String::new(),
         evidenced_class: String::new(),
         capture_receipt: None,
+        // #2862: the three owner-evidence commitments. Absent here for the same
+        // reason the eight terms above are empty, and the absence is
+        // load-bearing rather than a placeholder: no production
+        // `impl PublicationPort` resolves a retained handle on this path (the
+        // only implementation is `MemPublisher` in
+        // `bins/eliot-kernel/tests/backup_capture.rs`), and no
+        // `BackupRole::Verifier` session issues a capture receipt or an archive
+        // validity attestation on this product at all. They are recorded as the
+        // owner's own answer and are never filled from caller text; ORS
+        // `validate()` requires each to be either a well-formed digest or absent.
+        archive_handle: None,
+        capture_receipt_digest: None,
+        validity_attestation_digest: None,
         retention_and_collision_window: BACKUP_VERIFY_RETENTION_WINDOW.to_owned(),
         identity_digest: String::new(),
     })
@@ -1496,6 +1528,67 @@ fn successor_caller_principal(session: &Session) -> Result<&str, TransportError>
     authenticated_backup_principal(session).map(|(principal, _)| principal)
 }
 
+/// Returns whether the owner re-decides, for the bytes just decoded, exactly the
+/// operation the named predecessor row already holds.
+///
+/// This is the owner half of #2883 instruction 4 and acceptance clause 3, and it
+/// is deliberately a CONTENT comparison over owner-proved values rather than a
+/// check that the presented succession evidence is well formed. The evidence a
+/// successor presents is a pair of digests the predecessor's own `ok` reply
+/// already carried, so a shape-valid pair proves nothing on its own: what makes
+/// the reconciliation an observation of THAT operation is that the capture owner,
+/// re-deciding the presented bytes on this call, lands on the same archive
+/// identity, the same declared source and owner contract, the same export and
+/// archived fence digests, the same evidenced class, the same evidence level and
+/// ceiling, the same publication receipt and the same independent member
+/// denominators that the stored row recorded. Every term compared is one the
+/// owner decides from the ARCHIVE, so it is a function of the bytes rather than
+/// of the verifying session.
+///
+/// The three denominators are counted from the owner's own
+/// [`member_domain_count`] dispositions — an INDEPENDENT expected set derived
+/// from the decoded archive — and compared against the three retained counts.
+/// They are not a coverage comparison of the stored list against a second copy
+/// of the caller's list, and the stored row retains only the counts, never the
+/// member list, so there is nothing to compare twice.
+///
+/// The archived-fence RELATION, its proof qualifier, its restriction tokens and
+/// its contract version are deliberately NOT compared. Those are relations
+/// between the archive's fence and the LIVE verifying target, so they are
+/// historical answer evidence (instruction 7) and a reconciliation read after an
+/// Authority Epoch rotation must still be able to report the relation that was
+/// observed then. Requiring them to match would forbid the rotation replay this
+/// durable row exists to enable. Everything compared here is either the archive
+/// itself or a value inside it.
+///
+/// The row is read back through
+/// [`RedbRecoveryStore::load_backup_verification_result`], which decodes and
+/// validates it through [`BackupVerificationResultRecord::validate`], so the
+/// RECORDED values on the other side of every comparison are the original ones
+/// and the flat/identity drift checks have already run. No digest is recomputed
+/// here to stand in for a recorded one.
+fn owner_reproves_predecessor_operation(
+    report: &CaptureReport,
+    stored: &BackupVerificationResultRecord,
+) -> bool {
+    let Ok(Value::String(class_ceiling)) = serde_json::to_value(report.class_ceiling) else {
+        return false;
+    };
+    report.archive_sha256 == stored.identity.archive_sha256
+        && report.backup_id == stored.backup_id
+        && class_name(report.class) == stored.identity.evidenced_class
+        && report.evidence_level.as_wire_name() == stored.verification_level
+        && class_ceiling == stored.class_ceiling
+        && report.owner_contract == stored.identity.archive_owner_contract
+        && report.source_installation == stored.identity.archive_source_installation
+        && report.export_fence_digest == stored.identity.archive_export_fence_digest
+        && report.archived_state_fence_digest == stored.identity.archived_fence_digest
+        && report.receipt_identity == stored.capture_receipt
+        && member_domain_count(report, MEMBER_DOMAIN_CANONICAL) == stored.event_count
+        && member_domain_count(report, MEMBER_DOMAIN_RECEIPT) == stored.receipt_count
+        && member_domain_count(report, MEMBER_DOMAIN_BLOB) == stored.blob_count
+}
+
 /// Projects the ONE refusal the failed AUTHORIZATION checks on the reconciliation
 /// path answer with (instructions 4, 5, 7 and 8 on that path).
 ///
@@ -1632,6 +1725,38 @@ fn legacy_unscoped_evidence_reply(idempotency_key: &str) -> Value {
     )
 }
 
+/// Projects the typed refusal for a pre-#2862 durable row under the previous
+/// verify profile's idempotency namespace (#2862).
+///
+/// It is a SEPARATE sentence from [`legacy_unscoped_evidence_reply`] on purpose,
+/// and the difference between the two is a fact the caller needs: the pre-#2883
+/// row is unscoped evidence that carries no ownership at all, while the pre-#2862
+/// row is a fully scoped, isolated, replayable verification result that simply
+/// predates the owner-evidence commitments. Telling a caller to "re-run under a
+/// fresh key" is right for the first and misleading for the second, which is
+/// quarantined for a different reason.
+///
+/// The reason states that reason and nothing else. It echoes no stored level, no
+/// stored class, no stored digest, no archive identity and no store error, and it
+/// makes no claim about what the legacy row contained beyond the one fact this
+/// route can honestly assert about it: it was produced under a verify profile
+/// that carried no retained artifact handle, no capture-receipt digest and no
+/// validity-attestation digest. That is a property of the PROFILE, not a reading
+/// of the row, and it is the whole of why the row is not upgraded — there is no
+/// owner evidence in it for an upgrade to promote.
+///
+/// The next step it names is the one the issue prescribes: a NEW explicit
+/// verification operation, which is a new `operation_id` and therefore a
+/// different legacy key that reads `Absent`.
+fn legacy_unqualified_evidence_reply(idempotency_key: &str) -> Value {
+    invalid_reply(
+        BACKUP_VERIFY_OPERATION,
+        idempotency_key,
+        "backup.verify",
+        "this operation already holds a durable verification result written under a previous verify profile that carried no retained artifact handle, no owner-issued capture receipt and no verifier-issued validity attestation; it is quarantined as legacy unqualified evidence and is neither upgraded nor projected here, and no code change makes it provenance-bound; submit a new explicit verification operation to obtain the current result",
+    )
+}
+
 /// Returns whether one durable-store failure is the I5.27 identity conflict
 /// rather than an outage.
 ///
@@ -1741,6 +1866,18 @@ enum PriorVerification {
     /// A pre-#2883 unscoped row owns the caller's raw text. It is quarantined
     /// legacy evidence: never certified to, re-keyed for, or projected.
     LegacyUnscoped,
+    /// A pre-#2862 row owns this operation under the PREVIOUS verify profile's
+    /// idempotency namespace. It is a correctly scoped, isolated, replayable
+    /// STRUCTURAL-CANDIDATE result that carries no retained handle, no capture
+    /// receipt digest and no validity attestation digest at all.
+    ///
+    /// It is quarantined rather than adopted for the reason #2862's acceptance
+    /// states: an old structural row must NOT become provenance-bound because
+    /// the code was upgraded. There is nothing in it to read that from, so
+    /// "upgrading" it would be inventing owner evidence. The caller that wants
+    /// the owner-evidence level submits a NEW explicit verification operation —
+    /// a new `operation_id`, hence a different legacy key that reads `Absent`.
+    LegacyUnqualified,
     /// Bytes are stored under the caller's raw text and decode as NEITHER the
     /// current contract nor the pre-#2883 shape. The durable row is unreadable, so
     /// the route fails closed and answers no verification result at all. This arm
@@ -1773,9 +1910,12 @@ enum PriorVerification {
 ///    digest comparison and before the row is used for anything observable.
 /// 2. the named predecessor must belong to the SAME authenticated principal, so a
 ///    caller cannot read another principal's operation at all.
-/// 3. the presented request hash must equal the stored one AND the presented archive
-///    must be the stored archive. The stored request hash covers the predecessor's
-///    own PRINCIPAL, `WorkScope`, operation id and archive provenance, so guessing the
+/// 3. the presented request hash must equal the stored one AND the owner must
+///    re-prove the stored operation for the decoded bytes
+///    ([`owner_reproves_predecessor_operation`]). The stored request hash covers the
+///    predecessor's
+///    own PRINCIPAL, `WorkScope`, operation id and archive provenance, and the owner
+///    re-proof covers the archive's whole decided content, so guessing the
 ///    namespace key alone — which is on the wire as `operation_namespace` — yields
 ///    nothing. It provably does NOT cover the predecessor's session, because
 ///    `session_id` is ambient; that is deliberate and is justified in
@@ -1804,10 +1944,23 @@ enum PriorVerification {
 /// trade is taken deliberately, and for the fact that the successor path has no
 /// operator surface today.
 ///
-/// What the pair is NOT is an owner-issued capability: nothing here proves the
-/// owner would have authorised THIS caller to reconcile THAT operation, because
+/// The pair is a POINTER, never an authorization on its own: both halves were
+/// already on the wire in the predecessor's own `ok` reply, so their shape and
+/// even their value prove nothing by themselves. What authorizes the
+/// reconciliation is [`owner_reproves_predecessor_operation`] — the capture
+/// owner, re-deciding the presented bytes on this call, must land on exactly the
+/// operation the named row holds — together with the scope, lineage and
+/// principal joins. The pair selects WHICH row is read; the owner decides
+/// whether that row is the operation the caller is reconciling.
+///
+/// What the pair still is NOT is an owner-ISSUED, one-shot succession capability:
 /// no owner issues a backup-verify succession or reconciliation receipt on this
-/// product. That owner is `backup-capture-owner (#959)`, which is OPEN.
+/// product, so there is no due time and no single-use consumption, and a holder
+/// of the pair may reconcile the same operation again. That residual belongs to
+/// `backup-capture-owner (#959)`, which is OPEN. It is a narrower claim than
+/// "the owner did not authorise this reconciliation": the owner does re-prove
+/// that the reconciled operation IS the named operation, and it does so over the
+/// whole archive content, not over a correlation the caller chose.
 struct VerifySuccessorEvidence {
     /// The predecessor operation's durable namespace key.
     predecessor_namespace_digest: String,
@@ -2028,13 +2181,24 @@ impl KernelComposition {
     /// I14.21); a changed authority LINEAGE is not one of those, because it is a key
     /// component, so it moves the key and stages a new row instead.
     ///
+    /// #2862 adds the third durable state this route can find. The verify profile is
+    /// now `v3` because the accepted identity binds the retained artifact handle, the
+    /// capture-receipt digest and the validity-attestation digest, so a pre-#2862
+    /// `v2` row sits under a different `idempotency_namespace` and a different key.
+    /// That row is QUARANTINED, not adopted and not upgraded: it stays the exact
+    /// historical structural-candidate result it was, and no code upgrade makes it
+    /// provenance-bound, because it contains no owner evidence to promote. A NEW
+    /// explicit verification operation is what produces a row under the current
+    /// profile. See [`Self::load_prior_verification`] for the probe order.
+    ///
     /// `successor_of` is therefore for exactly one case: a caller that is NOT the
     /// principal owning the operation, which the namespace key cannot otherwise
     /// separate from it. Such a reconciliation answers from the NAMED predecessor's
     /// own row, not from a recompute of the presented bytes, so the presented bundle
-    /// must be that predecessor's archive: the freshly decoded
-    /// `report.archive_sha256` is compared against the stored
-    /// `identity.archive_sha256` before anything is projected. The bundle is still
+    /// must be that predecessor's archive: the owner re-decides the decoded bytes
+    /// and the whole of that decision is compared against the stored row by
+    /// [`owner_reproves_predecessor_operation`] before anything is projected. The
+    /// bundle is still
     /// decoded and validated first either way, so a reconciliation never skips the
     /// capture owner's admission gate.
     ///
@@ -2133,7 +2297,9 @@ impl KernelComposition {
                     ));
                 }
             };
-        let Ok(prior) = self.load_prior_verification(record_key.as_str(), idempotency_key) else {
+        let Ok(prior) =
+            self.load_prior_verification(&identity, record_key.as_str(), idempotency_key)
+        else {
             return Ok(verification_not_recorded_reply(idempotency_key));
         };
         Ok(self.answer_backup_verify(prior, &identity, &fresh, idempotency_key))
@@ -2188,7 +2354,8 @@ impl KernelComposition {
     }
 
     /// Reads the durable verification result already bound to this scoped
-    /// identity, and quarantines a pre-#2883 row on the caller's raw text.
+    /// identity, and quarantines a pre-#2883 row on the caller's raw text and a
+    /// pre-#2862 row under the previous profile's namespace.
     ///
     /// `record_key` is the accepted identity's 64-hex namespace digest, not caller
     /// text. A scoped lookup that finds nothing is NOT proof that nothing is stored
@@ -2196,32 +2363,63 @@ impl KernelComposition {
     /// is carried through rather than collapsed into "absent":
     /// [`LegacyUnscopedBackupVerificationClass::Absent`] is the only arm that lets a
     /// fresh row be staged, `Legacy` is quarantined, and `Unreadable` fails closed.
-    /// Both probes return store failures rather than degrading, because a store
+    ///
+    /// #2862 adds the THIRD probe, and it is the one the verify profile bump made
+    /// necessary. The profile is now `v3`, and a bump is a new
+    /// `idempotency_namespace` by construction, so a `v2` row sits under a key this
+    /// route's `record_key` can never address. Reading that as "absent" is the
+    /// fail-OPEN outcome: the caller would re-run an operation that already has a
+    /// durable answer and stage a second row beside it. So when the current key and
+    /// the raw caller key are both free, the PREVIOUS profile's key for the SAME
+    /// operation is addressed explicitly, through
+    /// [`BackupVerifyRequestIdentity::legacy_fence_bound_namespace_digest`], and its
+    /// class decides the answer.
+    ///
+    /// The order is: current key, then the raw caller text, then the legacy
+    /// profile key. It is exhaustive over the three durable states this operation
+    /// can be in, and each probe is asked only when every stricter one has already
+    /// come back clean, so no probe can mask a row the previous one found.
+    ///
+    /// All three probes return store failures rather than degrading, because a store
     /// outage that silently downgraded to a non-persisted answer would let this route
     /// answer `ok` for a verification with no durable result behind it, which A0.3
     /// classifies as a false proof claim.
     fn load_prior_verification(
         &self,
+        identity: &BackupVerifyRequestIdentity,
         record_key: &str,
         idempotency_key: &str,
     ) -> Result<PriorVerification, OrsError> {
-        match self.p07_ors.load_backup_verification_result(record_key)? {
-            Some(record) => Ok(PriorVerification::Bound(Box::new(record))),
-            None => Ok(
-                match self
-                    .p07_ors
-                    .legacy_unscoped_backup_verification_class(idempotency_key)?
-                {
-                    LegacyUnscopedBackupVerificationClass::Absent => PriorVerification::Absent,
-                    LegacyUnscopedBackupVerificationClass::Legacy => {
-                        PriorVerification::LegacyUnscoped
-                    }
-                    LegacyUnscopedBackupVerificationClass::Unreadable => {
-                        PriorVerification::Unreadable
-                    }
-                },
-            ),
+        if let Some(record) = self.p07_ors.load_backup_verification_result(record_key)? {
+            return Ok(PriorVerification::Bound(Box::new(record)));
         }
+        match self
+            .p07_ors
+            .legacy_unscoped_backup_verification_class(idempotency_key)?
+        {
+            LegacyUnscopedBackupVerificationClass::Absent => {}
+            LegacyUnscopedBackupVerificationClass::Legacy => {
+                return Ok(PriorVerification::LegacyUnscoped);
+            }
+            LegacyUnscopedBackupVerificationClass::Unreadable => {
+                return Ok(PriorVerification::Unreadable);
+            }
+        }
+        let legacy_key = identity.legacy_fence_bound_namespace_digest()?;
+        Ok(
+            match self
+                .p07_ors
+                .legacy_fence_bound_backup_verification_class(legacy_key.as_str())?
+            {
+                LegacyFenceBoundBackupVerificationClass::Absent => PriorVerification::Absent,
+                LegacyFenceBoundBackupVerificationClass::LegacyUnqualified => {
+                    PriorVerification::LegacyUnqualified
+                }
+                LegacyFenceBoundBackupVerificationClass::Unreadable => {
+                    PriorVerification::Unreadable
+                }
+            },
+        )
     }
 
     /// Answers one reconciliation from the predecessor row the caller named.
@@ -2256,12 +2454,15 @@ impl KernelComposition {
     /// archive provenance. A namespace key alone is therefore not a succession
     /// claim.
     ///
-    /// (3) The presented archive IS that predecessor's archive: the freshly
-    /// decoded `report.archive_sha256` must equal the stored
-    /// `identity.archive_sha256`. Without this the caller could present a valid
-    /// but different archive and be answered with the predecessor's identity,
-    /// class, counts and fence relation, which would be a projection about bytes
-    /// the caller did not present.
+    /// (3) The owner re-decides THAT operation for the bytes just presented: see
+    /// [`owner_reproves_predecessor_operation`], which is the whole archive content
+    /// — identity, declared source and owner contract, export and archived fence
+    /// digests, class, evidence level and ceiling, receipt and member denominators
+    /// — and not one correlation value. The archive digest is a necessary part of
+    /// it, not the whole of it: without the full comparison a caller could present
+    /// a valid but different archive and be answered with the predecessor's
+    /// identity, class, counts and fence relation, which would be a projection
+    /// about bytes the caller did not present.
     ///
     /// The answer then keeps BOTH facts the transport needs. The envelope
     /// correlation is always the reconciling caller's own `idempotency_key`,
@@ -2288,7 +2489,7 @@ impl KernelComposition {
     /// ARMS ONLY, NOT ALL SIX ARMS OF THIS FUNCTION. This function has six refusal
     /// call sites, and they answer with TWO different sentences:
     /// - the three AUTHORIZATION call sites — the scope/lineage join, the separate
-    ///   principal compare, and the presented-digest + presented-archive compare —
+    ///   principal compare, and the presented-digest + owner re-proof compare —
     ///   all answer with the ONE [`successor_not_observed_reply`], whose reason is a
     ///   single static sentence naming no principal, no session, no scope, no
     ///   lineage, no digest, no archive identity, no count and no store error;
@@ -2326,23 +2527,35 @@ impl KernelComposition {
     /// caller is admitted for the front door, by [`admit_backup_caller`] and by
     /// `verify_only`'s own `require_capture_admitted`, before this function runs;
     /// (b) the caller is in the same `WorkScope` and on the same authority LINEAGE as
-    /// the named predecessor; and (c) the named predecessor is a real stored
+    /// the named predecessor; (c) the named predecessor is a real stored
     /// `backup.verify` row in this ORS file, whose canonical request hash — which
     /// covers its PRINCIPAL, `WorkScope`, operation id and archive provenance, and
-    /// provably NOT its session — is exactly the one presented, and whose archive is
-    /// exactly the one presented. The predecessor's own SESSION is deliberately not
+    /// provably NOT its session — is exactly the one presented; and (d) the capture
+    /// owner, re-deciding the bytes this call presented, re-proves that this is the
+    /// SAME operation the row holds, over the whole archive content rather than over
+    /// one correlation value — see [`owner_reproves_predecessor_operation`]. The
+    /// predecessor's own SESSION is deliberately not
     /// required to match and is deliberately not covered by the hash, and the
     /// justification is not a claim that the hash names it: a new session inheriting
     /// a prior session's operation is the ENTIRE POINT of a succession, so requiring
     /// session equality would make every reconciliation impossible.
     ///
-    /// What it does NOT prove is that the owner would authorise THIS caller to
-    /// reconcile THAT operation, because no owner issues a backup-verify succession
-    /// or reconciliation receipt on this product. That owner is
-    /// `backup-capture-owner (#959)`, which is OPEN. Instruction 4's
-    /// "owner-authorized" half is therefore NOT met on this product, and it cannot
-    /// be met here without inventing a capability, a receipt type, or an owner value
-    /// that does not exist.
+    /// (d) is what separates this from a successor that is merely ACCEPTED because
+    /// the pair it presented is well formed. The pair is a pointer: both halves were
+    /// on the wire in the predecessor's own `ok` reply, so nothing about their shape
+    /// or their value authorizes anything. What authorizes the read is that the OWNER
+    /// re-decided this archive and reached the same archive identity, declared
+    /// source and owner contract, export and archived fence digests, evidenced
+    /// class, evidence level and class ceiling, publication receipt and independent
+    /// member denominators the row recorded.
+    ///
+    /// What it still does NOT prove is that the owner would authorise a REPEAT
+    /// reconciliation by the same caller: no owner issues a one-shot backup-verify
+    /// succession or reconciliation receipt on this product, so the pair may be
+    /// replayed for as long as the row lives. That residual belongs to
+    /// `backup-capture-owner (#959)`, which is OPEN, and closing it would mean
+    /// inventing a capability, a receipt type or an owner value that does not exist
+    /// — not something this issue's own scope may add.
     ///
     /// # OPEN POINT FOR THE OWNER — the issue's clause-1 phrase. Clause 1 says "two
     /// authenticated principals OR SESSIONS" may use the same human idempotency text
@@ -2384,7 +2597,7 @@ impl KernelComposition {
             return successor_not_observed_reply(idempotency_key);
         }
         if stored.identity.identity_digest != successor.predecessor_identity_digest
-            || stored.identity.archive_sha256 != report.archive_sha256
+            || !owner_reproves_predecessor_operation(report, &stored)
         {
             return successor_not_observed_reply(idempotency_key);
         }
@@ -2427,6 +2640,15 @@ impl KernelComposition {
                 answer_bound_verification(&record, fresh, idempotency_key)
             }
             PriorVerification::LegacyUnscoped => legacy_unscoped_evidence_reply(idempotency_key),
+            // #2862: a pre-#2862 row under the previous profile's namespace. It
+            // stays the exact historical structural-candidate result it was and
+            // is answered as legacy unqualified evidence, never upgraded and
+            // never projected as a current-profile answer. A NEW explicit
+            // verification operation is what produces a row under the current
+            // profile.
+            PriorVerification::LegacyUnqualified => {
+                legacy_unqualified_evidence_reply(idempotency_key)
+            }
             // Fail closed: bytes are stored under this caller's text and decode as
             // neither shape. Staging over them would destroy evidence and answer
             // `ok` for a verification whose prior answer is still on disk, so the

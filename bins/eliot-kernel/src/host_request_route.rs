@@ -66,8 +66,8 @@ use eliot_observability_runtime::{ModuleIdentity, WorkClass};
 use eliot_ors::{
     CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestAttempt, HostRequestEffectEvidence,
     HostRequestKind as OrsHostRequestKind, HostRequestRecord, HostRequestRetainedLineage,
-    HostRequestRetainedSourceRevision, HostRequestState, OpaqueLabel, OperationIdentity, OrsError,
-    RedbRecoveryStore,
+    HostRequestRetainedResultClass, HostRequestRetainedSourceRevision, HostRequestState,
+    OpaqueLabel, OperationIdentity, OrsError, RedbRecoveryStore,
 };
 use eliot_protocol::{
     AGENT_BRIDGE_PROCESS_BINDING_WIRE_ID, AGENT_HOST_REQUEST_FAILURE_WIRE_ID,
@@ -539,6 +539,7 @@ impl KernelComposition {
                     ))
                     .map_err(|_| TransportError::SessionFenced)?,
                     generation,
+                    claim_expires_at_unix_ms: None,
                     fence_digest: stored.fence_digest.clone(),
                     owner_connection_ref: OpaqueLabel::new(session.connection_id.clone())
                         .map_err(|_| TransportError::SessionFenced)?,
@@ -546,6 +547,9 @@ impl KernelComposition {
                         .map_err(|_| TransportError::SessionFenced)?,
                     owner_session_epoch: session.session_epoch,
                     phase: eliot_ors::HostRequestAttemptPhase::Claimed,
+                    channel_binding_sha256: None,
+                    transport_observations: Vec::new(),
+                    owner_readback: None,
                 }
             }
         };
@@ -1105,8 +1109,18 @@ impl KernelComposition {
                 }
             };
             // Issue #1837: durable audit evidence for the routing decision.
+            // Issue #1839 (I16.4 capability discovery/probe/admission): the
+            // requested capability was probed against the daemon-claimable
+            // lanes; a discovered lane records discovery plus admission.
+            self.audit_observe(AuditEventDraft::capability_probe(envelope));
             if let Some(lane) = routed_lane {
                 self.audit_observe(AuditEventDraft::route_invoke_read_routed(
+                    envelope, &receipt, lane,
+                ));
+                self.audit_observe(AuditEventDraft::capability_lane_discovered(
+                    envelope, &receipt, lane,
+                ));
+                self.audit_observe(AuditEventDraft::capability_admission(
                     envelope, &receipt, lane,
                 ));
             } else if let Some(reason) = mismatch_reason {
@@ -2915,6 +2929,14 @@ impl KernelComposition {
             observation.presented_attempt_id,
             observation.presented_generation,
             retired,
+        ));
+        // Issue #1839 (I16.4 capability expiry): the fenced capability
+        // bound to the claim expired with the same absolute deadline.
+        self.audit_observe(AuditEventDraft::capability_expiry(
+            observation.session,
+            observation.stored,
+            observation.lane,
+            observation.phase,
         ));
         Err(TransportError::Timeout)
     }
@@ -4744,6 +4766,27 @@ fn retained_result_provenance(
             closure_refs: lineage.closure_refs.clone(),
             policy_fence: lineage.policy_fence.clone(),
             origin_evidence_refs: lineage.origin_evidence_refs.clone(),
+            semantic_receipt_ref: lineage.semantic_receipt_ref.clone(),
+            result_class: match lineage.result_class {
+                eliot_protocol::HostRequestResultClass::Unclassified => {
+                    HostRequestRetainedResultClass::Unclassified
+                }
+                eliot_protocol::HostRequestResultClass::ExistingEvidenceRead => {
+                    HostRequestRetainedResultClass::ExistingEvidenceRead
+                }
+                eliot_protocol::HostRequestResultClass::NewCandidate => {
+                    HostRequestRetainedResultClass::NewCandidate
+                }
+                eliot_protocol::HostRequestResultClass::VerifierObservation => {
+                    HostRequestRetainedResultClass::VerifierObservation
+                }
+                eliot_protocol::HostRequestResultClass::CanonicalWriteReceipt => {
+                    HostRequestRetainedResultClass::CanonicalWriteReceipt
+                }
+                eliot_protocol::HostRequestResultClass::RetainedDeliveryRecord => {
+                    HostRequestRetainedResultClass::RetainedDeliveryRecord
+                }
+            },
             proof_ceiling: lineage.proof_ceiling,
             influence_state: lineage.influence_state,
             instruction_taint: lineage.instruction_taint,
@@ -4767,6 +4810,8 @@ pub(crate) fn requested_host_request_record(
     let optional_label = |value: Option<&String>| value.map(|identity| label(identity)).transpose();
     Ok(HostRequestRecord {
         contract_version: ORS_CONTRACT_VERSION,
+        send_claim_protocol_version: 0,
+        transport_channel_binding_sha256: None,
         operation_id: OperationIdentity::new(host_request_operation_id(envelope))
             .map_err(|_| TransportError::SessionFenced)?,
         kind: match envelope.kind {
@@ -4795,6 +4840,7 @@ pub(crate) fn requested_host_request_record(
         deadline_unix_ms: envelope.identity.deadline_unix_ms,
         state: HostRequestState::Requested,
         attempt: None,
+        attempt_history: Vec::new(),
         cancellation_target: None,
         result_digest: None,
         result_response: None,
@@ -5199,24 +5245,58 @@ impl KernelComposition {
         let value = match operation {
             AGENT_BRIDGE_EVENT_FORWARD_OPERATION => {
                 let event = bridge_event_envelope_from_payload(&payload)?;
-                self.admit_bridge_event_envelope(
-                    session,
-                    &event,
-                    &identity.request.state_fence,
-                    identity.deadline_unix_ms,
-                )?
+                if event.delivery_class == DeliveryClass::BestEffortTelemetry {
+                    let _transition = self.agent_bridge_transition_read()?;
+                    self.admit_bridge_event_envelope(
+                        session,
+                        &event,
+                        &identity.request.state_fence,
+                        identity.deadline_unix_ms,
+                    )?
+                } else {
+                    self.with_live_bridge_application_binding(
+                        session,
+                        &identity.request.state_fence,
+                        || {
+                            self.admit_bridge_event_envelope(
+                                session,
+                                &event,
+                                &identity.request.state_fence,
+                                identity.deadline_unix_ms,
+                            )
+                        },
+                    )?
+                }
             }
             AGENT_BRIDGE_HOOK_FORWARD_OPERATION => {
+                // A hook is a digest-only transport observation with no ORS
+                // mutation; preserve this cold observation lane without
+                // fabricating an application binding.
+                let _transition = self.agent_bridge_transition_read()?;
                 let hook = bridge_hook_from_payload(&payload)?;
                 self.admit_bridge_hook_observation(session, &hook)?
             }
             AGENT_BRIDGE_EVENT_GAP_OPERATION => {
                 let gap = bridge_gap_from_payload(&payload, &session.connection_id)?;
-                self.admit_bridge_event_gap(session, &gap, &identity.request.state_fence)?
+                self.with_live_bridge_application_binding(
+                    session,
+                    &identity.request.state_fence,
+                    || self.admit_bridge_event_gap(session, &gap, &identity.request.state_fence),
+                )?
             }
             AGENT_BRIDGE_EVENT_RECONCILE_OPERATION => {
                 let scope = bridge_reconcile_scope_from_payload(&payload)?;
-                self.answer_bridge_event_reconcile(session, &scope, &identity.request.state_fence)?
+                self.with_live_bridge_application_binding(
+                    session,
+                    &identity.request.state_fence,
+                    || {
+                        self.answer_bridge_event_reconcile_under_transition(
+                            session,
+                            &scope,
+                            &identity.request.state_fence,
+                        )
+                    },
+                )?
             }
             _ => return Err(TransportError::SessionFenced),
         };
@@ -5226,6 +5306,142 @@ impl KernelComposition {
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
         Ok(KernelFrameAction::Reply(reply))
+    }
+
+    /// Keeps the exact retained activation, live application Session, and
+    /// presenting transport continuously valid across a synchronous bridge
+    /// event operation.
+    ///
+    /// The order is the bridge transition read lock, activation-result
+    /// readback, the pending-result owner, the retained connection and the
+    /// application-session owner. Holding pending-result ownership through the
+    /// ORS operation prevents a concurrent accepted result from evicting the
+    /// exact activation result between its currentness check and this commit.
+    /// Disconnect/profile transitions and explicit application-session
+    /// revocation therefore linearize before or after the operation rather
+    /// than between a check and commit.
+    /// The installation value is only the identity composed from the
+    /// authenticated Host startup binding; ORS namespace persistence still
+    /// requires its own typed installation/session fields.
+    fn with_live_bridge_application_binding<T>(
+        &self,
+        session: &Session,
+        frame_fence: &eliot_contracts::StateFence,
+        operation: impl FnOnce() -> Result<T, TransportError>,
+    ) -> Result<T, TransportError> {
+        let _transition = self.agent_bridge_transition_read()?;
+        let (retained, _pending) =
+            self.bridge_event_activation_binding_under_transition(session, frame_fence)?;
+
+        let connections = self
+            .agent_bridge_connections
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let current = connections
+            .get(&session.connection_id)
+            .ok_or(TransportError::SessionFenced)?;
+        if !current.activation_completed
+            || current.session.as_ref() != Some(session)
+            || current.activated_binding.as_ref() != Some(&retained)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+
+        let application_sessions = self
+            .agent_application_sessions
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let now = unix_ms();
+        let application_session = application_sessions
+            .get(retained.session_id.as_str())
+            .ok_or(TransportError::SessionFenced)?;
+        let current_transport =
+            application_session
+                .transport_bindings()
+                .last()
+                .is_some_and(|binding| {
+                    binding.binding_id == session.connection_id
+                        && binding.session_epoch == session.session_epoch
+                        && binding.observed_at_unix_ms <= now
+                });
+        let live = application_session.session_id() == retained.session_id
+            && application_session.state() == eliot_ipc::ApplicationSessionState::Active
+            && application_session
+                .authority_epoch()
+                .is_same_authority(&retained.authority_epoch)
+            && current_transport
+            && application_session.bound_leases().values().all(|lease| {
+                !lease.revoked && lease.issued_at_unix_ms <= now && now < lease.expires_at_unix_ms
+            });
+        if !live {
+            return Err(TransportError::SessionFenced);
+        }
+
+        operation()
+    }
+
+    /// Reads the exact accepted activation and proves its fence is still
+    /// current. The caller holds the bridge transition read lock. The returned
+    /// pending-result guard stays held while the caller rechecks the retained
+    /// connection and application session and performs the ORS operation, so
+    /// accepted-result eviction cannot race that currentness proof.
+    fn bridge_event_activation_binding_under_transition(
+        &self,
+        session: &Session,
+        frame_fence: &eliot_contracts::StateFence,
+    ) -> Result<
+        (
+            super::ActivatedApplicationBinding,
+            std::sync::MutexGuard<'_, super::AgentActivationPendingState>,
+        ),
+        TransportError,
+    > {
+        if super::dispatch_contour()
+            .is_none_or(|contour| contour.installation_id().trim().is_empty())
+        {
+            return Err(TransportError::SessionFenced);
+        }
+
+        let retained = {
+            let connections = self
+                .agent_bridge_connections
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            let state = connections
+                .get(&session.connection_id)
+                .ok_or(TransportError::SessionFenced)?;
+            if !state.activation_completed || state.session.as_ref() != Some(session) {
+                return Err(TransportError::SessionFenced);
+            }
+            state
+                .activated_binding
+                .clone()
+                .ok_or(TransportError::SessionFenced)?
+        };
+        if retained.principal_id.trim().is_empty()
+            || retained.session_id.trim().is_empty()
+            || !frame_fence
+                .authority_epoch
+                .is_same_authority(&retained.authority_epoch)
+            || frame_fence.resource_generation != retained.activation_generation
+            || !session
+                .authority_epoch
+                .is_same_authority(&retained.authority_epoch)
+            || session.module_generation.state_fence.resource_generation
+                != retained.activation_generation
+            || session.state != eliot_ipc::SessionState::Open
+        {
+            return Err(TransportError::SessionFenced);
+        }
+
+        let pending = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if !self.activation_result_still_retained(&pending, &retained, &session.connection_id) {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok((retained, pending))
     }
 
     /// Admits one durable/control event envelope for bridge-event delivery.
@@ -5833,18 +6049,16 @@ impl KernelComposition {
         clippy::too_many_lines,
         reason = "owner resolution, atomic ack, pure read, and keyed answer share one serialization guard"
     )]
-    fn answer_bridge_event_reconcile(
+    fn answer_bridge_event_reconcile_under_transition(
         &self,
         session: &Session,
         scope: &BridgeReconcileScope,
         frame_fence: &eliot_contracts::StateFence,
     ) -> Result<serde_json::Value, TransportError> {
-        // Existing transition serialization first: the read guard is held
-        // across the owner read and any consumed-frontier batch commit, so
-        // bridge profile fencing (the revocation path) cannot interleave
-        // unnoticed. No caller above holds this guard; the service-state
-        // read inside takes only its own short-lived lock.
-        let _transition = self.agent_bridge_transition_read()?;
+        // The bridge event dispatcher holds the transition read guard across
+        // this owner read and any consumed-frontier batch commit; profile
+        // fencing and the active application-session guard therefore share
+        // one linearization boundary.
         if !matches!(
             self.service_state()
                 .map_err(|_| TransportError::SessionFenced)?,
@@ -6578,6 +6792,8 @@ fn watchdog_intent_projection_record(
     let submitted_fence = eliot_contracts::StateFence::new(authority_epoch, resource_generation);
     Ok(HostRequestRecord {
         contract_version: ORS_CONTRACT_VERSION,
+        send_claim_protocol_version: 0,
+        transport_channel_binding_sha256: None,
         operation_id: operation_id.clone(),
         kind: OrsHostRequestKind::Reconciliation,
         // The request identity is the derived reconciliation key: one spool
@@ -6603,6 +6819,7 @@ fn watchdog_intent_projection_record(
         deadline_unix_ms: payload.expires_at_ms,
         state: HostRequestState::Requested,
         attempt: None,
+        attempt_history: Vec::new(),
         cancellation_target: None,
         result_digest: None,
         result_response: None,
@@ -7422,6 +7639,16 @@ pub(crate) fn check_local_state_admission(
 /// take the fresh-answer leg instead of serving a partial answer. A forged
 /// pair fails closed instead of serving. Pure: readback performs no dispatch
 /// and no store IO by construction.
+///
+/// Replay preserves the ORIGINAL execution and result identity — the record is
+/// returned unchanged, nothing re-executes, nothing is overwritten and no
+/// earlier delivery is erased — while the retained result's class is checked
+/// against the class the row actually recorded. The check is one-directional:
+/// it can refuse a replay whose retained claims are internally inconsistent,
+/// and it never promotes a class. A class it does not recognise, or a row that
+/// records no class at all, is served with that unknown intact rather than
+/// resolved here: the disclosure owner has no producer on this path, and this
+/// function is not allowed to become one.
 pub(crate) fn local_read_replay_response(
     receipt: &HostRequestAdmissionReceipt,
     record: &HostRequestRecord,
@@ -7430,6 +7657,22 @@ pub(crate) fn local_read_replay_response(
     let (Some(digest), Some(body)) = (&record.result_digest, &record.result_response) else {
         return Ok(None);
     };
+    if let Some(lineage) = &record.result_lineage {
+        // Compare the ORIGINALLY RECORDED retained digest with the ORIGINALLY
+        // RECORDED result digest. Nothing is recomputed over the bytes handed
+        // to this function: a fresh checksum would replace the proof instead of
+        // checking it.
+        if lineage.output_digest != *digest {
+            return Err(TransportError::SessionFenced);
+        }
+        let canonical = matches!(
+            lineage.result_class,
+            HostRequestRetainedResultClass::CanonicalWriteReceipt
+        );
+        if canonical != lineage.semantic_receipt_ref.is_some() {
+            return Err(TransportError::SessionFenced);
+        }
+    }
     HostRequestResultBody {
         wire_id: HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
         wire_version: HostRequestResultBody::CONTRACT_VERSION,

@@ -111,7 +111,8 @@
                         <Button Content="Clear filters" Click="ClearFilter_OnClick" />
                     </StackPanel>
                     <TextBlock Grid.Row="1" Grid.Column="5" Grid.ColumnSpan="2" Text="{Binding ResultSummary}"
-                               TextWrapping="Wrap" VerticalAlignment="Bottom" />
+                               TextWrapping="Wrap" VerticalAlignment="Bottom"
+                               AutomationProperties.Name="Projection result summary" />
                 </Grid>
             </Expander>
 
@@ -201,6 +202,8 @@
                             <InfoBadge Value="{Binding ItemCount}" />
                         </StackPanel>
                         <TextBlock Text="{Binding SectionDescription}" TextWrapping="Wrap" Opacity="0.8" />
+                        <TextBlock Text="{Binding BindingSummary}" TextWrapping="Wrap" Opacity="0.7" FontSize="12"
+                                   AutomationProperties.Name="Authenticated User Broker session binding" />
                     </StackPanel>
 
                     <Canvas x:Name="GraphCanvas" Grid.Row="1" Height="230" Visibility="Collapsed"
@@ -236,7 +239,7 @@
                         </ListView.ItemTemplate>
                     </ListView>
                     <Button Grid.Row="3" Content="Load next page" Click="LoadMore_OnClick" IsEnabled="{Binding CanLoadMore}"
-                            HorizontalAlignment="Center" AutomationProperties.Name="Load next bounded result page" />
+                            HorizontalAlignment="Center" AccessKey="L" AutomationProperties.Name="Load next bounded result page" />
                 </Grid>
 
                 <Border Grid.Column="1" Padding="14" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}" CornerRadius="8">
@@ -294,6 +297,7 @@
                                      Text="{Binding ActionInput, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                                      TextWrapping="Wrap" AcceptsReturn="True" MinHeight="56" />
                             <Button Content="Submit typed action" Click="ExecuteAction_OnClick"
+                                    IsEnabled="{Binding CanIssueCommands}"
                                     AutomationProperties.Name="Submit selected typed action through Governor" />
                             <StackPanel x:Name="UnknownOutcomePanel" Spacing="6" Visibility="Collapsed">
                                 <TextBlock Text="Unknown outcome: a mutation may have executed. Reconciling reuses the same operation identity; it never creates a second mutation."
@@ -307,10 +311,14 @@
             </Grid>
 
             <StackPanel x:Name="RunControls" Grid.Row="5" Orientation="Horizontal" Spacing="8" Visibility="Collapsed">
-                <Button Content="Start run" Click="Start_OnClick" />
-                <Button Content="Pause run" Click="Pause_OnClick" />
-                <Button Content="Resume run" Click="Resume_OnClick" />
-                <Button Content="Cancel run" Click="CancelRun_OnClick" />
+                <Button Content="Start run" Click="Start_OnClick" IsEnabled="{Binding CanIssueCommands}"
+                        AutomationProperties.Name="Start autonomy run" />
+                <Button Content="Pause run" Click="Pause_OnClick" IsEnabled="{Binding CanIssueCommands}"
+                        AutomationProperties.Name="Pause autonomy run" />
+                <Button Content="Resume run" Click="Resume_OnClick" IsEnabled="{Binding CanIssueCommands}"
+                        AutomationProperties.Name="Resume autonomy run" />
+                <Button Content="Cancel run" Click="CancelRun_OnClick" IsEnabled="{Binding CanIssueCommands}"
+                        AutomationProperties.Name="Cancel autonomy run" />
                 <TextBlock Text="All durable mutations require typed Governor acceptance and a canonical receipt." VerticalAlignment="Center" Opacity="0.75" />
             </StackPanel>
         </Grid>

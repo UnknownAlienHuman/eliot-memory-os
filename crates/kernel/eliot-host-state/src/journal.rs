@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use eliot_platform::{KernelActivationNonce, PlatformHandle};
@@ -7,9 +8,10 @@ use thiserror::Error;
 
 use crate::backend::{BackendReconcileState, CommittedAppend, DurableImage, PreparedAppend};
 use crate::model::{
-    AppliedOperation, CutoverIntentState, DrainState, EpochEvidence, EpochRetirementRecord,
-    HostInstallationEpoch, HostState, HostStateRecord, IdempotencyIdentity,
-    PredecessorRetirementRelation, RecordFence, RecoveryLineageReason, activation_transition,
+    AppliedOperation, BackupPreparationState, CutoverIntentState, DrainState, EpochEvidence,
+    EpochRetirementRecord, HostInstallationEpoch, HostState, HostStateRecord, IdempotencyIdentity,
+    PredecessorRetirementRelation, RecordFence, RecoveryLineageReason,
+    WakeCancellationBatchProjection, activation_transition, backup_preparation_transition,
     dependency_transition, drain_transition, epoch_transition_is_direct_child_of,
     kernel_transition, store_rebind_transition, wake_transition,
 };
@@ -69,6 +71,80 @@ impl AppendReceipt {
 pub struct EpochRetirementQuery {
     /// Canonical operation identity of the retirement record.
     pub operation: IdempotencyIdentity,
+}
+
+/// Exact Host journal selector for one `UserAutomation` wake-cancellation batch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WakeCancellationBatchQuery {
+    /// Canonical Host batch operation identity computed from the original
+    /// typed cancellation request.
+    pub operation: IdempotencyIdentity,
+    /// Canonical SHA-256 commitment of the exact typed request bytes.
+    pub request_commitment_sha256: String,
+}
+
+fn wake_cancellation_key(operation: &IdempotencyIdentity) -> (String, String) {
+    (
+        operation.operation_id.as_str().to_owned(),
+        operation.idempotency_key.as_str().to_owned(),
+    )
+}
+
+/// Journal-owned observation of one committed wake-cancellation batch.
+///
+/// The record is selected from the reducer's exact-operation index, rebuilt
+/// from validated Host journal frames. The index entry is published only with
+/// a checked durable commit receipt; readback revalidates its original record
+/// checksum and reconstructs the exact operation/sequence/transaction receipt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WakeCancellationBatchObservation {
+    record: crate::WakeCancellationBatchRecord,
+    receipt: AppendReceipt,
+    record_checksum: String,
+}
+
+impl WakeCancellationBatchObservation {
+    /// Exact cancellation batch record applied by the Host journal.
+    pub const fn record(&self) -> &crate::WakeCancellationBatchRecord {
+        &self.record
+    }
+
+    /// Exact durable journal append receipt reconstructed by the journal owner.
+    pub const fn receipt(&self) -> &AppendReceipt {
+        &self.receipt
+    }
+
+    /// Checksum of the exact retained Host record.
+    pub fn record_checksum(&self) -> &str {
+        &self.record_checksum
+    }
+}
+
+/// Typed outcomes of an exact Host cancellation-batch query.
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub enum WakeCancellationBatchQueryError {
+    /// The Host journal or backend could not provide a verified read.
+    #[error("host cancellation journal: {0}")]
+    Journal(#[from] JournalError),
+    /// The operation or request commitment was malformed.
+    #[error("wake cancellation query is invalid: {0}")]
+    Invalid(String),
+    /// No durable cancellation batch exists for the exact Host operation.
+    #[error("wake cancellation batch was not found for the named operation")]
+    NotFound,
+    /// A legacy batch exists but did not retain its original typed request
+    /// commitment, so it cannot prove the exact cancellation request.
+    #[error("wake cancellation batch predates request-commitment retention")]
+    LegacyUnbound,
+    /// The operation exists but is bound to different typed request bytes.
+    #[error("wake cancellation batch request commitment conflicts")]
+    RequestCommitmentMismatch,
+    /// More than one durable record or receipt matched the operation.
+    #[error("wake cancellation batch journal evidence is contradictory")]
+    Contradictory,
+    /// The journal frame did not have its exact durable commit receipt.
+    #[error("wake cancellation batch has no durable commit receipt")]
+    MissingReceipt,
 }
 
 /// Retirement resolved by the journal owner under one exact operation
@@ -663,6 +739,21 @@ fn apply(
             for (index, entry) in indexes.into_iter().zip(&next.entries) {
                 state.wakes[index] = entry.wake.clone();
             }
+            let key = wake_cancellation_key(&next.operation);
+            if Arc::make_mut(&mut state.wake_cancellation_batches)
+                .insert(
+                    key,
+                    WakeCancellationBatchProjection {
+                        record: next.clone(),
+                        sequence,
+                        record_checksum: applied_record_checksum.to_owned(),
+                        receipt_valid: false,
+                    },
+                )
+                .is_some()
+            {
+                return Err(JournalError::IdempotencyConflict);
+            }
             state.clean_marker = None;
         }
         HostStateRecord::Observation(next) => {
@@ -727,6 +818,15 @@ fn apply(
                 .pending_cutover
                 .as_ref()
                 .is_none_or(|intent| intent.state != CutoverIntentState::Pending);
+            // A preparation with no recorded result is the same hazard for the
+            // same reason: the operation was admitted and its destination may
+            // exist, so closing a clean Host epoch lineage would re-base this
+            // journal and discard the only durable proof that it was admitted.
+            // A recorded result is settled history and does not block shutdown.
+            let preparations_settled = state
+                .backup_preparations
+                .iter()
+                .all(|record| record.state != BackupPreparationState::Pending);
             let reactive_context_clean = state
                 .reactive_context
                 .as_ref()
@@ -740,6 +840,7 @@ fn apply(
                     && !genesis_without_runtime_contour)
                 || !reactive_context_clean
                 || !cutover_settled
+                || !preparations_settled
             {
                 return Err(JournalError::Invalid(
                     "clean marker does not cover a cleanly stopped journal".into(),
@@ -882,6 +983,39 @@ fn apply(
                 ));
             }
             state.pending_cutover = Some(next.clone());
+            state.clean_marker = None;
+        }
+        HostStateRecord::BackupPreparation(next) => {
+            // Preparation is a per-operation state machine in this journal's
+            // own projection, keyed by the admitted preparation operation
+            // identity - not a second registry. `backup_preparation_transition`
+            // holds the law; this arm is the single-writer bookkeeping:
+            //  * one entry per admitted preparation, replaced only by that same
+            //    operation identity, so a repeat resolves the original entry
+            //    instead of starting a second preparation;
+            //  * a `Prepared` result is admitted only after a durable `Pending`
+            //    with identical bindings and fence, so a root can never be
+            //    claimed as created without a recorded admission that proposed
+            //    exactly that root;
+            //  * a changed source, archive, class, admission, destination or
+            //    owner-issued identity under one operation identity is a
+            //    conflict, not a re-scoped preparation;
+            //  * `Prepared` is terminal, so an unsettled admission is never
+            //    re-opened and a partial destination is never silently replaced
+            //    by a second outcome.
+            let index = state
+                .backup_preparations
+                .iter()
+                .position(|item| item.preparation_operation == next.preparation_operation);
+            backup_preparation_transition(
+                index.map(|index| &state.backup_preparations[index]),
+                next,
+            )?;
+            if let Some(index) = index {
+                state.backup_preparations[index] = next.clone();
+            } else {
+                state.backup_preparations.push(next.clone());
+            }
             state.clean_marker = None;
         }
     }
@@ -1042,6 +1176,7 @@ fn state_for_host(
             .into_iter()
             .filter(|item| item.host != *host)
             .collect();
+        validate_cancellation_projection_receipts(image, &mut current)?;
         return Ok(current);
     }
     if image.epochs.is_empty() {
@@ -1093,6 +1228,45 @@ fn state_for_host(
         .or_else(|| parent.prior_kernel.clone());
     next.prior_kernel_unknown = parent.prior_kernel_unknown;
     Ok(next)
+}
+
+/// Bind each replayed batch projection to its original durable commit receipt
+/// once at journal open/recovery. Per-operation readback can then be bounded
+/// to the indexed record instead of loading every retained frame again.
+fn validate_cancellation_projection_receipts(
+    image: &DurableImage,
+    state: &mut HostState,
+) -> Result<(), JournalError> {
+    let mut committed = Vec::new();
+    for (key, projection) in state.wake_cancellation_batches.iter() {
+        let mut receipts = image.receipts.iter().filter(|receipt| {
+            receipt.host == state.host && receipt.operation == projection.record.operation
+        });
+        let Some(receipt) = receipts.next() else {
+            continue;
+        };
+        if receipts.next().is_some() {
+            return Err(JournalError::IdempotencyConflict);
+        }
+        let sequence = validate_committed_append(receipt, state)?;
+        let record = HostStateRecord::WakeCancellationBatch(projection.record.clone());
+        let expected_transaction_id = journal_transaction_id(&record, &projection.record_checksum)?;
+        if sequence != projection.sequence
+            || receipt.record_checksum != projection.record_checksum
+            || receipt.transaction_id != expected_transaction_id
+        {
+            return Err(JournalError::IdempotencyConflict);
+        }
+        committed.push(key.clone());
+    }
+    let projections = Arc::make_mut(&mut state.wake_cancellation_batches);
+    for key in committed {
+        let projection = projections
+            .get_mut(&key)
+            .ok_or(JournalError::IdempotencyConflict)?;
+        projection.receipt_valid = true;
+    }
+    Ok(())
 }
 
 fn validate_committed_append(
@@ -1374,6 +1548,87 @@ impl<B: JournalBackend> HostStateJournal<B> {
         })
     }
 
+    /// Reads one exact committed wake-cancellation batch by both its original
+    /// Host operation identity and canonical typed-request commitment.
+    ///
+    /// This scans the verified durable frame and checks its reducer projection
+    /// plus backend commit receipt. Current wake rows are not used as a proxy:
+    /// their absence or later lifecycle state cannot settle an earlier batch.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the durable frame, reducer projection, and backend receipt are checked together"
+    )]
+    pub fn query_wake_cancellation_batch(
+        &self,
+        query: &WakeCancellationBatchQuery,
+    ) -> Result<WakeCancellationBatchObservation, WakeCancellationBatchQueryError> {
+        query
+            .operation
+            .validate()
+            .map_err(|error| WakeCancellationBatchQueryError::Invalid(error.to_string()))?;
+        if query.request_commitment_sha256.len() != 64
+            || !query
+                .request_commitment_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(WakeCancellationBatchQueryError::Invalid(
+                "request commitment must be lowercase sha256".to_owned(),
+            ));
+        }
+
+        // `apply` builds this index from the original validated frame.
+        // `open` replays the journal and checks every committed receipt before
+        // publishing state; `append_inner` publishes the next state only after
+        // commit. This short read lock therefore selects one exact committed
+        // batch without loading or scanning unbounded journal history.
+        let current = self
+            .state
+            .lock()
+            .map_err(|_| WakeCancellationBatchQueryError::Journal(JournalError::Synchronization))?;
+        let projection = current
+            .wake_cancellation_batches
+            .get(&wake_cancellation_key(&query.operation))
+            .ok_or(WakeCancellationBatchQueryError::NotFound)?;
+        let record = &projection.record;
+        if record.operation != query.operation {
+            return Err(WakeCancellationBatchQueryError::Contradictory);
+        }
+        match record.request_commitment_sha256.as_deref() {
+            None => return Err(WakeCancellationBatchQueryError::LegacyUnbound),
+            Some(commitment) if commitment != query.request_commitment_sha256 => {
+                return Err(WakeCancellationBatchQueryError::RequestCommitmentMismatch);
+            }
+            Some(_) => {}
+        }
+
+        let host_record = HostStateRecord::WakeCancellationBatch(record.clone());
+        let actual_checksum =
+            record_checksum(&host_record).map_err(WakeCancellationBatchQueryError::Journal)?;
+        if actual_checksum != projection.record_checksum
+            || projection.sequence == 0
+            || projection.sequence > current.sequence
+        {
+            return Err(WakeCancellationBatchQueryError::Journal(
+                JournalError::IdempotencyConflict,
+            ));
+        }
+        if !projection.receipt_valid {
+            return Err(WakeCancellationBatchQueryError::MissingReceipt);
+        }
+        let transaction_id = journal_transaction_id(&host_record, &projection.record_checksum)
+            .map_err(WakeCancellationBatchQueryError::Journal)?;
+        Ok(WakeCancellationBatchObservation {
+            record: record.clone(),
+            receipt: AppendReceipt {
+                sequence: projection.sequence,
+                disposition: AppendDisposition::Replayed,
+                transaction_id,
+            },
+            record_checksum: projection.record_checksum.clone(),
+        })
+    }
+
     #[allow(clippy::needless_pass_by_value)]
     pub fn reconcile_reactive_context(
         &self,
@@ -1467,6 +1722,13 @@ impl<B: JournalBackend> HostStateJournal<B> {
         backend
             .commit(&transaction_id)
             .map_err(|error| persist_error(error, &transaction_id))?;
+        if let HostStateRecord::WakeCancellationBatch(batch) = &record {
+            let key = wake_cancellation_key(&batch.operation);
+            let projection = Arc::make_mut(&mut next.wake_cancellation_batches)
+                .get_mut(&key)
+                .ok_or(JournalError::IdempotencyConflict)?;
+            projection.receipt_valid = true;
+        }
         next.sequence = sequence;
         next.last_checksum = Some(record_checksum);
         *state = next;

@@ -18,9 +18,9 @@
     "runnable": "the declared command is independently invocable for this package"
   },
   "proof_level_ceiling": {
-    "state": "UNDECLARED",
+    "state": "DECLARED",
     "origin": "module.toml|proof_ceiling",
-    "value": null
+    "value": "Module proof of the fixtures themselves; the contract or adapter behavior a test exercises keeps its own proof ceiling, as the crate itself records"
   },
   "shape_checks": {
     "deny_unknown_fields": {
@@ -43,9 +43,14 @@
   },
   "unit_property_model_tests": {
     "declared_proof_surface": {
-      "state": "UNDECLARED",
+      "state": "DECLARED",
       "origin": "module.toml|proof_surface",
-      "value": null
+      "value": [
+        "deterministic clock and identifier generation",
+        "fixture roundtrip",
+        "typed failpoint, fake process and fake store rejection",
+        "bounded temporary root"
+      ]
     },
     "selected_tests": [],
     "test_attribute_count": 7
@@ -96,20 +101,20 @@
     "test_stu": 0,
     "nonzero": true
   },
-  "bound_contract_digest": "66e04199fbce86a3d8b456f55413e62723c7c9d8bbff9b24e03e52a5984b71bd",
+  "bound_contract_digest": "7deefe00930c88281344cf2bee38cf2cbbc563429dd15381bab3da354448256e",
   "source_provenance": {
     "input_digests": {
       "workspace_manifest": {
         "path": "Cargo.toml",
-        "sha256": "35b06d9051eb99533bd8bb97836ba684ce964f2a1e5554c35b406b2264220cfa"
+        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
       },
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
-        "sha256": "eca054bc9efa1d4fb5e9f7732903b5f453bca7a192801c5363e2f2d2bc0a22f5"
+        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
       },
       "architecture_boundaries": {
         "path": "config/architecture-boundaries.toml",
-        "sha256": "b65c52dc646993bfcb273290bfa6d7bd48b382fb5fe3471a50bea5f28f221e9b"
+        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
       },
       "logical_block_config": {
         "path": "docs/code-navigation/logical-blocks.toml",
@@ -117,9 +122,12 @@
       },
       "package_manifest": {
         "path": "crates/foundation/eliot-test-support/Cargo.toml",
-        "sha256": "9784f68f8826bde4b73cd579c755753c166fb8560d190ef241ed6c6b9a53b593"
+        "sha256": "a32e3b4ffb732cbe5e8030b2fc40f3a91b57e62a2c9dffec49d2a2d830881ada"
       },
-      "module_manifest": null,
+      "module_manifest": {
+        "path": "crates/foundation/eliot-test-support/module.toml",
+        "sha256": "c7f9cc6f3fd2918007f9bd9b3a1e0cc6c50140e0a5e45c8dab45bcc9d5d5e210"
+      },
       "selected_source": {
         "path_count": 1,
         "sha256": "c1acdb71b027653141708cda735a938de8de9d05e815d46bea5a52855edc9c08"
@@ -128,9 +136,9 @@
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "627fbe6202b19e6442eee5149441ea41b9f743ae048233da1fb6a1f9bba1d378",
+  "artifact_digest": "89926279c1bdb4329887331c33c0c5538b84ad4c9704f5328fe56941138e3bc0",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "627fbe6202b19e64"
+    "value": "89926279c1bdb432"
   }
 }
