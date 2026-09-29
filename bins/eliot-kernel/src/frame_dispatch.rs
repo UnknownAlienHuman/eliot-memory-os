@@ -1791,7 +1791,7 @@ impl KernelComposition {
                     observe_frame("kernel.frame_cancel_observed", "cancelled");
                 }
             }
-            Err(_) => {
+            Err(error) => {
                 observe_frame("kernel.frame_doctor_execute", "fenced");
                 if emit_terminal {
                     super::kernel_diagnostics::observe_terminal_error(frame_terminal_code(error));
@@ -2105,7 +2105,7 @@ impl KernelComposition {
                     observe_frame("kernel.frame_cancel_observed", "cancelled");
                 }
             }
-            Err(_) => {
+            Err(error) => {
                 observe_frame("kernel.frame_testd_execute", "fenced");
                 if emit_terminal {
                     super::kernel_diagnostics::observe_terminal_error(frame_terminal_code(error));
