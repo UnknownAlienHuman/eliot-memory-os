@@ -750,7 +750,10 @@ impl EbpStoreTransport for ScriptTransport {
                 ProtocolVersion::CURRENT,
                 Some(request_id),
                 StoreResponse::Readiness {
-                    receipt: eliot_store_api::ReadinessReceipt::ready("1.0.0".to_owned()),
+                    receipt: eliot_store_api::ReadinessReceipt::ready(
+                        "1.0.0".to_owned(),
+                        eliot_store_api::StoreSemanticReadiness::compatible(),
+                    ),
                 },
             )
             .expect("scripted readiness"));
@@ -1281,7 +1284,10 @@ async fn client_rejects_wrong_response_kind_and_misbound_receipts() {
         (
             "readiness",
             StoreResponse::Readiness {
-                receipt: eliot_store_api::ReadinessReceipt::ready("1.0.0".to_owned()),
+                receipt: eliot_store_api::ReadinessReceipt::ready(
+                    "1.0.0".to_owned(),
+                    eliot_store_api::StoreSemanticReadiness::compatible(),
+                ),
             },
         ),
         (
@@ -1512,7 +1518,10 @@ async fn delivery_acknowledgement_exit_and_liveness_never_prove_success() {
         (
             "readiness observation",
             StoreResponse::Readiness {
-                receipt: eliot_store_api::ReadinessReceipt::ready("1.0.0".to_owned()),
+                receipt: eliot_store_api::ReadinessReceipt::ready(
+                    "1.0.0".to_owned(),
+                    eliot_store_api::StoreSemanticReadiness::compatible(),
+                ),
             },
         ),
         (

@@ -8268,7 +8268,10 @@ mod named_read_gateway_tests {
                         self.requirement.connection_id.as_str().to_owned(),
                         request_id,
                         StoreResponse::Readiness {
-                            receipt: eliot_store_api::ReadinessReceipt::ready("1.0.0".to_owned()),
+                            receipt: eliot_store_api::ReadinessReceipt::ready(
+                                "1.0.0".to_owned(),
+                                eliot_store_api::StoreSemanticReadiness::compatible(),
+                            ),
                         },
                     ));
                 }

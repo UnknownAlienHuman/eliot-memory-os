@@ -376,6 +376,8 @@ use eliot_kernel_core::{
 #[cfg(windows)]
 pub use eliot_kernel_service::KernelStoreGateway;
 #[cfg(windows)]
+use eliot_kernel_service::HostProcessBinding;
+#[cfg(windows)]
 use eliot_kernel_service::StoreRebindQuery;
 use eliot_kernel_service::{
     AgentBridgeAdmissionDescriptor, EliotdLaunchDescriptor, HostKernelCandidateBinding,

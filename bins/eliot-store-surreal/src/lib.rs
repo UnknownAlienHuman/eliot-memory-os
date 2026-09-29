@@ -44,7 +44,8 @@ use eliot_store_api::{
     genesis_manifest, verify_canonical_request_hash,
 };
 pub use eliot_store_api::{
-    ReadinessReceipt, ReadinessStatus, StoreRequest as Request, StoreResponse as Response,
+    ReadinessReceipt, ReadinessStatus, SemanticDimension, StoreRequest as Request,
+    StoreResponse as Response, StoreSemanticReadiness,
 };
 #[cfg(test)]
 use eliot_store_api::{
@@ -54,7 +55,8 @@ use eliot_store_api::{
 #[cfg(test)]
 use eliot_store_surreal_adapter::SchemaGeneration;
 use eliot_store_surreal_adapter::{
-    AdapterError, MigrationReceipt, SemanticReadiness, SurrealStoreAdapter,
+    AdapterError, MigrationReceipt, PINNED_SURREALDB_MAJOR, SemanticReadiness,
+    SurrealStoreAdapter,
 };
 #[cfg(test)]
 use secrecy::SecretString;
@@ -502,15 +504,63 @@ impl StoreComposition {
                 return Err(StoreError::FenceMismatch);
             }
         }
-        Ok(match readiness {
-            SemanticReadiness::Unavailable => ReadinessReceipt::unavailable(),
-            SemanticReadiness::MigrationRequired { expected, observed } => {
-                ReadinessReceipt::migration_required(expected.to_string(), observed)
-            }
-            SemanticReadiness::Ready { generation } => {
-                ReadinessReceipt::ready(generation.to_string())
-            }
+        Ok(ReadinessReceipt {
+            status: match &readiness {
+                SemanticReadiness::Ready { .. } => ReadinessStatus::Ready,
+                SemanticReadiness::MigrationRequired { .. } => ReadinessStatus::MigrationRequired,
+                SemanticReadiness::Unavailable => ReadinessStatus::Unavailable,
+            },
+            expected_generation: match &readiness {
+                SemanticReadiness::Ready { generation } => Some(generation.to_string()),
+                SemanticReadiness::MigrationRequired { expected, .. } => {
+                    Some(expected.to_string())
+                }
+                SemanticReadiness::Unavailable => None,
+            },
+            observed_generation: match &readiness {
+                SemanticReadiness::Ready { generation } => Some(generation.to_string()),
+                SemanticReadiness::MigrationRequired { observed, .. } => observed.clone(),
+                SemanticReadiness::Unavailable => None,
+            },
+            semantic: self.semantic_readiness(&readiness),
         })
+    }
+
+    /// The three semantic dimensions, reported separately and never reduced into
+    /// one another.
+    ///
+    /// The reduced [`ReadinessReceipt::status`] above is the schema projection
+    /// only. A caller that must name the dimension that failed reads the field
+    /// for that dimension here.
+    fn semantic_readiness(&self, readiness: &SemanticReadiness) -> StoreSemanticReadiness {
+        // Version compatibility is the live, ownership-verified authenticated
+        // provider session, not a record/config echo. No claimed live session
+        // means the dimension is unobserved, never compatible.
+        let version = match self.store.authenticated_provider_identity() {
+            Some(identity) if identity.version_major == PINNED_SURREALDB_MAJOR => {
+                SemanticDimension::Compatible
+            }
+            Some(_) => SemanticDimension::Incompatible,
+            None => SemanticDimension::Unavailable,
+        };
+        let schema = match readiness {
+            SemanticReadiness::Ready { .. } => SemanticDimension::Compatible,
+            SemanticReadiness::MigrationRequired { .. } => SemanticDimension::Incompatible,
+            SemanticReadiness::Unavailable => SemanticDimension::Unavailable,
+        };
+        // Transaction viability is a real executed read path through the
+        // bridge. `readiness_inner` already ran it and fails closed on error,
+        // so reaching this point with a ready schema is the passed probe.
+        let transaction = if schema == SemanticDimension::Compatible {
+            SemanticDimension::Compatible
+        } else {
+            SemanticDimension::Unavailable
+        };
+        StoreSemanticReadiness {
+            version,
+            schema,
+            transaction,
+        }
     }
 
     /// Applies exactly the adapter's explicit first-generation schema plan.
@@ -2578,15 +2628,30 @@ mod tests {
     #[test]
     fn pipe_gate_requires_exact_complete_semantic_ready_receipt() {
         assert!(
-            require_semantic_ready_for_pipe(&ReadinessReceipt::ready("1.0.0".to_owned()), "1.0.0")
-                .is_ok()
-        );
-        assert!(
-            require_semantic_ready_for_pipe(&ReadinessReceipt::unavailable(), "1.0.0").is_err()
+            require_semantic_ready_for_pipe(
+                &ReadinessReceipt::ready("1.0.0".to_owned(), StoreSemanticReadiness::compatible()),
+                "1.0.0",
+            )
+            .is_ok()
         );
         assert!(
             require_semantic_ready_for_pipe(
-                &ReadinessReceipt::migration_required("1.0.0".to_owned(), None),
+                &ReadinessReceipt::unavailable(StoreSemanticReadiness::unobserved()),
+                "1.0.0",
+            )
+            .is_err()
+        );
+        assert!(
+            require_semantic_ready_for_pipe(
+                &ReadinessReceipt::migration_required(
+                    "1.0.0".to_owned(),
+                    None,
+                    StoreSemanticReadiness {
+                        version: SemanticDimension::Compatible,
+                        schema: SemanticDimension::Incompatible,
+                        transaction: SemanticDimension::Unavailable,
+                    },
+                ),
                 "1.0.0",
             )
             .is_err()
@@ -2595,6 +2660,7 @@ mod tests {
             status: ReadinessStatus::Ready,
             expected_generation: Some("1.0.0".to_owned()),
             observed_generation: Some("0.9.0".to_owned()),
+            semantic: StoreSemanticReadiness::compatible(),
         };
         assert!(require_semantic_ready_for_pipe(&partial, "1.0.0").is_err());
     }

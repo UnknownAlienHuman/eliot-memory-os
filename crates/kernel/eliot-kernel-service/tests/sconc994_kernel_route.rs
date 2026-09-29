@@ -560,7 +560,10 @@ async fn serve(
                 ProtocolVersion::CURRENT,
                 Some(request_id),
                 StoreResponse::Readiness {
-                    receipt: ReadinessReceipt::ready("kernel-route-994kr".to_owned()),
+                    receipt: ReadinessReceipt::ready(
+                        "kernel-route-994kr".to_owned(),
+                        StoreSemanticReadiness::compatible(),
+                    ),
                 },
             )
             .expect("994-kr readiness encodes"),

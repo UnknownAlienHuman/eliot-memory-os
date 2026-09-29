@@ -778,6 +778,7 @@ async fn serve_store_route(
                 eliot_store_api::StoreResponse::Readiness {
                     receipt: eliot_store_api::ReadinessReceipt::ready(
                         "kernel-route-994".to_owned(),
+                        eliot_store_api::StoreSemanticReadiness::compatible(),
                     ),
                 },
             )

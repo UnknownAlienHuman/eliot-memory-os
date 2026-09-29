@@ -8,6 +8,8 @@
 //! the pure cell 3/6 store-rebind predicates moved here from `lib` without
 //! touching the `rebind_store` transaction body, which stays whole in `lib`.
 
+#[cfg(windows)]
+use super::HostProcessBinding;
 use super::HostStoreBootstrapRequirement;
 use super::KernelBuildError;
 use super::KernelComposition;
@@ -35,7 +37,10 @@ use eliot_ipc::NamedPipeTransport;
 #[cfg(windows)]
 use eliot_kernel_core::RouteScope;
 #[cfg(windows)]
-use eliot_kernel_service::{EbpCanonicalStoreClient, StoreClientError};
+use eliot_kernel_service::{
+    EbpCanonicalStoreClient, StoreClientError, publish_canonical_store_write_readiness,
+    qualify_canonical_store_writes,
+};
 #[cfg(windows)]
 use eliot_platform_windows::{NamedPipePeerExpectation, observe_named_pipe_peer_process_in_job};
 
@@ -318,6 +323,15 @@ impl KernelComposition {
             );
             KernelBuildError::Principal(error.to_string())
         })?;
+        // The Host/Watchdog half of the I1.9 canonical-store write-admission
+        // join, captured from the live authenticated peer before the binding is
+        // consumed by the pipe expectation.
+        let observed_peer = HostProcessBinding {
+            process_id: observed.process_binding().process_id(),
+            start_time_100ns: observed.process_binding().start_time_100ns(),
+            image_path: observed.process_binding().image_path().to_owned(),
+        };
+        let observed_job = observed.job_name().to_owned();
         if observed.process_binding().process_id() != process.process_id
             || observed.process_binding().start_time_100ns() != process.start_time_100ns
             || observed.process_binding().image_path() != process.image_path
@@ -380,6 +394,44 @@ impl KernelComposition {
         observe_entrypoint_with_detail(
             EntrypointStage::StoreBootstrap,
             "kernel.store.client_connected",
+        );
+        // I1.9: the two-owner write-admission join. The Host/Watchdog half is
+        // the freshly re-observed authenticated peer process inside the
+        // Host-owned Job, bound to the Host-issued instance handoff; the
+        // semantic half is the bridge's own version/schema/transaction receipt
+        // for this same session. Normal canonical writes open only on the exact
+        // current join, and the failing dimension is named rather than reduced
+        // to one "store healthy" boolean.
+        let Some(semantic) = client.readiness_receipt().map(|receipt| receipt.semantic) else {
+            observe_entrypoint_with_detail(
+                EntrypointStage::StoreBootstrap,
+                "kernel.store.write_readiness_rejected:no_bridge_readiness",
+            );
+            return Err(KernelBuildError::Service(
+                "canonical writes stay closed without a store-bridge readiness receipt".to_owned(),
+            ));
+        };
+        let qualified =
+            qualify_canonical_store_writes(&handoff, &observed_peer, &observed_job, &semantic)
+                .map_err(|refusal| {
+                    observe_entrypoint_with_detail(
+                        EntrypointStage::StoreBootstrap,
+                        &format!("kernel.store.write_readiness_rejected:{refusal:?}"),
+                    );
+                    KernelBuildError::Service(format!("canonical writes stay closed: {refusal:?}"))
+                })?;
+        // Re-check the instance immediately before the gateway is built, so a
+        // replacement generation cannot inherit an older qualification.
+        publish_canonical_store_write_readiness(&qualified, &handoff).map_err(|refusal| {
+            observe_entrypoint_with_detail(
+                EntrypointStage::StoreBootstrap,
+                &format!("kernel.store.write_readiness_recheck_rejected:{refusal:?}"),
+            );
+            KernelBuildError::Service(format!("canonical writes stay closed: {refusal:?}"))
+        })?;
+        observe_entrypoint_with_detail(
+            EntrypointStage::StoreBootstrap,
+            "kernel.store.write_readiness_joined",
         );
         let route_scope = RouteScope::new(STORE_BRIDGE_ROUTE)
             .map_err(|error| KernelBuildError::Core(error.to_string()))?;

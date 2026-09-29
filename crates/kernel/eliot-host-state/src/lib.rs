@@ -39,7 +39,8 @@ pub use journal::{
 pub use legacy::{LegacyHostStateImporter, LegacyHostStateSnapshot};
 pub use model::{
     ActivationState, AppliedOperation, BackupPreparationRecord, BackupPreparationState,
-    CanonicalStoreWriteRefusal, CleanMarker, CutoverIntentRecord, CutoverIntentState,
+    CanonicalStoreObservation, CanonicalStoreObservationRefusal, CleanMarker, CutoverIntentRecord,
+    CutoverIntentState,
     DependencyLifecycleBudget, DependencyRecord, DependencyResourceBudget, DependencyState,
     DrainCommitRecord, DrainRecord, DrainState, EliotActivationRecord, EpochEvidence,
     EpochRetirementRecord, FailureRecoveryDirective, HostInstallationEpoch, HostKernelStoreLineage,

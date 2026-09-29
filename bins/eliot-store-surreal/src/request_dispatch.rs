@@ -25,6 +25,7 @@ use eliot_store_api::StoreBackupRequest;
 use eliot_store_api::StoreError;
 use eliot_store_api::StoreFailure;
 use eliot_store_api::StoreFailureIdentityContext;
+use eliot_store_api::StoreSemanticReadiness;
 use eliot_store_api::StoreGenesisRequest;
 use eliot_store_api::StoreHealth;
 use eliot_store_api::StoreHealthStatus;
@@ -543,7 +544,7 @@ fn project_compatibility_readiness(
     if verdict.is_writer_admitted() {
         receipt
     } else {
-        ReadinessReceipt::unavailable()
+        ReadinessReceipt::unavailable(StoreSemanticReadiness::unobserved())
     }
 }
 

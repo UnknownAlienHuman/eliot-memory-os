@@ -356,7 +356,10 @@ impl EbpStoreTransport for FakeTransport {
                     &connection,
                     request_id,
                     StoreResponse::Readiness {
-                        receipt: eliot_store_api::ReadinessReceipt::ready("1.0.0".to_owned()),
+                        receipt: eliot_store_api::ReadinessReceipt::ready(
+                            "1.0.0".to_owned(),
+                            eliot_store_api::StoreSemanticReadiness::compatible(),
+                        ),
                     },
                 ));
             }
@@ -714,7 +717,10 @@ async fn wrong_response_kind_is_a_typed_contract_error_with_no_second_send() {
     let client = EbpCanonicalStoreClient::connect(
         FakeTransport::new(kind_requirement.clone(), counters.clone())
             .with_reserved_write_response(StoreResponse::Readiness {
-                receipt: eliot_store_api::ReadinessReceipt::ready("1.0.0".to_owned()),
+                receipt: eliot_store_api::ReadinessReceipt::ready(
+                    "1.0.0".to_owned(),
+                    eliot_store_api::StoreSemanticReadiness::compatible(),
+                ),
             }),
         kind_requirement,
     )

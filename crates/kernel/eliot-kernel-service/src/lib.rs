@@ -50,6 +50,7 @@ mod storage_replacement;
 mod store_client;
 #[cfg(windows)]
 mod store_gateway;
+mod store_write_readiness;
 mod store_write_reservation;
 #[cfg(test)]
 mod store_write_reservation_tests;
@@ -225,6 +226,10 @@ pub use store_gateway::StoreApplyRefusal;
 pub use store_gateway::DreamerCommitUncertain;
 #[cfg(windows)]
 pub use store_gateway::DreamerJobGatewayError;
+pub use store_write_readiness::{
+    CanonicalStoreWriteReadiness, CanonicalStoreWriteRefusal,
+    publish_canonical_store_write_readiness, qualify_canonical_store_writes,
+};
 pub use store_write_reservation::{
     CompositionReservation, ObservedHead, RESERVATION_KEY_NAME, RESERVATION_KEY_PROVIDER,
     RESERVATION_VISIBILITY, ReservationSeed, ReservationWriteError, ReservedSubmission,

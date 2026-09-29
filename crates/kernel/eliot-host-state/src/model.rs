@@ -1187,86 +1187,116 @@ impl ManagedDependencyRecord {
         }
     }
 
-    /// Joins this record's five operational bindings with an independently
-    /// evaluated store-bridge semantic-probe verdict to derive canonical-store
-    /// write readiness.
+    /// Derives the Host-managed process half of canonical-store write readiness.
     ///
-    /// The caller owns and evaluates the version, schema, and transaction
-    /// probes, and passes their combined verdict here. Process liveness cannot
-    /// satisfy that verdict, and the probe verdict cannot substitute for the
-    /// Host-managed process evidence. The caller also supplies the required
-    /// Job Object/PID lineage references, which must exactly match this record.
-    /// This function starts no process and runs no probe; callers must pass
-    /// `false` until all semantic probes succeed.
+    /// This is the operational observation only (I1.9). It answers launch
+    /// lineage, process approval, exact duplicate-free Job Object/PID lineage
+    /// and observed liveness, and returns the exact observed instance identity
+    /// the caller binds the store bridge's semantic-probe receipt against. It
+    /// runs no probe, starts no process, and holds no DB semantic judgement: a
+    /// caller-supplied boolean is deliberately not accepted here, because two
+    /// healthy booleans are not a join. The final write-admission join lives in
+    /// the Kernel/store-readiness consumer.
     ///
+    /// Remaining restart permission is reported on the returned observation and
+    /// is not a readiness dimension: zero future restart allowance forbids
+    /// another restart, it does not fail the current process's liveness.
     /// Refusal order follows the operational bindings: launch lineage, process
-    /// approval, Job Object/PID lineage, observed liveness, restart budget, then
-    /// semantic readiness. The decision never consults [`Self::state`].
-    pub fn canonical_store_write_readiness(
+    /// approval, Job Object/PID lineage, then observed liveness. The decision
+    /// never consults [`Self::state`].
+    pub fn canonical_store_process_readiness(
         &self,
         required_process_manifest: &ImmutableProcessManifest,
         required_process_generation: &EpochTransition,
         required_artifact_hash: &PlatformHandle,
         required_config_hash: &PlatformHandle,
         required_pid_job_lineage_refs: &[PlatformHandle],
-        semantic_probes_ready: bool,
-    ) -> Result<(), CanonicalStoreWriteRefusal> {
+    ) -> Result<CanonicalStoreObservation, CanonicalStoreObservationRefusal> {
         if self.process_manifest != *required_process_manifest
             || self.process_generation != *required_process_generation
         {
-            return Err(CanonicalStoreWriteRefusal::LaunchLineageMismatch);
+            return Err(CanonicalStoreObservationRefusal::LaunchLineageMismatch);
         }
         if self.approved_artifact_hash != *required_artifact_hash
             || self.approved_config_hash != *required_config_hash
         {
-            return Err(CanonicalStoreWriteRefusal::ProcessApprovalMismatch);
+            return Err(CanonicalStoreObservationRefusal::ProcessApprovalMismatch);
         }
-        if self.pid_job_lineage_refs.is_empty()
-            || self.pid_job_lineage_refs.len() != required_pid_job_lineage_refs.len()
-            || self
-                .pid_job_lineage_refs
-                .iter()
-                .any(|reference| !required_pid_job_lineage_refs.contains(reference))
-            || required_pid_job_lineage_refs
-                .iter()
-                .any(|reference| !self.pid_job_lineage_refs.contains(reference))
-        {
-            return Err(CanonicalStoreWriteRefusal::MissingPidJobLineage);
+        if !lineage_matches_exactly(
+            &self.pid_job_lineage_refs,
+            required_pid_job_lineage_refs,
+        ) {
+            return Err(CanonicalStoreObservationRefusal::MissingPidJobLineage);
         }
         if !self.observed_liveness() {
-            return Err(CanonicalStoreWriteRefusal::NotObservedLive);
+            return Err(CanonicalStoreObservationRefusal::NotObservedLive);
         }
-        if self.lifecycle_budget.restart_attempts_remaining == 0 {
-            return Err(CanonicalStoreWriteRefusal::RestartBudgetExhausted);
-        }
-        if !semantic_probes_ready {
-            return Err(CanonicalStoreWriteRefusal::SemanticallyNotReady);
-        }
-        Ok(())
+        Ok(CanonicalStoreObservation {
+            dependency: self.dependency.clone(),
+            process_generation: self.process_generation.clone(),
+            artifact_hash: self.approved_artifact_hash.clone(),
+            config_hash: self.approved_config_hash.clone(),
+            pid_job_lineage_refs: self.pid_job_lineage_refs.clone(),
+            restart_attempts_remaining: self.lifecycle_budget.restart_attempts_remaining,
+        })
     }
 }
 
-/// Why canonical-store writes remain closed for a managed dependency.
+/// Exact, duplicate-free Job Object/PID lineage equality.
 ///
-/// This fieldless classification is not serialized into the `HostStateJournal`
-/// and has no ready variant. `SemanticallyNotReady` reports only that the
-/// caller's independent version/schema/transaction probe verdict was false;
-/// it does not identify which probe failed. Probe details remain owned by the
-/// store bridge.
+/// Mutual containment with equal lengths would accept `[a, a, b]` against a
+/// required `[a, b, b]`. Every required reference must occur exactly once in
+/// the observed set and the lengths must agree, so both sides are duplicate-free
+/// and the sets are equal as sets.
+fn lineage_matches_exactly(observed: &[PlatformHandle], required: &[PlatformHandle]) -> bool {
+    if observed.is_empty() || observed.len() != required.len() {
+        return false;
+    }
+    required
+        .iter()
+        .all(|reference| observed.iter().filter(|member| *member == reference).count() == 1)
+}
+
+/// The exact Host-managed process instance observed live for a canonical store.
+///
+/// The caller binds the store bridge's version/schema/transaction receipt
+/// against this identity, so a valid probe answered by a predecessor generation
+/// cannot qualify its replacement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CanonicalStoreObservation {
+    /// Dependency identity of the Host-managed record that answered.
+    pub dependency: PlatformHandle,
+    /// Process generation/start identity observed live.
+    pub process_generation: EpochTransition,
+    /// Approved executable/artifact hash of the observed process.
+    pub artifact_hash: PlatformHandle,
+    /// Approved configuration hash of the observed process.
+    pub config_hash: PlatformHandle,
+    /// Exact duplicate-free Job Object/PID lineage members observed live.
+    pub pid_job_lineage_refs: Vec<PlatformHandle>,
+    /// Remaining bounded restart attempts. Zero forbids another restart and is
+    /// not a failed current readiness observation.
+    pub restart_attempts_remaining: u32,
+}
+
+/// Why the Host-managed half of canonical-store readiness is unavailable.
+///
+/// This fieldless classification is not serialized into the `HostStateJournal`.
+/// It carries no store semantic judgement: version, schema and transaction
+/// failures are separate results owned by the store bridge and kept alongside
+/// these Host failures by the consumer's projection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CanonicalStoreWriteRefusal {
+pub enum CanonicalStoreObservationRefusal {
     /// The required immutable launch manifest or process generation differs.
     LaunchLineageMismatch,
     /// The approved artifact or config hash differs from the required value.
     ProcessApprovalMismatch,
-    /// Host-managed Job Object/PID lineage is absent or differs from the required lineage.
+    /// Host-managed Job Object/PID lineage is absent, duplicated, or differs
+    /// from the required lineage.
     MissingPidJobLineage,
-    /// The carried process observation does not report live liveness.
+    /// The carried process observation does not report live liveness, or no
+    /// observation is carried at all.
     NotObservedLive,
-    /// The current process generation has exhausted its restart allowance.
-    RestartBudgetExhausted,
-    /// The caller's combined semantic-probe verdict is false.
-    SemanticallyNotReady,
 }
 
 /// Compatibility alias for the canonical [`ManagedDependencyRecord`]. Host code

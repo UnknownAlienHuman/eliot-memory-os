@@ -228,8 +228,9 @@ pub use wire::{
     CAPABILITY_RECOVERY, CAPABILITY_RESERVED_WRITE, CAPABILITY_REVISION_HEADS,
     CAPABILITY_STORE_BACKUP, CAPABILITY_VALIDATION_SNAPSHOT, EFFECTS, EcxfExportReport,
     EcxfExportRequest, ErasureSurfaceRequest, ReadinessReceipt, ReadinessStatus,
-    StoreBackupOperation, StoreBackupRequest, StoreBackupResponse, StoreBackupStatus,
-    StoreBackupStatusOutcome, StoreRequest, StoreResponse, StoreWireError, decode_request_frame,
+    SemanticDimension, StoreBackupOperation, StoreBackupRequest, StoreBackupResponse,
+    StoreBackupStatus, StoreBackupStatusOutcome, StoreRequest, StoreResponse,
+    StoreSemanticReadiness, StoreWireError, decode_request_frame,
     decode_request_frame_with_authority, decode_response_frame, dreamer_job_capability,
     request_frame, request_frame_with_payload_authority, response_frame,
 };

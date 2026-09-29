@@ -481,7 +481,10 @@ impl EbpStoreTransport for ScriptedPeer {
                 self.pending = Some(self.answer_frame(
                     request_id,
                     StoreResponse::Readiness {
-                        receipt: ReadinessReceipt::ready("edge-1.0.0".to_owned()),
+                        receipt: ReadinessReceipt::ready(
+                            "edge-1.0.0".to_owned(),
+                            StoreSemanticReadiness::compatible(),
+                        ),
                     },
                 ));
             }
@@ -932,7 +935,10 @@ async fn dreamer_job_wrong_variant_reconciles_admitted_identity() {
         .as_str()
         .to_owned();
     let (client, state) = connect_client(DreamerReply::Fixed(StoreResponse::Readiness {
-        receipt: ReadinessReceipt::ready("edge-1.0.0".to_owned()),
+        receipt: ReadinessReceipt::ready(
+            "edge-1.0.0".to_owned(),
+            StoreSemanticReadiness::compatible(),
+        ),
     }))
     .await;
     let error = CanonicalStoreClient::dreamer_job(&client, &edge.ctx, edge.request)
@@ -1505,7 +1511,10 @@ mod gateway_cases {
                     ProtocolVersion::CURRENT,
                     Some(request_id),
                     StoreResponse::Readiness {
-                        receipt: ReadinessReceipt::ready("loopback-1.0.0".to_owned()),
+                        receipt: ReadinessReceipt::ready(
+                            "loopback-1.0.0".to_owned(),
+                            StoreSemanticReadiness::compatible(),
+                        ),
                     },
                 )
                 .expect("readiness encodes"),

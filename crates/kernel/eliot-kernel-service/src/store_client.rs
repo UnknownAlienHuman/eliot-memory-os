@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicU8, AtomicU64, Ordering},
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -231,6 +231,9 @@ pub struct EbpCanonicalStoreClient<T> {
     /// it through this atomic; the transport path never invents faults on
     /// its own.
     fault: AtomicU8,
+    /// The bridge's exact readiness receipt for this authenticated session,
+    /// retained verbatim for the canonical-store write-admission join.
+    readiness: OnceLock<eliot_store_api::ReadinessReceipt>,
 }
 
 impl<T> std::fmt::Debug for EbpCanonicalStoreClient<T> {
@@ -280,6 +283,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             limits,
             request_counter: AtomicU64::new(1),
             fault: AtomicU8::new(StoreClientFault::NONE),
+            readiness: OnceLock::new(),
         };
         client.verify_readiness().await?;
         Ok(client)
@@ -334,7 +338,20 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
                 "store schema generation is not the Host-approved ready generation".to_owned(),
             ));
         }
+        self.readiness.set(receipt).map_err(|_| {
+            StoreClientError::Contract("readiness receipt already recorded".to_owned())
+        })?;
         Ok(())
+    }
+
+    /// The bridge's exact readiness receipt for this authenticated session,
+    /// including its three separately reported semantic dimensions.
+    ///
+    /// This is the bridge half of the canonical-store write-admission join; it
+    /// is retained verbatim and never recomputed from the reduced `status`.
+    #[must_use]
+    pub fn readiness_receipt(&self) -> Option<&eliot_store_api::ReadinessReceipt> {
+        self.readiness.get()
     }
 
     fn validate_requirement_fence(&self, observed: &StateFence) -> Result<(), StoreError> {
@@ -1319,7 +1336,10 @@ mod tests {
                         self.requirement.connection_id.as_str().to_owned(),
                         request_id,
                         StoreResponse::Readiness {
-                            receipt: eliot_store_api::ReadinessReceipt::ready("1.0.0".to_owned()),
+                            receipt: eliot_store_api::ReadinessReceipt::ready(
+                                "1.0.0".to_owned(),
+                                eliot_store_api::StoreSemanticReadiness::compatible(),
+                            ),
                         },
                     ));
                 }

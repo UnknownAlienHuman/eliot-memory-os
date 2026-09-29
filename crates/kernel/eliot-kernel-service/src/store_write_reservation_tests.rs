@@ -2629,7 +2629,10 @@ mod gateway_cases {
                     ProtocolVersion::CURRENT,
                     Some(request_id),
                     StoreResponse::Readiness {
-                        receipt: ReadinessReceipt::ready("loopback-992".to_owned()),
+                        receipt: ReadinessReceipt::ready(
+                            "loopback-992".to_owned(),
+                            StoreSemanticReadiness::compatible(),
+                        ),
                     },
                 )
                 .expect("992 readiness encodes"),
@@ -3762,7 +3765,10 @@ async fn serve_startup(
                 eliot_protocol::ProtocolVersion::CURRENT,
                 Some(request_id),
                 eliot_store_api::StoreResponse::Readiness {
-                    receipt: eliot_store_api::ReadinessReceipt::ready("startup-992".to_owned()),
+                    receipt: eliot_store_api::ReadinessReceipt::ready(
+                        "startup-992".to_owned(),
+                        eliot_store_api::StoreSemanticReadiness::compatible(),
+                    ),
                 },
             )
             .expect("startup readiness encodes"),
