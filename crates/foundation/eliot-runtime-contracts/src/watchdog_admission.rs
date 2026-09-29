@@ -465,6 +465,9 @@ mod tests {
             activation_id: "activation-1".to_owned(),
             activation_generation: generation,
             kernel_epoch: kernel_epoch.clone(),
+            kernel_front_door_server_sid: "S-1-5-19".to_owned(),
+            kernel_front_door_session_id: 0,
+            kernel_front_door_artifact_sha256: "a".repeat(64),
             watchdog_epoch: AuthorityEpoch::new(1).expect("watchdog epoch"),
             generation_binding: crate::SupervisionGenerationBinding {
                 target_id: "eliot-kernel".to_owned(),

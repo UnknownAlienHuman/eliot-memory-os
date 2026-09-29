@@ -3376,6 +3376,7 @@ impl KernelComposition {
         contour: &DaemonSupervisionContour,
         issued_at_ms: u64,
         policy: &DaemonSupervisionRenewalPolicy,
+        kernel_artifact_sha256: &str,
     ) -> Result<eliot_ors::SupervisionLeaseBinding, SupervisionLeaseAuthorityError> {
         if issued_at_ms == 0 {
             return Err(SupervisionLeaseAuthorityError::Configuration(
@@ -3415,6 +3416,9 @@ impl KernelComposition {
             activation_id: OperationIdentity::new(incarnation.activation_id.clone())?,
             activation_generation: contour.activation.generation,
             kernel_epoch: contour.activation.authority_epoch.clone(),
+            kernel_front_door_server_sid: "S-1-5-19".to_owned(),
+            kernel_front_door_session_id: 0,
+            kernel_front_door_artifact_sha256: kernel_artifact_sha256.to_owned(),
             watchdog_epoch: AuthorityEpoch::new(incarnation.watchdog_epoch.sequence)
                 .map_err(|error| SupervisionLeaseAuthorityError::Contract(error.to_string()))?,
             generation_binding: contour.generation_binding.clone(),
@@ -3533,6 +3537,7 @@ impl KernelComposition {
         authority: &KernelSupervisionLeaseAuthority,
         contour: &DaemonSupervisionContour,
         now_ms: u64,
+        kernel_artifact_sha256: &str,
     ) -> Result<SupervisionLeaseSnapshot, SupervisionLeaseAuthorityError> {
         let lease_id = contour.incarnation.supervision_lease_id.as_str();
         Self::supersede_predecessor(authority, contour)?;
@@ -3562,6 +3567,7 @@ impl KernelComposition {
                 contour,
                 now_ms,
                 &SUPERVISION_LEASE_RENEWAL_POLICY,
+                kernel_artifact_sha256,
             )?;
             authority.prepare(SupervisionLeasePrepareRequest {
                 ticket_id: supervision_operation_identity("commit-ticket", lease_id, None)?,
@@ -3591,6 +3597,7 @@ impl KernelComposition {
         authority: &KernelSupervisionLeaseAuthority,
         contour: &DaemonSupervisionContour,
         now_ms: u64,
+        kernel_artifact_sha256: &str,
     ) -> Result<SupervisionLeaseSnapshot, SupervisionLeaseAuthorityError> {
         let lease_id = contour.incarnation.supervision_lease_id.as_str();
         let current =
@@ -3627,6 +3634,7 @@ impl KernelComposition {
                 contour,
                 now_ms,
                 &SUPERVISION_LEASE_RENEWAL_POLICY,
+                kernel_artifact_sha256,
             )?;
             authority.prepare(SupervisionLeasePrepareRequest {
                 ticket_id: supervision_operation_identity(
@@ -3763,6 +3771,7 @@ impl KernelComposition {
         progress: &mut DaemonSupervisionProgressState,
         policy: &DaemonSupervisionRenewalPolicy,
         now_ms: u64,
+        kernel_artifact_sha256: &str,
     ) -> Result<
         (
             SupervisionLeaseSnapshot,
@@ -3822,7 +3831,8 @@ impl KernelComposition {
             }
             stage
         } else {
-            let binding = Self::active_supervision_binding(contour, now_ms, policy)?;
+            let binding =
+                Self::active_supervision_binding(contour, now_ms, policy, kernel_artifact_sha256)?;
             authority.prepare(SupervisionLeasePrepareRequest {
                 ticket_id: supervision_operation_identity(
                     "renew-ticket",
@@ -3883,8 +3893,17 @@ impl KernelComposition {
             .supervision_lease_authority
             .as_ref()
             .ok_or(KernelServiceError::ReadinessNotProven)?;
-        let snapshot = Self::commit_or_replay_active_supervision(authority, &contour, unix_ms())
-            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        let kernel_artifact_sha256 = self
+            .kernel_artifact_sha256
+            .as_deref()
+            .ok_or(KernelServiceError::ReadinessNotProven)?;
+        let snapshot = Self::commit_or_replay_active_supervision(
+            authority,
+            &contour,
+            unix_ms(),
+            kernel_artifact_sha256,
+        )
+        .map_err(|_| KernelServiceError::ReadinessNotProven)?;
         // Issue #1837: durable audit evidence for lease establishment.
         self.audit_observe(AuditEventDraft::lease_supervision_established(
             &snapshot,
@@ -3971,6 +3990,10 @@ impl KernelComposition {
         request
             .validate()
             .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        let kernel_artifact_sha256 = self
+            .kernel_artifact_sha256
+            .as_deref()
+            .ok_or(KernelServiceError::ReadinessNotProven)?;
         let mut progress = {
             let mut state = self.daemon_runtime.lock().map_err(|_| {
                 KernelServiceError::Platform("daemon runtime lock poisoned".to_owned())
@@ -3987,6 +4010,7 @@ impl KernelComposition {
             &mut progress,
             &SUPERVISION_LEASE_RENEWAL_POLICY,
             unix_ms(),
+            kernel_artifact_sha256,
         );
         let put_back = |progress: DaemonSupervisionProgressState,
                         expired: Option<bool>|
@@ -4133,8 +4157,15 @@ impl KernelComposition {
         } else {
             // Front-door continuity only. This fallback cannot satisfy I1.11
             // step 11 and therefore cannot admit Material/Critical authority.
-            let renewed = Self::renew_current_supervision(authority, &contour, unix_ms())
-                .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+            let renewed = Self::renew_current_supervision(
+                authority,
+                &contour,
+                unix_ms(),
+                self.kernel_artifact_sha256
+                    .as_deref()
+                    .ok_or(KernelServiceError::ReadinessNotProven)?,
+            )
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
             let published = self.publish_eliotd_live_receipt(
                 &launch,
                 &process,

@@ -355,6 +355,9 @@ pub struct SupervisionLeaseBinding {
     pub activation_id: OpaqueLabel,
     pub activation_generation: ResourceGeneration,
     pub kernel_epoch: EpochId,
+    pub kernel_front_door_server_sid: String,
+    pub kernel_front_door_session_id: u32,
+    pub kernel_front_door_artifact_sha256: String,
     pub watchdog_epoch: AuthorityEpoch,
     pub generation_binding: SupervisionGenerationBinding,
     pub state_fence: StateFence,
@@ -378,6 +381,9 @@ impl SupervisionLeaseBinding {
             && self.activation_id == successor.activation_id
             && self.activation_generation == successor.activation_generation
             && self.kernel_epoch == successor.kernel_epoch
+            && self.kernel_front_door_server_sid == successor.kernel_front_door_server_sid
+            && self.kernel_front_door_session_id == successor.kernel_front_door_session_id
+            && self.kernel_front_door_artifact_sha256 == successor.kernel_front_door_artifact_sha256
             && self.watchdog_epoch == successor.watchdog_epoch
             && self.generation_binding == successor.generation_binding
             && self.state_fence == successor.state_fence
@@ -404,6 +410,9 @@ impl SupervisionLeaseBinding {
             activation_id: self.activation_id.as_str().to_owned(),
             activation_generation: self.activation_generation,
             kernel_epoch: self.kernel_epoch.clone(),
+            kernel_front_door_server_sid: self.kernel_front_door_server_sid.clone(),
+            kernel_front_door_session_id: self.kernel_front_door_session_id,
+            kernel_front_door_artifact_sha256: self.kernel_front_door_artifact_sha256.clone(),
             watchdog_epoch: self.watchdog_epoch,
             generation_binding: self.generation_binding.clone(),
             state_fence: self.state_fence.clone(),

@@ -20,12 +20,12 @@ use eliot_contracts::{
 use super::{HealthDimension, LeaseState, RuntimeContractError};
 
 /// Stable schema marker for the signed supervision-lease payload.
-pub const SUPERVISION_LEASE_SCHEMA: &str = "eliot.supervision-lease.v1";
+pub const SUPERVISION_LEASE_SCHEMA: &str = "eliot.supervision-lease.v2";
 /// Stable contract identity for this lease surface.
 pub const SUPERVISION_LEASE_CONTRACT_NAME: &str =
     "eliot.foundation.runtime-contracts.supervision-lease";
 /// Current contract revision for the lease surface.
-pub const SUPERVISION_LEASE_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
+pub const SUPERVISION_LEASE_CONTRACT_VERSION: ContractVersion = ContractVersion::new(2, 0, 0);
 /// Fixed signature algorithm admitted by this contract.
 pub const SUPERVISION_LEASE_SIGNATURE_ALGORITHM: &str = "Ed25519";
 /// Ed25519 public-key size in bytes.
@@ -229,6 +229,12 @@ pub struct SupervisionLease {
     pub activation_generation: ResourceGeneration,
     /// Kernel authority epoch (lineage-aware exact tuple).
     pub kernel_epoch: EpochId,
+    /// Authenticated Kernel front-door server user SID selected for this lease.
+    pub kernel_front_door_server_sid: String,
+    /// Authenticated Kernel front-door server session selected for this lease.
+    pub kernel_front_door_session_id: u32,
+    /// Approved Kernel executable SHA-256 expected at the front door.
+    pub kernel_front_door_artifact_sha256: String,
     /// Watchdog authority epoch.
     pub watchdog_epoch: AuthorityEpoch,
     /// Target/module/process generation binding.
@@ -290,6 +296,13 @@ impl SupervisionLease {
             return Err(invalid_lease_field(
                 "activation_generation",
                 "must be greater than zero",
+            ));
+        }
+        validate_front_door_sid(&self.kernel_front_door_server_sid)?;
+        if !is_sha256_hex(&self.kernel_front_door_artifact_sha256) {
+            return Err(invalid_lease_field(
+                "kernel_front_door_artifact_sha256",
+                "must be lowercase SHA-256",
             ));
         }
         // `EpochId` is always a validated non-zero `(lineage_id, sequence)`
@@ -1266,6 +1279,26 @@ fn is_sha256_hex(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn validate_front_door_sid(value: &str) -> Result<(), RuntimeContractError> {
+    non_empty_text(value, "kernel_front_door_server_sid")?;
+    let mut components = value.split('-');
+    if components.next() != Some("S")
+        || components.next() != Some("1")
+        || components.next().is_none_or(|authority| {
+            authority.is_empty() || !authority.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        || components.any(|component| {
+            component.is_empty() || !component.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    {
+        return Err(invalid_lease_field(
+            "kernel_front_door_server_sid",
+            "must be a canonical Windows SID",
+        ));
+    }
+    Ok(())
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
