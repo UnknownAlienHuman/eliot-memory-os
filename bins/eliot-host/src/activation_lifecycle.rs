@@ -1141,7 +1141,11 @@ pub(super) fn prove_terminal_runtime_release(
 ) -> Result<(), HostError> {
     let expected =
         runtime_lease_id_for(&current.activation_id, &current.fence.activation_generation)?;
-    if current.runtime_lease_refs.iter().all(|held| *held == expected) {
+    if current
+        .runtime_lease_refs
+        .iter()
+        .all(|held| *held == expected)
+    {
         return Ok(());
     }
     Err(HostError::RecoveryRequired(
