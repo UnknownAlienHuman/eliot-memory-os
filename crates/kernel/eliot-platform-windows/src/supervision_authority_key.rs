@@ -862,7 +862,8 @@ impl WindowsPortableDevSupervisionAuthorityKeyProvider {
             Ok(
                 PortableDevSupervisionAuthorityKeyObservation::Absent { .. }
                 | PortableDevSupervisionAuthorityKeyObservation::Mismatch { .. },
-            ) | Err(_) => Ok(PortableDevSupervisionAuthorityKeyWriteOutcome::Unknown { receipt }),
+            )
+            | Err(_) => Ok(PortableDevSupervisionAuthorityKeyWriteOutcome::Unknown { receipt }),
         }
     }
 
@@ -938,11 +939,9 @@ impl WindowsPortableDevSupervisionAuthorityKeyProvider {
             Err(
                 SupervisionAuthorityKeyError::KeyInvalid
                 | SupervisionAuthorityKeyError::InvalidBinding,
-            ) => {
-                Ok(PortableDevSupervisionAuthorityKeyObservation::Mismatch {
-                    relative_path: request.relative_path.clone(),
-                })
-            }
+            ) => Ok(PortableDevSupervisionAuthorityKeyObservation::Mismatch {
+                relative_path: request.relative_path.clone(),
+            }),
             Err(error) => Err(error),
         }
     }
@@ -1605,8 +1604,9 @@ fn signer_for_anchor(
 
 fn map_user_owned_path_error(error: ProtectedPathError) -> SupervisionAuthorityKeyError {
     match error {
-        ProtectedPathError::AclMismatch
-        | ProtectedPathError::Win32 { code: 5, .. } => SupervisionAuthorityKeyError::AccessDenied,
+        ProtectedPathError::AclMismatch | ProtectedPathError::Win32 { code: 5, .. } => {
+            SupervisionAuthorityKeyError::AccessDenied
+        }
         ProtectedPathError::InvalidRoot
         | ProtectedPathError::InvalidPath
         | ProtectedPathError::ReparsePoint
