@@ -430,11 +430,13 @@ pub use publication::{
 };
 
 pub use rules::{
-    CompetentIntegrationCoverage, IntegrationGapEvaluation, IntegrationGapObservation,
-    IntegrationGapRule, IntegrationGapSensor, IntegrationGapSignalCandidate,
-    IntegrationGapSignalContext, IntegrationGapUnknown, ProviderAttemptIdentity,
-    ProviderEventIdentity, StateFenceProjection, evaluate_provider_host_event_gap,
-    provider_host_event_gap_rule,
+    ApplicabilitySubject, CompetentIntegrationCoverage, CorrelationInterval, EnvelopeMeasurement,
+    IntegrationGapEvaluation, IntegrationGapObservation, IntegrationGapSensor,
+    IntegrationGapSignalCandidate, IntegrationGapSignalContext, IntegrationGapUnknown,
+    ProviderAttemptIdentity, ProviderEventIdentity, RequiredObservation, RuleApplicability,
+    RuleClass, RuleDescriptor, RuleInapplicable, StateFenceProjection,
+    PROVIDER_HOST_EVENT_GAP_RULE_INDEX, RULE_TABLE, evaluate_provider_host_event_gap,
+    evaluate_rule_applicability, provider_host_event_gap_rule, rule_by_id,
 };
 
 pub use health_detectors::{
