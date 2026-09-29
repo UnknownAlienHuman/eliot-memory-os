@@ -22,8 +22,8 @@ use eliot_kernel::{
     BlobOwnerClient, CanonicalOwnerClient, DESTINATION_ADMISSION_FILE, DestinationManifestEvidence,
     InvalidationKind, InvalidationOwnerClient, KernelBackupRestore, KernelIsolatedDestination,
     KernelRestoreError, PinnedDestinationAdmission, PurgeOwnerClient, RESTORE_ISOLATED_AREA,
-    RESTORE_JOURNAL_OWNER_LABEL, RestorePorts, backup_to_kernel,
-    check_kernel_effect_fence, phase_owner, require_production_admitted,
+    RESTORE_JOURNAL_OWNER_LABEL, RestorePorts, backup_to_kernel, check_kernel_effect_fence,
+    phase_owner, require_production_admitted,
 };
 
 const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
