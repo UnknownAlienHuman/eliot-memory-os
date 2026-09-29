@@ -366,7 +366,9 @@ impl RedbInstallationRegistry {
     }
 
     /// Opens the existing registry below one retained current-user Host root
-    /// without creating a database or file.
+    /// without creating a database or file. The caller supplies the original
+    /// persisted profile selection receipt; its Host-root file identity,
+    /// canonical path, and owner SID must match the live retained root lease.
     #[allow(
         clippy::needless_pass_by_value,
         reason = "the registry owner must retain the caller-provided Host root lease"
@@ -374,7 +376,9 @@ impl RedbInstallationRegistry {
     pub fn open_existing_user_owned_at(
         host_root: UserOwnedRootLease,
         profile: crate::InstallationProfile,
+        selection: &eliot_platform_windows::profile_supervision::ProfileSelectionReceipt,
     ) -> Result<Option<Self>, InstallationError> {
+        Self::verify_user_owned_registry_root_binding(&host_root, profile, selection)?;
         let path = installation_registry_path_user_owned(&host_root, profile)?;
         match std::fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.is_file() => {}
@@ -407,6 +411,58 @@ impl RedbInstallationRegistry {
                 _file: file,
             },
         }))
+    }
+
+    /// Verifies that an existing current-user registry writer is being opened
+    /// beneath the exact Host-root object retained by the original profile
+    /// selection receipt. A predictable registry child path alone is not an
+    /// identity binding.
+    fn verify_user_owned_registry_root_binding(
+        root: &UserOwnedRootLease,
+        profile: crate::InstallationProfile,
+        selection: &eliot_platform_windows::profile_supervision::ProfileSelectionReceipt,
+    ) -> Result<(), InstallationError> {
+        let expected_profile = match profile {
+            crate::InstallationProfile::UserMode => {
+                eliot_platform_windows::profile_supervision::ProfileSelection::UserMode
+            }
+            crate::InstallationProfile::PortableDev => {
+                eliot_platform_windows::profile_supervision::ProfileSelection::PortableDev
+            }
+            crate::InstallationProfile::SystemService => {
+                return Err(InstallationError::ProfileViolation(
+                    "SystemService registry opens do not accept a current-user profile receipt"
+                        .to_owned(),
+                ));
+            }
+        };
+        let mut observations = selection
+            .roots
+            .iter()
+            .filter(|observation| observation.role == "runtime_state_roots.host_state_root");
+        let Some(observation) = observations.next() else {
+            return Err(InstallationError::IdentityConflict);
+        };
+        if selection.profile != expected_profile || observations.next().is_some() {
+            return Err(InstallationError::IdentityConflict);
+        }
+        root.verify_stable_identity()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        root.verify_path_identity()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let canonical_root = root
+            .canonical_path()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        if selection.owner_sid != root.current_user_sid()
+            || observation.identity != root.identity()
+            || !eliot_platform_windows::windows_paths_equal(
+                &observation.canonical_path,
+                &canonical_root,
+            )
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
     }
 
     fn validate_host_owner_binding_for_identity(
