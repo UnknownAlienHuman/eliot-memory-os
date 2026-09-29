@@ -3584,6 +3584,7 @@ dependencies = [
  "eliot-ipc",
  "eliot-kernel-core",
  "eliot-kernel-service",
+ "eliot-ors",
  "eliot-learning-contracts",
  "eliot-learning-state-view",
  "eliot-maintenance",
