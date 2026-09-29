@@ -46,9 +46,9 @@ pub use eliot_workscope::{
     HostObservedHandles, IdentityEvidence, IdentityLegOutcome, ManifestBoundaryClaim,
     ObservedScopeResources, PrivacyProfile, ProposalSource, RegisteredInstanceEvidence,
     ResolutionAuthentication, ResolutionOutcome, ResolutionRequest, ResolutionTier,
-    ResumedTaskEvidence, ScopeBinding, ScopeBindingDisposition, ScopeBindingGuard, ScopeFingerprint,
-    ScopeRelocationOrAttachReceipt, ScopeResolution, SessionTaskClaim, TriggerReport,
-    WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeDescriptor,
+    ResumedTaskEvidence, ScopeBinding, ScopeBindingDisposition, ScopeBindingGuard,
+    ScopeFingerprint, ScopeRelocationOrAttachReceipt, ScopeResolution, SessionTaskClaim,
+    TriggerReport, WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeDescriptor,
     WorkScopeResolutionReceipt, WorkScopeResolver, WorkspaceInstanceIdentity, check_at_trigger,
     derive_observed_resources, identity_legs, issue_resolution_receipt, observed_scope_binding,
     produce_attach_receipt, rebind_with_receipt,
@@ -259,17 +259,21 @@ pub fn require_matched_guard_at_use_boundary(
     source_closure: Option<(&GoverningSourceSet, &PrivacyProfile)>,
     trigger: GuardTrigger,
 ) -> Result<TriggerReport, CompositionError> {
-    let observed_binding =
-        observed_scope_binding(expected, observed, privacy_class, governing_source_generation)
-            .map_err(|error| match error {
-                eliot_workscope::WorkScopeError::AmbiguousObservation { observed_instances } => {
-                    CompositionError::ScopeObservationAmbiguous {
-                        trigger,
-                        observed_instances,
-                    }
-                }
-                other => CompositionError::Recovery(other.to_string()),
-            })?;
+    let observed_binding = observed_scope_binding(
+        expected,
+        observed,
+        privacy_class,
+        governing_source_generation,
+    )
+    .map_err(|error| match error {
+        eliot_workscope::WorkScopeError::AmbiguousObservation { observed_instances } => {
+            CompositionError::ScopeObservationAmbiguous {
+                trigger,
+                observed_instances,
+            }
+        }
+        other => CompositionError::Recovery(other.to_string()),
+    })?;
     let report = check_at_trigger(expected, &observed_binding, source_closure, trigger);
     if report.is_matched() {
         Ok(report)
