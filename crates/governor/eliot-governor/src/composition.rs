@@ -6904,6 +6904,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// stale one (Implements #22 W1). A catalog change makes the binding
     /// stale; it needs a new admission, never a local repair.
     /// All parameters are required; blank or malformed input fails closed.
+    /// `facet_manifest_ref` must match the canonical ELIOT-owned native-worker
+    /// facet contract exactly; Governor does not accept a caller-invented ref.
     #[allow(
         clippy::too_many_arguments,
         reason = "M1 binding joins every T9.md 3.2 denominator field in one versioned projection"
@@ -6956,6 +6958,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     ) -> Result<NativeWorkerExecutableBinding, CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
+        }
+        let canonical_facet_ref = native_worker_binding::canonical_native_worker_facet_ref()
+            .map_err(CompositionError::Recovery)?;
+        if facet_manifest_ref != canonical_facet_ref.as_str() {
+            return Err(CompositionError::Recovery(
+                "native binding facet manifest ref does not match the canonical ELIOT native-worker facet ref"
+                    .to_owned(),
+            ));
         }
         let fence = self.snapshot.state_fence();
         let authority_epoch = self.snapshot.authority_epoch.clone();
@@ -7022,7 +7032,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             config_digest: config_digest.to_owned(),
             protocol_digest: protocol_digest.to_owned(),
             command_ref: command_ref.to_owned(),
-            facet_manifest_ref: facet_manifest_ref.to_owned(),
+            facet_manifest_ref: canonical_facet_ref,
             capability_cell,
             introduction_refs,
             supporting_grant_refs,

@@ -25,6 +25,10 @@
 //! route/adapter/config/facet/grant/epoch change makes the binding stale; this
 //! module performs no local repair.
 //!
+//! The facet identity is taken from ELIOT's shared native-worker resource
+//! facet contract. A caller may present the expected identity for correlation,
+//! but an opaque, stale, or locally invented ref is rejected.
+//!
 //! Refinements decided from the docs (underspecification per `T9.md` 4, not a
 //! contradiction):
 //! - `worker_generation` and `process_generation` require nonzero, matching the
@@ -64,6 +68,16 @@ const MAX_REFS: usize = 64;
 const MIN_NONCE_LEN: usize = 16;
 /// Maximum presented launch-nonce length.
 const MAX_NONCE_LEN: usize = 256;
+
+/// Returns the canonical reference for the ELIOT-owned native-worker facet.
+///
+/// This derives the ref from the validated source contract rather than
+/// duplicating its identity/version/digest spelling in Governor.
+pub(crate) fn canonical_native_worker_facet_ref() -> Result<String, String> {
+    eliot_contracts::native_worker_resource_facet_v1()
+        .and_then(|facet| facet.canonical_ref())
+        .map_err(|error| format!("cannot derive canonical native-worker facet ref: {error}"))
+}
 
 fn validate_text(value: &str, field: &'static str) -> Result<(), String> {
     if value.trim().is_empty() {
@@ -264,6 +278,13 @@ impl NativeWorkerExecutableBinding {
         }
         if self.wire_version != NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_VERSION {
             return Err("wire_version must be 2".to_owned());
+        }
+        let canonical_facet_ref = canonical_native_worker_facet_ref()?;
+        if self.facet_manifest_ref != canonical_facet_ref {
+            return Err(
+                "facet_manifest_ref must equal the canonical ELIOT native-worker facet ref"
+                    .to_owned(),
+            );
         }
         for (value, field) in [
             (&self.claim_id, "claim_id"),
