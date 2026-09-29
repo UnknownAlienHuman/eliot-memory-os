@@ -1021,12 +1021,17 @@ fn observed_installed_route_stage(
     receipt: &FinishDecisionReceipt,
 ) -> Option<eliot_reports::product_proof::ProductProofStageReceipt> {
     let expected = PRODUCT_PROOF_PLAN.installed_route_receipt;
-    receipt
+    let observed = receipt
         .decision
         .proof
         .artifact_and_verifier_bindings
         .iter()
-        .find_map(|binding| installed_route_receipt_id(binding, expected))
+        .find_map(|binding| installed_route_receipt_id(binding, expected))?;
+    Some(
+        eliot_reports::product_proof::ProductProofStageReceipt::Observed {
+            receipt_id: observed.to_owned(),
+        },
+    )
 }
 
 /// Extracts the installed-route receipt identity a binding handle names.
@@ -1036,10 +1041,7 @@ fn observed_installed_route_stage(
 /// generation or decision that produced it. Only an exact `ProductPulseReceipt`
 /// name, on its own or as a trailing segment, counts — a binding that merely
 /// contains the word is not an installed-route receipt.
-fn installed_route_receipt_id<'a>(
-    binding: &'a str,
-    expected: &str,
-) -> Option<&'a str> {
+fn installed_route_receipt_id<'a>(binding: &'a str, expected: &str) -> Option<&'a str> {
     let trimmed = binding.trim();
     if trimmed == expected {
         return Some(trimmed);
@@ -1080,13 +1082,9 @@ fn installed_route_stage(
 /// fabricated log reference.
 fn product_proof_raw_log_refs(receipt: Option<&FinishDecisionReceipt>) -> Vec<String> {
     receipt.map_or_else(Vec::new, |receipt| {
-        receipt
-            .decision
-            .proof
-            .artifact_and_verifier_bindings
-            .iter()
-            .cloned()
-            .collect()
+        let mut refs = Vec::new();
+        refs.clone_from_slice(&receipt.decision.proof.artifact_and_verifier_bindings);
+        refs
     })
 }
 
@@ -1113,8 +1111,7 @@ fn product_proof_missing_evidence(
         missing.insert(INSTALLED_ROUTE_REQUIRED_PROOF.to_owned());
         missing.insert(format!(
             "{} receipt bound to the installed route (expected by the Product Proof plan {})",
-            PRODUCT_PROOF_PLAN.installed_route_receipt,
-            PRODUCT_PROOF_PLAN.plan_path
+            PRODUCT_PROOF_PLAN.installed_route_receipt, PRODUCT_PROOF_PLAN.plan_path
         ));
     }
     missing.into_iter().collect()
@@ -5163,6 +5160,15 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             ),
         }
         .map_err(product_proof_error)?;
+        // The installed-route receipt identity is read once, here, before the
+        // stage receipt is moved into the retained record below, so the live
+        // evidence below cites the same value rather than a recomputed one.
+        let observed_receipt_id = match &installed_route {
+            eliot_reports::product_proof::ProductProofStageReceipt::Observed { receipt_id } => {
+                Some(receipt_id.clone())
+            }
+            eliot_reports::product_proof::ProductProofStageReceipt::Missing { .. } => None,
+        };
         // The retained evidence is rebuilt from this same record's identities
         // plus the receipt's own raw-log handles, so the revision never drops a
         // previously retained fact and never invents one.
@@ -5192,14 +5198,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             // evidence bound to the product property is the one that actually
             // proves it. The revision still binds to the exact retained finish
             // bytes, so the digest is computed from content, never supplied.
-            let receipt_id = match &installed_route {
-                eliot_reports::product_proof::ProductProofStageReceipt::Observed {
-                    receipt_id,
-                } => receipt_id.clone(),
-                eliot_reports::product_proof::ProductProofStageReceipt::Missing { .. } => {
-                    return Err(product_proof_error("product proof stage receipt disappeared"));
-                }
-            };
+            let receipt_id = observed_receipt_id
+                .clone()
+                .ok_or_else(|| product_proof_error("product proof stage receipt disappeared"))?;
             vec![
                 eliot_reports::product_proof::ProductProofEvidence::new(
                     eliot_reports::product_proof::ProductProofEvidenceDomain::Runtime,
