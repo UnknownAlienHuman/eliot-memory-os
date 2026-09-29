@@ -129,7 +129,7 @@ fn apply(
 fn ledger_upsert_reads_back_verbatim_with_revision() {
     let store = MemoryStore::new();
     let first = ledger_json(2);
-    let request = reactive_ledger_mutation_request("session-1".to_owned(), first.clone());
+    let request = reactive_ledger_mutation_request("session-1".to_owned(), 0, first.clone());
     apply(&store, "ledger-1", request.operation, request.parameters)
         .expect("ledger upsert commits");
     let query = reactive_ledger_read_request("session-1".to_owned(), fence()).expect("read");
@@ -145,7 +145,7 @@ fn ledger_upsert_reads_back_verbatim_with_revision() {
     );
     // A second admitted snapshot replaces verbatim with a bumped revision.
     let second = ledger_json(5);
-    let request = reactive_ledger_mutation_request("session-1".to_owned(), second.clone());
+    let request = reactive_ledger_mutation_request("session-1".to_owned(), 1, second.clone());
     apply(&store, "ledger-2", request.operation, request.parameters)
         .expect("second upsert commits");
     let query = reactive_ledger_read_request("session-1".to_owned(), fence()).expect("read");
@@ -243,13 +243,15 @@ fn foreign_contract_bad_uri_and_digest_mismatch_are_rejected() {
     let store = MemoryStore::new();
     let foreign = reactive_ledger_mutation_request(
         "session-1".to_owned(),
+        0,
         r#"{"contract":"foreign"}"#.to_owned(),
     );
     assert!(
         apply(&store, "neg-1", foreign.operation, foreign.parameters).is_err(),
         "foreign ledger contract is rejected"
     );
-    let corrupt = reactive_ledger_mutation_request("session-1".to_owned(), "not json".to_owned());
+    let corrupt =
+        reactive_ledger_mutation_request("session-1".to_owned(), 0, "not json".to_owned());
     assert!(
         apply(&store, "neg-2", corrupt.operation, corrupt.parameters).is_err(),
         "undecodable ledger bytes are rejected"
@@ -282,7 +284,7 @@ fn reactive_operations_reject_a_foreign_transition_class() {
     let (ctx, mut transition) = transition_with(
         "class-1",
         NamedMutationOperation::ApplyReactiveInjectionState,
-        reactive_ledger_mutation_request("session-1".to_owned(), ledger_json(1)).parameters,
+        reactive_ledger_mutation_request("session-1".to_owned(), 0, ledger_json(1)).parameters,
     );
     transition.transition_class = TransitionClass::CaptureCandidate;
     transition.requested_effect_ceiling = EffectClass::Candidate;

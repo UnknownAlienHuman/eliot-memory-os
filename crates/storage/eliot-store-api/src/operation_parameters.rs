@@ -674,11 +674,17 @@ static GET_NOTIFICATION_STATE_PARAMETERS: [ParameterDeclaration; 6] = [
 ];
 
 /// Owner-approved reactive-ledger upsert fields (issue #1941 C4): the exact
-/// session selector plus the opaque bridge ledger snapshot. Snapshot
+/// session selector, caller-observed expected revision (decimal `u64`, with
+/// zero denoting absence), and opaque bridge ledger snapshot. Snapshot
 /// contract/bounds are enforced by the reactive-state contract.
-static APPLY_REACTIVE_LEDGER_PARAMETERS: [ParameterDeclaration; 2] = [
+static APPLY_REACTIVE_LEDGER_PARAMETERS: [ParameterDeclaration; 3] = [
     ParameterDeclaration {
         name: "session_id",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "expected_revision",
         shape: ParameterShape::Subject,
         required: true,
     },
@@ -1371,7 +1377,8 @@ pub const fn declared_read_parameters(
 /// `source_receipt_json`, `delivery_json`, `channel`, `notification_id`,
 /// `principal`, `disposition`, `authorization_json`; leg completeness is
 /// enforced by the notification-state contract);
-/// `ApplyReactiveInjectionState` declares the required `session_id` plus the
+/// `ApplyReactiveInjectionState` declares the required `session_id`, the
+/// expected owner revision as a decimal string (`0` means absent), and the
 /// opaque `ledger_json` snapshot (contract/bounds enforced by the
 /// reactive-state contract); `ApplyResourceSnapshot` declares the required
 /// `uri`, `content_sha256`, and `content_base64` (grammar/digest agreement

@@ -137,11 +137,15 @@ fn ledger_json(item_count: u32) -> String {
     .expect("fixture serializes")
 }
 
-fn ledger_params(session: &str, ledger: &str) -> BTreeMap<String, Value> {
+fn ledger_params(session: &str, expected_revision: u64, ledger: &str) -> BTreeMap<String, Value> {
     BTreeMap::from([
         (
             eliot_store_api::REACTIVE_PARAM_SESSION_ID.to_owned(),
             json!(session),
+        ),
+        (
+            eliot_store_api::REACTIVE_PARAM_EXPECTED_REVISION.to_owned(),
+            json!(expected_revision.to_string()),
         ),
         (
             eliot_store_api::REACTIVE_PARAM_LEDGER_JSON.to_owned(),
@@ -392,7 +396,7 @@ async fn ledger_upsert_round_trips_verbatim_with_guarded_revision() {
     let (ctx, transition) = transition_with(
         "ledger-1",
         NamedMutationOperation::ApplyReactiveInjectionState,
-        ledger_params("session-live-1", &first),
+        ledger_params("session-live-1", 0, &first),
     );
     let receipt = eliot_store_api::CanonicalStoreClient::apply_prepared(
         harness.adapter(),
@@ -427,7 +431,7 @@ async fn ledger_upsert_round_trips_verbatim_with_guarded_revision() {
     let (ctx, transition) = transition_with(
         "ledger-2",
         NamedMutationOperation::ApplyReactiveInjectionState,
-        ledger_params("session-live-1", &second),
+        ledger_params("session-live-1", 1, &second),
     );
     eliot_store_api::CanonicalStoreClient::apply_prepared(
         harness.adapter(),
@@ -456,7 +460,7 @@ async fn ledger_upsert_round_trips_verbatim_with_guarded_revision() {
     let (ctx, transition) = transition_with(
         "ledger-2",
         NamedMutationOperation::ApplyReactiveInjectionState,
-        ledger_params("session-live-1", &second),
+        ledger_params("session-live-1", 1, &second),
     );
     let replayed = eliot_store_api::CanonicalStoreClient::apply_prepared(
         harness.adapter(),
@@ -603,7 +607,7 @@ async fn foreign_contract_and_digest_mismatch_fail_closed() {
     let (ctx, transition) = transition_with(
         "neg-1",
         NamedMutationOperation::ApplyReactiveInjectionState,
-        ledger_params("session-live-1", r#"{"contract":"foreign"}"#),
+        ledger_params("session-live-1", 0, r#"{"contract":"foreign"}"#),
     );
     assert!(
         eliot_store_api::CanonicalStoreClient::apply_prepared(

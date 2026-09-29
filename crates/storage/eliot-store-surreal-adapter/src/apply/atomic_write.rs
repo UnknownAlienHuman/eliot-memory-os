@@ -106,7 +106,6 @@ const ALLOCATION_CONFLICT_MARKERS: &[&str] = &[
     "canonical_fence_cas_conflict",
     "canonical_fence_create_conflict",
     "notification_revision_conflict",
-    "reactive_session_conflict",
     "reactive_snapshot_conflict",
     "automation_revision_conflict",
     "automation_current_conflict",
@@ -130,6 +129,7 @@ const SEMANTIC_CONFLICT_MARKERS: &[&str] = &[
     "canonical_owner_create_conflict",
     "swarm_owner_revision_conflict",
     "blackboard_item_revision_conflict",
+    "reactive_session_conflict",
 ];
 
 /// Reports whether a provider statement error proves shared-allocation

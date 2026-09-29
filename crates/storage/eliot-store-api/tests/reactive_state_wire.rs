@@ -118,7 +118,7 @@ fn catalogue_activates_all_four_reactive_operations() {
 
 #[test]
 fn ledger_mutation_builder_validates_positive_and_negative() {
-    let request = reactive_ledger_mutation_request("session-1".to_owned(), ledger_json(2));
+    let request = reactive_ledger_mutation_request("session-1".to_owned(), 0, ledger_json(2));
     assert_eq!(
         request.operation,
         NamedMutationOperation::ApplyReactiveInjectionState

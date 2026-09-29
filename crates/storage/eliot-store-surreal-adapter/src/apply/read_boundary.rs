@@ -2052,6 +2052,7 @@ async fn reactive_ledger_payload(
     Ok(json!({
         "session_id": session_id,
         "ledger_json": ledger_json,
+        "ledger_revision": revision,
         "revision": revision,
         "state_fence": state_fence,
     }))
