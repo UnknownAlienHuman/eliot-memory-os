@@ -24,6 +24,7 @@ eliot-contracts.workspace = true
 eliot-evidence.workspace = true
 eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts", version = "0.1.0" }
 eliot-epistemic-contracts = { path = "../eliot-epistemic-contracts", version = "0.1.0" }
+serde.workspace = true
 
 [lints]
 workspace = true

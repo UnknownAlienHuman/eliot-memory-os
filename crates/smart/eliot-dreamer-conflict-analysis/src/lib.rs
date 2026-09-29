@@ -149,6 +149,7 @@ use eliot_dreamer_contracts::{
 use eliot_epistemic_contracts::{
     ArgumentAcceptability, ConflictKind, ConflictLifecycle, ConflictSet,
 };
+use serde::Serialize;
 
 // ---------------------------------------------------------------------------
 // Independent bounds (no cross-subsidy between dimensions).
@@ -651,6 +652,20 @@ impl SourceRecordCommitment {
     }
 }
 
+/// One owner-issued source commitment admitted with the request.
+///
+/// A commitment is supplied once per position rather than once per comparison
+/// pair: the owner-issued record and comparison profile belong to the source,
+/// not to the pair it happens to be compared in. A comparison naming a source
+/// with no admitted commitment is refused rather than admitted unverified.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceCommitmentEntry {
+    /// Source handle the commitment is issued for.
+    pub source: String,
+    /// Owner-issued commitment bound to `source`.
+    pub commitment: SourceRecordCommitment,
+}
+
 /// One canonical dimension outcome whose value stays coupled to its source.
 ///
 /// `first_value` belongs to [`CanonicalComparisonPair::first_source`] and
@@ -876,33 +891,13 @@ impl CanonicalComparisonPair {
         format!("{}|{}", parts[0], parts[1])
     }
 
-    /// Returns the value this source contributed for one canonical dimension.
+    /// Returns true when this pair compares the named source with a position.
     ///
-    /// A consumer identifies value ownership from the pair alone, without
-    /// knowing the original caller order.
+    /// Both positions of one pair answer true, which is what makes the mapping
+    /// derived from it symmetric without a second normalization.
     #[must_use]
-    pub fn value_for(&self, source: &str, dimension: ComparisonDimension) -> Option<&str> {
-        let entry = self
-            .dimensions
-            .iter()
-            .find(|entry| entry.dimension == dimension)?;
-        let is_first = source == self.first_source;
-        let is_second = source == self.second_source;
-        if !is_first && !is_second {
-            return None;
-        }
-        match &entry.outcome {
-            CanonicalDimensionOutcome::Equal { value } => Some(value.as_str()),
-            CanonicalDimensionOutcome::Differing {
-                first_value,
-                second_value,
-            } => Some(if is_first {
-                first_value.as_str()
-            } else {
-                second_value.as_str()
-            }),
-            CanonicalDimensionOutcome::Unnormalizable { .. } => None,
-        }
+    pub fn covers(&self, source: &str) -> bool {
+        source == self.first_source || source == self.second_source
     }
 
     /// Confirms the pair carries one canonical orientation and full commitments.
@@ -1015,25 +1010,74 @@ impl CompatibilityRelation {
     }
 }
 
-/// One position's preserved legacy declaration mapping against another.
+/// One dimension outcome as the position that owns the mapping reads it.
 ///
-/// [`Self::outcomes`] carries the caller's declarations in
-/// [`COMPARISON_DIMENSIONS`] order. `relation` stays ambiguous because no
-/// owner-bound source/profile/value records exist in legacy v1. The declared
-/// differing and unnormalizable dimensions are retained for review, not proof.
+/// `self_value` is the value the position holding this mapping supplied and
+/// `other_value` is the value the other position supplied. A consumer therefore
+/// identifies value ownership from the mapping alone, with no knowledge of the
+/// order the caller happened to declare the pair in. Equal values still carry
+/// both sides, and an unnormalizable reason stays attached to the pair whose
+/// `self_source`/`other_source` bindings name the exact records and profiles
+/// the declaration was made under.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PositionDimensionOutcome {
+    /// Both positions declare the same value under their own source bindings.
+    Equal {
+        /// Value this position supplied.
+        self_value: String,
+        /// Value the other position supplied; equal to `self_value`.
+        other_value: String,
+    },
+    /// The positions declare different values, each labelled by ownership.
+    Differing {
+        /// Value this position supplied.
+        self_value: String,
+        /// Value the other position supplied.
+        other_value: String,
+    },
+    /// The field cannot be normalized for this exact pair and dimension.
+    Unnormalizable {
+        /// Bounded reason the field cannot be normalized.
+        reason: String,
+    },
+}
+
+/// One canonical dimension of a position-facing compatibility mapping.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PositionDimensionComparison {
+    /// Which canonical dimension this entry compares.
+    pub dimension: ComparisonDimension,
+    /// Outcome labelled by value ownership rather than by caller order.
+    pub outcome: PositionDimensionOutcome,
+}
+
+/// One position's preserved declaration mapping against another position.
+///
+/// The mapping is derived from the single [`CanonicalComparisonPair`] both
+/// positions share, never from the caller's field order: `outcomes` is in
+/// [`COMPARISON_DIMENSIONS`] order and every value is labelled `self` or
+/// `other`. `relation` stays ambiguous because the declarations are still not
+/// owner-qualified evidence of equality or difference. The declared differing
+/// and unnormalizable dimensions are retained for review, not proof.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PositionCompatibility {
+    /// Source handle of the position that owns this mapping.
+    pub self_source: String,
+    /// Owner-issued commitment for `self_source`.
+    pub self_source_commitment: SourceRecordCommitment,
     /// Source handle of the other position.
     pub other_source: String,
-    /// Legacy proof ceiling; always ambiguous until owner records exist.
+    /// Owner-issued commitment for `other_source`.
+    pub other_source_commitment: SourceRecordCommitment,
+    /// Legacy proof ceiling; always ambiguous until owner records qualify it.
     pub relation: CompatibilityRelation,
     /// Proof ceiling for these retained declarations.
     pub supplement_version: SupplementVersion,
-    /// Every dimension outcome in canonical order, values preserved.
-    pub outcomes: Vec<DimensionComparison>,
-    /// Dimensions the legacy caller declares to differ, in canonical order.
+    /// Every dimension outcome in canonical order, values labelled by owner.
+    pub outcomes: Vec<PositionDimensionComparison>,
+    /// Dimensions declared to differ, in canonical order.
     pub differing_dimensions: Vec<ComparisonDimension>,
-    /// Dimensions the legacy caller declares unnormalizable, in canonical order.
+    /// Dimensions declared unnormalizable, in canonical order.
     pub unnormalizable_dimensions: Vec<ComparisonDimension>,
 }
 
@@ -1155,6 +1199,13 @@ pub struct ConflictSupplements {
     pub supplied_probes: Vec<SuppliedProbe>,
     /// Legacy v1 caller declarations over canonical dimensions; never qualified.
     pub comparisons: Vec<SuppliedComparison>,
+    /// Owner-issued source-record commitments admitted with this request.
+    ///
+    /// Every compared position needs one. The commitment travels with its
+    /// source through the canonical pair, the emitted mapping and the
+    /// candidate identity; a comparison naming an uncommitted source fails
+    /// closed instead of being admitted without owner-issued evidence.
+    pub source_commitments: Vec<SourceCommitmentEntry>,
     /// Legacy v1 causal/predictive declarations; prose is not evidence.
     pub causal_claims: Vec<SuppliedCausalClaim>,
     /// Externally supplied resolution status, when one exists.
@@ -1392,6 +1443,13 @@ pub struct ConflictAnalysisCandidate {
     /// Preserved causal claims with declared and effective states, sorted by
     /// source handle.
     pub causal_states: Vec<CausalClaimRecord>,
+    /// Admitted comparisons in their single canonical orientation.
+    ///
+    /// This is the one normalized representation every emitted compatibility
+    /// mapping is derived from and the exact comparison data the candidate
+    /// identity commits, so a consumer never has to re-derive orientation from
+    /// a caller's field order.
+    pub comparison_pairs: Vec<CanonicalComparisonPair>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1611,6 +1669,11 @@ fn preflight_supplement_bounds(
         MAX_COMPARISONS,
     )?;
     bound_list_length(
+        "source-commitments",
+        supplements.source_commitments.len(),
+        MAX_SOURCES,
+    )?;
+    bound_list_length(
         "causal-claims",
         supplements.causal_claims.len(),
         MAX_CAUSAL_CLAIMS,
@@ -1680,6 +1743,14 @@ fn preflight_total_bytes(
             &claim.falsifier,
             &claim.control_evaluator,
             &claim.rivals_or_confounders,
+        ]));
+    }
+    for entry in &supplements.source_commitments {
+        total = total.saturating_add(count_text_bytes(&[
+            &entry.source,
+            entry.commitment.record_digest(),
+            entry.commitment.profile(),
+            entry.commitment.profile_digest(),
         ]));
     }
     for position in &conflict_set.positions {
@@ -1858,86 +1929,146 @@ fn comparison_pair_key(left: &str, right: &str) -> String {
     )
 }
 
-/// Validates legacy declarations before they are preserved in the candidate.
+/// Validates the owner-issued source commitments admitted with the request.
 ///
-/// Every comparison must name two distinct positions that exist in the set and
-/// must cover each canonical dimension exactly once. A mirrored duplicate pair
-/// is rejected so the emitted mapping is order-independent.
-fn validate_comparisons(
-    conflict_set: &ConflictSet,
-    comparisons: &[SuppliedComparison],
+/// Exactly one commitment is admitted per source and it must already be bound to
+/// the handle it is filed under, so a commitment cannot be detached from the
+/// record it was issued for and re-attached to another source.
+fn validate_source_commitments(
+    supplements: &ConflictSupplements,
 ) -> Result<(), ConflictAnalysisError> {
-    let handles = position_source_handles(conflict_set);
-    let mut seen_pairs: Vec<String> = Vec::with_capacity(comparisons.len());
-    for comparison in comparisons {
-        check_handle(&comparison.left_source, "comparison.left")?;
-        check_handle(&comparison.right_source, "comparison.right")?;
-        if comparison.left_source == comparison.right_source {
-            return Err(ConflictAnalysisError::Binding {
-                field: "comparison.pair".to_owned(),
-                detail: "a comparison must name two distinct positions".to_owned(),
-            });
-        }
-        for source in [&comparison.left_source, &comparison.right_source] {
-            if !handles.contains(source) {
-                return Err(ConflictAnalysisError::Binding {
-                    field: "comparison.source".to_owned(),
-                    detail: format!(
-                        "comparison names a source outside the position denominator: {}",
-                        redact(source)
-                    ),
-                });
-            }
-        }
-        if comparison.dimensions.len() != EXPECTED_COMPARISON_DIMENSIONS {
+    let mut seen: Vec<&str> = Vec::with_capacity(supplements.source_commitments.len());
+    for entry in &supplements.source_commitments {
+        check_handle(&entry.source, "commitment.source")?;
+        check_commitment_binding(&entry.commitment, &entry.source, "commitment")?;
+        if seen.contains(&entry.source.as_str()) {
             return Err(ConflictAnalysisError::Denominator {
                 detail: format!(
-                    "each comparison must cover exactly {EXPECTED_COMPARISON_DIMENSIONS} canonical dimensions"
+                    "two owner-issued source commitments were admitted for {}",
+                    redact(&entry.source)
                 ),
             });
         }
-        let mut seen_dimensions: Vec<ComparisonDimension> =
-            Vec::with_capacity(EXPECTED_COMPARISON_DIMENSIONS);
-        for entry in &comparison.dimensions {
-            if seen_dimensions.contains(&entry.dimension) {
-                return Err(ConflictAnalysisError::Denominator {
-                    detail: format!(
-                        "duplicate comparison dimension {}",
-                        entry.dimension.as_str()
-                    ),
-                });
-            }
-            seen_dimensions.push(entry.dimension);
-            match &entry.outcome {
-                DimensionOutcome::Equal { value } => {
-                    check_bounded_text(value, "comparison.equal", MAX_TEXT_BYTES)?;
-                }
-                DimensionOutcome::Differing { left, right } => {
-                    check_bounded_text(left, "comparison.left_value", MAX_TEXT_BYTES)?;
-                    check_bounded_text(right, "comparison.right_value", MAX_TEXT_BYTES)?;
-                    if left == right {
-                        return Err(ConflictAnalysisError::Denominator {
-                            detail: format!(
-                                "a differing dimension must state two distinct values, not {} twice",
-                                entry.dimension.as_str()
-                            ),
-                        });
-                    }
-                }
-                DimensionOutcome::Unnormalizable { reason } => {
-                    check_bounded_text(reason, "comparison.unnormalizable", MAX_NOTE_BYTES)?;
-                }
-            }
-        }
-        let key = comparison_pair_key(&comparison.left_source, &comparison.right_source);
-        if seen_pairs.contains(&key) {
-            return Err(ConflictAnalysisError::Denominator {
-                detail: "duplicate comparison pair".to_owned(),
-            });
-        }
-        seen_pairs.push(key);
+        seen.push(entry.source.as_str());
     }
     Ok(())
+}
+
+/// Checks one comparison against the position denominator before it is
+/// normalized, recording its unordered pair identity in `seen_pairs`.
+///
+/// A pair that names a position twice, a source outside the set, a wrong
+/// dimension count, a repeated dimension, or a second entry for an unordered
+/// pair already seen all fail closed here: a second entry is a denominator
+/// error and never overwrites or is counted against the first one.
+fn check_comparison_denominator(
+    handles: &[String],
+    comparison: &SuppliedComparison,
+    seen_pairs: &mut Vec<String>,
+) -> Result<(), ConflictAnalysisError> {
+    check_handle(&comparison.left_source, "comparison.left")?;
+    check_handle(&comparison.right_source, "comparison.right")?;
+    if comparison.left_source == comparison.right_source {
+        return Err(ConflictAnalysisError::Binding {
+            field: "comparison.pair".to_owned(),
+            detail: "a comparison must name two distinct positions".to_owned(),
+        });
+    }
+    for source in [&comparison.left_source, &comparison.right_source] {
+        if !handles.contains(source) {
+            return Err(ConflictAnalysisError::Binding {
+                field: "comparison.source".to_owned(),
+                detail: format!(
+                    "comparison names a source outside the position denominator: {}",
+                    redact(source)
+                ),
+            });
+        }
+    }
+    if comparison.dimensions.len() != EXPECTED_COMPARISON_DIMENSIONS {
+        return Err(ConflictAnalysisError::Denominator {
+            detail: format!(
+                "each comparison must cover exactly {EXPECTED_COMPARISON_DIMENSIONS} canonical dimensions"
+            ),
+        });
+    }
+    let mut seen_dimensions: Vec<ComparisonDimension> =
+        Vec::with_capacity(EXPECTED_COMPARISON_DIMENSIONS);
+    for entry in &comparison.dimensions {
+        if seen_dimensions.contains(&entry.dimension) {
+            return Err(ConflictAnalysisError::Denominator {
+                detail: format!(
+                    "duplicate comparison dimension {}",
+                    entry.dimension.as_str()
+                ),
+            });
+        }
+        seen_dimensions.push(entry.dimension);
+    }
+    let key = comparison_pair_key(&comparison.left_source, &comparison.right_source);
+    if seen_pairs.contains(&key) {
+        return Err(ConflictAnalysisError::Denominator {
+            detail: "duplicate comparison pair".to_owned(),
+        });
+    }
+    seen_pairs.push(key);
+    Ok(())
+}
+
+/// Returns the owner-issued commitment admitted for one source handle.
+///
+/// The lookup is by the handle the commitment itself carries, so a caller
+/// cannot point a comparison at another position's record.
+fn commitment_for<'a>(
+    supplements: &'a ConflictSupplements,
+    source: &str,
+) -> Result<&'a SourceRecordCommitment, ConflictAnalysisError> {
+    supplements
+        .source_commitments
+        .iter()
+        .find(|entry| entry.source == source)
+        .map(|entry| &entry.commitment)
+        .ok_or_else(|| ConflictAnalysisError::Binding {
+            field: "comparison.source_commitment".to_owned(),
+            detail: format!(
+                "no owner-issued source commitment was admitted for {}",
+                redact(source)
+            ),
+        })
+}
+
+/// Normalizes every supplied comparison into its one canonical representation.
+///
+/// This is the single place orientation is decided for the whole analysis: the
+/// duplicate-pair, denominator and commitment checks all run here, the caller
+/// declarations become [`CanonicalComparisonPair`] values, and the result is
+/// sorted by pair identity so the order comparisons arrived in cannot reach the
+/// emitted mapping, the notes, or the candidate identity. Every downstream
+/// operation reads these values; none re-derives orientation from caller
+/// fields.
+fn canonicalize_comparisons(
+    conflict_set: &ConflictSet,
+    supplements: &ConflictSupplements,
+) -> Result<Vec<CanonicalComparisonPair>, ConflictAnalysisError> {
+    let handles = position_source_handles(conflict_set);
+    let mut seen_pairs: Vec<String> = Vec::with_capacity(supplements.comparisons.len());
+    let mut pairs: Vec<CanonicalComparisonPair> =
+        Vec::with_capacity(supplements.comparisons.len());
+    for comparison in &supplements.comparisons {
+        check_comparison_denominator(&handles, comparison, &mut seen_pairs)?;
+        let pair = CanonicalComparisonPair::from_supplied(
+            comparison,
+            commitment_for(supplements, &comparison.left_source)?,
+            commitment_for(supplements, &comparison.right_source)?,
+        )?;
+        pairs.push(pair);
+    }
+    pairs.sort_by(|left, right| {
+        left.first_source
+            .cmp(&right.first_source)
+            .then_with(|| left.second_source.cmp(&right.second_source))
+    });
+    Ok(pairs)
 }
 
 /// Validates supplied causal claims against the position denominator.
@@ -2422,92 +2553,116 @@ fn spell_dimensions(dimensions: &[ComparisonDimension]) -> String {
         .join("+")
 }
 
-/// Returns a deterministic spelling of one dimension outcome for the digest.
+/// Returns one canonical dimension outcome labelled by value ownership.
 ///
-/// The two values of a `Differing` are spelled in sorted order because the
-/// analysis never reads them in an orientation-dependent way: without this the
-/// digest would be strictly more sensitive than the analysis it hashes, and the
-/// same comparison supplied from either side would produce two digests for one
-/// result.
-fn dimension_outcome_spelling(outcome: &DimensionOutcome) -> String {
-    match outcome {
-        DimensionOutcome::Equal { value } => format!("equal:{}:{}", value.len(), value),
-        DimensionOutcome::Differing { left, right } => {
-            let mut values = [left.as_str(), right.as_str()];
-            values.sort_unstable();
-            format!(
-                "differing:{}:{}{}:{}",
-                values[0].len(),
-                values[0],
-                values[1].len(),
-                values[1]
-            )
+/// The labels come from the pair, never from the caller's field order, so the
+/// mapping read by the first source and the mapping read by the second are
+/// exact mirrors of one normalized record.
+fn position_dimension_outcome(
+    pair: &CanonicalComparisonPair,
+    entry: &CanonicalDimensionEntry,
+    source: &str,
+) -> PositionDimensionOutcome {
+    match &entry.outcome {
+        CanonicalDimensionOutcome::Equal { value } => PositionDimensionOutcome::Equal {
+            self_value: value.clone(),
+            other_value: value.clone(),
+        },
+        CanonicalDimensionOutcome::Differing {
+            first_value,
+            second_value,
+        } => {
+            let (self_value, other_value) = if source == pair.first_source {
+                (first_value.clone(), second_value.clone())
+            } else {
+                (second_value.clone(), first_value.clone())
+            };
+            PositionDimensionOutcome::Differing {
+                self_value,
+                other_value,
+            }
         }
-        DimensionOutcome::Unnormalizable { reason } => {
-            format!("unnormalizable:{}:{}", reason.len(), reason)
+        CanonicalDimensionOutcome::Unnormalizable { reason } => {
+            PositionDimensionOutcome::Unnormalizable {
+                reason: reason.clone(),
+            }
         }
     }
 }
 
-/// Preserves the legacy compatibility declarations for one position.
+/// Builds one position's mapping over one canonical pair.
 ///
-/// Every supplied comparison naming this position contributes one entry, from
-/// either side, so the mapping is symmetric. Because version 1 has no
-/// owner-bound source/profile/value records, every relation remains
-/// [`CompatibilityRelation::Ambiguous`] even when the caller declares eight
-/// equal or differing dimensions. Outcomes are preserved only as declarations.
+/// Both source commitments travel with the mapping, so an equal or
+/// unnormalizable outcome stays bound to the exact records and comparison
+/// profiles it was declared under rather than to a bare handle.
+fn position_compatibility(
+    pair: &CanonicalComparisonPair,
+    source_handle: &str,
+) -> PositionCompatibility {
+    let (self_source, self_commitment, other_source, other_commitment) =
+        if source_handle == pair.first_source {
+            (
+                pair.first_source.as_str(),
+                &pair.first_source_commitment,
+                pair.second_source.as_str(),
+                &pair.second_source_commitment,
+            )
+        } else {
+            (
+                pair.second_source.as_str(),
+                &pair.second_source_commitment,
+                pair.first_source.as_str(),
+                &pair.first_source_commitment,
+            )
+        };
+    // The dimension order is the canonical table's, because the pair itself is
+    // already in that order: the order entries were supplied in cannot reach
+    // the emitted mapping, the notes, or the digest.
+    let mut outcomes: Vec<PositionDimensionComparison> =
+        Vec::with_capacity(EXPECTED_COMPARISON_DIMENSIONS);
+    let mut differing: Vec<ComparisonDimension> = Vec::new();
+    let mut unnormalizable: Vec<ComparisonDimension> = Vec::new();
+    for entry in &pair.dimensions {
+        outcomes.push(PositionDimensionComparison {
+            dimension: entry.dimension,
+            outcome: position_dimension_outcome(pair, entry, source_handle),
+        });
+        match &entry.outcome {
+            CanonicalDimensionOutcome::Differing { .. } => differing.push(entry.dimension),
+            CanonicalDimensionOutcome::Unnormalizable { .. } => unnormalizable.push(entry.dimension),
+            CanonicalDimensionOutcome::Equal { .. } => {}
+        }
+    }
+    PositionCompatibility {
+        self_source: self_source.to_owned(),
+        self_source_commitment: self_commitment.clone(),
+        other_source: other_source.to_owned(),
+        other_source_commitment: other_commitment.clone(),
+        relation: CompatibilityRelation::Ambiguous,
+        supplement_version: SupplementVersion::LegacyV1Unverified,
+        outcomes,
+        differing_dimensions: differing,
+        unnormalizable_dimensions: unnormalizable,
+    }
+}
+
+/// Preserves the compatibility mapping for one position from the canonical
+/// pairs.
+///
+/// Every canonical pair covering this position contributes one entry, so the
+/// mapping is symmetric, and it is built from the same normalized record for
+/// both positions. Because the declarations are still not owner-qualified
+/// evidence, every relation remains [`CompatibilityRelation::Ambiguous`] even
+/// when the caller declares eight equal or differing dimensions.
 fn build_compatibility(
     source_handle: &str,
-    comparisons: &[SuppliedComparison],
+    pairs: &[CanonicalComparisonPair],
 ) -> Vec<PositionCompatibility> {
     let mut out: Vec<PositionCompatibility> = Vec::new();
-    for comparison in comparisons {
-        let other = if comparison.left_source == source_handle {
-            Some(comparison.right_source.as_str())
-        } else if comparison.right_source == source_handle {
-            Some(comparison.left_source.as_str())
-        } else {
-            None
-        };
-        let Some(other) = other else {
-            continue;
-        };
-        // Canonical order comes from the dimension table, not from the order the
-        // caller happened to supply the entries in. Sorting here as well as in
-        // the digest is what keeps the two in step: otherwise two supplements
-        // differing only in entry order would share a digest while emitting
-        // byte-different analyses.
-        let mut outcomes: Vec<DimensionComparison> =
-            Vec::with_capacity(EXPECTED_COMPARISON_DIMENSIONS);
-        let mut differing: Vec<ComparisonDimension> = Vec::new();
-        let mut unnormalizable: Vec<ComparisonDimension> = Vec::new();
-        for dimension in COMPARISON_DIMENSIONS {
-            let Some(entry) = comparison
-                .dimensions
-                .iter()
-                .find(|entry| entry.dimension == dimension)
-            else {
-                continue;
-            };
-            match &entry.outcome {
-                DimensionOutcome::Differing { .. } => differing.push(dimension),
-                DimensionOutcome::Unnormalizable { .. } => unnormalizable.push(dimension),
-                DimensionOutcome::Equal { .. } => {}
-            }
-            outcomes.push(DimensionComparison {
-                dimension,
-                outcome: entry.outcome.clone(),
-            });
+    for pair in pairs {
+        if pair.covers(source_handle) {
+            out.push(position_compatibility(pair, source_handle));
         }
-        let relation = CompatibilityRelation::Ambiguous;
-        out.push(PositionCompatibility {
-            other_source: other.to_owned(),
-            relation,
-            supplement_version: SupplementVersion::LegacyV1Unverified,
-            outcomes,
-            differing_dimensions: differing,
-            unnormalizable_dimensions: unnormalizable,
-        });
     }
     out.sort_by(|left, right| left.other_source.cmp(&right.other_source));
     out
@@ -2620,11 +2775,16 @@ fn collect_causal_claims(supplements: &ConflictSupplements) -> Vec<CausalClaimRe
 }
 
 /// Disposes one position without choosing a winner.
+///
+/// The compatibility mapping comes from the canonical pairs, so this position
+/// reads values labelled by ownership out of the one normalized record rather
+/// than out of whichever caller field happened to be named `left`.
 fn dispose_position(
     index: usize,
     conflict_set: &ConflictSet,
     supplements: &ConflictSupplements,
     classes: &[ConflictKind],
+    pairs: &[CanonicalComparisonPair],
 ) -> PositionAnalysis {
     let empty_position = conflict_set.positions.get(index);
     let (source_handle, stance, minority, assumptions, counters) = match empty_position {
@@ -2705,7 +2865,7 @@ fn dispose_position(
             "{compatibility}; chronology, count, confidence, recency, or topology is not causal or truth evidence"
         );
     }
-    let compatibility_map = build_compatibility(&source_handle, &supplements.comparisons);
+    let compatibility_map = build_compatibility(&source_handle, pairs);
     let compatibility_note = compatibility_note_with_mapping(&compatibility, &compatibility_map);
     PositionAnalysis {
         position_index: index,
@@ -3118,148 +3278,638 @@ fn check_preservation(
 // Digest and emission.
 // ---------------------------------------------------------------------------
 
-/// Builds the sorted digest parts binding the legacy v1 comparison and causal
-/// declaration inputs.
+// ---------------------------------------------------------------------------
+// Version 2 candidate identity.
+//
+// One candidate digest names one serialized candidate. The preimage below is a
+// typed, serializable projection of the emitted candidate plus the input
+// commitments the candidate does not carry itself, so two candidates that
+// serialize differently cannot share an identity, and one candidate that
+// replays exactly reproduces both its bytes and its digest.
+// ---------------------------------------------------------------------------
+
+/// Domain tag separating the candidate-identity preimage from every other
+/// hashed structure in the system.
+pub const CANDIDATE_IDENTITY_DOMAIN: &str = "eliot.conflict-analysis.candidate-identity";
+
+/// Schema version of the candidate-identity preimage.
 ///
-/// Both lists are bound whole: a caller that changes a declared value, outcome,
-/// or causal prose moves the candidate digest. This digest binds declarations,
-/// not their truth or owner qualification. The comparison pair key is
-/// order-independent, so supplying the same pair from either side yields the
-/// same digest.
-fn comparison_and_causal_digest_parts(supplements: &ConflictSupplements) -> Vec<String> {
-    let mut parts: Vec<String> = Vec::new();
-    for comparison in &supplements.comparisons {
-        let mut dimensions: Vec<String> = comparison
-            .dimensions
-            .iter()
-            .map(|entry| {
-                format!(
-                    "{}={}",
-                    entry.dimension.as_str(),
-                    dimension_outcome_spelling(&entry.outcome)
-                )
-            })
-            .collect();
-        dimensions.sort();
-        parts.push(format!(
-            "comparison:{}:{}",
-            comparison_pair_key(&comparison.left_source, &comparison.right_source),
-            dimensions.join(",")
-        ));
-    }
-    for claim in &supplements.causal_claims {
-        parts.push(format!(
-            "causal:{}:{}:{}:{}:{}:{}",
-            claim.source_handle,
-            claim.declared_state.as_str(),
-            claim.mechanism,
-            claim.falsifier,
-            claim.control_evaluator,
-            claim.rivals_or_confounders
-        ));
-    }
-    parts.sort();
-    parts
+/// A version 1 identity hashed length-prefixed formatted strings and named no
+/// typed structure, so it cannot name a version 2 candidate and is never
+/// reinterpreted as one: the two preimages share no bytes, and every version 2
+/// digest is computed over data that records this schema version explicitly.
+pub const CANDIDATE_IDENTITY_SCHEMA: &str = "v2";
+
+/// One owner-issued commitment as the candidate identity commits it.
+#[derive(Serialize)]
+struct CommitmentIdentity {
+    source: String,
+    record_digest: String,
+    profile: String,
+    profile_digest: String,
 }
 
-/// Computes the deterministic digest binding the analyzed inputs.
-pub fn compute_candidate_digest(
-    conflict_set: &ConflictSet,
-    supplements: &ConflictSupplements,
-    policy: &ConflictAnalysisPolicy,
-    positions: &[PositionAnalysis],
-    recommended_probes: &[RecommendedProbe],
-    owner: &DecisionOwnerRecommendation,
-    outcome_spelling: &str,
-) -> Result<String, ConflictAnalysisError> {
-    let mut parts: Vec<String> = Vec::new();
-    parts.push(format!("conflict:{}", conflict_set.conflict_id));
-    parts.push(format!("kind:{}", kind_to_spelling(conflict_set.kind)));
-    parts.push(format!("scope:{}", conflict_set.scope));
-    parts.push(format!("digest:{}", conflict_set.digest));
-    parts.push(format!("outcome:{outcome_spelling}"));
-    parts.push(format!(
-        "policy:{}@{}",
-        policy.policy_id, policy.policy_revision
-    ));
-    parts.push(format!("bundle:{}", supplements.frozen_bundle_digest));
-    parts.push(format!("manifest:{}", supplements.frozen_manifest_digest));
-    let mut index = 0usize;
-    while index < positions.len() {
-        if let Some(position) = positions.get(index) {
-            parts.push(format!(
-                "position:{}|{}|{}|{}",
-                position.position_index,
-                position.source_handle,
-                position.disposition.as_str(),
-                position.stance
-            ));
-            let mut classes: Vec<String> = position
+impl CommitmentIdentity {
+    fn new(commitment: &SourceRecordCommitment) -> Self {
+        Self {
+            source: commitment.source().to_owned(),
+            record_digest: commitment.record_digest().to_owned(),
+            profile: commitment.profile().to_owned(),
+            profile_digest: commitment.profile_digest().to_owned(),
+        }
+    }
+}
+
+/// One canonical dimension outcome with its values still coupled to sources.
+#[derive(Serialize)]
+enum CanonicalOutcomeIdentity {
+    Equal {
+        value: String,
+    },
+    Differing {
+        first_value: String,
+        second_value: String,
+    },
+    Unnormalizable {
+        reason: String,
+    },
+}
+
+impl CanonicalOutcomeIdentity {
+    fn new(outcome: &CanonicalDimensionOutcome) -> Self {
+        match outcome {
+            CanonicalDimensionOutcome::Equal { value } => Self::Equal {
+                value: value.clone(),
+            },
+            CanonicalDimensionOutcome::Differing {
+                first_value,
+                second_value,
+            } => Self::Differing {
+                first_value: first_value.clone(),
+                second_value: second_value.clone(),
+            },
+            CanonicalDimensionOutcome::Unnormalizable { reason } => Self::Unnormalizable {
+                reason: reason.clone(),
+            },
+        }
+    }
+}
+
+/// One canonical dimension of one committed comparison pair.
+#[derive(Serialize)]
+struct CanonicalDimensionIdentity {
+    dimension: String,
+    outcome: CanonicalOutcomeIdentity,
+}
+
+/// One admitted comparison pair, exactly as the candidate carries it.
+#[derive(Serialize)]
+struct ComparisonPairIdentity {
+    first_source: String,
+    first_source_commitment: CommitmentIdentity,
+    second_source: String,
+    second_source_commitment: CommitmentIdentity,
+    dimensions: Vec<CanonicalDimensionIdentity>,
+}
+
+/// Projects one canonical pair onto the identity preimage.
+fn comparison_pair_identity(pair: &CanonicalComparisonPair) -> ComparisonPairIdentity {
+    let dimensions = pair
+        .dimensions
+        .iter()
+        .map(|entry| CanonicalDimensionIdentity {
+            dimension: entry.dimension.as_str().to_owned(),
+            outcome: CanonicalOutcomeIdentity::new(&entry.outcome),
+        })
+        .collect();
+    ComparisonPairIdentity {
+        first_source: pair.first_source.clone(),
+        first_source_commitment: CommitmentIdentity::new(&pair.first_source_commitment),
+        second_source: pair.second_source.clone(),
+        second_source_commitment: CommitmentIdentity::new(&pair.second_source_commitment),
+        dimensions,
+    }
+}
+
+/// One position-facing dimension outcome as the identity commits it.
+#[derive(Serialize)]
+enum PositionOutcomeIdentity {
+    Equal {
+        self_value: String,
+        other_value: String,
+    },
+    Differing {
+        self_value: String,
+        other_value: String,
+    },
+    Unnormalizable {
+        reason: String,
+    },
+}
+
+impl PositionOutcomeIdentity {
+    fn new(outcome: &PositionDimensionOutcome) -> Self {
+        match outcome {
+            PositionDimensionOutcome::Equal {
+                self_value,
+                other_value,
+            } => Self::Equal {
+                self_value: self_value.clone(),
+                other_value: other_value.clone(),
+            },
+            PositionDimensionOutcome::Differing {
+                self_value,
+                other_value,
+            } => Self::Differing {
+                self_value: self_value.clone(),
+                other_value: other_value.clone(),
+            },
+            PositionDimensionOutcome::Unnormalizable { reason } => Self::Unnormalizable {
+                reason: reason.clone(),
+            },
+        }
+    }
+}
+
+/// One dimension of one emitted position-facing mapping.
+#[derive(Serialize)]
+struct PositionDimensionIdentity {
+    dimension: String,
+    outcome: PositionOutcomeIdentity,
+}
+
+/// One emitted compatibility mapping, exactly as the candidate carries it.
+///
+/// Committing the mapping itself — not only the pair it was derived from — is
+/// what closes the identity: no alternate spelling of the emitted values can
+/// sit behind the same digest.
+#[derive(Serialize)]
+struct CompatibilityIdentity {
+    self_source: String,
+    self_source_commitment: CommitmentIdentity,
+    other_source: String,
+    other_source_commitment: CommitmentIdentity,
+    relation: String,
+    supplement_version: String,
+    outcomes: Vec<PositionDimensionIdentity>,
+    differing_dimensions: Vec<String>,
+    unnormalizable_dimensions: Vec<String>,
+}
+
+impl CompatibilityIdentity {
+    fn new(mapping: &PositionCompatibility) -> Self {
+        let outcomes = mapping
+            .outcomes
+            .iter()
+            .map(|entry| PositionDimensionIdentity {
+                dimension: entry.dimension.as_str().to_owned(),
+                outcome: PositionOutcomeIdentity::new(&entry.outcome),
+            })
+            .collect();
+        Self {
+            self_source: mapping.self_source.clone(),
+            self_source_commitment: CommitmentIdentity::new(&mapping.self_source_commitment),
+            other_source: mapping.other_source.clone(),
+            other_source_commitment: CommitmentIdentity::new(&mapping.other_source_commitment),
+            relation: mapping.relation.as_str().to_owned(),
+            supplement_version: mapping.supplement_version.as_str().to_owned(),
+            outcomes,
+            differing_dimensions: dimension_spellings(&mapping.differing_dimensions),
+            unnormalizable_dimensions: dimension_spellings(&mapping.unnormalizable_dimensions),
+        }
+    }
+}
+
+/// Returns the canonical spellings of one dimension set, in its own order.
+fn dimension_spellings(dimensions: &[ComparisonDimension]) -> Vec<String> {
+    dimensions
+        .iter()
+        .map(|dimension| dimension.as_str().to_owned())
+        .collect()
+}
+
+/// One analyzed position, exactly as the candidate carries it.
+#[derive(Serialize)]
+struct PositionIdentity {
+    position_index: usize,
+    source_handle: String,
+    stance: String,
+    minority: bool,
+    disposition: String,
+    conflict_classes: Vec<String>,
+    compatibility_note: String,
+    assumptions: Vec<String>,
+    counters: Vec<String>,
+    compatibility: Vec<CompatibilityIdentity>,
+}
+
+impl PositionIdentity {
+    fn new(position: &PositionAnalysis) -> Self {
+        Self {
+            position_index: position.position_index,
+            source_handle: position.source_handle.clone(),
+            stance: position.stance.clone(),
+            minority: position.minority,
+            disposition: position.disposition.as_str().to_owned(),
+            conflict_classes: position
                 .conflict_classes
                 .iter()
                 .map(|kind| kind_to_spelling(*kind))
-                .collect();
-            classes.sort();
-            for class in classes {
-                parts.push(format!("class:{}:{class}", position.position_index));
-            }
+                .collect(),
+            compatibility_note: position.compatibility_note.clone(),
+            assumptions: position.assumptions.clone(),
+            counters: position.counters.clone(),
+            compatibility: position
+                .compatibility
+                .iter()
+                .map(CompatibilityIdentity::new)
+                .collect(),
         }
-        index = index.saturating_add(1);
     }
-    let mut objections: Vec<String> = supplements
-        .objections
-        .iter()
-        .map(|objection| {
-            format!(
-                "objection:{}:{}",
-                objection.objection_id, objection.statement
-            )
-        })
-        .collect();
-    objections.sort();
-    parts.extend(objections);
-    let mut evidence: Vec<String> = supplements
-        .counterevidence
-        .iter()
-        .map(|entry| format!("counter:{entry}"))
-        .chain(
-            supplements
-                .unknowns
+}
+
+/// One lineage group, exactly as the candidate carries it.
+#[derive(Serialize)]
+struct LineageGroupIdentity {
+    lineage_root: String,
+    known: bool,
+    member_sources: Vec<String>,
+}
+
+/// One common-mode risk, exactly as the candidate carries it.
+#[derive(Serialize)]
+struct CommonModeRiskIdentity {
+    kind: String,
+    description: String,
+    affected_sources: Vec<String>,
+}
+
+/// One preserved objection, exactly as the candidate carries it.
+#[derive(Serialize)]
+struct ObjectionIdentity {
+    objection_id: String,
+    target_source: String,
+    statement: String,
+    grounded: bool,
+}
+
+/// One recommended probe, exactly as the candidate carries it.
+#[derive(Serialize)]
+struct ProbeIdentity {
+    probe_id: String,
+    objective_digest: String,
+    result_digest: String,
+    discriminates_positions: Vec<String>,
+    resolves_unknown: Option<String>,
+    owner: String,
+    verifier: String,
+    cost_note: String,
+    risk_note: String,
+    privacy_note: String,
+    effect_note: String,
+}
+
+/// The named external decision owner, exactly as the candidate carries it.
+#[derive(Serialize)]
+struct OwnerIdentity {
+    kind: String,
+    owner_handle: String,
+    rationale: String,
+    contract_needed: String,
+}
+
+/// One preservation verdict, exactly as the candidate carries it.
+#[derive(Serialize)]
+struct VerdictIdentity {
+    dimension: String,
+    passed: bool,
+    known: bool,
+    note: String,
+}
+
+/// The seven preservation verdicts, exactly as the candidate carries them.
+#[derive(Serialize)]
+struct PreservationIdentity {
+    verdicts: Vec<VerdictIdentity>,
+}
+
+/// One preserved causal state, exactly as the candidate carries it.
+#[derive(Serialize)]
+struct CausalStateIdentity {
+    source_handle: String,
+    declared_state: String,
+    effective_state: String,
+    supplement_version: String,
+    reduction_reason: String,
+}
+
+/// An externally supplied resolution, exactly as the candidate carries it.
+#[derive(Serialize)]
+struct ResolutionIdentity {
+    decision_digest: String,
+    decided_by: String,
+    note: String,
+}
+
+/// The complete version 2 candidate-identity preimage.
+///
+/// Every field is identity-bearing: two candidates differing in any field of
+/// this record serialize differently and therefore cannot share a digest. The
+/// record covers the emitted candidate in full except `candidate_digest`
+/// itself, plus the input commitments the candidate does not carry.
+#[derive(Serialize)]
+struct CandidateIdentity {
+    domain: &'static str,
+    schema: &'static str,
+    conflict_id: String,
+    conflict_kind: String,
+    conflict_scope: String,
+    conflict_digest: String,
+    outcome: String,
+    policy_id: String,
+    policy_revision: u32,
+    frozen_bundle_digest: String,
+    frozen_manifest_digest: String,
+    positions: Vec<PositionIdentity>,
+    lineage_groups: Vec<LineageGroupIdentity>,
+    independent_root_count: usize,
+    common_mode_risks: Vec<CommonModeRiskIdentity>,
+    objections: Vec<ObjectionIdentity>,
+    counterevidence: Vec<String>,
+    unknowns: Vec<String>,
+    assumptions: Vec<String>,
+    recommended_probes: Vec<ProbeIdentity>,
+    recommended_owner: OwnerIdentity,
+    preservation: PreservationIdentity,
+    invalidation_conditions: Vec<String>,
+    note: String,
+    resolution_status: Option<ResolutionIdentity>,
+    causal_states: Vec<CausalStateIdentity>,
+    comparison_pairs: Vec<ComparisonPairIdentity>,
+}
+
+impl LineageGroupIdentity {
+    /// Projects one emitted lineage group onto the preimage.
+    fn new(group: &LineageGroup) -> Self {
+        Self {
+            lineage_root: group.lineage_root.clone(),
+            known: group.known,
+            member_sources: group.member_sources.clone(),
+        }
+    }
+}
+
+impl CommonModeRiskIdentity {
+    /// Projects one emitted common-mode risk onto the preimage.
+    fn new(risk: &CommonModeRisk) -> Self {
+        Self {
+            kind: risk.kind.clone(),
+            description: risk.description.clone(),
+            affected_sources: risk.affected_sources.clone(),
+        }
+    }
+}
+
+impl ObjectionIdentity {
+    /// Projects one emitted objection onto the preimage.
+    fn new(objection: &SuppliedObjection) -> Self {
+        Self {
+            objection_id: objection.objection_id.clone(),
+            target_source: objection.target_source.clone(),
+            statement: objection.statement.clone(),
+            grounded: objection.grounded,
+        }
+    }
+}
+
+impl ProbeIdentity {
+    /// Projects one emitted probe recommendation onto the preimage.
+    fn new(probe: &RecommendedProbe) -> Self {
+        Self {
+            probe_id: probe.probe_id.clone(),
+            objective_digest: probe.objective_digest.clone(),
+            result_digest: probe.result_digest.clone(),
+            discriminates_positions: probe.discriminates_positions.clone(),
+            resolves_unknown: probe.resolves_unknown.clone(),
+            owner: probe.owner.clone(),
+            verifier: probe.verifier.clone(),
+            cost_note: probe.cost_note.clone(),
+            risk_note: probe.risk_note.clone(),
+            privacy_note: probe.privacy_note.clone(),
+            effect_note: probe.effect_note.clone(),
+        }
+    }
+}
+
+impl OwnerIdentity {
+    /// Projects one emitted owner recommendation onto the preimage.
+    fn new(owner: &DecisionOwnerRecommendation) -> Self {
+        Self {
+            kind: owner.kind.as_str().to_owned(),
+            owner_handle: owner.owner_handle.clone(),
+            rationale: owner.rationale.clone(),
+            contract_needed: owner.contract_needed.clone(),
+        }
+    }
+}
+
+impl VerdictIdentity {
+    /// Projects one emitted preservation verdict onto the preimage.
+    fn new(verdict: &DimensionVerdict) -> Self {
+        Self {
+            dimension: verdict.dimension.as_str().to_owned(),
+            passed: verdict.passed,
+            known: verdict.known,
+            note: verdict.note.clone(),
+        }
+    }
+}
+
+impl PreservationIdentity {
+    /// Projects the emitted preservation report onto the preimage.
+    fn new(preservation: &PreservationReport) -> Self {
+        Self {
+            verdicts: preservation.verdicts.iter().map(VerdictIdentity::new).collect(),
+        }
+    }
+}
+
+impl ResolutionIdentity {
+    /// Projects one retained external resolution onto the preimage.
+    fn new(resolution: &ExternalResolution) -> Self {
+        Self {
+            decision_digest: resolution.decision_digest.clone(),
+            decided_by: resolution.decided_by.clone(),
+            note: resolution.note.clone(),
+        }
+    }
+}
+
+impl CausalStateIdentity {
+    /// Projects one preserved causal declaration onto the preimage.
+    fn new(claim: &CausalClaimRecord) -> Self {
+        Self {
+            source_handle: claim.source_handle.clone(),
+            declared_state: claim.declared_state.as_str().to_owned(),
+            effective_state: claim.effective_state.as_str().to_owned(),
+            supplement_version: claim.supplement_version.as_str().to_owned(),
+            reduction_reason: claim.reduction_reason.clone(),
+        }
+    }
+}
+
+impl CandidateIdentity {
+    /// Projects one emitted candidate and its retained inputs onto the preimage.
+    fn new(
+        candidate: &ConflictAnalysisCandidate,
+        conflict_set: &ConflictSet,
+        supplements: &ConflictSupplements,
+        policy: &ConflictAnalysisPolicy,
+    ) -> Self {
+        Self {
+            domain: CANDIDATE_IDENTITY_DOMAIN,
+            schema: CANDIDATE_IDENTITY_SCHEMA,
+            conflict_id: candidate.conflict_id.clone(),
+            conflict_kind: kind_to_spelling(conflict_set.kind),
+            conflict_scope: conflict_set.scope.clone(),
+            conflict_digest: conflict_set.digest.clone(),
+            outcome: candidate.outcome.as_str().to_owned(),
+            policy_id: policy.policy_id.clone(),
+            policy_revision: policy.policy_revision,
+            frozen_bundle_digest: supplements.frozen_bundle_digest.clone(),
+            frozen_manifest_digest: supplements.frozen_manifest_digest.clone(),
+            positions: candidate
+                .positions
                 .iter()
-                .map(|entry| format!("unknown:{entry}")),
-        )
-        .chain(
-            supplements
-                .assumptions
+                .map(PositionIdentity::new)
+                .collect(),
+            lineage_groups: candidate
+                .lineage_groups
                 .iter()
-                .map(|entry| format!("assumption:{entry}")),
-        )
-        .collect();
-    evidence.sort();
-    parts.extend(evidence);
-    let mut probes: Vec<String> = recommended_probes
-        .iter()
-        .map(|probe| {
-            format!(
-                "probe:{}:{}:{}",
-                probe.probe_id, probe.objective_digest, probe.result_digest
-            )
-        })
-        .collect();
-    probes.sort();
-    parts.extend(probes);
-    parts.extend(comparison_and_causal_digest_parts(supplements));
-    parts.push(format!(
-        "owner:{}:{}",
-        owner.kind.as_str(),
-        owner.owner_handle
-    ));
-    parts.sort();
-    canonical_json_bytes(&parts)
+                .map(LineageGroupIdentity::new)
+                .collect(),
+            independent_root_count: candidate.independent_root_count,
+            common_mode_risks: candidate
+                .common_mode_risks
+                .iter()
+                .map(CommonModeRiskIdentity::new)
+                .collect(),
+            objections: candidate.objections.iter().map(ObjectionIdentity::new).collect(),
+            counterevidence: candidate.counterevidence.clone(),
+            unknowns: candidate.unknowns.clone(),
+            assumptions: candidate.assumptions.clone(),
+            recommended_probes: candidate
+                .recommended_probes
+                .iter()
+                .map(ProbeIdentity::new)
+                .collect(),
+            recommended_owner: OwnerIdentity::new(&candidate.recommended_owner),
+            preservation: PreservationIdentity::new(&candidate.preservation),
+            invalidation_conditions: candidate.invalidation_conditions.clone(),
+            note: candidate.note.clone(),
+            resolution_status: candidate
+                .resolution_status
+                .as_ref()
+                .map(ResolutionIdentity::new),
+            causal_states: candidate
+                .causal_states
+                .iter()
+                .map(CausalStateIdentity::new)
+                .collect(),
+            comparison_pairs: candidate
+                .comparison_pairs
+                .iter()
+                .map(comparison_pair_identity)
+                .collect(),
+        }
+    }
+}
+
+/// Hashes one version 2 candidate-identity preimage.
+fn hash_candidate_identity(identity: &CandidateIdentity) -> Result<String, ConflictAnalysisError> {
+    canonical_json_bytes(identity)
         .map(|bytes| sha256_hex(&bytes))
         .map_err(|err| ConflictAnalysisError::Digest {
             detail: redact(&err.to_string()),
         })
+}
+
+/// Computes the version 2 digest of exactly one candidate.
+///
+/// The preimage is the candidate's own emitted content plus the input
+/// commitments the candidate does not carry — the conflict-set identity, the
+/// governing policy, and the frozen bundle and manifest digests — with
+/// `candidate_digest` itself excluded. Because the comparison pairs enter as
+/// normalized typed data with each value coupled to its own source, declaring
+/// the same pair from either side yields the same digest, while declaring it
+/// with a different source/value association or a different owner-issued
+/// commitment moves it. The digest binds declarations, not their truth.
+pub fn compute_candidate_digest(
+    candidate: &ConflictAnalysisCandidate,
+    conflict_set: &ConflictSet,
+    supplements: &ConflictSupplements,
+    policy: &ConflictAnalysisPolicy,
+) -> Result<String, ConflictAnalysisError> {
+    hash_candidate_identity(&CandidateIdentity::new(
+        candidate,
+        conflict_set,
+        supplements,
+        policy,
+    ))
+}
+
+/// Confirms the canonical pairs a candidate carries are the normalization of the
+/// retained request.
+///
+/// Each carried pair is compared against the pair rebuilt from the original
+/// request through the one canonicalization entry, by the pair's own
+/// order-independent identity. The carried copy is therefore checked against
+/// the request rather than against itself.
+fn validate_carried_pairs(
+    candidate: &ConflictAnalysisCandidate,
+    conflict_set: &ConflictSet,
+    supplements: &ConflictSupplements,
+) -> Result<(), ConflictAnalysisError> {
+    let rebuilt = canonicalize_comparisons(conflict_set, supplements)?;
+    if rebuilt.len() != candidate.comparison_pairs.len() {
+        return Err(ConflictAnalysisError::Binding {
+            field: "candidate.comparison_pairs".to_owned(),
+            detail: "the carried canonical pairs are not the normalization of this request"
+                .to_owned(),
+        });
+    }
+    for (carried, expected) in candidate.comparison_pairs.iter().zip(rebuilt.iter()) {
+        if carried.canonical_key() != expected.canonical_key() {
+            return Err(ConflictAnalysisError::Binding {
+                field: "candidate.comparison_pairs".to_owned(),
+                detail: "a carried canonical pair is not the normalization of this request"
+                    .to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Verifies the digest a candidate carries against its recomputed identity.
+///
+/// The recomputation reads the candidate itself plus the retained input
+/// commitments and excludes only `candidate_digest`, so a digest copied from a
+/// request, or carried by a candidate whose content was altered after emission,
+/// fails closed.
+pub fn validate_candidate_digest(
+    candidate: &ConflictAnalysisCandidate,
+    conflict_set: &ConflictSet,
+    supplements: &ConflictSupplements,
+    policy: &ConflictAnalysisPolicy,
+) -> Result<(), ConflictAnalysisError> {
+    validate_carried_pairs(candidate, conflict_set, supplements)?;
+    let recomputed = compute_candidate_digest(candidate, conflict_set, supplements, policy)?;
+    if recomputed == candidate.candidate_digest {
+        return Ok(());
+    }
+    Err(ConflictAnalysisError::Digest {
+        detail: "the carried candidate digest is not this candidate's recomputed identity".to_owned(),
+    })
 }
 
 /// Returns the canonical spelling of one conflict kind.
@@ -3304,6 +3954,11 @@ fn build_invalidation_conditions(
 }
 
 /// Emits the terminal candidate envelope for one resolved outcome.
+///
+/// The candidate is assembled first and its identity is computed over the
+/// assembled envelope, so the digest commits the exact bytes this call returns
+/// rather than a separate description of them. The canonical pairs travel with
+/// the envelope: they are the record every emitted mapping was derived from.
 #[allow(clippy::too_many_arguments)]
 fn emit_candidate(
     outcome: ConflictOutcome,
@@ -3317,6 +3972,7 @@ fn emit_candidate(
     recommended_probes: &[RecommendedProbe],
     owner: &DecisionOwnerRecommendation,
     note: &str,
+    pairs: &[CanonicalComparisonPair],
 ) -> Result<ConflictAnalysisCandidate, ConflictAnalysisError> {
     let preservation = check_preservation(
         conflict_set,
@@ -3327,15 +3983,6 @@ fn emit_candidate(
         owner,
     );
     preservation.validate()?;
-    let digest = compute_candidate_digest(
-        conflict_set,
-        supplements,
-        policy,
-        positions,
-        recommended_probes,
-        owner,
-        outcome.as_str(),
-    )?;
     let mut sorted_positions = positions.to_vec();
     sorted_positions.sort_by_key(|left| left.position_index);
     let mut sorted_objections = supplements.objections.clone();
@@ -3357,7 +4004,7 @@ fn emit_candidate(
     let mut sorted_probes = recommended_probes.to_vec();
     sorted_probes.sort_by(|left, right| left.probe_id.cmp(&right.probe_id));
     let invalidation_conditions = build_invalidation_conditions(supplements, groups);
-    Ok(ConflictAnalysisCandidate {
+    let mut candidate = ConflictAnalysisCandidate {
         outcome,
         conflict_id: conflict_set.conflict_id.clone(),
         scope: conflict_set.scope.clone(),
@@ -3373,11 +4020,17 @@ fn emit_candidate(
         recommended_owner: owner.clone(),
         preservation,
         invalidation_conditions,
-        candidate_digest: digest,
+        candidate_digest: String::new(),
         note: note.to_owned(),
         resolution_status: supplements.external_resolution.clone(),
         causal_states: collect_causal_claims(supplements),
-    })
+        comparison_pairs: pairs.to_vec(),
+    };
+    // The identity preimage excludes this one field, so filling it in cannot
+    // change what the digest covers.
+    candidate.candidate_digest =
+        compute_candidate_digest(&candidate, conflict_set, supplements, policy)?;
+    Ok(candidate)
 }
 
 // ---------------------------------------------------------------------------
@@ -3429,7 +4082,10 @@ pub fn analyze_conflict(
     validate_policy_shapes(policy)?;
     validate_supplement_shapes(supplements)?;
     validate_conflict_denominators(conflict_set, policy)?;
-    validate_comparisons(conflict_set, &supplements.comparisons)?;
+    validate_source_commitments(supplements)?;
+    // Orientation is decided once, here, and every leg below consumes the one
+    // normalized value: no later step re-derives it from caller fields.
+    let pairs = canonicalize_comparisons(conflict_set, supplements)?;
     validate_causal_claims(conflict_set, &supplements.causal_claims)?;
     check_supplement_identity_uniqueness(supplements)?;
     if policy.policy_id != item.receipt.validator_policy {
@@ -3457,7 +4113,13 @@ pub fn analyze_conflict(
         let mut positions: Vec<PositionAnalysis> = Vec::with_capacity(conflict_set.positions.len());
         let mut index = 0usize;
         while index < conflict_set.positions.len() {
-            positions.push(dispose_position(index, conflict_set, supplements, &classes));
+            positions.push(dispose_position(
+                index,
+                conflict_set,
+                supplements,
+                &classes,
+                &pairs,
+            ));
             index = index.saturating_add(1);
         }
         let (groups, independent) = group_lineage(conflict_set, supplements);
@@ -3475,13 +4137,20 @@ pub fn analyze_conflict(
             &[],
             &owner,
             early_note,
+            &pairs,
         );
     }
     let classes = classify_conflict(conflict_set);
     let mut positions: Vec<PositionAnalysis> = Vec::with_capacity(conflict_set.positions.len());
     let mut index = 0usize;
     while index < conflict_set.positions.len() {
-        positions.push(dispose_position(index, conflict_set, supplements, &classes));
+        positions.push(dispose_position(
+            index,
+            conflict_set,
+            supplements,
+            &classes,
+            &pairs,
+        ));
         index = index.saturating_add(1);
     }
     let (groups, independent) = group_lineage(conflict_set, supplements);
@@ -3530,6 +4199,7 @@ pub fn analyze_conflict(
             &recommended,
             &owner,
             note,
+            &pairs,
         );
     }
     emit_candidate(
@@ -3544,6 +4214,7 @@ pub fn analyze_conflict(
         &recommended,
         &owner,
         CONFLICT_PROOF_NOTE,
+        &pairs,
     )
 }
 
@@ -3897,6 +4568,7 @@ mod tests {
             unknowns: vec!["hit rate under load".to_owned()],
             supplied_probes: vec![test_discriminative_probe("probe-1")],
             comparisons: Vec::new(),
+            source_commitments: Vec::new(),
             causal_claims: Vec::new(),
             external_resolution: None,
         }
