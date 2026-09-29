@@ -346,11 +346,13 @@ pub struct BackupConfigRequest {
 
 /// Forensic audit note with a typed non-authoritative ceiling (case 958/3).
 ///
-/// Carries a digest plus observed dispositions only. There is deliberately NO
-/// constructor, conversion, or method that turns this into a lease, grant,
-/// or current-state assertion; [`describe_audit_fence`] renders the note
-/// with its ceiling stated, and [`AuditFenceNote::validate`] ENFORCES that
-/// ceiling rather than only describing it.
+/// Carries a digest, observed dispositions, and the one flag that states the
+/// ceiling. There is deliberately NO constructor, conversion, or method that
+/// turns this into a lease, grant, or current-state assertion;
+/// [`describe_audit_fence`] renders the note with its ceiling stated, and
+/// [`AuditFenceNote::validate`] ENFORCES that ceiling rather than only
+/// describing it. No field here can be read as authority: the note has no
+/// lease, grant, generation, epoch or state field to populate.
 ///
 /// [`active_authority_restored`] is the ceiling made representable. Before it
 /// existed, a note had no field in which a restored-authority claim could even
