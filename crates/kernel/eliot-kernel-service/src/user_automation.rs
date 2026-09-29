@@ -418,7 +418,7 @@ fn validate_mutation_result(
         ) => {
             expected.validate()?;
             revision.validate()?;
-            if expected != revision
+            if expected.as_ref() != revision
                 || revision.supersedes.is_some()
                 || !cancelled_wake_ids.is_empty()
             {
@@ -440,7 +440,7 @@ fn validate_mutation_result(
         ) => {
             expected.validate_supersedes(previous_revision)?;
             revision.validate_supersedes(previous_revision)?;
-            if expected != revision || !cancelled_wake_ids.is_empty() {
+            if expected.as_ref() != revision || !cancelled_wake_ids.is_empty() {
                 return Err(UserAutomationServiceError::ResponseMismatch(
                     "edit revision result",
                 ));
