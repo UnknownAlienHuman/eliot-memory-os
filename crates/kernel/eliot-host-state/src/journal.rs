@@ -72,7 +72,7 @@ pub struct EpochRetirementQuery {
     pub operation: IdempotencyIdentity,
 }
 
-/// Exact Host journal selector for one UserAutomation wake-cancellation batch.
+/// Exact Host journal selector for one `UserAutomation` wake-cancellation batch.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WakeCancellationBatchQuery {
     /// Canonical Host batch operation identity computed from the original
@@ -1490,6 +1490,10 @@ impl<B: JournalBackend> HostStateJournal<B> {
     /// This scans the verified durable frame and checks its reducer projection
     /// plus backend commit receipt. Current wake rows are not used as a proxy:
     /// their absence or later lifecycle state cannot settle an earlier batch.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the durable frame, reducer projection, and backend receipt are checked together"
+    )]
     pub fn query_wake_cancellation_batch(
         &self,
         query: &WakeCancellationBatchQuery,

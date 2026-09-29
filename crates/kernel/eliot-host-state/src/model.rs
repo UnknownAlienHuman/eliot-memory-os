@@ -1515,7 +1515,7 @@ impl WakeCancellationBatchEntry {
 pub struct WakeCancellationBatchRecord {
     pub fence: RecordFence,
     pub operation: IdempotencyIdentity,
-    /// Canonical commitment of the exact typed UserAutomation cancellation
+    /// Canonical commitment of the exact typed `UserAutomation` cancellation
     /// request received by the Host. Legacy batches omit it and cannot satisfy
     /// exact cancellation readback.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -1567,8 +1567,10 @@ impl UserAutomationHostExecutionTransport for AuthenticatedUserAutomationHostExe
                 return Err(error);
             }
         };
-        observer.dispatch_started(&request)?;
         let mut transport = self.transport.lock().await;
+        // The claim expiry is checked by the durable observer after waiting
+        // for this transport, immediately before the first possible write.
+        observer.dispatch_started(&request)?;
         let outcome = match transport.send_frame(&frame, self.limits).await {
             Ok(outcome) => outcome,
             Err(_) => {
