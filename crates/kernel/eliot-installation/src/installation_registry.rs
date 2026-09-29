@@ -178,6 +178,41 @@ impl ApprovedGenerationRegistry {
         )?;
         Ok(receipt)
     }
+
+    /// Reads the exact committed activation receipt when a terminal is present.
+    ///
+    /// `Ok(None)` is limited to the validated pending contour for the requested
+    /// transaction, plan, and generation. Registry validation proves that the
+    /// pending activation's prior active generation matches the current active
+    /// pointer before the missing terminal is treated as an uncommitted result.
+    /// A missing or different pending activation, or any present terminal that
+    /// does not satisfy the strict committed-receipt read, remains an error.
+    pub fn read_optional_committed_activation_receipt(
+        &self,
+        transaction_id: &PlatformHandle,
+        plan_digest: &PlatformHandle,
+        generation: &PlatformHandle,
+    ) -> Result<Option<ActivationCommitReceipt>, InstallationError> {
+        if self.last_terminal_activation.is_some() {
+            return self
+                .read_committed_activation_receipt(transaction_id, plan_digest, generation)
+                .map(Some);
+        }
+
+        self.validate()?;
+        let pending = self.pending_activation.as_ref().ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "no terminal activation or pending activation exists".to_owned(),
+            )
+        })?;
+        if pending.transaction_id != *transaction_id
+            || pending.plan_digest != *plan_digest
+            || pending.manifest.generation != *generation
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(None)
+    }
 }
 
 impl RedbInstallationRegistry {
@@ -628,6 +663,19 @@ impl RedbInstallationRegistry {
     ) -> Result<ActivationCommitReceipt, InstallationError> {
         self.load()?
             .read_committed_activation_receipt(transaction_id, plan_digest, generation)
+    }
+
+    /// Reads the exact committed activation receipt when present, returning
+    /// `None` only for a validated pending activation with the requested
+    /// transaction, plan, and generation.
+    pub fn read_optional_committed_activation_receipt(
+        &self,
+        transaction_id: &PlatformHandle,
+        plan_digest: &PlatformHandle,
+        generation: &PlatformHandle,
+    ) -> Result<Option<ActivationCommitReceipt>, InstallationError> {
+        self.load()?
+            .read_optional_committed_activation_receipt(transaction_id, plan_digest, generation)
     }
 
     /// Loads the sealed transaction and atomically stages its exact pending
