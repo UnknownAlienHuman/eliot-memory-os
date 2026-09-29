@@ -231,7 +231,10 @@ impl ObservationCoverageManifest {
     /// to blind intervals so a derived trace can always name its blocker.
     pub fn validate(&self) -> Result<(), EvaluationContractError> {
         self.fingerprint.validate()?;
-        text(&self.allowed_manifest_digest, "manifest.allowed_manifest_digest")?;
+        text(
+            &self.allowed_manifest_digest,
+            "manifest.allowed_manifest_digest",
+        )?;
         if self.expected_event_sources_and_event_classes.is_empty() {
             return Err(EvaluationContractError::EmptyCollection {
                 field: "manifest.expected_event_sources_and_event_classes",
@@ -267,47 +270,7 @@ impl ObservationCoverageManifest {
             }
         }
         self.counts.validate()?;
-        for blind in &self.blind_intervals_and_missing_source_reasons {
-            blind.validate()?;
-            let range = self
-                .first_and_last_expected_cursors_by_stream
-                .iter()
-                .find(|range| range.stream == blind.stream)
-                .ok_or(EvaluationContractError::EvidenceState {
-                    field: "manifest.blind_intervals_and_missing_source_reasons",
-                    reason: "blind interval names a stream outside the declared cursor denominator",
-                })?;
-            if blind.first_missing_cursor < range.first_expected_cursor
-                || blind.last_missing_cursor > range.last_expected_cursor
-            {
-                return Err(EvaluationContractError::EvidenceState {
-                    field: "manifest.blind_intervals_and_missing_source_reasons",
-                    reason: "blind interval lies outside its stream cursor range",
-                });
-            }
-        }
-        {
-            let mut ordered: Vec<(&str, u64, u64)> = self
-                .blind_intervals_and_missing_source_reasons
-                .iter()
-                .map(|blind| {
-                    (
-                        blind.stream.as_str(),
-                        blind.first_missing_cursor,
-                        blind.last_missing_cursor,
-                    )
-                })
-                .collect();
-            ordered.sort();
-            for pair in ordered.windows(2) {
-                if pair[0].0 == pair[1].0 && pair[1].1 <= pair[0].2 {
-                    return Err(EvaluationContractError::EvidenceState {
-                        field: "manifest.blind_intervals_and_missing_source_reasons",
-                        reason: "blind intervals overlap and double-count one cursor",
-                    });
-                }
-            }
-        }
+        self.validate_blind_intervals_as_partition()?;
         unique_texts(
             &self.missing_source_reasons,
             "manifest.missing_source_reasons",
@@ -329,42 +292,7 @@ impl ObservationCoverageManifest {
             }
         }
         self.denominator_origin_and_sampling_policy.validate()?;
-        if self.completeness == CoverageCompleteness::Complete {
-            if !self.blind_intervals_and_missing_source_reasons.is_empty() {
-                return Err(EvaluationContractError::EvidenceState {
-                    field: "manifest.completeness",
-                    reason: "complete denominator cannot carry blind intervals",
-                });
-            }
-            if !self.missing_source_reasons.is_empty() {
-                return Err(EvaluationContractError::EvidenceState {
-                    field: "manifest.completeness",
-                    reason: "complete denominator cannot carry missing-source reasons",
-                });
-            }
-            if self
-                .coverage_by_material_action_and_effect_route
-                .iter()
-                .any(|entry| !entry.covered)
-            {
-                return Err(EvaluationContractError::EvidenceState {
-                    field: "manifest.completeness",
-                    reason: "complete denominator cannot carry uncovered material actions",
-                });
-            }
-            if self.counts.unknown > 0 {
-                return Err(EvaluationContractError::EvidenceState {
-                    field: "manifest.completeness",
-                    reason: "complete denominator cannot carry received-but-unclassified events",
-                });
-            }
-            if self.counts.accounted()? != self.counts.received {
-                return Err(EvaluationContractError::EvidenceState {
-                    field: "manifest.completeness",
-                    reason: "complete denominator must fully account received events",
-                });
-            }
-        }
+        self.validate_complete_denominator()?;
         if self.proof_ceiling > ProofCeiling::Observation {
             return Err(EvaluationContractError::ProofOverclaim);
         }
@@ -382,6 +310,97 @@ impl ObservationCoverageManifest {
         )
     }
 
+    /// Validates blind intervals as one partition: every interval names a
+    /// declared stream, lies inside its stream cursor range, and shares no
+    /// cursor with another interval on the same stream.
+    fn validate_blind_intervals_as_partition(&self) -> Result<(), EvaluationContractError> {
+        for blind in &self.blind_intervals_and_missing_source_reasons {
+            blind.validate()?;
+            let range = self
+                .first_and_last_expected_cursors_by_stream
+                .iter()
+                .find(|range| range.stream == blind.stream)
+                .ok_or(EvaluationContractError::EvidenceState {
+                    field: "manifest.blind_intervals_and_missing_source_reasons",
+                    reason: "blind interval names a stream outside the declared cursor denominator",
+                })?;
+            if blind.first_missing_cursor < range.first_expected_cursor
+                || blind.last_missing_cursor > range.last_expected_cursor
+            {
+                return Err(EvaluationContractError::EvidenceState {
+                    field: "manifest.blind_intervals_and_missing_source_reasons",
+                    reason: "blind interval lies outside its stream cursor range",
+                });
+            }
+        }
+        let mut ordered: Vec<(&str, u64, u64)> = self
+            .blind_intervals_and_missing_source_reasons
+            .iter()
+            .map(|blind| {
+                (
+                    blind.stream.as_str(),
+                    blind.first_missing_cursor,
+                    blind.last_missing_cursor,
+                )
+            })
+            .collect();
+        ordered.sort_unstable();
+        for pair in ordered.windows(2) {
+            if pair[0].0 == pair[1].0 && pair[1].1 <= pair[0].2 {
+                return Err(EvaluationContractError::EvidenceState {
+                    field: "manifest.blind_intervals_and_missing_source_reasons",
+                    reason: "blind intervals overlap and double-count one cursor",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Rejects a `Complete` denominator that carries blind intervals,
+    /// missing-source reasons, uncovered material actions, unclassified
+    /// events, or a received count the dispositions do not fully account.
+    /// Non-complete denominators pass through untouched.
+    fn validate_complete_denominator(&self) -> Result<(), EvaluationContractError> {
+        if self.completeness != CoverageCompleteness::Complete {
+            return Ok(());
+        }
+        if !self.blind_intervals_and_missing_source_reasons.is_empty() {
+            return Err(EvaluationContractError::EvidenceState {
+                field: "manifest.completeness",
+                reason: "complete denominator cannot carry blind intervals",
+            });
+        }
+        if !self.missing_source_reasons.is_empty() {
+            return Err(EvaluationContractError::EvidenceState {
+                field: "manifest.completeness",
+                reason: "complete denominator cannot carry missing-source reasons",
+            });
+        }
+        if self
+            .coverage_by_material_action_and_effect_route
+            .iter()
+            .any(|entry| !entry.covered)
+        {
+            return Err(EvaluationContractError::EvidenceState {
+                field: "manifest.completeness",
+                reason: "complete denominator cannot carry uncovered material actions",
+            });
+        }
+        if self.counts.unknown > 0 {
+            return Err(EvaluationContractError::EvidenceState {
+                field: "manifest.completeness",
+                reason: "complete denominator cannot carry received-but-unclassified events",
+            });
+        }
+        if self.counts.accounted()? != self.counts.received {
+            return Err(EvaluationContractError::EvidenceState {
+                field: "manifest.completeness",
+                reason: "complete denominator must fully account received events",
+            });
+        }
+        Ok(())
+    }
+
     /// Returns true only when `source_class` is a declared expected source or
     /// class of this denominator.
     #[must_use]
@@ -390,7 +409,6 @@ impl ObservationCoverageManifest {
             .iter()
             .any(|entry| entry == source_class)
     }
-
 }
 
 /// One immutable host/runtime record consumed by trace derivation.
@@ -549,7 +567,7 @@ impl HostObservedComplianceTrace {
 /// alongside the two objects and verifies, in one place, that both validate
 /// and that both reference that exact revision for this run/attempt/route.
 /// Validating two independent objects separately is not this join: only
-/// [`derive_compliance_trace_checked`] derives a disposition from a bound
+/// [`derive_compliance_trace`] derives a disposition from a bound
 /// input, and an unbound manifest plus evidence pair cannot produce a trace
 /// through it.
 pub struct BoundComplianceInputs<'a> {
@@ -572,10 +590,7 @@ impl<'a> BoundComplianceInputs<'a> {
     ) -> Result<Self, EvaluationContractError> {
         manifest.validate()?;
         evidence.validate()?;
-        text(
-            allowed_manifest_digest,
-            "inputs.allowed_manifest_digest",
-        )?;
+        text(allowed_manifest_digest, "inputs.allowed_manifest_digest")?;
         if manifest.allowed_manifest_digest != allowed_manifest_digest {
             return Err(EvaluationContractError::EvidenceState {
                 field: "manifest.allowed_manifest_digest",
@@ -600,8 +615,18 @@ impl<'a> BoundComplianceInputs<'a> {
 /// evidence only. The binding is verified by
 /// [`BoundComplianceInputs::bind`]; the derived trace is re-validated before
 /// it is returned, so an invalid or unbound pair fails typed instead of
-/// producing a valid `PASS`.
-pub fn derive_compliance_trace_checked(
+/// producing a valid `PASS`. This is the single derivation scheme: no
+/// unbound manifest plus evidence pair can produce a trace.
+///
+/// Classification, in order: forbidden tool action yields `FAIL`;
+/// undeclared or hidden access, out-of-namespace write, blind interval, or
+/// cursor gap (sequence gaps and payload mutations) yields `TAINTED`;
+/// received-but-unclassified events, uncovered material actions, or
+/// missing-source reasons lower the denominator and yield `UNKNOWN`; a
+/// non-complete denominator without a concrete taint signal yields `UNKNOWN`;
+/// only a fully accounted complete denominator with no taint signal yields
+/// `PASS`.
+pub fn derive_compliance_trace(
     inputs: &BoundComplianceInputs<'_>,
 ) -> Result<HostObservedComplianceTrace, EvaluationContractError> {
     let trace = derive_core(inputs.manifest, inputs.evidence);
@@ -611,32 +636,6 @@ pub fn derive_compliance_trace_checked(
         "bound derivation must carry the allowed manifest revision",
     );
     Ok(trace)
-}
-
-/// Derives a [`HostObservedComplianceTrace`] only from immutable host/runtime
-/// records joined to the permitted denominator.
-///
-/// Classification, in order: forbidden tool action yields `FAIL`;
-/// undeclared or hidden access, out-of-namespace write, blind interval, or
-/// cursor gap (sequence gaps and payload mutations) yields `TAINTED`;
-/// received-but-unclassified events, uncovered material actions, or
-/// missing-source reasons lower the denominator and yield `UNKNOWN`; a
-/// non-complete denominator without a concrete taint signal yields `UNKNOWN`;
-/// only a fully accounted complete denominator with no taint signal yields
-/// `PASS`. The result always carries the explicit denominator including its
-/// completeness and can never present a gapped or undeclared run as compliant
-/// `PASS`. Callers join a validated manifest: sequence faults without
-/// localized blind intervals are rejected by
-/// [`ObservationCoverageManifest::validate`], so a trace derived from a valid
-/// manifest always satisfies [`HostObservedComplianceTrace::validate`].
-/// Production callers prefer [`derive_compliance_trace_checked`], which
-/// additionally verifies the common allowed-manifest binding and fails typed.
-#[must_use]
-pub fn derive_compliance_trace(
-    manifest: &ObservationCoverageManifest,
-    evidence: &ImmutableHostEvidence,
-) -> HostObservedComplianceTrace {
-    derive_core(manifest, evidence)
 }
 
 fn derive_core(
@@ -949,11 +948,12 @@ impl ComplianceTraceLedger {
         text(&self.ledger_id, "trace_ledger.ledger_id")?;
         for (index, record) in self.records.iter().enumerate() {
             record.validate()?;
-            let expected = (index as u64).checked_add(1).ok_or(
-                EvaluationContractError::InvalidInterval {
-                    field: "trace_ledger.records.trace_version",
-                },
-            )?;
+            let expected =
+                (index as u64)
+                    .checked_add(1)
+                    .ok_or(EvaluationContractError::InvalidInterval {
+                        field: "trace_ledger.records.trace_version",
+                    })?;
             if record.trace_version != expected {
                 return Err(EvaluationContractError::EvidenceState {
                     field: "trace_ledger.records.trace_version",
@@ -1012,10 +1012,7 @@ impl ComplianceTraceLedger {
     /// Returns the latest applicable version for `fingerprint`, or `None`
     /// when no applicable version exists for it.
     #[must_use]
-    pub fn current_for(
-        &self,
-        fingerprint: &RunFingerprint,
-    ) -> Option<&VersionedComplianceTrace> {
+    pub fn current_for(&self, fingerprint: &RunFingerprint) -> Option<&VersionedComplianceTrace> {
         self.records
             .iter()
             .rev()
@@ -1107,7 +1104,10 @@ mod coverage_trace_tests_1936 {
     fn complete_source_clean_run_yields_pass_with_explicit_denominator() {
         let manifest = complete_manifest();
         assert!(manifest.validate().is_ok());
-        let trace = derive_compliance_trace(&manifest, &clean_evidence());
+        let evidence = clean_evidence();
+        let inputs = BoundComplianceInputs::bind(&manifest, &evidence, "manifest-digest-1936")
+            .expect("bound test inputs");
+        let trace = derive_compliance_trace(&inputs).expect("derived test trace");
         assert!(trace.validate().is_ok());
         assert_eq!(trace.disposition, ComplianceDisposition::Pass);
         assert_eq!(trace.expected_source_count, 2);
@@ -1134,7 +1134,10 @@ mod coverage_trace_tests_1936 {
                 reason: "journal-gap".to_owned(),
             });
         assert!(manifest.validate().is_ok());
-        let trace = derive_compliance_trace(&manifest, &clean_evidence());
+        let evidence = clean_evidence();
+        let inputs = BoundComplianceInputs::bind(&manifest, &evidence, "manifest-digest-1936")
+            .expect("bound test inputs");
+        let trace = derive_compliance_trace(&inputs).expect("derived test trace");
         assert!(trace.validate().is_ok());
         assert_ne!(trace.disposition, ComplianceDisposition::Pass);
         assert_eq!(trace.disposition, ComplianceDisposition::Tainted);
@@ -1159,7 +1162,9 @@ mod coverage_trace_tests_1936 {
             hidden_schema_or_output_read: true,
         });
         assert!(evidence.validate().is_ok());
-        let trace = derive_compliance_trace(&manifest, &evidence);
+        let inputs = BoundComplianceInputs::bind(&manifest, &evidence, "manifest-digest-1936")
+            .expect("bound test inputs");
+        let trace = derive_compliance_trace(&inputs).expect("derived test trace");
         assert!(trace.validate().is_ok());
         assert_ne!(trace.disposition, ComplianceDisposition::Pass);
         assert_eq!(trace.disposition, ComplianceDisposition::Tainted);
@@ -1185,7 +1190,10 @@ mod coverage_trace_tests_1936 {
                 reason: "payload-mismatch".to_owned(),
             });
         assert!(manifest.validate().is_ok());
-        let trace = derive_compliance_trace(&manifest, &clean_evidence());
+        let evidence = clean_evidence();
+        let inputs = BoundComplianceInputs::bind(&manifest, &evidence, "manifest-digest-1936")
+            .expect("bound test inputs");
+        let trace = derive_compliance_trace(&inputs).expect("derived test trace");
         assert!(trace.validate().is_ok());
         assert_eq!(trace.disposition, ComplianceDisposition::Tainted);
         assert!(
@@ -1242,7 +1250,10 @@ mod coverage_trace_tests_1936 {
         let mut manifest = complete_manifest();
         manifest.completeness = CoverageCompleteness::Partial;
         assert!(manifest.validate().is_ok());
-        let trace = derive_compliance_trace(&manifest, &clean_evidence());
+        let evidence = clean_evidence();
+        let inputs = BoundComplianceInputs::bind(&manifest, &evidence, "manifest-digest-1936")
+            .expect("bound test inputs");
+        let trace = derive_compliance_trace(&inputs).expect("derived test trace");
         assert_eq!(trace.disposition, ComplianceDisposition::Unknown);
         assert!(trace.validate().is_ok());
         assert_eq!(
@@ -1256,7 +1267,10 @@ mod coverage_trace_tests_1936 {
     #[test]
     fn pass_requires_complete_denominator() {
         let manifest = complete_manifest();
-        let mut trace = derive_compliance_trace(&manifest, &clean_evidence());
+        let evidence = clean_evidence();
+        let inputs = BoundComplianceInputs::bind(&manifest, &evidence, "manifest-digest-1936")
+            .expect("bound test inputs");
+        let mut trace = derive_compliance_trace(&inputs).expect("derived test trace");
         assert_eq!(trace.disposition, ComplianceDisposition::Pass);
         assert!(trace.validate().is_ok());
         trace.denominator_completeness = CoverageCompleteness::Partial;

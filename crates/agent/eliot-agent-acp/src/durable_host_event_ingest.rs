@@ -893,8 +893,14 @@ impl DurableHostEventJournal {
             };
             let (declared, forbidden) = match &tool_name {
                 Some(name) => (
-                    allowed.declared_tool_names.iter().any(|entry| entry == name),
-                    allowed.forbidden_tool_names.iter().any(|entry| entry == name),
+                    allowed
+                        .declared_tool_names
+                        .iter()
+                        .any(|entry| entry == name),
+                    allowed
+                        .forbidden_tool_names
+                        .iter()
+                        .any(|entry| entry == name),
                 ),
                 None => (false, false),
             };
