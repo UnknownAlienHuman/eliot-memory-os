@@ -244,21 +244,19 @@ pub async fn read_current_position(
         .map_err(|error| ExperienceDriverError::Composition(error.to_string()))?;
     let scope_key = RevisionKey::new(format!("scope:{scope}"))?;
     let observed = client.revision_heads(vec![scope_key.clone()]).await?;
-    let minimum = observed
-        .iter()
-        .find(|head| head.key == scope_key)
-        .ok_or(ExperienceDriverError::Position {
+    let minimum = observed.iter().find(|head| head.key == scope_key).ok_or(
+        ExperienceDriverError::Position {
             field: "revision_heads",
             reason: "store observed no head for the requested scope",
-        })?;
+        },
+    )?;
     let mut dependency_revisions = BTreeMap::new();
     dependency_revisions.insert(scope_key, minimum.revision);
-    let parameters =
-        NamedParameters::from_map(BTreeMap::from([(
-            "position".to_owned(),
-            serde_json::Value::String(position_subject),
-        )]))
-        .map_err(ExperienceDriverError::ReadOwner)?;
+    let parameters = NamedParameters::from_map(BTreeMap::from([(
+        "position".to_owned(),
+        serde_json::Value::String(position_subject),
+    )]))
+    .map_err(ExperienceDriverError::ReadOwner)?;
     let reads = ReadService::new(client);
     let bound = reads
         .bound_state(
