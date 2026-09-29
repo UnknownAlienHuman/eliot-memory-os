@@ -139,6 +139,7 @@ pub use genesis_owner_packet::{
 mod native_worker_binding;
 pub use native_worker_binding::{
     NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_ID, NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_VERSION,
+    NativeWorkerBindingClaimDisposition, NativeWorkerBindingObservation,
     NativeWorkerExecutableBinding, process_invocation_digest_for,
 };
 
@@ -6408,6 +6409,88 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         if scope.binding.scope.scope_ref != work_scope_id {
             return Err(CompositionError::Recovery(
                 "native binding work scope does not match the bound WorkScope".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Revalidates a retained executable binding against the current
+    /// Governor-owned plan, task, session, WorkScope, config, and Module
+    /// Catalog projections (issue #1108 W1/A1).
+    ///
+    /// This is the read-side counterpart to
+    /// [`Self::publish_native_worker_binding`]. The caller must first obtain
+    /// `binding` from the authenticated Kernel/ORS binding readback and
+    /// correlate its claim/attempt/operation tuple with that readback. This
+    /// method never treats caller-presented intake fields as owner evidence:
+    /// it validates the complete Governor record against the retained live
+    /// owners and refuses any fence, plan, task, session, route, scope, config,
+    /// or catalog drift. It does not resolve provider route/capacity revisions
+    /// or mint provider admission; those remain separate required owner inputs.
+    /// now_unix_ms must be the fresh time observation carried by the
+    /// authenticated owner readback, not an intake timestamp. The binding is
+    /// usable only before both its execution deadline and its expiry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError::NotReady`] when this composition is not
+    /// admitted, or [`CompositionError::Recovery`] when the retained binding
+    /// is malformed, foreign, stale, or no longer matches the current owner
+    /// projections.
+    pub fn validate_native_worker_binding_current(
+        &self,
+        binding: &NativeWorkerExecutableBinding,
+        now_unix_ms: u64,
+    ) -> Result<(), CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        binding.validate().map_err(CompositionError::Recovery)?;
+        if now_unix_ms == 0
+            || now_unix_ms >= binding.deadline_unix_ms
+            || now_unix_ms >= binding.expires_at_unix_ms
+        {
+            return Err(CompositionError::Recovery(
+                "native binding readback is at/after its deadline or expiry".to_owned(),
+            ));
+        }
+
+        let fence = self.snapshot.state_fence();
+        if binding.state_fence != fence {
+            return Err(CompositionError::Recovery(
+                "native binding readback is not current at the retained Governor fence".to_owned(),
+            ));
+        }
+        if binding.config_snapshot_digest != self.snapshot.protected_snapshot_digest
+            || binding.config_snapshot_digest != self.owners.config.snapshot_digest()
+        {
+            return Err(CompositionError::Recovery(
+                "native binding readback config snapshot is not the retained protected snapshot"
+                    .to_owned(),
+            ));
+        }
+
+        let plan = self.owners.canonical.read_current_plan(fence)?;
+        if plan.plan_id != binding.plan_id
+            || plan.plan_revision != binding.plan_revision
+            || plan.task_id.as_str() != binding.task_id
+            || plan.work_scope_id != binding.work_scope_id
+        {
+            return Err(CompositionError::Recovery(
+                "native binding readback no longer matches the current canonical plan".to_owned(),
+            ));
+        }
+        self.check_native_binding_identity(
+            fence,
+            &binding.task_id,
+            binding.task_revision,
+            &binding.session_id,
+            &binding.route_ref,
+            &binding.work_scope_id,
+        )?;
+        if binding.module_catalog_revision != self.owners.module_registry.revision() {
+            return Err(CompositionError::Recovery(
+                "native binding readback catalog revision is no longer current".to_owned(),
             ));
         }
         Ok(())

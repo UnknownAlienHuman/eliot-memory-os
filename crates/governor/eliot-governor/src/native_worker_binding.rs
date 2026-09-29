@@ -317,6 +317,154 @@ impl NativeWorkerExecutableBinding {
     }
 }
 
+/// Typed result of re-reading the owner-persisted executable binding for one
+/// exact native-worker claim tuple (issue #1108 W1/A1).
+///
+/// GovernorCurrentButProviderRevisionsUnavailable means the authenticated
+/// Kernel/ORS readback and retained Governor owners agree on the complete M1
+/// binding, its tuple, fence, plan, task, session, config, catalog, and time
+/// window. It is deliberately not an admitted provider capability: the live
+/// provider route and capacity revision owners are not currently connected to
+/// this composition, so effecting Coordinator construction remains closed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeWorkerBindingObservation {
+    /// The exact tuple exists as a pending publication, but the owner has not
+    /// exposed an admitted executable binding yet. A found Requested claim
+    /// carries that state; a pending publication has no claim-state row yet.
+    Pending {
+        /// Durable claim identity.
+        claim_id: String,
+        /// Durable registered-attempt identity.
+        attempt_id: String,
+        /// Exact external-effect operation identity.
+        operation_id: String,
+        /// Governed task identity.
+        task_id: String,
+        /// ORS state, when the owner read returned the claim row.
+        claim_state: Option<eliot_ors::NativeWorkerClaimState>,
+        /// Kernel owner time at the readback operation.
+        observed_at_unix_ms: u64,
+    },
+    /// The exact owner row is terminal; it cannot restore provider admission.
+    Revoked {
+        /// Durable claim identity.
+        claim_id: String,
+        /// Durable registered-attempt identity.
+        attempt_id: String,
+        /// Exact external-effect operation identity.
+        operation_id: String,
+        /// Governed task identity.
+        task_id: String,
+        /// Full owner-produced binding retained for audit/reconciliation.
+        binding: NativeWorkerExecutableBinding,
+        /// Original owner-persisted executable-binding digest.
+        executable_binding_digest: String,
+        /// Terminal ORS claim state.
+        claim_state: eliot_ors::NativeWorkerClaimState,
+        /// Kernel owner time at the readback operation.
+        observed_at_unix_ms: u64,
+    },
+    /// The exact owner row has an unknown or reconciling outcome. It remains
+    /// under its original identities and cannot be retried or re-admitted.
+    UnknownOutcome {
+        /// Durable claim identity.
+        claim_id: String,
+        /// Durable registered-attempt identity.
+        attempt_id: String,
+        /// Exact external-effect operation identity.
+        operation_id: String,
+        /// Governed task identity.
+        task_id: String,
+        /// Full owner-produced binding retained for reconciliation.
+        binding: NativeWorkerExecutableBinding,
+        /// Original owner-persisted executable-binding digest.
+        executable_binding_digest: String,
+        /// Unknown or reconciling ORS claim state.
+        claim_state: eliot_ors::NativeWorkerClaimState,
+        /// Kernel owner time at the readback operation.
+        observed_at_unix_ms: u64,
+    },
+    /// The owner-persisted binding is current under Governor state, but no
+    /// independent live route/capacity revisions exist to construct an
+    /// admitted provider capability safely.
+    GovernorCurrentButProviderRevisionsUnavailable {
+        /// Durable claim identity.
+        claim_id: String,
+        /// Durable registered-attempt identity.
+        attempt_id: String,
+        /// Exact external-effect operation identity.
+        operation_id: String,
+        /// Governed task identity.
+        task_id: String,
+        /// Full owner-produced executable binding read from Kernel/ORS.
+        binding: NativeWorkerExecutableBinding,
+        /// Original owner-persisted executable-binding digest.
+        executable_binding_digest: String,
+        /// ORS claim state read with the binding.
+        claim_state: eliot_ors::NativeWorkerClaimState,
+        /// Kernel owner time at the readback operation.
+        observed_at_unix_ms: u64,
+    },
+}
+
+/// Closed non-effecting classification of an ORS native-worker claim state
+/// when surfaced by the authenticated binding readback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeWorkerBindingClaimDisposition {
+    /// Admission has not occurred yet.
+    Requested,
+    /// The claim is terminal and permanently closed.
+    Terminal,
+    /// The outcome is uncertain and must remain under reconciliation.
+    UnknownOutcome,
+    /// Governor currentness is required, while provider revisions remain a
+    /// separate gate.
+    GovernorCurrentnessRequired,
+}
+
+impl NativeWorkerBindingObservation {
+    /// Classifies a closed Kernel readback spelling of an ORS native-worker
+    /// claim state. Unknown values are rejected rather than mapped to an
+    /// effectable or terminal state.
+    pub fn classify_claim_state(
+        value: &str,
+    ) -> Result<
+        (
+            eliot_ors::NativeWorkerClaimState,
+            NativeWorkerBindingClaimDisposition,
+        ),
+        String,
+    > {
+        use eliot_ors::NativeWorkerClaimState as State;
+
+        let state = match value {
+            "REQUESTED" => Ok(State::Requested),
+            "ADMITTED" => Ok(State::Admitted),
+            "READY" => Ok(State::Ready),
+            "ACTIVE" => Ok(State::Active),
+            "CANCELLING" => Ok(State::Cancelling),
+            "SUBMITTED" => Ok(State::Submitted),
+            "UNKNOWN" => Ok(State::Unknown),
+            "RECONCILING" => Ok(State::Reconciling),
+            "TERMINAL" => Ok(State::Terminal),
+            _ => Err("native-worker readback has an unknown claim state".to_owned()),
+        }?;
+        let disposition = match state {
+            State::Requested => NativeWorkerBindingClaimDisposition::Requested,
+            State::Terminal => NativeWorkerBindingClaimDisposition::Terminal,
+            State::Unknown | State::Reconciling => {
+                NativeWorkerBindingClaimDisposition::UnknownOutcome
+            }
+            State::Admitted
+            | State::Ready
+            | State::Active
+            | State::Cancelling
+            | State::Submitted => NativeWorkerBindingClaimDisposition::GovernorCurrentnessRequired,
+        };
+        Ok((state, disposition))
+    }
+}
+
 /// Computes the R1 production `process_invocation_digest` over the exact
 /// process invocation value.
 ///
