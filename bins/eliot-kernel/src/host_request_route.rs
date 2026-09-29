@@ -3591,6 +3591,18 @@ impl KernelComposition {
 /// staging.
 pub(crate) const OBSERVE_CAPABILITY: &str = "eliot.observe";
 
+/// Closed capability admitted to the act submit entry (issue #1739, #1742
+/// W4: the Kernel-side act submit path).
+///
+/// Digest-only `eliot.act` invocations ride the shared submit entry through
+/// [`KernelComposition::admit_and_queue_observe_submit`]. The Kernel owns
+/// only the mechanical dispatch binding here — capability plus invocation
+/// kind, checked before any staging — never the material floor, lineage, or
+/// authority verdict: those belong to the Governor owner's
+/// `eliot-context-admission::admit_material_decision` (I01-08 canonical
+/// write path; I07-08 step 7).
+pub(crate) const ACT_CAPABILITY: &str = "eliot.act";
+
 /// Whether one requested capability is task-relative or effectful and
 /// therefore needs the exact applicable task binding (issue #1746, W2).
 ///
@@ -3730,6 +3742,33 @@ pub(crate) fn check_observe_tool_linkage(
 /// exact retained task binding. An absent or unknown discriminator is
 /// ambiguous and fails closed rather than inheriting the capability's safe
 /// raw-capture treatment.
+/// Validates one digest-only act submit binding before any staging (no IO).
+///
+/// Runs only the mechanical dispatch join the Kernel owns on this entry:
+/// the envelope must name the admitted `eliot.act` capability and the
+/// `Invocation` kind the submit entry serves. A swapped capability or a
+/// non-invocation kind fails closed as `SessionFenced` before the caller
+/// stages anything. Pure: validation performs no IO by construction.
+///
+/// Digest-only act submits carry no tool bytes, so there is no payload
+/// digest to link here — the envelope digest already commits to the exact
+/// canonical request through admission, and the live session/fence/
+/// connection binding is enforced by the frame gateway plus the admission
+/// gates. The material floor/lineage/authority gate itself stays the
+/// Governor owner's `eliot-context-admission::admit_material_decision`,
+/// never a Kernel verdict (I01-08 canonical write path).
+pub(crate) fn check_act_submit_binding(
+    envelope: &HostRequestEnvelope,
+) -> Result<(), TransportError> {
+    if envelope.identity.capability != ACT_CAPABILITY {
+        return Err(TransportError::SessionFenced);
+    }
+    if envelope.kind != HostRequestKind::Invocation {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(())
+}
+
 fn observe_tool_requires_exact_task_binding(
     tool: &serde_json::Value,
 ) -> Result<bool, TransportError> {
@@ -3751,6 +3790,11 @@ fn observe_tool_requires_exact_task_binding(
 impl KernelComposition {
     /// Admits a host request and atomically hands linked Observe input to the
     /// bounded daemon queue before the caller may acknowledge it.
+    ///
+    /// Digest-only `eliot.act` invocations take the same entry: the
+    /// Kernel-owned dispatch binding ([`check_act_submit_binding`]) is
+    /// revalidated before admission, while the material admission verdict
+    /// stays the Governor owner's `admit_material_decision` (I01-08).
     pub(crate) fn admit_and_queue_observe_submit(
         &self,
         envelope: &HostRequestEnvelope,
@@ -3759,6 +3803,14 @@ impl KernelComposition {
         let _transition = self.agent_bridge_transition_read()?;
         let is_observe = envelope.identity.capability == OBSERVE_CAPABILITY
             && envelope.kind == HostRequestKind::Invocation;
+        // Act effect dispatch (issue #1739, #1742 W4): digest-only
+        // `eliot.act` submits ride this same entry. Revalidate the
+        // Kernel-owned dispatch binding before staging; the material
+        // floor/lineage/authority gate itself runs at the Governor owner
+        // (`eliot-context-admission::admit_material_decision`).
+        if !is_observe && envelope.identity.capability == ACT_CAPABILITY {
+            check_act_submit_binding(envelope)?;
+        }
         let task_relative_tool = if is_observe {
             tool.map(|tool| check_observe_tool_linkage(envelope, tool))
                 .transpose()?
