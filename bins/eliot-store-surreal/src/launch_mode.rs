@@ -42,6 +42,25 @@ pub(super) enum LaunchMode {
         config_path: PathBuf,
         initialize_schema_only: bool,
     },
+    /// One-shot `ECXF/1` export for a single declared scope (issue #1871).
+    ///
+    /// It is a portable-dev launch, not a service launch, for the same reason
+    /// `initialize_schema_only` is: the export reads the canonical source
+    /// through the store owner this process composes itself, so it must not
+    /// adopt or become the long-running writer, and it must not be reachable
+    /// from the production service profile where it could contend with a live
+    /// provider. The `--export-ecxf` form carries the operator's declared
+    /// export id, declared scope, canonical request hash and absolute
+    /// destination; the export fence itself is observed inside the store's
+    /// single capture transaction, never taken from argv.
+    ExportEcxf {
+        root: PathBuf,
+        config_path: PathBuf,
+        export_id: String,
+        scope_id: String,
+        canonical_request_hash: String,
+        out_dir: PathBuf,
+    },
     EmitBootstrapDescriptor {
         config_path: PathBuf,
         output_path: PathBuf,
@@ -61,14 +80,7 @@ pub(super) async fn prepare_launch(mode: LaunchMode) -> Result<Option<StoreLaunc
             config_path,
             initialize_schema_only,
         } => {
-            let root = eliot_platform_windows::UserOwnedRootLease::open_existing(&root)
-                .map_err(|error| format!("open portable-dev root: {error}"))?;
-            let config_path = if config_path.is_absolute() {
-                config_path
-            } else {
-                root.path().join(config_path)
-            };
-            let config = load_portable_dev_config(&root, &config_path)?;
+            let (root, config) = resolve_portable_dev_config(root, config_path)?;
             if initialize_schema_only {
                 // Schema initialization is a provider write, so it must pass
                 // the same installation-visible compatibility gate as the
@@ -104,7 +116,73 @@ pub(super) async fn prepare_launch(mode: LaunchMode) -> Result<Option<StoreLaunc
             }
             Ok(Some(config))
         }
+        LaunchMode::ExportEcxf {
+            root,
+            config_path,
+            export_id,
+            scope_id,
+            canonical_request_hash,
+            out_dir,
+        } => {
+            // The lease stays bound for the whole arm; `_` would drop it at
+            // once and release the root this export is reading through.
+            let (_root_lease, config) = resolve_portable_dev_config(root, config_path)?;
+            // The export reads the closed canonical source through this
+            // process's own store owner, so it passes the same installation
+            // gates the portable-dev one-shot does: the compatibility decision
+            // before the provider starts, and the observed provider identity
+            // after it connects. Without the identity binding the recorded
+            // `source_adapter_version` of an archive would describe a binary
+            // nobody verified.
+            super::require_writer_admission(&config)?;
+            let composition = StoreComposition::new(&config)?;
+            composition.connect().await?;
+            super::require_writer_admission(&config)?;
+            super::bind_observed_identity(&composition, &config)?;
+            let clock = read_portable_dev_clock(&config)?;
+            eliot_store_surreal::export_ecxf_once(
+                &composition,
+                &config,
+                &clock,
+                &eliot_store_surreal::EcxfExportArgs {
+                    export_id,
+                    scope_id,
+                    canonical_request_hash,
+                    out_dir,
+                },
+            )
+            .await?;
+            Ok(None)
+        }
     }
+}
+
+/// Resolves one portable-dev root lease and the launch config beside it.
+///
+/// The lease is returned with the config because it is the validated handle the
+/// config was resolved through: dropping it before the provider work would
+/// release the root this launch is bound to. A relative config path resolves
+/// inside the leased root, never against the process current directory.
+#[cfg(windows)]
+fn resolve_portable_dev_config(
+    root: PathBuf,
+    config_path: PathBuf,
+) -> Result<
+    (
+        eliot_platform_windows::UserOwnedRootLease,
+        eliot_store_surreal::StoreLaunchConfig,
+    ),
+    String,
+> {
+    let root = eliot_platform_windows::UserOwnedRootLease::open_existing(&root)
+        .map_err(|error| format!("open portable-dev root: {error}"))?;
+    let config_path = if config_path.is_absolute() {
+        config_path
+    } else {
+        root.path().join(config_path)
+    };
+    let config = load_portable_dev_config(&root, &config_path)?;
+    Ok((root, config))
 }
 
 #[cfg(windows)]
@@ -147,6 +225,7 @@ fn read_portable_dev_clock(config: &StoreLaunchConfig) -> Result<ClockObservatio
 /// - `eliot-store-surreal --emit-bootstrap-descriptor <config path> <descriptor path>`
 /// - `eliot-store-surreal --portable-dev-root <absolute existing root> --config <path>`
 /// - `eliot-store-surreal --portable-dev-root <absolute existing root> --config <path> --initialize-schema-only`
+/// - `eliot-store-surreal --portable-dev-root <absolute existing root> --config <path> --export-ecxf <export id> <scope id> <canonical request hash> <absolute destination>`
 pub(super) fn parse_launch_mode<I>(args: I) -> Result<LaunchMode, String>
 where
     I: IntoIterator<Item = std::ffi::OsString>,
@@ -197,9 +276,21 @@ where
             let initialize_schema_only = match args.next() {
                 None => false,
                 Some(flag) if flag == "--initialize-schema-only" && args.next().is_none() => true,
+                Some(flag) if flag == "--export-ecxf" => {
+                    let (export_id, scope_id, canonical_request_hash, out_dir) =
+                        parse_export_ecxf(&mut args)?;
+                    return Ok(LaunchMode::ExportEcxf {
+                        root,
+                        config_path,
+                        export_id,
+                        scope_id,
+                        canonical_request_hash,
+                        out_dir,
+                    });
+                }
                 Some(_) => {
                     return Err(
-                        "portable-dev launch accepts only --initialize-schema-only after --config"
+                        "portable-dev launch accepts only --initialize-schema-only or --export-ecxf after --config"
                             .to_owned(),
                     );
                 }
@@ -212,6 +303,44 @@ where
         }
         Some(value) => Err(format!("unknown argument: {}", value.to_string_lossy())),
     }
+}
+
+/// Decodes the exact `--export-ecxf <export id> <scope id> <canonical request
+/// hash> <destination>` argument tail.
+///
+/// The form is positional and closed, exactly like
+/// `--emit-bootstrap-descriptor <config path> <descriptor path>`: a missing,
+/// extra, or non-absolute member refuses the launch instead of being defaulted.
+/// The destination must be absolute here as well as inside the command, so a
+/// launch never resolves a package destination against whatever current
+/// directory the process happened to inherit.
+fn parse_export_ecxf<I>(args: &mut I) -> Result<(String, String, String, PathBuf), String>
+where
+    I: Iterator<Item = std::ffi::OsString>,
+{
+    let export_id = args
+        .next()
+        .map(|value| value.to_string_lossy().into_owned())
+        .ok_or_else(|| "--export-ecxf requires an export id".to_owned())?;
+    let scope_id = args
+        .next()
+        .map(|value| value.to_string_lossy().into_owned())
+        .ok_or_else(|| "--export-ecxf requires a declared scope id".to_owned())?;
+    let canonical_request_hash = args
+        .next()
+        .map(|value| value.to_string_lossy().into_owned())
+        .ok_or_else(|| "--export-ecxf requires the canonical request hash".to_owned())?;
+    let out_dir = args
+        .next()
+        .map(PathBuf::from)
+        .ok_or_else(|| "--export-ecxf requires an absolute destination path".to_owned())?;
+    if !out_dir.is_absolute() {
+        return Err("--export-ecxf requires an absolute destination path".to_owned());
+    }
+    if args.next().is_some() {
+        return Err("--export-ecxf requires exactly four arguments".to_owned());
+    }
+    Ok((export_id, scope_id, canonical_request_hash, out_dir))
 }
 
 pub(super) fn control_frame(
