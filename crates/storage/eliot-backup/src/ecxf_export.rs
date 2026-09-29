@@ -59,6 +59,11 @@
 //! implementor in the workspace and [`export_ecxf_package`] has no caller, so
 //! no process currently produces an `ECXF/1` package. Nothing here stands in
 //! for that edge: a source that returns nothing would make an export look real.
+//! The installation identity the source observes is carried onto the emitted
+//! fence and manifest (issue #1141, W3/A2), and `eliot_ecxf::import_ecxf_package`
+//! refuses a package that records a different identity from the one the importing
+//! caller states; what is still missing is the implementor that can observe the
+//! identity at all, not a place to put it.
 //! I5.1 puts the coherent read behind the store bridge, and this crate depends
 //! on the neutral store contracts only, so the implementor belongs on the
 //! bridge that already owns the admitted coherent-capture port
@@ -154,14 +159,17 @@ pub struct CoherentSourceExport {
     /// filling it in. An export that cannot be attributed to one installation
     /// produces a package nobody can hold responsible for it.
     ///
-    /// BLOCKED-BY `crates/storage/eliot-ecxf/src/lib.rs`: neither
-    /// `eliot_ecxf::ExportFence` nor `eliot_ecxf::EcxfManifest` (distinct from
-    /// this crate's own `eliot_backup::EcxfManifest`, which the backup bundle
-    /// carries) has an installation identity member, so the value bound here
-    /// cannot yet be carried into the emitted `manifest.json`. The binding is
-    /// proved at the port and reaches the package when that struct gains the
-    /// member; it is never derived from the exporter, a config value or the
-    /// request.
+    /// The value reaches the emitted package: `export_ecxf_package` copies it
+    /// verbatim onto `eliot_ecxf::ExportFence::installation_id` and
+    /// `eliot_ecxf::EcxfManifest::installation_id` (issue #1141, W3/A2), so
+    /// `manifest.json` names the installation that produced it. Both copies are
+    /// the same field of this one observed struct, never a value the exporter
+    /// composed.
+    ///
+    /// `eliot_ecxf::import_ecxf_package` requires the importing caller to state
+    /// the installation it is importing into and refuses a package that records a
+    /// different one. That is what stops the exported identity from being a value
+    /// that only ever agrees with its own copy.
     pub installation_id: String,
     /// Store adapter identity that produced this view.
     pub source_adapter: String,
@@ -262,6 +270,10 @@ pub async fn export_ecxf_package<S: EcxfSourceStore + ?Sized>(
     let (revision_start, revision_end) = revision_range(&snapshot.revision_heads);
     let fence = eliot_ecxf::ExportFence {
         export_id: export_id.clone(),
+        // The source owner's own observation, carried verbatim. `prove_coherent_boundary`
+        // has already refused a blank value, so the fence and the manifest below
+        // cannot disagree: both are cloned from this one field.
+        installation_id: snapshot.installation_id.clone(),
         schema_generation: snapshot.schema_generation.clone(),
         store_generation: snapshot.store_generation.clone(),
         state_fence: snapshot.state_fence.clone(),
@@ -272,8 +284,14 @@ pub async fn export_ecxf_package<S: EcxfSourceStore + ?Sized>(
         blob_reachability_manifest: snapshot.reachable_blob_residency_keys.clone(),
         consistent: snapshot.completeness.is_complete(),
     };
+    // `eliot_ecxf::EcxfManifest`, not this crate's own `eliot_backup::EcxfManifest`
+    // that the backup bundle carries: the two share a name and are different types.
     let manifest = eliot_ecxf::EcxfManifest {
         format: eliot_ecxf::FORMAT_VERSION.to_owned(),
+        // Issue #1141, W3/A2: the same owner-observed value the fence carries, so
+        // `manifest.json` states whose installation the package is. It is never
+        // composed from the export id, the adapter name or the request.
+        installation_id: snapshot.installation_id.clone(),
         source_adapter: snapshot.source_adapter.clone(),
         source_adapter_version: snapshot.source_adapter_version.clone(),
         architecture_source_digest: snapshot.architecture_source_digest.clone(),
