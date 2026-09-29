@@ -24,6 +24,17 @@ pub const FORMAT_VERSION: &str = "ECXF/1";
 pub const MAX_RECORD_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_SECTION_BYTES: usize = 1024 * 1024 * 1024;
 
+/// Emitted package member names, owned here so the writer in [`EcxfArchive::layout`]
+/// and the reader in [`admit_ecxf_import`] cannot drift apart.
+const MANIFEST_FILE: &str = "manifest.json";
+const INTEGRITY_FILE: &str = "integrity.json";
+const PURGE_LEDGER_FILE: &str = "privacy-purge-ledger.json";
+const SCHEMA_FILE: &str = "schema/ecxf-1.json";
+/// Section members are `<kind>/records.ndjson<codec-suffix>` (I05-10 layout).
+const SECTION_MEMBER_PREFIX: &str = "/records.ndjson";
+/// Blob members are the residency-keyed entry path plus this suffix.
+const BLOB_MEMBER_SUFFIX: &str = ".blob";
+
 fn text(value: &str, field: &'static str) -> Result<(), EcxfError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
         return Err(EcxfError::InvalidField {
@@ -386,6 +397,17 @@ fn blob_entry_path(residency_key_digest: &str, content_digest: &str) -> String {
     format!("blobs/{residency_key_digest}/{content_digest}")
 }
 
+/// Logical package member name of one blob entry (issue #1141: the writer and
+/// the importer derive it from one function so they cannot drift).
+fn blob_member_name(entry_path: &str) -> String {
+    format!("{entry_path}{BLOB_MEMBER_SUFFIX}")
+}
+
+/// Logical package member name of one section (issue #1141).
+fn section_member_name(wire_name: &str, codec_suffix: &str) -> String {
+    format!("{wire_name}{SECTION_MEMBER_PREFIX}{codec_suffix}")
+}
+
 /// Manifest-side residency entry for one exported blob (issue #1871, D2).
 ///
 /// I05-13 requires that every export entry preserve the opaque residency-key
@@ -638,6 +660,29 @@ pub struct IntegrityManifest {
     pub blob_sha256: BTreeMap<String, String>,
     pub purge_ledger_sha256: String,
     pub archive_sha256: String,
+}
+
+impl IntegrityManifest {
+    /// Every recorded digest must be a lowercase SHA-256 hex value, so a
+    /// corrupt or absent `integrity.json` cannot be read back as an empty
+    /// successful export (issue #1141, A2/A5).
+    pub fn validate(&self) -> Result<(), EcxfError> {
+        digest(&self.manifest_sha256, "integrity.manifest_sha256")?;
+        digest(
+            &self.purge_ledger_sha256,
+            "integrity.purge_ledger_sha256",
+        )?;
+        digest(&self.archive_sha256, "integrity.archive_sha256")?;
+        for (name, checksum) in &self.section_sha256 {
+            text(name, "integrity.section_sha256.name")?;
+            digest(checksum, "integrity.section_sha256.value")?;
+        }
+        for (name, checksum) in &self.blob_sha256 {
+            text(name, "integrity.blob_sha256.name")?;
+            digest(checksum, "integrity.blob_sha256.value")?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -928,9 +973,9 @@ impl EcxfArchive {
     pub fn layout(&self, codec: &dyn SectionCodec) -> Result<BTreeMap<String, Vec<u8>>, EcxfError> {
         self.validate()?;
         let mut files = BTreeMap::new();
-        files.insert("manifest.json".to_owned(), self.manifest_json()?);
+        files.insert(MANIFEST_FILE.to_owned(), self.manifest_json()?);
         files.insert(
-            "schema/ecxf-1.json".to_owned(),
+            SCHEMA_FILE.to_owned(),
             canonical(&serde_json::json!({
                 "format": FORMAT_VERSION,
                 "contract": CONTRACT_NAME,
@@ -947,21 +992,15 @@ impl EcxfArchive {
                 if encoded.len() > MAX_SECTION_BYTES {
                     return Err(EcxfError::Codec("encoded section exceeds limit".to_owned()));
                 }
-                files.insert(
-                    format!("{}/records.ndjson{}", kind.wire_name(), codec.suffix()),
-                    encoded,
-                );
+                files.insert(section_member_name(kind.wire_name(), codec.suffix()), encoded);
             }
         }
         for blob in &self.blobs {
-            files.insert(
-                format!("{}.blob", blob.entry_path()?),
-                blob.sealed_bytes.clone(),
-            );
+            files.insert(blob_member_name(&blob.entry_path()?), blob.sealed_bytes.clone());
         }
-        files.insert("integrity.json".to_owned(), self.integrity_json()?);
+        files.insert(INTEGRITY_FILE.to_owned(), self.integrity_json()?);
         files.insert(
-            "privacy-purge-ledger.json".to_owned(),
+            PURGE_LEDGER_FILE.to_owned(),
             canonical(&self.privacy_purge_ledger)?,
         );
         // Issue #1871, D3: no separate fence artifact is emitted. The fence is
@@ -975,6 +1014,14 @@ impl EcxfArchive {
 pub trait SectionCodec: Send + Sync {
     fn suffix(&self) -> &'static str;
     fn encode(&self, canonical_ndjson: &[u8]) -> Result<Vec<u8>, EcxfError>;
+    /// Restores the canonical NDJSON bytes of one encoded section member.
+    ///
+    /// Issue #1141: the import side must re-check a recorded section digest
+    /// against the emitted member, and the recorded digest covers the canonical
+    /// NDJSON. A codec that can encode but not decode leaves that digest
+    /// unverifiable, so decoding is part of the same closed port as encoding
+    /// rather than a separate capability the importer has to assume.
+    fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, EcxfError>;
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -988,4 +1035,341 @@ impl SectionCodec for IdentitySectionCodec {
     fn encode(&self, canonical_ndjson: &[u8]) -> Result<Vec<u8>, EcxfError> {
         Ok(canonical_ndjson.to_vec())
     }
+
+    fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, EcxfError> {
+        Ok(encoded.to_vec())
+    }
+}
+
+/// One blob member of an imported package.
+///
+/// Issue #1141: the import side cannot rebuild [`EcxfBlob`], because
+/// [`BlobReadyReceipt`] is a serialize-only capability with no public
+/// constructor and no `Deserialize` impl. Reconstructing one here would
+/// fabricate the exact receipt the export bound, so the import returns the
+/// sealed bytes plus the residency identity the manifest recorded, and leaves
+/// the receipt reconstruction to the owner that holds the blob service.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImportedBlob {
+    /// Residency-keyed logical entry path, without the member suffix.
+    pub entry_path: String,
+    pub sealed_bytes: Vec<u8>,
+    /// The digest the manifest and the integrity manifest both recorded.
+    pub sealed_sha256: String,
+    /// The residency, retention, erasure and key-lineage identity the manifest
+    /// recorded for this entry.
+    pub residency: EcxfBlobResidency,
+}
+
+/// An `ECXF/1` package admitted for restore.
+///
+/// Every field here was recovered from the emitted package and re-checked
+/// against a digest the package itself recorded at export time. Nothing is
+/// recomputed from a value the importer supplied.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EcxfImport {
+    pub manifest: EcxfManifest,
+    /// Carried through unchanged. `archive_sha256` covers the export-time
+    /// `EcxfArchive`, whose `BlobReadyReceipt` values are serialize-only and
+    /// therefore not reconstructible here, so that one digest is NOT
+    /// independently verified by this import. Every manifest, section and blob
+    /// digest below it is.
+    pub integrity: IntegrityManifest,
+    pub sections: BTreeMap<SectionKind, CanonicalSection>,
+    pub blobs: Vec<ImportedBlob>,
+    pub privacy_purge_ledger: Vec<PurgeLedgerEntry>,
+}
+
+impl EcxfImport {
+    /// The recorded blob digests, keyed by residency-keyed entry path.
+    pub fn blob_digests(&self) -> BTreeMap<&str, &str> {
+        self.blobs
+            .iter()
+            .map(|blob| (blob.entry_path.as_str(), blob.sealed_sha256.as_str()))
+            .collect()
+    }
+}
+
+/// Resolves one recorded section wire name back to its [`SectionKind`].
+fn section_kind_from_wire_name(wire_name: &str) -> Result<SectionKind, EcxfError> {
+    match wire_name {
+        "events" => Ok(SectionKind::Events),
+        "projections" => Ok(SectionKind::Projections),
+        "receipts" => Ok(SectionKind::Receipts),
+        _ => Err(EcxfError::InvalidField {
+            field: "integrity.section_sha256.name",
+            reason: "recorded section name is not an ECXF/1 section",
+        }),
+    }
+}
+
+/// Reads back and admits one emitted `ECXF/1` package for restore.
+///
+/// This is the import half of the exchange format (issue #1141, W3 and A2): the
+/// crate only ever offered `build` and `layout`, so an emitted package had no
+/// path back to a validated value. It takes the package members as they were
+/// read from the published artifact and, for every member, checks the bytes
+/// against the digest the package recorded for that member.
+///
+/// The order is deliberate and every refusal happens before any caller can act
+/// on the result:
+///
+/// ```text
+/// manifest/integrity/ledger/schema members present and well formed
+///   → the manifest's own `validate()` runs on the recorded values
+///   → the recorded manifest digest is checked against the manifest bytes
+///   → the recorded purge-ledger digest is checked against the ledger bytes,
+///     and the ledger's own validation, purge revision and state fence
+///   → the recorded schema declaration is checked against this crate's format
+///   → every recorded section member is decoded and checked against its digest
+///   → every recorded blob member is checked against its digest
+///   → the member set is compared in both directions, so a missing member and
+///     an unrecorded member are both explicit
+/// ```
+///
+/// This function is deliberately NOT a restore: it reads no database and no
+/// filesystem, and it decides nothing about cutover, revocation or the current
+/// Store generation. It returns a validated artifact; the owner that admitted
+/// the export decides whether it may become current state.
+pub fn import_ecxf_package(
+    files: &BTreeMap<String, Vec<u8>>,
+    codec: &dyn SectionCodec,
+) -> Result<EcxfImport, EcxfError> {
+    // Fixed package members. These four names are static, so each refusal
+    // names the member it is about.
+    let manifest_bytes = files.get(MANIFEST_FILE).ok_or(EcxfError::InvalidField {
+        field: MANIFEST_FILE,
+        reason: "package member is absent",
+    })?;
+    let integrity_bytes = files.get(INTEGRITY_FILE).ok_or(EcxfError::InvalidField {
+        field: INTEGRITY_FILE,
+        reason: "package member is absent",
+    })?;
+    let ledger_bytes = files.get(PURGE_LEDGER_FILE).ok_or(EcxfError::InvalidField {
+        field: PURGE_LEDGER_FILE,
+        reason: "package member is absent",
+    })?;
+    let schema_bytes = files.get(SCHEMA_FILE).ok_or(EcxfError::InvalidField {
+        field: SCHEMA_FILE,
+        reason: "package member is absent",
+    })?;
+
+    // Parse the recorded artifacts and run their own existing validators, so
+    // this function never becomes a second validator for a type it did not
+    // write.
+    let manifest: EcxfManifest =
+        serde_json::from_slice(manifest_bytes).map_err(|error| EcxfError::Serialization(error.to_string()))?;
+    manifest.validate()?;
+    let integrity: IntegrityManifest = serde_json::from_slice(integrity_bytes)
+        .map_err(|error| EcxfError::Serialization(error.to_string()))?;
+    integrity.validate()?;
+    let privacy_purge_ledger: Vec<PurgeLedgerEntry> = serde_json::from_slice(ledger_bytes)
+        .map_err(|error| EcxfError::Serialization(error.to_string()))?;
+
+    // The recorded digests, checked against the bytes as emitted. These are the
+    // values the export recorded in `integrity.json`; recomputing them from the
+    // manifest and calling that a proof would only prove the manifest hashes to
+    // itself.
+    if integrity.manifest_sha256 != sha256_hex(manifest_bytes) {
+        return Err(EcxfError::DigestMismatch {
+            subject: MANIFEST_FILE.to_owned(),
+        });
+    }
+    if integrity.purge_ledger_sha256 != sha256_hex(ledger_bytes) {
+        return Err(EcxfError::DigestMismatch {
+            subject: PURGE_LEDGER_FILE.to_owned(),
+        });
+    }
+    let recorded_ledger_digest = manifest
+        .checksums
+        .get("privacy-purge-ledger")
+        .ok_or(EcxfError::InvalidField {
+            field: "checksums.privacy-purge-ledger",
+            reason: "manifest does not record the purge-ledger member",
+        })?;
+    if recorded_ledger_digest != &integrity.purge_ledger_sha256 {
+        return Err(EcxfError::DigestMismatch {
+            subject: "privacy-purge-ledger".to_owned(),
+        });
+    }
+
+    // The ledger the package carries must be the ledger the manifest describes:
+    // valid entries, the recorded purge revision, and one state fence with the
+    // export fence. A ledger from another epoch cannot be admitted as this
+    // export's erasure evidence.
+    unique(
+        privacy_purge_ledger.iter().map(|entry| entry.purge_id.clone()),
+        "privacy_purge_ledger.purge_id",
+    )?;
+    for entry in &privacy_purge_ledger {
+        entry
+            .validate()
+            .map_err(|error| EcxfError::Security(error.to_string()))?;
+        if entry.state_fence != manifest.export_fence.state_fence {
+            return Err(EcxfError::InconsistentBoundary);
+        }
+    }
+    if manifest.purge_ledger_revision != derived_purge_ledger_revision(&privacy_purge_ledger)? {
+        return Err(EcxfError::DigestMismatch {
+            subject: "purge ledger revision".to_owned(),
+        });
+    }
+
+    // The recorded schema declaration must be this crate's format and contract,
+    // so a package that declares another format cannot be read as ECXF/1.
+    let schema: Value =
+        serde_json::from_slice(schema_bytes).map_err(|error| EcxfError::Serialization(error.to_string()))?;
+    if schema.get("format").and_then(Value::as_str) != Some(FORMAT_VERSION)
+        || schema.get("contract").and_then(Value::as_str) != Some(CONTRACT_NAME)
+    {
+        return Err(EcxfError::InvalidField {
+            field: SCHEMA_FILE,
+            reason: "recorded schema declaration is not this ECXF/1 contract",
+        });
+    }
+
+    // Every recorded section member. The expected set is the section names the
+    // integrity manifest recorded; the actual set is the decoded member bytes,
+    // and the two must agree before any record is returned.
+    let mut sections = BTreeMap::new();
+    for (wire_name, recorded_digest) in &integrity.section_sha256 {
+        let kind = section_kind_from_wire_name(wire_name)?;
+        let member = section_member_name(wire_name, codec.suffix());
+        let encoded = files
+            .get(&member)
+            .ok_or_else(|| EcxfError::Codec(format!("recorded section member {member} is absent")))?;
+        if encoded.len() > MAX_SECTION_BYTES {
+            return Err(EcxfError::Codec(format!(
+                "section member {member} exceeds MAX_SECTION_BYTES"
+            )));
+        }
+        let canonical_ndjson = codec.decode(encoded)?;
+        if sha256_hex(&canonical_ndjson) != *recorded_digest {
+            return Err(EcxfError::DigestMismatch {
+                subject: member.clone(),
+            });
+        }
+        // The manifest records the same section checksum under its
+        // `<name>/records` key; a manifest that disagrees with the integrity
+        // manifest about a section is a corrupt package, not a choice.
+        if manifest.checksums.get(&format!("{wire_name}/records")) != Some(recorded_digest) {
+            return Err(EcxfError::DigestMismatch {
+                subject: format!("{wire_name}/records"),
+            });
+        }
+        // A section member is NDJSON: one canonical record object per line.
+        // Each record carries its own payload digest, so a corrupted or
+        // reordered line is refused by the record and section validators rather
+        // than reassembled into a section that merely hashes the same.
+        let mut records = Vec::new();
+        for line in canonical_ndjson.split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let record: EcxfRecord = serde_json::from_slice(line)
+                .map_err(|error| EcxfError::Serialization(error.to_string()))?;
+            records.push(record);
+        }
+        let section = CanonicalSection::new(kind, records)?;
+        if section.canonical_sha256 != *recorded_digest {
+            return Err(EcxfError::DigestMismatch {
+                subject: format!("{wire_name}/records"),
+            });
+        }
+        if sections.insert(kind, section).is_some() {
+            return Err(EcxfError::Duplicate {
+                field: "sections.kind",
+            });
+        }
+    }
+
+    // Every recorded blob member. The expected set is derived from the
+    // residency entries the manifest recorded, so a member dropped from the
+    // package is detected against a set the importer never chose.
+    let mut recorded_reachability: BTreeSet<String> = BTreeSet::new();
+    let mut blobs = Vec::new();
+    for residency in &manifest.blob_residency {
+        if !recorded_reachability.insert(residency.residency_key_digest.clone()) {
+            return Err(EcxfError::Duplicate {
+                field: "blob_residency.residency_key_digest",
+            });
+        }
+        let entry_path = blob_entry_path(
+            &residency.residency_key_digest,
+            &residency.content_digest.digest.to_string(),
+        );
+        let member = blob_member_name(&entry_path);
+        let sealed_bytes = files
+            .get(&member)
+            .ok_or_else(|| EcxfError::Blob(format!("recorded blob member {member} is absent")))?
+            .clone();
+        let recorded_digest = manifest
+            .checksums
+            .get(&entry_path)
+            .ok_or_else(|| EcxfError::Blob(format!("manifest does not record blob {entry_path}")))?;
+        if integrity.blob_sha256.get(&entry_path) != Some(recorded_digest) {
+            return Err(EcxfError::DigestMismatch {
+                subject: format!("integrity blob {entry_path}"),
+            });
+        }
+        if sha256_hex(&sealed_bytes) != *recorded_digest {
+            return Err(EcxfError::DigestMismatch { subject: member });
+        }
+        blobs.push(ImportedBlob {
+            entry_path,
+            sealed_bytes,
+            sealed_sha256: recorded_digest.clone(),
+            residency: residency.clone(),
+        });
+    }
+    // The export fence's reachability set and the manifest's projected
+    // residency set are recorded by different steps of the export; a
+    // disagreement means one of them lost a reachable blob. This is a
+    // coherence check between two recorded sets, not the completeness check
+    // above, which compares a recorded set against the actual member bytes.
+    if recorded_reachability
+        != manifest
+            .export_fence
+            .blob_reachability_manifest
+            .iter()
+            .cloned()
+            .collect()
+    {
+        return Err(EcxfError::InconsistentBoundary);
+    }
+
+    // Completeness in both directions. The expected member set is built from
+    // the recorded artifacts above; the actual set is the package. An extra
+    // member is refused rather than ignored, so nothing rides into a restore
+    // that the export did not record.
+    let mut expected = BTreeSet::new();
+    expected.insert(MANIFEST_FILE.to_owned());
+    expected.insert(INTEGRITY_FILE.to_owned());
+    expected.insert(PURGE_LEDGER_FILE.to_owned());
+    expected.insert(SCHEMA_FILE.to_owned());
+    for wire_name in integrity.section_sha256.keys() {
+        expected.insert(section_member_name(wire_name, codec.suffix()));
+    }
+    for blob in &blobs {
+        expected.insert(blob_member_name(&blob.entry_path));
+    }
+    if files.keys().any(|name| !expected.contains(name)) {
+        // The offending member name is a dynamic package path and
+        // `EcxfError::InvalidField` carries a static field, so the class of the
+        // refusal is named here and the caller identifies the member from its
+        // own member set. The refusal itself is unconditional: an unrecorded
+        // member never rides into a restore unnoticed.
+        return Err(EcxfError::InvalidField {
+            field: "package_members",
+            reason: "package carries a member no recorded artifact names",
+        });
+    }
+
+    Ok(EcxfImport {
+        manifest,
+        integrity,
+        sections,
+        blobs,
+        privacy_purge_ledger,
+    })
 }
