@@ -180,30 +180,71 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Omitted: broad unit behavior, installed Windows services, Store correctness/recovery, external providers, release packaging, Product Pulse, live acceptance"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "No live Windows/store/Product-Pulse claim."
 
-  audit-source-snapshot:
-    if: ${{ github.event_name == 'push' && contains(github.event.head_commit.message, 'capture post-merge audit source snapshot') }}
+  post-merge-repair:
+    if: ${{ github.event_name == 'push' && contains(github.event.head_commit.message, 'run bounded post-merge queue repair proof') }}
     runs-on: windows-latest
-    timeout-minutes: 5
+    timeout-minutes: 70
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: f4e05bc50117e47382d9e1e666d89934443b5b25
           fetch-depth: 1
           persist-credentials: false
-      - name: Retain exact tracked source without local state
+      - name: Acquire the exact reviewed repair scripts
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git switch -C main
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json' }
+          $inputs = @{'repair.py'='970e4c23ab40f944adae70852eb12693f44c4e5e';'augment.py'='3f42d7f358371e450737b33774af0ae68eac45a8'}
+          foreach ($name in $inputs.Keys) {
+            $blob=$inputs[$name]
+            $data=Invoke-RestMethod -Uri "https://api.github.com/repos/UnknownAlienHuman/eliot-memory-os/git/blobs/$blob" -Headers $headers
+            $path=Join-Path $env:RUNNER_TEMP $name
+            [IO.File]::WriteAllBytes($path,[Convert]::FromBase64String($data.content))
+            if ((((git hash-object $path)|Out-String).Trim()) -ne $blob) { throw 'Script digest mismatch' }
+          }
+      - name: Run the bounded source repairs and compile checks without credentials
         shell: pwsh
         run: |
-          $out = Join-Path $env:RUNNER_TEMP 'post-merge-source'
-          New-Item -ItemType Directory -Path $out -Force | Out-Null
-          git archive --format=zip --output="$out/source.zip" HEAD
-          if ($LASTEXITCODE -ne 0) { throw 'git archive failed' }
-          git rev-parse HEAD | Set-Content "$out/source-sha.txt"
-          git rev-parse 'HEAD^{tree}' | Set-Content "$out/tree-sha.txt"
-          git ls-tree -r HEAD | Set-Content "$out/tree.txt"
-          Get-FileHash "$out/source.zip" -Algorithm SHA256 | Format-List | Out-File "$out/archive-sha256.txt"
+          $repair=Join-Path $env:RUNNER_TEMP 'repair.py'
+          python (Join-Path $env:RUNNER_TEMP 'augment.py') $repair
+          if ($LASTEXITCODE -ne 0) { throw 'Augmentation failed' }
+          python -m py_compile $repair
+          if ($LASTEXITCODE -ne 0) { throw 'Repair syntax failed' }
+          python $repair
+          exit $LASTEXITCODE
+      - name: Retain candidate source blobs without updating any ref
+        if: ${{ always() }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $root=Join-Path $env:RUNNER_TEMP 'post-merge-repair'
+          $summaryPath=Join-Path $root 'summary.json'
+          if (-not (Test-Path $summaryPath)) { exit 0 }
+          $s=Get-Content $summaryPath -Raw|ConvertFrom-Json
+          $allowed=@('bins/eliot-kernel/src/host_request_route.rs','bins/eliot-kernel/src/hot_path_runtime.rs','bins/eliot-kernel/src/tests.rs','bins/eliot-kernel/src/dreamer_job_dispatch.rs','bins/eliot-kernel/src/dispatch_launch.rs','crates/foundation/eliot-runtime-contracts/src/hot_path.rs','crates/foundation/eliot-runtime-contracts/tests/hot_path_queue_binding.rs','crates/foundation/eliot-runtime-contracts/tests/shipped_hot_path.rs')
+          $headers=@{Authorization="Bearer $env:GH_TOKEN";Accept='application/vnd.github+json'}
+          $published=@{}
+          foreach ($p in $s.candidate_files.PSObject.Properties) {
+            if ($allowed -cnotcontains $p.Name) { throw 'Unexpected candidate path' }
+            $path=Join-Path (Join-Path $root 'candidate') $p.Name
+            $expected=$p.Value.git_blob
+            if ((((git hash-object --no-filters $path)|Out-String).Trim()) -ne $expected) { throw 'Candidate bytes changed' }
+            $body=@{encoding='base64';content=[Convert]::ToBase64String([IO.File]::ReadAllBytes($path))}|ConvertTo-Json -Compress
+            $response=Invoke-RestMethod -Method Post -Uri 'https://api.github.com/repos/UnknownAlienHuman/eliot-memory-os/git/blobs' -Headers $headers -ContentType 'application/json' -Body $body
+            if ($response.sha -ne $expected) { throw 'Published blob mismatch' }
+            $published[$p.Name]=$response.sha
+          }
+          $published|ConvertTo-Json|Set-Content (Join-Path $root 'published-blobs.json')
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() }}
         with:
-          name: post-merge-source-f4e05bc5
-          path: ${{ runner.temp }}/post-merge-source/
+          name: post-merge-repair-f4e05bc5
+          path: ${{ runner.temp }}/post-merge-repair/
           if-no-files-found: error
           retention-days: 5
