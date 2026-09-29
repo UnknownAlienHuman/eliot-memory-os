@@ -148,6 +148,29 @@ pub enum RegistryError {
         /// Machine-derived observation.
         observed: String,
     },
+    /// The instrument package disposition ledger rejected the assembly.
+    ///
+    /// The typed [`DispositionError`](crate::package_disposition::DispositionError)
+    /// is carried across the layer boundary unchanged, so a caller can still
+    /// match the exact disposition cause instead of parsing a message.
+    #[error(transparent)]
+    Disposition(#[from] crate::package_disposition::DispositionError),
+    /// One profile identity slot is unbound.
+    #[error("{instrument} leaves the {slot} identity slot unbound")]
+    IdentitySlotBlank {
+        /// Instrument contract identity.
+        instrument: String,
+        /// The unbound identity slot.
+        slot: IdentitySlot,
+    },
+    /// One profile identity slot disagrees with the entry it is bound to.
+    #[error("{instrument} records a {slot} identity that differs from the entry binding")]
+    IdentitySlotDrift {
+        /// Instrument contract identity.
+        instrument: String,
+        /// The drifted identity slot.
+        slot: IdentitySlot,
+    },
 }
 
 /// Exact cause of a [`RegistryError::Stale`] rejection.
@@ -169,25 +192,6 @@ pub enum StaleReason {
     Fingerprint {
         /// Fingerprint slot that moved.
         field: FingerprintField,
-    },
-    /// The instrument package disposition ledger rejected the assembly.
-    #[error(transparent)]
-    Disposition(#[from] crate::package_disposition::DispositionError),
-    /// One profile identity slot is unbound.
-    #[error("{instrument} leaves the {slot} identity slot unbound")]
-    IdentitySlotBlank {
-        /// Instrument contract identity.
-        instrument: String,
-        /// The unbound identity slot.
-        slot: IdentitySlot,
-    },
-    /// One profile identity slot disagrees with the entry it is bound to.
-    #[error("{instrument} records a {slot} identity that differs from the entry binding")]
-    IdentitySlotDrift {
-        /// Instrument contract identity.
-        instrument: String,
-        /// The drifted identity slot.
-        slot: IdentitySlot,
     },
 }
 
@@ -1375,9 +1379,9 @@ fn cargo_entry(
             executable: "cargo".to_owned(),
             features: ADMITTED_FEATURES.to_owned(),
             environment: ISOLATED_PROCESS.to_owned(),
-            artifact: "cargo build/test outputs under the admitted target layout",
+            artifact: "cargo build/test outputs under the admitted target layout".to_owned(),
             fence: ADMITTED_FENCE.to_owned(),
-            operation: "P-03 OperationId for the admitted cargo stage",
+            operation: "P-03 OperationId for the admitted cargo stage".to_owned(),
             timeout: ADMITTED_TIMEOUT.to_owned(),
             cancellation: cancellation_contract.to_owned(),
             resource: resource_contract.to_owned(),
@@ -1428,9 +1432,9 @@ fn rustc_entry(
             executable: RUSTC_EXECUTABLE.to_owned(),
             features: ADMITTED_FEATURES.to_owned(),
             environment: ISOLATED_PROCESS.to_owned(),
-            artifact: "rustc emits no artifact; diagnostics stream through the raw evidence handle",
+            artifact: "rustc emits no artifact; diagnostics stream through the raw evidence handle".to_owned(),
             fence: ADMITTED_FENCE.to_owned(),
-            operation: "P-03 OperationId for the admitted rustc stage",
+            operation: "P-03 OperationId for the admitted rustc stage".to_owned(),
             timeout: ADMITTED_TIMEOUT.to_owned(),
             cancellation: cancellation_contract.to_owned(),
             resource: resource_contract,
@@ -1482,9 +1486,9 @@ fn rustfmt_entry(
             executable: "cargo".to_owned(),
             features: ADMITTED_FEATURES.to_owned(),
             environment: ISOLATED_PROCESS.to_owned(),
-            artifact: "rustfmt --check emits no artifact; the check outcome streams as raw evidence",
+            artifact: "rustfmt --check emits no artifact; the check outcome streams as raw evidence".to_owned(),
             fence: ADMITTED_FENCE.to_owned(),
-            operation: "P-03 OperationId for the admitted rustfmt stage",
+            operation: "P-03 OperationId for the admitted rustfmt stage".to_owned(),
             timeout: ADMITTED_TIMEOUT.to_owned(),
             cancellation: cancellation_contract.to_owned(),
             resource: resource_contract,
@@ -1536,9 +1540,9 @@ fn nextest_entry(
             executable: "cargo".to_owned(),
             features: ADMITTED_FEATURES.to_owned(),
             environment: ISOLATED_PROCESS.to_owned(),
-            artifact: "nextest test binaries under the admitted target layout; the run report is raw evidence",
+            artifact: "nextest test binaries under the admitted target layout; the run report is raw evidence".to_owned(),
             fence: ADMITTED_FENCE.to_owned(),
-            operation: "P-03 OperationId for the admitted nextest stage",
+            operation: "P-03 OperationId for the admitted nextest stage".to_owned(),
             timeout: ADMITTED_TIMEOUT.to_owned(),
             cancellation: cancellation_contract.to_owned(),
             resource: resource_contract,
@@ -1590,10 +1594,10 @@ fn scip_entry(
             executable: SCIP_INSTRUMENT.to_owned(),
             features: ADMITTED_FEATURES.to_owned(),
             environment: OFFLINE_DECODE.to_owned(),
-            artifact: "emitted SCIP index bytes decoded in process; no child process is created",
+            artifact: "emitted SCIP index bytes decoded in process; no child process is created".to_owned(),
             fence: ADMITTED_FENCE.to_owned(),
-            operation: "decode-only operation identity; no admitted launch is required",
-            timeout: "not applicable: decoder-only, decode is bounded by MAX_SCIP_BYTES",
+            operation: "decode-only operation identity; no admitted launch is required".to_owned(),
+            timeout: "not applicable: decoder-only, decode is bounded by MAX_SCIP_BYTES".to_owned(),
             cancellation: cancellation_contract.to_owned(),
             resource: resource_contract,
         }),
@@ -1649,9 +1653,9 @@ fn dotnet_entry(
             executable: DOTNET_EXECUTABLE.to_owned(),
             features: ADMITTED_FEATURES.to_owned(),
             environment: ISOLATED_PROCESS.to_owned(),
-            artifact: "msbuild outputs under the admitted target layout; the report is raw evidence",
+            artifact: "msbuild outputs under the admitted target layout; the report is raw evidence".to_owned(),
             fence: ADMITTED_FENCE.to_owned(),
-            operation: "P-03 OperationId for the admitted msbuild stage",
+            operation: "P-03 OperationId for the admitted msbuild stage".to_owned(),
             timeout: ADMITTED_TIMEOUT.to_owned(),
             cancellation: cancellation_contract.to_owned(),
             resource: resource_contract.to_owned(),
