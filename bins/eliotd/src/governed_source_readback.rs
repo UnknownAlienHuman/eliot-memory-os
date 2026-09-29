@@ -89,8 +89,9 @@ fn body_coordinates(
         .map_err(|_| ReadbackRefusal::gap("readback.owner.encoding", None))?;
     let body = canonical_json_bytes(&document.body)
         .map_err(|_| ReadbackRefusal::gap("readback.owner.encoding", None))?;
-    let offset = match find_subslice(&bytes, &body) {
-        [offset] => offset,
+    let found = find_subslice(&bytes, &body);
+    let offset = match found.as_slice() {
+        [offset] => *offset,
         [] => return Err(ReadbackRefusal::gap("readback.anchor.unresolvable", None)),
         _ => return Err(ReadbackRefusal::gap("readback.anchor.ambiguous", None)),
     };
