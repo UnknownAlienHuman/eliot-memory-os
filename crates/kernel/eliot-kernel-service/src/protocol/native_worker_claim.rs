@@ -328,7 +328,7 @@ pub struct NativeWorkerExecutableBindingPublication {
     pub task_id: String,
     /// Work unit delegated to the worker for this attempt.
     pub work_unit_id: String,
-    /// WorkScope that bounds the worker's permitted inputs and effects.
+    /// `WorkScope` that bounds the worker's permitted inputs and effects.
     pub work_scope_id: String,
     /// Attempt number within the bound work unit.
     pub attempt: u32,
