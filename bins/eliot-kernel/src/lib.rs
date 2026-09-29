@@ -4645,10 +4645,7 @@ impl KernelComposition {
             };
             match gateway {
                 Some(gateway) => {
-                    if let Err(error) = gateway
-                        .fence_and_drain(Duration::from_secs(5))
-                        .await
-                    {
+                    if let Err(error) = gateway.fence_and_drain(Duration::from_secs(5)).await {
                         return Err(DrainHalt::with_pending(
                             "store-stop-unproven",
                             vec![format!("store-gateway-drain-incomplete:{error}")],
