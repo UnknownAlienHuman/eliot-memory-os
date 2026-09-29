@@ -19,6 +19,7 @@
 //! the single conversion from a requested operation to a collision answer, so
 //! a read-only observation has no path to a destructive request.
 
+use eliot_contracts::StateFence;
 use eliot_platform::{PlatformHandle, ServiceObservation};
 use eliot_runtime_contracts::ServiceProcessRecord;
 use schemars::JsonSchema;
@@ -278,6 +279,149 @@ pub struct RoleFilteredReference {
     pub handle: PlatformHandle,
 }
 
+/// One exact endpoint an installation planned and a foreign occupant holds.
+///
+/// The endpoint is a structured field rather than prose so the planned host and
+/// the planned port stay separately checkable, and so an endpoint reference
+/// never has to be re-parsed to be disclosed.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlannedEndpoint {
+    /// Planned host, which the observation requires to be loopback.
+    pub host: String,
+    /// Planned port, which the observation requires to be non-zero.
+    pub port: u16,
+}
+
+/// One neutral observation of a listener holding a planned loopback endpoint.
+///
+/// This is observation data, never an ownership proof. Every field is the
+/// *approved* identity the observing site already holds: the installation, the
+/// managed generation and the authority state fence are the approved launch
+/// descriptor's own values and are never synthesised here. In particular the
+/// generation is an opaque [`PlatformHandle`] and is never parsed into a
+/// [`StateFence`] resource generation; parsing it would fabricate a fence for a
+/// generation this installation never approved, and would make this typed
+/// directive unreachable on a real descriptor.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlannedEndpointOccupant {
+    /// The exact planned endpoint the occupant was observed holding.
+    pub planned_endpoint: PlannedEndpoint,
+    /// Installation that planned and owns this endpoint.
+    pub installation: PlatformHandle,
+    /// Managed generation that planned this endpoint. Opaque identity.
+    pub generation: PlatformHandle,
+    /// The approved descriptor's own authority state fence.
+    pub state_fence: StateFence,
+    /// Observed owner process id, when the read completed and reported one.
+    /// `None` means the read did not produce a trustworthy owner, which is
+    /// never absence of an occupant.
+    pub observed_owner_process_id: Option<u32>,
+    /// The retained owned child PID the caller proved through Job membership
+    /// and committed predecessor binding.
+    pub retained_owned_process_id: Option<u32>,
+    /// When the neutral observation was made. Wall time is observation, never
+    /// causal order.
+    pub observed_at_unix_ms: u64,
+}
+
+impl PlannedEndpointOccupant {
+    /// Fails closed unless the observation is internally consistent and its
+    /// approved fence is a real contract fence.
+    ///
+    /// A zero timestamp, a blank host, a zero port, a blank handle, an observed
+    /// owner equal to the retained owned child, or an invalid fence would each
+    /// let a collision be described against an identity the installation never
+    /// approved, so the directive is refused instead.
+    fn validate(&self) -> Result<(), ForeignOccupantRecoveryError> {
+        if self.planned_endpoint.host.trim().is_empty() {
+            return Err(ForeignOccupantRecoveryError::InvalidDirective(
+                "planned endpoint host is blank",
+            ));
+        }
+        if self.planned_endpoint.port == 0 {
+            return Err(ForeignOccupantRecoveryError::InvalidDirective(
+                "planned endpoint port is zero",
+            ));
+        }
+        if self.installation.as_str().trim().is_empty() {
+            return Err(ForeignOccupantRecoveryError::InvalidDirective(
+                "collision installation identity is blank",
+            ));
+        }
+        if self.generation.as_str().trim().is_empty() {
+            return Err(ForeignOccupantRecoveryError::InvalidDirective(
+                "collision generation identity is blank",
+            ));
+        }
+        if self.observed_at_unix_ms == 0 {
+            return Err(ForeignOccupantRecoveryError::InvalidDirective(
+                "collision observation timestamp is zero",
+            ));
+        }
+        if self.observed_owner_process_id == self.retained_owned_process_id {
+            return Err(ForeignOccupantRecoveryError::InvalidDirective(
+                "the observed occupant is the retained owned child",
+            ));
+        }
+        self.state_fence
+            .validate()
+            .map_err(|_error| ForeignOccupantRecoveryError::InvalidDirective(
+                "collision state fence is not a valid contract fence",
+            ))
+    }
+}
+
+/// One neutral observation of a process holding a planned service identity.
+///
+/// This is the observation a service port returns: a managed-service identity
+/// and the process record the platform read back. It deliberately carries no
+/// endpoint, installation, generation or fence, because this seam holds none
+/// and synthesising one would describe a collision against an authority the
+/// observing site does not have.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceIdentityOccupant {
+    /// The installation-planned service identity that is occupied.
+    pub planned_identity: PlatformHandle,
+    /// The observed process record, when the read produced one.
+    pub observed_process: Option<ServiceProcessRecord>,
+}
+
+/// The neutral observation one foreign-occupant collision was classified from.
+///
+/// The two variants are the two seams that can actually observe an occupant.
+/// Neither carries a conversion to the other, and neither may be widened into
+/// the other: a listener read is not a service read, so a caller cannot present
+/// a port observation as a managed-service observation or invent the missing
+/// approved identity for either.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", tag = "observation")]
+pub enum ForeignOccupantObservation {
+    /// A loopback listener holds the installation-planned endpoint.
+    PlannedEndpoint(PlannedEndpointOccupant),
+    /// A process holds the installation-planned service identity.
+    ServiceIdentity(ServiceIdentityOccupant),
+}
+
+impl ForeignOccupantObservation {
+    /// Fails closed unless the observation is internally consistent.
+    fn validate(&self) -> Result<(), ForeignOccupantRecoveryError> {
+        match self {
+            Self::PlannedEndpoint(occupant) => occupant.validate(),
+            Self::ServiceIdentity(occupant) => {
+                if occupant.planned_identity.as_str().trim().is_empty() {
+                    return Err(ForeignOccupantRecoveryError::InvalidDirective(
+                        "planned service identity is blank",
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Why one requested operation class is not admitted for this occupant.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CollisionRefusal {
@@ -340,6 +484,8 @@ pub struct ForeignOccupantRecoveryDirective {
     pub next_action: SafeNextAction,
     /// References, each with the role it may be disclosed to.
     pub references: Vec<RoleFilteredReference>,
+    /// The neutral observation this classification was made from.
+    pub observation: ForeignOccupantObservation,
 }
 
 impl fmt::Display for ForeignOccupantRecoveryDirective {
@@ -380,10 +526,59 @@ impl ForeignOccupantRecoveryDirective {
         observed: &ServiceObservation,
         managed_tree: ManagedTreeObservation,
     ) -> Result<Self, ForeignOccupantRecoveryError> {
+        Self::assemble(
+            admitted_operation,
+            ForeignOccupantObservation::ServiceIdentity(ServiceIdentityOccupant {
+                planned_identity: planned_identity.clone(),
+                observed_process: observed.process.clone(),
+            }),
+            managed_tree,
+        )
+    }
+
+    /// Builds the directive for a neutral observation of a listener that holds
+    /// one installation-planned loopback endpoint.
+    ///
+    /// This is the same single typed answer, reached through the same
+    /// [`Self::admit`] fold as [`Self::for_observed_occupant`]; there is no
+    /// second directive family and no second conversion point. It exists
+    /// because the endpoint seam observes a real listener owner and holds the
+    /// approved launch descriptor's installation, generation and authority
+    /// state fence, none of which the service seam holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForeignOccupantRecoveryError::InvalidDirective`] when the
+    /// observation is internally inconsistent, when an observed reference is not
+    /// a usable handle, or when a derived set is incomplete.
+    pub fn for_observed_endpoint_occupant(
+        admitted_operation: AdmittedCollisionOperation,
+        occupant: PlannedEndpointOccupant,
+        managed_tree: ManagedTreeObservation,
+    ) -> Result<Self, ForeignOccupantRecoveryError> {
+        Self::assemble(
+            admitted_operation,
+            ForeignOccupantObservation::PlannedEndpoint(occupant),
+            managed_tree,
+        )
+    }
+
+    /// The one construction path both public constructors share.
+    ///
+    /// `permitted` and `blocked` are folded from the complete independent
+    /// operation set through [`Self::admit`], so no caller can supply a partial
+    /// or invented disposition set, and the two observation seams cannot drift
+    /// into two different answers.
+    fn assemble(
+        admitted_operation: AdmittedCollisionOperation,
+        observation: ForeignOccupantObservation,
+        managed_tree: ManagedTreeObservation,
+    ) -> Result<Self, ForeignOccupantRecoveryError> {
+        observation.validate()?;
         let classified_origin = managed_tree.classified_origin();
         let next_action = safe_next_action(classified_origin);
         let missing_ownership_evidence = unproven_ownership_evidence();
-        let references = recovery_references(planned_identity, observed.process.as_ref())?;
+        let references = recovery_references(&observation)?;
 
         let skeleton = Self {
             admitted_operation,
@@ -393,6 +588,7 @@ impl ForeignOccupantRecoveryDirective {
             missing_ownership_evidence,
             next_action,
             references,
+            observation,
         };
 
         let mut permitted = Vec::new();
@@ -476,6 +672,7 @@ impl ForeignOccupantRecoveryDirective {
     /// incomplete, over-complete or reordered, or when the references are
     /// absent, over-bound, blank or repeated within one role.
     pub fn validate(&self) -> Result<(), ForeignOccupantRecoveryError> {
+        self.observation.validate()?;
         if self.permitted != expected_permitted(self.admitted_operation) {
             return Err(ForeignOccupantRecoveryError::InvalidDirective(
                 "permitted operation set is not the complete expected set",
@@ -654,21 +851,70 @@ fn unproven_ownership_evidence() -> Vec<OwnershipEvidenceClass> {
 }
 
 /// Builds the role-filtered references for one collision.
+///
+/// Every reference is a role-tagged handle to an identity the observing site
+/// already holds. The endpoint seam discloses the planned endpoint to the
+/// installer and the observed owner to the platform observer; the service seam
+/// discloses the planned service identity and, when the read produced one, the
+/// observed process lineage. No raw secret, key, argv text or config body is
+/// ever carried here, and the count stays inside
+/// [`MAX_RECOVERY_REFERENCES`].
 fn recovery_references(
-    planned_identity: &PlatformHandle,
-    observed_process: Option<&ServiceProcessRecord>,
+    observation: &ForeignOccupantObservation,
 ) -> Result<Vec<RoleFilteredReference>, ForeignOccupantRecoveryError> {
-    let mut references = vec![RoleFilteredReference {
-        role: RecoveryReferenceRole::Installer,
-        handle: planned_identity.clone(),
-    }];
-    if let Some(process) = observed_process {
-        references.push(RoleFilteredReference {
-            role: RecoveryReferenceRole::PlatformObserver,
-            handle: PlatformHandle::new(process.process_id.clone()).map_err(|_error| {
-                ForeignOccupantRecoveryError::InvalidDirective("observed process lineage")
-            })?,
-        });
+    match observation {
+        ForeignOccupantObservation::PlannedEndpoint(occupant) => {
+            let mut references = vec![RoleFilteredReference {
+                role: RecoveryReferenceRole::Installer,
+                handle: PlatformHandle::new(format!(
+                    "store-endpoint-planned:{}:{}",
+                    occupant.planned_endpoint.host, occupant.planned_endpoint.port
+                ))
+                .map_err(|_error| {
+                    ForeignOccupantRecoveryError::InvalidDirective("planned endpoint identity")
+                })?,
+            }];
+            references.push(RoleFilteredReference {
+                role: RecoveryReferenceRole::Installer,
+                handle: occupant.installation.clone(),
+            });
+            // I3.3: an unreadable owner is not an absent one. The reference says
+            // so explicitly instead of reading like "no owner".
+            references.push(RoleFilteredReference {
+                role: RecoveryReferenceRole::PlatformObserver,
+                handle: PlatformHandle::new(format!(
+                    "store-endpoint-owner:{}",
+                    observed_owner_process_id_label(occupant.observed_owner_process_id)
+                ))
+                .map_err(|_error| {
+                    ForeignOccupantRecoveryError::InvalidDirective("observed owner identity")
+                })?,
+            });
+            Ok(references)
+        }
+        ForeignOccupantObservation::ServiceIdentity(occupant) => {
+            let mut references = vec![RoleFilteredReference {
+                role: RecoveryReferenceRole::Installer,
+                handle: occupant.planned_identity.clone(),
+            }];
+            if let Some(process) = occupant.observed_process.as_ref() {
+                references.push(RoleFilteredReference {
+                    role: RecoveryReferenceRole::PlatformObserver,
+                    handle: PlatformHandle::new(process.process_id.clone()).map_err(|_error| {
+                        ForeignOccupantRecoveryError::InvalidDirective("observed process lineage")
+                    })?,
+                });
+            }
+            Ok(references)
+        }
     }
-    Ok(references)
+}
+
+/// Renders the observed owner for a reference without ever widening a missing
+/// observation into an invented process identity.
+fn observed_owner_process_id_label(observed_owner_process_id: Option<u32>) -> String {
+    match observed_owner_process_id {
+        Some(process_id) => format!("observed-pid:{process_id}"),
+        None => "observed-pid:unreadable".to_owned(),
+    }
 }

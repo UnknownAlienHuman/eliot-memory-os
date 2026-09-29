@@ -24,10 +24,11 @@ mod service;
 
 pub use foreign_occupant_recovery::{
     AdmittedCollisionOperation, BlockedRecoveryOperation, CollisionOperationDisposition,
-    CollisionOriginClass, CollisionRefusal, ForeignOccupantRecoveryDirective,
-    ForeignOccupantRecoveryError, ManagedTreeObservation, OwnershipEvidenceClass,
-    PermittedRecoveryOperation, RecoveryReferenceRole, RequestedProcessOperation,
-    RoleFilteredReference, SafeNextAction,
+    CollisionOriginClass, CollisionRefusal, ForeignOccupantObservation,
+    ForeignOccupantRecoveryDirective, ForeignOccupantRecoveryError, ManagedTreeObservation,
+    OwnershipEvidenceClass, PermittedRecoveryOperation, PlannedEndpoint,
+    PlannedEndpointOccupant, RecoveryReferenceRole, RequestedProcessOperation,
+    RoleFilteredReference, SafeNextAction, ServiceIdentityOccupant,
 };
 
 pub use service::{

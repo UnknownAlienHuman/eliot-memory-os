@@ -1753,20 +1753,15 @@ pub enum HostError {
     /// installation ownership is unproven.
     ///
     /// Issue #1775. The typed directive is the recovery instruction: it names
-    /// the blocked control class, the missing ownership evidence and the
-    /// read-only next actions, and it renders into the single existing
-    /// `eliot_runtime_contracts::RecoveryDirective` projection. It authorizes
-    /// nothing — the occupant is left running, and no stop, kill, credential
-    /// attachment, login, adoption, reuse or data migration is performed.
+    /// the classified origin, the read-only operations still permitted, the
+    /// blocked control operations, the exact missing ownership evidence and one
+    /// safe next action. It authorizes nothing — the occupant is left running,
+    /// and no stop, kill, credential attachment, login, adoption, reuse or data
+    /// migration is performed. Its `Display` is the bounded, non-sensitive
+    /// summary, so endpoints and process identities stay in typed fields.
     #[cfg(windows)]
-    #[error(
-        "planned Store endpoint is occupied and exact installation ownership is unproven: {}",
-        .0.render().map_or_else(
-            |error| format!("collision directive is not renderable ({error})"),
-            |rendered| rendered.reason
-        )
-    )]
-    OriginCollisionUnproven(eliot_host_service::OriginCollisionDirective),
+    #[error("planned Store endpoint is occupied and exact installation ownership is unproven: {0}")]
+    OriginCollisionUnproven(eliot_host_service::ForeignOccupantRecoveryDirective),
     /// The planned Store endpoint's owner could not be read.
     ///
     /// Issue #1775. A read that failed is not a read that succeeded with an

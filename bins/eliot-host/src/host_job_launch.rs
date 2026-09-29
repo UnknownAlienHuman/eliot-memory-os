@@ -21,8 +21,8 @@ use eliot_kernel_service::semantic_store_config_hash_from_json;
 use eliot_contracts::StateFence;
 #[cfg(windows)]
 use eliot_host_service::{
-    MissingOwnershipEvidence, OriginCollisionDirective, OriginNextAction, OriginOperationClass,
-    ProcessOriginClassification, StoreEndpointCollision,
+    AdmittedCollisionOperation, ForeignOccupantRecoveryDirective, ManagedTreeObservation,
+    PlannedEndpoint, PlannedEndpointOccupant,
 };
 #[cfg(windows)]
 use eliot_platform::PlatformHandle;
@@ -396,25 +396,26 @@ pub(super) fn ensure_store_endpoint_available_or_owned(
     }
 }
 
-/// Builds the typed process-origin collision directive for one observed
+/// Builds the typed foreign-occupant recovery directive for one observed
 /// foreign occupant of the planned Store endpoint.
 ///
 /// Everything passed here is what this site actually holds: the endpoint read
 /// back from the approved launch descriptor, the observed owner process ID
 /// (or `None` when the owner could not be read), the retained owned child PID
 /// the caller proved through Job membership and committed predecessor binding,
-/// the managed generation from the approved descriptor, and the installation
-/// epoch whose authority fence scopes the observation.
+/// the managed generation from the approved descriptor, and the installation's
+/// own authority state fence.
 ///
 /// The result is a directive, never an effect: it names the blocked control
-/// class and the missing ownership evidence, and it grants nothing.
+/// operations, the exact missing ownership evidence and the one safe next
+/// action, and it grants nothing. The occupant is left running.
 #[cfg(windows)]
 fn store_endpoint_collision_directive(
     endpoint: std::net::SocketAddr,
     observed_owner_process_id: Option<u32>,
     retained_owned_process_id: Option<u32>,
     binding: &StoreEndpointOwnershipBinding<'_>,
-) -> Result<OriginCollisionDirective, HostError> {
+) -> Result<ForeignOccupantRecoveryDirective, HostError> {
     let observed_at_unix_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|error| {
@@ -434,91 +435,50 @@ fn store_endpoint_collision_directive(
         ));
     }
 
-    // The authority fence is the one the approved handoff descriptor already
+    // The authority fence is the one the approved launch descriptor already
     // carries (`RuntimeLaunchDescriptor::authority_state_fence`), not one
-    // synthesised here. Deriving a fresh fence would let a collision be
-    // described against a generation this installation never approved, and a
-    // generation handle is an opaque identity rather than a parseable counter,
-    // so a derived fence would be a fabrication. The launch descriptor's own
-    // fence is the real binding; an invalid one fails closed below.
-    binding.state_fence.validate().map_err(|error| {
-        HostError::ProcessContour(format!(
-            "collision state fence is not a valid contract fence: {error}"
-        ))
-    })?;
-
-    // Role-filtered, bounded references only. No raw key, bearer token, argv
-    // text or config body is carried here; the endpoint and the observed owner
-    // PID are the facts the directive is actually about.
-    let evidence_refs = vec![
-        format!("store-endpoint-planned:{endpoint}"),
-        format!("store-endpoint-owner:{}", observed_owner_process_id_label(
-            observed_owner_process_id
-        )),
-    ];
-
-    let collision = StoreEndpointCollision {
-        planned_endpoint_host: endpoint.ip().to_string(),
-        planned_endpoint_port: endpoint.port(),
+    // synthesised here, and the directive validates it. Deriving a fresh fence
+    // would let a collision be described against a generation this
+    // installation never approved, and the generation handle is an opaque
+    // identity rather than a parseable counter, so a derived fence would be a
+    // fabrication that also made this typed directive unreachable on a real
+    // descriptor. An invalid approved fence fails closed inside the directive.
+    let occupant = PlannedEndpointOccupant {
+        planned_endpoint: PlannedEndpoint {
+            host: endpoint.ip().to_string(),
+            port: endpoint.port(),
+        },
         installation: binding.installation.clone(),
         generation: binding.generation.clone(),
         state_fence: binding.state_fence.clone(),
-        origin: ProcessOriginClassification::Unknown,
         observed_owner_process_id,
         retained_owned_process_id,
         observed_at_unix_ms,
-        evidence_refs,
     };
 
-    let directive = OriginCollisionDirective::new(
-        collision,
-        // The control class a collision blocks. `Stop` is the class this
-        // launch/reconnect path would need to reach past the occupant; the
-        // directive names it as *blocked*, and `OriginOperationClass::Stop` is
-        // a control class, so the constructor's read-only refusal cannot apply.
-        OriginOperationClass::Stop,
-        &[
-            OriginNextAction::InspectForeignOccupant,
-            OriginNextAction::ImportLegacyDataReadOnly,
-            OriginNextAction::SelectAlternateEndpoint,
-        ],
-        &[
-            MissingOwnershipEvidence::InstallationLineage,
-            MissingOwnershipEvidence::ProcessStartIdentity,
-            MissingOwnershipEvidence::ImageArtifact,
-            MissingOwnershipEvidence::AuthorityEpochAndStateFence,
-            MissingOwnershipEvidence::OperationChallenge,
-            MissingOwnershipEvidence::ConnectionOwner,
-        ],
+    // #1775: the real detector produces the one typed directive family from an
+    // actual observation, not a prose string. The origin is deliberately
+    // `UNKNOWN`: a listener PID on the planned endpoint proves neither
+    // managed-tree nor shared-substrate membership, and a name, port or endpoint
+    // response can never establish control, so shared-runtime membership can
+    // never silently become exclusive ownership. I3.3 admits only
+    // read-only inspection or a separately admitted alternate endpoint, so the
+    // permitted set is read-only by construction and `admit` is the only
+    // conversion point from a requested operation to a disposition.
+    //
+    // The occupant is left RUNNING. Nothing here terminates, kills,
+    // authenticates against, adopts, reuses or migrates from it.
+    ForeignOccupantRecoveryDirective::for_observed_endpoint_occupant(
+        AdmittedCollisionOperation::FreshDependencyStart,
+        occupant,
+        ManagedTreeObservation::Unavailable,
     )
     .map_err(|error| {
         HostError::ProcessContour(format!(
             "planned Store endpoint collision evidence is invalid: {error}"
         ))
-    })?;
-    // Fail closed at the producer: a directive that cannot be rendered is not a
-    // usable recovery instruction, and silently degrading it to prose is
-    // exactly the failure #1775 exists to remove.
-    directive.render().map_err(|error| {
-        HostError::ProcessContour(format!(
-            "planned Store endpoint collision directive could not be rendered: {error}"
-        ))
-    })?;
-    Ok(directive)
+    })
 }
-
-/// Renders the observed owner for an evidence reference without ever widening a
-/// missing observation into an invented process identity.
-#[cfg(windows)]
-fn observed_owner_process_id_label(observed_owner_process_id: Option<u32>) -> String {
-    match observed_owner_process_id {
-        Some(process_id) => format!("observed-pid:{process_id}"),
-        // I3.3: an unreadable owner is not an absent one. The reference says so
-        // explicitly instead of reading like "no owner".
-        None => "observed-pid:unreadable".to_owned(),
-    }
-}
-
 /// Builds the exact Kernel child argv by injecting the Host-approved
 /// digest-bound Doctor executable path into the sealed launch descriptor's
 /// stored `kernel_arguments`.
