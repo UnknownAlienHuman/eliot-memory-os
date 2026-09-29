@@ -753,6 +753,22 @@ pub struct SkillCatalogue {
 /// tool owner's view — never a recomputed substitute. Entries pin exactly the
 /// observed dependency set, so added, removed, and changed names all count as
 /// drift.
+///
+/// # STITCH: no production caller in this slice
+///
+/// `caller: STITCH`. The sweep implementation is present but no production
+/// driver builds this world yet. The designated caller is the bridge
+/// activation display path ([`activation_display_against`](SkillCatalogue::activation_display_against))
+/// once its owner can observe the full live world for the operation: the
+/// versioned display entry the daemon drives today carries only the
+/// tool-owner view and the admitted Tool Definition version — no live
+/// dependency set and no live host/profile versions — so the owning crate
+/// cannot build this world without inventing live terms, which would be a
+/// fake caller. Install-time legs already mark drift from the presented
+/// material and the promote path observes the committed candidate set; this
+/// world covers the remaining display-time leg. A timer, startup, or refresh
+/// arm must never synthesize the world: every leg must compare against
+/// caller-observed live content.
 pub struct LiveSkillWorld<'a> {
     /// Currently registered dependency versions (the full live set).
     pub current_dependencies: &'a [DependencyVersion],
@@ -1038,6 +1054,18 @@ impl SkillCatalogue {
     /// with it and Hotset receipts issued before the sweep fail closed at
     /// activation instead of displaying a drifted body. Returns the skill ids
     /// that became stale, in catalogue order.
+    ///
+    /// # STITCH: production drivers adopt per leg
+    ///
+    /// `caller: STITCH`. Install-time legs mark from the presented material
+    /// (`install_package`), the promote path observes the committed candidate
+    /// set, and the tool/definition display legs mark upstream of
+    /// `activation_display`; the full-sweep production driver is the pre-serve
+    /// entry [`activation_display_against`](Self::activation_display_against)
+    /// once its display-path owner supplies the observed world. The
+    /// install-wide sweep is deliberately not restored here: without an
+    /// operation-observed world it false-marks. No caller is manufactured
+    /// from the owning crate — bins-owned live terms stay with their lanes.
     pub fn reconcile_staleness(
         &mut self,
         world: &LiveSkillWorld<'_>,
@@ -1221,6 +1249,14 @@ impl SkillCatalogue {
     /// [`promote`](Self::promote). A promotion that never passed the gate
     /// cannot mint `Current`: without this binding the entry stays
     /// provisional and its delivery carries the provisional ceiling.
+    ///
+    /// # STITCH: designated catalogue-promotion caller
+    ///
+    /// `caller: STITCH`. The designated caller is the catalogue promotion
+    /// driver that binds the same [`PromotionGate`] the lifecycle owner
+    /// enforces; today promotion commits through the Governor owner with
+    /// pre-commit and post-commit dependency observation, so no second
+    /// promotion path is manufactured here.
     pub fn promote_gated(
         &mut self,
         skill_id: &str,
@@ -1380,6 +1416,18 @@ impl SkillCatalogue {
     /// existing `is_usable`/display refusal, and bounded use returns only as
     /// provisional. A passing display keeps the full receipt chain
     /// (validation + catalogue-staleness + delivery-ack records).
+    ///
+    /// # STITCH: designated display-path caller
+    ///
+    /// `caller: STITCH`. The designated caller is the daemon display drive
+    /// (`skill_carry_receipt_to_display` into the versioned acknowledge
+    /// entry) once it can supply the operation-observed [`LiveSkillWorld`];
+    /// until then production display flows through
+    /// [`activation_display`](Self::activation_display) with the
+    /// tool/definition drift legs enforced upstream. The owning crate holds
+    /// the catalogue behind its own handle and cannot observe the bins-owned
+    /// live dependency set or host/profile versions, so no caller is
+    /// manufactured here.
     pub fn activation_display_against(
         &mut self,
         skill_id: &str,
@@ -1540,6 +1588,16 @@ impl HotsetDeliveryReceipt {
                 return Err(SkillError::InvalidField {
                     field: "delivery.delivered_skill_ids",
                     reason: "stale or retired Skills cannot be delivered",
+                });
+            }
+            // Promotion-gate binding on the delivery entry (issue #1882
+            // W2/A4, `I7.13`): same `Current`-requires-evidence rule as
+            // `activation_display`, so an unvalidated `Current` is never
+            // representable as generally delivered.
+            if entry.status == SkillStatus::Current && entry.promotion_evidence.is_none() {
+                return Err(SkillError::InvalidField {
+                    field: "entry.promotion_evidence",
+                    reason: "current Skills require bound promotion evidence; unvalidated Skills are blocked from Material use",
                 });
             }
             if entry.status != SkillStatus::Current {
