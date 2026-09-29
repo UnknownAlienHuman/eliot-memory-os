@@ -62,8 +62,9 @@
 //! lock, reads the full Governor binding and same-row ORS projection through
 //! the authenticated Kernel path without holding that lock across the await,
 //! then revalidates the row with Governor. Route/capacity currentness is not
-//! available from the M1 owner record, so the poll returns a typed pending or
-//! refusal before capability construction, activation, or dispatch. The
+//! available from the M1 owner record, so the poll returns typed pending,
+//! terminal/unknown, or provider-revision outcomes before capability
+//! construction, activation, or dispatch. The
 //! test-only historical dispatch projection is persisted under the daemon
 //! state root before `emit`; uncertain ownership is never released without an
 //! observed terminal disposition.
@@ -773,6 +774,15 @@ pub struct SoloAttemptStatus {
     pub emitted: bool,
 }
 
+/// Why the authenticated owner has not exposed a currently admitted binding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SoloBindingPendingReason {
+    /// No ORS claim-state row was present in the authenticated readback.
+    BindingPublicationPending,
+    /// The owner row is still in its pre-admission REQUESTED state.
+    ClaimRequested,
+}
+
 /// Tick outcome for the runtime solo poll hook.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SoloPollOutcome {
@@ -780,8 +790,8 @@ pub enum SoloPollOutcome {
     Idle,
     /// The live slot holds a non-settled attempt; the queue waits.
     SlotBusy,
-    /// The requested Kernel claim exists but its Governor binding has not
-    /// yet been published. The exact queue head remains available for retry.
+    /// The authenticated owner reports either a not-yet-published binding or
+    /// a claim that remains in REQUESTED. The exact queue head stays queued.
     OwnerBindingPending {
         /// Claim identity selected by the retained queue head.
         claim_id: String,
@@ -791,6 +801,9 @@ pub enum SoloPollOutcome {
         operation_id: String,
         /// Task identity selected by the retained queue head.
         task_id: String,
+        /// Distinguishes a missing binding publication from a durable
+        /// REQUESTED claim row.
+        reason: SoloBindingPendingReason,
         /// Kernel owner time at which the missing binding was observed.
         observed_at_unix_ms: u64,
     },
@@ -807,6 +820,35 @@ pub enum SoloPollOutcome {
         /// Task identity selected by the retained queue head.
         task_id: String,
         /// Kernel owner time at which the current binding was observed.
+        observed_at_unix_ms: u64,
+    },
+    /// The authenticated ORS row is terminal for the exact retained tuple.
+    /// The intake stays queued for readback; it is never re-launched.
+    OwnerBindingRevoked {
+        /// Claim identity selected by the retained queue head.
+        claim_id: String,
+        /// Attempt identity selected by the retained queue head.
+        attempt_id: String,
+        /// Operation identity selected by the retained queue head.
+        operation_id: String,
+        /// Task identity selected by the retained queue head.
+        task_id: String,
+        /// Kernel owner time at which the terminal row was observed.
+        observed_at_unix_ms: u64,
+    },
+    /// The authenticated ORS row has an uncertain/reconciling outcome for the
+    /// exact retained tuple. It remains queued and cannot be retried as new
+    /// work.
+    OwnerBindingUnknownOutcome {
+        /// Claim identity selected by the retained queue head.
+        claim_id: String,
+        /// Attempt identity selected by the retained queue head.
+        attempt_id: String,
+        /// Operation identity selected by the retained queue head.
+        operation_id: String,
+        /// Task identity selected by the retained queue head.
+        task_id: String,
+        /// Kernel owner time at which the uncertain row was observed.
         observed_at_unix_ms: u64,
     },
     /// One queued intake drove to a retained dispatch.
@@ -1621,12 +1663,6 @@ pub async fn solo_poll_queue_async(
         if composition.readiness() != CompositionReadiness::Ready {
             return Err(DaemonError::Composition(CompositionError::NotReady));
         }
-        let live_kernel_fence = kernel.kernel_fence();
-        if !fences_match_exact(&expected_kernel_fence, &live_kernel_fence) {
-            return Err(DaemonError::ProviderAdmission(FabricError::StaleFence(
-                "Kernel fence changed while the solo binding readback was in flight".to_owned(),
-            )));
-        }
         let state = composition.solo_state.lock().map_err(|_| {
             DaemonError::Composition(CompositionError::Recovery(
                 "solo driver state lock poisoned".to_owned(),
@@ -1643,32 +1679,52 @@ pub async fn solo_poll_queue_async(
             return Ok(SoloPollOutcome::SlotBusy);
         }
         drop(state);
-        composition.validate_solo_native_worker_binding_readback(
+        let observation = composition.validate_solo_native_worker_binding_readback(
             kernel,
             &intake.claimed.claim_id,
             &intake.claimed.attempt_id,
             &intake.claimed.operation_id,
             task_id,
             readback,
-        )?
+        )?;
+        let historical_non_effect = matches!(
+            &observation,
+            eliot_governor::NativeWorkerBindingObservation::Revoked { .. }
+                | eliot_governor::NativeWorkerBindingObservation::UnknownOutcome { .. }
+        );
+        if !historical_non_effect
+            && !fences_match_exact(&expected_kernel_fence, &kernel.kernel_fence())
+        {
+            return Err(DaemonError::ProviderAdmission(FabricError::StaleFence(
+                "Kernel fence changed while the solo binding readback was in flight".to_owned(),
+            )));
+        }
+        observation
     };
 
     // The owner validator confirms Governor currentness using Kernel's
     // observed timestamp. M1 binding has no independently current route or
-    // capacity revision, so both outcomes remain before capability
-    // construction and the queue head is preserved for later reconciliation.
+    // capacity revision, so admitted rows remain before capability
+    // construction. Historical terminal/unknown states are surfaced as
+    // typed observations; the exact queue head remains present in all cases.
     match observation {
         eliot_governor::NativeWorkerBindingObservation::Pending {
             claim_id,
             attempt_id,
             operation_id,
             task_id,
+            claim_state,
             observed_at_unix_ms,
         } => Ok(SoloPollOutcome::OwnerBindingPending {
             claim_id,
             attempt_id,
             operation_id,
             task_id,
+            reason: if claim_state.is_some() {
+                SoloBindingPendingReason::ClaimRequested
+            } else {
+                SoloBindingPendingReason::BindingPublicationPending
+            },
             observed_at_unix_ms,
         }),
         eliot_governor::NativeWorkerBindingObservation::GovernorCurrentButProviderRevisionsUnavailable {
@@ -1685,18 +1741,34 @@ pub async fn solo_poll_queue_async(
             task_id,
             observed_at_unix_ms,
         }),
-        eliot_governor::NativeWorkerBindingObservation::Revoked { .. } => {
-            Err(DaemonError::ProviderAdmission(FabricError::Contract(
-                "Governor reports the native-worker binding is revoked; the retained solo item remains blocked"
-                    .to_owned(),
-            )))
-        }
-        eliot_governor::NativeWorkerBindingObservation::UnknownOutcome { .. } => {
-            Err(DaemonError::ProviderAdmission(FabricError::Contract(
-                "Kernel reports an unknown native-worker binding outcome; exact reconciliation is required before retry"
-                    .to_owned(),
-            )))
-        }
+        eliot_governor::NativeWorkerBindingObservation::Revoked {
+            claim_id,
+            attempt_id,
+            operation_id,
+            task_id,
+            observed_at_unix_ms,
+            ..
+        } => Ok(SoloPollOutcome::OwnerBindingRevoked {
+            claim_id,
+            attempt_id,
+            operation_id,
+            task_id,
+            observed_at_unix_ms,
+        }),
+        eliot_governor::NativeWorkerBindingObservation::UnknownOutcome {
+            claim_id,
+            attempt_id,
+            operation_id,
+            task_id,
+            observed_at_unix_ms,
+            ..
+        } => Ok(SoloPollOutcome::OwnerBindingUnknownOutcome {
+            claim_id,
+            attempt_id,
+            operation_id,
+            task_id,
+            observed_at_unix_ms,
+        }),
     }
 }
 
