@@ -90,21 +90,46 @@
 //!   `observed_publication` from the store owner's fenced record, and refuse
 //!   hot firing and Material support unless the outcome is `CommittedCurrent`.
 //! - Neither function has a production caller in `eliotd`, and this cell adds
-//!   none, because no owner produces their required inputs. For
-//!   `evaluate_freshness_admission` the live `eliotd` admission edge
-//!   (`eliotd::kernel_transition_client::check_identity_binding`) holds no
-//!   predicate normal form, no predicate pinned scopes, no expected
-//!   post-commit revision heads, no observed source heads, and no resolved
-//!   provenance or task-selection standing, and no owner maps a transition
-//!   effect ceiling onto [`RequestedEffect`]; evaluation there would be
-//!   `INCOMPLETE` for every real request. For `fetch_committed_candidate` the
-//!   closed `eliot_store_api::NamedReadOperation` catalogue exposes no
-//!   projection-publication read and no candidate-by-handle read, and the one
-//!   production `eliot_store_api::CanonicalReadClient` in `eliotd`
-//!   (`KernelContextReadClient`) activates only `GetRevisionHeads`, so no
-//!   observed publication can reach this cell at runtime. Until those
-//!   producers exist, this cell proves the gate logic only and claims no
-//!   runtime admission, persistence, or publication behavior.
+//!   none, because no owner produces their required inputs. Re-measured on this
+//!   tree by symbol, not inferred:
+//!
+//!   - For `evaluate_freshness_admission` the live `eliotd` admission edge
+//!     (`eliotd::kernel_transition_client::check_identity_binding`) is handed
+//!     only `&[RevisionHeadExpectation]` and `&[OrderingHeadExpectation]` —
+//!     compare-and-swap EXPECTATIONS, read before transport, never observed
+//!     heads. It holds no predicate normal form and no predicate pinned scopes
+//!     (the only two spellings of those coordinates anywhere in the workspace
+//!     are this file's own fields and their test fixture), no observed source
+//!     heads, and no resolved provenance or task-selection standing, and no
+//!     owner maps a transition effect ceiling onto [`RequestedEffect`];
+//!     evaluation there is `INCOMPLETE` for every real request, so a caller
+//!     would be a gate that refuses all traffic.
+//!   - `expected_post_commit_revision_heads` is derivable before the commit —
+//!     the store advances each key by exactly one — but the derivation is
+//!     private and duplicated per adapter, in
+//!     `eliot-store-surreal-adapter::plan::plan_apply_with_payload_authority`
+//!     and `eliot-store-memory`'s `transaction_plan` (each holding its own
+//!     `revision_keys` and `checked_increment` copies). Neither is named by this
+//!     issue's Work, so neither is edited here;
+//!     `WriteReceipt::revision_before_after` is circular at admission because it
+//!     is only observable after the commit the admission is deciding about.
+//!   - For `fetch_committed_candidate` the closed
+//!     `eliot_store_api::NamedReadOperation` catalogue exposes no
+//!     projection-publication read and no candidate-by-handle read. The
+//!     publication records exist durably (`read.projection_publications` in the
+//!     adapter's read boundary) but are reachable only through a
+//!     `WriteReceipt` the store already holds, on a read the catalogue does not
+//!     name; `GetBlackboardItem` is a candidate read that returns a
+//!     `BlackboardItemRecord`, which carries no commit reference, no projection
+//!     kind, and no publication identity, so it is not a source for
+//!     [`CommittedCandidate`]. `KernelContextReadClient` admits no
+//!     publication-shaped read, so no observed publication can reach this cell
+//!     at runtime.
+//!
+//!   Until those producers exist, this cell proves the gate logic only and
+//!   claims no runtime admission, persistence, or publication behavior. Each
+//!   missing input above is a named blocker, not a gap this cell may paper
+//!   over with a stand-in value.
 //!
 //! Like the neighboring admission joins, this helper never mints admission:
 //! it evaluates presented values and returns a disposition.
@@ -555,11 +580,13 @@ pub fn observed_publication<'a>(
 /// projection definition, and a fence whose atomic commit reference disagrees
 /// with the record's atomic data commit. The one clause the record cannot
 /// prove against itself — that it is the publication whose data the caller is
-/// about to serve — stays with the caller, as the store documents. This
-/// function adds exactly the three clauses left over: an empty candidate head
-/// set is never coverage, the projection kind must match exactly, and the
-/// observed dependency definition digest must match exactly, because a bare
-/// definition match is not enough (I5.8).
+/// about to serve — stays with the caller, as the store documents, and this
+/// function is that caller. It adds exactly the four clauses left over: an
+/// empty candidate head set is never coverage, the projection kind must match
+/// exactly, the observed dependency definition digest must match exactly
+/// because a bare definition match is not enough (I5.8), and the record's own
+/// `atomic_data_commit` must be the commit the candidate's data became
+/// visible under.
 #[must_use]
 pub fn publication_serves_candidate(
     publication: &ObservedPublication<'_>,
@@ -572,6 +599,28 @@ pub fn publication_serves_candidate(
         return false;
     }
     if publication.dependency_definition_digest != candidate.dependency_definition_digest {
+        return false;
+    }
+    // I5.8's atomic data/provenance receipt, decided here because the store
+    // documents it as the caller's clause: `FencedProjectionPublication::validate`
+    // proves the fence's `atomic_commit_ref` equals the record's own
+    // `atomic_data_commit`, and `check_current` proves nothing about either of
+    // them. That is self-consistency, not binding. The binding is this
+    // comparison, made BY CONTENT against the ORIGINAL recorded commit
+    // reference — never a digest recomputed over what is held here, and never
+    // the mere well-formedness of `durability_receipt`.
+    //
+    // Without it the clause is reachable and wrong: a publication committed by
+    // an earlier commit — same kind, same currently declared definition, same
+    // dependency definitions, same source generation, same fence-pinned source
+    // heads — reads as current for a candidate whose own commit published no
+    // record for that kind, and the candidate's bytes would be served out of a
+    // publication that never carried them. The store's own read boundary
+    // already refuses that pair at
+    // `eliot-store-surreal-adapter`'s `record.atomic_data_commit != *commit_id`
+    // check; this is the same clause on the Governor read edge, where nothing
+    // else performs it.
+    if publication.fenced.atomic_commit_ref.as_str() != candidate.durability_receipt.as_str() {
         return false;
     }
     publication
@@ -741,6 +790,8 @@ mod tests {
         "2b8c7e401f0d1c620a3b4c9e9d612a5f2b8c7e401f0d1c620a3b4c9e9d612a5f";
     const REBUILT_DEPENDENCY_DIGEST: &str =
         "9d612a5f2b8c7e401f0d1c620a3b4c9e9d612a5f2b8c7e401f0d1c620a3b4c9e";
+    /// The single commit both the candidate and its publication name.
+    const CANDIDATE_COMMIT: &str = "commit-atomic-1";
 
     fn head(scope: &str, revision: &str) -> RevisionHead {
         RevisionHead {
@@ -787,7 +838,11 @@ mod tests {
     fn committed_candidate() -> CommittedCandidate {
         CommittedCandidate {
             handle: "candidate-1".to_owned(),
-            durability_receipt: "receipt-commit-1".to_owned(),
+            // The one commit whose data this candidate is: `publication_serves_candidate`
+            // binds the publication to it by content, so the fixture and the
+            // publication below must name the SAME commit for `CommittedCurrent` to
+            // be reachable at all. A receipt that merely exists proves nothing.
+            durability_receipt: CANDIDATE_COMMIT.to_owned(),
             projection_kind: "cue-index".to_owned(),
             projection_definition_digest: DEFINITION_DIGEST.to_owned(),
             dependency_definition_digest: DEPENDENCY_DIGEST.to_owned(),
@@ -797,7 +852,7 @@ mod tests {
     }
 
     fn current_publication() -> FencedProjectionPublication {
-        let atomic_data_commit = CommitId::new("commit-atomic-1").expect("valid commit id");
+        let atomic_data_commit = CommitId::new(CANDIDATE_COMMIT).expect("valid commit id");
         FencedProjectionPublication {
             record: eliot_store_api::ProjectionPublicationRecord {
                 publication_id: ProjectionPublicationId::new("publication-1")
