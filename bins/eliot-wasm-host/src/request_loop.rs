@@ -64,6 +64,12 @@
 //! - **Execution evidence** is the projected result event sequence; the
 //!   uncertain `Unknown` event and the later containment/reconciliation
 //!   event are separate retained observations, never one rewritten record.
+//!   Each names the command that produced it — the #2785 handover token
+//!   carried as `command_sequence` — so a consumer orders events by the
+//!   command, not by when the loop happened to observe it, and a control
+//!   event admitted from an owner delivery names that exact delivery and the
+//!   acknowledgement the child staged for it (#2786), never an order or an
+//!   identity inferred from arrival.
 //! - **Cleanup evidence** is this loop's own termination record: whether
 //!   the tracked worker was asked to stop, whether its Shutdown reply
 //!   arrived, and whether the thread was actually joined. A clean stop is
@@ -133,6 +139,7 @@ use crate::dispatch_drive::{
 use crate::dispatch_material::{
     ControlAckPhase, ControlFileClass, ExpectedControlBinding, MaterialError,
     ValidatedDispatchMaterial, WASM_CONTROL_ACK_WIRE_ID, WASM_CONTROL_ACK_WIRE_VERSION,
+    WASM_CONTROL_KIND_CANCEL, WASM_CONTROL_KIND_RECONCILE, WASM_CONTROL_KIND_SHUTDOWN,
     WASM_CONTROL_MAX_DETAIL_BYTES, WASM_CONTROL_SPOOL_MAX_DELIVERIES, WASM_CONTROL_SPOOL_SCAN_CAP,
     WASM_HOST_CONTROL_FILE_NAME, WasmControlAck, WasmControlDelivery, WasmControlKind,
     admitted_material_path, control_ack_name, control_delivery_name, join_control_delivery,
@@ -167,7 +174,20 @@ pub const WASM_HOST_RESULT_WIRE_ID: &str = "eliot.wasm.host-result";
 /// bounded `observation_predecessors` field; this producer no longer emits
 /// version 1. Consumers must reject every other version. (Prior emissions
 /// carried the request constant by defect.)
-pub const WASM_HOST_RESULT_WIRE_VERSION: u16 = 2;
+///
+/// Version 3 adds the two exact coordination identities this family was
+/// missing: the observed worker command's own command sequence
+/// ([`WasmHostResultFrame::command_sequence`], issue #2787 S3.5, coordinate
+/// with #2785) and the owner's exact control delivery identity plus the
+/// acknowledgement phase the child actually staged for it
+/// ([`WasmHostResultFrame::delivery_ack`], issue #2787 S6.2, #2786's exact
+/// delivery identity/acknowledgement). Before this version both fields did
+/// not exist, so an event's position in the stream was the arrival order of
+/// the loop's own counter and a control event named no delivery it answered.
+/// An external consumer of version 2 must be migrated: the producer no
+/// longer emits it, and every other version is rejected by
+/// [`validate_frame`].
+pub const WASM_HOST_RESULT_WIRE_VERSION: u16 = 3;
 /// Closed observation phase: the frame observes guest execution.
 pub const RESULT_PHASE_EXECUTE: &str = "execute";
 /// Closed observation phase: the frame observes containment of an uncertain
@@ -182,6 +202,20 @@ pub const RESULT_PHASE_RECONCILE: &str = "reconcile";
 /// stays in the closed vocabulary so a future pre-execution denial frame
 /// cannot masquerade as an execution observation.
 pub const RESULT_PHASE_DENY: &str = "deny";
+/// Closed acknowledgement phase reported on a result event for an owner
+/// delivery the child durably staged an `enqueued` ack for, because its
+/// command reached the worker. Spelled exactly as
+/// [`ControlAckPhase::Enqueued`] serializes, because it names the ack the
+/// child staged, not a new phase invented for the result family.
+///
+/// There is deliberately no `completed` phase here. The child does stage a
+/// `completed` ack when it observes a control outcome, but it does so AFTER
+/// the observation is retained and after this event is projected, so an
+/// emitted event can never attest to an ack that had not been written when
+/// the bytes were produced. An event that observed a control outcome and
+/// names no staged phase therefore says the delivery was never confirmed —
+/// which is exactly what the child knew at emission time.
+pub const ACK_PHASE_ENQUEUED: &str = "enqueued";
 /// Bound on the retained/emitted result-event sequence per operation
 /// (#2787). The follow-up taxonomy admits at most one initial observation
 /// plus one follow-up observation per operation, so two events is the
@@ -721,6 +755,51 @@ fn check_control(binding: &AdmittedBinding, control: &WasmHostControl) -> Result
     Ok(())
 }
 
+/// The exact owner control delivery a control result event answers, and the
+/// acknowledgement phase the child actually staged for it (#2787 S6.2, #2786
+/// exact delivery identity/acknowledgement).
+///
+/// This is a result-family type, not a second ack wire: it carries the
+/// identity the child READ from the owner's validated delivery bytes plus the
+/// phase of the ack it actually staged, so a consumer can join this event to
+/// the exact owner slot and can never read a staged ack as owner acceptance.
+/// It is deliberately separate from [`WasmControlAck`], whose file the owner
+/// writes back in — this travels on the result stream and is never staged as
+/// an ack itself. The loop never generates any of these values: each is
+/// copied from the delivery the child validated, or is the loop's own
+/// observed ack outcome for it.
+///
+/// Every field is absent together or present together: a delivery this
+/// process never read has no identity and therefore no acknowledgement, so
+/// the group is [`Option`] as a whole rather than a struct of empty strings.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlDeliveryAcknowledgement {
+    /// Owner control kind (`cancel`, `reconcile`, `shutdown`) of the
+    /// delivery this event answers.
+    pub control_kind: String,
+    /// Owner sequence of the delivery inside its generation spool.
+    pub owner_sequence: u64,
+    /// Deterministic owner replay key of the delivery (hex).
+    pub replay_key: String,
+    /// Lowercase digest of the exact validated delivery bytes (hex).
+    pub delivery_digest: String,
+    /// Acknowledgement phase the child actually staged for this delivery
+    /// before this event was projected, or `None` while the delivery was
+    /// still unacknowledged at that moment.
+    ///
+    /// The only phase that can be present here is `enqueued` (see
+    /// [`ACK_PHASE_ENQUEUED`]): the child stages its `completed` ack only
+    /// AFTER this event is projected and retained, so an emitted event can
+    /// never attest to a phase that had not been written when these bytes
+    /// were produced. Absence therefore says exactly what the child knew at
+    /// emission time — the delivery was not confirmed yet — and never that an
+    /// ack was refused: a refused delivery never reaches the worker and so
+    /// never produced an observation at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ack_phase: Option<String>,
+}
+
 /// Correlated owner-backed result event (#2787: the one versioned result
 /// contract). Bounded serialization only: the guest output travels as
 /// lowercase hex under the admitted output ceiling, and a frame that would
@@ -741,13 +820,23 @@ fn check_control(binding: &AdmittedBinding, control: &WasmHostControl) -> Result
 /// - a publication failure surfaces through the loop error and the retained
 ///   observation, never as an ad hoc fallback object.
 ///
+/// Every event additionally names the coordination identity of the command
+/// that produced it ([`command_sequence`](Self::command_sequence), the #2785
+/// handover token) and, for a control event admitted from an owner delivery,
+/// the exact delivery it answers and the acknowledgement the child staged
+/// for it ([`delivery_ack`](Self::delivery_ack), #2786). A consumer orders
+/// events by the command that produced them, never by arrival, and joins a
+/// control event to the exact owner spool slot it belongs to.
+///
 /// Consumers must reject mixed versions, duplicate terminal events, sequence
-/// gaps, and contradictory identities. That rejection is not left to a
-/// consumer's own reading of this comment: [`validate_result_stream`] is
-/// exported from this same owner, so a consumer of captured stdout bytes
-/// decodes with this type and rejects with the producer's own validator
-/// instead of re-deriving a weaker local check. The loop itself uses it on
-/// every emission path and on retained-sequence replay republish.
+/// gaps, contradictory command sequences, and contradictory identities. That
+/// rejection is not left to a consumer's own reading of this comment:
+/// [`validate_result_stream`] is exported from this same owner, so a consumer
+/// of captured stdout bytes decodes with this type and rejects with the
+/// producer's own validator instead of re-deriving a weaker local check. The
+/// loop itself uses it on every emission path and on retained-sequence replay
+/// republish.
+///
 /// Absence stays absence per I5.16: `None` serializes absent,
 /// measured zero stays numeric zero, Booleans stay Booleans, and no
 /// formatting helper feeds stringified values back into this contract.
@@ -776,6 +865,24 @@ pub struct WasmHostResultFrame {
     /// this event. The first event has no predecessors; each follow-up names
     /// every retained event before it, bounded by `sequence`.
     pub observation_predecessors: Vec<u64>,
+    /// The observed worker command's OWN command sequence (#2787 S3.5,
+    /// coordinated with #2785) — the `COMMAND_SEQUENCE` correlation token
+    /// this loop stamped on the accepted command handover.
+    ///
+    /// This is the ordering evidence the issue requires and `sequence` is
+    /// not: `sequence` is the loop's own arrival counter over retained
+    /// observations, while this token is assigned by the single command
+    /// handover that produced the observed reply. The two are independent —
+    /// a control follow-up can be requested only after the slot that carried
+    /// the previous token was retired — so a consumer can order events by the
+    /// command that produced them rather than by when they happened to be
+    /// observed, and two events of one operation can never share a token.
+    ///
+    /// `None` for a frame that refuses before any worker command ran: there
+    /// was no handover, so there is no command sequence to report and none is
+    /// invented.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_sequence: Option<u64>,
     /// Whether this event closes the operation's result stream.
     pub terminal: bool,
     /// Operation this frame answers.
@@ -796,11 +903,20 @@ pub struct WasmHostResultFrame {
     pub artifact_digest: String,
     /// Proven input digest.
     pub input_digest: String,
-    /// Opaque #2786 delivery identity passthrough. `None` until the
-    /// delivery/acknowledgement lane binds it; carried as an opaque string,
-    /// never interpreted here.
+    /// The exact owner control delivery this control event answers, with the
+    /// acknowledgement phase the child actually staged for it (#2787 S6.2,
+    /// #2786 exact delivery identity/acknowledgement).
+    ///
+    /// `Some` exactly when the observed worker command came from an
+    /// owner-staged control delivery this process validated: the values are
+    /// copied from that delivery's own bytes, never generated here, so the
+    /// event joins the exact owner spool slot. `None` for the delivery-set
+    /// `Execute` and for a loop-derived follow-up, which answer no owner
+    /// delivery and therefore acknowledge none. A `Some` value reports what
+    /// the CHILD staged locally; it is never owner acceptance, and it never
+    /// authorizes reclaiming that delivery's evidence.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub delivery_id: Option<String>,
+    pub delivery_ack: Option<ControlDeliveryAcknowledgement>,
     /// Seated engine mode identity; `None` when no engine observation
     /// exists (a refusal invents no engine evidence).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -944,6 +1060,7 @@ fn project_result(
         worker_command: Some(command_name(command).to_owned()),
         sequence: 0,
         observation_predecessors: Vec::new(),
+        command_sequence: None,
         terminal: false,
         operation: command_operation(command).to_owned(),
         claim_id: binding.claim_id.clone(),
@@ -954,7 +1071,7 @@ fn project_result(
         component_id: binding.component_id.clone(),
         artifact_digest: binding.artifact_digest.clone(),
         input_digest: binding.input_digest.clone(),
-        delivery_id: None,
+        delivery_ack: None,
         engine_implementation_id: Some(engine.implementation_id.clone()),
         engine_version: Some(engine.exact_version.clone()),
         disposition: disposition_text(result.receipt.disposition),
@@ -1055,10 +1172,94 @@ fn validate_observation_predecessors(frame: &WasmHostResultFrame) -> Result<(), 
     Ok(())
 }
 
+/// Validates the command-coordination half of the result contract (#2787
+/// S3.5).
+///
+/// The rule is a consequence of what the field MEANS, not a new policy: a
+/// command sequence exists only for a frame that observed a worker command,
+/// and that command produced exactly one handover, so an event that observed
+/// a command must carry the token and an event that observed none must not.
+/// A frame claiming the handover of a command it also says never ran is a
+/// contradiction. No value is refused beyond that pairing: the token is the
+/// producer's own [`COMMAND_SEQUENCE`] handover number, and judging its
+/// magnitude would be a policy this contract does not own.
+fn validate_command_coordination(frame: &WasmHostResultFrame) -> Result<(), LoopError> {
+    match (
+        frame.worker_command.is_some(),
+        frame.command_sequence.is_some(),
+    ) {
+        // Observed command with no token: the producer must report the
+        // handover it stamped, never leave the ordering evidence absent.
+        (true, false) | (false, true) => Err(invalid("command-sequence")),
+        (true, true) | (false, false) => Ok(()),
+    }
+}
+
+/// Validates the exact-delivery half of the result contract (#2787 S6.2).
+///
+/// A delivery acknowledgement may only be carried by a control observation:
+/// the delivery-set `Execute` and a loop-derived containment/reconciliation
+/// follow-up answer no owner delivery, so naming one would bind the event to
+/// a delivery slot it never came from. The named delivery must also answer the
+/// SAME control the observed command was: an event that observed a `reconcile`
+/// and names a `cancel` delivery binds two different operations together, which
+/// is the exact contradiction a consumer must not have to detect. Every
+/// identity field is copied from the owner's validated bytes, so each must be
+/// well formed: a control kind from the closed vocabulary, and two lowercase
+/// digests.
+fn validate_delivery_acknowledgement(frame: &WasmHostResultFrame) -> Result<(), LoopError> {
+    let Some(ack) = frame.delivery_ack.as_ref() else {
+        return Ok(());
+    };
+    let control_is_delivery = matches!(
+        frame.operation.as_str(),
+        OP_CANCEL | OP_RECONCILE | OP_SHUTDOWN
+    );
+    if !control_is_delivery || frame.worker_command.is_none() {
+        return Err(invalid("delivery-ack"));
+    }
+    // The delivery's own kind must be the operation this event answers, so
+    // the exact owner spool slot it names is the slot that produced this
+    // command. The operation vocabulary and the owner control vocabulary are
+    // the same three words, one `to_owned` mapping each.
+    let expected_kind = match frame.operation.as_str() {
+        OP_CANCEL => WASM_CONTROL_KIND_CANCEL,
+        OP_RECONCILE => WASM_CONTROL_KIND_RECONCILE,
+        _ => WASM_CONTROL_KIND_SHUTDOWN,
+    };
+    if ack.control_kind != expected_kind {
+        return Err(invalid("delivery-ack"));
+    }
+    for digest in [ack.replay_key.as_str(), ack.delivery_digest.as_str()] {
+        if !is_lowercase_hex_digest(digest) {
+            return Err(invalid("delivery-ack"));
+        }
+    }
+    // The closed phase vocabulary is `enqueued` and absence. A `completed`
+    // phase is not accepted because the child stages that ack only after this
+    // event is projected, so an event could never attest to it truthfully.
+    match ack.ack_phase.as_deref() {
+        Some(ACK_PHASE_ENQUEUED) | None => Ok(()),
+        Some(_) => Err(invalid("delivery-ack")),
+    }
+}
+
+/// Whether a value is a lowercase hexadecimal digest of the exact length this
+/// codebase records for one (64 hex characters, i.e. SHA-256). An uppercase
+/// or truncated value never came from a digest, so it is refused rather than
+/// normalized.
+fn is_lowercase_hex_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
 /// Validates one result frame's internal consistency before emission
 /// (#2787 step 5): wire identity/version, closed operation/phase/command
 /// vocabulary and their agreement, sequence bound and complete ordered
-/// predecessor prefix, output
+/// predecessor prefix, the command-sequence and delivery-acknowledgement
+/// coordination bindings, output
 /// digest/length/hex agreement and omission semantics, and engine-evidence
 /// bindings. A frame that cannot prove itself is never emitted; a refusal
 /// carries its exact phase with no invented engine, usage, or output
@@ -1112,6 +1313,8 @@ pub fn validate_frame(frame: &WasmHostResultFrame) -> Result<(), LoopError> {
     if !phase_matches_command {
         return Err(invalid("phase-command"));
     }
+    validate_command_coordination(frame)?;
+    validate_delivery_acknowledgement(frame)?;
     if frame.claim_id.is_empty()
         || frame.operation_id.is_empty()
         || frame.invocation_id.is_empty()
@@ -1226,9 +1429,10 @@ fn validate_lifecycle_vocabulary(frame: &WasmHostResultFrame) -> Result<(), Loop
 ///
 /// Returns [`LoopError::ResultInvalid`] when any event fails
 /// [`validate_frame`], when the stream mixes wire identities or versions, when
-/// `sequence` values are not gapless from 0, when more than one event is
-/// terminal or none closes the stream, or when the parent identities disagree
-/// across events.
+/// `sequence` values are not gapless from 0, when command sequences do not
+/// strictly increase (#2787 S3.5), when more than one event is terminal or
+/// none closes the stream, or when the parent identities disagree across
+/// events.
 pub fn validate_result_stream(events: &[WasmHostResultFrame]) -> Result<(), LoopError> {
     let Some(first) = events.first() else {
         return Err(invalid("result-stream"));
@@ -1237,6 +1441,7 @@ pub fn validate_result_stream(events: &[WasmHostResultFrame]) -> Result<(), Loop
         validate_frame(event)?;
     }
     let mut terminal_seen = false;
+    let mut previous_command: Option<u64> = None;
     for (index, event) in events.iter().enumerate() {
         if event.wire_id != WASM_HOST_RESULT_WIRE_ID {
             return Err(invalid("wire-id"));
@@ -1248,6 +1453,19 @@ pub fn validate_result_stream(events: &[WasmHostResultFrame]) -> Result<(), Loop
         if event.sequence != expected {
             return Err(invalid("sequence-gap"));
         }
+        // Command order (#2787 S3.5): each observation's handover token must
+        // be strictly greater than its predecessor's. The bound-1 command
+        // slot means two observations can never share one handover, and the
+        // loop can only request a follow-up after the previous slot was
+        // retired, so a repeat or a step backwards is a contradiction a
+        // consumer must reject rather than reorder. The check is against the
+        // ORIGINAL recorded values, not against arrival position.
+        if let Some(token) = event.command_sequence
+            && previous_command.is_some_and(|previous| token <= previous)
+        {
+            return Err(invalid("command-sequence"));
+        }
+        previous_command = event.command_sequence.or(previous_command);
         if event.request_digest != first.request_digest
             || event.operation_id != first.operation_id
             || event.claim_id != first.claim_id
@@ -1360,6 +1578,7 @@ fn denial_frame(
         worker_command: worker_command.map(|command| command_name(command).to_owned()),
         sequence: 0,
         observation_predecessors: Vec::new(),
+        command_sequence: None,
         terminal: false,
         operation: operation.to_owned(),
         claim_id: binding.claim_id.clone(),
@@ -1370,7 +1589,7 @@ fn denial_frame(
         component_id: binding.component_id.clone(),
         artifact_digest: binding.artifact_digest.clone(),
         input_digest: binding.input_digest.clone(),
-        delivery_id: None,
+        delivery_ack: None,
         engine_implementation_id: None,
         engine_version: None,
         disposition: "Rejected".to_owned(),
@@ -1419,6 +1638,7 @@ fn unknown_frame(
         worker_command: worker_command.map(|command| command_name(command).to_owned()),
         sequence: 0,
         observation_predecessors: Vec::new(),
+        command_sequence: None,
         terminal: false,
         operation: operation.to_owned(),
         claim_id: binding.claim_id.clone(),
@@ -1429,7 +1649,7 @@ fn unknown_frame(
         component_id: binding.component_id.clone(),
         artifact_digest: binding.artifact_digest.clone(),
         input_digest: binding.input_digest.clone(),
-        delivery_id: None,
+        delivery_ack: None,
         engine_implementation_id: None,
         engine_version: None,
         disposition: UNCERTAIN_DISPOSITION.to_owned(),
@@ -1539,6 +1759,22 @@ pub trait WasmHostRequestChannel {
     /// being dropped or admitted twice (issue #2785 P1/W2). The default has
     /// no external source and has nothing to release.
     fn release_control(&mut self) {}
+
+    /// Reports the exact owner delivery identity the child holds for the
+    /// control command it has enqueued for `operation`, together with the
+    /// acknowledgement phase already staged for it (#2787 S6.2).
+    ///
+    /// This is a read of the reader's own custody state, not a write and not
+    /// an acknowledgement: nothing is staged, nothing is confirmed, and a
+    /// `None` means this source never validated an owner delivery for that
+    /// operation — so the result event names no delivery and none is
+    /// invented. The default has no external source and reports none.
+    fn accepted_control_delivery(
+        &self,
+        _operation: &str,
+    ) -> Option<ControlDeliveryAcknowledgement> {
+        None
+    }
 
     /// Dispositions the last polled frame as refused for `detail`: the child
     /// itself could not admit it. This is the terminal typed disposition,
@@ -2440,10 +2676,79 @@ impl KernelControlReader {
         };
         self.stage_ack(accepted.generation, accepted.sequence, &ack)?;
         // The delivery is terminal: its exact outcome is recorded, so the
-        // custody slot and any un-staged `enqueued` write it still owed are
+        // custody slot and any un-staged `enqueued` ack it still owed are
         // both released.
         self.accepted = None;
         Ok(())
+    }
+
+    /// Reports the exact delivery identity and staged acknowledgement for the
+    /// custody slot this reader currently holds for `operation` (#2787
+    /// S6.2).
+    ///
+    /// It reads only what the reader itself recorded: the delivery's own
+    /// validated bytes, and the phase derived from the reader's own ack state
+    /// — never a phase assumed because a command happened to run. The
+    /// enqueue-confirmed [`Self::accepted`] slot outranks the transient
+    /// pending slot, exactly as it does in [`Self::confirm_completed`], so a
+    /// delivery whose outcome the child is about to observe is the one named.
+    /// A `None` means this reader holds no spool delivery for that operation —
+    /// the command was loop-derived, or arrived over the legacy fixed file
+    /// that carries no owner identity — and the result event then names none.
+    fn accepted_delivery(&self, operation: &str) -> Option<ControlDeliveryAcknowledgement> {
+        // The enqueue-confirmed [`Self::accepted`] slot outranks the transient
+        // slots, exactly as it does in [`Self::confirm_completed`], so a
+        // delivery whose outcome the child is about to observe is the one
+        // named. Its identity is read directly off the retained slot rather
+        // than rebuilt as a `PendingControl`, because the slot already holds
+        // exactly those values.
+        if let Some(accepted) = self
+            .accepted
+            .as_ref()
+            .filter(|accepted| control_operation(accepted.kind) == operation)
+        {
+            // The `enqueued` ack for this exact delivery was durably staged
+            // (an un-staged one is retried by the next bounded poll, so a
+            // false value here means the write is still owed and nothing is
+            // claimed).
+            return Some(ControlDeliveryAcknowledgement {
+                control_kind: accepted.kind.as_str().to_owned(),
+                owner_sequence: accepted.sequence,
+                replay_key: accepted.replay_key.clone(),
+                delivery_digest: accepted.delivery_digest.clone(),
+                ack_phase: accepted.ack_staged.then(|| ACK_PHASE_ENQUEUED.to_owned()),
+            });
+        }
+        // No confirmed delivery: the retained `Shutdown` slot outranks the
+        // transient pending one, because its enqueue is proven in the drain
+        // and not on the tick that yielded it. Either slot names the delivery
+        // only when it really is a spool delivery — the legacy fixed file
+        // carries no owner identity, so it names none.
+        let control = self
+            .shutdown
+            .as_ref()
+            .filter(|shutdown| shutdown.operation() == operation)
+            .or_else(|| {
+                self.pending
+                    .as_ref()
+                    .filter(|pending| pending.operation() == operation)
+            })?;
+        match control {
+            PendingControl::Spool {
+                kind,
+                sequence,
+                replay_key,
+                delivery_digest,
+                ..
+            } => Some(ControlDeliveryAcknowledgement {
+                control_kind: kind.as_str().to_owned(),
+                owner_sequence: *sequence,
+                replay_key: replay_key.clone(),
+                delivery_digest: delivery_digest.clone(),
+                ack_phase: None,
+            }),
+            PendingControl::Legacy { .. } => None,
+        }
     }
 
     /// Stages one ack at its exact generation/sequence name.
@@ -2695,6 +3000,12 @@ impl WasmHostRequestChannel for DeliverySetChannel {
         }
     }
 
+    fn accepted_control_delivery(&self, operation: &str) -> Option<ControlDeliveryAcknowledgement> {
+        self.control
+            .as_ref()
+            .and_then(|reader| reader.accepted_delivery(operation))
+    }
+
     fn poll_control_urgent(&mut self) -> Result<Option<WasmHostRequestFrame>, LoopError> {
         match self.control.as_mut() {
             Some(reader) => Ok(reader.poll_urgent()),
@@ -2777,6 +3088,22 @@ fn command_name(command: WorkerCommand) -> &'static str {
         WorkerCommand::Shutdown => "shutdown",
     }
 }
+
+/// The exact coordination identity of one command the worker accepted
+/// (#2787 S3.5/S6.2).
+///
+/// `CommandDelivery::Accepted` already holds the #2785 handover token, and
+/// the channel reader holds #2786's exact owner delivery identity for the
+/// command it enqueued from one. This pairs the two so a result event reports
+/// the command that PRODUCED it, instead of inferring its position from when
+/// the loop happened to observe it.
+///
+/// It is read while the accepted slot still holds that command and is never
+/// reconstructed afterwards: an event whose handover token is not held here
+/// records no command sequence rather than guessing one. A `delivery` of
+/// `None` is not a missing value but a fact — that command answered no owner
+/// delivery, so it acknowledges none.
+type ObservedCommandIdentity = Option<(u64, Option<ControlDeliveryAcknowledgement>)>;
 
 impl std::str::FromStr for WorkerCommand {
     type Err = ();
@@ -3376,12 +3703,30 @@ impl BoundedRequestLoop {
 
     /// The command the command channel accepted and whose exact reply is
     /// still owed, or `None` when no command is outstanding. The
-    /// correlation token is deliberately not readable here: the bound-1
     /// single-slot worker can only ever reply to the command it was handed,
-    /// so the slot itself is the correlation.
+    /// so the slot itself is the correlation; the #2785 handover token that
+    /// command additionally carries is read by
+    /// [`Self::accepted_command_sequence`] (#2787 S3.5).
     fn accepted_command(&self) -> Option<WorkerCommand> {
         match self.delivery {
             Some(CommandDelivery::Accepted { command, .. }) => Some(command),
+            _ => None,
+        }
+    }
+
+    /// The #2785 handover correlation token of the accepted command, or `None`
+    /// when no command is outstanding.
+    ///
+    /// This is the ordering evidence a result event carries as
+    /// [`WasmHostResultFrame::command_sequence`]: it is stamped by
+    /// [`Self::send`] on the one command handover the worker received, so two
+    /// observations of one operation can never name the same token, and a
+    /// consumer orders events by the command that produced them rather than
+    /// by arrival. It is read while the accepted slot still holds that
+    /// command, and never guessed afterwards.
+    fn accepted_command_sequence(&self) -> Option<u64> {
+        match self.delivery {
+            Some(CommandDelivery::Accepted { token, .. }) => Some(token),
             _ => None,
         }
     }
@@ -3396,7 +3741,18 @@ impl BoundedRequestLoop {
     /// through its owners, after authority closed it is contained once, and
     /// either way the original operation identity is retained for the
     /// owner-side reconciliation record rather than reissued.
-    fn on_outcome(&mut self, outcome: WorkerOutcome) -> Option<WasmHostResultFrame> {
+    ///
+    /// `identity` is the coordination identity of the command whose reply
+    /// this is (#2787 S3.5/S6.2). The caller reads it from the accepted
+    /// command slot BEFORE that slot is retired here, so the event carries
+    /// the handover token of the command that produced it and the exact
+    /// owner delivery it answers — never an order inferred from arrival, and
+    /// never a delivery identity the command did not come from.
+    fn on_outcome(
+        &mut self,
+        outcome: WorkerOutcome,
+        identity: ObservedCommandIdentity,
+    ) -> Option<WasmHostResultFrame> {
         // The accepted command's own reply settled, so interruption demand
         // for that execution is moot: a still-staged Cancel is re-demanded
         // by the next urgent tick while a command stays accepted, and the
@@ -3441,6 +3797,16 @@ impl BoundedRequestLoop {
             .flatten()
             .map(|previous| previous.sequence)
             .collect();
+        // The event's own coordination identity, read from the accepted
+        // command that produced it (#2787 S3.5/S6.2). It is applied before
+        // the budget check so an identity ever larger than the frame budget
+        // is caught by the same omission rule as any other field, and before
+        // the event joins the retained sequence so the durable record carries
+        // it too.
+        if let Some((command_sequence, delivery)) = identity {
+            frame.command_sequence = Some(command_sequence);
+            frame.delivery_ack = delivery;
+        }
         frame = enforce_frame_budget(frame, self.binding.max_output_bytes);
         self.next_sequence = self.next_sequence.saturating_add(1);
         self.admission.one_shot_spent = true;
@@ -3626,6 +3992,21 @@ impl BoundedRequestLoop {
             .flatten()
             .map(|previous| previous.sequence)
             .collect();
+        // The lost command's own coordination identity (#2787 S3.5/S6.2),
+        // read from the accepted slot that still holds it: the loss is
+        // attributed to the exact command whose reply never arrived, not to
+        // the operation as a whole. A `Shutdown` loss projects the demand
+        // itself with no worker command, so it names neither a command
+        // sequence nor a delivery — a frame that claims no worker command ran
+        // cannot also claim the handover of one.
+        if worker_command.is_some()
+            && let Some((command_sequence, delivery)) = self
+                .accepted_command_sequence()
+                .map(|token| (token, channel.accepted_control_delivery(operation)))
+        {
+            frame.command_sequence = Some(command_sequence);
+            frame.delivery_ack = delivery;
+        }
         frame = enforce_frame_budget(frame, self.binding.max_output_bytes);
         frame.terminal = true;
         self.next_sequence = self.next_sequence.saturating_add(1);
@@ -4655,6 +5036,16 @@ fn consume_worker_outcome(
     // before the accepted slot is retired, because only an owner-sourced
     // command may be completed against one (issue #2896 A2/A3).
     let owner = state.accepted_owner_delivery();
+    // The command's coordination identity (#2787 S3.5/S6.2), read from the
+    // accepted slot while it still holds that command and before the slot is
+    // retired below. An owner-sourced command names the exact delivery the
+    // channel reader holds for it, with the acknowledgement phase the reader
+    // itself recorded. A command from no owner delivery names the handover it
+    // really had and acknowledges no delivery.
+    let identity = state.accepted_command_sequence().map(|token| {
+        let delivery = channel.accepted_control_delivery(command_operation(command));
+        (token, delivery)
+    });
     // The accepted command's own reply settled, so that accepted slot is
     // retired BEFORE the outcome is observed (issue #2785 audit, defect 1).
     // `on_outcome` may run `settle_uncertain -> request_follow_up`, and that
@@ -4665,7 +5056,7 @@ fn consume_worker_outcome(
     //
     // The preceding equality check must remain before this mutation.
     state.delivery = None;
-    let frame = state.on_outcome(outcome);
+    let frame = state.on_outcome(outcome, identity);
     // Preserve any Requested(Cancel/Reconcile) created by on_outcome: the
     // slot now holds that successor, never the command just settled.
     if let Some(frame) = frame.as_ref() {
@@ -4846,9 +5237,18 @@ fn observe_residual_outcome(
         state.record_residual(denied("uncorrelated-outcome"));
         return;
     }
+    // The command's coordination identity (#2787 S3.5/S6.2), read from the
+    // accepted slot while it still holds that command. The phase is whatever
+    // the channel reader itself recorded; this supervisor completes no owner
+    // delivery — it owns no command sender, so it stages no `completed` ack —
+    // and therefore never claims one.
+    let identity = state.accepted_command_sequence().map(|token| {
+        let delivery = channel.accepted_control_delivery(command_operation(outcome.command));
+        (token, delivery)
+    });
     // The preceding equality check must remain before this mutation.
     state.delivery = None;
-    let frame = state.on_outcome(outcome);
+    let frame = state.on_outcome(outcome, identity);
     // The observation's follow-up is only reachable through a command
     // sender, and this supervisor owns none. Retiring the request and
     // recording it as unresolved keeps the late observation honest: the

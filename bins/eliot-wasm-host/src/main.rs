@@ -147,13 +147,19 @@ fn main() {
         //
         // The consequence is recorded rather than left implicit: the
         // consumer-side rejection rule (mixed versions, duplicate terminal
-        // events, sequence gaps, contradictory identities) is exported from
-        // the same owner as the schema, as
-        // `eliot_wasm_host::validate_result_stream`, so the first external
-        // consumer of this wire family decodes with `WasmHostResultFrame`
-        // and rejects with the producer's own validator instead of
-        // re-deriving a weaker local check. `emit_receipt` stays for the
-        // separate experimental describe mode only.
+        // events, sequence gaps, contradictory command sequences,
+        // contradictory identities) is exported from the same owner as the
+        // schema, as `eliot_wasm_host::validate_result_stream`, so the first
+        // external consumer of this wire family decodes with
+        // `WasmHostResultFrame` and rejects with the producer's own validator
+        // instead of re-deriving a weaker local check. That consumer must be
+        // written against the current `WASM_HOST_RESULT_WIRE_VERSION`:
+        // every event now names the command that produced it
+        // (`command_sequence`, the #2785 handover token), and a control event
+        // admitted from an owner delivery names that exact delivery and the
+        // acknowledgement the child staged for it (`delivery_ack`, #2786).
+        // `emit_receipt` stays for the separate experimental describe mode
+        // only.
         Ok(_) => {}
         Err(error) => {
             emit_error("KERNEL_ADMISSION_REQUIRED", &error.to_string());

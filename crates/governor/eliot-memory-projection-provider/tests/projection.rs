@@ -112,13 +112,14 @@ fn request(observations: Vec<AdmittedMemoryObservation>) -> ProjectionRequest {
         projection_revision: 3,
         denominator_total: observations.len(),
         observations,
-        // Minimal fixture completion only: the request gained the two
+        // Minimal fixture completion only: the request gained the three
         // continuity fields, so an empty, view-less read keeps the single-read
         // contract `denominator_total == observations.len()` and every
         // existing assertion below it is unchanged. No test was added,
         // removed, or weakened.
         continuity: vec![],
         workflow_view: None,
+        workflow_continuity: None,
     }
 }
 
