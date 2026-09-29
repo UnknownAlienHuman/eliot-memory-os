@@ -194,6 +194,81 @@ impl DestinationManifestEvidence {
         }
         Ok(())
     }
+
+    /// The owner-issued producer: the Kernel projection of the Host-side active
+    /// manifest binding (issue #962, AUDIT-7; I5.13 `full_recovery` manifest;
+    /// A13.7 provenance and integrity).
+    ///
+    /// The three values are the ones the Host manifest binding issues — the
+    /// active manifest's own configuration digest, the manifest-bound runtime
+    /// roots' own digest, and the registry revision observed at inspection time
+    /// — and this function's whole job is to bind them to the KERNEL's work root
+    /// without recomputing, reinterpreting or defaulting any of them. The Host
+    /// roots type is not a parameter and could not be: it stays in the Host owner,
+    /// and this is the verifiable projection of it, exactly as the type's own doc
+    /// states. Nothing here mints a Host binding, and nothing here can substitute
+    /// for one — a caller with three strings still names the Host binding as the
+    /// issuer.
+    ///
+    /// ## What is decided here, and what is deliberately decided elsewhere
+    ///
+    /// DECIDED HERE, by reusing the checks this type already owns:
+    ///
+    /// - digest shape. The constructed value is passed to
+    ///   [`Self::validate`], which is the type's single 64-hex rule. No second
+    ///   shape rule is added, and a value that the restore owner would later
+    ///   refuse is refused at issue instead of after it was pinned.
+    /// - "the work root is the Kernel's own root, never caller text". The root
+    ///   is resolved with `canonicalize` at issue, so what is admitted, pinned
+    ///   into [`PinnedDestinationAdmission`] and persisted is the resolved
+    ///   object rather than the caller's spelling of it; a relative root refuses
+    ///   before that, and a root that does not exist refuses rather than being
+    ///   recorded as a fact about a directory nobody proved.
+    ///
+    /// DECIDED AT RESTORE ENTRY, and therefore NOT repeated here: whether the
+    /// canonicalised root equals `KernelBackupRestore`'s own work root
+    /// (`KernelBackupRestore::restore`, this crate's `backup_restore.rs`), and
+    /// whether an archive that carries a `config` artifact carries one whose
+    /// digest is the admitted `manifest_digest`. Both belong to the restore owner
+    /// because only it knows the Kernel's work root and the archive under
+    /// restore. Copying either check here would produce a second rule that could
+    /// drift from the one that actually gates effects.
+    ///
+    /// DECIDED AT PREPARE AND AFTER, and therefore NOT repeated here: the pin to
+    /// [`DESTINATION_ADMISSION_FILE`]. The prepare phase writes the admitted
+    /// values, and every post-prepare effect re-verifies the pin and refuses drift
+    /// (`backup_restore.rs`). The drift rule is a property of that durable pin,
+    /// not of the moment of issue.
+    ///
+    /// `registry_revision` is a point-in-time observation carried as data. It is
+    /// not a fence: it can advance the instant after this returns, and nothing
+    /// downstream may read the admitted revision as "the revision during
+    /// restore". Comparing the observed revision against a later one is the
+    /// composition's decision, made where the Host is reachable.
+    pub fn issue_from_owner_manifest(
+        manifest_digest: &str,
+        roots_digest: &str,
+        registry_revision: u64,
+        kernel_work_root: &Path,
+    ) -> Result<Self, KernelRestoreError> {
+        if !kernel_work_root.is_absolute() {
+            return Err(KernelRestoreError::InvalidInput {
+                field: "restore.kernel_work_root",
+                reason: "the admitted work root must be absolute",
+            });
+        }
+        let evidence = Self {
+            manifest_digest: manifest_digest.to_owned(),
+            roots_digest: roots_digest.to_owned(),
+            registry_revision,
+            kernel_work_root: std::fs::canonicalize(kernel_work_root)
+                .map_err(|error| KernelRestoreError::DestinationInvalid(error.to_string()))?,
+        };
+        // The type's own validator is the only shape rule: digests must be 64-hex
+        // and the admitted root must be an existing absolute directory.
+        evidence.validate()?;
+        Ok(evidence)
+    }
 }
 
 fn is_hex64(value: &str) -> bool {
@@ -461,7 +536,8 @@ pub fn require_production_admitted(
 /// ORS recovery, Watchdog spool, Blob, installation identity) arrive as
 /// evidence obligations in the finalized receipt, never as live handles in
 /// this struct. The issues that delivered those owner sides — #952 (PR #3881),
-/// #953 (PR #3833), #955 (PR #2716), #956 (PR #2435) and #958 (PR #3879) — are
+/// #953 (PR #3833), #955 (PR #2716), #956 (PR #2435) and #958 (PR #3879, whose
+/// destination-evidence producer this file now carries) — are
 /// coordination history, not code in this repository: what is absent is the
 /// Kernel-side producer of the corresponding evidence, not the owner itself.
 /// Nothing on this struct's behalf is proved by those merge records.
@@ -476,11 +552,17 @@ pub struct RestorePorts<'a> {
     pub blob_scope: Option<&'a eliot_backup::DestinationScope>,
     /// Owner-approved destination manifest evidence.
     ///
-    /// The issuing owner is the Host-side manifest binding that merged as PR
-    /// #3879 (issue #958). #958 is CLOSED: it delivered the Host-side
-    /// preparation owner, and it did NOT deliver a producer of this Kernel-side
-    /// value, so this is a record of provenance, not an open blocker and not a
-    /// claim that an emitter exists.
+    /// The issuing owner is the Host-side manifest binding (#958), reached as the
+    /// three owner-issued values
+    /// [`DestinationManifestEvidence::issue_from_owner_manifest`] binds. #958
+    /// delivered the Host-side preparation owner and the owner lease reference,
+    /// audit note and purge-ledger revision; the Kernel-side producer of this
+    /// value is #962/AUDIT-7 and lives in this file, so the value is now
+    /// constructible from owner evidence rather than only describable.
+    ///
+    /// `None` is a supported shape, not an absent one: it is a bundle with no Host
+    /// admission, which is the rehearsal-without-admission case the
+    /// [`DestinationManifestEvidence`] doc names.
     pub manifest_evidence: Option<DestinationManifestEvidence>,
     /// Rehearsal mode: isolated import runs, but cutover refuses and no
     /// activation, retirement, or effect unblocking exists on any path.
@@ -499,6 +581,71 @@ impl RestorePorts<'_> {
             evidence.validate()?;
         }
         Ok(())
+    }
+}
+
+impl<'a> RestorePorts<'a> {
+    /// Returns this per-execution bundle carrying the owner-issued destination
+    /// evidence, built by [`DestinationManifestEvidence::issue_from_owner_manifest`]
+    /// (issue #962, AUDIT-7).
+    ///
+    /// This is the wiring point for the owner-issued evidence: the journal
+    /// admission on a bundle is replaced by the value the durable owner issued
+    /// for this exact plan (`admitted_restore_ports` in `backup_restore.rs`,
+    /// called from [`KernelBackupRestore`](super::backup_restore::KernelBackupRestore)'s
+    /// production entry) because the Kernel re-issues that value itself. The
+    /// destination manifest evidence is the opposite case — nothing on the
+    /// Kernel side observes the Host's manifest binding, so the Kernel cannot
+    /// re-issue it, and the only honest thing it can do is admit the owner value
+    /// the composition received. So the field is populated HERE, once, from the
+    /// owner's three values plus the Kernel's own work root, and every later read
+    /// of the bundle sees one producer rather than a value assembled at the point
+    /// of use.
+    ///
+    /// Every other field moves across unchanged, so the ONLY difference between
+    /// the bundle the composition presented and the bundle the restore runs on is
+    /// the destination evidence, and that one field is owner-issued. Nothing is
+    /// defaulted and nothing is dropped: absent key material or blob scope stays
+    /// absent, and the rehearsal posture is untouched.
+    ///
+    /// ## Why `None` is a supported answer and is not repaired here
+    ///
+    /// A bundle whose `manifest_evidence` is `None` is a bundle with **no Host
+    /// admission** — the rehearsal-without-admission shape the type's own doc names.
+    /// That is not a missing value to fill in: isolated import still runs under
+    /// it, prepare writes no [`DESTINATION_ADMISSION_FILE`] pin, and cutover
+    /// qualification refuses for want of a pinned owner-approved admission. A
+    /// caller that holds Host admission calls this method; a caller that does not
+    /// simply keeps the `None` it has, and the gate is what makes the difference
+    /// observable instead of guessed. This method therefore never invents an
+    /// evidence value to fill the gap, and it never clears an existing one.
+    ///
+    /// The rehearsal flag is deliberately NOT a reason to refuse. A rehearsal that
+    /// *does* hold Host admission is a supported shape: it carries this evidence,
+    /// pins it at prepare, and is still structurally unable to become a cutover
+    /// candidate, because [`PinnedDestinationAdmission`] pins the rehearsal posture
+    /// beside the evidence and refuses a continuation that changes either.
+    pub fn with_owner_destination_evidence(
+        &self,
+        manifest_digest: &str,
+        roots_digest: &str,
+        registry_revision: u64,
+        kernel_work_root: &Path,
+    ) -> Result<Self, KernelRestoreError> {
+        let evidence = DestinationManifestEvidence::issue_from_owner_manifest(
+            manifest_digest,
+            roots_digest,
+            registry_revision,
+            kernel_work_root,
+        )?;
+        Ok(Self {
+            journal_admission: self.journal_admission,
+            kernel_fence: self.kernel_fence,
+            keys: self.keys,
+            blob_scope: self.blob_scope,
+            manifest_evidence: Some(evidence),
+            rehearsal: self.rehearsal,
+        })
     }
 }
 
