@@ -2244,6 +2244,160 @@ impl GovernorInquiryAdmissionRequest {
     pub const REQUEST_KIND: &'static str = "inquiry_profile_admission";
 }
 
+/// One required independence dimension, measured over the eligible set.
+///
+/// The measurement is deliberately *not* a count. A count is exactly the shape
+/// that lets ten pages from one vendor read as ten independent sources, so each
+/// dimension is reported as the partition it actually imposes plus the
+/// dimension-specific unknown linkage, and the requirement is checked against the
+/// partition rather than against a score. Unknown linkage is preserved inside
+/// the partition and never folded into it, so a member whose family cannot be
+/// established cannot contribute a group to any of these.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndependenceDimensionMeasurement {
+    /// The dimension this partition was measured on.
+    pub dimension: IndependenceDimension,
+    /// Distinct group identities the eligible members fall into, sorted. Two
+    /// members in the same group are dependent on this dimension.
+    pub groups: Vec<String>,
+    /// Eligible handles whose group on this dimension could not be
+    /// established. They are excluded from `groups` and never counted as
+    /// independent support.
+    pub unknown_handles: Vec<String>,
+    /// Number of groups the requirement for this dimension demands, or zero when
+    /// the requirement names none for this dimension.
+    pub required_groups: u64,
+    /// Whether the observed partition meets the dimension's own requirement.
+    ///
+    /// `false` whenever any group on this dimension is unknown, because an
+    /// unestablished group is missing evidence rather than an extra group.
+    pub meets_requirement: bool,
+    /// Digest over the measurement shape.
+    pub digest: String,
+}
+
+impl IndependenceDimensionMeasurement {
+    /// Measures one dimension over the eligible handles and their records.
+    ///
+    /// The group identity of a handle is read from the exact vetted record on
+    /// the one input that can establish it, and a handle with no record or no
+    /// value on that input lands in `unknown_handles` rather than being given a
+    /// group of its own. Duplication therefore never adds a group: two members
+    /// that restate one primary work share the work's own group identity, and
+    /// two members read off one evaluator share the evaluator's.
+    #[must_use]
+    fn measure(
+        dimension: IndependenceDimension,
+        eligible: &[String],
+        records: &BTreeMap<String, SourceRecord>,
+        required_groups: u64,
+    ) -> Self {
+        let (mut groups, mut unknown_handles) = independent_groups(dimension, eligible, records);
+        groups.sort();
+        groups.dedup();
+        unknown_handles.sort();
+        unknown_handles.dedup();
+        let observed = u64::try_from(groups.len()).unwrap_or(u64::MAX);
+        // A zero requirement means the declared profile named no minimum on this
+        // axis, so the axis is measured and published but nothing is demanded of
+        // it. A non-zero one is satisfied only by distinct known groups: an
+        // unknown group is missing evidence, never an extra group.
+        let meets_requirement =
+            required_groups == 0 || (unknown_handles.is_empty() && observed >= required_groups);
+        let mut measurement = Self {
+            dimension,
+            groups,
+            unknown_handles,
+            required_groups,
+            meets_requirement,
+            digest: String::new(),
+        };
+        measurement.digest = measurement.compute_digest();
+        measurement
+    }
+
+    fn compute_digest(&self) -> String {
+        let mut preimage = String::from("independence-dimension/v1;");
+        push_field(&mut preimage, "dimension", self.dimension.wire_name());
+        push_count(&mut preimage, "groups", self.groups.len());
+        for group in &self.groups {
+            push_field(&mut preimage, "group", group);
+        }
+        push_count(&mut preimage, "unknown_handles", self.unknown_handles.len());
+        for handle in &self.unknown_handles {
+            push_field(&mut preimage, "unknown_handle", handle);
+        }
+        push_field(
+            &mut preimage,
+            "required_groups",
+            &self.required_groups.to_string(),
+        );
+        push_field(
+            &mut preimage,
+            "meets_requirement",
+            bool_text(self.meets_requirement),
+        );
+        freeze(&preimage)
+    }
+}
+
+/// The group identity one eligible handle falls into on one dimension, or
+/// `None` when the vetted record behind it establishes none.
+///
+/// Each dimension reads the single record field that can actually establish it,
+/// rather than a projection of the lineage root: a provider family and an
+/// evaluator family are facts about *how* the material was produced, and a
+/// shared context ancestor is a fact about what the material descends from.
+/// Falling back to the lineage root for those three would make a shared
+/// evaluator look like a shared source and would let a source-family
+/// measurement stand in for the other four.
+fn independent_groups(
+    dimension: IndependenceDimension,
+    eligible: &[String],
+    records: &BTreeMap<String, SourceRecord>,
+) -> (Vec<String>, Vec<String>) {
+    let mut groups = Vec::new();
+    let mut unknown_handles = Vec::new();
+    for handle in eligible {
+        let Some(record) = records.get(handle) else {
+            unknown_handles.push(handle.clone());
+            continue;
+        };
+        let group: Option<String> = match dimension {
+            IndependenceDimension::SourceFamily => record.lineage_root.clone(),
+            IndependenceDimension::ProviderFamily => record.provider_family.clone(),
+            IndependenceDimension::EvaluatorFamily => record.evaluator_family.clone(),
+            IndependenceDimension::SharedContextAncestor => record.transformed_from.clone(),
+            IndependenceDimension::SharedAssumptions => shared_assumption_group(record),
+        };
+        match group {
+            Some(group) => groups.push(group),
+            None => unknown_handles.push(handle.clone()),
+        }
+    }
+    (groups, unknown_handles)
+}
+
+/// The group identity shared-assumption independence falls into for one record.
+///
+/// Assumptions are a *set*, not a value, so two members share an assumption
+/// family only when their whole assumption sets are equal. A record that carries
+/// no assumption establishes none, and is therefore not placed in a shared
+/// group with another record: "no known assumption" is a statement about what was
+/// recorded, and treating it as a family would let any two unannotated members
+/// corroborate each other.
+fn shared_assumption_group(record: &SourceRecord) -> Option<String> {
+    if record.assumptions.is_empty() {
+        return None;
+    }
+    let mut preimage = String::from("assumption-family/v1;");
+    push_count(&mut preimage, "assumptions", record.assumptions.len());
+    for assumption in &record.assumptions {
+        push_field(&mut preimage, "assumption", assumption);
+    }
+    Some(freeze(&preimage))
+}
+
 /// Independence profile of one source portfolio (I21.6).
 ///
 /// Ten pages from one vendor are not ten independent sources: two outputs are
@@ -2251,6 +2405,11 @@ impl GovernorInquiryAdmissionRequest {
 /// model family, saw one parent summary, use one evaluator or inherit one
 /// mistaken assumption. Unknown lineage stays preserved and never inflates the
 /// independent count.
+///
+/// The profile measures each of those five axes separately and binds the
+/// result to the dimensions the profile actually declared, so the requirement
+/// comes from [`IndependenceBlindingPolicy::dimensions`] rather than from a
+/// hardcoded rule here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndependenceProfile {
     /// Distinct known lineage roots behind the eligible evidence set.
@@ -2263,17 +2422,39 @@ pub struct IndependenceProfile {
     pub minimum_independent_families: u64,
     /// Whether the observed independence meets the profile requirement.
     pub meets_requirement: bool,
+    /// One measurement per dimension [`IndependenceBlindingPolicy::dimensions`]
+    /// declared, in the declared order.
+    ///
+    /// The list is the declared requirement itself, not a fixed five: a profile
+    /// that declared only source and provider family carries only those two
+    /// measurements, so a consumer never has to infer which axes were in force.
+    pub dimensions: Vec<IndependenceDimensionMeasurement>,
     /// Digest over the profile shape.
     pub digest: String,
 }
 
 impl IndependenceProfile {
-    /// Derives the independence profile from the eligible handles and the exact
-    /// vetted records behind them.
+    /// Derives the independence profile from the eligible handles, the exact
+    /// vetted records behind them and the dimensions the profile declared.
+    ///
+    /// `required_dimensions` comes from
+    /// [`IndependenceBlindingPolicy::dimensions`], so the measurement is bound
+    /// to the claim and protocol rather than to a global rule, and
+    /// `minimum_independent_families` supplies the count each declared axis has
+    /// to reach. That count applies to every axis uniformly, including the two
+    /// I21.6 phrases negatively ("saw one parent summary", "inherits one
+    /// mistaken assumption"): both are partitions of the eligible set, and
+    /// "no shared ancestor" is exactly "at least one group per member", so
+    /// requiring distinct groups is the same statement in countable form.
+    ///
+    /// With no declared dimension the measurements list is empty and
+    /// `meets_requirement` falls back to the lineage-level answer, which is the
+    /// honest reading of a profile that declared no independence requirement.
     #[must_use]
     pub fn derive(
         eligible: &[String],
         records: &BTreeMap<String, SourceRecord>,
+        required_dimensions: &[IndependenceDimension],
         minimum_independent_families: u64,
     ) -> Self {
         let lineage = LineageTable::build(records);
@@ -2302,13 +2483,46 @@ impl IndependenceProfile {
         let observed = u64::try_from(independent).unwrap_or(u64::MAX);
         // Unknown lineage is preserved as an explicit count and never counted
         // as independence, so it can never satisfy the requirement.
-        let meets_requirement = unknown == 0 && observed >= minimum_independent_families;
+        let lineage_meets_requirement = unknown == 0 && observed >= minimum_independent_families;
+        let mut dimensions: Vec<IndependenceDimensionMeasurement> = required_dimensions
+            .iter()
+            .copied()
+            .map(|dimension| {
+                // The same minimum applies to every declared axis, including the
+                // two I21.6 phrases negatively: "no shared context ancestor" and
+                // "no shared assumption" are partitions of the eligible set, and
+                // each is satisfied exactly when its members form at least that
+                // many distinct groups. A zero minimum therefore names no demand
+                // on the axis while still measuring and publishing it.
+                IndependenceDimensionMeasurement::measure(
+                    dimension,
+                    eligible,
+                    records,
+                    minimum_independent_families,
+                )
+            })
+            .collect();
+        dimensions.sort_by_key(|measurement| measurement.dimension);
+        dimensions.dedup_by_key(|measurement| measurement.dimension);
+        let meets_requirement = if dimensions.is_empty() {
+            lineage_meets_requirement
+        } else {
+            // Every declared dimension must be satisfied. An axis that is
+            // unmeasured or unmet cannot be compensated by another axis meeting
+            // its own: five pages from one evaluator are not five independent
+            // sources, however many different vendors they quote.
+            lineage_meets_requirement
+                && dimensions
+                    .iter()
+                    .all(|measurement| measurement.meets_requirement)
+        };
         let mut profile = Self {
             lineage_roots,
             unknown_independence_handles,
             independent_lineages: independent,
             minimum_independent_families,
             meets_requirement,
+            dimensions,
             digest: String::new(),
         };
         profile.digest = profile.compute_digest();
@@ -2316,7 +2530,7 @@ impl IndependenceProfile {
     }
 
     fn compute_digest(&self) -> String {
-        let mut preimage = String::from("independence-profile/v1;");
+        let mut preimage = String::from("independence-profile/v2;");
         push_count(&mut preimage, "lineage_roots", self.lineage_roots.len());
         for root in &self.lineage_roots {
             push_field(&mut preimage, "lineage_root", root);
@@ -2344,6 +2558,15 @@ impl IndependenceProfile {
             "meets_requirement",
             bool_text(self.meets_requirement),
         );
+        push_count(&mut preimage, "dimensions", self.dimensions.len());
+        for measurement in &self.dimensions {
+            push_field(
+                &mut preimage,
+                "dimension",
+                measurement.dimension.wire_name(),
+            );
+            push_field(&mut preimage, "dimension_digest", &measurement.digest);
+        }
         freeze(&preimage)
     }
 }
@@ -2416,6 +2639,7 @@ impl SourcePortfolio {
                 independent_lineages: 0,
                 minimum_independent_families: 0,
                 meets_requirement: false,
+                dimensions: Vec::new(),
                 digest: String::new(),
             },
             digest: String::new(),
@@ -2477,6 +2701,7 @@ impl SourcePortfolio {
         portfolio.independence = IndependenceProfile::derive(
             &eligible,
             &records_by_handle,
+            &profile.independence_and_blinding_policy.dimensions,
             profile
                 .independence_and_blinding_policy
                 .minimum_independent_families,
@@ -2518,6 +2743,51 @@ impl SourcePortfolio {
         push_field(&mut preimage, "independence", &self.independence.digest);
         freeze(&preimage)
     }
+}
+
+/// Names exactly which independence axis fell short, and why.
+///
+/// The lineage-level count alone is no longer the whole story now that the
+/// profile measures every declared dimension, so the debt says which axis
+/// produced the shortfall rather than leaving a reader to re-derive it. An axis
+/// whose groups are all known but too few is reported as a count; an axis with
+/// unknown linkage is reported as unknown, because a missing group is missing
+/// evidence and never an extra group.
+fn independence_shortfall(profile: &IndependenceProfile) -> String {
+    let unmet: Vec<String> = profile
+        .dimensions
+        .iter()
+        .filter(|measurement| !measurement.meets_requirement)
+        .map(|measurement| {
+            if measurement.unknown_handles.is_empty() {
+                format!(
+                    "{}: {} distinct group(s) do not meet the declared minimum {}",
+                    measurement.dimension.wire_name(),
+                    measurement.groups.len(),
+                    measurement.required_groups
+                )
+            } else {
+                format!(
+                    "{}: {} of {} eligible member(s) have no established group",
+                    measurement.dimension.wire_name(),
+                    measurement.unknown_handles.len(),
+                    measurement.groups.len() + measurement.unknown_handles.len()
+                )
+            }
+        })
+        .collect();
+    if unmet.is_empty() {
+        return format!(
+            "observed independent lineages {} do not meet the declared minimum {}",
+            profile.independent_lineages, profile.minimum_independent_families
+        );
+    }
+    format!(
+        "observed independent lineages {} do not meet the declared minimum {}; unmet: {}",
+        profile.independent_lineages,
+        profile.minimum_independent_families,
+        unmet.join("; ")
+    )
 }
 
 /// Builds the exact vetted-record map the existing lineage owner consumes.
@@ -7126,11 +7396,7 @@ fn research_debts(
             &observation.inquiry_id,
             profile,
             ResearchDebtKind::Replication,
-            &format!(
-                "observed independent lineages {} do not meet the declared minimum {}",
-                portfolio.independence.independent_lineages,
-                portfolio.independence.minimum_independent_families
-            ),
+            &independence_shortfall(&portfolio.independence),
             "researcher",
             "independent lineages meet the declared minimum with no unknown lineage",
             None,
@@ -7485,6 +7751,22 @@ fn candidate_source_record(
         grade: None,
         authority_domains,
         lineage_root: candidate.lineage_root.clone(),
+        // One provider generation is one provider family, and it is the exact
+        // admitted generation on the candidate rather than a label derived from
+        // it. A record with no established provider family carries `None`, which
+        // keeps it off that independence axis instead of placing it in a family
+        // of its own.
+        provider_family: (!candidate.provider_generation.is_empty())
+            .then(|| candidate.provider_generation.clone()),
+        // The evaluator that judged a retained provider artifact is the
+        // instrument-plane execution that admitted it, which the candidate names
+        // by route. It is not a claim that a human or model re-read the material.
+        evaluator_family: (!candidate.route.is_empty()).then(|| candidate.route.clone()),
+        // The retained snapshot is the material itself, so it inherits no
+        // assumption of its own beyond the refusal flag already in
+        // `content_flags`; an empty set is preserved as unknown on the
+        // shared-assumption axis rather than read as "shares no assumption".
+        assumptions: BTreeSet::new(),
         disclosure: observation.disclosure,
         content_flags,
         incentives_note: "not assessed by the admitted provider process".to_owned(),
