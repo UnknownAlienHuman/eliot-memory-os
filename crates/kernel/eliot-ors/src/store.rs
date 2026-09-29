@@ -5475,11 +5475,10 @@ impl RedbRecoveryStore {
             write.commit().map_err(storage)?;
             return Ok(stored.applied_revision);
         }
-        applied.applied_revision = Self::purge_ledger_revision_in(
-            &write.open_table(META).map_err(storage)?,
-        )?
-        .checked_add(1)
-        .ok_or(OrsError::ProjectionLimitExceeded)?;
+        applied.applied_revision =
+            Self::purge_ledger_revision_in(&write.open_table(META).map_err(storage)?)?
+                .checked_add(1)
+                .ok_or(OrsError::ProjectionLimitExceeded)?;
         applied.validate()?;
         {
             let mut table = write.open_table(PURGE_LEDGER).map_err(storage)?;
@@ -5518,7 +5517,9 @@ impl RedbRecoveryStore {
     /// so a revision is never produced by two rules that could disagree. An
     /// absent counter is revision zero; a counter that is not an unsigned
     /// integer is an integrity failure rather than a number to guess at.
-    fn purge_ledger_revision_in(meta: &impl ReadableTable<&str, &str>) -> Result<u64, OrsError> {
+    fn purge_ledger_revision_in(
+        meta: &impl ReadableTable<&'static str, &'static str>,
+    ) -> Result<u64, OrsError> {
         let Some(value) = meta.get(PURGE_LEDGER_REVISION_KEY).map_err(storage)? else {
             return Ok(0);
         };
