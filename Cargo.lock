@@ -2720,6 +2720,7 @@ dependencies = [
  "eliot-observation-contracts",
  "eliot-platform",
  "eliot-receipts",
+ "eliot-runtime-contracts",
  "eliot-security-contracts",
  "schemars",
  "serde",
