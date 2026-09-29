@@ -23,14 +23,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_contracts::{ContractVersion, OperationId, ResourceGeneration, TaskId};
+use eliot_contracts::{ContractVersion, OperationId, ResourceGeneration, StateFence, TaskId};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
     AgentAttemptId, ContractError, HANDOFF_EFFECT_REFERENCE_KIND, HandoffCheckpoint,
-    HandoffCheckpointId, PublicReference, validate_text,
+    HandoffCheckpointId, HandoffCursors, HandoffSourceGenerations, PublicReference, RevisionId,
+    validate_text,
 };
 
 /// Stable contract name of the controlled-boundary capture operation.
@@ -235,6 +236,16 @@ pub struct HandoffCaptureSource {
     pub source_attempt_id: AgentAttemptId,
     /// Session the source attempt was running in.
     pub source_session_ref: PublicReference,
+    /// Plan revision observed at the boundary.
+    pub source_plan_revision: RevisionId,
+    /// Acceptance revision the plan revision was admitted against.
+    pub source_acceptance_revision: RevisionId,
+    /// State Fence the snapshot was taken under.
+    pub source_fence: StateFence,
+    /// Scope, world, module and route generations observed at the boundary.
+    pub source_generations: HandoffSourceGenerations,
+    /// Source event and outbox cursors observed at the boundary.
+    pub source_cursors: HandoffCursors,
     /// Current diff, frozen as a digest-bound immutable artifact.
     pub frozen_diff: PublicReference,
     /// Digest of the captured checkpoint payload as recorded at capture time.
@@ -273,6 +284,36 @@ impl HandoffCaptureSource {
         if self.frozen_diff.digest.is_none() {
             return Err(HandoffCaptureError::FrozenDiffIsNotImmutable);
         }
+        self.validate_coherence()
+    }
+
+    /// Proves the snapshot was taken at one moment rather than assembled from
+    /// several.
+    ///
+    /// A checkpoint whose fence disagrees with its own scope, world, module and
+    /// route generations, or whose revisions are blank, is a record stitched
+    /// together after the boundary and cannot bound what was captured. Every
+    /// disagreement is a named refusal.
+    fn validate_coherence(&self) -> Result<(), HandoffCaptureError> {
+        validate_text(
+            self.source_plan_revision.as_str(),
+            "source.source_plan_revision",
+        )?;
+        validate_text(
+            self.source_acceptance_revision.as_str(),
+            "source.source_acceptance_revision",
+        )?;
+        self.source_fence
+            .validate()
+            .map_err(|_| HandoffCaptureError::SnapshotFenceIsStale)?;
+        if self.source_fence.resource_generation != self.source_generations.scope {
+            return Err(HandoffCaptureError::SnapshotIsNotCoherent {
+                field: "source_generations.scope",
+            });
+        }
+        self.source_cursors
+            .validate()
+            .map_err(HandoffCaptureError::Capture)?;
         Ok(())
     }
 }
@@ -299,6 +340,16 @@ pub struct HandoffCapture {
     pub source_attempt_id: AgentAttemptId,
     /// Session the source attempt was running in.
     pub source_session_ref: PublicReference,
+    /// Plan revision observed at the boundary.
+    pub source_plan_revision: RevisionId,
+    /// Acceptance revision the plan revision was admitted against.
+    pub source_acceptance_revision: RevisionId,
+    /// State Fence the capture was taken under.
+    pub source_fence: StateFence,
+    /// Scope, world, module and route generations observed at the boundary.
+    pub source_generations: HandoffSourceGenerations,
+    /// Source event and outbox cursors observed at the boundary.
+    pub source_cursors: HandoffCursors,
     /// Current diff, frozen as a digest-bound immutable artifact.
     pub frozen_diff: PublicReference,
     /// Digest of the captured checkpoint payload as recorded at capture time.
@@ -338,6 +389,11 @@ impl HandoffCapture {
             source_task_id: source.source_task_id,
             source_attempt_id: source.source_attempt_id,
             source_session_ref: source.source_session_ref,
+            source_plan_revision: source.source_plan_revision,
+            source_acceptance_revision: source.source_acceptance_revision,
+            source_fence: source.source_fence,
+            source_generations: source.source_generations,
+            source_cursors: source.source_cursors,
             frozen_diff: source.frozen_diff,
             recorded_checkpoint_digest: source.recorded_checkpoint_digest,
             recorded_diff_digest: source.recorded_diff_digest,
@@ -372,6 +428,11 @@ impl HandoffCapture {
             source_task_id: self.source_task_id,
             source_attempt_id: self.source_attempt_id.clone(),
             source_session_ref: self.source_session_ref.clone(),
+            source_plan_revision: self.source_plan_revision.clone(),
+            source_acceptance_revision: self.source_acceptance_revision.clone(),
+            source_fence: self.source_fence,
+            source_generations: self.source_generations,
+            source_cursors: self.source_cursors.clone(),
             frozen_diff: self.frozen_diff.clone(),
             recorded_checkpoint_digest: self.recorded_checkpoint_digest.clone(),
             recorded_diff_digest: self.recorded_diff_digest.clone(),
@@ -478,6 +539,20 @@ impl HandoffCapture {
         }
         if self.source_session_ref != checkpoint.source_session_ref {
             return Err(HandoffCaptureError::CaptureSourceSessionMismatch);
+        }
+        if self.source_plan_revision != checkpoint.source_plan_revision
+            || self.source_acceptance_revision != checkpoint.source_acceptance_revision
+        {
+            return Err(HandoffCaptureError::CaptureRevisionMismatch);
+        }
+        if self.source_fence != checkpoint.state_fence {
+            return Err(HandoffCaptureError::CaptureFenceMismatch);
+        }
+        if self.source_generations != checkpoint.source_generations {
+            return Err(HandoffCaptureError::CaptureGenerationMismatch);
+        }
+        if self.source_cursors != checkpoint.source_cursors {
+            return Err(HandoffCaptureError::CaptureCursorMismatch);
         }
         if self.frozen_diff.digest != checkpoint.diff_ref.digest
             || self.frozen_diff.id != checkpoint.diff_ref.id
@@ -960,6 +1035,15 @@ pub enum HandoffCaptureError {
     /// The frozen diff is a mutable path or a bare commit identity.
     #[error("frozen diff is not a digest-bound immutable artifact")]
     FrozenDiffIsNotImmutable,
+    /// The snapshot's state fence did not validate.
+    #[error("the source snapshot was taken under a stale state fence")]
+    SnapshotFenceIsStale,
+    /// Two source positions in the snapshot disagree with each other.
+    #[error("the source snapshot is not coherent: {field} disagrees with the fence")]
+    SnapshotIsNotCoherent {
+        /// Snapshot field that disagrees.
+        field: &'static str,
+    },
     /// A retained artifact is not a digest-bound immutable artifact.
     #[error("retained artifact is not a digest-bound immutable artifact")]
     RetainedArtifactIsNotImmutable,
@@ -989,6 +1073,18 @@ pub enum HandoffCaptureError {
     /// The capture froze a different diff than the payload records.
     #[error("frozen diff does not match the checkpoint payload")]
     FrozenDiffDoesNotMatchCheckpoint,
+    /// The capture was taken under different plan or acceptance revisions.
+    #[error("capture revisions do not match the checkpoint payload")]
+    CaptureRevisionMismatch,
+    /// The capture was taken under a different state fence.
+    #[error("capture state fence does not match the checkpoint payload")]
+    CaptureFenceMismatch,
+    /// The capture observed different source generations.
+    #[error("capture source generations do not match the checkpoint payload")]
+    CaptureGenerationMismatch,
+    /// The capture observed different source cursors.
+    #[error("capture source cursors do not match the checkpoint payload")]
+    CaptureCursorMismatch,
     /// A digest the store returned differs from the recorded value.
     #[error("readback {field} is {observed}, not the recorded {recorded}")]
     ReadbackDigestMismatch {

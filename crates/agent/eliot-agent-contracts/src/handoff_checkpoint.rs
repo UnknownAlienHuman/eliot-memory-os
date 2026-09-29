@@ -306,7 +306,8 @@ pub struct HandoffCursors {
 }
 
 impl HandoffCursors {
-    fn validate(&self) -> Result<(), HandoffCheckpointError> {
+    /// Validates that neither cursor position is blank or uncaused.
+    pub fn validate(&self) -> Result<(), HandoffCheckpointError> {
         self.event.validate()?;
         self.outbox.validate()
     }
