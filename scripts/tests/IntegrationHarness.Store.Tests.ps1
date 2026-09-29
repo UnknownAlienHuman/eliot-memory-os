@@ -139,13 +139,39 @@ function Get-StoreTestAcquisition {
     return $acq
 }
 
+$script:TestReservationListeners = [Collections.Generic.List[System.Net.Sockets.TcpListener]]::new()
+$script:TestObservedImagePath = 'C:\runtime\surreal.exe'
+$script:TestObservedStartTimeUtc = '2026-09-27T12:00:00.0000000Z'
+
+function New-StoreTestReservation {
+    param([Parameter(Mandatory)][int]$Port)
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $Port)
+    $listener.Start()
+    [void]$script:TestReservationListeners.Add($listener)
+    return @{ port = $Port; host = '127.0.0.1'; listener = $listener }
+}
+
+function Close-StoreTestReservations {
+    foreach ($live in $script:TestReservationListeners) {
+        try { $live.Stop() } catch { }
+    }
+    $script:TestReservationListeners.Clear()
+}
+
+function New-StoreTestLauncher {
+    param([int]$ObservedPid = 4242, [string]$Nonce = 'feedface01')
+    $image = $script:TestObservedImagePath
+    $started = $script:TestObservedStartTimeUtc
+    return ({ param($input_) return @{ observedPid = $ObservedPid; observedNonce = $Nonce; imagePath = $image; startTimeUtc = $started } }).GetNewClosure()
+}
+
 function Get-StoreTestAllocation {
-    param([hashtable]$Binding)
+    param([hashtable]$Binding, [int]$Port = 18001, [string]$EntropySeed = 'abcdef01')
     if ($null -eq $Binding) { $Binding = Get-StoreTestBinding }
     $plan = Invoke-StorePlan -Binding $Binding -Requirement (Get-StoreTestRequirement)
     $base = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
-    $reservation = { param($ctx) return @{ port = 18001; host = '127.0.0.1' } }
-    $entropy = { return 'abcdef01' }
+    $reservation = { param($ctx) return (New-StoreTestReservation -Port $Port) }.GetNewClosure()
+    $entropy = { return $EntropySeed }.GetNewClosure()
     return (Invoke-StoreAllocate -Binding $Binding -Plan $plan -BaseTemp $base -Entropy $entropy -PortReservation $reservation)
 }
 
@@ -153,7 +179,7 @@ function Get-StoreTestStartReceipt {
     param([hashtable]$Binding, [hashtable]$Allocation)
     if ($null -eq $Binding) { $Binding = Get-StoreTestBinding }
     if ($null -eq $Allocation) { $Allocation = Get-StoreTestAllocation $Binding }
-    $launcher = { param($input_) return @{ observedPid = 4242; observedNonce = 'feedface01' } }
+    $launcher = New-StoreTestLauncher
     $entropy = { return 'cafef00d' }
     return (Invoke-StoreStart -Binding $Binding -Allocation $Allocation -Acquisition (Get-StoreTestAcquisition) -Launcher $launcher -Entropy $entropy)
 }
@@ -245,9 +271,14 @@ function Test-StoreCase4 {
     param([Collections.Generic.List[string]]$Failures)
     if (-not $script:ModulesAvailable) { return }
     $binding = Get-StoreTestBinding
-    $allocation = Get-StoreTestAllocation $binding
-    foreach ($provenance in @('acquired-verified', 'cached-reverified')) {
-        $launcher = { param($input_) return @{ observedPid = 5001; observedNonce = 'aa01bb02' } }
+    $attempts = @(
+        @{ provenance = 'acquired-verified'; port = 18011; entropySeed = 'deadbeef' },
+        @{ provenance = 'cached-reverified'; port = 18012; entropySeed = 'deadbee0' }
+    )
+    foreach ($attempt in $attempts) {
+        $provenance = [string]$attempt['provenance']
+        $allocation = Get-StoreTestAllocation $binding -Port ([int]$attempt['port']) -EntropySeed ([string]$attempt['entropySeed'])
+        $launcher = New-StoreTestLauncher -ObservedPid 5001 -Nonce 'aa01bb02'
         $entropy = { return 'deadbeef' }
         $receipt = Invoke-StoreStart -Binding $binding -Allocation $allocation -Acquisition (Get-StoreTestAcquisition -Provenance $provenance) -Launcher $launcher -Entropy $entropy
         Assert-StoreTrue $Failures ($receipt['startState'] -ceq 'StartRequested') ("4-started-$provenance")
@@ -265,7 +296,7 @@ function Test-StoreCase5 {
     if (-not $script:ModulesAvailable) { return }
     $binding = Get-StoreTestBinding
     $allocation = Get-StoreTestAllocation $binding
-    $launcher = { param($input_) return @{ observedPid = 5002; observedNonce = 'bb02cc03' } }
+    $launcher = New-StoreTestLauncher -ObservedPid 5002 -Nonce 'bb02cc03'
     $entropy = { return 'cafef00d' }
     $latest = { param($ctx) return @{ version = 'latest'; architecture = 'windows-x64'; peMachine = '8664'; digest = '13781bc97db9348498bd6b5e0090cf2770e9d296640be8adacf73956e8a568a1'; provenance = 'acquired-verified'; storePath = 'C:\runtime\surreal.exe' } }
     Test-StoreRejects $Failures '5-latest' { Invoke-StoreStart -Binding $binding -Allocation $allocation -Acquisition $latest -Launcher $launcher -Entropy $entropy }
@@ -293,7 +324,9 @@ function Test-StoreCase6 {
     }
     $allocation = Get-StoreTestAllocation $binding
     $seen = @{ argv = $null }
-    $spyLauncher = { param($input_) $seen['argv'] = $input_['argv']; return @{ observedPid = 6001; observedNonce = 'cc03dd04' } }.GetNewClosure()
+    $spyImage = $script:TestObservedImagePath
+    $spyStarted = $script:TestObservedStartTimeUtc
+    $spyLauncher = { param($input_) $seen['argv'] = $input_['argv']; return @{ observedPid = 6001; observedNonce = 'cc03dd04'; imagePath = $spyImage; startTimeUtc = $spyStarted } }.GetNewClosure()
     $entropy = { return 'abcdef12' }
     [void](Invoke-StoreStart -Binding $binding -Allocation $allocation -Acquisition (Get-StoreTestAcquisition) -Launcher $spyLauncher -Entropy $entropy)
     Assert-StoreTrue $Failures ($null -ne $seen['argv']) '6-launcher-received-argv'
@@ -318,8 +351,8 @@ function Test-StoreCase7 {
     $planA = Invoke-StorePlan -Binding $bindingA -Requirement (Get-StoreTestRequirement)
     $planB = Invoke-StorePlan -Binding $bindingB -Requirement (Get-StoreTestRequirement)
     $base = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
-    $reservationA = { param($ctx) return @{ port = 18101; host = '127.0.0.1' } }
-    $reservationB = { param($ctx) return @{ port = 18102; host = '127.0.0.1' } }
+    $reservationA = { param($ctx) return (New-StoreTestReservation -Port 18101) }
+    $reservationB = { param($ctx) return (New-StoreTestReservation -Port 18102) }
     $allocA = Invoke-StoreAllocate -Binding $bindingA -Plan $planA -BaseTemp $base -Entropy { return 'a1b2c3d4' } -PortReservation $reservationA
     $allocB = Invoke-StoreAllocate -Binding $bindingB -Plan $planB -BaseTemp $base -Entropy { return 'e5f60718' } -PortReservation $reservationB
     Assert-StoreTrue $Failures ($allocA['runRoot'] -cne $allocB['runRoot']) '7-roots-unique'
@@ -330,6 +363,7 @@ function Test-StoreCase7 {
     Assert-StoreTrue $Failures ($allocA['host'] -ceq '127.0.0.1') '7-loopback'
     Assert-StoreTrue $Failures ($allocA['endpoint'] -ceq '127.0.0.1:18101') '7-endpoint-shape'
     Assert-StoreTrue $Failures ($allocA['ownerMarker'] -ceq 'eliot-harness-owned-root-v1') '7-marker'
+    Assert-StoreTrue $Failures ($allocA['reservationIdentity']['endpoint'] -ceq $allocA['endpoint']) '7-reservation-endpoint-bound'
 }
 
 # ---------------------------------------------------------------------------
@@ -373,7 +407,7 @@ function Test-StoreCase9 {
         [void]$Failures.Add('9-conflict-expected-throw')
     }
     catch {
-        Assert-StoreTrue $Failures ($_.Exception.Message -match 'STORE-PORT-CONFLICT') '9-conflict-typed'
+        Assert-StoreTrue $Failures ($_.Exception.Message -match 'STORE-PORT-RESERVATION-UNKNOWN') '9-conflict-typed'
     }
 }
 
@@ -441,8 +475,11 @@ function Test-StoreCase13 {
     $binding = Get-StoreTestBinding
     $allocation = Get-StoreTestAllocation $binding
     $start = Get-StoreTestStartReceipt $binding $allocation
-    $proc = { param($ctx) return @{ alive = $true; pid = $ctx['pid'] } }
-    $port = { param($ctx) return @{ open = $true; endpoint = $ctx['endpoint'] } }
+    $ownedPid = [int]$start['observed']['pid']
+    $ownedImage = [string]$start['observed']['imagePath']
+    $ownedStarted = [string]$start['observed']['startTimeUtc']
+    $proc = { param($ctx) return @{ alive = $true; pid = $ownedPid; imagePath = $ownedImage; startTimeUtc = $ownedStarted } }.GetNewClosure()
+    $port = { param($ctx) return @{ open = $true; endpoint = $ctx['endpoint']; ownerPid = $ownedPid } }.GetNewClosure()
     $noAuth = { param($ctx) return @{ authenticated = $false; namespace = 'eliot_ns_01234567'; database = 'eliot_db_89abcdef'; schemaDigest = ('ab' * 32); fixtureReady = $false; endpoint = $ctx['endpoint'] } }
     $receipt = Invoke-StoreObserveReadiness -Binding $binding -StartReceipt $start -ProcessObserver $proc -PortObserver $port -StoreClient $noAuth
     Assert-StoreTrue $Failures (-not [bool]$receipt['ready']) '13-not-ready'
@@ -462,8 +499,11 @@ function Test-StoreCase14 {
     $start = Get-StoreTestStartReceipt $binding $allocation
     $start['namespace'] = $allocation['namespace']
     $start['database'] = $allocation['database']
-    $proc = { param($ctx) return @{ alive = $true; pid = $ctx['pid'] } }
-    $port = { param($ctx) return @{ open = $true; endpoint = $ctx['endpoint'] } }
+    $ownedPid = [int]$start['observed']['pid']
+    $ownedImage = [string]$start['observed']['imagePath']
+    $ownedStarted = [string]$start['observed']['startTimeUtc']
+    $proc = { param($ctx) return @{ alive = $true; pid = $ownedPid; imagePath = $ownedImage; startTimeUtc = $ownedStarted } }.GetNewClosure()
+    $port = { param($ctx) return @{ open = $true; endpoint = $ctx['endpoint']; ownerPid = $ownedPid } }.GetNewClosure()
     $authNoFixture = { param($ctx) return @{ authenticated = $true; namespace = 'eliot_ns_01234567'; database = 'eliot_db_89abcdef'; schemaDigest = ('cd' * 32); fixtureReady = $false; endpoint = $ctx['endpoint'] } }
     $receipt = Invoke-StoreObserveReadiness -Binding $binding -StartReceipt $start -ProcessObserver $proc -PortObserver $port -StoreClient $authNoFixture
     Assert-StoreTrue $Failures ([bool]$receipt['authenticated']) '14-auth-true'
@@ -506,8 +546,11 @@ function Test-StoreCase16 {
     $binding = Get-StoreTestBinding
     $allocation = Get-StoreTestAllocation $binding
     $start = Get-StoreTestStartReceipt $binding $allocation
-    $proc = { param($ctx) return @{ alive = $true; pid = $ctx['pid'] } }
-    $port = { param($ctx) return @{ open = $true; endpoint = $ctx['endpoint'] } }
+    $ownedPid = [int]$start['observed']['pid']
+    $ownedImage = [string]$start['observed']['imagePath']
+    $ownedStarted = [string]$start['observed']['startTimeUtc']
+    $proc = { param($ctx) return @{ alive = $true; pid = $ownedPid; imagePath = $ownedImage; startTimeUtc = $ownedStarted } }.GetNewClosure()
+    $port = { param($ctx) return @{ open = $true; endpoint = $ctx['endpoint']; ownerPid = $ownedPid } }.GetNewClosure()
     $client = { param($ctx) return @{ authenticated = $true; namespace = 'eliot_ns_01234567'; database = 'eliot_db_89abcdef'; schemaDigest = ('12' * 32); fixtureReady = $false; endpoint = $ctx['endpoint'] } }
     $start['namespace'] = $allocation['namespace']
     $start['database'] = $allocation['database']
@@ -703,6 +746,9 @@ function Invoke-StoreCaseById {
         if ($failures.Count -gt 0) {
             $note = $note + '; prior assertion failures: ' + ($failures -join ' | ')
         }
+    }
+    finally {
+        Close-StoreTestReservations
     }
     if ($note.Length -gt 2000) {
         $note = $note.Substring(0, 2000)
