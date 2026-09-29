@@ -848,11 +848,17 @@ impl CanaryRemovalOperation {
             }
             match progress.state {
                 CanaryRemovalEffectState::Pending => open += 1,
-                CanaryRemovalEffectState::IntentCommitted { .. }
-                | CanaryRemovalEffectState::Resolved { .. } => {
+                CanaryRemovalEffectState::IntentCommitted { .. } => {
                     open += 1;
                     started += 1;
                 }
+                // An authoritatively resolved row is neither open nor merely
+                // started: its exact postcondition was already read back from
+                // the resource's own owner. Counting it as open would keep
+                // `open` above zero for every plan that removes anything, so
+                // `Completed` would be unreachable and the terminal registry
+                // retirement could never be recorded as a durable outcome.
+                CanaryRemovalEffectState::Resolved { .. } => {}
                 CanaryRemovalEffectState::Unknown { .. } => {
                     open += 1;
                     unknown += 1;
