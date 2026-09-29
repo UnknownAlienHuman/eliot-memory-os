@@ -343,11 +343,13 @@ impl MaintenanceTriggerDeliveryLedger {
     ///
     /// An exact retry (same revision, delivery identity, fence, session)
     /// returns the live claim without minting a competing one; a concurrent
-    /// claim under another identity is refused. Expired eligibility blocks
-    /// stale execution: the caller must record terminal expiry first. A claim
-    /// against an acknowledged or terminal row conflicts with the settled
-    /// identity: it reconciles through the recorded receipt or terminal
-    /// disposition, never through a fresh claim.
+    /// claim under another identity is refused. A claim against an
+    /// already-settled identity (`Acknowledged`, `Expired`, `Superseded`)
+    /// fails with [`ProtocolError::ReplayConflict`] before any expiry check,
+    /// so a replayed claim observes the settled result instead of a rewritten
+    /// eligibility verdict: it reconciles through the recorded receipt or
+    /// terminal disposition, never through a fresh claim. Expired eligibility
+    /// blocks stale execution: the caller must record terminal expiry first.
     /// Claim timeout does not rename the trigger: the owner releases the
     /// expired claim back to `Pending` through [`Self::release_expired`]
     /// and reissues under the same identity.
