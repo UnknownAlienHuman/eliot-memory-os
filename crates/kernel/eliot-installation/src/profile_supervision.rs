@@ -13,13 +13,13 @@
 //!
 //! The proof is structural, not textual. It revalidates the selected
 //! current-user or repository anchor through the existing OS adapter, retains
-//! that anchor as a real no-follow root object wherever the OS lease contract
-//! admits it, compares each resolved I3.1 role to its exact profile layout
-//! beneath the retained object, and requires the profile to claim neither SCM
-//! supervision nor administrative authority. A layout that only matches a
-//! predictable path name is not verified root ownership and is never counted as
-//! such. Non-service selection does not query, receive, or depend on a
-//! `ProgramData` anchor.
+//! that anchor as a real no-follow root object through the existing profile
+//! lease or cross-profile read-only handle, compares each resolved I3.1 role
+//! to its exact profile layout beneath that retained object, and requires the
+//! profile to claim neither SCM supervision nor administrative authority. A
+//! layout that only matches a predictable path name is not verified root
+//! ownership and is never counted as such. Non-service selection does not
+//! query, receive, or depend on a `ProgramData` anchor.
 //!
 //! Normative basis: I3.1 (exact layouts, default profile, supervision, and
 //! owner/session binding). This module resolves no new root and mints no
@@ -31,6 +31,10 @@ use std::path::{Path, PathBuf};
 
 use eliot_platform_windows::profile_supervision::{
     CurrentUserTaskRequest, ProfileRootRequest, ProfileSelection as PlatformProfileSelection,
+};
+use eliot_platform_windows::{
+    FileIdentity, current_user_local_app_data_root, file_identity_for_open_handle,
+    open_no_follow_directory,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -393,6 +397,12 @@ pub struct NoServiceProfileAuthorityProof {
     pub verified_root_roles: u32,
 }
 
+struct UserModeProfileAnchor {
+    canonical_path: String,
+    identity: FileIdentity,
+    handle: std::fs::File,
+}
+
 /// Returns the supervision path I3.1 names for `profile`.
 ///
 /// This is a pure column of the I3.1 profile table. It reads no anchor and
@@ -504,17 +514,17 @@ impl ProfileGovernedRoots {
 ///
 /// 1. the selected current-user or repository anchor is revalidated through
 ///    the existing OS adapter;
-/// 2. the anchor is *retained* as a live no-follow OS root object wherever the
-///    OS lease contract admits it, and the retained lease is proven to bind
-///    that same root object rather than merely repeat its name;
+/// 2. the anchor is *retained* as a live no-follow OS root object, through its
+///    profile lease or a cross-profile read-only handle, and the retained
+///    object is rechecked rather than merely repeating its name;
 /// 3. all four I3.1 root roles exactly match the layout derived from the
 ///    retained anchor and lie strictly beneath it; and
 /// 4. the profile does not claim SCM supervision or administrative authority.
 ///
 /// [`NoServiceProfileAuthorityProof::verified_root_roles`] counts only the roles
-/// whose layout was verified against a retained root object. A role derived from
-/// a path that no OS lease holds is not counted, because a predictable name is
-/// not ownership.
+/// whose layout was verified beneath a retained root object. A role derived
+/// from a path that no OS handle holds is not counted, because a predictable
+/// name is not ownership.
 ///
 /// This proof does not claim lexical exclusion from a hypothetical
 /// `ProgramData` path. Non-service selection receives no `ProgramData` anchor and
@@ -549,31 +559,12 @@ pub fn prove_no_service_profile_authority_dependency(
     runtime_state_roots.validate()?;
     let mut anchor_provider = WindowsRuntimeRootLeaseProvider::for_roots(runtime_state_roots)?;
 
-    // The profile anchor is the only root in this selection the OS lease
-    // contract admits as a retainable object. `portable_dev` names an already
-    // retained current-user directory, so the provider opens and holds a real
-    // no-follow handle to it for the whole proof.
-    //
-    // `user_mode` anchors on the OS-known-folder `LocalAppData` contour, and no
-    // lease is retained for it. This is NOT an adapter capability choice and
-    // must not be "fixed" by relaxing the user-owned lease precondition. The
-    // anchor is the OS folder itself, shared machine-wide across every per-user
-    // application, and `UserOwnedRootReadLease::open_existing` requires a
-    // protected two-ACE DACL owned by the current SID
-    // (`user_owned_leases.rs::verify_user_owned_opened_handle_read_only`). A
-    // stock `%LocalAppData%` root is inheritable (`D:AI`) and carries AppContainer
-    // capability, `Users` and `BA` ACEs, so it can never satisfy that contract.
-    // Provisioning it to satisfy the contract would strip those ACEs from a
-    // shared OS folder and break unrelated software, and the read lease
-    // structurally never requests `WRITE_DAC`, so it cannot do so itself.
-    //
-    // The consequence is that `user_mode` reports zero verified root roles. That
-    // is the honest number, not a defect to be papered over: the derived
-    // per-user roots under the anchor are Eliot-owned and become leaseable via
-    // this same unmodified `retain_root` path once an installer effect
-    // provisions them. Until then no role is counted, because counting a role
-    // against a constructed path string rather than a retained object would
-    // claim a verification this code does not perform.
+    // `portable_dev` retains its repository root through the existing
+    // user-owned lease. `user_mode` uses the OS-known `%LocalAppData%` root,
+    // whose shared operating-system DACL must not be changed to satisfy
+    // Eliot's protected-root lease policy. Retain it with the cross-profile
+    // read-only no-follow directory API instead; this proves the anchor object
+    // without applying an Eliot ACL or claiming Eliot ownership of the OS root.
     let retained_anchor = match governed.profile {
         InstallationProfile::SystemService => unreachable!("service profile rejected above"),
         InstallationProfile::PortableDev => {
@@ -582,6 +573,11 @@ pub fn prove_no_service_profile_authority_dependency(
         InstallationProfile::UserMode => None,
     };
     let declared_anchor = runtime_state_roots.profile_anchor_root.as_str();
+    let retained_user_mode_anchor = if governed.profile == InstallationProfile::UserMode {
+        Some(retain_user_mode_profile_anchor(declared_anchor)?)
+    } else {
+        None
+    };
     if let Some(lease) = &retained_anchor {
         if !lease.is_reparse_free() {
             return Err(InstallationError::ProfileViolation(
@@ -602,13 +598,13 @@ pub fn prove_no_service_profile_authority_dependency(
         )?;
     }
 
-    // The layout is derived from the retained lease's OS-resolved canonical
-    // path when one exists, so the expected side of every comparison is a value
-    // the OS reported about a held object rather than an echo of the caller's
-    // own anchor string.
+    // Derive the layout from the OS-resolved path of the retained anchor object,
+    // not from a path string supplied by the caller.
     let anchor = match &retained_anchor {
         Some(lease) => lease.canonical_path(),
-        None => declared_anchor,
+        None => retained_user_mode_anchor
+            .as_ref()
+            .map_or(declared_anchor, |anchor| anchor.canonical_path.as_str()),
     };
     let anchor_identity = WindowsPathIdentity::parse_root(anchor, "profile_supervision.anchor")?;
     let expected =
@@ -620,11 +616,10 @@ pub fn prove_no_service_profile_authority_dependency(
         ("user_cache", governed.user_cache.as_str()),
     ];
     // A role counts as verified only when the anchor it was derived from is a
-    // retained OS root object. Without a retained lease this loop is still a
-    // required refusal check -- a role that is not the exact layout under the
-    // selected anchor is refused either way -- but it is a lexical check, and
-    // nothing it agrees with is counted.
-    let anchor_is_retained = retained_anchor.is_some();
+    // retained OS root object. The expected path is then compared to the
+    // selected role and must remain strictly beneath that anchor.
+    let anchor_is_retained =
+        retained_anchor.is_some() || retained_user_mode_anchor.is_some();
     let mut verified_root_roles = 0_u32;
     for ((expected_field, expected_path), (actual_field, actual_path)) in
         expected.into_iter().zip(actual)
@@ -650,6 +645,10 @@ pub fn prove_no_service_profile_authority_dependency(
         }
     }
 
+    if let Some(anchor) = retained_user_mode_anchor.as_ref() {
+        verify_user_mode_profile_anchor(declared_anchor, anchor)?;
+    }
+
     Ok(NoServiceProfileAuthorityProof {
         profile: governed.profile,
         selects_scm_supervision: false,
@@ -659,6 +658,69 @@ pub fn prove_no_service_profile_authority_dependency(
     })
 }
 
+fn retain_user_mode_profile_anchor(
+    declared_anchor: &str,
+) -> Result<UserModeProfileAnchor, InstallationError> {
+    let observed_path = current_user_local_app_data_root()
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let canonical_path = observed_path.to_string_lossy().into_owned();
+    if !same_windows_root(declared_anchor, &canonical_path)? {
+        return Err(InstallationError::ProfileViolation(
+            "UserMode profile anchor differs from the OS-known LocalAppData root".to_owned(),
+        ));
+    }
+    let (identity, handle) = open_no_follow_directory(&observed_path)
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    if file_identity_for_open_handle(&handle)
+        .map_err(|error| InstallationError::Platform(error.to_string()))?
+        != identity
+    {
+        return Err(InstallationError::ProfileViolation(
+            "UserMode profile anchor changed while its no-follow handle was retained".to_owned(),
+        ));
+    }
+    Ok(UserModeProfileAnchor {
+        canonical_path,
+        identity,
+        handle,
+    })
+}
+
+fn verify_user_mode_profile_anchor(
+    declared_anchor: &str,
+    retained_anchor: &UserModeProfileAnchor,
+) -> Result<(), InstallationError> {
+    let retained_identity = file_identity_for_open_handle(&retained_anchor.handle)
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    if retained_identity != retained_anchor.identity {
+        return Err(InstallationError::ProfileViolation(
+            "retained UserMode profile anchor identity changed during layout verification"
+                .to_owned(),
+        ));
+    }
+    let observed_path = current_user_local_app_data_root()
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let observed_canonical_path = observed_path.to_string_lossy().into_owned();
+    if !same_windows_root(declared_anchor, &observed_canonical_path)?
+        || !same_windows_root(&retained_anchor.canonical_path, &observed_canonical_path)?
+    {
+        return Err(InstallationError::ProfileViolation(
+            "UserMode profile anchor path changed during layout verification".to_owned(),
+        ));
+    }
+    let (path_identity, path_handle) = open_no_follow_directory(&observed_path)
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    let reopened_identity = file_identity_for_open_handle(&path_handle)
+        .map_err(|error| InstallationError::Platform(error.to_string()))?;
+    if path_identity != retained_anchor.identity || reopened_identity != retained_anchor.identity {
+        return Err(InstallationError::ProfileViolation(
+            "UserMode profile anchor path no longer names the retained directory object"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Builds the exact I3.1 root layout a profile names beneath `anchor`.
 ///
 /// This is the expected side of the no-service-authority comparison: for each
@@ -666,9 +728,9 @@ pub fn prove_no_service_profile_authority_dependency(
 /// by joining `anchor` with that role's own fixed contour. It is pure layout
 /// arithmetic and proves nothing by itself; the caller supplies `anchor` as the
 /// OS-reported canonical path of the retained anchor object wherever the OS
-/// lease contract admits one, so the paths produced here are anchored to a
-/// value the OS reported about a held object rather than to an echo of the
-/// caller's own anchor string.
+/// profile's root-retention contract admits it, so the paths produced here
+/// are anchored to a value the OS reported about a held object rather than to
+/// an echo of the caller's own anchor string.
 ///
 /// The `SystemService` arm is unreachable because the caller refuses that
 /// profile before any layout is built.
