@@ -106,15 +106,11 @@ impl HostComposition {
         // be substituted by it.
         let manifest_descriptor_path = PathBuf::from(launch.authority_descriptor_path.as_str());
         let manifest_host_root = PathBuf::from(launch.runtime_state_roots.host_state_root.as_str());
-        let expected_descriptor_digest = match launch.profile {
-            InstallationProfile::SystemService => {
-                phase_b_scm_selector(&launch.authority_descriptor_digest)
-                    .map_err(HostError::Installation)?
-            }
-            InstallationProfile::UserMode | InstallationProfile::PortableDev => {
-                launch.authority_descriptor_digest.clone()
-            }
-        };
+        // The typed Phase-A pending marker is never passed as a digest on
+        // argv. Every profile uses the same bounded SHA-256 selector until
+        // Phase-B publishes the live descriptor digest.
+        let expected_descriptor_digest = phase_b_scm_selector(&launch.authority_descriptor_digest)
+            .map_err(HostError::Installation)?;
         if manifest_descriptor_path != options.config_descriptor_path
             || expected_descriptor_digest.as_str() != options.config_descriptor_digest().as_str()
             || launch.installation_epoch.installation != *options.installation()

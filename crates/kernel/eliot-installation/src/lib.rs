@@ -249,7 +249,10 @@ use plan::{
     validate_user_mode_authority_effect_bindings,
 };
 pub use profile_governed_roots::{ProfileGovernedRoots, ProfileRootAnchors, select_profile_roots};
-pub use profile_roots::{INSTALLATION_ROOT_BINDING_VERSION, InstallationRoots};
+pub use profile_roots::{
+    INSTALLATION_ROOT_BINDING_VERSION, InstallationRoots,
+    profile_selection_receipts_match_retained_roots,
+};
 pub use profile_supervision::{
     NoServiceProfileAuthorityProof, ProfileGovernanceReport, ProfileRootRoles, ProfileSupervision,
     prove_no_service_profile_authority_dependency,
@@ -359,7 +362,7 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(5, 0, 0);
 /// shape. Version 26 adds the original `UserMode` authority key receipt and
 /// terminal no-effect-abort progress. Older wires require explicit migration
 /// and are never synthesized.
-pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(26, 0, 0);
+pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(27, 0, 0);
 
 /// Current durable approved-generation registry wire revision.
 ///
@@ -3144,7 +3147,12 @@ impl InstallationEffectRequest {
                     ));
                 };
                 validate_installation_key(key)?;
-                if !installation_root.ends_with(&["eliot", "installations", key]) {
+                let expected_suffix: &[&str] = match self.profile {
+                    InstallationProfile::SystemService => &["eliot", "installations", key],
+                    InstallationProfile::UserMode => &["eliot", "data", "installations", key],
+                    InstallationProfile::PortableDev => unreachable!(),
+                };
+                if !installation_root.ends_with(expected_suffix) {
                     return Err(InstallationError::ProfileViolation(
                         "effect installation_root is not the exact profiled contour".to_owned(),
                     ));

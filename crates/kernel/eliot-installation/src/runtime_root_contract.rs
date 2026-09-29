@@ -406,9 +406,14 @@ impl RuntimeStateRoots {
     pub(super) fn installer_profile_root(&self) -> Result<PlatformHandle, InstallationError> {
         match self.profile {
             InstallationProfile::SystemService | InstallationProfile::UserMode => {
+                let durable_suffix = match self.profile {
+                    InstallationProfile::SystemService => "Eliot",
+                    InstallationProfile::UserMode => "Eliot\\data",
+                    InstallationProfile::PortableDev => unreachable!(),
+                };
                 PlatformHandle::new(joined_windows_path(
                     self.profile_anchor_root.as_str(),
-                    "Eliot",
+                    durable_suffix,
                 ))
                 .map_err(|error| InstallationError::InvalidField {
                     field: "runtime_state_roots.profile_root".to_owned(),
@@ -588,11 +593,14 @@ impl RuntimeStateRoots {
                     ));
                 };
                 validate_installation_key(key)?;
-                if installation.components.len() < 3
-                    || !installation.ends_with(&["eliot", "installations", key])
-                {
+                let expected_suffix: &[&str] = match self.profile {
+                    InstallationProfile::SystemService => &["eliot", "installations", key],
+                    InstallationProfile::UserMode => &["eliot", "data", "installations", key],
+                    InstallationProfile::PortableDev => unreachable!(),
+                };
+                if !installation.ends_with(expected_suffix) {
                     return Err(InstallationError::ProfileViolation(
-                        "profiled installation root must end in Eliot/installations/<key>"
+                        "profiled installation root does not match its selected durable contour"
                             .to_owned(),
                     ));
                 }

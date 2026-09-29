@@ -6643,6 +6643,22 @@ impl HostComposition {
             }
         };
         #[cfg(windows)]
+        if let Some(leases) = profile_root_leases.as_ref() {
+            let original = registry
+                .profile_selection_receipt_for_generation(&startup_manifest.generation)
+                .map_err(HostError::Installation)?;
+            if !eliot_installation::profile_selection_receipts_match_retained_roots(
+                original,
+                leases.selection(),
+            )
+            .map_err(HostError::Installation)?
+            {
+                return Err(HostError::RecoveryRequired(
+                    "profile root identities changed since installation".to_owned(),
+                ));
+            }
+        }
+        #[cfg(windows)]
         {
             verify_current_host_artifact(startup_manifest)?;
         }

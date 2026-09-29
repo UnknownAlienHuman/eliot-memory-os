@@ -323,8 +323,17 @@ impl HostComposition {
                 "supervision authority is foreign to the approved Phase-A launch".to_owned(),
             ));
         }
-        let portable_root = if launch_template.profile == InstallationProfile::PortableDev {
-            Some(
+        let user_owned_launch_root = match launch_template.profile {
+            InstallationProfile::UserMode => Some(
+                UserOwnedRootLease::open_existing(Path::new(
+                    launch_template
+                        .profile_governed_roots
+                        .immutable_binaries
+                        .as_str(),
+                ))
+                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?,
+            ),
+            InstallationProfile::PortableDev => Some(
                 UserOwnedRootLease::open_existing(Path::new(
                     launch_template
                         .portable_root
@@ -337,22 +346,21 @@ impl HostComposition {
                         .as_str(),
                 ))
                 .map_err(|error| HostError::RecoveryRequired(error.to_string()))?,
-            )
-        } else {
-            None
+            ),
+            InstallationProfile::SystemService => None,
         };
         let profile = launch_template.profile;
         let authority_path = approved_phase_b_destination_locator(
             Path::new(launch_template.authority_descriptor_path.as_str()),
             &launch_template.authority_descriptor_path,
             profile,
-            portable_root.as_ref(),
+            user_owned_launch_root.as_ref(),
         )?;
         let observed_previous_binding = phase_b_observe_previous_binding(
             manifest,
             &self.host,
             &self.activation_generation.current,
-            portable_root.as_ref(),
+            user_owned_launch_root.as_ref(),
             &authority_path,
         )?;
         let durable_manifest_digest = phase_b_manifest_digest(manifest)?;
@@ -375,8 +383,11 @@ impl HostComposition {
         };
         let allow_expired_exact_replay = match std::fs::symlink_metadata(&authority_path) {
             Ok(_) => {
-                let lease =
-                    phase_b_open_existing(profile, portable_root.as_ref(), &authority_path)?;
+                let lease = phase_b_open_existing(
+                    profile,
+                    user_owned_launch_root.as_ref(),
+                    &authority_path,
+                )?;
                 lease.verify().map_err(HostError::RecoveryRequired)?;
                 phase_b_lease_bytes(&lease)? == input.authority_descriptor_bytes
             }
@@ -418,7 +429,7 @@ impl HostComposition {
         )?;
         let config_template_bytes = phase_b_template_bytes(
             profile,
-            portable_root.as_ref(),
+            user_owned_launch_root.as_ref(),
             &config_path,
             &manifest.config_digest,
             "Store config",
@@ -453,7 +464,7 @@ impl HostComposition {
         )?;
         let eliotd_template_bytes = phase_b_template_bytes(
             profile,
-            portable_root.as_ref(),
+            user_owned_launch_root.as_ref(),
             &eliotd_descriptor_path,
             &launch_template.eliotd_descriptor_digest,
             "eliotd descriptor",
@@ -488,7 +499,7 @@ impl HostComposition {
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         let previous_eliotd_digest = phase_b_previous_eliotd_digest(
             profile,
-            portable_root.as_ref(),
+            user_owned_launch_root.as_ref(),
             &eliotd_descriptor_path,
             &eliotd_live_bytes,
             &launch_template.eliotd_descriptor_digest,
@@ -565,7 +576,7 @@ impl HostComposition {
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         let previous_config_digest = phase_b_previous_config_digest(
             profile,
-            portable_root.as_ref(),
+            user_owned_launch_root.as_ref(),
             &config_path,
             &config_live_bytes,
             &manifest.config_digest,
@@ -646,7 +657,7 @@ impl HostComposition {
             Path::new(launch_template.store_bootstrap_descriptor_path.as_str()),
             &launch_template.store_bootstrap_descriptor_path,
             profile,
-            portable_root.as_ref(),
+            user_owned_launch_root.as_ref(),
         )?;
         let previous_config_value = previous_binding
             .as_ref()
@@ -677,7 +688,7 @@ impl HostComposition {
         );
         let previous_bootstrap_digest = phase_b_previous_bootstrap_digest(
             profile,
-            portable_root.as_ref(),
+            user_owned_launch_root.as_ref(),
             &bootstrap_path,
             &bootstrap_bytes,
             previous_config_value.as_ref().unwrap_or(&config),
@@ -908,7 +919,7 @@ impl HostComposition {
         let (authority_readback_digest, authority_identity) =
             phase_b_materialize_file_with_rollback(
                 profile,
-                portable_root.as_ref(),
+                user_owned_launch_root.as_ref(),
                 &authority_path,
                 &input.authority_descriptor_bytes,
                 &previous_authority_digests,
@@ -921,7 +932,7 @@ impl HostComposition {
         }
         let (eliotd_readback_digest, eliotd_identity) = phase_b_materialize_file_with_rollback(
             profile,
-            portable_root.as_ref(),
+            user_owned_launch_root.as_ref(),
             &eliotd_descriptor_path,
             &eliotd_live_bytes,
             &eliotd_allowed_digests,
@@ -934,7 +945,7 @@ impl HostComposition {
         }
         let (config_readback_digest, config_identity) = phase_b_materialize_file_with_rollback(
             profile,
-            portable_root.as_ref(),
+            user_owned_launch_root.as_ref(),
             &config_path,
             &config_live_bytes,
             &config_allowed_digests,
@@ -950,7 +961,7 @@ impl HostComposition {
         let (bootstrap_readback_digest, bootstrap_identity) =
             phase_b_materialize_file_with_rollback(
                 profile,
-                portable_root.as_ref(),
+                user_owned_launch_root.as_ref(),
                 &bootstrap_path,
                 &bootstrap_bytes,
                 &bootstrap_allowed_digests,
@@ -998,7 +1009,7 @@ impl HostComposition {
             }
             publish_agent_bridge_pair(
                 profile,
-                portable_root.as_ref(),
+                user_owned_launch_root.as_ref(),
                 agent_bridge,
                 &bridge_allowed_profile_digests,
                 &bridge_allowed_declaration_digests,
@@ -1381,8 +1392,18 @@ impl HostComposition {
             ));
         }
         let profile = manifest.runtime_launch.profile;
-        let portable_root = if profile == InstallationProfile::PortableDev {
-            Some(
+        let user_owned_launch_root = match profile {
+            InstallationProfile::UserMode => Some(
+                UserOwnedRootLease::open_existing(Path::new(
+                    manifest
+                        .runtime_launch
+                        .profile_governed_roots
+                        .immutable_binaries
+                        .as_str(),
+                ))
+                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?,
+            ),
+            InstallationProfile::PortableDev => Some(
                 UserOwnedRootLease::open_existing(Path::new(
                     manifest
                         .runtime_launch
@@ -1396,15 +1417,14 @@ impl HostComposition {
                         .as_str(),
                 ))
                 .map_err(|error| HostError::RecoveryRequired(error.to_string()))?,
-            )
-        } else {
-            None
+            ),
+            InstallationProfile::SystemService => None,
         };
         let readback = |path: &Path,
                         expected: &PlatformHandle,
                         label: &str|
          -> Result<FileIdentity, HostError> {
-            let lease = phase_b_open_existing(profile, portable_root.as_ref(), path)?;
+            let lease = phase_b_open_existing(profile, user_owned_launch_root.as_ref(), path)?;
             lease.verify().map_err(HostError::RecoveryRequired)?;
             let bytes = phase_b_lease_bytes(&lease)?;
             let actual = phase_b_bytes_digest(&bytes)?;
@@ -1646,8 +1666,19 @@ impl HostComposition {
             ));
         }
         let profile = pending.manifest.runtime_launch.profile;
-        let portable_root = if profile == InstallationProfile::PortableDev {
-            Some(
+        let user_owned_launch_root = match profile {
+            InstallationProfile::UserMode => Some(
+                UserOwnedRootLease::open_existing(Path::new(
+                    pending
+                        .manifest
+                        .runtime_launch
+                        .profile_governed_roots
+                        .immutable_binaries
+                        .as_str(),
+                ))
+                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?,
+            ),
+            InstallationProfile::PortableDev => Some(
                 UserOwnedRootLease::open_existing(Path::new(
                     pending
                         .manifest
@@ -1662,9 +1693,8 @@ impl HostComposition {
                         .as_str(),
                 ))
                 .map_err(|error| HostError::RecoveryRequired(error.to_string()))?,
-            )
-        } else {
-            None
+            ),
+            InstallationProfile::SystemService => None,
         };
         let authority_path = approved_locator(
             Path::new(
@@ -1709,21 +1739,21 @@ impl HostComposition {
         )?;
         phase_b_restore_or_remove(
             profile,
-            portable_root.as_ref(),
+            user_owned_launch_root.as_ref(),
             &authority_path,
             "authority descriptor",
             None,
         )?;
         phase_b_restore_or_remove(
             profile,
-            portable_root.as_ref(),
+            user_owned_launch_root.as_ref(),
             &config_path,
             "Store config",
             Some(&pending.manifest.config_digest),
         )?;
         phase_b_restore_or_remove(
             profile,
-            portable_root.as_ref(),
+            user_owned_launch_root.as_ref(),
             &bootstrap_path,
             "Store bootstrap descriptor",
             Some(
@@ -1735,13 +1765,13 @@ impl HostComposition {
         )?;
         phase_b_restore_or_remove(
             profile,
-            portable_root.as_ref(),
+            user_owned_launch_root.as_ref(),
             &eliotd_path,
             "eliotd descriptor",
             Some(&pending.manifest.runtime_launch.eliotd_descriptor_digest),
         )?;
         if let Some(binding) = prepared.agent_bridge.as_ref() {
-            rollback_agent_bridge_pair(profile, portable_root.as_ref(), binding)?;
+            rollback_agent_bridge_pair(profile, user_owned_launch_root.as_ref(), binding)?;
             rollback_agent_bridge_stage(&binding.stage_prepared)?;
         } else if let Some(stage) = pending.phase_b_agent_bridge_stage_prepared.as_ref() {
             rollback_agent_bridge_stage(stage)?;
