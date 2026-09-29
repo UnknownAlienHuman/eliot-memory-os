@@ -33,8 +33,8 @@ use crate::model::{
     ReadySelectionOutcome, ReassignmentId, ReassignmentReceipt, ResultSubmission,
     RoleProfileManifest, RouteCandidateEvidence, SchedulingProfile, StaffingLaneCandidate,
     StaffingPlanCandidate, StaffingPlanRequest, SubmissionId, UnknownOutcomeFinalReceipt,
-    WipPartitionKey, WorkClass, WorkClassProfile, WorkClassSelectionReport, WorkerId,
-    validate_text,
+    WipPartitionKey, WorkClass, WorkClassAgeRule, WorkClassProfile, WorkClassSelectionReport,
+    WorkerId, validate_text,
 };
 use crate::provider_admission::{
     AdmittedProviderCapability, KernelProviderVerifier, ProviderSelectionHealth,
@@ -440,6 +440,7 @@ fn class_report(
         item_ceiling: class_profile.map(|profile| count_as_u64(profile.max_items)),
         concurrency_ceiling: class_profile.map(|profile| count_as_u64(profile.max_concurrency)),
         byte_ceiling: class_profile.map(|profile| profile.max_bytes),
+        age_rule: class_profile.map(|profile| profile.age_rule),
         scanned_ready_items: view.scanned,
         oldest_ready_enqueue_sequence: view.oldest_ready_sequence(),
         offered_attempt_id: view.head.map(|attempt| attempt.attempt_id.clone()),
@@ -533,13 +534,41 @@ fn offer_class_head(
         ));
         return;
     }
-    // Bounded scan for the oldest eligible head; the window is the class item
-    // ceiling. See the known-limitation note on `next_ready`: the window always
-    // starts at the oldest admitted item, so a window whose items are all
-    // permanently out of profile never advances.
-    for (_, attempt) in view.ready.iter().take(context.profile.max_items) {
+    // Bounded scan for the oldest eligible head.
+    //
+    // The class item ceiling bounds how many items the class is still *owed*
+    // the pull examines, and the walk is in ascending canonical enqueue
+    // ordinal, so a truncated window can only leave later items unserved.
+    //
+    // The class's I14.2 age rule decides what an over-age item costs. Under
+    // `Preserve` it is owed: it consumes the window, keeps the head and is
+    // reported infeasible, so a window whose items are all permanently out of
+    // profile does not advance — which is exactly what I14.2's `verification`
+    // ("preserve finish/proof") and `canonical writes` ("durable stage or
+    // backpressure") rows require. Under `Rebuildable` — the `background` ("pause
+    // /drop rebuildable work") and `reports` ("regenerate later") rows, whose
+    // work may be discarded and produced again — an over-age item is not owed,
+    // so it is stepped over without consuming the window and the rest of the
+    // class still progresses. Stepping over is not dropping: nothing is removed,
+    // the item keeps its canonical enqueue ordinal, and this pull publishes no
+    // disposition for it.
+    let mut owed = 0usize;
+    for (_, attempt) in view.ready.iter() {
+        let block = item_block(view, attempt, context.profile);
+        let over_age = block.as_ref().is_some_and(|block| {
+            block.reason == ReadyItemSkipReason::ClassDeadlineCeiling
+        });
+        if over_age && context.profile.age_rule == WorkClassAgeRule::Rebuildable {
+            view.scanned += 1;
+            view.skipped += 1;
+            continue;
+        }
+        if owed == context.profile.max_items {
+            break;
+        }
+        owed += 1;
         view.scanned += 1;
-        let Some(block) = item_block(view, attempt, context.profile) else {
+        let Some(block) = block else {
             view.head = Some(attempt);
             return;
         };
@@ -1401,18 +1430,25 @@ impl AgentCoordinator {
     ///   infeasible and gets no service promise from this selector. Disposing of
     ///   it is the admission owner's decision.
     ///
-    /// Known limitation, not papered over: the scan window always starts at the
-    /// oldest admitted item of its class. If every item inside the window is
-    /// permanently out of profile — the deadline-ceiling case above — then the
-    /// class reports `AllReadyItemsSkipped`, publishes no capacity deferral
-    /// (a deadline mismatch is not a capacity dimension), and the window never
-    /// advances, so both the blocked items and everything queued behind them in
-    /// that class make no progress on any pull. Nothing in this selector breaks
-    /// that: the disposition belongs to admission, which must refuse or stage an
+    /// Known limitation, not papered over, and now stated per class: for a
+    /// [`WorkClassAgeRule::Preserve`] class the scan window always starts at the
+    /// oldest admitted item. If every item inside the window is permanently out
+    /// of profile — the deadline-ceiling case above — then the class reports
+    /// `AllReadyItemsSkipped`, publishes no capacity deferral (a deadline
+    /// mismatch is not a capacity dimension), and the window never advances, so
+    /// both the blocked items and everything queued behind them in that class
+    /// make no progress on any pull. That is the behaviour I14.2 requires of
+    /// `verification` ("preserve finish/proof") and `canonical writes` ("durable
+    /// stage or backpressure"), so nothing here breaks it; the disposition of
+    /// such an item still belongs to admission, which must refuse or stage an
     /// item whose budget exceeds the class deadline ceiling, and `plan`/`admit`
-    /// take no profile today. The condition is reachable by profile choice
-    /// alone: any class whose `deadline_ms` is below the `wall_time_ms` budget of
-    /// its first `max_items` admitted items.
+    /// take no profile today. A [`WorkClassAgeRule::Rebuildable`] class — the
+    /// `background` and `reports` rows, whose work may be dropped or regenerated
+    /// — is not subject to it: an over-age item is stepped over without
+    /// consuming the window, so the rest of that class progresses. The condition
+    /// remains reachable for a `Preserve` class by profile choice alone: any
+    /// class whose `deadline_ms` is below the `wall_time_ms` budget of its first
+    /// `max_items` admitted items.
     ///
     /// The pull selects; it does not start anything. A caller that receives a
     /// `selected_attempt_id` starts that attempt through the existing

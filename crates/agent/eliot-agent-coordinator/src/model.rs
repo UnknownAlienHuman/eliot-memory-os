@@ -1190,17 +1190,65 @@ impl<'de> Deserialize<'de> for WorkClass {
 pub const FAIRNESS_QUANTUM: u64 = 1_000_000;
 
 /// Name of the frozen selection algorithm recorded in every pull outcome,
-/// including the frozen within-class age rule it implements.
+/// including the within-class age order it implements.
 ///
-/// The age rule is `oldest-canonical-enqueue-first` and its clock domain is the
-/// durable canonical enqueue ordinal assigned when an attempt is admitted or
-/// reassigned, not a wall clock: replaying the event log re-derives the same
-/// ordinal, so neither a projection rebuild nor a coordinator restart can renew
-/// an item's age, and no caller-supplied clock participates in the decision.
-/// The ordinal is unique per attempt, so the within-class order is total and
-/// no further tie-break exists.
+/// The within-class **order** is `oldest-canonical-enqueue-first` and its clock
+/// domain is the durable canonical enqueue ordinal assigned when an attempt is
+/// admitted or reassigned, not a wall clock: replaying the event log re-derives
+/// the same ordinal, so neither a projection rebuild nor a coordinator restart
+/// can renew an item's age, and no caller-supplied clock participates in the
+/// decision. The ordinal is unique per attempt, so the within-class order is
+/// total and no further tie-break exists.
+///
+/// What a class does with an item that has aged past its own deadline ceiling
+/// is per-class policy, not part of this name: it is
+/// [`WorkClassAgeRule`], carried on every [`WorkClassProfile`] and published in
+/// every [`WorkClassSelectionReport`].
 pub const FAIR_PULL_ALGORITHM: &str =
     "eliot-agent-coordinator/smooth-weighted-fair-pull-v1/oldest-canonical-enqueue-first";
+
+/// I14.2 per-class age rule: what a class owes an admitted item that has aged
+/// past the class's own deadline ceiling.
+///
+/// I14.8 fixes "weighted fair polling and age within class" and the within-class
+/// order, so the order itself is one rule and is frozen in
+/// [`FAIR_PULL_ALGORITHM`]. What I14.2 states **per pool** is the third column
+/// of its table, "Behavior under pressure", and that column is this rule: it
+/// says whether aged work of that pool is a preservation obligation or work that
+/// may be discarded and produced again. Both variants keep the same
+/// oldest-canonical-enqueue order and the same durable clock; they differ only
+/// in whether an over-age head still holds its class's bounded scan window.
+///
+/// The two values are the two behaviours I14.2's own column states, cited
+/// verbatim:
+///
+/// - `background` is "pause/drop rebuildable work" and `reports` is "regenerate
+///   later". Both say the work may be dropped and produced again, so an item
+///   past the class deadline ceiling is not an obligation of that class.
+/// - `verification` is "preserve finish/proof" and `canonical writes` is
+///   "durable stage or backpressure", and the remaining I14.2 rows — `control`
+///   ("never borrowed by normal work"), `interactive` ("BUSY with short
+///   retry"), `model jobs` ("checkpoint/deny") and `swarm` ("stop
+///   admission/replan") — all keep their work. I14.22 states the same for
+///   `maintenance`: it may be deferred, but it is not discarded.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum WorkClassAgeRule {
+    /// The class still owes this item service: an item whose own `wall_time_ms`
+    /// budget exceeds the class deadline ceiling keeps the head of the class's
+    /// bounded scan window, is retained with its canonical enqueue ordinal, and
+    /// is reported infeasible. This is the behaviour I14.2 states for every row
+    /// except `background` and `reports`.
+    Preserve,
+    /// The class does not owe this item service: I14.2's own column says this
+    /// pool's work is rebuildable or regenerable, so an item past the class
+    /// deadline ceiling is stepped over without holding the class's bounded
+    /// scan window, and the rest of the class still progresses. Stepping over
+    /// is not dropping: the item stays admitted, keeps its canonical enqueue
+    /// ordinal and is never removed by a pull, and a pull publishes no
+    /// disposition for it — its disposition belongs to admission.
+    Rebuildable,
+}
 
 /// I14.8 WIP partition dimension, restricted to the dimensions a stored
 /// `AttemptRecord` can actually derive.
@@ -1252,13 +1300,11 @@ pub struct WipPartitionLimit {
 /// class's own scan window. Every value is positive; a missing or zero value is
 /// rejected instead of being read as unlimited.
 ///
-/// Deliberate narrowing of issue #1683 W1, which lists an "age rule" per class:
-/// the within-class age rule is **not** per-class policy here. I14.8 fixes
-/// "weighted fair polling and age within class" and the issue fixes the
-/// within-class order to the oldest eligible canonical enqueue ordinal, so there
-/// is exactly one rule. A per-class field able to hold only that one value
-/// would be a declaration that steers nothing, so the rule lives in
-/// [`FAIR_PULL_ALGORITHM`] and in the ordering itself instead.
+/// The class's age policy is [`WorkClassProfile::age_rule`], not an implicit
+/// property of the within-class order: I14.2's per-pool "Behavior under
+/// pressure" column is the only per-class statement of what a class owes an
+/// item that has aged past its deadline ceiling, so it is carried here per
+/// class rather than assumed for all nine. See [`WorkClassAgeRule`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkClassProfile {
@@ -1279,6 +1325,11 @@ pub struct WorkClassProfile {
     pub deadline_ms: u64,
     /// I14.8 weight of this class in the weighted fair pull.
     pub weight: u32,
+    /// I14.2 per-class age rule. Required: a class whose age behaviour I14.2
+    /// leaves to policy must state one, and one that I14.2 states takes the
+    /// stated behaviour unless policy overrides it, exactly like
+    /// [`WorkClassProfile::max_items`].
+    pub age_rule: WorkClassAgeRule,
     pub wip_partitions: Vec<WipPartitionLimit>,
 }
 
@@ -1318,11 +1369,11 @@ impl WorkClassProfile {
 /// The I14.2 values the fragment does not fix, supplied by the policy owner.
 ///
 /// I14.2 fixes no concurrency, deadline, byte, weight or WIP value for any
-/// class, and fixes no item ceiling at all for `control`, `model_jobs`, `swarm`
-/// and `maintenance`; those stay required inputs here instead of being invented
-/// by this crate. I14.1 nevertheless requires a bounded byte profile for every
-/// class, so `max_bytes` is a required input for all nine and no class may be
-/// constructed without one.
+/// class, and fixes no item ceiling and no pressure behaviour at all for
+/// `control`, `model_jobs`, `swarm` and `maintenance`; those stay required
+/// inputs here instead of being invented by this crate. I14.1 nevertheless
+/// requires a bounded byte profile for every class, so `max_bytes` is a
+/// required input for all nine and no class may be constructed without one.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyBoundClassLimits {
@@ -1338,16 +1389,25 @@ pub struct PolicyBoundClassLimits {
     pub max_concurrency: usize,
     pub deadline_ms: u64,
     pub weight: u32,
+    /// The class's age rule. `None` means "use the I14.2 documented
+    /// 'Behavior under pressure' value" and is accepted only for the eight
+    /// classes I14.2 gives a row to; it is required for `maintenance`, whose
+    /// age rule I14.2 does not state. A `Some` value always wins, for the same
+    /// reason a `Some` item ceiling always wins.
+    pub age_rule: Option<WorkClassAgeRule>,
     pub wip_partitions: Vec<WipPartitionLimit>,
 }
 
 /// Versioned per-class scheduling policy: exactly one [`WorkClassProfile`] for
 /// each of the nine I14.1 classes.
 ///
-/// The age rule is deliberately not a field of this set. It is fixed by the
-/// governing fragment and the issue to the oldest canonical enqueue ordinal and
-/// is recorded once in [`FAIR_PULL_ALGORITHM`], which every pull outcome
-/// publishes; see [`WorkClassProfile`] for the narrowing note.
+/// The within-class age **order** is deliberately not a field of this set: I14.8
+/// and issue #1683 W2 fix it to the oldest canonical enqueue ordinal and it is
+/// recorded once in [`FAIR_PULL_ALGORITHM`], which every pull outcome publishes.
+/// What *is* per class is the age rule — what the class owes an item that has
+/// aged past its own deadline ceiling — because I14.2's per-pool "Behavior under
+/// pressure" column states that separately for each pool. It is
+/// [`WorkClassProfile::age_rule`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SchedulingProfile {
@@ -1380,19 +1440,59 @@ impl SchedulingProfile {
         }
     }
 
+    /// I14.2 "Behavior under pressure" column, as the per-class age rule.
+    ///
+    /// Verbatim, the column says: `background` — "pause/drop rebuildable work";
+    /// `reports` — "regenerate later". Those two rows say the pool's work may be
+    /// discarded and produced again, so they are [`WorkClassAgeRule::Rebuildable`].
+    /// Every other row keeps its work — `verification` "preserve finish/proof",
+    /// `canonical writes` "durable stage or backpressure", `control` "never
+    /// borrowed by normal work", `interactive` "BUSY with short retry", `model
+    /// jobs` "checkpoint/deny", `swarm` "stop admission/replan" — and are
+    /// [`WorkClassAgeRule::Preserve`].
+    ///
+    /// `None` marks `maintenance`, which has no row in I14.2's table at all: the
+    /// fragment states no pressure behaviour for it, so its age rule stays
+    /// policy-bound and is required from the caller. Every I14.1 class is
+    /// listed, so a Kernel-side addition fails to compile here instead of
+    /// silently inheriting a rule.
+    fn fixed_age_rule(work_class: WorkClass) -> Option<WorkClassAgeRule> {
+        match work_class {
+            WorkClass::Normal(NormalWorkClass::NormalBackground)
+            | WorkClass::Normal(NormalWorkClass::Reporting) => {
+                Some(WorkClassAgeRule::Rebuildable)
+            }
+            WorkClass::Control
+            | WorkClass::Normal(
+                NormalWorkClass::Interactive
+                | NormalWorkClass::Verification
+                | NormalWorkClass::CanonicalWrite
+                | NormalWorkClass::ModelJob
+                | NormalWorkClass::Swarm,
+            ) => Some(WorkClassAgeRule::Preserve),
+            WorkClass::Normal(NormalWorkClass::Maintenance) => None,
+        }
+    }
+
     /// Builds the I14.2 initial profile: the documented initial item ceilings
-    /// above, overridable by policy, with every remaining value — including the
-    /// byte ceiling of all nine classes — taken from `policy`.
+    /// above and the documented initial age rule per pool, both overridable by
+    /// policy, with every remaining value — including the byte ceiling of all
+    /// nine classes — taken from `policy`.
     ///
     /// A class whose `max_items` is `None` gets the I14.2 documented default; a
     /// class that supplies one gets that value instead. I14.2 states its numbers
     /// are defaults in `runtime.toml` and not Architecture, so refusing an
-    /// override would make this crate's table outrank the fragment.
+    /// override would make this crate's table outrank the fragment. The same
+    /// applies to `age_rule`: a class whose `age_rule` is `None` gets the
+    /// documented pressure behaviour of its row, and a class that supplies one
+    /// gets that value instead.
     ///
     /// A class with no `max_items` default in I14.2 (`control`, `model_jobs`,
-    /// `swarm`, `maintenance`) must supply one, and **every** class must supply a
-    /// positive `max_bytes`, because I14.1 requires a bounded byte profile for
-    /// each of the nine. A missing value is a typed refusal, never a default.
+    /// `swarm`, `maintenance`) must supply one, `maintenance` must supply an
+    /// `age_rule` because I14.2 states none for it, and **every** class must
+    /// supply a positive `max_bytes`, because I14.1 requires a bounded byte
+    /// profile for each of the nine. A missing value is a typed refusal, never a
+    /// default, and no class is ever left unlimited.
     ///
     /// This is not a second configuration source. It reads no file, no
     /// environment variable and no working directory; the Kernel runtime
@@ -1418,6 +1518,10 @@ impl SchedulingProfile {
                 .max_items
                 .or_else(|| Self::fixed_items(work_class))
                 .ok_or(CoordinatorError::InvalidField("max_items"))?;
+            let age_rule = entry
+                .age_rule
+                .or_else(|| Self::fixed_age_rule(work_class))
+                .ok_or(CoordinatorError::InvalidField("age_rule"))?;
             classes.push(WorkClassProfile {
                 work_class,
                 max_items,
@@ -1425,6 +1529,7 @@ impl SchedulingProfile {
                 max_concurrency: entry.max_concurrency,
                 deadline_ms: entry.deadline_ms,
                 weight: entry.weight,
+                age_rule,
                 wip_partitions: entry.wip_partitions.clone(),
             });
         }
@@ -1592,10 +1697,18 @@ pub struct WorkClassSelectionReport {
     pub item_ceiling: Option<u64>,
     pub concurrency_ceiling: Option<u64>,
     pub byte_ceiling: Option<u64>,
-    /// Admitted items actually examined. The scan is bounded by the item
-    /// ceiling (or by the whole class on the profile-free path) and walks the
-    /// items in ascending canonical enqueue ordinal, so a truncated window can
-    /// only leave later items unserved, never displace an older one.
+    /// I14.2 age rule in force for this class, or `None` on the profile-free
+    /// peek path, which applies no per-class policy at all.
+    pub age_rule: Option<WorkClassAgeRule>,
+    /// Admitted items actually examined. The class item ceiling bounds how many
+    /// items the class is still **owed** the pull examines, and the walk is in
+    /// ascending canonical enqueue ordinal, so a truncated window can only leave
+    /// later items unserved, never displace an older one. Under
+    /// [`WorkClassAgeRule::Rebuildable`], items past the class deadline ceiling
+    /// are examined and stepped over without consuming that window, so this
+    /// count can exceed `item_ceiling` while the owed window does not; the
+    /// excess is a linear walk of the class's own already-materialised admitted
+    /// set, with no allocation, retry or re-poll.
     pub scanned_ready_items: usize,
     /// Canonical enqueue ordinal of the oldest admitted item, if any, under the
     /// frozen age rule named in [`FAIR_PULL_ALGORITHM`]. This is the age of the
@@ -1611,7 +1724,10 @@ pub struct WorkClassSelectionReport {
     /// Admitted items passed over inside this class, retained and not re-queued.
     pub skipped_ready_items: usize,
     /// Passed-over items that are not temporarily closed and therefore get no
-    /// service promise from this selector.
+    /// service promise from this selector. Only a [`WorkClassAgeRule::Preserve`]
+    /// class contributes here: a [`WorkClassAgeRule::Rebuildable`] class is
+    /// stepped over rather than blocked by an over-age head, so its over-age
+    /// items are passed over but are not permanent obstacles to that class.
     pub infeasible_items: usize,
 }
 

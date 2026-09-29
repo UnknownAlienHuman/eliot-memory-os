@@ -32,6 +32,7 @@
 //! max_concurrency = 4
 //! deadline_ms = 30000
 //! weight = 1000
+//! age_rule = "PRESERVE"
 //!
 //! [[classes.wip_partitions]]
 //! key = "ROUTE"
@@ -43,22 +44,23 @@
 //! `normal_background`, `model_jobs`, `swarm`, `reporting`, `maintenance`)
 //! through the existing [`WorkClass`] boundary type, whose `Deserialize` is
 //! already the sole validated constructor from a wire string. `key` accepts
-//! the four existing [`WipPartitionKey`] names. Unknown fields are refused on
-//! the document, on each class entry and inside each partition, so a typo is a
-//! refusal and never an ignored limit.
+//! the four existing [`WipPartitionKey`] names, and `age_rule` the two existing
+//! [`WorkClassAgeRule`] names. Unknown fields are refused on the document, on
+//! each class entry and inside each partition, so a typo is a refusal and never
+//! an ignored limit.
 //!
 //! # Defaults and refusals
 //!
-//! I14.2 fixes an item ceiling for only five pools and no other ceiling at
-//! all, so the file is the default source for exactly those five numbers and a
-//! required source for everything else:
+//! I14.2 fixes an item ceiling and a pressure behaviour for only part of the
+//! table and no other ceiling at all, so the file is the default source for
+//! exactly those values and a required source for everything else:
 //!
-//! - `max_items` is the only optional field. A present value always wins; an
-//!   absent value is the existing `Option` contract and takes the I14.2
-//!   documented default for `interactive`, `verification`, `canonical_write`,
-//!   `normal_background` and `reporting`. For `control`, `model_jobs`, `swarm`
-//!   and `maintenance` I14.2 names no ceiling, so an absent value is a typed
-//!   refusal from `i14_2_initial`, never a default.
+//! - `max_items` and `age_rule` are the only optional fields. A present value
+//!   always wins; an absent value is the existing `Option` contract and takes
+//!   the I14.2 documented value. For `control`, `model_jobs`, `swarm` and
+//!   `maintenance` I14.2 names no item ceiling, and for `maintenance` it names
+//!   no row at all and so no pressure behaviour, so an absent value for those is
+//!   a typed refusal from `i14_2_initial`, never a default.
 //! - `max_bytes`, `max_concurrency`, `deadline_ms`, `weight` and
 //!   `wip_partitions` are required on every class. I14.1 states "Each has
 //!   bounded items, bytes, concurrency and deadline profile", so no class may
@@ -75,9 +77,10 @@
 //!
 //! An absent file is its own typed case ([`RuntimeProfileRejection::Absent`])
 //! and is deliberately *not* a defaulted profile. I14.2 fixes no byte,
-//! concurrency, deadline, weight or WIP value for any class and no item
-//! ceiling for four of them, so "no file" cannot be compiled into a complete
-//! nine-class policy without inventing numbers that no fragment states.
+//! concurrency, deadline, weight or WIP value for any class, no item ceiling for
+//! four of them and no pressure behaviour at all for `maintenance`, so "no
+//! file" cannot be compiled into a complete nine-class policy without inventing
+//! numbers that no fragment states.
 //! Silently defaulting it would let an installation that never wrote a
 //! runtime profile run on nine ceilings this repository cannot justify.
 //!
@@ -110,7 +113,7 @@ use thiserror::Error;
 
 use crate::model::{
     CoordinatorError, PolicyBoundClassLimits, SchedulingProfile, WipPartitionLimit, WorkClass,
-    validate_text,
+    WorkClassAgeRule, validate_text,
 };
 
 /// File name of the Kernel-owned runtime configuration document.
@@ -147,8 +150,9 @@ pub enum RuntimeProfileRejection {
     ///
     /// This is explicitly distinct from a parse failure, and it does not
     /// resolve to a defaulted profile: I14.1 requires a bounded byte profile
-    /// for all nine classes and I14.2 fixes no item ceiling for `control`,
-    /// `model_jobs`, `swarm` or `maintenance`, so an absent document supplies
+    /// for all nine classes, I14.2 fixes no item ceiling for `control`,
+    /// `model_jobs`, `swarm` or `maintenance`, and it gives `maintenance` no
+    /// row at all and so no pressure behaviour, so an absent document supplies
     /// too little policy to compile nine classes.
     #[error(
         "runtime configuration is absent at {0}: it is the only source of the queue-profile values I14.1 and I14.2 leave to policy, so absence is a refusal and not a defaulted profile"
@@ -190,6 +194,10 @@ pub struct RuntimeClassLimits {
     pub deadline_ms: u64,
     /// I14.8 weight of this class in the weighted fair pull.
     pub weight: u32,
+    /// I14.2 "Behavior under pressure" for this class. `None` takes the
+    /// documented value of that class's row and is accepted only for the eight
+    /// classes I14.2 gives a row to; a present value always wins.
+    pub age_rule: Option<WorkClassAgeRule>,
     /// I14.8 WIP partitions of this class. At least one is required by the
     /// existing per-class validator.
     pub wip_partitions: Vec<WipPartitionLimit>,
@@ -321,8 +329,9 @@ pub fn load_runtime_profile_document(
 /// fields, converts each class entry into the existing
 /// [`PolicyBoundClassLimits`], and hands them to the existing
 /// [`SchedulingProfile::i14_2_initial`], which applies the documented I14.2
-/// item-ceiling defaults for the five classes that have one and refuses the
-/// four that do not. No default, ceiling or legality rule is computed here.
+/// item-ceiling and pressure-behaviour defaults for the classes that have one
+/// and refuses the ones that do not. No default, ceiling or legality rule is
+/// computed here.
 ///
 /// # Errors
 /// Returns [`CoordinatorError::RuntimeProfileRejected`] for a document-level
@@ -345,6 +354,7 @@ pub fn compile_runtime_scheduling_profile(
             max_concurrency: class.max_concurrency,
             deadline_ms: class.deadline_ms,
             weight: class.weight,
+            age_rule: class.age_rule,
             wip_partitions: class.wip_partitions,
         })
         .collect::<Vec<PolicyBoundClassLimits>>();
