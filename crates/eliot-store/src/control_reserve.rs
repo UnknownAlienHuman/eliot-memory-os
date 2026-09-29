@@ -1278,7 +1278,11 @@ struct StoreReserveInner {
 /// Acquiring from one partition never observes or consumes another:
 /// saturating normal connections, transactions or pending-write bytes leaves
 /// the full protected capacity available for admitted
-/// cancellation/recovery/fencing records and vice versa. Acquisition is
+/// cancellation/recovery/fencing records and vice versa. Partition selection
+/// is typed: normal acquisition resolves only normal counters from its
+/// NormalWorkClass value and protected acquisition only protected counters
+/// from its ControlOperationClass value, so a normal-only path cannot name a
+/// protected counter. Acquisition is
 /// non-blocking and atomic; release is explicit and exactly-once via
 /// [`StorePermit::release`], with drop as the backstop returning exactly the
 /// consumed partition and amount.
@@ -1453,7 +1457,7 @@ impl StorePermit {
                 permit_id: self.permit_id.clone(),
             });
         };
-        let (counter, _) = select_slot(&slot, self.dimension, self.class);
+        let (counter, _) = select_held_slot(&slot, self.dimension, self.operation);
         debug_assert!(
             counter.load(Ordering::Acquire) >= self.amount,
             "Store permit release without a held partition amount"
@@ -1506,7 +1510,7 @@ impl StorePermit {
 impl Drop for StorePermit {
     fn drop(&mut self) {
         if let Some(slot) = self.slot.take() {
-            let (counter, _) = select_slot(&slot, self.dimension, self.class);
+            let (counter, _) = select_held_slot(&slot, self.dimension, self.operation);
             debug_assert!(
                 counter.load(Ordering::Acquire) >= self.amount,
                 "Store permit drop without a held partition amount"
@@ -1516,39 +1520,75 @@ impl Drop for StorePermit {
     }
 }
 
-/// Selects the live in-flight counter and its partition capacity for one
-/// dimension/class cell. Single selector for acquire, release, drop and
-/// restart re-hold paths so no path can address the wrong partition.
-fn select_slot(
+/// Resolves the live normal-partition counter and its capacity for one
+/// dimension. The [`NormalWorkClass`] value is evidence-only: its type is the
+/// partition key, so a normal-only path cannot name, and therefore cannot
+/// resolve, a protected counter. One dimension resolves exactly its own
+/// counter; saturating it leaves every other dimension untouched.
+fn select_normal_slot(
     inner: &StoreReserveInner,
     dimension: StoreDimension,
-    class: CapacityClass,
+    _work: NormalWorkClass,
 ) -> (&AtomicU64, u64) {
-    match (dimension, class) {
-        (StoreDimension::ConnectionSlots, CapacityClass::NormalWorkload) => (
+    match dimension {
+        StoreDimension::ConnectionSlots => (
             &inner.connection_normal_in_flight,
             inner.connection_normal_capacity,
         ),
-        (StoreDimension::ConnectionSlots, _) => (
-            &inner.connection_protected_in_flight,
-            inner.connection_protected_capacity,
-        ),
-        (StoreDimension::TransactionSlots, CapacityClass::NormalWorkload) => (
+        StoreDimension::TransactionSlots => (
             &inner.transaction_normal_in_flight,
             inner.transaction_normal_capacity,
         ),
-        (StoreDimension::TransactionSlots, _) => (
-            &inner.transaction_protected_in_flight,
-            inner.transaction_protected_capacity,
-        ),
-        (StoreDimension::PendingWriteMemory, CapacityClass::NormalWorkload) => (
+        StoreDimension::PendingWriteMemory => (
             &inner.pending_normal_in_flight_bytes,
             inner.pending_normal_capacity_bytes,
         ),
-        (StoreDimension::PendingWriteMemory, _) => (
+    }
+}
+
+/// Resolves the live protected-partition counter and its capacity for one
+/// dimension. Only a [`ControlOperationClass`] value typechecks here, so this
+/// is reachable only from control/recovery entry after that entry revalidates
+/// the normal authority bindings first (every protected acquisition opens
+/// with the same checked request validation as normal work, before any
+/// protected counter is touched). One dimension resolves exactly its own
+/// counter; there is no shared pool and no emergency cell in this slice.
+fn select_protected_slot(
+    inner: &StoreReserveInner,
+    dimension: StoreDimension,
+    _operation: ControlOperationClass,
+) -> (&AtomicU64, u64) {
+    match dimension {
+        StoreDimension::ConnectionSlots => (
+            &inner.connection_protected_in_flight,
+            inner.connection_protected_capacity,
+        ),
+        StoreDimension::TransactionSlots => (
+            &inner.transaction_protected_in_flight,
+            inner.transaction_protected_capacity,
+        ),
+        StoreDimension::PendingWriteMemory => (
             &inner.pending_protected_in_flight_bytes,
             inner.pending_protected_capacity_bytes,
         ),
+    }
+}
+
+/// Resolves the exact held-partition counter for one live permit from its
+/// recorded [`StorePermitOperation`]: release and drop return the amount to
+/// the cell it was claimed from, never to the other class. Single resolver
+/// for the held-permit return paths so no path can address the wrong
+/// partition.
+fn select_held_slot(
+    inner: &StoreReserveInner,
+    dimension: StoreDimension,
+    operation: StorePermitOperation,
+) -> (&AtomicU64, u64) {
+    match operation {
+        StorePermitOperation::Normal(work) => select_normal_slot(inner, dimension, work),
+        StorePermitOperation::Protected(operation) => {
+            select_protected_slot(inner, dimension, operation)
+        }
     }
 }
 
@@ -1820,11 +1860,8 @@ impl StoreReserve {
         request: StorePermitRequest<'_>,
     ) -> Result<StorePermit, StoreReserveError> {
         Self::checked_request(&request)?;
-        let (slot, capacity) = select_slot(
-            &self.inner,
-            StoreDimension::ConnectionSlots,
-            CapacityClass::NormalWorkload,
-        );
+        let (slot, capacity) =
+            select_normal_slot(&self.inner, StoreDimension::ConnectionSlots, work);
         if !cas_add(slot, capacity, 1) {
             return Err(StoreReserveError::NormalCapacityExhausted {
                 bottleneck: STORE_CONNECTION_BOTTLENECK,
@@ -1860,11 +1897,8 @@ impl StoreReserve {
         request: StorePermitRequest<'_>,
     ) -> Result<StorePermit, StoreReserveError> {
         Self::checked_request(&request)?;
-        let (slot, capacity) = select_slot(
-            &self.inner,
-            StoreDimension::TransactionSlots,
-            CapacityClass::NormalWorkload,
-        );
+        let (slot, capacity) =
+            select_normal_slot(&self.inner, StoreDimension::TransactionSlots, work);
         if !cas_add(slot, capacity, 1) {
             return Err(StoreReserveError::NormalCapacityExhausted {
                 bottleneck: STORE_TRANSACTION_BOTTLENECK,
@@ -1902,11 +1936,8 @@ impl StoreReserve {
         bytes: NonZeroU64,
     ) -> Result<StorePermit, StoreReserveError> {
         Self::checked_request(&request)?;
-        let (slot, capacity) = select_slot(
-            &self.inner,
-            StoreDimension::PendingWriteMemory,
-            CapacityClass::NormalWorkload,
-        );
+        let (slot, capacity) =
+            select_normal_slot(&self.inner, StoreDimension::PendingWriteMemory, work);
         if !cas_add(slot, capacity, bytes.get()) {
             return Err(StoreReserveError::NormalCapacityExhausted {
                 bottleneck: STORE_PENDING_WRITE_BOTTLENECK,
@@ -1945,11 +1976,8 @@ impl StoreReserve {
         request: StorePermitRequest<'_>,
     ) -> Result<StorePermit, StoreReserveError> {
         Self::checked_request(&request)?;
-        let (slot, capacity) = select_slot(
-            &self.inner,
-            StoreDimension::ConnectionSlots,
-            CapacityClass::ProtectedControl,
-        );
+        let (slot, capacity) =
+            select_protected_slot(&self.inner, StoreDimension::ConnectionSlots, operation);
         if !cas_add(slot, capacity, 1) {
             return Err(StoreReserveError::ProtectedReserveExhausted {
                 bottleneck: STORE_CONNECTION_BOTTLENECK,
@@ -1986,11 +2014,8 @@ impl StoreReserve {
         request: StorePermitRequest<'_>,
     ) -> Result<StorePermit, StoreReserveError> {
         Self::checked_request(&request)?;
-        let (slot, capacity) = select_slot(
-            &self.inner,
-            StoreDimension::TransactionSlots,
-            CapacityClass::ProtectedControl,
-        );
+        let (slot, capacity) =
+            select_protected_slot(&self.inner, StoreDimension::TransactionSlots, operation);
         if !cas_add(slot, capacity, 1) {
             return Err(StoreReserveError::ProtectedReserveExhausted {
                 bottleneck: STORE_TRANSACTION_BOTTLENECK,
@@ -2028,11 +2053,8 @@ impl StoreReserve {
         bytes: NonZeroU64,
     ) -> Result<StorePermit, StoreReserveError> {
         Self::checked_request(&request)?;
-        let (slot, capacity) = select_slot(
-            &self.inner,
-            StoreDimension::PendingWriteMemory,
-            CapacityClass::ProtectedControl,
-        );
+        let (slot, capacity) =
+            select_protected_slot(&self.inner, StoreDimension::PendingWriteMemory, operation);
         if !cas_add(slot, capacity, bytes.get()) {
             return Err(StoreReserveError::ProtectedReserveExhausted {
                 bottleneck: STORE_PENDING_WRITE_BOTTLENECK,
@@ -2233,7 +2255,40 @@ impl StoreReserve {
     ) -> Result<StoreReconcileDisposition, StoreReserveError> {
         let disposition = record.reconcile(current_owner_generation, current_profile_revision);
         if disposition.keeps_reserved() && record.amount > 0 {
-            let (slot, capacity) = select_slot(&self.inner, record.dimension, record.class);
+            let inner = &self.inner;
+            let (slot, capacity): (&AtomicU64, u64) = match (record.dimension, record.class) {
+                (StoreDimension::ConnectionSlots, CapacityClass::NormalWorkload) => (
+                    &inner.connection_normal_in_flight,
+                    inner.connection_normal_capacity,
+                ),
+                (StoreDimension::ConnectionSlots, CapacityClass::ProtectedControl) => (
+                    &inner.connection_protected_in_flight,
+                    inner.connection_protected_capacity,
+                ),
+                (StoreDimension::TransactionSlots, CapacityClass::NormalWorkload) => (
+                    &inner.transaction_normal_in_flight,
+                    inner.transaction_normal_capacity,
+                ),
+                (StoreDimension::TransactionSlots, CapacityClass::ProtectedControl) => (
+                    &inner.transaction_protected_in_flight,
+                    inner.transaction_protected_capacity,
+                ),
+                (StoreDimension::PendingWriteMemory, CapacityClass::NormalWorkload) => (
+                    &inner.pending_normal_in_flight_bytes,
+                    inner.pending_normal_capacity_bytes,
+                ),
+                (StoreDimension::PendingWriteMemory, CapacityClass::ProtectedControl) => (
+                    &inner.pending_protected_in_flight_bytes,
+                    inner.pending_protected_capacity_bytes,
+                ),
+                (_, CapacityClass::EmergencyLastResort) => {
+                    return Err(StoreReserveError::RestartReconcileContradiction {
+                        permit_id: record.permit_id.clone(),
+                        detail: "Store holds no emergency partition; the record contradicts Store accounting"
+                            .to_owned(),
+                    });
+                }
+            };
             if !cas_add(slot, capacity, record.amount) {
                 return Err(StoreReserveError::RestartReconcileContradiction {
                     permit_id: record.permit_id.clone(),
