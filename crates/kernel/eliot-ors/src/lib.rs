@@ -24,6 +24,7 @@ mod snapshot_model;
 mod status;
 mod status_projection;
 mod store;
+mod user_broker;
 mod versioned_artifact;
 
 #[cfg(feature = "test-support")]
@@ -122,6 +123,7 @@ pub use store::{
     CanonicalEvidenceProvider, OperationalRecoveryStore, OrsCoordinator, RedbRecoveryStore,
     RuntimeLeaseCensusRows, ScanDisclosureRecordOwner,
 };
+pub use user_broker::{UserBrokerHeartbeat, UserBrokerRegistrationSnapshot};
 pub use versioned_artifact::{
     ArtifactGenerationState, CompatibilityEvidence, CompatibilityRefusal, VersionedArtifact,
     VersionedArtifactCutoverRecord, VersionedArtifactEntry, VersionedArtifactRegistry,
