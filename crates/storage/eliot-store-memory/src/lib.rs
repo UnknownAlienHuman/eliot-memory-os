@@ -1146,7 +1146,8 @@ impl<'a> AutomationDispatch<'a> {
     }
 
     /// Retains one immutable revision row together with the normalization
-    /// envelope retained on it.
+    /// envelope retained on it, and returns the projection of the exact row
+    /// bytes that were stored.
     ///
     /// The row is create-only: an identical replay converges, while a repeat
     /// carrying a different revision document OR a different retained envelope
@@ -1155,13 +1156,26 @@ impl<'a> AutomationDispatch<'a> {
     /// it is compared as the stored bytes it is; nothing here re-derives a
     /// digest or interprets the envelope, which is the requesting owner's
     /// question against the envelope's own parsed identity.
+    ///
+    /// Both documents are TAKEN BY VALUE and moved into the row written below.
+    /// That is what the row stores: the decoding leg holds no other copy, so a
+    /// move is the truth about the bytes rather than a second allocation of
+    /// them. Taking them as `&str` here instead would describe the same row and
+    /// force every caller to borrow only for this call to copy — borrowing at
+    /// the boundary the value already crossed, in the wrong direction.
+    ///
+    /// The returned projection is of those SAME bytes, read from the value the
+    /// insert moves, so the owner sees the document that was retained and never
+    /// a re-serialized or digest-derived substitute for it.
     fn retain_revision_row(
         &mut self,
         automation_id: &str,
         revision: &str,
-        revision_json: &str,
-        normalization_envelope_json: &str,
-    ) -> Result<(), StoreError> {
+        revision_json: String,
+        normalization_envelope_json: String,
+    ) -> Result<Value, StoreError> {
+        let projected_revision = serde_json::to_value(&revision_json)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
         let key = automation_revision_key(automation_id, revision);
         match self.state.automation_revisions.get(&key) {
             Some(existing)
@@ -1177,8 +1191,8 @@ impl<'a> AutomationDispatch<'a> {
                     AutomationRevisionRow {
                         automation_id: automation_id.to_owned(),
                         revision: revision.to_owned(),
-                        revision_json: revision_json.to_owned(),
-                        normalization_envelope_json: normalization_envelope_json.to_owned(),
+                        revision_json,
+                        normalization_envelope_json,
                         state_fence: self.state_fence.clone(),
                         scope_id: self.scope_id.clone(),
                         task_id: self.task_id.clone(),
@@ -1186,10 +1200,15 @@ impl<'a> AutomationDispatch<'a> {
                 );
             }
         }
-        Ok(())
+        Ok(projected_revision)
     }
 
     /// Create leg: fresh immutable revision row plus a fresh current pointer.
+    ///
+    /// The two documents are handed to `retain_revision_row` by move, which
+    /// stores them and returns their projection; the leg itself keeps no copy
+    /// of a value it does not own, so it has nothing to pass by value that it
+    /// does not consume.
     fn create_leg(
         &mut self,
         automation_id: String,
@@ -1198,11 +1217,11 @@ impl<'a> AutomationDispatch<'a> {
         normalization_envelope_json: String,
         configuration_state: String,
     ) -> Result<Value, StoreError> {
-        self.retain_revision_row(
+        let projected_revision = self.retain_revision_row(
             &automation_id,
             &revision,
-            &revision_json,
-            &normalization_envelope_json,
+            revision_json,
+            normalization_envelope_json,
         )?;
         if self.state.automation_currents.contains_key(&automation_id) {
             return Err(StoreError::IdentityConflict);
@@ -1218,12 +1237,15 @@ impl<'a> AutomationDispatch<'a> {
                 task_id: self.task_id.clone(),
             },
         );
-        serde_json::to_value(&revision_json)
-            .map_err(|error| StoreError::Serialization(error.to_string()))
+        Ok(projected_revision)
     }
 
     /// Edit leg: fresh immutable revision row plus a pointer move off the
     /// lineage base, which must be the pointer this transition observed.
+    ///
+    /// The documents are retained and projected exactly as the create leg does
+    /// it, by the same call, so neither leg owns a second copy of a document
+    /// whose only destination is the immutable row.
     fn edit_leg(
         &mut self,
         automation_id: String,
@@ -1247,11 +1269,11 @@ impl<'a> AutomationDispatch<'a> {
         if current.state_fence != self.state_fence {
             return Err(StoreError::FenceMismatch);
         }
-        self.retain_revision_row(
+        let projected_revision = self.retain_revision_row(
             &automation_id,
             &revision,
-            &revision_json,
-            &normalization_envelope_json,
+            revision_json,
+            normalization_envelope_json,
         )?;
         self.state.automation_currents.insert(
             automation_id.clone(),
@@ -1264,8 +1286,7 @@ impl<'a> AutomationDispatch<'a> {
                 task_id: self.task_id.clone(),
             },
         );
-        serde_json::to_value(&revision_json)
-            .map_err(|error| StoreError::Serialization(error.to_string()))
+        Ok(projected_revision)
     }
 
     /// Pause/resume/remove leg: pointer move only. The immutable revision row
