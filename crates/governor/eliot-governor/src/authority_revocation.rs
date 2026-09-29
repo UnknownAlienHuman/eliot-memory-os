@@ -60,12 +60,11 @@ use eliot_ors::{GrantClosureProjection, OperationIdentity, OperationalRecoverySt
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::{GrantClosureReceipt, GrantClosureState, ReceiptIdentity};
 use eliot_store_api::{
-    EffectClass, EventProjectionRelationIntents, GrantClosureAuthorityReceiptRef,
-    InfluenceDependencyClosure, InfluenceState, NamedMutationOperation, NamedMutationRequest,
-    NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationManifestDigest,
-    OrderingHeadExpectation, OrderingScopeId, ReadConsistency, RecordedRevocationDisposition,
-    RevocationReason, ScopeId, SecurityContext, TransitionClass, WriteReceipt,
-    generated_operation_manifests, operation_manifest_set_digest,
+    EffectClass, EventProjectionRelationIntents, InfluenceDependencyClosure, InfluenceState,
+    NamedMutationOperation, NamedMutationRequest, NamedReadOperation, NamedReadRequest,
+    NamedReadResponse, OperationManifestDigest, OrderingHeadExpectation, OrderingScopeId,
+    ReadConsistency, RecordedRevocationDisposition, RevocationReason, ScopeId, SecurityContext,
+    TransitionClass, WriteReceipt, generated_operation_manifests, operation_manifest_set_digest,
     parse_revocation_history_payload,
 };
 
@@ -300,7 +299,6 @@ pub fn canonical_receipt_identity(
 fn bind_durable_closure_coordinates(
     envelope: &mut CanonicalWriteEnvelope,
     closure: &GrantClosureReceipt,
-    affected: &[String],
 ) -> Result<(), CompositionError> {
     // Validate the ORIGINAL recorded closure, not a recomputed copy of it.
     closure
@@ -339,7 +337,7 @@ fn bind_durable_closure_coordinates(
     let influence_closure = InfluenceDependencyClosure {
         closure_id: closure.operation_id.clone(),
         root_ref: closure.declaration.target_grant_id.clone(),
-        dependent_refs: affected.to_vec(),
+        dependent_refs: closure.declaration.affected_grants(),
         invalidation_reason: Some(RevocationReason::SourceRevoked),
         current_influence: InfluenceState::Revoked,
         state_fence: closure.authority.state_fence.clone(),
@@ -355,6 +353,10 @@ fn bind_durable_closure_coordinates(
             "durable closure fence disagrees with the recorded revocation request".to_owned(),
         ));
     }
+    // The expected set is the durable closure's OWN declaration, read back
+    // here, not a second copy of what the caller passed: the recorded fields
+    // are compared against the closure they claim to bind.
+    let durable_affected = closure.declaration.affected_grants();
     let recorded_origin = recorded("origin_ref")?;
     let recorded_closure_id = recorded("closure_id")?;
     let recorded_revision = recorded("closure_revision")?;
@@ -364,8 +366,8 @@ fn bind_durable_closure_coordinates(
     if recorded_origin != closure.declaration.authority_root_ref
         || recorded_closure_id != closure.operation_id
         || recorded_revision != closure.declaration.grant_graph_revision.to_string()
-        || recorded_affected_digest != canonical_digest(&affected)?
-        || recorded_affected_count != affected.len().to_string()
+        || recorded_affected_digest != canonical_digest(&durable_affected)?
+        || recorded_affected_count != durable_affected.len().to_string()
         || recorded_fence_digest != canonical_digest(&closure.authority.state_fence)?
     {
         return Err(identity_refused(
@@ -442,7 +444,7 @@ pub fn authority_revocation_envelope_from_closure(
         AUTHORITY_REVOCATION_KERNEL_FIRST_REASON,
         &fence_digest,
     )?;
-    bind_durable_closure_coordinates(&mut envelope, closure, &affected)?;
+    bind_durable_closure_coordinates(&mut envelope, closure)?;
     Ok(envelope)
 }
 
