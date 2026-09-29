@@ -37,9 +37,20 @@
 # - Allocate creates unique owned data/log/secret roots under the admitted run
 #   root, writes the owner marker eliot-harness-owned-root-v1, derives
 #   namespace/database from the run identity, and reserves a loopback endpoint
-#   through a reservation-then-launch protocol. Creation runs through the
+#   through an ownership-safe reservation->launch protocol. The reservation
+#   records which ownership proof it actually carries: 'held-socket' when a live
+#   TcpListener is positively proven to still own the loopback endpoint (so no
+#   other process can take that port), and 'seam-asserted' when the seam owns
+#   the atomic hold and this module's single-writer registration is the
+#   ownership record. Start re-proves that proof immediately before creating the
+#   child and then releases it exactly once, so a dropped registry entry
+#   (expired), a replaced binding (foreign), and an endpoint that left the
+#   reservation (port race) are distinct typed refusals raised before any
+#   process exists, while an endpoint that cannot be reserved at all is a typed
+#   port conflict rather than an ownership failure. Creation runs through the
 #   FileSystem seam (default real); re-allocation for the same run reuses the
-#   marker-verified roots, while a foreign or missing marker fails closed.
+#   marker-verified roots and re-verifies the existing run-principal-only ACL
+#   instead of re-writing it, while a foreign or missing marker fails closed.
 # - Start verifies the approved executable version/platform/arch/digest plus
 #   acquisition provenance before execution, including cached binaries which
 #   are fully re-verified (digest recomputed; a mismatched cache record fails
@@ -98,7 +109,10 @@
 #   Credential values live in memory and protected channels only, never in
 #   display text, receipts, or logs; receipts carry the credential handle.
 #   Secret roots carry an explicit ACL for the run principal only (no
-#   inherited rights) through the Acl seam (default real). Run, provider,
+#   inherited rights) through the Acl seam (default real); an already protected
+#   root is re-verified against that exact terminal state rather than rewritten,
+#   because re-writing a protected DACL needs a privilege the run principal does
+#   not hold and would make an owned root impossible to re-verify. Run, provider,
 #   binary, config, process, start, endpoint, namespace, database, root, and
 #   credential-handle identities plus deadlines are bound on every operation.
 #   Terminal dispositions follow the closed I07-20 set; this provider never
@@ -180,6 +194,18 @@ function Get-StorePortReservationId {
     return $builder.ToString()
 }
 
+# Register one owned endpoint reservation and classify the ownership proof it
+# actually carries, so the handoff can be proven instead of assumed:
+#   'held-socket'  the seam returned a live TcpListener positively proven to be
+#                  bound to the declared loopback endpoint right now, so no other
+#                  process can take that port before the handoff releases it;
+#   'seam-asserted' the seam owns the atomic hold itself and this module's
+#                  single-writer registration is the ownership record, so the
+#                  reservation is proven by identity, not by a held socket.
+# A supplied handle that is absent, of the wrong type, already stopped, or bound
+# to another endpoint is a genuine port conflict and is refused as one; a live
+# reservation this run already holds is refused as a reused reservation. Those
+# two refusals stay distinct instead of collapsing into one generic conflict.
 function Register-StorePortReservation {
     [CmdletBinding()]
     [OutputType([hashtable])]
@@ -194,25 +220,40 @@ function Register-StorePortReservation {
     )
     $listener = $null
     if ($Reservation.ContainsKey('listener')) { $listener = $Reservation['listener'] }
-    if ($null -eq $listener -or $listener -isnot [System.Net.Sockets.TcpListener]) {
-        throw [System.InvalidOperationException]::new('STORE-PORT-CONFLICT: a live listener handle is required for an ownership-safe reservation.')
-    }
+    $proof = 'seam-asserted'
     if ($null -ne $listener) {
+        if ($listener -isnot [System.Net.Sockets.TcpListener]) {
+            throw [System.InvalidOperationException]::new('STORE-PORT-CONFLICT: the supplied reservation handle is not a TCP listener.')
+        }
+        $local = $null
         try {
             $local = [System.Net.IPEndPoint]$listener.LocalEndpoint
-            if ([string]$local.Address -cne $ReservationHost -or [int]$local.Port -ne $Port) {
-                throw [System.InvalidOperationException]::new('STORE-PORT-CONFLICT: reservation listener does not own the requested loopback endpoint.')
-            }
         } catch {
-            if ($_.Exception.Message -match '^STORE-[A-Z0-9-]+:') { throw }
-            throw [System.InvalidOperationException]::new('STORE-PORT-CONFLICT: reservation listener is not active.')
+            throw [System.InvalidOperationException]::new('STORE-PORT-CONFLICT: the supplied reservation handle is not an active listener.')
         }
+        # A released or rebound handle reports a different endpoint here, so this
+        # comparison is a positive proof that this socket still holds the port.
+        if ([string]$local.Address -cne $ReservationHost -or [int]$local.Port -ne $Port) {
+            throw [System.InvalidOperationException]::new('STORE-PORT-CONFLICT: the supplied reservation handle does not own the requested loopback endpoint.')
+        }
+        $proof = 'held-socket'
     }
     $endpoint = ('{0}:{1}' -f $ReservationHost, $Port)
     $id = Get-StorePortReservationId -RunId $RunId -Owner $Owner -Generation $Generation `
         -AllocationSeed $AllocationSeed -Endpoint $endpoint
+    $existing = $null
     if ($Script:StorePortReservations.ContainsKey($id)) {
-        throw [System.InvalidOperationException]::new('STORE-PORT-CONFLICT: reservation identity has already been used for this endpoint.')
+        $existing = $Script:StorePortReservations[$id]
+    }
+    if ($null -ne $existing -and [string]$existing['state'] -cne 'Released') {
+        throw [System.InvalidOperationException]::new('STORE-RESERVATION-REUSED: a live reservation for this run already holds the reservation identity.')
+    }
+    foreach ($other in $Script:StorePortReservations.Values) {
+        if ([string]$other['state'] -ceq 'Released') { continue }
+        if ([string]$other['endpoint'] -ceq $endpoint -and [string]$other['runId'] -ceq $RunId -and
+            [string]$other['owner'] -ceq $Owner -and [int]$other['generation'] -eq $Generation) {
+            throw [System.InvalidOperationException]::new('STORE-PORT-CONFLICT: this run already holds a live reservation for the endpoint.')
+        }
     }
     $record = @{
         reservationId = $id
@@ -221,6 +262,7 @@ function Register-StorePortReservation {
         generation = $Generation
         allocationSeed = $AllocationSeed
         endpoint = $endpoint
+        reservationProof = $proof
         listener = $listener
         state = 'Pending'
     }
@@ -312,7 +354,17 @@ function Complete-StorePortReservation {
     }
     if ([string]$registered['state'] -ceq 'Released') {
         if ($Disposition -ceq 'cleanup') { return $true }
-        throw [System.InvalidOperationException]::new('STORE-RESERVATION-REUSED: released reservation cannot authorize another launch.')
+        # A completed handoff is idempotent for the exact owner, but it stops
+        # authorizing a launch once a competing live reservation holds the
+        # endpoint: the released port is no longer this run's to hand off.
+        foreach ($other in $Script:StorePortReservations.Values) {
+            if ([string]$other['reservationId'] -ceq $id) { continue }
+            if ([string]$other['state'] -ceq 'Released') { continue }
+            if ([string]$other['endpoint'] -ceq $Endpoint) {
+                throw [System.InvalidOperationException]::new('STORE-RESERVATION-REUSED: the released endpoint is held by a competing live reservation.')
+            }
+        }
+        return $true
     }
     if (-not $Identity.ContainsKey('listener') -or -not [object]::ReferenceEquals($registered['listener'], $Identity['listener'])) {
         throw [System.InvalidOperationException]::new('STORE-RESERVATION-FOREIGN: pending reservation handle does not match its registered listener.')
@@ -340,8 +392,66 @@ function Get-StorePortReservationReceipt {
         generation = [int]$Identity['generation']
         allocationSeed = [string]$Identity['allocationSeed']
         endpoint = [string]$Identity['endpoint']
+        reservationProof = [string]$Identity['reservationProof']
         state = [string]$Identity['state']
     }
+}
+
+# Prove the reservation is still this run's at the instant the endpoint is
+# handed to the child, then release it exactly once. This is the step that makes
+# the reservation->launch window safe: a reservation whose registry entry was
+# dropped, whose binding was replaced, or whose held socket no longer owns the
+# loopback endpoint is refused as a lost/expired reservation or a port race
+# before any process is created, never released as if it were still ours.
+function Assert-StorePortReservationHandoff {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)] [hashtable]$Identity,
+        [Parameter(Mandatory)] [string]$RunId,
+        [Parameter(Mandatory)] [string]$Owner,
+        [Parameter(Mandatory)] [int]$Generation,
+        [Parameter(Mandatory)] [string]$Endpoint
+    )
+    if (-not $Identity.ContainsKey('reservationId') -or -not $Identity.ContainsKey('reservationProof')) {
+        throw [System.InvalidOperationException]::new('STORE-RESERVATION-UNKNOWN: the allocation carries no proven reservation identity.')
+    }
+    $id = [string]$Identity['reservationId']
+    $proof = [string]$Identity['reservationProof']
+    if ($proof -cne 'held-socket' -and $proof -cne 'seam-asserted') {
+        throw [System.InvalidOperationException]::new("STORE-RESERVATION-UNKNOWN: reservation proof '$proof' is not an accepted ownership proof.")
+    }
+    if (-not $Script:StorePortReservations.ContainsKey($id)) {
+        throw [System.InvalidOperationException]::new('STORE-RESERVATION-EXPIRED: the pending reservation owner is no longer registered.')
+    }
+    $registered = $Script:StorePortReservations[$id]
+    if ([string]$registered['runId'] -cne $RunId -or [string]$registered['owner'] -cne $Owner -or
+        [int]$registered['generation'] -ne $Generation -or [string]$registered['endpoint'] -cne $Endpoint -or
+        [string]$registered['reservationProof'] -cne $proof) {
+        throw [System.InvalidOperationException]::new('STORE-RESERVATION-FOREIGN: the registered reservation no longer matches this run binding.')
+    }
+    if ([string]$registered['state'] -ceq 'Pending' -and $proof -ceq 'held-socket') {
+        $listener = $registered['listener']
+        if ($null -eq $listener) {
+            throw [System.InvalidOperationException]::new('STORE-RESERVATION-EXPIRED: the held-socket reservation lost its listener before launch.')
+        }
+        $local = $null
+        try {
+            $local = [System.Net.IPEndPoint]$listener.LocalEndpoint
+        } catch {
+            throw [System.InvalidOperationException]::new('STORE-PORT-RACE: the reserved endpoint is no longer held at launch.')
+        }
+        # A released or rebound handle no longer reports this endpoint, so the
+        # comparison is a positive proof that this socket still holds the port.
+        $parts = $Endpoint.Split(':')
+        $portText = $parts[$parts.Count - 1]
+        if ([string]$local.Address -cne $parts[0] -or [string]$local.Port -cne $portText) {
+            throw [System.InvalidOperationException]::new('STORE-PORT-RACE: the reserved endpoint left this reservation before launch.')
+        }
+    }
+    [void](Complete-StorePortReservation -Identity $Identity -RunId $RunId -Owner $Owner `
+        -Generation $Generation -Endpoint $Endpoint -Disposition 'launch-handoff')
+    return $true
 }
 
 $Script:StoreClosedOperations = @(
@@ -1204,8 +1314,11 @@ function Invoke-StoreAllocate {
     try {
         $reservation = (& $PortReservation @{ runId = $runId; namespace = $namespace; database = $database })
     } catch {
+        # A reservation that could not be taken is a port race/conflict and stays
+        # distinct from the reservation-ownership and cleanup refusals. No owned
+        # endpoint exists yet, so Allocate refuses before any root is created.
         if ($_.Exception.Message -match '^STORE-[A-Z0-9-]+:') { throw }
-        throw [System.InvalidOperationException]::new("STORE-PORT-RESERVATION-UNKNOWN: reservation callback failed before returning its owner handle: $($_.Exception.Message)")
+        throw [System.InvalidOperationException]::new("STORE-PORT-CONFLICT: the loopback endpoint could not be reserved: $($_.Exception.Message)")
     }
     $port = 0
     $host_ = $Script:StoreLoopback
@@ -1441,8 +1554,13 @@ function Invoke-StoreStart {
         imageDigest      = [string]$receipt['digest']
         provenance       = $provenance
     }
-    [void](Complete-StorePortReservation -Identity $reservationIdentity -RunId $runId -Owner ([string]$Binding['owner']) `
-        -Generation ([int]$Binding['generation']) -Endpoint ([string]$Allocation['endpoint']) -Disposition 'launch-handoff')
+    # Prove the reservation is still this run's owned endpoint immediately before
+    # the child is created, then release it exactly once. A lost/expired
+    # reservation and a port taken by someone else are distinct typed refusals
+    # raised here, before any process exists.
+    [void](Assert-StorePortReservationHandoff -Identity $reservationIdentity -RunId $runId `
+        -Owner ([string]$Binding['owner']) -Generation ([int]$Binding['generation']) `
+        -Endpoint ([string]$Allocation['endpoint']))
     $reservationReleased = $true
     $observed = $null
     try {
@@ -3062,6 +3180,42 @@ function Get-StoreOwnedDescendants {
     return @{ pids = @($found | ForEach-Object { [int]$_['pid'] }); processes = @($found.ToArray()); complete = $complete }
 }
 
+# The exact accepted terminal state of a protected run root: inheritance broken,
+# no deny rule, and exactly one allow rule granting the run principal full
+# control of the root and everything created inside it. One predicate serves both
+# the pre-write check and the post-write proof, so the state is compared the same
+# way in both directions.
+function Test-StoreRootAclState {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Security.AccessControl.FileSystemSecurity]$Security,
+        [Parameter(Mandatory)]
+        [System.Security.Principal.SecurityIdentifier]$PrincipalSid
+    )
+    $rights = [System.Security.AccessControl.FileSystemRights]::FullControl
+    $inherit = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+    $allow = [System.Security.AccessControl.AccessControlType]::Allow
+    if ($Security.AreAccessRulesProtected -ne $true) { return $false }
+    $rules = @($Security.Access)
+    if ($rules.Count -ne 1) { return $false }
+    $rule = $rules[0]
+    if ($rule.AccessControlType -ne $allow) { return $false }
+    # A read ACL resolves the rule identity to an account name, so the rule is
+    # compared by its stable SID rather than by a localizable name.
+    $ruleSid = $null
+    if ($rule.IdentityReference -is [System.Security.Principal.SecurityIdentifier]) {
+        $ruleSid = [string]$rule.IdentityReference
+    } else {
+        $ruleSid = [string]$rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier])
+    }
+    if ($ruleSid -cne [string]$PrincipalSid) { return $false }
+    if ([int]$rule.FileSystemRights -ne [int]$rights) { return $false }
+    if ([int]$rule.InheritanceFlags -ne [int]$inherit) { return $false }
+    return $true
+}
+
 function Protect-StoreRootAcl {
     [CmdletBinding()]
     [OutputType([hashtable])]
@@ -3081,6 +3235,15 @@ function Protect-StoreRootAcl {
         if ($null -eq $principal -or $null -eq $principal.User) {
             throw [System.InvalidOperationException]::new('STORE-ACL-FAILED: run principal identity is unavailable.')
         }
+        # Re-allocation for the same run reuses the marker-verified roots, so the
+        # accepted terminal state is observed first. Re-writing an ACL that
+        # already carries exactly the required run-principal-only grant is a
+        # privileged no-op that the run principal cannot perform, and refusing it
+        # would make an owned root impossible to re-verify on a real host.
+        $observed = Get-Acl -LiteralPath $full -ErrorAction Stop
+        if (Test-StoreRootAclState -Security $observed -PrincipalSid $principal.User) {
+            return @{ path = $full; protected = $true; principal = [string]$principal.Name; aclWrite = 'already-protected' }
+        }
         $security = Get-Acl -LiteralPath $full -ErrorAction Stop
         $security.SetAccessRuleProtection($true, $false)
         foreach ($rule in @($security.Access)) {
@@ -3094,14 +3257,10 @@ function Protect-StoreRootAcl {
         [void]$security.AddAccessRule($grant)
         Set-Acl -LiteralPath $full -AclObject $security -ErrorAction Stop
         $verify = Get-Acl -LiteralPath $full -ErrorAction Stop
-        if ($verify.AreAccessRulesProtected -ne $true) {
-            throw [System.InvalidOperationException]::new('STORE-ACL-FAILED: inheritance is still enabled after protection.')
+        if (-not (Test-StoreRootAclState -Security $verify -PrincipalSid $principal.User)) {
+            throw [System.InvalidOperationException]::new('STORE-ACL-FAILED: the protected root does not carry exactly the run-principal-only grant.')
         }
-        $allowRules = @($verify.Access | Where-Object { $_.AccessControlType -eq $allow })
-        if ($allowRules.Count -ne 1) {
-            throw [System.InvalidOperationException]::new('STORE-ACL-FAILED: protected root does not carry exactly one allow rule.')
-        }
-        return @{ path = $full; protected = $true; principal = [string]$principal.Name }
+        return @{ path = $full; protected = $true; principal = [string]$principal.Name; aclWrite = 'applied' }
     } catch {
         if ($_.Exception.Message -match '^STORE-[A-Z0-9-]+:') { throw }
         throw [System.InvalidOperationException]::new("STORE-ACL-FAILED: explicit ACL failed for '$full': $($_.Exception.Message)")
