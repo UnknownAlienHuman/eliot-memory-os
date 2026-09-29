@@ -251,7 +251,7 @@ use plan::{
 pub use profile_governed_roots::{ProfileGovernedRoots, ProfileRootAnchors, select_profile_roots};
 pub use profile_roots::{
     INSTALLATION_ROOT_BINDING_VERSION, InstallationRoots, profile_root_request_for_launch,
-    profile_selection_receipts_match_retained_roots,
+    profile_root_request_for_live_launch, profile_selection_receipts_match_retained_roots,
 };
 pub use profile_supervision::{
     NoServiceProfileAuthorityProof, ProfileGovernanceReport, ProfileRootRoles, ProfileSupervision,
@@ -1523,7 +1523,13 @@ impl RuntimeLaunchDescriptor {
                 "--config".to_owned(),
                 config_path.as_str().to_owned(),
             ],
-            InstallationProfile::SystemService | InstallationProfile::UserMode => {
+            InstallationProfile::UserMode => vec![
+                "--user-mode-root".to_owned(),
+                self.profile_governed_roots.immutable_binaries.clone(),
+                "--config".to_owned(),
+                config_path.as_str().to_owned(),
+            ],
+            InstallationProfile::SystemService => {
                 vec!["--config".to_owned(), config_path.as_str().to_owned()]
             }
         }
@@ -10934,10 +10940,11 @@ where
         self.inner.reconcile_active_verified(receipt, evidence)
     }
 
-    /// Drives the durable prefix up to, but not through, the first ordered SCM
-    /// service start.  Both Watchdog and Host starts must remain pending while
-    /// the caller projects the exact signed activation record; no SCM start is
-    /// attempted by this prefix method.
+    /// Drives the durable prefix up to, but not through, the profile's Host
+    /// bootstrap handoff. SystemService stops before its first ordered SCM
+    /// start. UserMode stops before Phase B after its current-user credentials
+    /// are applied. The caller projects the exact pending activation before
+    /// either profile can start an approved runtime.
     pub fn drive_until_host_bootstrap(
         &mut self,
         transaction_id: &PlatformHandle,
@@ -10972,10 +10979,15 @@ where
                     evidence_refs: current.observed_postconditions,
                 });
             };
-            if matches!(
+            let bootstrap_boundary = matches!(
                 current.installer_effects[index],
                 InstallerEffectPlan::StartService { .. }
-            ) {
+            ) || (current.profile == InstallationProfile::UserMode
+                && matches!(
+                    current.installer_effects[index],
+                    InstallerEffectPlan::MaterializePhaseB { .. }
+                ));
+            if bootstrap_boundary {
                 return Ok(InstallationStepOutcome::Applied {
                     stage: current.stage,
                     evidence_refs: current.observed_postconditions,
