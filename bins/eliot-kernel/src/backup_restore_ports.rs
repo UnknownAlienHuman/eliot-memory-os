@@ -753,7 +753,7 @@ impl OrsRestoreBinding {
 /// [`OrsRestoreBinding`] and the same live [`StateFence`] the adapter seals
 /// every row with, and it answers
 /// [`RestoreJournalAdmissionOwner::durable_journal_record`] from that durable
-/// row alone. It is built from the same production arguments
+/// state alone. It is built from the same production arguments
 /// [`OrsRestoreJournal::production`] takes — the owner handle, the composition
 /// binding, the live effect fence and the sealed payload root — and it has no
 /// constructor a request, a config value or a test fixture can reach with a
