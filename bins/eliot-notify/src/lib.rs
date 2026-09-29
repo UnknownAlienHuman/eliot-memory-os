@@ -1905,6 +1905,18 @@ pub fn activate_watchdog_fallback_task() -> Result<WatchdogTaskRunReceipt, Notif
 /// Loads one autonomous scheduler envelope and derives every request identity
 /// from the protected declaration and signed payload. No stdin or caller-owned
 /// [`NotificationRequest`] participates in this route.
+///
+/// Load-time gates fail closed before any request identity is derived: the
+/// lease, canonical-bytes, and size gates above, plus the envelope's
+/// installation identity against the installer declaration and the envelope
+/// timestamp against the owner freshness policy
+/// (`validate_fallback_freshness`). Signature, algorithm/key/domain binding,
+/// and digest/route binding stay with the delivery-time signature port, which
+/// runs on every fallback delivery; a load-time rejection records the same
+/// fallback-contour degradation marker the port refusal would have left, so
+/// the Event Log / spool obligation survives the early refusal (I11.6:13-14
+/// no toast promised without a session, I11.6:19 adapter loss degrades
+/// delivery only).
 pub fn load_watchdog_fallback_request()
 -> Result<(SignedWatchdogFallbackEnvelope, NotificationRequest), NotifyBuildError> {
     let material = load_fallback_material()?;
@@ -1954,6 +1966,29 @@ pub fn load_watchdog_fallback_request()
     validate_fallback_envelope_size(&bytes).map_err(|error| {
         NotifyBuildError::Fallback(format!("watchdog envelope size rejected: {error}"))
     })?;
+    // Fail closed before any request identity is derived: a foreign
+    // installation identity or a stale timestamp never reaches the
+    // delivery-time signature port. The rejection records the same
+    // fallback-contour degradation marker the port refusal would have left,
+    // so the Event Log / spool obligation survives the early refusal.
+    if envelope.envelope.installation_identity != material.declaration.installation_identity {
+        return Err(no_session_fallback_error(
+            FALLBACK_ADAPTER_UNAVAILABLE,
+            "watchdog envelope installation identity rejected".to_owned(),
+        ));
+    }
+    let envelope_now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| NotifyBuildError::Fallback("host clock is before Unix epoch".to_owned()))?
+        .as_millis();
+    let envelope_now_ms = u64::try_from(envelope_now_ms)
+        .map_err(|_| NotifyBuildError::Fallback("host clock exceeds request range".to_owned()))?;
+    if validate_fallback_freshness(envelope.envelope.timestamp_ms, envelope_now_ms).is_err() {
+        return Err(no_session_fallback_error(
+            FALLBACK_ADAPTER_UNAVAILABLE,
+            "watchdog envelope freshness rejected".to_owned(),
+        ));
+    }
     let request_hash = watchdog_request_hash(&envelope)
         .map_err(|error| NotifyBuildError::Fallback(error.to_string()))?;
     let request_id = watchdog_request_id(&envelope)
