@@ -992,24 +992,23 @@ fn validate_resolutions(
     // can only narrow the permitted uses and effects, never widen them, and a
     // source, profile or fence that moved after diagnosis fails closed here.
     // Independent work with no recorded assessment keeps its own assurance.
-    let (permitted_uses, permitted_effects, instruction_taint) =
-        match &source.security_assessment {
-            Some(assessment) => {
-                let use_authority = assessment
-                    .resolve_source_use(&source.assurance, &governor.generation.state_fence)
-                    .map_err(|_| RuntimeError::SourceNotAdmitted)?;
-                (
-                    use_authority.permitted_uses,
-                    use_authority.permitted_effects,
-                    use_authority.instruction_taint,
-                )
-            }
-            None => (
-                source.assurance.allowed_epistemic_use.clone(),
-                source.assurance.allowed_effects.clone(),
-                source.assurance.instruction_taint,
-            ),
-        };
+    let (permitted_uses, permitted_effects, instruction_taint) = match &source.security_assessment {
+        Some(assessment) => {
+            let use_authority = assessment
+                .resolve_source_use(&source.assurance, &governor.generation.state_fence)
+                .map_err(|_| RuntimeError::SourceNotAdmitted)?;
+            (
+                use_authority.permitted_uses,
+                use_authority.permitted_effects,
+                use_authority.instruction_taint,
+            )
+        }
+        None => (
+            source.assurance.allowed_epistemic_use.clone(),
+            source.assurance.allowed_effects.clone(),
+            source.assurance.instruction_taint,
+        ),
+    };
     if !matches!(source.assurance.integrity, IntegrityStatus::Verified)
         || !matches!(source.assurance.freshness, FreshnessStatus::Current)
         || !matches!(
