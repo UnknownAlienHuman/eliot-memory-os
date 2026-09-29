@@ -825,6 +825,15 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
+        // #1824 (I10.21 A2): an unreconciled unknown-origin Material change
+        // (or a still-unverified host/filesystem hint) blocks governed
+        // finish-candidate acceptance until reconciled. Exact replays above
+        // stay readback and unrelated lanes are untouched: the monitor owns
+        // its ledger, this leg only queries its gate, and the refusal fails
+        // closed without crashing the route.
+        if super::change_monitor::governed_acceptance_blocked() {
+            return Err(TransportError::SessionFenced);
+        }
         let persisted = self
             .generation_gateway
             .ors

@@ -87,6 +87,14 @@ use std::collections::BTreeMap;
 
 mod daemon_claim_queue;
 
+/// Kernel-owned ChangeMonitor ledger (issue #1824, I10.21): hint ingest,
+/// Git/content checksum/re-read confirmation, governed-tool records, and
+/// the unknown-origin acceptance block. The canonical file lives beside
+/// this route at `src/change_monitor.rs`; it is nested here because the
+/// only in-tree consumer of its gate is the finish-acceptance leg below.
+#[path = "change_monitor.rs"]
+pub(crate) mod change_monitor;
+
 use self::daemon_claim_queue::{
     campaign_packet_admission, check_finish_admission, check_task_controller_admission,
 };
