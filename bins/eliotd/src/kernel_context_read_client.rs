@@ -1408,7 +1408,8 @@ impl PacketAdmissionBundle {
         priority
             .validate()
             .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
-        rule.validate().map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
+        rule.validate()
+            .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
         measurement_profile
             .validate()
             .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
@@ -1422,7 +1423,11 @@ impl PacketAdmissionBundle {
             return Err(PacketCompositionError::BindingMismatch);
         }
         let floor_roles: BTreeSet<_> = floor.floor.mandatory_roles.iter().collect();
-        if !recipe.mandatory_roles.iter().all(|role| floor_roles.contains(role)) {
+        if !recipe
+            .mandatory_roles
+            .iter()
+            .all(|role| floor_roles.contains(role))
+        {
             return Err(PacketCompositionError::BindingMismatch);
         }
         floor

@@ -471,7 +471,9 @@ fn candidate_request_for_packet(
     recipe: &ContextRecipe,
     binding: &CampaignPacketBinding,
 ) -> Result<CandidateRequest, CampaignPacketError> {
-    recipe.validate().map_err(|_| CampaignPacketError::UnboundContextRecipe)?;
+    recipe
+        .validate()
+        .map_err(|_| CampaignPacketError::UnboundContextRecipe)?;
     if recipe.binding.task_id.as_str() != binding.task_id
         || recipe.binding.scope_id.as_str() != binding.work_scope_id
         || recipe.binding.state_fence != binding.state_fence
@@ -484,7 +486,9 @@ fn candidate_request_for_packet(
             .map_err(|_| CampaignPacketError::InvalidInvocation)?,
         idempotency_key: attempt.attempt_id.clone(),
     };
-    request.validate().map_err(|_| CampaignPacketError::InvalidInvocation)?;
+    request
+        .validate()
+        .map_err(|_| CampaignPacketError::InvalidInvocation)?;
     Ok(request)
 }
 
