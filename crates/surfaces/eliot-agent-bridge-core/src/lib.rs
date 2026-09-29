@@ -4811,7 +4811,9 @@ impl AgentBridgeCore {
         gap.validate()
             .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
         let binding = self.binding()?.clone();
-        self.forwarder()?.forward_gap(&binding, gap)?;
+        self.forwarder()?
+            .forward_gap(&binding, gap)
+            .map_err(BridgeError::from_forwarding_failure)?;
         Ok(())
     }
 
