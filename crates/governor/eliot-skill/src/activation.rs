@@ -16,9 +16,9 @@ use eliot_contracts::StateFence;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    DependencyVersion, ExecutionOutcome, LifecycleAction, LifecycleCounters, SkillCatalogueEntry,
-    SkillError, SkillExecutionEvidence, SkillInteractionView, SkillLifecycleView, SkillRef,
-    SkillScope, SkillStatus, digest, text, unique,
+    DependencyVersion, ExecutionOutcome, KnownTools, LifecycleAction, LifecycleCounters,
+    LiveSkillWorld, SkillCatalogueEntry, SkillError, SkillExecutionEvidence, SkillInteractionView,
+    SkillLifecycleView, SkillRef, SkillScope, SkillStatus, digest, text, unique,
 };
 
 /// How retrieval of the Skill for one attempt was observed.
@@ -751,6 +751,78 @@ pub fn gate_material_use(
         return Err(SkillError::InvalidField {
             field: "entry.dependencies",
             reason: "dependency versions changed since install; the Skill is stale until revalidated or explicitly scoped/provisional",
+        });
+    }
+    Ok(())
+}
+
+/// Material-use gate binding every declared dependency leg to the observed
+/// live world (`I7.13`, issue #1882 W2/A2).
+///
+/// [`gate_material_use`] covers stored status plus the dependency set; this
+/// is the full-leg variant the bridge activation path runs before Material
+/// use once it can supply the operation-observed live world: stored status,
+/// the promotion-evidence binding for `Current`, the dependency set, the
+/// host/profile versions, the admitted Tool Definition version, and the
+/// declared tool basis rechecked against the tool owner's view. Any drift
+/// refuses with its own typed field, so an unvalidated or stale Skill cannot
+/// reach Material use through a stored-status lag; a drifted Skill passes
+/// again only after revalidation or explicit scoped/provisional admission
+/// through the governed lifecycle path. Evidence is compared, never
+/// synthesized: every leg reads the caller-observed world.
+///
+/// # STITCH: designated Material-use caller
+///
+/// `caller: STITCH`. The designated caller is the bridge Material-use
+/// admission drive (`skill_admit_material_attempt`) once it observes the live
+/// dependency set and host/profile versions alongside the entry pins it
+/// already reads; until then admission flows through `is_usable` plus the
+/// dependency-set gate with the tool/definition legs enforced upstream.
+pub fn gate_material_use_against(
+    entry: &SkillCatalogueEntry,
+    world: &LiveSkillWorld<'_>,
+) -> Result<(), SkillError> {
+    if !material_use_allowed(entry.status) {
+        return Err(SkillError::InvalidField {
+            field: "entry.status",
+            reason: "stale or quarantined Skills are blocked from Material use until governed review or restore",
+        });
+    }
+    if entry.status == SkillStatus::Current && entry.promotion_evidence.is_none() {
+        return Err(SkillError::InvalidField {
+            field: "entry.promotion_evidence",
+            reason: "current Skills require bound promotion evidence; unvalidated Skills are blocked from Material use",
+        });
+    }
+    if detect_dependency_staleness(&entry.dependencies, world.current_dependencies).is_some() {
+        return Err(SkillError::InvalidField {
+            field: "entry.dependencies",
+            reason: "dependency versions changed since install; the Skill is stale until revalidated or explicitly scoped/provisional",
+        });
+    }
+    if entry.host_version != world.live_host_version
+        || entry.profile_version != world.live_profile_version
+    {
+        return Err(SkillError::InvalidField {
+            field: "entry.host_version",
+            reason: "host or profile versions changed since install; the Skill is stale until revalidated or explicitly scoped/provisional",
+        });
+    }
+    if entry.admitted_definition_version != world.live_definition_version {
+        return Err(SkillError::InvalidField {
+            field: "entry.definition_version",
+            reason: "tool definition version changed since install; the Skill is stale until revalidated or explicitly scoped/provisional",
+        });
+    }
+    if entry
+        .body
+        .tool_refs
+        .iter()
+        .any(|tool| !world.tools.knows_tool(tool))
+    {
+        return Err(SkillError::InvalidField {
+            field: "entry.tool_basis",
+            reason: "declared tools changed since install; the Skill is stale until revalidated or explicitly scoped/provisional",
         });
     }
     Ok(())

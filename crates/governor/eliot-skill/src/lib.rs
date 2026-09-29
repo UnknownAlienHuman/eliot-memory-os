@@ -70,8 +70,9 @@ pub use activation::{
     SkillExecutionOwnerPosition, SkillHarnessActivationReceipt, SkillRetrievalStatus,
     SkillUsefulness, SourceRevision, apply_dependency_staleness, assess_execution_reconciliation,
     changed_dependency_names, derive_attempt_summary, derive_lifecycle_view,
-    detect_dependency_staleness, fold_execution_evidence, gate_material_use, material_use_allowed,
-    project_execution_outcomes, qualify_useful_outcomes, record_instruction_conflict,
+    detect_dependency_staleness, fold_execution_evidence, gate_material_use,
+    gate_material_use_against, material_use_allowed, project_execution_outcomes,
+    qualify_useful_outcomes, record_instruction_conflict,
 };
 
 pub(crate) fn text(value: &str, field: &'static str) -> Result<(), SkillError> {
