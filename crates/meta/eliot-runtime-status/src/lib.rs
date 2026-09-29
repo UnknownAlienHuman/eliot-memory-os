@@ -72,7 +72,8 @@ pub use runtime_health_status::{
 
 mod capability_cell_readback;
 pub use capability_cell_readback::{
-    CellReadbackError, GenerationCellResolution, resolve_generation_via_registry,
+    CellOwnerDeclarationReadback, CellOwnerDeclarationReadbackError, CellReadbackError,
+    GenerationCellResolution, read_cell_owner_declaration, resolve_generation_via_registry,
 };
 
 mod implementation_deviation_status;

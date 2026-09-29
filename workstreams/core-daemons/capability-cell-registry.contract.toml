@@ -1,17 +1,18 @@
 schema = "eliot.capability-cell-registry-implementation.v1"
 authority = "NON_NORMATIVE_IMPLEMENTATION_CONTRACT"
-status = "DAEMON_DECLARATIONS_PRESENT_EXECUTABLE_REGISTRY_PENDING"
-implementation_support = "ROUTING_METADATA_PRESENT_DAEMON_CELLS_DECLARED_EXECUTABLE_REGISTRY_MISSING"
-evidence_execution_status = "SOURCE_AUDIT_EXECUTED_TESTS_NOT_EXECUTED"
-proof_ceiling = "CAPABILITY_CELL_REGISTRY_SOURCE_EDGE_CANDIDATE"
+status = "SOURCE_OWNER_PROJECTION_AVAILABLE_EXECUTABLE_REGISTRY_PENDING"
+implementation_support = "ELIOTD_OWNER_DECLARATIONS_READABLE_PROOF_MISSING"
+evidence_execution_status = "DECLARATION_GENERATOR_EXECUTED_TESTS_NOT_EXECUTED"
+proof_ceiling = "SOURCE_DECLARATION_ONLY_MISSING_PROOF"
 issue = 13
 integration_issue = 11
+prerequisite_issue = 18
 base_branch = "main"
-base_sha = "65b68d5eb56fbf31743e6ee78e133d3f2e4eaba1"
+base_sha = "212db3dbf423c3517737f3a2a1ed3c1e8dfd72a1"
 normative_pair_ref = "docs/normative-pair.toml"
-normative_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
-normative_architecture_sha256 = "c6932eaf26935e752eefb4de591afc91ea1a7180be5a8ff0005554b8029bac1a"
-normative_implementation_sha256 = "7805bf238fe91819aba50d7e13aa86a8b977561195dbb98aa979f986e2fab063"
+normative_pair_key = "sha256:ab2011bd67557d89b2f094061d350a297389f7f57d0478be5e1ff8d2da8ed1c1"
+normative_architecture_sha256 = "a3c5b2028d9df89a53cd565f8ff493484be74078e4efd7b534c0f1c3169577c7"
+normative_implementation_sha256 = "ead4ceff2db254e4202c8fa7ae167225a6f65b720c222075ada61fc45fc407a4"
 
 [documentation]
 architecture = [
@@ -32,7 +33,7 @@ anchors = ["ARCH-MOD-01", "ARCH-MOD-02", "ARCH-MOD-03", "ARCH-GROUND-01"]
 path = "workstreams/core-daemons/inventory.json"
 schema = "eliot.core-daemon-workstream.v4"
 updated_at = "2026-08-29"
-authority_pair_key = "sha256:105558fc8957e150fab407b4fc5818ec49dc784f23f246f42dc9d3ca5843196b"
+authority_pair_key = "sha256:ab2011bd67557d89b2f094061d350a297389f7f57d0478be5e1ff8d2da8ed1c1"
 role = "Non-authoritative routing projection and migration input only; never runtime authority."
 
 [[inventory_family]]
@@ -50,92 +51,8 @@ id = "governor_daemon"
 process = "eliotd.exe"
 paths = ["bins/eliotd", "crates/governor"]
 
-# Issue #18 required work 1, implemented through this #13 contract: the real
-# `eliotd` capability cells and the one mutable-state owner of each. The
-# canonical source of this projection is
-# `bins/eliotd/Cargo.toml::[package.metadata.eliot]` (`functional_cell_refs` and
-# `functional_cell_state_owners`); this table repeats it so the migration input
-# is readable from the contract alone, and both stay in one-to-one agreement.
-# I2.23: a cell with an undeclared state owner is a registry defect.
-[[declared_functional_cell]]
-cell = "governor.daemon.composition"
-declared_by = "bins/eliotd/Cargo.toml::package.metadata.eliot.functional_cell_refs"
-source_owner = "eliotd::DaemonComposition"
-mutable_state_owner = "eliotd::DaemonComposition"
-source_evidence = "bins/eliotd/src/lib.rs:461"
-state_evidence = "bins/eliotd/src/lib.rs:461-553"
-runtime_bundle = "eliotd"
-stateless = false
-
-[[declared_functional_cell]]
-cell = "governor.daemon.startup-binding"
-declared_by = "bins/eliotd/Cargo.toml::package.metadata.eliot.functional_cell_refs"
-source_owner = "eliotd::StartupCapabilityBindings"
-mutable_state_owner = "eliotd::StartupCapabilityBindings"
-source_evidence = "bins/eliotd/src/startup_capability_bindings.rs:336"
-state_evidence = "bins/eliotd/src/startup_capability_bindings.rs:336-388"
-runtime_bundle = "eliotd"
-stateless = false
-
-[[declared_functional_cell]]
-cell = "governor.daemon.poll-contour"
-declared_by = "bins/eliotd/Cargo.toml::package.metadata.eliot.functional_cell_refs"
-source_owner = "eliotd::daemon_runtime"
-mutable_state_owner = "eliotd::daemon_runtime::run"
-source_evidence = "bins/eliotd/src/daemon_runtime.rs:452"
-state_evidence = "bins/eliotd/src/daemon_runtime.rs:452-490"
-runtime_bundle = "eliotd"
-stateless = false
-
-[[declared_functional_cell]]
-cell = "governor.daemon.kernel-transport"
-declared_by = "bins/eliotd/Cargo.toml::package.metadata.eliot.functional_cell_refs"
-source_owner = "eliotd::DaemonKernelClient"
-mutable_state_owner = "eliotd::DaemonKernelClient"
-source_evidence = "bins/eliotd/src/daemon_kernel_client.rs:1"
-state_evidence = "bins/eliotd/src/daemon_runtime.rs:461"
-runtime_bundle = "eliotd"
-stateless = false
-
-[[declared_functional_cell]]
-cell = "governor.daemon.operator-replay"
-declared_by = "bins/eliotd/Cargo.toml::package.metadata.eliot.functional_cell_refs"
-source_owner = "eliotd::controlboard_adapters::SharedOperatorReplay"
-mutable_state_owner = "eliotd::controlboard_adapters::SharedOperatorReplay"
-source_evidence = "bins/eliotd/src/lib.rs:481"
-state_evidence = "bins/eliotd/src/lib.rs:813"
-runtime_bundle = "eliotd"
-stateless = false
-
-[[declared_functional_cell]]
-cell = "governor.daemon.skill-catalogue"
-declared_by = "bins/eliotd/Cargo.toml::package.metadata.eliot.functional_cell_refs"
-source_owner = "eliotd::skill_lifecycle_adapters::CatalogueHandle"
-mutable_state_owner = "eliot_skill::SkillCatalogue"
-source_evidence = "bins/eliotd/src/lib.rs:534"
-state_evidence = "bins/eliotd/src/lib.rs:816-818"
-runtime_bundle = "eliotd"
-stateless = false
-
-[[declared_functional_cell]]
-cell = "governor.daemon.capability-admission"
-declared_by = "bins/eliotd/Cargo.toml::package.metadata.eliot.functional_cell_refs"
-source_owner = "eliotd::capability_evidence_wiring::GovernorCapabilityAdmission"
-mutable_state_owner = "eliotd::capability_evidence_wiring::GovernorCapabilityAdmission"
-source_evidence = "bins/eliotd/src/lib.rs:542"
-state_evidence = "bins/eliotd/src/lib.rs:819"
-runtime_bundle = "eliotd"
-stateless = false
-
-[[declared_functional_cell]]
-cell = "governor.daemon.learning-closure"
-declared_by = "bins/eliotd/Cargo.toml::package.metadata.eliot.functional_cell_refs"
-source_owner = "eliotd::close_attempt_learning"
-mutable_state_owner = "eliot_governor::LearningClosureService"
-source_evidence = "bins/eliotd/src/lib.rs:552"
-state_evidence = "bins/eliotd/src/lib.rs:820"
-runtime_bundle = "eliotd"
-stateless = false
+# Issue #18 W1 reads cell/state-owner declarations from the generated source-only projection in docs/code-navigation/capsules/index.json.
+# This contract carries no parallel per-cell owner list.
 
 [[inventory_family]]
 id = "watchdog"
@@ -206,12 +123,12 @@ paths = ["bins/eliot", "crates/meta/eliot-runtime-status", "crates/kernel/eliot-
 
 [confirmed_gap]
 observations = [
-  "workstreams/core-daemons/inventory.json and package-local metadata provide planning and routing projections, not one executable current-pair CapabilityCellRegistry.",
-  "Repository-wide search on base 65b68d5e finds no CapabilityCellRegistry type or validator in crates/ or bins/ that resolves a process generation to one cell, contract digest, mutable-state owner, proof entrypoint and Product Pulse.",
-  "The current core-daemon verifier (scripts/verify-core-daemon-inventory.py) validates a handwritten inventory and fixed expected fields; it cannot generate current cells from Cargo/package/contract/proof inputs or prove every mutable state has exactly one owner.",
-  "Several parent Issues depend on #13, while package presence and metadata can still be mistaken for runtime support without one generated stale-rejecting registry.",
+  "The generated cell declaration projection exposes exact package-declared cell/state-owner rows and typed proof gaps; it is not the executable CapabilityCellRegistry.",
+  "The eight eliotd ModuleTestCapsules have no declared executable proof entrypoint. independent_proof_profile is not an executable entrypoint.",
+  "Full generation-to-Product-Pulse readback remains fail-closed until current-pair records have valid proof and remaining required owner/contract data.",
+  "Runtime liveness and installed generation remain owned by #11; the source-only projection grants no runtime or support authority.",
 ]
-discriminator = "Ask current runtime/planning code to resolve any installed process generation to its capability cell, public contract digest, state owner, proof entrypoint and Product Pulse. No single generated current-pair record is available."
+discriminator = "Read a current-pair cell declaration by exact cell ID: source manifest digest and state-owner rows must match package metadata, and missing proof remains typed rather than inferred."
 
 [causal_property]
 statement = "Every independently supported capability resolves through one reproducible current-pair registry record naming exact contract, source owner, mutable-state/lifecycle owner, runtime generation, proof entrypoint/ceiling, affected edges, Product Pulse, replacement/removal boundary and invalidation set."
