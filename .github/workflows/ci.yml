@@ -157,7 +157,7 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "### Merge Compile Run Manifest"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Repository: $env:GITHUB_REPOSITORY event=$env:GITHUB_EVENT_NAME ref=$env:GITHUB_REF Source SHA=$manifestSha"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Runner: os=$env:RUNNER_OS image=$env:ImageOS arch=$env:RUNNER_ARCH"
-          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Toolchain: $rustcIdentity / $cargoIdentity / dotnet $dotnetIdentity / python $pythonIdentity"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Toolchain: $rustcIdentity / $cargoIdentity / dotnet $dotnetIdentity / $pythonIdentity"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Inputs: Cargo.lock=$lockHash rust-toolchain=$toolHash ci.yml=$ciHash verify.ps1=$profileHash"
           $gwfJson = Join-Path $env:RUNNER_TEMP 'gwf-actions.json'
           python scripts/verify-github-workflows.py --root . --json-out $gwfJson
@@ -181,7 +181,7 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "No live Windows/store/Product-Pulse claim."
 
   repair-source-bootstrap:
-    if: ${{ github.event_name == 'push' && github.event.head_commit.message == 'chore: bootstrap pinned repair workspace for R1-R4 (temporary source-only job)' }}
+    if: ${{ github.event_name == 'push' && contains(github.event.head_commit.message, 'bootstrap pinned repair workspace for R1-R4') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:

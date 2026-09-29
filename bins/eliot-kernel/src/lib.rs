@@ -49,6 +49,7 @@ mod backup_capture;
 mod backup_capture_ports;
 mod backup_restore;
 mod backup_restore_ports;
+mod backup_verify_provenance;
 #[cfg(windows)]
 mod blackboard;
 mod blob_store_controller;
