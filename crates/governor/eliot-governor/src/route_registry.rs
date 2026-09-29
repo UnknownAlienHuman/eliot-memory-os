@@ -1195,6 +1195,16 @@ impl CapabilityRouteRegistry {
     /// predicates of [`CapabilityRegistry::admit_production_route`] instead of
     /// re-deriving admissibility here.
     ///
+    /// The launch is authorized on this path itself, not only at the bridge
+    /// contour. `delegated_user_broker_class` names the User Broker class the
+    /// launch resolved to, or `None` when the daemon or Kernel launches the
+    /// route directly. An `interactive_user` attempt that bypasses its declared
+    /// User Broker is rejected with
+    /// [`RouteRegistryError::InteractiveUserRequiresUserBroker`] before
+    /// anything is recorded, so this admission path can never be used to run
+    /// a user-desktop identity around the authorized User Broker (I10.3).
+    /// `service` and `remote` attempts carry no delegation requirement.
+    ///
     /// Staleness needs no flag: an adapter-hash or serializer change moves the
     /// derived scope, the exact-fingerprint match fails, and the refusal names
     /// the diverging layers so the route can be requalified.
@@ -1221,15 +1231,20 @@ impl CapabilityRouteRegistry {
     /// # Errors
     ///
     /// Returns [`RouteRegistryError`] when the receipt is not a consistent,
-    /// well-formed route observation, or when the complete effective route key
-    /// of the current fingerprint cannot be built.
+    /// well-formed route observation, when an `interactive_user` route
+    /// bypasses its declared User Broker, or when the complete effective
+    /// route key of the current fingerprint cannot be built.
     pub fn admit_route(
         &mut self,
         evidence: &CapabilityRegistry,
         receipt: ActualRouteReceipt,
         capability: &str,
         now: u64,
+        delegated_user_broker_class: Option<&str>,
     ) -> Result<RouteAdmission, RouteRegistryError> {
+        receipt
+            .requested
+            .authorize_launch(delegated_user_broker_class)?;
         let route_id = receipt.route_id.clone();
         let prior = self
             .receipts
