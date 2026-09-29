@@ -3513,6 +3513,11 @@ impl<P: KernelDurableJobPort + ?Sized> MaintenanceStateStore for KernelDurableJo
     }
 
     fn save(&mut self, job: &MaintenanceJob) -> Result<(), MaintenanceError> {
+        // #1694 W4: only a valid revision may reach the Kernel-owned durable
+        // ledger as a committed decision. Controller flows already validate,
+        // so this owner-boundary check changes no admitted flow; it keeps an
+        // invalid revision from ever becoming a commit candidate.
+        job.validate()?;
         if job.state_fence != self.state_fence {
             return Err(MaintenanceError::FenceMismatch);
         }

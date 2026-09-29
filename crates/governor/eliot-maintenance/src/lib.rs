@@ -471,6 +471,11 @@ impl MaintenanceJob {
                 MaintenanceJobState::Completed
                     | MaintenanceJobState::RollbackRequired
                     | MaintenanceJobState::Failed
+                    // #1694 W5: a reconciled proven-no-effect returns the job
+                    // to Deferred for same-identity retry without repeating
+                    // the uncertain effect; without this edge
+                    // `reconcile_unknown(ProvenNoEffect)` always fails.
+                    | MaintenanceJobState::Deferred
             )
         );
         if !legal {

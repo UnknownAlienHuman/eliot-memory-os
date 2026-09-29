@@ -89,7 +89,7 @@ impl KernelDurableJobPort for DaemonKernelClient {
         // #1694 W4: a transport acknowledgement is not proof of a canonical
         // decision commit. Require the Kernel-owned durable-job receipt to
         // carry the exact persisted job and bind it to the submitted trigger,
-        // job identity and State Fence before reporting the save.
+        // job identity, affected scope and State Fence before reporting the save.
         let persisted: MaintenanceJob = serde_json::from_value(kind_value(&value, "durable_job")?)
             .map_err(|error| KernelPortError::Contract(error.to_string()))?;
         persisted
@@ -97,10 +97,11 @@ impl KernelDurableJobPort for DaemonKernelClient {
             .map_err(|error| KernelPortError::Contract(error.to_string()))?;
         if persisted.job_id != job.job_id
             || persisted.trigger_id != job.trigger_id
+            || persisted.scope_ref != job.scope_ref
             || persisted.state_fence != job.state_fence
         {
             return Err(KernelPortError::Contract(
-                "Kernel durable-job receipt does not bind the submitted trigger, job identity and fence"
+                "Kernel durable-job receipt does not bind the submitted trigger, job identity, affected scope and fence"
                     .to_owned(),
             ));
         }
