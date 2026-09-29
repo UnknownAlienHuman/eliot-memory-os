@@ -179,3 +179,42 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "MERGE_COMPILE_SOURCE_ONLY"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Omitted: broad unit behavior, installed Windows services, Store correctness/recovery, external providers, release packaging, Product Pulse, live acceptance"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "No live Windows/store/Product-Pulse claim."
+
+  hot-path-4042-proof:
+    if: ${{ github.event_name == 'push' && contains(github.event.head_commit.message, 'run bounded 4042 shipped-manifest proof') }}
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 92000ee16a07bdb08ba15865ec50223dd6d32e63
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Check shipped manifests before and after the bounded repair
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git switch -C main
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json' }
+          $inputs = @{
+            'hot-path-4042-proof.py' = '2818a185bf0b751ab6170425112845f3acffe0ff'
+            'hot-path-4042-test.rs' = '09cf088ea1a8903497403e4dc7023e5c725001d9'
+          }
+          foreach ($name in $inputs.Keys) {
+            $blob = $inputs[$name]
+            $data = Invoke-RestMethod -Uri "https://api.github.com/repos/UnknownAlienHuman/eliot-memory-os/git/blobs/$blob" -Headers $headers
+            $path = Join-Path $env:RUNNER_TEMP $name
+            [IO.File]::WriteAllBytes($path, [Convert]::FromBase64String($data.content))
+            if ((((git hash-object $path) | Out-String).Trim()) -ne $blob) { throw 'Proof input identity mismatch' }
+          }
+          Remove-Item Env:GH_TOKEN
+          python (Join-Path $env:RUNNER_TEMP 'hot-path-4042-proof.py') (Join-Path $env:RUNNER_TEMP 'hot-path-4042-test.rs')
+          exit $LASTEXITCODE
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ always() }}
+        with:
+          name: hot-path-4042-proof-92000ee1
+          path: ${{ runner.temp }}/hot-path-4042-evidence/
+          if-no-files-found: error
+          retention-days: 5
