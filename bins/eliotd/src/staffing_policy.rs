@@ -817,21 +817,13 @@ fn coordinator_recipe_policy(
     let review_requested = !request.recipe.audit_requirements.is_empty();
     let human_intent = &request.human_staffing_intent;
     let policy = match human_intent.preset {
-        StaffingPreset::Economy => {
-            ModelRolePolicy::economy(human_intent.per_job_budget.clone())?
-        }
-        StaffingPreset::Balanced => {
-            ModelRolePolicy::balanced(human_intent.per_job_budget.clone())?
-        }
+        StaffingPreset::Economy => ModelRolePolicy::economy(human_intent.per_job_budget.clone())?,
+        StaffingPreset::Balanced => ModelRolePolicy::balanced(human_intent.per_job_budget.clone())?,
         StaffingPreset::Assurance => {
             ModelRolePolicy::assurance(human_intent.per_job_budget.clone())?
         }
-        StaffingPreset::Research => {
-            ModelRolePolicy::research(human_intent.per_job_budget.clone())?
-        }
-        StaffingPreset::Incident => {
-            ModelRolePolicy::incident(human_intent.per_job_budget.clone())?
-        }
+        StaffingPreset::Research => ModelRolePolicy::research(human_intent.per_job_budget.clone())?,
+        StaffingPreset::Incident => ModelRolePolicy::incident(human_intent.per_job_budget.clone())?,
     };
     if request.lanes.len() > usize::from(policy.max_active_lanes) {
         return Err(StaffingPolicyError::Contract(format!(
@@ -963,8 +955,7 @@ fn coordinator_route_evidence(
     let mut placed: BTreeMap<String, Vec<RouteCandidate>> = BTreeMap::new();
     for lane in &request.lanes {
         for candidate in &lane.route_candidates {
-            let mapped =
-                coordinator_route_candidate(config, request.privacy_class, candidate)?;
+            let mapped = coordinator_route_candidate(config, request.privacy_class, candidate)?;
             let binding = coordinator_lane_class_binding(request, lane, candidate);
             for class in binding {
                 let candidates = placed.entry(class.clone()).or_default();
@@ -1054,9 +1045,7 @@ fn coordinator_route_policy_evidence(
                         .extend(route_class_evidence_refs);
                     existing.route_class_evidence_refs.sort();
                     existing.route_class_evidence_refs.dedup();
-                    existing
-                        .privacy_evidence_refs
-                        .extend(privacy_evidence_refs);
+                    existing.privacy_evidence_refs.extend(privacy_evidence_refs);
                     existing.privacy_evidence_refs.sort();
                     existing.privacy_evidence_refs.dedup();
                 }
