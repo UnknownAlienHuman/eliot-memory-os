@@ -1712,7 +1712,9 @@ fn map_contract_error(error: TypedContractError) -> TypedExecutionError {
             TypedExecutionError::Engine("capsule-engine-unknown".to_owned())
         }
         TypedContractError::InvalidKit(detail) => TypedExecutionError::AdmissionMismatch(detail),
-        TypedContractError::InvalidCapsule(detail) => TypedExecutionError::AdmissionMismatch(detail),
+        TypedContractError::InvalidCapsule(detail) => {
+            TypedExecutionError::AdmissionMismatch(detail)
+        }
         TypedContractError::Serialization(_) => {
             TypedExecutionError::AdmissionMismatch("kit-digest".to_owned())
         }
