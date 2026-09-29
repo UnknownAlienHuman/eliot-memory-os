@@ -179,7 +179,11 @@ pub struct ToolCallRequest {
     pub route_fingerprint: String,
     /// Cost and effect class of the call.
     pub call_class: ToolCallClass,
-    /// Lowercase SHA-256 over canonical call inputs.
+    /// Lowercase SHA-256 over canonical call inputs, excluding
+    /// caller-declared intent text: builders must hash the effective tool
+    /// inputs so a reworded `expected_delta` keeps the repeat identity and
+    /// meets the evidence-bound comparison instead of evading it as fresh
+    /// inputs.
     pub inputs_digest: String,
     /// Intent; required for every class except cheap exact reads.
     pub intent: Option<ToolCallIntent>,

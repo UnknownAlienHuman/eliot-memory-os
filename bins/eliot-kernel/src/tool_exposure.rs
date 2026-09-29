@@ -47,9 +47,28 @@ pub(crate) fn call_class(admission: &LocalReadAdmission) -> ToolCallClass {
     }
 }
 
-/// Computes the SHA-256 digest over the canonical JSON form of the tool.
+/// Computes the SHA-256 identity digest over the effective call inputs.
+///
+/// The caller-declared `intent` block is stripped before canonicalization:
+/// it is gate justification, not tool inputs. Folding justification text
+/// into the identity would let a reworded `expected_delta` change the
+/// digest and evade the evidence-bound repeat comparison as a
+/// never-before-seen call, which step 5 forbids — a reworded delta alone
+/// is not progress. Retries that advance real inputs still hash
+/// differently and stay fresh; retries that change only justification
+/// keep the identity and meet the [`LoopSignal::NoProgress`] arm unless
+/// owner-observed evidence advanced.
 fn inputs_digest(tool: &serde_json::Value) -> Result<String, serde_json::Error> {
-    let bytes = serde_json::to_vec(tool)?;
+    let mut canonical = tool.clone();
+    if let Some(object) = canonical.as_object_mut() {
+        if let Some(arguments) = object
+            .get_mut("arguments")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            arguments.remove("intent");
+        }
+    }
+    let bytes = serde_json::to_vec(&canonical)?;
     Ok(sha256_hex(&bytes))
 }
 
@@ -57,7 +76,11 @@ fn inputs_digest(tool: &serde_json::Value) -> Result<String, serde_json::Error> 
 ///
 /// The cost/effect class derives from `admission` — the accepted method —
 /// never from the caller-supplied name string. The versioned tool definition
-/// identity still names the invoked tool; classification does not.
+/// identity still names the invoked tool; classification does not. The
+/// inputs digest covers the effective call inputs with the caller-declared
+/// `intent` block stripped, so a reworded `expected_delta` keeps the repeat
+/// identity and meets the evidence-bound comparison instead of hashing as
+/// fresh inputs.
 pub(crate) fn build_tool_call_request(
     envelope: &eliot_protocol::HostRequestEnvelope,
     tool: &serde_json::Value,
@@ -148,7 +171,11 @@ pub(crate) fn requires_intent(admission: &LocalReadAdmission) -> bool {
 /// for the staging candidate; unreconstructible pairs never match. The
 /// retained per-route stage is the existing attempt history — no new loop
 /// ledger — and the comparison is the evidence-bound
-/// [`detect_repeat_without_progress_with_evidence`] join.
+/// [`detect_repeat_without_progress_with_evidence`] join. The compared
+/// inputs digest excludes caller-declared intent text by construction
+/// ([`build_tool_call_request`]), so a reworded `expected_delta` keeps the
+/// repeat identity and yields [`LoopSignal::NoProgress`], never a fresh
+/// staging as progress.
 ///
 /// No owner-observed evidence is joined at this gate: payloads travel by
 /// digest only, so the source revision, poll cursor, and prior outcome the
