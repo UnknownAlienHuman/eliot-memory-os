@@ -25,6 +25,8 @@ use eliot_context_contracts::{
     SemanticRole,
 };
 use eliot_contracts::{ArtifactId, StateFence, TaskRevision, canonical_json_bytes, sha256_hex};
+use eliot_epistemic_context_provider::EpistemicContextContribution;
+use eliot_epistemic_contracts::Currentness;
 use eliot_evidence::{Assertability, EpistemicStatus};
 use eliot_receipts::ProofCeiling;
 use schemars::JsonSchema;
@@ -39,10 +41,11 @@ use crate::inputs::{
     EpistemicInput, EvidenceInput, OpaqueMember, OpaqueProjection, ProjectionState,
     check_denominator_is_seven, cue_availability,
 };
+use crate::provider_registry::{registered_providers, registered_slot_for};
 use crate::vocabulary::{
     KIND_MAP_VERSION, KindRule, PROVIDER_AFFORDANCE, PROVIDER_ATTENTION, PROVIDER_CUE,
     PROVIDER_EPISTEMIC, PROVIDER_EVIDENCE, PROVIDER_NEGATIVE_MEMORY, PROVIDER_TASK_FRAME,
-    kind_rule, role_rank, seven_slots,
+    kind_rule, role_rank,
 };
 
 /// Rank slot availability worst-case first for the rollup.
@@ -425,7 +428,7 @@ fn check_envelope(
     if recipe.binding != request.binding {
         return Err(ContextError::InvalidFence);
     }
-    let slots = seven_slots()?;
+    let slots = registered_providers()?;
     let mut mandatory = BTreeSet::new();
     for rule in &recipe.role_policies {
         if rule.required {
@@ -587,7 +590,23 @@ fn collect_epistemic(
     if input.position.admission.fence != binding.state_fence {
         return Err(ContextError::InvalidFence);
     }
-    let derived = derive_epistemic(input, &slot.provider, AtomAvailability::PresentCurrent)?;
+    // The declared consumer edge of the `smart.epistemic.context_provider`
+    // cell: an ADMITTED position crosses this boundary framed by that
+    // provider's own owner-envelope contribution, and the registered Context
+    // slot for that contributing identity supplies the candidate handle. The
+    // contribution is framed, never re-interpreted: the owner envelope stays
+    // the single contribution authority and no parallel schema exists here.
+    // A position that is not admitted has no owner contribution to frame, so
+    // it keeps the recipe's registered slot exactly as before.
+    let registered = match input.position.currentness {
+        Currentness::Current => {
+            let contribution = EpistemicContextContribution::from_position(&input.position)
+                .map_err(|_| ContextError::InvalidField("epistemic.contribution"))?;
+            registered_slot_for(contribution.provider.as_str())?
+        }
+        _ => slot.clone(),
+    };
+    let derived = derive_epistemic(input, &registered.provider, AtomAvailability::PresentCurrent)?;
     for member in &derived {
         let rule = kind_rule(PROVIDER_EPISTEMIC, member.kind.as_str())
             .ok_or(ContextError::InvalidField("epistemic.kind"))?;

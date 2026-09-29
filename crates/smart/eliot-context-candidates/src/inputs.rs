@@ -578,7 +578,7 @@ pub use eliot_cue_contracts::ActivationResult as CueActivationResult;
 /// Order-insensitive; an eighth slot, a missing slot or a swapped role is a
 /// denominator mismatch, never silent absorption.
 pub fn check_denominator_is_seven(recipe: &ContextRecipe) -> Result<(), ContextError> {
-    let mut expected = crate::seven_slots()?;
+    let mut expected = crate::provider_registry::registered_providers()?;
     let mut actual = recipe.denominator.requested.clone();
     expected.sort();
     actual.sort();
@@ -808,7 +808,7 @@ pub fn memory_availability(input: &MemoryInput) -> AtomAvailability {
 /// decides whether memory atoms merge into evidence emission or form their
 /// own emission, but the denominator slot identity is stable now.
 pub fn eight_slots() -> Result<Vec<ProviderRole>, ContextError> {
-    let mut slots = crate::seven_slots()?;
+    let mut slots = crate::provider_registry::registered_providers()?;
     slots.push(ProviderRole {
         provider: ProviderId::new(MEMORY_PROVIDER)
             .map_err(|_| ContextError::InvalidField("memory.provider"))?,
@@ -824,7 +824,7 @@ pub fn eight_slots() -> Result<Vec<ProviderRole>, ContextError> {
 /// explicitly missing; an eight-slot recipe must name the exact memory
 /// slot. Anything else is a denominator mismatch, never silent absorption.
 pub fn check_denominator_is_seven_or_eight(recipe: &ContextRecipe) -> Result<(), ContextError> {
-    let mut seven = crate::seven_slots()?;
+    let mut seven = crate::provider_registry::registered_providers()?;
     let mut eight = eight_slots()?;
     let mut actual = recipe.denominator.requested.clone();
     seven.sort();
