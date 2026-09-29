@@ -70,6 +70,10 @@ Replace the placeholder with the pure candidate-only analyzer of one exact bound
 - Correlation, chronology, topology, confidence, recency or count cannot become causal/truth/authority evidence.
 - Every recommended probe has differing outcomes or an exact unknown-resolution criterion plus owner, verifier, cost/risk/privacy/effect bounds.
 - No source acquisition, prose entailment, model/tool/Store call, peer transport, Concilium launch, probe execution, mutation, authority, effect or Finish API exists.
+- Owner-issued `SourceMemberRecord`/`OwnerComparisonProfile`/`DimensionObservation`/`EvidenceRecord`/`CausalEvidenceRecord` records are consumed, never acquired or upgraded; the producer and authoritative identity of each class is recorded in the owner-map table in `src/lib.rs`.
+- `CompatibilityRelation` and `CausalClaimState` are DERIVED from admitted owner values and evidence, never from a caller-supplied verdict. Legacy v1 `SuppliedComparison`/`SuppliedCausalClaim` stay unverified and cannot qualify equality, difference, prediction, intervention, or attribution.
+- Owner-unavailable, stale, mixed-fence, partial, or omitted records are an explicit inert result: ambiguous relation, unknown causal state, valid observations preserved, named gap carried. No fetch, retry, fallback owner, or acquisition surface exists.
+- Prediction support, intervention execution, and causal attribution stay distinct; a digest validated against its originally recorded value is never recomputed over the local copy it checks.
 - All 68 `WORK_UNIT_CASE: 673/1..68` cases execute and pass.
 - Package `fmt`, `test`, `clippy -D warnings`, `doc --no-deps` and `git diff --check` pass.
 - Package remains standalone until #969 performs serialized workspace admission.
