@@ -97,7 +97,7 @@ pub use reactive_injection_receipts::{
     ItemDisposition, NormalizedCue, REACTIVE_INJECTION_CONTRACT, ReactiveInjectionError,
     ReactiveInjectionLedger, RiskTier, Severity, UseOutcome,
 };
-use route_identity_gate::{admit_bridge_route_launch, classify_bridge_route_resume};
+use route_identity_gate::{admit_bridge_route_launch, classify_bridge_route_reconnect};
 pub use settled_plan_transport::{
     AdmittedPlanItem, FeedAdmissionOutcome, GovernorAssessmentView, MAX_TRANSPORT_REPLAY_KEYS,
     PlanAdmissionError, PlanAdmissionReport, SettledPlanAdmission, WithheldPlanItem,
@@ -4745,8 +4745,9 @@ pub struct BridgeRunner {
     /// Fingerprint persisted for the last admitted launch (issue #1816, W3).
     ///
     /// The complete W3 material returned by [`admit_bridge_route_launch`].
-    /// [`BridgeRunner::reconnect`] classifies resume against it through
-    /// [`classify_bridge_route_resume`], so a fingerprint move can never
+    /// [`BridgeRunner::reconnect`] fingerprints the Governor-retained route
+    /// definition and classifies it against this launch value through
+    /// [`classify_bridge_route_reconnect`], so a fingerprint move can never
     /// silently continue. Process memory only, like the rest of the attach
     /// state: a new process admits a new launch.
     active_route_fingerprint: Option<RouteBehaviorFingerprint>,
@@ -5151,18 +5152,22 @@ impl BridgeRunner {
     /// Reconnects under a replacement connection: the real bridge resume path
     /// (issue #1816, W4).
     ///
-    /// The live route is classified against the launch fingerprint through
-    /// [`classify_bridge_route_resume`]. An unchanged fingerprint keeps
-    /// native resume; any divergence refuses with an explicit
+    /// The Governor-retained route definition is fingerprinted and classified
+    /// against the launch fingerprint through
+    /// [`classify_bridge_route_reconnect`]. An unchanged retained definition
+    /// keeps native resume; any divergence refuses with an explicit
     /// rehydrated/new-attempt state instead of silently continuing under the
     /// previous session identity.
     #[allow(clippy::result_large_err)]
     pub fn reconnect(&mut self, request: ReconnectRequest) -> Result<AttachView, BridgeError> {
         let route_moved = match &self.active_route_fingerprint {
             Some(prior) => {
-                let next =
-                    RouteBehaviorFingerprint::of(&self.bridge_route, &self.route_installation);
-                classify_bridge_route_resume(prior, &next) == ContinuityKind::Rehydrated
+                classify_bridge_route_reconnect(
+                    &self.route_registry,
+                    prior,
+                    &self.bridge_route,
+                    &self.route_installation,
+                ) == ContinuityKind::Rehydrated
             }
             None => false,
         };
