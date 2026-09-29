@@ -94,7 +94,7 @@ pub(crate) struct UserModeProfileTaskCleanupRequired {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum UserModeProfileTaskRegistrationError {
     Rejected(WindowsAdapterError),
-    CleanupRequired(UserModeProfileTaskCleanupRequired),
+    CleanupRequired(Box<UserModeProfileTaskCleanupRequired>),
 }
 
 impl From<WindowsAdapterError> for UserModeProfileTaskRegistrationError {
@@ -1374,14 +1374,14 @@ fn register_user_mode_profile_task_in_apartment(
             return match cleanup_error {
                 None => Err(UserModeProfileTaskRegistrationError::Rejected(cause)),
                 Some(cleanup_error) => Err(UserModeProfileTaskRegistrationError::CleanupRequired(
-                    UserModeProfileTaskCleanupRequired {
+                    Box::new(UserModeProfileTaskCleanupRequired {
                         task_name: spec.task_name.clone(),
                         requested_xml_sha256,
                         observed_xml_sha256,
                         spec: spec.clone(),
                         cause,
                         cleanup_error,
-                    },
+                    }),
                 )),
             };
         }
