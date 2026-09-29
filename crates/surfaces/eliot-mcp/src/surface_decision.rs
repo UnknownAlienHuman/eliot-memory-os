@@ -4,7 +4,8 @@
 //! This module compiles one closed, versioned [`ToolSurfaceDecision`] for the
 //! current task/role/route from the registry's complete considered set plus
 //! task conditions supplied by the Governor/Kernel owners, then derives the
-//! permitted subset from the generated descriptors ([`canonical_tool_schemas`])
+//! permitted subset from the owner-joined published surface
+//! ([`published_mcp_tool_surface`])
 //! and validated semantic-owner bindings. Unavailable and forbidden methods
 //! are withheld from the permitted subset, never merely discouraged in prose.
 //! Dispositions never grant authority: call admission resolves the invoked
@@ -25,7 +26,7 @@ use thiserror::Error;
 
 use crate::{
     CANONICAL_DEFINITION_VERSION, EffectClass, OperationClass, SemanticRegistry,
-    ToolMethodIdentity, ToolSchema, canonical_tool_schemas, known_tool_profile,
+    ToolMethodIdentity, ToolSchema, known_tool_profile, published_mcp_tool_surface,
 };
 
 /// Maximum number of methods carried by one surface decision.
@@ -799,9 +800,11 @@ pub struct TaskRelativeSurface {
 
 /// Compiles the decision and derives the permitted subset in one pass.
 ///
-/// Starts from the generated descriptors and validated semantic-owner
-/// bindings, applies the owner-supplied task conditions deterministically,
-/// and withholds unavailable or forbidden methods.
+/// Starts from the owner-joined published surface
+/// ([`published_mcp_tool_surface`]: generated descriptors with validated live
+/// semantic-owner bindings, failing closed on version disagreement), applies
+/// the owner-supplied task conditions deterministically, and withholds
+/// unavailable or forbidden methods.
 ///
 /// # Errors
 ///
@@ -812,7 +815,7 @@ pub fn compile_task_relative_surface(
     conditions: &TaskSurfaceConditions,
 ) -> Result<TaskRelativeSurface, SurfaceDecisionError> {
     let descriptors =
-        canonical_tool_schemas().map_err(|_| SurfaceDecisionError::DescriptorsUnavailable)?;
+        published_mcp_tool_surface().map_err(|_| SurfaceDecisionError::DescriptorsUnavailable)?;
     let decision = compile_surface_decision(registry, conditions)?;
     let derived = derive_permitted_surface(registry, &decision, &descriptors)?;
     Ok(TaskRelativeSurface {
