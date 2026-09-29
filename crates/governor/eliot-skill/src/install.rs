@@ -101,9 +101,9 @@ use eliot_skills::{
 };
 
 use super::{
-    DependencyVersion, LiveSkillWorld, SkillBody, SkillCatalogue, SkillCatalogueEntry, SkillError,
-    SkillIndexEntry, SkillRegistry, SkillRuntimeMetadata, SkillScope, SkillStatus,
-    StructuralValidationReport, detect_dependency_staleness,
+    DependencyVersion, SkillBody, SkillCatalogue, SkillCatalogueEntry, SkillError, SkillIndexEntry,
+    SkillRegistry, SkillRuntimeMetadata, SkillScope, SkillStatus, StructuralValidationReport,
+    detect_dependency_staleness,
 };
 use crate::KnownTools;
 use serde::{Deserialize, Serialize};
@@ -534,10 +534,7 @@ fn install_status(package: &SkillPackage) -> (SkillStatus, Option<String>) {
 /// Re-installing a revised package replaces the entry wholesale
 /// (immutable-body revision): the catalogue digest changes, so Hotset receipts
 /// issued before the revision fail closed at activation instead of displaying
-/// a stale body. Before insert, every standing entry is reconciled
-/// against this install's observed live world through
-/// [`SkillCatalogue::reconcile_staleness`](crate::SkillCatalogue::reconcile_staleness),
-/// so drift in entries no reinstall arrives for is still recorded. Returns the `skill_id` the Governor owner binds to its
+/// a stale body. Returns the `skill_id` the Governor owner binds to its
 /// lifecycle `SkillRef.package_digest` (`package.digests.source_digest`).
 pub fn install_package(
     catalogue: &mut SkillCatalogue,
@@ -596,24 +593,6 @@ pub fn install_package(
     if !missing_tools.is_empty() {
         catalogue.mark_tool_basis_stale(&skill_id, &missing_tools)?;
     }
-    // Pre-insert staleness sweep over every standing entry (`I7.13`,
-    // issue #1882 W2/A2): the incoming declaration is the newest observation
-    // of the live world, so standing entries pinning anything else drifted
-    // without a reinstall of their own arriving. Reconciling here — through
-    // the existing mark paths, first drift wins, `Current`/`Provisional`
-    // only — records that drift even when the insert below refuses (unknown
-    // tools): a refused install must not leave old pins looking current
-    // against the new declaration. A mark rotates the catalogue digest, so
-    // Hotset receipts issued before this install fail closed at
-    // `activation_display`.
-    let world = LiveSkillWorld {
-        current_dependencies: &entry.dependencies,
-        live_host_version: &context.host_version,
-        live_profile_version: &context.profile_version,
-        live_definition_version: &context.admitted_definition_version,
-        tools,
-    };
-    catalogue.reconcile_staleness(&world)?;
     catalogue.insert(entry, tools)?;
     Ok(skill_id)
 }
