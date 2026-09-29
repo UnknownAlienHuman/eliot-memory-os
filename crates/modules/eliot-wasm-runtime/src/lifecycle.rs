@@ -1630,10 +1630,12 @@ mod lifecycle_proof_tests {
         }));
         // The proposed epoch is the record's own lineage-validated successor,
         // and the rollback target is the record's own prior generation.
-        assert!(route
-            .cutover
-            .new_epoch
-            .is_direct_child_of(&route.cutover.old_epoch));
+        assert!(
+            route
+                .cutover
+                .new_epoch
+                .is_direct_child_of(&route.cutover.old_epoch)
+        );
         assert_eq!(route.cutover.new_generation.value(), 2);
         assert_eq!(route.cutover_id, "cutover-1956-rollback");
 
