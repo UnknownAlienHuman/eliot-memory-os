@@ -20,13 +20,17 @@
 //!   caller's own candidate set read *before* ranking or admission could alter
 //!   it. Nothing downstream may restate it.
 //! - **Per-member disposition** is the membership accounting of the stage that
-//!   actually ran, joined to the admission owner's own [`OmissionRecord`]
-//!   reasons. A member the owner withheld without an omission record gets an
-//!   explicit unattributed reason, so a gap is named rather than silently
-//!   dropped.
-//! - **Final membership** comes from the owner's `AdmittedContextSet` records,
-//!   and an all-rejected result is recorded as an honestly empty final set
-//!   rather than padded with a fake candidate.
+//!   actually ran, joined to that boundary's own authored rows. A stage never
+//!   borrows another boundary's reason: a member that left the membership
+//!   without its own stage naming why is refused as
+//!   [`SelectionChainError::UnattributedRemoval`], and a member the owner
+//!   withheld without an omission record gets an explicit unattributed reason,
+//!   so a gap is named rather than silently dropped.
+//! - **Final membership** comes from the last stage the chain actually ran: the
+//!   owner's `AdmittedContextSet` records through admission, and the
+//!   compilation's own reported output when a compile stage ran. An
+//!   all-rejected result is recorded as an honestly empty final set rather than
+//!   padded with a fake candidate.
 //!
 //! The function is pure: no Store IO, no minted authority, and it returns a
 //! stage candidate to its caller exactly as issue step 3 requires of "a pure
@@ -99,6 +103,19 @@ pub enum SelectionChainError {
     /// advertised from an unproven compilation.
     #[error("selection chain: admission is incomplete and yields no sealed membership")]
     IncompleteAdmission,
+    /// A member left a stage's membership without that stage naming why.
+    ///
+    /// The reason belongs to the boundary that removed the member. Borrowing
+    /// another boundary's omission record here would produce a receipt that
+    /// validates but misstates which transformation did the work, so the chain
+    /// is refused instead and the gap is named.
+    #[error(
+        "selection chain: stage removed member {member_ref} without its own authored disposition"
+    )]
+    UnattributedRemoval {
+        /// Identity of the member that left the membership unattributed.
+        member_ref: String,
+    },
 }
 
 /// Exact facts one transformation boundary observed about itself.
@@ -124,6 +141,19 @@ pub struct SelectionStageObservation<'a> {
     pub untrusted_influence: SelectionInfluenceState,
     /// Evidence backing a `Present` or `Unknown` influence statement.
     pub influence_evidence_refs: Vec<String>,
+    /// The membership accounting of *this* boundary, in this boundary's own
+    /// words.
+    ///
+    /// One row per member this boundary actually changed the disposition of,
+    /// carrying that boundary's own reason (or derived output / admitted source
+    /// evidence). A row the boundary did not author is never inferred from a
+    /// different boundary's evidence: `build_stage` either consumes a row here,
+    /// or derives `Retained` because the member is still in the output, or
+    /// refuses. That refusal is the point — a member that left the membership
+    /// without its own boundary naming why is an explicit chain gap
+    /// ([`SelectionChainError::UnattributedRemoval`]), never a reason borrowed
+    /// from admission and relabelled as the compilation's.
+    pub member_dispositions: Vec<SelectionMemberDisposition>,
 }
 
 /// Prepares the complete selection chain for one admission boundary and the
@@ -186,34 +216,25 @@ pub fn prepare_selection_chain(
     let rejected_candidate_refs = rejected_refs(&initial_candidate_members, &final_output_refs);
 
     // Ordinal one: the admission/prune boundary itself.
-    let admission_observation = SelectionStageObservation {
-        stage_id: ADMISSION_STAGE_ID,
-        stage: SelectionStageKind::Prune,
-        transformer_identity_and_config_revision: ADMISSION_TRANSFORMER_REVISION,
-        disclosure_closure_ref: &disclosure_closure_ref,
-        suppressed_counterevidence_refs: suppressed_counterevidence(&result.evidence.omissions),
-        budget_or_policy_omission_refs: budget_or_policy_omissions(&result.evidence.omissions),
-        untrusted_influence: SelectionInfluenceState::Unknown,
-        influence_evidence_refs: influence_evidence(result),
-    };
-    let admission_stage = build_stage(
-        &admission_observation,
-        1,
-        SelectionStageLink::FromPredecessor {
-            predecessor_stage_id: INITIAL_MEMBERSHIP_STAGE_ID.to_owned(),
-        },
+    let admission_stage = build_admission_stage(
         &initial_candidate_members,
         &output_members,
-        &result.evidence.omissions,
+        &final_output_refs,
+        &disclosure_closure_ref,
         &state_fence,
+        result,
     )?;
 
     let mut stages = vec![initial_stage, admission_stage];
 
     // Ordinal two: the context-compilation/export boundary, when the caller
     // supplies its observation. This is the last stage whose output is the
-    // delivered packet, so it is the stage a seal is taken against.
+    // delivered packet, so it is the stage a seal is taken against. Its
+    // membership accounting is the compilation's own: a compilation that
+    // dropped an admitted member must name that member in its observation, and
+    // `build_stage` refuses the chain when it does not.
     if let Some(compile) = compile_observation {
+        let compiled_members = compile_output_members(compile, &output_members);
         stages.push(build_stage(
             compile,
             2,
@@ -221,8 +242,7 @@ pub fn prepare_selection_chain(
                 predecessor_stage_id: ADMISSION_STAGE_ID.to_owned(),
             },
             &output_members,
-            &output_members,
-            &result.evidence.omissions,
+            &compiled_members,
             &state_fence,
         )?);
     }
@@ -232,6 +252,22 @@ pub fn prepare_selection_chain(
         .map(|stage| stage.untrusted_input_influenced_membership)
         .max()
         .unwrap_or(SelectionInfluenceState::Absent);
+
+    // The chain's final membership is the LAST stage's output, not the
+    // admission stage's. `seal_delivered_packet` and the security contract's
+    // `verify_against` both compare the sealed ordered membership against
+    // `final_output_refs`, so this field must name the membership that is
+    // actually delivered.
+    let chain_final_output_refs: Vec<String> = stages
+        .last()
+        .map(|stage| {
+            stage
+                .output_members
+                .iter()
+                .map(|member| member.member_ref.clone())
+                .collect()
+        })
+        .unwrap_or_default();
 
     let receipt = SelectionIntegrityReceipt {
         schema: SELECTION_INTEGRITY_SCHEMA.to_owned(),
@@ -244,7 +280,7 @@ pub fn prepare_selection_chain(
         admitted_candidate_refs: final_output_refs.clone(),
         rejected_candidate_refs,
         transformation_stages: stages,
-        final_output_refs,
+        final_output_refs: chain_final_output_refs,
         chain_untrusted_influence: observed_influence,
         state_fence,
         revision: 1,
@@ -329,17 +365,38 @@ pub fn disposition_keeps_membership(disposition: AdmissionDisposition) -> bool {
 /// admission owner actually produced, so a substituted chain or a substituted
 /// final set fails here rather than at a consumer. The owner-issued
 /// membership is the compared value; the chain is what it is verified against.
+///
+/// The compared membership is the ADMITTED stage's output, not the chain's last
+/// stage: `eliot-context-assembly` renders admitted records by projection and
+/// admits and renders the same identities, so the admitted set is the authority
+/// for this equality. A chain whose final stage dropped or replaced a member
+/// fails the security contract's own `SelectionIntegrityProof` check instead,
+/// which is where a compile-stage membership change belongs. When the chain has
+/// no compile stage, the admitted stage IS the last stage and this is the
+/// pre-existing end-to-end equality check unchanged.
 #[must_use]
 pub fn final_membership_matches(
     receipt: &SelectionIntegrityReceipt,
     admitted: &AdmittedContextSet,
 ) -> bool {
-    admitted
+    let admitted_refs: Vec<String> = admitted
         .records
         .iter()
         .map(|record| record.candidate.atom_id.as_str().to_owned())
-        .collect::<Vec<String>>()
-        == receipt.final_output_refs
+        .collect();
+    let chain_admitted_refs = receipt
+        .transformation_stages
+        .iter()
+        .find(|stage| stage.stage_id == ADMISSION_STAGE_ID)
+        .map(|stage| {
+            stage
+                .output_members
+                .iter()
+                .map(|member| member.member_ref.clone())
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default();
+    admitted_refs == chain_admitted_refs
 }
 
 /// The stable append identity of one chain.
@@ -376,6 +433,91 @@ fn retained_disposition(member: &SelectionMember) -> SelectionMemberDisposition 
         derived_output_ref: None,
         source_evidence_ref: None,
     }
+}
+
+/// The admission boundary's own membership accounting.
+///
+/// Every initial candidate the owner did not carry into the final membership
+/// gets one row here, and the reason is the admission owner's own omission
+/// record. A member the owner withheld without an omission record is named as
+/// an explicit gap ([`UNATTRIBUTED_WITHHELD_REASON`]) rather than dropped: the
+/// stage says "withheld, unattributed" instead of implying a measured reason.
+fn admission_dispositions(
+    initial_candidate_members: &[SelectionMember],
+    final_output_refs: &[String],
+    omissions: &[OmissionRecord],
+) -> Vec<SelectionMemberDisposition> {
+    initial_candidate_members
+        .iter()
+        .filter(|member| !final_output_refs.contains(&member.member_ref))
+        .map(|member| SelectionMemberDisposition {
+            member_ref: member.member_ref.clone(),
+            disposition: SelectionMemberDispositionKind::Removed,
+            reason: Some(
+                omissions
+                    .iter()
+                    .find(|record| record.atom_id.as_str() == member.member_ref)
+                    .map_or_else(|| UNATTRIBUTED_WITHHELD_REASON.to_owned(), omission_reason),
+            ),
+            derived_output_ref: None,
+            source_evidence_ref: None,
+        })
+        .collect()
+}
+
+/// The membership the compilation boundary actually emitted.
+///
+/// The admitted set is the compilation's *input*; its output is what the
+/// boundary itself reports through the dispositions it authored. A compilation
+/// that introduced a new member names it with `Admitted` plus its source
+/// evidence, and a compilation that derived a replacement names the
+/// `derived_output_ref` that took the input member's place. Anything else
+/// leaves the admitted membership unchanged, which is the common case for the
+/// `ContextCompile` stage: `eliot-context-assembly` renders admitted records by
+/// projection and never selects, so its honest output membership IS the input.
+fn compile_output_members(
+    observation: &SelectionStageObservation<'_>,
+    admitted_members: &[SelectionMember],
+) -> Vec<SelectionMember> {
+    let mut output = admitted_members.to_vec();
+    for disposition in &observation.member_dispositions {
+        match disposition.disposition {
+            // An admitted expansion introduces a member whose identity,
+            // revision and representation come from the named source
+            // evidence, not from a restatement of the input.
+            SelectionMemberDispositionKind::Admitted => {
+                let Some(evidence) = &disposition.source_evidence_ref else {
+                    continue;
+                };
+                output.push(SelectionMember {
+                    member_ref: disposition.member_ref.clone(),
+                    member_revision: evidence.clone(),
+                    representation_ref: evidence.clone(),
+                });
+            }
+            // A derived output replaces the input member it names, so the
+            // output membership carries the derived identity at the position
+            // the removed input held.
+            SelectionMemberDispositionKind::Derived => {
+                let Some(derived) = &disposition.derived_output_ref else {
+                    continue;
+                };
+                if let Some(position) = output
+                    .iter()
+                    .position(|member| member.member_ref == disposition.member_ref)
+                {
+                    output[position] = SelectionMember {
+                        member_ref: derived.clone(),
+                        member_revision: derived.clone(),
+                        representation_ref: derived.clone(),
+                    };
+                }
+            }
+            SelectionMemberDispositionKind::Retained
+            | SelectionMemberDispositionKind::Removed => {}
+        }
+    }
+    output
 }
 
 /// Builds the ordinal-zero stage that binds the caller's candidate set as it
@@ -417,44 +559,109 @@ fn initial_membership_stage(
     })
 }
 
+/// Builds the ordinal-one stage: the admission/prune boundary itself.
+///
+/// The observation this stage records is the admission owner's own, so its
+/// untrusted influence stays the `Unknown` the owner declared — it is never
+/// defaulted to `Absent` — and every omission reference comes from the recorded
+/// `result.evidence.omissions` rather than from a freshly derived set.
+///
+/// # Errors
+///
+/// Returns an error when the membership accounting cannot attribute a removal
+/// or the shared stage builder refuses this boundary.
+fn build_admission_stage(
+    initial_candidate_members: &[SelectionMember],
+    output_members: &[SelectionMember],
+    final_output_refs: &[String],
+    disclosure_closure_ref: &str,
+    state_fence: &StateFence,
+    result: &AdmissionResult,
+) -> Result<SelectionStage, SelectionChainError> {
+    let admission_observation = SelectionStageObservation {
+        stage_id: ADMISSION_STAGE_ID,
+        stage: SelectionStageKind::Prune,
+        transformer_identity_and_config_revision: ADMISSION_TRANSFORMER_REVISION,
+        disclosure_closure_ref,
+        suppressed_counterevidence_refs: suppressed_counterevidence(&result.evidence.omissions),
+        budget_or_policy_omission_refs: budget_or_policy_omissions(&result.evidence.omissions),
+        untrusted_influence: SelectionInfluenceState::Unknown,
+        influence_evidence_refs: influence_evidence(result),
+        member_dispositions: admission_dispositions(
+            initial_candidate_members,
+            final_output_refs,
+            &result.evidence.omissions,
+        ),
+    };
+    build_stage(
+        &admission_observation,
+        1,
+        SelectionStageLink::FromPredecessor {
+            predecessor_stage_id: INITIAL_MEMBERSHIP_STAGE_ID.to_owned(),
+        },
+        initial_candidate_members,
+        output_members,
+        state_fence,
+    )
+}
+
 /// Builds one immutable stage with the membership accounting of the boundary
 /// that actually ran.
+///
+/// `Retained` is derived from the membership itself — a member still present in
+/// the output was not changed, so no author had to narrate it. Every other
+/// disposition comes from `observation.member_dispositions`, which is the
+/// boundary's own vocabulary. A removed member with no authored row is
+/// [`SelectionChainError::UnattributedRemoval`]: an uninstrumented membership
+/// change is an explicit gap, never a reason borrowed from another stage.
 fn build_stage(
     observation: &SelectionStageObservation<'_>,
     ordinal: usize,
     input_link: SelectionStageLink,
     input_members: &[SelectionMember],
     output_members: &[SelectionMember],
-    omissions: &[OmissionRecord],
     state_fence: &eliot_contracts::StateFence,
 ) -> Result<SelectionStage, SelectionChainError> {
     let output_refs: BTreeSet<&str> = output_members
         .iter()
         .map(|member| member.member_ref.as_str())
         .collect();
+    let authored: BTreeMap<&str, &SelectionMemberDisposition> = observation
+        .member_dispositions
+        .iter()
+        .map(|disposition| (disposition.member_ref.as_str(), disposition))
+        .collect();
     let member_dispositions = input_members
         .iter()
         .map(|member| {
             if output_refs.contains(member.member_ref.as_str()) {
-                retained_disposition(member)
+                Ok(retained_disposition(member))
             } else {
-                // A removed member names the owner's own authored reason, so a
-                // later serializer cannot reconstruct or overstate why a rival
-                // left the membership.
-                let reason = omissions
-                    .iter()
-                    .find(|record| record.atom_id.as_str() == member.member_ref)
-                    .map_or_else(|| UNATTRIBUTED_WITHHELD_REASON.to_owned(), omission_reason);
-                SelectionMemberDisposition {
-                    member_ref: member.member_ref.clone(),
-                    disposition: SelectionMemberDispositionKind::Removed,
-                    reason: Some(reason),
-                    derived_output_ref: None,
-                    source_evidence_ref: None,
-                }
+                authored
+                    .get(member.member_ref.as_str())
+                    .map(|disposition| (*disposition).clone())
+                    .ok_or_else(|| SelectionChainError::UnattributedRemoval {
+                        member_ref: member.member_ref.clone(),
+                    })
             }
         })
-        .collect();
+        .collect::<Result<Vec<SelectionMemberDisposition>, SelectionChainError>>()?;
+    // A row this boundary authored for a member it never received and that it
+    // neither derived nor admitted is refused rather than silently dropped: it
+    // would restate the stage's accounting with content the membership cannot
+    // support. `Derived` and `Admitted` rows are exactly the rows the security
+    // contract requires for a member this stage introduced.
+    let unsupported = observation.member_dispositions.iter().find(|disposition| {
+        !matches!(
+            disposition.disposition,
+            SelectionMemberDispositionKind::Derived | SelectionMemberDispositionKind::Admitted
+        ) && !output_refs.contains(disposition.member_ref.as_str())
+    });
+    if let Some(disposition) = unsupported {
+        return Err(SelectionChainError::UnattributedRemoval {
+            member_ref: disposition.member_ref.clone(),
+        });
+    }
     Ok(SelectionStage {
         stage_id: observation.stage_id.to_owned(),
         ordinal,
