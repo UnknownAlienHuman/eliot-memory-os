@@ -68,6 +68,23 @@
 //! bytes idempotent while the same operation with different bytes fails
 //! closed.
 //!
+//! Maintenance source results take the same canonical route through
+//! [`GovernorObservationReconciliation::admit_maintenance_result`]: the
+//! Governor prepares the typed observation for the governed self scope from the
+//! maintained subsystem's own record (its exact v1 event core, scope,
+//! provenance and privacy disclosure, with the field-complete
+//! [`MaintenanceRecord`] family in the v2 payload), the Kernel checks
+//! authority/fence/identity through [`CanonicalAdmissionOwner::commit`], and the
+//! Store returns its own receipt unchanged. The stable publication identity is
+//! derived from the source event and its revisions, never from retry time, so
+//! an identical replay reconciles the existing receipt while changed content
+//! under the same identity conflicts. A lost acknowledgement reads the original
+//! receipt back through the neutral port rather than committing again, and
+//! required proof carries only the execution evidence the source result really
+//! holds, so a no-attempt deferral publishes with no fabricated execution
+//! references. `eliot_system` is a projection of that source data, never
+//! permission to copy arbitrary project contents into a global record.
+//!
 //! Failure mapping reuses the existing [`CompositionError`] variants (no new
 //! variant is introduced so the closed matches elsewhere in this crate keep
 //! compiling): request-identity, fence, and operation-identity mismatches are
@@ -96,9 +113,11 @@ use eliot_doctor_core::{IndependentVerification, VerificationReport};
 use eliot_observation::{
     CaptureRoute, CoverageDisposition, CoverageEvidence, CoverageGap, Durability, GapDisposition,
     ObservationAdmissionResult, ObservationEventCore, ObservationEventIdentity, ObservationJournal,
-    ObservationKind, ObservationRecordEnvelope, ObservationRecordKind, ObservationScope,
-    ObservationSubmission, PrivacyRetentionDisclosure, ProducerTrace, RejectionDisposition,
+    ObservationKind, ObservationRecordEnvelope, ObservationRecordEnvelopeV2, ObservationRecordKind,
+    ObservationScope, ObservationSubmission, PrivacyRetentionDisclosure, ProducerTrace,
+    RecordFamilyPayloadV2, RejectionDisposition,
 };
+use eliot_observation_contracts::{MaintenanceRecord, MaintenanceResultV1};
 use eliot_problem::{
     DeliveryState, OwnerRef, Problem, ProblemId, ProblemState, Signal, SignalAttribution,
     SignalDisposition, SignalId, SignalProcessingState, SignalSeverity,
@@ -692,7 +711,261 @@ fn build_doctor_leg_envelopes(
     })
 }
 
+/// Builds the deterministic observation submission for one maintenance result.
+///
+/// The exact v1 event core, scope, provenance and privacy disclosure come from
+/// the maintained subsystem's own record; this path never substitutes a global
+/// identity for them, so publishing into `eliot_system` stays a projection of
+/// source data rather than a copy of arbitrary project contents. The v2 payload
+/// carries the exact [`MaintenanceRecord`] family, which keeps the versioned
+/// result and its utility evidence field-complete.
+fn maintenance_result_submission(
+    operation_id: &OperationId,
+    idempotency_key: &str,
+    identity: &eliot_protocol::RequestIdentity,
+    record: &MaintenanceRecord,
+) -> ObservationSubmission {
+    let record_v2 = ObservationRecordEnvelopeV2 {
+        payload: RecordFamilyPayloadV2::Maintenance(record.clone()),
+        caller_family_hint: Some(ObservationRecordKind::Maintenance),
+        parent_record_id: None,
+    };
+    ObservationSubmission {
+        operation_id: operation_id.as_str().to_owned(),
+        idempotency_key: idempotency_key.to_owned(),
+        state_fence: identity.request.metadata.state_fence.clone(),
+        record: ObservationRecordEnvelope {
+            record_id: record.record_id.clone(),
+            kind: ObservationRecordKind::Maintenance,
+            event: Some(record.core.clone()),
+            coverage_gap: None,
+            journal_control_event: false,
+            parent_record_id: None,
+        },
+        record_v2: Some(record_v2),
+        capture_route: CaptureRoute::CanonicalJournal,
+        durability: Durability::Durable,
+        plan: None,
+        task_selection: None,
+        evidence: None,
+    }
+}
+
+/// Builds the observation-leg envelope for one maintenance result.
+///
+/// The envelope addresses the maintained subsystem's own work scope and binds
+/// the stable publication identity: record identity, source outcome revision
+/// and evaluation revision. Required proof carries only the execution evidence
+/// the source result actually holds, so a no-attempt deferral publishes with
+/// empty proof rather than fabricated execution references.
+fn maintenance_observation_envelope(
+    identity: &eliot_protocol::RequestIdentity,
+    observation_operation: &OperationId,
+    submission: &ObservationSubmission,
+    record: &MaintenanceRecord,
+    proof_refs: &[String],
+    manifest_digest: &OperationManifestDigest,
+) -> Result<CanonicalWriteEnvelope, CompositionError> {
+    let fence = &identity.request.metadata.state_fence;
+    let request_digest = submission
+        .request_digest()
+        .map_err(|error| owner_refused(error.to_string()))?;
+    let work_scope = record.core.affected_scope.work_scope.as_str();
+    let mut parameters = BTreeMap::new();
+    for (name, value) in [
+        ("record_id", record.record_id.clone()),
+        ("request_digest", request_digest),
+        ("operation_id", submission.operation_id.clone()),
+        ("idempotency_key", submission.idempotency_key.clone()),
+        ("maintenance_action", record.maintenance_action.clone()),
+        ("trigger_ref", record.trigger_ref.clone()),
+        (
+            "source_outcome_revision",
+            record
+                .result
+                .as_ref()
+                .map_or_else(String::new, |result| result.source_outcome_revision.clone()),
+        ),
+        (
+            "evaluation_revision",
+            record
+                .result
+                .as_ref()
+                .map_or_else(String::new, |result| result.evaluation_revision.to_string()),
+        ),
+        ("work_scope", work_scope.to_owned()),
+    ] {
+        parameters.insert(name.to_owned(), serde_json::Value::String(value));
+    }
+    let envelope = CanonicalWriteEnvelope {
+        operation_id: observation_operation.clone(),
+        request: identity.request.metadata.clone(),
+        idempotency_key: submission.idempotency_key.clone(),
+        scope_id: ScopeId::new(work_scope).map_err(|error| owner_refused(error.to_string()))?,
+        task_id: identity
+            .request
+            .metadata
+            .task_id
+            .as_ref()
+            .map(|task| task.as_str().to_owned()),
+        transition_class: TransitionClass::CaptureCandidate,
+        requested_effect_ceiling: EffectClass::Candidate,
+        admission_contract_set_digest: canonical_digest(submission)?,
+        operation_manifest_digest: manifest_digest.clone(),
+        semantic_commands: vec![NamedMutationRequest {
+            operation: NamedMutationOperation::CaptureObservation,
+            parameters,
+        }],
+        event_projection_relation_intents: EventProjectionRelationIntents {
+            event_ids: Vec::new(),
+            projection_kinds: Vec::new(),
+            relation_kinds: Vec::new(),
+        },
+        security: SecurityContext::default(),
+        required_proof_and_approval_refs: proof_refs.to_vec(),
+        expected_revision_heads: Vec::new(),
+        expected_ordering_heads: vec![OrderingHeadExpectation {
+            scope: OrderingScopeId::new(format!("scope:{work_scope}"))
+                .map_err(|error| owner_refused(error.to_string()))?,
+            expected_sequence: 1,
+            state_fence: fence.clone(),
+        }],
+    };
+    envelope.validate()?;
+    Ok(envelope)
+}
+
+/// Collects the execution evidence the source result actually holds.
+///
+/// A no-attempt deferral carries none, and this returns an empty proof set
+/// rather than inventing attempt, effect or receipt references.
+fn maintenance_execution_proof(record: &MaintenanceRecord) -> Vec<String> {
+    let Some(result) = record.result.as_deref() else {
+        return Vec::new();
+    };
+    let mut refs: Vec<String> = Vec::new();
+    for reference in result
+        .actual_effect_refs
+        .iter()
+        .chain(&result.checkpoint_refs)
+        .chain(&result.reconciliation_refs)
+    {
+        if !refs.contains(reference) {
+            refs.push(reference.clone());
+        }
+    }
+    refs
+}
+
 impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> {
+    /// Admits one maintenance source result into the canonical observation path
+    /// and returns the exact store receipt.
+    ///
+    /// The Governor prepares the typed observation for the governed self scope;
+    /// the Kernel checks authority, fence and identity through
+    /// [`CanonicalAdmissionOwner::commit`], and the Store returns its own
+    /// receipt unchanged. Stable publication identity is derived from the
+    /// source event and its revisions, never from retry time, so an identical
+    /// replay reconciles the existing receipt while changed content under the
+    /// same identity conflicts. A lost acknowledgement reads back the original
+    /// receipt through the neutral port instead of committing again; logging or
+    /// transport acknowledgement is never treated as publication.
+    pub async fn admit_maintenance_result(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        base_operation_id: &OperationId,
+        record: &MaintenanceRecord,
+    ) -> Result<WriteReceipt, CompositionError> {
+        self.validate_capture_identity_fence(identity)?;
+        record.validate().map_err(|error| {
+            owner_refused(format!("maintenance result is not admissible: {error}"))
+        })?;
+        let publication_id = record.result.as_deref().map_or_else(
+            || record.record_id.clone(),
+            |result: &MaintenanceResultV1| result.publication_id.clone(),
+        );
+        let revision_suffix = record.result.as_deref().map_or_else(String::new, |result| {
+            format!("-r{}", result.evaluation_revision)
+        });
+        let observation_operation = OperationId::new(format!(
+            "{base_operation_id}/maintenance-{publication_id}{revision_suffix}"
+        ))
+        .map_err(|error| owner_refused(error.to_string()))?;
+        let per_result_idempotency = format!(
+            "{}:maintenance:{publication_id}{revision_suffix}",
+            identity.idempotency_key
+        );
+        // Derived per-result identity: the canonical owner requires the
+        // envelope idempotency to equal the admitted identity idempotency, and
+        // the envelope request binding must stay the caller's. A retry must
+        // therefore reuse the caller identity and the base operation, so the
+        // derived store identity stays a pure function of the source event.
+        let result_identity = eliot_protocol::RequestIdentity {
+            request: identity.request.clone(),
+            idempotency_key: per_result_idempotency.clone(),
+            deadline_unix_ms: identity.deadline_unix_ms,
+            cancellation_id: identity.cancellation_id.clone(),
+        };
+        let submission = maintenance_result_submission(
+            &observation_operation,
+            &per_result_idempotency,
+            identity,
+            record,
+        );
+        let mut scratch = self.observation.clone();
+        match scratch
+            .admit(submission.clone())
+            .map_err(|error| owner_refused(error.to_string()))?
+        {
+            ObservationAdmissionResult::Accepted { .. }
+            | ObservationAdmissionResult::Replayed { .. } => {}
+            ObservationAdmissionResult::Rejected { rejection } => {
+                if rejection.disposition == RejectionDisposition::Conflict {
+                    return Err(owner_refused(format!(
+                        "maintenance observation identity conflict: {}",
+                        rejection.all_contract_errors.join("; ")
+                    )));
+                }
+                return Err(owner_refused(format!(
+                    "maintenance observation is not admissible: {}",
+                    rejection.all_contract_errors.join("; ")
+                )));
+            }
+        }
+        let manifest_digest = production_manifest_digest()?;
+        let proof_refs = maintenance_execution_proof(record);
+        let envelope = maintenance_observation_envelope(
+            &result_identity,
+            &observation_operation,
+            &submission,
+            record,
+            &proof_refs,
+            &manifest_digest,
+        )?;
+        let expected_hash = envelope
+            .canonical_request_hash()
+            .map_err(CompositionError::Canonical)?;
+        if let Some(receipt) = self
+            .reconcile_capture_observation_receipt(
+                &result_identity,
+                &observation_operation,
+                &expected_hash,
+                &manifest_digest,
+            )
+            .await?
+        {
+            return Ok(receipt);
+        }
+        self.commit_observation_leg(
+            &result_identity,
+            &observation_operation,
+            envelope,
+            &expected_hash,
+            &manifest_digest,
+        )
+        .await
+    }
+
     /// Validates readiness, request identity shape, and exact fence agreement,
     /// projecting the canonical fence to the scalar doctor echo.
     fn validate_identity_fence(
@@ -1291,12 +1564,13 @@ fn watchdog_observation_envelope(
 }
 
 impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> {
-    /// Validates readiness plus exact fence agreement for Watchdog admission.
+    /// Validates readiness plus exact fence agreement for a direct canonical
+    /// capture (Watchdog spool and maintenance results).
     ///
     /// Mirrors [`Self::validate_identity_fence`] without the doctor echo: the
     /// request binding fence, the envelope metadata fence, and the canonical
     /// owner fence must coincide. No verifier endorsement applies here.
-    fn validate_watchdog_identity_fence(
+    fn validate_capture_identity_fence(
         &self,
         identity: &eliot_protocol::RequestIdentity,
     ) -> Result<(), CompositionError> {
@@ -1325,7 +1599,11 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
     /// different bytes. The caller passes the derived per-entry identity
     /// (caller binding plus per-entry idempotency), so the receipt binding
     /// check compares against that identity.
-    async fn reconcile_watchdog_observation_receipt(
+    ///
+    /// This is also the lost-acknowledgement readback for every direct
+    /// canonical capture: an identical source event queries the original
+    /// receipt here instead of executing a second publication.
+    async fn reconcile_capture_observation_receipt(
         &self,
         identity: &eliot_protocol::RequestIdentity,
         observation_operation: &OperationId,
@@ -1371,7 +1649,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
         batch_digest: &str,
         entries: &[WatchdogEntryAdmission],
     ) -> Result<Vec<WatchdogAdmittedEntry>, CompositionError> {
-        self.validate_watchdog_identity_fence(identity)?;
+        self.validate_capture_identity_fence(identity)?;
         validate_watchdog_batch_identity(batch_id, batch_digest)?;
         for entry in entries {
             validate_watchdog_entry(entry)?;
@@ -1447,7 +1725,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
                 .canonical_request_hash()
                 .map_err(CompositionError::Canonical)?;
             if let Some(receipt) = self
-                .reconcile_watchdog_observation_receipt(
+                .reconcile_capture_observation_receipt(
                     &entry_identity,
                     &observation_operation,
                     &expected_hash,
