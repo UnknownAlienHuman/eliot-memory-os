@@ -3038,12 +3038,13 @@ impl CoverageReceipt {
         // change; what changed is the value space of a field that was already
         // there, which is the same reason `source-record/v1` -> `v2` was recorded.
         //
-        // Transitively, `evidence-freeze/v1` and `inquiry-terminal-record/*` bind
+        // Transitively, `evidence-freeze/v2` and `inquiry-terminal-record/*` bind
         // this digest and therefore produce different values for the same run.
-        // `evidence-freeze/v1`'s own field set and domain are unchanged and are
-        // deliberately not bumped: a domain names the shape of the record being
-        // hashed, and a changed value in a field it already declared is exactly
-        // the dependency behaving as declared, not a new shape.
+        // `evidence-freeze` was then bumped `v1` -> `v2` by #1765, and for the
+        // other reason: its own preimage field set *grew* (the State Fence and the
+        // three successor-relation fields), and one name must not cover two field
+        // sets. That is the shape-change rule stated here, applied to the freeze
+        // rather than to the receipt.
         // `inquiry-terminal-record` was bumped `v1` -> `v2` by #1762 for the
         // opposite reason: its preimage *field set* changed when the evidence
         // freeze, the claim audit and the unsupported-precision residue became
@@ -4578,8 +4579,11 @@ impl InquiryTerminalRecord {
         // preimage comment states for itself: a domain names the shape of the
         // record being hashed, so a shape change bumps it, while a changed *value*
         // in a field that was already declared does not (which is why
-        // `evidence-freeze/v1` above is deliberately left alone — its own field
-        // set is unchanged and only the values it transitively binds moved).
+        // `evidence-freeze/v2` above is deliberately not bumped by #1762: at
+        // that time its own field set was unchanged and only the values it
+        // transitively binds moved. #1765 later grew that field set (the State
+        // Fence and the three successor-relation fields), which is the bump that
+        // took the freeze to `v2`.
         let mut preimage = String::from("inquiry-terminal-record/v2;");
         push_field(&mut preimage, "inquiry_id", &self.inquiry_id);
         push_field(&mut preimage, "profile_id", &self.profile_id);
