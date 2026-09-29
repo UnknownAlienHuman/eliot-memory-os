@@ -222,11 +222,7 @@ impl InquiryObligation {
     #[allow(clippy::too_many_arguments)]
     pub fn new(params: InquiryObligationParams<'_>) -> Result<Self, InquiryError> {
         text(&params.obligation_id, "obligation.obligation_id").map_err(InquiryError::from)?;
-        text(
-            &params.coverage_member,
-            "obligation.coverage_member",
-        )
-        .map_err(InquiryError::from)?;
+        text(&params.coverage_member, "obligation.coverage_member").map_err(InquiryError::from)?;
         text(&params.parent_question, "obligation.parent_question").map_err(InquiryError::from)?;
         text(&params.goal, "obligation.goal").map_err(InquiryError::from)?;
         text(

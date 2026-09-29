@@ -4964,31 +4964,7 @@ impl InquiryGovernance {
                 field: "inquiry.compilation_inputs",
             });
         }
-        // I21.7: the allowlist is re-proved on the RECORD, not only on the
-        // observation `record` was handed. `AllowedReferenceManifest::validate`
-        // recomputes the canonical digest over the manifest's own content and
-        // refuses a mismatch, so the manifest carried beside the published
-        // `manifest=` digest is the one that digest was computed from. The three
-        // bindings below then make the same manifest the one the profile, the
-        // freeze and the terminal disposition were all bound to: comparing the
-        // carried `digest` field against each of those is a real comparison
-        // between two independently produced values, whereas before the manifest
-        // was carried at all the record held only its digest and had nothing to
-        // re-derive an admission or a certificate from.
-        self.run_reference_manifest
-            .validate()
-            .map_err(|_| InquiryError::IntegrityMismatch {
-                field: "inquiry.run_reference_manifest",
-            })?;
-        if self.run_reference_manifest.digest != self.profile.reference_manifest_digest
-            || self.run_reference_manifest.digest != self.freeze.manifest_digest
-            || self.run_reference_manifest.digest != self.terminal.manifest_digest
-            || self.run_reference_manifest.state_fence != self.terminal.state_fence
-        {
-            return Err(InquiryError::IntegrityMismatch {
-                field: "inquiry.run_reference_manifest_binding",
-            });
-        }
+        self.validate_run_reference_manifest()?;
         if !self
             .profile
             .binds(&self.inquiry_id, &self.freeze.state_fence)
@@ -5031,44 +5007,7 @@ impl InquiryGovernance {
         for record in &self.admissibility {
             record.validate_integrity()?;
         }
-        // The Researcher half of the two-record pair a positive admitted source
-        // has to show is re-proved here rather than trusted: each
-        // Governor-facing request is an artefact that leaves this domain, and a
-        // request whose inquiry, evidence set, profile revision, source handle,
-        // source-record digest, eligibility, scope or fence was rewritten after
-        // it was built would otherwise be published beside a decision it no
-        // longer describes. The other half of the pair — the actual
-        // Governor/Kernel/Store commit receipt — is deliberately absent and this
-        // domain does not synthesize one; I21.1 puts the transition through the
-        // sole canonical writer.
-        if self.source_admission_requests.len() != self.admissibility.len() {
-            return Err(InquiryError::IntegrityMismatch {
-                field: "inquiry.source_admission_requests",
-            });
-        }
-        for (request, record) in self
-            .source_admission_requests
-            .iter()
-            .zip(&self.admissibility)
-        {
-            request.validate_integrity()?;
-            // The request must still be the request for *this* decision under
-            // *this* inquiry and evidence set. Its own digest proves it was not
-            // edited; these bindings prove it was not swapped for a well-formed
-            // request about a different source, a different decision or a
-            // different set.
-            if request.inquiry_id != self.inquiry_id
-                || request.evidence_set_id != self.evidence_set_id
-                || request.admissibility_digest != record.digest
-                || request.source_handle != record.record.handle
-                || request.eligibility != record.eligibility
-                || request.state_fence != record.state_fence
-            {
-                return Err(InquiryError::IntegrityMismatch {
-                    field: "inquiry.source_admission_request_binding",
-                });
-            }
-        }
+        self.validate_source_admission_requests()?;
         for diagnostic in &self.unadmitted_references {
             diagnostic.validate_integrity()?;
             if diagnostic.inquiry_id != self.inquiry_id
@@ -5116,6 +5055,96 @@ impl InquiryGovernance {
         if recorded != derived {
             return Err(InquiryError::IntegrityMismatch {
                 field: "inquiry.certified_obligations",
+            });
+        }
+        Ok(())
+    }
+
+    /// Re-proves the Governor-facing source-admission requests this record
+    /// carries against the admissibility records it publishes beside them.
+    ///
+    /// The Researcher half of the two-record pair a positive admitted source
+    /// has to show is re-proved here rather than trusted: each
+    /// Governor-facing request is an artefact that leaves this domain, and a
+    /// request whose inquiry, evidence set, profile revision, source handle,
+    /// source-record digest, eligibility, scope or fence was rewritten after
+    /// it was built would otherwise be published beside a decision it no
+    /// longer describes. The other half of the pair - the actual
+    /// Governor/Kernel/Store commit receipt - is deliberately absent and this
+    /// domain does not synthesize one; I21.1 puts the transition through the
+    /// sole canonical writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an integrity mismatch when the request count does not match the
+    /// admissibility record count, when a request no longer re-derives its own
+    /// digest, or when a request has been swapped for a well-formed request
+    /// about a different source, decision, evidence set or fence.
+    fn validate_source_admission_requests(&self) -> Result<(), InquiryError> {
+        if self.source_admission_requests.len() != self.admissibility.len() {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "inquiry.source_admission_requests",
+            });
+        }
+        for (request, record) in self
+            .source_admission_requests
+            .iter()
+            .zip(&self.admissibility)
+        {
+            request.validate_integrity()?;
+            // The request must still be the request for *this* decision under
+            // *this* inquiry and evidence set. Its own digest proves it was not
+            // edited; these bindings prove it was not swapped for a well-formed
+            // request about a different source, a different decision or a
+            // different set.
+            if request.inquiry_id != self.inquiry_id
+                || request.evidence_set_id != self.evidence_set_id
+                || request.admissibility_digest != record.digest
+                || request.source_handle != record.record.handle
+                || request.eligibility != record.eligibility
+                || request.state_fence != record.state_fence
+            {
+                return Err(InquiryError::IntegrityMismatch {
+                    field: "inquiry.source_admission_request_binding",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-proves the run-bound reference allowlist this record carries.
+    ///
+    /// I21.7: the allowlist is re-proved on the RECORD, not only on the
+    /// observation `record` was handed. `AllowedReferenceManifest::validate`
+    /// recomputes the canonical digest over the manifest's own content and
+    /// refuses a mismatch, so the manifest carried beside the published
+    /// `manifest=` digest is the one that digest was computed from. The three
+    /// bindings below then make the same manifest the one the profile, the
+    /// freeze and the terminal disposition were all bound to: comparing the
+    /// carried `digest` field against each of those is a real comparison
+    /// between two independently produced values, whereas before the manifest
+    /// was carried at all the record held only its digest and had nothing to
+    /// re-derive an admission or a certificate from.
+    ///
+    /// # Errors
+    ///
+    /// Returns an integrity mismatch when the carried manifest does not
+    /// re-derive its own published digest, or when the profile, the freeze and
+    /// the terminal disposition are not all bound to that same manifest and
+    /// fence.
+    fn validate_run_reference_manifest(&self) -> Result<(), InquiryError> {
+        self.run_reference_manifest
+            .validate()
+            .map_err(|_| InquiryError::IntegrityMismatch {
+                field: "inquiry.run_reference_manifest",
+            })?;
+        if self.run_reference_manifest.digest != self.profile.reference_manifest_digest
+            || self.run_reference_manifest.digest != self.freeze.manifest_digest
+            || self.run_reference_manifest.digest != self.terminal.manifest_digest
+            || self.run_reference_manifest.state_fence != self.terminal.state_fence
+        {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "inquiry.run_reference_manifest_binding",
             });
         }
         Ok(())
@@ -7550,11 +7579,11 @@ fn refused_dispositions_for(kind: ResearchDebtKind) -> Vec<&'static str> {
 /// Returns the first integrity failure of an admitted record whose handle is
 /// read while re-deriving a presented kind, rather than counting a certificate
 /// from a record that no longer re-proves its own digest.
-fn certified_obligations(
+fn certified_obligations<'a>(
     manifest: &AllowedReferenceManifest,
-    obligations: &[InquiryObligation],
+    obligations: &'a [InquiryObligation],
     admissibility: &[SourceAdmissibilityRecord],
-) -> Result<Vec<&str>, InquiryError> {
+) -> Result<Vec<&'a str>, InquiryError> {
     let mut certified = Vec::new();
     for obligation in obligations {
         if obligation.status != InquiryObligationStatus::Verified {
