@@ -4788,7 +4788,7 @@ impl InquiryGovernance {
             observation.reference_manifest.allowed_anchor_precision,
             &admissibility,
         );
-        let obligations = open_obligations(&observation, &profile, &account)?;
+        let obligations = open_obligations(&observation, &profile, &account, &admissibility)?;
         let compilation_inputs = TaskGraphCompilationInputs::for_inquiry(
             &profile,
             &observation.evidence_set_id,
@@ -5034,6 +5034,14 @@ impl std::fmt::Display for InquiryGovernance {
     /// proposals, so the line states that no owner receipt exists: the
     /// Governor/Kernel/Store commit receipt is the owner's, and a line that
     /// implied one would be a false proof claim under A0.3.
+    ///
+    /// `certified` is the number of obligations this run recorded as satisfied by
+    /// their declared acceptance certificate, re-proved here through
+    /// [`InquiryObligation::is_verified_by_certificate`] against the kind each
+    /// obligation declares rather than read off a status alone.
+    /// `certified=0` is the honest spelling of the live state whenever the run
+    /// holds no admitted certificate of a declared kind for any member, and the
+    /// line says that instead of omitting the figure.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let terminal = &self.terminal;
         let eligible = self
@@ -5051,7 +5059,7 @@ impl std::fmt::Display for InquiryGovernance {
              expected_members={} open_members={} accounted={} all_closed={} enumeration={} \
              observed_outside={} denominator_kind={} absence={} absence_reason={} \
              supported_precision={} precision_residue={} obligations={} \
-             materialisable={} deferred={} compilation_inputs={} freeze={} \
+             materialisable={} deferred={} certified={} compilation_inputs={} freeze={} \
              terminal_freeze={} terminal_claim_audit={} terminal_precision_residue={} \
              debts={} debt_kinds={} debt_restricted={} debt_restriction_refused={} \
              disposition={} terminal_denominator_kind={} may_close={} \
@@ -5094,6 +5102,7 @@ impl std::fmt::Display for InquiryGovernance {
             self.obligations.len(),
             self.compilation_inputs.materialisable().len(),
             self.compilation_inputs.deferred().len(),
+            certified_obligations(&self.obligations),
             self.compilation_inputs.digest,
             self.freeze.digest,
             terminal.freeze.digest,
@@ -6133,12 +6142,31 @@ fn degradation(observation: &InquiryObservation, account: &CoverageAccount) -> R
     }
 }
 
-/// Materialises the obligations that the open denominator members make
-/// necessary.
+/// Materialises the obligations that the frozen denominator makes necessary.
 ///
 /// Planning is receding-horizon: only what current observations can determine is
 /// materialised, and an information-dependent future stays `Stub` until the
 /// upstream result arrives.
+///
+/// Three member classes exist on this path, and the class is decided by the
+/// certificate the run actually holds, not by the caller's intent:
+///
+/// - a member this run resolved with admitted evidence that carries an exact
+///   passage is **satisfied by that certificate** and lands `VERIFIED`;
+/// - a member the run-bound manifest withholds is `INVALIDATED` with the cause;
+/// - a member with no admitted evidence at all stays `STUB`.
+///
+/// A satisfied obligation is retained rather than dropped, for the same reason an
+/// invalidated one is: I21.5 keeps what became true and what it cost visible, and
+/// [`TaskGraphCompilationInputs::materialisable`] excludes every terminal
+/// obligation, so a verified member is never handed to the work graph as work.
+///
+/// The satisfied obligation goes `STUB` -> `VERIFIED` without passing through
+/// `READY`, `RUNNING` or `SUBMITTED`, and that skip is deliberate rather than a
+/// missing step: this record is built after the run, so those three states were
+/// never observed here and are not narrated. The recorded status is the
+/// certificate verdict, which is the one thing I21.5 says settles an
+/// obligation, and the same reasoning is why `resources_spent` below is `0`.
 ///
 /// # Why a revoked member's obligation is invalidated rather than re-materialised
 ///
@@ -6173,18 +6201,45 @@ fn degradation(observation: &InquiryObservation, account: &CoverageAccount) -> R
 /// does not carry: the trigger is the run-bound manifest's own revocation list,
 /// which this crate already reads on the candidate path.
 ///
-/// MEASURED, and stated so no one reads more into this than it is: no admitted
-/// material that exists today carries a handle in both the admissible and the
-/// revoked list, so this branch is not exercised by any fixture on the
-/// `eliot-mod-research` path. It fires only for an admitted manifest the contract
-/// explicitly permits in exactly that state.
+/// # The certificate check is what decides, and it runs first
+///
+/// The check is not a post-hoc read: it is consulted before the status is
+/// decided, and the answer is what moves the obligation. A member the run
+/// withheld is invalidated because the certificate check refused it *and* the
+/// manifest withholds the handle; a member the run resolved is `VERIFIED` only
+/// because the check accepted the certificate it presented. Neither status could
+/// be reached without that answer.
+///
+/// MEASURED, and stated so no one reads more into this than it is: on the
+/// `eliot-mod-research` path no candidate handle is a frozen-denominator handle
+/// today — the composition root mints `provider-artifact:<raw stdout digest>`,
+/// which no manifest declares — and `candidate_source_record` records
+/// `evidence_spans: Vec::new()`, so the satisfied arm does not fire on any
+/// admitted material that exists now and every live obligation is `STUB` or
+/// `INVALIDATED`. The arm is reachable, and correct, the moment an admitted
+/// candidate carries a declared handle with an exact passage; nothing here was
+/// faked to make it fire.
 fn open_obligations(
     observation: &InquiryObservation,
     profile: &InquiryProtocolProfile,
     account: &CoverageAccount,
+    admissibility: &[SourceAdmissibilityRecord],
 ) -> Result<Vec<InquiryObligation>, InquiryError> {
+    let manifest = &observation.reference_manifest;
+    // A member the run already resolved is an obligation too. Materialising only
+    // the open members would make the satisfied class unreachable by
+    // construction — an open member has, by definition, no admitted record — and
+    // `AllowedReferenceManifest::allows` is the one existing admission predicate
+    // that says whether a record's handle is a declared member, so it is the one
+    // used here rather than a second membership test.
+    let mut members: BTreeSet<String> = account.open_members().into_iter().collect();
+    for record in admissibility {
+        if manifest.allows(&record.record.handle) {
+            members.insert(record.record.handle.clone());
+        }
+    }
     let mut obligations = Vec::new();
-    for member in account.open_members() {
+    for member in members {
         let mut obligation = InquiryObligation::new(InquiryObligationParams {
             obligation_id: format!("obl-{member}"),
             parent_question: observation.question.clone(),
@@ -6201,16 +6256,20 @@ fn open_obligations(
             status: InquiryObligationStatus::Stub,
             profile,
         })?;
-        if observation
-            .reference_manifest
-            .stale_or_revoked_handles
-            .iter()
-            .any(|revoked| revoked == &member)
+        // The certificate this run actually holds is presented and checked before
+        // any state is decided, and the answer is what the state depends on.
+        let presented = presented_acceptance_certificate(manifest, &member, admissibility)?;
+        if !obligation.admit_acceptance_certificate(presented)
+            && manifest
+                .stale_or_revoked_handles
+                .iter()
+                .any(|revoked| revoked == &member)
         {
             obligation.invalidate(
                 &format!(
                     "the run-bound manifest lists reference {member} as stale or revoked, so no \
-                     admission of this manifest can resolve it; the member is retained as an open \
+                     admission of this manifest can resolve it and the acceptance certificate this \
+                     obligation declared is not one the run holds; the member is retained as an open \
                      denominator member and this obligation is retained as INVALIDATED with the \
                      cause instead of being re-materialised as pending work on every run"
                 ),
@@ -6221,6 +6280,57 @@ fn open_obligations(
         obligations.push(obligation);
     }
     Ok(obligations)
+}
+
+/// The acceptance-certificate kind this run actually holds for one obligation.
+///
+/// `member` is a frozen-denominator handle. The kind is read only from material
+/// the run admitted, and it is read through the existing owners:
+///
+/// - the exact source identity is the run-bound manifest, which
+///   [`InquiryGovernance::record`] has already re-proved through
+///   [`AllowedReferenceManifest::validate`] before any of this runs, and which
+///   [`AllowedReferenceManifest::allows`] answers for;
+/// - the exact passage is the admitted evidence that supports an anchor for that
+///   member, which exists only when an admitted, eligible source record for it
+///   carries exact evidence spans. Each such record is re-proved through its own
+///   owner, [`SourceAdmissibilityRecord::validate_integrity`], on the recorded
+///   value before it is read — not by recomputing a fresh checksum over what is
+///   held here.
+///
+/// So the presented kind is
+/// [`AcceptanceCertificateKind::ExactSourceIdentityAndPassage`] when both halves
+/// are present, and [`AcceptanceCertificateKind::ImmutableInputsAndRawMeasurements`]
+/// when only the frozen handle is. The second spelling is a true statement about
+/// what the run holds — an immutable input with no raw measurement for this
+/// member — and it is deliberately not the kind the obligation declared, so
+/// [`InquiryObligation::is_verified_by_certificate`] refuses it. A withheld
+/// handle yields the same refusal, because a stale or revoked handle is not a
+/// source identity at all.
+///
+/// # Errors
+///
+/// Returns the first integrity failure of an admitted record whose handle is
+/// read for the passage test, rather than deciding on a record that no longer
+/// re-proves its own digest.
+fn presented_acceptance_certificate(
+    manifest: &AllowedReferenceManifest,
+    member: &str,
+    admissibility: &[SourceAdmissibilityRecord],
+) -> Result<AcceptanceCertificateKind, InquiryError> {
+    if !manifest.allows(member) {
+        return Ok(AcceptanceCertificateKind::ImmutableInputsAndRawMeasurements);
+    }
+    for record in admissibility {
+        if record.record.handle != member || record.eligibility != SourceEligibility::Eligible {
+            continue;
+        }
+        record.validate_integrity()?;
+        if !record.record.evidence_spans.is_empty() {
+            return Ok(AcceptanceCertificateKind::ExactSourceIdentityAndPassage);
+        }
+    }
+    Ok(AcceptanceCertificateKind::ImmutableInputsAndRawMeasurements)
 }
 
 /// Registers the research debts the observed residue makes necessary.
@@ -6670,6 +6780,28 @@ fn refused_dispositions_for(kind: ResearchDebtKind) -> Vec<&'static str> {
     .filter(|disposition| kind.blocks_disposition(*disposition))
     .map(disposition_wire)
     .collect()
+}
+
+/// Number of obligations this run recorded as satisfied by their declared
+/// acceptance certificate.
+///
+/// Both halves are required, and neither alone is the answer: the recorded
+/// `VERIFIED` status is this domain's own verdict, and
+/// [`InquiryObligation::is_verified_by_certificate`] re-proves it against the
+/// certificate kind the obligation declares, so an obligation that was recorded
+/// verified under a kind it does not declare, or whose recorded state the
+/// certificate predicate refuses, is not published as certified. It is the
+/// read-side counterpart of the transition [`open_obligations`] performs on the
+/// build side, and it is on the live route: `eliot-mod-research` renders this
+/// line on every run.
+fn certified_obligations(obligations: &[InquiryObligation]) -> usize {
+    obligations
+        .iter()
+        .filter(|obligation| {
+            obligation.status == InquiryObligationStatus::Verified
+                && obligation.is_verified_by_certificate(obligation.acceptance_certificate_kind)
+        })
+        .count()
 }
 
 /// Stable wire spelling of the debt kinds a run registered, deduplicated and
