@@ -8,7 +8,7 @@
 //! handles, and State-Fence invalidations", and that "unknown-origin
 //! Material mutation blocks governed acceptance until reconciliation".
 //! This module is the Kernel-owned half of that contract: an in-memory
-//! ledger over host/filesystem hint ingest, Git/content checksum/re-read
+//! ledger over host-event hint ingest, Git/content checksum/re-read
 //! confirmation, governed-tool records, and the acceptance block the
 //! host-request route queries. The Governor-owned semantic projection
 //! lives in `eliot-change-monitor` under `crates/governor`; this module
@@ -31,7 +31,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 
-/// Typed ChangeMonitor failures. Every variant is constructed below; there
+/// Typed `ChangeMonitor` failures. Every variant is constructed below; there
 /// is no stringly error and no silent drop.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ChangeMonitorError {
@@ -81,21 +81,24 @@ impl std::fmt::Display for ChangeMonitorError {
 
 impl std::error::Error for ChangeMonitorError {}
 
-/// Host/filesystem route of one untrusted hint. Only these two origins may
-/// enter the ledger as hints; Git/tool/artifact origins belong to the
-/// Governor-owned adapter and arrive here only as readback evidence.
+/// Route of one untrusted hint observed Kernel-side. Host-request admission
+/// is the only in-crate producer, so `HintOrigin::HostEvent` is the only
+/// constructible origin: every admitted envelope arrival is a host event.
+/// Filesystem, Git, tool, and artifact semantics live in the Governor-owned
+/// projection (`eliot-change-monitor` under `crates/governor`); a
+/// filesystem-sourced transition still surfaces here when confirmation
+/// observes it, as an unknown-origin Material change, never as a hint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HintOrigin {
     HostEvent,
-    FilesystemNotification,
 }
 
-/// Untrusted host/filesystem event: a re-check hint, never a Material
-/// observation by itself.
+/// Untrusted host event: a re-check hint, never a Material observation by
+/// itself.
 ///
-/// STITCH (#1824, I10.21 W2): the designated caller is the host/filesystem
-/// hint emitter owned by Governor adapter work; it does not exist
-/// Kernel-side yet, so no in-tree caller constructs this today.
+/// Caller (I10.21 W2): `super::observe_change_monitor_host_hint`, which
+/// converts each admitted host-request envelope arrival into a host-event
+/// hint keyed by its operation handle.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct KernelChangeHint {
     pub hint_id: String,
@@ -105,27 +108,26 @@ pub(crate) struct KernelChangeHint {
     pub origin_ref: Option<String>,
 }
 
-/// One direct content read: the exact bytes hashed, or absence for a
-/// confirmed deletion.
+/// One direct content read: the exact bytes hashed. Deletion readback has
+/// no in-crate producer yet, so absence is expressed only through a missing
+/// baseline (`None`), never through this type.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ContentRead {
     Present { sha256: String },
-    Absent,
 }
 
 impl ContentRead {
-    fn digest(&self) -> Option<&str> {
+    fn digest(&self) -> &str {
         match self {
-            Self::Present { sha256 } => Some(sha256.as_str()),
-            Self::Absent => None,
+            Self::Present { sha256 } => sha256,
         }
     }
 }
 
-/// Read-only Git evidence bound by the adapter to the same hinted path as
-/// the two direct content reads. The adapter constructs it only from
-/// successful read-only Git invocations; the Kernel checks shapes and
-/// digest agreement, never repository semantics.
+/// Readback evidence bound to the same hinted path as the two direct
+/// content reads. The host-request admission observer reuses the admitted
+/// connection, descriptor, and envelope digests; the Kernel checks shapes
+/// and digest agreement, never repository semantics.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GitReadback {
     pub repository: String,
@@ -140,12 +142,12 @@ pub(crate) struct GitReadback {
 
 /// Trusted confirmation evidence for one pending hint: the admitted
 /// baseline, two independent content reads that must agree, and the bound
-/// Git readback. The adapter performs the real reads; the Kernel confirms
-/// stability and materiality against the exact operation's evidence.
+/// readback evidence. The host-request admission observer reuses the
+/// admitted envelope and descriptor digests for both reads; the Kernel
+/// confirms stability and materiality against the exact operation's
+/// evidence.
 ///
-/// STITCH (#1824, I10.21 W2): the designated caller is the Governor
-/// change-monitor adapter performing real content/Git readback; it does
-/// not exist Kernel-side yet.
+/// Caller (I10.21 W2): `super::observe_change_monitor_host_hint`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HintVerification {
     pub before_digest: Option<String>,
@@ -155,15 +157,15 @@ pub(crate) struct HintVerification {
 }
 
 /// Governed-tool mutation record (I10.21 A1): exact before/after revisions
-/// with the exact bytes the adapter read back, the associated
-/// Session/ActionLease/tool operation/attempt, the diff handle, and the
-/// observed State-Fence invalidation. The Kernel hashes the supplied bytes
-/// itself and drops them; only digests are retained.
+/// with the exact bytes read back on the completing path, the associated
+/// session, fenced-attempt lease, tool operation, and attempt receipt, the
+/// diff handle, and the observed State-Fence invalidation. The Kernel
+/// hashes the supplied bytes itself and drops them; only digests are
+/// retained.
 ///
-/// STITCH (#1824, I10.21 A1): the designated caller is the Governor
-/// change-monitor adapter on the reconcile path (via the
-/// `GovernedProcessEffectPort` once its receipt carries revisions); it
-/// does not exist Kernel-side yet.
+/// Caller (I10.21 A1):
+/// `super::daemon_claim_queue::observe_finish_governed_change`, which feeds
+/// the record from the completed `eliot.finish` receipt.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GovernedToolChange {
     pub change_id: String,
@@ -332,21 +334,40 @@ fn validate_verification(verification: &HintVerification) -> Result<(), ChangeMo
         return Err(ChangeMonitorError::InvalidGitEvidence);
     }
     for read in [&verification.first_read, &verification.reread] {
-        if let ContentRead::Present { sha256 } = read
-            && !is_sha256_hex(sha256)
-        {
+        if !is_sha256_hex(&read.sha256) {
             return Err(ChangeMonitorError::InvalidGitEvidence);
         }
     }
     validate_git(&verification.git)
 }
 
-/// Ingests one untrusted host/filesystem hint as a pending re-check (I10.21
-/// W2, first half). A pending hint is not a Material observation, but it
-/// blocks governed acceptance until a verified readback resolves it.
+/// Stable lane-relative artifact path for host-request admission hints.
 ///
-/// STITCH (#1824, I10.21 W2): see [`KernelChangeHint`] for the designated
-/// caller.
+/// The hinted artifact is the admitted envelope, which has no file path;
+/// the constant names the artifact kind while the hint identity scopes the
+/// operation.
+pub(crate) const HOST_HINT_PATH: &str = "host-request/envelope";
+
+/// Stable lane-relative artifact path for governed finish-result records.
+///
+/// A finish result has no file path; the constant names the artifact kind
+/// while the change identity scopes the operation.
+pub(crate) const FINISH_RESULT_PATH: &str = "finish/result";
+
+/// Builds the idempotent hint identity for one host-request operation.
+///
+/// The same operation handle always maps to the same hint, so exact
+/// admission replays re-ingest as `HintAdmission::Replayed` instead of
+/// conflicting.
+pub(crate) fn host_hint_id(operation_id: &str) -> String {
+    format!("cmh:{operation_id}")
+}
+
+/// Ingests one untrusted host-event hint as a pending re-check (I10.21 W2,
+/// first half). A pending hint is not a Material observation, but it blocks
+/// governed acceptance until a verified readback resolves it.
+///
+/// Caller (I10.21 W2): `super::observe_change_monitor_host_hint`.
 pub(crate) fn ingest_hint(hint: KernelChangeHint) -> Result<HintAdmission, ChangeMonitorError> {
     validate_hint(&hint)?;
     let mut ledger = ledger()?;
@@ -366,20 +387,40 @@ pub(crate) fn ingest_hint(hint: KernelChangeHint) -> Result<HintAdmission, Chang
     Ok(HintAdmission::Accepted)
 }
 
-/// Confirms one pending hint with trusted content and Git readback
-/// evidence (I10.21 W2, second half). The two content reads must agree or
-/// the readback proves nothing; a Material transition (after digest
-/// differs from the admitted baseline) emits an unknown-origin Material
-/// change (I10.21 A2), reconciled immediately only when a recorded
-/// governed change already proves the exact same resource transition.
+/// Derives the unknown-origin change identity and transition digest for one
+/// Material transition.
 ///
-/// STITCH (#1824, I10.21 W2/A2): see [`HintVerification`] for the
-/// designated caller.
+/// The transition digest binds the exact before/after pair (`"absent"` for
+/// a missing side); the change identity scopes it to the hint that
+/// observed it. Shared by [`confirm_hint`] and the finish-leg
+/// reconciliation attempt so both name the same transition the same way.
+pub(crate) fn material_transition_ids(
+    hint_id: &str,
+    before_digest: Option<&str>,
+    after_digest: Option<&str>,
+) -> (String, String) {
+    let preimage = format!(
+        "{}>{}",
+        before_digest.unwrap_or("absent"),
+        after_digest.unwrap_or("absent")
+    );
+    let transition_digest = crate::sha256_hex(preimage.as_bytes());
+    (format!("cmu:{hint_id}:{transition_digest}"), transition_digest)
+}
+
+/// Confirms one pending hint with trusted content and readback evidence
+/// (I10.21 W2, second half). The two content reads must agree or the
+/// readback proves nothing; a Material transition (after digest differs
+/// from the admitted baseline) emits an unknown-origin Material change
+/// (I10.21 A2), reconciled immediately only when a recorded governed
+/// change already proves the exact same resource transition.
+///
+/// Caller (I10.21 W2): `super::observe_change_monitor_host_hint`.
 pub(crate) fn confirm_hint(
     hint_id: &str,
-    verification: HintVerification,
+    verification: &HintVerification,
 ) -> Result<HintConfirmation, ChangeMonitorError> {
-    validate_verification(&verification)?;
+    validate_verification(verification)?;
     if verification.first_read != verification.reread {
         return Err(ChangeMonitorError::UnstableReadback);
     }
@@ -393,8 +434,8 @@ pub(crate) fn confirm_hint(
     {
         return Ok(confirmed);
     }
-    let after_digest = verification.reread.digest().map(str::to_owned);
-    if verification.before_digest.as_deref() == after_digest.as_deref() {
+    let after_digest = verification.reread.digest().to_owned();
+    if verification.before_digest.as_deref() == Some(after_digest.as_str()) {
         let entry = ledger
             .hints
             .get_mut(hint_id)
@@ -402,12 +443,11 @@ pub(crate) fn confirm_hint(
         entry.confirmation = Some(HintConfirmation::VerifiedImmaterial);
         return Ok(HintConfirmation::VerifiedImmaterial);
     }
-    let transition_preimage = format!(
-        "{}>{}",
-        verification.before_digest.as_deref().unwrap_or("absent"),
-        after_digest.as_deref().unwrap_or("absent")
+    let (change_id, transition_digest) = material_transition_ids(
+        hint_id,
+        verification.before_digest.as_deref(),
+        Some(after_digest.as_str()),
     );
-    let change_id = format!("cmu:{hint_id}:{}", crate::sha256_hex(transition_preimage.as_bytes()));
     let resource = ledger
         .hints
         .get(hint_id)
@@ -418,28 +458,34 @@ pub(crate) fn confirm_hint(
     let reconciled = ledger
         .governed
         .values()
-        .any(|record| record.resource == resource && record.after_digest == after_digest);
+        .any(|record| {
+            record.resource == resource
+                && record.after_digest.as_deref() == Some(after_digest.as_str())
+        });
     let evidence_id = ledger
         .governed
         .iter()
-        .find(|(_, record)| record.resource == resource && record.after_digest == after_digest)
+        .find(|(_, record)| {
+            record.resource == resource
+                && record.after_digest.as_deref() == Some(after_digest.as_str())
+        })
         .map(|(evidence_id, _)| evidence_id.clone());
     ledger
         .unknown
         .entry(change_id.clone())
         .or_insert(UnknownOriginRecord {
-            resource: resource.clone(),
-            after_digest: after_digest.clone(),
-            transition_digest: crate::sha256_hex(transition_preimage.as_bytes()),
+            resource,
+            after_digest: Some(after_digest),
+            transition_digest,
             reconciled,
         });
-    if reconciled {
-        if let Some(evidence_id) = evidence_id {
-            ledger.reconciliations.push(UnknownReconciliation {
-                unknown_change_id: change_id.clone(),
-                evidence_change_id: evidence_id,
-            });
-        }
+    if reconciled
+        && let Some(evidence_id) = evidence_id
+    {
+        ledger.reconciliations.push(UnknownReconciliation {
+            unknown_change_id: change_id.clone(),
+            evidence_change_id: evidence_id,
+        });
     }
     let entry = ledger
         .hints
@@ -456,19 +502,20 @@ pub(crate) fn confirm_hint(
 }
 
 /// Records one governed-tool mutation with exact before/after revisions,
-/// the associated attempt/tool operation, the diff handle, and the
-/// observed State-Fence invalidation (I10.21 A1). Content checksums are
-/// computed here over the exact bytes supplied; the bytes are dropped and
-/// only digests retained. A recorded governed transition reconciles the
-/// matching unknown-origin change for the exact same resource transition.
-/// History is never rewritten: an exact replay is reported, a conflicting
-/// identity is refused, and a lease/session/operation owned by another
-/// operation is never reused.
+/// the associated session, fenced-attempt lease, tool operation, and
+/// attempt receipt, the diff handle, and the observed State-Fence
+/// invalidation (I10.21 A1). Content checksums are computed here over the
+/// exact bytes supplied; the bytes are dropped and only digests retained.
+/// A recorded governed transition reconciles the matching unknown-origin
+/// change for the exact same resource transition. History is never
+/// rewritten: an exact replay is reported, a conflicting identity is
+/// refused, and a lease/session/operation owned by another operation is
+/// never reused.
 ///
-/// STITCH (#1824, I10.21 A1): see [`GovernedToolChange`] for the
-/// designated caller.
+/// Caller (I10.21 A1):
+/// `super::daemon_claim_queue::observe_finish_governed_change`.
 pub(crate) fn record_governed_tool_change(
-    change: GovernedToolChange,
+    change: &GovernedToolChange,
 ) -> Result<GovernedAdmission, ChangeMonitorError> {
     if !text(&change.change_id)
         || !text(&change.resource)
@@ -519,10 +566,13 @@ pub(crate) fn record_governed_tool_change(
         fence_invalidated: change.fence_invalidated,
     };
     let mut ledger = ledger()?;
-    if let Some(bound) = ledger.governed_by_operation.get(&change.operation).cloned() {
-        if bound != change.change_id {
-            return Err(ChangeMonitorError::OperationReuse);
-        }
+    if let Some(bound) = ledger
+        .governed_by_operation
+        .get(&change.operation)
+        .cloned()
+        && bound != change.change_id
+    {
+        return Err(ChangeMonitorError::OperationReuse);
     }
     if let Some(existing) = ledger.governed.get(&change.change_id) {
         if *existing != record {
@@ -561,9 +611,10 @@ pub(crate) fn record_governed_tool_change(
 /// preserved: reconciliation appends a link instead of rewriting history,
 /// so human correction keeps the original observation addressable.
 ///
-/// STITCH (#1824, I10.21 A2): the designated caller is the Governor
-/// reconciliation entry admitting the evidence; it does not exist
-/// Kernel-side yet.
+/// Caller (I10.21 A2):
+/// `super::daemon_claim_queue::observe_finish_governed_change`, which
+/// reconciles the unknown change for the finished operation's exact
+/// transition when one was recorded.
 pub(crate) fn reconcile_unknown_change(
     change_id: &str,
     evidence_transition_digest: &str,
@@ -590,17 +641,16 @@ pub(crate) fn reconcile_unknown_change(
     Ok(())
 }
 
-/// Returns whether governed acceptance is currently blocked: a
-/// host/filesystem hint is still unverified, or an unknown-origin
-/// Material change is still unreconciled (I10.21 A2). A poisoned ledger
-/// fails closed. This mirrors the Governor-side `blocks_acceptance`
-/// gate for the Kernel-owned finish leg.
+/// Returns whether governed acceptance is currently blocked: a host-event
+/// hint is still unverified, or an unknown-origin Material change is still
+/// unreconciled (I10.21 A2). A poisoned ledger fails closed. This mirrors
+/// the Governor-side `blocks_acceptance` gate for the Kernel-owned finish
+/// leg.
 ///
 /// Caller: `host_request_route::daemon_claim_queue::submit_finish_result`.
 pub(crate) fn governed_acceptance_blocked() -> bool {
-    let ledger = match ledger() {
-        Ok(ledger) => ledger,
-        Err(_) => return true,
+    let Ok(ledger) = ledger() else {
+        return true;
     };
     ledger.hints.values().any(|entry| entry.confirmation.is_none())
         || ledger.unknown.values().any(|unknown| !unknown.reconciled)
