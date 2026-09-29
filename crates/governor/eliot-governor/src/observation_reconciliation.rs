@@ -891,8 +891,10 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
             "{base_operation_id}/maintenance-{publication_id}{revision_suffix}"
         ))
         .map_err(|error| owner_refused(error.to_string()))?;
-        let per_result_idempotency =
-            format!("{}:maintenance:{publication_id}{revision_suffix}", identity.idempotency_key);
+        let per_result_idempotency = format!(
+            "{}:maintenance:{publication_id}{revision_suffix}",
+            identity.idempotency_key
+        );
         // Derived per-result identity: the canonical owner requires the
         // envelope idempotency to equal the admitted identity idempotency, and
         // the envelope request binding must stay the caller's. A retry must
