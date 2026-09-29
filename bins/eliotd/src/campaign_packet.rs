@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use eliot_context::campaign_publication::{
     ContextCampaignRecipeBody, context_delivery_body_digest, context_recipe_body_digest,
 };
-use eliot_context_contracts::SessionDeliverySnapshot;
+use eliot_context_contracts::{ProjectedCitation, SessionDeliverySnapshot};
 use eliot_contracts::{ArtifactId, StateFence, TaskId, canonical_json_bytes, sha256_hex};
 use eliot_learning_contracts::{
     CampaignLearningStateView, CampaignOwnerRecordId, CampaignOwnerRevision, CampaignPositionKind,
@@ -312,6 +312,24 @@ struct CampaignPacketResponse {
     /// Per-material delivery account for the published view, or `None` when no
     /// view was published at all.
     material_account: Option<ContextDeliveryMaterialAccount>,
+    /// The governed source-readback citation this packet's Task Plan was cited
+    /// through, or `None` when this response publishes no cited support.
+    ///
+    /// I12.26 requires citation and support to rest on governed source readback,
+    /// and the readback gate verifies that citation but does not by itself place
+    /// it in front of a consumer. This field is that placement: it carries the
+    /// verified `ProjectedCitation` unchanged, so a consumer reads the EXACT
+    /// `source_revision` and `anchor` handles the excerpt was read back
+    /// through, together with the excerpt digest that binds the excerpt to the
+    /// anchor. The handles are copied from the gate's own verified value; they
+    /// are never re-derived, re-labelled or synthesised here.
+    ///
+    /// It is `None` on every outcome that publishes no cited support, including
+    /// a gate refusal. That is the fail-closed half of the pair: the refusal
+    /// itself is reported through `gaps` with
+    /// [`CampaignPacketGapCode::RequiredSourceUnavailable`], and a consumer
+    /// never sees a citation for a revision the gate did not verify.
+    cited_support: Option<ProjectedCitation>,
     gaps: Vec<CampaignPacketGap>,
     missing_roles: Vec<CampaignSourceRole>,
     stale_roles: Vec<CampaignSourceRole>,
@@ -474,6 +492,7 @@ async fn resolve_compile_and_bind_result(
                         completeness: Completeness::Blocked,
                         view: None,
                         material_account: None,
+                        cited_support: None,
                         gaps: vec![CampaignPacketGap {
                             code: CampaignPacketGapCode::TaskPlanUnavailable,
                             role: Some(CampaignSourceRole::TaskPlan),
@@ -499,6 +518,7 @@ async fn resolve_compile_and_bind_result(
                         completeness: Completeness::Blocked,
                         view: None,
                         material_account: None,
+                        cited_support: None,
                         gaps: vec![CampaignPacketGap {
                             code: CampaignPacketGapCode::PriorViewUnavailable,
                             role: None,
@@ -534,6 +554,7 @@ async fn resolve_compile_and_bind_result(
                     completeness: Completeness::Blocked,
                     view: None,
                     material_account: None,
+                    cited_support: None,
                     gaps: vec![CampaignPacketGap {
                         code: CampaignPacketGapCode::OwnerReadUnavailable,
                         role: None,
@@ -559,6 +580,7 @@ async fn resolve_compile_and_bind_result(
                         completeness: Completeness::Blocked,
                         view: None,
                         material_account: None,
+                        cited_support: None,
                         gaps: vec![CampaignPacketGap {
                             code: CampaignPacketGapCode::HistoryPlanUnavailable,
                             role: None,
@@ -613,6 +635,7 @@ async fn resolve_compile_and_bind_result(
                         completeness: Completeness::Blocked,
                         view: None,
                         material_account: None,
+                        cited_support: None,
                         gaps: source_gaps(&resolved.resolutions),
                         missing_roles: missing_roles(&resolved.resolutions),
                         stale_roles: stale_roles(&resolved.resolutions),
@@ -637,6 +660,7 @@ async fn resolve_compile_and_bind_result(
                         completeness: Completeness::Blocked,
                         view: None,
                         material_account: None,
+                        cited_support: None,
                         gaps: vec![CampaignPacketGap {
                             code: CampaignPacketGapCode::RequiredSourceUnavailable,
                             role: None,
@@ -676,6 +700,7 @@ async fn resolve_compile_and_bind_result(
                     completeness: Completeness::Blocked,
                     view: None,
                     material_account: None,
+                    cited_support: None,
                     gaps: vec![CampaignPacketGap {
                         code: CampaignPacketGapCode::RequiredSourceUnavailable,
                         role: Some(CampaignSourceRole::FrozenAnchor),
@@ -738,6 +763,7 @@ async fn resolve_compile_and_bind_result(
                         completeness: Completeness::Blocked,
                         view: None,
                         material_account: None,
+                        cited_support: None,
                         gaps: source_gaps(&resolved.resolutions),
                         missing_roles: missing_roles(&resolved.resolutions),
                         stale_roles: stale_roles(&resolved.resolutions),
@@ -766,6 +792,7 @@ async fn resolve_compile_and_bind_result(
                         completeness: Completeness::Blocked,
                         view: None,
                         material_account: None,
+                        cited_support: None,
                         gaps: vec![CampaignPacketGap {
                             code: CampaignPacketGapCode::RequiredSourceUnavailable,
                             role: None,
@@ -798,6 +825,7 @@ async fn resolve_compile_and_bind_result(
                 completeness,
                 view: Some(publication),
                 material_account: Some(material_account),
+                cited_support: None,
                 gaps: source_gaps(&resolved.resolutions),
                 missing_roles: missing_roles(&resolved.resolutions),
                 stale_roles: stale_roles(&resolved.resolutions),
@@ -964,7 +992,19 @@ async fn resolve_compile_and_bind_result(
     // (`unsupported` / `replan` / `gap`): the packet is blocked, and the
     // retrieved bytes are never emitted as cited support. This is a
     // read/projection constraint and authorizes no durable mutation.
-    if let Err(refusal) = gate_task_plan_citation(&task_plan_record, &task_plan_receipt, &binding) {
+    //
+    // On success the gate's own verified `ProjectedCitation` — carrying the exact
+    // source-revision and anchor handles the excerpt was read back through — is
+    // captured here and published as `cited_support` on the response below, so a
+    // consumer resolves the cited support to the verified handles rather than to
+    // whatever bytes a current path happens to hold.
+    let mut cited_support = None;
+    if let Err(refusal) = gate_task_plan_citation(
+        &task_plan_record,
+        &task_plan_receipt,
+        &binding,
+        |citation| cited_support = Some(citation.clone()),
+    ) {
         tracing::warn!(
             kind = ?refusal.kind,
             reason = %refusal.reason,
@@ -1001,6 +1041,10 @@ async fn resolve_compile_and_bind_result(
             completeness: publication.view.completeness,
             view: Some(publication),
             material_account: Some(material_account),
+            // The gate invoked its consumer exactly once on the way here, so
+            // this is present on every `Compiled` response and absent from
+            // every response that published no cited support.
+            cited_support,
             gaps,
             missing_roles: missing_roles(&resolved.resolutions),
             stale_roles: stale_roles(&resolved.resolutions),
@@ -1592,30 +1636,38 @@ async fn read_task_plan_recipe(
 /// constants), then reopens those owner bytes and runs the citation gate via
 /// [`crate::governed_source_readback::project_owner_document_citation`].
 ///
-/// The `project` callback is a no-op observer here: the compiled packet already
-/// carries the view and this gate only decides whether the retrieved source may
-/// support it. It exists so the gate is invoked through `project_citation`,
-/// which runs `project` exactly once and only after verification, and so a
-/// refusal never reaches the projection step.
+/// `project` is the gate's real consumer, not an observer: `project_citation`
+/// invokes it exactly once, and only with the verified
+/// [`ProjectedCitation`], so this packet receives the gate's own
+/// source-revision and anchor handles and publishes them. A refusal returns the
+/// typed [`eliot_context_contracts::ReadbackRefusal`] and `project` is never
+/// invoked, so no unverified handle can reach a consumer. Nothing here
+/// re-derives a handle, re-labels an identity, or reconstructs an excerpt.
 fn gate_task_plan_citation(
     record: &CampaignSourceRecord,
     receipt: &CampaignOwnerReadReceipt,
     binding: &CampaignPacketBinding,
+    project: impl FnOnce(&ProjectedCitation),
 ) -> Result<(), eliot_context_contracts::ReadbackRefusal> {
     let (view, workspace_revision) =
         crate::governed_source_readback::owner_source_view(&binding.work_scope_id, record)
             .ok_or_else(|| {
                 eliot_context_contracts::ReadbackRefusal::gap("readback.owner.view", None)
             })?;
+    // `project_owner_document_citation` returns the same `ProjectedCitation`
+    // that `project` has already received by reference, so this call carries
+    // only the refusal half: the verified handles themselves were delivered
+    // through `project`, and a refusal never invokes it. The returned value is
+    // therefore the same handles, not a second source of authority.
     crate::governed_source_readback::project_owner_document_citation(
         record,
         receipt,
         view,
         workspace_revision,
         &binding.state_fence,
-        |_citation| {},
+        project,
     )
-    .map(|_citation| ())
+    .map(drop)
 }
 
 fn campaign_read_request(
@@ -1777,6 +1829,10 @@ fn context_blocked_response(
         completeness: Completeness::Blocked,
         view: Some(view),
         material_account,
+        // A blocked response publishes no cited support: the source it names was
+        // refused or withheld, so there is no revision any consumer may read
+        // back through.
+        cited_support: None,
         gaps,
         missing_roles: missing_roles(resolutions),
         stale_roles: stale_roles(resolutions),
