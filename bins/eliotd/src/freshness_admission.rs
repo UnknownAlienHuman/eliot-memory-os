@@ -555,11 +555,17 @@ pub fn observed_publication<'a>(
 /// projection definition, and a fence whose atomic commit reference disagrees
 /// with the record's atomic data commit. The one clause the record cannot
 /// prove against itself — that it is the publication whose data the caller is
-/// about to serve — stays with the caller, as the store documents. This
-/// function adds exactly the three clauses left over: an empty candidate head
-/// set is never coverage, the projection kind must match exactly, and the
-/// observed dependency definition digest must match exactly, because a bare
-/// definition match is not enough (I5.8).
+/// about to serve — stays with the caller, as the store documents, and this
+/// function is that caller. It therefore compares the publication's own
+/// recorded `atomic_data_commit` against the candidate's own recorded
+/// `durability_receipt`, so a publication that shares the candidate's source
+/// fence, source heads, source generation, projection kind and definition but
+/// was published by a DIFFERENT commit is refused instead of standing in for
+/// the candidate's own data. This function adds exactly the four clauses left
+/// over: an empty candidate head set is never coverage, the projection kind
+/// must match exactly, the observed dependency definition digest must match
+/// exactly because a bare definition match is not enough (I5.8), and the
+/// durable atomic data commit must be the candidate's own commit.
 #[must_use]
 pub fn publication_serves_candidate(
     publication: &ObservedPublication<'_>,
@@ -572,6 +578,17 @@ pub fn publication_serves_candidate(
         return false;
     }
     if publication.dependency_definition_digest != candidate.dependency_definition_digest {
+        return false;
+    }
+    // The store plans one `atomic_data_commit` per publication from the very
+    // commit that made the data visible (`plan.rs` builds `commit_id` once and
+    // binds it into every record of that transaction), and it documents this
+    // clause as the caller's. Comparing the candidate's recorded receipt to
+    // the record's recorded commit is the only way a record published for a
+    // sibling commit at the same fence can never serve a Material decision on
+    // this candidate's data: the equality is by content of the two recorded
+    // identities, never by name, by mere presence, or by a recomputed digest.
+    if publication.fenced.record.atomic_data_commit.as_str() != candidate.durability_receipt {
         return false;
     }
     publication
@@ -597,6 +614,11 @@ pub struct CommittedCandidate {
     /// Exact handle the record is fetched by.
     pub handle: String,
     /// Durable commit receipt; proves transport only, never freshness.
+    ///
+    /// It is not a label: it is compared by content against the
+    /// `atomic_data_commit` a publication record itself recorded, so a
+    /// publication for a sibling commit at the same fence can never stand in
+    /// for this candidate's own data.
     pub durability_receipt: String,
     /// Projection kind whose currency gates hot/proof-bearing use.
     pub projection_kind: String,
