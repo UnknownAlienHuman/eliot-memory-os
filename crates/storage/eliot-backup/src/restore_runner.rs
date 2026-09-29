@@ -1,6 +1,42 @@
 //! Actual isolated restore runner over the governed journaled executor
 //! (issue #1873 product lane; rehearsal grade).
 //!
+//! # Restore is staged validation, migration, then admission (issue #1141, W5)
+//!
+//! I5.13 orders restore as "restore to isolated root; validate
+//! format/schema/checksums; apply privacy purge ledger; rebuild
+//! projections/indexes; verify receipt/event chain; …" and puts "Human/System
+//! Owner authorizes cutover" last; I14.24 adds that "backup/restore
+//! verification fails | forbid cutover and retain current active state". W5
+//! makes that order an enforced property of this runner rather than a
+//! convention:
+//!
+//! 1. `stage_validation` validates the archive and mints the isolated plan.
+//!    It performs no filesystem write at all, so nothing can be applied to a
+//!    current state before validation has succeeded — and this module never
+//!    holds a current-state path to write to: every write goes through
+//!    `FileRestoreTarget::contained_member_path` under an [`IsolatedRoot`],
+//!    which [`IsolatedRestorePlan::validate`](super::IsolatedRestorePlan::validate)
+//!    re-checks to be a live directory under the system temp directory.
+//! 2. `stage_migration` runs the governed journaled executor. All of its
+//!    effects land inside the candidate root. A failure here returns the typed
+//!    error and leaves the current state untouched: there is no apply-then-roll
+//!    -back path, because nothing outside the candidate root is ever written.
+//! 3. `stage_admission` is the gate. It re-validates the recorded plan and
+//!    receipt, then proves completion **against the owner's own durable
+//!    records inside the candidate root** — the journal record for this exact
+//!    transaction, the target's per-phase effect receipts, the owner-recorded
+//!    finalize evidence, and the member files actually present. The
+//!    [`IsolatedRestorePlan`](super::IsolatedRestorePlan) that cutover
+//!    authorization consumes is returned by the outcome only after this stage
+//!    succeeds, so no partially staged, unverified, or skipped-stage candidate
+//!    can reach [`authorize_cutover`](super::authorize_cutover).
+//!
+//! Nothing here recomputes a digest and calls it validation: the recorded
+//! values are checked with the existing `validate()` /
+//! `validate_against_plan` methods, and completeness is checked against the
+//! archive's own carried member set rather than a copy of a caller list.
+//!
 //! [`FileRestoreTarget`] implements the accepted `RestoreTarget` effect seam
 //! ([`apply_restore_effect`](super::RestoreTarget::apply_restore_effect) /
 //! [`reconcile_restore_effect`](super::RestoreTarget::reconcile_restore_effect))
@@ -17,7 +53,7 @@
 //! required trait methods delegate to the same validated bundle members the
 //! coordinator phases derive from.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
 use eliot_contracts::{EpochId, ResourceGeneration, canonical_json_bytes, sha256_hex};
@@ -25,12 +61,12 @@ use eliot_security_contracts::PurgeLedgerEntry;
 use eliot_store_api::WriteReceipt;
 
 use super::{
-    BackupBlob, BackupBundle, BackupError, CanonicalRecord, IsolatedRoot, OrsSnapshotFence,
-    RestoreAppliedEffect, RestoreContext, RestoreEffectReceipt, RestoreEvidence,
+    BackupBlob, BackupBundle, BackupError, CanonicalRecord, IsolatedRestorePlan, IsolatedRoot,
+    OrsSnapshotFence, RestoreAppliedEffect, RestoreContext, RestoreEffectReceipt, RestoreEvidence,
     RestoreHistoricalAuthority, RestoreIntent, RestoreJournalPort, RestoreJournalRecord,
-    RestoreOwnerObligation, RestorePhase, RestorePlan, RestoreReconciliation, RestoreTarget,
-    WrappedKeyManifest, plan_isolated_restore, suspended_recovery_entries,
-    verify_portable_key_material,
+    RestoreJournalState, RestoreOwnerObligation, RestorePhase, RestorePlan, RestoreReceipt,
+    RestoreReconciliation, RestoreTarget, WrappedKeyManifest, plan_isolated_restore,
+    suspended_recovery_entries, verify_portable_key_material,
 };
 
 /// Temp-file-backed restore journal (rehearsal grade).
@@ -109,7 +145,6 @@ impl RestoreJournalPort for FileRestoreJournal {
 pub struct FileRestoreTarget {
     root: PathBuf,
     calls: Vec<String>,
-    final_evidence: Option<RestoreEvidence>,
 }
 
 impl FileRestoreTarget {
@@ -118,7 +153,6 @@ impl FileRestoreTarget {
         Self {
             root: root.path().to_path_buf(),
             calls: Vec::new(),
-            final_evidence: None,
         }
     }
 
@@ -127,12 +161,6 @@ impl FileRestoreTarget {
     #[must_use]
     pub fn calls(&self) -> &[String] {
         &self.calls
-    }
-
-    /// Finalize evidence observed by this target, if the final phase ran.
-    #[must_use]
-    pub fn final_evidence(&self) -> Option<&RestoreEvidence> {
-        self.final_evidence.as_ref()
     }
 
     /// Resolves one member path that is guaranteed to stay inside the root.
@@ -381,7 +409,7 @@ impl FileRestoreTarget {
                 }
             }
             RestorePhase::RebuildProjections => {
-                self.require_imported_counts(bundle)?;
+                self.require_staged_members(bundle)?;
                 let bytes = serde_json::json!({
                     "blobs": bundle.blobs.len(),
                     "events": bundle.canonical_events.len(),
@@ -417,7 +445,6 @@ impl FileRestoreTarget {
                 self.write_file("evidence.json", &bytes)?;
                 self.calls.push("finalize".to_owned());
                 let receipt = Self::effect_receipt(intent, &bytes)?;
-                self.final_evidence = Some(evidence.clone());
                 RestoreAppliedEffect {
                     receipt,
                     final_evidence: Some(evidence),
@@ -428,12 +455,17 @@ impl FileRestoreTarget {
         Ok(applied)
     }
 
-    fn count_dir(&self, relative: &str) -> Result<usize, BackupError> {
+    /// File names the target itself wrote into one member directory.
+    ///
+    /// Read back from the candidate root rather than remembered from the
+    /// effects this process applied, so a resumed or out-of-band run cannot
+    /// make a missing member look present.
+    fn observed_member_names(&self, relative: &str) -> Result<BTreeSet<String>, BackupError> {
         let path = self.root.join(relative);
         if !path.exists() {
-            return Ok(0);
+            return Ok(BTreeSet::new());
         }
-        let mut count = 0;
+        let mut names = BTreeSet::new();
         let entries =
             std::fs::read_dir(&path).map_err(|error| BackupError::Target(error.to_string()))?;
         for entry in entries {
@@ -443,19 +475,59 @@ impl FileRestoreTarget {
                 .map_err(|error| BackupError::Target(error.to_string()))?
                 .is_file()
             {
-                count += 1;
+                names.insert(entry.file_name().to_string_lossy().into_owned());
             }
         }
-        Ok(count)
+        Ok(names)
     }
 
-    fn require_imported_counts(&self, bundle: &BackupBundle) -> Result<(), BackupError> {
-        if self.count_dir("blobs")? != bundle.blobs.len()
-            || self.count_dir("events")? != bundle.canonical_events.len()
-            || self.count_dir("receipts")? != bundle.receipts.len()
-            || self.count_dir("projections")? != bundle.projections.len()
-        {
-            return Err(BackupError::RestoreEvidenceIncomplete);
+    /// Requires the candidate root to hold exactly the members the archive
+    /// declares — no missing member and no surplus one (issue #1141, W5).
+    ///
+    /// Completeness is compared against the archive's own expected set, never
+    /// against a copy of the caller's list. The blob set is anchored on the
+    /// exporter's declared `blob_reachability_manifest` rather than on the
+    /// carried `bundle.blobs`, so the two positions are independent: a target
+    /// that wrote the wrong member, or a bundle that declared a member it did
+    /// not carry, both fail here instead of agreeing with themselves.
+    fn require_staged_members(&self, bundle: &BackupBundle) -> Result<(), BackupError> {
+        let declared: BTreeSet<String> = bundle
+            .export_fence
+            .blob_reachability_manifest
+            .iter()
+            .map(|hash| hash.as_str().to_owned())
+            .collect();
+        let expected: [(&str, BTreeSet<String>); 4] = [
+            ("blobs", declared),
+            (
+                "events",
+                bundle
+                    .canonical_events
+                    .iter()
+                    .map(|record| format!("{}.json", record.record_id))
+                    .collect(),
+            ),
+            (
+                "receipts",
+                bundle
+                    .receipts
+                    .iter()
+                    .map(|receipt| format!("{}.json", receipt.operation_id))
+                    .collect(),
+            ),
+            (
+                "projections",
+                bundle
+                    .projections
+                    .iter()
+                    .map(|record| format!("{}.json", record.record_id))
+                    .collect(),
+            ),
+        ];
+        for (relative, members) in expected {
+            if self.observed_member_names(relative)? != members {
+                return Err(BackupError::RestoreEvidenceIncomplete);
+            }
         }
         Ok(())
     }
@@ -765,6 +837,10 @@ fn suspended_recovery_entries_optional(
 
 /// Outcome of one isolated runner execution: receipt, evidence, suspended
 /// work, the exact applied phase log, and the temp-only paths observed.
+///
+/// `plan` is the admitted isolated candidate. It is produced only after all
+/// three stages completed, so holding this value is itself the evidence that
+/// validation, migration and admission ran in that order (issue #1141, W5).
 #[derive(Clone, Debug)]
 pub struct RunnerOutcome {
     pub receipt: super::RestoreReceipt,
@@ -773,17 +849,181 @@ pub struct RunnerOutcome {
     pub phase_log: Vec<String>,
     pub root: PathBuf,
     pub journal_path: PathBuf,
+    /// The admitted isolated candidate, ready to be offered to
+    /// [`authorize_cutover`](super::authorize_cutover) — and to nothing else.
+    pub plan: IsolatedRestorePlan,
 }
 
-/// Executes one isolated restore with real bytes into `root`.
+/// Stage 1 of the W5 guarantee: validate, and mint the isolated plan.
 ///
-/// Binds the portable key manifest when supplied (blob-carrying archives
-/// without coverage fail before any effect, and a manifest minted for a
-/// different archive fails as a fence mismatch), plans the isolated restore
-/// (validating bundle, lineage advance, purge-first order, fresh lineage),
-/// then drives the governed journaled executor with a file-backed journal
-/// and a file-backed target. Re-running against the same root resumes from
+/// Performs **no filesystem write**. Key-material binding is checked first, so
+/// a blob-carrying archive with no coverage, or one whose manifest was minted
+/// for a different archive, fails here — before the migration stage can create
+/// a single directory in the candidate root. `plan_isolated_restore` then
+/// validates the bundle, the lineage advance, the purge-first step order and
+/// the freshly minted fence, and calls
+/// [`IsolatedRestorePlan::validate`](super::IsolatedRestorePlan::validate)
+/// before returning.
+fn stage_validation(
+    bundle: &BackupBundle,
+    target: RestoreContext,
+    authority_epoch: EpochId,
+    resource_generation: ResourceGeneration,
+    root: &IsolatedRoot,
+    keys: Option<&WrappedKeyManifest>,
+) -> Result<IsolatedRestorePlan, BackupError> {
+    match keys {
+        Some(manifest) => verify_portable_key_material(bundle, manifest)?,
+        None if !bundle.blobs.is_empty() => {
+            return Err(BackupError::MissingRecoveryComponent("blob_key_material"));
+        }
+        None => {}
+    }
+    plan_isolated_restore(bundle, target, authority_epoch, resource_generation, root)
+}
+
+/// What the migration stage left behind: the observed receipt plus the two
+/// owner seams admission re-reads it through.
+struct StagedMigration {
+    receipt: RestoreReceipt,
+    journal: FileRestoreJournal,
+    target: FileRestoreTarget,
+    journal_path: PathBuf,
+}
+
+/// Stage 2 of the W5 guarantee: migrate into the isolated candidate root.
+///
+/// The governed journaled executor applies every phase through
+/// [`FileRestoreTarget`], whose only write path is `contained_member_path`
+/// under the candidate root. Nothing outside that root is opened, created or
+/// written here, so a validation or migration failure cannot have touched a
+/// current state: there is nothing to roll back, because nothing outside the
+/// candidate was ever applied. Re-running against the same root resumes from
 /// the durable journal instead of re-applying.
+fn stage_migration(
+    plan: &RestorePlan,
+    bundle: &BackupBundle,
+    root: &IsolatedRoot,
+) -> Result<StagedMigration, BackupError> {
+    let journal_path = root.path().join("journal.json");
+    let mut journal = FileRestoreJournal::at(journal_path.clone());
+    let mut target = FileRestoreTarget::new(root);
+    let receipt = plan.execute_with_journal(bundle, &mut target, &mut journal)?;
+    Ok(StagedMigration {
+        receipt,
+        journal,
+        target,
+        journal_path,
+    })
+}
+
+/// Stage 3 of the W5 guarantee: admit the staged candidate, or refuse.
+///
+/// Everything here is read back from the **owner's own durable records inside
+/// the candidate root** — never from a value this runner chose to pass to
+/// itself:
+///
+/// * the executor's journal row for this exact transaction, which must be
+///   `Completed`, at the final phase, and carry this exact `RestoreReceipt`
+///   (`FileRestoreJournal` / [`RestoreJournalPort`]);
+/// * the target's per-phase effect receipts (`load_applied`), one per planned
+///   phase, each re-deriving its own intent so a receipt for a foreign
+///   transaction or a foreign phase is refused;
+/// * the finalize evidence the target itself wrote, re-validated with
+///   [`RestoreEvidence::validate`](super::RestoreEvidence::validate) and
+///   [`validate_against_plan`](super::RestoreEvidence::validate_against_plan)
+///   against this plan and bundle;
+/// * the member files actually on disk, compared by name against the archive's
+///   own declared set.
+///
+/// A stage that merely *ran* is not enough: the target's finalize phase writes
+/// `evidence.json`, and a resume never re-runs it. So the evidence admitted
+/// here is the one read back from the candidate root, and when it is absent
+/// this stage refuses instead of re-deriving a value that no owner recorded.
+fn stage_admission(
+    isolated: &IsolatedRestorePlan,
+    bundle: &BackupBundle,
+    receipt: &RestoreReceipt,
+    journal: &mut FileRestoreJournal,
+    target: &FileRestoreTarget,
+) -> Result<RestoreEvidence, BackupError> {
+    // The recorded plan, re-validated: `IsolatedRestorePlan::validate` compares
+    // the plan's two recorded copies of `bundle_sha256`/`restored_fence` and
+    // requires the candidate root to still be a live temp directory.
+    isolated.validate()?;
+    receipt.validate()?;
+    let transaction = isolated.plan.transaction()?;
+    let journal_key = isolated.plan.journal_key()?;
+    let record = journal
+        .load(&journal_key)?
+        .ok_or(BackupError::RestoreJournalRequired)?;
+    // The crate's single definition of the phase order is reused here rather
+    // than restated: this loop is a completeness proof over that sequence, not
+    // a second source of what the order is.
+    let phases = super::restore_phases(bundle);
+    let completed_phases =
+        u64::try_from(phases.len()).map_err(|_| BackupError::RestoreJournalMismatch)?;
+    // The owner's own journal row must be this transaction's, complete, and
+    // final. `record.transaction` is the owner's recorded identity; comparing
+    // it to the freshly derived one is the coherence check, not a re-proof.
+    if record.journal_key != journal_key
+        || record.transaction != transaction
+        || record.state != RestoreJournalState::Completed
+        || !matches!(record.phase, RestorePhase::FinalizeIsolatedRoot)
+        || record.completed_phases != completed_phases
+    {
+        return Err(BackupError::RestoreJournalMismatch);
+    }
+    // The owner-recorded final receipt must be the one this run observed. The
+    // journal is the coordinator's own durable substrate, so agreement here is
+    // between two recorded positions rather than one value restated.
+    if record.final_receipt.as_ref() != Some(receipt) {
+        return Err(BackupError::RestoreJournalMismatch);
+    }
+    // Every planned phase must carry the target's own persisted effect receipt,
+    // and the finalize phase's must carry the finalize evidence. This is the
+    // owner-verified staging record: a phase with no target receipt was never
+    // applied, however complete the journal row claims to be.
+    let mut finalize_evidence: Option<RestoreEvidence> = None;
+    for phase in phases {
+        let intent = super::restore_intent(&transaction, &phase)?;
+        let applied = target
+            .load_applied(&intent)?
+            .ok_or(BackupError::RestoreEvidenceIncomplete)?;
+        if phase == RestorePhase::FinalizeIsolatedRoot {
+            finalize_evidence = applied.final_evidence;
+        } else if applied.final_evidence.is_some() {
+            return Err(BackupError::RestoreJournalCorrupt);
+        }
+    }
+    let evidence = finalize_evidence.ok_or(BackupError::RestoreEvidenceIncomplete)?;
+    // Validate the ORIGINAL recorded value with its own validator, against the
+    // plan and bundle it claims — never a digest recomputed here.
+    evidence.validate()?;
+    evidence.validate_against_plan(&isolated.plan, bundle)?;
+    if !evidence.isolated_root || evidence.active_authority_restored {
+        return Err(BackupError::RestoreEvidenceIncomplete);
+    }
+    // Completeness against the archive's own expected set, read from disk.
+    target.require_staged_members(bundle)?;
+    Ok(evidence)
+}
+
+/// Executes one isolated restore with real bytes into `root`, as staged
+/// validation, then migration, then admission (issue #1141, W5).
+///
+/// I5.13 orders restore as "restore to isolated root; validate
+/// format/schema/checksums; apply privacy purge ledger; rebuild
+/// projections/indexes; verify receipt/event chain" and puts "Human/System
+/// Owner authorizes cutover" after them. Those three stages run here in that
+/// order, and the admitted [`IsolatedRestorePlan`] that
+/// [`authorize_cutover`](super::authorize_cutover) consumes is returned only
+/// once all three have succeeded — so no partially staged candidate can reach
+/// cutover. I14.24's "backup/restore verification fails | forbid cutover and
+/// retain current active state" holds because a failing stage returns before
+/// any path outside the isolated candidate root is written, and because the
+/// candidate root itself is refused unless the owner-recorded evidence
+/// validates against this plan and bundle.
 ///
 /// Sealed blob bytes cross into the isolated root byte-for-byte unchanged:
 /// `FileRestoreTarget::apply_phase` writes `blob.sealed_bytes` itself after
@@ -801,34 +1041,29 @@ pub fn execute_isolated_restore(
     root: &IsolatedRoot,
     keys: Option<&WrappedKeyManifest>,
 ) -> Result<RunnerOutcome, BackupError> {
-    match keys {
-        Some(manifest) => verify_portable_key_material(bundle, manifest)?,
-        None if !bundle.blobs.is_empty() => {
-            return Err(BackupError::MissingRecoveryComponent("blob_key_material"));
-        }
-        None => {}
-    }
-    let isolated =
-        plan_isolated_restore(bundle, target, authority_epoch, resource_generation, root)?;
-    let journal_path = root.path().join("journal.json");
-    let mut journal = FileRestoreJournal::at(journal_path.clone());
-    let mut runner_target = FileRestoreTarget::new(root);
-    let receipt = isolated
-        .plan
-        .execute_with_journal(bundle, &mut runner_target, &mut journal)?;
-    // On a resumed run the fresh target never executes finalize: rebuild the
-    // deterministic evidence from plan and bundle instead of failing. Both
-    // paths yield the identical value (`build_evidence` is pure).
-    let evidence = match runner_target.final_evidence() {
-        Some(observed) => observed.clone(),
-        None => build_evidence(&isolated.plan, bundle)?,
-    };
+    let isolated = stage_validation(
+        bundle,
+        target,
+        authority_epoch,
+        resource_generation,
+        root,
+        keys,
+    )?;
+    let mut staged = stage_migration(&isolated.plan, bundle, root)?;
+    let evidence = stage_admission(
+        &isolated,
+        bundle,
+        &staged.receipt,
+        &mut staged.journal,
+        &staged.target,
+    )?;
     Ok(RunnerOutcome {
-        receipt,
-        evidence,
         suspended_entries: isolated.suspended_entries.clone(),
-        phase_log: runner_target.calls().to_vec(),
+        phase_log: staged.target.calls().to_vec(),
         root: root.path().to_path_buf(),
-        journal_path,
+        journal_path: staged.journal_path,
+        receipt: staged.receipt,
+        evidence,
+        plan: isolated,
     })
 }

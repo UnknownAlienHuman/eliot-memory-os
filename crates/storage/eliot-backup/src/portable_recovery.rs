@@ -11,6 +11,20 @@
 //! carried blob lineage is missing or unverifiable. The backup contains key
 //! lineage and format metadata, never plaintext master/data keys, and no key
 //! is ever opened here: digests bind opaque wrapped bytes only.
+//!
+//! # Coverage is measured against the archive's own declaration (#1141, W5)
+//!
+//! `verify_key_coverage` is the issuance-side set proof over a caller-supplied
+//! blob list. The restore direction uses `verify_declared_key_coverage`
+//! instead, which anchors the expected set on
+//! `manifest.encryption.key_lineages` — the archive's own record, bound by
+//! `manifest.integrity_sha256` — and then requires that record, the carried
+//! blobs and the wrapped-key manifest all name the same lineages. Completeness
+//! measured only against the blob list the restore phases iterate would be a
+//! copy of the same caller list, and would pass an archive whose key
+//! declaration and material were narrowed together. I5.13 requires the
+//! opposite: missing key material "makes the affected blob set unrestorable and
+//! fails `full_recovery` proof".
 
 use std::collections::BTreeSet;
 
@@ -111,13 +125,26 @@ pub fn verify_key_coverage(
 ) -> Result<(), BackupError> {
     manifest.validate()?;
     let needed: BTreeSet<&str> = blobs.iter().map(|blob| blob.key_lineage.as_str()).collect();
-    let covered = manifest.lineage_set();
-    for lineage in &needed {
+    require_exact_lineage_coverage(&needed, &manifest.lineage_set())
+}
+
+/// Exact set equality between the lineages that need key material and the
+/// lineages the manifest covers, in both directions.
+///
+/// The refusals are the two existing typed recovery-component errors: a
+/// missing lineage makes the affected blob set unrestorable at the
+/// destination, and a surplus lineage means the manifest describes key
+/// material this archive never needed.
+fn require_exact_lineage_coverage(
+    needed: &BTreeSet<&str>,
+    covered: &BTreeSet<&str>,
+) -> Result<(), BackupError> {
+    for lineage in needed {
         if !covered.contains(lineage) {
             return Err(BackupError::MissingRecoveryComponent("blob_key_material"));
         }
     }
-    for lineage in &covered {
+    for lineage in covered {
         if !needed.contains(lineage) {
             return Err(BackupError::UnexpectedRecoveryComponent(
                 "blob_key_material",
@@ -125,6 +152,58 @@ pub fn verify_key_coverage(
         }
     }
     Ok(())
+}
+
+/// Proves wrapped-key coverage against the archive's **own declared** lineage
+/// set, and that the archive's two recorded positions agree (issue #1141, W5).
+///
+/// [`verify_key_coverage`] derives its expected set from the very blob list
+/// the restore phases iterate, so on its own it is a copy of the same caller
+/// list compared with itself: a bundle whose carried blobs were narrowed
+/// alongside its key manifest would pass while the archive still declares key
+/// lineages the destination never received material for. I5.13 requires the
+/// opposite — missing key material "makes the affected blob set unrestorable
+/// and fails `full_recovery` proof" — and I14.24 requires that a failing
+/// verification forbid cutover rather than let an unproven candidate proceed.
+///
+/// This check therefore compares three independently recorded positions:
+///
+/// * `bundle.manifest.encryption.key_lineages` — the archive's declared
+///   encryption summary, covered by `manifest.integrity_sha256` through
+///   `manifest_integrity_digest`, so it is bound to the manifest rather than
+///   to a caller's list;
+/// * the key lineages the carried blobs actually reference;
+/// * the lineages the wrapped-key manifest covers.
+///
+/// All three must be the same set. A manifest that is narrowed to match a
+/// tampered blob list, an archive whose declaration drifts from its blobs, and
+/// a manifest that both over- and under-covers all fail closed with the
+/// existing typed errors rather than agreeing with a copy of themselves.
+///
+/// Not re-exported: it is the restore direction's coverage proof and is
+/// reached through [`verify_portable_key_material`], which is the one entry
+/// point the restore runner and the operator command already call.
+fn verify_declared_key_coverage(
+    bundle: &BackupBundle,
+    manifest: &WrappedKeyManifest,
+) -> Result<(), BackupError> {
+    let declared: BTreeSet<&str> = bundle
+        .manifest
+        .encryption
+        .key_lineages
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let carried: BTreeSet<&str> = bundle
+        .blobs
+        .iter()
+        .map(|blob| blob.key_lineage.as_str())
+        .collect();
+    // Two archive-recorded positions first: the manifest's own declaration and
+    // the lineages its carried blobs reference. Neither is the caller's list.
+    require_exact_lineage_coverage(&declared, &carried)?;
+    manifest.validate()?;
+    require_exact_lineage_coverage(&declared, &manifest.lineage_set())
 }
 
 /// Proves the wrapped-key manifest is *this* archive's key material.
@@ -140,6 +219,12 @@ pub fn verify_key_coverage(
 /// [`FullRecoveryPackage::validate`] already required at issuance — before the
 /// runner may write a single sealed byte.
 ///
+/// The coverage proof itself is the crate's declared-coverage check, not
+/// [`verify_key_coverage`]: it is anchored on the archive's own declared
+/// `encryption.key_lineages` and cross-checked against both the carried blobs
+/// and the manifest, so completeness is never measured against a copy of the
+/// same caller list the restore phases iterate (issue #1141, W5).
+///
 /// This does not decrypt anything: `wrapped_key_bytes` stay opaque here. The
 /// unwrap/re-seal under destination key ownership remains the `BlobStore` and
 /// secret-provider owner's step, driven by the restoration receipts.
@@ -152,7 +237,7 @@ pub fn verify_portable_key_material(
             subject: "key manifest backup binding".to_owned(),
         });
     }
-    verify_key_coverage(&bundle.blobs, manifest)
+    verify_declared_key_coverage(bundle, manifest)
 }
 
 /// Per-blob restoration receipt binding one carried blob to its wrapped key.
