@@ -2391,12 +2391,13 @@ pub fn task_relative_tools_list_result(
     conditions: &TaskSurfaceConditions,
     grant_closure: Option<&GrantClosureReceipt>,
 ) -> Result<Value, WireRejection> {
-    let surface = compile_task_relative_surface(registry, conditions, grant_closure).map_err(|_| {
-        WireRejection::new(
-            WIRE_INTERNAL_ERROR,
-            "task-relative tool surface is unavailable",
-        )
-    })?;
+    let surface =
+        compile_task_relative_surface(registry, conditions, grant_closure).map_err(|_| {
+            WireRejection::new(
+                WIRE_INTERNAL_ERROR,
+                "task-relative tool surface is unavailable",
+            )
+        })?;
     tools_list_result_for_permitted_surface(&PermittedTaskSurface {
         permitted: surface.permitted,
         withheld: surface.withheld,

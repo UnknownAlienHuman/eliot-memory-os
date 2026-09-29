@@ -14,12 +14,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_protocol::HARD_STRUCTURED_RESPONSE_BYTES;
+use eliot_receipts::surface::{MaterialGrantStanding, resolve_material_grant};
 use eliot_receipts::{
     BudgetCoverage, BudgetOverflow, GrantClosureReceipt, OverflowDisposition, RenderedToolCost,
     SurfaceBudgetInput, TOOL_SURFACE_CONTRACT_VERSION, TokenCountObservation,
     TokenCountUnavailableReason, ToolExposureError, ToolSurfaceBudget, compile_surface_budget,
 };
-use eliot_receipts::surface::{MaterialGrantStanding, resolve_material_grant};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
