@@ -945,17 +945,7 @@ impl ModuleCatalog {
                 // under it: accepting one would put a running child under an
                 // unadmitted restart policy, which is precisely the wider
                 // authority the disposition refuses.
-                if !current
-                    .restart_policy_disposition
-                    .permits_automatic_restart()
-                {
-                    return Err(ModuleError::IdentityConflict);
-                }
-                let expected_policy_digest = current
-                    .restart_policy_disposition
-                    .policy_digest()
-                    .map(str::to_owned)
-                    .ok_or(ModuleError::IdentityConflict)?;
+                let expected_policy_digest = admitted_policy_digest(&current)?;
                 if admission.candidate.module_id != request.module_id
                     || admission.state_fence != self.state_fence
                     || admission.catalog_revision != self.revision
