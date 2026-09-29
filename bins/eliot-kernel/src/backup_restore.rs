@@ -701,11 +701,12 @@ impl KernelBackupRestore {
     /// This is the production entry to
     /// [`RestoreJournalAdmission::issue_for_operation`]. The owner is
     /// [`OrsRestoreJournalOwner`], built from the same composition-owned
-    /// [`RedbRecoveryStore`] handle, the same [`OrsRestoreBinding`] and the same
-    /// live effect fence [`restore_with_ors_journal`](Self::restore_with_ors_journal)
-    /// seals the journal's rows with, and the journal it proves is the same
-    /// durable ORS journal. Nothing here is a request field: the four
-    /// owner-issued references are read out of the ORS stream-binding row the
+    /// [`RedbRecoveryStore`] handle, the same [`OrsRestoreBinding`], the same
+    /// live effect fence and the same sealed payload root
+    /// [`restore_with_ors_journal`](Self::restore_with_ors_journal) seals the
+    /// journal's rows with, and the journal it proves is the same durable ORS
+    /// journal. Nothing here is a request field: the owner-issued references are
+    /// read out of the ORS stream-binding row and the durable journal record the
     /// owner already committed, and `fixture_proof_only` is never set.
     ///
     /// The admission is issued against a journal that ALREADY holds `plan`'s
@@ -714,9 +715,12 @@ impl KernelBackupRestore {
     /// yet therefore refuses with [`BackupError::RestoreJournalRequired`]
     /// surfaced as a typed [`KernelRestoreError::TargetFailed`] with its cause
     /// intact; nothing is minted to make a fresh stream look admitted. Starting
-    /// the stream needs the plan's stream identity, which
-    /// `RestorePlan::journal_key` does not expose outside `eliot-backup`, so
-    /// that half is not reachable from this file.
+    /// the stream needs the plan's stream identity, and
+    /// `RestorePlan::journal_key` is private to `eliot-backup`, so that half is
+    /// not reachable from this file. Until it is, a production restore is
+    /// admitted on resume and refused on a first run — the resume path is
+    /// genuinely provable, the first run is not, and this method says so rather
+    /// than admitting an operation the owner cannot name.
     ///
     /// The returned value grants no cutover, no readiness and no activation
     /// (A13.7: cutover requires separate authority).
