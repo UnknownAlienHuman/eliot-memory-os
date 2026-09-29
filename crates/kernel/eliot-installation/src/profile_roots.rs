@@ -438,7 +438,7 @@ impl InstallationRoots {
     /// The observations carry the original file-object identities. This
     /// method checks their role and path bindings without deriving or
     /// substituting identities from paths.
-    pub(crate) fn validate_profile_selection_receipt(
+    pub fn validate_profile_selection_receipt(
         &self,
         launch: &RuntimeLaunchDescriptor,
         receipt: &ProfileSelectionReceipt,
