@@ -458,7 +458,8 @@ pub fn qualify_useful_outcomes(
         receipt.verified_outcome_refs.contains(&candidate.reference)
             && candidate.record.execution_ref == candidate.reference
             && candidate.record.observed_skill_id.as_deref() == Some(receipt.skill_id.as_str())
-            && candidate.record.observed_attempt_ref.as_deref() == Some(receipt.attempt_ref.as_str())
+            && candidate.record.observed_attempt_ref.as_deref()
+                == Some(receipt.attempt_ref.as_str())
             && candidate.record.observed_fence.as_ref() == Some(&receipt.state_fence)
             && candidate.record.validate().is_ok()
     });
