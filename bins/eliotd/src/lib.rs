@@ -1766,7 +1766,7 @@ impl DaemonComposition {
             Ok(result)
                 if result.resolved_binding().is_some() && ticket.workspace_selector.is_some() =>
             {
-                self.attach_cold_start_question(ticket, now, result)
+                Self::attach_cold_start_question(ticket, now, result)
             }
             other => other,
         };
@@ -1779,7 +1779,6 @@ impl DaemonComposition {
     /// the scanner may return only its smallest privacy-boundary question
     /// until an installation-backed disclosure owner is supplied.
     fn attach_cold_start_question(
-        &self,
         ticket: &AgentActivationResolutionTicket,
         now: u64,
         result: AgentActivationResolutionResult,
