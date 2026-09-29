@@ -4,10 +4,10 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use eliot_wasm_host::{
-    CliError, ContourGateError, PrototypeContourDecision, TypedWorld, admit_generation,
-    admit_prototype, default_experimental_limits, execute_describe_experimental,
-    experimental_manifest, parse_args, read_bounded_artifact, run_guest_exec,
-    run_ordinary_request_loop, typed_wit_digest,
+    CliError, ContourGateError, OrdinaryDriveError, PrototypeContourDecision, TypedWorld,
+    admit_generation, admit_prototype, default_experimental_limits,
+    execute_describe_experimental, experimental_manifest, parse_args, read_bounded_artifact,
+    run_guest_exec, run_ordinary_request_loop, typed_wit_digest,
 };
 
 const INVALID_ARGUMENT_EXIT: i32 = 2;
@@ -23,10 +23,27 @@ const RECEIPT_MAX_BYTES: usize = 64 * 1024;
 /// exceed the receipt budget, so an untrusted field can never break the
 /// framing or smuggle a newline into it.
 fn emit_error(code: &str, detail: &str) {
-    let line = serde_json::to_vec(&serde_json::json!({
+    emit_stderr_json(serde_json::json!({
         "error": code,
         "detail": detail,
     }));
+}
+
+/// Emits one bounded JSON line on `stderr` for an unresolved delivery,
+/// preserving the exact claim identity the caller must reconcile.
+fn emit_delivery_in_progress(operation_id: &str, generation: u64, claim_id: &str) {
+    emit_stderr_json(serde_json::json!({
+        "error": "ORDINARY_DELIVERY_IN_PROGRESS",
+        "detail": "outcome unresolved; reconcile this exact delivery before retrying",
+        "operation_id": operation_id,
+        "generation": generation,
+        "claim_id": claim_id,
+    }));
+}
+
+/// Emits one bounded JSON object on `stderr`.
+fn emit_stderr_json(value: serde_json::Value) {
+    let line = serde_json::to_vec(&value);
     let Ok(bytes) = line else {
         return;
     };
@@ -134,14 +151,19 @@ fn main() {
     match run_ordinary_request_loop() {
         // The ordinary result publisher already emitted the versioned
         // result-event stream on stdout; this branch emits no second
-        // summary object (#2787 step 2). Reader audit (2026-09-26): no
-        // process or Kernel reader of `eliot.wasm.host-result` or
-        // `ordinary-request-complete` exists anywhere in the repository —
-        // the only references were the crate's own re-export and this
-        // removed call — so no diagnostic moved to stderr and no consumer
-        // migration was required. `emit_receipt` stays for the separate
-        // experimental describe mode only.
+        // summary object (#2787 step 2). No process or Kernel consumer for
+        // this stream is wired here, so keep the successful publication
+        // unchanged. `emit_receipt` stays for the separate experimental
+        // describe mode only.
         Ok(_) => {}
+        Err(OrdinaryDriveError::DeliveryInProgress {
+            operation_id,
+            generation,
+            claim_id,
+        }) => {
+            emit_delivery_in_progress(&operation_id, generation, &claim_id);
+            std::process::exit(ADMISSION_REQUIRED_EXIT);
+        }
         Err(error) => {
             emit_error("KERNEL_ADMISSION_REQUIRED", &error.to_string());
             std::process::exit(ADMISSION_REQUIRED_EXIT);
