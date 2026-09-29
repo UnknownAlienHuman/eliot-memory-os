@@ -18,6 +18,7 @@ use eliot_installation::InstallationError;
 use eliot_installation::InstallationTransactionStore;
 use eliot_installation::{
     CandidateManifest, InstallationProfile, InstallationRoots, InstallerServiceRole,
+    ProfileSupervision,
 };
 use eliot_kernel_core::KernelRuntimeHealthEvidence;
 use eliot_runtime_contracts::{HealthDimension, SupervisionLeaseVerifier};
@@ -198,7 +199,7 @@ pub struct ProfileRootBindingContour {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProfileSupervisionContour {
     pub profile: InstallationProfile,
-    pub intended_supervision: eliot_installation::profile_supervision::ProfileSupervision,
+    pub intended_supervision: ProfileSupervision,
     pub state: ComponentState,
     pub gap: String,
 }
@@ -2309,13 +2310,13 @@ fn profile_supervision_contour(manifest: &CandidateManifest) -> Option<ProfileSu
     let profile = manifest.runtime_launch.profile;
     let intended_supervision = match profile {
         InstallationProfile::SystemService => {
-            eliot_installation::profile_supervision::ProfileSupervision::ScmDemandStart
+            ProfileSupervision::ScmDemandStart
         }
         InstallationProfile::UserMode => {
-            eliot_installation::profile_supervision::ProfileSupervision::CurrentUserLauncherTaskScheduler
+            ProfileSupervision::CurrentUserLauncherTaskScheduler
         }
         InstallationProfile::PortableDev => {
-            eliot_installation::profile_supervision::ProfileSupervision::RepositoryLocalDisposable
+            ProfileSupervision::RepositoryLocalDisposable
         }
     };
     (profile != InstallationProfile::SystemService).then(|| ProfileSupervisionContour {
