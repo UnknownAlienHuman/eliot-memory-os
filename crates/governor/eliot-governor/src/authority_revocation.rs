@@ -60,11 +60,13 @@ use eliot_ors::{GrantClosureProjection, OperationIdentity, OperationalRecoverySt
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::{GrantClosureReceipt, GrantClosureState, ReceiptIdentity};
 use eliot_store_api::{
-    EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
+    EffectClass, EventProjectionRelationIntents, GrantClosureAuthorityReceiptRef,
+    InfluenceDependencyClosure, InfluenceState, NamedMutationOperation, NamedMutationRequest,
     NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationManifestDigest,
     OrderingHeadExpectation, OrderingScopeId, ReadConsistency, RecordedRevocationDisposition,
-    ScopeId, SecurityContext, TransitionClass, WriteReceipt, generated_operation_manifests,
-    operation_manifest_set_digest, parse_revocation_history_payload,
+    RevocationReason, ScopeId, SecurityContext, TransitionClass, WriteReceipt,
+    generated_operation_manifests, operation_manifest_set_digest,
+    parse_revocation_history_payload,
 };
 
 use crate::{
