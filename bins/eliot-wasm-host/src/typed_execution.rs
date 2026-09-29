@@ -11,6 +11,12 @@
 //! by the single `bindgen!` owner in [`crate::typed_bindings`]; it does not
 //! import a domain crate to manufacture a result, and the neutral
 //! `eliot-wasm-runtime` crate keeps no Wasmtime dependency.
+//!
+//! Item-26 source guard: [`check_world_registry`] pins the six #756 worlds as
+//! registered exactly once before any engine is built;
+//! `preflight_component_type` refuses any component import (zero ambient) and
+//! admits exactly one selected-world export; the capsule lane delegates back
+//! into the direct lane, so both reach the same guard.
 
 use std::fmt;
 use std::path::Path;
@@ -972,6 +978,26 @@ fn check_ceiling(
     Ok(())
 }
 
+/// Source guard for item 26: the selected world must be registered exactly
+/// once in [`crate::typed_bindings::TypedWorld::all`]. Both production lanes
+/// pass through this check before any engine is built (the capsule lane
+/// re-enters the direct lane, so it is covered too); a world missing from the
+/// registry — or listed twice — fails closed with the owned typed denial
+/// instead of reaching dispatch.
+fn check_world_registry(world: TypedWorld) -> Result<(), TypedExecutionError> {
+    let registered = TypedWorld::all()
+        .iter()
+        .filter(|registered| **registered == world)
+        .count();
+    if registered == 1 {
+        Ok(())
+    } else {
+        Err(TypedExecutionError::WorldSelection {
+            reason: "unregistered-world".to_owned(),
+        })
+    }
+}
+
 /// Executes the typed `describe` descriptor for one world through the real
 /// Wasmtime component engine under deny-by-default sandbox policy.
 ///
@@ -992,6 +1018,7 @@ pub fn execute_describe_experimental(
     limits: &InvocationLimits,
 ) -> Result<(TypedReceipt, TypedDescriptor), TypedExecutionError> {
     let start = Instant::now();
+    check_world_registry(world)?;
     // Same-buffer hash/compile: preflight once, compile the same slice.
     let preflight = preflight_bytes(artifact)?;
     validate_limits(limits, &preflight.digest)?;
@@ -1060,6 +1087,23 @@ pub fn execute_describe_experimental(
     Ok((receipt, descriptor))
 }
 
+/// Item-26 source guard both production lanes pass before instantiation or
+/// any descriptor invocation: the component links with zero ambient imports,
+/// exports exactly one selected-world interface, and matches the generated
+/// typed signatures — without invoking guest code to discover type.
+///
+/// Zero ambient is a blanket refusal, not a per-family allow-list: ANY import
+/// (WASI command/preopens/stdio, network/HTTP/DNS, env/args, clock, random,
+/// process/thread, credential/store/provider/model/tool/mutation, or anything
+/// else) fails closed as `ForbiddenImport`. Instantiation-time import errors
+/// map to the same denial, and every instantiate site links against a fresh
+/// empty `Linker` that defines nothing, so a descriptor claim can never grant
+/// an import or change policy. A legacy `run` export fails as
+/// `LegacyMismatch`; anything but the single frozen-package interface (or a
+/// wrongly typed descriptor/domain function) fails as `MissingExport` /
+/// `ExportTypeMismatch` / `WorldSelection`. There is no second engine: every
+/// `Engine` on this path is the single Wasmtime provider engine, and the
+/// neutral `eliot-wasm-runtime` crate carries no Wasmtime dependency.
 fn preflight_component_type(
     world: TypedWorld,
     engine: &wasmtime::Engine,
@@ -1985,6 +2029,9 @@ pub fn execute_domain_experimental(
             kit, capsule, artifact, limits, request, admitted,
         );
     }
+    // The capsule lane above re-enters this direct lane with `None`, so the
+    // registry guard below covers both provenances.
+    check_world_registry(world)?;
     admitted.validate()?;
     if request.world() != world {
         return Err(TypedExecutionError::WorldSelection {
