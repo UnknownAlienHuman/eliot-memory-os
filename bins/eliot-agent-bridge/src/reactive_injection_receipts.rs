@@ -625,6 +625,23 @@ impl ReactiveInjectionLedger {
         count
     }
 
+    /// Invalidates only a delivered item named by its live session and exact
+    /// cue owner identity. Other cues from the same source stay deduplicated.
+    pub fn invalidate_cue(&mut self, session_id: &str, source: &str, cue_id: &str) -> usize {
+        let mut count = 0;
+        for item in self.items.values_mut() {
+            if item.session_id == session_id
+                && item.cue.source == source
+                && item.cue.cue_id == cue_id
+                && matches!(item.state, ItemState::Delivered { .. })
+            {
+                item.invalidated = true;
+                count += 1;
+            }
+        }
+        count
+    }
+
     /// Project the attention output for a session: every open critical item
     /// (pending or delivered — sticky until a terminal disposition), plus
     /// pending normal items. Delivered normals appear only after

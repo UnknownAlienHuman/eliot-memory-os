@@ -93,9 +93,11 @@ pub use dreamer_job::{
 };
 pub use reactive_restore::{
     MAX_RESTORE_LEDGER_BYTES, MAX_RESTORE_SNAPSHOT_BYTES, MAX_RESTORE_TEXT_BYTES, MAX_RESTORE_URIS,
+    REACTIVE_LEDGER_MUTATION_CONTRACT_NAME, REACTIVE_LEDGER_MUTATION_OPERATION,
     REACTIVE_RESTORE_CAPABILITY, REACTIVE_RESTORE_CONTRACT_NAME, REACTIVE_RESTORE_CONTRACT_VERSION,
-    REACTIVE_RESTORE_OPERATION, REACTIVE_RESTORE_PAYLOAD_SCHEMA_ID, ReactiveRestoreError,
-    ReactiveRestoreQuery, ReactiveRestoreReply, RestoredSnapshot, restore_correlation,
+    REACTIVE_RESTORE_OPERATION, REACTIVE_RESTORE_PAYLOAD_SCHEMA_ID, ReactiveLedgerMutationReply,
+    ReactiveLedgerMutationRequest, ReactiveRestoreError, ReactiveRestoreQuery,
+    ReactiveRestoreReply, RestoredSnapshot, restore_correlation,
 };
 
 /// Stable identity of this protocol surface.

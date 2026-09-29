@@ -54,6 +54,20 @@ pub trait KernelHostRequestPort {
             reason: "reactive restore is not implemented by this port".to_owned(),
         })
     }
+
+    /// Commits one exact candidate ledger against its restored ledger-specific
+    /// owner revision. Implementations fail closed when no authenticated
+    /// mutation route is available.
+    fn commit_reactive_ledger(
+        &mut self,
+        request: &eliot_protocol::ReactiveLedgerMutationRequest,
+    ) -> Result<eliot_protocol::ReactiveLedgerMutationReply, PortFailure> {
+        let _ = request;
+        Err(PortFailure::Unsupported {
+            capability: "reactive-ledger-mutation".to_owned(),
+            reason: "reactive ledger mutation is not implemented by this port".to_owned(),
+        })
+    }
 }
 
 /// Positive result returned by the trusted port for one invocation.

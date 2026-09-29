@@ -30,9 +30,7 @@
 use eliot_agent_bridge_core::{AttachBinding, BridgeError, ResourceUri};
 use eliot_contracts::{ResourceGeneration, StateFence};
 use eliot_mcp::{KernelHostRequestPort, PortFailure};
-use eliot_protocol::{
-    MAX_RESTORE_URIS, ReactiveRestoreQuery, ReactiveRestoreReply, RestoredSnapshot,
-};
+use eliot_protocol::{MAX_RESTORE_URIS, ReactiveLedgerMutationRequest, ReactiveRestoreQuery};
 
 use super::BridgeRunner;
 
@@ -197,7 +195,7 @@ pub fn restore_reactive_runtime(
     }
     let ledger = match &reply.ledger_json {
         Some(json) => {
-            runner.restore_reactive_ledger(json.as_bytes())?;
+            runner.restore_reactive_ledger_at_revision(json.as_bytes(), reply.ledger_revision)?;
             LedgerRestoreOutcome::Restored
         }
         None => LedgerRestoreOutcome::Absent,
@@ -226,6 +224,89 @@ pub fn restore_reactive_runtime(
     })
 }
 
+/// Commits one mutated ledger candidate before installing it in the live
+/// runner. Failed, stale, or uncertain Store outcomes leave the runner's
+/// current ledger and revision untouched.
+pub fn commit_reactive_ledger_candidate(
+    runner: &mut BridgeRunner,
+    port: &mut dyn KernelHostRequestPort,
+    candidate: super::ReactiveInjectionLedger,
+) -> Result<u64, BridgeError> {
+    let view = runner.attach_view().ok_or(BridgeError::NotAttached)?;
+    let session_id = view.binding().session_id().as_str().to_owned();
+    let state_fence = live_state_fence(view.binding())?;
+    let expected_revision = runner.reactive_ledger_revision();
+    let candidate_bytes = candidate
+        .to_json_bytes()
+        .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
+    let ledger_json = String::from_utf8(candidate_bytes).map_err(|_| {
+        BridgeError::ProviderContract("reactive ledger candidate was not UTF-8".to_owned())
+    })?;
+    if runner.reactive_ledger_snapshot()? == ledger_json.as_bytes() {
+        return Ok(expected_revision);
+    }
+    let request = ReactiveLedgerMutationRequest {
+        session_id: session_id.clone(),
+        state_fence: state_fence.clone(),
+        expected_revision,
+        ledger_json: ledger_json.clone(),
+    };
+    request
+        .validate()
+        .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
+    let reply = port
+        .commit_reactive_ledger(&request)
+        .map_err(map_reactive_mutation_failure)?;
+    reply
+        .receipt
+        .validate()
+        .map_err(|error| BridgeError::ProviderContract(error.to_string()))?;
+    let expected_after = expected_revision
+        .checked_add(1)
+        .ok_or(BridgeError::StaleAuthority)?;
+    if reply.session_id != session_id
+        || reply.state_fence != state_fence
+        || reply.ledger_revision != expected_after
+        || reply.ledger_json != ledger_json
+        || reply.receipt.core.request.metadata.session_id.as_ref()
+            != Some(view.binding().session_id())
+        || reply.receipt.core.request.state_fence != state_fence
+        || reply.receipt.core.operation.state_fence != state_fence
+    {
+        return Err(BridgeError::ProviderContract(
+            "reactive ledger commit did not return the exact Store receipt and candidate"
+                .to_owned(),
+        ));
+    }
+    runner.install_committed_reactive_ledger_candidate(
+        candidate,
+        expected_revision,
+        reply.ledger_revision,
+    )?;
+    Ok(reply.ledger_revision)
+}
+
+fn map_reactive_mutation_failure(error: PortFailure) -> BridgeError {
+    match error {
+        PortFailure::FenceMismatch => BridgeError::StaleAuthority,
+        PortFailure::TransportBindingRejected { reason } => BridgeError::ProviderContract(reason),
+        PortFailure::Unsupported { reason, .. } | PortFailure::PlanGap { reason, .. } => {
+            BridgeError::ProviderContract(reason)
+        }
+        PortFailure::IdempotencyConflict => BridgeError::InvalidTransition(
+            "reactive ledger idempotency identity is bound to different candidate bytes",
+        ),
+        PortFailure::LegacyCorrelationUnresolved => BridgeError::LegacyCorrelationUnresolved,
+        PortFailure::DeadlineExceeded => {
+            BridgeError::ProviderContract("reactive ledger commit deadline exceeded".to_owned())
+        }
+        PortFailure::Cancelled => {
+            BridgeError::ProviderContract("reactive ledger commit cancelled".to_owned())
+        }
+        PortFailure::AgentResponse { failure } => BridgeError::AgentHostRequestFailure(failure),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,6 +320,7 @@ mod tests {
         HostCancellationPortOutcome, HostCancellationRequest, HostInvocationPortOutcome,
         HostInvocationRequest,
     };
+    use eliot_protocol::{ReactiveRestoreReply, RestoredSnapshot};
     use std::num::NonZeroU64;
 
     use super::super::{
@@ -409,6 +491,7 @@ mod tests {
             ledger_json: Some(
                 String::from_utf8(ledger_bytes(TEST_SESSION)).expect("ledger is UTF-8"),
             ),
+            ledger_revision: 1,
             snapshots: vec![RestoredSnapshot {
                 uri: "eliot://evidence/source-9".to_owned(),
                 content: b"snapshot-bytes-9".to_vec(),

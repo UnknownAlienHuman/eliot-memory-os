@@ -18,8 +18,8 @@ use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, EffectClass, EventProjectionRelationIntents,
     OperationId, OperationManifestDigest, OrderingScopeId, PreparedTransition, ReceiptEnvelope,
     RequestMetadata, ScopeId, SecurityContext, StoreError, TransitionClass, WriteReceiptStatus,
-    canonical_json_bytes, generated_operation_manifests, operation_manifest_set_digest,
-    reactive_ledger_mutation_request, reactive_ledger_read_request,
+    canonical_json_bytes, canonical_request_hash, generated_operation_manifests,
+    operation_manifest_set_digest, reactive_ledger_mutation_request, reactive_ledger_read_request,
     resource_snapshot_mutation_request, resource_snapshot_read_request, sha256_hex,
     verify_canonical_request_hash,
 };
@@ -311,6 +311,18 @@ pub async fn handle_reactive_ledger_request(
     let context = session
         .service_context(service)
         .map_err(ReactiveServiceError::Service)?;
+    handle_reactive_ledger_request_in_context(client, context, request).await
+}
+
+/// Handles a ledger write after the Kernel has bound its session and live
+/// service context under the owner lock. The captured context is checked
+/// against the request fence, then the canonical Store CAS remains the final
+/// currentness arbiter across asynchronous IO.
+pub async fn handle_reactive_ledger_request_in_context(
+    client: &impl CanonicalStoreClient,
+    context: ReactiveServiceContext,
+    request: &ReactiveLedgerRequest,
+) -> Result<ReactiveLedgerResponse, ReactiveServiceError> {
     validate_ledger_request(request)?;
     require_live_fence(&context, &request.state_fence)?;
     if request.context.state_fence != request.state_fence {
@@ -385,6 +397,20 @@ pub async fn handle_reactive_ledger_request(
         receipt: envelope,
         replayed: false,
     })
+}
+
+/// Seals a Kernel-derived operation identity over the exact candidate and
+/// expected owner revision. The caller supplies only retry identity fields;
+/// this owner recomputes the canonical request digest consumed by the write
+/// handler and canonical Store.
+pub fn seal_reactive_ledger_request(
+    mut request: ReactiveLedgerRequest,
+) -> Result<ReactiveLedgerRequest, ReactiveServiceError> {
+    let (transition, _) = build_ledger_transition(&request)?;
+    let view = CanonicalRequestView::from_apply(&request.context, &transition, &[], &[]);
+    request.operation.canonical_request_hash =
+        canonical_request_hash(&view).map_err(ReactiveServiceError::from_store)?;
+    Ok(request)
 }
 
 /// Handles one authenticated reactive-ledger read.

@@ -21,10 +21,16 @@ pub const REACTIVE_RESTORE_OPERATION: &str = "agent_host_request_reactive_restor
 /// Envelope capability carried by restore requests. Names the operation
 /// itself; it borrows no tool authority and admits no tool linkage.
 pub const REACTIVE_RESTORE_CAPABILITY: &str = "agent_host_request_reactive_restore";
+/// Closed Kernel entry that commits one bridge reactive-ledger candidate by
+/// exact owner-revision compare-and-set.
+pub const REACTIVE_LEDGER_MUTATION_OPERATION: &str = "agent_bridge_reactive_ledger_mutation";
 /// Exact payload-schema identity for the canonical restore query bytes.
 pub const REACTIVE_RESTORE_PAYLOAD_SCHEMA_ID: &str = "eliot.bridge.reactive-restore.v1";
 /// Stable identity of the reactive restore contract.
 pub const REACTIVE_RESTORE_CONTRACT_NAME: &str = "eliot.foundation.reactive-restore";
+/// Stable identity of the reactive-ledger mutation contract.
+pub const REACTIVE_LEDGER_MUTATION_CONTRACT_NAME: &str =
+    "eliot.foundation.reactive-ledger-mutation";
 /// Current semantic contract revision.
 pub const REACTIVE_RESTORE_CONTRACT_VERSION: eliot_contracts::ContractVersion =
     eliot_contracts::ContractVersion::new(1, 0, 0);
@@ -43,6 +49,60 @@ pub const MAX_RESTORE_LEDGER_BYTES: usize = 1024 * 1024;
 /// projection ceiling (`MAX_CONTENT_BYTES`); digest binding stays with
 /// publish.
 pub const MAX_RESTORE_SNAPSHOT_BYTES: usize = 1024 * 1024;
+
+/// Authenticated whole-ledger replacement candidate. The outer RequestIdentity
+/// binds the session/fence and idempotency; these fields are repeated so the
+/// Kernel can reject caller/payload mismatches before Store IO.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReactiveLedgerMutationRequest {
+    /// Live attach session, repeated from RequestIdentity metadata.
+    pub session_id: String,
+    /// Live attach fence, repeated from RequestIdentity binding.
+    pub state_fence: StateFence,
+    /// Exact owner revision read before candidate construction (`0` absent).
+    pub expected_revision: u64,
+    /// Candidate bytes to commit as the next complete session ledger.
+    pub ledger_json: String,
+}
+
+impl ReactiveLedgerMutationRequest {
+    /// Validates shape; admission and currentness are proved by Kernel.
+    pub fn validate(&self) -> Result<(), ReactiveRestoreError> {
+        bounded_text(&self.session_id, "ledger_mutation.session_id")?;
+        self.state_fence
+            .validate()
+            .map_err(|_| ReactiveRestoreError::InvalidField {
+                field: "ledger_mutation.state_fence",
+                reason: "fence has no identity-bearing dependency",
+            })?;
+        if self.ledger_json.is_empty() || self.ledger_json.len() > MAX_RESTORE_LEDGER_BYTES {
+            return Err(ReactiveRestoreError::InvalidField {
+                field: "ledger_mutation.ledger_json",
+                reason: "ledger document exceeds the bounded ledger ceiling",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Store-committed receipt and exact readback required before Bridge publish.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReactiveLedgerMutationReply {
+    /// Session the candidate was committed for.
+    pub session_id: String,
+    /// Fence under which the Store receipt was committed.
+    pub state_fence: StateFence,
+    /// Ledger-specific owner revision after commit.
+    pub ledger_revision: u64,
+    /// Exact committed ledger bytes read back from the canonical owner.
+    pub ledger_json: String,
+    /// Store-issued receipt envelope proving the write outcome.
+    pub receipt: eliot_contracts::ReceiptEnvelope,
+    /// True when the same operation identity was already committed.
+    pub replayed: bool,
+}
 
 /// Errors returned by the pure reactive restore contract.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -159,6 +219,8 @@ pub struct ReactiveRestoreReply {
     pub state_fence: StateFence,
     /// Verbatim canonical ledger snapshot, when durable state exists.
     pub ledger_json: Option<String>,
+    /// Ledger-specific revision (`0` when the session ledger is absent).
+    pub ledger_revision: u64,
     /// Served snapshots in request order.
     pub snapshots: Vec<RestoredSnapshot>,
     /// Highest owner revision observed across served projections.
@@ -182,6 +244,12 @@ impl ReactiveRestoreReply {
             return Err(ReactiveRestoreError::InvalidField {
                 field: "restore_reply.ledger_json",
                 reason: "ledger document exceeds the bounded ledger ceiling",
+            });
+        }
+        if self.ledger_json.is_none() && self.ledger_revision != 0 {
+            return Err(ReactiveRestoreError::InvalidField {
+                field: "restore_reply.ledger_revision",
+                reason: "an absent ledger must have revision zero",
             });
         }
         if self.snapshots.len() > MAX_RESTORE_URIS {
@@ -291,6 +359,7 @@ mod tests {
             ledger_json: Some(
                 "{\"contract\":\"eliot.agent-bridge.reactive-injection-receipts/v1\"}".to_owned(),
             ),
+            ledger_revision: 1,
             snapshots: vec![RestoredSnapshot {
                 uri: "eliot://evidence/source-9".to_owned(),
                 content: vec![9, 9],
