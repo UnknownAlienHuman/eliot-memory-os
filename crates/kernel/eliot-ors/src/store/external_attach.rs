@@ -277,7 +277,7 @@ impl super::RedbRecoveryStore {
         let physical_key = physical_key(&request.owner_session_binding, &request.key);
         let index_key = index_key(&request.owner_session_binding);
         let write = self.database.begin_write().map_err(super::storage)?;
-        let mut rows = write
+        let rows = write
             .open_table(super::EXTERNAL_ATTACH_RECEIPTS)
             .map_err(super::storage)?;
         if let Some(value) = rows.get(physical_key.as_str()).map_err(super::storage)? {
@@ -293,8 +293,6 @@ impl super::RedbRecoveryStore {
                 return Err(OrsError::DuplicateConflict);
             }
             readback.validate()?;
-            drop(rows);
-            drop(write);
             return Ok(readback);
         }
         drop(rows);
