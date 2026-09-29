@@ -149,7 +149,7 @@ pub use genesis_owner_packet::{
 mod native_worker_binding;
 pub use native_worker_binding::{
     NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_ID, NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_VERSION,
-    NativeWorkerExecutableBinding, process_invocation_digest_for,
+    NativeWorkerExecutableBinding, NativeWorkerLifecycleBinding, process_invocation_digest_for,
 };
 
 /// Canonical write result kept together with the negative-memory decision
@@ -7071,6 +7071,30 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         Ok(())
     }
 
+    fn validate_native_binding_facet_and_catalog(
+        &self,
+        facet_manifest_ref: &str,
+        module_catalog_revision: u64,
+    ) -> Result<String, CompositionError> {
+        let canonical_facet_ref = native_worker_binding::canonical_native_worker_facet_ref()
+            .map_err(CompositionError::Recovery)?;
+        if facet_manifest_ref != canonical_facet_ref {
+            return Err(CompositionError::Recovery(
+                "native binding facet manifest ref does not match the canonical ELIOT native-worker facet ref"
+                    .to_owned(),
+            ));
+        }
+        // A catalog change requires new admission; a stale caller cannot
+        // refresh this binding against its own revision.
+        if module_catalog_revision != self.owners.module_registry.revision() {
+            return Err(CompositionError::Recovery(
+                "native binding catalog revision is not the live Module Catalog revision"
+                    .to_owned(),
+            ));
+        }
+        Ok(canonical_facet_ref)
+    }
+
     /// Publishes one versioned Governor-owned executable binding projection
     /// (T9-01 M1, `T9.md` 3.2) for a registered native-worker attempt.
     ///
@@ -7092,13 +7116,16 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// This method performs no transport: the caller commits a sibling
     /// `PreparedTransition` through the existing `commit_canonical` path and
     /// correlates by `operation_id` / `canonical_request_hash` / `state_fence`.
-    /// The admitted capability cell and Module Catalog revision are required
-    /// caller-supplied owner inputs; this method does not infer either value.
+    /// The admitted capability cell, Module Catalog revision and
+    /// `NativeWorkerLifecycleBinding` are required caller-supplied owner
+    /// inputs; this method does not infer or refresh those values.
     /// The supplied revision must equal the live `module_registry` revision at
     /// publish: a binding is compiled against the current catalog, never a
     /// stale one (Implements #22 W1). A catalog change makes the binding
     /// stale; it needs a new admission, never a local repair.
     /// All parameters are required; blank or malformed input fails closed.
+    /// `facet_manifest_ref` must match the canonical ELIOT-owned native-worker
+    /// facet contract exactly; Governor does not accept a caller-invented ref.
     #[allow(
         clippy::too_many_arguments,
         reason = "M1 binding joins every T9.md 3.2 denominator field in one versioned projection"
@@ -7137,6 +7164,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         effective_ceiling: eliot_store_api::EffectClass,
         credential_refs: Vec<String>,
         resource_refs: Vec<String>,
+        lifecycle_binding: NativeWorkerLifecycleBinding,
         replay_stream_id: &str,
         launch_nonce: &str,
         process_invocation_digest: &str,
@@ -7151,6 +7179,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
         }
+        let canonical_facet_ref = self.validate_native_binding_facet_and_catalog(
+            facet_manifest_ref,
+            module_catalog_revision,
+        )?;
         let fence = self.snapshot.state_fence();
         let authority_epoch = self.snapshot.authority_epoch.clone();
         let generation = self.snapshot.generation;
@@ -7180,17 +7212,6 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             route_ref,
             work_scope_id,
         )?;
-        // Catalog-revision pin (Implements #22 W1): the binding is compiled
-        // against the admitted Module Catalog revision, so the supplied
-        // revision must equal the live `module_registry` revision at publish.
-        // A stale revision fails closed as `Recovery`; the owner advances the
-        // revision through a new admission, never a local repair here.
-        if module_catalog_revision != self.owners.module_registry.revision() {
-            return Err(CompositionError::Recovery(
-                "native binding catalog revision is not the live Module Catalog revision"
-                    .to_owned(),
-            ));
-        }
         let mut binding = NativeWorkerExecutableBinding {
             claim_id: claim_id.to_owned(),
             registration_id: registration_id.to_owned(),
@@ -7206,6 +7227,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             session_id: session_id.to_owned(),
             worker_generation,
             process_tree_id: process_tree_id.to_owned(),
+            job_object_lineage_ref: lifecycle_binding.job_object_lineage_ref,
             process_generation,
             process_fence: process_fence.to_owned(),
             route_ref: route_ref.to_owned(),
@@ -7215,12 +7237,19 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             config_digest: config_digest.to_owned(),
             protocol_digest: protocol_digest.to_owned(),
             command_ref: command_ref.to_owned(),
-            facet_manifest_ref: facet_manifest_ref.to_owned(),
+            facet_manifest_ref: canonical_facet_ref,
             capability_cell,
             introduction_refs,
             supporting_grant_refs,
             grant_graph_revision,
             module_catalog_revision,
+            capability_cell_registry_digest: lifecycle_binding.capability_cell_registry_digest,
+            kernel_execution_manifest_digest: lifecycle_binding.kernel_execution_manifest_digest,
+            resource_limits_digest: lifecycle_binding.resource_limits_digest,
+            cancellation_policy_ref: lifecycle_binding.cancellation_policy_ref,
+            checkpoint_policy_digest: lifecycle_binding.checkpoint_policy_digest,
+            drain_policy_ref: lifecycle_binding.drain_policy_ref,
+            restart_policy_digest: lifecycle_binding.restart_policy_digest,
             effective_ceiling,
             credential_refs,
             resource_refs,
@@ -7301,6 +7330,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         effective_ceiling: eliot_store_api::EffectClass,
         credential_refs: Vec<String>,
         resource_refs: Vec<String>,
+        lifecycle_binding: NativeWorkerLifecycleBinding,
         replay_stream_id: &str,
         launch_nonce: &str,
         process_invocation: &serde_json::Value,
@@ -7347,6 +7377,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             effective_ceiling,
             credential_refs,
             resource_refs,
+            lifecycle_binding,
             replay_stream_id,
             launch_nonce,
             &derived,
@@ -11679,6 +11710,16 @@ mod tests {
                 eliot_store_api::EffectClass::ReversibleMutation,
                 vec!["cred-1".to_owned()],
                 vec!["res-1".to_owned()],
+                NativeWorkerLifecycleBinding {
+                    capability_cell_registry_digest: "5".repeat(64),
+                    kernel_execution_manifest_digest: "9".repeat(64),
+                    job_object_lineage_ref: "job-lineage-1".to_owned(),
+                    resource_limits_digest: "8".repeat(64),
+                    cancellation_policy_ref: "cancel-policy-1".to_owned(),
+                    checkpoint_policy_digest: "7".repeat(64),
+                    drain_policy_ref: "drain-policy-1".to_owned(),
+                    restart_policy_digest: "6".repeat(64),
+                },
                 "stream-1",
                 "0123456789abcdef",
                 invocation,

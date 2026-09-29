@@ -8,6 +8,9 @@
 #![forbid(unsafe_code)]
 
 mod action_envelope;
+mod generated {
+    include!(concat!(env!("OUT_DIR"), "/native_worker_facets_v1.rs"));
+}
 mod ports;
 mod protocol;
 
@@ -160,6 +163,62 @@ pub enum WorkerError {
         code: &'static str,
         detail: &'static str,
     },
+}
+
+fn map_native_worker_facet_stub_error(
+    error: crate::generated::NativeWorkerFacetStubError,
+) -> WorkerError {
+    match error {
+        crate::generated::NativeWorkerFacetStubError::InvalidField(field) => {
+            WorkerError::InvalidRequest(field)
+        }
+        crate::generated::NativeWorkerFacetStubError::InvalidSource => {
+            WorkerError::InvalidRequest("execute_facet_source")
+        }
+        crate::generated::NativeWorkerFacetStubError::Serialization => {
+            WorkerError::InvalidRequest("execute_facet_encoding")
+        }
+    }
+}
+
+fn prepare_execute_call_and_fingerprint(
+    frame: &WorkerFrame,
+    grant: &CapabilityGrant,
+) -> Result<
+    (
+        Option<crate::generated::NativeWorkerExecuteEbpCallV1>,
+        String,
+    ),
+    WorkerError,
+> {
+    let call = match &frame.body {
+        WorkerFrameBody::Execute(request) => {
+            let admitted_facet = crate::protocol::admitted_facet_ref_for_dispatch(
+                grant.claim_binding_digest(),
+                grant.executable_expectation(),
+            )?;
+            admitted_facet
+                .map(|facet_ref| {
+                    crate::generated::compile_native_worker_execute_call_v1(facet_ref, request)
+                })
+                .transpose()
+                .map_err(map_native_worker_facet_stub_error)?
+        }
+        _ => None,
+    };
+    let fingerprint = if let Some(call) = &call {
+        serde_json::to_string(&(
+            &call.facet_manifest_ref,
+            &call.facet_contract_identity,
+            &call.method_id,
+            &call.method_schema_identity,
+            &call.payload,
+        ))
+    } else {
+        serde_json::to_string(&frame.body)
+    }
+    .map_err(|_| WorkerError::InvalidFrame("fingerprint"))?;
+    Ok((call, fingerprint))
 }
 
 /// A-13's composition core. Generic P-03 injection is required because the
@@ -717,8 +776,8 @@ where
             return Ok(Vec::new());
         }
 
-        let fingerprint = serde_json::to_string(&frame.body)
-            .map_err(|_| WorkerError::InvalidFrame("fingerprint"))?;
+        let (generated_execute_call, fingerprint) =
+            prepare_execute_call_and_fingerprint(&frame, &grant)?;
         match self
             .replay
             .as_mut()
@@ -740,7 +799,8 @@ where
             }
             DurableRequestDecision::Conflict => return Err(WorkerError::IdempotencyConflict),
         }
-        let prepared_effect = self.prepare_body(&frame.body, &grant)?;
+        let prepared_effect =
+            self.prepare_body(&frame.body, &grant, generated_execute_call.as_ref())?;
         match self
             .replay
             .as_mut()
@@ -820,6 +880,7 @@ where
         &mut self,
         body: &WorkerFrameBody,
         grant: &CapabilityGrant,
+        generated_execute_call: Option<&crate::generated::NativeWorkerExecuteEbpCallV1>,
     ) -> Result<Option<AuthorizedEffect>, WorkerError> {
         match body {
             WorkerFrameBody::Execute(request) => {
@@ -829,7 +890,9 @@ where
                 ) {
                     return Err(WorkerError::InvalidLifecycle);
                 }
-                request.validate_shape()?;
+                request
+                    .validate_shape()
+                    .map_err(WorkerError::InvalidRequest)?;
                 if !grant.capabilities().contains(&request.capability) {
                     return Err(WorkerError::AdmissionRejected(
                         "capability was not admitted".to_owned(),
@@ -839,10 +902,22 @@ where
                 // executes only under the owner-admitted facet identity
                 // carried by the v2 executable expectation. A legacy start
                 // without a claim echo dispatches unchanged.
-                let _admitted_facet = crate::protocol::admitted_facet_ref_for_dispatch(
+                let admitted_facet = crate::protocol::admitted_facet_ref_for_dispatch(
                     grant.claim_binding_digest(),
                     grant.executable_expectation(),
                 )?;
+                match (admitted_facet, generated_execute_call) {
+                    (Some(facet_ref), Some(call)) => call
+                        .validate_for_dispatch(facet_ref, request)
+                        .map_err(map_native_worker_facet_stub_error)?,
+                    (Some(_), _) => {
+                        return Err(WorkerError::InvalidRequest("execute_facet_stub"));
+                    }
+                    (None, Some(_)) => {
+                        return Err(WorkerError::InvalidRequest("legacy_execute_facet_stub"));
+                    }
+                    (None, None) => {}
+                }
                 request
                     .proposed_effect
                     .as_ref()
