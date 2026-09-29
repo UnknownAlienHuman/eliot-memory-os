@@ -206,7 +206,7 @@ pub fn evaluate_publication_intent(
     counted_evidence: &[String],
 ) -> Result<PublicationDecision, SignalValidationError> {
     let revision = signal.revision();
-    for identity in counted_evidence.iter() {
+    for identity in counted_evidence {
         text(identity, "counted_evidence")?;
     }
     let references = match &revision.evidence {
@@ -222,7 +222,7 @@ pub fn evaluate_publication_intent(
     // collapsed, so neither a retransmitted observation nor a duplicated
     // reference can raise the distinct count.
     let mut crossing_evidence: Vec<String> = Vec::new();
-    for reference in references.iter() {
+    for reference in references {
         if !crossing_evidence.contains(&reference.evidence_id)
             && !counted_evidence.contains(&reference.evidence_id)
         {
