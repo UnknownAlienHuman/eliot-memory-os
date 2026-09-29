@@ -320,7 +320,82 @@ pub fn prove_no_service_profile_authority_dependency(
         None => declared_anchor,
     };
     let anchor_identity = WindowsPathIdentity::parse_root(anchor, "profile_supervision.anchor")?;
-    let expected = match governed.profile {
+    let expected =
+        expected_profile_layout(governed.profile, anchor, component, version, generation)?;
+    let actual = [
+        ("immutable_binaries", governed.immutable_binaries.as_str()),
+        ("durable_data", governed.durable_data.as_str()),
+        ("user_config", governed.user_config.as_str()),
+        ("user_cache", governed.user_cache.as_str()),
+    ];
+    // A role counts as verified only when the anchor it was derived from is a
+    // retained OS root object. Without a retained lease this loop is still a
+    // required refusal check -- a role that is not the exact layout under the
+    // selected anchor is refused either way -- but it is a lexical check, and
+    // nothing it agrees with is counted.
+    let anchor_is_retained = retained_anchor.is_some();
+    let mut verified_root_roles = 0_u32;
+    for ((expected_field, expected_path), (actual_field, actual_path)) in
+        expected.into_iter().zip(actual)
+    {
+        let expected_identity = WindowsPathIdentity::parse_root(&expected_path, expected_field)?;
+        let actual_identity = WindowsPathIdentity::parse_root(actual_path, actual_field)?;
+        if expected_field != actual_field || expected_identity != actual_identity {
+            return Err(InstallationError::ProfileViolation(format!(
+                "{actual_field} differs from the exact {:?} root derived from its retained profile anchor",
+                governed.profile
+            )));
+        }
+        // The role must be strictly inside the anchor, so a role can never
+        // satisfy its own layout by collapsing onto the anchor itself.
+        if expected_identity == anchor_identity || !anchor_identity.contains(&expected_identity) {
+            return Err(InstallationError::ProfileViolation(format!(
+                "{expected_field} is not strictly below the {:?} profile anchor",
+                governed.profile
+            )));
+        }
+        if anchor_is_retained {
+            verified_root_roles += 1;
+        }
+    }
+
+    Ok(NoServiceProfileAuthorityProof {
+        profile: governed.profile,
+        selects_scm_supervision: false,
+        requires_admin: false,
+        requires_program_data_anchor: false,
+        verified_root_roles,
+    })
+}
+
+/// Builds the exact I3.1 root layout a profile names beneath `anchor`.
+///
+/// This is the expected side of the no-service-authority comparison: for each
+/// of the four I3.1 roles it returns the path that profile requires, obtained
+/// by joining `anchor` with that role's own fixed contour. It is pure layout
+/// arithmetic and proves nothing by itself; the caller supplies `anchor` as the
+/// OS-reported canonical path of the retained anchor object wherever the OS
+/// lease contract admits one, so the paths produced here are anchored to a
+/// value the OS reported about a held object rather than to an echo of the
+/// caller's own anchor string.
+///
+/// The `SystemService` arm is unreachable because the caller refuses that
+/// profile before any layout is built.
+///
+/// # Errors
+///
+/// Returns [`InstallationError::ProfileViolation`] when a `portable_dev`
+/// selection carries no generation identity to lay its disposable state roots
+/// under, and [`InstallationError::InvalidField`] when the component, version
+/// or generation identity is not a usable field value.
+fn expected_profile_layout(
+    profile: InstallationProfile,
+    anchor: &str,
+    component: &str,
+    version: &str,
+    generation: Option<&str>,
+) -> Result<[(&'static str, String); 4], InstallationError> {
+    Ok(match profile {
         InstallationProfile::SystemService => unreachable!("service profile rejected above"),
         InstallationProfile::UserMode => {
             text(component, "profile_component")?;
@@ -371,49 +446,5 @@ pub fn prove_no_service_profile_authority_dependency(
                 ("user_cache", joined_windows_path(&state, "cache")),
             ]
         }
-    };
-    let actual = [
-        ("immutable_binaries", governed.immutable_binaries.as_str()),
-        ("durable_data", governed.durable_data.as_str()),
-        ("user_config", governed.user_config.as_str()),
-        ("user_cache", governed.user_cache.as_str()),
-    ];
-    // A role counts as verified only when the anchor it was derived from is a
-    // retained OS root object. Without a retained lease this loop is still a
-    // required refusal check -- a role that is not the exact layout under the
-    // selected anchor is refused either way -- but it is a lexical check, and
-    // nothing it agrees with is counted.
-    let anchor_is_retained = retained_anchor.is_some();
-    let mut verified_root_roles = 0_u32;
-    for ((expected_field, expected_path), (actual_field, actual_path)) in
-        expected.into_iter().zip(actual)
-    {
-        let expected_identity = WindowsPathIdentity::parse_root(&expected_path, expected_field)?;
-        let actual_identity = WindowsPathIdentity::parse_root(actual_path, actual_field)?;
-        if expected_field != actual_field || expected_identity != actual_identity {
-            return Err(InstallationError::ProfileViolation(format!(
-                "{actual_field} differs from the exact {:?} root derived from its retained profile anchor",
-                governed.profile
-            )));
-        }
-        // The role must be strictly inside the anchor, so a role can never
-        // satisfy its own layout by collapsing onto the anchor itself.
-        if expected_identity == anchor_identity || !anchor_identity.contains(&expected_identity) {
-            return Err(InstallationError::ProfileViolation(format!(
-                "{expected_field} is not strictly below the {:?} profile anchor",
-                governed.profile
-            )));
-        }
-        if anchor_is_retained {
-            verified_root_roles += 1;
-        }
-    }
-
-    Ok(NoServiceProfileAuthorityProof {
-        profile: governed.profile,
-        selects_scm_supervision: false,
-        requires_admin: false,
-        requires_program_data_anchor: false,
-        verified_root_roles,
     })
 }
