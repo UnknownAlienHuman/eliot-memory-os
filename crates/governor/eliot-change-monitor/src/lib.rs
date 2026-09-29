@@ -1266,9 +1266,9 @@ impl ChangeMonitor {
     pub fn confirm_hint_with_readback(
         &mut self,
         hint_id: &str,
-        verification: ChangeHintVerification,
+        verification: &ChangeHintVerification,
     ) -> Result<ChangeHintConfirmation, ChangeMonitorError> {
-        self.confirm_hint_inner(hint_id, &verification, true)
+        self.confirm_hint_inner(hint_id, verification, true)
     }
 
     fn confirm_hint_inner(
