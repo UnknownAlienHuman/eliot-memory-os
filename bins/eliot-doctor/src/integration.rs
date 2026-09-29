@@ -568,11 +568,16 @@ pub fn report_json(report: &IntegrationReport) -> serde_json::Value {
         "handshake": {
             "ok": report.handshake_ok,
         },
-        "installation": report.installation.as_ref().map(|status| serde_json::json!({
-            "status": status.status,
-            "code": status.code,
-            "completed": status.completed,
-        })),
+        // `null` when the record stated no installation status: absence is
+        // reported as absence, never as an assumed or default status.
+        "installation": report.installation.as_ref().map_or(
+            serde_json::Value::Null,
+            |status| serde_json::json!({
+                "status": status.status,
+                "code": status.code,
+                "completed": status.completed,
+            }),
+        ),
         "installed": report.installed,
         "live": report.live,
         "disposition": report.disposition,
