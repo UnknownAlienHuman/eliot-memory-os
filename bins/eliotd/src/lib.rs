@@ -2236,6 +2236,16 @@ impl DaemonComposition {
     /// while the Governor owner binds the receipt to its exact
     /// promoted revision and package digest. A wire receipt alone is never
     /// enough to make an installed Skill usable.
+    ///
+    /// Dependency currency is bound across both records: the stored lifecycle
+    /// view pins the dependency versions it was derived against, and the
+    /// catalogue entry carries the currently admitted set. A host, tool, or
+    /// contract version the two disagree on refuses the attempt, so a Skill
+    /// whose declared dependencies changed after the view was derived cannot
+    /// reach Material use until the view is revalidated or restored through
+    /// the governed lifecycle path. The catalogue entry itself is the current
+    /// record here, so it is never marked by this check; marking a drifted
+    /// entry stale stays with the install, reconcile, and display paths.
     #[allow(clippy::result_large_err)]
     pub fn skill_admit_material_attempt(
         &self,
@@ -2246,7 +2256,7 @@ impl DaemonComposition {
             return Err(eliot_skill::SkillError::FenceMismatch);
         }
         self.skill_reconcile_tool_basis()?;
-        {
+        let current_dependencies = {
             let catalogue = self
                 .skill_catalogue
                 .lock()
@@ -2264,6 +2274,16 @@ impl DaemonComposition {
                     reason: "unvalidated, stale, or retired Skills are blocked from Material use",
                 });
             }
+            entry.dependencies.clone()
+        };
+        if let Some(view) = self.governor.owners().skill.view(&receipt.skill_id)
+            && eliot_skill::detect_dependency_staleness(&view.dependencies, &current_dependencies)
+                .is_some()
+        {
+            return Err(eliot_skill::SkillError::InvalidField {
+                field: "view.dependencies",
+                reason: "declared host/tool/contract dependencies changed after the lifecycle view was derived; the Skill is blocked from Material use until revalidated",
+            });
         }
         self.governor.owners().skill.admit_material_attempt(receipt)
     }
