@@ -90,7 +90,7 @@ pub struct KernelConfig {
     /// supervision key reference is admitted only when its variant matches.
     #[cfg(windows)]
     pub(super) supervision_installation_profile: Option<InstallationProfile>,
-    /// Descriptor-retained repository root used only for PortableDev keys.
+    /// Descriptor-retained repository root used only for `PortableDev` keys.
     /// It is never inferred from the current directory or environment.
     #[cfg(windows)]
     pub(super) portable_dev_repository_root: Option<(PathBuf, FileIdentity)>,
@@ -298,7 +298,7 @@ impl KernelConfig {
     }
 
     /// Injects the exact profile and optional repository root retained from
-    /// the Host-approved launch descriptor. PortableDev requires the root;
+    /// the Host-approved launch descriptor. `PortableDev` requires the root;
     /// other profiles reject one during authority composition.
     #[cfg(windows)]
     #[must_use]
