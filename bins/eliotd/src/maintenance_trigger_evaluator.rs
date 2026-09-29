@@ -535,6 +535,55 @@ impl DaemonComposition {
         .await
     }
 
+    /// Recovers one retained maintenance trigger after a daemon crash (issue
+    /// #1694 W5).
+    ///
+    /// The caller re-presents the exact retained record, claim, and
+    /// observation: nothing is re-minted. A crash before the decision commit
+    /// therefore replays the same trigger through
+    /// [`Self::commit_maintenance_trigger_decision`] under its existing
+    /// identity and revision.
+    ///
+    /// A crash after the commit but before delivery acknowledgement passes
+    /// that committed receipt back in. It is re-validated against the
+    /// retained trigger and returned unchanged for acknowledgement — no
+    /// re-evaluation, no second intent, and therefore no second job,
+    /// recommendation, or wake. Recording and acknowledgement travel the
+    /// follow-up daemon-to-Kernel decision route named on
+    /// [`Self::commit_maintenance_trigger_decision`].
+    ///
+    /// A lost or ambiguous commit stays open: the commit's `Ok(None)`
+    /// contract already carries the pending/reconciling shape, and this
+    /// method propagates it unchanged for receipt-lookup reconciliation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaintenanceDecisionCommitError`] for the same refusals as
+    /// [`Self::commit_maintenance_trigger_decision`], plus a recovered
+    /// receipt that answers a different trigger or binds a different revision
+    /// than the retained claim.
+    pub async fn recover_maintenance_trigger_after_crash(
+        &self,
+        kernel: &Arc<DaemonKernelClient>,
+        observation: MaintenanceObservation,
+        record: &MaintenanceTriggerRecord,
+        claim: &MaintenanceTriggerClaim,
+        committed: Option<&MaintenanceTriggerDecisionReceipt>,
+    ) -> Result<Option<MaintenanceTriggerDecisionReceipt>, MaintenanceDecisionCommitError> {
+        let Some(receipt) = committed else {
+            return self
+                .commit_maintenance_trigger_decision(kernel, observation, record, claim)
+                .await;
+        };
+        receipt.matches_trigger(record)?;
+        if receipt.revision != claim.revision {
+            return Err(MaintenanceDecisionCommitError::Protocol(
+                ProtocolError::ReplayConflict,
+            ));
+        }
+        Ok(Some(receipt.clone()))
+    }
+
     /// Binds the canonical commit receipt for an admitted downstream intent.
     ///
     /// The committed intent identity is looked up through the owning read
