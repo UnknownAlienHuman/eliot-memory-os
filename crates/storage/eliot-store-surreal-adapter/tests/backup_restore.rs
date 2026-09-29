@@ -164,6 +164,7 @@ fn valid_batch() -> CanonicalRestoreBatch {
         }],
         members: members_for(2),
         member_count: 2,
+        retained_members: Vec::new(),
     }
 }
 

@@ -1622,6 +1622,51 @@ impl NativeReadyReport {
         Ok(())
     }
 
+    /// Refuses a credential-bearing Ready report declared at or after the
+    /// presenting registration's lease expiry (Implements #22 AC5).
+    ///
+    /// Credential references are broker-issued references scoped to the exact
+    /// principal/operation: the registration lease bounds that authority
+    /// (expiry ends authority without renewal), so a Ready declared at or
+    /// after `lease_expires_at_unix_ms` while still carrying credential
+    /// references is a refused presentation — lease loss revokes the
+    /// credential authority, and only a new admission seals a new grant. A
+    /// report with no credential references asserts no credential authority
+    /// and passes here; its general lease liveness stays with the claim
+    /// deadline (`validate_for_claim`) and admission revalidation. Epoch and
+    /// fence agreement between the report and the registration flows through
+    /// the admitted claim (report-bound in `validate_for_claim`,
+    /// registration-bound in `ClaimAdmissionRequest::validate_binding`); this
+    /// gate additionally requires the consulted lease to be the report's own
+    /// registration lease (registration identity and generation equality).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::InvalidRequest`] for a report answering another
+    /// registration or an unbound lease/declaration time, and
+    /// [`WorkerError::StaleLease`] when credential references outlive the
+    /// registration lease.
+    pub fn validate_credential_lease(
+        &self,
+        registration: &NativeWorkerRegistration,
+    ) -> Result<(), WorkerError> {
+        if self.credential_refs.is_empty() {
+            return Ok(());
+        }
+        if self.registration_id != registration.registration_id
+            || self.worker_generation != registration.worker_generation
+        {
+            return Err(WorkerError::InvalidRequest("credential_lease"));
+        }
+        if registration.lease_expires_at_unix_ms == 0 || self.ready_at_unix_ms == 0 {
+            return Err(WorkerError::InvalidRequest("credential_lease"));
+        }
+        if self.ready_at_unix_ms >= registration.lease_expires_at_unix_ms {
+            return Err(WorkerError::StaleLease);
+        }
+        Ok(())
+    }
+
     /// Checks the identity, generation, epoch, fence, and digest binding
     /// against the admitted claim, shared by ready and blocked reports.
     fn validate_binding(&self, claim: &NativeWorkerClaim) -> Result<(), WorkerError> {

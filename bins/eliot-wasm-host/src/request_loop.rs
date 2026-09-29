@@ -23,7 +23,9 @@
 //!
 //! - **The engine worker owns the runner.** Synchronous guest work never
 //!   runs on the control loop, and no untracked timer or detached thread is
-//!   introduced: exactly one worker is spawned, it is joined, and the
+//!   introduced: exactly one worker is spawned, every return path joins it
+//!   (the containment path joins a worker its drain bound expired on, so an
+//!   expiry can never leave the guest-executing thread detached), and the
 //!   control loop talks to it over a bounded command channel.
 //! - **Authority is re-checked, never inherited.** The admitted grant is a
 //!   window ([`LiveAuthority`]); the control loop refreshes the observed
@@ -245,10 +247,15 @@ enum WorkerState {
     TerminationRequested,
     /// The worker thread was observed finished and joined.
     Terminated,
-    /// A bound expired with the worker still alive: the thread is
-    /// contained, not terminated, and this process is about to end. No
-    /// clean shutdown may be claimed.
+    /// A bound expired with the worker still alive: the operation is
+    /// contained, not terminated, and no clean shutdown may be claimed. The
+    /// thread itself is then joined into `Reaped`, which changes no verdict.
     Contained,
+    /// A bound expired and the worker thread was then joined, so the thread
+    /// itself is reaped rather than detached. This is a thread fact only: the
+    /// operation is still contained, `Contained` is not upgraded to
+    /// `Terminated`, and no process termination is claimed from it.
+    Reaped,
 }
 
 /// Accepted-command lifecycle of one command handed to the worker. Distinct
@@ -3890,44 +3897,11 @@ fn drain_and_shutdown_request_worker(
         &worker.handle,
     );
     // Step 2: the tracked Shutdown, the single termination protocol
-    // (issue #2785 I5). The slot is checked BEFORE the request is taken:
-    // requesting first would occupy the slot and clobber an unsettled
-    // accepted command, so the check-then-request order is what keeps the
-    // accepted-command accounting exact. `send` refuses — rather than
-    // silently claiming delivery — if the command channel does not take
-    // it. The live authority cell is revoked first, so nothing further can
-    // resolve through it while the worker stops.
+    // (issue #2785 I5). The live authority cell is revoked first, so nothing
+    // further can resolve through it while the worker stops.
     state.live.revoke();
-    // The loop's own termination protocol, so this request is never
-    // owner-sourced: an owner `Shutdown` delivery is bound to this send by
-    // the reader's retained slot, not by the command's name. That is what
-    // makes the acknowledgement below prove an enqueue for that exact
-    // delivery instead of merely a demand that was recorded.
-    let shutdown_sent = if state.command_slot_free() {
-        state.request(WorkerCommand::Shutdown, false);
-        match state.send(WorkerCommand::Shutdown, &worker.commands) {
-            Ok(()) => true,
-            Err(error) => {
-                // A refused Shutdown enqueue stays an explicit bounded
-                // residual and is never reported as accepted termination.
-                state.record_residual(error);
-                false
-            }
-        }
-    } else {
-        false
-    };
-    // The retained owner `Shutdown` delivery is acknowledged only here: after
-    // the worker actually accepted the tracked enqueue, and only for the
-    // delivery the reader still retains. With no retained delivery — the
-    // loop's own termination, or an owner `Shutdown` never yielded — the
-    // confirmation is a no-op, so no `enqueued` ack exists for a command the
-    // worker did not take (issue #2896 W5/A2). An ack that cannot be staged
-    // fails the loop honestly once the worker is joined.
-    let mut confirm_error: Option<LoopError> = None;
-    if shutdown_sent && let Err(error) = channel.confirm_control_enqueued(OP_SHUTDOWN) {
-        confirm_error = Some(error);
-    }
+    let (shutdown_sent, mut confirm_error) =
+        request_tracked_shutdown(state, channel, &worker.commands);
     if shutdown_sent {
         drain_to_settlement(
             state,
@@ -3941,16 +3915,23 @@ fn drain_and_shutdown_request_worker(
     // thread finished; the wait keeps draining any late bounded outcome so a
     // producer can never be left blocked on an unread full outcome channel.
     if !supervise_to_worker_exit(state, channel, &worker.outcomes, &worker.handle) {
-        // Process-level containment path (issue #2785 A6): the worker is
-        // still alive past the admitted drain bound, so this thread is not
-        // joinable and cannot be reported as terminated. The process that
-        // owns it ends here, the guest child it started is left for the
-        // outer process-containment owner to reconcile, and the original
-        // unknown effect is retained instead of being reported as a clean
-        // shutdown. The retained operation record is this process's written
-        // handover to that owner: the loop ends with an explicit unresolved
-        // result rather than an implicit stop.
+        // Process-level containment path (issue #2785 A6): the drain bound
+        // expired with the worker still alive, so this thread was not
+        // observed finished inside that bound. The guest child it started is
+        // left for the outer process-containment owner to reconcile, and the
+        // original unknown effect is retained instead of being reported as a
+        // clean shutdown. The retained operation record is this process's
+        // written handover to that owner: the loop ends with an explicit
+        // unresolved result rather than an implicit stop.
         let contained = contained_failure(state, channel);
+        // The bound that expired is this loop's own drain accounting, not the
+        // worker's lifetime. The handle is still owned here, and no return
+        // path may drop it: dropping a live `JoinHandle` detaches the
+        // guest-executing thread, which is precisely the untracked worker
+        // this issue forbids. Joining is the tracked termination, and it
+        // changes no verdict — the report below is still the unresolved
+        // containment failure whatever the join returns.
+        join_contained_worker(state, channel, &worker.outcomes, worker.handle);
         return failed_loop_report(state, contained);
     }
     let shutdown_observed = shutdown_sent
@@ -4038,6 +4019,115 @@ fn drain_and_shutdown_request_worker(
     match state.published() {
         Some(_) => RequestLoopReport::served(state.retained_sequence()),
         None => failed_loop_report(state, denied("no-request")),
+    }
+}
+
+/// Requests the one tracked `Shutdown` and reports whether the command
+/// channel actually accepted it, beside the acknowledgement that could not be
+/// staged (issue #2785 I2/I5).
+///
+/// The slot is checked BEFORE the request is taken: requesting first would
+/// occupy the slot and clobber an unsettled accepted command, so the
+/// check-then-request order is what keeps the accepted-command accounting
+/// exact. `send` refuses — rather than silently claiming delivery — if the
+/// command channel does not take it, and that refusal stays an explicit
+/// bounded residual rather than becoming accepted termination.
+///
+/// This is the loop's own termination protocol, so the request is never
+/// owner-sourced: an owner `Shutdown` delivery is bound to this send by the
+/// reader's retained slot, not by the command's name. That is what makes the
+/// acknowledgement prove an enqueue for that exact delivery instead of merely
+/// a demand that was recorded. With no retained delivery — the loop's own
+/// termination, or an owner `Shutdown` never yielded — the confirmation is a
+/// no-op, so no `enqueued` ack exists for a command the worker did not take
+/// (issue #2896 W5/A2). An ack that cannot be staged is returned beside the
+/// enqueue fact and fails the loop honestly once the worker is joined.
+fn request_tracked_shutdown(
+    state: &mut BoundedRequestLoop,
+    channel: &mut dyn WasmHostRequestChannel,
+    commands: &SyncSender<WorkerCommand>,
+) -> (bool, Option<LoopError>) {
+    let sent = if state.command_slot_free() {
+        state.request(WorkerCommand::Shutdown, false);
+        match state.send(WorkerCommand::Shutdown, commands) {
+            Ok(()) => true,
+            Err(error) => {
+                state.record_residual(error);
+                false
+            }
+        }
+    } else {
+        false
+    };
+    let confirm_error = if sent {
+        channel.confirm_control_enqueued(OP_SHUTDOWN).err()
+    } else {
+        None
+    };
+    (sent, confirm_error)
+}
+
+/// Joins the worker the drain bound expired on, so no return path can drop a
+/// live handle (issue #2785 A6).
+///
+/// `JoinHandle::drop` detaches, and a detached guest-executing thread is the
+/// untracked worker the issue goal forbids: the guest child it started would
+/// keep running with no owner, no outcome accounting and no join. The drain
+/// bound that expired is this loop's own accounting — the worker was admitted
+/// under the same grant wall deadline inside the P-03 child — so the handle is
+/// joined here rather than abandoned, and the wait keeps consuming any late
+/// bounded outcome so a producer is never left blocked on a full channel.
+///
+/// This join proves thread termination only. It is deliberately NOT process
+/// termination evidence: the caller keeps its unresolved containment report
+/// whatever this returns, and the worker state is set to
+/// [`WorkerState::Reaped`], never [`WorkerState::Terminated`]. Child
+/// termination is still read solely from the P-03 owner's evidence by the
+/// caller, so a joined thread can never turn an unknown guest effect into a
+/// no-effect claim or authorise reclaiming its recovery evidence (issue #2785
+/// I6).
+fn join_contained_worker(
+    state: &mut BoundedRequestLoop,
+    channel: &mut dyn WasmHostRequestChannel,
+    outcomes: &Receiver<WorkerOutcome>,
+    handle: std::thread::JoinHandle<()>,
+) {
+    while !handle.is_finished() {
+        match outcomes.recv_timeout(CONTROL_POLL) {
+            Ok(outcome) => observe_residual_outcome(state, channel, outcome),
+            Err(RecvTimeoutError::Timeout) => {}
+            // The sender is gone, so no further outcome can arrive and every
+            // receive would return at once. Yield rather than spin hot while
+            // the thread finishes.
+            Err(RecvTimeoutError::Disconnected) => std::thread::yield_now(),
+        }
+    }
+    while let Ok(outcome) = outcomes.try_recv() {
+        observe_residual_outcome(state, channel, outcome);
+    }
+    // A command this worker never acknowledged has no outcome and will never
+    // get one now that the thread is gone. The loss is recorded beside the
+    // containment failure rather than replacing it: the unresolved
+    // disposition is the containment, and this only says the reply is owed
+    // to no one.
+    if let Some(delivery) = state.delivery {
+        let command = match delivery {
+            CommandDelivery::Requested { command, .. }
+            | CommandDelivery::Accepted { command, .. } => command,
+        };
+        state.record_residual(LoopError::WorkerTerminatedWithoutOutcome {
+            command: command_name(command),
+        });
+    }
+    // The thread is reaped, so the worker state is a real observation rather
+    // than the containment placeholder. It never reaches `Terminated` here:
+    // that state is reserved for the ordinary path where the tracked
+    // `Shutdown` reply was observed first. A panic inside the worker is the
+    // thread's own fact and changes no verdict either — the unresolved
+    // report already recorded above stands.
+    state.worker = WorkerState::Reaped;
+    if handle.join().is_err() {
+        state.record_residual(denied("worker-panicked"));
     }
 }
 

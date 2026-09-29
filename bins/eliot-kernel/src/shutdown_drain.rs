@@ -289,7 +289,7 @@ impl DrainHalt {
     reason = "the publication is a coherent one-reader snapshot; splitting it would fork the observed state"
 )]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ShutdownPublication {
+pub struct ShutdownPublication {
     pub(crate) generation: String,
     pub(crate) requested: bool,
     pub(crate) phases_completed: Vec<String>,
@@ -1268,6 +1268,22 @@ impl ShutdownDrainCoordinator {
             return "draining";
         }
         "proceed"
+    }
+
+    /// Reports whether a wake cancelled this generation's drain before the
+    /// linearization point.
+    ///
+    /// Read-only, and deliberately not derived from
+    /// [`Self::drain_disposition`]: the composition root needs to know
+    /// whether the drain it must *not* finish was cancelled, which is a
+    /// different question from what a diagnostic projection reports. A
+    /// post-linearization wake never sets the flag (it resolves to
+    /// `QueueNextGeneration`/`RejectStale` instead), and a recorded terminal
+    /// ends the generation, so both are excluded here rather than reported as
+    /// a cancellation.
+    pub(crate) fn cancelled_by_wake(&self) -> bool {
+        let state = self.lock();
+        state.cancelled && state.committed.is_none() && state.terminal.is_none()
     }
 
     /// Read-only publication for Host and Watchdog over their existing

@@ -17,6 +17,10 @@
 //! Building or validating a payload performs no IO, mints no authority and
 //! proves nothing about persistence. Durable capture and readback belong to the
 //! Governor/Task Controller producer and to the Store.
+//!
+//! A retained checkpoint plus its resume-time revalidation
+//! ([`RetainedHandoffCheckpoint`]) is the Resume input the decision gate
+//! consumes instead of treating compaction as a fresh authority source.
 
 #![forbid(unsafe_code)]
 
@@ -29,7 +33,8 @@ use thiserror::Error;
 
 use crate::{
     AgentAttemptId, ContractError, HandoffAttemptIdentity, HandoffCausalLink, HandoffCheckpointId,
-    HandoffContinuity, PublicReference, RevisionId, WorkItemId, validate_collection, validate_text,
+    HandoffContinuity, HandoffId, PublicReference, RevisionId, TargetId, WorkItemId,
+    validate_collection, validate_text,
 };
 
 /// Stable contract name of the pre-compaction handoff checkpoint payload.
@@ -46,6 +51,12 @@ pub const HANDOFF_CHECKPOINT_CONTRACT_VERSION: ContractVersion = ContractVersion
 /// The reference locates a persisted checkpoint payload; it is neither the
 /// payload itself nor a persistence proof.
 pub const HANDOFF_CHECKPOINT_REFERENCE_KIND: &str = "handoff-checkpoint";
+
+/// Required [`PublicReference::kind`] of a resume-time revalidation record.
+///
+/// The revalidation names the retained checkpoint it was computed over. It is
+/// neither a fresh authority grant nor a rebuilt View (I12.17).
+pub const HANDOFF_REVALIDATION_REFERENCE_KIND: &str = "handoff-revalidation";
 
 /// Typed disposition of a unit the checkpoint cannot present as exact.
 ///
@@ -528,6 +539,533 @@ impl HandoffCheckpoint {
         }
         Ok(())
     }
+
+    /// Returns whether the dependent action stays blocked after a resume.
+    ///
+    /// A blocking critical attention item or conflict is never dropped from
+    /// the list: it is resolved, or it blocks the action that depends on it
+    /// (I12.13). Diagnostic inspection may remain available while the action
+    /// stays blocked.
+    pub fn dependent_action_blocked(&self) -> bool {
+        self.critical_items
+            .iter()
+            .any(|item| item.blocks_dependent_action)
+    }
+
+    /// Returns whether unfinished verifiers or unreconciled effects survive
+    /// the boundary, so a restart retains them instead of dropping them.
+    ///
+    /// An unreconciled operation keeps its
+    /// [`HandoffEffectDisposition::OutcomeUnknown`] disposition: a lost
+    /// acknowledgement, an expired lease or a silent retry is not proof that
+    /// the effect stopped (I7.15).
+    pub fn has_unfinished_verifiers_or_effects(&self) -> bool {
+        !self.pending_verifier_refs.is_empty()
+            || self.effects.iter().any(|effect| {
+                matches!(
+                    effect.disposition,
+                    HandoffEffectDisposition::OutcomeUnknown { .. }
+                )
+            })
+    }
+}
+
+/// Resume-time revalidation of one retained checkpoint (I12.17, I7.15).
+///
+/// The record compares the generations retained at the capture boundary
+/// against the generations the resume owner observes now. A changed member
+/// fences only the dependent permissions and content, never unrelated work:
+/// the flags below name exactly which members changed, so the resume owner
+/// rebuilds a current delta View and obtains new authority for those members
+/// instead of restamping the retained fence. Recording a change is not
+/// refusing the resume; a binding or fence-shape failure is.
+/// The five changed-flags are the I12.17-specified orthogonal generation/fence
+/// observations, not collapsible flags, so the pedantic bool-count lint is
+/// allowed here by the same precedent used across `eliot-types` contract
+/// records.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HandoffResumeRevalidation {
+    /// Identity of the retained checkpoint this revalidation was computed over.
+    pub checkpoint_id: HandoffCheckpointId,
+    /// Continuity the retained transfer supports.
+    pub continuity: HandoffContinuity,
+    /// Attempt that was running at the capture boundary.
+    pub source_attempt_id: AgentAttemptId,
+    /// Generations the resume owner observes now.
+    pub current_generations: HandoffSourceGenerations,
+    /// Whether the scope generation still matches the retained boundary.
+    pub scope_changed: bool,
+    /// Whether the world generation still matches the retained boundary.
+    pub world_changed: bool,
+    /// Whether the module generation still matches the retained boundary.
+    pub module_changed: bool,
+    /// Whether the route generation still matches the retained boundary.
+    pub route_changed: bool,
+    /// Whether the current fence still equals the retained fence.
+    pub fence_changed: bool,
+    /// Fence the resume owner observes now.
+    pub current_fence: StateFence,
+}
+
+impl HandoffResumeRevalidation {
+    /// Returns whether any retained generation changed, so dependent
+    /// permissions and content must be fenced and rebuilt from canonical
+    /// state rather than resumed under the retained fence.
+    pub fn has_changed_generation(&self) -> bool {
+        self.scope_changed || self.world_changed || self.module_changed || self.route_changed
+    }
+}
+
+/// Retained checkpoint plus its resume-time revalidation (I12.17, I7.15).
+///
+/// This is the Resume input the decision gate consumes instead of treating
+/// compaction as a fresh authority source. The resume owner carries this
+/// value and feeds its references into the phase-aware lineage check
+/// (`validate_for_phase` at `Resume` via `admit_material_decision`):
+///
+/// - the lineage `handoff` slot cites [`Self::checkpoint_ref`];
+/// - already-due effect execution and outcome records that are still
+///   unreconciled stay [`HandoffEffectDisposition::OutcomeUnknown`] here,
+///   which is the evidence behind an explicit unknown lineage slot, never a
+///   silent success;
+/// - the lineage `omissions` slot cites the retained [`HandoffKnownLoss`] and
+///   [`HandoffUnavailableMember`] entries.
+///
+/// Building or checking this value performs no IO, mints no authority and
+/// reads no owner: the current generations and fence are caller-supplied
+/// observations. When the Kernel cannot read back current authority, the
+/// caller must refuse the resume instead of calling
+/// [`Self::revalidate_for_resume`] with unobserved inputs.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedHandoffCheckpoint {
+    /// Retained complete payload from the capture boundary.
+    pub checkpoint: HandoffCheckpoint,
+    /// Causal link the retained payload is bound to.
+    pub link: HandoffCausalLink,
+    /// Attempt-identity evidence the link was admitted under.
+    pub attempt_identity: HandoffAttemptIdentity,
+    /// Resume-time revalidation of the retained payload.
+    pub revalidation: HandoffResumeRevalidation,
+}
+
+impl RetainedHandoffCheckpoint {
+    /// Revalidates a retained checkpoint for resume under current observations.
+    ///
+    /// Runs the full checkpoint-to-link binding (including the continuity
+    /// attempt-identity rule) and records the retained-to-current generation
+    /// and fence comparison. A changed generation is recorded, not refused:
+    /// the resume owner fences the dependent authority and rebuilds. A
+    /// binding mismatch or an ill-formed current fence fails closed.
+    pub fn revalidate_for_resume(
+        checkpoint: HandoffCheckpoint,
+        link: HandoffCausalLink,
+        attempt_identity: HandoffAttemptIdentity,
+        current_generations: HandoffSourceGenerations,
+        current_fence: StateFence,
+    ) -> Result<Self, HandoffCheckpointError> {
+        checkpoint.validate_binding(&link, &attempt_identity)?;
+        current_fence
+            .validate()
+            .map_err(|_| ContractError::StaleFence)?;
+        let retained_generations = checkpoint.source_generations;
+        let revalidation = HandoffResumeRevalidation {
+            checkpoint_id: checkpoint.checkpoint_id.clone(),
+            continuity: checkpoint.continuity,
+            source_attempt_id: checkpoint.source_attempt_id.clone(),
+            current_generations,
+            scope_changed: retained_generations.scope != current_generations.scope,
+            world_changed: retained_generations.world != current_generations.world,
+            module_changed: retained_generations.module != current_generations.module,
+            route_changed: retained_generations.route != current_generations.route,
+            fence_changed: checkpoint.state_fence != current_fence,
+            current_fence,
+        };
+        Ok(Self {
+            checkpoint,
+            link,
+            attempt_identity,
+            revalidation,
+        })
+    }
+
+    /// Re-checks a retained value whose fields may have been reassigned after
+    /// [`Self::revalidate_for_resume`] built it.
+    ///
+    /// Re-runs the binding, the current-fence shape and the agreement between
+    /// the revalidation record and the retained payload. A revalidation that
+    /// no longer describes its payload is refused.
+    pub fn validate(&self) -> Result<(), HandoffCheckpointError> {
+        self.checkpoint
+            .validate_binding(&self.link, &self.attempt_identity)?;
+        self.revalidation
+            .current_fence
+            .validate()
+            .map_err(|_| ContractError::StaleFence)?;
+        let retained_generations = self.checkpoint.source_generations;
+        let current_generations = self.revalidation.current_generations;
+        if self.revalidation.checkpoint_id != self.checkpoint.checkpoint_id
+            || self.revalidation.continuity != self.checkpoint.continuity
+            || self.revalidation.source_attempt_id != self.checkpoint.source_attempt_id
+            || self.revalidation.scope_changed
+                != (retained_generations.scope != current_generations.scope)
+            || self.revalidation.world_changed
+                != (retained_generations.world != current_generations.world)
+            || self.revalidation.module_changed
+                != (retained_generations.module != current_generations.module)
+            || self.revalidation.route_changed
+                != (retained_generations.route != current_generations.route)
+            || self.revalidation.fence_changed
+                != (self.checkpoint.state_fence != self.revalidation.current_fence)
+        {
+            return Err(HandoffCheckpointError::RevalidationCheckpointMismatch);
+        }
+        Ok(())
+    }
+
+    /// Returns the canonical reference the lineage `handoff` slot cites: the
+    /// checkpoint kind and identity under the retained plan revision.
+    ///
+    /// The reference locates the retained payload; like every reference here
+    /// it carries no digest of its own and proves no persistence.
+    pub fn checkpoint_ref(&self) -> Result<PublicReference, HandoffCheckpointError> {
+        let reference = PublicReference {
+            kind: HANDOFF_CHECKPOINT_REFERENCE_KIND.to_owned(),
+            id: TargetId::new(self.checkpoint.checkpoint_id.as_str())?,
+            revision: self.checkpoint.source_plan_revision.clone(),
+            digest: None,
+        };
+        reference.validate()?;
+        Ok(reference)
+    }
+
+    /// Returns the reference that names this revalidation, for the link's
+    /// `post_resume_revalidation_ref` and the lineage evidence trail.
+    pub fn revalidation_ref(&self) -> Result<PublicReference, HandoffCheckpointError> {
+        let reference = PublicReference {
+            kind: HANDOFF_REVALIDATION_REFERENCE_KIND.to_owned(),
+            id: TargetId::new(self.revalidation.checkpoint_id.as_str())?,
+            revision: self.checkpoint.source_plan_revision.clone(),
+            digest: None,
+        };
+        reference.validate()?;
+        Ok(reference)
+    }
+
+    /// Returns whether the retained checkpoint needs fresh authority before
+    /// the resume owner may issue an executable resumed session.
+    ///
+    /// Any changed generation or fence means the retained fence no longer
+    /// covers the dependent permissions and content: the resume owner must
+    /// obtain new authority for those members and rebuild a current delta
+    /// View instead of executing under the retained fence (I12.17). When
+    /// authority readback is unavailable, the resume owner must refuse the
+    /// resume rather than issue an executable session.
+    pub fn requires_fresh_authority_before_execution(&self) -> bool {
+        self.revalidation.has_changed_generation() || self.revalidation.fence_changed
+    }
+}
+
+/// Durability acceptance of one capture operation (I12.17).
+///
+/// A transport acknowledgement or a locally computed hash is not durable
+/// readback: only a Store receipt proves the checkpoint and its
+/// artifact-retention bindings survived. An unknown acceptance — typically a
+/// lost commit response — refuses destructive compaction until the same
+/// operation is reconciled.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HandoffCaptureAcceptance {
+    /// The Store returned a durable receipt for this exact checkpoint.
+    DurablyStored {
+        /// Exact receipt of the persisted checkpoint payload.
+        receipt_ref: PublicReference,
+    },
+    /// The commit response was lost, so acceptance is unknown. The checkpoint
+    /// must not be compacted under and no second checkpoint identity may be
+    /// created for the operation.
+    Unknown {
+        /// Observed cause of the unknown acceptance.
+        cause: String,
+    },
+}
+
+impl HandoffCaptureAcceptance {
+    fn validate(&self) -> Result<(), HandoffCheckpointError> {
+        match self {
+            Self::DurablyStored { receipt_ref } => {
+                receipt_ref.validate()?;
+            }
+            Self::Unknown { cause } => {
+                validate_text(cause, "capture.cause")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One registered capture operation at the controlled boundary (I12.17).
+///
+/// Every actual ELIOT-controlled compaction and resumable handoff caller
+/// registers against one value of this type: the operation carries the
+/// checkpoint identity it persists, and the acceptance proves durable
+/// readback before destructive compaction is permitted. On commit-response
+/// loss the caller reconciles the same operation instead of minting a second
+/// checkpoint identity. Registering or reconciling an operation performs no
+/// IO and proves no persistence; the Governor/Task Controller producer and
+/// the Store own the durable path.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HandoffCaptureOperation {
+    /// Identity of this capture operation.
+    pub operation_id: OperationId,
+    /// Identity of the checkpoint payload this operation persists.
+    pub checkpoint_id: HandoffCheckpointId,
+    /// Durability acceptance observed for the operation so far.
+    pub acceptance: HandoffCaptureAcceptance,
+}
+
+impl HandoffCaptureOperation {
+    /// Registers a capture operation with its first observed acceptance.
+    pub fn new(
+        operation_id: OperationId,
+        checkpoint_id: HandoffCheckpointId,
+        acceptance: HandoffCaptureAcceptance,
+    ) -> Result<Self, HandoffCheckpointError> {
+        validate_text(operation_id.as_str(), "capture.operation_id")?;
+        validate_text(checkpoint_id.as_str(), "capture.checkpoint_id")?;
+        acceptance.validate()?;
+        Ok(Self {
+            operation_id,
+            checkpoint_id,
+            acceptance,
+        })
+    }
+
+    /// Reconciles a lost commit response against the same operation.
+    ///
+    /// Refuses a different checkpoint identity: reconciling never mints a
+    /// second checkpoint for one operation.
+    pub fn reconcile(
+        &mut self,
+        checkpoint_id: &HandoffCheckpointId,
+        acceptance: HandoffCaptureAcceptance,
+    ) -> Result<(), HandoffCheckpointError> {
+        if *checkpoint_id != self.checkpoint_id {
+            return Err(
+                HandoffCheckpointError::SecondCheckpointIdentityForOperation {
+                    operation_id: self.operation_id.as_str().to_owned(),
+                },
+            );
+        }
+        acceptance.validate()?;
+        self.acceptance = acceptance;
+        Ok(())
+    }
+
+    /// Returns whether destructive compaction is permitted under this
+    /// operation: only durable readback admits it. Unknown acceptance fails
+    /// closed.
+    pub fn permits_compaction(&self) -> bool {
+        matches!(
+            self.acceptance,
+            HandoffCaptureAcceptance::DurablyStored { .. }
+        )
+    }
+
+    /// Refuses the requested compaction unless durable readback was observed.
+    pub fn require_compaction_permit(&self) -> Result<(), HandoffCheckpointError> {
+        if self.permits_compaction() {
+            Ok(())
+        } else {
+            Err(HandoffCheckpointError::CompactionWithoutDurableReadback)
+        }
+    }
+
+    /// Re-checks the operation record.
+    pub fn validate(&self) -> Result<(), HandoffCheckpointError> {
+        validate_text(self.operation_id.as_str(), "capture.operation_id")?;
+        validate_text(self.checkpoint_id.as_str(), "capture.checkpoint_id")?;
+        self.acceptance.validate()
+    }
+}
+
+/// Capability of a provider with respect to the pre-compaction boundary
+/// (I12.17).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HandoffProviderCompactionCapability {
+    /// The provider offers a controllable pre-hook the capture operation
+    /// runs under.
+    ControllablePreHook,
+    /// The provider compacts internally with no controllable pre-hook.
+    InternalCompactionWithoutPreHook,
+}
+
+/// Honestly recorded provider-compaction gap (I12.17).
+///
+/// Where a provider compacts internally without a controllable pre-hook, no
+/// checkpoint may be claimed to have preceded it. The gap is recorded here
+/// with the observed cause only — never with serialized private native
+/// reasoning or transcript — and continuation is restricted to an explicitly
+/// partial/rehydrated path; every other continuity is refused. The
+/// capability-aware adapter hook itself belongs to the actual adapter/fabric
+/// compaction-resume entrypoints, which own the provider pre-hook.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HandoffProviderGap {
+    /// Provider that compacted without a preceding capture.
+    pub provider_ref: PublicReference,
+    /// Capability observed for that provider.
+    pub capability: HandoffProviderCompactionCapability,
+    /// Observed cause of the gap.
+    pub cause: String,
+}
+
+impl HandoffProviderGap {
+    /// Validates the gap record. A gap requires internal compaction without
+    /// a controllable pre-hook: a provider that offers the hook has no gap
+    /// to record, it has a capture to run.
+    pub fn validate(&self) -> Result<(), HandoffCheckpointError> {
+        self.provider_ref.validate()?;
+        validate_text(&self.cause, "provider_gap.cause")?;
+        if self.capability != HandoffProviderCompactionCapability::InternalCompactionWithoutPreHook
+        {
+            return Err(HandoffCheckpointError::ProviderGapWithoutInternalCompaction);
+        }
+        Ok(())
+    }
+
+    /// Returns whether a transfer in the given continuity may continue under
+    /// this gap. Only an explicitly partial/rehydrated path is admitted;
+    /// `Fresh` is unaffected because it inherits no state and claims no
+    /// checkpoint. Every other continuity is refused and the dependent
+    /// action stays refused until the resume owner admits `Rehydrated`.
+    pub fn admits_continuation(&self, continuity: HandoffContinuity) -> bool {
+        matches!(
+            continuity,
+            HandoffContinuity::Rehydrated | HandoffContinuity::Fresh
+        )
+    }
+}
+
+/// Observable recovery-handoff status (I12.17).
+///
+/// The five states are the only resume outcomes a resume owner may report;
+/// each state requires the proof its name states.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HandoffResumeStatus {
+    /// The checkpoint and its artifact-retention bindings are durably stored.
+    CheckpointStored,
+    /// Destructive compaction was observed after the stored checkpoint.
+    CompactionObserved,
+    /// The checkpoint is stored but resume-time revalidation is not computed
+    /// yet.
+    RevalidationPending,
+    /// Revalidation passed under fresh authority; the bound worker may be
+    /// launched.
+    ResumeAdmitted,
+    /// The resumed worker actually executes.
+    ResumedExecution,
+}
+
+impl HandoffResumeStatus {
+    /// Position of the status on the recovery path. A resume owner advances
+    /// forward only; claiming an earlier state after a later one was
+    /// reported is refused by [`HandoffResumeIntent::advance`].
+    const fn ordinal(self) -> u8 {
+        match self {
+            Self::CheckpointStored => 0,
+            Self::CompactionObserved => 1,
+            Self::RevalidationPending => 2,
+            Self::ResumeAdmitted => 3,
+            Self::ResumedExecution => 4,
+        }
+    }
+}
+
+/// Idempotent resume intent binding one handoff to one target attempt
+/// (I12.17, I7.15).
+///
+/// Repeated resume requests reconcile the same target intent instead of
+/// launching another worker: [`Self::reconcile`] admits a repeated request
+/// for the same handoff and target attempt and refuses a stale request
+/// naming a different target. Execution is admitted only from
+/// [`HandoffResumeStatus::ResumeAdmitted`]: a repeated request observed at
+/// [`HandoffResumeStatus::ResumedExecution`] reconciles as the same intent
+/// but admits no second launch. Retained data and resources are released
+/// only by their existing owners under terminal-retention rules, never by
+/// this record.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HandoffResumeIntent {
+    /// Handoff whose resume outcome this intent binds.
+    pub handoff_id: HandoffId,
+    /// Target attempt the resume may launch, exactly once.
+    pub target_attempt_id: AgentAttemptId,
+    /// Latest reported recovery status for this intent.
+    pub status: HandoffResumeStatus,
+}
+
+impl HandoffResumeIntent {
+    /// Binds a handoff to its target attempt before any compaction is
+    /// observed. The intent starts at
+    /// [`HandoffResumeStatus::CheckpointStored`].
+    pub fn new(
+        handoff_id: HandoffId,
+        target_attempt_id: AgentAttemptId,
+    ) -> Result<Self, HandoffCheckpointError> {
+        validate_text(handoff_id.as_str(), "resume.handoff_id")?;
+        validate_text(target_attempt_id.as_str(), "resume.target_attempt_id")?;
+        Ok(Self {
+            handoff_id,
+            target_attempt_id,
+            status: HandoffResumeStatus::CheckpointStored,
+        })
+    }
+
+    /// Reconciles a repeated resume request against the same target intent.
+    ///
+    /// A request for the same handoff and target attempt is the same intent
+    /// and is admitted. A request naming a different target attempt is stale
+    /// and is refused so it cannot launch another worker.
+    pub fn reconcile(&self, request: &HandoffResumeIntent) -> Result<(), HandoffCheckpointError> {
+        if self.handoff_id != request.handoff_id
+            || self.target_attempt_id != request.target_attempt_id
+        {
+            return Err(HandoffCheckpointError::StaleResumeRequest {
+                handoff_id: request.handoff_id.as_str().to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Advances the reported status forward along the recovery path.
+    /// Regression to an earlier state is refused.
+    pub fn advance(&mut self, status: HandoffResumeStatus) -> Result<(), HandoffCheckpointError> {
+        if status.ordinal() < self.status.ordinal() {
+            return Err(HandoffCheckpointError::ResumeStatusRegression);
+        }
+        self.status = status;
+        Ok(())
+    }
+
+    /// Returns whether the bound worker may actually be launched now: only
+    /// an admitted resume launches. Every earlier state refuses, and an
+    /// already-executing intent admits no second launch.
+    pub fn admits_execution(&self) -> bool {
+        self.status == HandoffResumeStatus::ResumeAdmitted
+    }
+
+    /// Re-checks the intent record.
+    pub fn validate(&self) -> Result<(), HandoffCheckpointError> {
+        validate_text(self.handoff_id.as_str(), "resume.handoff_id")?;
+        validate_text(self.target_attempt_id.as_str(), "resume.target_attempt_id")?;
+        Ok(())
+    }
 }
 
 /// Validates a list of public references and rejects repeated units.
@@ -632,4 +1170,28 @@ pub enum HandoffCheckpointError {
     /// The link and the payload were captured under different state fences.
     #[error("the causal link was captured under a different state fence")]
     StateFenceMismatch,
+    /// The resume revalidation no longer describes the retained payload.
+    #[error("the resume revalidation does not describe the retained checkpoint payload")]
+    RevalidationCheckpointMismatch,
+    /// Destructive compaction was requested without durable readback.
+    #[error("destructive compaction is refused without durable checkpoint readback")]
+    CompactionWithoutDurableReadback,
+    /// Reconciling a capture operation named a second checkpoint identity.
+    #[error("capture operation {operation_id} cannot persist a second checkpoint identity")]
+    SecondCheckpointIdentityForOperation {
+        /// The operation the second identity was offered to.
+        operation_id: String,
+    },
+    /// A provider gap was recorded for a provider that offers the pre-hook.
+    #[error("a provider gap requires internal compaction without a controllable pre-hook")]
+    ProviderGapWithoutInternalCompaction,
+    /// A stale resume request named a different target attempt.
+    #[error("stale resume request for handoff {handoff_id} cannot launch another worker")]
+    StaleResumeRequest {
+        /// The handoff the stale request named.
+        handoff_id: String,
+    },
+    /// A resume owner reported an earlier recovery state after a later one.
+    #[error("resume status cannot regress to an earlier recovery state")]
+    ResumeStatusRegression,
 }

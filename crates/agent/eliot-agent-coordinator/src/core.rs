@@ -574,9 +574,10 @@ fn offer_class_head(
 /// no item is ever passed over.
 ///
 /// One writer per deliverable is deliberately *not* re-checked here. It is
-/// already enforced once, at the owning transition, by `plan`, `admit` and
-/// `reassign` on the Work/Action lease identity, and it cannot be violated from
-/// this side: `writer_holders` is written only where that lease is taken, and
+/// enforced once, where the Work/Action lease is taken, by `admit` and
+/// `reassign` — `plan` reserves nothing and touches no holder, so naming it
+/// here would cite a check that does not exist. It cannot be violated from this
+/// side either: `writer_holders` is written only where that lease is taken, and
 /// each of its four release sites immediately settles the releasing attempt
 /// terminally, so a scope's holder is always the only non-terminal attempt on
 /// that scope and is never a different admitted item. A second check here
@@ -684,6 +685,13 @@ fn choose_fair_head<'a, 'profile>(
 /// deliverable, rather than re-deriving holders from the attempt list. An entry
 /// whose attempt record is absent is skipped: the holder and its record are
 /// written together, so the pair cannot diverge.
+///
+/// `holder_lease_id` is the holder's stored Work/Action lease identity, read
+/// from the same record as `holder_state` and never derived from the scope
+/// string or recomputed from the attempt. Issue #1683 W4 requires that
+/// deliverable ownership rest on that lease identity rather than on a raw path
+/// string or a process-local holder alone, so the published claim carries it and
+/// a caller can name the owning lease without re-deriving one.
 fn deliverable_claims(
     attempts: &BTreeMap<AttemptId, AttemptRecord>,
     writer_holders: &BTreeMap<String, AttemptId>,
@@ -695,6 +703,7 @@ fn deliverable_claims(
             Some(DeliverableClaim {
                 mutation_scope: scope.clone(),
                 holder_attempt_id: attempt_id.clone(),
+                holder_lease_id: holder.lease_id.clone(),
                 holder_state: holder.state,
             })
         })

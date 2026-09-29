@@ -1029,7 +1029,7 @@ fn select_required(
     Ok(Ok((admitted, required_cost, fixed)))
 }
 
-fn floor_closure(
+pub(crate) fn floor_closure(
     input: &AdmissionInput,
     candidates: &BTreeMap<eliot_contracts::ArtifactId, &eliot_context_contracts::ContextCandidate>,
 ) -> Result<BTreeSet<eliot_contracts::ArtifactId>, ContextError> {

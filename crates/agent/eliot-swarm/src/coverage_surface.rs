@@ -11,11 +11,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use eliot_receipts::ProofCeiling;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::durable_dispatch::PlanDrain;
 use crate::durable_work::{BudgetAccount, DurableWorkMachine, TerminalKind, WorkUnitPhase};
+
+/// The strongest interpretation of a coverage projection emitted here.
+pub const COVERAGE_PROOF_CEILING: ProofCeiling = ProofCeiling::CandidateArtifact;
 
 /// Opaque child slot label echoed from one denominator namespace.
 ///
@@ -136,6 +140,18 @@ pub struct SwarmCoverage {
     pub budget_remaining: u64,
     /// The next safe local action. Candidate only.
     pub next_safe_action: NextSafeAction,
+}
+
+impl SwarmCoverage {
+    /// Fixed candidate-only proof ceiling for this projection.
+    ///
+    /// Expected consumer (sibling STITCH, owns the Governor/operator surface):
+    /// `bins/eliotd` swarm composition over
+    /// `crates/agent/eliot-swarm/src/coverage_surface.rs::project_coverage`.
+    #[must_use]
+    pub const fn proof_ceiling() -> ProofCeiling {
+        COVERAGE_PROOF_CEILING
+    }
 }
 
 /// Projects coverage over the machine and drain views without writing anything.

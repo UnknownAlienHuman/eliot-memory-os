@@ -706,7 +706,9 @@ dependencies = [
  "blake3",
  "eliot-agent-api",
  "eliot-contracts",
+ "eliot-evaluation-contracts",
  "eliot-process",
+ "eliot-receipts",
  "eliot-source-assurance",
  "schemars",
  "serde",
@@ -759,6 +761,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1928,6 +1931,8 @@ version = "0.1.0"
 dependencies = [
  "eliot-canonical",
  "eliot-contracts",
+ "eliot-instrument-api",
+ "eliot-reports",
  "schemars",
  "serde",
  "serde_json",
@@ -1989,6 +1994,7 @@ dependencies = [
  "eliot-reactive-context-plan",
  "eliot-read",
  "eliot-receipts",
+ "eliot-reports",
  "eliot-runtime-contracts",
  "eliot-security-contracts",
  "eliot-session",
@@ -3484,6 +3490,7 @@ dependencies = [
  "eliot-contracts",
  "eliot-host-state",
  "eliot-installation",
+ "eliot-ipc",
  "eliot-notify-core",
  "eliot-ors",
  "eliot-platform",
@@ -3585,6 +3592,7 @@ dependencies = [
  "eliot-reactive-context-plan",
  "eliot-read",
  "eliot-receipts",
+ "eliot-reports",
  "eliot-runtime-contracts",
  "eliot-security-contracts",
  "eliot-self-quality",

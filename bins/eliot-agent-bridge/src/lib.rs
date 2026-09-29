@@ -62,6 +62,10 @@ mod bridge_contract;
 mod cli_contract;
 mod kernel_activation_client;
 mod kernel_host_request_client;
+/// Issue #2899: the live stdio -> host-event -> Agent Bridge correlation. It
+/// lives in the bridge-owning process because the join verifies against the
+/// owner's own journal, and this is the only process that holds one.
+pub mod mcp_correlation;
 pub mod memory_handle_join;
 pub mod opencode_host_events;
 pub mod reactive_injection_receipts;
@@ -4705,6 +4709,11 @@ pub struct BridgeRunner {
     reactive_ledger: ReactiveInjectionLedger,
     bootstrap_session: BootstrapSession,
     bootstrap_snapshot: Option<BootstrapSnapshot>,
+    /// Bounded retention of ELIOT emission correlations awaiting a host-event
+    /// join (#2899). See [`mcp_correlation`]: it is a first-in first-out window
+    /// over records the OWNER already holds durably, never a second store, and
+    /// a rotated correlation is unknown rather than degraded.
+    correlations: mcp_correlation::CorrelationTracker,
 }
 
 /// Owner-supplied bootstrap inputs sealed to the live attach binding.
@@ -4942,6 +4951,7 @@ impl BridgeRunner {
             reactive_ledger: ReactiveInjectionLedger::new(),
             bootstrap_session: BootstrapSession::default(),
             bootstrap_snapshot: None,
+            correlations: mcp_correlation::CorrelationTracker::default(),
         })
     }
     #[must_use]

@@ -4,12 +4,15 @@
 //! the Kernel orchestration boundary. It validates a lightweight
 //! [`ToolCallIntent`] before dispatch so an expensive, model-backed, swarm,
 //! network, broad-search, or effect-capable call is rejected when it carries no
-//! intent, while cheap exact reads stay exempt.
+//! intent, while cheap exact reads stay exempt. It also compares each staging
+//! candidate against the retained per-route stage so a materially repeated
+//! call on unchanged inputs without a new expected delta surfaces a
+//! [`LoopSignal`] instead of staging as progress.
 
 #![forbid(unsafe_code)]
 
 use eliot_contracts::sha256_hex;
-use eliot_receipts::{ToolCallClass, ToolCallIntent, ToolCallRequest};
+use eliot_receipts::{LoopSignal, ToolCallClass, ToolCallIntent, ToolCallRequest};
 
 /// Route fingerprint for tool calls admitted through the local-read boundary.
 fn route_fingerprint(envelope: &eliot_protocol::HostRequestEnvelope) -> String {
@@ -121,4 +124,28 @@ pub(crate) fn authorize_pre_dispatch(
 /// Returns whether the tool class requires an intent before dispatch.
 pub(crate) fn requires_intent(name: &str) -> bool {
     call_class(name).is_some_and(eliot_receipts::ToolCallClass::requires_intent)
+}
+
+/// Reports a staging-time loop/no-progress signal for a materially repeated call.
+///
+/// Rebuilds each retained candidate's [`ToolCallRequest`] from its staged
+/// envelope and tool bytes and applies
+/// [`eliot_receipts::detect_repeat_without_progress`] against the staging
+/// candidate. Returns the first [`LoopSignal`] when tool definition, route
+/// fingerprint, and inputs are identical without a new expected delta, and
+/// `None` for non-expensive tools, unreconstructible pairs, or fresh
+/// inputs/routes/deltas. Pure and total: reads only, never stages, never fails.
+pub(crate) fn staged_repeat_without_progress<'a>(
+    mut retained: impl Iterator<
+        Item = (
+            &'a eliot_protocol::HostRequestEnvelope,
+            &'a serde_json::Value,
+        ),
+    >,
+    current: &ToolCallRequest,
+) -> Option<LoopSignal> {
+    retained.find_map(|(envelope, tool)| {
+        let previous = build_tool_call_request(envelope, tool)?;
+        eliot_receipts::detect_repeat_without_progress(&previous, current)
+    })
 }

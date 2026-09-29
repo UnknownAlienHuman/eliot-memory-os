@@ -11,7 +11,7 @@ mod policy;
 mod synthesis;
 
 pub use policy::ConceptPolicy;
-pub use synthesis::{ConceptDecision, handler_port, propose_concept_or_abstraction};
+pub use synthesis::{handler_port, propose_concept_or_abstraction};
 
 /// Stable handler identity for the single `Concept` wire kind.
 pub const HANDLER_ID: &str = "eliot-dreamer-concept";

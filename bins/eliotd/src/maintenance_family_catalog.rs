@@ -407,8 +407,8 @@ pub struct MaintenanceResultObservation {
     pub receipt_refs: &'static [&'static str],
 }
 
-/// The exact symbols that stop a maintenance start from becoming a Durable Job
-/// request, one variant per missing capability.
+/// The exact owner inputs or route that still stop a maintenance start from
+/// becoming a Durable Job request, one variant per missing capability.
 ///
 /// These are not cautions. Each is a verified absence, and they apply to all
 /// fifteen families because the admission they block is the shared I14.22
@@ -419,7 +419,6 @@ pub enum MaintenanceAdmissionBlocker {
     /// `owners(&self) -> &GovernorOwners<P>`; there is no `owners_mut`, so
     /// `eliot_maintenance::MaintenanceController::admit(&mut self, ..)` cannot
     /// be reached from `eliotd`.
-    MutableOwnerAccess,
     /// `MaintenanceController::admit` requires an
     /// `eliot_runtime_contracts::RuntimeLease`; no `bins/eliotd` source
     /// constructs, retains, or renews one.
@@ -468,9 +467,6 @@ impl MaintenanceAdmissionBlocker {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::MutableOwnerAccess => {
-                "eliot_governor::GovernorComposition::owners_mut is absent: composition.rs exposes only owners(&self) -> &GovernorOwners<P>, and eliot_maintenance::MaintenanceController::admit takes &mut self"
-            }
             Self::RuntimeLease => {
                 "eliot_runtime_contracts::RuntimeLease: eliot_maintenance::MaintenanceController::admit requires one and no bins/eliotd source constructs, retains, or renews it"
             }
@@ -487,7 +483,6 @@ impl MaintenanceAdmissionBlocker {
 /// Every family shares the same Durable Job admission blockers, because the
 /// admission they block is shared.
 pub const DURABLE_JOB_ADMISSION_BLOCKERS: &[MaintenanceAdmissionBlocker] = &[
-    MaintenanceAdmissionBlocker::MutableOwnerAccess,
     MaintenanceAdmissionBlocker::RuntimeLease,
     MaintenanceAdmissionBlocker::BudgetAuthority,
     MaintenanceAdmissionBlocker::MaintenanceJobWire,
@@ -1123,7 +1118,7 @@ impl MaintenanceFamilyEntry {
         &self,
         decision: &AutomationTriggerDecision,
         observed: MaintenanceObservedEvidence,
-    ) {
+    ) -> MaintenanceFamilyDecision {
         let mut recorded = self.decide(decision);
         recorded.bind_observed(observed);
         let route = recorded.route;
@@ -1164,6 +1159,7 @@ impl MaintenanceFamilyEntry {
             scope = %crate::diagnostics::sanitize_identity(&recorded.scope_ref),
             recommendation = %recorded.recommendation.text(),
         );
+        recorded
     }
 }
 

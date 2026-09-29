@@ -518,6 +518,63 @@ fn require_stopped_scm_contour(
     ))
 }
 
+/// Refuses a new canary admission for a generation already under governed
+/// canary removal.
+///
+/// This is the admission fence read from the owner side, not from the removal
+/// side. A removal that has not reached `COMPLETED` is still retiring that
+/// generation: staging a new pending activation for it would admit a canary the
+/// installation owner is concurrently deleting, so the admission is refused here
+/// before any registry CAS is attempted. The comparison is against that
+/// record's own stage, not a flag, a timestamp or a caller-supplied value, and
+/// the loaded record is validated through its own validator before its stage is
+/// trusted.
+///
+/// The removal identity is keyed by the transaction that ORIGINALLY INSTALLED
+/// the target generation, exactly as `plan_canary_removal` derives it from the
+/// approved generation's activation approval. It is therefore resolved here
+/// from that same owner projection rather than from the incoming transaction's
+/// own id: a new canary admission is a distinct install transaction, so keying
+/// the lookup on it could never collide with the removal record and the fence
+/// would admit unconditionally. An ambiguous generation is refused instead of
+/// resolved, and a generation with no approved-generation binding is not a
+/// removal target, because planning requires that binding.
+fn refuse_fenced_canary_admission(
+    projection: &super::ApprovedGenerationRegistry,
+    transaction_store: &RedbInstallationTransactionStore,
+    transaction: &InstallationTransaction,
+) -> Result<(), InstallationError> {
+    let generation = &transaction.candidate_manifest.generation;
+    let mut bound = projection
+        .generations()
+        .iter()
+        .filter(|entry| &entry.manifest.generation == generation);
+    let Some(entry) = bound.next() else {
+        return Ok(());
+    };
+    if bound.next().is_some() {
+        return Err(InstallationError::Duplicate {
+            kind: "approved generation".to_owned(),
+            identity: generation.as_str().to_owned(),
+        });
+    }
+    let install_transaction_id = entry.approval.transaction_id();
+    let Some(removal) =
+        transaction_store.load_canary_removal_for_generation(install_transaction_id, generation)?
+    else {
+        return Ok(());
+    };
+    removal.validate()?;
+    if removal.stage != super::CanaryRemovalStage::Completed {
+        return Err(InstallationError::IncompleteObservation(format!(
+            "generation {} is under governed canary removal {}; a new activation is refused for a fenced canary",
+            generation.as_str(),
+            removal.removal_transaction_id.as_str()
+        )));
+    }
+    Ok(())
+}
+
 impl RedbInstallationRegistry {
     fn pending_projection_matches(
         &self,
@@ -585,6 +642,11 @@ impl RedbInstallationRegistry {
             .activation_projection_intent()
             .ok_or(InstallationError::IdentityConflict)?;
         intent.validate_against_transaction(transaction)?;
+        // The fence is resolved against the registry's own current approved
+        // generation projection, so the removal identity it looks up is the one
+        // planning would have written, and the read happens before any registry
+        // CAS below can stage a pending activation.
+        refuse_fenced_canary_admission(&self.load()?, transaction_store, transaction)?;
         if self.pending_projection_matches(transaction, approval)? {
             return Ok(());
         }

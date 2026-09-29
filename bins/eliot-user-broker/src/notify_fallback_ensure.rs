@@ -4,9 +4,10 @@
 //! session, it ensures the signed Task Scheduler fallback is registered
 //! against the installer-published declaration. The declaration itself is
 //! installer-published (Host Phase-B per-user setup); this trigger never
-//! fabricates one — absence skips explicitly. Registration replays the
-//! existing notify route, which re-verifies the pinned artifact and the live
-//! caller identity before touching the scheduler.
+//! fabricates one — absence skips explicitly, and a declaration this broker
+//! cannot read is *not* absence, so it defers instead. Registration replays
+//! the existing notify route, which re-verifies the pinned artifact and the
+//! live caller identity before touching the scheduler.
 //!
 //! The ensure is best-effort and infallible by design: fallback delivery is
 //! optional next to normal User-Broker launch, so a deferred ensure must
@@ -26,12 +27,31 @@ pub struct NotifyFallbackRegistration {
     pub verifier_sha256: String,
 }
 
+/// What the protected declaration path reports to the ensure.
+///
+/// The contour is per user, so a declaration published for one interactive
+/// user is unreadable from another user's broker. A presence probe that
+/// collapses every error into "absent" would report that as
+/// `skipped_no_declaration` — a state that reads as "nothing was published"
+/// and that never changes, hiding a real registration fault (I11.7: a
+/// perpetually deferred fallback stays visible). Absence and unreadability are
+/// therefore separate observations, never one boolean.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NotifyFallbackDeclaration {
+    /// The declaration file is present at the protected path.
+    Present,
+    /// No declaration file exists at the protected path.
+    Absent,
+    /// The protected path could not be probed, so presence is unknown.
+    Unreadable,
+}
+
 /// Injected platform effect seam for the ensure. Production uses
 /// [`LiveNotifyFallbackEffects`]; tests inject fakes with scripted
 /// presence/registration outcomes and zero machine effects.
 pub trait NotifyFallbackEffects {
     /// Whether an installer-published declaration is present (read-only).
-    fn declaration_present(&self) -> bool;
+    fn declaration_present(&self) -> NotifyFallbackDeclaration;
     /// Registers the signed fallback against the published declaration.
     fn register(&self) -> Result<NotifyFallbackRegistration, CompositionError>;
 }
@@ -41,11 +61,24 @@ pub trait NotifyFallbackEffects {
 pub struct LiveNotifyFallbackEffects;
 
 impl NotifyFallbackEffects for LiveNotifyFallbackEffects {
-    fn declaration_present(&self) -> bool {
-        eliot_platform_windows::protected_program_data_path(
+    /// Probes the protected declaration path and reads the error kind rather
+    /// than collapsing it: `Path::exists` reports every failure — a denied
+    /// traversal, a dangling reparse point, a reparse loop — as "absent",
+    /// which would make a per-user contour this broker cannot traverse
+    /// indistinguishable from a contour that was never published.
+    fn declaration_present(&self) -> NotifyFallbackDeclaration {
+        let Ok(path) = eliot_platform_windows::protected_program_data_path(
             "Eliot/notify/watchdog-verification.json",
-        )
-        .is_ok_and(|path| std::path::Path::new(&path).exists())
+        ) else {
+            return NotifyFallbackDeclaration::Unreadable;
+        };
+        match std::fs::metadata(&path) {
+            Ok(_) => NotifyFallbackDeclaration::Present,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                NotifyFallbackDeclaration::Absent
+            }
+            Err(_) => NotifyFallbackDeclaration::Unreadable,
+        }
     }
 
     fn register(&self) -> Result<NotifyFallbackRegistration, CompositionError> {
@@ -100,16 +133,33 @@ impl NotifyFallbackEnsure {
     }
 }
 
+/// Stable deferral code for a declaration path this broker could not probe.
+/// It is a distinct code rather than a reused one so the operator can tell
+/// "the installer published nothing" from "the protected contour is not
+/// readable as this user".
+const DECLARATION_UNREADABLE: &str = "DECLARATION_UNREADABLE";
+
 /// Ensures fallback registration through the injected effect seam.
 ///
-/// Absence skips explicitly; registration failure defers with a stable code.
+/// Absence skips explicitly; an unprobeable declaration and a registration
+/// failure both defer with a stable code, so a fault in the protected
+/// contour stays visible instead of reading as "nothing was published".
 /// This function cannot fail: fallback delivery is optional next to normal
 /// launch, and broker startup must not depend on it.
 pub fn ensure_notify_fallback_registered(
     effects: &impl NotifyFallbackEffects,
 ) -> NotifyFallbackEnsure {
-    if !effects.declaration_present() {
-        return NotifyFallbackEnsure::SkippedNoDeclaration;
+    match effects.declaration_present() {
+        NotifyFallbackDeclaration::Absent => return NotifyFallbackEnsure::SkippedNoDeclaration,
+        // Presence is unknown, not disproven. `SkippedNoDeclaration` would
+        // claim the installer published nothing and stop retrying for a
+        // different reason; deferring keeps the outcome honest and retried.
+        NotifyFallbackDeclaration::Unreadable => {
+            return NotifyFallbackEnsure::Deferred {
+                reason: DECLARATION_UNREADABLE,
+            };
+        }
+        NotifyFallbackDeclaration::Present => {}
     }
     match effects.register() {
         Ok(registration) => NotifyFallbackEnsure::Registered {
@@ -144,13 +194,13 @@ mod tests {
     use super::*;
 
     struct FakeEffects {
-        present: bool,
+        declaration: NotifyFallbackDeclaration,
         fail_register: bool,
     }
 
     impl NotifyFallbackEffects for FakeEffects {
-        fn declaration_present(&self) -> bool {
-            self.present
+        fn declaration_present(&self) -> NotifyFallbackDeclaration {
+            self.declaration
         }
 
         fn register(&self) -> Result<NotifyFallbackRegistration, CompositionError> {
@@ -167,7 +217,7 @@ mod tests {
     #[test]
     fn absent_declaration_skips_without_registering() {
         let effects = FakeEffects {
-            present: false,
+            declaration: NotifyFallbackDeclaration::Absent,
             fail_register: true,
         };
         assert_eq!(
@@ -179,7 +229,7 @@ mod tests {
     #[test]
     fn present_declaration_registers_task_evidence() {
         let effects = FakeEffects {
-            present: true,
+            declaration: NotifyFallbackDeclaration::Present,
             fail_register: false,
         };
         assert_eq!(
@@ -194,7 +244,7 @@ mod tests {
     #[test]
     fn registration_failure_defers_with_stable_code() {
         let effects = FakeEffects {
-            present: true,
+            declaration: NotifyFallbackDeclaration::Present,
             fail_register: true,
         };
         assert_eq!(

@@ -1902,12 +1902,14 @@ impl KernelComposition {
     ) -> Result<Frame, TransportError> {
         observe_daemon_request("kernel.daemon_request_received", "attempt");
         observe_daemon_operation(trusted_daemon_operation(operation), "received");
+        let mut subordinate_terminal_emitted = false;
         let result = Box::pin(self.execute_daemon_request_inner(
             session,
             request_id,
             operation,
             &payload,
             request_identity.as_ref(),
+            &mut subordinate_terminal_emitted,
         ))
         .await;
         match &result {
@@ -1938,7 +1940,16 @@ impl KernelComposition {
                     // the terminal below stays the single designated terminal.
                     observe_daemon_request("kernel.daemon_cancel_observed", "cancelled");
                 }
-                super::kernel_diagnostics::observe_terminal_error(daemon_terminal_code(error));
+                // F-LOG-KERNEL-1 (#897 T20): a failed receipt sub-dispatch
+                // already owns that operation's single designated terminal,
+                // so a second terminal here would inflate one failure into
+                // two records. Pre-match gates and the post-match frame
+                // build emit no subordinate terminal, so they still
+                // terminalise here: exactly one terminal either way. The
+                // fenced observations above stay unconditional.
+                if !subordinate_terminal_emitted {
+                    super::kernel_diagnostics::observe_terminal_error(daemon_terminal_code(error));
+                }
                 observe_daemon_request("kernel.daemon_request_cleanup", "fenced");
             }
         }
@@ -1986,6 +1997,7 @@ impl KernelComposition {
         operation: &str,
         payload: &serde_json::Value,
         request_identity: Option<&RequestIdentity>,
+        subordinate_terminal_emitted: &mut bool,
     ) -> Result<Frame, TransportError> {
         #[cfg(windows)]
         if operation == USER_AUTOMATION_OPERATOR_OPERATION {
@@ -2169,7 +2181,17 @@ impl KernelComposition {
             NOTIFICATION_STATE_READ_OPERATION => {
                 Box::pin(self.notification_state_read_operation(session, payload.clone())).await
             }
-            "receipt" => store_receipt_dispatch::dispatch(self, session, payload.clone()).await,
+            "receipt" => {
+                // F-LOG-KERNEL-1 (#897 T20): only a dispatch failure carries
+                // the subordinate designated terminal, so only that leg
+                // transfers terminal ownership to the sub-dispatch.
+                let outcome =
+                    store_receipt_dispatch::dispatch(self, session, payload.clone()).await;
+                if outcome.is_err() {
+                    *subordinate_terminal_emitted = true;
+                }
+                outcome
+            }
             "store_named" => self.store_named_operation(session, payload.clone()).await,
             "local_read" => self.local_read_operation(session, payload.clone()).await,
             "daemon_degraded" => {
@@ -3520,6 +3542,13 @@ impl KernelComposition {
         Self::progress_answer_envelope(None, None, Some(error.code()), &proof, &accepted)
     }
 
+    #[cfg(windows)]
+    fn supervision_kernel_artifact(&self) -> Result<&str, TransportError> {
+        self.kernel_artifact_sha256
+            .as_deref()
+            .ok_or(TransportError::SessionFenced)
+    }
+
     /// Drives one per-tick progress submit from observed daemon evidence
     /// through the typed renewal route (Implements #88, wave 3).
     ///
@@ -3581,6 +3610,7 @@ impl KernelComposition {
             .supervision_lease_authority
             .as_ref()
             .ok_or(TransportError::SessionFenced)?;
+        let artifact = self.supervision_kernel_artifact()?;
         let renewal = Self::renew_current_supervision_with_progress(
             authority.as_ref(),
             &contour,
@@ -3588,6 +3618,7 @@ impl KernelComposition {
             &mut progress,
             &SUPERVISION_LEASE_RENEWAL_POLICY,
             unix_ms(),
+            artifact,
         );
         let (snapshot, decision, receipt) = match renewal {
             Ok(decided) => decided,
@@ -6390,7 +6421,16 @@ impl KernelComposition {
             (gate_outcome, pending_journal)
         };
         if let Some(snapshot) = pending_journal {
-            persist_pre_stage_corrections(&self.work_root, &snapshot);
+            // Write-ahead and best-effort: the helper below acknowledges the
+            // exact saved revision only after the rename commits, so a failed
+            // save stays pending and is offered again by the next take. The
+            // typed outcome is observed here but never fails the write whose
+            // retain it records.
+            let _persist_outcome = persist_pre_stage_corrections(
+                &self.work_root,
+                &self.pre_stage_identity_cache,
+                &snapshot,
+            );
         }
         let verified_correction = match gate_outcome {
             Err(rejection) => {
@@ -6430,8 +6470,9 @@ impl KernelComposition {
                 &campaign_source_publications,
             )
         {
-            return Ok(Self::store_error_response_text(
+            return Ok(Self::store_staging_refusal_response(
                 "write_receipt",
+                campaign_source_operation_id.as_str(),
                 &error.to_string(),
             ));
         }
@@ -8296,6 +8337,48 @@ impl KernelComposition {
         }
     }
 
+    /// Renders one refused pre-call durable staging attempt as the operation's
+    /// error response (issue #1681 W4, I5.6, I14.4).
+    ///
+    /// This refusal is reached only BEFORE any possible Store call: the ORS
+    /// reservation above is the durable intent record that must precede every
+    /// canonical send on this route, so its failure means the complete opaque
+    /// operation was not durably staged. `I5.2` therefore forbids
+    /// `ACCEPTED_PENDING` here, and this response does not claim it: it reports
+    /// `STORAGE_BACKPRESSURE` (the `I14.4` name for "no durable staging was
+    /// available") and carries no stage receipt, no poll handle, and no
+    /// resubmission instruction, because nothing was staged to poll.
+    ///
+    /// The exact admitted operation identity is preserved verbatim so the caller
+    /// retries THIS operation rather than a fresh one, and the ORS refusal text
+    /// is carried through unchanged instead of being replaced with a generic
+    /// error string. It is not read from the absence of a receipt: this arm is
+    /// entered only on a real `reserve_campaign_source_publications` error, so
+    /// the durable staging attempt is known to have failed rather than inferred
+    /// from a later check being absent.
+    #[cfg(windows)]
+    fn store_staging_refusal_response(
+        kind: &str,
+        operation_id: &str,
+        refusal: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "status": "error",
+            "code": "STORAGE_BACKPRESSURE",
+            "reason": refusal,
+            "value": { "kind": kind, "value": null },
+            "recovery": {
+                "staging": {
+                    "operation_id": operation_id,
+                    "preserve_operation_id": true,
+                    "accepted_pending": false,
+                    "stage_receipt": serde_json::Value::Null,
+                    "poll_handle": serde_json::Value::Null,
+                },
+            },
+        })
+    }
+
     #[cfg(windows)]
     fn store_read_failure_response(kind: &str, error: &NamedReadGatewayError) -> serde_json::Value {
         if matches!(error, NamedReadGatewayError::Store(StoreError::Unavailable)) {
@@ -9037,19 +9120,23 @@ fn pre_stage_correction_journal_path(work_root: &std::path::Path) -> std::path::
 /// Restores retained refusals from the Kernel-owned durable pre-stage
 /// journal into a freshly started, still-empty gate cache (issue #1796 F1).
 ///
-/// Merging is a union over deterministic records, so a retain that landed
-/// after the journal was read is never lost by the merge. Best-effort: a
-/// missing or unreadable journal starts empty, which is exactly the
-/// pre-journal behavior, and a cache that already holds a live refusal is
-/// never overwritten by stale disk state. No store, receipt, or envelope
-/// format is touched.
+/// A legitimate first-use absent journal restores nothing, which is exactly
+/// the pre-journal behavior. An existing journal that cannot be read,
+/// decoded, or validated leaves the cache unrestored instead of being
+/// claimed as an empty cache: it is re-read on the next request, and until
+/// then the gate issues no correction lineage at all rather than stamping
+/// an unproven one. A cache that already holds a live refusal is never
+/// overwritten by stale disk state. No store, receipt, or envelope format
+/// is touched.
 #[cfg(windows)]
 fn restore_pre_stage_corrections(
     work_root: &std::path::Path,
     cache: &std::sync::Mutex<eliot_kernel_service::PreStageIdentityCache>,
 ) {
-    let Ok(bytes) = std::fs::read(pre_stage_correction_journal_path(work_root)) else {
-        return;
+    let bytes = match std::fs::read(pre_stage_correction_journal_path(work_root)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(_) => return,
+        Ok(bytes) => bytes,
     };
     let Ok(snapshot) =
         serde_json::from_slice::<eliot_kernel_service::PreStageIdentitySnapshot>(&bytes)
@@ -9060,8 +9147,31 @@ fn restore_pre_stage_corrections(
         return;
     };
     if guard.is_empty() {
-        guard.restore(snapshot);
+        // Validated merge: an inconsistent snapshot is refused without
+        // partial mutation, so the cache stays empty for the next attempt.
+        let _ = guard.restore(snapshot);
     }
+}
+
+/// Typed outcome of one durable pre-stage journal write attempt (issue
+/// #1796 AUD2): a file-write attempt is reported, never treated as a
+/// persistence acknowledgement.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JournalPersistOutcome {
+    /// The rename committed and the exact saved revision was acknowledged.
+    Persisted,
+    /// The snapshot could not be encoded; nothing reached the disk.
+    SerializeFailed,
+    /// The journal directory could not be prepared; nothing was written.
+    JournalDirUnreachable,
+    /// The temporary journal file could not be written.
+    JournalWriteFailed,
+    /// The temporary journal file could not be committed over the journal.
+    JournalCommitFailed,
+    /// A newer retain landed while this save was in flight; the older save
+    /// retired nothing and wrote nothing over the newer state.
+    Superseded,
 }
 
 /// Persists retained refusals to the Kernel-owned durable pre-stage journal
@@ -9070,28 +9180,51 @@ fn restore_pre_stage_corrections(
 /// Called write-ahead of the commit the retain authorizes, so a restart
 /// between commit and response still replays the lineage. Best-effort: a
 /// failed write keeps the in-memory behavior and never fails the write it
-/// records. The tmp-plus-rename keeps a crash from leaving a half-written
-/// journal behind.
+/// records. The pending journal stays pending until its exact revision is
+/// acknowledged after the rename commits, so a failed save is offered again
+/// instead of being forgotten; the revision comparison also keeps an older
+/// in-flight save from overwriting newer retained refusals. The
+/// tmp-plus-rename keeps a crash from leaving a half-written journal
+/// behind.
 #[cfg(windows)]
 fn persist_pre_stage_corrections(
     work_root: &std::path::Path,
+    cache: &std::sync::Mutex<eliot_kernel_service::PreStageIdentityCache>,
     snapshot: &eliot_kernel_service::PreStageIdentitySnapshot,
-) {
+) -> JournalPersistOutcome {
+    let pending = match cache.lock() {
+        Ok(guard) => guard.pending_journal_revision(),
+        Err(_) => return JournalPersistOutcome::Superseded,
+    };
+    if pending != Some(snapshot.revision()) {
+        return JournalPersistOutcome::Superseded;
+    }
     let Ok(bytes) = serde_json::to_vec_pretty(snapshot) else {
-        return;
+        return JournalPersistOutcome::SerializeFailed;
     };
     let path = pre_stage_correction_journal_path(work_root);
     if path
         .parent()
         .is_some_and(|dir| std::fs::create_dir_all(dir).is_err())
     {
-        return;
+        return JournalPersistOutcome::JournalDirUnreachable;
     }
     let tmp = path.with_extension("json.tmp");
     if std::fs::write(&tmp, &bytes).is_err() {
-        return;
+        return JournalPersistOutcome::JournalWriteFailed;
     }
-    let _ = std::fs::rename(&tmp, &path);
+    if std::fs::rename(&tmp, &path).is_err() {
+        return JournalPersistOutcome::JournalCommitFailed;
+    }
+    let acknowledged = match cache.lock() {
+        Ok(mut guard) => guard.acknowledge_journal_save(snapshot.revision()),
+        Err(_) => false,
+    };
+    if acknowledged {
+        JournalPersistOutcome::Persisted
+    } else {
+        JournalPersistOutcome::Superseded
+    }
 }
 fn store_apply_response(
     receipt: &WriteReceipt,

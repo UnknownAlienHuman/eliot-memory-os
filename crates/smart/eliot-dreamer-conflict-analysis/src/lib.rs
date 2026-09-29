@@ -68,6 +68,34 @@
 //! not qualify equality, difference, prediction support, intervention, or
 //! causal attribution. No legacy bytes are deserialized into a stronger shape.
 //!
+//! # Owner map and what production wiring must supply
+//!
+//! This cell CONSUMES owner-issued records and never acquires, upgrades, or
+//! reissues one. The producer and authoritative identity for each class is
+//! recorded in the owner-map table above the [`SourceMemberRecord`] type. The
+//! runtime producer must supply, through [`OwnerRecords`]:
+//!
+//! - one [`SourceMemberRecord`] per `ConflictSet` position whose owner
+//!   retained bytes, an immutable handle, a canonical digest, a source
+//!   revision/snapshot, and the current task, scope, and fence;
+//! - one [`OwnerComparison`] per compared pair, carrying a single
+//!   [`OwnerComparisonProfile`] and one [`DimensionObservation`] per source per
+//!   canonical dimension. A caller submits no `Equal`/`Differing` verdict:
+//!   [`CompatibilityRelation`] is derived from the admitted values;
+//! - one [`CausalEvidenceRecord`] per causal or predictive claim, carrying the
+//!   mechanism claim identity and revision, the falsifier specification and its
+//!   observed status, the matched control and the competent evaluator result,
+//!   the intervention execution and receipt where one is claimed, the
+//!   rival/confounder denominator with its omissions, and the retained
+//!   [`EvidenceRecord`] envelopes.
+//!
+//! Absent, stale, mixed-fence, or incomplete owner records are an explicit
+//! inert result: the relation stays [`CompatibilityRelation::Ambiguous`], the
+//! causal state stays [`CausalClaimState::Unknown`], the valid observations are
+//! still preserved, and the named gap travels with the candidate. That is the
+//! whole of the owner-unavailable path — there is no fetch, no retry, no
+//! fallback owner, and no acquisition surface here.
+//!
 //! Test coverage note: 65 of 68 `WORK_UNIT_CASE 673/*` cases execute here
 //! (673/1 valid completes, 673/2 wrong job and scope fail closed, 673/3
 //! empty and single position are not conflicts, 673/5 duplicate and changed
@@ -140,7 +168,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use eliot_contracts::{canonical_json_bytes, sha256_hex};
+use eliot_contracts::{StateFence, canonical_json_bytes, fences_match_exact, sha256_hex};
 use eliot_dreamer_contracts::{
     CurationRejectionCode, GroundedDreamDraft, PossibleResultSchema, PreservationDimension,
     ProbeObjective, ResultTarget, ResultUpdate, ValidatedCurationItem, ValidatedDreamDraft,
@@ -148,6 +176,10 @@ use eliot_dreamer_contracts::{
 };
 use eliot_epistemic_contracts::{
     ArgumentAcceptability, ConflictKind, ConflictLifecycle, ConflictSet,
+};
+use eliot_evidence::{
+    Assertability, EpistemicStatus, EvidenceAuthority, EvidenceCoverage, EvidenceEnvelope,
+    EvidenceFreshness,
 };
 
 // ---------------------------------------------------------------------------
@@ -186,9 +218,23 @@ pub const MAX_COMPARISONS: usize = 64;
 pub const MAX_CAUSAL_CLAIMS: usize = 64;
 /// Canonical dimensions every supplied comparison must cover exactly once.
 pub const EXPECTED_COMPARISON_DIMENSIONS: usize = 8;
+/// Maximum owner-issued source members admitted in one analysis.
+pub const MAX_SOURCE_MEMBERS: usize = 64;
+/// Maximum owner-issued causal evidence records admitted in one analysis.
+pub const MAX_CAUSAL_EVIDENCE_RECORDS: usize = 64;
+/// Maximum evidence envelopes bound to one causal evidence record.
+pub const MAX_ENVELOPES_PER_RECORD: usize = 16;
+/// Maximum retained source bytes per owner-issued source member.
+pub const MAX_RETAINED_SOURCE_BYTES: usize = 65_536;
+/// Maximum owner-issued comparison profile descriptors.
+pub const MAX_PROFILE_DESCRIPTORS: usize = 8;
+/// Maximum bytes for one owner-issued profile definition.
+pub const MAX_PROFILE_DEFINITION_BYTES: usize = 16_384;
+/// Maximum normalization rules carried by one owner-issued profile.
+pub const MAX_NORMALIZATION_RULES: usize = 16;
 
 /// Routing-only proof ceiling carried by every emitted candidate.
-pub const CONFLICT_PROOF_NOTE: &str = "a-39 candidate-only aggregation: bounded rival analysis preserved; legacy v1 comparison and causal declarations remain unverified and cannot qualify equality, difference, prediction, intervention, or causality; no Concilium planning, vote tally, source acquisition, probe execution, mutation, authority, effect, store, governor, model, clock, or finish";
+pub const CONFLICT_PROOF_NOTE: &str = "a-39 candidate-only aggregation: bounded rival analysis preserved; legacy v1 comparison and causal declarations remain unverified and never qualify equality, difference, prediction, intervention, or causality; owner-record v2 relations and causal states are derived only from admitted owner source, profile, value, and evidence records and never exceed their evidence, coverage, or authority ceiling; no Concilium planning, vote tally, source acquisition, probe execution, mutation, authority, effect, store, governor, model, clock, or finish";
 
 // ---------------------------------------------------------------------------
 // Small pure helpers (no ambient clock, no allocation of authority).
@@ -587,6 +633,774 @@ pub struct SuppliedComparison {
     pub right_source: String,
     /// Exactly one entry per canonical dimension.
     pub dimensions: Vec<DimensionComparison>,
+}
+
+// ---------------------------------------------------------------------------
+// Owner-record contract (issue #2869, algorithm steps 1-6 and 8).
+//
+// Every record below is CONSUMED, never acquired or upgraded, by this cell. The
+// producer and the authoritative identity for each class are:
+///
+/// | record | producer | authoritative identity |
+///// |---|---|---|
+/// | [`SourceMemberRecord`] | the source owner that retained the bytes | `position_source` + `record_digest` + `source_revision` under one `state_fence` |
+/// | [`OwnerComparisonProfile`] | the normalization/comparison profile owner | `profile_id` + `owner` + `definition_digest` |
+/// | [`DimensionObservation`] | the profile owner, applied to one source member | `source` + `dimension` + `source_member_digest` |
+/// | [`EvidenceRecord`] | the evidence-source owner | `evidence_id` + `envelope` provenance + `receipt_digest` |
+/// | [`CausalEvidenceRecord`] | the evaluator/verifier owner | `source_handle` + `mechanism.claim_id` + fence |
+///
+/// A-39 reads those identities, validates them against the item's own
+/// task/scope/fence and retained bytes, and derives no stronger state than the
+/// records support. It never mints, upgrades, or reissues one.
+/// ---------------------------------------------------------------------------
+/// One versioned source member binding a `ConflictSet` position to the
+/// immutable material the source owner retained for it.
+///
+/// The retained bytes and the owner-recorded [`Self::record_digest`] are the
+/// pair that matters: the digest is the value the owner recorded, and the bytes
+/// are what it retained, so a member whose bytes do not reproduce its recorded
+/// digest is refused rather than admitted as merely well-formed. This cell
+/// acquires nothing; it only checks that the record it was handed is
+/// self-consistent and bound to the exact position it names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceMemberRecord {
+    /// `ConflictSet` position source handle this member is bound to.
+    pub position_source: String,
+    /// Authoritative owner identity that retained this material.
+    pub source_owner: String,
+    /// Immutable artifact or retained-handle reference for the material.
+    pub retained_handle: String,
+    /// Exact bytes the source owner retained for this position.
+    pub retained_bytes: Vec<u8>,
+    /// Canonical digest the source owner RECORDED for the retained bytes.
+    ///
+    /// This is the original recorded value. It is never recomputed here and
+    /// substituted for the check: the retained bytes are compared against it.
+    pub record_digest: String,
+    /// Source revision or snapshot the material was read at.
+    pub source_revision: String,
+    /// Immutable snapshot identity behind the revision.
+    pub source_snapshot: String,
+    /// Task the member was admitted under.
+    pub task_id: String,
+    /// `WorkScope` the member was admitted under.
+    pub scope_id: String,
+    /// Fence the member was admitted under.
+    pub state_fence: StateFence,
+}
+
+impl SourceMemberRecord {
+    /// Validates the intrinsic shape and the recorded-digest/retained-bytes
+    /// binding of one source member.
+    ///
+    /// The digest is the owner-recorded value; the retained bytes must reproduce
+    /// it. A member that merely carries a well-formed digest is not admitted.
+    pub fn validate(&self) -> Result<(), ConflictAnalysisError> {
+        check_handle(&self.position_source, "source_member.position_source")?;
+        check_handle(&self.source_owner, "source_member.source_owner")?;
+        check_handle(&self.retained_handle, "source_member.retained_handle")?;
+        check_bounded_text(
+            &self.source_revision,
+            "source_member.source_revision",
+            MAX_SCOPE_BYTES,
+        )?;
+        check_bounded_text(
+            &self.source_snapshot,
+            "source_member.source_snapshot",
+            MAX_SCOPE_BYTES,
+        )?;
+        check_bounded_text(&self.task_id, "source_member.task_id", MAX_SCOPE_BYTES)?;
+        check_bounded_text(&self.scope_id, "source_member.scope_id", MAX_SCOPE_BYTES)?;
+        check_digest(&self.record_digest, "source_member.record_digest")?;
+        if self.retained_bytes.is_empty() || self.retained_bytes.len() > MAX_RETAINED_SOURCE_BYTES {
+            return Err(ConflictAnalysisError::Bounds {
+                phase: "source_member.retained_bytes".to_owned(),
+                detail: "retained source bytes are empty or exceed their ceiling".to_owned(),
+            });
+        }
+        if sha256_hex(&self.retained_bytes) != self.record_digest {
+            return Err(ConflictAnalysisError::Digest {
+                detail: "retained source bytes do not reproduce the recorded digest".to_owned(),
+            });
+        }
+        check_fence(&self.state_fence).map_err(|err| receipt_err(&err.to_string()))?;
+        Ok(())
+    }
+}
+
+/// How an owner-issued profile records a dimension it cannot resolve.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DispositionKind {
+    /// The owner records the field as unnormalizable under this profile.
+    Unnormalizable,
+    /// The owner records the field as outside this profile's support.
+    Unsupported,
+}
+
+impl DispositionKind {
+    /// Returns the canonical spelling of this disposition.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unnormalizable => "unnormalizable",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+/// One owner-issued comparison profile.
+///
+/// The profile is the single authority for normalization: it binds its owner,
+/// schema revision, canonical definition bytes and their recorded digest, all
+/// eight canonical descriptors, the normalization rules, and the disposition for
+/// both a missing and an unsupported dimension. A caller cannot submit an
+/// `Equal`/`Differing` verdict as authority; the profile only says how a value
+/// is read, and [`OwnerComparison`] carries the observed values it read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnerComparisonProfile {
+    /// Profile identity as issued by its owner.
+    pub profile_id: String,
+    /// Authoritative owner identity that issued this profile.
+    pub owner: String,
+    /// Profile schema revision; never defaulted.
+    pub schema_revision: u32,
+    /// Canonical definition bytes as issued by the owner.
+    pub definition_bytes: Vec<u8>,
+    /// Digest the owner RECORDED for the definition bytes.
+    pub definition_digest: String,
+    /// The eight canonical descriptors, in [`COMPARISON_DIMENSIONS`] order.
+    pub descriptors: Vec<ComparisonDimension>,
+    /// Owner-issued normalization rules.
+    pub normalization_rules: Vec<String>,
+    /// Disposition for a dimension whose value is missing.
+    pub missing_disposition: DispositionKind,
+    /// Disposition for a dimension this profile does not support.
+    pub unsupported_disposition: DispositionKind,
+}
+
+impl OwnerComparisonProfile {
+    /// Validates the profile's owner, revision, definition binding, and full
+    /// canonical descriptor coverage.
+    pub fn validate(&self) -> Result<(), ConflictAnalysisError> {
+        check_handle(&self.profile_id, "profile.profile_id")?;
+        check_handle(&self.owner, "profile.owner")?;
+        if self.schema_revision == 0 {
+            return Err(ConflictAnalysisError::Policy {
+                detail: "profile schema_revision must be explicit, not defaulted".to_owned(),
+            });
+        }
+        check_digest(&self.definition_digest, "profile.definition_digest")?;
+        if self.definition_bytes.is_empty()
+            || self.definition_bytes.len() > MAX_PROFILE_DEFINITION_BYTES
+        {
+            return Err(ConflictAnalysisError::Bounds {
+                phase: "profile.definition_bytes".to_owned(),
+                detail: "profile definition bytes are empty or exceed their ceiling".to_owned(),
+            });
+        }
+        if sha256_hex(&self.definition_bytes) != self.definition_digest {
+            return Err(ConflictAnalysisError::Digest {
+                detail: "profile definition bytes do not reproduce the recorded digest".to_owned(),
+            });
+        }
+        if self.descriptors.len() != EXPECTED_COMPARISON_DIMENSIONS
+            || self.descriptors.len() > MAX_PROFILE_DESCRIPTORS
+        {
+            return Err(ConflictAnalysisError::Denominator {
+                detail: format!(
+                    "an owner-issued profile must carry exactly {EXPECTED_COMPARISON_DIMENSIONS} canonical descriptors"
+                ),
+            });
+        }
+        for (index, dimension) in COMPARISON_DIMENSIONS.iter().enumerate() {
+            if self.descriptors[index] != *dimension {
+                return Err(ConflictAnalysisError::Denominator {
+                    detail: format!(
+                        "profile descriptor {index} is {} rather than {}",
+                        self.descriptors[index].as_str(),
+                        dimension.as_str()
+                    ),
+                });
+            }
+        }
+        if self.normalization_rules.is_empty()
+            || self.normalization_rules.len() > MAX_NORMALIZATION_RULES
+        {
+            return Err(ConflictAnalysisError::Denominator {
+                detail: "an owner-issued profile must carry its normalization rules".to_owned(),
+            });
+        }
+        for rule in &self.normalization_rules {
+            check_bounded_text(rule, "profile.normalization_rule", MAX_NOTE_BYTES)?;
+        }
+        Ok(())
+    }
+}
+
+/// One observed dimension value, bound to the source member and descriptor it
+/// was read from.
+///
+/// The observation names its source and that source's member digest, so a value
+/// cannot be re-attached to a different position, and it names the canonical
+/// descriptor it answers, so a value cannot answer a dimension it was not read
+/// under. It is a single-source value, never a verdict about a pair.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DimensionObservation {
+    /// Source handle whose member this value was read from.
+    pub source: String,
+    /// Owner-issued [`SourceMemberRecord::record_digest`] of that member.
+    pub source_member_digest: String,
+    /// Canonical dimension this value answers.
+    pub dimension: ComparisonDimension,
+    /// Descriptor spelling this value was read under.
+    pub descriptor: String,
+    /// Normalized value the profile owner read from the member.
+    pub value: String,
+}
+
+impl DimensionObservation {
+    /// Validates one observed dimension value's shape and member binding.
+    pub fn validate(&self) -> Result<(), ConflictAnalysisError> {
+        check_handle(&self.source, "observation.source")?;
+        check_digest(
+            &self.source_member_digest,
+            "observation.source_member_digest",
+        )?;
+        check_bounded_text(&self.descriptor, "observation.descriptor", MAX_TEXT_BYTES)?;
+        check_bounded_text(&self.value, "observation.value", MAX_TEXT_BYTES)?;
+        Ok(())
+    }
+}
+
+/// One owner-issued evidence envelope joined to its retained material and
+/// receipt through canonical digest identity.
+///
+/// There is no `trusted`, `verified`, or `complete` Boolean here. Authority,
+/// freshness, coverage, epistemic status, and assertability are read from the
+/// envelope itself and validated by its own contract, so a caller cannot
+/// assert a ceiling it did not earn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvidenceRecord {
+    /// Evidence identity as issued by its owner.
+    pub evidence_id: String,
+    /// Authoritative owner identity that captured this evidence.
+    pub owner: String,
+    /// The normalized evidence envelope.
+    pub envelope: EvidenceEnvelope,
+    /// Canonical digest of the retained material this evidence is tied to.
+    pub material_digest: String,
+    /// Canonical digest of the receipt that issued this evidence.
+    pub receipt_digest: String,
+}
+
+impl EvidenceRecord {
+    /// Validates the envelope intrinsically plus the material/receipt digests.
+    ///
+    /// The envelope's own contract supplies the status, authority, and
+    /// assertability invariants, including that `Verified` carries an actual
+    /// verification binding.
+    pub fn validate(&self) -> Result<(), ConflictAnalysisError> {
+        check_handle(&self.evidence_id, "evidence.evidence_id")?;
+        check_handle(&self.owner, "evidence.owner")?;
+        check_digest(&self.material_digest, "evidence.material_digest")?;
+        check_digest(&self.receipt_digest, "evidence.receipt_digest")?;
+        self.envelope
+            .validate()
+            .map_err(|err| ConflictAnalysisError::Binding {
+                field: "evidence.envelope".to_owned(),
+                detail: redact(&err.to_string()),
+            })?;
+        Ok(())
+    }
+
+    /// Returns whether this record's authority can qualify an evidence-bound
+    /// state.
+    ///
+    /// Model interpretation and heuristic static evidence keep their lower
+    /// authority ceiling: they are preserved and may support a review, but they
+    /// never promote a declaration to an evidence-qualified state. A stale,
+    /// contested, superseded, or rejected envelope likewise qualifies nothing.
+    #[must_use]
+    pub fn qualifies(&self) -> bool {
+        matches!(
+            self.envelope.authority,
+            EvidenceAuthority::SourceIdentity
+                | EvidenceAuthority::CompilerLanguage
+                | EvidenceAuthority::CompilerDerivedSemantics
+                | EvidenceAuthority::DeterministicRuntimeTest
+        ) && matches!(
+            self.envelope.freshness,
+            EvidenceFreshness::ExactCandidate
+                | EvidenceFreshness::ExactCommit
+                | EvidenceFreshness::ExactQuiescedWorktree
+        ) && matches!(
+            self.envelope.status,
+            EpistemicStatus::Supported | EpistemicStatus::Verified
+        ) && self.envelope.assertability == Assertability::Assertable
+    }
+}
+
+/// Owner-issued binding of a mechanism claim to the revision it was read at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MechanismBinding {
+    /// Mechanism claim identity as issued by its owner.
+    pub claim_id: String,
+    /// Source revision the mechanism claim was read at.
+    pub source_revision: String,
+    /// Canonical digest the owner RECORDED for the mechanism claim.
+    pub claim_digest: String,
+}
+
+/// Observed status of an owner-issued falsifier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FalsifierStatus {
+    /// The falsifier was specified but not observed.
+    Unobserved,
+    /// The falsifier ran and the claim survived it.
+    Consistent,
+    /// The falsifier ran and refuted the claim.
+    Inconsistent,
+}
+
+impl FalsifierStatus {
+    /// Returns the canonical spelling of this falsifier status.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unobserved => "unobserved",
+            Self::Consistent => "consistent",
+            Self::Inconsistent => "inconsistent",
+        }
+    }
+}
+
+/// Owner-issued falsifier specification plus its observed status.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FalsifierBinding {
+    /// Bounded falsifier specification.
+    pub specification: String,
+    /// Status the owner observed.
+    pub observed: FalsifierStatus,
+    /// Evidence identity the observation is traced to.
+    pub evidence_id: String,
+}
+
+/// Result a competent evaluator or verifier returned for a matched control.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EvaluatorResult {
+    /// A competent evaluator/verifier returned a usable result.
+    Competent,
+    /// The evaluator is present but not competent for this claim.
+    Unqualified,
+    /// No evaluator or verifier result exists.
+    Absent,
+}
+
+impl EvaluatorResult {
+    /// Returns the canonical spelling of this evaluator result.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Competent => "competent",
+            Self::Unqualified => "unqualified",
+            Self::Absent => "absent",
+        }
+    }
+}
+
+/// Owner-issued matched control and the evaluator/verifier result for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ControlBinding {
+    /// Matched control identity.
+    pub control_id: String,
+    /// Owner that issued the control.
+    pub owner: String,
+    /// Result a competent evaluator or verifier returned.
+    pub evaluator_result: EvaluatorResult,
+    /// Evidence identity the result is traced to.
+    pub evidence_id: String,
+}
+
+/// Owner-issued intervention execution and its receipt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InterventionBinding {
+    /// Execution identity of the intervention.
+    pub execution_id: String,
+    /// Canonical digest of the receipt proving that execution.
+    pub receipt_digest: String,
+}
+
+/// Rival/confounder denominator with its own independent completeness check.
+///
+/// Completeness is decided against the retained evidence records, never against
+/// a second copy of the caller's own expected list: every expected rival must
+/// appear in `observed`, no member may be both observed and omitted, and
+/// [`EvidenceCoverage::CompleteForScope`] cannot coexist with an omission.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RivalDenominator {
+    /// Rival/confounder handles the owner set out to cover.
+    pub expected: Vec<String>,
+    /// Rival/confounder handles the owner actually observed.
+    pub observed: Vec<String>,
+    /// Handles the owner did not cover, named explicitly.
+    pub omitted: Vec<String>,
+    /// Owner-declared coverage of this denominator.
+    pub coverage: EvidenceCoverage,
+}
+
+impl RivalDenominator {
+    /// Validates the denominator against the independent retained evidence set.
+    ///
+    /// `evidence_ids` is the set of evidence identities actually retained for
+    /// this record. An observed rival that no retained evidence names is a
+    /// coverage shortfall, and complete coverage is refused outright.
+    pub fn validate(&self, evidence_ids: &[String]) -> Result<(), ConflictAnalysisError> {
+        bound_list_length("rivals.expected", self.expected.len(), MAX_EVIDENCE_ITEMS)?;
+        bound_list_length("rivals.observed", self.observed.len(), MAX_EVIDENCE_ITEMS)?;
+        bound_list_length("rivals.omitted", self.omitted.len(), MAX_EVIDENCE_ITEMS)?;
+        for handle in self
+            .expected
+            .iter()
+            .chain(self.observed.iter())
+            .chain(self.omitted.iter())
+        {
+            check_handle(handle, "rivals.handle")?;
+        }
+        for handle in &self.omitted {
+            if self.observed.contains(handle) {
+                return Err(ConflictAnalysisError::Denominator {
+                    detail: "a rival cannot be both observed and omitted".to_owned(),
+                });
+            }
+            if !self.expected.contains(handle) {
+                return Err(ConflictAnalysisError::Denominator {
+                    detail: "an omitted rival is not in the expected denominator".to_owned(),
+                });
+            }
+        }
+        for handle in &self.observed {
+            if !evidence_ids.contains(handle) {
+                return Err(ConflictAnalysisError::Denominator {
+                    detail: format!(
+                        "observed rival {} is not backed by retained evidence",
+                        redact(handle)
+                    ),
+                });
+            }
+            if !self.expected.contains(handle) {
+                return Err(ConflictAnalysisError::Denominator {
+                    detail: "an observed rival is not in the expected denominator".to_owned(),
+                });
+            }
+        }
+        if self.coverage == EvidenceCoverage::CompleteForScope && !self.omitted.is_empty() {
+            return Err(ConflictAnalysisError::Denominator {
+                detail: "complete rival coverage cannot coexist with an omission".to_owned(),
+            });
+        }
+        if self.coverage == EvidenceCoverage::CompleteForScope {
+            for handle in &self.expected {
+                if !self.observed.contains(handle) {
+                    return Err(ConflictAnalysisError::Denominator {
+                        detail: format!(
+                            "complete rival coverage omits expected member {}",
+                            redact(handle)
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the coverage this cell derives from the retained evidence,
+    /// independent of the coverage the owner declared.
+    #[must_use]
+    pub fn derived_coverage(&self) -> EvidenceCoverage {
+        if self.observed.len() == self.expected.len()
+            && self
+                .expected
+                .iter()
+                .all(|handle| self.observed.contains(handle))
+            && self.omitted.is_empty()
+        {
+            EvidenceCoverage::CompleteForScope
+        } else if self.observed.is_empty() {
+            EvidenceCoverage::Unknown
+        } else {
+            EvidenceCoverage::PartialForScope
+        }
+    }
+}
+
+/// One owner-issued causal or predictive evidence record.
+///
+/// The declared state is preserved verbatim and separately from the assessment
+/// this cell computes. Prediction support, intervention execution, and causal
+/// attribution stay distinct: this record can carry all three and still promote
+/// only the one the declaration claims.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CausalEvidenceRecord {
+    /// Source handle holding the claim.
+    pub source_handle: String,
+    /// State the source declared, preserved verbatim.
+    pub declared_state: CausalClaimState,
+    /// Mechanism claim identity and the revision it was read at.
+    pub mechanism: MechanismBinding,
+    /// Falsifier specification and its observed status.
+    pub falsifier: FalsifierBinding,
+    /// Matched control and the competent evaluator/verifier result.
+    pub control: ControlBinding,
+    /// Intervention execution and receipt, when one exists.
+    pub intervention: Option<InterventionBinding>,
+    /// Rival/confounder denominator with its omissions and coverage.
+    pub rivals: RivalDenominator,
+    /// Retained evidence envelopes joined to material and receipts.
+    pub evidence: Vec<EvidenceRecord>,
+    /// Task the record was admitted under.
+    pub task_id: String,
+    /// `WorkScope` the record was admitted under.
+    pub scope_id: String,
+    /// Fence the record was admitted under.
+    pub state_fence: StateFence,
+}
+
+impl CausalEvidenceRecord {
+    /// Validates the record's shape, evidence, and rival denominator.
+    pub fn validate(&self) -> Result<(), ConflictAnalysisError> {
+        check_handle(&self.source_handle, "causal_evidence.source_handle")?;
+        check_handle(
+            &self.mechanism.claim_id,
+            "causal_evidence.mechanism.claim_id",
+        )?;
+        check_bounded_text(
+            &self.mechanism.source_revision,
+            "causal_evidence.mechanism.source_revision",
+            MAX_SCOPE_BYTES,
+        )?;
+        check_digest(
+            &self.mechanism.claim_digest,
+            "causal_evidence.mechanism.claim_digest",
+        )?;
+        check_bounded_text(
+            &self.falsifier.specification,
+            "causal_evidence.falsifier.specification",
+            MAX_TEXT_BYTES,
+        )?;
+        check_handle(
+            &self.falsifier.evidence_id,
+            "causal_evidence.falsifier.evidence_id",
+        )?;
+        check_handle(
+            &self.control.control_id,
+            "causal_evidence.control.control_id",
+        )?;
+        check_handle(&self.control.owner, "causal_evidence.control.owner")?;
+        check_handle(
+            &self.control.evidence_id,
+            "causal_evidence.control.evidence_id",
+        )?;
+        if let Some(intervention) = &self.intervention {
+            check_handle(
+                &intervention.execution_id,
+                "causal_evidence.intervention.execution_id",
+            )?;
+            check_digest(
+                &intervention.receipt_digest,
+                "causal_evidence.intervention.receipt_digest",
+            )?;
+        }
+        check_bounded_text(&self.task_id, "causal_evidence.task_id", MAX_SCOPE_BYTES)?;
+        check_bounded_text(&self.scope_id, "causal_evidence.scope_id", MAX_SCOPE_BYTES)?;
+        check_fence(&self.state_fence).map_err(|err| receipt_err(&err.to_string()))?;
+        bound_list_length(
+            "causal_evidence.evidence",
+            self.evidence.len(),
+            MAX_ENVELOPES_PER_RECORD,
+        )?;
+        let mut evidence_ids: Vec<String> = Vec::with_capacity(self.evidence.len());
+        for record in &self.evidence {
+            record.validate()?;
+            if evidence_ids.contains(&record.evidence_id) {
+                return Err(ConflictAnalysisError::Denominator {
+                    detail: "duplicate causal evidence identity".to_owned(),
+                });
+            }
+            evidence_ids.push(record.evidence_id.clone());
+        }
+        if !evidence_ids.contains(&self.falsifier.evidence_id) {
+            return Err(ConflictAnalysisError::Binding {
+                field: "causal_evidence.falsifier.evidence_id".to_owned(),
+                detail: "falsifier observation is not traced to retained evidence".to_owned(),
+            });
+        }
+        if !evidence_ids.contains(&self.control.evidence_id) {
+            return Err(ConflictAnalysisError::Binding {
+                field: "causal_evidence.control.evidence_id".to_owned(),
+                detail: "evaluator result is not traced to retained evidence".to_owned(),
+            });
+        }
+        self.rivals.validate(&evidence_ids)
+    }
+}
+
+/// One owner-issued comparison admitted under a single owner-issued profile.
+///
+/// The pair carries its source commitments and the observed values for both
+/// sources; the relation itself is DERIVED here from those values. A caller
+/// supplies no verdict.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnerComparison {
+    /// Lexicographically lesser source handle of the pair.
+    pub first_source: String,
+    /// Owner-issued commitment for `first_source`.
+    pub first_commitment: SourceRecordCommitment,
+    /// Lexicographically greater source handle of the pair.
+    pub second_source: String,
+    /// Owner-issued commitment for `second_source`.
+    pub second_commitment: SourceRecordCommitment,
+    /// The single owner-issued profile both sources were read under.
+    pub profile: OwnerComparisonProfile,
+    /// Observed values, one per source per canonical dimension.
+    pub observations: Vec<DimensionObservation>,
+    /// Dimensions this profile recorded as unnormalizable.
+    pub unnormalizable_dimensions: Vec<ComparisonDimension>,
+    /// Dimensions this profile recorded as unsupported.
+    pub unsupported_dimensions: Vec<ComparisonDimension>,
+}
+
+impl OwnerComparison {
+    /// Validates the pair's orientation, profile, commitments, and observations.
+    pub fn validate(&self) -> Result<(), ConflictAnalysisError> {
+        check_handle(&self.first_source, "owner_comparison.first_source")?;
+        check_handle(&self.second_source, "owner_comparison.second_source")?;
+        if self.first_source >= self.second_source {
+            return Err(ConflictAnalysisError::Binding {
+                field: "owner_comparison.order".to_owned(),
+                detail: "owner comparison requires first_source < second_source".to_owned(),
+            });
+        }
+        check_commitment_binding(
+            &self.first_commitment,
+            &self.first_source,
+            "owner_comparison.first",
+        )?;
+        check_commitment_binding(
+            &self.second_commitment,
+            &self.second_source,
+            "owner_comparison.second",
+        )?;
+        self.profile.validate()?;
+        for commitment in [&self.first_commitment, &self.second_commitment] {
+            if commitment.profile() != self.profile.profile_id {
+                return Err(ConflictAnalysisError::Binding {
+                    field: "owner_comparison.profile".to_owned(),
+                    detail: "a source commitment names a different profile".to_owned(),
+                });
+            }
+            if commitment.profile_digest() != self.profile.definition_digest {
+                return Err(ConflictAnalysisError::Binding {
+                    field: "owner_comparison.profile_digest".to_owned(),
+                    detail: "a source commitment names a different profile revision".to_owned(),
+                });
+            }
+        }
+        self.validate_observations()
+    }
+
+    /// Validates that every canonical dimension has one value from each source,
+    /// each bound to that source's committed member digest.
+    fn validate_observations(&self) -> Result<(), ConflictAnalysisError> {
+        let expected = EXPECTED_COMPARISON_DIMENSIONS * 2;
+        bound_list_length(
+            "owner_comparison.observations",
+            self.observations.len(),
+            expected,
+        )?;
+        if self.observations.len() != expected {
+            return Err(ConflictAnalysisError::Denominator {
+                detail: format!(
+                    "an owner comparison must carry {expected} observed values, one per source per dimension"
+                ),
+            });
+        }
+        for entry in &self.observations {
+            entry.validate()?;
+            if entry.source != self.first_source && entry.source != self.second_source {
+                return Err(ConflictAnalysisError::Binding {
+                    field: "owner_comparison.observation.source".to_owned(),
+                    detail: "an observation names a source outside this pair".to_owned(),
+                });
+            }
+            if entry.dimension.as_str() != entry.descriptor {
+                return Err(ConflictAnalysisError::Binding {
+                    field: "owner_comparison.observation.descriptor".to_owned(),
+                    detail: format!(
+                        "observation descriptor {} does not answer dimension {}",
+                        entry.descriptor,
+                        entry.dimension.as_str()
+                    ),
+                });
+            }
+            let commitment = if entry.source == self.first_source {
+                &self.first_commitment
+            } else {
+                &self.second_commitment
+            };
+            if entry.source_member_digest != commitment.record_digest() {
+                return Err(ConflictAnalysisError::Binding {
+                    field: "owner_comparison.observation.source_member_digest".to_owned(),
+                    detail: format!(
+                        "observation for {} names a different member revision than the commitment",
+                        redact(&entry.source)
+                    ),
+                });
+            }
+        }
+        for dimension in COMPARISON_DIMENSIONS {
+            for source in [&self.first_source, &self.second_source] {
+                let matches = self
+                    .observations
+                    .iter()
+                    .filter(|entry| entry.dimension == dimension && entry.source == *source)
+                    .count();
+                if matches != 1 {
+                    return Err(ConflictAnalysisError::Denominator {
+                        detail: format!(
+                            "dimension {} must carry exactly one value from each source",
+                            dimension.as_str()
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the value this source contributed for one canonical dimension.
+    #[must_use]
+    pub fn value_for(&self, source: &str, dimension: ComparisonDimension) -> Option<&str> {
+        self.observations
+            .iter()
+            .find(|entry| entry.dimension == dimension && entry.source == source)
+            .map(|entry| entry.value.as_str())
+    }
+}
+
+/// Owner-issued comparison and causal evidence bound to one `ConflictSet`.
+///
+/// These are the records production wiring must supply. A-39 consumes them
+/// exactly as it consumes legacy declarations: it validates them against the
+/// item's own task/scope/fence and the retained bytes, derives the strongest
+/// state they support, and never acquires or upgrades one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OwnerRecords {
+    /// Versioned source members, one per admitted position.
+    pub source_members: Vec<SourceMemberRecord>,
+    /// Owner-issued comparisons admitted under one profile each.
+    pub comparisons: Vec<OwnerComparison>,
+    /// Owner-issued causal and predictive evidence records.
+    pub causal_evidence: Vec<CausalEvidenceRecord>,
 }
 
 /// Owner-issued commitment binding one source handle to the record it names.
@@ -1015,26 +1829,35 @@ impl CompatibilityRelation {
     }
 }
 
-/// One position's preserved legacy declaration mapping against another.
+/// One position's preserved mapping against another.
 ///
-/// [`Self::outcomes`] carries the caller's declarations in
-/// [`COMPARISON_DIMENSIONS`] order. `relation` stays ambiguous because no
-/// owner-bound source/profile/value records exist in legacy v1. The declared
-/// differing and unnormalizable dimensions are retained for review, not proof.
+/// [`Self::outcomes`] carries the retained dimension outcomes in
+/// [`COMPARISON_DIMENSIONS`] order. `relation` is DERIVED here, never supplied:
+/// under [`SupplementVersion::LegacyV1Unverified`] it stays
+/// [`CompatibilityRelation::Ambiguous`] because no owner-bound source, profile,
+/// or value records exist, and under [`SupplementVersion::OwnerRecordV2`] it is
+/// the relation the admitted typed values support and no stronger. The declared
+/// differing and unnormalizable dimensions are retained in every case.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PositionCompatibility {
     /// Source handle of the other position.
     pub other_source: String,
-    /// Legacy proof ceiling; always ambiguous until owner records exist.
+    /// Relation derived from the admitted values, or ambiguous when unproven.
     pub relation: CompatibilityRelation,
     /// Proof ceiling for these retained declarations.
     pub supplement_version: SupplementVersion,
     /// Every dimension outcome in canonical order, values preserved.
     pub outcomes: Vec<DimensionComparison>,
-    /// Dimensions the legacy caller declares to differ, in canonical order.
+    /// Dimensions derived to differ, in canonical order.
     pub differing_dimensions: Vec<ComparisonDimension>,
-    /// Dimensions the legacy caller declares unnormalizable, in canonical order.
+    /// Dimensions the owner recorded unnormalizable, in canonical order.
     pub unnormalizable_dimensions: Vec<ComparisonDimension>,
+    /// Dimensions the owner recorded unsupported, in canonical order.
+    pub unsupported_dimensions: Vec<ComparisonDimension>,
+    /// Coverage derived for this comparison against the canonical denominator.
+    pub coverage: EvidenceCoverage,
+    /// Bounded reason for the derived relation and its ceiling.
+    pub derivation_note: String,
 }
 
 /// Version and proof ceiling of a retained caller-supplied supplement.
@@ -1042,6 +1865,8 @@ pub struct PositionCompatibility {
 pub enum SupplementVersion {
     /// Legacy caller declarations with no owner-bound records; never verified.
     LegacyV1Unverified,
+    /// Owner-issued source, profile, and evidence records; derivable.
+    OwnerRecordV2,
 }
 
 impl SupplementVersion {
@@ -1050,6 +1875,7 @@ impl SupplementVersion {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::LegacyV1Unverified => "legacy_v1_unverified",
+            Self::OwnerRecordV2 => "owner_record_v2",
         }
     }
 }
@@ -1113,19 +1939,29 @@ pub struct SuppliedCausalClaim {
     pub rivals_or_confounders: String,
 }
 
-/// One preserved causal declaration and its lower-ceiling legacy assessment.
+/// One preserved causal declaration and its evidence-qualified assessment.
+///
+/// `declared_state` is the source's own claim, preserved verbatim.
+/// `effective_state` is derived: it equals the declared state only when the
+/// owner-issued evidence supports that exact state, and is
+/// [`CausalClaimState::Unknown`] otherwise. A declaration is never promoted
+/// past the evidence, and prose never promotes it at all.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CausalClaimRecord {
     /// Source handle holding the claim.
     pub source_handle: String,
-    /// State the caller declared.
+    /// State the caller declared, preserved verbatim.
     pub declared_state: CausalClaimState,
     /// State after the algorithm step 7 evidence rule is applied.
     pub effective_state: CausalClaimState,
-    /// Proof ceiling for the caller-declared supplement.
+    /// Proof ceiling for this supplement.
     pub supplement_version: SupplementVersion,
     /// Bounded reason for reduction or unverified preservation.
     pub reduction_reason: String,
+    /// Rival/confounder coverage derived from the retained evidence.
+    pub coverage: EvidenceCoverage,
+    /// Owner mechanism claim identity this assessment is bound to, when any.
+    pub mechanism_claim_id: Option<String>,
 }
 
 /// Caller-supplied supplements bound to one `ConflictSet` analysis.
@@ -1159,6 +1995,11 @@ pub struct ConflictSupplements {
     pub causal_claims: Vec<SuppliedCausalClaim>,
     /// Externally supplied resolution status, when one exists.
     pub external_resolution: Option<ExternalResolution>,
+    /// Owner-issued source, profile, and causal evidence records.
+    ///
+    /// Empty means no owner admitted a record for this analysis, and every
+    /// comparison and causal state then stays at its legacy unverified ceiling.
+    pub owner_records: OwnerRecords,
 }
 
 /// One analyzed position with its original proposition preserved.
@@ -1574,6 +2415,96 @@ fn count_text_bytes(values: &[&str]) -> usize {
 // Preflight bounds (shape only; semantic shortfalls stay outcomes).
 // ---------------------------------------------------------------------------
 
+/// Counts bytes across the whole owner-record surface with saturation.
+///
+/// Owner records arrive after [`ConflictSupplements`] is declared, so they are
+/// counted in their own pass rather than folded into the legacy lists. The
+/// aggregate ceiling therefore covers retained source bytes, profile
+/// definitions, observed values, and evidence identities together.
+fn count_owner_record_bytes(records: &OwnerRecords) -> usize {
+    let mut total = 0usize;
+    for member in &records.source_members {
+        total = total.saturating_add(count_text_bytes(&[
+            member.position_source.as_str(),
+            member.source_owner.as_str(),
+            member.retained_handle.as_str(),
+            member.record_digest.as_str(),
+            member.source_revision.as_str(),
+            member.source_snapshot.as_str(),
+            member.task_id.as_str(),
+            member.scope_id.as_str(),
+        ]));
+        total = total.saturating_add(member.retained_bytes.len());
+    }
+    for comparison in &records.comparisons {
+        total = total.saturating_add(count_text_bytes(&[
+            comparison.first_source.as_str(),
+            comparison.second_source.as_str(),
+            comparison.profile.profile_id.as_str(),
+            comparison.profile.owner.as_str(),
+            comparison.profile.definition_digest.as_str(),
+        ]));
+        total = total.saturating_add(comparison.profile.definition_bytes.len());
+        for rule in &comparison.profile.normalization_rules {
+            total = total.saturating_add(rule.len());
+        }
+        for entry in &comparison.observations {
+            total = total.saturating_add(count_text_bytes(&[
+                entry.source.as_str(),
+                entry.source_member_digest.as_str(),
+                entry.descriptor.as_str(),
+                entry.value.as_str(),
+            ]));
+        }
+    }
+    total = total.saturating_add(count_causal_evidence_bytes(&records.causal_evidence));
+    total
+}
+
+/// Counts bytes across the owner-issued causal evidence surface.
+fn count_causal_evidence_bytes(records: &[CausalEvidenceRecord]) -> usize {
+    let mut total = 0usize;
+    for record in records {
+        total = total.saturating_add(count_text_bytes(&[
+            record.source_handle.as_str(),
+            record.mechanism.claim_id.as_str(),
+            record.mechanism.source_revision.as_str(),
+            record.mechanism.claim_digest.as_str(),
+            record.falsifier.specification.as_str(),
+            record.falsifier.evidence_id.as_str(),
+            record.control.control_id.as_str(),
+            record.control.owner.as_str(),
+            record.control.evidence_id.as_str(),
+            record.task_id.as_str(),
+            record.scope_id.as_str(),
+        ]));
+        if let Some(intervention) = &record.intervention {
+            total = total.saturating_add(count_text_bytes(&[
+                intervention.execution_id.as_str(),
+                intervention.receipt_digest.as_str(),
+            ]));
+        }
+        for handle in record
+            .rivals
+            .expected
+            .iter()
+            .chain(record.rivals.observed.iter())
+            .chain(record.rivals.omitted.iter())
+        {
+            total = total.saturating_add(handle.len());
+        }
+        for evidence in &record.evidence {
+            total = total.saturating_add(count_text_bytes(&[
+                evidence.evidence_id.as_str(),
+                evidence.owner.as_str(),
+                evidence.material_digest.as_str(),
+                evidence.receipt_digest.as_str(),
+            ]));
+        }
+    }
+    total
+}
+
 /// Preflights supplement list lengths against policy and global ceilings.
 fn preflight_supplement_bounds(
     supplements: &ConflictSupplements,
@@ -1614,6 +2545,21 @@ fn preflight_supplement_bounds(
         "causal-claims",
         supplements.causal_claims.len(),
         MAX_CAUSAL_CLAIMS,
+    )?;
+    bound_list_length(
+        "source-members",
+        supplements.owner_records.source_members.len(),
+        MAX_SOURCE_MEMBERS,
+    )?;
+    bound_list_length(
+        "owner-comparisons",
+        supplements.owner_records.comparisons.len(),
+        MAX_COMPARISONS,
+    )?;
+    bound_list_length(
+        "owner-causal-evidence",
+        supplements.owner_records.causal_evidence.len(),
+        MAX_CAUSAL_EVIDENCE_RECORDS,
     )?;
     Ok(())
 }
@@ -1682,6 +2628,7 @@ fn preflight_total_bytes(
             &claim.rivals_or_confounders,
         ]));
     }
+    total = total.saturating_add(count_owner_record_bytes(&supplements.owner_records));
     for position in &conflict_set.positions {
         total = total.saturating_add(position.stance.len());
         for assumption in &position.assumptions {
@@ -1974,6 +2921,249 @@ fn validate_causal_claims(
         seen.push(claim.source_handle.clone());
     }
     Ok(())
+}
+
+/// Validates owner-issued source members against the position denominator and
+/// the item's own task, scope, and fence.
+///
+/// A member that names no position in the set is refused: equal handle text is
+/// not a binding to the exact `ConflictSet` member. A member admitted under a
+/// different task, scope, or fence than the item is refused too, because a
+/// record captured outside the current boundary cannot qualify anything here.
+fn validate_source_members(
+    item: &ValidatedCurationItem,
+    conflict_set: &ConflictSet,
+    members: &[SourceMemberRecord],
+) -> Result<(), ConflictAnalysisError> {
+    let handles = position_source_handles(conflict_set);
+    let mut seen: Vec<String> = Vec::with_capacity(members.len());
+    for member in members {
+        member.validate()?;
+        if !handles.contains(&member.position_source) {
+            return Err(ConflictAnalysisError::Binding {
+                field: "source_member.position_source".to_owned(),
+                detail: format!(
+                    "source member names a position outside the conflict denominator: {}",
+                    redact(&member.position_source)
+                ),
+            });
+        }
+        if seen.contains(&member.position_source) {
+            return Err(ConflictAnalysisError::Denominator {
+                detail: "duplicate source member identity".to_owned(),
+            });
+        }
+        seen.push(member.position_source.clone());
+        check_owner_boundary(
+            &member.task_id,
+            &member.scope_id,
+            &member.state_fence,
+            item,
+            "source_member",
+        )?;
+    }
+    Ok(())
+}
+
+/// Confirms one owner record was admitted under the item's current task, scope,
+/// and fence.
+fn check_owner_boundary(
+    task_id: &str,
+    scope_id: &str,
+    fence: &StateFence,
+    item: &ValidatedCurationItem,
+    field: &str,
+) -> Result<(), ConflictAnalysisError> {
+    if task_id != item.task_id || scope_id != item.scope_id {
+        return Err(ConflictAnalysisError::Binding {
+            field: format!("{field}.task_scope"),
+            detail: "owner record was admitted under a different task or scope".to_owned(),
+        });
+    }
+    if !fences_match_exact(fence, &item.state_fence) {
+        return Err(ConflictAnalysisError::Binding {
+            field: format!("{field}.state_fence"),
+            detail: "owner record was admitted under a different fence".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Returns the owner source member admitted for one position handle.
+fn find_source_member<'a>(
+    members: &'a [SourceMemberRecord],
+    position_source: &str,
+) -> Option<&'a SourceMemberRecord> {
+    members
+        .iter()
+        .find(|member| member.position_source == position_source)
+}
+
+/// Validates one owner-issued comparison against the retained source members.
+///
+/// The pair's commitments are the owner-issued binding, so the retained member
+/// for each source must carry exactly the digest the commitment names. A
+/// source byte or revision that changed under an old commitment is refused here
+/// rather than being compared as though it were current.
+fn check_owner_comparison_members(
+    comparison: &OwnerComparison,
+    members: &[SourceMemberRecord],
+) -> Result<(), ConflictAnalysisError> {
+    for (source, commitment) in [
+        (&comparison.first_source, &comparison.first_commitment),
+        (&comparison.second_source, &comparison.second_commitment),
+    ] {
+        let member =
+            find_source_member(members, source).ok_or_else(|| ConflictAnalysisError::Binding {
+                field: "owner_comparison.source_member".to_owned(),
+                detail: format!(
+                    "no owner source member is admitted for position {}",
+                    redact(source)
+                ),
+            })?;
+        if member.record_digest != commitment.record_digest() {
+            return Err(ConflictAnalysisError::Binding {
+                field: "owner_comparison.source_member".to_owned(),
+                detail: format!(
+                    "retained member for {} records a different digest than the comparison commitment, so that commitment is stale or conflicting",
+                    redact(source)
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Validates owner-issued comparisons against the position denominator.
+fn validate_owner_comparisons(
+    conflict_set: &ConflictSet,
+    records: &OwnerRecords,
+) -> Result<(), ConflictAnalysisError> {
+    let handles = position_source_handles(conflict_set);
+    let mut seen_pairs: Vec<String> = Vec::with_capacity(records.comparisons.len());
+    for comparison in &records.comparisons {
+        comparison.validate()?;
+        for source in [&comparison.first_source, &comparison.second_source] {
+            if !handles.contains(source) {
+                return Err(ConflictAnalysisError::Binding {
+                    field: "owner_comparison.source".to_owned(),
+                    detail: format!(
+                        "owner comparison names a position outside the denominator: {}",
+                        redact(source)
+                    ),
+                });
+            }
+        }
+        check_owner_comparison_members(comparison, &records.source_members)?;
+        let key = comparison_pair_key(&comparison.first_source, &comparison.second_source);
+        if seen_pairs.contains(&key) {
+            return Err(ConflictAnalysisError::Denominator {
+                detail: "duplicate owner comparison pair".to_owned(),
+            });
+        }
+        seen_pairs.push(key);
+    }
+    Ok(())
+}
+
+/// Validates owner-issued causal evidence against the position denominator and
+/// the item's current boundary.
+///
+/// Every evidence envelope is validated by its own contract and must be joined
+/// to the retained material it claims. The A-05 receipt attests the curation
+/// item and draft boundary only, so a causal record may not present that
+/// receipt as its own evidence receipt.
+fn validate_causal_evidence(
+    item: &ValidatedCurationItem,
+    conflict_set: &ConflictSet,
+    records: &OwnerRecords,
+) -> Result<(), ConflictAnalysisError> {
+    let handles = position_source_handles(conflict_set);
+    let retained: Vec<String> = records
+        .source_members
+        .iter()
+        .map(|member| member.record_digest.clone())
+        .collect();
+    let mut seen: Vec<String> = Vec::with_capacity(records.causal_evidence.len());
+    for record in &records.causal_evidence {
+        record.validate()?;
+        if !handles.contains(&record.source_handle) {
+            return Err(ConflictAnalysisError::Binding {
+                field: "causal_evidence.source_handle".to_owned(),
+                detail: "causal evidence names a position outside the denominator".to_owned(),
+            });
+        }
+        if seen.contains(&record.source_handle) {
+            return Err(ConflictAnalysisError::Denominator {
+                detail: "duplicate causal evidence source".to_owned(),
+            });
+        }
+        seen.push(record.source_handle.clone());
+        check_owner_boundary(
+            &record.task_id,
+            &record.scope_id,
+            &record.state_fence,
+            item,
+            "causal_evidence",
+        )?;
+        check_mechanism_revision(record, records)?;
+        check_evidence_joins(record, item, &retained)?;
+    }
+    Ok(())
+}
+
+/// Confirms one mechanism claim was read at the retained source revision.
+fn check_mechanism_revision(
+    record: &CausalEvidenceRecord,
+    records: &OwnerRecords,
+) -> Result<(), ConflictAnalysisError> {
+    let Some(member) = find_source_member(&records.source_members, &record.source_handle) else {
+        return Ok(());
+    };
+    if member.source_revision == record.mechanism.source_revision {
+        return Ok(());
+    }
+    Err(ConflictAnalysisError::Binding {
+        field: "causal_evidence.mechanism.source_revision".to_owned(),
+        detail: "mechanism claim revision drifts from the retained source revision".to_owned(),
+    })
+}
+
+/// Joins every retained envelope to the material it claims and keeps the A-05
+/// receipt out of the causal evidence set.
+fn check_evidence_joins(
+    record: &CausalEvidenceRecord,
+    item: &ValidatedCurationItem,
+    retained: &[String],
+) -> Result<(), ConflictAnalysisError> {
+    for evidence in &record.evidence {
+        if !retained.contains(&evidence.material_digest) {
+            return Err(ConflictAnalysisError::Binding {
+                field: "causal_evidence.material_digest".to_owned(),
+                detail: "evidence is not joined to any retained source material".to_owned(),
+            });
+        }
+        if evidence.receipt_digest == item.receipt.bundle_digest {
+            return Err(ConflictAnalysisError::Binding {
+                field: "causal_evidence.receipt_digest".to_owned(),
+                detail:
+                    "the A-05 receipt attests the curation boundary only and is not causal evidence"
+                        .to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Validates the whole owner-record surface before any interpretation.
+fn validate_owner_records(
+    item: &ValidatedCurationItem,
+    conflict_set: &ConflictSet,
+    records: &OwnerRecords,
+) -> Result<(), ConflictAnalysisError> {
+    validate_source_members(item, conflict_set, &records.source_members)?;
+    validate_owner_comparisons(conflict_set, records)?;
+    validate_causal_evidence(item, conflict_set, records)
 }
 
 /// Rejects duplicate supplement identities before interpretation.
@@ -2449,65 +3639,302 @@ fn dimension_outcome_spelling(outcome: &DimensionOutcome) -> String {
     }
 }
 
-/// Preserves the legacy compatibility declarations for one position.
+/// Returns the peer source handle of one comparison for `source_handle`.
 ///
-/// Every supplied comparison naming this position contributes one entry, from
-/// either side, so the mapping is symmetric. Because version 1 has no
-/// owner-bound source/profile/value records, every relation remains
-/// [`CompatibilityRelation::Ambiguous`] even when the caller declares eight
-/// equal or differing dimensions. Outcomes are preserved only as declarations.
-fn build_compatibility(
+/// Every comparison naming this position contributes one entry, from either
+/// side, so the mapping is symmetric.
+fn comparison_peer<'a>(first: &'a str, second: &'a str, source_handle: &str) -> Option<&'a str> {
+    if first == source_handle {
+        Some(second)
+    } else if second == source_handle {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+/// Reorders one dimension's two admitted values into canonical pair order.
+///
+/// `swapped` is the single ordering decision the pair makes; the values move
+/// with the source that declared them.
+fn pair_dimension_outcome(
+    _dimension: ComparisonDimension,
+    first_value: &str,
+    second_value: &str,
+) -> DimensionOutcome {
+    if first_value == second_value {
+        DimensionOutcome::Equal {
+            value: first_value.to_owned(),
+        }
+    } else {
+        DimensionOutcome::Differing {
+            left: first_value.to_owned(),
+            right: second_value.to_owned(),
+        }
+    }
+}
+
+/// One comparison's locally derived relation and the records it came from.
+struct DerivedRelation {
+    relation: CompatibilityRelation,
+    outcomes: Vec<DimensionComparison>,
+    differing: Vec<ComparisonDimension>,
+    coverage: EvidenceCoverage,
+    note: String,
+}
+
+/// Collects one dimension's outcome from both admitted values, recording a
+/// dimension as unresolved when either side is missing.
+fn collect_dimension_outcome(
+    comparison: &OwnerComparison,
+    dimension: ComparisonDimension,
+    unresolved: &mut Vec<ComparisonDimension>,
+) -> DimensionOutcome {
+    let first = comparison.value_for(&comparison.first_source, dimension);
+    let second = comparison.value_for(&comparison.second_source, dimension);
+    let (Some(left), Some(right)) = (first, second) else {
+        {
+            unresolved.push(dimension);
+            return DimensionOutcome::Unnormalizable {
+                reason: format!(
+                    "no admitted value for dimension {} under owner profile {}",
+                    dimension.as_str(),
+                    comparison.profile.profile_id
+                ),
+            };
+        }
+    };
+    pair_dimension_outcome(dimension, left, right)
+}
+
+/// Folds the owner-issued unnormalizable and unsupported dimensions into the
+/// unresolved set, so an explicit owner gap can never be read as agreement.
+fn collect_unresolved_dimensions(
+    comparison: &OwnerComparison,
+    unresolved: &mut Vec<ComparisonDimension>,
+) {
+    for dimension in comparison
+        .unnormalizable_dimensions
+        .iter()
+        .chain(comparison.unsupported_dimensions.iter())
+    {
+        if !unresolved.contains(dimension) {
+            unresolved.push(*dimension);
+        }
+    }
+}
+
+/// Derives the coverage of one comparison against the canonical denominator.
+///
+/// The expected set is the canonical eight dimensions this cell holds itself,
+/// never a copy of the owner's own observed list.
+fn derive_comparison_coverage(
+    outcomes: &[DimensionComparison],
+    all_resolved: bool,
+) -> EvidenceCoverage {
+    if all_resolved {
+        return EvidenceCoverage::CompleteForScope;
+    }
+    let any_admitted = outcomes.iter().any(|entry| {
+        matches!(
+            entry.outcome,
+            DimensionOutcome::Differing { .. } | DimensionOutcome::Equal { .. }
+        )
+    });
+    if any_admitted {
+        EvidenceCoverage::PartialForScope
+    } else {
+        EvidenceCoverage::Unknown
+    }
+}
+
+/// Writes the bounded note naming the derived relation and its ceiling.
+fn relation_note(
+    comparison: &OwnerComparison,
+    all_resolved: bool,
+    differing: &[ComparisonDimension],
+    unresolved: &[ComparisonDimension],
+    coverage: EvidenceCoverage,
+) -> String {
+    let profile = &comparison.profile;
+    if !all_resolved {
+        return format!(
+            "owner records retain dimensions {} unresolved, so no relation is derived; coverage is {}",
+            spell_dimensions(unresolved),
+            coverage_spelling(coverage)
+        );
+    }
+    if differing.is_empty() {
+        return format!(
+            "all {EXPECTED_COMPARISON_DIMENSIONS} canonical dimensions carry equal admitted values under owner profile {}@{}; coverage is complete",
+            profile.profile_id, profile.schema_revision
+        );
+    }
+    format!(
+        "admitted values differ in {} under owner profile {}@{}; coverage is complete",
+        spell_dimensions(differing),
+        profile.profile_id,
+        profile.schema_revision
+    )
+}
+
+/// Derives one comparison's relation from its admitted typed values.
+///
+/// The caller supplied no verdict. For every canonical dimension both exact
+/// source values are required under the same admitted profile; only when all
+/// eight are present and equal does the relation become
+/// [`CompatibilityRelation::EqualConditions`], only when all eight are present
+/// and at least one differs does it become [`CompatibilityRelation::TypedDifference`],
+/// and a competent owner-issued unnormalizable or unsupported result, a
+/// missing value, or partial coverage yields [`CompatibilityRelation::Ambiguous`]
+/// while every declaration is preserved.
+fn derive_owner_relation(comparison: &OwnerComparison) -> DerivedRelation {
+    let mut outcomes: Vec<DimensionComparison> = Vec::with_capacity(EXPECTED_COMPARISON_DIMENSIONS);
+    let mut differing: Vec<ComparisonDimension> = Vec::new();
+    let mut unresolved: Vec<ComparisonDimension> = Vec::new();
+    for dimension in COMPARISON_DIMENSIONS {
+        let outcome = collect_dimension_outcome(comparison, dimension, &mut unresolved);
+        if matches!(outcome, DimensionOutcome::Differing { .. }) {
+            differing.push(dimension);
+        }
+        outcomes.push(DimensionComparison { dimension, outcome });
+    }
+    collect_unresolved_dimensions(comparison, &mut unresolved);
+    let all_resolved = unresolved.is_empty();
+    let coverage = derive_comparison_coverage(&outcomes, all_resolved);
+    let relation = if !all_resolved {
+        CompatibilityRelation::Ambiguous
+    } else if differing.is_empty() {
+        CompatibilityRelation::EqualConditions
+    } else {
+        CompatibilityRelation::TypedDifference
+    };
+    let note = relation_note(comparison, all_resolved, &differing, &unresolved, coverage);
+    DerivedRelation {
+        relation,
+        outcomes,
+        differing,
+        coverage,
+        note,
+    }
+}
+
+/// Returns the canonical spelling of one evidence coverage value.
+fn coverage_spelling(coverage: EvidenceCoverage) -> &'static str {
+    match coverage {
+        EvidenceCoverage::CompleteForScope => "complete_for_scope",
+        EvidenceCoverage::PartialForScope => "partial_for_scope",
+        EvidenceCoverage::NotApplicable => "not_applicable",
+        EvidenceCoverage::Unknown => "unknown",
+    }
+}
+
+/// Builds one compatibility entry for an owner-issued comparison.
+fn owner_compatibility_entry(
     source_handle: &str,
-    comparisons: &[SuppliedComparison],
-) -> Vec<PositionCompatibility> {
-    let mut out: Vec<PositionCompatibility> = Vec::new();
-    for comparison in comparisons {
-        let other = if comparison.left_source == source_handle {
-            Some(comparison.right_source.as_str())
-        } else if comparison.right_source == source_handle {
-            Some(comparison.left_source.as_str())
-        } else {
-            None
-        };
-        let Some(other) = other else {
+    comparison: &OwnerComparison,
+) -> Option<PositionCompatibility> {
+    let peer = comparison_peer(
+        &comparison.first_source,
+        &comparison.second_source,
+        source_handle,
+    )?;
+    let derived = derive_owner_relation(comparison);
+    let mut unnormalizable: Vec<ComparisonDimension> = comparison.unnormalizable_dimensions.clone();
+    unnormalizable.sort();
+    unnormalizable.dedup();
+    let mut unsupported: Vec<ComparisonDimension> = comparison.unsupported_dimensions.clone();
+    unsupported.sort();
+    unsupported.dedup();
+    Some(PositionCompatibility {
+        other_source: peer.to_owned(),
+        relation: derived.relation,
+        supplement_version: SupplementVersion::OwnerRecordV2,
+        outcomes: derived.outcomes,
+        differing_dimensions: derived.differing,
+        unnormalizable_dimensions: unnormalizable,
+        unsupported_dimensions: unsupported,
+        coverage: derived.coverage,
+        derivation_note: derived.note,
+    })
+}
+
+/// Builds one compatibility entry for a legacy declaration.
+fn legacy_compatibility_entry(
+    source_handle: &str,
+    comparison: &SuppliedComparison,
+) -> Option<PositionCompatibility> {
+    let peer = comparison_peer(
+        &comparison.left_source,
+        &comparison.right_source,
+        source_handle,
+    )?;
+    // Canonical order comes from the dimension table, not from the order the
+    // caller happened to supply the entries in. Sorting here as well as in
+    // the digest is what keeps the two in step: otherwise two supplements
+    // differing only in entry order would share a digest while emitting
+    // byte-different analyses.
+    let mut outcomes: Vec<DimensionComparison> = Vec::with_capacity(EXPECTED_COMPARISON_DIMENSIONS);
+    let mut differing: Vec<ComparisonDimension> = Vec::new();
+    let mut unnormalizable: Vec<ComparisonDimension> = Vec::new();
+    for dimension in COMPARISON_DIMENSIONS {
+        let Some(entry) = comparison
+            .dimensions
+            .iter()
+            .find(|entry| entry.dimension == dimension)
+        else {
             continue;
         };
-        // Canonical order comes from the dimension table, not from the order the
-        // caller happened to supply the entries in. Sorting here as well as in
-        // the digest is what keeps the two in step: otherwise two supplements
-        // differing only in entry order would share a digest while emitting
-        // byte-different analyses.
-        let mut outcomes: Vec<DimensionComparison> =
-            Vec::with_capacity(EXPECTED_COMPARISON_DIMENSIONS);
-        let mut differing: Vec<ComparisonDimension> = Vec::new();
-        let mut unnormalizable: Vec<ComparisonDimension> = Vec::new();
-        for dimension in COMPARISON_DIMENSIONS {
-            let Some(entry) = comparison
-                .dimensions
-                .iter()
-                .find(|entry| entry.dimension == dimension)
-            else {
-                continue;
-            };
-            match &entry.outcome {
-                DimensionOutcome::Differing { .. } => differing.push(dimension),
-                DimensionOutcome::Unnormalizable { .. } => unnormalizable.push(dimension),
-                DimensionOutcome::Equal { .. } => {}
-            }
-            outcomes.push(DimensionComparison {
-                dimension,
-                outcome: entry.outcome.clone(),
-            });
+        match &entry.outcome {
+            DimensionOutcome::Differing { .. } => differing.push(dimension),
+            DimensionOutcome::Unnormalizable { .. } => unnormalizable.push(dimension),
+            DimensionOutcome::Equal { .. } => {}
         }
-        let relation = CompatibilityRelation::Ambiguous;
-        out.push(PositionCompatibility {
-            other_source: other.to_owned(),
-            relation,
-            supplement_version: SupplementVersion::LegacyV1Unverified,
-            outcomes,
-            differing_dimensions: differing,
-            unnormalizable_dimensions: unnormalizable,
+        outcomes.push(DimensionComparison {
+            dimension,
+            outcome: entry.outcome.clone(),
         });
+    }
+    Some(PositionCompatibility {
+        other_source: peer.to_owned(),
+        relation: CompatibilityRelation::Ambiguous,
+        supplement_version: SupplementVersion::LegacyV1Unverified,
+        outcomes,
+        differing_dimensions: differing,
+        unnormalizable_dimensions: unnormalizable,
+        unsupported_dimensions: Vec::new(),
+        coverage: EvidenceCoverage::Unknown,
+        derivation_note: "legacy v1 declaration: no owner-bound source, profile, or value records, so no relation is derived".to_owned(),
+    })
+}
+
+/// Builds one position's preserved mapping against every compared position.
+///
+/// An owner-issued comparison is preferred for a given peer, because it is the
+/// only one that can carry a derived relation; a legacy declaration for the
+/// same peer is still preserved under its own unverified ceiling rather than
+/// being dropped or silently overwritten.
+fn build_compatibility(
+    source_handle: &str,
+    supplements: &ConflictSupplements,
+) -> Vec<PositionCompatibility> {
+    let mut out: Vec<PositionCompatibility> = Vec::new();
+    for comparison in &supplements.owner_records.comparisons {
+        if let Some(entry) = owner_compatibility_entry(source_handle, comparison) {
+            out.push(entry);
+        }
+    }
+    for comparison in &supplements.comparisons {
+        let Some(entry) = legacy_compatibility_entry(source_handle, comparison) else {
+            continue;
+        };
+        if out
+            .iter()
+            .any(|existing| existing.other_source == entry.other_source)
+        {
+            continue;
+        }
+        out.push(entry);
     }
     out.sort_by(|left, right| left.other_source.cmp(&right.other_source));
     out
@@ -2539,10 +3966,11 @@ fn compatibility_clause(mapping: &[PositionCompatibility]) -> String {
             )
         };
         clauses.push(format!(
-            "against {}: {} {}{}{}",
+            "against {}: {} {} coverage={}{}{}",
             entry.other_source,
             entry.relation.as_str(),
             entry.supplement_version.as_str(),
+            coverage_spelling(entry.coverage),
             differing,
             unnormalizable
         ));
@@ -2605,16 +4033,132 @@ fn effective_causal_claim(claim: &SuppliedCausalClaim) -> CausalClaimRecord {
         effective_state: effective,
         supplement_version: SupplementVersion::LegacyV1Unverified,
         reduction_reason,
+        coverage: EvidenceCoverage::Unknown,
+        mechanism_claim_id: None,
     }
 }
 
-/// Preserves every supplied causal claim with its effective state.
+/// Returns the first evidence leg that blocks an evidence-qualified state, or
+/// `None` when every required leg is present and qualifying.
+///
+/// The legs are checked in the order the issue names them so the reported
+/// reason is the first real gap rather than an arbitrary one.
+fn blocking_causal_leg(record: &CausalEvidenceRecord) -> Option<String> {
+    if record.evidence.is_empty() {
+        return Some("no owner evidence envelope is bound to this claim".to_owned());
+    }
+    if !record.evidence.iter().all(EvidenceRecord::qualifies) {
+        return Some(
+            "an envelope retains a lower authority, freshness, or assertability ceiling".to_owned(),
+        );
+    }
+    if record.falsifier.observed == FalsifierStatus::Unobserved {
+        return Some("the falsifier is specified but no status was observed".to_owned());
+    }
+    if record.control.evaluator_result != EvaluatorResult::Competent {
+        return Some(format!(
+            "the matched control carries an {} evaluator result",
+            record.control.evaluator_result.as_str()
+        ));
+    }
+    let coverage = record.rivals.derived_coverage();
+    if coverage != EvidenceCoverage::CompleteForScope {
+        return Some(format!(
+            "the rival/confounder denominator is {} rather than complete",
+            coverage_spelling(coverage)
+        ));
+    }
+    None
+}
+
+/// Derives one causal assessment from its owner-issued evidence record.
+///
+/// The declared state is preserved verbatim. Prediction support, intervention
+/// execution, and causal attribution stay distinct: each leg is checked against
+/// the state the source actually declared, so a supported prediction never
+/// becomes an intervention, an executed intervention never becomes a causal
+/// attribution on its own, and correlation and chronology never promote
+/// either. Anything short of the declared state's own requirements stays
+/// [`CausalClaimState::Unknown`].
+fn derive_causal_state(record: &CausalEvidenceRecord) -> CausalClaimState {
+    if blocking_causal_leg(record).is_some() {
+        return CausalClaimState::Unknown;
+    }
+    match record.declared_state {
+        CausalClaimState::Structural | CausalClaimState::Correlational => record.declared_state,
+        CausalClaimState::CausalHypothesis => match record.falsifier.observed {
+            FalsifierStatus::Inconsistent => CausalClaimState::Refuted,
+            _ => CausalClaimState::CausalHypothesis,
+        },
+        CausalClaimState::Prediction => CausalClaimState::Prediction,
+        CausalClaimState::Intervention => match &record.intervention {
+            Some(_) => CausalClaimState::Intervention,
+            None => CausalClaimState::Unknown,
+        },
+        CausalClaimState::Refuted => match record.falsifier.observed {
+            FalsifierStatus::Inconsistent => CausalClaimState::Refuted,
+            _ => CausalClaimState::Unknown,
+        },
+        CausalClaimState::Unknown => CausalClaimState::Unknown,
+    }
+}
+
+/// Builds one causal assessment from an owner-issued evidence record.
+fn owner_causal_record(record: &CausalEvidenceRecord) -> CausalClaimRecord {
+    let coverage = record.rivals.derived_coverage();
+    let effective = derive_causal_state(record);
+    let reduction_reason = match blocking_causal_leg(record) {
+        Some(gap) => format!(
+            "declared {} stays unknown under owner records: {gap}; rival coverage is {}",
+            record.declared_state.as_str(),
+            coverage_spelling(coverage)
+        ),
+        None if effective == record.declared_state => format!(
+            "declared {} retained under owner mechanism claim {}@{} with complete rival coverage",
+            record.declared_state.as_str(),
+            record.mechanism.claim_id,
+            record.mechanism.source_revision
+        ),
+        None => format!(
+            "declared {} qualified down to {} under owner records: the evidence supports the lower state only",
+            record.declared_state.as_str(),
+            effective.as_str()
+        ),
+    };
+    CausalClaimRecord {
+        source_handle: record.source_handle.clone(),
+        declared_state: record.declared_state,
+        effective_state: effective,
+        supplement_version: SupplementVersion::OwnerRecordV2,
+        reduction_reason,
+        coverage,
+        mechanism_claim_id: Some(record.mechanism.claim_id.clone()),
+    }
+}
+
+/// Preserves every supplied and every owner-issued causal claim.
+///
+/// An owner-issued record for a source is the one that carries an assessment;
+/// a legacy declaration for the same source is still preserved under its own
+/// unverified ceiling rather than dropped, so the declaration stays visible
+/// beside the evidence that qualified or refused it.
 fn collect_causal_claims(supplements: &ConflictSupplements) -> Vec<CausalClaimRecord> {
     let mut out: Vec<CausalClaimRecord> = supplements
-        .causal_claims
+        .owner_records
+        .causal_evidence
         .iter()
-        .map(effective_causal_claim)
+        .map(owner_causal_record)
         .collect();
+    let qualified: Vec<String> = out
+        .iter()
+        .map(|record| record.source_handle.clone())
+        .collect();
+    for claim in &supplements.causal_claims {
+        if qualified.contains(&claim.source_handle) {
+            continue;
+        }
+        out.push(effective_causal_claim(claim));
+    }
     out.sort_by(|left, right| left.source_handle.cmp(&right.source_handle));
     out
 }
@@ -2705,7 +4249,7 @@ fn dispose_position(
             "{compatibility}; chronology, count, confidence, recency, or topology is not causal or truth evidence"
         );
     }
-    let compatibility_map = build_compatibility(&source_handle, &supplements.comparisons);
+    let compatibility_map = build_compatibility(&source_handle, supplements);
     let compatibility_note = compatibility_note_with_mapping(&compatibility, &compatibility_map);
     PositionAnalysis {
         position_index: index,
@@ -3162,6 +4706,107 @@ fn comparison_and_causal_digest_parts(supplements: &ConflictSupplements) -> Vec<
     parts
 }
 
+/// Builds the digest parts committing the owner-issued source records, profile,
+/// observed values, evidence receipts, and coverage.
+///
+/// The candidate identity binds the exact owner material, not the assertions
+/// made about it: a changed source byte or revision, a changed profile
+/// definition, a changed receipt, or a changed observed value all move the
+/// digest, so a changed owner record can never share a candidate identity with
+/// the analysis that admitted the earlier one.
+fn owner_record_digest_parts(records: &OwnerRecords) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    for member in &records.source_members {
+        parts.push(format!(
+            "source_member:{}:{}:{}:{}:{}",
+            member.position_source,
+            member.source_owner,
+            member.record_digest,
+            member.source_revision,
+            member.source_snapshot
+        ));
+    }
+    for comparison in &records.comparisons {
+        let derived = derive_owner_relation(comparison);
+        parts.push(format!(
+            "owner_profile:{}:{}:{}:{}:{}:{}:{}:{}",
+            comparison.first_source,
+            comparison.second_source,
+            comparison.profile.profile_id,
+            comparison.profile.owner,
+            comparison.profile.schema_revision,
+            comparison.profile.definition_digest,
+            comparison.profile.missing_disposition.as_str(),
+            comparison.profile.unsupported_disposition.as_str()
+        ));
+        for dimension in COMPARISON_DIMENSIONS {
+            for source in [&comparison.first_source, &comparison.second_source] {
+                let value = comparison.value_for(source, dimension).unwrap_or("absent");
+                parts.push(format!(
+                    "owner_value:{source}:{}:{value}",
+                    dimension.as_str()
+                ));
+            }
+        }
+        parts.push(format!(
+            "owner_relation:{}:{}:{}:{}",
+            comparison.first_source,
+            comparison.second_source,
+            derived.relation.as_str(),
+            coverage_spelling(derived.coverage)
+        ));
+    }
+    for record in &records.causal_evidence {
+        parts.extend(causal_evidence_digest_parts(record));
+    }
+    parts.sort();
+    parts
+}
+
+/// Builds the digest parts committing one owner-issued causal evidence record.
+fn causal_evidence_digest_parts(record: &CausalEvidenceRecord) -> Vec<String> {
+    let mut parts: Vec<String> = vec![format!(
+        "causal_evidence:{}:{}:{}:{}:{}:{}:{}:{}",
+        record.source_handle,
+        record.declared_state.as_str(),
+        record.mechanism.claim_id,
+        record.mechanism.source_revision,
+        record.mechanism.claim_digest,
+        record.falsifier.observed.as_str(),
+        record.control.control_id,
+        record.control.evaluator_result.as_str()
+    )];
+    // `map_or` cannot unify an `&str` default with a `String` closure result,
+    // and the two branches are genuinely different types, so this is an
+    // explicit match rather than a coerced default.
+    let intervention = match record.intervention.as_ref() {
+        Some(binding) => format!("{}:{}", binding.execution_id, binding.receipt_digest),
+        None => String::from("absent"),
+    };
+    parts.push(format!(
+        "causal_intervention:{}:{intervention}",
+        record.source_handle
+    ));
+    for handle in &record.rivals.omitted {
+        parts.push(format!("rival_omitted:{}:{handle}", record.source_handle));
+    }
+    for evidence in &record.evidence {
+        parts.push(format!(
+            "causal_evidence_envelope:{}:{}:{}:{}:{}:{:?}:{:?}:{:?}:{:?}",
+            record.source_handle,
+            evidence.evidence_id,
+            evidence.owner,
+            evidence.material_digest,
+            evidence.receipt_digest,
+            evidence.envelope.status,
+            evidence.envelope.authority,
+            evidence.envelope.freshness,
+            evidence.envelope.assertability
+        ));
+    }
+    parts
+}
+
 /// Computes the deterministic digest binding the analyzed inputs.
 pub fn compute_candidate_digest(
     conflict_set: &ConflictSet,
@@ -3249,6 +4894,7 @@ pub fn compute_candidate_digest(
     probes.sort();
     parts.extend(probes);
     parts.extend(comparison_and_causal_digest_parts(supplements));
+    parts.extend(owner_record_digest_parts(&supplements.owner_records));
     parts.push(format!(
         "owner:{}:{}",
         owner.kind.as_str(),
@@ -3431,6 +5077,7 @@ pub fn analyze_conflict(
     validate_conflict_denominators(conflict_set, policy)?;
     validate_comparisons(conflict_set, &supplements.comparisons)?;
     validate_causal_claims(conflict_set, &supplements.causal_claims)?;
+    validate_owner_records(item, conflict_set, &supplements.owner_records)?;
     check_supplement_identity_uniqueness(supplements)?;
     if policy.policy_id != item.receipt.validator_policy {
         return Err(ConflictAnalysisError::Policy {
@@ -3899,6 +5546,7 @@ mod tests {
             comparisons: Vec::new(),
             causal_claims: Vec::new(),
             external_resolution: None,
+            owner_records: OwnerRecords::default(),
         }
     }
 

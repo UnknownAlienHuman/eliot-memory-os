@@ -540,7 +540,7 @@ impl ValidatedDispatch {
 /// Runs `validate_binding`, the `from_claim` join against the owner-supplied
 /// hello and in-memory process request, and the executable-binding
 /// currentness check against the live owner expectation. Any wrong, stale,
-/// revoked, foreign, or expired presentation fails here, before any factory
+/// revoked, foreign, lease-expired, or expired presentation fails here, before any factory
 /// side effect.
 ///
 /// # Errors
@@ -563,6 +563,19 @@ pub fn validate_admitted_dispatch(
     claim
         .require_executable_binding(expected, now_unix_ms)
         .map_err(RegistryError::BadClaim)?;
+    // Registration-lease currentness (Implements #22 AC5 lease scope and
+    // the W1 admitted-lease dimension): the presenting registration states
+    // the exact lease window this generation was admitted under, and expiry
+    // ends authority without renewal. A dispatch observed at or past the
+    // lease end is refused with the typed stale-lease refusal, so
+    // broker/session/lease loss revokes credential/resource scope here,
+    // before any factory side effect. This runs after the executable
+    // currentness check so an expired binding window keeps its exact
+    // `DeadlineExpired` dimension. The owner restores authority through a
+    // new admission, never a local repair in the worker.
+    if now_unix_ms >= admission.registration().lease_expires_at_unix_ms {
+        return Err(WorkerError::StaleLease.into());
+    }
     let join = claim
         .executable_binding
         .as_ref()

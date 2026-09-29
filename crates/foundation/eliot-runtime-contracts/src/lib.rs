@@ -118,10 +118,12 @@ pub use module_manifest::{
     module_manifest_file_name,
 };
 pub use restart_policy::{
-    AutomaticRestartDecision, RestartClass, RestartDependency, RestartDependencyKind,
-    RestartFailureEvidence, RestartGroupStrategy, RestartIdentityEvidence, RestartIntensityPolicy,
-    RestartInvalidationTrigger, RestartOwnerLifecycle, RestartPolicyAdmissionBinding,
-    RestartPolicyError, RestartPolicyV1, decide_automatic_restart,
+    AutomaticRestartDecision, RestartAttemptOutcome, RestartAttemptRecord, RestartClass,
+    RestartDecisionRecord, RestartDenial, RestartDependency, RestartDependencyKind,
+    RestartFailureEvidence, RestartGroupStrategy, RestartIdentityEvidence, RestartIntensityLedger,
+    RestartIntensityPolicy, RestartInvalidationTrigger, RestartOperationIdentity,
+    RestartOwnerLifecycle, RestartPolicyAdmissionBinding, RestartPolicyError, RestartPolicyV1,
+    RestartReservation, decide_automatic_restart,
 };
 pub use runtime_live::{
     RUNTIME_LIVE_STORE_BIND, RUNTIME_LIVE_STORE_ENDPOINT, RUNTIME_LIVE_STORE_NAMESPACE,

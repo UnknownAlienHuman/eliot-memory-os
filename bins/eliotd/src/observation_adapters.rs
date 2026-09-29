@@ -16,6 +16,12 @@
 //!   path. Only a `Committed` observation receipt admits the recovery leg;
 //!   every terminal receipt is returned exactly as issued, and a lost
 //!   acknowledgement reconciles the same operation receipt.
+//! - `admit_maintenance_result` forwards the maintained subsystem's own typed
+//!   maintenance record to the Governor canonical observation path and returns
+//!   only the exact issued store receipt. Publication identity, replay
+//!   reconciliation and lost-acknowledgement readback stay with the Governor
+//!   owner; this adapter never claims a result was published without that
+//!   receipt.
 //! - Watchdog export acknowledgement mapping is pure and lives here (never
 //!   in the Governor, which must not depend on the Watchdog): a terminal
 //!   canonical receipt maps to its sink disposition, an unknown outcome maps
@@ -65,6 +71,28 @@ impl<P: KernelTransitionPort + ?Sized> ForwardingObservationReconciliation<'_, P
     ) -> Result<eliot_store_api::WriteReceipt, CompositionError> {
         self.inner
             .admit_doctor_verification(identity, operation_id, report)
+            .await
+    }
+
+    /// Forwards one maintenance source result to the Governor canonical
+    /// observation path and returns only the exact issued store receipt.
+    ///
+    /// The maintenance record is the maintained subsystem's own typed result,
+    /// including its optional versioned evaluation binding. This adapter adds
+    /// no admission rule: fence agreement, the maintenance contract's own
+    /// validation, scratch journal legality, the proactive same-operation
+    /// receipt check, and the canonical commit all stay with the Governor
+    /// owner. A retry of the same source event reconciles the existing receipt;
+    /// a lost acknowledgement is read back through the same operation, and no
+    /// result is reported as published without an exact store receipt.
+    pub async fn admit_maintenance_result(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        base_operation_id: &eliot_contracts::OperationId,
+        record: &eliot_observation_contracts::MaintenanceRecord,
+    ) -> Result<eliot_store_api::WriteReceipt, CompositionError> {
+        self.inner
+            .admit_maintenance_result(identity, base_operation_id, record)
             .await
     }
 

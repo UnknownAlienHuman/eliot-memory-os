@@ -339,7 +339,7 @@ fn active_readiness_fixture() -> Result<ReadinessFixture, TestError> {
             authority_epoch: AuthorityEpoch::new(candidate.kernel_epoch.sequence.get())?,
         },
     )?;
-    driver.handoff_prepared()?;
+    driver.handoff_prepared(None)?;
     driver.prior_disposition_committed()?;
     let permit = driver.issue_nonce(&candidate, ResourceGeneration::genesis())?;
     driver.activating()?;
@@ -414,6 +414,13 @@ fn readiness_supervision_snapshot(
         activation_id: eliot_ors::OperationIdentity::new(fixture.candidate.activation_id.as_str())?,
         activation_generation: fixture.activation.generation,
         kernel_epoch: fixture.candidate.kernel_epoch.clone(),
+        kernel_front_door_server_sid: "S-1-5-19".to_owned(),
+        kernel_front_door_session_id: 0,
+        kernel_front_door_artifact_sha256: fixture
+            .candidate
+            .kernel_artifact_digest
+            .as_str()
+            .to_owned(),
         watchdog_epoch: AuthorityEpoch::new(1)?,
         generation_binding: eliot_runtime_contracts::SupervisionGenerationBinding {
             target_id: "kernel-readiness".to_owned(),
@@ -2878,7 +2885,7 @@ fn reconciled_active_readiness_failure_preserves_contour_then_recovers() -> Test
             authority_epoch: AuthorityEpoch::new(candidate.kernel_epoch.sequence.get())?,
         },
     )?;
-    driver.handoff_prepared()?;
+    driver.handoff_prepared(None)?;
     driver.prior_disposition_committed()?;
     let permit = driver.issue_nonce(&candidate, ResourceGeneration::genesis())?;
     driver.activating()?;

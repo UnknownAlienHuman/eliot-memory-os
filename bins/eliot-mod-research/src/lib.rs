@@ -21,7 +21,7 @@ pub mod kernel_client;
 pub mod protocol;
 
 use eliot_contracts::StateFence;
-use eliot_process::ExitDisposition;
+use eliot_process::{ExitDisposition, OperationId};
 use eliot_research_exchange::{ExchangeError, ExchangeJob, ResearchBridge};
 use eliot_research_exchange_api::{
     CoverageGapKind, DisclosureClass, ExternalKnowledgeFailure, ResearchQueryRequest,
@@ -57,13 +57,6 @@ pub use protocol::{
 
 /// Stable gap code emitted when no governed provider execution is available.
 pub const RESEARCH_SOURCE_UNAVAILABLE: &str = "RESEARCH_SOURCE_UNAVAILABLE";
-
-/// Shared "the readback was never reached" observation.
-///
-/// A static rather than a promoted temporary because the enum carries drop
-/// glue in one variant, and because every such failure must report the same
-/// not-attempted state rather than a per-call value.
-static EVIDENCE_NOT_ATTEMPTED: EvidenceObservation = EvidenceObservation::NotAttempted;
 
 /// Length of a lowercase SHA-256 hex digest binding one bridge executable.
 const SHA256_HEX_LEN: usize = 64;
@@ -106,6 +99,14 @@ pub enum BridgeError {
         /// process that genuinely completed be reported as though nothing ran.
         /// `None` when no terminal process state was observed.
         disposition: Option<ProviderOutcome>,
+    },
+    #[error("research provider stream readback did not answer")]
+    StreamReadbackFailed {
+        /// Executor disposition observed before the stream readback failed.
+        disposition: Option<ProviderOutcome>,
+        /// Typed executor refusal from the attempted readback.
+        #[source]
+        source: Box<eliot_process::ProcessExecutionError>,
     },
     #[error("research provider execution failed: {reason}")]
     ProviderFailed {
@@ -158,6 +159,28 @@ pub enum BridgeError {
         /// Boxed for the same reason as [`BridgeError::TimedOut`].
         evidence: Option<Box<RawProviderEvidence>>,
     },
+    #[error("executor start did not return a verified receipt; reconcile by operation identity")]
+    StartFailed {
+        /// Exact operation binding retained across the possible handoff.
+        context: Box<StartAttemptContext>,
+        /// Typed executor refusal; the operation may still exist.
+        #[source]
+        source: Box<eliot_process::ProcessExecutionError>,
+    },
+    #[error(
+        "executor start receipt did not preserve the bound request; reconcile by operation identity"
+    )]
+    StartReceiptMismatch {
+        /// Exact operation binding retained across the possible handoff.
+        context: Box<StartAttemptContext>,
+    },
+    #[error("runner could not retain the verified start binding: {reason}")]
+    StartBindingInstallFailed {
+        /// Exact operation binding retained across the possible handoff.
+        context: Box<StartAttemptContext>,
+        /// Stable lock failure reason.
+        reason: &'static str,
+    },
     #[error("shared process contour failed: {0}")]
     Process(#[from] eliot_process::ProcessExecutionError),
 }
@@ -195,6 +218,10 @@ impl BridgeError {
             Self::TimedOut { .. } => CoverageGapKind::Timeout,
             Self::ProviderFailed { .. }
             | Self::EvidenceIncomplete { .. }
+            | Self::StartFailed { .. }
+            | Self::StartReceiptMismatch { .. }
+            | Self::StartBindingInstallFailed { .. }
+            | Self::StreamReadbackFailed { .. }
             | Self::UnknownOutcome { .. }
             | Self::Process(_) => CoverageGapKind::Unknown,
         }
@@ -213,10 +240,15 @@ impl BridgeError {
             Self::ProviderFailed { .. } | Self::Process(_) => {
                 eliot_kernel_service::REASON_RUNTIME_FAILED
             }
-            Self::EvidenceIncomplete { .. } => {
+            Self::EvidenceIncomplete { .. } | Self::StreamReadbackFailed { .. } => {
                 eliot_kernel_service::REASON_INSTRUMENT_EVIDENCE_INCOMPLETE
             }
-            Self::UnknownOutcome { .. } => eliot_kernel_service::REASON_UNKNOWN_OUTCOME,
+            Self::UnknownOutcome { .. }
+            | Self::StartFailed { .. }
+            | Self::StartReceiptMismatch { .. }
+            | Self::StartBindingInstallFailed { .. } => {
+                eliot_kernel_service::REASON_UNKNOWN_OUTCOME
+            }
         }
     }
 
@@ -292,10 +324,18 @@ impl BridgeError {
     /// [`EvidenceObservation::NotAttempted`]: the readback was genuinely not
     /// reached, which is an honest statement rather than an empty stream.
     #[must_use]
-    pub const fn evidence_observation(&self) -> &EvidenceObservation {
+    pub fn evidence_observation(&self) -> EvidenceObservation {
         match self {
-            Self::TimedOut { evidence, .. } => evidence,
-            _ => &EVIDENCE_NOT_ATTEMPTED,
+            Self::TimedOut { evidence, .. } => evidence.as_ref().clone(),
+            Self::ProtocolViolation {
+                evidence: Some(evidence),
+                ..
+            }
+            | Self::UnknownOutcome {
+                evidence: Some(evidence),
+            } => EvidenceObservation::Observed(evidence.clone()),
+            Self::StreamReadbackFailed { .. } => EvidenceObservation::Unobserved,
+            _ => EvidenceObservation::NotAttempted,
         }
     }
 
@@ -308,7 +348,20 @@ impl BridgeError {
     #[must_use]
     pub const fn process_disposition(&self) -> Option<ProviderOutcome> {
         match self {
-            Self::ProtocolViolation { disposition, .. } => *disposition,
+            Self::ProtocolViolation { disposition, .. }
+            | Self::StreamReadbackFailed { disposition, .. } => *disposition,
+            _ => None,
+        }
+    }
+
+    /// Returns the exact operation context retained before executor start,
+    /// when the start handoff or receipt failed.
+    #[must_use]
+    pub fn start_attempt_context(&self) -> Option<&StartAttemptContext> {
+        match self {
+            Self::StartFailed { context, .. }
+            | Self::StartReceiptMismatch { context }
+            | Self::StartBindingInstallFailed { context, .. } => Some(context),
             _ => None,
         }
     }
@@ -440,9 +493,19 @@ impl ResearchBridge for GovernedResearchBridge {
             BridgeError::EvidenceIncomplete { reason } => {
                 ExternalKnowledgeFailure::EvidenceIncomplete { reason }
             }
+            BridgeError::StreamReadbackFailed { .. } => {
+                ExternalKnowledgeFailure::EvidenceIncomplete {
+                    reason: "executor stream readback did not answer",
+                }
+            }
             // The retained raw provider evidence stays with this error so a
             // reconcile reuses the same bytes; only the outcome is projected.
-            BridgeError::UnknownOutcome { .. } => ExternalKnowledgeFailure::UnknownOutcome,
+            BridgeError::UnknownOutcome { .. }
+            | BridgeError::StartFailed { .. }
+            | BridgeError::StartReceiptMismatch { .. }
+            | BridgeError::StartBindingInstallFailed { .. } => {
+                ExternalKnowledgeFailure::UnknownOutcome
+            }
             BridgeError::Process(_) => ExternalKnowledgeFailure::ProcessFailed,
         }
     }
@@ -498,6 +561,9 @@ struct SubmittedState {
     /// stable identity instead of being reported as an attempt that never
     /// happened — and it is explicitly not permission to mint a new one.
     operation_id: Option<String>,
+    /// Exact pre-handoff operation context when start did not produce a
+    /// verified receipt. Retained here after the typed start failure returns.
+    start_attempt: Option<StartAttemptContext>,
 }
 
 /// Cloneable terminal classification of one failed provider attempt.
@@ -519,6 +585,9 @@ pub struct TerminalFailure {
     pub evidence: Option<RawProviderEvidence>,
     /// Cancellation receipt fragment, when a cancellation was issued.
     pub cancellation: Option<CancellationEvidence>,
+    /// Typed cancellation disposition, including an attempted cancellation
+    /// whose receipt never arrived.
+    pub cancellation_outcome: CancellationOutcome,
     /// How this failure's stream readback resolved.
     ///
     /// Retained so a consumer can tell a stream that was never read back from
@@ -527,13 +596,6 @@ pub struct TerminalFailure {
     /// carry that distinction, and rendering a missing readback as an empty
     /// capture would be exactly the false observation these repairs remove.
     pub evidence_observation: EvidenceObservation,
-    /// Whether a cancellation was actually issued.
-    ///
-    /// `true` for a cancellation the executor never answered. This is what
-    /// keeps an attempted-but-unconfirmed cancellation distinguishable from one
-    /// that was never tried: [`TerminalFailure::cancellation`] is empty in both
-    /// cases, and only this flag tells them apart.
-    pub cancellation_attempted: bool,
     /// Which bounded follow-up obligations the primary cause could not
     /// discharge, in attempt order.
     ///
@@ -549,7 +611,11 @@ impl TerminalFailure {
     pub fn from_error(error: &BridgeError) -> Self {
         let outcome = match error {
             BridgeError::TimedOut { .. } => ProviderOutcome::TimedOut,
-            BridgeError::UnknownOutcome { .. } => ProviderOutcome::Unknown,
+            BridgeError::UnknownOutcome { .. }
+            | BridgeError::StartFailed { .. }
+            | BridgeError::StartReceiptMismatch { .. }
+            | BridgeError::StartBindingInstallFailed { .. }
+            | BridgeError::StreamReadbackFailed { .. } => ProviderOutcome::Unknown,
             // A refused or failed attempt reached the executor or its contour,
             // so it is crash-class acquisition evidence, never a clean stop and
             // never a fabricated completion.
@@ -561,14 +627,11 @@ impl TerminalFailure {
             outcome,
             evidence: error.evidence().cloned(),
             cancellation: error.cancellation().cloned(),
-            evidence_observation: error.evidence_observation().clone(),
-            // An unresolved cancellation is still an attempt: it is reported as
-            // attempted with no receipt, never as a cancellation that never
-            // happened.
-            cancellation_attempted: matches!(
-                error.cancellation_state(),
-                Some(CancellationOutcome::Confirmed(_) | CancellationOutcome::Unresolved)
-            ),
+            evidence_observation: error.evidence_observation(),
+            cancellation_outcome: error
+                .cancellation_state()
+                .cloned()
+                .unwrap_or(CancellationOutcome::NotAttempted),
             undischarged: error
                 .undischarged()
                 .iter()
@@ -616,11 +679,13 @@ impl TerminalFailure {
             evidence: None,
             cancellation: cancellation.cloned(),
             // This path is reached only when `execute` returned `Ok`, so no
-            // stream readback was ever attempted and no cancellation was issued
-            // on this bridge's own path. Both are therefore their honest
-            // not-attempted states, never an empty observation.
+            // failed readback is being projected here. The final receipt gets
+            // the successful stream observation directly from the execution.
             evidence_observation: EvidenceObservation::NotAttempted,
-            cancellation_attempted: false,
+            cancellation_outcome: cancellation
+                .map_or(CancellationOutcome::NotAttempted, |receipt| {
+                    CancellationOutcome::Confirmed(Box::new(receipt.clone()))
+                }),
             undischarged: Vec::new(),
         }
     }
@@ -762,6 +827,24 @@ pub struct SubmissionRecord {
     pub envelope_sha256: String,
     /// The exact canonical submit envelope bytes.
     pub envelope_bytes: Vec<u8>,
+}
+
+/// Bounded identity and sealed submit retained across the executor-start
+/// handoff when no verified start receipt is returned.
+///
+/// This is carried on the existing bridge error/submitted-state path. It is
+/// not a second operation ledger: the operation identity and request digest
+/// come from the exact `ProcessRequest` passed to `ProcessExecutor::start`.
+#[derive(Clone, Debug)]
+pub struct StartAttemptContext {
+    /// Stable identity taken from the admitted `ProcessRequest`.
+    pub operation_id: OperationId,
+    /// Exact invocation digest taken from that same request.
+    pub invocation_digest: String,
+    /// Process generation accepted by the request.
+    pub process_generation: u64,
+    /// Exact canonical submit record sealed before handoff.
+    pub submission: SubmissionRecord,
 }
 
 /// Terminal record of one submitted attempt.
@@ -970,9 +1053,19 @@ impl AdmittedResearchBridge {
                 reason: "outcome is classified or already reconciled",
             });
         }
-        let evidence = self
-            .runner
-            .reconcile_operation(self.admission.operation_id())?;
+        let operation = self
+            .submitted()
+            .and_then(|state| state.start_attempt.as_ref())
+            .map_or_else(
+                || self.admission.operation_id().clone(),
+                |context| context.operation_id.clone(),
+            );
+        if &operation != self.admission.operation_id() {
+            return Err(BridgeError::NotAdmitted {
+                reason: "retained attempt identity no longer matches its admission",
+            });
+        }
+        let evidence = self.runner.reconcile_operation(&operation)?;
         if let BridgePhase::Submitted(state) = &mut self.phase {
             state.reconciled = true;
         }
@@ -1017,6 +1110,7 @@ impl ResearchBridge for AdmittedResearchBridge {
                     reconciled: false,
                     observed_disposition: Some(observed),
                     operation_id: Some(execution.job_id.clone()),
+                    start_attempt: None,
                 }));
                 Ok(job_id)
             }
@@ -1028,7 +1122,11 @@ impl ResearchBridge for AdmittedResearchBridge {
                 // unknown outcomes stay reconcile-gated.
                 let terminal = match &error {
                     BridgeError::TimedOut { .. } => SubmittedOutcome::TimedOut,
-                    BridgeError::UnknownOutcome { .. } => SubmittedOutcome::Unknown,
+                    BridgeError::UnknownOutcome { .. }
+                    | BridgeError::StartFailed { .. }
+                    | BridgeError::StartReceiptMismatch { .. }
+                    | BridgeError::StartBindingInstallFailed { .. }
+                    | BridgeError::StreamReadbackFailed { .. } => SubmittedOutcome::Unknown,
                     BridgeError::ProviderFailed { .. }
                     | BridgeError::EvidenceIncomplete { .. }
                     | BridgeError::ProtocolViolation { .. }
@@ -1042,20 +1140,31 @@ impl ResearchBridge for AdmittedResearchBridge {
                 // `evidence: None`, which threw away the stderr/exit/lineage
                 // record for exactly the two terminal cases that most need it,
                 // and it left a start-response loss looking like an attempt that
-                // was never made. The submission record and the operation
-                // identity come from the runner, which sealed them before the
-                // executor handoff, so a possibly-started operation stays
-                // addressable by its stable identity.
+                // was never made. A failed start carries its sealed context
+                // directly; later failures use runner fields installed after
+                // the receipt passed binding checks. Either way the
+                // possibly-started operation stays addressable by its original
+                // identity.
+                let start_attempt = error.start_attempt_context().cloned();
+                let submission = start_attempt
+                    .as_ref()
+                    .map(|context| context.submission.clone())
+                    .or_else(|| self.runner.last_submission());
+                let operation_id = start_attempt
+                    .as_ref()
+                    .map(|context| context.operation_id.as_str().to_owned())
+                    .or_else(|| self.runner.last_bound_operation());
                 self.phase = BridgePhase::Submitted(Box::new(SubmittedState {
                     outcome: terminal,
                     evidence: error.evidence().cloned(),
                     provider_job_ref: None,
                     cancellation: error.cancellation().cloned(),
-                    submission: self.runner.last_submission(),
+                    submission,
                     failure: Some(TerminalFailure::from_error(&error)),
                     reconciled: false,
                     observed_disposition: error.process_disposition(),
-                    operation_id: self.runner.last_bound_operation(),
+                    operation_id,
+                    start_attempt,
                 }));
                 Err(error)
             }
@@ -1075,19 +1184,57 @@ impl ResearchBridge for AdmittedResearchBridge {
             // identity, request digest, and Authority Epoch. Cancelling by a
             // bare job id would let a stale generation or a retargeted request
             // reach another operation's process tree.
-            let view = self.runner.observe_bound_operation()?;
-            if view.operation_id() != self.admission.operation_id()
+            let (target_operation, expected_digest, expected_generation) = {
+                let state = self.submitted().ok_or(BridgeError::NotAdmitted {
+                    reason: "no submitted attempt owns the operation",
+                })?;
+                if let Some(context) = &state.start_attempt {
+                    (
+                        context.operation_id.clone(),
+                        context.invocation_digest.clone(),
+                        context.process_generation,
+                    )
+                } else {
+                    let submission = state.submission.as_ref().ok_or(BridgeError::NotAdmitted {
+                        reason: "submitted attempt has no sealed operation binding",
+                    })?;
+                    let envelope =
+                        SubmitEnvelope::decode(&submission.envelope_bytes).map_err(|_| {
+                            BridgeError::NotAdmitted {
+                                reason: "submitted attempt has no decodable operation binding",
+                            }
+                        })?;
+                    if envelope.operation_id != self.admission.operation_id().as_str() {
+                        return Err(BridgeError::NotAdmitted {
+                            reason: "sealed submit targets a foreign operation",
+                        });
+                    }
+                    (
+                        self.admission.operation_id().clone(),
+                        envelope.invocation_digest,
+                        self.admission.process_generation().get(),
+                    )
+                }
+            };
+            let view = self.runner.observe_operation(&target_operation)?;
+            if view.operation_id() != &target_operation
+                || &target_operation != self.admission.operation_id()
+                || view.request_digest() != expected_digest
+                || view.fence().generation().get() != expected_generation
+                || view.fence().generation() != self.admission.process_generation()
                 || !view
                     .fence()
                     .authority_epoch()
                     .is_same_authority(self.admission.epoch())
             {
                 return Err(BridgeError::NotAdmitted {
-                    reason: "stored operation no longer matches the admitted identity or epoch",
+                    reason: "stored operation no longer matches the admitted identity, request, generation, or fence",
                 });
             }
-            self.runner
-                .cancel_operation(self.admission.operation_id())?;
+            let receipt = self.runner.cancel_operation(&target_operation)?;
+            if let BridgePhase::Submitted(state) = &mut self.phase {
+                state.cancellation = Some(CancellationEvidence::from_receipt(&receipt));
+            }
             return Ok(());
         }
         Err(BridgeError::NotAdmitted {
@@ -1127,9 +1274,19 @@ impl ResearchBridge for AdmittedResearchBridge {
             BridgeError::EvidenceIncomplete { reason } => {
                 ExternalKnowledgeFailure::EvidenceIncomplete { reason }
             }
+            BridgeError::StreamReadbackFailed { .. } => {
+                ExternalKnowledgeFailure::EvidenceIncomplete {
+                    reason: "executor stream readback did not answer",
+                }
+            }
             // The retained raw provider evidence stays with this error so a
             // reconcile reuses the same bytes; only the outcome is projected.
-            BridgeError::UnknownOutcome { .. } => ExternalKnowledgeFailure::UnknownOutcome,
+            BridgeError::UnknownOutcome { .. }
+            | BridgeError::StartFailed { .. }
+            | BridgeError::StartReceiptMismatch { .. }
+            | BridgeError::StartBindingInstallFailed { .. } => {
+                ExternalKnowledgeFailure::UnknownOutcome
+            }
             BridgeError::Process(_) => ExternalKnowledgeFailure::ProcessFailed,
         }
     }
@@ -1188,6 +1345,18 @@ pub const INQUIRY_GOVERNANCE_VIEW: &str = "INQUIRY_GOVERNANCE_VIEW";
 /// that cannot be built is reported as a typed gap, never as a closed inquiry
 /// and never as an admitted result.
 pub const INQUIRY_GOVERNANCE_REFUSED: &str = "INQUIRY_GOVERNANCE_REFUSED";
+
+/// Spelling of a release gate that admitted this run's material claims.
+///
+/// I21.8 item 6: a claim may be promoted only when every required chain, excerpt
+/// and audit dimension is established. The gate answer is published on the
+/// governance line so a consumer reads the decision rather than having to
+/// re-derive it, and so an absent gate is visibly absent.
+pub const RELEASE_GATE_ADMITTED: &str = "admitted";
+
+/// Spelling of a release gate that refused to promote this run's material
+/// claims, followed by the specific member or condition that refused it.
+pub const RELEASE_GATE_BLOCKED: &str = "blocked";
 
 /// Projects the `R6` inquiry-governance view of one admitted provider
 /// operation.
@@ -1336,13 +1505,27 @@ pub fn project_admitted_inquiry(
         provider_generation: receipt.module_generation_id.clone(),
         admissible_routes: vec![route.clone()],
         features: admitted_selection_features(request),
-        candidates: vec![retained_provider_material(request, receipt, &route)],
+        candidates: retained_provider_material(request, receipt, &route)
+            .into_iter()
+            .collect(),
         outcome: acquisition_outcome(receipt),
         reason_code: degradation
             .inquiry_reason_code()
             .unwrap_or(receipt.reason_code)
             .to_owned(),
         assessment_time_ms,
+        // MEASURED: `ResearchQueryRequest` carries no predecessor-freeze or
+        // reopen-reason custody, and this crate is not the owner of the exchange
+        // wire contract, so a run admitted here has no declared predecessor and
+        // the freeze it produces is an honest first freeze rather than a silent
+        // successor. Both fields are therefore initialised to their honest
+        // first-freeze value rather than to a fabricated relation:
+        // `EvidenceFreeze` will name, re-prove and refuse a successor the moment
+        // an admitted request does carry the pair; supplying that custody on the
+        // request is BLOCKED-BY #1762, which owns inquiry/R6 composition. No
+        // value is invented here to make the successor arm fire.
+        predecessor_freeze_digest: None,
+        reopen_reason: None,
     };
     InquiryGovernance::record(observation).map_err(crate::R6ProjectionError::from)
 }
@@ -1415,7 +1598,8 @@ fn retained_provider_material(
     request: &ResearchQueryRequest,
     receipt: &ProviderExecutionReceipt,
     route: &str,
-) -> CandidateEvidence {
+) -> Option<CandidateEvidence> {
+    let content_digest = receipt.raw.stdout.sha256.clone()?;
     let stream = match (receipt.raw.stdout.omission, receipt.raw.stdout.complete) {
         (Some(StreamOmission::NoHandle), _) => StreamEvidence::Absent,
         (None, true) => StreamEvidence::Complete,
@@ -1425,15 +1609,15 @@ fn retained_provider_material(
         || receipt.raw.invocation_digest.clone(),
         |record| record.transport_sha256.clone(),
     );
-    CandidateEvidence {
-        handle: format!("provider-artifact:{}", receipt.raw.stdout.sha256),
+    Some(CandidateEvidence {
+        handle: format!("provider-artifact:{content_digest}"),
         class: request
             .source_classes
             .first()
             .copied()
             .unwrap_or(SourceClass::Unknown),
         operation_id: receipt.operation_id.clone(),
-        content_digest: receipt.raw.stdout.sha256.clone(),
+        content_digest,
         receipt_handle,
         route: route.to_owned(),
         provider_generation: receipt.module_generation_id.clone(),
@@ -1445,7 +1629,7 @@ fn retained_provider_material(
         // contour, so its absence with no stream handle is the exact "refused
         // before acquisition" signal rather than a crash with no output.
         refused: stream == StreamEvidence::Absent && receipt.submit_binding_sha256.is_empty(),
-    }
+    })
 }
 
 /// Maps this crate's typed provider outcome onto the `R6` domain vocabulary.

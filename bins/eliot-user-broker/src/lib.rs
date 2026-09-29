@@ -59,8 +59,8 @@ mod protected_launch_config;
 use bridge_contract::{user_broker_contract, validate_user_broker_contract};
 use kernel_authority_port::KernelAuthorityPort;
 pub use notify_fallback_ensure::{
-    LiveNotifyFallbackEffects, NotifyFallbackEffects, NotifyFallbackEnsure,
-    NotifyFallbackRegistration, ensure_notify_fallback_registered,
+    LiveNotifyFallbackEffects, NotifyFallbackDeclaration, NotifyFallbackEffects,
+    NotifyFallbackEnsure, NotifyFallbackRegistration, ensure_notify_fallback_registered,
 };
 pub use notify_launch_callin::{
     BrokerNotifyError, BrokerNotifyLaunchAuthority, NotifyAcknowledge, NotifyDeliver,
@@ -1729,26 +1729,31 @@ impl BrokerComposition {
         self.broker.launch(request).map_err(Self::classify)
     }
 
-    /// Spawns the per-user notification adapter to record one authenticated
-    /// Human acknowledgement (issue #1780, A2).
+    /// Admits one authenticated Human acknowledgement without spawning a
+    /// canonical writer (issue #1780, A2).
     ///
-    /// This is the composition's production entry to the acknowledgement leg,
-    /// and the reason `eliot-notify`'s acknowledgement line has a caller: the
-    /// broker is the only admitted spawner (I11.6:7, "canonical notification →
-    /// User Broker → native toast → authenticated local UI"), so the broker is
-    /// what composes the line the adapter serves
+    /// This is the composition's production entry to the acknowledgement leg:
+    /// the broker is the only admitted spawner (I11.6:7, "canonical
+    /// notification → User Broker → native toast → authenticated local UI"),
+    /// so the broker is what admits the actor and validates the exact line
+    /// the adapter schema defines
     /// ([`notify_launch_callin::render_notify_acknowledge_line`]).
     ///
     /// The same three independent gates as [`Self::launch_notify`] apply — the
     /// protected launch lease, the retained verified launch reference, and the
     /// request naming exactly those bytes — plus one more: a caller-supplied
-    /// `stdin_payload` is refused, so the bytes handed to the child are always
-    /// the line this composition rendered and never caller text.
+    /// `stdin_payload` is refused, so only the triple this composition
+    /// rendered and validated is ever admitted.
     ///
     /// The acknowledgement is a Human role action (I11.3:13) and it is not a
-    /// resolution (I11.7:5): the principal travels as record data, the
-    /// transition is applied and re-validated on the admitted Kernel route
-    /// inside the adapter, and the record stays unresolved.
+    /// resolution (I11.7:5): the principal travels as record data and the
+    /// record stays unresolved. The canonical transition itself is owned by
+    /// `eliotd`, not by any broker-spawned child: the adapter's direct frame
+    /// reaches the store only through a dead route (the surface selector is
+    /// admitted by no `frame_dispatch.rs` predicate, and the serving arm
+    /// requires the daemon session), so no child is spawned here and this
+    /// entry answers the admitted triple with an explicit non-completion
+    /// instead of a launch receipt for a write that can never land.
     ///
     /// `principal` is the authenticated principal this broker admitted for the
     /// request. It is never taken from the request line: it is the identity
@@ -1756,29 +1761,35 @@ impl BrokerComposition {
     /// canonical record can name no actor but the admitted Human.
     pub fn launch_notify_acknowledge(
         &mut self,
-        request: LaunchRequest,
+        request: &LaunchRequest,
         acknowledgement: &NotifyAcknowledge,
         principal: &str,
     ) -> Result<eliot_user_broker_core::LaunchReceipt, CompositionError> {
         self.verify_launch_lease()?;
         // This gate also refuses a caller-supplied `stdin_payload`, so the bytes
         // bound below are the only bytes this launch can ever carry.
-        notify_launch_callin::admit_notify_request(&self.notify_launch, &request).map_err(
+        notify_launch_callin::admit_notify_request(&self.notify_launch, request).map_err(
             |error| CompositionError::Launch(format!("notify launch rejected: {}", error.code())),
         )?;
-        let line = notify_launch_callin::render_notify_acknowledge_line(acknowledgement, principal)
-            .map_err(|error| {
-                CompositionError::Launch(format!("notify launch rejected: {}", error.code()))
-            })?;
-        // The rendered line becomes the admitted request's own standard-input
-        // bytes, so it is inside `digest(&request)`: this operation identity is
-        // bound to exactly this acknowledgement, and a replay carrying different
-        // bytes is a `ReplayConflict` rather than a second effect.
-        let request = LaunchRequest {
-            stdin_payload: Some(line),
-            ..request
-        };
-        self.launch(request)
+        let _line =
+            notify_launch_callin::render_notify_acknowledge_line(acknowledgement, principal)
+                .map_err(|error| {
+                    CompositionError::Launch(format!("notify launch rejected: {}", error.code()))
+                })?;
+        // No child is spawned: the rendered line only proves the admitted
+        // triple was well-formed, and its bytes are discarded. The canonical
+        // acknowledgement is owned by `eliotd` (issue #1780, A2) — the
+        // broker-spawned adapter reaches the store only through a dead frame
+        // (the surface selector is admitted by no `frame_dispatch.rs`
+        // predicate, and the serving arm requires the daemon session) — so
+        // spawning it would mint a second ungoverned owner path (A0.3) and
+        // answer a launch receipt for a write that can never land. The
+        // admitted triple is refused here instead, until the acknowledgement
+        // intake lane forwards it to the owner.
+        Err(CompositionError::Launch(
+            "notify acknowledgement not completed: canonical acknowledgement is owned by eliotd"
+                .to_owned(),
+        ))
     }
 
     /// Spawns the per-user notification adapter to deliver one canonical

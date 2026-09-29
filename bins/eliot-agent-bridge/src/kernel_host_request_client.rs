@@ -1781,7 +1781,7 @@ fn host_request_observe_submit_frame(
 /// | `eliot.packet` | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | exact bounded compiler result with revision via Governor read owner |
 /// | `eliot.observe` | submit frame (tool bytes) | `agent_host_request_submit` | daemon observe flight claims the retained pair, decodes the closed vocabulary and routes to the Governor observation owner; retained result via the governed submit leg |
 /// | `eliot.query` | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | exact bounded read result with revision via Governor read owner |
-/// | `eliot.act` | submit frame (digest-only) | `agent_host_request_submit` | admission handle only; action-model/authority gate + effect dispatch missing (#1742) |
+/// | `eliot.act` | submit frame (digest-only, dispatch-time revalidated) | `agent_host_request_submit` | admission handle only; bridge revalidates session/fence/connection/payload linkage at dispatch and the Kernel submit gate revalidates the act dispatch binding pre-staging; the daemon-side `admit_material_decision` invocation over owner-resolved inputs with dispatch-time revalidation through a live act claim/flight is the remaining join (#1742 W4) |
 /// | `eliot.verify` | submit frame (digest-only) | `agent_host_request_submit` | admission handle only; verifier-owner invocation + evidence preservation missing |
 /// | `eliot.coordinate` | submit frame (digest-only) | `agent_host_request_submit` | admission handle only; execution-fabric join missing (#1740) |
 /// | `eliot.finish` | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | exact bounded finish decision receipt from the Governor finish owner; a simulated/stale/unbound/unknown-verifier candidate and a caller-supplied proof never yield `VERIFIED_COMPLETE` |
@@ -1802,6 +1802,19 @@ enum CanonicalDispatchEntry {
     /// `completion_join` names the exact missing owner execution that must
     /// complete the row before a completed response is legitimate.
     SubmitAdmitOnly { completion_join: &'static str },
+    /// Act effect dispatch with dispatch-time revalidation (issue #1742 W4,
+    /// owned by #1739 dispatch).
+    ///
+    /// The bridge revalidates only what it owns at dispatch time (act shape,
+    /// live session/fence/connection binding, exact payload-digest linkage)
+    /// and rides the same `agent_host_request_submit` entry; the Kernel
+    /// submit entry revalidates the act dispatch binding pre-staging
+    /// (`check_act_submit_binding`). The daemon-side
+    /// `eliot-context-admission::admit_material_decision` invocation over
+    /// owner-resolved inputs with live-fence revalidation runs at the future
+    /// live act claim/flight, not here. The Accepted reply stays an operation
+    /// handle until the effect owner completes it.
+    SubmitActGated { completion_join: &'static str },
     /// Observe submit carrying the exact canonical tool bytes (issue #2565).
     /// Rides the same `agent_host_request_submit` entry as the digest-only
     /// submits; the Kernel linkage gate binds the bytes to the admitted
@@ -1834,8 +1847,8 @@ fn canonical_dispatch_entry(tool: &ToolRequest) -> CanonicalDispatchEntry {
         // and the daemon flight claims them under a fenced attempt.
         | ToolRequest::Finish(_) => CanonicalDispatchEntry::InvokeRead,
         ToolRequest::Observe(_) => CanonicalDispatchEntry::SubmitObservePair,
-        ToolRequest::Act(_) => CanonicalDispatchEntry::SubmitAdmitOnly {
-            completion_join: "action-model/authority gate + effect dispatch (#1742 material-context gate)",
+        ToolRequest::Act(_) => CanonicalDispatchEntry::SubmitActGated {
+            completion_join: "daemon-side admit_material_decision invocation over Governor owner-resolved inputs with dispatch-time revalidation through a live act claim/flight (Kernel submit gate check_act_submit_binding and bridge dispatch revalidation done; #1742 W4)",
         },
         ToolRequest::Verify(_) => CanonicalDispatchEntry::SubmitAdmitOnly {
             completion_join: "verifier-owner invocation through the existing verifier owner with not-executed/partial/unknown evidence preserved",
@@ -1845,6 +1858,58 @@ fn canonical_dispatch_entry(tool: &ToolRequest) -> CanonicalDispatchEntry {
         },
         ToolRequest::UserAutomation(_) => CanonicalDispatchEntry::SubmitCarryingBytes,
     }
+}
+
+/// Dispatch-time revalidation for one `eliot.act` effect dispatch (issue
+/// #1742 W4 via #1739 dispatch).
+///
+/// Re-checks at dispatch, against live Kernel-issued facts, only what the
+/// bridge owns: the tool is still the exact `eliot.act` request admitted,
+/// the envelope still names the live session/fence/connection, and the
+/// canonical payload digest still binds the exact tool bytes. A swapped
+/// packet, forged binding, or stale fence fails closed here before any
+/// submit frame is built; the material floor/lineage/authority gate itself
+/// stays the Kernel admission owner's `admit_material_decision`, never a
+/// bridge verdict (I01-08 external effect path; I07-08 step 7). Failures are
+/// typed (I07-20): fence mismatch stays `FenceMismatch`, binding mismatches
+/// stay `TransportBindingRejected`, a missing session stays `PlanGap`.
+fn revalidate_act_dispatch(
+    request: &HostInvocationRequest,
+    envelope: &HostRequestEnvelope,
+    facts: &TransportFacts,
+) -> Result<(), PortFailure> {
+    if !matches!(request.tool, ToolRequest::Act(_)) {
+        return Err(request_failure());
+    }
+    if request.tool.canonical_name() != "eliot.act"
+        || envelope.identity.capability != request.tool.canonical_name()
+    {
+        return Err(PortFailure::TransportBindingRejected {
+            reason: "act dispatch capability does not match the admitted tool".to_owned(),
+        });
+    }
+    let live_session = facts.session.clone().ok_or_else(plan_gap_no_session)?;
+    if envelope.identity.session_id.as_deref() != Some(live_session.as_str()) {
+        return Err(PortFailure::TransportBindingRejected {
+            reason: "act dispatch session does not match the live attach session".to_owned(),
+        });
+    }
+    if envelope.state_fence != facts.state_fence {
+        return Err(PortFailure::FenceMismatch);
+    }
+    if envelope.connection_id != facts.connection_id {
+        return Err(PortFailure::TransportBindingRejected {
+            reason: "act dispatch connection does not match the live admitted connection"
+                .to_owned(),
+        });
+    }
+    let expected_payload = canonical_payload_digest(&request.tool)?;
+    if expected_payload != envelope.identity.payload_sha256 {
+        return Err(PortFailure::TransportBindingRejected {
+            reason: "act dispatch payload does not match the admitted payload digest".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Invoke-read membership for tests: true exactly when the recorded dispatch
@@ -2679,6 +2744,28 @@ fn expected_canonical_request_digest_by_parts(
     Ok(sha256_hex(&bytes))
 }
 
+/// Maps one durable terminal record that carries no servable result to its
+/// typed invocation outcome (issue #1739 W6).
+///
+/// The Kernel-authored failure envelope (stable disposition, verbatim reason
+/// code, typed directive, issue #1743) is the only producer of that triple,
+/// and only the Kernel can author one — the bridge never invents it here.
+/// What this preserves instead, in one stable shape rather than ad-hoc prose
+/// per site: the original operation identity and the reconcile directive,
+/// with the durable state (`Terminal` vs `Conflicted`) named so the two
+/// stay distinguishable. A terminal record WITH a servable result never
+/// reaches here: it decodes through [`decode_stored_response`] above.
+fn terminal_without_result_outcome(
+    operation_id: &str,
+    state: HostRequestRecordState,
+) -> PortFailure {
+    PortFailure::TransportBindingRejected {
+        reason: format!(
+            "operation {operation_id} is {state:?} without a servable result; reconcile the exact operation"
+        ),
+    }
+}
+
 fn submit_outcome(
     receipt: &HostRequestAdmissionReceipt,
     record: &AdmittedReplyView,
@@ -2717,13 +2804,15 @@ fn submit_outcome(
                     response: Box::new(response),
                 });
             }
-            Err(PortFailure::TransportBindingRejected {
-                reason: "operation is already terminal; reconcile the exact operation".to_owned(),
-            })
+            Err(terminal_without_result_outcome(
+                &receipt.operation_id,
+                record.state,
+            ))
         }
-        HostRequestRecordState::Conflicted => Err(PortFailure::TransportBindingRejected {
-            reason: "operation is already terminal; reconcile the exact operation".to_owned(),
-        }),
+        HostRequestRecordState::Conflicted => Err(terminal_without_result_outcome(
+            &receipt.operation_id,
+            record.state,
+        )),
     }
 }
 
@@ -2777,13 +2866,15 @@ fn submit_outcome_for_resolved(
                     response: Box::new(response),
                 });
             }
-            Err(PortFailure::TransportBindingRejected {
-                reason: "operation is already terminal; reconcile the exact operation".to_owned(),
-            })
+            Err(terminal_without_result_outcome(
+                &record.operation_id,
+                record.state,
+            ))
         }
-        HostRequestRecordState::Conflicted => Err(PortFailure::TransportBindingRejected {
-            reason: "operation is already terminal; reconcile the exact operation".to_owned(),
-        }),
+        HostRequestRecordState::Conflicted => Err(terminal_without_result_outcome(
+            &record.operation_id,
+            record.state,
+        )),
     }
 }
 
@@ -2878,6 +2969,14 @@ impl KernelHostRequestPort for KernelHostRequestClient {
                 &envelope,
                 &facts,
             )?,
+            CanonicalDispatchEntry::SubmitActGated { .. } => {
+                revalidate_act_dispatch(request, &envelope, &facts)?;
+                host_request_frame_for_envelope(
+                    AGENT_HOST_REQUEST_SUBMIT_OPERATION,
+                    &envelope,
+                    &facts,
+                )?
+            }
             CanonicalDispatchEntry::SubmitCarryingBytes => {
                 host_request_user_automation_frame(request, &envelope, &facts)?
             }

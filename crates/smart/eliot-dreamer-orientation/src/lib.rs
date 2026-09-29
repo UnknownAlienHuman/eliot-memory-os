@@ -14,7 +14,7 @@ pub mod result;
 pub use input::{
     AdmittedOrientationJob, CanonicalEvidenceHandle, CoverageCepMember, CoverageEvidenceMember,
     CurrentEpistemicPositionHandle, LocalOrientationFrame, OrientationCoverageDenominator,
-    OrientationError, ValidatedOrientationCandidate,
+    OrientationError,
 };
 pub use policy::OrientationPolicy;
 pub use projection::{
@@ -28,7 +28,7 @@ pub use result::{OrientationDisposition, OrientationResult};
 pub fn project_orientation(
     admitted_orientation_job: &AdmittedOrientationJob,
     bounded_bundle: &eliot_dreamer_contracts::DreamInputBundle,
-    validated_dream_draft: &ValidatedOrientationCandidate,
+    validated_dream_draft: &eliot_dreamer_contracts::ValidatedCandidate,
     current_epistemic_position_handles: &[CurrentEpistemicPositionHandle],
     orientation_policy: &OrientationPolicy,
 ) -> OrientationResult {

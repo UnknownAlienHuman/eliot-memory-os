@@ -26,6 +26,13 @@
 //! evidence. No second sidecar, route, or attempt is ever launched to escape
 //! uncertainty, and [`try_promote_to_finish`](crate::try_promote_to_finish)
 //! still proves no promotion path exists.
+//!
+//! The admitted [`ProviderExecutionBinding`](eliot_agent_api::ProviderExecutionBinding)
+//! is retained privately from preparation through launch to the terminal
+//! candidate, and [`translate_candidate_result`] refuses any terminal that
+//! was not produced under the binding the caller translates under: one
+//! attempt's candidate evidence can never be returned under another
+//! attempt's identity.
 
 use std::sync::Arc;
 
@@ -454,6 +461,7 @@ pub struct ClaudeRunningSidecar {
     frames_ingested: u64,
     deadline_ms: u64,
     terminal_seen: bool,
+    binding: ProviderExecutionBinding,
 }
 
 impl ClaudeRunningSidecar {
@@ -557,7 +565,9 @@ impl ClaudeRunningSidecar {
     /// attempt id fails closed so one attempt's output is never attributed
     /// to another. The claimed output digest is recomputed over the exact
     /// output bytes and must match; a mismatch fails closed. The returned
-    /// record carries the request and plan linkage of this sidecar.
+    /// record carries the request and plan linkage of this sidecar plus the
+    /// exact admitted binding, so the terminal's own provenance survives
+    /// independently of whatever binding a caller presents later.
     pub fn complete_terminal(
         &self,
         candidate: &ClaudeCandidateResult,
@@ -581,6 +591,7 @@ impl ClaudeRunningSidecar {
             raw,
             request_id: self.request_id.clone(),
             plan_digest: self.plan_digest.clone(),
+            binding: self.binding.clone(),
         })
     }
 }
@@ -618,6 +629,7 @@ pub struct ClaudeTerminalCandidate {
     raw: PreservedOrOmitted,
     request_id: String,
     plan_digest: String,
+    binding: ProviderExecutionBinding,
 }
 
 impl std::fmt::Debug for ClaudeTerminalCandidate {
@@ -629,7 +641,7 @@ impl std::fmt::Debug for ClaudeTerminalCandidate {
             .field("raw", &self.raw)
             .field("request_id", &self.request_id)
             .field("plan_digest", &self.plan_digest)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -652,6 +664,30 @@ impl ClaudeTerminalCandidate {
     /// Plan digest of the sidecar that produced this candidate.
     pub fn plan_digest(&self) -> &str {
         self.plan_digest.as_str()
+    }
+
+    /// Source-to-target binding gate. Refuses a terminal whose recorded
+    /// candidate attempt or retained launch binding does not match the
+    /// binding the caller is translating under. Exact equality covers the
+    /// whole binding, so the same attempt text with a different start
+    /// request, fence, generation, lease, route, session or scope is
+    /// refused too. Missing historical context is never back-filled from the
+    /// newly supplied binding: absence is a refusal, not a repair.
+    fn validate_for_binding(
+        &self,
+        binding: &ProviderExecutionBinding,
+    ) -> Result<(), ClaudeSidecarError> {
+        if self.candidate.attempt_id != binding.attempt_id.as_str() {
+            return Err(ClaudeSidecarError::BindingMismatch(
+                "terminal candidate addresses another attempt".to_owned(),
+            ));
+        }
+        if self.binding != *binding {
+            return Err(ClaudeSidecarError::BindingMismatch(
+                "terminal candidate was produced under a different launch binding".to_owned(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -683,10 +719,15 @@ pub struct ClaudeResultInput {
 /// `UNKNOWN_OUTCOME` with a recovery handle. The result is validated against
 /// the live binding, admission, and effect ceiling before return, and can
 /// never express task finish.
-/// STITCH (#370 A27): the future live caller passes the real terminal
-/// candidate of an executed attempt with its binding/admission/ceiling;
-/// BLOCKED-BY the adapter driver (test-only callers). Forbidden: a
-/// fabricated terminal candidate to manufacture a caller.
+///
+/// Source-to-target binding is checked FIRST, before disposition
+/// classification and before any evidence or digest is constructed: a
+/// supplied terminal must have been produced by the very attempt and launch
+/// binding the caller translates under. This closes the relabelling gap where
+/// one attempt's candidate evidence could be returned under another attempt's
+/// identity — including under `cancelled = true`, because cancellation must
+/// not import another attempt's evidence either. The terminal's own recorded
+/// provenance is never overwritten from the supplied binding.
 pub fn translate_candidate_result(
     input: ClaudeResultInput,
     binding: &ProviderExecutionBinding,
@@ -694,6 +735,9 @@ pub fn translate_candidate_result(
     ceiling: &EffectCeiling,
 ) -> Result<AgentResult, ClaudeSidecarError> {
     validate_binding_for_claude(binding)?;
+    if let Some(terminal) = input.terminal.as_ref() {
+        terminal.validate_for_binding(binding)?;
+    }
     let disposition = if input.cancelled {
         ResultDisposition::CancelledObserved
     } else {
@@ -1001,6 +1045,7 @@ impl<E: ProcessExecutor + 'static> ClaudeSidecarFactory<E> {
             frames_ingested: 0,
             deadline_ms,
             terminal_seen: false,
+            binding: prepared.binding.clone(),
         })
     }
 
@@ -2158,6 +2203,7 @@ mod tests {
             frames_ingested: 0,
             deadline_ms: 31_000,
             terminal_seen: false,
+            binding: prepared.binding().clone(),
         };
         assert!(matches!(
             factory.cancel_running(&missing_running, &envelope).await,
@@ -2178,6 +2224,7 @@ mod tests {
             frames_ingested: 0,
             deadline_ms: 31_000,
             terminal_seen: false,
+            binding: binding_fixture().expect("exact binding"),
         };
         assert!(!sidecar_expired(&running, 31_000));
         assert!(sidecar_expired(&running, 31_001));
@@ -2198,6 +2245,7 @@ mod tests {
             raw: crate::preserve_or_omit(&line, MAX_FRAME_BYTES)?,
             request_id: "req-claude-1".into(),
             plan_digest: prepared.plan_digest().to_owned(),
+            binding: prepared.binding().clone(),
         };
         let terminal_debug = format!("{terminal:?}");
         let candidate_json = serde_json::to_string(terminal.candidate())?;

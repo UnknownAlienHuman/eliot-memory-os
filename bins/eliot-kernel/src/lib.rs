@@ -692,6 +692,15 @@ pub struct KernelComposition {
     canonical_store_gateway: Mutex<Option<Arc<KernelStoreGateway>>>,
     #[cfg(windows)]
     supervision_lease_authority: Option<Arc<KernelSupervisionLeaseAuthority>>,
+    /// I14.16 side-by-side cutover: the exclusive Kernel owner object for the
+    /// exact installation/activation contour Host bound to this process. It is
+    /// created when Host reconciles the candidate - before any authority
+    /// exists - and is held for the process lifetime, so a second Kernel
+    /// claiming the same contour cannot also create it. `None` before that
+    /// reconcile; the composition is a shadow candidate with zero authority
+    /// until then.
+    #[cfg(windows)]
+    kernel_owner: Mutex<Option<eliot_platform_windows::KernelOwnerLease>>,
     /// The atomically retained Host-approved bridge profile and its protected
     /// declaration, if the active candidate supplied one.
     #[cfg(windows)]
@@ -3377,6 +3386,7 @@ impl KernelComposition {
         contour: &DaemonSupervisionContour,
         issued_at_ms: u64,
         policy: &DaemonSupervisionRenewalPolicy,
+        kernel_artifact_sha256: &str,
     ) -> Result<eliot_ors::SupervisionLeaseBinding, SupervisionLeaseAuthorityError> {
         if issued_at_ms == 0 {
             return Err(SupervisionLeaseAuthorityError::Configuration(
@@ -3416,6 +3426,9 @@ impl KernelComposition {
             activation_id: OperationIdentity::new(incarnation.activation_id.clone())?,
             activation_generation: contour.activation.generation,
             kernel_epoch: contour.activation.authority_epoch.clone(),
+            kernel_front_door_server_sid: "S-1-5-19".to_owned(),
+            kernel_front_door_session_id: 0,
+            kernel_front_door_artifact_sha256: kernel_artifact_sha256.to_owned(),
             watchdog_epoch: AuthorityEpoch::new(incarnation.watchdog_epoch.sequence)
                 .map_err(|error| SupervisionLeaseAuthorityError::Contract(error.to_string()))?,
             generation_binding: contour.generation_binding.clone(),
@@ -3534,6 +3547,7 @@ impl KernelComposition {
         authority: &KernelSupervisionLeaseAuthority,
         contour: &DaemonSupervisionContour,
         now_ms: u64,
+        kernel_artifact_sha256: &str,
     ) -> Result<SupervisionLeaseSnapshot, SupervisionLeaseAuthorityError> {
         let lease_id = contour.incarnation.supervision_lease_id.as_str();
         Self::supersede_predecessor(authority, contour)?;
@@ -3563,6 +3577,7 @@ impl KernelComposition {
                 contour,
                 now_ms,
                 &SUPERVISION_LEASE_RENEWAL_POLICY,
+                kernel_artifact_sha256,
             )?;
             authority.prepare(SupervisionLeasePrepareRequest {
                 ticket_id: supervision_operation_identity("commit-ticket", lease_id, None)?,
@@ -3592,6 +3607,7 @@ impl KernelComposition {
         authority: &KernelSupervisionLeaseAuthority,
         contour: &DaemonSupervisionContour,
         now_ms: u64,
+        kernel_artifact_sha256: &str,
     ) -> Result<SupervisionLeaseSnapshot, SupervisionLeaseAuthorityError> {
         let lease_id = contour.incarnation.supervision_lease_id.as_str();
         let current =
@@ -3628,6 +3644,7 @@ impl KernelComposition {
                 contour,
                 now_ms,
                 &SUPERVISION_LEASE_RENEWAL_POLICY,
+                kernel_artifact_sha256,
             )?;
             authority.prepare(SupervisionLeasePrepareRequest {
                 ticket_id: supervision_operation_identity(
@@ -3764,6 +3781,7 @@ impl KernelComposition {
         progress: &mut DaemonSupervisionProgressState,
         policy: &DaemonSupervisionRenewalPolicy,
         now_ms: u64,
+        kernel_artifact_sha256: &str,
     ) -> Result<
         (
             SupervisionLeaseSnapshot,
@@ -3823,7 +3841,8 @@ impl KernelComposition {
             }
             stage
         } else {
-            let binding = Self::active_supervision_binding(contour, now_ms, policy)?;
+            let binding =
+                Self::active_supervision_binding(contour, now_ms, policy, kernel_artifact_sha256)?;
             authority.prepare(SupervisionLeasePrepareRequest {
                 ticket_id: supervision_operation_identity(
                     "renew-ticket",
@@ -3884,8 +3903,17 @@ impl KernelComposition {
             .supervision_lease_authority
             .as_ref()
             .ok_or(KernelServiceError::ReadinessNotProven)?;
-        let snapshot = Self::commit_or_replay_active_supervision(authority, &contour, unix_ms())
-            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        let kernel_artifact_sha256 = self
+            .kernel_artifact_sha256
+            .as_deref()
+            .ok_or(KernelServiceError::ReadinessNotProven)?;
+        let snapshot = Self::commit_or_replay_active_supervision(
+            authority,
+            &contour,
+            unix_ms(),
+            kernel_artifact_sha256,
+        )
+        .map_err(|_| KernelServiceError::ReadinessNotProven)?;
         // Issue #1837: durable audit evidence for lease establishment.
         self.audit_observe(AuditEventDraft::lease_supervision_established(
             &snapshot,
@@ -3972,6 +4000,10 @@ impl KernelComposition {
         request
             .validate()
             .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+        let kernel_artifact_sha256 = self
+            .kernel_artifact_sha256
+            .as_deref()
+            .ok_or(KernelServiceError::ReadinessNotProven)?;
         let mut progress = {
             let mut state = self.daemon_runtime.lock().map_err(|_| {
                 KernelServiceError::Platform("daemon runtime lock poisoned".to_owned())
@@ -3988,6 +4020,7 @@ impl KernelComposition {
             &mut progress,
             &SUPERVISION_LEASE_RENEWAL_POLICY,
             unix_ms(),
+            kernel_artifact_sha256,
         );
         let put_back = |progress: DaemonSupervisionProgressState,
                         expired: Option<bool>|
@@ -4134,8 +4167,15 @@ impl KernelComposition {
         } else {
             // Front-door continuity only. This fallback cannot satisfy I1.11
             // step 11 and therefore cannot admit Material/Critical authority.
-            let renewed = Self::renew_current_supervision(authority, &contour, unix_ms())
-                .map_err(|_| KernelServiceError::ReadinessNotProven)?;
+            let renewed = Self::renew_current_supervision(
+                authority,
+                &contour,
+                unix_ms(),
+                self.kernel_artifact_sha256
+                    .as_deref()
+                    .ok_or(KernelServiceError::ReadinessNotProven)?,
+            )
+            .map_err(|_| KernelServiceError::ReadinessNotProven)?;
             let published = self.publish_eliotd_live_receipt(
                 &launch,
                 &process,
@@ -4422,9 +4462,13 @@ impl KernelComposition {
             coordinator
                 .complete_terminal(ShutdownTerminal::Intentional)
                 .map_err(ProcessExecutionError::Unavailable)?;
+            // I14.23/W4: the published terminal reaches Host and Watchdog
+            // through the audit chain they already read. It is read back from
+            // the coordinator AFTER the terminal is durable, so the record
+            // carries the state that was actually persisted rather than the
+            // one this branch intended to persist.
             self.audit_observe(AuditEventDraft::shutdown_terminal_published(
-                "intentional",
-                0,
+                &coordinator.publication(),
             ));
             // Issue #1839 (I16.4 stop): the intentional terminal stopped
             // the supervised daemon process with no pending work.
@@ -4448,9 +4492,11 @@ impl KernelComposition {
             coordinator
                 .complete_terminal(ShutdownTerminal::Incomplete { pending })
                 .map_err(ProcessExecutionError::Unavailable)?;
+            // The incomplete terminal is published the same way, and it
+            // retains exactly the pending work `complete_terminal` persisted
+            // rather than the count this branch computed before the call.
             self.audit_observe(AuditEventDraft::shutdown_terminal_published(
-                "incomplete",
-                pending_count,
+                &coordinator.publication(),
             ));
             // Issue #1839 (I16.4 stop): the incomplete terminal stopped the
             // supervised daemon process with retained pending work.
@@ -4724,6 +4770,15 @@ impl KernelComposition {
             irreversible_stage: "authority-fenced".to_owned(),
             recovery_owner: "kernel-composition".to_owned(),
         };
+        // I1.5/W5/A3: a wake that arrived before this linearization point
+        // cancels the drain, and a cancelled drain must not be finished by
+        // stopping the process. The durable cancellation is re-read here
+        // rather than inferred from the absence of a commit, so a commit
+        // refused for any other reason is still reported as a refused commit
+        // and still produces the incomplete-shutdown terminal below.
+        if coordinator.cancelled_by_wake() {
+            return Err(DrainHalt::new("drain-cancelled-by-wake"));
+        }
         coordinator.commit_drain(decision.clone()).map_err(|_| {
             DrainHalt::with_pending("drain-commit-rejected", coordinator.pending_receipts())
         })?;

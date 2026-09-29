@@ -985,13 +985,76 @@ impl IsolatedDestinationReceipt {
     }
 }
 
+/// One archive member's retained canonical logical payload, as the
+/// archive/artifact owner holds it for an admitted restore.
+///
+/// Narrow versioned extension of the #950 restore carrier, and the retained
+/// reference that carrier was missing: [`CanonicalRestoreBatch::members`] names
+/// identities, digests and residency metadata, and a 64-hex digest is not a
+/// payload source, so without this the batch can never say *what* it restores.
+/// The admitted batch's own [`CanonicalRestoreBatch::contract_version`] is the
+/// version of this shape — an older peer refuses the field through
+/// `deny_unknown_fields` instead of decoding a reference it cannot admit.
+///
+/// It names no statement, table, path, endpoint or credential. The closed
+/// [`Self::class`] and the [`Self::record_id`] address are the only destination
+/// facts, and the port re-derives them through its own destination owner before
+/// anything is written. [`Self::payload`] is the canonical JSON encoding of the
+/// logical document, and [`Self::payload_digest`] / [`Self::byte_count`] describe
+/// exactly those canonical bytes, so the receiving port validates the owner's
+/// *recorded* values against the bytes it actually holds rather than replacing
+/// them with a fresh checksum over whatever arrived.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedArchiveMember {
+    /// Identity of the admitted member this retained payload answers for.
+    pub member_id: String,
+    /// Closed canonical class the payload restores into.
+    pub class: String,
+    /// Destination record address the payload restores to.
+    pub record_id: String,
+    /// Owner-recorded digest of the canonical payload bytes.
+    pub payload_digest: String,
+    /// Actual byte length of the canonical payload bytes.
+    pub byte_count: u64,
+    /// The canonical logical payload, in its canonical JSON encoding.
+    pub payload: String,
+}
+
+impl RetainedArchiveMember {
+    /// Validates the retained reference's own shape.
+    ///
+    /// Shape only. Whether this payload answers for the member it travels beside
+    /// is a destination-side comparison against the admitted batch, never a
+    /// property this record can assert about itself.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        validate_text(&self.member_id, "restore.retained_member_id")?;
+        validate_text(&self.class, "restore.retained_member_class")?;
+        validate_text(&self.record_id, "restore.retained_member_record_id")?;
+        validate_digest(
+            &self.payload_digest,
+            "restore.retained_member_payload_digest",
+        )?;
+        if self.byte_count == 0 {
+            return Err(StoreError::InvalidField {
+                field: "restore.retained_member_byte_count",
+                reason: "must be non-zero",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Bounded canonical restore batch into an isolated destination.
 ///
 /// Structural only; archive content is referenced solely as an opaque member
 /// digest, never as a second archive format. [`Self::members`] reuses the
 /// neutral capture vocabulary so the same canonical records the capture counted
 /// are named here: a declared [`Self::member_count`] with no members behind it
-/// is not a restore obligation.
+/// is not a restore obligation. [`Self::retained_members`] is the one content
+/// reference the batch may carry, and it stays a reference: whether a member
+/// restores is decided by the port against the destination, never by this
+/// structure.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CanonicalRestoreBatch {
@@ -1012,6 +1075,19 @@ pub struct CanonicalRestoreBatch {
     /// residency domains stay distinct logical objects.
     pub members: Vec<SnapshotMember>,
     pub member_count: u64,
+    /// The archive/artifact owner's retained canonical payloads for this batch.
+    ///
+    /// The retained reference the member list cannot be: a member's digest names
+    /// content, never carries it. Every member the destination would import —
+    /// every member that is not a reference edge — must be named here exactly
+    /// once, and the port refuses a batch that omits one rather than answering
+    /// with a well-formed partial receipt for content it never received. That
+    /// decision belongs to the port, which owns source resolution, so an absent
+    /// key decodes as no retained reference here and is refused there with the
+    /// typed error that names the member; a member this structure cannot import
+    /// is never asked to retain anything.
+    #[serde(default)]
+    pub retained_members: Vec<RetainedArchiveMember>,
 }
 
 impl CanonicalRestoreBatch {
@@ -1081,7 +1157,49 @@ impl CanonicalRestoreBatch {
         if self.member_count > MAX_RESTORE_MEMBERS as u64 {
             return Err(StoreError::PayloadTooLarge);
         }
-        self.validate_members()
+        self.validate_members()?;
+        self.validate_retained_members()
+    }
+
+    /// Validates the retained reference closure of the batch.
+    ///
+    /// Every retained entry names one admitted member exactly once, and a
+    /// reference edge retains nothing because a reference edge is never imported
+    /// as a row of its own. This is shape: whether the port can actually resolve
+    /// a payload is decided against the destination, where a member with no
+    /// retained entry is a typed refusal, so a structural gap here and a
+    /// resolution gap there stay two distinct answers instead of one silent
+    /// partial result.
+    fn validate_retained_members(&self) -> Result<(), StoreError> {
+        if self.retained_members.len() > MAX_RESTORE_MEMBERS {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        unique(
+            self.retained_members
+                .iter()
+                .map(|retained| retained.member_id.clone()),
+            "restore.retained_members",
+        )?;
+        for retained in &self.retained_members {
+            retained.validate()?;
+            let Some(member) = self
+                .members
+                .iter()
+                .find(|member| member.member_id == retained.member_id)
+            else {
+                return Err(StoreError::InvalidField {
+                    field: "restore.retained_members",
+                    reason: "retained payload must answer for an admitted member",
+                });
+            };
+            if member.member_type == SnapshotMemberType::Reference {
+                return Err(StoreError::InvalidField {
+                    field: "restore.retained_members",
+                    reason: "a reference edge carries no payload of its own",
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Validates the batch's real member denominator.

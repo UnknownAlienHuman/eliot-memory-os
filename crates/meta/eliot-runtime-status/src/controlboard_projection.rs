@@ -674,6 +674,8 @@ mod tests {
             provenance: Vec::new(),
             notifications: NotificationInbox {
                 rows: Vec::new(),
+                unresolved_critical: Vec::new(),
+                failed_delivery: Vec::new(),
                 metrics: NotificationMetrics::default(),
             },
         }

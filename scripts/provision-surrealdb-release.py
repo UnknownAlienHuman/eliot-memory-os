@@ -3,6 +3,7 @@
 
 This command never writes the shared C:\\Tools installation. It downloads the
 official release/source/tag and OSV snapshots selected by the tracked policy.
+Historical OSV bytes must be restored from the pinned snapshot, not a live query.
 The selected-candidate OSV response is fetched on every invocation so a release
 receipt can bind a fresh query to its exact response bytes. The verifier checks
 the PE, source-tree, tag, and advisory bindings.
@@ -287,9 +288,44 @@ def url_for_release(tag: str) -> str:
     return f"{GITHUB_API_REPOSITORY}/releases/tags/{tag}"
 
 
+def read_historical_advisory(root: Path, policy: dict, supplied_path: str | None = None) -> bytes:
+    """Read the digest-pinned historical snapshot, never reconstruct it from a live query.
+
+    The optional import uses the same project-local, no-reparse reader as every
+    other input. Its content must match the existing policy before any download
+    or materialization occurs. It cannot repin policy or claim current coverage.
+    """
+    source = supplied_path or policy["advisory_response_path"]
+    try:
+        _, _, payload = read_local(root, source)
+    except RuntimeError as exc:
+        if "not a regular file" not in str(exc):
+            raise
+        raise RuntimeError(
+            "HISTORICAL_OSV_INPUT_REQUIRED: restore the approved snapshot into "
+            f"{policy['advisory_response_path']} or use --historical-osv-response "
+            "with a project-local evidence path; a current OSV response is not "
+            f"a historical snapshot (expected SHA-256 {policy['advisory_response_digest']})"
+        ) from exc
+    try:
+        data = json.loads(payload.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("historical SurrealDB OSV response is not valid JSON") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("vulns"), list):
+        raise RuntimeError("historical SurrealDB OSV response must contain a vulns array")
+    canonical = canonical_json_bytes(data)
+    if sha256_bytes(canonical) != policy["advisory_response_digest"].lower():
+        raise RuntimeError("HISTORICAL_OSV_DIGEST_MISMATCH: imported snapshot does not match policy")
+    return canonical
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument(
+        "--historical-osv-response",
+        help="Repository-relative frozen response under .eliot/dependency-policy/surrealdb/; must match the policy digest",
+    )
     args = parser.parse_args()
     root = args.root.resolve()
     manifest = tomllib.loads((root / "config" / "dependency-policy.toml").read_text(encoding="utf-8"))
@@ -369,6 +405,10 @@ def main() -> int:
     require_canonical(surreal["release_source"], f"{OFFICIAL_REPOSITORY}/releases/tag/{old_tag}", "installed release_source")
     require_canonical(surreal["release_asset"], f"{OFFICIAL_REPOSITORY}/releases/download/{old_tag}/surreal-{old_tag}.windows-amd64.exe", "installed release_asset")
 
+    # Validate the immutable historical input before network or write effects.
+    # Candidate advisories below remain a separate, explicitly fresh query.
+    response_bytes = read_historical_advisory(root, surreal, args.historical_osv_response)
+
     fetch_to(
         candidate["artifact_path"],
         candidate_asset,
@@ -419,25 +459,12 @@ def main() -> int:
         "expected_bytes": None,
         **query_record,
     })
-    try:
-        _, _, source_response_bytes = read_local(root, surreal["advisory_response_path"])
-    except RuntimeError as exc:
-        if "not a regular file" not in str(exc) or _validate_components(root, _relative_path(surreal["advisory_response_path"])).exists():
-            raise
-        source_response_bytes = fetch(OSV_ENDPOINT, data=query_bytes, accept="application/json")
-    try:
-        response_data = json.loads(source_response_bytes.decode("utf-8-sig"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"installed SurrealDB OSV response is not valid JSON: {exc}") from exc
-    if not isinstance(response_data, dict) or not isinstance(response_data.get("vulns"), list):
-        raise RuntimeError("installed SurrealDB OSV response must contain a vulns array")
-    response_bytes = canonical_json_bytes(response_data)
     response_record = materialize(
         root,
         surreal["advisory_response_path"],
         response_bytes,
         surreal["advisory_response_digest"],
-        replace_existing=source_response_bytes != response_bytes,
+        replace_existing=True,
     )
     records.append({
         "subject": "osv.response.surrealdb",

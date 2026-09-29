@@ -284,6 +284,21 @@ pub enum InquiryError {
     /// a malformed manifest, or one whose digest does not cover its own content,
     /// is refused here rather than being published as a bound allowlist.
     Contract(ResearchContractError),
+    /// The release gate refused to promote this run's material claims.
+    ///
+    /// I21.8 item 6 forbids a `SUPPORTED` promotion while a required chain,
+    /// excerpt or audit dimension fails or is unknown, and the issue's
+    /// acceptance requires an omitted material claim to block a complete-audit
+    /// claim. The two gates refuse for different reasons, so the gate that
+    /// refused and the specific member that refused it are both carried: a
+    /// consumer that only learns "blocked" would have to re-derive which
+    /// requirement failed.
+    ReleaseGateRefused {
+        /// Which gate refused: `claim_coverage` or `claim_audit`.
+        gate: &'static str,
+        /// The specific member or condition the gate refused on.
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for InquiryError {
@@ -365,6 +380,9 @@ impl std::fmt::Display for InquiryError {
             }
             Self::Contract(error) => {
                 write!(formatter, "reference manifest contract: {error}")
+            }
+            Self::ReleaseGateRefused { gate, detail } => {
+                write!(formatter, "release gate {gate} refused: {detail}")
             }
         }
     }
@@ -3020,12 +3038,13 @@ impl CoverageReceipt {
         // change; what changed is the value space of a field that was already
         // there, which is the same reason `source-record/v1` -> `v2` was recorded.
         //
-        // Transitively, `evidence-freeze/v1` and `inquiry-terminal-record/*` bind
+        // Transitively, `evidence-freeze/v2` and `inquiry-terminal-record/*` bind
         // this digest and therefore produce different values for the same run.
-        // `evidence-freeze/v1`'s own field set and domain are unchanged and are
-        // deliberately not bumped: a domain names the shape of the record being
-        // hashed, and a changed value in a field it already declared is exactly
-        // the dependency behaving as declared, not a new shape.
+        // `evidence-freeze` was then bumped `v1` -> `v2` by #1765, and for the
+        // other reason: its own preimage field set *grew* (the State Fence and the
+        // three successor-relation fields), and one name must not cover two field
+        // sets. That is the shape-change rule stated here, applied to the freeze
+        // rather than to the receipt.
         // `inquiry-terminal-record` was bumped `v1` -> `v2` by #1762 for the
         // opposite reason: its preimage *field set* changed when the evidence
         // freeze, the claim audit and the unsupported-precision residue became
@@ -3277,7 +3296,33 @@ fn coordinate_residue(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EvidenceFreeze {
     /// Stable freeze identity.
+    ///
+    /// Derived from the inquiry, the profile revision **and the content
+    /// commitment of the frozen set itself**. The previous spelling named only
+    /// the inquiry and the profile revision, so two successive freezes of the
+    /// same inquiry at the same profile revision — the reopen case I21.8
+    /// describes — received one identical identity and became indistinguishable
+    /// from each other. The portfolio, manifest and coverage digests are all
+    /// already in the preimage, so naming the freeze over them costs nothing and
+    /// makes the identity move exactly when the frozen content does.
     pub freeze_id: String,
+    /// Digest of the freeze this one supersedes, when it is a successor.
+    ///
+    /// `None` on the first freeze of an inquiry. I21.8 requires new material,
+    /// materially changed source content or a changed protocol to produce an
+    /// explicit successor carrying its reason and its expected revision, and it
+    /// must not mutate the prior brief or audit: the prior freeze is named, never
+    /// rewritten, so both stay addressable.
+    pub supersedes: Option<String>,
+    /// Why this freeze was opened as a successor, when it is one.
+    pub supersede_reason: Option<String>,
+    /// The evidence revision this successor expected to find, when it is one.
+    ///
+    /// Recorded as a declared expectation rather than a comparison result: the
+    /// prior freeze's own digest is in `supersedes`, and this is the revision the
+    /// run said it was reopening to reach. A run that reopens without a declared
+    /// expectation is refused by [`Self::validate_successor`].
+    pub expected_revision: Option<String>,
     /// Inquiry identity.
     pub inquiry_id: String,
     /// Profile revision the freeze was taken under.
@@ -3312,46 +3357,130 @@ pub struct EvidenceFreeze {
     pub digest: String,
 }
 
+/// Named constructor arguments for [`EvidenceFreeze::freeze`].
+///
+/// A params struct rather than a longer positional list: the freeze takes more
+/// inputs than a positional signature can carry without a lint suppression, and
+/// a named struct is what makes the successor relation readable at the call
+/// site instead of hiding it behind a bag of `&str`s.
+#[derive(Clone, Debug)]
+pub struct EvidenceFreezeParams {
+    /// Inquiry identity.
+    pub inquiry_id: String,
+    /// Portfolio digest frozen with the evidence.
+    pub portfolio_digest: String,
+    /// Reference manifest digest frozen with the evidence.
+    pub manifest_digest: String,
+    /// Coverage receipt digest frozen with the evidence.
+    pub coverage_receipt_digest: String,
+    /// Evidence-set identity the freeze covers.
+    pub evidence_set_id: String,
+    /// Included evidence references.
+    pub included_evidence_refs: Vec<String>,
+    /// Excluded evidence and the reason it was excluded.
+    pub excluded_evidence: Vec<(String, String)>,
+    /// Unresolved contradictions observed between members.
+    pub unresolved_contradictions: Vec<String>,
+    /// Open research debts at freeze time.
+    pub open_research_debts: Vec<String>,
+    /// Freeze instant in Unix milliseconds.
+    pub frozen_at_ms: i64,
+    /// Digest of the freeze this one supersedes, when it is a successor.
+    pub supersedes: Option<String>,
+    /// Why this freeze was opened as a successor, when it is one.
+    pub supersede_reason: Option<String>,
+    /// The evidence revision this successor expected to find, when it is one.
+    pub expected_revision: Option<String>,
+}
+
 impl EvidenceFreeze {
     /// Freezes the accepted evidence revision for one inquiry.
     ///
     /// # Errors
     ///
-    /// Returns a field error for blank identities or malformed digests.
-    #[allow(clippy::too_many_arguments)]
+    /// Returns a field error for blank identities or malformed digests, and a
+    /// successor error when a successor freeze is declared without all three of
+    /// its relation fields.
     pub fn freeze(
-        inquiry_id: &str,
+        params: EvidenceFreezeParams,
         profile: &InquiryProtocolProfile,
-        portfolio_digest: &str,
-        manifest_digest: &str,
-        coverage_receipt_digest: &str,
-        evidence_set_id: &str,
-        included_evidence_refs: Vec<String>,
-        excluded_evidence: Vec<(String, String)>,
-        unresolved_contradictions: Vec<String>,
-        open_research_debts: Vec<String>,
-        frozen_at_ms: i64,
     ) -> Result<Self, InquiryError> {
-        require_text(inquiry_id, "freeze.inquiry_id")?;
-        require_text(evidence_set_id, "freeze.evidence_set_id")?;
-        require_digest(portfolio_digest, "freeze.portfolio_digest")?;
-        require_digest(manifest_digest, "freeze.manifest_digest")?;
-        require_digest(coverage_receipt_digest, "freeze.coverage_receipt_digest")?;
+        require_text(&params.inquiry_id, "freeze.inquiry_id")?;
+        require_text(&params.evidence_set_id, "freeze.evidence_set_id")?;
+        require_digest(&params.portfolio_digest, "freeze.portfolio_digest")?;
+        require_digest(&params.manifest_digest, "freeze.manifest_digest")?;
+        require_digest(
+            &params.coverage_receipt_digest,
+            "freeze.coverage_receipt_digest",
+        )?;
+        // `supersedes` and `expected_revision` are commitments and are checked as
+        // digests; `supersede_reason` is the recorded cause and is bounded text,
+        // because a digest would say only that some reason exists and not which
+        // one — and I21.8 requires the reason itself to be recorded.
+        for (tag, value) in [
+            ("freeze.supersedes", params.supersedes.as_deref()),
+            (
+                "freeze.expected_revision",
+                params.expected_revision.as_deref(),
+            ),
+        ] {
+            if let Some(value) = value {
+                require_digest(value, tag)?;
+            }
+        }
+        // The three successor fields are one relation, not three independent
+        // optionals. A successor without its reason states no cause, and a
+        // successor without its expected revision states no target, so either
+        // half alone is refused rather than published as a relation that means
+        // nothing.
+        let successor_fields = [
+            params.supersedes.is_some(),
+            params.supersede_reason.is_some(),
+            params.expected_revision.is_some(),
+        ];
+        if successor_fields.iter().filter(|present| **present).count() != 0
+            && !successor_fields.iter().all(|present| *present)
+        {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "freeze.successor_relation",
+            });
+        }
+        if let Some(reason) = &params.supersede_reason {
+            require_text(reason, "freeze.supersede_reason")?;
+        }
+        // The identity names the content commitment, not only the question and
+        // the protocol. Two freezes of one inquiry at one profile revision over
+        // different evidence are different freezes and say so.
+        let content_commitment = freeze(&format!(
+            "freeze-identity/v1;{}|{}|{}|{}",
+            params.portfolio_digest,
+            params.manifest_digest,
+            params.coverage_receipt_digest,
+            params.evidence_set_id
+        ));
         let mut record = Self {
-            freeze_id: format!("freeze-{inquiry_id}-{}", profile.profile_id_and_revision()),
-            inquiry_id: inquiry_id.to_owned(),
+            freeze_id: format!(
+                "freeze-{}-{}@{}",
+                params.inquiry_id,
+                profile.profile_id_and_revision(),
+                &content_commitment[..16]
+            ),
+            supersedes: params.supersedes,
+            supersede_reason: params.supersede_reason,
+            expected_revision: params.expected_revision,
+            inquiry_id: params.inquiry_id,
             profile_id_and_revision: profile.profile_id_and_revision(),
             profile_digest: profile.integrity_digest.clone(),
-            portfolio_digest: portfolio_digest.to_owned(),
-            manifest_digest: manifest_digest.to_owned(),
-            coverage_receipt_digest: coverage_receipt_digest.to_owned(),
-            evidence_set_id: evidence_set_id.to_owned(),
-            included_evidence_refs,
-            excluded_evidence,
-            unresolved_contradictions,
-            open_research_debts,
+            portfolio_digest: params.portfolio_digest,
+            manifest_digest: params.manifest_digest,
+            coverage_receipt_digest: params.coverage_receipt_digest,
+            evidence_set_id: params.evidence_set_id,
+            included_evidence_refs: params.included_evidence_refs,
+            excluded_evidence: params.excluded_evidence,
+            unresolved_contradictions: params.unresolved_contradictions,
+            open_research_debts: params.open_research_debts,
             state_fence: profile.state_fence.clone(),
-            frozen_at_ms,
+            frozen_at_ms: params.frozen_at_ms,
             canonical: false,
             governor_admission_required: true,
             digest: String::new(),
@@ -3360,9 +3489,68 @@ impl EvidenceFreeze {
         Ok(record)
     }
 
+    /// Declared identity domain of [`EvidenceFreeze::digest`].
+    ///
+    /// Bumped `v1` -> `v2` for `#1765`. The `v1` preimage named every field
+    /// except `state_fence` and the three successor-relation fields, so two
+    /// records that differed only in their State Fence, or in which freeze they
+    /// reopened, rehashed identically. One name must not cover two field sets,
+    /// and the same rule the `coverage-receipt` and `inquiry-terminal-record`
+    /// preimages state for themselves applies here.
+    pub const DIGEST_DOMAIN: &'static str = "evidence-freeze/v2";
+
+    /// Whether this freeze is the successor of a prior one.
+    #[must_use]
+    pub fn is_successor(&self) -> bool {
+        self.supersedes.is_some()
+    }
+
+    /// Re-proves the successor relation, if this freeze declares one.
+    ///
+    /// The three fields move together by construction, and this re-proves that
+    /// on readback so a record that lost one of them between construction and
+    /// publication is refused rather than presented as a first freeze.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::IntegrityMismatch`] when exactly some of the
+    /// three relation fields are present.
+    pub fn validate_successor(&self) -> Result<(), InquiryError> {
+        let present = [
+            self.supersedes.is_some(),
+            self.supersede_reason.is_some(),
+            self.expected_revision.is_some(),
+        ];
+        if present.iter().filter(|held| **held).count() != 0 && !present.iter().all(|held| *held) {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "freeze.successor_relation",
+            });
+        }
+        Ok(())
+    }
+
     fn compute_digest(&self) -> String {
-        let mut preimage = String::from("evidence-freeze/v1;");
+        let mut preimage = String::from(Self::DIGEST_DOMAIN);
+        preimage.push(';');
         push_field(&mut preimage, "freeze_id", &self.freeze_id);
+        // The successor relation is inside the identity: a reopen is a different
+        // freeze, and a record that named the same members under a different
+        // reason or expectation would otherwise re-present the prior identity.
+        push_field(
+            &mut preimage,
+            "supersedes",
+            self.supersedes.as_deref().unwrap_or("none"),
+        );
+        push_field(
+            &mut preimage,
+            "supersede_reason",
+            self.supersede_reason.as_deref().unwrap_or("none"),
+        );
+        push_field(
+            &mut preimage,
+            "expected_revision",
+            self.expected_revision.as_deref().unwrap_or("none"),
+        );
         push_field(&mut preimage, "inquiry_id", &self.inquiry_id);
         push_field(
             &mut preimage,
@@ -3416,16 +3604,34 @@ impl EvidenceFreeze {
             "frozen_at_ms",
             &self.frozen_at_ms.to_string(),
         );
+        // The State Fence was published on the record but never named in the
+        // preimage, so the freeze's own identity was fence-insensitive: the same
+        // members frozen under a different authority epoch, resource generation
+        // or task revision rehashed to the same digest. I21.8 names fence,
+        // policy and interpretation-sensitive fields as exactly the ones a
+        // rehash must cover, so the fence is inside.
+        push_field(
+            &mut preimage,
+            "state_fence",
+            &fence_preimage(&self.state_fence),
+        );
         freeze(&preimage)
     }
 
-    /// Re-proves this freeze's own digest.
+    /// Re-proves this freeze's own digest and its successor relation.
     ///
     /// # Errors
     ///
     /// Returns [`InquiryError::IntegrityMismatch`] when the recomputed digest
-    /// disagrees with the stored one.
+    /// disagrees with the stored one, when the record claims canonical state, or
+    /// when the successor relation is half-present.
     pub fn validate_integrity(&self) -> Result<(), InquiryError> {
+        if self.canonical {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "freeze.canonical",
+            });
+        }
+        self.validate_successor()?;
         if self.compute_digest() != self.digest {
             return Err(InquiryError::IntegrityMismatch {
                 field: "freeze.digest",
@@ -4373,8 +4579,11 @@ impl InquiryTerminalRecord {
         // preimage comment states for itself: a domain names the shape of the
         // record being hashed, so a shape change bumps it, while a changed *value*
         // in a field that was already declared does not (which is why
-        // `evidence-freeze/v1` above is deliberately left alone — its own field
-        // set is unchanged and only the values it transitively binds moved).
+        // `evidence-freeze/v2` above is deliberately not bumped by #1762: at
+        // that time its own field set was unchanged and only the values it
+        // transitively binds moved. #1765 later grew that field set (the State
+        // Fence and the three successor-relation fields), which is the bump that
+        // took the freeze to `v2`.
         let mut preimage = String::from("inquiry-terminal-record/v2;");
         push_field(&mut preimage, "inquiry_id", &self.inquiry_id);
         push_field(&mut preimage, "profile_id", &self.profile_id);
@@ -4472,6 +4681,26 @@ impl InquiryTerminalRecord {
     fn push_carried_artifacts(&self, preimage: &mut String) {
         push_field(preimage, "evidence_freeze_digest", &self.freeze.digest);
         push_field(preimage, "evidence_freeze_id", &self.freeze.freeze_id);
+        // The successor relation is inside the terminal identity: a disposition
+        // taken over a reopened freeze describes a different evidence revision
+        // than one taken over the freeze it superseded, and a terminal digest
+        // that could not tell them apart would let a reopen restate the prior
+        // brief's answer under a new identity.
+        push_field(
+            preimage,
+            "evidence_freeze_supersedes",
+            self.freeze.supersedes.as_deref().unwrap_or("none"),
+        );
+        push_field(
+            preimage,
+            "evidence_freeze_supersede_reason",
+            self.freeze.supersede_reason.as_deref().unwrap_or("none"),
+        );
+        push_field(
+            preimage,
+            "evidence_freeze_expected_revision",
+            self.freeze.expected_revision.as_deref().unwrap_or("none"),
+        );
         if let Some(audit) = &self.claim_audit {
             push_field(preimage, "claim_audit_digest", &audit.digest);
             push_field(preimage, "claim_audit_claim_id", &audit.claim_id);
@@ -5010,6 +5239,21 @@ pub struct InquiryObservation {
     pub reason_code: String,
     /// Assessment instant in Unix milliseconds.
     pub assessment_time_ms: i64,
+    /// Digest of the evidence freeze this run reopens, when it reopens one.
+    ///
+    /// I21.8 requires new material, materially changed source content or a
+    /// changed protocol to produce an explicit successor freeze that names its
+    /// predecessor. The predecessor is named by the digest the run was admitted
+    /// under, never rewritten, so the prior freeze and its audit stay addressable.
+    /// `None` is a first freeze, which is the honest state for a run admitted
+    /// without a predecessor.
+    pub predecessor_freeze_digest: Option<String>,
+    /// Why this run reopens the predecessor freeze, when it reopens one.
+    ///
+    /// Required together with [`Self::predecessor_freeze_digest`]: a successor
+    /// without a stated cause states no reopen, and `EvidenceFreeze::freeze`
+    /// refuses a half-present relation.
+    pub reopen_reason: Option<String>,
 }
 
 /// The `R6` inquiry-governance record for one inquiry.
@@ -5245,6 +5489,50 @@ impl InquiryGovernance {
         };
         record.validate_integrity()?;
         Ok(record)
+    }
+
+    /// The release gate a consumer must ask before it may release this run's
+    /// material claims as fully supported.
+    ///
+    /// I21.8 item 6: "No `SUPPORTED` promotion while a required chain, excerpt
+    /// or audit dimension fails/is unknown", and the issue's acceptance
+    /// sentence: "an omitted claim blocks a complete-audit claim". The previous
+    /// code published `is_complete()`, `dimensions_complete()` and
+    /// `public_class()` and nothing read them, so the verdict existed and no
+    /// production path ever asked. This is that question, over the record's own
+    /// carried audit trail and coverage map.
+    ///
+    /// Every conjunct is decided by content over the carried records, never by a
+    /// caller flag: the coverage map is re-proved, its published `unaccounted`
+    /// list is re-derived from the same gate, and each claim's own verdict is
+    /// re-read through [`crate::evidence_portfolio::ClaimVerdict::releasable_as_supported`],
+    /// which requires the five-class projection, every recorded dimension and
+    /// both I21.8 requirement obligations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::IntegrityMismatch`] naming the first gate that
+    /// refuses, so a consumer reads WHICH requirement failed rather than only
+    /// that the release is blocked.
+    pub fn release_gate(&self) -> Result<(), InquiryError> {
+        if let Some(prior) =
+            crate::evidence_portfolio::require_complete_claim_coverage(&self.claim_coverage).err()
+        {
+            return Err(InquiryError::ReleaseGateRefused {
+                gate: "claim_coverage",
+                detail: prior.join(","),
+            });
+        }
+        for audit in &self.claim_audits {
+            audit.validate_integrity()?;
+            if !audit.verdict.releasable_as_supported() {
+                return Err(InquiryError::ReleaseGateRefused {
+                    gate: "claim_audit",
+                    detail: audit.claim_id.clone(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Re-proves every digest this record publishes and every binding between
@@ -6008,6 +6296,7 @@ fn run_lane_discipline(
         .filter(|record| record.eligibility == SourceEligibility::Eligible)
         .map(|record| record.record.handle.clone())
         .collect();
+    revalidate_lane_discipline(&discipline, observation)?;
     let current_fence = &profile.state_fence;
     let release = discipline.release_outcome_material(
         &evidence_freeze.digest,
@@ -6087,6 +6376,38 @@ fn run_lane_discipline(
     };
     outcome.digest = outcome.compute_digest();
     Ok(outcome)
+}
+
+/// Revalidates the current fence and profile on the release edge (I21.4 item 6).
+///
+/// I21.4 requires that queued execution and a resume present the fence and the
+/// profile revision the work was admitted under, and that a restart cannot
+/// create a fresh registration with a backdated claim. This is that check, on
+/// the edge that actually authorises a release, so it is reached by every run
+/// rather than by a caller that may skip it.
+///
+/// `revalidate` re-proves the profile's own integrity preimage and the exposure
+/// ledger's, refuses a fence other than the one this profile revision was frozen
+/// under, and re-checks that the active registration, when there is one, still
+/// binds this revision. The fence presented is the run-bound allowlist's own
+/// sealed State Fence: it was sealed by the requester at submission and is a
+/// separate object from the profile that names it, so this compares the
+/// submitted binding against the revision resolved from it rather than a value
+/// against itself. It reads no clock, and the registration history is
+/// append-only, so no restart can substitute a newer registration for an older
+/// one.
+///
+/// # Errors
+///
+/// Returns the [`LaneRegistrationError`]-derived [`InquiryError`] when the
+/// presented fence is stale, the profile or ledger fails its own integrity
+/// re-proof, or the active registration binds another profile revision.
+fn revalidate_lane_discipline(
+    discipline: &InquiryLaneDiscipline,
+    observation: &InquiryObservation,
+) -> Result<(), InquiryError> {
+    discipline.revalidate(&observation.reference_manifest.state_fence)?;
+    Ok(())
 }
 
 /// The contract owner that commits lane registrations into the ordering journal
@@ -7592,19 +7913,78 @@ fn evidence_freeze(
         })
         .collect();
     let contradictions = unresolved_contradictions(admissibility);
+    let FreezePredecessor {
+        supersedes,
+        supersede_reason,
+        expected_revision,
+    } = freeze_predecessor(observation);
     EvidenceFreeze::freeze(
-        &observation.inquiry_id,
+        EvidenceFreezeParams {
+            inquiry_id: observation.inquiry_id.clone(),
+            portfolio_digest: portfolio.digest.clone(),
+            manifest_digest: profile.reference_manifest_digest.clone(),
+            coverage_receipt_digest: coverage_receipt.digest.clone(),
+            evidence_set_id: observation.evidence_set_id.clone(),
+            included_evidence_refs: included,
+            excluded_evidence: excluded,
+            unresolved_contradictions: contradictions,
+            open_research_debts: debts.iter().map(|debt| debt.debt_id.clone()).collect(),
+            frozen_at_ms: observation.assessment_time_ms,
+            supersedes,
+            supersede_reason,
+            expected_revision,
+        },
         profile,
-        &portfolio.digest,
-        &profile.reference_manifest_digest,
-        &coverage_receipt.digest,
-        &observation.evidence_set_id,
-        included,
-        excluded,
-        contradictions,
-        debts.iter().map(|debt| debt.debt_id.clone()).collect(),
-        observation.assessment_time_ms,
     )
+}
+
+/// The successor relation this run's freeze carries, derived from what the run
+/// itself declares.
+///
+/// I21.8: "New material, materially changed source content or changed protocol
+/// requires a recorded reopen/successor freeze with reason and expected
+/// revision." A reopen is exactly this: the two fields that identify it are
+/// already on the admitted request — the `predecessor_freeze_digest` the run was
+/// admitted under and the `reopen_reason` it declared. Neither is invented here,
+/// and a run that declares neither is a first freeze rather than a silent
+/// successor.
+///
+/// The prior freeze is NAMED, never rewritten: this relation is carried on the
+/// new record only, so the old freeze and its audit stay exactly where they were
+/// and both remain addressable by digest.
+fn freeze_predecessor(observation: &InquiryObservation) -> FreezePredecessor {
+    match (
+        observation.predecessor_freeze_digest.as_deref(),
+        observation.reopen_reason.as_deref(),
+    ) {
+        (Some(prior), Some(reason)) => FreezePredecessor {
+            supersedes: Some(prior.to_owned()),
+            supersede_reason: Some(reason.to_owned()),
+            // The expected revision is the commitment this reopen reached: the
+            // evidence-set identity it was admitted under, which is what the
+            // successor was opened to record. It is read off the admitted request
+            // rather than recomputed from the freeze's own fields, so the
+            // expectation cannot be made to agree with the outcome by editing one
+            // of them.
+            expected_revision: Some(freeze(&format!(
+                "expected-evidence-revision/v1;{}|{}",
+                observation.evidence_set_id, observation.inquiry_digest
+            ))),
+        },
+        _ => FreezePredecessor::default(),
+    }
+}
+
+/// The three successor-relation fields of [`EvidenceFreezeParams`], filled from
+/// the run's own declared reopen.
+#[derive(Clone, Debug, Default)]
+struct FreezePredecessor {
+    /// Digest of the freeze this one supersedes.
+    supersedes: Option<String>,
+    /// Why this freeze was opened as a successor.
+    supersede_reason: Option<String>,
+    /// The evidence revision this successor expected to find.
+    expected_revision: Option<String>,
 }
 
 /// Derives the terminal typed disposition from the observed run.

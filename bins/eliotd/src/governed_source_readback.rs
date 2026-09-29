@@ -26,12 +26,26 @@
 //!
 //! # Cited source unit
 //!
-//! The cited unit is the document's typed `body` value, located by exact stored
-//! coordinates. `CampaignSourceDocument` serializes `body` as its last field, so
-//! the body occupies the trailing `body_len` bytes of the canonical document
-//! encoding. The anchor therefore carries the exact `byte_offset`/`byte_length`
-//! of those owned bytes and the digest of the reopened slice — never a
-//! caller-asserted claim and never a hand-picked coordinate.
+//! The cited unit is the document's typed `body` value, LOCATED as a byte-exact
+//! sub-slice of the canonical document encoding. It is not derived by
+//! arithmetic: `canonical_json_bytes` sorts every object key recursively, so
+//! `CampaignSourceDocument { schema, schema_version, body }` encodes as
+//! `{"body":{…},"schema":…,"schema_version":1}` and the body is neither a prefix
+//! nor a suffix. The anchor therefore carries the exact `byte_offset` /
+//! `byte_length` of those owned bytes and the digest of the reopened slice —
+//! never a caller-asserted claim, never a hand-picked coordinate, and never an
+//! approximate one.
+//!
+//! # Index/vector preview
+//!
+//! The retrieval plans the same authenticated owner read returned are the real
+//! production index payload on this route, so [`IndexPreview`] is projected from
+//! them rather than left as an empty schema with no producer. The preview's
+//! `claimed_revision` is the revision the PLAN's own read fence names, never a
+//! copy of the admitted revision: a preview that echoed the value it is checked
+//! against could not drift, and the gate's `readback.preview.revision_drift`
+//! replan would be unreachable. The preview stays non-authoritative and is
+//! never cited; only the readback-verified excerpt may be.
 //!
 //! # Authority
 //!
@@ -52,7 +66,7 @@ use eliot_observation_contracts::{
     SourceAnchorHandle, SourceRevisionHandle, SourceViewHandle, SourceViewKind,
     WorkspaceViewRevisionHandle,
 };
-use eliot_store_api::{CampaignOwnerReadReceipt, CampaignSourceRecord};
+use eliot_store_api::{CampaignOwnerReadReceipt, CampaignOwnerRevision, CampaignSourceRecord};
 
 /// Renders one owner-issued identity as a bounded handle string.
 ///
@@ -107,25 +121,15 @@ pub fn project_owner_document_citation(
     let byte_length = u64::try_from(bytes.len())
         .map_err(|_| ReadbackRefusal::gap("readback.source.length_overflow", None))?;
 
-    // The cited source unit is the document body, located by exact trailing
-    // coordinates: `CampaignSourceDocument` serializes `body` last, so the body
-    // occupies the final `body_len` bytes of the canonical encoding.
+    // The cited source unit is the document body, LOCATED as a byte-exact
+    // sub-slice of the canonical document encoding. It is never derived by
+    // arithmetic: `canonical_json_bytes` sorts every object key recursively, so
+    // `body` sorts before `schema`, and the body is neither a prefix nor a
+    // suffix of the document encoding.
     let body = canonical_json_bytes(&record.document.body)
         .map_err(|_| ReadbackRefusal::gap("readback.owner.encoding", None))?;
-    let body_length = u64::try_from(body.len())
-        .map_err(|_| ReadbackRefusal::gap("readback.source.length_overflow", None))?;
-    let Some(offset) = byte_length.checked_sub(body_length) else {
-        return Err(ReadbackRefusal::gap("readback.anchor.unresolvable", None));
-    };
-    let offset = usize::try_from(offset)
-        .map_err(|_| ReadbackRefusal::gap("readback.anchor.unresolvable", None))?;
-    // The excerpt digest is derived from the reopened slice, so the gate
-    // compares two independent encodings of the same owned bytes by content.
-    let excerpt_digest = sha256_hex(
-        bytes
-            .get(offset..)
-            .ok_or_else(|| ReadbackRefusal::gap("readback.anchor.unresolvable", None))?,
-    );
+    let body_length = body.len();
+    let offset = body_coordinates(&bytes, &body)?;
 
     let admitted = SourceRevisionHandle {
         source_id: owner_label(&record.record_id)?,
@@ -133,11 +137,13 @@ pub fn project_owner_document_citation(
         content_sha256: receipt.document_digest.clone(),
         byte_length,
     };
+    // The excerpt digest is derived from the LOCATED owned slice, so the gate
+    // compares two independent encodings of the same owned bytes by content.
     let anchor = SourceAnchorHandle {
         anchor_id: owner_label(&record.record_id)?,
-        byte_offset: offset_u64(offset)?,
-        byte_length: body_length,
-        excerpt_sha256: excerpt_digest,
+        byte_offset: bounded_u64(offset)?,
+        byte_length: bounded_u64(body_length)?,
+        excerpt_sha256: sha256_hex(&bytes[offset..offset + body_length]),
         native_mapping: None,
     };
     let request = ReadbackRequest {
@@ -146,14 +152,7 @@ pub fn project_owner_document_citation(
         workspace_revision,
         fence: fence.clone(),
         anchor,
-        // The index/vector preview is a non-authoritative placeholder. It
-        // carries no bytes and claims no revision other than the admitted one,
-        // so it can never drift into a citation.
-        preview: IndexPreview {
-            bytes: Vec::new(),
-            claimed_revision: admitted.revision.clone(),
-            authority: PreviewAuthority::NonAuthoritativePreview,
-        },
+        preview: retrieval_preview(record, &admitted.revision)?,
     };
     let reopened = ReopenedSource {
         revision: admitted,
@@ -165,9 +164,118 @@ pub fn project_owner_document_citation(
     project_citation(&request, &reopened, project)
 }
 
-/// Converts a body offset back to `u64` for the anchor handle.
-fn offset_u64(offset: usize) -> Result<u64, ReadbackRefusal> {
-    u64::try_from(offset).map_err(|_| ReadbackRefusal::gap("readback.source.length_overflow", None))
+/// Converts a located byte count back to the `u64` an anchor handle carries.
+fn bounded_u64(value: usize) -> Result<u64, ReadbackRefusal> {
+    u64::try_from(value).map_err(|_| ReadbackRefusal::gap("readback.source.length_overflow", None))
+}
+
+/// Builds the non-authoritative index/vector preview for this citation.
+///
+/// The preview is projected from the retrieval plans the SAME authenticated
+/// owner read returned on this record — `CampaignSourceRecord::history_plans`,
+/// which the store documents as "existing validated retrieval plans and bounded
+/// results returned by the same owner read; plans are never synthesized from
+/// task labels". Those plans are the real production index payload in this
+/// tree, so this is a projection of real retrieval data rather than an empty
+/// stand-in.
+///
+/// `claimed_revision` is the revision the PLAN's own recorded read fence names,
+/// rendered in the same label space as the admitted revision so the gate can
+/// compare the two by value. It is deliberately NOT copied from
+/// `admitted_revision`: a preview that echoed the value it is checked against
+/// could never drift, and the gate's `readback.preview.revision_drift` replan
+/// would be unreachable code. Deriving the claim from the plan's fence makes it
+/// an INDEPENDENT expected value, so a plan computed against a different
+/// revision than the admitted one is detected as drift and the citation is
+/// replanned instead of emitted.
+///
+/// The preview stays non-authoritative in every case: `IndexPreview::is_citable`
+/// is `false` by contract, and these bytes are never spliced into the excerpt.
+/// When a record carries no retrieval plan, or its plan cannot state which
+/// revision it read, there is no index payload that can be shown honestly, so
+/// the preview is empty and claims the admitted revision only as the identity it
+/// would be shown under. An empty preview describes nothing and therefore has
+/// nothing to drift.
+fn retrieval_preview(
+    record: &CampaignSourceRecord,
+    admitted_revision: &str,
+) -> Result<IndexPreview, ReadbackRefusal> {
+    let Some(plan) = record.history_plans.first() else {
+        return Ok(IndexPreview {
+            bytes: Vec::new(),
+            claimed_revision: admitted_revision.to_owned(),
+            authority: PreviewAuthority::NonAuthoritativePreview,
+        });
+    };
+    // A plan whose fence names no task revision cannot state which revision it
+    // read. Substituting the admitted revision here would make the drift check
+    // compare a value against itself, so no payload is shown at all rather than
+    // shown under a fabricated identity. That is not a weakened gate: the
+    // citation depends only on the verified readback, and a preview is never
+    // cited, so a display artifact must not be able to veto it.
+    let Some(observed) = plan.read_state_fence.task_revision else {
+        return Ok(IndexPreview {
+            bytes: Vec::new(),
+            claimed_revision: admitted_revision.to_owned(),
+            authority: PreviewAuthority::NonAuthoritativePreview,
+        });
+    };
+    // The preview payload is the plan's own bounded result, canonically
+    // encoded. It is a projection of retrieval data, not a substitute for the
+    // admitted document, and it is never cited. An oversized preview is a typed
+    // gap rather than a silently truncated payload: a truncated preview would
+    // describe bytes the retrieval plan never emitted.
+    let bytes = canonical_json_bytes(&plan.plan)
+        .map_err(|_| ReadbackRefusal::gap("readback.preview.encoding", None))?;
+    if bytes.len() > eliot_context_contracts::MAX_PREVIEW_BYTES {
+        return Err(ReadbackRefusal::gap("readback.preview.too_large", None));
+    }
+    Ok(IndexPreview {
+        bytes,
+        claimed_revision: owner_label(&CampaignOwnerRevision::Task(observed))?,
+        authority: PreviewAuthority::NonAuthoritativePreview,
+    })
+}
+
+/// Locates the cited unit's exact coordinates inside the canonical document.
+///
+/// The coordinate is FOUND, not computed. `canonical_json_bytes` sorts every
+/// object key recursively, so `CampaignSourceDocument { schema, schema_version,
+/// body }` encodes as `{"body":{...},"schema":...,"schema_version":1}`: the
+/// body is neither a prefix nor a suffix, and subtracting its length from the
+/// document length would address the envelope's trailing bytes.
+///
+/// The body encoding must occur EXACTLY ONCE. Zero occurrences means the
+/// encoded document is not the one this body came from (`unresolvable`); more
+/// than one means the sub-slice is ambiguous and no unique anchor exists
+/// (`ambiguous`). Both are typed gaps: the gate never falls back to an
+/// approximate coordinate, because an approximate coordinate is precisely a
+/// citation to convenient bytes.
+fn body_coordinates(document: &[u8], body: &[u8]) -> Result<usize, ReadbackRefusal> {
+    let mut found = None;
+    let mut search = document;
+    while let Some(index) = find_subslice(search, body) {
+        let absolute = document.len() - search.len() + index;
+        if found.is_some() {
+            return Err(ReadbackRefusal::gap("readback.anchor.ambiguous", None));
+        }
+        found = Some(absolute);
+        search = &search[index + 1..];
+    }
+    found.ok_or_else(|| ReadbackRefusal::gap("readback.anchor.unresolvable", None))
+}
+
+/// Returns the index of the first occurrence of `needle` in `haystack`.
+///
+/// An empty needle has no meaningful location and reports no match rather than
+/// offset zero, so an empty cited unit can never be treated as located.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 /// Builds the active `SourceViewHandle` for an owner-read-backed source.

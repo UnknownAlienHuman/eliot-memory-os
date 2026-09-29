@@ -160,6 +160,9 @@ pub enum ReplacementError {
     /// A late outcome tagged with a foreign generation cannot mutate the call.
     #[error("call outcome generation mismatch")]
     GenerationTagMismatch,
+    /// A call ID already has a different retained terminal disposition.
+    #[error("call terminal disposition conflicts with retained history")]
+    TerminalDispositionConflict,
     /// The candidate violates artifact/type/import/limit compatibility.
     #[error("incompatible candidate: {0}")]
     IncompatibleCandidate(String),
@@ -690,6 +693,11 @@ pub struct RollbackReceipt {
     pub restored_generation: u64,
     /// Artifact digest bound to the restored generation.
     pub restored_artifact: Sha256Digest,
+    /// Canonical digest of the exact owner-committed cutover consumed by this
+    /// rollback. This field intentionally changes the receipt schema: legacy
+    /// receipts without cutover identity cannot attest which authority epoch
+    /// became the effective activation fence.
+    pub cutover_digest: Sha256Digest,
     /// Accepted calls on the retired generation retained as history.
     pub new_calls_retained: u64,
     /// Previous receipt-chain digest.
@@ -815,6 +823,48 @@ struct PreparedCandidate {
     active_fence_digest: Sha256Digest,
 }
 
+/// Effective activation of a generation. `record` remains the immutable
+/// admitted description (including its historical registration fence), while
+/// a rollback receipt, when present, supplies the newer current fence.
+#[derive(Clone, Debug)]
+struct ActiveBinding {
+    record: GenerationRecord,
+    rollback_cutover: Option<GenerationCutoverReceipt>,
+}
+
+impl ActiveBinding {
+    fn initial(record: GenerationRecord) -> Self {
+        Self {
+            record,
+            rollback_cutover: None,
+        }
+    }
+
+    fn generation_number(&self) -> u64 {
+        self.record.generation_number()
+    }
+
+    fn effective_fence_digest(&self) -> Result<Sha256Digest, ReplacementError> {
+        let cutover_digest = self
+            .rollback_cutover
+            .as_ref()
+            .map(canonical_digest)
+            .transpose()
+            .map_err(|_| external_contract("fence-seal-failed"))?;
+        canonical_digest(&ActiveFenceIdentity {
+            registration_fence: &self.record.generation.state_fence,
+            rollback_cutover_digest: cutover_digest.as_ref(),
+        })
+        .map_err(|_| external_contract("fence-seal-failed"))
+    }
+}
+
+#[derive(Serialize)]
+struct ActiveFenceIdentity<'a, T> {
+    registration_fence: &'a T,
+    rollback_cutover_digest: Option<&'a Sha256Digest>,
+}
+
 #[derive(Clone, Debug)]
 struct DrainState {
     operation_id: String,
@@ -844,7 +894,7 @@ struct QuarantinedGeneration {
 }
 
 struct CoordinatorState {
-    active: Option<GenerationRecord>,
+    active: Option<ActiveBinding>,
     adoption: Option<AdoptionInfo>,
     candidate: Option<PreparedCandidate>,
     operation: Option<String>,
@@ -991,7 +1041,7 @@ impl GenerationCoordinator {
             return Err(ReplacementError::AlreadyActive);
         }
         let number = record.generation_number();
-        state.active = Some(record.clone());
+        state.active = Some(ActiveBinding::initial(record.clone()));
         state.adoption = Some(AdoptionInfo {
             operation_id: "initial-admission".to_owned(),
             calls_accepted_since: 0,
@@ -1003,12 +1053,9 @@ impl GenerationCoordinator {
     /// Returns the currently admitted (new-call) generation number, if any.
     #[must_use]
     pub fn active_generation_number(&self) -> Option<u64> {
-        self.lock_state().ok().and_then(|state| {
-            state
-                .active
-                .as_ref()
-                .map(GenerationRecord::generation_number)
-        })
+        self.lock_state()
+            .ok()
+            .and_then(|state| state.active.as_ref().map(ActiveBinding::generation_number))
     }
 
     /// Validates the exclusive operation, the exact expected generation, and
@@ -1189,32 +1236,42 @@ impl GenerationCoordinator {
 
     /// Records the call's own observed terminal or unknown result. The
     /// outcome generation tag must equal the accepting lease; late old output
-    /// therefore cannot mutate a new call, and duplicate delivery replays
-    /// without mutation.
+    /// therefore cannot mutate a new call. A duplicate replays only when its
+    /// retained generation and disposition are exactly equal; contradictory
+    /// terminal delivery is rejected unchanged.
     ///
     /// # Errors
     ///
-    /// Returns a typed failure for unknown calls and generation-tag mismatch.
+    /// Returns a typed failure for unknown calls, generation-tag mismatch, or
+    /// contradictory terminal history.
     pub fn complete_call(&self, outcome: &CallOutcome) -> Result<CallCompletion, ReplacementError> {
         check_text(&outcome.call_id, "call.call_id")?;
-        let mut state = self.lock_state()?;
-        let Some(lease) = state.inflight.get(&outcome.call_id).cloned() else {
-            let replayed = state.history.iter().any(|entry| {
-                entry.call_id == outcome.call_id && entry.generation == outcome.generation
-            });
-            if replayed {
-                return Ok(CallCompletion::DuplicateReplay);
-            }
-            return Err(ReplacementError::UnknownCall);
-        };
-        if lease.accepted_generation != outcome.generation {
-            return Err(ReplacementError::GenerationTagMismatch);
-        }
         let disposition = match outcome.terminal {
             CallTerminal::Completed => CallDisposition::Completed,
             CallTerminal::Cancelled => CallDisposition::Cancelled,
             CallTerminal::Unknown => CallDisposition::Unknown,
         };
+        let mut state = self.lock_state()?;
+        let Some(lease) = state.inflight.get(&outcome.call_id).cloned() else {
+            let Some(entry) = state
+                .history
+                .iter()
+                .find(|entry| entry.call_id == outcome.call_id)
+            else {
+                return Err(ReplacementError::UnknownCall);
+            };
+            if entry.generation != outcome.generation {
+                return Err(ReplacementError::GenerationTagMismatch);
+            }
+            return if entry.disposition == disposition {
+                Ok(CallCompletion::DuplicateReplay)
+            } else {
+                Err(ReplacementError::TerminalDispositionConflict)
+            };
+        };
+        if lease.accepted_generation != outcome.generation {
+            return Err(ReplacementError::GenerationTagMismatch);
+        }
         state.inflight.remove(&outcome.call_id);
         state.push_history(CallHistoryEntry {
             call_id: outcome.call_id.clone(),
@@ -1377,7 +1434,7 @@ impl GenerationCoordinator {
         // Direction-agnostic compatibility only. `check_compatible` additionally
         // refuses a generation-number regression, which is correct for a forward
         // replacement and would make the restore direction unreachable.
-        check_compatible_fields(&active, &target)?;
+        check_compatible_fields(&active.record, &target)?;
         if let Some(adoption) = state.adoption.as_ref() {
             let risky = !adoption.confirmed || adoption.calls_accepted_since > 0;
             let reconciled = state
@@ -1397,8 +1454,7 @@ impl GenerationCoordinator {
             .clone()
             .ok_or(ReplacementError::KernelCutoverRequired)?;
         target.validate_owned()?;
-        let fence_digest = canonical_digest(&active.generation.state_fence)
-            .map_err(|_| external_contract("fence-seal-failed"))?;
+        let fence_digest = active.effective_fence_digest()?;
         state.operation = Some(request.operation_id.clone());
         state.candidate = Some(PreparedCandidate {
             record: target,
@@ -1590,10 +1646,7 @@ impl GenerationCoordinator {
     /// Returns [`ReplacementError::InvariantViolation`] on any breach.
     pub fn verify_call_invariants(&self) -> Result<(), ReplacementError> {
         let state = self.lock_state()?;
-        let active_number = state
-            .active
-            .as_ref()
-            .map(GenerationRecord::generation_number);
+        let active_number = state.active.as_ref().map(ActiveBinding::generation_number);
         for lease in state.inflight.values() {
             if active_number.is_none_or(|active| lease.accepted_generation != active) {
                 return Err(ReplacementError::InvariantViolation(
@@ -1865,9 +1918,8 @@ impl GenerationCoordinator {
         if active.generation_number() != request.expected_active {
             return Err(ReplacementError::StaleExpectedGeneration);
         }
-        check_compatible(&active, &request.candidate.record)?;
-        let fence_digest = canonical_digest(&active.generation.state_fence)
-            .map_err(|_| external_contract("fence-seal-failed"))?;
+        check_compatible(&active.record, &request.candidate.record)?;
+        let fence_digest = active.effective_fence_digest()?;
         state.operation = Some(request.operation_id.clone());
         Ok(ActiveSnapshot {
             number: active.generation_number(),
@@ -1985,8 +2037,7 @@ impl CoordinatorState {
         // immediately below), so the newer-epoch rule is re-evaluated against
         // that same fence.
         check_committed_cutover(cutover, expected_current, expected_restore, active)?;
-        let fence_digest = canonical_digest(&active.generation.state_fence)
-            .map_err(|_| external_contract("fence-seal-failed"))?;
+        let fence_digest = active.effective_fence_digest()?;
         if fence_digest != candidate.active_fence_digest {
             return Err(ReplacementError::StaleExpectedGeneration);
         }
@@ -2015,7 +2066,17 @@ impl CoordinatorState {
             self.candidate = Some(candidate);
             return Err(ReplacementError::NoActiveGeneration);
         };
-        if let Err(error) = self.retain_old(previous.clone()) {
+        let Some(cutover) = candidate.basis.committed_cutover().cloned() else {
+            self.active = Some(previous);
+            self.candidate = Some(candidate);
+            return Err(ReplacementError::NoArmedRollback);
+        };
+        let Ok(cutover_digest) = canonical_digest(&cutover) else {
+            self.active = Some(previous);
+            self.candidate = Some(candidate);
+            return Err(external_contract("cutover-seal-failed"));
+        };
+        if let Err(error) = self.retain_old(previous.record.clone()) {
             self.active = Some(previous);
             self.candidate = Some(candidate);
             return Err(error);
@@ -2033,6 +2094,7 @@ impl CoordinatorState {
             expected_current,
             expected_restore,
             &restored_artifact,
+            &cutover_digest,
             new_calls_retained,
             &prev,
         ) {
@@ -2050,7 +2112,10 @@ impl CoordinatorState {
                 return Err(error);
             }
         };
-        self.active = Some(candidate.record);
+        self.active = Some(ActiveBinding {
+            record: candidate.record,
+            rollback_cutover: Some(cutover),
+        });
         self.adoption = Some(AdoptionInfo {
             operation_id: operation_id.to_owned(),
             calls_accepted_since: 0,
@@ -2103,8 +2168,7 @@ impl CoordinatorState {
         {
             return Err(ReplacementError::StaleExpectedGeneration);
         }
-        let fence_digest = canonical_digest(&active.generation.state_fence)
-            .map_err(|_| external_contract("fence-seal-failed"))?;
+        let fence_digest = active.effective_fence_digest()?;
         if fence_digest != candidate.active_fence_digest {
             return Err(ReplacementError::StaleExpectedGeneration);
         }
@@ -2140,14 +2204,14 @@ impl CoordinatorState {
             self.candidate = Some(candidate);
             return Err(ReplacementError::NoActiveGeneration);
         };
-        if let Err(error) = self.retain_old(previous.clone()) {
+        if let Err(error) = self.retain_old(previous.record.clone()) {
             self.active = Some(previous);
             self.candidate = Some(candidate);
             return Err(error);
         }
         let new_number = candidate.record.generation_number();
         let new_artifact = candidate.record.artifact_digest.clone();
-        self.active = Some(candidate.record);
+        self.active = Some(ActiveBinding::initial(candidate.record));
         self.adoption = Some(AdoptionInfo {
             operation_id: request.operation_id.clone(),
             calls_accepted_since: 0,
@@ -2165,7 +2229,7 @@ impl CoordinatorState {
             &request.operation_id,
             previous.generation_number(),
             new_number,
-            &previous.artifact_digest,
+            &previous.record.artifact_digest,
             &new_artifact,
             &inflight_digest,
             &prev,
@@ -2217,7 +2281,7 @@ fn check_compatible(
 /// unrelated). No new dependency is introduced for this.
 fn check_rollback_cutover(
     request: &RollbackRequest,
-    active: &GenerationRecord,
+    active: &ActiveBinding,
 ) -> Result<GenerationCutoverReceipt, ReplacementError> {
     let (Some(cutover), Some(expected_digest)) = (&request.cutover, &request.cutover_digest) else {
         return Err(ReplacementError::KernelCutoverRequired);
@@ -2250,7 +2314,7 @@ fn check_committed_cutover(
     cutover: &GenerationCutoverReceipt,
     expected_current: u64,
     expected_restore: u64,
-    retired: &GenerationRecord,
+    retired: &ActiveBinding,
 ) -> Result<(), ReplacementError> {
     cutover
         .validate()
@@ -2268,11 +2332,30 @@ fn check_committed_cutover(
         return Err(external_contract("cutover-old-generation-mismatch"));
     }
     let supplied = &cutover.authority_epoch;
-    let fenced = &retired.generation.state_fence.authority_epoch;
-    if supplied.lineage_id != fenced.lineage_id {
+    let (lineage_id, sequence) = match retired.rollback_cutover.as_ref() {
+        Some(current) => (
+            &current.authority_epoch.lineage_id,
+            current.authority_epoch.sequence,
+        ),
+        None => (
+            &retired
+                .record
+                .generation
+                .state_fence
+                .authority_epoch
+                .lineage_id,
+            retired
+                .record
+                .generation
+                .state_fence
+                .authority_epoch
+                .sequence,
+        ),
+    };
+    if supplied.lineage_id != *lineage_id {
         return Err(ReplacementError::RollbackEpochNotNewer);
     }
-    if supplied.sequence <= fenced.sequence {
+    if supplied.sequence <= sequence {
         return Err(ReplacementError::OldEpochReactivation);
     }
     Ok(())
@@ -2443,6 +2526,7 @@ struct RollbackSeal<'a> {
     from_generation: u64,
     restored_generation: u64,
     restored_artifact: &'a Sha256Digest,
+    cutover_digest: &'a Sha256Digest,
     new_calls_retained: u64,
     prev_receipt_digest: &'a Sha256Digest,
 }
@@ -2458,6 +2542,7 @@ fn seal_rollback_receipt(
     from_generation: u64,
     restored_generation: u64,
     restored_artifact: &Sha256Digest,
+    cutover_digest: &Sha256Digest,
     new_calls_retained: u64,
     prev: &Sha256Digest,
 ) -> Result<RollbackReceipt, ReplacementError> {
@@ -2467,6 +2552,7 @@ fn seal_rollback_receipt(
         from_generation,
         restored_generation,
         restored_artifact,
+        cutover_digest,
         new_calls_retained,
         prev_receipt_digest: prev,
     };
@@ -2478,6 +2564,7 @@ fn seal_rollback_receipt(
         from_generation,
         restored_generation,
         restored_artifact: restored_artifact.clone(),
+        cutover_digest: cutover_digest.clone(),
         new_calls_retained,
         prev_receipt_digest: prev.clone(),
         receipt_digest,

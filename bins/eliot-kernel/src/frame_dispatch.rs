@@ -773,12 +773,13 @@ impl KernelComposition {
                         | TransportError::UnknownOutcome
                         | TransportError::Timeout
                 ) {
-                    // F-LOG-KERNEL-1 (#897 T10): failed frame input observed
-                    // without payload at the dispatch boundary. Static
-                    // event/outcome only; transport-level partial/zero/EOF at
+                    // F-LOG-KERNEL-1 (#897 T10/T26): failed frame input is
+                    // observed without payload at the owned dispatch boundary
+                    // through the shared classifier. Static event/outcome
+                    // only (W6, I15.4); transport-level partial/zero/EOF at
                     // `receive_frame` never reaches this seam (the driver
                     // fences first) and needs a revised explicit assignment.
-                    observe_frame("kernel.frame_input_unknown", "unknown");
+                    Self::observe_frame_read_input(error);
                 }
                 if matches!(error, TransportError::Cancelled) {
                     // F-LOG-KERNEL-1 (#897 W2): cancellation observed as the

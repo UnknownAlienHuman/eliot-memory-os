@@ -1423,10 +1423,9 @@ impl SchedulingProfile {
 /// A passed-over item is retained: it stays admitted and keeps its canonical
 /// enqueue ordinal, so skipping it never re-queues or re-ages it.
 ///
-/// One writer per deliverable is not a member of this set: it is enforced once
-/// at the owning transition (`plan`, `admit`, `reassign`) on the Work/Action
-/// lease identity and cannot be violated from the selection side, so no
-/// unreachable reason is published here.
+/// One writer per deliverable is not a member of this set: it is enforced where
+/// the Work/Action lease is taken (`admit` and `reassign`) and cannot be
+/// violated from the selection side, so no unreachable reason is published here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ReadyItemSkipReason {
@@ -1573,12 +1572,14 @@ pub struct WorkClassSelectionReport {
 /// a live writer.
 ///
 /// This is published state for the caller, not a gate: the one-writer property
-/// is enforced at the owning transition (`plan`, `admit`, `reassign`) on the
+/// is enforced at the owning transitions (`admit` and `reassign`) on the
 /// Work/Action lease identity, so a second concurrent holder of one scope is
-/// rejected there. What this record answers is which attempt holds the
-/// deliverable and in what state, which is what tells a caller why the scope is
-/// not available. There is deliberately no count of waiting items: a second
-/// holder is rejected on admission, so such a count could only ever be one.
+/// rejected there. `plan` does **not** enforce it — it takes no scope holder
+/// decision and admits nothing — so a claim is never a statement about a plan.
+/// What this record answers is which attempt holds the deliverable, under which
+/// lease, and in what state, which is what tells a caller why the scope is not
+/// available. There is deliberately no count of waiting items: a second holder
+/// is rejected on admission, so such a count could only ever be one.
 ///
 /// `writer_holders` is rebuilt by replaying this coordinator's own admissions,
 /// so the exclusion it reflects holds only within one snapshot lineage; it is
@@ -1589,6 +1590,15 @@ pub struct DeliverableClaim {
     pub mutation_scope: String,
     /// Always present: a claim is only published for a scope that has a holder.
     pub holder_attempt_id: AttemptId,
+    /// The holder's own Work/Action lease identity, read from its stored record.
+    ///
+    /// Issue #1683 W4 requires deliverable ownership to rest on that lease
+    /// identity rather than on a raw path string or a process-local holder
+    /// alone, so the claim names the lease that owns the deliverable. It is
+    /// never synthesized from the scope or recomputed from the attempt; it is
+    /// the same value `validate_attempt_binding` and every release site compare
+    /// against, so a caller can act on the lease without re-deriving one.
+    pub holder_lease_id: WorkLeaseId,
     /// The holder's state. Any non-terminal state appears here — `Admitted`,
     /// `Running`, `CancellationRequested` and `UnknownOutcome` — because a
     /// non-terminal holder keeps the claim, including under an unknown outcome

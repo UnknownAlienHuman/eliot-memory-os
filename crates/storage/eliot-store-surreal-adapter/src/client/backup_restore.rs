@@ -14,9 +14,12 @@
 //! restore inherits the v2 baseline plus its unique `(namespace, key)` index
 //! for insert-if-absent exclusion, exact replay and changed-content conflict.
 //! A restore transaction writes only the destination's own canonical class
-//! tables through the fixed import clauses of the apply operation: it never
-//! executes archive text, never imports operational session/lease/grant/epoch
-//! state, and never names a table, path or endpoint of its own.
+//! tables through the fixed import clauses of the apply operation, and its one
+//! other write is the bounded carrier publication that materialises the archive
+//! owner's retained payload under the admitted operation before any member is
+//! resolved: it never executes archive text, never imports operational
+//! session/lease/grant/epoch state, and never names a table, path or endpoint of
+//! its own.
 
 use crate::error::AdapterError;
 use eliot_store_api::BACKUP_IO_CAPABILITY_ISOLATED_RESTORE;
@@ -37,7 +40,9 @@ pub(crate) const RESTORE_OPERATION_PURGE_LEDGER: &str = "restore_current_purge_l
 ///
 /// A member digest and a caller's member list are metadata, not a payload
 /// source. The canonical logical bytes enter the port only through the
-/// archive/artifact owner's own carrier rows, read back under this one closed
+/// archive/artifact owner's own carrier rows — published by
+/// [`RESTORE_OPERATION_CARRIER_PUBLISH`] from the batch's retained reference
+/// under this exact operation — and are read back under this one closed
 /// observation.
 pub(crate) const RESTORE_OPERATION_ARCHIVE_MEMBERS: &str = "restore_archive_member_payloads";
 /// Reads one canonical row of the destination back through its own read path.
@@ -46,6 +51,15 @@ pub(crate) const RESTORE_OPERATION_ARCHIVE_MEMBERS: &str = "restore_archive_memb
 /// readback of an imported record, and the destination's own head value the
 /// batch's expected state is compared against.
 pub(crate) const RESTORE_OPERATION_CANONICAL_READ: &str = "restore_canonical_record_read";
+/// Publishes the archive-member carrier rows one admitted batch resolves from.
+///
+/// The owner contract retains the canonical logical payload a member restores
+/// from, and the port cannot resolve a member it has not durably published under
+/// its own operation identity. This is that publication: create-only, one row
+/// per member, keyed by the admitted archive member, the admitted operation and
+/// the member's own logical identity. The payload is a bound parameter; nothing
+/// a caller supplies becomes a table, a statement, a path or a connection.
+pub(crate) const RESTORE_OPERATION_CARRIER_PUBLISH: &str = "restore_archive_member_carrier";
 
 /// Closed restore vocabulary, in canonical registration order.
 ///
@@ -64,14 +78,23 @@ pub(crate) const RESTORE_OPERATIONS: &[&str] = &[
 /// durable destination admission/fence/build/purge readback, the current
 /// purge-ledger readback, the archive-member carrier resolution, and the
 /// post-commit canonical import readback. They are disjoint from
-/// [`RESTORE_OPERATIONS`], so the fixed registry's closed set is exactly the
-/// union and nothing else.
+/// [`RESTORE_OPERATIONS`] and from [`RESTORE_PROVIDER_CARRIER_WRITES`], so the
+/// fixed registry's closed set is exactly the union of the three and nothing
+/// else.
 pub(crate) const RESTORE_PROVIDER_OBSERVATIONS: &[&str] = &[
     RESTORE_OPERATION_FENCE,
     RESTORE_OPERATION_PURGE_LEDGER,
     RESTORE_OPERATION_ARCHIVE_MEMBERS,
     RESTORE_OPERATION_CANONICAL_READ,
 ];
+
+/// Closed provider-side carrier-publication vocabulary, in canonical order.
+///
+/// The one write the port performs on its own behalf before it resolves any
+/// member: the archive-member carrier rows the resolution step reads back. It is
+/// not one of the four caller-addressable port operations and never commits
+/// canonical data, so it stays disjoint from [`RESTORE_OPERATIONS`].
+pub(crate) const RESTORE_PROVIDER_CARRIER_WRITES: &[&str] = &[RESTORE_OPERATION_CARRIER_PUBLISH];
 
 /// Private registry namespace for isolated-restore state.
 ///
@@ -98,8 +121,9 @@ pub(crate) const RESTORE_KEY_PURGE_MEMBER_PREFIX: &str = "purge_member_";
 /// Current purge-ledger scope row prefix, keyed by the source installation the
 /// obligation applies to.
 pub(crate) const RESTORE_KEY_PURGE_SCOPE_PREFIX: &str = "purge_scope_";
-/// Archive-member carrier row prefix, keyed by the archive member digest the
-/// archive/artifact owner resolved the payload for.
+/// Archive-member carrier row prefix, keyed by the archive member digest, the
+/// admitted restore operation and the member the archive/artifact owner
+/// resolved the payload for.
 pub(crate) const RESTORE_KEY_ARCHIVE_MEMBER_PREFIX: &str = "archive_member_";
 
 /// Payload schema of a destination fence/admission row.
@@ -124,6 +148,9 @@ pub(crate) const RESTORE_RECORD_CREATE_CONFLICT: &str = "restore_record_create_c
 /// Marker thrown when the archive placement is already owned by another
 /// operation identity.
 pub(crate) const RESTORE_PLACEMENT_CREATE_CONFLICT: &str = "restore_placement_create_conflict";
+/// Marker thrown when an archive-member carrier row already exists, so the
+/// publication is an exact-replay readback rather than an overwrite.
+pub(crate) const RESTORE_CARRIER_CREATE_CONFLICT: &str = "restore_archive_member_carrier_conflict";
 /// Marker thrown when a destination revision head no longer carries the
 /// expected revision the batch was admitted against.
 pub(crate) const RESTORE_REVISION_HEAD_CHANGED: &str = "restore_revision_head_changed";
@@ -191,6 +218,26 @@ const RESTORE_STATEMENT_ARCHIVE_MEMBER: &str = RESTORE_STATEMENT_READ_ROW;
 /// registered placement into an observed canonical import, and the observation
 /// the destination's own head value is read through.
 const RESTORE_STATEMENT_CANONICAL_READ: &str = "SELECT VALUE body FROM ONLY type::record($restore_canonical_table, $restore_canonical_row_id);";
+
+/// Pinned statement for [`RESTORE_OPERATION_CARRIER_PUBLISH`].
+///
+/// One provider transaction that inserts the whole bounded carrier set of one
+/// admitted operation, so a resolution step either finds every member's carrier
+/// row or none of them. Create-only: a row a previous incarnation of this same
+/// operation already published raises the unique-index duplicate, which the port
+/// resolves by exact readback of that row's content rather than by overwriting
+/// the retained payload.
+const RESTORE_STATEMENT_CARRIER_PUBLISH: &str = r"
+BEGIN TRANSACTION;
+";
+
+/// One create of one archive-member carrier row.
+///
+/// `{i}` selects the binding index. The row is the same keyed registry row every
+/// other restore family uses, addressed by the registry's own record id and
+/// carrying only bound values: the namespace, key, fence, revision, schema,
+/// payload and value digest the port derived for this operation and member.
+const RESTORE_STATEMENT_CARRIER: &str = "LET $restore_carrier{i} = (CREATE type::record($restore_table, $restore_carrier_row_id{i}) CONTENT { namespace: $restore_carrier_record{i}.namespace, key: $restore_carrier_record{i}.key, state_fence: $restore_carrier_record{i}.state_fence, revision: $restore_carrier_record{i}.revision, schema: $restore_carrier_record{i}.schema, payload: <bytes>$restore_carrier_record{i}.payload, value_digest: $restore_carrier_record{i}.value_digest } RETURN AFTER); IF array::len($restore_carrier{i} ?? []) != 1 { THROW 'restore_archive_member_carrier_conflict'; };";
 
 /// Pinned statement for [`RESTORE_OPERATION_PREPARE`].
 ///
@@ -293,11 +340,14 @@ pub(crate) fn is_restore_operation(name: &str) -> bool {
 
 /// Admits only members of the closed fixed-provider restore vocabulary.
 ///
-/// The closed set is the four port operations plus the two provider-side
-/// observations. Unknown names fail with a redacted static label; the input is
-/// never echoed into the error.
+/// The closed set is the four port operations, the provider-side observations
+/// and the provider-side carrier publication. Unknown names fail with a redacted
+/// static label; the input is never echoed into the error.
 pub(crate) fn validate_restore_operation(name: &str) -> Result<(), AdapterError> {
-    if is_restore_operation(name) || RESTORE_PROVIDER_OBSERVATIONS.contains(&name) {
+    if is_restore_operation(name)
+        || RESTORE_PROVIDER_OBSERVATIONS.contains(&name)
+        || RESTORE_PROVIDER_CARRIER_WRITES.contains(&name)
+    {
         Ok(())
     } else {
         Err(AdapterError::NamedOperationUnavailable {
@@ -320,6 +370,8 @@ pub(crate) fn fixed_restore_statement(operation: &str) -> Result<&'static str, A
         Ok(RESTORE_STATEMENT_PURGE_LEDGER)
     } else if operation == RESTORE_OPERATION_ARCHIVE_MEMBERS {
         Ok(RESTORE_STATEMENT_ARCHIVE_MEMBER)
+    } else if operation == RESTORE_OPERATION_CARRIER_PUBLISH {
+        Ok(RESTORE_STATEMENT_CARRIER_PUBLISH)
     } else if operation == RESTORE_OPERATION_CANONICAL_READ {
         Ok(RESTORE_STATEMENT_CANONICAL_READ)
     } else if operation == RESTORE_OPERATION_APPLY {
@@ -385,6 +437,21 @@ pub(crate) fn restore_apply_statement(shape: RestoreApplyShape) -> String {
     sql
 }
 
+/// Renders the carrier publication transaction for one bounded batch shape.
+///
+/// The composed text is [`RESTORE_STATEMENT_CARRIER_PUBLISH`] followed by one
+/// create per member the operation retains, then one commit. The count is the
+/// port's own bounded member set, never caller text, so the composed statement
+/// stays a fixed adapter-owned template over bound parameters.
+pub(crate) fn restore_carrier_statement(carriers: usize) -> String {
+    let mut sql = String::from(RESTORE_STATEMENT_CARRIER_PUBLISH);
+    for index in 0..carriers {
+        sql.push_str(&crate::schema::indexed(RESTORE_STATEMENT_CARRIER, index));
+    }
+    sql.push_str("COMMIT TRANSACTION;\n");
+    sql
+}
+
 /// Reports whether one provider statement error is a duplicate/unique-index
 /// rejection, i.e. a concurrent winner created the row first.
 ///
@@ -398,6 +465,7 @@ pub(crate) fn is_restore_duplicate(error: &str) -> bool {
     if error.contains(RESTORE_DESTINATION_CREATE_CONFLICT)
         || error.contains(RESTORE_RECORD_CREATE_CONFLICT)
         || error.contains(RESTORE_PLACEMENT_CREATE_CONFLICT)
+        || error.contains(RESTORE_CARRIER_CREATE_CONFLICT)
         || error.contains(RESTORE_IMPORT_CREATE_CONFLICT)
     {
         return true;

@@ -171,15 +171,24 @@ pub fn project_read_page(
 /// Board-visible notification inbox section (issue #1780).
 ///
 /// Rebuildable projection of the owner-supplied canonical records: every
-/// row the owner reports, with locally computed metrics. The board never
-/// filters this section by role, privacy, or quiet hours — canonical
-/// creation and board visibility are never suppressed. Consumers use
-/// [`inbox`], [`unresolved_critical`], and [`failed_delivery`] for the
-/// unresolved subsets.
+/// row the owner reports, with locally computed metrics, plus the two
+/// obligation subsets the board must show without the consumer recomputing
+/// them. The board never filters this section by role, privacy, or quiet
+/// hours — canonical creation and board visibility are never suppressed.
+///
+/// `rows` is the complete owner-reported set, so resolved records and their
+/// closure evidence stay visible. `unresolved_critical` is the unresolved
+/// critical subset of those same rows and `failed_delivery` is their
+/// unresolved failed-delivery subset; both keep acknowledged and
+/// failed-delivery rows until the owner reports an authorized disposition.
+/// The board builds both from the rows it already carries rather than from a
+/// second input, so a subset can never disagree with its own inbox.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NotificationInbox {
     pub rows: Vec<NotificationRow>,
+    pub unresolved_critical: Vec<NotificationRow>,
+    pub failed_delivery: Vec<NotificationRow>,
     pub metrics: NotificationMetrics,
 }
 

@@ -4,6 +4,14 @@ use time::OffsetDateTime;
 
 use crate::{AgentHostId, BlobRef, ProcessReapReceipt};
 
+fn deserialize_required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ProviderInvocationState {
@@ -111,13 +119,16 @@ pub struct ProviderInvocationTransition {
     pub evidence_refs: Vec<String>,
 }
 
-/// Decoder: derived and closed. The eleven optional outcome fields below
-/// (`provider_route_policy` through `stderr_truncated`) now follow the same
-/// explicit presence rule this record's other `Option` fields already use —
-/// `Option` without `#[serde(default)]`, so an absent key is a typed
-/// missing-field failure rather than a silent `None`.
+/// Decoder: derived and closed. The ten required-nullable outcome fields below
+/// (`provider_route_policy`, `timeout_class`, `process_reap_receipt`,
+/// `process_timed_out`, `process_cancelled`, `process_worker_error`,
+/// `stdout_total_bytes`, `stderr_total_bytes`, `stdout_truncated`,
+/// `stderr_truncated`) each carry
+/// `#[serde(deserialize_with = "deserialize_required_nullable")]` and no
+/// `#[serde(default)]`, so an absent key is a typed missing-field failure
+/// rather than a silent `None`, while an explicit null still decodes to `None`.
 ///
-/// Those eleven fields carry timeout/cancel/truncation, byte-count and
+/// Those ten fields carry timeout/cancel/truncation, byte-count and
 /// route-policy meaning for a governed external process. Defaulting them let a
 /// record that never recorded a timeout, a reap receipt, a cancellation, a
 /// truncation or its route-policy binding read as if it had recorded
@@ -130,7 +141,7 @@ pub struct ProviderInvocationTransition {
 /// `ProviderInvocationJournal::{create, persist}`
 /// (`eliot-engine/src/provider_invocation.rs`), one file per attempt, and read
 /// back on reconciliation and timeout repair. Every current producer sets all
-/// eleven explicitly, including `None`:
+/// ten explicitly, including `None`:
 /// `eliot-engine/src/antigravity.rs:5109`,
 /// `eliot-app/src/host_runtime/external_agent.rs:2567` and
 /// `eliot-app/src/delegation_runtime.rs:844` all construct the full literal.
@@ -157,6 +168,7 @@ pub struct ProviderInvocationAttempt {
     pub cwd: Option<String>,
     pub environment_fingerprint: Option<String>,
     pub timeout_profile_id: String,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub provider_route_policy: Option<ProviderRoutePolicyBinding>,
     pub state_transitions: Vec<ProviderInvocationTransition>,
     #[serde(with = "time::serde::rfc3339::option")]
@@ -178,14 +190,23 @@ pub struct ProviderInvocationAttempt {
     pub structured_output_blob_or_hash: Option<BlobRef>,
     pub exit_code_or_signal: Option<String>,
     pub process_or_job_identity: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub timeout_class: Option<ProviderTimeoutClass>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub process_reap_receipt: Option<ProcessReapReceipt>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub process_timed_out: Option<bool>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub process_cancelled: Option<bool>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub process_worker_error: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub stdout_total_bytes: Option<u64>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub stderr_total_bytes: Option<u64>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub stdout_truncated: Option<bool>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub stderr_truncated: Option<bool>,
     pub quota_or_cost_if_known: Option<String>,
     pub original_closeout_ref: Option<String>,
@@ -594,10 +615,12 @@ pub struct ProviderFailureIncident {
 }
 
 /// Decoder: derived and closed. The nine readiness observations below
-/// (`installed` through `console_headless_ready`) and
-/// `last_successful_smoke_ref` now follow the same explicit presence rule this
-/// gate's other fields already use: `bool` and `Option<String>` with no
-/// `#[serde(default)]`.
+/// (`installed` through `console_headless_ready`) are plain `bool` with no
+/// `#[serde(default)]`, so an absent key already fails decoding.
+/// `last_successful_smoke_ref` carries
+/// `#[serde(deserialize_with = "deserialize_required_nullable")]` and no
+/// `#[serde(default)]`, so its key must be present while an explicit null
+/// still decodes to `None`.
 ///
 /// Defaulting them conflated "the gate observed this is false / no smoke has
 /// ever succeeded" with "the gate never observed it at all". Both readings fed
@@ -627,6 +650,7 @@ pub struct ProviderRouteReadinessGate {
     pub required_tools_visible: bool,
     pub structured_output_ready: bool,
     pub console_headless_ready: bool,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub last_successful_smoke_ref: Option<String>,
     pub provider_gate_current: bool,
     pub last_incident_class: ProviderInvocationOutcomeClass,

@@ -1840,6 +1840,10 @@ fn finish_active_kernel_cleanup(
 mod kernel_activation_driver;
 #[cfg(windows)]
 use kernel_activation_driver::DurableKernelActivationDriver;
+#[cfg(windows)]
+mod kernel_owner_exclusivity;
+#[cfg(windows)]
+use kernel_owner_exclusivity::{KernelHandoffReceipt, prove_candidate_owner_held};
 
 #[cfg(windows)]
 mod host_startup_evidence;
@@ -3024,6 +3028,11 @@ impl HostJobBranches {
             authority_epoch: AuthorityEpoch::new(candidate.kernel_epoch.sequence.get())
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?,
         };
+        // I14.16 step 5: retain the retired contour's handoff boundary before
+        // the candidate may seek authority. The receipt is built from the
+        // disposition this same call already proved, and the prior
+        // disposition is moved into the candidate record below.
+        let kernel_handoff = KernelHandoffReceipt::for_disposition(&prior_kernel_disposition)?;
         let mut activation = DurableKernelActivationDriver::bind_candidate(
             journal,
             host,
@@ -3151,7 +3160,7 @@ impl HostJobBranches {
                     ));
                 }
             }
-            activation.handoff_prepared()?;
+            activation.handoff_prepared(kernel_handoff.as_ref())?;
             activation.prior_disposition_committed()?;
             let permit = activation.issue_nonce(&candidate, launch.authority_generation)?;
             activation.activating()?;

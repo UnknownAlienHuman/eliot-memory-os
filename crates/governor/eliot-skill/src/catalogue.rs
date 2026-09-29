@@ -537,6 +537,20 @@ pub const CHECK_RUNTIME_BUDGETS: &str = "runtime.budgets";
 pub const CHECK_ENTRY_IDENTITY: &str = "entry.identity";
 pub const CHECK_ENTRY_VERSIONS: &str = "entry.versions";
 
+/// Every structural check a persisted validation report must carry.
+///
+/// [`StructuralValidationReport::record`] always writes exactly this set and
+/// [`StructuralValidationReport::validate`] requires every name present and
+/// passed, so a hand-cut report that never ran the structural projection
+/// cannot back an installation or activation.
+const REQUIRED_STRUCTURAL_CHECKS: &[&str] = &[
+    CHECK_INDEX_ELIGIBILITY_TRIGGER,
+    CHECK_BODY_STRUCTURE,
+    CHECK_RUNTIME_BUDGETS,
+    CHECK_ENTRY_IDENTITY,
+    CHECK_ENTRY_VERSIONS,
+];
+
 /// One persisted structural-check outcome: the check ran and this is what it
 /// found. A report is only ever recorded when every check passed — any
 /// failure fails the projection closed before the entry exists — so a stored
@@ -622,19 +636,13 @@ impl StructuralValidationReport {
             skill_id: index.skill_id.clone(),
             body_version: body.body_version.clone(),
             body_digest: body.body_digest.clone(),
-            checks: [
-                CHECK_INDEX_ELIGIBILITY_TRIGGER,
-                CHECK_BODY_STRUCTURE,
-                CHECK_RUNTIME_BUDGETS,
-                CHECK_ENTRY_IDENTITY,
-                CHECK_ENTRY_VERSIONS,
-            ]
-            .iter()
-            .map(|check| StructuralCheckRecord {
-                check: (*check).to_owned(),
-                passed: true,
-            })
-            .collect(),
+            checks: REQUIRED_STRUCTURAL_CHECKS
+                .iter()
+                .map(|check| StructuralCheckRecord {
+                    check: (*check).to_owned(),
+                    passed: true,
+                })
+                .collect(),
             report_digest: String::new(),
         };
         report.report_digest = report.identity_digest()?;
@@ -667,10 +675,61 @@ impl StructuralValidationReport {
                 });
             }
         }
+        for required in REQUIRED_STRUCTURAL_CHECKS {
+            if !self.checks.iter().any(|record| record.check == *required) {
+                return Err(SkillError::InvalidField {
+                    field: "validation.checks",
+                    reason: "every structural check must run before activation",
+                });
+            }
+        }
         check_digest(&self.report_digest, "validation.report_digest")?;
         if self.identity_digest()? != self.report_digest {
             return Err(SkillError::IdentityMismatch);
         }
+        Ok(())
+    }
+}
+
+/// Version pins a governed review attests when returning a stale entry to
+/// bounded use (`I7.13`: a changed host/tool/contract dependency marks the
+/// Skill stale; bounded use resumes only as provisional/scoped).
+///
+/// The dependency pins must equal the live set the caller observed (checked
+/// against the observed feed on the method); the host/profile/definition
+/// versions and scope are the review-attested live values — shape-checked
+/// here, never currency-invented. The tool basis is checked live against the
+/// owner's view at revalidation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StaleRevalidationPins {
+    pub dependencies: Vec<DependencyVersion>,
+    pub host_version: String,
+    pub profile_version: String,
+    pub admitted_definition_version: String,
+    pub scope: SkillScope,
+}
+
+impl StaleRevalidationPins {
+    pub fn validate(&self) -> Result<(), SkillError> {
+        let mut sorted = self.dependencies.clone();
+        sorted.sort();
+        sorted.dedup();
+        if sorted.len() != self.dependencies.len() {
+            return Err(SkillError::Duplicate {
+                field: "entry.dependencies",
+            });
+        }
+        for dependency in &self.dependencies {
+            dependency.validate()?;
+        }
+        check_text(&self.host_version, "entry.host_version")?;
+        check_text(&self.profile_version, "entry.profile_version")?;
+        check_text(
+            &self.admitted_definition_version,
+            "entry.admitted_definition_version",
+        )?;
+        self.scope.validate()?;
         Ok(())
     }
 }
@@ -903,6 +962,75 @@ impl SkillCatalogue {
         Ok(true)
     }
 
+    /// Returns a stale entry to explicitly scoped/provisional use after
+    /// governed review (`I7.13`).
+    ///
+    /// A changed host/tool/contract dependency marks the entry stale and
+    /// blocks general delivery; this is the only catalogue path back, and it
+    /// lands on `Provisional` with the review-attested scope — never on
+    /// `Current`. The new dependency pins must equal the live set the caller
+    /// observed (no cherry-picking); the named tools are rechecked against
+    /// the owner's view, so a removed tool basis still refuses here and
+    /// needs a new body through the install path. The structural report is
+    /// re-recorded over the new pins and bound to the entry. Prior promotion
+    /// evidence is cleared: `Current` must be re-earned through
+    /// [`promote`](Self::promote) with route-proportional evidence, so a
+    /// dependency-changed Skill is never representable as generally
+    /// delivered on this path. Non-stale entries have nothing to revalidate;
+    /// quarantined entries stay under governed review in the lifecycle owner.
+    pub fn revalidate_stale_to_provisional(
+        &mut self,
+        skill_id: &str,
+        pins: StaleRevalidationPins,
+        observed: &[DependencyVersion],
+        review_ref: &str,
+        tools: &dyn KnownTools,
+    ) -> Result<(), SkillError> {
+        check_text(review_ref, "entry.review_ref")?;
+        pins.validate()?;
+        for dependency in observed {
+            dependency.validate()?;
+        }
+        let entry = self.entries.get_mut(skill_id).ok_or(SkillError::NotFound)?;
+        if entry.status != SkillStatus::Stale {
+            return Err(SkillError::InvalidField {
+                field: "entry.status",
+                reason: "only stale entries revalidate; quarantined entries require governed review",
+            });
+        }
+        let mut pinned = pins.dependencies.clone();
+        pinned.sort();
+        let mut live = observed.to_vec();
+        live.sort();
+        if pinned != live {
+            return Err(SkillError::InvalidField {
+                field: "entry.dependencies",
+                reason: "revalidation must pin exactly the observed live dependency set",
+            });
+        }
+        entry.body.validate_tools(tools)?;
+        let validation = StructuralValidationReport::record(
+            &entry.index,
+            &entry.body,
+            &entry.runtime,
+            &pins.dependencies,
+            &pins.host_version,
+            &pins.profile_version,
+            &pins.admitted_definition_version,
+        )?;
+        entry.dependencies = pins.dependencies;
+        entry.host_version = pins.host_version;
+        entry.profile_version = pins.profile_version;
+        entry.admitted_definition_version = pins.admitted_definition_version;
+        entry.scope = pins.scope;
+        entry.validation = validation;
+        entry.status = SkillStatus::Provisional;
+        entry.stale_reason = None;
+        entry.promotion_evidence = None;
+        entry.validate()?;
+        Ok(())
+    }
+
     /// Promotes a provisional entry to current when the proportional depth
     /// rule holds (`I7.13`): one matching real route for host/task-specific
     /// Skills; two materially different routes plus approval for shared or
@@ -1015,6 +1143,12 @@ impl SkillCatalogue {
                 match ack.disposition {
                     HotsetAckDisposition::Applied => "applied",
                     HotsetAckDisposition::Rejected { .. } => "rejected",
+                },
+                // The chain commits to the delivery ceiling: a provisional
+                // activation never shares a chain with a current-grade one.
+                match entry.status {
+                    SkillStatus::Current => "current",
+                    _ => "provisional",
                 },
             ),
             "activation.receipt_chain",
@@ -1319,7 +1453,8 @@ pub struct ActivatedSkillDisplay {
     pub catalogue_digest: String,
     pub delivery_receipt_digest: String,
     /// Receipt chain binding validation + catalogue-staleness + delivery-ack
-    /// records for this activation.
+    /// records for this activation, including the Current/provisional
+    /// delivery ceiling the entry displayed under.
     pub receipt_chain_digest: String,
 }
 
@@ -1360,6 +1495,8 @@ impl ActivatedSkillDisplay {
                 reason: "at least one eligible route, profile, or policy is required",
             });
         }
+        check_unique(&self.eligible_routes, "activation.eligible_routes")?;
+        check_unique(&self.eligible_profiles, "activation.eligible_profiles")?;
         check_unique(&self.eligible_policies, "activation.eligible_policies")?;
         for dependency in &self.dependency_versions {
             dependency.validate()?;

@@ -9,6 +9,35 @@
 //! the fresh lineage through [`RestoredFence::mint`](super::RestoredFence).
 //! Cutover needs a separate owner authorization: without one the request is
 //! refused with [`CutoverNotAuthorized`](super::BackupError::CutoverNotAuthorized).
+//!
+//! # The candidate root is validated before any cutover (issue #1141, A6)
+//!
+//! A13.7 requires that "Restore occurs in an isolated area and verifies schema
+//! and format compatibility; provenance and integrity; privacy purge and
+//! revocation closure; …" and that "Cutover requires separate authority". The
+//! ordering those two sentences impose is that everything the isolated root
+//! must prove is proven *inside that root*, and the plan that names it is
+//! itself proved before it may authorize a cutover.
+//!
+//! Two gaps that allowed the ordering to be skipped are closed here:
+//!
+//! * [`IsolatedRestorePlan::validate`] did not compare the identities this
+//!   struct records twice — the outer `bundle_sha256`/`restored_fence` and the
+//!   nested `plan.bundle_sha256`/`plan.restored_fence`. `authorize_cutover`
+//!   matches the authorization against the *outer* value, so a plan that
+//!   disagreed with itself could be cut over against an authorization minted
+//!   for a different bundle. Both positions are now compared, and the recorded
+//!   root must still be a real directory, so a plan naming a root that no
+//!   longer exists cannot be authorized.
+//! * [`authorize_cutover`] did not call [`IsolatedRestorePlan::validate`] at
+//!   all, so any plan value — deserialized, hand-built, or validated and then
+//!   drifted — reached cutover unchecked. It now validates first, before it
+//!   looks at the authorization.
+//!
+//! What this file still does not do is perform the cutover. It mints the
+//! authorization receipt; applying it to a current state is a separate owner
+//! decision outside this crate, and the receipt exists precisely so that owner
+//! can check the exact plan and bundle it is acting on.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -99,6 +128,28 @@ pub struct IsolatedRestorePlan {
 }
 
 impl IsolatedRestorePlan {
+    /// Proves this plan may be used as the basis of a cutover.
+    ///
+    /// Issue #1141, A6: the ordering A13.7 requires is that the isolated
+    /// candidate root is validated and its plan proved *before* any current
+    /// state can be cut over. This method is that proof, and
+    /// [`authorize_cutover`] runs it before it looks at any authorization.
+    ///
+    /// The two positions this struct records for the same identities are
+    /// compared here. The outer `bundle_sha256` and `restored_fence` are the
+    /// positions a cutover authorization is matched against; the nested
+    /// `plan.bundle_sha256` and `plan.restored_fence` are the positions the
+    /// governed executor works from. This is a coherence check between two
+    /// recorded positions of one plan, not an authenticity proof — what the
+    /// bundle actually is was established by
+    /// [`RestorePlan::compile`](super::RestorePlan::compile), and the digest is
+    /// carried so a mismatch is a refusal rather than a silent preference for
+    /// one copy.
+    ///
+    /// The root must still be a directory under the system temp directory. A
+    /// plan whose candidate root has been removed, or that names a production
+    /// path, cannot be the validated isolated rehearsal that a cutover is
+    /// supposed to rest on.
     pub fn validate(&self) -> Result<(), BackupError> {
         text(&self.plan.plan_id, "restore.plan_id")?;
         digest(&self.bundle_sha256, "restore.bundle_sha256")?;
@@ -108,7 +159,28 @@ impl IsolatedRestorePlan {
                 reason: "isolated roots live under the system temp dir",
             });
         }
+        if !self.root.is_dir() {
+            return Err(BackupError::InvalidField {
+                field: "restore.root",
+                reason: "isolated candidate root must still exist as a directory",
+            });
+        }
+        // Issue #1141, A6: the outer recorded bundle identity and the plan's own
+        // must be the same value. `authorize_cutover` matches the owner
+        // authorization against `self.bundle_sha256`, so a plan whose two
+        // copies disagree would be authorized against a bundle its own
+        // executor never validated.
+        if self.bundle_sha256 != self.plan.bundle_sha256 {
+            return Err(BackupError::PlanMismatch);
+        }
         self.restored_fence.validate()?;
+        // The same two positions for the minted lineage. `RestoredFence` is
+        // the Authority Epoch and resource generation the restore would make
+        // current, so a plan whose outer and inner copies disagree has no
+        // single lineage to cut over to.
+        if self.restored_fence != self.plan.restored_fence {
+            return Err(BackupError::PlanMismatch);
+        }
         for entry in &self.suspended_entries {
             entry.validate()?;
         }
@@ -133,13 +205,35 @@ pub fn plan_isolated_restore(
     root: &IsolatedRoot,
 ) -> Result<IsolatedRestorePlan, BackupError> {
     let plan = RestorePlan::compile(bundle, target)?;
-    if plan.steps.get(0..2)
-        != Some(
-            &[
-                RestoreStep::PrepareIsolatedRoot,
-                RestoreStep::ApplyPurgeLedger,
-            ][..],
-        )
+    // Issue #1141, A6: A13.7 orders the isolated rehearsal ahead of cutover —
+    // "restore to isolated root; validate format/schema/checksums; apply privacy
+    // purge ledger; rebuild projections/indexes; verify receipt/event chain" —
+    // and ARCH-RES-03 requires that purge and revocation closure precede any
+    // import. The prior check asserted only the first two steps, so a plan that
+    // opened correctly and then imported before purging was admitted.
+    //
+    // This asserts the ordering *properties* A13.7 states rather than
+    // re-listing the plan's steps: the candidate root is prepared first, the
+    // purge ledger is applied second, every subsequent import / rebuild /
+    // verification step comes after the purge, and the root is finalized last.
+    // `expected_restore_steps` remains the single definition of which steps a
+    // plan contains; this only checks that they are ordered as the normative
+    // sequence requires.
+    if plan.steps.first() != Some(&RestoreStep::PrepareIsolatedRoot)
+        || plan.steps.get(1) != Some(&RestoreStep::ApplyPurgeLedger)
+        || plan.steps.last() != Some(&RestoreStep::FinalizeIsolatedRoot)
+    {
+        return Err(BackupError::PlanMismatch);
+    }
+    // Nothing may re-enter the root-preparation or purge phases after the
+    // imports have begun: a second purge would reorder ARCH-RES-03's
+    // purge-before-import obligation relative to already-applied data. The
+    // three checks above already establish that the plan holds at least three
+    // steps, so the slice is in range; `get` is used anyway so a future change
+    // to the ordering cannot turn this into a panic.
+    if let Some(tail) = plan.steps.get(2..plan.steps.len().saturating_sub(1))
+        && (tail.contains(&RestoreStep::PrepareIsolatedRoot)
+            || tail.contains(&RestoreStep::ApplyPurgeLedger))
     {
         return Err(BackupError::PlanMismatch);
     }
@@ -218,10 +312,20 @@ impl CutoverReceipt {
 /// without a separate owner authorization. A mismatched plan or bundle
 /// identity is refused with `PlanMismatch`: authorization never transfers
 /// between restores.
+///
+/// Issue #1141, A6: the plan is validated *before* the authorization is even
+/// looked at. A13.7 orders the isolated rehearsal ahead of cutover, so a plan
+/// that has not been proved — a deserialized value, a hand-built one, or one
+/// that drifted after it was validated — must be refused on its own state
+/// rather than become current because some authorization named its id. The
+/// validation covers the recorded bundle identity, the recorded lineage and
+/// the still-existing isolated candidate root; see
+/// [`IsolatedRestorePlan::validate`].
 pub fn authorize_cutover(
     plan: &IsolatedRestorePlan,
     auth: Option<&CutoverAuthorization>,
 ) -> Result<CutoverReceipt, BackupError> {
+    plan.validate()?;
     let Some(auth) = auth else {
         return Err(BackupError::CutoverNotAuthorized);
     };

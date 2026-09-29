@@ -24,14 +24,20 @@
 //!
 //! - [`derive_applicable_floor`] selects the owner-issued [`FloorAtomPolicy`]
 //!   set applicable to the owner-resolved impact class, closes it over the
-//!   declared dependency references, and counts the required identities per
-//!   semantic role. It reads no caller packet, recipe, compiled floor, tool name
-//!   or `read_only` bit, so a caller cannot narrow the floor.
-//! - [`admit_material_decision`] then invokes the existing pure compiler
-//!   ([`crate::admit_context_traced`]) over the owner-resolved closure, proves
-//!   that the compiled delivery actually covers the derived floor with the
-//!   representations the owner policy permits, and validates the phase-aware
-//!   `I12.31` lineage for the current decision phase.
+//!   owner-declared dependency edges (transitively, following every supplied
+//!   owner policy for a visited identity as well as the observed candidate
+//!   graph), preserves the complete required identity closure, and resolves a
+//!   representation rule for every closure member. It reads no caller packet,
+//!   recipe, compiled floor, tool name or `read_only` bit, so a caller cannot
+//!   narrow the floor. A successfully visited dependency is never discarded.
+//! - [`admit_material_decision`] first requires the prepared input's effective
+//!   floor closure (the existing [`crate::floor_closure`] logic) to cover the
+//!   owner-derived closure, so an owner-required edge the compiler was never
+//!   given is a refusal, never a silent pass. It then invokes the existing pure
+//!   compiler ([`crate::admit_context_traced`]) over the owner-resolved
+//!   closure, proves that the compiled delivery actually carries every
+//!   owner-required dependency in an owner-permitted representation, and
+//!   validates the phase-aware `I12.31` lineage for the current decision phase.
 //!
 //! Nothing here re-implements `prepare_floor`/`select_required`/
 //! `select_optional`, and nothing here invents a Governance Profile, directive
@@ -48,8 +54,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_authority::ImpactClass;
 use eliot_context_contracts::{
-    AdmissionDisposition, AdmissionInput, AdmittedContextSet, AtomAvailability, ContextError,
-    ContextOutcome, DecisionContextIncomplete, DecisionExecutionLineageRefs,
+    AdmissionDisposition, AdmissionInput, AdmittedContextSet, AtomAvailability, ContextCandidate,
+    ContextError, ContextOutcome, DecisionContextIncomplete, DecisionExecutionLineageRefs,
     DecisionLineageCompleteness, DecisionLineagePhase, DecisionLineageRef, DecisionLineageSlot,
     DecisionLineageSupersession, LossPolicy, OmissionRecord, RepresentationKind, RoleLossRule,
     SemanticRole, canonical_digest,
@@ -216,8 +222,13 @@ pub struct RequiredFloorAtom {
 ///
 /// This is derived independently of the caller's packet and recipe: it is the
 /// set the owner policies require for the resolved impact class, closed over
-/// their declared dependencies. The compiled packet floor is *checked against*
-/// this set, never the other way round.
+/// their declared dependencies. `required` holds the directly applicable policy
+/// atoms *and* every transitively required dependency, each with the
+/// representation rule resolved from a supplied owner policy or, when no owner
+/// policy describes the dependency, from the canonical floor-member contract
+/// under the strictest (`NON_DROPPABLE`, whole-unit) delivery rule. The
+/// compiled packet floor is *checked against* this set, never the other way
+/// round.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApplicableFloor {
@@ -406,9 +417,12 @@ fn decision_floor_handle(floor: &AdmittedDecisionFloor) -> Result<String, Contex
 /// The derived set is the owner-issued [`FloorAtomPolicy`] slice applicable to the
 /// owner-resolved impact class, closed over the declared dependency references
 /// through the owner-resolved candidate identities. One atom per class is not
-/// enough: every applicable identity, every declared dependency and every
-/// semantic role the owner bound is counted, and any identity the closure cannot
-/// supply is returned as an exact `missing` gap rather than dropped.
+/// enough: every applicable identity, every transitively declared dependency
+/// and every semantic role the owner bound is counted, and any identity the
+/// closure cannot supply is returned as an exact `missing` gap rather than
+/// dropped. The complete visited closure is preserved into the returned floor,
+/// so no mandatory owner-policy edge can disappear between this derivation and
+/// the final delivery check.
 ///
 /// # Errors
 ///
@@ -416,7 +430,9 @@ fn decision_floor_handle(floor: &AdmittedDecisionFloor) -> Result<String, Contex
 /// [`FloorEvidenceStatus::OwnerPolicyMissing`] when no owner-issued policy is
 /// applicable to the resolved impact class, and with
 /// [`FloorEvidenceStatus::RequiredAtomMissing`] naming the exact atom identities
-/// the declared dependency closure cannot supply. A malformed owner input or
+/// the declared dependency closure cannot supply, or the exact owner-required
+/// dependency no owner rule and no canonical floor member describes (no weaker
+/// rule is invented for an undescribed declaration). A malformed owner input or
 /// owner policy is a [`MaterialDecisionRefusal::Boundary`] refusal, so a shape
 /// error is never reported as missing evidence.
 pub fn derive_applicable_floor(
@@ -436,19 +452,21 @@ pub fn derive_applicable_floor(
     if selected.required.is_empty() {
         return Err(deny_without_applicable_policy(owners, closure));
     }
-    let undeliverable = undeliverable_dependencies(&selected, closure)
+    let dependency_closure = close_floor_dependencies(&selected, policies, closure)
         .map_err(MaterialDecisionRefusal::Boundary)?;
-    if !undeliverable.is_empty() {
+    if !dependency_closure.missing.is_empty() {
         return Err(typed_refusal(
             owners,
             FloorEvidenceStatus::RequiredAtomMissing,
             AllowedFloorAction::Expand,
-            &undeliverable,
+            &dependency_closure.missing,
             "the applicable floor requires an atom the owner-resolved closure does not supply",
             None,
             Vec::new(),
         ));
     }
+    let required =
+        resolve_floor_requirements(owners, policies, closure, &selected, &dependency_closure)?;
     Ok(ApplicableFloor {
         decision_id: owners.decision_id.clone(),
         state_fence: owners.state_fence.clone(),
@@ -456,7 +474,7 @@ pub fn derive_applicable_floor(
         governance_profile_ref: owners.governance_profile_ref.to_owned(),
         authority_ref: owners.authority_ref.to_owned(),
         acceptance_revision: owners.acceptance_revision,
-        required: selected.required.into_values().collect(),
+        required,
         rule_evidence: owners.rule_evidence.clone(),
     })
 }
@@ -506,21 +524,47 @@ struct SelectedFloorRequirements {
     declared: Vec<ArtifactId>,
 }
 
-/// Close the selected requirements over their declared and observed dependencies,
-/// counting every visited identity and reporting every identity the closure
-/// cannot supply.
+/// The complete owner-required dependency closure: every visited identity plus
+/// every visited identity the owner-resolved closure cannot supply.
+///
+/// Both sets are deterministic: `ids` iterates in identity order and `missing`
+/// is sorted. A successfully visited dependency is preserved here, never
+/// discarded, so the final delivery check sees the same mandatory edges this
+/// derivation saw.
+struct FloorDependencyClosure {
+    /// Every identity the bounded walk visited, in deterministic order.
+    ids: BTreeSet<ArtifactId>,
+    /// Visited identities with no owner-resolved candidate, sorted.
+    missing: Vec<ArtifactId>,
+}
+
+/// Close the selected requirements over the owner-declared and observed
+/// dependency edges, preserving the complete required identity closure as well
+/// as its missing identities.
+///
+/// The walk starts from the directly applicable policy atoms and their declared
+/// dependencies. For every visited identity it follows both the observed
+/// [`ContextCandidate`] dependency edges and the `required_dependencies` of
+/// every supplied owner policy for that identity, transitively: the requirement
+/// flows from an applicable root, so a dependency policy's own applicability no
+/// longer matters once its atom is required, and `A → B → C` cannot lose `C`.
+/// An identity with no candidate is recorded as missing, but its owner-policy
+/// edges are still followed, so a missing middle cannot hide a deeper
+/// requirement.
 ///
 /// The bound is fail-closed: an over-large closure is a `Bounds` boundary
-/// failure, never a silently truncated requirement set.
-fn undeliverable_dependencies(
+/// failure, never a silently truncated requirement set. Cycles terminate on the
+/// visited set.
+fn close_floor_dependencies(
     selected: &SelectedFloorRequirements,
+    policies: &[FloorAtomPolicy],
     closure: &AdmissionInput,
-) -> Result<Vec<ArtifactId>, ContextError> {
+) -> Result<FloorDependencyClosure, ContextError> {
     let mut queue: Vec<ArtifactId> = Vec::new();
     queue.extend(selected.required.keys().cloned());
     queue.extend(selected.declared.iter().cloned());
     let mut visited: BTreeSet<ArtifactId> = BTreeSet::new();
-    let mut undeliverable: Vec<ArtifactId> = Vec::new();
+    let mut missing: BTreeSet<ArtifactId> = BTreeSet::new();
     while let Some(atom_id) = queue.pop() {
         if !visited.insert(atom_id.clone()) {
             continue;
@@ -530,19 +574,92 @@ fn undeliverable_dependencies(
                 field: "floor.closure",
             });
         }
-        match closure
+        if let Some(candidate) = closure
             .candidates
             .candidates
             .iter()
             .find(|candidate| candidate.atom_id == atom_id)
         {
-            Some(candidate) => queue.extend(candidate.dependencies.iter().cloned()),
-            None if !undeliverable.contains(&atom_id) => undeliverable.push(atom_id),
-            None => {}
+            queue.extend(candidate.dependencies.iter().cloned());
+        } else {
+            missing.insert(atom_id.clone());
+        }
+        for policy in policies.iter().filter(|policy| policy.atom_id == atom_id) {
+            queue.extend(policy.required_dependencies.iter().cloned());
         }
     }
-    undeliverable.sort();
-    Ok(undeliverable)
+    Ok(FloorDependencyClosure {
+        ids: visited,
+        missing: missing.into_iter().collect(),
+    })
+}
+
+/// Resolve a representation rule for every identity in the owner-derived
+/// closure, ordered by atom identity.
+///
+/// Precedence per identity: the directly selected requirement when the identity
+/// is a directly applicable policy atom; otherwise the supplied owner policy
+/// for that identity; otherwise the canonical floor-member contract of the
+/// prepared input, whose role is kept and whose delivery rule is the strictest
+/// one (`NON_DROPPABLE`, whole-unit only) — `I7.11` admits a floor of
+/// non-droppable atoms, so an owner-required atom without an explicit loss
+/// declaration defaults to whole-unit delivery, never to a weaker
+/// representation. An identity neither an owner policy nor a floor member
+/// describes is an input/owner-policy disagreement and fails closed as
+/// [`FloorEvidenceStatus::RequiredAtomMissing`]: no weaker — or invented —
+/// rule may stand in for the missing declaration.
+fn resolve_floor_requirements(
+    owners: &OperationOwnerInputs<'_>,
+    policies: &[FloorAtomPolicy],
+    closure: &AdmissionInput,
+    selected: &SelectedFloorRequirements,
+    dependency_closure: &FloorDependencyClosure,
+) -> Result<Vec<RequiredFloorAtom>, MaterialDecisionRefusal> {
+    let mut required: Vec<RequiredFloorAtom> = Vec::new();
+    let mut undescribed: Vec<ArtifactId> = Vec::new();
+    for atom_id in &dependency_closure.ids {
+        if let Some(direct) = selected.required.get(atom_id) {
+            required.push(direct.clone());
+            continue;
+        }
+        if let Some(policy) = policies.iter().find(|policy| policy.atom_id == *atom_id) {
+            required.push(RequiredFloorAtom {
+                atom_id: policy.atom_id.clone(),
+                role: policy.role,
+                loss_policy: policy.loss_policy,
+                allowed_representations: policy.allowed_representations.clone(),
+            });
+            continue;
+        }
+        if let Some(member) = closure
+            .floor
+            .floor
+            .members
+            .iter()
+            .find(|member| member.atom_id == *atom_id)
+        {
+            required.push(RequiredFloorAtom {
+                atom_id: member.atom_id.clone(),
+                role: member.role,
+                loss_policy: LossPolicy::NonDroppable,
+                allowed_representations: vec![RepresentationKind::Whole],
+            });
+            continue;
+        }
+        undescribed.push(atom_id.clone());
+    }
+    if !undescribed.is_empty() {
+        return Err(typed_refusal(
+            owners,
+            FloorEvidenceStatus::RequiredAtomMissing,
+            AllowedFloorAction::Expand,
+            &undescribed,
+            "the applicable floor requires an atom no owner rule and no canonical floor member describes",
+            None,
+            Vec::new(),
+        ));
+    }
+    Ok(required)
 }
 
 /// Compile and prove delivery of the applicable floor, or refuse with the exact
@@ -551,22 +668,33 @@ fn undeliverable_dependencies(
 /// Order of operations, each step fail-closed:
 ///
 /// 1. [`derive_applicable_floor`] from the owner inputs, never from the caller's
-///    packet or recipe.
+///    packet or recipe. The derived floor carries the complete owner-required
+///    dependency closure, not just the directly applicable atoms.
 /// 2. Validate the `I12.31` [`DecisionExecutionLineageRefs`] for the current
 ///    decision phase through the shared `validate_for_phase`, so a new effect
 ///    binds its proposal, authorization and required future observable without
 ///    demanding a not-yet-existing execution or outcome receipt, while resume,
 ///    verification and finish require the already-due observed or explicitly
 ///    unknown records.
-/// 3. Invoke the existing pure compiler ([`crate::admit_context_traced`]) over the
+/// 3. Require the prepared input's effective floor closure (the existing
+///    [`crate::floor_closure`] logic over the same input) to cover the
+///    owner-derived closure. The input is never rewritten or resealed to pass:
+///    an interpretation dependency already counts toward coverage without being
+///    relabelled as a top-level mandatory atom, but an owner-required edge the
+///    compiler was never given is a `RequiredAtomMissing` refusal.
+/// 4. Invoke the existing pure compiler ([`crate::admit_context_traced`]) over the
 ///    owner-resolved closure. Its `Incomplete` outcome is carried through
 ///    verbatim; its boundary refusals are preserved uncollapsed.
-/// 4. Prove the delivery: every derived requirement is in the compiled floor,
-///    admitted, and carried in a representation its owner policy permits. A handle
+/// 5. Prove the delivery: every owner-required dependency — not only the
+///    directly applicable atoms — is checked against the actual admitted
+///    records, current availability and the permitted representation or
+///    expansion. Presence in the closure candidates is insufficient. A handle
 ///    satisfies a requirement only when the exact source is currently present or
 ///    carries a reversible owner expansion handle, so a handle for absent or
 ///    non-current material is a delivery gap rather than a satisfied requirement.
-/// 5. Return the exact floor, the delivered identities, the permitted loss and
+///    Each gap is filed under its exact missing, stale, blocked, unavailable,
+///    omitted, exhausted, unknown, known-empty or partial identity.
+/// 6. Return the exact floor, the delivered identities, the permitted loss and
 ///    expansion manifest, and a content-addressed handle over them.
 ///
 /// # Errors
@@ -622,6 +750,24 @@ pub fn admit_material_decision(
             references,
         ));
     }
+    let effective = prepared_floor_closure(closure).map_err(MaterialDecisionRefusal::Boundary)?;
+    let uncovered: Vec<ArtifactId> = floor
+        .required
+        .iter()
+        .map(|required| required.atom_id.clone())
+        .filter(|atom_id| !effective.contains(atom_id))
+        .collect();
+    if !uncovered.is_empty() {
+        return Err(typed_refusal(
+            owners,
+            FloorEvidenceStatus::RequiredAtomMissing,
+            AllowedFloorAction::Expand,
+            &uncovered,
+            "the owner-derived floor requires an atom the prepared input floor closure does not cover; the compiler was never given that edge",
+            None,
+            Vec::new(),
+        ));
+    }
     let (result, traces) =
         crate::admit_context_traced(closure).map_err(MaterialDecisionRefusal::Boundary)?;
     let admitted = match &result.outcome {
@@ -635,17 +781,9 @@ pub fn admit_material_decision(
             ContextError::InvalidFence,
         ));
     }
-    let undelivered = undelivered_atoms(&floor, admitted, closure);
-    if !undelivered.is_empty() {
-        return Err(typed_refusal(
-            owners,
-            FloorEvidenceStatus::RepresentationNotDeliverable,
-            AllowedFloorAction::Expand,
-            &undelivered,
-            "the compiled delivery does not carry the applicable floor in an owner-permitted representation",
-            None,
-            Vec::new(),
-        ));
+    let gaps = check_floor_delivery(&floor, admitted, closure, &result.evidence.omissions);
+    if !gaps.is_empty() {
+        return Err(delivery_refusal(owners, &gaps));
     }
     let delivered = floor
         .required
@@ -671,49 +809,233 @@ pub fn admit_material_decision(
     Ok(admitted_floor)
 }
 
-/// Required atoms the compiled delivery does not actually carry.
+/// The prepared input's effective floor closure over the same input.
 ///
-/// A requirement is satisfied only when the atom is in the compiled floor, is
-/// admitted, and carries a representation its owner policy permits. A handle-only
-/// delivery additionally requires the exact source to be currently present or to
-/// carry a reversible owner expansion handle, because possession of a handle for
-/// absent or non-current material is not access.
-fn undelivered_atoms(
+/// This reuses the existing [`crate::floor_closure`] selection — mandatory
+/// atoms, interpretation dependencies and member requirements, closed over the
+/// candidate graph — so the coverage check trusts no second selector and the
+/// caller input is never rewritten or resealed. An interpretation dependency
+/// counts toward coverage as-is; nothing is relabelled as a top-level
+/// mandatory atom to pass.
+fn prepared_floor_closure(closure: &AdmissionInput) -> Result<BTreeSet<ArtifactId>, ContextError> {
+    let candidates: BTreeMap<ArtifactId, &ContextCandidate> = closure
+        .candidates
+        .candidates
+        .iter()
+        .map(|candidate| (candidate.atom_id.clone(), candidate))
+        .collect();
+    crate::floor_closure(closure, &candidates)
+}
+
+/// Owner-required atoms the compiled delivery does not actually carry.
+///
+/// Every requirement in the derived floor — directly applicable atoms and
+/// transitively required dependencies alike — is checked against the actual
+/// admitted records, current availability and the permitted representation or
+/// expansion. Presence in the closure candidates is insufficient: a candidate
+/// the compiler omitted, staled, or admitted in a representation the owner rule
+/// forbids is a gap. Membership in the compiled mandatory list is not delivery
+/// proof either; the admitted record is.
+///
+/// A requirement is satisfied only when an admitted record carries it in a
+/// representation its owner rule permits. A handle-only delivery additionally
+/// requires the exact source to be currently present or to carry a reversible
+/// owner expansion handle, because possession of a handle for absent or
+/// non-current material is not access.
+///
+/// Each gap is filed under its exact evidence identity — missing, stale,
+/// blocked, unavailable, omitted, exhausted, unknown, known-empty or partial —
+/// from the admission disposition, the compiler's omission manifest and the
+/// current candidate availability, so the refusal names the limitation the
+/// owner contracts already typed.
+#[derive(Debug, Default)]
+struct FloorDeliveryGaps {
+    missing: Vec<ArtifactId>,
+    stale: Vec<ArtifactId>,
+    blocked: Vec<ArtifactId>,
+    unavailable: Vec<ArtifactId>,
+    omitted: Vec<ArtifactId>,
+    exhausted: Vec<ArtifactId>,
+    unknown: Vec<ArtifactId>,
+    known_empty: Vec<ArtifactId>,
+    partial: Vec<ArtifactId>,
+}
+
+impl FloorDeliveryGaps {
+    fn is_empty(&self) -> bool {
+        self.missing.is_empty()
+            && self.stale.is_empty()
+            && self.blocked.is_empty()
+            && self.unavailable.is_empty()
+            && self.omitted.is_empty()
+            && self.exhausted.is_empty()
+            && self.unknown.is_empty()
+            && self.known_empty.is_empty()
+            && self.partial.is_empty()
+    }
+
+    fn push(&mut self, atom_id: ArtifactId, availability: Option<AtomAvailability>, omitted: bool) {
+        match availability {
+            Some(AtomAvailability::Stale) => self.stale.push(atom_id),
+            Some(AtomAvailability::Blocked) => self.blocked.push(atom_id),
+            Some(AtomAvailability::Unavailable | AtomAvailability::Missing) => {
+                self.unavailable.push(atom_id);
+            }
+            Some(AtomAvailability::Omitted) => self.omitted.push(atom_id),
+            Some(AtomAvailability::Exhausted) => self.exhausted.push(atom_id),
+            Some(AtomAvailability::Unknown) => self.unknown.push(atom_id),
+            Some(AtomAvailability::KnownEmpty) => self.known_empty.push(atom_id),
+            Some(AtomAvailability::Partial) => self.partial.push(atom_id),
+            Some(AtomAvailability::PresentCurrent) | None => {
+                if omitted {
+                    self.omitted.push(atom_id);
+                } else {
+                    self.missing.push(atom_id);
+                }
+            }
+        }
+    }
+
+    fn sort(&mut self) {
+        self.missing.sort();
+        self.stale.sort();
+        self.blocked.sort();
+        self.unavailable.sort();
+        self.omitted.sort();
+        self.exhausted.sort();
+        self.unknown.sort();
+        self.known_empty.sort();
+        self.partial.sort();
+    }
+}
+
+fn check_floor_delivery(
     floor: &ApplicableFloor,
     admitted: &AdmittedContextSet,
     closure: &AdmissionInput,
-) -> Vec<ArtifactId> {
-    let mut undelivered = Vec::new();
+    omissions: &[OmissionRecord],
+) -> FloorDeliveryGaps {
+    let mut gaps = FloorDeliveryGaps::default();
     for required in &floor.required {
-        if !admitted.floor.mandatory_atoms.contains(&required.atom_id) {
-            undelivered.push(required.atom_id.clone());
-            continue;
-        }
-        let Some(record) = admitted
+        let record = admitted
             .records
             .iter()
-            .find(|record| record.candidate.atom_id == required.atom_id)
-        else {
-            undelivered.push(required.atom_id.clone());
-            continue;
+            .find(|record| record.candidate.atom_id == required.atom_id);
+        let omitted = omissions
+            .iter()
+            .any(|omission| omission.atom_id == required.atom_id);
+        let satisfied = match record {
+            Some(record) => {
+                let admitted_kind = matches!(
+                    record.disposition,
+                    AdmissionDisposition::Include | AdmissionDisposition::HandleOnly
+                );
+                let permitted = required
+                    .allowed_representations
+                    .contains(&record.candidate.representation.kind());
+                let deliverable = record.disposition != AdmissionDisposition::HandleOnly
+                    || record.candidate.availability == AtomAvailability::PresentCurrent
+                    || has_reversible_expansion(closure, &required.atom_id);
+                admitted_kind && permitted && deliverable
+            }
+            None => false,
         };
-        let admitted_kind = matches!(
-            record.disposition,
-            AdmissionDisposition::Include | AdmissionDisposition::HandleOnly
-        );
-        let permitted = required
-            .allowed_representations
-            .contains(&record.candidate.representation.kind());
-        let deliverable = record.disposition != AdmissionDisposition::HandleOnly
-            || record.candidate.availability == AtomAvailability::PresentCurrent
-            || has_reversible_expansion(closure, &required.atom_id);
-        if !admitted_kind || !permitted || !deliverable {
-            undelivered.push(required.atom_id.clone());
+        if satisfied {
+            continue;
+        }
+        match record {
+            Some(record)
+                if matches!(
+                    record.disposition,
+                    AdmissionDisposition::Blocked | AdmissionDisposition::Quarantine
+                ) =>
+            {
+                gaps.blocked.push(required.atom_id.clone());
+            }
+            Some(record) if record.disposition == AdmissionDisposition::Unavailable => {
+                gaps.unavailable.push(required.atom_id.clone());
+            }
+            _ => {
+                let availability =
+                    record
+                        .map(|record| record.candidate.availability)
+                        .or_else(|| {
+                            closure
+                                .candidates
+                                .candidates
+                                .iter()
+                                .find(|candidate| candidate.atom_id == required.atom_id)
+                                .map(|candidate| candidate.availability)
+                        });
+                gaps.push(required.atom_id.clone(), availability, omitted);
+            }
         }
     }
-    undelivered.sort();
-    undelivered.dedup();
-    undelivered
+    gaps.sort();
+    gaps
+}
+
+/// Build the typed `DECISION_CONTEXT_INCOMPLETE` refusal for a failed delivery
+/// proof, carrying the exact categorized gap identities.
+///
+/// The evidence status follows the gaps — stale, blocked, unavailable, omitted,
+/// exhausted, unknown, known-empty or partial material is a delivery failure,
+/// a purely missing identity is a requirement failure — and the allowed action
+/// is expansion, or refresh when the only gaps are stale. A refusal that cannot
+/// name any gap degrades to a boundary failure through the shared typed-refusal
+/// finish rather than becoming contentless.
+fn delivery_refusal(
+    owners: &OperationOwnerInputs<'_>,
+    gaps: &FloorDeliveryGaps,
+) -> MaterialDecisionRefusal {
+    let mut incomplete = DecisionContextIncomplete::new(owners.rule_evidence.clone());
+    incomplete.missing.extend(gaps.missing.iter().cloned());
+    incomplete.stale.extend(gaps.stale.iter().cloned());
+    incomplete.blocked.extend(gaps.blocked.iter().cloned());
+    incomplete
+        .unavailable
+        .extend(gaps.unavailable.iter().cloned());
+    incomplete.omitted.extend(gaps.omitted.iter().cloned());
+    incomplete.exhausted.extend(gaps.exhausted.iter().cloned());
+    incomplete.unknown.extend(gaps.unknown.iter().cloned());
+    incomplete
+        .known_empty
+        .extend(gaps.known_empty.iter().cloned());
+    incomplete.partial.extend(gaps.partial.iter().cloned());
+    let allowed_action = if gaps.stale.len() == gaps_count(gaps) {
+        AllowedFloorAction::Refresh
+    } else {
+        AllowedFloorAction::Expand
+    };
+    incomplete
+        .reopening_requirements
+        .push(action_text(allowed_action));
+    incomplete.reopening_requirements.push(
+        "the compiled delivery does not carry the applicable floor in an owner-permitted representation"
+            .to_owned(),
+    );
+    let refusal = DecisionFloorRefusal {
+        evidence_status: incomplete_evidence_status(&incomplete),
+        incomplete,
+        phase: owners.phase,
+        affected_references: Vec::new(),
+        allowed_action,
+        missing_owner: None,
+    };
+    refusal.into_material()
+}
+
+/// Total number of categorized delivery gaps.
+fn gaps_count(gaps: &FloorDeliveryGaps) -> usize {
+    gaps.missing.len()
+        + gaps.stale.len()
+        + gaps.blocked.len()
+        + gaps.unavailable.len()
+        + gaps.omitted.len()
+        + gaps.exhausted.len()
+        + gaps.unknown.len()
+        + gaps.known_empty.len()
+        + gaps.partial.len()
 }
 
 /// Whether the owner supplied a reversible expansion handle for this atom.

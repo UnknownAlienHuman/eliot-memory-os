@@ -22,6 +22,7 @@ mod client;
 mod config;
 mod dreamer_job;
 mod error;
+mod exclusive_admission;
 mod health;
 mod plan;
 mod readiness;
@@ -100,7 +101,18 @@ pub struct SurrealStoreAdapter {
     pub(crate) config: SurrealAdapterConfig,
     pub(crate) provider_process_lease: std::sync::Arc<RetainedProcessPathLease>,
     pub(crate) client: tokio::sync::OnceCell<Result<client::RpcTransport, AdapterError>>,
+    /// Process-global guard retained by the exclusive entrypoints only.
+    /// Ordinary canonical applies stopped acquiring it when the normal-write
+    /// guard was removed, so it no longer excludes them; store-level
+    /// exclusivity against ordinary writes is the `exclusive_admission` gate
+    /// below instead. Kept as the exclusive-ops mutual-exclusion guard and
+    /// never counted as ordinary-write protection.
     pub(crate) write_lock: tokio::sync::Mutex<()>,
+    /// Admission gate between ordinary canonical applies and store-level
+    /// exclusive operations (issue #67, R3/A6). Ordinary applies hold a
+    /// shared permit; migrations and first-generation genesis hold the
+    /// exclusive permit.
+    pub(crate) exclusive_admission: exclusive_admission::ExclusiveAdmission,
     /// Immutable closed operation manifest admitted by this adapter instance.
     pub(crate) operation_manifest: NamedOperationManifest,
     /// Fixed bounded RPC session-set limits (S-CONC-CLIENTS, issue #987).
@@ -129,6 +141,7 @@ impl fmt::Debug for SurrealStoreAdapter {
             .field("provider_process_lease", &"retained")
             .field("connected", &self.client.get().is_some_and(Result::is_ok))
             .field("write_lock", &"private")
+            .field("exclusive_admission", &"private")
             .field("execution", &"private")
             .field("operation_manifest", &self.operation_manifest)
             .field("client_limits", &self.client_limits)
@@ -177,6 +190,7 @@ impl SurrealStoreAdapter {
             provider_process_lease: std::sync::Arc::new(provider_process_lease),
             client: tokio::sync::OnceCell::new(),
             write_lock: tokio::sync::Mutex::new(()),
+            exclusive_admission: exclusive_admission::ExclusiveAdmission::new(),
             tx_rendezvous: std::sync::Mutex::new(None),
             execution: std::sync::Mutex::new(None),
             operation_manifest,
@@ -211,6 +225,7 @@ impl SurrealStoreAdapter {
             provider_process_lease: std::sync::Arc::new(provider_process_lease),
             client: tokio::sync::OnceCell::new(),
             write_lock: tokio::sync::Mutex::new(()),
+            exclusive_admission: exclusive_admission::ExclusiveAdmission::new(),
             tx_rendezvous: std::sync::Mutex::new(None),
             execution: std::sync::Mutex::new(None),
             operation_manifest: manifest,
@@ -240,6 +255,7 @@ impl SurrealStoreAdapter {
             provider_process_lease: std::sync::Arc::new(provider_process_lease),
             client: tokio::sync::OnceCell::new(),
             write_lock: tokio::sync::Mutex::new(()),
+            exclusive_admission: exclusive_admission::ExclusiveAdmission::new(),
             tx_rendezvous: std::sync::Mutex::new(None),
             execution: std::sync::Mutex::new(None),
             operation_manifest: manifest,

@@ -53,6 +53,7 @@ pub mod canonical_config_precedence;
 mod capability_admission;
 mod capability_evidence_wiring;
 pub mod capability_outcome;
+pub mod cell_declaration_registry;
 /// Issue #2857 W1/W2/W4: the live `eliot.query` `ContextReconstruction`
 /// route. This is the one production edge that resolves the closed selector set
 /// from the admitted envelope plus the authenticated Task Controller owner and
@@ -97,6 +98,7 @@ mod kernel_authority_client;
 mod kernel_context_read_client;
 mod kernel_recovery_client;
 mod kernel_transition_client;
+pub mod maintenance_dispatch;
 pub mod maintenance_family_catalog;
 mod maintenance_trigger_evaluator;
 pub mod notification_acknowledge_emit;
@@ -261,6 +263,7 @@ pub use improvement_candidate_route::{
 };
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
+pub use maintenance_dispatch::{MaintenanceDecisionGap, MaintenanceDispatch, decision_gap};
 pub use maintenance_trigger_evaluator::{
     MaintenanceObservation, MaintenanceTriggerOrigin, SELF_OBSERVED_FAMILY, UNRESOLVED_AUTHORITIES,
 };
@@ -400,6 +403,15 @@ pub enum DaemonError {
     /// Governor commit, so neither the task nor the store is touched.
     #[error(transparent)]
     TaskBinding(#[from] crate::task_binding_admission::TaskBindingError),
+    /// Executable capability-cell registry refused composition (issue #18
+    /// AUD-5848557601-1, I2.23).
+    ///
+    /// The baked manifest declaration and the baked contract block disagree,
+    /// the compiled table drifts from the manifest, or one owner is claimed
+    /// twice. The typed defect travels unchanged so the refusal names the
+    /// exact divergent content instead of collapsing into a lifecycle string.
+    #[error(transparent)]
+    CellRegistry(#[from] cell_declaration_registry::CellRegistryError),
 }
 
 /// Typed revision-fence match failure for the daemon cache gate (issue #18
@@ -927,6 +939,10 @@ impl DaemonComposition {
         kernel: Arc<dyn KernelGenerationPort>,
         authority_activation: Option<Arc<dyn eliot_authority::P07AuthorityPort>>,
     ) -> Result<Self, DaemonError> {
+        // Issue #18 AUD-5848557601-1: prove the executable registry before
+        // composing anything. A diverged declaration/contract tree refuses
+        // to start here instead of running on a stale cell registry.
+        cell_declaration_registry::enforce_declared_cells()?;
         let config_lease = config.config_lease.take().ok_or_else(|| {
             DaemonError::Lifecycle(
                 "production start requires the retained Host-approved config lease".to_owned(),
@@ -1507,6 +1523,29 @@ impl DaemonComposition {
     #[must_use]
     pub fn kernel_snapshot(&self) -> &eliot_governor::KernelGenerationSnapshot {
         self.governor.kernel_snapshot()
+    }
+
+    /// Returns the ProductProof/FinishService acceptance owner's terminal
+    /// product-proof record for the parked Windows acceptance item, together
+    /// with its own fail-closed rollup (issue #1903).
+    ///
+    /// The acceptance owner is the Governor composition that this daemon
+    /// already holds, so this is a read of that owner rather than a second
+    /// source of the same fact. The rollup is the owner's own: it reports
+    /// `Pass` only when the record validated and its required installed-route
+    /// execution was actually observed, and it otherwise carries the exact
+    /// outcome, reason, authority, and missing evidence. A refusal is a
+    /// normal result here, not an error.
+    pub fn product_proof_status(
+        &self,
+    ) -> Result<
+        (
+            eliot_reports::product_proof::ProductProofStatus,
+            eliot_reports::product_proof::ProductProofRollup,
+        ),
+        eliot_governor::CompositionError,
+    > {
+        self.governor.product_proof_status()
     }
 
     /// Returns the live Governor owner handle.

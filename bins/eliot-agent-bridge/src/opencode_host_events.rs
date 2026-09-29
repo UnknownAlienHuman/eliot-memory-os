@@ -39,7 +39,8 @@ use eliot_agent_opencode::{
     ActionGate, ActionGateDecision, ActionGateError, ActionGateRequest, CredentialResolver,
     EffectDecisionRecord, HOST_EVENTS_PAYLOAD_TYPE, HostEventAdmission, HostEventAdmissionError,
     HostEventAdmissionFailure, HostEventAdmissionReceipt, HostEventDelivery, HostEventGap,
-    HostEventKind, HostEventPorts, HostEventSubmission, IntroductionStore,
+    HostEventKind, HostEventPorts, HostEventSubmission, HostEventsBindError, HostEventsListener,
+    HostEventsShutdown, IntroductionStore, LoopbackEndpoint,
 };
 use eliot_contracts::{EpochId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_governor::{GovernorActionGateRefusal, GovernorActionGateRequest, decide_pre_effect};
@@ -468,7 +469,7 @@ impl HostEventAdmission for BridgeHostEventAdmission<'_> {
                         HostEventAdmissionFailure::Unavailable,
                     ));
                 }
-                Ok(HostEventAdmissionReceipt {
+                let admitted = HostEventAdmissionReceipt {
                     stream_id: submission.stream_id.clone(),
                     event_id: submission.event_id.clone(),
                     phase: phase_text(phase).to_owned(),
@@ -486,7 +487,13 @@ impl HostEventAdmission for BridgeHostEventAdmission<'_> {
                     // returned here so a retry after a lost response reconciles
                     // the original decision instead of evaluating a second one.
                     replayed_decision: self.committed_decisions.get(&submission.event_id).cloned(),
-                })
+                };
+                // #2899: the event is now in the owner's live journal, so a
+                // terminal invocation can be joined against the correlation it
+                // names. This is the competent host evidence the correlation was
+                // waiting for; nothing before this point could have resolved it.
+                Self::reconcile_admitted_event(self, submission, &admitted);
+                Ok(admitted)
             }
             EventForwardStatus::BestEffortForwarded
             | EventForwardStatus::BestEffortGapSignalled { .. } => Err(
@@ -626,6 +633,71 @@ impl HostEventAdmission for BridgeHostEventAdmission<'_> {
     }
 }
 
+impl BridgeHostEventAdmission<'_> {
+    /// Joins a just-admitted terminal host event onto the correlation it names.
+    ///
+    /// #2899: the host event is now in the OWNER's live journal, so this is
+    /// the first point at which a competent host terminal state exists. The
+    /// join verifies the candidate against that journal, the owner's attach
+    /// binding and the owner's observed route before deriving anything, so a
+    /// stale, foreign, duplicated or reordered event closes nothing current.
+    ///
+    /// A reconciliation failure never fails the admission: the host event is
+    /// already durable, and refusing to admit it because a correlation could
+    /// not be closed would discard a competent observation. The failure is
+    /// reported on stderr instead.
+    fn reconcile_admitted_event(
+        &mut self,
+        submission: &HostEventSubmission,
+        receipt: &HostEventAdmissionReceipt,
+    ) {
+        let Some(inputs) = self.runner.terminal_reduction_inputs() else {
+            return;
+        };
+        let Some(journaled) = inputs
+            .history()
+            .iter()
+            .find(|event| event.event_id.as_str() == receipt.event_id.as_str())
+        else {
+            return;
+        };
+        let now = crate::mcp_correlation::owner_now_unix_ms().unwrap_or(0);
+        let outcome =
+            self.runner
+                .reconcile_terminal_host_event(journaled, &submission.producer_id, now);
+        let (correlation_digest, state, edge_filed, failure) = match outcome {
+            Ok(crate::mcp_correlation::HostEventReconciliation::Resolved {
+                correlation_digest,
+                state,
+                edge_filed,
+            }) => (
+                correlation_digest,
+                state.as_str(),
+                edge_filed,
+                String::new(),
+            ),
+            Ok(crate::mcp_correlation::HostEventReconciliation::NotTerminal) => {
+                (String::new(), "not_terminal", false, String::new())
+            }
+            Ok(crate::mcp_correlation::HostEventReconciliation::NoTrackedCorrelation) => (
+                String::new(),
+                "no_tracked_correlation",
+                false,
+                String::new(),
+            ),
+            Err(error) => (String::new(), "unreconciled", false, error.to_string()),
+        };
+        tracing::info!(
+            host_event_id = %receipt.event_id,
+            correlation_digest = %correlation_digest,
+            assessment_state = state,
+            transport_edge_filed = edge_filed,
+            reconcile_failure = %failure,
+            "mcp host-event correlation reconciliation"
+        );
+    }
+}
+
 /// Assembles the ingress ports over the live bridge composition.
 ///
 /// The admission port borrows the runner on the bridge thread; the gate is the
@@ -656,4 +728,126 @@ where
         introductions: store,
         credentials: FnCredentialResolver::new(resolve_credential),
     }
+}
+
+/// Startup disposition of the supervised `/v1/host-events` service.
+///
+/// The service is admitted only from [`HostEventsStartup::Introduced`]: an
+/// unintroduced composition never binds a port, so the route cannot be
+/// reachable without a User Broker-issued introduction naming the exact
+/// endpoint this process would serve.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HostEventsStartup {
+    /// The owner installed a current introduction for the exact endpoint this
+    /// process will own; the service may be started.
+    Introduced {
+        /// Exact loopback port the owner pinned for this bridge incarnation.
+        port: u16,
+        /// Bridge generation the introduction is bound to; the listener stops
+        /// when the live generation moves away from it.
+        bound_generation: u64,
+    },
+    /// No current introduction is installed, so nothing is served and no
+    /// socket is opened.
+    Unintroduced,
+}
+
+/// Resolves the startup disposition of the supervised `/v1/host-events`
+/// service from the owner's current introduction.
+///
+/// The port and bound generation are read from the installed introduction —
+/// never from a command-line value, an environment entry, or a constant — so
+/// the route is admitted only when the User Broker has already named the
+/// exact endpoint this bridge incarnation will own. An unintroduced
+/// composition resolves [`HostEventsStartup::Unintroduced`] and no socket is
+/// ever opened.
+fn host_events_startup(
+    store: &BridgeIntroductionStore,
+) -> Result<HostEventsStartup, HostEventsServiceError> {
+    let Some(introduction) = store.current_introduction() else {
+        return Ok(HostEventsStartup::Unintroduced);
+    };
+    let port = LoopbackEndpoint::parse(&introduction.endpoint)
+        .map_err(|_| HostEventsServiceError::EndpointNotLoopback)?
+        .port();
+    Ok(HostEventsStartup::Introduced {
+        port,
+        bound_generation: introduction.bridge_generation.get(),
+    })
+}
+
+/// Failure of the supervised `/v1/host-events` service (issue #2898).
+///
+/// Each variant is terminal and typed; no secret material, no caller value
+/// and no server prose is carried.
+#[derive(Debug, Error)]
+pub enum HostEventsServiceError {
+    /// No current introduction is installed, so the route stays closed.
+    #[error("host-events route is not introduced: the User Broker owns no current introduction")]
+    Unintroduced,
+    /// The introduction does not name a canonical loopback endpoint, so the
+    /// process cannot claim the port the owner reserved for it.
+    #[error("introduction endpoint is not a canonical loopback endpoint")]
+    EndpointNotLoopback,
+    /// The exclusively-owned loopback socket could not be obtained.
+    #[error("host-events listener bind failed: {0}")]
+    Bind(#[from] HostEventsBindError),
+    /// The single-threaded serving runtime could not be constructed.
+    #[error("host-events serving runtime could not be constructed: {0}")]
+    Runtime(#[source] std::io::Error),
+}
+
+/// Supervises `POST /v1/host-events` for the whole life of the bridge
+/// process (issue #2898, steps 1, 4, 5 and 14).
+///
+/// The route is served only when the User Broker-issued introduction is
+/// already installed in `store`, and only on the port that introduction
+/// pins. The socket is obtained exclusively by this process through
+/// [`HostEventsListener::bind_loopback`], which binds it and re-proves the
+/// loopback address and the explicit non-zero port; a competing listener
+/// cannot inherit the route, because a bind conflict is a refusal. Every
+/// admitted request is additionally joined against this listener's own bound
+/// port by the handler's `join_introduction` ownership check.
+///
+/// The stop and generation senders are held for the whole serving life, so a
+/// dropped supervisor channel can never be mistaken for a supervised stop:
+/// [`HostEventsListener::serve_until`] observes a channel closure as
+/// [`HostEventsShutdown::Rotated`], and the returned
+/// [`HostEventsShutdown`] is returned here as the real typed shutdown rather
+/// than discarded. An unintroduced composition returns
+/// [`HostEventsServiceError::Unintroduced`] without binding a port at all.
+pub fn serve_host_events<F>(
+    runner: &mut BridgeRunner,
+    store: BridgeIntroductionStore,
+    current_profile: Option<GovernanceProfile>,
+    resolve_credential: F,
+    stop: tokio::sync::watch::Receiver<bool>,
+    active_generation: tokio::sync::watch::Receiver<u64>,
+) -> Result<HostEventsShutdown, HostEventsServiceError>
+where
+    F: Fn(&SecretRef) -> Option<SecretString> + Send,
+{
+    let (port, bound_generation) = match host_events_startup(&store)? {
+        HostEventsStartup::Introduced {
+            port,
+            bound_generation,
+        } => (port, bound_generation),
+        HostEventsStartup::Unintroduced => return Err(HostEventsServiceError::Unintroduced),
+    };
+    // `bind_loopback` both binds the socket and wraps it, re-proving the
+    // loopback address and refusing a zero port. Wrapping it a second time via
+    // `from_pre_bound` would bind a second socket and leave the first one
+    // owned by nobody.
+    let listener = HostEventsListener::bind_loopback(port)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(HostEventsServiceError::Runtime)?;
+    let mut ports = assemble_ports(runner, store, current_profile, resolve_credential);
+    Ok(runtime.block_on(listener.serve_until(
+        &mut ports,
+        bound_generation,
+        stop,
+        active_generation,
+    )))
 }

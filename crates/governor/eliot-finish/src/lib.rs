@@ -9,6 +9,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod product_proof;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_canonical::{

@@ -2785,10 +2785,33 @@ fn run_mcp_front_door(
                 break;
             }
         }
-        if let Some(response) = outcome.response
-            && emit_mcp_frame(&response)
-        {
-            break;
+        if let Some(response) = outcome.response {
+            // #2899: the emission observation is produced from the exact bytes
+            // this process placed on stdout, then submitted to the OWNER's
+            // admitted route. This declares no host terminal fact: it records
+            // only that ELIOT emitted, and a later admitted host event is what
+            // can resolve the correlation.
+            let receipt = write_mcp_frame(&response);
+            if let Ok(request) = serde_json::from_str::<Value>(&text) {
+                let observed = eliot_agent_bridge::mcp_correlation::StdioEmissionOutcome {
+                    bytes: receipt.bytes,
+                    flushed: receipt.flushed,
+                    emitted: matches!(receipt.cause, StdioBreakCause::Emitted),
+                };
+                if let Err(error) = eliot_agent_bridge::mcp_correlation::observe_mcp_emission(
+                    runner,
+                    &request,
+                    request.get("method").and_then(Value::as_str).unwrap_or(""),
+                    None,
+                    observed,
+                    None,
+                ) {
+                    emit_error("MCP_EMISSION_OBSERVATION_REFUSED", &error.to_string());
+                }
+            }
+            if receipt.bytes_written() == 0 || receipt.should_break() {
+                break;
+            }
         }
     }
     if provider_failure {

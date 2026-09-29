@@ -26,8 +26,8 @@ use eliot_learning_contracts::{
     CampaignLearningStateView, CampaignOwnerRecordId, CampaignOwnerRevision, CampaignPositionKind,
     CampaignPositionRef, CampaignSourceBinding, CampaignSourceRequirement,
     CampaignSourceResolution, CampaignSourceResolutionStatus, CampaignSourceRevisionRef,
-    CampaignSourceRole, CampaignViewRebuildReason, Completeness, LearningStateViewRecipe,
-    OwnerDisagreement, OwnerId, TASK_CONTROLLER_CAMPAIGN_OWNER_ID,
+    CampaignSourceRole, CampaignViewRebuildReason, Completeness, LearningStateViewRecipe, MemberId,
+    OwnerDisagreement, OwnerId, SlotDisposition, SlotId, TASK_CONTROLLER_CAMPAIGN_OWNER_ID,
 };
 use eliot_learning_state_view::{
     CampaignHistoryPlanInput, CampaignLearningStateCompilationInput,
@@ -158,6 +158,28 @@ enum CampaignPacketGapCode {
     RequiredSourceUnavailable,
     ContextRecipeUnavailable,
     ContextDeliveryUnavailable,
+    /// The composition bound no admission closure, so this delivery carries no
+    /// per-material `FusedRankTrace` and no rank-trace handle.
+    ///
+    /// The traced join this packet's material would be accounted by is
+    /// `eliot_context_admission::admit_context_traced`, reached from the
+    /// composition through
+    /// `KernelContextReadClient::compile_context_packet`. That composition
+    /// takes the owner-minted closure `PacketAdmissionBundle`, whose four
+    /// identities (`SafetyFloorIdentity`, `PriorityPolicyIdentity`,
+    /// `AdmissionRuleIdentity`, `MeasurementCompositionProfile`) have zero
+    /// production construction sites in this tree, and whose typed candidate
+    /// set is itself reached by no caller. The daemon therefore closes over no
+    /// protected floor, priority policy, admission rule, or measurement
+    /// composition profile.
+    ///
+    /// Minting any of them here from a constant, a CLI flag, an env var, or a
+    /// caller-supplied string would fabricate the exact selection record I12.26
+    /// requires this packet to carry, so the composition reports the refusal
+    /// instead. Reporting it is what keeps the withheld rank trace from being
+    /// read as support: the absence of a handle is a named, delivered gap, not
+    /// a silent omission and not a claim that nothing was withheld.
+    AdmissionClosureUnbound,
     /// The current learning-state owner refused the view for this attempt:
     /// stale, missing, invalidated, or partial across a load-bearing slot,
     /// owner revision, State Fence, or `RetrievalPlan` history.
@@ -171,6 +193,115 @@ struct CampaignPacketGap {
     role: Option<CampaignSourceRole>,
 }
 
+/// One material this delivery placed, and what the current owner says about it.
+///
+/// Every field is owner-recorded: the slot and member identities and their
+/// dispositions are the ones the learning-state owner compiled into this
+/// immutable view, and the evidence handles are that owner's own. Nothing here
+/// is re-decided, re-ranked, or inferred from the absence of a rank trace.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DeliveredMaterialTrace {
+    /// Declared recipe slot this material was projected into.
+    slot_id: SlotId,
+    /// Declared member identity within that slot.
+    member_id: MemberId,
+    /// Owner that issued the projection.
+    owner: OwnerId,
+    /// The owner's explicit disposition for this member.
+    disposition: SlotDisposition,
+    /// Packet location: this member's position in the delivered view.
+    packet_location: u32,
+    /// Owner-issued evidence handles supporting this disposition.
+    evidence: Vec<ArtifactId>,
+}
+
+/// The I12.26 delivery account for one published packet.
+///
+/// This is the visible/suppressed count pair and the per-material disposition
+/// set I12.26 requires a delivered packet to expose, derived by counting the
+/// owner-compiled view itself. `rank_trace_handle` is the full
+/// `FusedRankTrace` handle field the contract asks for; it is `None` here
+/// because the daemon closes over no owner-minted admission closure, and
+/// [`CampaignPacketGapCode::AdmissionClosureUnbound`] is delivered alongside it
+/// to say so. The handle slot is present and typed precisely so an unbound
+/// handle can never be read as "nothing was withheld".
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ContextDeliveryMaterialAccount {
+    /// The owner-recorded view digest this account was derived from.
+    view_digest: String,
+    /// Members the current owner placed in the delivered view.
+    visible: u32,
+    /// Members the current owner withheld, each with its own disposition above.
+    suppressed: u32,
+    /// One explicit disposition per delivered member.
+    materials: Vec<DeliveredMaterialTrace>,
+    /// The full rank-trace handle, or `None` when no closure could be bound.
+    rank_trace_handle: Option<String>,
+}
+
+/// Counts the delivered and suppressed material of one published view.
+///
+/// The visible/suppressed split is the owner's own disposition, not a budget
+/// decision made here: a member the current owner marked `Current` is visible,
+/// and every other disposition is a member that was withheld for a stated
+/// reason. The per-member counts are derived from this view's own slot
+/// vector, so the reported location is where the material actually sits in the
+/// delivered packet.
+///
+/// A view that cannot be counted at all refuses rather than reporting a
+/// partial account: an unattributable count would be indistinguishable from a
+/// complete one.
+///
+/// The refusal is returned as the same [`String`] every enclosing packet
+/// function already returns, so the whole route reports one error shape. It
+/// carries the failure as [`CampaignPacketError::OwnerReadUnavailable`]'s own
+/// text, which names the typed failure instead of flattening it.
+fn account_delivered_materials(
+    view: &CampaignLearningStateView,
+) -> Result<ContextDeliveryMaterialAccount, String> {
+    let mut materials = Vec::new();
+    let mut suppressed = 0_u32;
+    for slot in &view.slots {
+        for member in &slot.members {
+            if member.disposition != SlotDisposition::Current {
+                suppressed = suppressed
+                    .checked_add(1)
+                    .ok_or(CampaignPacketError::OwnerReadUnavailable.to_string())?;
+            }
+            materials.push(DeliveredMaterialTrace {
+                slot_id: slot.slot_id.clone(),
+                member_id: member.member_id.clone(),
+                owner: member.owner.clone(),
+                disposition: member.disposition,
+                packet_location: 0,
+                evidence: member.evidence.clone(),
+            });
+        }
+    }
+    // Packet location is this material's position in the delivered view as a
+    // whole, so a consumer resolves a handle to one place in one packet rather
+    // than to a per-slot index it would have to re-derive.
+    for (position, material) in materials.iter_mut().enumerate() {
+        material.packet_location = u32::try_from(position)
+            .map_err(|_| CampaignPacketError::OwnerReadUnavailable.to_string())?;
+    }
+    let visible = u32::try_from(materials.len())
+        .map_err(|_| CampaignPacketError::OwnerReadUnavailable.to_string())?
+        .checked_sub(suppressed)
+        .ok_or(CampaignPacketError::OwnerReadUnavailable.to_string())?;
+    Ok(ContextDeliveryMaterialAccount {
+        view_digest: view.canonical_digest.clone(),
+        visible,
+        suppressed,
+        materials,
+        // The owner-minted admission closure this handle would be derived from
+        // has no production construction site, so no handle is asserted.
+        rank_trace_handle: None,
+    })
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CampaignPacketResponse {
@@ -178,6 +309,9 @@ struct CampaignPacketResponse {
     completeness: Completeness,
     #[serde(rename = "campaign_learning_state_view")]
     view: Option<CampaignLearningStateViewPublication>,
+    /// Per-material delivery account for the published view, or `None` when no
+    /// view was published at all.
+    material_account: Option<ContextDeliveryMaterialAccount>,
     gaps: Vec<CampaignPacketGap>,
     missing_roles: Vec<CampaignSourceRole>,
     stale_roles: Vec<CampaignSourceRole>,
@@ -339,6 +473,7 @@ async fn resolve_compile_and_bind_result(
                         outcome: CampaignPacketOutcome::Blocked,
                         completeness: Completeness::Blocked,
                         view: None,
+                        material_account: None,
                         gaps: vec![CampaignPacketGap {
                             code: CampaignPacketGapCode::TaskPlanUnavailable,
                             role: Some(CampaignSourceRole::TaskPlan),
@@ -363,6 +498,7 @@ async fn resolve_compile_and_bind_result(
                         outcome: CampaignPacketOutcome::Blocked,
                         completeness: Completeness::Blocked,
                         view: None,
+                        material_account: None,
                         gaps: vec![CampaignPacketGap {
                             code: CampaignPacketGapCode::PriorViewUnavailable,
                             role: None,
@@ -397,6 +533,7 @@ async fn resolve_compile_and_bind_result(
                     outcome: CampaignPacketOutcome::Blocked,
                     completeness: Completeness::Blocked,
                     view: None,
+                    material_account: None,
                     gaps: vec![CampaignPacketGap {
                         code: CampaignPacketGapCode::OwnerReadUnavailable,
                         role: None,
@@ -421,6 +558,7 @@ async fn resolve_compile_and_bind_result(
                         outcome: CampaignPacketOutcome::Blocked,
                         completeness: Completeness::Blocked,
                         view: None,
+                        material_account: None,
                         gaps: vec![CampaignPacketGap {
                             code: CampaignPacketGapCode::HistoryPlanUnavailable,
                             role: None,
@@ -474,6 +612,7 @@ async fn resolve_compile_and_bind_result(
                         outcome: CampaignPacketOutcome::Blocked,
                         completeness: Completeness::Blocked,
                         view: None,
+                        material_account: None,
                         gaps: source_gaps(&resolved.resolutions),
                         missing_roles: missing_roles(&resolved.resolutions),
                         stale_roles: stale_roles(&resolved.resolutions),
@@ -497,6 +636,7 @@ async fn resolve_compile_and_bind_result(
                         outcome: CampaignPacketOutcome::Blocked,
                         completeness: Completeness::Blocked,
                         view: None,
+                        material_account: None,
                         gaps: vec![CampaignPacketGap {
                             code: CampaignPacketGapCode::RequiredSourceUnavailable,
                             role: None,
@@ -535,6 +675,7 @@ async fn resolve_compile_and_bind_result(
                     outcome: CampaignPacketOutcome::Blocked,
                     completeness: Completeness::Blocked,
                     view: None,
+                    material_account: None,
                     gaps: vec![CampaignPacketGap {
                         code: CampaignPacketGapCode::RequiredSourceUnavailable,
                         role: Some(CampaignSourceRole::FrozenAnchor),
@@ -596,6 +737,7 @@ async fn resolve_compile_and_bind_result(
                         outcome: CampaignPacketOutcome::Blocked,
                         completeness: Completeness::Blocked,
                         view: None,
+                        material_account: None,
                         gaps: source_gaps(&resolved.resolutions),
                         missing_roles: missing_roles(&resolved.resolutions),
                         stale_roles: stale_roles(&resolved.resolutions),
@@ -623,6 +765,7 @@ async fn resolve_compile_and_bind_result(
                         outcome: CampaignPacketOutcome::Blocked,
                         completeness: Completeness::Blocked,
                         view: None,
+                        material_account: None,
                         gaps: vec![CampaignPacketGap {
                             code: CampaignPacketGapCode::RequiredSourceUnavailable,
                             role: None,
@@ -637,6 +780,12 @@ async fn resolve_compile_and_bind_result(
             }
         };
         let completeness = publication.view.completeness;
+        // A stale or blocked view is still published for diagnosis, so its
+        // per-material disposition is still counted and delivered: a consumer
+        // must be able to see which material this refusal withheld. A view that
+        // cannot be counted fails this whole response closed rather than
+        // publishing a view with an unattributable material account.
+        let material_account = account_delivered_materials(&publication.view)?;
         return campaign_packet_result_body(
             envelope,
             attempt,
@@ -648,6 +797,7 @@ async fn resolve_compile_and_bind_result(
                 },
                 completeness,
                 view: Some(publication),
+                material_account: Some(material_account),
                 gaps: source_gaps(&resolved.resolutions),
                 missing_roles: missing_roles(&resolved.resolutions),
                 stale_roles: stale_roles(&resolved.resolutions),
@@ -832,6 +982,17 @@ async fn resolve_compile_and_bind_result(
             ),
         );
     }
+    // Issue #1949 (I12.26): this compiled packet is the delivery a consumer
+    // resolves per-material handles against, so it states its own material
+    // account here. The account is counted from the published owner view, and
+    // the admission closure that would carry a full `FusedRankTrace` handle is
+    // reported as unbound beside it rather than left silently absent.
+    let material_account = account_delivered_materials(&publication.view)?;
+    let mut gaps = source_gaps(&resolved.resolutions);
+    gaps.push(CampaignPacketGap {
+        code: CampaignPacketGapCode::AdmissionClosureUnbound,
+        role: None,
+    });
     campaign_packet_result_body(
         envelope,
         attempt,
@@ -839,7 +1000,8 @@ async fn resolve_compile_and_bind_result(
             outcome: CampaignPacketOutcome::Compiled,
             completeness: publication.view.completeness,
             view: Some(publication),
-            gaps: source_gaps(&resolved.resolutions),
+            material_account: Some(material_account),
+            gaps,
             missing_roles: missing_roles(&resolved.resolutions),
             stale_roles: stale_roles(&resolved.resolutions),
             blocked_roles: blocked_roles(&resolved.resolutions),
@@ -1600,10 +1762,21 @@ fn context_blocked_response(
 ) -> CampaignPacketResponse {
     let mut gaps = source_gaps(resolutions);
     gaps.push(CampaignPacketGap { code, role });
+    // A context refusal still publishes its view, so the material it withheld
+    // is still counted and delivered rather than reduced to a bare gap code. This
+    // account is optional for real: the view being published here was already
+    // accepted by `make_view_publication`, and a count that still fails on it
+    // means the published view and the account disagree. Reporting that as
+    // `None` is the fail-closed half of the pair — the named refusal above is
+    // what makes an absent account legible, and the alternative would be a
+    // zeroed account that reads as "nothing was withheld", the opposite of the
+    // refusal this response is reporting.
+    let material_account = account_delivered_materials(&view.view).ok();
     CampaignPacketResponse {
         outcome: CampaignPacketOutcome::Blocked,
         completeness: Completeness::Blocked,
         view: Some(view),
+        material_account,
         gaps,
         missing_roles: missing_roles(resolutions),
         stale_roles: stale_roles(resolutions),

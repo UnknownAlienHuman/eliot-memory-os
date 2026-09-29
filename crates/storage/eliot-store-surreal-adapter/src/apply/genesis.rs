@@ -357,6 +357,11 @@ pub(crate) async fn initialize_genesis_direct(
         .validate_for_context(context)
         .map_err(AdapterError::Store)?;
     let db = super::client(adapter).await?;
+    // Issue #67 (R3/A6): the caller `initialize_genesis` already holds the
+    // exclusive `exclusive_admission` permit on both the generation-less and
+    // the drained branch, so the ordinary-write path is closed for this whole
+    // operation. This `write_lock` is the retained exclusive-entrypoint
+    // guard; it is not ordinary-write protection.
     let _guard = adapter.write_lock.lock().await;
     let state = read_genesis_state(db, &adapter.config).await?;
     validate_genesis_schema_fence(&state, &adapter.config, &request)?;

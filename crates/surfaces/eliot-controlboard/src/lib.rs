@@ -52,7 +52,9 @@
 //! *Notification projection (`notification_projection`, re-exported):*
 //! `ProjectedSeverity`, `NotificationRow`, `project`,
 //! `CanonicalNotificationMetrics`, `NotificationReadProjection`,
-//! `project_read_page`, `NotificationInbox`, `NotificationMetrics`, `inbox`,
+//! `project_read_page`, `NotificationInbox` (carries `rows`,
+//! `unresolved_critical`, `failed_delivery`, `metrics`),
+//! `NotificationMetrics`, `inbox`,
 //! `unresolved_critical`, `failed_delivery`, `metrics`.
 //!
 //! *Swarm read surface (`swarm_read`, re-exported):* `AUTHENTICATED_SWARM_VIEW_VERSION`,
@@ -798,7 +800,9 @@ pub struct ControlBoardView {
     pub provenance: Vec<ProvenanceEdge>,
     /// Persistent notification inbox section (issue #1780, I11.2/I11.5).
     /// Projected from the owner-supplied canonical records; never filtered
-    /// by role, privacy, or quiet hours at this layer.
+    /// by role, privacy, or quiet hours at this layer. It carries the whole
+    /// inbox, the unresolved-critical obligations, the failed-delivery rows,
+    /// and the metrics, so no consumer has to recompute a subset.
     pub notifications: NotificationInbox,
 }
 
@@ -1897,8 +1901,19 @@ fn filter_view(state: CanonicalState, access: &AccessBinding) -> ControlBoardVie
         .collect();
     // Notification inbox: every owner-supplied canonical record projects
     // without role/privacy/quiet-hours filtering. Canonical creation and
-    // board visibility are never suppressed at this layer.
+    // board visibility are never suppressed at this layer. The two
+    // obligation subsets are derived here from the very same rows the
+    // inbox carries, so the view cannot report a subset that its own row
+    // set does not contain.
     let notification_rows = notification_projection::project(&state.notifications);
+    let critical_obligation_rows: Vec<NotificationRow> = unresolved_critical(&notification_rows)
+        .into_iter()
+        .cloned()
+        .collect();
+    let delivery_failure_rows: Vec<NotificationRow> = failed_delivery(&notification_rows)
+        .into_iter()
+        .cloned()
+        .collect();
     let notification_metrics = notification_projection::metrics(&notification_rows);
     ControlBoardView {
         revision: state.revision,
@@ -1908,6 +1923,8 @@ fn filter_view(state: CanonicalState, access: &AccessBinding) -> ControlBoardVie
         provenance,
         notifications: NotificationInbox {
             rows: notification_rows,
+            unresolved_critical: critical_obligation_rows,
+            failed_delivery: delivery_failure_rows,
             metrics: notification_metrics,
         },
     }

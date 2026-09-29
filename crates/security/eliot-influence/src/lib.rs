@@ -10,7 +10,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_security_contracts::{
-    EpistemicUse, InfluenceDependencyClosure, InfluenceState, RevocationReason, SourceAssurance,
+    EpistemicUse, FreshnessStatus, IndependenceLevel, InfluenceDependencyClosure, InfluenceState,
+    QuarantineState, RevocationReason, SourceAssurance,
 };
 use schemars::JsonSchema;
 use serde::de::{self, MapAccess, Visitor};
@@ -2378,7 +2379,10 @@ pub fn resume_bounded_revocation(
 // a digest-bound receipt from the previous stage, so no stage is reachable by
 // skipping its predecessor. The gate returns an allow / deny / degraded-use
 // verdict with explicit reasons. Retrieval (`retrieve_view`) takes only a
-// shared reference and never mutates support or influence.
+// shared reference and never mutates support or influence. Material decision
+// and result binding each offer an acceptance-scoped entry
+// (`decide_material_for_acceptance`, `bind_result_for_acceptance`) that binds
+// the use to one acceptance item with scope and freshness checks.
 // ---------------------------------------------------------------------------
 
 /// Wire/schema revision of the staged influence runtime path.
@@ -2457,13 +2461,22 @@ pub enum RuntimeReason {
     VerifierRequiresVerificationInput,
     ConfirmatoryRequiresQualification,
     UseCappedToExploratory,
+    SourceQuarantined,
+    SourceStale {
+        freshness: FreshnessStatus,
+    },
+    SelfReportRequiresIndependentRoute,
+    AcceptanceScopeMismatch,
 }
 
 /// Subject gated by the runtime path.
 ///
 /// `support_revision` names the support state and `influence` names the
-/// influence state; neither is mutated by retrieval. A qualifying transition
-/// produces a new subject value and leaves the original untouched.
+/// influence state; neither is mutated by retrieval. Allowed influence stays
+/// independent of existence, support, and accessibility (A4.7): `allowed_uses`
+/// is evaluated on its own, while `freshness`, `quarantine`, and
+/// `independence` bound which uses the allowance may satisfy. A qualifying
+/// transition produces a new subject value and leaves the original untouched.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeSubject {
@@ -2475,6 +2488,9 @@ pub struct RuntimeSubject {
     pub qualified_for_confirmatory: bool,
     pub support_revision: u64,
     pub state_fence: StateFence,
+    pub freshness: FreshnessStatus,
+    pub quarantine: QuarantineState,
+    pub independence: IndependenceLevel,
 }
 
 impl RuntimeSubject {
@@ -2482,6 +2498,8 @@ impl RuntimeSubject {
     ///
     /// New subjects start unqualified for confirmatory acceptance; only an
     /// explicit [`qualify_transition`] can set the qualification flag.
+    /// Assurance signals default to current, unquarantined, and independent;
+    /// [`from_contracts`] replaces them with the live source values.
     pub fn new(
         subject_ref: String,
         origin_ref: String,
@@ -2500,6 +2518,9 @@ impl RuntimeSubject {
             qualified_for_confirmatory: false,
             support_revision,
             state_fence,
+            freshness: FreshnessStatus::Current,
+            quarantine: QuarantineState::None,
+            independence: IndependenceLevel::Independent,
         };
         subject.validate()?;
         Ok(subject)
@@ -2513,6 +2534,10 @@ impl RuntimeSubject {
     /// state fences must agree, mirroring [`InfluenceRequest::validate`]. A
     /// merged subject would otherwise bind one lineage's influence state to
     /// another origin's allowed use for the whole staged path.
+    ///
+    /// Carries the assurance validity signals (freshness, quarantine,
+    /// independence) onto the subject so the gate evaluates scope, freshness,
+    /// and privacy/erasure state independently of the allowed-use set (A4.7).
     pub fn from_contracts(
         subject_ref: String,
         provenance: &ProvenanceRecord,
@@ -2531,7 +2556,7 @@ impl RuntimeSubject {
         {
             return Err(InfluenceRuntimeError::InvalidField("dependency_closure"));
         }
-        Self::new(
+        let mut subject = Self::new(
             subject_ref,
             provenance.origin_ref.clone(),
             provenance.source_assurance.allowed_epistemic_use.clone(),
@@ -2539,7 +2564,11 @@ impl RuntimeSubject {
             retrievable,
             support_revision,
             provenance.state_fence.clone(),
-        )
+        )?;
+        subject.freshness = provenance.source_assurance.freshness;
+        subject.quarantine = provenance.source_assurance.quarantine;
+        subject.independence = provenance.source_assurance.independence;
+        Ok(subject)
     }
 
     pub fn validate(&self) -> Result<(), InfluenceRuntimeError> {
@@ -2590,6 +2619,9 @@ pub struct RuntimeView {
     pub influence: InfluenceState,
     pub retrievable: bool,
     pub support_revision: u64,
+    pub freshness: FreshnessStatus,
+    pub quarantine: QuarantineState,
+    pub independence: IndependenceLevel,
 }
 
 /// Retrieve a read-only view without mutating support or influence.
@@ -2605,6 +2637,9 @@ pub fn retrieve_view(subject: &RuntimeSubject) -> RuntimeView {
         influence: subject.influence,
         retrievable: subject.retrievable,
         support_revision: subject.support_revision,
+        freshness: subject.freshness,
+        quarantine: subject.quarantine,
+        independence: subject.independence,
     }
 }
 
@@ -2626,6 +2661,136 @@ impl RuntimeVerdict {
     pub fn is_allow(&self) -> bool {
         matches!(self.kind, RuntimeVerdictKind::Allow)
     }
+}
+
+/// Quarantine refusal for the policy gate (A4.7).
+///
+/// Returns the verdict parts when source quarantine denies every use, `None`
+/// when the source may proceed to the remaining checks.
+fn quarantine_refusal(
+    subject: &RuntimeSubject,
+) -> Option<(RuntimeVerdictKind, Vec<RuntimeReason>, Option<RuntimeUse>)> {
+    if matches!(
+        subject.quarantine,
+        QuarantineState::None | QuarantineState::Released
+    ) {
+        None
+    } else {
+        Some((
+            RuntimeVerdictKind::Deny,
+            vec![RuntimeReason::SourceQuarantined],
+            None,
+        ))
+    }
+}
+
+/// Freshness refusal for the policy gate (A5.2, A5.5).
+///
+/// Stale or superseded positions stay inspectable but cannot satisfy
+/// decision-grade uses: decision input degrades to exploratory read while
+/// verifier and confirmatory uses are denied outright.
+fn freshness_refusal(
+    subject: &RuntimeSubject,
+    requested: RuntimeUse,
+) -> Option<(RuntimeVerdictKind, Vec<RuntimeReason>, Option<RuntimeUse>)> {
+    if subject.freshness == FreshnessStatus::Current
+        || matches!(requested, RuntimeUse::ExploratoryRead)
+    {
+        return None;
+    }
+    let stale = RuntimeReason::SourceStale {
+        freshness: subject.freshness,
+    };
+    if matches!(requested, RuntimeUse::DecisionInput) {
+        Some((
+            RuntimeVerdictKind::DegradedUse,
+            vec![stale],
+            Some(RuntimeUse::ExploratoryRead),
+        ))
+    } else {
+        Some((RuntimeVerdictKind::Deny, vec![stale], None))
+    }
+}
+
+/// Self-report refusal for the policy gate (A5.5).
+///
+/// Elevated-impact uses must not rely on the actor's self-report when an
+/// independent route is practical: a non-independent source finishes honestly
+/// degraded at decision input.
+fn self_report_refusal(
+    subject: &RuntimeSubject,
+    requested: RuntimeUse,
+) -> Option<(RuntimeVerdictKind, Vec<RuntimeReason>, Option<RuntimeUse>)> {
+    if !matches!(
+        requested,
+        RuntimeUse::VerifierInput | RuntimeUse::ConfirmatoryAcceptance
+    ) || subject.independence == IndependenceLevel::Independent
+    {
+        return None;
+    }
+    Some((
+        RuntimeVerdictKind::DegradedUse,
+        vec![RuntimeReason::SelfReportRequiresIndependentRoute],
+        Some(RuntimeUse::DecisionInput),
+    ))
+}
+
+/// Capped-use refusal for the policy gate.
+///
+/// The subject's allowed set does not reach the requested use:
+/// exploratory-only subjects are denied outright, wider subjects degrade to
+/// the nearest weaker allowance.
+fn capped_refusal(
+    subject: &RuntimeSubject,
+    requested: RuntimeUse,
+    required: EpistemicUse,
+) -> (RuntimeVerdictKind, Vec<RuntimeReason>, Option<RuntimeUse>) {
+    let not_allowed = RuntimeReason::EpistemicUseNotAllowed {
+        requested: required,
+        allowed: subject.allowed_uses.clone(),
+    };
+    if subject.is_exploratory_only() {
+        let specific = match requested {
+            RuntimeUse::ExploratoryRead => None,
+            RuntimeUse::DecisionInput => Some(RuntimeReason::UseCappedToExploratory),
+            RuntimeUse::VerifierInput => Some(RuntimeReason::ExploratoryOnlyCannotSatisfyVerifier),
+            RuntimeUse::ConfirmatoryAcceptance => {
+                Some(RuntimeReason::ExploratoryOnlyCannotSatisfyConfirmatory)
+            }
+        };
+        let mut reasons = vec![not_allowed];
+        if let Some(reason) = specific {
+            reasons.push(reason);
+        }
+        return (RuntimeVerdictKind::Deny, reasons, None);
+    }
+    let (reasons, fallback) = match requested {
+        RuntimeUse::ExploratoryRead => (vec![not_allowed], None),
+        RuntimeUse::DecisionInput => (
+            vec![not_allowed, RuntimeReason::UseCappedToExploratory],
+            Some(RuntimeUse::ExploratoryRead),
+        ),
+        RuntimeUse::VerifierInput => (
+            vec![
+                not_allowed,
+                RuntimeReason::VerifierRequiresVerificationInput,
+            ],
+            Some(RuntimeUse::DecisionInput),
+        ),
+        RuntimeUse::ConfirmatoryAcceptance => (
+            vec![
+                not_allowed,
+                RuntimeReason::ConfirmatoryRequiresQualification,
+            ],
+            Some(RuntimeUse::DecisionInput),
+        ),
+    };
+    let kind = if fallback.is_some() {
+        RuntimeVerdictKind::DegradedUse
+    } else {
+        RuntimeVerdictKind::Deny
+    };
+    (kind, reasons, fallback)
 }
 
 /// Mandatory policy gate for the reachable influence runtime path.
@@ -2669,6 +2834,14 @@ pub fn policy_gate(
             None,
         ));
     }
+    // Privacy/erasure state denies on its own (A4.7), and stale positions
+    // cannot satisfy decision-grade uses (A5.2, A5.5).
+    if let Some((kind, reasons, fallback)) = quarantine_refusal(subject) {
+        return Ok(stated(kind, reasons, fallback));
+    }
+    if let Some((kind, reasons, fallback)) = freshness_refusal(subject, requested) {
+        return Ok(stated(kind, reasons, fallback));
+    }
 
     let required = requested.required_use();
     let max_rank = subject.max_rank();
@@ -2682,54 +2855,14 @@ pub fn policy_gate(
                 Some(RuntimeUse::DecisionInput),
             ));
         }
+        // Elevated-impact uses must not rely on the actor's self-report (A5.5).
+        if let Some((kind, reasons, fallback)) = self_report_refusal(subject, requested) {
+            return Ok(stated(kind, reasons, fallback));
+        }
         return Ok(stated(RuntimeVerdictKind::Allow, Vec::new(), None));
     }
 
-    let not_allowed = RuntimeReason::EpistemicUseNotAllowed {
-        requested: required,
-        allowed: subject.allowed_uses.clone(),
-    };
-    if subject.is_exploratory_only() {
-        let specific = match requested {
-            RuntimeUse::ExploratoryRead => None,
-            RuntimeUse::DecisionInput => Some(RuntimeReason::UseCappedToExploratory),
-            RuntimeUse::VerifierInput => Some(RuntimeReason::ExploratoryOnlyCannotSatisfyVerifier),
-            RuntimeUse::ConfirmatoryAcceptance => {
-                Some(RuntimeReason::ExploratoryOnlyCannotSatisfyConfirmatory)
-            }
-        };
-        let mut reasons = vec![not_allowed];
-        if let Some(reason) = specific {
-            reasons.push(reason);
-        }
-        return Ok(stated(RuntimeVerdictKind::Deny, reasons, None));
-    }
-    let (reasons, fallback) = match requested {
-        RuntimeUse::ExploratoryRead => (vec![not_allowed], None),
-        RuntimeUse::DecisionInput => (
-            vec![not_allowed, RuntimeReason::UseCappedToExploratory],
-            Some(RuntimeUse::ExploratoryRead),
-        ),
-        RuntimeUse::VerifierInput => (
-            vec![
-                not_allowed,
-                RuntimeReason::VerifierRequiresVerificationInput,
-            ],
-            Some(RuntimeUse::DecisionInput),
-        ),
-        RuntimeUse::ConfirmatoryAcceptance => (
-            vec![
-                not_allowed,
-                RuntimeReason::ConfirmatoryRequiresQualification,
-            ],
-            Some(RuntimeUse::DecisionInput),
-        ),
-    };
-    let kind = if fallback.is_some() {
-        RuntimeVerdictKind::DegradedUse
-    } else {
-        RuntimeVerdictKind::Deny
-    };
+    let (kind, reasons, fallback) = capped_refusal(subject, requested, required);
     Ok(stated(kind, reasons, fallback))
 }
 
@@ -2776,6 +2909,9 @@ pub fn qualify_transition(
         subject.state_fence.clone(),
     )?;
     next.qualified_for_confirmatory = qualified;
+    next.freshness = subject.freshness;
+    next.quarantine = subject.quarantine;
+    next.independence = subject.independence;
     Ok(next)
 }
 
@@ -3023,6 +3159,101 @@ pub fn bind_result(
     }
 }
 
+/// Acceptance item a material use or binding is claimed to satisfy.
+///
+/// The Governor binds the verifier to an acceptance item and checks scope and
+/// freshness (A5.5). Scope travels in the state fence, so binding requires
+/// the acceptance fence to equal the subject fence; freshness is checked
+/// against the subject's assurance signal. The caller persists this value
+/// next to the returned receipt: the paired digests are the binding evidence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptanceScope {
+    pub acceptance_ref: String,
+    pub scope_ref: String,
+    pub state_fence: StateFence,
+}
+
+impl AcceptanceScope {
+    pub fn validate(&self) -> Result<(), InfluenceRuntimeError> {
+        if self.acceptance_ref.trim().is_empty()
+            || self.acceptance_ref.chars().any(char::is_control)
+        {
+            return Err(InfluenceRuntimeError::InvalidField("acceptance_ref"));
+        }
+        if self.scope_ref.trim().is_empty() || self.scope_ref.chars().any(char::is_control) {
+            return Err(InfluenceRuntimeError::InvalidField("scope_ref"));
+        }
+        self.state_fence
+            .validate()
+            .map_err(|_| InfluenceRuntimeError::InvalidField("acceptance_scope.state_fence"))?;
+        Ok(())
+    }
+
+    pub fn digest(&self) -> Result<String, InfluenceRuntimeError> {
+        self.validate()?;
+        canonical_json_bytes(self)
+            .map(|bytes| sha256_hex(&bytes))
+            .map_err(|_| InfluenceRuntimeError::Canonicalization)
+    }
+}
+
+/// Scope and freshness check shared by the acceptance-bound boundaries.
+///
+/// A fence mismatch denies with [`RuntimeReason::AcceptanceScopeMismatch`];
+/// a non-current subject denies with [`RuntimeReason::SourceStale`].
+fn check_acceptance(
+    subject: &RuntimeSubject,
+    acceptance: &AcceptanceScope,
+    stage: RuntimeStage,
+) -> Result<(), InfluenceRuntimeError> {
+    acceptance.validate()?;
+    if acceptance.state_fence != subject.state_fence {
+        return Err(InfluenceRuntimeError::Denied {
+            stage,
+            subject: subject.subject_ref.clone(),
+            reasons: vec![RuntimeReason::AcceptanceScopeMismatch],
+        });
+    }
+    if subject.freshness != FreshnessStatus::Current {
+        return Err(InfluenceRuntimeError::Denied {
+            stage,
+            subject: subject.subject_ref.clone(),
+            reasons: vec![RuntimeReason::SourceStale {
+                freshness: subject.freshness,
+            }],
+        });
+    }
+    Ok(())
+}
+
+/// Material-decision boundary scoped to one acceptance item: checks the
+/// acceptance scope and freshness, then delegates to [`decide_material`].
+pub fn decide_material_for_acceptance(
+    subject: &RuntimeSubject,
+    pending: &PendingReceipt,
+    admission: &AdmissionReceipt,
+    requested: RuntimeUse,
+    acceptance: &AcceptanceScope,
+) -> Result<DecisionReceipt, InfluenceRuntimeError> {
+    check_acceptance(subject, acceptance, RuntimeStage::MaterialDecision)?;
+    decide_material(subject, pending, admission, requested)
+}
+
+/// Result-binding boundary scoped to one acceptance item: checks the
+/// acceptance scope and freshness, then delegates to [`bind_result`].
+pub fn bind_result_for_acceptance(
+    subject: &RuntimeSubject,
+    decision: &DecisionReceipt,
+    pending: &PendingReceipt,
+    admission: &AdmissionReceipt,
+    requested: RuntimeUse,
+    acceptance: &AcceptanceScope,
+) -> Result<BindingReceipt, InfluenceRuntimeError> {
+    check_acceptance(subject, acceptance, RuntimeStage::ResultBinding)?;
+    bind_result(subject, decision, pending, admission, requested)
+}
+
 /// Digest-bound admission receipt: context-admission boundary.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -3126,6 +3357,110 @@ pub enum InfluenceRuntimeError {
     },
     #[error("runtime record cannot be canonically serialized")]
     Canonicalization,
+}
+
+/// Mandated boundary route for a refused runtime use.
+///
+/// The gate never silently drops a refused use: every policy refusal
+/// ([`InfluenceRuntimeError::Denied`] / `Degraded`) maps to exactly one route
+/// the boundary caller must apply to its own outcome type — an Unknown
+/// record, a conflict, an inquiry, or a degraded completion. Non-policy
+/// failures (malformed fields, binding mismatches, stage misuse) are caller
+/// bugs, not policy refusals, and map to no route.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DenialRoute {
+    Unknown,
+    Conflict,
+    Inquiry,
+    DegradedCompletion,
+}
+
+/// Digest-bound routing receipt for one refused runtime use.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DenialRouting {
+    pub subject_ref: String,
+    pub stage: RuntimeStage,
+    pub route: DenialRoute,
+    pub reasons: Vec<RuntimeReason>,
+    pub fallback: Option<RuntimeUse>,
+}
+
+impl DenialRouting {
+    pub fn digest(&self) -> Result<String, InfluenceRuntimeError> {
+        canonical_json_bytes(self)
+            .map(|bytes| sha256_hex(&bytes))
+            .map_err(|_| InfluenceRuntimeError::Canonicalization)
+    }
+}
+
+/// Route a refused runtime use to its mandated boundary outcome.
+///
+/// Total over policy refusals: `Degraded` with a stated fallback routes to
+/// `DegradedCompletion` (the caller may proceed only at the fallback use); a
+/// degraded refusal without a fallback is routed by reason like a denial.
+/// `Denied` routes by reason: unretrievable records and unknown influence
+/// state route to `Unknown`; revoked or quarantined influence and
+/// allowance caps route to `Conflict`; stale evidence, self-report without an
+/// independent route, acceptance scope mismatch, and refusals resolvable by
+/// an explicit qualifying transition route to `Inquiry`. Returns `None` for
+/// non-policy failures, which must fail closed as errors rather than routed
+/// outcomes.
+#[must_use]
+pub fn route_denial(error: &InfluenceRuntimeError) -> Option<DenialRouting> {
+    let (stage, subject, reasons, fallback) = match error {
+        InfluenceRuntimeError::Denied {
+            stage,
+            subject,
+            reasons,
+        } => (*stage, subject.clone(), reasons.clone(), None),
+        InfluenceRuntimeError::Degraded {
+            stage,
+            subject,
+            reasons,
+            fallback,
+        } => (*stage, subject.clone(), reasons.clone(), *fallback),
+        InfluenceRuntimeError::InvalidField(_)
+        | InfluenceRuntimeError::BindingMismatch { .. }
+        | InfluenceRuntimeError::InvalidUseForStage { .. }
+        | InfluenceRuntimeError::Canonicalization => return None,
+    };
+    let route = if fallback.is_some() {
+        DenialRoute::DegradedCompletion
+    } else if reasons.iter().any(|reason| {
+        matches!(
+            reason,
+            RuntimeReason::RecordNotRetrievable
+                | RuntimeReason::InfluenceNotActive {
+                    state: InfluenceState::Unknown,
+                }
+        )
+    }) {
+        DenialRoute::Unknown
+    } else if reasons.iter().any(|reason| {
+        matches!(
+            reason,
+            RuntimeReason::ExploratoryOnlyCannotSatisfyVerifier
+                | RuntimeReason::ExploratoryOnlyCannotSatisfyConfirmatory
+                | RuntimeReason::VerifierRequiresVerificationInput
+                | RuntimeReason::ConfirmatoryRequiresQualification
+                | RuntimeReason::SourceStale { .. }
+                | RuntimeReason::SelfReportRequiresIndependentRoute
+                | RuntimeReason::AcceptanceScopeMismatch
+        )
+    }) {
+        DenialRoute::Inquiry
+    } else {
+        DenialRoute::Conflict
+    };
+    Some(DenialRouting {
+        subject_ref: subject,
+        stage,
+        route,
+        reasons,
+        fallback,
+    })
 }
 
 fn text(value: &str, field: &'static str) -> Result<(), InfluenceError> {

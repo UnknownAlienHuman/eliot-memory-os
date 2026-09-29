@@ -1555,6 +1555,8 @@ impl KernelComposition {
             #[cfg(windows)]
             supervision_lease_authority: supervision_lease_authority.map(Arc::new),
             #[cfg(windows)]
+            kernel_owner: Mutex::new(None),
+            #[cfg(windows)]
             agent_bridge_profile: Mutex::new(None),
             #[cfg(windows)]
             agent_bridge_transition: std::sync::RwLock::new(()),
