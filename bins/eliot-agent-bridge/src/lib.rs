@@ -4913,6 +4913,30 @@ impl BootstrapSnapshot {
         }
         Ok(())
     }
+
+    /// Requires the caller task set to equal the sealed snapshot task set.
+    ///
+    /// The snapshot task set is the exact owner-supplied set noted under the
+    /// live attach seal (handles, revisions, acceptance digests,
+    /// history/crossover flags, scope level, authoritative selection). Every
+    /// sealed delivery composes from that frozen set, so one seal yields one
+    /// task-bound bootstrap: a caller set naming any other task, revision,
+    /// digest, or selection is a changed task set, not a delivery input.
+    /// Change it by re-noting under the live attach; delivery refuses with
+    /// `BOOTSTRAP_TASK_SET_MISMATCH` instead of composing mixed-source
+    /// authority.
+    fn delivery_tasks_match(&self, tasks: &BootstrapTaskInputs) -> Result<(), BootstrapError> {
+        if self.tasks == *tasks {
+            Ok(())
+        } else {
+            Err(BootstrapError {
+                code: "BOOTSTRAP_TASK_SET_MISMATCH",
+                detail:
+                    "caller task set disagrees with the task set sealed in the noted bootstrap snapshot; re-note under the live attach to change it"
+                        .to_owned(),
+            })
+        }
+    }
 }
 
 /// Attaches the route-profiled payload measurement to one sealed bootstrap.
@@ -5798,7 +5822,10 @@ impl BridgeRunner {
     /// Always available, including after the once-per-session auto-boot was
     /// delivered. Requires a noted snapshot and a live attach still equal
     /// to the noted seal; a wrong session, stale fence, or changed
-    /// scope/task binding fails closed instead of projecting `READY`. A
+    /// scope/task binding fails closed instead of projecting `READY`. The
+    /// caller task set must equal the sealed snapshot task set
+    /// (`BOOTSTRAP_TASK_SET_MISMATCH`); the frozen set changes only by
+    /// re-noting under the live attach. A
     /// composed selection that names any task other than the sealed
     /// activation task is refused the same way, so a forged or stale packet
     /// can never retrieve `READY` through this path either.
@@ -5819,6 +5846,7 @@ impl BridgeRunner {
                 detail: "noted bootstrap seal disagrees with the live attach binding".to_owned(),
             });
         };
+        snapshot.delivery_tasks_match(tasks)?;
         let mut bootstrap =
             get_understanding_bootstrap(&snapshot.context, tasks, requested_assessment)?;
         BootstrapSnapshot::selection_matches_sealed_task(&bootstrap, &sealed)?;
@@ -5827,6 +5855,8 @@ impl BridgeRunner {
     }
     /// Previews the one-time bootstrap without marking it delivered. A
     /// response can check its complete frame before consuming the delivery.
+    /// Composes only the sealed snapshot task set; a changed caller set
+    /// yields `None` without consuming the slot.
     pub fn preview_first_response_bootstrap(
         &self,
         tasks: &BootstrapTaskInputs,
@@ -5834,6 +5864,7 @@ impl BridgeRunner {
     ) -> Option<UnderstandingBootstrap> {
         let snapshot = self.bootstrap_snapshot.clone()?;
         let sealed = snapshot.sealed_live_binding(self.attach_view())?;
+        snapshot.delivery_tasks_match(tasks).ok()?;
         let preview =
             get_understanding_bootstrap(&snapshot.context, tasks, requested_assessment).ok()?;
         BootstrapSnapshot::selection_matches_sealed_task(&preview, &sealed).ok()?;
@@ -5851,7 +5882,9 @@ impl BridgeRunner {
     /// noted, or when the live attach moved away from the noted seal;
     /// composition failures also yield `None` without marking delivery
     /// so a later response with complete inputs can still carry the bootstrap.
-    /// A composed selection that names any task other than the sealed
+    /// A caller task set that differs from the sealed snapshot set yields
+    /// `None` the same way, without consuming the once-per-session slot. A
+    /// composed selection that names any task other than the sealed
     /// activation task yields `None` the same way, without consuming the
     /// once-per-session slot, so a forged or stale packet can never
     /// auto-boot `READY` and a later coherent response can still deliver.
@@ -5862,6 +5895,7 @@ impl BridgeRunner {
     ) -> Option<UnderstandingBootstrap> {
         let snapshot = self.bootstrap_snapshot.clone()?;
         let sealed = snapshot.sealed_live_binding(self.attach_view())?;
+        snapshot.delivery_tasks_match(tasks).ok()?;
         let preview =
             get_understanding_bootstrap(&snapshot.context, tasks, requested_assessment).ok()?;
         BootstrapSnapshot::selection_matches_sealed_task(&preview, &sealed).ok()?;
