@@ -474,7 +474,7 @@ def build_preparation_manifest(
 
 
 def preparation_ready(manifest: dict) -> bool:
-    """True only when every profile-required input is ready (TEST-PHASE entrypoint)."""
+    """True only when every profile-required input is ready (production gate predicate)."""
     return bool(manifest.get("ready")) and not manifest.get("missing_inputs")
 
 
