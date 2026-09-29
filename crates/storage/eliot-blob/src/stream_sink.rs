@@ -141,11 +141,19 @@ struct SinkState {
     session: Option<ProcessStreamSinkSession>,
     staged: Vec<u8>,
     digester: Sha256,
+    admitted_chunks: Vec<AdmittedChunk>,
     next_sequence: u64,
     next_offset: u64,
     terminal: Option<ProcessStreamSinkTerminal>,
     terminal_command: Option<ProcessStreamSinkTerminalCommandIdentity>,
     finalizing: Option<ProcessStreamSinkTerminalCommandIdentity>,
+}
+
+struct AdmittedChunk {
+    sequence: u64,
+    offset: u64,
+    length: u64,
+    sha256: String,
 }
 
 enum FinalizeKind {
@@ -174,6 +182,7 @@ impl SinkState {
             session: None,
             staged: Vec::new(),
             digester: Sha256::new(),
+            admitted_chunks: Vec::new(),
             next_sequence: 0,
             next_offset: 0,
             terminal: None,
@@ -337,15 +346,24 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             });
         }
         session.validate_append(request)?;
-        if let Some(covered) = Self::admitted_prefix(state, request.offset(), request.byte_length())
-            && covered == request.bytes()
-        {
-            return Ok(ProcessStreamSinkAppendDisposition::Replayed {
-                next_sequence: state.next_sequence,
-                next_offset: state.next_offset,
-            });
-        }
         if request.sequence() < state.next_sequence {
+            let matches_admitted_chunk = usize::try_from(request.sequence())
+                .ok()
+                .and_then(|index| state.admitted_chunks.get(index))
+                .is_some_and(|chunk| {
+                    chunk.sequence == request.sequence()
+                        && chunk.offset == request.offset()
+                        && chunk.length == request.byte_length()
+                        && chunk.sha256 == request.sha256()
+                        && Self::admitted_prefix(state, chunk.offset, chunk.length)
+                            == Some(request.bytes())
+                });
+            if matches_admitted_chunk {
+                return Ok(ProcessStreamSinkAppendDisposition::Replayed {
+                    next_sequence: state.next_sequence,
+                    next_offset: state.next_offset,
+                });
+            }
             return Err(ProcessStreamSinkError::MismatchedReplay);
         }
         if request.sequence() > state.next_sequence {
@@ -373,7 +391,15 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         }
         // This synchronous adapter has no append queue: each request is
         // admitted as one bounded chunk. The total byte and chunk ceilings
-        // bound staged memory and reject overflow explicitly above.
+        // bound staged memory and reject overflow explicitly above. Since
+        // each admitted sequence adds one record, max_chunks also bounds
+        // this metadata without retaining another plaintext copy.
+        state.admitted_chunks.push(AdmittedChunk {
+            sequence: request.sequence(),
+            offset: request.offset(),
+            length: request.byte_length(),
+            sha256: request.sha256().to_owned(),
+        });
         state.digester.update(request.bytes());
         state.staged.extend_from_slice(request.bytes());
         state.next_sequence = state.next_sequence.saturating_add(1);
