@@ -791,6 +791,43 @@ pub struct KernelComposition {
     pub(crate) diagnostic_brief: Mutex<Option<diagnostic_brief::DiagnosticBrief>>,
 }
 
+/// What one production isolated restore decided about cutover readiness.
+///
+/// The two are separate answers because a qualification refusal is not a
+/// restore failure. An isolated import that completed correctly and is not
+/// yet cutover-qualified is the ordinary safe-partial state, and reporting it
+/// as a restore failure would either hide a completed restore or force the
+/// restore to be gated on cutover evidence it must never require (A13.7
+/// "Cutover requires separate authority"). The refusal is therefore carried
+/// typed and intact rather than flattened into a success or swapped for the
+/// restore's own error.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CutoverReadiness {
+    /// Every qualification gate held for this exact restore. Carries a
+    /// report only: no receipt is minted and nothing is activated, retired,
+    /// or cut over on the strength of it.
+    Qualified(CutoverQualification),
+    /// Cutover qualification refused, with the exact typed reason. The
+    /// restore itself is unaffected and stays observable beside it.
+    Refused(KernelRestoreError),
+}
+
+/// One production isolated restore and the cutover qualification read that
+/// follows it (issue #960).
+///
+/// `outcome` is the journaled phase engine's result exactly as returned, and
+/// `qualification` is the readiness decision for that same outcome. Neither
+/// substitutes for the other: the restore never fails because qualification
+/// refused, and qualification is never reported without the restore it
+/// qualifies.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KernelRestoreCompletion {
+    /// The isolated restore the composition-owned durable ORS journal ran.
+    pub outcome: KernelRestoreOutcome,
+    /// The cutover qualification read over that restore's own owner state.
+    pub qualification: CutoverReadiness,
+}
+
 impl KernelComposition {
     /// Returns the Kernel-owned production restore adapter (issue #960).
     ///
@@ -832,13 +869,40 @@ impl KernelComposition {
     }
 
     /// Runs one isolated restore on the composition-owned durable ORS journal
-    /// (issue #960).
+    /// and then reads back its cutover qualification (issue #960).
     ///
-    /// This is the production entry: the journal is the `RedbRecoveryStore`
-    /// this composition already opened and owns, so a caller cannot substitute
-    /// an in-memory, JSON-file or no-op journal for a production restore, and
-    /// the per-execution journal is built from that owner handle plus the
-    /// Kernel's own live effect fence.
+    /// This is the production entry, and it is the whole call chain a live
+    /// restore uses. Both halves run here, in this order, and neither is
+    /// optional:
+    ///
+    /// 1. the plan is compiled first through the accepted `RestorePlan::compile`
+    ///    seam, so the intent exists before any effect and the qualification
+    ///    below is checked against the very plan the engine executed rather
+    ///    than a second compilation;
+    /// 2. the restore runs on the `RedbRecoveryStore` this composition already
+    ///    opened and owns, so a caller cannot substitute an in-memory,
+    ///    JSON-file or no-op journal for a production restore, and the
+    ///    per-execution journal is built from that owner handle plus the
+    ///    Kernel's own live effect fence;
+    /// 3. cutover qualification then runs over the evidence THIS restore
+    ///    produced — its own receipt, its own observed finalize evidence, and
+    ///    its own destination reopened from the root the engine reported.
+    ///
+    /// Step 3 is a read, not an authorization, and this entry mints nothing:
+    /// the separate owner-issued cutover authority is a parameter the
+    /// owner-channel transport supplies (#961), never a value assembled here.
+    /// A caller with no such authority gets the typed refusal
+    /// [`KernelRestoreError::CutoverNotAuthorized`] rather than a
+    /// manufactured approval, and a rehearsal reaches the same read and is
+    /// refused from the durable rehearsal posture its own destination pinned
+    /// at prepare — nothing here activates, cuts over, or retires a source,
+    /// and no path in this entry routes around that pin.
+    ///
+    /// The restore result and the qualification are returned together and
+    /// cannot be separated: the readiness decision is not droppable, so a
+    /// caller cannot run a production restore and never learn whether the
+    /// isolated root may cut over. The restore's own failure still propagates
+    /// as `Err` and never becomes a readiness answer.
     ///
     /// The owner-channel transport that reaches this entry is #962's frame
     /// arm; until it lands, nothing dispatches here, and no placeholder call
@@ -849,9 +913,45 @@ impl KernelComposition {
         target: eliot_backup::RestoreContext,
         ports: &RestorePorts<'_>,
         identity: &OrsRestoreBinding,
-    ) -> Result<KernelRestoreOutcome, KernelRestoreError> {
-        self.backup_restore
-            .restore_with_ors_journal(&self.p07_ors, bundle, target, ports, identity)
+        cutover_authority: Option<&eliot_backup::CutoverAuthorization>,
+    ) -> Result<KernelRestoreCompletion, KernelRestoreError> {
+        // Intent before effect: the governed plan this restore will execute
+        // is compiled from the same accepted seam the adapter uses, before
+        // the phase engine runs, and the same value is what the qualification
+        // below is bound to. `RestoreContext` is `Clone`, so the restore
+        // still receives its own owned copy and no epoch or generation is
+        // minted to make the two agree.
+        let plan = KernelBackupRestore::compile_plan(bundle, target.clone())?;
+        let outcome = self.backup_restore.restore_with_ors_journal(
+            &self.p07_ors,
+            bundle,
+            target,
+            ports,
+            identity,
+        )?;
+        // The destination is reopened from the root THIS execution reported,
+        // through the accepted existing-destination constructor, so the
+        // qualification reads the admission and rehearsal posture the engine
+        // actually pinned rather than a path or a posture chosen here.
+        let qualification = KernelIsolatedDestination::open_existing(
+            outcome.destination_root.clone(),
+            self.backup_restore.work_root(),
+        )
+        .and_then(|destination| {
+            self.backup_restore.qualify_cutover(
+                &plan,
+                bundle,
+                &outcome.receipt,
+                outcome.evidence.as_ref(),
+                &destination,
+                cutover_authority,
+            )
+        });
+        Ok(KernelRestoreCompletion {
+            outcome,
+            qualification: qualification
+                .map_or_else(CutoverReadiness::Refused, CutoverReadiness::Qualified),
+        })
     }
 }
 

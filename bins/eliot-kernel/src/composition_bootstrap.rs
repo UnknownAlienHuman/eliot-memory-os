@@ -1418,9 +1418,15 @@ impl KernelComposition {
         }
         // Issue #960: hold the Kernel-owned production restore adapter on
         // the composition. The adapter binds the work root only; the durable
-        // journal is injected per execution by production composition (#962),
-        // so no second database is opened here and unrelated Kernel work is
-        // unaffected while no restore executes.
+        // journal is not opened here — the one production entry
+        // (`KernelComposition::backup_restore_with_ors_journal` in `lib.rs`)
+        // supplies the composition's own already-open `p07_ors` handle per
+        // execution, so no second database exists and unrelated Kernel work is
+        // unaffected while no restore executes. That same entry is what runs
+        // the cutover-qualification read over the restore it just performed,
+        // so qualification is reached from the one real production restore
+        // call chain rather than from a separate or parallel path, and this
+        // registration is its only injection point.
         let backup_restore = KernelBackupRestore::bind(work_root.clone());
         // Issue #962 (Writer-D): bind the exact-owner backup channel clients
         // in production assembly and HOLD them on the composition. Both
