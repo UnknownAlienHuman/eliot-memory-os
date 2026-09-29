@@ -2569,6 +2569,34 @@ impl KernelComposition {
         }
     }
 
+    /// Refuses a materially repeated expensive call on unchanged inputs
+    /// without new owner-observed evidence (I7.24 step 5). The retained
+    /// per-route stage is the kernel-owned attempt history; the repeat is
+    /// refused with the existing identity-conflict signal so it is never
+    /// staged as progress. The class derives from the accepted admission
+    /// and a reworded expected delta alone is not progress.
+    fn refuse_staged_local_read_repeat(
+        index: &std::collections::BTreeMap<String, Vec<HostRequestOperationRef>>,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+        admission: &LocalReadAdmission,
+    ) -> Result<(), TransportError> {
+        if let Some(current) =
+            super::tool_exposure::build_tool_call_request(envelope, tool, admission)
+        {
+            let retained = index.values().flatten().filter_map(|candidate| {
+                Some((
+                    candidate.local_read_envelope.as_ref()?,
+                    candidate.local_read_tool.as_ref()?,
+                ))
+            });
+            if super::tool_exposure::staged_repeat_without_progress(retained, &current).is_some() {
+                return Err(TransportError::IdentityConflict);
+            }
+        }
+        Ok(())
+    }
+
     fn enqueue_local_read_pair_under_transition(
         &self,
         envelope: &HostRequestEnvelope,
@@ -2598,26 +2626,9 @@ impl KernelComposition {
             LocalReadReplay::AlreadyStaged => return Ok(()),
             LocalReadReplay::Fresh => {}
         }
-        // I7.24 step 5: a materially repeated expensive call on unchanged
-        // inputs without new owner-observed evidence is a loop/no-progress
-        // signal, not a fresh dispatch. The retained per-route stage above is
-        // the kernel-owned attempt history; the repeat is refused with the
-        // existing identity-conflict signal so it is never staged as
-        // progress. The class derives from the accepted admission and a
-        // reworded expected delta alone is not progress.
-        if let Some(current) =
-            super::tool_exposure::build_tool_call_request(envelope, tool, &admission)
-        {
-            let retained = index.values().flatten().filter_map(|candidate| {
-                Some((
-                    candidate.local_read_envelope.as_ref()?,
-                    candidate.local_read_tool.as_ref()?,
-                ))
-            });
-            if super::tool_exposure::staged_repeat_without_progress(retained, &current).is_some() {
-                return Err(TransportError::IdentityConflict);
-            }
-        }
+        // I7.24 step 5: refuse materially repeated calls with no new
+        // owner-observed evidence before staging them as progress.
+        Self::refuse_staged_local_read_repeat(&index, envelope, tool, &admission)?;
         let queued = index
             .values()
             .flatten()
