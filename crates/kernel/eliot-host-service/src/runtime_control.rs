@@ -882,8 +882,9 @@ fn validate_user_automation_response(
         }
         UserAutomationHostExecutionResponse::WakeRead { .. }
         | UserAutomationHostExecutionResponse::WakeEnumeration { .. }
-        | UserAutomationHostExecutionResponse::WakeCancellationBatchReadback { .. } => Err(
-            "user automation wake readback, cancellation-batch readback, and batch enumeration travel over the authenticated execution transport, never runtime-control"
+        | UserAutomationHostExecutionResponse::WakeCancellationBatchReadback { .. }
+        | UserAutomationHostExecutionResponse::WakeHorizonPublication { .. } => Err(
+            "user automation wake readback, cancellation-batch readback, batch enumeration, and wake-horizon publication travel over the authenticated execution transport, never runtime-control"
                 .to_owned(),
         ),
     }

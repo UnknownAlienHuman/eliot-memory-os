@@ -41,7 +41,8 @@ use super::user_automation_execution::{
     UserAutomationHorizonTrigger, UserAutomationRuntimeAdmission, UserAutomationRuntimeError,
     UserAutomationRuntimePort, UserAutomationWakeCancellation,
     UserAutomationWakeEnumerationReceipt, UserAutomationWakeEnumerationRequest,
-    UserAutomationWakePort, UserAutomationWakeReadRequest, UserAutomationWakeReadback,
+    UserAutomationWakeHorizonPublication, UserAutomationWakePort, UserAutomationWakePublication,
+    UserAutomationWakeReadRequest, UserAutomationWakeReadback,
 };
 use super::user_automation_execution_client::{
     UserAutomationHostExecutionClient, UserAutomationHostExecutionObserver,
@@ -1632,6 +1633,35 @@ impl<T> UserAutomationWakePort for UserAutomationOperatorRuntime<'_, T>
 where
     T: UserAutomationHostExecutionTransport,
 {
+    /// Publishes one bounded recurring horizon through the same authenticated
+    /// Host transport every other owner call on this adapter uses.
+    ///
+    /// This override is load-bearing: the operator route reaches
+    /// `publish_wake_horizon` through the `UserAutomationWakePort` trait on this
+    /// concrete type, so without it the Create/Edit/Resume handoff would resolve
+    /// to the trait default and answer `Unavailable` no matter what the client
+    /// publishes. It forwards to the client's own trait implementation, which is
+    /// bound to the client's single transport, so this adapter adds no second
+    /// transport path and no second wake owner.
+    async fn publish_wake_horizon(
+        &self,
+        request: impl Into<Box<UserAutomationWakeHorizonPublication>>,
+    ) -> Result<UserAutomationWakePublication, UserAutomationRuntimeError> {
+        UserAutomationWakePort::publish_wake_horizon(self.client, request).await
+    }
+
+    /// Reconciles one exact horizon publication with the schedule owner. Like
+    /// the other readbacks here it resolves through the client's trait
+    /// implementation, and it issues no owner effect: a caller that crossed an
+    /// unknown boundary re-presents the same publication identity rather than
+    /// publishing the slice again.
+    async fn read_wake_horizon_publication(
+        &self,
+        request: impl Into<Box<UserAutomationWakeHorizonPublication>>,
+    ) -> Result<UserAutomationWakePublication, UserAutomationRuntimeError> {
+        UserAutomationWakePort::read_wake_horizon_publication(self.client, request).await
+    }
+
     async fn read_pending_wake(
         &self,
         request: impl Into<Box<UserAutomationWakeReadRequest>>,
