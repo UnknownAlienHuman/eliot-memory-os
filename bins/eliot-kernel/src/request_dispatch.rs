@@ -1523,6 +1523,67 @@ fn successor_caller_principal(session: &Session) -> Result<&str, TransportError>
     authenticated_backup_principal(session).map(|(principal, _)| principal)
 }
 
+/// Returns whether the owner re-decides, for the bytes just decoded, exactly the
+/// operation the named predecessor row already holds.
+///
+/// This is the owner half of #2883 instruction 4 and acceptance clause 3, and it
+/// is deliberately a CONTENT comparison over owner-proved values rather than a
+/// check that the presented succession evidence is well formed. The evidence a
+/// successor presents is a pair of digests the predecessor's own `ok` reply
+/// already carried, so a shape-valid pair proves nothing on its own: what makes
+/// the reconciliation an observation of THAT operation is that the capture owner,
+/// re-deciding the presented bytes on this call, lands on the same archive
+/// identity, the same declared source and owner contract, the same export and
+/// archived fence digests, the same evidenced class, the same evidence level and
+/// ceiling, the same publication receipt and the same independent member
+/// denominators that the stored row recorded. Every term compared is one the
+/// owner decides from the ARCHIVE, so it is a function of the bytes rather than
+/// of the verifying session.
+///
+/// The three denominators are counted from the owner's own
+/// [`member_domain_count`] dispositions — an INDEPENDENT expected set derived
+/// from the decoded archive — and compared against the three retained counts.
+/// They are not a coverage comparison of the stored list against a second copy
+/// of the caller's list, and the stored row retains only the counts, never the
+/// member list, so there is nothing to compare twice.
+///
+/// The archived-fence RELATION, its proof qualifier, its restriction tokens and
+/// its contract version are deliberately NOT compared. Those are relations
+/// between the archive's fence and the LIVE verifying target, so they are
+/// historical answer evidence (instruction 7) and a reconciliation read after an
+/// Authority Epoch rotation must still be able to report the relation that was
+/// observed then. Requiring them to match would forbid the rotation replay this
+/// durable row exists to enable. Everything compared here is either the archive
+/// itself or a value inside it.
+///
+/// The row is read back through
+/// [`RedbRecoveryStore::load_backup_verification_result`], which decodes and
+/// validates it through [`BackupVerificationResultRecord::validate`], so the
+/// RECORDED values on the other side of every comparison are the original ones
+/// and the flat/identity drift checks have already run. No digest is recomputed
+/// here to stand in for a recorded one.
+fn owner_reproves_predecessor_operation(
+    report: &CaptureReport,
+    stored: &BackupVerificationResultRecord,
+) -> bool {
+    let Ok(Value::String(class_ceiling)) = serde_json::to_value(report.class_ceiling) else {
+        return false;
+    };
+    report.archive_sha256 == stored.identity.archive_sha256
+        && report.backup_id == stored.backup_id
+        && class_name(report.class) == stored.identity.evidenced_class
+        && report.evidence_level.as_wire_name() == stored.verification_level
+        && class_ceiling == stored.class_ceiling
+        && report.owner_contract == stored.identity.archive_owner_contract
+        && report.source_installation == stored.identity.archive_source_installation
+        && report.export_fence_digest == stored.identity.archive_export_fence_digest
+        && report.archived_state_fence_digest == stored.identity.archived_fence_digest
+        && report.receipt_identity == stored.capture_receipt
+        && member_domain_count(report, MEMBER_DOMAIN_CANONICAL) == stored.event_count
+        && member_domain_count(report, MEMBER_DOMAIN_RECEIPT) == stored.receipt_count
+        && member_domain_count(report, MEMBER_DOMAIN_BLOB) == stored.blob_count
+}
+
 /// Projects the ONE refusal the failed AUTHORIZATION checks on the reconciliation
 /// path answer with (instructions 4, 5, 7 and 8 on that path).
 ///
