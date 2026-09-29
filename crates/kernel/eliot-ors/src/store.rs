@@ -9373,7 +9373,7 @@ impl RedbRecoveryStore {
             table
                 .get(key.as_str())
                 .map_err(storage)?
-                .map(|value| decode(value.value()))
+                .map(|value| decode::<crate::HostRequestRecord>(value.value()))
                 .transpose()?
         }) else {
             return Ok(None);
@@ -9476,7 +9476,7 @@ impl RedbRecoveryStore {
             table
                 .get(key.as_str())
                 .map_err(storage)?
-                .map(|value| decode(value.value()))
+                .map(|value| decode::<crate::HostRequestRecord>(value.value()))
                 .transpose()?
         };
         let Some(mut record) = existing else {
@@ -9554,7 +9554,7 @@ impl RedbRecoveryStore {
             table
                 .get(key.as_str())
                 .map_err(storage)?
-                .map(|value| decode(value.value()))
+                .map(|value| decode::<crate::HostRequestRecord>(value.value()))
                 .transpose()?
         }) else {
             return Ok(None);
@@ -9718,7 +9718,7 @@ impl RedbRecoveryStore {
             table
                 .get(key.as_str())
                 .map_err(storage)?
-                .map(|value| decode(value.value()))
+                .map(|value| decode::<crate::HostRequestRecord>(value.value()))
                 .transpose()?
         };
         let Some(existing) = existing else {

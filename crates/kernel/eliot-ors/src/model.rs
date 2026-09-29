@@ -8135,7 +8135,7 @@ pub(crate) fn validate_digest(value: &str, field: &'static str) -> Result<(), Or
 /// wire-crate edge to durable state.
 pub const MAX_HOST_REQUEST_RESULT_RESPONSE_BYTES: usize = 256 * 1024;
 
-fn validate_result_response(body: &Value) -> Result<(), OrsError> {
+pub(crate) fn validate_result_response(body: &Value) -> Result<(), OrsError> {
     if !body.is_object() {
         return Err(OrsError::InvalidField {
             field: "host_request_result_response",
