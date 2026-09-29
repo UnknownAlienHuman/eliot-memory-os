@@ -1072,16 +1072,40 @@ impl SuspendedProcessCleanup {
     fn disarm(&mut self) {
         self.armed = false;
     }
+
+    fn terminate_and_reap(&mut self) -> bool {
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+
+        if !self.armed || self.process.is_null() {
+            return false;
+        }
+        let _ = unsafe { TerminateProcess(self.process, 0xE1_04) };
+        if unsafe { WaitForSingleObject(self.process, 5_000) } == WAIT_OBJECT_0 {
+            self.armed = false;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[cfg(windows)]
 impl Drop for SuspendedProcessCleanup {
     fn drop(&mut self) {
-        use windows_sys::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
-        if self.armed && !self.process.is_null() {
-            let _ = unsafe { TerminateProcess(self.process, 0xE1_04) };
-            let _ = unsafe { WaitForSingleObject(self.process, 5_000) };
-        }
+        let _ = self.terminate_and_reap();
+    }
+}
+
+#[cfg(windows)]
+fn cleanup_error(
+    cleanup: &mut SuspendedProcessCleanup,
+    original: WindowsAdapterError,
+) -> WindowsAdapterError {
+    if cleanup.terminate_and_reap() {
+        original
+    } else {
+        WindowsAdapterError::Timeout
     }
 }
 
@@ -1354,6 +1378,8 @@ impl SuspendedProcessEvidence {
 pub enum SuspendedValidationError<E> {
     Mechanics(WindowsAdapterError),
     Rejected(E),
+    /// Cleanup could not observe that the still-suspended child was reaped.
+    UnknownOutcome,
 }
 
 #[cfg(windows)]
@@ -1975,23 +2001,37 @@ impl JobChildHandles {
         Ok((exit_code, history))
     }
 
-    fn best_effort_cleanup(&mut self) {
+    fn best_effort_cleanup(&mut self) -> bool {
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
         use windows_sys::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
         if self.terminal {
-            return;
+            return true;
         }
         let _ = unsafe { TerminateProcess(self.process.0, 0xE1_04) };
         let _ = self.job.terminate(0xE1_04);
-        let _ = wait_for_job_empty(self.job.handle, std::time::Duration::from_secs(5));
-        let _ = unsafe { WaitForSingleObject(self.process.0, 5_000) };
-        self.terminal = true;
+        let job_empty =
+            wait_for_job_empty(self.job.handle, std::time::Duration::from_secs(5)).is_ok();
+        let process_reaped = unsafe { WaitForSingleObject(self.process.0, 5_000) } == WAIT_OBJECT_0;
+        self.terminal = job_empty && process_reaped;
+        self.terminal
+    }
+
+    fn cleanup_after_pre_resume_failure(
+        mut self,
+        original: WindowsAdapterError,
+    ) -> WindowsAdapterError {
+        if self.best_effort_cleanup() {
+            original
+        } else {
+            WindowsAdapterError::Timeout
+        }
     }
 }
 
 #[cfg(windows)]
 impl Drop for JobChildHandles {
     fn drop(&mut self) {
-        self.best_effort_cleanup();
+        let _ = self.best_effort_cleanup();
     }
 }
 
@@ -2882,9 +2922,11 @@ impl SuspendedJobChild {
             } else {
                 information.hProcess
             };
+            let mut cleanup_observed = false;
             if !cleanup_process.is_null() {
                 let _ = unsafe { TerminateProcess(cleanup_process, 0xE1_04) };
-                let _ = unsafe { WaitForSingleObject(cleanup_process, 5_000) };
+                cleanup_observed = unsafe { WaitForSingleObject(cleanup_process, 5_000) }
+                    == windows_sys::Win32::Foundation::WAIT_OBJECT_0;
                 if cleanup_process != information.hProcess {
                     unsafe { CloseHandle(cleanup_process) };
                 }
@@ -2895,7 +2937,11 @@ impl SuspendedJobChild {
             if !information.hProcess.is_null() {
                 unsafe { CloseHandle(information.hProcess) };
             }
-            return Err(WindowsAdapterError::Failed);
+            return Err(if cleanup_observed {
+                WindowsAdapterError::Failed
+            } else {
+                WindowsAdapterError::Timeout
+            });
         }
         // Parent keeps only the read sides. When the admitted launch carried a
         // one-shot request line it is written to the child's stdin first;
@@ -2908,15 +2954,28 @@ impl SuspendedJobChild {
         drop(stdin_write);
         drop(stdout_write);
         drop(stderr_write);
-        let process = OwnedProcessHandle::new(information.hProcess)?;
-        let thread = OwnedProcessHandle::new(information.hThread)?;
         let mut cleanup = SuspendedProcessCleanup {
-            process: process.0,
+            process: information.hProcess,
             armed: true,
         };
-        stdin_delivery?;
-        let spawn_identity = inspect_process_handle(information.dwProcessId, process.0)
-            .map_err(|error| windows_adapter_from_io(&error))?;
+        let process = match OwnedProcessHandle::new(information.hProcess) {
+            Ok(process) => process,
+            Err(error) => return Err(cleanup_error(&mut cleanup, error)),
+        };
+        let thread = match OwnedProcessHandle::new(information.hThread) {
+            Ok(thread) => thread,
+            Err(error) => return Err(cleanup_error(&mut cleanup, error)),
+        };
+        if let Err(error) = stdin_delivery {
+            return Err(cleanup_error(&mut cleanup, error));
+        }
+        let spawn_identity =
+            match inspect_process_handle(information.dwProcessId, information.hProcess) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    return Err(cleanup_error(&mut cleanup, windows_adapter_from_io(&error)));
+                }
+            };
         let inner = JobChildHandles {
             process,
             thread,
@@ -2932,31 +2991,37 @@ impl SuspendedJobChild {
             terminal: false,
         };
         cleanup.disarm();
-        inner.job.assign_process_handle(inner.process.0)?;
-        inner
-            .observer
-            .capture_pid(inner.spawn_identity.process_id)?;
-        if !inner
-            .job
-            .contains_process(inner.spawn_identity.process_id)?
-            || !is_process_in_job(inner.process.0, inner.job.handle)?
-        {
-            return Err(WindowsAdapterError::IdentityMismatch);
-        }
-        if let Some(outer_job) = required_outer_job
-            && !is_process_in_job(inner.process.0, outer_job.handle.0)?
-        {
-            return Err(WindowsAdapterError::IdentityMismatch);
-        }
-        let observed_file = file_identity(Path::new(&inner.spawn_identity.image_path))
-            .map_err(|error| windows_adapter_from_io(&error))?;
-        if observed_file != inner.executable.identity
-            || !same_windows_path(
-                &inner.spawn_identity.image_path,
-                &inner.spec.executable.to_string_lossy(),
-            )
-        {
-            return Err(WindowsAdapterError::IdentityMismatch);
+        let post_create = (|| {
+            inner.job.assign_process_handle(inner.process.0)?;
+            inner
+                .observer
+                .capture_pid(inner.spawn_identity.process_id)?;
+            if !inner
+                .job
+                .contains_process(inner.spawn_identity.process_id)?
+                || !is_process_in_job(inner.process.0, inner.job.handle)?
+            {
+                return Err(WindowsAdapterError::IdentityMismatch);
+            }
+            if let Some(outer_job) = required_outer_job
+                && !is_process_in_job(inner.process.0, outer_job.handle.0)?
+            {
+                return Err(WindowsAdapterError::IdentityMismatch);
+            }
+            let observed_file = file_identity(Path::new(&inner.spawn_identity.image_path))
+                .map_err(|error| windows_adapter_from_io(&error))?;
+            if observed_file != inner.executable.identity
+                || !same_windows_path(
+                    &inner.spawn_identity.image_path,
+                    &inner.spec.executable.to_string_lossy(),
+                )
+            {
+                return Err(WindowsAdapterError::IdentityMismatch);
+            }
+            Ok(())
+        })();
+        if let Err(error) = post_create {
+            return Err(inner.cleanup_after_pre_resume_failure(error));
         }
         Ok(Self { inner })
     }
@@ -2971,8 +3036,9 @@ impl SuspendedJobChild {
     ///
     /// # Errors
     /// Returns `Mechanics` for failed retained-handle validation or `Rejected`
-    /// with the caller's own policy/permit error. Either path kills and reaps
-    /// the full Job before the error escapes.
+    /// with the caller's own policy/permit error when cleanup is observed.
+    /// `UnknownOutcome` preserves the attempt when termination cannot be
+    /// observed for the still-suspended process and its Job.
     pub fn validate<V, E, F>(
         mut self,
         validator: F,
@@ -2983,15 +3049,21 @@ impl SuspendedJobChild {
         let evidence = match self.inner.fresh_evidence() {
             Ok(evidence) => evidence,
             Err(error) => {
-                self.inner.best_effort_cleanup();
-                return Err(SuspendedValidationError::Mechanics(error));
+                return Err(if self.inner.best_effort_cleanup() {
+                    SuspendedValidationError::Mechanics(error)
+                } else {
+                    SuspendedValidationError::UnknownOutcome
+                });
             }
         };
         let validation = match validator(&evidence) {
             Ok(validation) => validation,
             Err(error) => {
-                self.inner.best_effort_cleanup();
-                return Err(SuspendedValidationError::Rejected(error));
+                return Err(if self.inner.best_effort_cleanup() {
+                    SuspendedValidationError::Rejected(error)
+                } else {
+                    SuspendedValidationError::UnknownOutcome
+                });
             }
         };
         Ok(ValidatedSuspendedJobChild {
@@ -3031,8 +3103,11 @@ impl<V> ValidatedSuspendedJobChild<V> {
         use windows_sys::Win32::System::Threading::ResumeThread;
         if unsafe { ResumeThread(self.inner.thread.0) } == u32::MAX {
             let error = last_windows_adapter_error();
-            self.inner.best_effort_cleanup();
-            return Err(error);
+            return Err(if self.inner.best_effort_cleanup() {
+                error
+            } else {
+                WindowsAdapterError::Timeout
+            });
         }
         Ok(RunningJobChild {
             inner: self.inner,

@@ -43,7 +43,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use eliot_platform_windows::{
     JobObjectIdentity, JobObjectLimits, RecoverableJobBinding, RunningJobChild,
     RunningJobObservation, SuspendedJobChild, SuspendedLaunchSpec, SuspendedProcessEvidence,
-    SuspendedValidationError, TerminatedJobChild, cancel_capture_thread_io,
+    SuspendedValidationError, TerminatedJobChild, WindowsAdapterError, cancel_capture_thread_io,
 };
 
 #[cfg(windows)]
@@ -2087,10 +2087,17 @@ impl WindowsProcessExecutor {
                 SuspendedJobChild::spawn_nested_in_kernel_outer_kill_domain(
                     spec, job_name, limits, binding,
                 )
-                .map_err(unavailable)?
+                .map_err(|error| match error {
+                    WindowsAdapterError::Timeout => ProcessExecutionError::UnknownOutcome,
+                    error => unavailable(error),
+                })?
             } else {
-                SuspendedJobChild::spawn_named_with_limits(spec, job_name, limits)
-                    .map_err(unavailable)?
+                SuspendedJobChild::spawn_named_with_limits(spec, job_name, limits).map_err(
+                    |error| match error {
+                        WindowsAdapterError::Timeout => ProcessExecutionError::UnknownOutcome,
+                        error => unavailable(error),
+                    },
+                )?
             };
 
             // Issue-84 start state machine: `SuspendedLaunch` (above) →
@@ -2135,7 +2142,10 @@ impl WindowsProcessExecutor {
             // `Resumed`: resume must precede stream-capture ownership — the
             // stdout/stderr read handles live on `RunningJobChild` and can
             // only be taken after `resume()`.
-            let mut running = validated.resume().map_err(unavailable)?;
+            let mut running = validated.resume().map_err(|error| match error {
+                WindowsAdapterError::Timeout => ProcessExecutionError::UnknownOutcome,
+                error => unavailable(error),
+            })?;
             start_phase = StartPhase::Resumed;
             let now = now_ms();
             state.mark_resumed(
@@ -2804,6 +2814,7 @@ fn validation_error<E: std::fmt::Display>(
     match error {
         SuspendedValidationError::Mechanics(error) => unavailable(error),
         SuspendedValidationError::Rejected(error) => unavailable(error),
+        SuspendedValidationError::UnknownOutcome => ProcessExecutionError::UnknownOutcome,
     }
 }
 
