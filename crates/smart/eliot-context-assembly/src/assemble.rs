@@ -122,6 +122,11 @@ where
         }
         return Err(error.into());
     }
+    // W5/W6: one readiness rule at every consumer. `quality.validate()` above
+    // stayed structural integrity; this is the separate operation-scoped
+    // suitability check, and the COMPLETE scorecard travels with the refusal so
+    // every failed and unknown result survives. An incomplete compilation is
+    // therefore never replaced by a fabricated successful Active View.
     if quality.suitability(QualityOperation::Compile, &[]).is_err() {
         return Err(AssemblyError::QualityIncomplete(Box::new(quality)));
     }
@@ -136,6 +141,17 @@ where
         &recipe.recipe_sha256,
         &expected_fence_digest,
         &rendered,
+    )?;
+    // W4/A4: the scorecard's own membership and recipe content is compared
+    // against THIS packet, whose admitted set, rendered payload, serializer and
+    // route are derived independently. A scorecard swapped between two
+    // same-fence packets with different membership or recipes is rejected here.
+    check_grades_this_output(
+        &quality,
+        recipe,
+        admitted,
+        &output_digest,
+        policy,
     )?;
     let final_bytes =
         u64::try_from(bytes.len()).map_err(|_| AssemblyError::Contract(ContextError::Overflow))?;
@@ -181,6 +197,60 @@ where
         admitted: admitted.clone(),
         serialized_bytes: bytes,
     })
+}
+
+/// Check that the scorecard's own binding content describes THIS packet.
+///
+/// W4/A4: every expected value is derived from the packet — its recipe, its
+/// admitted set, its rendered payload, the serializer and route it was produced
+/// through and its omission handles — never from the scorecard. Comparing the
+/// packet against itself, or checking that a digest field is non-empty, would
+/// prove nothing and could not detect a swap.
+fn check_grades_this_output(
+    quality: &QualityScorecard,
+    recipe: &ContextRecipe,
+    admitted: &AdmittedContextSet,
+    output_digest: &str,
+    policy: &AssemblyPolicy,
+) -> Result<(), AssemblyError> {
+    quality
+        .grades_output(
+            &recipe.recipe_sha256,
+            &admitted.canonical_payload_digest()?,
+            output_digest,
+            &policy.serializer_id,
+            &policy.route_id,
+            &omission_handles(admitted),
+        )
+        .map_err(AssemblyError::Contract)
+}
+
+/// Check one requested dependent decision or effect of an assembled packet.
+///
+/// W5/W6: this is the actual admission/effect consumer of the scorecard, and
+/// it applies the SAME rule as assembly and as a direct View reader — one
+/// readiness rule, not one per consumer. The typed refusal travels with the
+/// error naming the requested operation and the exact missing/stale/unknown
+/// evidence, so a caller never collapses it into a generic quality error.
+/// Results that do not gate this operation are returned as informational
+/// limitations rather than refusals, so unrelated safe work is not disabled.
+pub fn check_suitability(
+    view: &ActiveUnderstandingView,
+    operation: QualityOperation,
+    additional_required: &[eliot_context_contracts::QualityDimension],
+) -> Result<Vec<eliot_context_contracts::QualityDimensionResult>, AssemblyError> {
+    view.suitability(operation, additional_required)
+        .map_err(|refusal| AssemblyError::OperationBlocked(Box::new(refusal)))
+}
+
+/// Exact omission handles covering every displaced member of this admitted set.
+fn omission_handles(admitted: &AdmittedContextSet) -> Vec<eliot_contracts::ArtifactId> {
+    admitted
+        .economy
+        .omissions
+        .iter()
+        .filter_map(|omission| omission.expansion.as_ref().map(|handle| handle.handle_id.clone()))
+        .collect()
 }
 
 fn preflight(

@@ -271,7 +271,11 @@ fn refresh_economy_receipt(value: &mut AdmittedContextSet) {
         eliot_context_contracts::canonical_digest(&unsigned).expect("economy receipt");
 }
 
-fn quality(context: &ContextBinding) -> QualityScorecard {
+fn quality(
+    context: &ContextBinding,
+    admitted: &AdmittedContextSet,
+    recipe: &ContextRecipe,
+) -> QualityScorecard {
     let dimensions = [
         QualityDimension::AcceptanceDecisionCoverage,
         QualityDimension::CausalOperationalSufficiency,
@@ -286,17 +290,65 @@ fn quality(context: &ContextBinding) -> QualityScorecard {
         QualityDimension::KnownOmissionsExpansionPaths,
         QualityDimension::TelemetryMeasurementCostCoverage,
     ];
+    let fence_digest =
+        eliot_context_contracts::canonical_fence_digest(&context.state_fence).expect("fence digest");
+    // The rendered set is the admitted set projected with the crate's stable
+    // role/provider/atom ordering, exactly as assembly renders it.
+    let mut rendered: Vec<RenderedAtom> = admitted
+        .records
+        .iter()
+        .map(RenderedAtom::from_admitted)
+        .collect();
+    rendered.sort_by(|left, right| {
+        left.role
+            .cmp(&right.role)
+            .then_with(|| left.provider.cmp(&right.provider))
+            .then_with(|| left.atom_id.cmp(&right.atom_id))
+    });
+    let rendered_payload_digest = ActiveUnderstandingView::canonical_output_digest(
+        context,
+        &recipe.recipe_sha256,
+        &fence_digest,
+        &rendered,
+    )
+    .expect("rendered payload digest");
     QualityScorecard {
         binding: context.clone(),
+        output: QualityScorecardBinding {
+            recipe_digest: recipe.recipe_sha256.clone(),
+            admitted_set_digest: admitted.canonical_payload_digest().expect("admitted digest"),
+            rendered_payload_digest,
+            serializer_id: "fixture-serde-v1".to_owned(),
+            route_id: "route".to_owned(),
+            evidence_revisions: Vec::new(),
+            omission_handles: admitted
+                .economy
+                .omissions
+                .iter()
+                .filter_map(|omission| {
+                    omission.expansion.as_ref().map(|handle| handle.handle_id.clone())
+                })
+                .collect(),
+        },
         results: dimensions
             .into_iter()
             .map(|dimension| QualityDimensionResult {
                 dimension,
                 state: QualityDimensionState::Passed,
+                required_evidence: vec![id("quality-evidence")],
                 evidence: vec![id("quality-evidence")],
                 measurements: Vec::new(),
+                missing_evidence: Vec::new(),
+                stale_evidence: Vec::new(),
                 failed_invariant: None,
                 unknown_evidence: Vec::new(),
+                applicability: QualityApplicability::Resolved,
+                rule: QualityRuleRevision {
+                    recipe_revision: recipe.decision.recipe_revision,
+                    recipe_digest: recipe.recipe_sha256.clone(),
+                    profile_revision: "fixture-profile".to_owned(),
+                },
+                limitation: None,
                 proof_ceiling: ProofCeiling::Observation,
                 invalidation: None,
                 binding: context.clone(),
@@ -464,7 +516,7 @@ fn assemble_marked_1864(
     assemble_active_view_with_learning(
         value,
         &recipe(&context),
-        quality(&context),
+        quality(&context, &value, &recipe(&context)),
         &policy_for(&context, 100_000),
         |bytes| Ok(measurement(&context, bytes)),
         presented_1864(
@@ -531,7 +583,7 @@ fn expired_overlay_revision_refuses_later_delivery_and_plain_projection_survives
     let view = assemble_active_view(
         &plain,
         &recipe(&context),
-        quality(&context),
+        quality(&context, &plain, &recipe(&context)),
         &policy_for(&context, 100_000),
         |bytes| Ok(measurement(&context, bytes)),
     )

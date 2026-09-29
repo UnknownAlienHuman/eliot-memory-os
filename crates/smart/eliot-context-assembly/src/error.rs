@@ -21,4 +21,13 @@ pub enum AssemblyError {
     /// Quality evidence cannot support a complete projection.
     #[error("quality evidence cannot support a complete projection")]
     QualityIncomplete(Box<eliot_context_contracts::QualityScorecard>),
+    /// A requested operation is blocked, with the typed refusal naming the
+    /// operation and the exact missing evidence.
+    ///
+    /// W6: the typed detail travels with the refusal instead of being
+    /// collapsed into the generic quality error above, so a caller can read the
+    /// requested operation, the blocking dimension results and their exact
+    /// missing/stale/unknown evidence without re-deriving them.
+    #[error("operation blocked by named quality dimensions: {0:?}")]
+    OperationBlocked(Box<eliot_context_contracts::QualityRefusal>),
 }

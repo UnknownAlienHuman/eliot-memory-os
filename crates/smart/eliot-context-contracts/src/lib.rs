@@ -67,6 +67,9 @@ pub use economy::{ContextEconomyReceipt, EconomyAllocations};
 pub use error::{
     ContextError, ContextErrorCode, ContextOutcome, DecisionContextIncomplete, ProviderRoleGap,
 };
+/// Re-exported so a consumer of these contracts can name the exact ceiling a
+/// contract field carries without taking a direct `eliot-receipts` dependency.
+pub use eliot_receipts::ProofCeiling;
 pub use identity::{
     CONTEXT_CONTRACT_NAME, CONTEXT_CONTRACT_VERSION, ContextBinding, DecisionRevision,
     ProofBinding, ProviderId, ProviderRole, SemanticRole, SourceSnapshot,
@@ -80,8 +83,9 @@ pub use measurement::{
 };
 pub use omission::{ExpansionHandle, NonRecoverableReason, OmissionReason, OmissionRecord};
 pub use quality::{
-    QUALITY_DIMENSIONS, QualityDimension, QualityDimensionResult, QualityDimensionState,
-    QualityOperation, QualityRefusal, QualityRefusalKind, QualityScorecard,
+    QUALITY_DIMENSIONS, QualityApplicability, QualityDimension, QualityDimensionResult,
+    QualityDimensionState, QualityMissingEvidence, QualityOperation, QualityRefusal,
+    QualityRefusalKind, QualityRuleRevision, QualityScorecard, QualityScorecardBinding,
 };
 pub use reactive_attention::{
     AttentionAcknowledgement, AttentionInfluence, AttentionOwnerClosure, AttentionResolution,

@@ -26,9 +26,11 @@ mod learning_gate;
 mod measurement;
 mod readback;
 mod render;
+mod scorecard;
 
 pub use assemble::{
     ASSEMBLY_ORDERING_REVISION, ActiveUnderstandingViewResult, AssemblyPolicy, assemble_active_view,
+    check_suitability,
 };
 pub use cite::project_citation;
 pub use error::AssemblyError;
@@ -36,9 +38,14 @@ pub use error::AssemblyError;
 pub use learning_gate::assemble_active_view_with_learning;
 pub use measurement::assemble_active_view_with_measurement;
 pub use readback::{ReopenedSource, gate_citation};
+pub use scorecard::{
+    QualityApplicabilityInput, QualityCompilationEvidence, QualityOutputBindingInput,
+    QualityRoleRequirement, build_scorecard,
+};
 
 pub use eliot_context_contracts::{
     ActiveUnderstandingView, AdmittedContextSet, ContextError, ContextOutcome, IndexPreview,
-    PreviewAuthority, ProjectedCitation, QualityScorecard, ReadbackRefusal, ReadbackRefusalKind,
-    ReadbackRequest, RenderedAtom, SelectionIntegrityProof, SerializedContextMeasurement,
+    PreviewAuthority, ProjectedCitation, QualityRefusal, QualityRefusalKind, QualityScorecard,
+    ReadbackRefusal, ReadbackRefusalKind, ReadbackRequest, RenderedAtom, SelectionIntegrityProof,
+    SerializedContextMeasurement,
 };

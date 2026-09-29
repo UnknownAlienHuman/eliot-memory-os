@@ -2305,10 +2305,20 @@ fn passing_dimension_result(
     QualityDimensionResult {
         dimension,
         state: QualityDimensionState::Passed,
+        required_evidence: vec![id(evidence)],
         evidence: vec![id(evidence)],
         measurements: Vec::new(),
+        missing_evidence: Vec::new(),
+        stale_evidence: Vec::new(),
         failed_invariant: None,
         unknown_evidence: Vec::new(),
+        applicability: QualityApplicability::Resolved,
+        rule: QualityRuleRevision {
+            recipe_revision: TaskRevision::new(0).expect("recipe revision"),
+            recipe_digest: "a".repeat(64),
+            profile_revision: "test-profile".to_owned(),
+        },
+        limitation: None,
         proof_ceiling: ProofCeiling::Observation,
         invalidation: None,
         binding: context.clone(),
@@ -2326,6 +2336,15 @@ fn full_quality_scorecard(context: &ContextBinding) -> QualityScorecard {
         .collect();
     QualityScorecard {
         binding: context.clone(),
+        output: QualityScorecardBinding {
+            recipe_digest: "a".repeat(64),
+            admitted_set_digest: "b".repeat(64),
+            rendered_payload_digest: "c".repeat(64),
+            serializer_id: "test-serializer".to_owned(),
+            route_id: "test-route".to_owned(),
+            evidence_revisions: Vec::new(),
+            omission_handles: Vec::new(),
+        },
         results,
     }
 }

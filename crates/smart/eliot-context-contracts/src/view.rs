@@ -238,6 +238,7 @@ impl ActiveUnderstandingView {
         if self.binding != admitted.binding {
             return Err(ContextError::InvalidFence);
         }
+        self.grades_this_output(admitted, &self.measurement.serializer_id, &self.measurement.route_id)?;
         let expected_omissions: BTreeSet<_> = admitted.economy.displaced.iter().cloned().collect();
         let actual_omissions: BTreeSet<_> =
             self.selection.omission_evidence.iter().cloned().collect();
@@ -287,6 +288,53 @@ impl ActiveUnderstandingView {
             }
         }
         Ok(())
+    }
+
+    /// A4: this view's own scorecard describes THIS view's output.
+    ///
+    /// The expected values are derived from the view, the admitted set and the
+    /// exact measurement this view carries, never from the scorecard, so a
+    /// scorecard swapped between two same-fence packets with different
+    /// membership or recipes is rejected.
+    pub fn grades_this_output(
+        &self,
+        admitted: &AdmittedContextSet,
+        serializer_id: &str,
+        route_id: &str,
+    ) -> Result<(), ContextError> {
+        let omission_handles: Vec<ArtifactId> = admitted
+            .economy
+            .omissions
+            .iter()
+            .filter_map(|omission| omission.expansion.as_ref().map(|handle| handle.handle_id.clone()))
+            .collect();
+        self.quality.grades_output(
+            &self.recipe_digest,
+            &admitted.canonical_payload_digest()?,
+            &self.output_digest,
+            serializer_id,
+            route_id,
+            &omission_handles,
+        )
+    }
+
+    /// Check suitability of this view for one requested operation.
+    ///
+    /// W5/A7: `validate` stays structural integrity and this is the ONE
+    /// readiness rule every consumer shares — a direct View reader and the
+    /// assembly path both call it, so neither can bypass it. A deserialized
+    /// view cannot skip the check either: it is the same method on the same
+    /// typed refusal, and a passed scorecard still grants no authority, no
+    /// action readiness and no task Finish.
+    pub fn suitability(
+        &self,
+        operation: crate::QualityOperation,
+        additional_required: &[crate::QualityDimension],
+    ) -> Result<Vec<crate::QualityDimensionResult>, crate::QualityRefusal> {
+        match self.quality.suitability(operation, additional_required) {
+            Ok(()) => Ok(self.quality.informational(operation)),
+            Err(refusal) => Err(refusal),
+        }
     }
 
     /// Detect any post-assembly mutation or injected non-admitted content.

@@ -58,10 +58,10 @@
 use std::collections::BTreeMap;
 
 use eliot_context_contracts::{
-    ContextBinding, QUALITY_DIMENSIONS, QualityDimension, QualityDimensionResult,
-    QualityDimensionState, QualityScorecard,
+    ContextBinding, QUALITY_DIMENSIONS, QualityApplicability, QualityDimension,
+    QualityDimensionResult, QualityDimensionState, QualityRuleRevision, QualityScorecard,
 };
-use eliot_contracts::ArtifactId;
+use eliot_contracts::{ArtifactId, TaskRevision};
 use eliot_dreamer_failure::{
     IdentityRelation, IncompleteReason, MatchEvidence, NegativeMemoryActionPolicy,
     NegativeMemoryDisposition, NegativeMemoryFingerprint, NegativeMemoryHorizonRelation,
@@ -966,24 +966,37 @@ fn negative_memory_loss_token(
     )
 }
 
+/// Exact identity of one governing negative-memory rule.
+///
+/// The record, its revision and its digest together name the rule, so two
+/// different rules can never collapse to one member of the coverage roster.
+fn governing_rule_identity(
+    rule: &AdmittedNegativeMemoryRule,
+) -> Result<ArtifactId, NegativeMemoryExposureError> {
+    ArtifactId::new(std::format!(
+        "negative-memory-rule:{}:{}:{}",
+        rule.record_id, rule.rule_revision, rule.record_digest
+    ))
+    .map_err(|_| NegativeMemoryExposureError::InvalidField("quality.evidence"))
+}
+
 /// Builds the one negative-memory coverage result for a projection.
 fn negative_memory_coverage_result(
     projection: &NegativeMemoryRuleProjection,
     scorecard: &QualityScorecard,
     binding: &ContextBinding,
 ) -> Result<QualityDimensionResult, NegativeMemoryExposureError> {
-    let mut evidence: Vec<ArtifactId> = Vec::new();
-    for rule in projection.governing_rules() {
-        evidence.push(
-            ArtifactId::new(std::format!(
-                "negative-memory-rule:{}:{}:{}",
-                rule.record_id,
-                rule.rule_revision,
-                rule.record_digest
-            ))
-            .map_err(|_| NegativeMemoryExposureError::InvalidField("quality.evidence"))?,
-        );
-    }
+    // The exposure roster is the one independent member set here: the
+    // governing rules the projection actually exposed. It is built once and
+    // serves as both the required set and the observed set, so an observed
+    // member can never stand in for one that is not covered and the coverage
+    // comparison stays a real one.
+    let roster: Vec<ArtifactId> = projection
+        .governing_rules()
+        .into_iter()
+        .map(governing_rule_identity)
+        .collect::<Result<Vec<_>, _>>()?;
+    let evidence = roster.clone();
     let mut unknown_evidence: Vec<ArtifactId> = Vec::new();
     for loss in &projection.losses {
         unknown_evidence.push(
@@ -1018,13 +1031,42 @@ fn negative_memory_coverage_result(
         QualityDimensionState::Unknown
     };
 
+    // The governing rule requires every named exposure to be covered; a rule
+    // revision absent from the exposure is an unresolved applicability, which
+    // blocks the dependent action rather than resolving to a weaker profile.
+    let applicability = if projection.evidence.rule_set_revision.is_empty() {
+        QualityApplicability::Unknown {
+            unresolved: "negative-memory: rule_set_revision is unresolved".to_owned(),
+        }
+    } else {
+        QualityApplicability::Resolved
+    };
+
     let result = QualityDimensionResult {
         dimension: QualityDimension::NegativeMemoryInvariantCoverage,
         state,
+        required_evidence: roster,
         evidence,
         measurements: Vec::new(),
+        missing_evidence: Vec::new(),
+        stale_evidence: Vec::new(),
         failed_invariant: None,
         unknown_evidence,
+        applicability,
+        rule: QualityRuleRevision {
+            recipe_revision: TaskRevision::new(0).map_err(|_| {
+                NegativeMemoryExposureError::InvalidField("quality.rule.recipe_revision")
+            })?,
+            recipe_digest: scorecard.output.recipe_digest.clone(),
+            profile_revision: projection.evidence.rule_set_revision.clone(),
+        },
+        limitation: (!projection.losses.is_empty()).then(|| {
+            std::format!(
+                "negative-memory exposure carries {} named loss(es) against read {}",
+                projection.losses.len(),
+                projection.evidence.read_handle
+            )
+        }),
         proof_ceiling: ProofCeiling::ScopedVerification,
         invalidation: None,
         binding: binding.clone(),
@@ -1034,10 +1076,12 @@ fn negative_memory_coverage_result(
     // exposes no per-axis validator, so the check is the owner's own card
     // validation over a card whose negative-memory axis is exactly this result.
     // It cannot pass vacuously: the owner's validator requires a `Passed` axis
-    // to carry observed evidence and no unknown evidence, and a failed, unknown
-    // or degraded axis to name its failed invariant or unknown evidence.
+    // to cover its independent required member set, carry no unknown evidence
+    // and resolve its applicability, and a failed, unknown or degraded axis to
+    // name its failed invariant or unknown evidence.
     let mut probe = QualityScorecard {
         binding: binding.clone(),
+        output: scorecard.output.clone(),
         results: scorecard.results.clone(),
     };
     if let Some(axis) = probe

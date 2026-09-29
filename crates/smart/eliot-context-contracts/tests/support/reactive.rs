@@ -9,15 +9,16 @@ use eliot_context_contracts::{
     CoverageEvidence, CoverageFreshness, CriticalAttentionMember, DecisionSafetyFloor,
     IntegrationCoverageProfile, LossPolicy, MeasurementRef, MeasurementStatus,
     PriorDeliveryBinding, PrivacyClass, ProofBinding, ProviderDisposition, ProviderId,
-    ProviderRole, ProviderRoleDenominator, QualityDimension, QualityDimensionResult,
-    QualityDimensionState, QualityScorecard, ReactiveDeliveryMode, SafetyFloorMember, SemanticRole,
+    ProviderRole, ProviderRoleDenominator, QualityApplicability, QualityDimension,
+    QualityDimensionResult, QualityDimensionState, QualityRuleRevision, QualityScorecard,
+    QualityScorecardBinding, ReactiveDeliveryMode, SafetyFloorMember, SemanticRole,
     SerializedContextMeasurement, SessionDeliverySnapshot, SnapshotCompleteness,
     SnapshotDenominator, SourceSnapshot,
 };
 use eliot_contracts::{
     ArtifactId, ClockReading, ContractId, ContractIdentity, ContractVersion, EpochId,
     EpochLineageId, OperationId, ProductId, RequestId, ResourceGeneration, SessionId, SourceId,
-    StateFence, TaskId, TransactionSequence, canonical_json_bytes,
+    StateFence, TaskId, TaskRevision, TransactionSequence, canonical_json_bytes,
 };
 use eliot_evidence::{
     Assertability, EpistemicStatus, EvidenceAuthority, EvidenceCoverage, EvidenceEnvelope,
@@ -127,15 +128,34 @@ fn quality(binding: &ContextBinding) -> QualityScorecard {
     ];
     QualityScorecard {
         binding: binding.clone(),
+        output: QualityScorecardBinding {
+            recipe_digest: "a".repeat(64),
+            admitted_set_digest: "b".repeat(64),
+            rendered_payload_digest: "c".repeat(64),
+            serializer_id: "test-serializer".to_owned(),
+            route_id: "test-route".to_owned(),
+            evidence_revisions: Vec::new(),
+            omission_handles: Vec::new(),
+        },
         results: dimensions
             .into_iter()
             .map(|dimension| QualityDimensionResult {
                 dimension,
                 state: QualityDimensionState::Passed,
+                required_evidence: vec![id("quality-evidence")],
                 evidence: vec![id("quality-evidence")],
                 measurements: Vec::new(),
+                missing_evidence: Vec::new(),
+                stale_evidence: Vec::new(),
                 failed_invariant: None,
                 unknown_evidence: Vec::new(),
+                applicability: QualityApplicability::Resolved,
+                rule: QualityRuleRevision {
+                    recipe_revision: TaskRevision::new(0).expect("recipe revision"),
+                    recipe_digest: "a".repeat(64),
+                    profile_revision: "test-profile".to_owned(),
+                },
+                limitation: None,
                 proof_ceiling: ProofCeiling::Observation,
                 invalidation: None,
                 binding: binding.clone(),
