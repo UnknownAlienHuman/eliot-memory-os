@@ -1319,9 +1319,7 @@ impl HumanAttentionClaimKind {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", tag = "kind")]
 pub enum HumanAttentionClaimBasis {
     /// A descriptive record is useful on its own and asserts no difference.
-    Descriptive {
-        observation_window_ref: ContractId,
-    },
+    Descriptive { observation_window_ref: ContractId },
     /// A comparative claim, conditional on the declared matched or paired
     /// profile and on the task-risk and exposure context it applies to.
     Comparative {
@@ -1410,13 +1408,15 @@ impl HumanAttentionClaim {
                     caveats,
                 },
                 kind,
-            ) => self.validate_comparative(
-                kind,
-                matched_profile_ref,
-                applicability,
-                caveats,
-                method,
-            ),
+            ) => {
+                self.validate_comparative(
+                    kind,
+                    matched_profile_ref,
+                    applicability,
+                    caveats,
+                    method,
+                )?;
+            }
             _ => {
                 return Err(EvaluationContractError::EvidenceState {
                     field: "human_attention.claim.basis",
@@ -1441,7 +1441,10 @@ impl HumanAttentionClaim {
                 reason: "a comparator profile does not make a description a difference",
             });
         }
-        text(matched_profile_ref, "human_attention.claim.basis.matched_profile_ref")?;
+        text(
+            matched_profile_ref,
+            "human_attention.claim.basis.matched_profile_ref",
+        )?;
         if matches!(
             method.comparison_basis,
             ComparisonBasis::None | ComparisonBasis::NotApplicableWithReason
@@ -1490,7 +1493,10 @@ impl HumanAttentionClaim {
                     field: "human_attention.claim.basis.caveats",
                 });
             }
-            text(caveat.statement(), "human_attention.claim.basis.caveats.statement")?;
+            text(
+                caveat.statement(),
+                "human_attention.claim.basis.caveats.statement",
+            )?;
         }
 
         self.validate_kind_evidence(kind)
