@@ -4972,41 +4972,7 @@ impl InquiryGovernance {
                 field: "inquiry.freeze_binding",
             });
         }
-        // The lane class the discipline decided is bound to the same evidence the
-        // record froze, so a class that was decided over one evidence revision
-        // cannot be published beside another. The outcome's own digest is
-        // re-proved first: it is an artefact that leaves this record, and a
-        // rewritten grade, lane, handle set or fence would otherwise be published
-        // as the discipline's own decision.
-        if self.lane_discipline.compute_digest() != self.lane_discipline.digest
-            || self.lane_discipline.inquiry_id != self.inquiry_id
-            || self.lane_discipline.evidence_revision_digest != self.freeze.digest
-            || self.lane_discipline.profile_digest != self.profile.integrity_digest
-            || self.lane_discipline.produced_under_grade != self.profile.evidence_grade
-            || self.lane_discipline.produced_under_lane != self.profile.lane
-            || self.lane_discipline.state_fence != self.profile.state_fence
-        {
-            return Err(InquiryError::IntegrityMismatch {
-                field: "inquiry.lane_discipline_binding",
-            });
-        }
-        // I21.2: the class is the only thing separating E3 exploratory from E3
-        // confirmatory, and a confirmatory class may only be read back from a
-        // lane that actually committed a registration. A record whose class
-        // claims a confirmation while its profile carries no committed
-        // registration is refused here rather than published, so the class can
-        // never be asserted beside a lane that never earned it.
-        if self.lane_discipline.evidence_class.is_confirmatory()
-            && self
-                .profile
-                .independence_and_blinding_policy
-                .lane_registration_digest
-                .is_none()
-        {
-            return Err(InquiryError::IntegrityMismatch {
-                field: "inquiry.lane_discipline_confirmatory_without_registration",
-            });
-        }
+        self.validate_lane_discipline_binding()?;
         self.validate_terminal_carried_bindings()?;
         // The claim-audit trail and the coverage map are re-proved here, not
         // carried on trust. A record that lost an audit between construction and
@@ -5131,6 +5097,53 @@ impl InquiryGovernance {
                     field: "inquiry.claim_audit_binding",
                 });
             }
+    }
+
+    /// The lane class the discipline decided is bound to the same evidence the
+    /// record froze, so a class decided over one evidence revision cannot be
+    /// published beside another.
+    ///
+    /// The outcome's own digest is re-proved first: it is an artefact that leaves
+    /// this record, and a rewritten grade, lane, handle set or fence would
+    /// otherwise be published as the discipline's own decision. Every comparison
+    /// is by content — the recorded evidence revision against
+    /// [`EvidenceFreeze::digest`], the recorded profile revision against the
+    /// profile's own integrity digest — never by a timestamp and never by a
+    /// caller flag.
+    ///
+    /// I21.2 keeps the class as the only thing separating E3 exploratory from E3
+    /// confirmatory, so a confirmatory class may only be read back from a lane
+    /// that actually committed a registration: the check is on the profile's
+    /// `CommittedLaneRegistration`, which is unforgeable, rather than on
+    /// `registered_before_outcome_exposure`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::IntegrityMismatch`] naming the first lane field
+    /// that disagrees with the composite that produced it.
+    fn validate_lane_discipline_binding(&self) -> Result<(), InquiryError> {
+        if self.lane_discipline.compute_digest() != self.lane_discipline.digest
+            || self.lane_discipline.inquiry_id != self.inquiry_id
+            || self.lane_discipline.evidence_revision_digest != self.freeze.digest
+            || self.lane_discipline.profile_digest != self.profile.integrity_digest
+            || self.lane_discipline.produced_under_grade != self.profile.evidence_grade
+            || self.lane_discipline.produced_under_lane != self.profile.lane
+            || self.lane_discipline.state_fence != self.profile.state_fence
+        {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "inquiry.lane_discipline_binding",
+            });
+        }
+        if self.lane_discipline.evidence_class.is_confirmatory()
+            && self
+                .profile
+                .independence_and_blinding_policy
+                .lane_registration_digest
+                .is_none()
+        {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "inquiry.lane_discipline_confirmatory_without_registration",
+            });
         }
         Ok(())
     }
@@ -5440,6 +5453,23 @@ impl LaneDisciplineOutcome {
             &self.recorded_at_ms.to_string(),
         );
         freeze(&preimage)
+    }
+}
+
+/// Renders exactly the fields `compute_digest` covers, so the published line and
+/// the re-proved value cannot drift apart.
+impl std::fmt::Display for LaneDisciplineOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "class={} result={} grade={} lane={} delivered_handles={} digest={}",
+            self.evidence_class.wire_name(),
+            self.result_id,
+            self.produced_under_grade,
+            self.produced_under_lane.wire_name(),
+            self.delivered_handle_count,
+            self.digest
+        )
     }
 }
 
