@@ -39,7 +39,7 @@ use thiserror::Error;
 /// Freeze identity this consumer builds against.
 ///
 /// See `crates/smart/cognitive-rev12-contract-schema-freeze.toml`.
-pub const FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-2026-09-22-r9";
+pub const FREEZE_ID: &str = "cognitive-rev12-contract-schema-freeze-2026-09-22-r10";
 /// Contract version carried by every candidate emitted here.
 pub const CANDIDATE_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
 /// Maximum revision-evidence refs carried by one intake.
@@ -281,7 +281,7 @@ pub const FREEZE_BYTES: &[u8] = include_bytes!("../../cognitive-rev12-contract-s
 /// rule the freeze does not state. The length is recorded next to the digest
 /// in the handoff row and checked by `scripts/read_freeze_digest.py`.
 pub const REQUIRED_FREEZE_DIGEST: &str =
-    "6656e090f7b380567bf126dbfff3762b59e4f7bb027742685f5a9a377bad628b";
+    "a29ca6e7dee0ab36c917b7040e1c1a602b8ca17e365e4376be0600d8fa2b2124";
 
 /// Typed freeze-binding divergence.
 ///
