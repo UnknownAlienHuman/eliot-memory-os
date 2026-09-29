@@ -1366,22 +1366,46 @@ impl SkillCatalogue {
 
     /// Bridge activation entry binding validation to the live staleness gate.
     ///
-    /// Same delivery contract as `activation_display`, with the pinned
-    /// dependency set compared against the currently registered versions
-    /// first through the activation Material-use gate: a Skill whose
-    /// declared host/tool/contract dependencies changed since install is
-    /// refused here even when the stored status still reads `Current`, so an
-    /// unvalidated or stale Skill cannot reach Material use through a
-    /// stored-status lag. A passing display keeps the full receipt chain
+    /// Same delivery contract as `activation_display`, with the standing
+    /// catalogue swept against the observed live world first: the pre-serve
+    /// sweep runs [`reconcile_staleness`](Self::reconcile_staleness) over the
+    /// caller-observed live dependency set, live host/profile versions, live
+    /// admitted Tool Definition version, and tool-owner view, so a Skill
+    /// whose declared host/tool/contract dependencies changed since install
+    /// is marked stale here even when no reinstall arrives — before any
+    /// display is served. Only `Current`/`Provisional` entries are visited;
+    /// marking reuses the existing mark paths with first-drift-wins, and a
+    /// mark rotates the catalogue digest so Hotset receipts issued before the
+    /// sweep fail closed at `activation_display` instead of displaying a
+    /// drifted body. The pinned dependency set is then compared against the
+    /// currently registered versions through the activation Material-use
+    /// gate, so an unvalidated or stale Skill cannot reach Material use
+    /// through a stored-status lag; stale entries stay refused through the
+    /// existing `is_usable`/display refusal, and bounded use returns only as
+    /// provisional. A passing display keeps the full receipt chain
     /// (validation + catalogue-staleness + delivery-ack records).
     pub fn activation_display_against(
-        &self,
+        &mut self,
         skill_id: &str,
         receipt: &HotsetDeliveryReceipt,
         ack: &HotsetDeliveryAck,
         tools: &dyn KnownTools,
         current_dependencies: &[DependencyVersion],
+        live_host_version: &str,
+        live_profile_version: &str,
+        live_definition_version: &str,
     ) -> Result<ActivatedSkillDisplay, SkillError> {
+        // Pre-serve sweep: persist drift marks before serving. The outcome
+        // list is intentionally not served — refusals flow through the
+        // existing gate and display paths below with their typed reasons.
+        let world = LiveSkillWorld {
+            current_dependencies,
+            live_host_version,
+            live_profile_version,
+            live_definition_version,
+            tools,
+        };
+        self.reconcile_staleness(&world)?;
         let entry = self.entries.get(skill_id).ok_or(SkillError::NotFound)?;
         entry.validate()?;
         super::activation::gate_material_use(
