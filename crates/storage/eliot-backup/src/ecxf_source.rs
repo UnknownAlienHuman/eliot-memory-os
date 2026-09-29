@@ -42,28 +42,43 @@
 //! The store owner alone cannot prove the whole view. It reads canonical rows
 //! and its own fence, so it honestly reports itself
 //! [`SnapshotCompleteness::Partial`] and names the evidence it cannot observe
-//! ([`SourceEvidenceGap`]). Those declarations are not refusals: each one names
-//! the owner that can actually close it, and this composition closes it by
-//! reading that owner.
+//! ([`SourceEvidenceGap`]). Those declarations are neither refusals nor
+//! bookkeeping: every declared gap is closed only by positive evidence this
+//! call actually obtained, and a gap with no such evidence refuses the export.
+//! A gap is never closed by the absence of the work that would have closed it,
+//! and never by a value that merely has the right shape.
 //!
-//! * [`SourceEvidenceGap::RequestedScopeClosureUnproven`] is the one gap no
-//!   other owner can close — only the canonical store can prove that the rows it
-//!   returned cover the requested scope — so it is refused here with
-//!   [`BackupError::InconsistentBoundary`] before any owner is read.
-//! * The other four gaps name owners this composition does read, so each is
-//!   closed only if that owner's read actually succeeds. A purge-ledger owner
-//!   that cannot answer, a blob owner that cannot seal a declared residency key,
-//!   an identity owner with no sealed receipt and an export-receipt owner with no
-//!   durable receipt each return their own typed failure, which propagates.
+//! * [`SourceEvidenceGap::RequestedScopeClosureUnproven`] is refused before any
+//!   owner is read, because it is the one gap only the canonical store can hold:
+//!   no other owner has the scope-to-record closure. An unproven scope closure is
+//!   exactly the "mixing unrelated table moments into one 'backup'" that I05.10
+//!   forbids, and deciding it here costs no blob or ledger work.
+//! * [`SourceEvidenceGap::SourcePurgeLedgerUnavailable`] is closed only by a
+//!   ledger this call obtained that carries entries. An owner that returns an
+//!   empty ledger under a declared gap has not observed the ledger:
+//!   `eliot-ecxf` would render that emptiness faithfully into
+//!   `privacy-purge-ledger.json`, and nothing downstream could tell it apart
+//!   from a source that genuinely holds no purge entries.
+//! * [`SourceEvidenceGap::BlobStoreEvidenceUnavailable`] is closed only when the
+//!   store declared at least one reachable residency identity and every one of
+//!   them came back sealed and revalidated. A store that declared the gap *and*
+//!   declared no locators produced the absence of the work, not its result.
+//! * [`SourceEvidenceGap::ExternalSourceIdentityEvidenceUnavailable`] and
+//!   [`SourceEvidenceGap::SourceExportReceiptUnavailable`] are refused. The
+//!   owner port returns a digest and a reference, which is exactly what the
+//!   manifest needs and nothing more, so shape is all that can be checked and
+//!   existence is not derivable from it. Assuming closure would let a store that
+//!   observed neither receipt ship a manifest attesting to both.
 //! * A capture that reports itself non-`Complete` while naming no gap is
-//!   refused too: an unnamed incompleteness is not something another owner can
-//!   close, and this module never guesses which gap it stands for.
+//!   refused too: an unnamed incompleteness names no evidence another owner
+//!   could supply.
 //!
-//! [`SnapshotCompleteness::Complete`] is therefore returned only when every
-//! declared gap is closed by a real owner value this composition actually
-//! holds. Nothing here is defaulted, and the exporter's own
-//! `prove_coherent_boundary` refusal is left in place and unreached by any
-//! composition value this module can build.
+//! [`SnapshotCompleteness::Complete`] is therefore reachable only when the
+//! export is either gap-free, because the store attested to its own completeness
+//! and named nothing it could not observe, or every gap it named is closed by
+//! positive evidence obtained in this same call. Nothing here is defaulted, and
+//! the exporter's own `prove_coherent_boundary` refusal is left in place and
+//! unreached by any composition value this module can build.
 //!
 //! # Every value comes from an owner
 //!
@@ -90,15 +105,19 @@
 //!
 //! # Judgement calls
 //!
-//! ASSUMPTION: the source's *store* completeness and this composition's *view*
-//! completeness are different claims, so the composition derives the view's
-//! value instead of copying the store's. I05.10 requires a coherence *proof*,
-//! and the store owner can only attest to what it read. When the store names the
-//! exact gaps it cannot observe, this composition either closes each one with a
-//! real owner value or refuses, which is the only reading under which the
-//! database-supported snapshot route can ever succeed against a real store. An
-//! unnamed non-`Complete` claim is still refused, because nothing in it
-//! identifies evidence another owner could supply.
+//! ASSUMPTION: the two gaps whose evidence this port cannot observe, the
+//! externally sealed identity pair and the source-side export receipt, are
+//! refused rather than assumed closed. No document settles it. I05.10 requires
+//! the manifest to carry both a `NormativePairIdentity` receipt digest and an
+//! export receipt and requires a coherence proof, but the values this port
+//! returns are precisely the values the manifest needs: a digest string and a
+//! reference. Checking their shape admits them; it does not establish that
+//! either receipt exists, and this crate never recomputes a digest an owner
+//! already recorded, so there is no owner-issued material here a digest could be
+//! tied to. Assuming closure would let a store that observed neither receipt ship
+//! a manifest attesting to both, which is the failure I05.10 forbids. Refusing
+//! is the safe reading; widening the port to carry the sealed receipt material is
+//! a change to this seam, not a judgement this module may make for it.
 
 use eliot_blob_api::{BlobLocator, SealedBlobRead};
 use eliot_contracts::StateFence;
@@ -116,12 +135,12 @@ use super::{
 /// Evidence the canonical store owner declares it cannot observe by itself.
 ///
 /// A gap is a declaration by the store owner about its own view, not a failure.
-/// It names the owner that can actually close it, and this composition closes
-/// each one by reading that owner; only a gap with no other owner is a refusal.
-/// The five cases are the store owner's own closed vocabulary, restated here
-/// because this crate may not depend on the admitted store adapter — the
-/// composition root maps the adapter's capture onto [`SourceCapture`], and a
-/// gap it cannot map is a gap it never reports, not a gap it may drop.
+/// It names the evidence that is missing, and this composition closes it only
+/// when this call actually obtained that evidence; otherwise the export is
+/// refused. The five cases are the store owner's own closed vocabulary, restated
+/// here because this crate may not depend on the admitted store adapter — the
+/// composition root maps the adapter's capture onto [`SourceCapture`], and a gap
+/// it cannot map is a gap it never reports, not a gap it may drop.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SourceEvidenceGap {
     /// The store returned rows without proving they cover the requested scope.
@@ -131,34 +150,41 @@ pub enum SourceEvidenceGap {
     RequestedScopeClosureUnproven,
     /// The admitted schema does not carry the source erasure/purge ledger.
     ///
-    /// Closed by [`EcxfSourceOwners::purge_ledger`], the privacy owner.
+    /// Closed by [`EcxfSourceOwners::purge_ledger`] returning a ledger that
+    /// carries entries. An empty ledger leaves the gap standing.
     SourcePurgeLedgerUnavailable,
     /// The store is not the `BlobStore` owner and read no sealed bytes.
     ///
-    /// Closed by [`EcxfSourceOwners::sealed_blob`], the `BlobStore` owner.
+    /// Closed by [`EcxfSourceOwners::sealed_blob`] answering for every residency
+    /// identity the store declared reachable, of which there must be at least
+    /// one. Declaring no reachable identity leaves the gap standing.
     BlobStoreEvidenceUnavailable,
     /// Architecture and `NormativePair` identity receipts are sealed elsewhere.
     ///
-    /// Closed by [`EcxfSourceOwners::source_identity`], the external identity
-    /// owner.
+    /// Refused: [`EcxfSourceOwners::source_identity`] returns the manifest's
+    /// digest, so its shape cannot distinguish an owner that holds the sealed
+    /// receipt from one that does not.
     ExternalSourceIdentityEvidenceUnavailable,
     /// The store holds no durable source-side ECXF export receipt.
     ///
-    /// Closed by [`EcxfSourceOwners::source_export_receipt`], the export-receipt
-    /// owner.
+    /// Refused: [`EcxfSourceOwners::source_export_receipt`] returns the
+    /// manifest's receipt reference, so its shape cannot distinguish a durable
+    /// receipt from a placeholder.
     SourceExportReceiptUnavailable,
 }
 
 impl SourceEvidenceGap {
-    /// The typed refusal this gap produces, or `None` when another owner in the
-    /// bundle can close it.
+    /// The typed refusal this gap produces up front, or `None` when this call
+    /// must still read an owner before it can judge the gap.
     ///
-    /// Only the scope closure is refused here, because it is the only gap whose
-    /// evidence no other owner holds. It is refused as
+    /// Only the scope closure is refused before any owner is read, because it is
+    /// the only gap no other owner can hold. It is refused as
     /// [`BackupError::InconsistentBoundary`] because an unproven scope closure
     /// is exactly the "mixing unrelated table moments into one 'backup'" that
-    /// I05.10 forbids, and it is decided before any other owner is read so a
-    /// hopeless export costs no blob or ledger work.
+    /// I05.10 forbids, and deciding it here costs no blob or ledger work.
+    ///
+    /// A `None` is not closure. It means the gap is decided later, against the
+    /// evidence this call actually obtained.
     const fn refusal(self) -> Option<BackupError> {
         match self {
             Self::RequestedScopeClosureUnproven => Some(BackupError::InconsistentBoundary),
@@ -179,8 +205,10 @@ impl SourceEvidenceGap {
 /// consistency point and this module never re-reads the store.
 ///
 /// `completeness` and `missing_evidence` are the store owner's honest account
-/// of *its own* view. The view this composition exports is complete only when
-/// every declared gap is closed by a real owner value; see the module header.
+/// of *its own* view. A capture that names no gap and reports itself
+/// `Complete` is the store's own attestation and is taken as such. A capture
+/// that names gaps is not complete until each named gap is closed by positive
+/// evidence this composition obtained; see the module header.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceCapture {
     /// Completeness of the store owner's own capture.
@@ -302,6 +330,10 @@ pub trait EcxfSourceOwners: Send + Sync {
     /// Returns the blob owner's typed [`BackupError`] when the residency
     /// identity is unknown, not durable, not readable, or not bound to the
     /// receipt it is returned with. Absence is never reported as an empty blob.
+    ///
+    /// Answering is what closes [`SourceEvidenceGap::BlobStoreEvidenceUnavailable`],
+    /// and only for a residency identity the store actually declared reachable;
+    /// a store that declared the gap and declared none leaves it standing.
     async fn sealed_blob(&self, locator: &BlobLocator) -> Result<SealedBlobRead, BackupError>;
 
     /// Reads the source privacy/purge ledger for the scope and fence of
@@ -311,6 +343,12 @@ pub trait EcxfSourceOwners: Send + Sync {
     /// is one the same consistency point can be held against. Entries that do
     /// not carry that fence are refused by the archive build, which checks each
     /// one against the export fence.
+    ///
+    /// Returning an empty ledger is a claim that the source holds no purge
+    /// entries. It closes
+    /// [`SourceEvidenceGap::SourcePurgeLedgerUnavailable`] only if the store did
+    /// not declare that gap; under a declared gap an empty ledger is the gap
+    /// still standing and refuses the export.
     ///
     /// # Errors
     ///
@@ -326,6 +364,11 @@ pub trait EcxfSourceOwners: Send + Sync {
     /// Reads the externally sealed Architecture source and
     /// `NormativePairIdentity` receipts for this installation.
     ///
+    /// The returned digests are the manifest's own values, so a well-formed one
+    /// is admitted into the export; it is not proof that the sealed receipt
+    /// exists, and it does not close
+    /// [`SourceEvidenceGap::ExternalSourceIdentityEvidenceUnavailable`].
+    ///
     /// # Errors
     ///
     /// Returns the identity owner's typed [`BackupError`] when either receipt is
@@ -335,6 +378,10 @@ pub trait EcxfSourceOwners: Send + Sync {
 
     /// Reads the reference of the source-side export receipt already issued for
     /// this export operation.
+    ///
+    /// The returned reference is the manifest's own value, so a non-blank one is
+    /// admitted into the export; it is not proof that a durable receipt exists,
+    /// and it does not close [`SourceEvidenceGap::SourceExportReceiptUnavailable`].
     ///
     /// # Errors
     ///
@@ -378,21 +425,25 @@ impl<O> CoherentEcxfSource<O> {
 impl<O: EcxfSourceOwners + ?Sized> EcxfSourceStore for CoherentEcxfSource<O> {
     /// Reads one coherent, fenced view of the source through the owner bundle.
     ///
-    /// The order is the order of the proof: the store's one consistent snapshot
-    /// first, because an unprovable boundary must cost nothing else; then each
-    /// remaining owner's evidence, so a gap the store declared is closed by a
-    /// real owner or refuses the export. The result is returned only when every
-    /// declared gap is closed.
+    /// The order is the order of the proof. The store's one consistent snapshot
+    /// comes first, and a gap no other owner can close refuses the export there
+    /// and then, before any blob or ledger work. Every other declared gap is
+    /// decided afterwards against the evidence this call actually obtained, so a
+    /// gap the owners could not evidence refuses the export here rather than
+    /// being marked closed. The view is returned only when no declared gap is
+    /// still standing.
     ///
     /// # Errors
     ///
     /// Returns [`BackupError::InconsistentBoundary`] when the store declares an
-    /// unclosable scope closure, or reports itself non-`Complete` without naming
-    /// a gap; [`BackupError::InvalidField`] when a sealed identity digest or the
-    /// export-receipt reference is not the shape the manifest requires; and the
-    /// owning component's own typed [`BackupError`] whenever a store, blob,
-    /// privacy, identity, export-receipt or profile owner cannot answer. No
-    /// failure is collapsed into a synthesised value.
+    /// unclosable scope closure, reports itself non-`Complete` without naming a
+    /// gap, or names a gap this call obtained no positive evidence for;
+    /// [`BackupError::InvalidField`] when a sealed identity digest or the
+    /// export-receipt reference is not the shape the manifest requires, which
+    /// admits the value into the export without establishing that the receipt
+    /// behind it exists; and the owning component's own typed [`BackupError`]
+    /// whenever a store, blob, privacy, identity, export-receipt or profile owner
+    /// cannot answer. No failure is collapsed into a synthesised value.
     async fn coherent_export(
         &self,
         request: &EcxfExportRequest,
@@ -413,11 +464,13 @@ impl<O: EcxfSourceOwners + ?Sized> EcxfSourceStore for CoherentEcxfSource<O> {
         let purge_ledger = self.owners.purge_ledger(&capture).await?;
         let profile = self.owners.export_profile()?;
         let (reachable_blob_residency_keys, blobs) = self.seal_reachable_blobs(&capture).await?;
+        prove_every_declared_gap_is_closed(&capture, &purge_ledger, &blobs)?;
         Ok(CoherentSourceExport {
-            // Derived, never copied: `capture.completeness` describes what the
-            // store alone could attest to, and the view exported here is complete
-            // only because every gap it declared has now been closed by an owner
-            // value this call actually holds.
+            // Reachable only because the call above refused every declared gap
+            // this composition could not evidence: either the store attested to
+            // its own completeness and named no gap, or every gap it named is
+            // closed by evidence obtained in this same call. A gap that is still
+            // standing never reaches this line.
             completeness: SnapshotCompleteness::Complete,
             source_adapter: capture.source_adapter,
             source_adapter_version: capture.source_adapter_version,
@@ -461,6 +514,12 @@ impl<O: EcxfSourceOwners + ?Sized> CoherentEcxfSource<O> {
     /// Each sealed read is revalidated before its bytes are taken, and the pair
     /// is moved through the owner's own `into_parts` accessor, so a receipt and
     /// a payload that were not issued together can never reach the exporter.
+    ///
+    /// The returned pairs are the positive evidence for
+    /// [`SourceEvidenceGap::BlobStoreEvidenceUnavailable`]: reaching this return
+    /// means every declared locator produced a validated pair, and the caller
+    /// still requires at least one declared locator for the gap to count as
+    /// closed.
     async fn seal_reachable_blobs(
         &self,
         capture: &SourceCapture,
@@ -485,8 +544,9 @@ impl<O: EcxfSourceOwners + ?Sized> CoherentEcxfSource<O> {
 ///
 /// An unclosable declared gap, or an incompleteness that names nothing, is the
 /// I5.10 refusal: the export fails rather than mixing whatever moments were
-/// available into one package. Every other declared gap is closable and is
-/// closed by reading its owner, so it is not a refusal here.
+/// available into one package. This is the pre-read half of that decision; the
+/// gaps it lets through are judged later, against the evidence this call
+/// obtained, by [`prove_every_declared_gap_is_closed`].
 fn prove_capture_is_closable(capture: &SourceCapture) -> Result<(), BackupError> {
     if let Some(refusal) = capture
         .missing_evidence
@@ -497,6 +557,54 @@ fn prove_capture_is_closable(capture: &SourceCapture) -> Result<(), BackupError>
         return Err(refusal);
     }
     if !capture.completeness.is_complete() && capture.missing_evidence.is_empty() {
+        return Err(BackupError::InconsistentBoundary);
+    }
+    Ok(())
+}
+
+/// Refuses an export whose declared gaps are not all closed by real evidence.
+///
+/// Any declared gap that no evidence obtained in this call closes refuses the
+/// export. A gap is never closed by the absence of the work that would have
+/// closed it, and never by a value that only has the right shape. The arms below
+/// say when a gap is still standing, one per gap, and each is the strongest
+/// evidence available rather than the weakest that would pass:
+///
+/// * the scope closure, the externally sealed identity pair and the source-side
+///   export receipt have no evidence available on this port. The scope closure
+///   is the pre-read refusal; the other two return only the manifest's own
+///   digest and reference, so all that can be checked there is shape, and shape
+///   is not existence. Assuming closure would let a store that observed neither
+///   receipt ship a manifest attesting to both.
+/// * the purge ledger is closed by entries this call obtained, because a ledger
+///   with no entries is a claim about the source rather than evidence of one,
+///   and under a declared gap `eliot-ecxf` would render that claim into the
+///   package indistinguishable from a source that really holds none.
+/// * blob evidence is closed by a non-empty declared reachability set whose every
+///   member was sealed and revalidated, because a store that declared the gap
+///   and declared no locators produced the absence of the work rather than its
+///   result.
+///
+/// The refusal is [`BackupError::InconsistentBoundary`], the same typed variant
+/// [`export_ecxf_package`](super::export_ecxf_package) already uses for a source
+/// that cannot prove one coherent boundary, so the two layers cannot disagree
+/// about what a coherent export is. It names the boundary rather than the gap
+/// because this crate's failure type carries no payload for the gap.
+fn prove_every_declared_gap_is_closed(
+    capture: &SourceCapture,
+    purge_ledger: &[PurgeLedgerEntry],
+    blobs: &[SealedBlobEntry],
+) -> Result<(), BackupError> {
+    let still_standing = capture.missing_evidence.iter().any(|gap| match gap {
+        SourceEvidenceGap::RequestedScopeClosureUnproven
+        | SourceEvidenceGap::ExternalSourceIdentityEvidenceUnavailable
+        | SourceEvidenceGap::SourceExportReceiptUnavailable => true,
+        SourceEvidenceGap::SourcePurgeLedgerUnavailable => purge_ledger.is_empty(),
+        SourceEvidenceGap::BlobStoreEvidenceUnavailable => {
+            capture.reachable_blobs.is_empty() || blobs.len() != capture.reachable_blobs.len()
+        }
+    });
+    if still_standing {
         return Err(BackupError::InconsistentBoundary);
     }
     Ok(())
