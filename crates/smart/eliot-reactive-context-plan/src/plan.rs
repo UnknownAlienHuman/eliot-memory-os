@@ -13,7 +13,7 @@ use eliot_contracts::{ArtifactId, OperationId, RequestId, canonical_json_bytes};
 use eliot_cue_contracts::{ActivationResult, Completeness};
 use eliot_protocol::{
     ReactiveContextContentRef, ReactiveContextPrivacy, ReactiveContextStage,
-    reactive_context_contract_identity,
+    ReactiveContextValidity, reactive_context_contract_identity,
 };
 use eliot_receipts::ProofCeiling;
 
@@ -91,6 +91,17 @@ struct ItemLedger {
     required_attention: bool,
     planning_work: u64,
     work_exhausted: bool,
+}
+
+struct PendingPlanEmission<'a> {
+    base: &'a OutputIdentity,
+    selected_mode: ReactiveDeliveryMode,
+    items: Vec<PlannedContextItem>,
+    accounting: PlanningAccounting,
+    frontier: Vec<String>,
+    request: InertDeliveryRequest,
+    policy: &'a ReactiveDeliveryPolicy,
+    session_snapshot: &'a SessionDeliverySnapshot,
 }
 
 /// Plan one bounded context injection from six immutable projections.
@@ -775,6 +786,7 @@ fn resolve_selection_and_emit(
         selected,
         accounting,
         no_new_work,
+        session_snapshot,
     )
 }
 
@@ -795,6 +807,7 @@ fn finish_selection_outcome(
     selected: Option<InertDeliveryRequest>,
     mut accounting: PlanningAccounting,
     no_new_work: bool,
+    session_snapshot: &SessionDeliverySnapshot,
 ) -> Result<ReactiveContextPlanResult, ReactiveContextPlanningError> {
     if trigger && selected.is_none() {
         for item in &mut items {
@@ -863,7 +876,7 @@ fn finish_selection_outcome(
             &base.input_digest,
         )
     })?;
-    emit_pending(
+    emit_pending(PendingPlanEmission {
         base,
         selected_mode,
         items,
@@ -871,7 +884,8 @@ fn finish_selection_outcome(
         frontier,
         request,
         policy,
-    )
+        session_snapshot,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -923,14 +937,18 @@ fn run_selection_and_accounting(
 }
 
 fn emit_pending(
-    base: &OutputIdentity,
-    selected_mode: ReactiveDeliveryMode,
-    items: Vec<PlannedContextItem>,
-    accounting: PlanningAccounting,
-    frontier: Vec<String>,
-    request: InertDeliveryRequest,
-    policy: &ReactiveDeliveryPolicy,
+    PendingPlanEmission {
+        base,
+        selected_mode,
+        items,
+        accounting,
+        frontier,
+        request,
+        policy,
+        session_snapshot,
+    }: PendingPlanEmission<'_>,
 ) -> Result<ReactiveContextPlanResult, ReactiveContextPlanningError> {
+    let invalidation = session_source_invalidations(&items, session_snapshot);
     let result_digest = output_digest(
         base,
         "PENDING",
@@ -939,7 +957,7 @@ fn emit_pending(
         &items,
         &accounting,
         &frontier,
-        &[],
+        &invalidation,
         Some(&request),
     )
     .map_err(|error| invalid(error, policy))?;
@@ -972,10 +990,49 @@ fn emit_pending(
             items,
             accounting,
             frontier,
-            invalidation: Vec::new(),
+            invalidation,
             request,
         },
     ))
+}
+
+/// Reopen bridge dedup for source dependencies whose owner-issued session
+/// records no longer describe the exact current item dependencies. The
+/// session projection has already been validated and bound to the current
+/// view before this adapter runs.
+fn session_source_invalidations(
+    items: &[PlannedContextItem],
+    session: &SessionDeliverySnapshot,
+) -> Vec<String> {
+    let mut invalidations = BTreeSet::new();
+    for item in items
+        .iter()
+        .filter(|item| item.kind == PlannedItemKind::Context)
+    {
+        let (Some(content), Some(source)) = (item.content.first(), item.source.first()) else {
+            continue;
+        };
+        for record in session.records.iter().filter(|record| {
+            record.item_id == item.item_id
+                && record.session_id == session.session_id
+                && record.runtime_id == session.runtime_id
+                && record.runtime_generation == session.runtime_generation
+                && record.host_generation == session.host_generation
+                && record.task_id == session.task_id
+                && record.attempt_id == session.attempt_id
+                && record.scope_id == session.scope_id
+                && record.state_fence == session.state_fence
+        }) {
+            let dependencies_changed = record.validity != ReactiveContextValidity::Current
+                || record.content != *content
+                || record.source != *source
+                || record.profile != item.profile;
+            if dependencies_changed {
+                invalidations.insert(record.source.contract.name.as_str().to_owned());
+            }
+        }
+    }
+    invalidations.into_iter().collect()
 }
 
 #[allow(clippy::too_many_arguments)]

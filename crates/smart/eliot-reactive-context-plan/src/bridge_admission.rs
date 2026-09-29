@@ -27,7 +27,7 @@
 //! re-admitting them would fork duplicate ledger items the bridge must then
 //! hold open. Counts of every skip class are reported so no drop is silent.
 
-use eliot_context_contracts::AttentionResolution;
+use eliot_context_contracts::{AttentionResolution, canonical_planning_digest};
 use eliot_contracts::{SessionId, StateFence};
 use eliot_protocol::ReactiveContextContentRef;
 use eliot_receipts::WorkScopeId;
@@ -94,7 +94,7 @@ pub struct BridgeAdmissionInstruction {
     pub severity: BridgeAdmissionSeverity,
     /// Delivery channel from the per-item disposition.
     pub delivery: BridgeAdmissionDelivery,
-    /// Stable replay key (`<plan result digest>:<item id>`).
+    /// Stable digest of the session, item, and exact dependency references.
     pub dedup_key: String,
     /// Native audit evidence (not bridge-consumed): plan item identity.
     pub plan_item_id: String,
@@ -139,6 +139,8 @@ pub enum BridgeAdmissionError {
     InvalidField { field: &'static str },
     /// An owner content reference fails its own validation.
     InvalidSourceContent { item_id: String, reason: String },
+    /// A stable session-item replay identity could not be derived.
+    IdentityDigestFailure { item_id: String },
 }
 
 impl std::fmt::Display for BridgeAdmissionError {
@@ -161,6 +163,12 @@ impl std::fmt::Display for BridgeAdmissionError {
             }
             Self::InvalidSourceContent { item_id, reason } => {
                 write!(formatter, "planned item {item_id} source invalid: {reason}")
+            }
+            Self::IdentityDigestFailure { item_id } => {
+                write!(
+                    formatter,
+                    "planned item {item_id} replay identity could not be derived"
+                )
             }
         }
     }
@@ -267,6 +275,19 @@ fn map_item(
     }
     non_blank(&item.item_id, "item.item_id")?;
     non_blank(&item.reason, "item.reason")?;
+    let dedup_key = canonical_planning_digest(&(
+        "eliot.reactive-context-session-item.v1",
+        &plan.request.session_id,
+        &plan.request.scope_id,
+        &plan.request.state_fence,
+        &item.item_id,
+        &item.content,
+        &item.source,
+        &item.profile,
+    ))
+    .map_err(|_| BridgeAdmissionError::IdentityDigestFailure {
+        item_id: item.item_id.clone(),
+    })?;
     Ok(MappedItem::Emit(BridgeAdmissionInstruction {
         cue_id: item.item_id.clone(),
         cue_source: source.contract.name.as_str().to_owned(),
@@ -280,7 +301,7 @@ fn map_item(
         fence: plan.request.state_fence.clone(),
         severity,
         delivery,
-        dedup_key: format!("{}:{}", plan.result_digest, item.item_id),
+        dedup_key,
         plan_item_id: item.item_id.clone(),
         plan_result_digest: plan.result_digest.clone(),
         item_reason: item.reason.clone(),
