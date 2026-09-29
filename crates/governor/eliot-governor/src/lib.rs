@@ -167,6 +167,10 @@ pub use eliot_finish::FinishDecisionReceipt;
 /// the exact delivery-gate receipt type without a second dependency path (same
 /// reason as the [`CanonicalWriteEnvelope`] re-export below).
 pub use eliot_learning_delta::AdmissionReceipt;
+/// Canonical scan-disclosure owner port re-exported so the daemon composition
+/// root can name the exact owner type without a second store dependency path
+/// (same reason as the [`CanonicalWriteEnvelope`] re-export above).
+pub use eliot_ors::ScanDisclosureRecordOwner;
 /// Task lifecycle domain types re-exported so the daemon composition root
 /// can name the exact task-command types without a second task dependency
 /// path (same reason as the [`CanonicalWriteEnvelope`] re-export below).
