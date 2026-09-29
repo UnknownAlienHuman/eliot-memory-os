@@ -907,10 +907,10 @@ pub struct RollbackRouteRequest {
 pub struct RollbackRouteProposal {
     pub cutover_id: String,
     pub route_scope: String,
-    pub from_generation: u64,
-    pub to_generation: u64,
-    pub old_epoch: u64,
-    pub new_epoch: u64,
+    /// The validated canonical cutover record, carried through unchanged so the
+    /// receipt that later commits this route is checked against the original
+    /// recorded epoch lineage rather than a re-derived scalar.
+    pub cutover: GenerationCutoverRecord,
     pub in_flight_count: u64,
     pub snapshot_strategy: SnapshotStrategy,
     pub route_digest: Sha256Digest,
