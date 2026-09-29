@@ -1761,20 +1761,21 @@ impl BrokerComposition {
     /// canonical record can name no actor but the admitted Human.
     pub fn launch_notify_acknowledge(
         &mut self,
-        request: LaunchRequest,
+        request: &LaunchRequest,
         acknowledgement: &NotifyAcknowledge,
         principal: &str,
     ) -> Result<eliot_user_broker_core::LaunchReceipt, CompositionError> {
         self.verify_launch_lease()?;
         // This gate also refuses a caller-supplied `stdin_payload`, so the bytes
         // bound below are the only bytes this launch can ever carry.
-        notify_launch_callin::admit_notify_request(&self.notify_launch, &request).map_err(
+        notify_launch_callin::admit_notify_request(&self.notify_launch, request).map_err(
             |error| CompositionError::Launch(format!("notify launch rejected: {}", error.code())),
         )?;
-        let _line = notify_launch_callin::render_notify_acknowledge_line(acknowledgement, principal)
-            .map_err(|error| {
-                CompositionError::Launch(format!("notify launch rejected: {}", error.code()))
-            })?;
+        let _line =
+            notify_launch_callin::render_notify_acknowledge_line(acknowledgement, principal)
+                .map_err(|error| {
+                    CompositionError::Launch(format!("notify launch rejected: {}", error.code()))
+                })?;
         // No child is spawned: the rendered line only proves the admitted
         // triple was well-formed, and its bytes are discarded. The canonical
         // acknowledgement is owned by `eliotd` (issue #1780, A2) — the

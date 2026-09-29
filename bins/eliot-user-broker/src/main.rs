@@ -543,7 +543,7 @@ fn dispatch(
             match admit_authenticated_human(composition, authority.as_ref(), &operation_key) {
                 Err(message) => message,
                 Ok(principal) => dispatch_launch(
-                    composition.launch_notify_acknowledge(request, &acknowledgement, &principal),
+                    composition.launch_notify_acknowledge(&request, &acknowledgement, &principal),
                 ),
             }
         }
