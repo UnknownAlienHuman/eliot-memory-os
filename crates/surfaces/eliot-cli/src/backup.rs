@@ -200,8 +200,8 @@ pub const BACKUP_STATE_CANCELLED: &str = "cancelled";
 /// owner did prove this archive's identity and class, so both are reported,
 /// but the outcome claims no verified lifecycle level. This state is
 /// deliberately not [`BACKUP_STATE_VERIFIED`], which now means only that
-/// the owner accepted [`BACKUP_LEVEL_PROVENANCE_BOUND`] or
-/// [`BACKUP_LEVEL_CLASS_QUALIFIED`].
+/// the owner accepted [`VerifyProofLevel::ProvenanceBound`] or
+/// [`VerifyProofLevel::ClassQualified`].
 pub const BACKUP_STATE_CANDIDATE: &str = "candidate";
 
 /// Closed owner-cleanup-state vocabulary this surface accepts from a
@@ -280,7 +280,8 @@ enum CaptureEvidenceRelation {
 ///
 /// It replaces the three level literals and the `BACKUP_LEVELS` string array
 /// this module used to keep in parallel with the owner's
-/// `CaptureEvidenceLevel`. It is deliberately a typed owner rather than a
+/// `CaptureEvidenceLevel` (issue #2862, I8). It is deliberately a typed owner
+/// rather than a
 /// re-export of that enum: the owner lives in `eliot-kernel`, a BINARY crate,
 /// and a surface crate cannot import one. So this owns the wire spelling, the
 /// exhaustive decoder and the capture-evidence relation, and the Kernel route
@@ -860,8 +861,9 @@ pub struct BackupOperationOutcome {
     /// [`BACKUP_STATE_CANCELLED`].
     ///
     /// `verified` is reserved for an owner-accepted
-    /// [`BACKUP_LEVEL_PROVENANCE_BOUND`] or [`BACKUP_LEVEL_CLASS_QUALIFIED`]
-    /// level, because backup existence is not recovery proof (I5.13); a
+    /// [`VerifyProofLevel::ProvenanceBound`] or
+    /// [`VerifyProofLevel::ClassQualified`] level, because backup existence is
+    /// not recovery proof (I5.13); a
     /// structurally valid archive with no retained capture provenance is
     /// [`BACKUP_STATE_CANDIDATE`], and a capture the owner cancelled is
     /// [`BACKUP_STATE_CANCELLED`] rather than a field-shape
@@ -1228,9 +1230,9 @@ fn envelope_idempotency(
 ///
 /// `ok` is the owner's success spelling and selects no outcome state by
 /// itself. [`backup_verify`] reports [`BACKUP_STATE_VERIFIED`] only after
-/// the owner names the [`BACKUP_LEVEL_PROVENANCE_BOUND`] or
-/// [`BACKUP_LEVEL_CLASS_QUALIFIED`] level, and reports a
-/// [`BACKUP_LEVEL_STRUCTURAL_CANDIDATE`] archive as
+/// the owner names the [`VerifyProofLevel::ProvenanceBound`] or
+/// [`VerifyProofLevel::ClassQualified`] level, and reports a
+/// [`VerifyProofLevel::StructuralCandidate`] archive as
 /// [`BACKUP_STATE_CANDIDATE`] instead of promoting it, because backup
 /// existence is not recovery proof (I5.13). [`BACKUP_STATE_CANCELLED`] is a
 /// refusal-shaped status, not a success one, and it is admitted here so an
@@ -1547,6 +1549,10 @@ pub fn backup_create(
         verification_level: None,
         class_ceiling: None,
         capture_receipt: None,
+        // A `plan_gap` refusal answers no result at all, so there is no identity
+        // to bind: the field stays an explicit absence rather than a synthesized
+        // one, which is what keeps a refusal from looking like a result.
+        result_identity: None,
         archive_fence_relation: None,
         archive_fence_proof: None,
         target_compatibility: None,
@@ -1582,9 +1588,9 @@ pub fn backup_create(
 /// and a structural candidate that claims one - is reported as a
 /// [`BACKUP_STATE_REFUSED`] outcome naming the exact missing owner evidence,
 /// never as a verified archive. Only the
-/// [`BACKUP_LEVEL_PROVENANCE_BOUND`] or [`BACKUP_LEVEL_CLASS_QUALIFIED`]
+/// [`VerifyProofLevel::ProvenanceBound`] or [`VerifyProofLevel::ClassQualified`]
 /// level reports [`BACKUP_STATE_VERIFIED`]; a
-/// [`BACKUP_LEVEL_STRUCTURAL_CANDIDATE`] archive is reported as
+/// [`VerifyProofLevel::StructuralCandidate`] archive is reported as
 /// [`BACKUP_STATE_CANDIDATE`] with the proven level left at
 /// [`BackupStage::Requested`], because a self-consistent decode of
 /// caller-supplied bytes is an untrusted candidate and not recovery proof. A
@@ -1648,6 +1654,10 @@ pub fn backup_verify(
         verification_level: None,
         class_ceiling: None,
         capture_receipt: None,
+        // Undecided until an `ok` reply's nested result identity has been
+        // decoded AND bound to this request by `require_result_identity`. Every
+        // other status answers no result, so the absence stays explicit.
+        result_identity: None,
         archive_fence_relation: None,
         archive_fence_proof: None,
         target_compatibility: None,
@@ -1667,6 +1677,20 @@ pub fn backup_verify(
             // field the owner must answer is decoded and closed-checked here
             // before any state or proven level is reported.
             let evidence = verify_evidence(&response)?;
+            // A proof is only as good as the request it answers. The nested
+            // result identity is bound to the request BEFORE the claim is
+            // graded, because an answer that is not about this request has no
+            // level this surface may report at all: the outer idempotency echo
+            // is a transport correlation and is explicitly not sufficient.
+            if let Err(unproven) = require_result_identity(&evidence, &request.request) {
+                return refuse_unproven_claim(
+                    request,
+                    &operation_id,
+                    CommandId::BackupVerify,
+                    outcome,
+                    unproven,
+                );
+            }
             // A closed set is not a proof: the owner's own answers must agree.
             if let Err(unproven) = require_proven_claim(&evidence) {
                 return refuse_unproven_claim(
@@ -1679,17 +1703,21 @@ pub fn backup_verify(
             }
             apply_verify_evidence(&mut outcome, &evidence);
             // The owner did prove this archive's identity and class at every
-            // level it names, so both are reported exactly as answered.
+            // level it names, so both are reported exactly as answered. The
+            // match is on the TYPED level and is exhaustive over
+            // [`VerifyProofLevel`], so a level added to the vocabulary is a
+            // compile error here rather than a silently unhandled state.
             match evidence.level {
-                BACKUP_LEVEL_PROVENANCE_BOUND | BACKUP_LEVEL_CLASS_QUALIFIED => {
+                VerifyProofLevel::ProvenanceBound | VerifyProofLevel::ClassQualified => {
                     BACKUP_STATE_VERIFIED.clone_into(&mut outcome.state);
                     outcome.proof_level = BackupStage::Verified;
                     outcome.reason = format!(
                         "owner accepted verification level {} with class ceiling {}; backup existence is not recovery proof, so rehearse the isolated restore before treating it as a recovery point",
-                        evidence.level, evidence.class_ceiling
+                        evidence.level.wire_name(),
+                        evidence.class_ceiling.wire_name()
                     );
                 }
-                BACKUP_LEVEL_STRUCTURAL_CANDIDATE => {
+                VerifyProofLevel::StructuralCandidate => {
                     // The proven level deliberately stays
                     // [`BackupStage::Requested`]: a structurally valid
                     // archive without retained capture provenance is an
@@ -1702,10 +1730,10 @@ pub fn backup_verify(
                     ];
                     outcome.reason = format!(
                         "owner reported structural candidate level {} with class ceiling {} and no retained capture provenance; the archive is an untrusted candidate, not a verified recovery point",
-                        evidence.level, evidence.class_ceiling
+                        evidence.level.wire_name(),
+                        evidence.class_ceiling.wire_name()
                     );
                 }
-                _ => return Err(BackupClientError::Client(CliError::ResultMismatch)),
             }
             outcome.next_reconciliation =
                 next_action(&outcome.state, BACKUP_VERIFY_OPERATION, &operation_id);
@@ -1746,18 +1774,27 @@ struct VerifyEvidence<'a> {
     bundle_id: String,
     /// Archive class the owner proved, from the closed class set.
     class: &'a str,
-    /// Evidence level the owner proved, from [`BACKUP_LEVELS`].
-    level: &'a str,
-    /// Exact class ceiling, from the owner's own ceiling spelling.
-    class_ceiling: &'a str,
+    /// Evidence level the owner proved, decoded through the ONE typed owner
+    /// [`VerifyProofLevel::from_wire`] so the level this surface checks is the
+    /// same type it later matches on and reports.
+    level: VerifyProofLevel,
+    /// Exact class ceiling, decoded through the one typed owner
+    /// [`VerifyClassCeiling::from_wire`] rather than kept as a bare string this
+    /// surface would then have to re-interpret.
+    class_ceiling: VerifyClassCeiling,
     /// STRUCTURAL archived-fence relation to this target, from
     /// [`BACKUP_ARCHIVE_FENCE_RELATIONS`].
     archive_fence_relation: &'a str,
-    /// PROVENANCE qualifier for the relation, from
-    /// [`BACKUP_ARCHIVE_FENCE_PROOFS`].
-    archive_fence_proof: &'a str,
+    /// PROVENANCE qualifier for the relation, decoded through the one typed
+    /// owner [`ArchiveFenceProof::from_wire`].
+    archive_fence_proof: ArchiveFenceProof,
     /// Owner-issued publication receipt, or `None` when the owner issued none.
     capture_receipt: Option<&'a str>,
+    /// Nested typed references binding this answer to the request it answers.
+    /// Carried as a value, not re-derived here, so
+    /// [`require_result_identity`] can compare the operation, the two digests
+    /// and the evidence references against the request that produced it.
+    result: BackupResultIdentity,
     /// Per-domain member counts, in the owner's own pass order.
     member_counts: Vec<String>,
 }
@@ -1768,9 +1805,11 @@ struct VerifyEvidence<'a> {
 /// with a value outside its closed set is a typed result mismatch rather than a
 /// partially trusted outcome: this surface cannot bound evidence it cannot
 /// name, and a caller-authored self-consistent checksum is not provenance.
-/// Reading each field into its closed set is not the whole check - the relation
-/// BETWEEN those fields is proved separately by [`require_proven_claim`],
-/// which this decoder's caller runs before any of them is reported.
+/// Reading each field into its closed set is not the whole check. The relation
+/// BETWEEN those fields is proved separately by [`require_proven_claim`], and
+/// the relation between the answer and the REQUEST it answers is proved
+/// separately by [`require_result_identity`]; this decoder's caller runs both
+/// before any of them is reported.
 fn verify_evidence(response: &Value) -> Result<VerifyEvidence<'_>, BackupClientError> {
     // The exact archive identity, the closed class and the integrity digest
     // shape come first: a reply that fails those is not a verification answer.
@@ -1791,15 +1830,19 @@ fn verify_evidence(response: &Value) -> Result<VerifyEvidence<'_>, BackupClientE
     .map(|(field, count)| format!("{field}={count}"))
     .collect();
     let level = envelope_text(response, "verification_level")?;
-    if !BACKUP_LEVELS.contains(&level) {
-        return Err(BackupClientError::Client(CliError::ResultMismatch));
-    }
+    // Decoded through the one typed owner rather than tested against a parallel
+    // string array: a level outside the type is a value this surface cannot
+    // bound, and a level inside the type arrives already carrying the
+    // capture-evidence relation [`require_proven_claim`] will enforce.
+    let level =
+        VerifyProofLevel::from_wire(level).ok_or(BackupClientError::Client(CliError::ResultMismatch))?;
     // The class ceiling is echoed rather than derived from the class token:
-    // only the owner knows which ceiling its own receipt reached.
+    // only the owner knows which ceiling its own receipt reached. It is decoded
+    // through its own typed owner so the reachability relation is a property of
+    // the member rather than a second table keyed on a string.
     let class_ceiling = envelope_text(response, "class_ceiling")?;
-    if !BACKUP_CLASS_CEILINGS.contains(&class_ceiling) {
-        return Err(BackupClientError::Client(CliError::ResultMismatch));
-    }
+    let class_ceiling = VerifyClassCeiling::from_wire(class_ceiling)
+        .ok_or(BackupClientError::Client(CliError::ResultMismatch))?;
     // The archived fence's relation to this target and its proof qualifier, so a
     // historical archive stays historical instead of being refused for an older
     // generation, and an exact structural value is never printed as proven
@@ -1810,13 +1853,18 @@ fn verify_evidence(response: &Value) -> Result<VerifyEvidence<'_>, BackupClientE
         return Err(BackupClientError::Client(CliError::ResultMismatch));
     }
     let archive_fence_proof = envelope_text(response, "archive_fence_proof")?;
-    if !BACKUP_ARCHIVE_FENCE_PROOFS.contains(&archive_fence_proof) {
-        return Err(BackupClientError::Client(CliError::ResultMismatch));
-    }
+    let archive_fence_proof = ArchiveFenceProof::from_wire(archive_fence_proof)
+        .ok_or(BackupClientError::Client(CliError::ResultMismatch))?;
     let capture_receipt = envelope_optional_text(response, "capture_receipt")?;
     if let Some(receipt) = capture_receipt {
         non_blank(receipt, "backup.capture_receipt").map_err(BackupClientError::Client)?;
     }
+    // The nested identity is decoded here, once, through the same closed reads
+    // as every other field, so no caller can reach the state decision with a
+    // half-decoded result identity. Whether those references agree with the
+    // REQUEST is a separate question, asked by [`require_result_identity`],
+    // because this function holds no request to compare them against.
+    let result = decode_result_identity(response, &integrity_sha256, capture_receipt)?;
     Ok(VerifyEvidence {
         bundle_id,
         class,
@@ -1825,8 +1873,122 @@ fn verify_evidence(response: &Value) -> Result<VerifyEvidence<'_>, BackupClientE
         archive_fence_relation,
         archive_fence_proof,
         capture_receipt,
+        result,
         member_counts,
     })
+}
+
+/// Decodes the nested typed references that bind a verify answer to the request
+/// it answers.
+///
+/// The outer `idempotency_key` is a TRANSPORT correlation and is explicitly not
+/// this: it is the same value on a replay, on a reconciliation of a predecessor's
+/// row, and on a substituted answer. These references are the ones that can tell
+/// those apart, and each is shape-checked here without being recomputed:
+/// re-deriving a digest over what this surface holds would replace the owner's
+/// recorded identity with a fresh local value instead of checking the one the
+/// owner recorded.
+///
+/// The archive digest and the capture receipt are the values the SAME reply
+/// already projected as `integrity_sha256` and `capture_receipt`, read once and
+/// carried into the identity rather than re-read, so the two cannot disagree
+/// about which archive or receipt they name.
+///
+/// The validity attestation is read as an explicit absence. The verify route
+/// projects no attestation today — no production `BackupRole::Verifier` session
+/// issues one — and a decoder that invented a value to fill it would report
+/// provenance the owner never issued. That absence is the owner's own answer and
+/// is exactly what refuses a provenance-level claim in [`require_proven_claim`].
+fn decode_result_identity(
+    response: &Value,
+    archive_digest: &str,
+    capture_receipt: Option<&str>,
+) -> Result<BackupResultIdentity, BackupClientError> {
+    let operation_id = envelope_text(response, "operation_id")?.to_owned();
+    non_blank(&operation_id, "backup.operation_id").map_err(BackupClientError::Client)?;
+    let request_digest = envelope_text(response, "request_digest")?.to_owned();
+    hex64(&request_digest, "backup.request_digest").map_err(BackupClientError::Client)?;
+    let operation_namespace = envelope_text(response, "operation_namespace")?.to_owned();
+    hex64(&operation_namespace, "backup.operation_namespace")
+        .map_err(BackupClientError::Client)?;
+    let validity_attestation = envelope_optional_text(response, "validity_attestation")?;
+    if let Some(attestation) = validity_attestation {
+        non_blank(attestation, "backup.validity_attestation").map_err(BackupClientError::Client)?;
+    }
+    Ok(BackupResultIdentity {
+        operation_id,
+        request_digest,
+        operation_namespace,
+        archive_digest: archive_digest.to_owned(),
+        capture_receipt: capture_receipt.map(str::to_owned),
+        validity_attestation: validity_attestation.map(str::to_owned),
+    })
+}
+
+/// Checks that one public result identity is bound to the request it answers.
+///
+/// This is the I9 check and it is deliberately NOT the envelope echo. I5.27
+/// defines idempotency over canonical bytes rather than caller spelling, and the
+/// Kernel projects `request_digest` and `operation_namespace` precisely so a
+/// frame-level consumer can correlate an answer to its durable row; this surface
+/// is that consumer. Three relations are checked, and each can only fail closed:
+///
+/// - The producing operation is this caller's own. The verify payload declares
+///   no `successor_of`, so this path is never the reconciliation leg; an answer
+///   naming a predecessor's operation is a substituted identity, not a
+///   reconciliation.
+/// - The namespace is a DIGEST and not caller text. If it equals the caller's
+///   own human key the durable key is no longer a digest and two principals'
+///   rows are no longer separable, so the answer is refused rather than
+///   reported as this caller's own row.
+/// - The two digests are DISTINCT. The request digest is a hash over the
+///   accepted request and the namespace is the row key derived from it; if they
+///   were the same value one binding would be standing in for the other, which
+///   is exactly the single-echo answer I9 forbids.
+///
+/// None of these is recomputed. Each compares what the owner recorded.
+fn require_result_identity(
+    evidence: &VerifyEvidence<'_>,
+    request: &RequestIdentity,
+) -> Result<(), UnprovenClaim> {
+    let identity = &evidence.result;
+    if identity.operation_id != request.idempotency_key.as_str() {
+        return Err(UnprovenClaim {
+            obligation: format!(
+                "a result identity naming the operation that produced this answer (it names {} for archive {}, and this request presented no successor delegation, so a predecessor's operation is a substituted identity and not a reconciliation)",
+                identity.operation_id, evidence.bundle_id
+            ),
+            reason: format!(
+                "owner answered for operation {} while this request presented operation {}; an outer idempotency echo is a transport correlation and cannot stand for the operation that produced the result",
+                identity.operation_id, request.idempotency_key.as_str()
+            ),
+        });
+    }
+    if identity.operation_namespace == request.idempotency_key.as_str() {
+        return Err(UnprovenClaim {
+            obligation: format!(
+                "a 64-hex durable-row namespace digest for archive {} (the owner echoed this caller's human operation key back as the row key, so the durable key is not a digest and cannot separate two principals' rows)",
+                evidence.bundle_id
+            ),
+            reason: format!(
+                "owner answered with operation_namespace {} for archive {}, which is this caller's own human operation key rather than a derived digest",
+                identity.operation_namespace, evidence.bundle_id
+            ),
+        });
+    }
+    if identity.request_digest == identity.operation_namespace {
+        return Err(UnprovenClaim {
+            obligation: format!(
+                "a canonical request digest and a durable-row namespace that are two separate bindings for archive {} (the owner answered with the same value {} for both, so one binding is standing in for the other)",
+                evidence.bundle_id, identity.request_digest
+            ),
+            reason: format!(
+                "owner answered for archive {} with request_digest and operation_namespace both equal to {}; the accepted request's canonical hash and its derived row key have different preimages and must not be one value",
+                evidence.bundle_id, identity.request_digest
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// One owner proof claim this surface cannot believe, carrying the exact
@@ -1851,10 +2013,10 @@ struct UnprovenClaim {
 ///
 /// [`verify_evidence`] proves that every string is inside a closed set; this
 /// proves that the set members agree. Before this check existed, a
-/// [`BACKUP_LEVEL_PROVENANCE_BOUND`] or [`BACKUP_LEVEL_CLASS_QUALIFIED`] reply
-/// carrying no capture receipt was reported as [`BACKUP_STATE_VERIFIED`], a
-/// [`BACKUP_LEVEL_STRUCTURAL_CANDIDATE`] reply could carry a receipt it did not
-/// earn, and a [`BACKUP_ARCHIVE_FENCE_PROOF_CAPTURE_OWNER_PROVEN`] fence could
+/// [`VerifyProofLevel::ProvenanceBound`] or [`VerifyProofLevel::ClassQualified`]
+/// reply carrying no capture receipt was reported as [`BACKUP_STATE_VERIFIED`],
+/// a [`VerifyProofLevel::StructuralCandidate`] reply could carry a receipt it did
+/// not earn, and an [`ArchiveFenceProof::CaptureOwnerProven`] fence could
 /// be printed with no capture owner behind it at all. I5.13 keeps backup
 /// existence from being recovery proof and a caller-authored self-consistent
 /// checksum is not capture provenance, so a claim whose owner evidence is
@@ -1862,13 +2024,15 @@ struct UnprovenClaim {
 /// [`BACKUP_STATE_REFUSED`] with the missing owner named - never reported at the
 /// level it claimed.
 ///
-/// The class ceiling's relation to the evidenced class is deliberately NOT
+/// The class ceiling's relation to the EVIDENCED CLASS is deliberately NOT
 /// checked here. Its only typed owner is
 /// `eliot_backup::RestoreEvidenceLevel::for_class`, reached through
 /// `BackupClass::evidence_level`, and `eliot-cli` does not depend on
 /// `eliot-backup`. Admitting that dependency, or mirroring its table here,
 /// would put a second class-to-ceiling owner in a surface crate, so that half
 /// of the relation is an owner decision and not a table this file may write.
+/// The ceiling's relation to what a read-only verify may REACH is a different
+/// question and is answered below, from the ceiling's own typed member.
 fn require_proven_claim(evidence: &VerifyEvidence<'_>) -> Result<(), UnprovenClaim> {
     // The archived fence's PROOF axis is a provenance claim in its own right,
     // so it is held to the same rule as the level that carries one: naming a
@@ -1877,67 +2041,116 @@ fn require_proven_claim(evidence: &VerifyEvidence<'_>) -> Result<(), UnprovenCla
     // archive says nothing about who produced the archived fence VALUE, so an
     // honest `structural-only` qualifier beside a receipt stays admissible and
     // refusing it would forbid a truthful future answer.
-    if evidence.archive_fence_proof == BACKUP_ARCHIVE_FENCE_PROOF_CAPTURE_OWNER_PROVEN
-        && evidence.capture_receipt.is_none()
-    {
+    if evidence.archive_fence_proof.requires_capture_receipt() && evidence.capture_receipt.is_none() {
         return Err(UnprovenClaim {
             obligation: format!(
                 "owner-issued capture receipt backing archive_fence_proof {} for archive {} (absent from the owner's own answer)",
-                BACKUP_ARCHIVE_FENCE_PROOF_CAPTURE_OWNER_PROVEN, evidence.bundle_id
+                evidence.archive_fence_proof.wire_name(),
+                evidence.bundle_id
             ),
             reason: format!(
                 "owner claimed archive fence proof {} for archive {} with no capture receipt; a capture-owner-proven fence is a provenance claim about who produced the archived fence, and this surface reports none that no owner receipt backs",
-                BACKUP_ARCHIVE_FENCE_PROOF_CAPTURE_OWNER_PROVEN, evidence.bundle_id
+                evidence.archive_fence_proof.wire_name(),
+                evidence.bundle_id
             ),
         });
     }
-    match evidence.level {
-        BACKUP_LEVEL_PROVENANCE_BOUND | BACKUP_LEVEL_CLASS_QUALIFIED => {
-            if evidence.capture_receipt.is_none() {
-                return Err(UnprovenClaim {
-                    obligation: format!(
-                        "owner-issued capture receipt matching archive {} and claimed verification level {} (absent from the owner's own answer)",
-                        evidence.bundle_id, evidence.level
-                    ),
-                    reason: format!(
-                        "owner claimed verification level {} for archive {} at class ceiling {} with no capture receipt; a provenance-bound or class-qualified level is a claim of retained capture provenance, and a self-consistent decode of caller-supplied bytes is not one",
-                        evidence.level, evidence.bundle_id, evidence.class_ceiling
-                    ),
-                });
+    // The level's own relation to the owner's evidence, read from the typed
+    // owner rather than from a string arm beside it. This is the complete
+    // relation, not a membership test: a level whose required evidence is
+    // ABSENT is refused instead of downgraded, and a level whose relation
+    // forbids that evidence is refused when it is PRESENT, because a candidate
+    // that claims a receipt is claiming provenance it does not have.
+    match evidence.level.capture_evidence() {
+        CaptureEvidenceRelation::RequiresOwnerEvidence => {
+            // A provenance-bound or class-qualified level is a claim about WHO
+            // produced these bytes, and no production verifier issues the
+            // attestation on this path. Refusing here is therefore not
+            // conservative bookkeeping: it is the only honest report, because
+            // the level's evidence cannot exist yet and a level string is not
+            // itself a claim.
+            for (present, obligation, description) in [
+                (
+                    evidence.capture_receipt.is_some(),
+                    "owner-issued capture receipt matching archive {} and claimed verification level {} (absent from the owner's own answer)",
+                    "owner claimed verification level {} for archive {} at class ceiling {} with no capture receipt; a provenance-bound or class-qualified level is a claim of retained capture provenance, and a self-consistent decode of caller-supplied bytes is not one",
+                ),
+                (
+                    evidence.result.validity_attestation.is_some(),
+                    "verifier-issued archive validity attestation backing archive {} and claimed verification level {} (absent from the owner's own answer; no BackupRole::Verifier session issues one on this product)",
+                    "owner claimed verification level {} for archive {} with no verifier-issued validity attestation; a recognized proof level with missing owner evidence is an unbacked claim, not a weaker proof, and this surface refuses it instead of downgrading it",
+                ),
+            ] {
+                if !present {
+                    return Err(UnprovenClaim {
+                        obligation: obligation
+                            .replacen("{}", &evidence.bundle_id, 1)
+                            .replacen("{}", evidence.level.wire_name(), 1),
+                        reason: description
+                            .replacen("{}", evidence.level.wire_name(), 1)
+                            .replacen("{}", &evidence.bundle_id, 1)
+                            .replacen("{}", evidence.class_ceiling.wire_name(), 1),
+                    });
+                }
             }
         }
-        BACKUP_LEVEL_STRUCTURAL_CANDIDATE => {
+        CaptureEvidenceRelation::RequiresOwnerEvidenceAbsence => {
             if evidence.capture_receipt.is_some() {
                 return Err(UnprovenClaim {
                     obligation: format!(
                         "owner-issued capture receipt is contradictory at claimed verification level {} for archive {}: a structural candidate proves no retained capture provenance, so this surface reports no level beside a receipt",
-                        evidence.level, evidence.bundle_id
+                        evidence.level.wire_name(),
+                        evidence.bundle_id
                     ),
                     reason: format!(
                         "owner claimed verification level {} for archive {} AND supplied a capture receipt; those two answers are not one answer, and a candidate that claims a receipt is claiming provenance it does not have",
-                        evidence.level, evidence.bundle_id
+                        evidence.level.wire_name(),
+                        evidence.bundle_id
                     ),
                 });
             }
         }
-        // Fail closed on a level this surface cannot relate. `verify_evidence`
-        // already refuses a level outside [`BACKUP_LEVELS`], so this arm is the
-        // standing guard for a level added to that closed set without its
-        // relation: an unnamed relation is not a relation, and a level with no
-        // relation to the owner's capture evidence is not a level this surface
-        // may report.
-        _ => {
+        // Fail closed on a level added to the typed owner without a relation to
+        // the owner's capture evidence. `verify_evidence` already refuses a
+        // level outside the type, so this arm is the standing guard for a
+        // member whose relation is still `Undefined`: an unnamed relation is
+        // not a relation, and a level this surface cannot bound is not a level
+        // it may report.
+        CaptureEvidenceRelation::Undefined => {
             return Err(UnprovenClaim {
                 obligation: format!(
                     "a defined capture-provenance relation for verification level {} (no relation to the owner's capture evidence is defined for it on this surface)",
-                    evidence.level
+                    evidence.level.wire_name()
                 ),
                 reason: format!(
                     "owner claimed verification level {} for archive {}, which this surface cannot relate to the owner's own capture evidence; it reports no proof level it cannot bound",
-                    evidence.level, evidence.bundle_id
+                    evidence.level.wire_name(),
+                    evidence.bundle_id
                 ),
             });
         }
+    }
+    // The class ceiling's REACHABILITY, as distinct from its spelling. A
+    // read-only verify holds no authority to declare operational validation or
+    // a cutover: A13.7 states that cutover requires separate authority and that
+    // restore verification happens in an isolated area, and the owner's own
+    // `RestoreEvidenceLevel` documents that neither of those rungs is something
+    // the backup library emits. An answer naming one is IMPOSSIBLE on this path
+    // and is refused rather than rendered, so an over-claiming owner cannot
+    // advertise operational recovery off a verify command.
+    if evidence.class_ceiling.requires_operational_authority() {
+        return Err(UnprovenClaim {
+            obligation: format!(
+                "a class ceiling this read-only verification may reach for archive {} (the owner claimed {}, which needs owner-issued bounded validation evidence or a separate cutover authority that a backup.verify does not hold)",
+                evidence.bundle_id,
+                evidence.class_ceiling.wire_name()
+            ),
+            reason: format!(
+                "owner answered for archive {} at class ceiling {}; A13.7 requires separate authority for cutover and confines restore verification to an isolated area, so this read-only operation cannot have reached that ceiling",
+                evidence.bundle_id,
+                evidence.class_ceiling.wire_name()
+            ),
+        });
     }
     Ok(())
 }
@@ -1954,12 +2167,19 @@ fn require_proven_claim(evidence: &VerifyEvidence<'_>) -> Result<(), UnprovenCla
 fn apply_verify_evidence(outcome: &mut BackupOperationOutcome, evidence: &VerifyEvidence<'_>) {
     outcome.archive_id = Some(evidence.bundle_id.clone());
     outcome.requested_class = Some(evidence.class.to_owned());
-    outcome.verification_level = Some(evidence.level.to_owned());
-    outcome.class_ceiling = Some(evidence.class_ceiling.to_owned());
+    // The reported spellings come from the typed owners the answer was decoded
+    // through, so what the operator reads is the same vocabulary the check
+    // enforced rather than a second restatement of it.
+    outcome.verification_level = Some(evidence.level.wire_name().to_owned());
+    outcome.class_ceiling = Some(evidence.class_ceiling.wire_name().to_owned());
     outcome.archive_fence_relation = Some(evidence.archive_fence_relation.to_owned());
-    outcome.archive_fence_proof = Some(evidence.archive_fence_proof.to_owned());
+    outcome.archive_fence_proof = Some(evidence.archive_fence_proof.wire_name().to_owned());
     outcome.target_compatibility = None;
     outcome.capture_receipt = evidence.capture_receipt.map(str::to_owned);
+    // The nested identity is projected as typed references, never as prose and
+    // never re-derived from the envelope echo, so the JSON and human
+    // projections carry the same bindings the checks above just enforced.
+    outcome.result_identity = Some(evidence.result.clone());
     outcome.gates_passed.clone_from(&evidence.member_counts);
 }
 
@@ -2215,6 +2435,11 @@ pub fn backup_restore_test(
         verification_level: None,
         class_ceiling: None,
         capture_receipt: None,
+        // A rehearsal proves no archive result, so there is no result identity to
+        // bind. It stays an explicit absence: the capture operation identity the
+        // request declared above is the request's own claim, never an owner's
+        // answer about a result this command did not produce.
+        result_identity: None,
         archive_fence_relation: None,
         archive_fence_proof: None,
         target_compatibility: None,
