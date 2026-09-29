@@ -60,63 +60,10 @@ use super::{
     unix_ms, unix_ms_i64,
 };
 
-const NATIVE_WORKER_EXECUTABLE_BINDING_PUBLISH_OPERATION: &str =
-    "native_worker.executable_binding.publish";
 const NATIVE_WORKER_EXECUTABLE_BINDING_READ_OPERATION: &str =
     "native_worker.executable_binding.read";
-const NATIVE_WORKER_EXECUTABLE_BINDING_PUBLICATION_RECEIPT_VERSION: &str =
-    "eliot-kernel-native-worker-binding-publication/v1";
 const NATIVE_WORKER_EXECUTABLE_BINDING_READBACK_KIND: &str =
     "native_worker_executable_binding_readback";
-
-/// The daemon-side outcome of publishing one exact Governor-owned executable
-/// binding to Kernel. `Pending` means the requested claim has not been staged
-/// yet; callers retain and retry the same binding and operation identity.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum NativeWorkerExecutableBindingPublicationOutcome {
-    /// The authenticated Kernel owner has not staged this claim yet.
-    Pending {
-        claim_id: String,
-        attempt_id: String,
-        operation_id: String,
-    },
-    /// Kernel retained the original Governor-issued digest on the claim row.
-    Published(NativeWorkerExecutableBindingPublicationReceipt),
-}
-
-/// Exact identity projection returned after Kernel records the original
-/// Governor executable binding. The receipt intentionally contains digests
-/// and identity references only, never credential or resource values.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct NativeWorkerExecutableBindingPublicationReceipt {
-    kind: String,
-    wire_version: String,
-    claim_id: String,
-    registration_id: String,
-    attempt_id: String,
-    operation_id: String,
-    worker_generation: u64,
-    state_fence: StateFence,
-    session_id: String,
-    executable_binding_digest: String,
-    receipt_digest: String,
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
-enum NativeWorkerExecutableBindingPublicationReplyWire {
-    Pending {
-        kind: String,
-        claim_id: String,
-        attempt_id: String,
-        operation_id: String,
-    },
-    Published {
-        kind: String,
-        receipt: NativeWorkerExecutableBindingPublicationReceipt,
-    },
-}
 
 /// Full Governor record and its Kernel-retained claim-row tuple, returned by
 /// the authenticated readback operation. Route and capacity currentness are
@@ -131,7 +78,6 @@ pub(super) struct NativeWorkerExecutableBindingReadback {
     observed_at_unix_ms: u64,
     executable_binding_digest: String,
     binding: GovernorNativeWorkerExecutableBinding,
-    executable_binding_projection: NativeWorkerExecutableBindingProjectionReadback,
 }
 
 impl NativeWorkerExecutableBindingReadback {
@@ -165,12 +111,6 @@ impl NativeWorkerExecutableBindingReadback {
 
     pub(super) fn binding(&self) -> &GovernorNativeWorkerExecutableBinding {
         &self.binding
-    }
-
-    pub(super) fn executable_binding_projection(
-        &self,
-    ) -> &NativeWorkerExecutableBindingProjectionReadback {
-        &self.executable_binding_projection
     }
 }
 
@@ -254,23 +194,6 @@ fn require_binding_lookup_text(value: &str, field: &'static str) -> Result<(), K
         )));
     }
     Ok(())
-}
-
-fn binding_publication_receipt_digest_is_valid(
-    receipt: &NativeWorkerExecutableBindingPublicationReceipt,
-) -> Result<bool, KernelClientError> {
-    let mut body = serde_json::to_value(receipt)
-        .map_err(|error| KernelClientError::Unknown(error.to_string()))?;
-    let Some(receipt_digest) = body
-        .as_object_mut()
-        .and_then(|object| object.remove("receipt_digest"))
-        .and_then(|digest| digest.as_str().map(str::to_owned))
-    else {
-        return Ok(false);
-    };
-    let bytes = canonical_json_bytes(&body)
-        .map_err(|error| KernelClientError::Unknown(error.to_string()))?;
-    Ok(sha256_hex(&bytes) == receipt_digest)
 }
 
 fn valid_native_worker_claim_state(value: &str) -> bool {
@@ -1692,106 +1615,6 @@ impl DaemonKernelClient {
         })
     }
 
-    /// Publishes the exact full record emitted by the Governor M1 binding
-    /// publisher to the authenticated Kernel claim lifecycle. The full owner
-    /// record is serialized unchanged; the Kernel retains both it and its
-    /// original `binding_digest` on the matching ORS claim row. A pending
-    /// result means the claim has not reached Requested yet, so callers must
-    /// retry the same Governor record and operation identity.
-    pub(super) async fn publish_native_worker_executable_binding_async(
-        &self,
-        binding: &GovernorNativeWorkerExecutableBinding,
-        expected_attempt_id: &str,
-    ) -> Result<NativeWorkerExecutableBindingPublicationOutcome, KernelClientError> {
-        use eliot_contracts::fences_match_exact;
-
-        binding.validate().map_err(KernelClientError::Contract)?;
-        require_binding_lookup_text(expected_attempt_id, "attempt_id")?;
-        let session_before = self.owner_session_facts().ok_or_else(|| {
-            KernelClientError::Contract(
-                "native-worker binding publication requires a validated Kernel owner session"
-                    .to_owned(),
-            )
-        })?;
-        let live_fence = self.kernel_fence();
-        if !fences_match_exact(&binding.state_fence, &live_fence) {
-            return Err(KernelClientError::Contract(
-                "Governor executable binding is stale under the current Kernel fence".to_owned(),
-            ));
-        }
-
-        let binding_json = serde_json::to_value(binding)
-            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
-        let response = self
-            .transact_async(
-                NATIVE_WORKER_EXECUTABLE_BINDING_PUBLISH_OPERATION,
-                serde_json::json!({
-                    "attempt_id": expected_attempt_id,
-                    "binding": binding_json,
-                }),
-            )
-            .await?;
-        if self
-            .owner_session_facts()
-            .is_none_or(|current| current.session_binding() != session_before.session_binding())
-        {
-            return Err(KernelClientError::Unknown(
-                "Kernel owner session changed during executable binding publication".to_owned(),
-            ));
-        }
-        let reply: NativeWorkerExecutableBindingPublicationReplyWire =
-            serde_json::from_value(response)
-                .map_err(|error| KernelClientError::Unknown(error.to_string()))?;
-        match reply {
-            NativeWorkerExecutableBindingPublicationReplyWire::Pending {
-                kind,
-                claim_id,
-                attempt_id,
-                operation_id,
-            } => {
-                if kind != "native_worker_executable_binding_publication"
-                    || claim_id != binding.claim_id
-                    || attempt_id != expected_attempt_id
-                    || operation_id != binding.operation_id
-                {
-                    return Err(KernelClientError::Unknown(
-                        "Kernel pending executable binding reply does not match the requested owner tuple"
-                            .to_owned(),
-                    ));
-                }
-                Ok(NativeWorkerExecutableBindingPublicationOutcome::Pending {
-                    claim_id,
-                    attempt_id,
-                    operation_id,
-                })
-            }
-            NativeWorkerExecutableBindingPublicationReplyWire::Published { kind, receipt } => {
-                if kind != "native_worker_executable_binding_publication"
-                    || receipt.kind != "native_worker_executable_binding_receipt"
-                    || receipt.wire_version
-                        != NATIVE_WORKER_EXECUTABLE_BINDING_PUBLICATION_RECEIPT_VERSION
-                    || receipt.claim_id != binding.claim_id
-                    || receipt.registration_id != binding.registration_id
-                    || receipt.attempt_id != expected_attempt_id
-                    || receipt.operation_id != binding.operation_id
-                    || receipt.worker_generation != binding.worker_generation
-                    || !fences_match_exact(&receipt.state_fence, &binding.state_fence)
-                    || receipt.session_id != binding.session_id
-                    || receipt.executable_binding_digest != binding.binding_digest
-                    || !binding_publication_receipt_digest_is_valid(&receipt)?
-                {
-                    return Err(KernelClientError::Unknown(
-                        "Kernel executable binding publication receipt does not match the Governor record"
-                            .to_owned(),
-                    ));
-                }
-                Ok(NativeWorkerExecutableBindingPublicationOutcome::Published(
-                    receipt,
-                ))
-            }
-        }
-    }
-
     /// Reads the Governor's full executable binding and its same-row Kernel
     /// claim projection through the authenticated lifecycle route. The lookup
     /// tuple is only a selector; every returned tuple field and all shared
@@ -1914,7 +1737,6 @@ impl DaemonKernelClient {
                         observed_at_unix_ms,
                         executable_binding_digest,
                         binding,
-                        executable_binding_projection,
                     },
                 ))
             }
