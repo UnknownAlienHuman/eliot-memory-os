@@ -71,9 +71,9 @@ pub use backup_io::{
     IsolatedDestinationReceipt, IsolatedRestorePort, IsolationEvidence, MAX_DENOMINATOR_REFERENCES,
     MAX_PROOF_HANDLES, MAX_RESTORE_MEMBERS, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_MEMBERS,
     MAX_SNAPSHOT_PAGE_MEMBERS, MAX_SNAPSHOT_PAGES, ReconciliationOutcome, RestoreConflictKind,
-    RestoreValidationReceipt, SnapshotBeginRequest, SnapshotBounds, SnapshotCompleteness,
-    SnapshotCursor, SnapshotDenominator, SnapshotEndReceipt, SnapshotHandle, SnapshotMember,
-    SnapshotMemberType, SnapshotPage, SnapshotPageCoverage, SnapshotPageState,
+    RestoreValidationReceipt, RetainedArchiveMember, SnapshotBeginRequest, SnapshotBounds,
+    SnapshotCompleteness, SnapshotCursor, SnapshotDenominator, SnapshotEndReceipt, SnapshotHandle,
+    SnapshotMember, SnapshotMemberType, SnapshotPage, SnapshotPageCoverage, SnapshotPageState,
     SnapshotSourceIdentity, SnapshotValidationReceipt, classify_restore_conflict,
     is_backup_io_capability, reconcile_same_operation,
 };
