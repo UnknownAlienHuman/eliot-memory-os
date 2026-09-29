@@ -579,7 +579,7 @@ fn horizon_wake_operation_identity(
 ///   `catch-up` or `deadline` policy is not part of the contract being published
 ///   and inventing one here would put a time in the journal that the revision
 ///   never normalized;
-/// - `required_capabilities` names the existing UserAutomation kernel
+/// - `required_capabilities` names the existing `UserAutomation` kernel
 ///   capability the due-wake consumer must hold, reusing the constant this
 ///   operation family already spells rather than introducing a new vocabulary;
 /// - `maintenance_family` and `budget_ref` are bound to the immutable
