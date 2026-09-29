@@ -4398,6 +4398,28 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         &self.owners
     }
 
+    /// Retains one execution-evidence page in the existing Skill lifecycle
+    /// owner and returns its resulting position. This narrow write seam keeps
+    /// the rest of the owner set immutable to daemon callers; it does not
+    /// imply durable persistence or restart recovery for the observation.
+    #[allow(clippy::result_large_err)]
+    pub fn record_skill_execution_evidence(
+        &mut self,
+        skill_id: &str,
+        skill_revision: &str,
+        package_digest: &str,
+        entry: &eliot_skill::SkillCatalogueEntry,
+        executions: &[eliot_skill::SkillExecutionEvidence],
+    ) -> Result<SkillLifecycleView, eliot_skill::SkillError> {
+        self.owners.skill.record_execution_evidence(
+            skill_id,
+            skill_revision,
+            package_digest,
+            entry,
+            executions,
+        )
+    }
+
     /// Prepares this composition's existing maintenance admission under its
     /// current state and fence (issue #1693).
     ///

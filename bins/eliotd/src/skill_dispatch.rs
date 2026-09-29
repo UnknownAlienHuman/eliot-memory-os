@@ -341,7 +341,7 @@ fn plan_execution(
 /// assessment is unavailable and is reported as a typed refusal rather than a
 /// self-comparison of the submitted page, which could never fail.
 fn commit_execution_candidate(
-    composition: &DaemonComposition,
+    composition: &mut DaemonComposition,
     candidate: &ExecutionCandidate,
 ) -> SkillResultEnvelope {
     let payload = &candidate.payload;
@@ -359,8 +359,9 @@ fn commit_execution_candidate(
         });
     }
     match composition.skill_publish_execution_evidence(payload) {
-        // The owner accepted the evidence: the assessment is only reported
-        // after the owner took it, so a claim never outruns persistence.
+        // The in-process owner retained the evidence: the assessment is only
+        // reported after the owner view contains it. Durable restart storage
+        // remains a separate owner path.
         Ok(_published) => {
             let committed = match read_execution_owner_position(composition, &payload.skill_id) {
                 OwnerPositionRead::Read(position) => position,
