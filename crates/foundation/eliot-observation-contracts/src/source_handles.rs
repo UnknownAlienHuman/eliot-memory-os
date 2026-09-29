@@ -40,6 +40,13 @@ fn bounded_text(
     Ok(())
 }
 
+fn invalid_native_mapping(field: &'static str) -> ObservationError {
+    ObservationError::InvalidField {
+        field,
+        reason: "must be `line:<n>;column:<n>` with one-based positive integers",
+    }
+}
+
 fn digest(value: &str, field: &'static str) -> Result<(), ObservationError> {
     if value.len() != 64
         || value
@@ -206,6 +213,55 @@ impl SourceRevisionHandle {
     }
 }
 
+/// One exact native coordinate inside the admitted source bytes.
+///
+/// This is the typed form of the closed `line:<n>;column:<n>` grammar declared
+/// on [`SourceAnchorHandle::native_mapping`] and resolved by the governed
+/// readback path, so the position half of the I12.35 anchor is a pair of
+/// numbers rather than prose. Both members are one-based over the reopened
+/// bytes' own `LF` line breaks and strictly positive: a zero coordinate
+/// addresses nothing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeCoordinate {
+    /// One-based line the excerpt starts on.
+    pub line: u64,
+    /// One-based column the excerpt starts at.
+    pub column: u64,
+}
+
+impl NativeCoordinate {
+    /// Parse the closed `line:<n>;column:<n>` grammar into a typed coordinate.
+    ///
+    /// The grammar is the one the readback path resolves, so a value accepted
+    /// here is a value that path can open: exactly the two names, each stated
+    /// once, each a strictly positive decimal integer, and no other text. Any
+    /// other shape is a typed [`ObservationError::InvalidField`] rather than a
+    /// mapping that is stored and later unresolvable.
+    pub fn parse(mapping: &str, field: &'static str) -> Result<Self, ObservationError> {
+        let mut line: Option<u64> = None;
+        let mut column: Option<u64> = None;
+        for part in mapping.split(';') {
+            let (name, value) = part
+                .split_once(':')
+                .ok_or_else(|| invalid_native_mapping(field))?;
+            let parsed = value
+                .parse::<u64>()
+                .ok()
+                .filter(|parsed| *parsed > 0)
+                .ok_or_else(|| invalid_native_mapping(field))?;
+            match name {
+                "line" if line.is_none() => line = Some(parsed),
+                "column" if column.is_none() => column = Some(parsed),
+                _ => return Err(invalid_native_mapping(field)),
+            }
+        }
+        match (line, column) {
+            (Some(line), Some(column)) => Ok(Self { line, column }),
+            _ => Err(invalid_native_mapping(field)),
+        }
+    }
+}
+
 /// Exact anchor resolved through stored coordinates or native mapping.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -224,6 +280,11 @@ pub struct SourceAnchorHandle {
     /// counted over the reopened bytes' own `LF` line breaks. The mapping
     /// names where the excerpt starts; the excerpt length and digest stay on
     /// this handle. An owner that uses raw byte offsets leaves this `None`.
+    ///
+    /// The grammar is closed here, not only in the readback path:
+    /// [`SourceAnchorHandle::validate`] refuses any mapping
+    /// [`SourceAnchorHandle::native_coordinate`] cannot decode, so a record
+    /// this owner accepts is a record the readback path can open.
     pub native_mapping: Option<String>,
 }
 
@@ -240,7 +301,23 @@ impl SourceAnchorHandle {
         digest(&self.excerpt_sha256, "source_anchor.excerpt_sha256")?;
         if let Some(mapping) = &self.native_mapping {
             bounded_text(mapping, "source_anchor.native_mapping", 1024)?;
+            // The mapping is the position half of the I12.35 anchor. Decoding
+            // it here is what keeps the owner from issuing a coordinate the
+            // readback path cannot resolve; the bound above stays in force.
+            self.native_coordinate()?;
         }
         Ok(())
+    }
+
+    /// The exact typed coordinate, or `None` when the owner anchors by raw
+    /// byte offset.
+    ///
+    /// Absence stays absence: a record that anchors by offset states no native
+    /// coordinate, and no default is substituted for the missing one.
+    pub fn native_coordinate(&self) -> Result<Option<NativeCoordinate>, ObservationError> {
+        self.native_mapping
+            .as_deref()
+            .map(|mapping| NativeCoordinate::parse(mapping, "source_anchor.native_mapping"))
+            .transpose()
     }
 }
