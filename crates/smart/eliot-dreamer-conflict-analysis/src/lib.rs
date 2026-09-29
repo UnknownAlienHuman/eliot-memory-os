@@ -41,6 +41,17 @@
 //! unknown names nothing, and a recommended probe lists only the positions the
 //! `ConflictSet` itself binds to it, never the whole set by default.
 //!
+//! A third rule bounds every claim a position makes about its relationship to
+//! the others. One qualification of the typed comparison mapping is computed
+//! per position, and the emitted disposition, the typed mapping, and the note
+//! are all read from that single result, so they cannot disagree about the proof
+//! ceiling. Only an owner-issued source-record commitment for BOTH compared
+//! sources qualifies a comparison: without them, or with any unnormalizable
+//! dimension, the relation stays [`CompatibilityRelation::Ambiguous`] under
+//! [`SupplementVersion::LegacyV1Unverified`] and the note is non-assertive.
+//! Disjoint assumption handles are never a comparison, so they cannot make a
+//! position a [`PositionDispositionKind::CompatibleResidue`] one.
+//!
 //! Every terminal outcome is read from input the analysis already holds; none
 //! is invented, defaulted, or inferred from prose. Cancellation and the frozen
 //! deadline give [`ConflictOutcome::Blocked`] and [`ConflictOutcome::Stale`].
@@ -62,11 +73,15 @@
 //! terminal-completion call by construction; the only cryptography is the
 //! canonical digest below, and the only fallible work is pure bounded
 //! validation. There are no placeholder, mock, canned, or pseudo paths:
-//! every branch binds an explicit input field. The retained comparison and
-//! causal supplement shapes are legacy version 1 declarations: their values
-//! are preserved and digested, but never treated as owner evidence. They do
-//! not qualify equality, difference, prediction support, intervention, or
-//! causal attribution. No legacy bytes are deserialized into a stronger shape.
+//! every branch binds an explicit input field. The retained causal supplement
+//! shape is a legacy version 1 declaration: its prose is preserved and digested,
+//! but never treated as owner evidence, so it does not qualify prediction
+//! support, intervention, or causal attribution. A comparison declaration is a
+//! legacy version 1 declaration until
+//! [`ConflictSupplements::source_commitments`] carries an owner-issued record
+//! for both of its sources, at which point its canonical dimension outcomes
+//! become compared evidence under [`SupplementVersion::OwnerBoundV2`]. No legacy
+//! bytes are deserialized into a stronger shape.
 //!
 //! Test coverage note: 65 of 68 `WORK_UNIT_CASE 673/*` cases execute here
 //! (673/1 valid completes, 673/2 wrong job and scope fail closed, 673/3
@@ -188,7 +203,7 @@ pub const MAX_CAUSAL_CLAIMS: usize = 64;
 pub const EXPECTED_COMPARISON_DIMENSIONS: usize = 8;
 
 /// Routing-only proof ceiling carried by every emitted candidate.
-pub const CONFLICT_PROOF_NOTE: &str = "a-39 candidate-only aggregation: bounded rival analysis preserved; legacy v1 comparison and causal declarations remain unverified and cannot qualify equality, difference, prediction, intervention, or causality; no Concilium planning, vote tally, source acquisition, probe execution, mutation, authority, effect, store, governor, model, clock, or finish";
+pub const CONFLICT_PROOF_NOTE: &str = "a-39 candidate-only aggregation: bounded rival analysis preserved; a comparison qualifies equality or difference only with an owner-issued source-record commitment for both compared sources, and legacy v1 causal declarations remain unverified and cannot qualify prediction, intervention, or causality; no Concilium planning, vote tally, source acquisition, probe execution, mutation, authority, effect, store, governor, model, clock, or finish";
 
 // ---------------------------------------------------------------------------
 // Small pure helpers (no ambient clock, no allocation of authority).
@@ -540,25 +555,41 @@ pub const COMPARISON_DIMENSIONS: [ComparisonDimension; EXPECTED_COMPARISON_DIMEN
     ComparisonDimension::FactualPredictiveCausal,
 ];
 
+/// The three canonical dimensions that bound a claim to its conditions.
+///
+/// Only an owner-bound difference on one of these can make two claims
+/// compatible residue. A difference on any other dimension is a typed difference
+/// that says nothing about the scope, time window, or definition the claims were
+/// measured against.
+const CONDITION_DIMENSIONS: [ComparisonDimension; 3] = [
+    ComparisonDimension::ScopePopulationEnvironment,
+    ComparisonDimension::TimeVersion,
+    ComparisonDimension::DefinitionUnitDenominator,
+];
+
 /// Legacy caller-declared outcome for one canonical comparison dimension.
+///
+/// Every variant is a declaration. The declaration reaches a relation only
+/// through the owner-bound qualification of the enclosing pair, so a value read
+/// here is never itself evidence.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DimensionOutcome {
-    /// The legacy caller declares the same value for both positions. This is
-    /// not an owner-bound observation and cannot establish equality.
+    /// The legacy caller declares the same value for both positions. An
+    /// unadmitted declaration cannot establish equality.
     Equal {
-        /// The caller-declared value, preserved verbatim and unverified.
+        /// The caller-declared value, preserved verbatim.
         value: String,
     },
-    /// The legacy caller declares different values for the positions. This is
-    /// not an owner-bound observation and cannot establish a difference.
+    /// The legacy caller declares different values for the positions. An
+    /// unadmitted declaration cannot establish a difference.
     Differing {
         /// Caller-declared value for the left position, preserved verbatim.
         left: String,
         /// Caller-declared value for the right position, preserved verbatim.
         right: String,
     },
-    /// The caller declares the field unnormalizable. It stays unverified and
-    /// cannot be promoted to an evidence-backed relation.
+    /// The caller declares the field unnormalizable. It cannot be promoted to
+    /// an evidence-backed relation even in an owner-bound pair.
     Unnormalizable {
         /// Bounded reason the field cannot be normalized.
         reason: String,
@@ -575,10 +606,12 @@ pub struct DimensionComparison {
 }
 
 /// Legacy version 1 caller declaration for two positions over the canonical
-/// dimensions. No source bytes, revisions, owner-issued profile, or admitted
-/// dimension records accompany this shape, so declarations are never
-/// qualified as equality or difference. Rust callers may continue constructing
-/// it for compatibility; this crate does not deserialize legacy bytes.
+/// dimensions. The shape carries no source bytes, revisions, or owner-issued
+/// profile of its own, so the declaration alone establishes neither equality nor
+/// difference; it is qualified only once
+/// [`ConflictSupplements::source_commitments`] supplies an owner-issued record
+/// for both of its sources. Rust callers may continue constructing it for
+/// compatibility; this crate does not deserialize legacy bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SuppliedComparison {
     /// Source handle of the left position.
@@ -995,11 +1028,13 @@ impl CanonicalComparisonPair {
 /// Typed relation between two positions over the canonical dimensions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CompatibilityRelation {
-    /// Reserved for a future owner-record-backed contract; legacy v1 cannot emit it.
+    /// Every canonical dimension is an owner-bound equality.
     EqualConditions,
-    /// Reserved for a future owner-record-backed contract; legacy v1 cannot emit it.
+    /// At least one canonical dimension is an owner-bound difference and every
+    /// remaining dimension normalized.
     TypedDifference,
-    /// Legacy declarations lack owner-bound evidence; relation is unknown.
+    /// No owner-bound record covers the comparison, or a dimension could not be
+    /// normalized; the relation is unknown.
     Ambiguous,
 }
 
@@ -1015,25 +1050,31 @@ impl CompatibilityRelation {
     }
 }
 
-/// One position's preserved legacy declaration mapping against another.
+/// One position's preserved comparison mapping against another.
 ///
 /// [`Self::outcomes`] carries the caller's declarations in
-/// [`COMPARISON_DIMENSIONS`] order. `relation` stays ambiguous because no
-/// owner-bound source/profile/value records exist in legacy v1. The declared
-/// differing and unnormalizable dimensions are retained for review, not proof.
+/// [`COMPARISON_DIMENSIONS`] order. `relation` and `supplement_version` are read
+/// from the same qualification: an owner-bound pair that normalized every
+/// dimension reaches [`CompatibilityRelation::EqualConditions`] or
+/// [`CompatibilityRelation::TypedDifference`] under
+/// [`SupplementVersion::OwnerBoundV2`], and a pair with no owner-bound
+/// commitment, or with an unnormalizable dimension, stays
+/// [`CompatibilityRelation::Ambiguous`] under
+/// [`SupplementVersion::LegacyV1Unverified`]. The declared differing and
+/// unnormalizable dimensions are always retained for review.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PositionCompatibility {
     /// Source handle of the other position.
     pub other_source: String,
-    /// Legacy proof ceiling; always ambiguous until owner records exist.
+    /// Relation the proof ceiling of `supplement_version` actually supports.
     pub relation: CompatibilityRelation,
     /// Proof ceiling for these retained declarations.
     pub supplement_version: SupplementVersion,
     /// Every dimension outcome in canonical order, values preserved.
     pub outcomes: Vec<DimensionComparison>,
-    /// Dimensions the legacy caller declares to differ, in canonical order.
+    /// Dimensions declared to differ, in canonical order.
     pub differing_dimensions: Vec<ComparisonDimension>,
-    /// Dimensions the legacy caller declares unnormalizable, in canonical order.
+    /// Dimensions declared unnormalizable, in canonical order.
     pub unnormalizable_dimensions: Vec<ComparisonDimension>,
 }
 
@@ -1042,6 +1083,10 @@ pub struct PositionCompatibility {
 pub enum SupplementVersion {
     /// Legacy caller declarations with no owner-bound records; never verified.
     LegacyV1Unverified,
+    /// Owner-issued source-record commitments admitted for both compared
+    /// sources, so the canonical dimension outcomes of that pair are compared
+    /// evidence rather than caller prose.
+    OwnerBoundV2,
 }
 
 impl SupplementVersion {
@@ -1050,6 +1095,7 @@ impl SupplementVersion {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::LegacyV1Unverified => "legacy_v1_unverified",
+            Self::OwnerBoundV2 => "owner_bound_v2",
         }
     }
 }
@@ -1131,8 +1177,10 @@ pub struct CausalClaimRecord {
 /// Caller-supplied supplements bound to one `ConflictSet` analysis.
 ///
 /// `comparisons` and `causal_claims` retain legacy v1 declaration shapes and
-/// are digested as such. This type has no byte deserializer that could silently
-/// fill defaults while upgrading old serialized values into a stronger schema.
+/// are digested as such. A comparison reaches a relation only through
+/// `source_commitments`; a causal claim never does. This type has no byte
+/// deserializer that could silently fill defaults while upgrading old
+/// serialized values into a stronger schema.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConflictSupplements {
     /// Expected A-05 receipt the item and draft receipts bind against.
@@ -1153,8 +1201,18 @@ pub struct ConflictSupplements {
     pub unknowns: Vec<String>,
     /// Supplied structured probe candidates in any order.
     pub supplied_probes: Vec<SuppliedProbe>,
-    /// Legacy v1 caller declarations over canonical dimensions; never qualified.
+    /// Legacy v1 caller declarations over canonical dimensions.
+    ///
+    /// A declaration is owner bound only when `source_commitments` carries a
+    /// commitment for both of its sources. Without both, the declaration and
+    /// every relation read from it stay legacy v1 unverified.
     pub comparisons: Vec<SuppliedComparison>,
+    /// Owner-issued source-record commitments in any order.
+    ///
+    /// A commitment names the source handle it was issued for, so it cannot be
+    /// detached from one position and re-attached to another. A comparison
+    /// missing either of its two commitments stays unqualified.
+    pub source_commitments: Vec<SourceRecordCommitment>,
     /// Legacy v1 causal/predictive declarations; prose is not evidence.
     pub causal_claims: Vec<SuppliedCausalClaim>,
     /// Externally supplied resolution status, when one exists.
@@ -1611,6 +1669,11 @@ fn preflight_supplement_bounds(
         MAX_COMPARISONS,
     )?;
     bound_list_length(
+        "source-commitments",
+        supplements.source_commitments.len(),
+        MAX_SOURCES,
+    )?;
+    bound_list_length(
         "causal-claims",
         supplements.causal_claims.len(),
         MAX_CAUSAL_CLAIMS,
@@ -1936,6 +1999,43 @@ fn validate_comparisons(
             });
         }
         seen_pairs.push(key);
+    }
+    Ok(())
+}
+
+/// Validates owner-issued source-record commitments against the position
+/// denominator.
+///
+/// A commitment whose shape checks out but names a source outside the set, or a
+/// second commitment for a source already committed, is refused before
+/// interpretation: an ambiguous commitment could otherwise decide which of two
+/// records a comparison reads.
+fn validate_source_commitments(
+    conflict_set: &ConflictSet,
+    commitments: &[SourceRecordCommitment],
+) -> Result<(), ConflictAnalysisError> {
+    let handles = position_source_handles(conflict_set);
+    let mut seen: Vec<&str> = Vec::with_capacity(commitments.len());
+    for commitment in commitments {
+        let source = commitment.source();
+        if !handles.contains(source) {
+            return Err(ConflictAnalysisError::Binding {
+                field: "commitment.source".to_owned(),
+                detail: format!(
+                    "source commitment names a source outside the position denominator: {}",
+                    redact(source)
+                ),
+            });
+        }
+        if seen.contains(&source) {
+            return Err(ConflictAnalysisError::Denominator {
+                detail: format!(
+                    "two source commitments name the same position: {}",
+                    redact(source)
+                ),
+            });
+        }
+        seen.push(source);
     }
     Ok(())
 }
@@ -2403,14 +2503,53 @@ fn classify_conflict(conflict_set: &ConflictSet) -> Vec<ConflictKind> {
     out
 }
 
-/// Returns true when two assumption sets are disjoint.
-fn assumptions_disjoint(left: &[String], right: &[String]) -> bool {
-    for item in left {
-        if right.contains(item) {
-            return false;
+/// Returns the owner-issued commitment issued for one source handle, if any.
+fn commitment_for<'a>(
+    commitments: &'a [SourceRecordCommitment],
+    source: &str,
+) -> Option<&'a SourceRecordCommitment> {
+    commitments
+        .iter()
+        .find(|commitment| commitment.source() == source)
+}
+
+/// Returns the single canonical pair for one comparison, when it is owner bound.
+///
+/// A comparison qualifies only when an owner-issued commitment exists for BOTH
+/// of its sources and the pair normalizes into one canonical orientation. A
+/// missing commitment, an unbound commitment, or a pair that does not validate
+/// leaves the declaration unqualified rather than partly proven.
+fn qualify_comparison(
+    supplied: &SuppliedComparison,
+    commitments: &[SourceRecordCommitment],
+) -> Option<CanonicalComparisonPair> {
+    let left = commitment_for(commitments, &supplied.left_source)?;
+    let right = commitment_for(commitments, &supplied.right_source)?;
+    CanonicalComparisonPair::from_supplied(supplied, left, right).ok()
+}
+
+/// Returns the relation one admitted pair actually proves.
+///
+/// Equality requires every canonical dimension to be an owner-bound equality.
+/// A single unnormalizable dimension leaves the whole relation ambiguous: the
+/// missing field could be the one that decides it.
+fn admitted_relation(pair: &CanonicalComparisonPair) -> CompatibilityRelation {
+    let mut differing = false;
+    let mut unnormalizable = false;
+    for entry in &pair.dimensions {
+        match entry.outcome {
+            CanonicalDimensionOutcome::Equal { .. } => {}
+            CanonicalDimensionOutcome::Differing { .. } => differing = true,
+            CanonicalDimensionOutcome::Unnormalizable { .. } => unnormalizable = true,
         }
     }
-    true
+    if unnormalizable {
+        CompatibilityRelation::Ambiguous
+    } else if differing {
+        CompatibilityRelation::TypedDifference
+    } else {
+        CompatibilityRelation::EqualConditions
+    }
 }
 
 /// Returns the canonical joined spelling of compared dimensions.
@@ -2449,16 +2588,23 @@ fn dimension_outcome_spelling(outcome: &DimensionOutcome) -> String {
     }
 }
 
-/// Preserves the legacy compatibility declarations for one position.
+/// Preserves the comparison mapping for one position.
 ///
 /// Every supplied comparison naming this position contributes one entry, from
-/// either side, so the mapping is symmetric. Because version 1 has no
-/// owner-bound source/profile/value records, every relation remains
-/// [`CompatibilityRelation::Ambiguous`] even when the caller declares eight
-/// equal or differing dimensions. Outcomes are preserved only as declarations.
+/// either side, so the mapping is symmetric. The relation and its proof ceiling
+/// come from the same qualification: an owner-bound canonical pair that
+/// normalized every dimension reaches
+/// [`CompatibilityRelation::EqualConditions`] or
+/// [`CompatibilityRelation::TypedDifference`] under
+/// [`SupplementVersion::OwnerBoundV2`], while a pair with no owner-bound
+/// commitment for both sources, or with an unnormalizable dimension, stays
+/// [`CompatibilityRelation::Ambiguous`] under
+/// [`SupplementVersion::LegacyV1Unverified`]. Declared outcomes are preserved
+/// either way, as declarations.
 fn build_compatibility(
     source_handle: &str,
     comparisons: &[SuppliedComparison],
+    commitments: &[SourceRecordCommitment],
 ) -> Vec<PositionCompatibility> {
     let mut out: Vec<PositionCompatibility> = Vec::new();
     for comparison in comparisons {
@@ -2499,11 +2645,18 @@ fn build_compatibility(
                 outcome: entry.outcome.clone(),
             });
         }
-        let relation = CompatibilityRelation::Ambiguous;
+        let (relation, supplement_version) =
+            match qualify_comparison(comparison, commitments) {
+                Some(pair) => (admitted_relation(&pair), SupplementVersion::OwnerBoundV2),
+                None => (
+                    CompatibilityRelation::Ambiguous,
+                    SupplementVersion::LegacyV1Unverified,
+                ),
+            };
         out.push(PositionCompatibility {
             other_source: other.to_owned(),
             relation,
-            supplement_version: SupplementVersion::LegacyV1Unverified,
+            supplement_version,
             outcomes,
             differing_dimensions: differing,
             unnormalizable_dimensions: unnormalizable,
@@ -2560,6 +2713,96 @@ fn compatibility_note_with_mapping(base: &str, mapping: &[PositionCompatibility]
         return base.to_owned();
     }
     format!("{base}; {}", compatibility_clause(mapping))
+}
+
+/// The one qualified comparison result a position's note and disposition share.
+///
+/// This is the only relation the analyzer may read out of the typed mapping. A
+/// position's note and its [`PositionDispositionKind`] are both derived from
+/// this single value, so they cannot disagree about the proof ceiling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QualifiedPositionRelation {
+    /// No supplied comparison names this position.
+    Absent,
+    /// A comparison names this position but no owner-bound record qualifies it,
+    /// or a compared dimension could not be normalized.
+    Unverified,
+    /// An owner-bound comparison proves every canonical dimension equal.
+    EqualConditions,
+    /// An owner-bound comparison proves a difference on at least one condition
+    /// dimension, so the claims are compatible residual claims.
+    ConditionDifference,
+    /// An owner-bound comparison proves a difference, but on no condition
+    /// dimension; it does not establish compatible residue.
+    OtherDimensionDifference,
+}
+
+impl QualifiedPositionRelation {
+    /// Returns the non-assertive note this qualified result supports.
+    ///
+    /// Nothing here names equality or compatible residue unless the typed
+    /// owner-bound comparison established it, so a missing or unnormalizable
+    /// comparison can never assert equal conditions.
+    fn note(self) -> String {
+        match self {
+            Self::Absent => String::from(
+                "live position preserved; no supplied comparison establishes a relation with the other positions",
+            ),
+            Self::Unverified => String::from(
+                "live position preserved; the supplied comparison carries no owner-bound record for both sources, so no relation is established",
+            ),
+            Self::EqualConditions => String::from(
+                "contradiction under equal subject, scope, time, version, and definition",
+            ),
+            Self::ConditionDifference => String::from(
+                "compatible residual claim under different scope, population, or definition",
+            ),
+            Self::OtherDimensionDifference => String::from(
+                "live position preserved; the owner-bound comparison proves a typed difference that does not bound scope, time, or definition",
+            ),
+        }
+    }
+}
+
+/// Returns the single qualified relation one position's mapping supports.
+///
+/// A position compared against several others keeps the weakest result any of
+/// them supports, so one qualified pair cannot lift a position past an
+/// unverified comparison against a third position.
+fn qualified_position_relation(mapping: &[PositionCompatibility]) -> QualifiedPositionRelation {
+    if mapping.is_empty() {
+        return QualifiedPositionRelation::Absent;
+    }
+    let mut equal = true;
+    let mut condition_difference = false;
+    for entry in mapping {
+        if entry.supplement_version != SupplementVersion::OwnerBoundV2 {
+            return QualifiedPositionRelation::Unverified;
+        }
+        match entry.relation {
+            CompatibilityRelation::EqualConditions => {}
+            CompatibilityRelation::TypedDifference => {
+                equal = false;
+                if entry
+                    .differing_dimensions
+                    .iter()
+                    .any(|dimension| CONDITION_DIMENSIONS.contains(dimension))
+                {
+                    condition_difference = true;
+                }
+            }
+            CompatibilityRelation::Ambiguous => {
+                return QualifiedPositionRelation::Unverified;
+            }
+        }
+    }
+    if condition_difference {
+        QualifiedPositionRelation::ConditionDifference
+    } else if equal {
+        QualifiedPositionRelation::EqualConditions
+    } else {
+        QualifiedPositionRelation::OtherDimensionDifference
+    }
 }
 
 /// Applies the legacy v1 proof ceiling to one supplied declaration.
@@ -2619,7 +2862,45 @@ fn collect_causal_claims(supplements: &ConflictSupplements) -> Vec<CausalClaimRe
     out
 }
 
+/// Returns the history disposition this position's canonical record supports.
+///
+/// History is retained on its own evidence and is never gated on the comparison
+/// axis: a superseded or refuted position keeps its addressable history whatever
+/// the comparison establishes. A minority position is not refuted by a defeated
+/// counterexample, so the refutation leg is skipped for it.
+fn history_disposition(
+    conflict_set: &ConflictSet,
+    minority: bool,
+    counters: &[String],
+) -> Option<(PositionDispositionKind, String)> {
+    if conflict_set.lifecycle == ConflictLifecycle::Superseded
+        && !conflict_set.resolved_parts.is_empty()
+    {
+        return Some((
+            PositionDispositionKind::SupersededHistory,
+            String::from("superseded history retained as addressable history"),
+        ));
+    }
+    if minority || counters.is_empty() {
+        return None;
+    }
+    for counter in counters {
+        if conflict_set.defeated_refs.contains(counter) {
+            return Some((
+                PositionDispositionKind::Refuted,
+                String::from("refuted position retained as addressable history"),
+            ));
+        }
+    }
+    None
+}
+
 /// Disposes one position without choosing a winner.
+///
+/// The comparison axis is read once. [`build_compatibility`] produces the typed
+/// mapping, [`qualified_position_relation`] reduces it to the single relation
+/// that mapping supports, and both the disposition and the note are taken from
+/// that one value. The minority and history axes stay independent of it.
 fn dispose_position(
     index: usize,
     conflict_set: &ConflictSet,
@@ -2651,61 +2932,30 @@ fn dispose_position(
             Vec::new(),
         ),
     };
+    let compatibility_map = build_compatibility(
+        &source_handle,
+        &supplements.comparisons,
+        &supplements.source_commitments,
+    );
+    let relation = qualified_position_relation(&compatibility_map);
     let mut disposition = PositionDispositionKind::LivePreserved;
-    let mut compatibility =
-        String::from("contradiction under equal subject, scope, time, version, and definition");
+    let mut compatibility = relation.note();
     if minority {
         disposition = PositionDispositionKind::MinorityPreserved;
         compatibility =
             String::from("minority position retained; majority count does not determine support");
-    } else {
-        let mut other_assumptions: Vec<String> = Vec::new();
-        for (other_index, other) in conflict_set.positions.iter().enumerate() {
-            if other_index != index {
-                for assumption in &other.assumptions {
-                    other_assumptions.push(assumption.as_str().to_owned());
-                }
-            }
-        }
-        if !assumptions.is_empty()
-            && !other_assumptions.is_empty()
-            && assumptions_disjoint(&assumptions, &other_assumptions)
-        {
-            disposition = PositionDispositionKind::CompatibleResidue;
-            compatibility = String::from(
-                "compatible residual claim under different scope, population, or definition",
-            );
-        }
+    } else if relation == QualifiedPositionRelation::ConditionDifference {
+        disposition = PositionDispositionKind::CompatibleResidue;
     }
-    if conflict_set.lifecycle == ConflictLifecycle::Superseded
-        && !conflict_set.resolved_parts.is_empty()
-    {
-        disposition = PositionDispositionKind::SupersededHistory;
-        compatibility = String::from("superseded history retained as addressable history");
-    }
-    if !counters.is_empty() {
-        let defeated: Vec<String> = conflict_set
-            .defeated_refs
-            .iter()
-            .map(|item| item.as_str().to_owned())
-            .collect();
-        let mut refuted = false;
-        for counter in &counters {
-            if defeated.contains(counter) {
-                refuted = true;
-            }
-        }
-        if refuted && !minority {
-            disposition = PositionDispositionKind::Refuted;
-            compatibility = String::from("refuted position retained as addressable history");
-        }
+    if let Some((history, history_note)) = history_disposition(conflict_set, minority, &counters) {
+        disposition = history;
+        compatibility = history_note;
     }
     if claims_chronology_is_causality(&stance) || claims_count_is_truth(&stance) {
         compatibility = format!(
             "{compatibility}; chronology, count, confidence, recency, or topology is not causal or truth evidence"
         );
     }
-    let compatibility_map = build_compatibility(&source_handle, &supplements.comparisons);
     let compatibility_note = compatibility_note_with_mapping(&compatibility, &compatibility_map);
     PositionAnalysis {
         position_index: index,
@@ -3118,12 +3368,14 @@ fn check_preservation(
 // Digest and emission.
 // ---------------------------------------------------------------------------
 
-/// Builds the sorted digest parts binding the legacy v1 comparison and causal
-/// declaration inputs.
+/// Builds the sorted digest parts binding the comparison and causal declaration
+/// inputs.
 ///
 /// Both lists are bound whole: a caller that changes a declared value, outcome,
-/// or causal prose moves the candidate digest. This digest binds declarations,
-/// not their truth or owner qualification. The comparison pair key is
+/// or causal prose moves the candidate digest. The owner-issued source-record
+/// commitments are bound with them, because the same declared comparison reaches
+/// a different typed relation once a commitment is admitted. This digest binds
+/// declarations and commitments, not their truth. The comparison pair key is
 /// order-independent, so supplying the same pair from either side yields the
 /// same digest.
 fn comparison_and_causal_digest_parts(supplements: &ConflictSupplements) -> Vec<String> {
@@ -3145,6 +3397,19 @@ fn comparison_and_causal_digest_parts(supplements: &ConflictSupplements) -> Vec<
             "comparison:{}:{}",
             comparison_pair_key(&comparison.left_source, &comparison.right_source),
             dimensions.join(",")
+        ));
+    }
+    for commitment in &supplements.source_commitments {
+        parts.push(format!(
+            "commitment:{}:{}|{}:{}|{}:{}|{}:{}",
+            commitment.source().len(),
+            commitment.source(),
+            commitment.record_digest().len(),
+            commitment.record_digest(),
+            commitment.profile().len(),
+            commitment.profile(),
+            commitment.profile_digest().len(),
+            commitment.profile_digest()
         ));
     }
     for claim in &supplements.causal_claims {
@@ -3188,11 +3453,15 @@ pub fn compute_candidate_digest(
     while index < positions.len() {
         if let Some(position) = positions.get(index) {
             parts.push(format!(
-                "position:{}|{}|{}|{}",
+                "position:{}|{}|{}|{}|{}",
                 position.position_index,
                 position.source_handle,
                 position.disposition.as_str(),
-                position.stance
+                position.stance,
+                // The note is where the qualified relation is spelled out, so a
+                // disposition or mapping that changed its proof ceiling cannot
+                // hide behind an unchanged position identity.
+                position.compatibility_note
             ));
             let mut classes: Vec<String> = position
                 .conflict_classes
@@ -3430,6 +3699,7 @@ pub fn analyze_conflict(
     validate_supplement_shapes(supplements)?;
     validate_conflict_denominators(conflict_set, policy)?;
     validate_comparisons(conflict_set, &supplements.comparisons)?;
+    validate_source_commitments(conflict_set, &supplements.source_commitments)?;
     validate_causal_claims(conflict_set, &supplements.causal_claims)?;
     check_supplement_identity_uniqueness(supplements)?;
     if policy.policy_id != item.receipt.validator_policy {
@@ -3897,12 +4167,63 @@ mod tests {
             unknowns: vec!["hit rate under load".to_owned()],
             supplied_probes: vec![test_discriminative_probe("probe-1")],
             comparisons: Vec::new(),
+            source_commitments: Vec::new(),
             causal_claims: Vec::new(),
             external_resolution: None,
         }
     }
 
-    /// Returns a valid governing policy for the test analysis.
+    /// Returns an owner-bound comparison plus the two commitments that qualify it.
+    ///
+    /// `differing` names the one canonical dimension the two positions declare
+    /// differently; every other dimension is an owner-bound equality. Passing
+    /// `None` produces an all-equal pair. Both commits are returned so the
+    /// calling case can supply them as the same two source handles the
+    /// comparison names.
+    fn test_owner_bound_comparison(
+        differing: Option<ComparisonDimension>,
+    ) -> (SuppliedComparison, Vec<SourceRecordCommitment>) {
+        let dimensions: Vec<DimensionComparison> = COMPARISON_DIMENSIONS
+            .iter()
+            .map(|dimension| DimensionComparison {
+                dimension: *dimension,
+                outcome: if Some(*dimension) == differing {
+                    DimensionOutcome::Differing {
+                        left: format!("{} under source-a", dimension.as_str()),
+                        right: format!("{} under source-b", dimension.as_str()),
+                    }
+                } else {
+                    DimensionOutcome::Equal {
+                        value: dimension.as_str().to_owned(),
+                    }
+                },
+            })
+            .collect();
+        let comparison = SuppliedComparison {
+            left_source: "source-a".to_owned(),
+            right_source: "source-b".to_owned(),
+            dimensions,
+        };
+        let commitments = vec![
+            SourceRecordCommitment::new(
+                "source-a",
+                &"1".repeat(64),
+                "profile-comparison-v2",
+                &"2".repeat(64),
+            )
+            .expect("valid source-a commitment"),
+            SourceRecordCommitment::new(
+                "source-b",
+                &"3".repeat(64),
+                "profile-comparison-v2",
+                &"4".repeat(64),
+            )
+            .expect("valid source-b commitment"),
+        ];
+        (comparison, commitments)
+    }
+
+    /// Returns valid governing policy for the test analysis.
     fn test_policy() -> ConflictAnalysisPolicy {
         ConflictAnalysisPolicy {
             policy_id: "policy-7".to_owned(),
@@ -4309,7 +4630,11 @@ mod tests {
             receipt_digest: receipt.bundle_digest.clone(),
         })
         .expect("valid scope conflict");
-        let supplements = test_supplements();
+        let (comparison, commitments) =
+            test_owner_bound_comparison(Some(ComparisonDimension::ScopePopulationEnvironment));
+        let mut supplements = test_supplements();
+        supplements.comparisons = vec![comparison];
+        supplements.source_commitments = commitments;
         let policy = test_policy();
         let candidate =
             match analyze_conflict(&item, &draft, &grounded, &conflict, &supplements, &policy) {
@@ -4322,6 +4647,18 @@ mod tests {
                 .iter()
                 .any(|position| position.disposition == PositionDispositionKind::CompatibleResidue)
         );
+        for position in &candidate.positions {
+            assert_eq!(
+                position.compatibility[0].relation,
+                CompatibilityRelation::TypedDifference,
+                "residue rests on the owner-bound condition difference, not on the "
+                    "disjoint assumption handles"
+            );
+            assert_eq!(
+                position.compatibility[0].supplement_version,
+                SupplementVersion::OwnerBoundV2
+            );
+        }
         assert_eq!(candidate.scope, "scope-1");
     }
 
@@ -6306,12 +6643,16 @@ mod tests {
             receipt_digest: receipt.bundle_digest.clone(),
         })
         .expect("contradiction conflict stays valid");
+        let (comparison, commitments) = test_owner_bound_comparison(None);
+        let mut supplements = test_supplements();
+        supplements.comparisons = vec![comparison];
+        supplements.source_commitments = commitments;
         let candidate = match analyze_conflict(
             &item,
             &draft,
             &grounded,
             &conflict,
-            &test_supplements(),
+            &supplements,
             &test_policy(),
         ) {
             Ok(candidate) => candidate,
@@ -6327,6 +6668,15 @@ mod tests {
                     .contains("contradiction under equal"),
                 "equal-condition contradiction stays explicit: {}",
                 position.compatibility_note
+            );
+            assert_eq!(
+                position.compatibility[0].relation,
+                CompatibilityRelation::EqualConditions
+            );
+            assert_eq!(
+                position.compatibility[0].supplement_version,
+                SupplementVersion::OwnerBoundV2,
+                "the note and the typed mapping read one owner-bound qualification"
             );
             assert!(
                 position.conflict_classes.contains(&ConflictKind::Epistemic),
@@ -6489,12 +6839,17 @@ mod tests {
             receipt_digest: receipt.bundle_digest.clone(),
         })
         .expect("definition conflict stays valid");
+        let (comparison, commitments) =
+            test_owner_bound_comparison(Some(ComparisonDimension::DefinitionUnitDenominator));
+        let mut supplements = test_supplements();
+        supplements.comparisons = vec![comparison];
+        supplements.source_commitments = commitments;
         let candidate = match analyze_conflict(
             &test_item(),
             &test_draft(),
             &test_grounded(),
             &conflict,
-            &test_supplements(),
+            &supplements,
             &test_policy(),
         ) {
             Ok(candidate) => candidate,
@@ -6508,6 +6863,11 @@ mod tests {
                 .any(|position| position.disposition == PositionDispositionKind::CompatibleResidue)
         );
         for position in &candidate.positions {
+            assert_eq!(
+                position.compatibility[0].differing_dimensions,
+                vec![ComparisonDimension::DefinitionUnitDenominator],
+                "the unit and denominator difference is the proven condition difference"
+            );
             assert_eq!(
                 position.stance, conflict.positions[position.position_index].stance,
                 "original propositions stay preserved"
@@ -6833,12 +7193,17 @@ mod tests {
             receipt_digest: receipt.bundle_digest.clone(),
         })
         .expect("partial-overlap conflict stays valid");
+        let (comparison, commitments) =
+            test_owner_bound_comparison(Some(ComparisonDimension::ScopePopulationEnvironment));
+        let mut supplements = test_supplements();
+        supplements.comparisons = vec![comparison];
+        supplements.source_commitments = commitments;
         let candidate = match analyze_conflict(
             &test_item(),
             &test_draft(),
             &test_grounded(),
             &conflict,
-            &test_supplements(),
+            &supplements,
             &test_policy(),
         ) {
             Ok(candidate) => candidate,
