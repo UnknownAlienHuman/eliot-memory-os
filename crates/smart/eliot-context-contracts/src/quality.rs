@@ -25,6 +25,12 @@ use crate::{ContextBinding, ContextError, MeasurementRef};
 /// supply the state, the required member set and the rule revision again. A
 /// schema-1 payload is rejected, never reinterpreted: `passed` is not a field of
 /// [`QualityDimensionResult`] any more, and that struct denies unknown fields.
+///
+/// The same rule governs the scorecard-level [`QualityOutputBinding`] added
+/// after this revision: a scorecard that does not name the exact output it
+/// graded has no compatibility path, because there is nothing to migrate it
+/// *to* — the digests are the binding, and inventing them during deserialization
+/// would be exactly the fabrication this module refuses everywhere else.
 pub const QUALITY_RESULT_SCHEMA_VERSION: u32 = 2;
 
 /// The twelve exact I12.13 quality dimensions.
@@ -137,7 +143,8 @@ where
     let message = format!(
         "quality result schema 1 Boolean `passed` is not readable as quality result schema \
          {QUALITY_RESULT_SCHEMA_VERSION}: re-emit it as `state` and supply `schema_version`, \
-         `rule_revision` and `required_evidence`"
+         `rule_revision`, `required_evidence` and the scorecard's `output` binding to the exact \
+         graded recipe, admitted set and ordered rendered payload"
     );
     match serde_json::Value::deserialize(deserializer)? {
         serde_json::Value::Bool(_) => Err(<D::Error as serde::de::Error>::custom(message)),
@@ -313,11 +320,115 @@ impl QualityApplicability {
     }
 }
 
+/// The exact output one scorecard graded.
+///
+/// I12.13 grades a *rendered packet*, not a candidate set, so a grade is only
+/// about the bytes it was actually produced for. This binding records that
+/// output by the digests the packet itself already carries — the recipe
+/// revision, the fence, the ordered admitted payload and the ordered rendered
+/// payload — plus the serializer/route identity the bytes were produced under
+/// and the source/evidence revisions the grades were read from.
+///
+/// **Anti-circularity.** The scorecard is not an input to any digest here.
+/// `admitted_digest` is `AdmittedContextSet::canonical_payload_digest` and
+/// `rendered_digest` is `ActiveUnderstandingView::canonical_output_digest`;
+/// both hash `{schema_version, binding, recipe_digest, fence_digest, records
+/// or rendered}` and neither reads `QualityScorecard`. There is therefore no
+/// "receipt containing its own output hash": grading the final representation
+/// and hashing that representation stay separate, ordered steps.
+///
+/// **Why it is content and not shape.** A matching
+/// [`ContextBinding`] proves task/attempt/fence, and nothing else. Two packets
+/// can share one binding and still differ in recipe, membership and rendered
+/// representation, so these digests — not the fence — are what make a swapped
+/// scorecard detectable. See [`QualityScorecard::validate`] for the intrinsic
+/// rules and `ActiveUnderstandingView::validate` for the comparison against the
+/// packet the card is presented with.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct QualityOutputBinding {
+    /// Canonical digest of the recipe revision that produced the packet.
+    pub recipe_digest: String,
+    /// Canonical digest of the state fence the packet was compiled under.
+    pub fence_digest: String,
+    /// `AdmittedContextSet::canonical_payload_digest` of the admitted set.
+    pub admitted_digest: String,
+    /// `ActiveUnderstandingView::canonical_output_digest` of the ordered
+    /// rendered payload: the final representation, not the pre-pruning
+    /// candidate set.
+    pub rendered_digest: String,
+    /// Serializer identity the rendered bytes were produced under.
+    pub serializer_id: String,
+    /// Serializer revision the rendered bytes were produced under.
+    pub serializer_version: String,
+    /// Serializer-options digest the rendered bytes were produced under.
+    pub serializer_options_digest: String,
+    /// Route identity the packet was compiled for.
+    pub route_id: String,
+    /// Source/evidence revisions every grade was read from. Distinct; a
+    /// duplicated revision is a single revision, never two observations.
+    pub evidence_revisions: Vec<ArtifactId>,
+    /// Omission handles this packet actually carries, in the order the owner
+    /// recorded them.
+    pub omission_handles: Vec<ArtifactId>,
+}
+
+impl QualityOutputBinding {
+    /// Validate the intrinsic shape of the binding only.
+    ///
+    /// Whether these values describe *this* packet is decided by the packet
+    /// itself: [`AdmittedContextSet::canonical_payload_digest`] and
+    /// [`ActiveUnderstandingView::canonical_output_digest`] are the existing
+    /// owners of those digests, and the view compares the recorded values
+    /// against them. Nothing here recomputes a checksum over what it holds.
+    pub fn validate(&self) -> Result<(), ContextError> {
+        for (digest, field) in [
+            (&self.recipe_digest, "quality.output.recipe_digest"),
+            (&self.fence_digest, "quality.output.fence_digest"),
+            (&self.admitted_digest, "quality.output.admitted_digest"),
+            (&self.rendered_digest, "quality.output.rendered_digest"),
+            (
+                &self.serializer_options_digest,
+                "quality.output.serializer_options_digest",
+            ),
+        ] {
+            crate::validate_digest(digest, field)?;
+        }
+        crate::validate_text(&self.serializer_id, "quality.output.serializer_id")?;
+        crate::validate_text(
+            &self.serializer_version,
+            "quality.output.serializer_version",
+        )?;
+        crate::validate_text(&self.route_id, "quality.output.route_id")?;
+        for (values, field) in [
+            (
+                &self.evidence_revisions,
+                "quality.output.evidence_revisions",
+            ),
+            (&self.omission_handles, "quality.output.omission_handles"),
+        ] {
+            let mut distinct = BTreeSet::new();
+            for value in values {
+                if !distinct.insert(value.clone()) {
+                    return Err(ContextError::Duplicate(field));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Closed twelve-axis quality scorecard.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct QualityScorecard {
     pub binding: ContextBinding,
+    /// The exact output these twelve results graded.
+    ///
+    /// Required and never defaulted: a grade without an output identity is a
+    /// grade about nothing in particular, which is the defect this binding
+    /// exists to close.
+    pub output: QualityOutputBinding,
     /// Applicability resolved for this packet before its dimensions were
     /// graded; never inferred from the grades themselves.
     pub applicability: QualityApplicability,
@@ -428,8 +539,15 @@ pub struct QualitySuitability {
 
 impl QualityScorecard {
     /// Validate exact closure and independent evidence for every dimension.
+    ///
+    /// This is structural integrity of the card itself. It says the card
+    /// describes twelve real dimensions graded against a declared rule
+    /// revision, and that it names a well-formed output; it does not say the
+    /// named output is *this* packet, which only the packet can decide (see
+    /// `ActiveUnderstandingView::validate`).
     pub fn validate(&self) -> Result<(), ContextError> {
         self.binding.validate()?;
+        self.output.validate()?;
         self.applicability.validate()?;
         for result in &self.results {
             result.validate(&self.binding)?;

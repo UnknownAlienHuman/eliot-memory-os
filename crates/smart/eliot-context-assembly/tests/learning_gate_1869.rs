@@ -259,6 +259,24 @@ fn resolved_applicability() -> QualityApplicability {
     }
 }
 
+/// Intrinsically well-formed output binding for a card that is only checked
+/// for structural integrity, or for a packet assembly refuses before the grade
+/// is read. [`quality_for`] is the card a real packet accepts.
+fn fixture_output_binding() -> QualityOutputBinding {
+    QualityOutputBinding {
+        recipe_digest: digest(),
+        fence_digest: digest(),
+        admitted_digest: digest(),
+        rendered_digest: digest(),
+        serializer_id: "fixture-serde-v1".to_owned(),
+        serializer_version: "1".to_owned(),
+        serializer_options_digest: digest(),
+        route_id: "fixture-route".to_owned(),
+        evidence_revisions: Vec::new(),
+        omission_handles: Vec::new(),
+    }
+}
+
 fn quality(context: &ContextBinding) -> QualityScorecard {
     let dimensions = [
         QualityDimension::AcceptanceDecisionCoverage,
@@ -276,6 +294,7 @@ fn quality(context: &ContextBinding) -> QualityScorecard {
     ];
     QualityScorecard {
         binding: context.clone(),
+        output: fixture_output_binding(),
         applicability: resolved_applicability(),
         results: dimensions
             .into_iter()
@@ -295,6 +314,41 @@ fn quality(context: &ContextBinding) -> QualityScorecard {
             })
             .collect(),
     }
+}
+
+/// The card a real packet accepts: it records the exact output it graded, so
+/// the recipe revision, the fence, the admitted set's own canonical payload
+/// digest and the ordered rendered payload digest are this packet's values.
+fn quality_for(admitted: &AdmittedContextSet, recipe: &ContextRecipe) -> QualityScorecard {
+    let mut card = quality(&admitted.binding);
+    let fence_digest =
+        eliot_context_contracts::canonical_fence_digest(&admitted.binding.state_fence)
+            .expect("fixture fence digest");
+    let mut rendered: Vec<RenderedAtom> = admitted
+        .records
+        .iter()
+        .map(RenderedAtom::from_admitted)
+        .collect();
+    rendered.sort_by(|left, right| {
+        left.role
+            .cmp(&right.role)
+            .then_with(|| left.provider.cmp(&right.provider))
+            .then_with(|| left.atom_id.cmp(&right.atom_id))
+    });
+    card.output.recipe_digest = recipe.recipe_sha256.clone();
+    card.output.fence_digest = fence_digest.clone();
+    card.output.admitted_digest = admitted
+        .canonical_payload_digest()
+        .expect("fixture admitted digest");
+    card.output.rendered_digest = ActiveUnderstandingView::canonical_output_digest(
+        &admitted.binding,
+        &recipe.recipe_sha256,
+        &fence_digest,
+        &rendered,
+    )
+    .expect("fixture rendered digest");
+    card.output.omission_handles = admitted.economy.displaced.clone();
+    card
 }
 
 fn measurement(context: &ContextBinding, bytes: &[u8]) -> SerializedContextMeasurement {
@@ -446,7 +500,7 @@ fn assemble_marked(
     assemble_active_view_with_learning(
         value,
         &recipe(&context),
-        quality(&context),
+        quality_for(value, &recipe(&context)),
         &policy_for(&context, 100_000),
         |bytes| Ok(measurement(&context, bytes)),
         presented_1869(governor, verified, overlay, backlog, now),
@@ -584,7 +638,7 @@ fn expired_mark_refuses_delivery_and_plain_projection_survives() {
     let view = assemble_active_view(
         &plain,
         &recipe(&context),
-        quality(&context),
+        quality_for(&plain, &recipe(&context)),
         &policy_for(&context, 100_000),
         |bytes| Ok(measurement(&context, bytes)),
     )

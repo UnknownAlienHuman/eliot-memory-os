@@ -2325,6 +2325,23 @@ fn passing_dimension_result(
     }
 }
 
+/// Intrinsically well-formed output binding for a card that is only checked
+/// for structural integrity. A card bound to a real packet is built below.
+fn fixture_output_binding() -> QualityOutputBinding {
+    QualityOutputBinding {
+        recipe_digest: digest(),
+        fence_digest: digest(),
+        admitted_digest: digest(),
+        rendered_digest: digest(),
+        serializer_id: "fixture-serde-v1".to_owned(),
+        serializer_version: "1".to_owned(),
+        serializer_options_digest: digest(),
+        route_id: "fixture-route".to_owned(),
+        evidence_revisions: Vec::new(),
+        omission_handles: Vec::new(),
+    }
+}
+
 fn full_quality_scorecard(context: &ContextBinding) -> QualityScorecard {
     let dimensions = all_quality_dimensions();
     let results = dimensions
@@ -2336,6 +2353,7 @@ fn full_quality_scorecard(context: &ContextBinding) -> QualityScorecard {
         .collect();
     QualityScorecard {
         binding: context.clone(),
+        output: fixture_output_binding(),
         applicability: resolved_applicability(),
         results,
     }
@@ -2343,7 +2361,6 @@ fn full_quality_scorecard(context: &ContextBinding) -> QualityScorecard {
 
 fn assembled_view() -> (AdmittedContextSet, ActiveUnderstandingView) {
     let admitted = admitted_single();
-    let quality = full_quality_scorecard(&admitted.binding);
     let rendered: Vec<RenderedAtom> = admitted
         .records
         .iter()
@@ -2358,6 +2375,16 @@ fn assembled_view() -> (AdmittedContextSet, ActiveUnderstandingView) {
         &rendered,
     )
     .expect("view output digest");
+    // The card grades this exact output, so it records this packet's own
+    // digests rather than a placeholder.
+    let mut quality = full_quality_scorecard(&admitted.binding);
+    quality.output.recipe_digest = recipe_digest.clone();
+    quality.output.fence_digest = fence_digest.clone();
+    quality.output.admitted_digest = admitted
+        .canonical_payload_digest()
+        .expect("admitted payload digest");
+    quality.output.rendered_digest = output_digest.clone();
+    quality.output.omission_handles = admitted.economy.displaced.clone();
     let rendered_bytes = ActiveUnderstandingView::canonical_output_utf8_bytes(
         &admitted.binding,
         &recipe_digest,

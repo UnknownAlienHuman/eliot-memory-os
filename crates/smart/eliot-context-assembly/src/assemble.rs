@@ -137,6 +137,22 @@ where
         &expected_fence_digest,
         &rendered,
     )?;
+    // Grade the exact output, not the pre-pruning candidate set. The card is
+    // compared against the recipe revision, the fence, the admitted set's own
+    // canonical payload digest and the ordered rendered payload digest this
+    // assembly just derived. All four are the packet's own recorded values,
+    // recomputed by their existing owners; the scorecard is not an input to
+    // any of them, so this comparison is not circular. A card swapped in from
+    // another same-fence packet with a different recipe or membership records a
+    // different value here and is refused with the card retained, so the
+    // operator sees the exact grades that were rejected.
+    if quality.output.recipe_digest != recipe.recipe_sha256
+        || quality.output.fence_digest != expected_fence_digest
+        || quality.output.admitted_digest != admitted.canonical_payload_digest()?
+        || quality.output.rendered_digest != output_digest
+    {
+        return Err(AssemblyError::QualityIncomplete(Box::new(quality)));
+    }
     let final_bytes =
         u64::try_from(bytes.len()).map_err(|_| AssemblyError::Contract(ContextError::Overflow))?;
     if final_bytes > policy.max_serialized_bytes {

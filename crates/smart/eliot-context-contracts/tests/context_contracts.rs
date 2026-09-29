@@ -157,6 +157,7 @@ fn quality(context: &ContextBinding) -> QualityScorecard {
     ];
     QualityScorecard {
         binding: context.clone(),
+        output: fixture_output_binding(),
         applicability: resolved_applicability(),
         results: dimensions
             .into_iter()
@@ -175,6 +176,24 @@ fn quality(context: &ContextBinding) -> QualityScorecard {
                 binding: context.clone(),
             })
             .collect(),
+    }
+}
+
+/// Intrinsically well-formed output binding for a card that is only checked
+/// for structural integrity. Cards presented with a real packet bind to that
+/// packet's own digests instead.
+fn fixture_output_binding() -> QualityOutputBinding {
+    QualityOutputBinding {
+        recipe_digest: digest(),
+        fence_digest: digest(),
+        admitted_digest: digest(),
+        rendered_digest: digest(),
+        serializer_id: "fixture-serde-v1".to_owned(),
+        serializer_version: "1".to_owned(),
+        serializer_options_digest: digest(),
+        route_id: "fixture-route".to_owned(),
+        evidence_revisions: Vec::new(),
+        omission_handles: Vec::new(),
     }
 }
 
@@ -695,6 +714,10 @@ fn assert_private_view_rejected(admitted: &AdmittedContextSet, view: &ActiveUnde
             &private_view.rendered,
         )
         .expect("private rendered bytes");
+    // The scorecard's own output binding has to name the same rendered payload
+    // the view now carries, otherwise `validate` refuses the mismatch before
+    // the injected content is ever reached.
+    private_view.quality.output.rendered_digest = private_view.output_digest.clone();
     private_view
         .validate()
         .expect("coherent inert private view");
@@ -733,9 +756,18 @@ fn admitted_view_preserves_protected_fields_and_rejects_injected_content() {
     let mut measurement = exact_measurement(&context);
     measurement.envelope_digest = output_digest.clone();
     measurement.rendered_utf8_bytes = rendered_bytes;
+    // The card grades this exact output, so it records this packet's digests.
+    let mut quality = quality(&context);
+    quality.output.recipe_digest = recipe_digest.clone();
+    quality.output.fence_digest = fence_digest.clone();
+    quality.output.admitted_digest = admitted
+        .canonical_payload_digest()
+        .expect("admitted payload digest");
+    quality.output.rendered_digest = output_digest.clone();
+    quality.output.omission_handles = admitted.economy.displaced.clone();
     let mut view = ActiveUnderstandingView::assemble(
         &admitted,
-        quality(&context),
+        quality,
         measurement,
         output_digest.clone(),
         recipe_digest,
