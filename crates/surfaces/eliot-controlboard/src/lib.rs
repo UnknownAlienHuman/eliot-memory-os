@@ -1906,10 +1906,14 @@ fn filter_view(state: CanonicalState, access: &AccessBinding) -> ControlBoardVie
     // inbox carries, so the view cannot report a subset that its own row
     // set does not contain.
     let notification_rows = notification_projection::project(&state.notifications);
-    let critical_obligation_rows: Vec<NotificationRow> =
-        unresolved_critical(&notification_rows).into_iter().cloned().collect();
-    let delivery_failure_rows: Vec<NotificationRow> =
-        failed_delivery(&notification_rows).into_iter().cloned().collect();
+    let critical_obligation_rows: Vec<NotificationRow> = unresolved_critical(&notification_rows)
+        .into_iter()
+        .cloned()
+        .collect();
+    let delivery_failure_rows: Vec<NotificationRow> = failed_delivery(&notification_rows)
+        .into_iter()
+        .cloned()
+        .collect();
     let notification_metrics = notification_projection::metrics(&notification_rows);
     ControlBoardView {
         revision: state.revision,
