@@ -9,6 +9,15 @@ description = "Governor-owned strict finish evaluation and lifecycle disposition
 [dependencies]
 eliot-canonical = { workspace = true }
 eliot-contracts = { workspace = true }
+# Issue #1903: this crate is the ProductProof/FinishService acceptance owner, so
+# it constructs and retains the terminal product-proof status record that
+# `eliot-reports` types. That is the missing producer the external audit named:
+# without this edge the `ProductProofStatus` type has no owner and no caller.
+# The edge is one-way and semantic-only: `eliot-reports` is a pure report
+# projection crate that owns no owner, store handle, or authority source, and
+# it does not depend on this crate, so no finish authority crosses back out.
+eliot-instrument-api = { workspace = true }
+eliot-reports = { workspace = true }
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
