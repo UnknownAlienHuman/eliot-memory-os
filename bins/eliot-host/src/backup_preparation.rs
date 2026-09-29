@@ -3361,9 +3361,11 @@ impl OwnerEvidence {
     /// `WRITE_DAC`), the retained handle's current final path is compared with
     /// the approved manifest's selection, and the retained identity plus the path
     /// identity are re-proved BOTH BEFORE the read and AGAIN AFTER it, so the
-    /// value provably comes from the exact file that was proved. A path that
-    /// moved across the read refuses instead of returning a value read from
-    /// somewhere else.
+    /// read is bracketed by the same identity pair on both sides and a path
+    /// that moved across the read refuses instead of returning a value read
+    /// from somewhere else. That is a time-bracket over the read, not a proof
+    /// of file identity — the read itself is a fresh open by path — and it is
+    /// exactly the guarantee the `watchdog_publication.rs` precedent offers.
     ///
     /// **This does not make this composition root a store owner.** The read is a
     /// `ReadOnlyDatabase` transaction: no write transaction, no store handle
@@ -3374,11 +3376,19 @@ impl OwnerEvidence {
     /// writer, no store handle and no ORS lease of its own.
     ///
     /// The `Ok(None)` answer is refused, not turned into a zero. The owner's own
-    /// rule — `RedbRecoveryStore::purge_ledger_revision_in`, "An absent counter
-    /// is revision zero" — governs a counter key inside an initialised store, and
-    /// a reader faithful to that rule answers `Some(0)` there; so a `None` from
-    /// the owner means no counter was established for this ORS at all, and
-    /// substituting `0` would state the owner's answer on its behalf. This
+    /// rule — `RedbRecoveryStore::purge_ledger_revision_in` and
+    /// `store.rs:427`, "An absent counter means no purge was ever applied, which
+    /// is revision zero and NOT AN UNKNOWN ANSWER" — governs a counter key inside
+    /// an initialised store, and `eliot_ors::read_purge_ledger_revision_read_only`
+    /// MUST answer `Some(0)` for that case: it is a requirement of consuming
+    /// this reader, not a courtesy it may withdraw. `Ok(None)` therefore covers
+    /// exactly one thing, a database holding **no tables at all** — an
+    /// uninitialised or empty ORS file — which is a broken installation rather
+    /// than an unknowable state, and is refused as such with
+    /// [`PreparationError::FilesystemEffect`] naming the file. Substituting `0`
+    /// would state the owner's answer on its behalf, and
+    /// [`PreparationError::UnknownState`] would erase the operator's ability to
+    /// tell "Host cannot know" apart from "the ORS on disk is empty". This
     /// module's standing rule applies: absence of proof is never treated as
     /// proof of absence. A store that has never purged says so with a real zero.
     ///
@@ -3406,9 +3416,10 @@ impl OwnerEvidence {
     /// open is mapped through the existing [`protected_path_to_preparation`]
     /// helper, a selection or identity disagreement is
     /// [`PreparationError::UnknownState`], an owner read that produced no
-    /// revision and an owner read that produced no counter are both
-    /// [`PreparationError::UnknownState`] with distinct static reasons, and the
-    /// owner's own error text is never echoed.
+    /// revision is [`PreparationError::UnknownState`] with a static reason, an
+    /// owner read that answered `Ok(None)` — the empty-database case — is
+    /// [`PreparationError::FilesystemEffect`] carrying the ORS path and a
+    /// static reason, and the owner's own error text is never echoed.
     pub fn owner_purge_ledger_revision(&self) -> Result<u64, PreparationError> {
         // The approved manifest's own ORS root, never a request field. Built
         // before the observation so the refusal below names the same path the
@@ -3447,14 +3458,27 @@ impl OwnerEvidence {
                     operation: OP_OWNER_EVIDENCE.to_owned(),
                     reason: "owner purge-ledger read did not produce a revision".to_owned(),
                 })?
-                .ok_or_else(|| PreparationError::UnknownState {
-                    operation: OP_OWNER_EVIDENCE.to_owned(),
-                    reason: "owner established no purge-ledger counter for this ORS".to_owned(),
+                // `Ok(None)` covers exactly one case now that the reader
+                // answers `Some(0)` for an absent counter inside an
+                // initialised store: a database holding NO TABLES AT ALL, i.e.
+                // an uninitialised or empty ORS file. That is a broken
+                // installation, not an unknowable state, so it is refused as a
+                // filesystem effect naming the file rather than through this
+                // module's `UnknownState` catch-all, which would erase the
+                // operator's ability to tell "Host cannot know" apart from
+                // "the ORS on disk is empty". The reason is static; the
+                // owner's own error text is never echoed.
+                .ok_or_else(|| PreparationError::FilesystemEffect {
+                    path: ors_path.to_string_lossy().into_owned(),
+                    reason:
+                        "owner ORS database holds no tables, so no ORS was initialised here and \
+                         its state cannot be established"
+                            .to_owned(),
                 })?;
-            // The value is only trusted if it came from the file that was
-            // proved: the same identity pair is re-proved across the read, and a
-            // handle that no longer resolves to the approved selection refuses
-            // rather than returning a revision read from somewhere else.
+            // The same identity pair brackets the read: it is re-proved on both
+            // sides, so a handle that no longer resolves to the approved
+            // selection refuses rather than yielding a revision read from
+            // somewhere else. A time-bracket, not proof of file identity.
             retained
                 .verify_stable_identity()
                 .and_then(|()| retained.verify_path_identity())

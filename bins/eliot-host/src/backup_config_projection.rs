@@ -48,9 +48,11 @@
 //!
 //! - The purge-ledger revision is owner-issued by the ORS owner
 //!   (`RedbRecoveryStore::purge_ledger_revision`, and its historical
-//!   `backup_verification_purge_ledger_revision` binding). **This contour still
-//!   holds no ORS store handle and is not a store owner, and must not become
-//!   one**: `crates/storage/AGENTS.md` forbids a **second mutable** root owner,
+//!   `backup_verification_purge_ledger_revision` binding). **This contour holds
+//!   no ORS store handle beyond the single short-lived read-only observation
+//!   `OwnerEvidence::owner_purge_ledger_revision` performs, and is not a store
+//!   owner, and must not become one**: `crates/storage/AGENTS.md` forbids a
+//!   **second mutable** root owner,
 //!   and a Host-side read of the ORS `META` counter would additionally be a
 //!   second copy of the owner's own rule (`META` and
 //!   `PURGE_LEDGER_REVISION_KEY` are private to
@@ -425,9 +427,12 @@ pub struct BackupConfigRequest {
     /// neither happens: an absent claim is visible as the owner's own number,
     /// not as a substituted zero. The owner-issued value comes from the ORS
     /// owner's read-only, schema-checked purge-ledger reader, observed by the
-    /// owner; this composition still holds no ORS store handle and is not a
-    /// store owner. The snapshot variant still compares it against its
-    /// [`AuthoritySnapshot`].
+    /// owner; this composition holds no ORS store handle beyond the single
+    /// short-lived read-only observation
+    /// `crate::backup_preparation::OwnerEvidence::owner_purge_ledger_revision`
+    /// performs, and is not a store owner (`crates/storage/AGENTS.md` forbids a
+    /// second **mutable** root owner). The snapshot variant still compares it
+    /// against its [`AuthoritySnapshot`].
     pub purge_ledger_revision: u64,
     /// Optional forensic audit note; never authority (case 958/3).
     ///
@@ -879,9 +884,9 @@ pub fn project_backup_config(
     // typed non-authoritative ceiling, so a stored v2 digest must not silently
     // match a digest over a note whose ceiling is now a proved field (I5.27).
     // The `snapshot.` infix also keeps this path's revision sequence disjoint
-    // from the owner-bound path's (there `v3`, `v4` and `v5` are retired and
-    // `v6` is current): the two paths bind different fields and must never be
-    // read as one revision series.
+    // from the owner-bound path's (there `v3`, `v4`, `v5` and `v6` are retired
+    // and `v7` is current): the two paths bind different fields and must never
+    // be read as one revision series.
     hasher.update(b"eliot.backup.config-projection.snapshot.v3\0");
     hasher.update(CONFIG_PROJECTION_VERSION.to_le_bytes());
     hash_field(
@@ -1273,12 +1278,14 @@ pub fn bind_approved_build(
 /// [`ProjectionError::StaleEvidence`] when it differs — the same shape as the
 /// lease reference and the forensic note.
 ///
-/// This composition still holds no ORS store handle and is not a store owner,
-/// and it must not open one: `crates/storage/AGENTS.md` forbids a **second
-/// mutable** root owner, so reading the ORS `META` counter here would be a
-/// second copy of the owner's own rule rather than evidence. What it consumes is
-/// the owner's reading over a short-lived read, the same retained-lease shape
-/// `crate::watchdog_publication` already consumes for the supervision lease.
+/// This composition holds no ORS store handle beyond the single short-lived
+/// read-only observation `OwnerEvidence::owner_purge_ledger_revision` performs,
+/// and is not a store owner, and it must not open a retained one:
+/// `crates/storage/AGENTS.md` forbids a **second mutable** root owner, so
+/// reading the ORS `META` counter here would be a second copy of the owner's own
+/// rule rather than evidence. What it consumes is the owner's reading over a
+/// short-lived read, the same retained-lease shape `crate::watchdog_publication`
+/// already consumes for the supervision lease.
 ///
 /// The refusal that stood here previously is gone, and nothing is weakened by
 /// its removal: before, a presented revision could never reach the record, and
