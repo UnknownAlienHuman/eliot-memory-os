@@ -1759,9 +1759,15 @@ pub enum HostError {
     /// and no stop, kill, credential attachment, login, adoption, reuse or data
     /// migration is performed. Its `Display` is the bounded, non-sensitive
     /// summary, so endpoints and process identities stay in typed fields.
+    ///
+    /// The directive is boxed so the `Err` path of every function returning
+    /// `Result<_, HostError>` stays pointer-sized. Boxing relocates the same
+    /// typed value; it changes where the bytes live, never which variant of the
+    /// directive is produced, and `Display` still renders the bounded summary
+    /// through the box.
     #[cfg(windows)]
     #[error("planned Store endpoint is occupied and exact installation ownership is unproven: {0}")]
-    OriginCollisionUnproven(eliot_host_service::ForeignOccupantRecoveryDirective),
+    OriginCollisionUnproven(Box<eliot_host_service::ForeignOccupantRecoveryDirective>),
     /// The planned Store endpoint's owner could not be read.
     ///
     /// Issue #1775. A read that failed is not a read that succeeded with an

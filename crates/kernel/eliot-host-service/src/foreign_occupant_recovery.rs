@@ -379,11 +379,11 @@ impl PlannedEndpointOccupant {
                 "the observed occupant is the retained owned child",
             ));
         }
-        self.state_fence
-            .validate()
-            .map_err(|_error| ForeignOccupantRecoveryError::InvalidDirective(
+        self.state_fence.validate().map_err(|_error| {
+            ForeignOccupantRecoveryError::InvalidDirective(
                 "collision state fence is not a valid contract fence",
-            ))
+            )
+        })
     }
 }
 

@@ -26,9 +26,9 @@ pub use foreign_occupant_recovery::{
     AdmittedCollisionOperation, BlockedRecoveryOperation, CollisionOperationDisposition,
     CollisionOriginClass, CollisionRefusal, ForeignOccupantObservation,
     ForeignOccupantRecoveryDirective, ForeignOccupantRecoveryError, ManagedTreeObservation,
-    OwnershipEvidenceClass, PermittedRecoveryOperation, PlannedEndpoint,
-    PlannedEndpointOccupant, RecoveryReferenceRole, RequestedProcessOperation,
-    RoleFilteredReference, SafeNextAction, ServiceIdentityOccupant,
+    OwnershipEvidenceClass, PermittedRecoveryOperation, PlannedEndpoint, PlannedEndpointOccupant,
+    RecoveryReferenceRole, RequestedProcessOperation, RoleFilteredReference, SafeNextAction,
+    ServiceIdentityOccupant,
 };
 
 pub use service::{

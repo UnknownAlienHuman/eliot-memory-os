@@ -9,6 +9,13 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 #[cfg(windows)]
+use eliot_contracts::StateFence;
+#[cfg(windows)]
+use eliot_host_service::{
+    AdmittedCollisionOperation, ForeignOccupantRecoveryDirective, ManagedTreeObservation,
+    PlannedEndpoint, PlannedEndpointOccupant,
+};
+#[cfg(windows)]
 use eliot_host_state::HostInstallationEpoch;
 #[cfg(windows)]
 use eliot_installation::{
@@ -17,13 +24,6 @@ use eliot_installation::{
 };
 #[cfg(windows)]
 use eliot_kernel_service::semantic_store_config_hash_from_json;
-#[cfg(windows)]
-use eliot_contracts::StateFence;
-#[cfg(windows)]
-use eliot_host_service::{
-    AdmittedCollisionOperation, ForeignOccupantRecoveryDirective, ManagedTreeObservation,
-    PlannedEndpoint, PlannedEndpointOccupant,
-};
 #[cfg(windows)]
 use eliot_platform::PlatformHandle;
 #[cfg(windows)]
@@ -369,14 +369,14 @@ pub(super) fn ensure_store_endpoint_available_or_owned(
             //
             // The occupant is left RUNNING. Nothing here terminates, kills,
             // authenticates against, adopts, reuses or migrates from it.
-            Err(HostError::OriginCollisionUnproven(
+            Err(HostError::OriginCollisionUnproven(Box::new(
                 store_endpoint_collision_directive(
                     endpoint,
                     Some(owner_process_id),
                     retained_old_child_pid,
                     binding,
                 )?,
-            ))
+            )))
         }
         StoreEndpointObservation::Absent => {
             host_launch_observe("host.launch store endpoint free");
