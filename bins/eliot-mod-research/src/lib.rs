@@ -1189,6 +1189,18 @@ pub const INQUIRY_GOVERNANCE_VIEW: &str = "INQUIRY_GOVERNANCE_VIEW";
 /// and never as an admitted result.
 pub const INQUIRY_GOVERNANCE_REFUSED: &str = "INQUIRY_GOVERNANCE_REFUSED";
 
+/// Spelling of a release gate that admitted this run's material claims.
+///
+/// I21.8 item 6: a claim may be promoted only when every required chain, excerpt
+/// and audit dimension is established. The gate answer is published on the
+/// governance line so a consumer reads the decision rather than having to
+/// re-derive it, and so an absent gate is visibly absent.
+pub const RELEASE_GATE_ADMITTED: &str = "admitted";
+
+/// Spelling of a release gate that refused to promote this run's material
+/// claims, followed by the specific member or condition that refused it.
+pub const RELEASE_GATE_BLOCKED: &str = "blocked";
+
 /// Projects the `R6` inquiry-governance view of one admitted provider
 /// operation.
 ///
@@ -1343,6 +1355,16 @@ pub fn project_admitted_inquiry(
             .unwrap_or(receipt.reason_code)
             .to_owned(),
         assessment_time_ms,
+        // MEASURED: `ResearchQueryRequest` carries no predecessor-freeze or
+        // reopen-reason custody, and this crate is not the owner of the exchange
+        // wire contract, so a run admitted here has no declared predecessor and
+        // the freeze it produces is an honest first freeze rather than a silent
+        // successor. `EvidenceFreeze` will name, re-prove and refuse a successor
+        // the moment an admitted request does carry the pair; supplying that
+        // custody is BLOCKED-BY #1762, which owns inquiry/R6 composition. No
+        // value is invented here to make the successor arm fire.
+        predecessor_freeze_digest: None,
+        reopen_reason: None,
     };
     InquiryGovernance::record(observation).map_err(crate::R6ProjectionError::from)
 }
