@@ -346,9 +346,17 @@ pub struct ImprovementArtifact {
 /// This performs no durability, no promotion and no activation: it returns the
 /// artifact, and the caller commits it through
 /// [`crate::DaemonComposition::commit_learning_record`].
+///
+/// `observed_closures` is the single Governor-owned learning-closure image
+/// ([`eliot_governor::CanonicalLearningDeltaStore`]) this daemon already holds,
+/// reached as `DaemonComposition::learning_closure().store()`. It is read here,
+/// under whatever guard the caller holds, so the brief's safe boundary is an
+/// owner-observed consequential boundary rather than a formatted literal (see
+/// the `SafeBoundary::from_observed_closure` call below).
 pub fn assemble_improvement_artifact(
     decision: &eliot_maintenance::AutomationTriggerDecision,
     state_fence: &StateFence,
+    observed_closures: &eliot_governor::CanonicalLearningDeltaStore,
 ) -> Result<ImprovementArtifact, ImprovementDispatchError> {
     // Evidence lineage: the decision's own stable identity, never a fresh
     // per-observation value, so a repeat deduplicates.
@@ -447,12 +455,29 @@ pub fn assemble_improvement_artifact(
     // including the two classes this path cannot represent at all.
     enforce_advisory_class_gate(&candidate)?;
 
-    // The safe boundary is the daemon's own admitted generation plus the
-    // daemon's decision owner, both real values this daemon holds.
-    let boundary = SafeBoundary {
-        active_main_agent_or_human_ref: format!("owner:{IMPROVEMENT_OWNER}"),
-        boundary_ref: format!("boundary:{}", decision.scope_ref),
-    };
+    // The safe boundary is READ, not spelled. It used to be two formatted
+    // strings (`owner:{IMPROVEMENT_OWNER}` and `boundary:{scope_ref}`), which
+    // satisfied `SafeBoundary::validate` while observing nothing at all: the
+    // owner was a constant and the boundary was the scope this very pass is
+    // about to write, so the check proved nothing about the operation it claims
+    // to gate. `SafeBoundary` now has private fields and one constructor,
+    // `SafeBoundary::from_observed_closure`, which takes both values from a
+    // record the Governor's learning-closure owner actually committed from
+    // owner-recorded lifecycle activities
+    // (`crates/governor/eliot-governor/src/learning_closure.rs:483`). That
+    // boundary is derived by `derive_boundaries`, which refuses an ordinary
+    // read and an empty activity set before anything is committed, per
+    // I12.24:181.
+    //
+    // STATED PLAINLY, because it changes what this pass does: `store` is read
+    // from already-committed in-process state and performs no exchange, but an
+    // EMPTY closure image is `ImprovementError::UnsafeBoundary`, so this pass
+    // now commits nothing until a consequential attempt has actually been
+    // closed in this process. That is the fail-closed direction I12.24:64
+    // requires — a brief must not reach an owner as though a boundary had been
+    // observed when none was — and the refusal is reported as a typed
+    // `ImprovementDispatchError::Improvement` by the caller, not swallowed.
+    let boundary = SafeBoundary::from_observed_closure(observed_closures)?;
     let brief = brief_at_safe_boundary(
         &candidate,
         &trigger,
