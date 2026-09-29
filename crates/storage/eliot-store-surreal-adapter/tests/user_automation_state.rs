@@ -927,12 +927,15 @@ async fn read_normalization(
 }
 
 /// The owner that performed the normalization retains its envelope durably and
-/// reads the same bytes back under the immutable revision's own identity.
+/// reads the same bytes back under the immutable revision that retained it.
 ///
 /// This is the real provider edge for the retention owner: the envelope must
-/// survive the round trip as the bytes that were written, and selection must be
-/// by the envelope's content-derived identity rather than by row address, so a
-/// caller that guesses an identity reaches nothing.
+/// survive the round trip as the bytes that were written, and the row that
+/// retains it must be reachable only through the exact immutable revision and
+/// the exact admission fence. The envelope's content-derived identity is NOT
+/// resolved by this contour — a storage adapter holds a value, it does not
+/// interpret one — so the requesting owner closes the content comparison
+/// against the parsed `identity.receipt_id`.
 #[tokio::test]
 async fn owner_retains_and_reads_back_its_normalization_envelope() {
     let harness = Harness::fresh("normalization").await;
@@ -972,26 +975,38 @@ async fn owner_retains_and_reads_back_its_normalization_envelope() {
         "the retained identity is genuinely content-derived"
     );
 
-    // Selection is by that identity, not by row address.
+    // The row address and the fence are the only gates this owner applies. It
+    // retains a value it was handed and therefore does not resolve the receipt
+    // identity inside that value, which is the requesting owner's content
+    // comparison to make against the parsed `identity.receipt_id`. A misnamed
+    // identity therefore still receives this revision's OWN retained bytes and
+    // never a substituted envelope.
     let (_, other_identity) = normalization_envelope("auto-1", "r-9");
     assert!(other_identity != create_identity);
-    assert!(
-        read_normalization(adapter, "auto-1", "r-1", &other_identity)
-            .await
-            .is_empty(),
-        "a receipt identity this revision never retained answers nothing"
+    let misnamed = read_normalization(adapter, "auto-1", "r-1", &other_identity).await;
+    assert_eq!(
+        misnamed.len(),
+        1,
+        "the owner answers the named immutable revision's retained envelope, not a name lookup"
     );
+    assert_eq!(
+        misnamed[0].get("envelope_json").and_then(Value::as_str),
+        Some(create_envelope.as_str()),
+        "a misnamed identity still yields the retained bytes, never a substituted envelope"
+    );
+    // A revision that retained nothing, and another automation entirely, answer
+    // nothing rather than this revision's envelope.
     assert!(
         read_normalization(adapter, "auto-1", "r-9", &create_identity)
             .await
             .is_empty(),
-        "a receipt identity is not answerable under a revision that never retained it"
+        "a revision that retained no envelope is not answerable"
     );
     assert!(
         read_normalization(adapter, "auto-2", "r-1", &create_identity)
             .await
             .is_empty(),
-        "a receipt identity is not answerable under another automation"
+        "a retained envelope is not answerable under another automation"
     );
 
     // The immutable revision row retains ONE envelope: replaying the leg with a

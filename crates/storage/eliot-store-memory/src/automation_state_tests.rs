@@ -755,8 +755,8 @@ fn owner_retains_and_reads_back_its_normalization_envelope() {
     ));
     apply(&store, "create-1", request.operation, request.parameters).expect("create commits");
 
-    // The retained envelope comes back as the OWNER'S OWN bytes, and the
-    // envelope's own identity is what selects it.
+    // The retained envelope comes back as the OWNER'S OWN bytes, addressed by
+    // the immutable revision that retained it rather than by a name.
     let envelopes = read_normalization(&store, "auto-1", "r-1", &create_identity);
     assert_eq!(
         envelopes.len(),
@@ -777,21 +777,36 @@ fn owner_retains_and_reads_back_its_normalization_envelope() {
         "the retained identity is genuinely content-derived"
     );
 
-    // Selection is by that identity, not by row address: any other identity
-    // yields nothing rather than some other envelope.
+    // The row address and the fence are the ONLY gates this owner applies: it
+    // retains a value it was handed, so it does not resolve the receipt identity
+    // inside that value and it does not gain the receipt model to do so. A
+    // caller naming some other identity therefore still receives this revision's
+    // OWN retained bytes, and the content comparison is the REQUESTING owner's
+    // to make against the parsed `identity.receipt_id` — a store contour that
+    // filtered on the name would be comparing a name, not content.
     let (other_envelope, other_identity) = normalization_envelope("auto-1", "r-2");
     assert!(other_identity != create_identity);
-    assert!(
-        read_normalization(&store, "auto-1", "r-1", &other_identity).is_empty(),
-        "a receipt identity this revision never retained answers nothing"
+    let misnamed = read_normalization(&store, "auto-1", "r-1", &other_identity);
+    assert_eq!(
+        misnamed.len(),
+        1,
+        "the owner answers the named immutable revision's retained envelope, not a name lookup"
     );
+    assert_eq!(
+        misnamed[0].get("envelope_json").and_then(Value::as_str),
+        Some(create_envelope.as_str()),
+        "a misnamed identity still yields the retained bytes, never a substituted envelope"
+    );
+    // What the owner does gate on is the immutable revision and the automation:
+    // another revision that retained nothing, and another automation entirely,
+    // answer nothing rather than this revision's envelope.
     assert!(
         read_normalization(&store, "auto-1", "r-2", &create_identity).is_empty(),
-        "a receipt identity is not answerable under a revision that never retained it"
+        "a revision that retained no envelope is not answerable"
     );
     assert!(
         read_normalization(&store, "auto-2", "r-1", &create_identity).is_empty(),
-        "a receipt identity is not answerable under another automation"
+        "a retained envelope is not answerable under another automation"
     );
     let _ = other_envelope;
 

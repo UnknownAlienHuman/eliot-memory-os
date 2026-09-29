@@ -2508,15 +2508,19 @@ fn automation_state_payload(
                         field: AUTOMATION_PARAM_REVISION,
                         reason: "exact immutable revision selector is required",
                     })?;
-            let receipt_id =
-                decoded
-                    .requested_receipt_id
-                    .as_deref()
-                    .ok_or(StoreError::InvalidField {
-                        field: AUTOMATION_PARAM_RECEIPT_ID,
-                        reason: "exact receipt identity selector is required",
-                    })?;
-            automation_normalization_envelopes_payload(state, fence, &id, revision, receipt_id)
+            // The closed `normalization` contract is defined only WITH the exact
+            // receipt identity selector, so a read that lost it is refused
+            // rather than answered. Its VALUE is deliberately not read here: the
+            // projected function below stores the retained envelope, it does not
+            // interpret it, and the identity binding is closed by the requesting
+            // owner against the envelope's own parsed `identity.receipt_id`.
+            if decoded.requested_receipt_id.is_none() {
+                return Err(StoreError::InvalidField {
+                    field: AUTOMATION_PARAM_RECEIPT_ID,
+                    reason: "exact receipt identity selector is required",
+                });
+            }
+            automation_normalization_envelopes_payload(state, fence, &id, revision)
         }
         _ => Err(StoreError::InvalidField {
             field: "query",
@@ -2772,26 +2776,34 @@ fn automation_invocations_payload(
     }))
 }
 
-/// Projects the retained normalization receipt envelopes the automation leg
+/// Projects the retained normalization receipt envelope the automation leg
 /// minted for one immutable revision under the request's exact fence.
 ///
 /// The read is answered by the automation subsystem's OWN retained row, which
 /// is the subsystem that performed the normalization transition (I05.19:96).
-/// The returned bytes are the envelope exactly as it was minted; this contour
-/// re-derives nothing and revalidates nothing beyond parsing the envelope far
-/// enough to read its OWN content-derived identity.
+/// The returned value is the envelope exactly as it was minted: this contour
+/// stores a value it was handed and stores it back, which is not the same thing
+/// as interpreting it. What a `ReceiptEnvelope` MEANS — including the
+/// content-derived `identity.receipt_id` that selects it — belongs to the
+/// subsystem that issued it, and answering that question on this contour would
+/// make a storage adapter interpret a receipt it was only asked to hold. So
+/// this projection re-derives no digest, parses no envelope, and validates
+/// nothing: the requesting owner parses these exact bytes, validates them
+/// through the envelope's own `validate()`, and requires the parsed
+/// `identity.receipt_id` to equal the identity the immutable revision names.
 ///
-/// Selection is by that parsed identity, not by a name: a retained envelope is
-/// returned only when its `identity.receipt_id` equals the requested receipt
-/// identity, so a caller that predicts a row name still reaches nothing. The
-/// fence gate is applied before the identity comparison, so an envelope
-/// retained under a different admission era is not answerable here at all.
+/// The two gates this contour does own are the exact immutable-revision row
+/// address and the exact admission fence, and the fence gate is applied before
+/// the row is projected at all: an envelope retained under a different
+/// admission era is not answerable here, and an absent or cross-fence row
+/// projects an empty array rather than another era's envelope. An immutable
+/// revision row retains exactly one envelope, so this projection is a
+/// zero-or-one answer and never a filtered subset.
 fn automation_normalization_envelopes_payload(
     state: &MemoryState,
     fence: &StateFence,
     automation_id: &str,
     revision: &str,
-    receipt_id: &str,
 ) -> Result<Value, StoreError> {
     let mut envelopes = Vec::new();
     if let Some(row) = state
@@ -2799,17 +2811,11 @@ fn automation_normalization_envelopes_payload(
         .get(&automation_revision_key(automation_id, revision))
         .filter(|row| row.automation_id == automation_id && row.state_fence == *fence)
     {
-        let retained: eliot_receipts::ReceiptEnvelope =
-            serde_json::from_str(&row.normalization_envelope_json)
-                .map_err(|error| StoreError::Serialization(error.to_string()))?;
-        if retained.identity.receipt_id.as_str() == receipt_id {
-            envelopes.push(json!({
-                "automation_id": row.automation_id,
-                "revision": row.revision,
-                "receipt_id": retained.identity.receipt_id.as_str(),
-                "envelope_json": row.normalization_envelope_json,
-            }));
-        }
+        envelopes.push(json!({
+            "automation_id": row.automation_id,
+            "revision": row.revision,
+            "envelope_json": row.normalization_envelope_json,
+        }));
     }
     Ok(json!({
         "normalization_envelopes": envelopes,

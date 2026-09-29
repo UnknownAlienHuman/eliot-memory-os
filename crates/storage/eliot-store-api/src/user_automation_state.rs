@@ -54,16 +54,18 @@
 //! Retained automation-owned normalization envelope (issue #1779). The
 //! revision legs carry the VERBATIM `ReceiptEnvelope` the automation leg
 //! minted over that revision's compiled occurrence set, and the closed
-//! `normalization` read returns those retained bytes selected by the
-//! envelope's own content-derived `identity.receipt_id` under the request's
-//! exact State Fence. I05.19:96 makes the envelope the property of the
+//! `normalization` read returns those retained bytes verbatim under the
+//! request's exact State Fence. I05.19:96 makes the envelope the property of the
 //! subsystem that performed the transition, so the envelope lives on the
 //! automation revision row that subsystem already writes: there is no second
 //! receipt store, no second writer, and no change to the generic Store receipt
-//! artifacts, which cannot express this transition. Nothing here re-derives a
-//! digest; the envelope's own `validate()` is the only validator, and the
-//! binding between the retained envelope and the revision's occurrence set is
-//! closed by the Kernel-owned preflight assembly.
+//! artifacts, which cannot express this transition. A store contour STORES the
+//! envelope and never interprets it, so the `receipt_id` selector is closed
+//! upstream against the envelope's own content-derived
+//! `identity.receipt_id`, not by a name the adapter could resolve. Nothing here
+//! re-derives a digest; the envelope's own `validate()` is the only validator,
+//! and the binding between the retained envelope and the revision's occurrence
+//! set is closed by the Kernel-owned preflight assembly.
 //!
 //! Paged continuation (issue #2859). A `TRUNCATED` completeness block carries
 //! an owner-issued V2 reference containing only its closed version and opaque
@@ -175,8 +177,13 @@ pub const AUTOMATION_PARAM_CURSOR: &str = "cursor";
 /// Exact content-derived receipt identity selector (normalization read only).
 ///
 /// This is the `identity.receipt_id` the immutable revision names. The owner
-/// selects retained envelopes by comparing their OWN parsed identity to it, so
-/// a caller cannot reach an envelope by predicting a row name.
+/// requires it, and the REQUESTING owner closes the binding against it: the
+/// owner's answer is the retained envelope's verbatim bytes, and that requester
+/// parses them, validates them through the envelope's own `validate()`, and
+/// compares the PARSED `identity.receipt_id` to this selector. The store
+/// contour never resolves the field itself — it is a store of a value, not an
+/// interpreter of one — so a caller still cannot reach an envelope by predicting
+/// a name, and naming the wrong identity is a typed conflict.
 pub const AUTOMATION_PARAM_RECEIPT_ID: &str = "receipt_id";
 
 /// Mutation leg discriminator values (mirror the domain operation
@@ -213,10 +220,11 @@ pub const AUTOMATION_QUERY_FAILURE: &str = "failure";
 /// I05.19:96 binds a durable receipt's envelope to the subsystem that performed
 /// the transition. The automation Store leg performed the normalization, so its
 /// envelope is retained there and read back there; this query is a read of that
-/// one owner, not a second receipt store. Selection is by the envelope's own
-/// content-derived `identity.receipt_id` — the read requests the exact receipt
-/// identity the immutable revision names and returns only envelopes carrying
-/// exactly that identity, never a name-derived lookup.
+/// one owner, not a second receipt store. The read requests the exact receipt
+/// identity the immutable revision names and returns that revision's retained
+/// envelope verbatim; the content comparison is then closed by the requesting
+/// owner against the PARSED `identity.receipt_id`, because the store contour
+/// stores a value rather than interpreting one.
 pub const AUTOMATION_QUERY_NORMALIZATION: &str = "normalization";
 
 /// Closed admission-state wire values (mirror the domain
@@ -240,9 +248,16 @@ pub const AUTOMATION_PAGE_INVOCATIONS: &str = "invocations";
 /// Read payload field: failure row or null (failure).
 pub const AUTOMATION_PAGE_FAILURE: &str = "failure";
 /// Read payload field: retained normalization receipt envelope array
-/// (normalization), each entry carrying the verbatim `envelope_json` and the
-/// envelope's own `receipt_id` so selection never depends on a predictable
-/// row name.
+/// (normalization), each entry carrying the verbatim `envelope_json` the owner
+/// stored beside the immutable revision it attests.
+///
+/// The owner projects the envelope as the opaque bytes it was handed and never
+/// names a field inside it, so an entry carries no receipt identity of its own:
+/// the owner stores a value, and what that value MEANS belongs to the subsystem
+/// that issued it. The requesting owner parses these bytes, validates them
+/// through the envelope's own `validate()`, and compares the envelope's own
+/// content-derived `identity.receipt_id` to the identity the immutable revision
+/// names, so selection is a content comparison and never a name comparison.
 pub const AUTOMATION_PAGE_NORMALIZATION_ENVELOPES: &str = "normalization_envelopes";
 /// Read payload field: owner revision read at (max current revision).
 pub const AUTOMATION_PAGE_REVISION: &str = "revision";
@@ -379,7 +394,9 @@ pub struct DecodedAutomationRead {
     pub requested_occurrence_id: Option<String>,
     /// Optional exact content-derived receipt identity for the retained
     /// normalization-envelope read. It is an identity, not a row name: the
-    /// owner returns only envelopes whose own `identity.receipt_id` equals it.
+    /// owner answers with the revision's retained envelope verbatim, and the
+    /// REQUESTING owner compares that envelope's own parsed
+    /// `identity.receipt_id` to this selector.
     pub requested_receipt_id: Option<String>,
     /// Retired-row inclusion (list only).
     pub include_retired: bool,
@@ -1043,11 +1060,13 @@ pub fn automation_invocation_read_request(
 /// revision under the request's own State Fence.
 ///
 /// The selector is accepted only by the closed `normalization` read contract.
-/// The owner returns retained envelopes whose OWN parsed `identity.receipt_id`
-/// equals `receipt_id`, so a caller cannot reach an envelope by predicting a
-/// row name; the fence is the same one the preflight request is bound to, so
-/// an envelope retained under a different admission era is not answerable
-/// here.
+/// The owner requires it and answers with that revision's retained envelope
+/// verbatim; the REQUESTING owner then parses those bytes and requires the
+/// envelope's OWN content-derived `identity.receipt_id` to equal `receipt_id`,
+/// so a caller cannot reach an envelope by predicting a row name, and the
+/// adapter never learns the receipt model. The fence is the same one the
+/// preflight request is bound to, so an envelope retained under a different
+/// admission era is not answerable here.
 pub fn automation_normalization_read_request(
     automation_id: String,
     revision: String,
