@@ -48,8 +48,8 @@ use eliot_platform_windows::{
     ServiceRegistrationOutcome, ServiceRegistrationRequest, ServiceRegistrationRuntimeInspection,
     ServiceRegistrationRuntimeReadback, ServiceStartMode, ServiceStartOutcome, ServiceStopOutcome,
     StagingReceipt, SupervisionAuthorityKeyError, SupervisionAuthorityKeyStoreRequest,
-    UserModeSupervisionAuthorityCredentialReceipt, UserModeSupervisionAuthorityCredentialRequest,
     UserModeSupervisionAuthorityCredentialObservation,
+    UserModeSupervisionAuthorityCredentialReceipt, UserModeSupervisionAuthorityCredentialRequest,
     UserModeSupervisionAuthorityCredentialTargetObservation,
     UserModeSupervisionAuthorityCredentialWriteOutcome, UserOwnedPathLease,
     WindowsInstallerRootPrimitive, WindowsInstallerSecretProvider, WindowsPlatform,
@@ -348,7 +348,7 @@ pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(5, 0, 0);
 /// into the durable registration receipt and its canonical marker digest.
 /// Version 25 requires the retained I3.1 profile-root binding on every current
 /// executable transaction and carries the corresponding launch descriptor
-/// shape. Version 26 adds the original UserMode authority key receipt and
+/// shape. Version 26 adds the original `UserMode` authority key receipt and
 /// terminal no-effect-abort progress. Older wires require explicit migration
 /// and are never synthesized.
 pub const INSTALLATION_TRANSACTION_WIRE_VERSION: ContractVersion = ContractVersion::new(26, 0, 0);
@@ -1127,7 +1127,7 @@ pub struct RuntimeLaunchDescriptor {
     /// Versioned immutable-root component release selected by I3.1.
     pub profile_version: PlatformHandle,
     /// Lowercase installation identity for SystemService/UserMode; absent for
-    /// PortableDev, whose root identity is the retained repository root.
+    /// `PortableDev`, whose root identity is the retained repository root.
     pub profile_installation_key: Option<PlatformHandle>,
     /// Complete I3.1 four-root binding retained on the launch wire.
     ///
@@ -1694,6 +1694,10 @@ impl RuntimeLaunchDescriptor {
         ))
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the canonical launch descriptor field order is one digest input"
+    )]
     fn unsigned_bytes(&self) -> Result<Vec<u8>, InstallationError> {
         #[derive(Serialize)]
         struct Unsigned<'a> {
@@ -2862,7 +2866,7 @@ pub struct InstallationEffectPrecondition {
     pub credential_snapshot: Option<StoreCredentialAbsentSnapshot>,
     /// Trusted package source observation bound to the exact retained root and manifest.
     pub package_snapshot: Option<PackageObservationSnapshot>,
-    /// Exact current-user UserMode authority-target absence observation.
+    /// Exact current-user `UserMode` authority-target absence observation.
     pub user_mode_authority_snapshot: Option<UserModeAuthorityAbsentSnapshot>,
     /// Digest binding the planned references and typed snapshots in order.
     pub digest: PlatformHandle,
@@ -3093,7 +3097,7 @@ pub struct InstallationEffectRequest {
     pub store_credential: Option<StoreCredentialProgress>,
     /// Typed durable package receipt for a committed stage/recovery request.
     pub staging_receipt: Option<StagingReceipt>,
-    /// Original current-user UserMode key receipt, persisted before the one
+    /// Original current-user `UserMode` key receipt, persisted before the one
     /// permitted Credential Manager write and used to reconcile the exact
     /// transaction/effect target.
     pub user_mode_authority_receipt: Option<UserModeSupervisionAuthorityCredentialReceipt>,
@@ -3825,7 +3829,7 @@ pub(crate) trait InstallationEffectPort: Send {
         PortOutcome::Unknown(UnknownReason::Unsupported)
     }
 
-    /// Generates one UserMode key seed and returns its secret-free receipt.
+    /// Generates one `UserMode` key seed and returns its secret-free receipt.
     /// The caller must commit that receipt with the exact effect intent before
     /// invoking `execute`; an absent post-intent readback is terminal because
     /// the seed is intentionally not regenerated after restart.
@@ -3846,7 +3850,7 @@ pub(crate) trait InstallationEffectPort: Send {
         false
     }
 
-    /// Drops an uncommitted in-memory UserMode seed after its transaction CAS
+    /// Drops an uncommitted in-memory `UserMode` seed after its transaction CAS
     /// fails. It does not inspect or change Credential Manager.
     fn discard_prepared_user_mode_authority(
         &mut self,
@@ -6267,7 +6271,7 @@ impl InstallationEffectPort for WindowsInstallationEffectPort {
                         Err(error) => PortOutcome::Error(supervision_key_port_error(error)),
                     }
                 }
-            }
+            };
         }
         if matches!(&request.plan, InstallerEffectPlan::StagePackage { .. }) {
             let key = match self.credential_secret(request) {
@@ -8049,13 +8053,13 @@ where
         let attempt = match transaction.effect_progress[index].state {
             InstallationEffectProgressState::Pending => 1,
             InstallationEffectProgressState::IntentCommitted { attempt, .. } => attempt,
-            InstallationEffectProgressState::NoEffectAborted { .. } => unreachable!(),
+            InstallationEffectProgressState::NoEffectAborted { .. }
+            | InstallationEffectProgressState::Applied { .. } => unreachable!(),
             InstallationEffectProgressState::Unknown { ref pending_ref } => {
                 return Ok(InstallationStepOutcome::RollbackRequired {
                     pending_refs: vec![pending_ref.clone()],
                 });
             }
-            InstallationEffectProgressState::Applied { .. } => unreachable!(),
         };
         if matches!(
             transaction.installer_effects[index],
@@ -8568,7 +8572,7 @@ where
                             index,
                             intent_attempt,
                             intent_digest,
-                            observed_precondition,
+                            &observed_precondition,
                             evidence,
                         );
                     }
@@ -8703,7 +8707,9 @@ where
                             PortOutcome::Partial { value, missing } => {
                                 self.port.discard_prepared_user_mode_authority(&value);
                                 return Err(InstallationError::IncompleteObservation(
-                                    port_pending(PortOutcome::Partial { value, missing }),
+                                    port_pending(PortOutcome::Partial { value, missing })
+                                        .as_str()
+                                        .to_owned(),
                                 ));
                             }
                             PortOutcome::Error(_) | PortOutcome::Unknown(_) => {
@@ -10117,7 +10123,7 @@ where
         index: usize,
         attempt: u32,
         intent_digest: PlatformHandle,
-        observed_precondition: InstallationEffectPrecondition,
+        observed_precondition: &InstallationEffectPrecondition,
         evidence: Vec<PlatformHandle>,
     ) -> Result<InstallationStepOutcome, InstallationError> {
         if !matches!(
@@ -10128,7 +10134,7 @@ where
             || transaction.effect_progress[index]
                 .admitted_precondition
                 .as_ref()
-                != Some(&observed_precondition)
+                != Some(observed_precondition)
         {
             return Err(InstallationError::IdentityConflict);
         }
@@ -10148,7 +10154,7 @@ where
         );
         if !matches_intent
             || request.intent_digest()? != intent_digest
-            || request.precondition != observed_precondition
+            || &request.precondition != observed_precondition
             || observed_precondition.user_mode_authority_snapshot.is_none()
         {
             return Err(InstallationError::IdentityConflict);
@@ -10162,7 +10168,7 @@ where
                 absence_digest,
                 evidence: evidence.clone(),
             };
-        transaction.pending_external_changes = evidence.clone();
+        transaction.pending_external_changes.clone_from(&evidence);
         transaction.stage = InstallationStage::RollbackRequired;
         increment_revision(&mut transaction)?;
         transaction.validate()?;

@@ -173,10 +173,10 @@ impl SupervisionAuthorityProvisionPlan {
     }
 }
 
-/// Immutable UserMode supervision authority plan. Unlike the service-SID
+/// Immutable `UserMode` supervision authority plan. Unlike the service-SID
 /// plan above, the signing key is scoped to one current-user Credential
 /// Manager target derived from this transaction/effect and the exact profile
-/// roots; no SCM identity, ProgramData path, or installer-root HMAC key is
+/// roots; no SCM identity, `ProgramData` path, or installer-root HMAC key is
 /// admitted by this contract.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -202,7 +202,7 @@ pub struct UserModeSupervisionAuthorityProvisionPlan {
     pub target: PlatformHandle,
     /// Current-user SID observed while the plan was admitted.
     pub owner_sid: PlatformHandle,
-    /// Complete I3.1 UserMode path binding, including all digest-bound runtime
+    /// Complete I3.1 `UserMode` path binding, including all digest-bound runtime
     /// roots. The effect executor reopens these roots and retains their
     /// current-user no-follow identities before key access.
     pub profile_roots: InstallationRoots,

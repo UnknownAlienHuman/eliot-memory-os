@@ -1115,7 +1115,7 @@ pub struct ProfileSelectionResolution {
     /// guarantees. Contains no key, secret or credential value.
     pub governance: ProfileGovernanceReport,
     /// Evidence that a non-service selection does not require SCM,
-    /// administrative authority or a ProgramData anchor. `system_service`
+    /// administrative authority or a `ProgramData` anchor. `system_service`
     /// uses SCM by definition, so it has no such proof; its requirements are
     /// reported by the selected profile's governance report instead.
     pub no_service_authority_proof: Option<NoServiceProfileAuthorityProof>,
@@ -1307,7 +1307,7 @@ impl GenerationPackagePlanner {
     pub fn plan_with_published_profile_binding(
         input: GenerationPackagePlanInput,
         selection: &ProfileSelectionInput,
-        published_roots: InstallationRoots,
+        published_roots: &InstallationRoots,
         source_identity: FileIdentity,
         files: Vec<PackageArtifactDigest>,
         evidence_digest: PlatformHandle,
@@ -1325,7 +1325,7 @@ impl GenerationPackagePlanner {
             ));
         }
         let resolution = Self::resolve_profile_selection(selection)?;
-        if resolution.roots != published_roots {
+        if &resolution.roots != published_roots {
             return Err(InstallationError::ProfileViolation(
                 "source publication profile binding differs from the resolved I3.1 selection"
                     .to_owned(),
@@ -2310,8 +2310,7 @@ impl GenerationPackagePlanner {
                         destination_root,
                         ..
                     } => destination_root
-                        .as_ref()
-                        .cloned()
+                        .clone()
                         .unwrap_or_else(|| staging_root.clone()),
                     InstallerEffectPlan::RegisterService { service_name, .. }
                     | InstallerEffectPlan::StartService { service_name, .. } => {

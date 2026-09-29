@@ -262,8 +262,8 @@ impl RuntimeStateRoots {
     /// Derives `SystemService` or `UserMode` roots from an explicit OS-validated
     /// profile anchor and a lowercase SHA-256 installation key. Both runtime
     /// topologies are refined beneath the profile's I3.1 durable-data root:
-    /// SystemService uses `%ProgramData%\Eliot\installations\<key>` and
-    /// UserMode uses `%LocalAppData%\Eliot\data\installations\<key>`.
+    /// `SystemService` uses `%ProgramData%\Eliot\installations\<key>` and
+    /// `UserMode` uses `%LocalAppData%\Eliot\data\installations\<key>`.
     pub fn derive_profiled(
         profile: InstallationProfile,
         profile_anchor_root: PlatformHandle,

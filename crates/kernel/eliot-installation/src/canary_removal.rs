@@ -54,7 +54,7 @@ use super::{
 /// is a separate durable record, not a rewritten install.
 ///
 /// Version 2 makes the absolute reconcile deadline of the bounded reconcile
-/// wait mandatory. Version 3 adds the UserMode supervision-authority credential
+/// wait mandatory. Version 3 adds the `UserMode` supervision-authority credential
 /// as a typed resource in the frozen removal graph. Older records require
 /// explicit migration; neither deadlines nor resource classifications are
 /// synthesized as defaults.
@@ -101,7 +101,7 @@ pub enum CanaryRemovalResource {
     /// The `LocalService` Store credential provisioned for this generation.
     StoreCredential,
     /// The exact current-user supervision-authority credential provisioned by
-    /// the original UserMode transaction.
+    /// the original `UserMode` transaction.
     UserModeAuthorityCredential,
     /// One canonical SCM service registration admitted for this generation.
     ServiceRegistration,
@@ -1300,6 +1300,10 @@ fn surviving_generations(
 /// `RETAINED` with its ownership evidence; a transaction-created row this owner
 /// has no admitted removal path for is `UNSUPPORTED` and therefore blocks
 /// apply instead of leaving the denominator.
+#[allow(
+    clippy::too_many_lines,
+    reason = "all install effects are classified against one frozen removal denominator"
+)]
 fn freeze_effect_graph(
     install: &InstallationTransaction,
     survivors: &[PlatformHandle],

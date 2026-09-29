@@ -110,7 +110,7 @@ pub enum InstallerEffectPlan {
         /// Secret-free immutable provision plan.
         provision: StoreCredentialProvisionPlan,
     },
-    /// Provision one current-user UserMode supervision key after package
+    /// Provision one current-user `UserMode` supervision key after package
     /// publication. The durable coordinator retains the original key receipt
     /// before the provider performs its create-only write.
     ProvisionUserModeSupervisionAuthority {
