@@ -11,8 +11,8 @@ use eliot_user_broker::{
     OperatorClientBinding, canonical_root, request_names_notify_image,
 };
 use eliot_user_broker_core::{
-    CutoverReceipt, LaunchRequest, OPERATOR_HANDOFF_TTL_MS, OperatorEndpoint,
-    OperatorHandoffRequest,
+    BrokerRedemption, CutoverReceipt, LaunchRequest, OperatorBindingChallengeGrant,
+    OperatorEndpoint, OperatorHandoffRequest, OPERATOR_HANDOFF_TTL_MS,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -179,19 +179,14 @@ enum OperatorPipeRequest {
 #[serde(tag = "status", rename_all = "snake_case")]
 enum OperatorPipeMessage {
     Challenge {
-        kernel_session_token: String,
+        challenge: OperatorBindingChallengeGrant,
         broker_epoch: u64,
         handoff_nonce: String,
         role: String,
         capabilities: Vec<String>,
     },
     Redeemed {
-        principal: String,
-        interactive_session_id: String,
-        client_process_id: u32,
-        kernel_session_token: String,
-        role: String,
-        capabilities: Vec<String>,
+        redemption: BrokerRedemption,
     },
     Error {
         code: &'static str,
@@ -558,8 +553,8 @@ fn dispatch_operator_pipe(
             .challenge_operator_handoff(&endpoint, peer)
             .map_or_else(
                 |error| operator_pipe_rejection(&error),
-                |kernel_session_token| OperatorPipeMessage::Challenge {
-                    kernel_session_token,
+                |challenge| OperatorPipeMessage::Challenge {
+                    challenge,
                     broker_epoch: endpoint.broker_epoch,
                     handoff_nonce: endpoint.handoff_nonce,
                     role: endpoint.role,
@@ -570,13 +565,8 @@ fn dispatch_operator_pipe(
             .redeem_operator_handoff(&endpoint, &client, peer)
             .map_or_else(
                 |error| operator_pipe_rejection(&error),
-                |_| OperatorPipeMessage::Redeemed {
-                    principal: peer.sid().to_owned(),
-                    interactive_session_id: peer.session_id().to_string(),
-                    client_process_id: peer.process().process_id,
-                    kernel_session_token: client.kernel_session_token,
-                    role: endpoint.role,
-                    capabilities: endpoint.capabilities,
+                |redemption| OperatorPipeMessage::Redeemed {
+                    redemption,
                 },
             ),
     }

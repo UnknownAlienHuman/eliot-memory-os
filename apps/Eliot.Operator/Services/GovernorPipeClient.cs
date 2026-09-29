@@ -287,6 +287,16 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
 
             var state = new ExchangeState();
             var requestId = Interlocked.Increment(ref _requestId);
+            if (connection.Redemption.ExpiresAt
+                <= (ulong)Math.Max(0, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()))
+            {
+                await AbortConnectionAsync(
+                    connection,
+                    OperatorHandoffInvalidation.ReconnectRequired,
+                    OperatorExchangeStages.Establishment).ConfigureAwait(false);
+                throw new OperatorRestartRequiredException(OperatorHandoff.ReacquisitionRequirement);
+            }
+            var callParameters = BuildToolCallParameters(tool, arguments, connection.Redemption);
             try
             {
                 var response = await RequestAsync<JsonRpcResponse<McpToolResult>>(connection, new
@@ -294,7 +304,7 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
                     jsonrpc = "2.0",
                     id = requestId,
                     method = "tools/call",
-                    @params = new { name = tool, arguments }
+                    @params = callParameters
                 }, budget, stage, state, applicationRequest: true).ConfigureAwait(false);
                 ValidateJsonRpcResponse(response, requestId);
                 if (response.Error is not null)
@@ -467,10 +477,12 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
             // The inherited handoff is consumed before any broker request.
             // Broker challenge and redemption share this establishment window
             // and finish before the Governor pipe is connected.
-            await BrokerPipeClient.RedeemOperatorHandoffAsync(
+            var redemption = await BrokerPipeClient.RedeemOperatorHandoffAsync(
                 handoff.Endpoint,
                 clientIdentity,
+                handoff.ExpiresAtUtc,
                 establishment.Token).ConfigureAwait(false);
+            connection.BindRedemption(redemption);
             try
             {
                 await pipe.ConnectAsync(establishment.Token).ConfigureAwait(false);
@@ -512,6 +524,9 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
                 operator_artifact_fingerprint = clientIdentity.ArtifactFingerprint,
                 requested_role = handoff.Endpoint.Role,
                 requested_capabilities = handoff.Endpoint.Capabilities,
+                kernel_session_token = redemption.KernelSessionToken,
+                principal = redemption.Principal,
+                broker_redemption = redemption.WireValue,
                 client_nonce = Guid.NewGuid().ToString("N"),
                 profile = "human_operator",
                 requested_session_id = (string?)null
@@ -581,6 +596,67 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
                 $"{OperatorFaultReason.HandshakeShapeRefused} at broker registration generation {handoff.BrokerRegistrationEpoch}");
         }
         return connection;
+    }
+
+    private static object BuildToolCallParameters(
+        string tool,
+        object arguments,
+        OperatorBrokerRedemption redemption)
+    {
+        var mutation = tool == LegacyOperatorAdapter.ToolCommand
+            || tool == UserAutomationContract.Route
+                && arguments is UserAutomationOperatorRequest automation
+                && automation.Operation.IsEffect();
+        if (!mutation) return new { name = tool, arguments };
+
+        var request = JsonSerializer.SerializeToElement(arguments, Json);
+        if (request.ValueKind != JsonValueKind.Object
+            || !request.TryGetProperty("idempotency_key", out var operationElement)
+            || operationElement.ValueKind != JsonValueKind.String
+            || string.IsNullOrWhiteSpace(operationElement.GetString()))
+        {
+            throw new OperatorProtocolException("human_authority", "operation_identity");
+        }
+
+        string? exactActionHash = null;
+        if (tool == LegacyOperatorAdapter.ToolCommand)
+        {
+            if (!request.TryGetProperty("command", out var command)
+                || command.ValueKind != JsonValueKind.Object
+                || !command.TryGetProperty("command", out var commandNameElement)
+                || commandNameElement.ValueKind != JsonValueKind.String)
+            {
+                throw new OperatorProtocolException("human_authority", "command_shape");
+            }
+            var commandName = commandNameElement.GetString();
+            if (commandName is "grant_approval" or "deny_approval")
+            {
+                if (!command.TryGetProperty("exact_action_hash", out var hashElement)
+                    || hashElement.ValueKind != JsonValueKind.String
+                    || hashElement.GetString() is not { } hash)
+                {
+                    throw new OperatorProtocolException("human_authority", "exact_action_hash_missing");
+                }
+                if (hash.Length != 64
+                    || hash.Any(character => !char.IsAsciiHexDigit(character) || char.IsUpper(character)))
+                {
+                    throw new OperatorProtocolException("human_authority", "exact_action_hash_shape");
+                }
+                exactActionHash = hash;
+            }
+        }
+
+        var humanAuthority = new Dictionary<string, object?>(StringComparer.Ordinal)
+        {
+            ["kernel_session_token"] = redemption.KernelSessionToken,
+            ["principal"] = redemption.Principal,
+            ["interactive_session_id"] = redemption.InteractiveSessionId,
+            ["role"] = redemption.Role,
+            ["capabilities"] = redemption.Capabilities,
+            ["operation_id"] = operationElement.GetString()
+        };
+        if (exactActionHash is not null) humanAuthority["exact_action_hash"] = exactActionHash;
+        return new { name = tool, arguments, human_authority = humanAuthority };
     }
 
     /// Writes one framed request and reads one framed answer on the captured
@@ -1072,6 +1148,7 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         private static long _sequence;
         private readonly object _gate = new();
         private GovernorStreams? _streams;
+        private OperatorBrokerRedemption? _redemption;
         private int _aborted;
         private int _released;
 
@@ -1087,6 +1164,31 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         public OperatorHandoff? Handoff { get; }
 
         public long Identity { get; }
+
+        public OperatorBrokerRedemption Redemption
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    return _redemption
+                        ?? throw new InvalidOperationException("Governor connection has no Broker redemption.");
+                }
+            }
+        }
+
+        public void BindRedemption(OperatorBrokerRedemption redemption)
+        {
+            ArgumentNullException.ThrowIfNull(redemption);
+            lock (_gate)
+            {
+                if (_aborted != 0 || _redemption is not null)
+                {
+                    throw new InvalidOperationException("Governor connection cannot replace its Broker redemption.");
+                }
+                _redemption = redemption;
+            }
+        }
 
         public bool IsAborted => Volatile.Read(ref _aborted) != 0;
 

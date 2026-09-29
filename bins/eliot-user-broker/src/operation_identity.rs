@@ -62,6 +62,12 @@ pub(crate) const HEARTBEAT_OPERATION: &str = "eliot.user-broker.heartbeat";
 pub(crate) const AUTHORIZE_LAUNCH_OPERATION: &str = "eliot.user-broker.authorize-launch";
 /// Canonical Kernel operation selectors issued through this broker.
 pub(crate) const FENCE_OPERATION: &str = "eliot.user-broker.fence";
+/// Canonical Kernel operation selector for the one-shot User Broker operator challenge.
+pub(crate) const OPERATOR_BINDING_CHALLENGE_OPERATION: &str =
+    "eliot.user-broker.operator-binding.challenge";
+/// Canonical Kernel operation selector for redeeming the exact operator challenge.
+pub(crate) const OPERATOR_BINDING_REDEEM_OPERATION: &str =
+    "eliot.user-broker.operator-binding.redeem";
 
 /// Stable broker product/source binding carried by every minted identity.
 const BROKER_PRODUCT_ID: &str = "eliot-user-broker";
@@ -85,6 +91,8 @@ pub(crate) enum BrokerOperation {
     HeartbeatRenewal,
     AuthorizeLaunch,
     FenceLogoff,
+    OperatorBindingChallenge,
+    OperatorBindingRedeem,
 }
 
 impl BrokerOperation {
@@ -96,6 +104,8 @@ impl BrokerOperation {
             Self::HeartbeatRenewal => HEARTBEAT_OPERATION,
             Self::AuthorizeLaunch => AUTHORIZE_LAUNCH_OPERATION,
             Self::FenceLogoff => FENCE_OPERATION,
+            Self::OperatorBindingChallenge => OPERATOR_BINDING_CHALLENGE_OPERATION,
+            Self::OperatorBindingRedeem => OPERATOR_BINDING_REDEEM_OPERATION,
         }
     }
 
@@ -106,6 +116,8 @@ impl BrokerOperation {
             Self::HeartbeatRenewal => "heartbeat",
             Self::AuthorizeLaunch => "authorize-launch",
             Self::FenceLogoff => "fence",
+            Self::OperatorBindingChallenge => "operator-binding-challenge",
+            Self::OperatorBindingRedeem => "operator-binding-redeem",
         }
     }
 }
@@ -695,6 +707,37 @@ impl OperationIdentityIssuer {
     ) -> Result<IssuedIdentity, OperationIdentityError> {
         self.issue(
             BrokerOperation::FenceLogoff,
+            payload,
+            now_unix_ms,
+            &CallerLink::none(),
+        )
+    }
+
+    /// Issues (or exactly retries) one Kernel operator challenge identity.
+    /// Its canonical payload includes the nonce, registration and OS-observed
+    /// peer, so a changed UI process cannot reuse the identity.
+    pub(crate) fn issue_operator_binding_challenge(
+        &mut self,
+        payload: &Value,
+        now_unix_ms: u64,
+    ) -> Result<IssuedIdentity, OperationIdentityError> {
+        self.issue(
+            BrokerOperation::OperatorBindingChallenge,
+            payload,
+            now_unix_ms,
+            &CallerLink::none(),
+        )
+    }
+
+    /// Issues (or exactly retries) one Kernel operator challenge redemption
+    /// identity, bound to the exact challenge and unchanged observed context.
+    pub(crate) fn issue_operator_binding_redeem(
+        &mut self,
+        payload: &Value,
+        now_unix_ms: u64,
+    ) -> Result<IssuedIdentity, OperationIdentityError> {
+        self.issue(
+            BrokerOperation::OperatorBindingRedeem,
             payload,
             now_unix_ms,
             &CallerLink::none(),

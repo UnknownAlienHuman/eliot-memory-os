@@ -1446,6 +1446,8 @@ impl IssuedOperationIdentity {
                 | "eliot.user-broker.heartbeat"
                 | "eliot.user-broker.authorize-launch"
                 | "eliot.user-broker.fence"
+                | "eliot.user-broker.operator-binding.challenge"
+                | "eliot.user-broker.operator-binding.redeem"
         );
         let broker_control = matches!(
             self.operation.as_str(),

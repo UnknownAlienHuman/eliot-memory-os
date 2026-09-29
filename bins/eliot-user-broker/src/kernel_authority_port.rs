@@ -24,14 +24,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_protocol::RequestIdentity;
 use eliot_user_broker_core::{
-    AuthorityPort, LaunchGrant, LaunchRequest, PortError, RegistrationFenceReceipt,
-    RegistrationFenceRequest, RegistrationGrant, RegistrationReceipt, RegistrationRequest,
+    AuthorityPort, LaunchGrant, LaunchRequest, OperatorBindingChallengeGrant,
+    OperatorBindingChallengeRequest, OperatorBindingGrant, OperatorBindingRedeemRequest,
+    PortError, RegistrationFenceReceipt, RegistrationFenceRequest, RegistrationGrant,
+    RegistrationReceipt, RegistrationRequest,
 };
 
 use super::SharedKernelClient;
 use crate::operation_identity::{
     AUTHORIZE_LAUNCH_OPERATION, BrokerOperation, FENCE_OPERATION, HEARTBEAT_OPERATION,
-    IssuerHandle, OperationIdentityError, REGISTER_OPERATION,
+    IssuerHandle, OPERATOR_BINDING_CHALLENGE_OPERATION, OPERATOR_BINDING_REDEEM_OPERATION,
+    OperationIdentityError, REGISTER_OPERATION,
 };
 
 fn kernel_port_error(error: eliot_cli::kernel_client::KernelClientError) -> PortError {
@@ -112,6 +115,12 @@ impl KernelAuthorityPort {
             BrokerOperation::Register => guard.issue_register(payload, now),
             BrokerOperation::HeartbeatRenewal => guard.issue_heartbeat(payload, now),
             BrokerOperation::FenceLogoff => guard.issue_fence(payload, now),
+            BrokerOperation::OperatorBindingChallenge => {
+                guard.issue_operator_binding_challenge(payload, now)
+            }
+            BrokerOperation::OperatorBindingRedeem => {
+                guard.issue_operator_binding_redeem(payload, now)
+            }
             BrokerOperation::AuthorizeLaunch => {
                 return Err(PortError::Invalid(
                     "authorize-launch requires its caller launch binding".to_owned(),
@@ -120,6 +129,64 @@ impl KernelAuthorityPort {
         }
         .map_err(identity_port_error)?;
         Ok(issued.identity)
+    }
+}
+
+impl KernelAuthorityPort {
+    /// Requests a fresh Kernel-owned challenge for the exact broker
+    /// registration, endpoint and OS-observed peer. The Broker only validates
+    /// and forwards the returned grant; it does not mint a token.
+    pub(crate) fn operator_binding_challenge(
+        &self,
+        request: &OperatorBindingChallengeRequest,
+    ) -> Result<OperatorBindingChallengeGrant, PortError> {
+        request
+            .validate()
+            .map_err(|error| PortError::Invalid(error.to_string()))?;
+        let payload = serde_json::to_value(request)
+            .map_err(|error| PortError::Invalid(error.to_string()))?;
+        let identity = self.issue(BrokerOperation::OperatorBindingChallenge, &payload)?;
+        let raw = kernel_call(
+            &self.client,
+            OPERATOR_BINDING_CHALLENGE_OPERATION,
+            payload,
+            identity,
+        )?;
+        let grant: OperatorBindingChallengeGrant = serde_json::from_value(raw)
+            .map_err(|error| PortError::Invalid(format!("decode operator challenge grant: {error}")))?;
+        let observed_at = now_unix_ms()?;
+        grant
+            .validate_for(request, observed_at)
+            .map_err(|error| PortError::Invalid(format!("operator challenge grant mismatch: {error}")))?;
+        Ok(grant)
+    }
+
+    /// Redeems a Kernel challenge only for the original, unchanged context.
+    /// The resulting session token is Kernel-issued and stays opaque here.
+    pub(crate) fn operator_binding_redeem(
+        &self,
+        request: &OperatorBindingRedeemRequest,
+    ) -> Result<OperatorBindingGrant, PortError> {
+        let observed_at = now_unix_ms()?;
+        request
+            .validate(observed_at)
+            .map_err(|error| PortError::Invalid(error.to_string()))?;
+        let payload = serde_json::to_value(request)
+            .map_err(|error| PortError::Invalid(error.to_string()))?;
+        let identity = self.issue(BrokerOperation::OperatorBindingRedeem, &payload)?;
+        let raw = kernel_call(
+            &self.client,
+            OPERATOR_BINDING_REDEEM_OPERATION,
+            payload,
+            identity,
+        )?;
+        let grant: OperatorBindingGrant = serde_json::from_value(raw)
+            .map_err(|error| PortError::Invalid(format!("decode operator binding grant: {error}")))?;
+        let observed_at = now_unix_ms()?;
+        grant
+            .validate_for(request, observed_at)
+            .map_err(|error| PortError::Invalid(format!("operator binding grant mismatch: {error}")))?;
+        Ok(grant)
     }
 }
 
