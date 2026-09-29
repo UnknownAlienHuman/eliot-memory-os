@@ -3064,6 +3064,41 @@ impl WorkScopeBindingOwner {
         }
         Ok(self.snapshot.clone())
     }
+
+    /// Issues the next immutable WorkScope binding revision at the exact
+    /// current fence after the caller has admitted `binding` and obtained a
+    /// fresh matched guard receipt.
+    ///
+    /// The next revision is derived from this retained owner with checked
+    /// arithmetic; callers cannot choose it, reuse an attach request counter,
+    /// or substitute a descriptor revision. This method sequences the owner
+    /// record only. It does not authorize a relocation or attach by itself.
+    pub fn advance_current_binding(
+        &self,
+        state_fence: &StateFence,
+        binding: ScopeBinding,
+        guard_receipt: ScopeBindingGuardReceipt,
+    ) -> Result<Self, WorkScopeError> {
+        let current = self.read_current(state_fence)?;
+        if current.binding.scope.generation != state_fence.resource_generation.value()
+            || binding.scope.generation != state_fence.resource_generation.value()
+        {
+            return Err(WorkScopeError::StateFenceMismatch);
+        }
+        let owner_revision = current
+            .owner_revision
+            .checked_add(1)
+            .ok_or(WorkScopeError::InvalidCounter {
+                field: "owner_revision",
+            })?;
+        let snapshot = WorkScopeBindingSnapshot::new(
+            state_fence.clone(),
+            owner_revision,
+            binding,
+            guard_receipt,
+        )?;
+        Self::new(snapshot)
+    }
 }
 
 #[cfg(test)]

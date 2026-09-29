@@ -5199,7 +5199,6 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         governing_source_generation: u64,
         sources: &GoverningSourceSet,
         privacy: &PrivacyProfile,
-        owner_revision: u64,
     ) -> Result<WorkScopeBindingOwner, CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
@@ -5227,9 +5226,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 "relocation source closure is not matched for the observed instance".to_owned(),
             ));
         }
-        let snapshot = WorkScopeBindingSnapshot::new(fence, owner_revision, relocated, fresh)
-            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        WorkScopeBindingOwner::new(snapshot)
+        owner
+            .advance_current_binding(&fence, relocated, fresh)
             .map_err(|error| CompositionError::Recovery(error.to_string()))
     }
 
@@ -5268,7 +5266,6 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         governing_source_generation: u64,
         sources: &GoverningSourceSet,
         privacy: &PrivacyProfile,
-        owner_revision: u64,
     ) -> Result<(ScopeRelocationOrAttachReceipt, WorkScopeBindingOwner), CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
@@ -5294,7 +5291,6 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             governing_source_generation,
             sources,
             privacy,
-            owner_revision,
         )?;
         Ok((receipt, bound))
     }
