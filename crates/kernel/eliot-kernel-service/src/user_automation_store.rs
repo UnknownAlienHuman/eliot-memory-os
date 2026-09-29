@@ -2164,11 +2164,15 @@ fn revision_with_owner_normalization_receipt(
             });
         }
     };
-    let session = request.context.session_id.clone().map(|session_id| SessionBinding {
-        session_id,
-        authority_epoch: state_fence.authority_epoch.clone(),
-        state_fence: state_fence.clone(),
-    });
+    let session = request
+        .context
+        .session_id
+        .clone()
+        .map(|session_id| SessionBinding {
+            session_id,
+            authority_epoch: state_fence.authority_epoch.clone(),
+            state_fence: state_fence.clone(),
+        });
     let core = ReceiptCore {
         contract: eliot_receipts::contract_identity().map_err(StoreError::Receipt)?,
         kind: ReceiptKind::Verification,
