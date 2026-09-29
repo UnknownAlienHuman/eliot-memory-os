@@ -79,7 +79,7 @@
 //!
 //! # Wire revision
 //!
-//! [`IMPROVEMENT_PIPELINE_WIRE_REVISION`] is `7`. Revision `2` added typed
+//! [`IMPROVEMENT_PIPELINE_WIRE_REVISION`] is `8`. Revision `2` added typed
 //! `cause`/`remedy` fields to the rejection and block branches, added the
 //! `Blocked` disposition and the inspectable canary handoff, bound
 //! candidate/experiment/content-revision/run identities onto the admission
@@ -130,7 +130,14 @@
 //! execution. A retry is permitted only by an owner-settled non-success
 //! terminal outcome: an [`EffectOutcome::Rejected`] the owner validated against
 //! its own canonical receipt whose disposition is `FAILURE` or `CANCELLED`,
-//! bound to this obligation's exact operation identity.
+//! bound to this obligation's exact operation identity. Revision `8` puts the
+//! revision where it was always claimed to be: [`ImprovementCanaryHandoff`]
+//! carries the [`IMPROVEMENT_PIPELINE_WIRE_REVISION`] its producer wrote, and
+//! [`check_handoff_wire_revision`] compares that recorded value against this
+//! build's constant at the handoff boundary, so a handoff assembled under
+//! another wire revision is a typed [`UncheckedWireRevision`] rather than a
+//! tolerated record. The constant was never compared before revision `8`; it is
+//! now read at the boundary whose shape it describes.
 //!
 //! That is precisely what the gate establishes, and the module claims no more.
 //! A `FAILURE` or `CANCELLED` disposition records what the owner observed about
@@ -147,8 +154,8 @@
 //! binding before it accepts anything; the field itself is private, so no caller
 //! can hand-build a receipt that opens either gate. That binding is NOT a wire
 //! revision: the owner outcome is skipped on serialize and defaults to absent on
-//! deserialize, so [`IMPROVEMENT_PIPELINE_WIRE_REVISION`] stays `7` and the bytes
-//! of an already-written obligation are unchanged. The absent default is the
+//! deserialize, so the bytes of an already-written obligation are unchanged by
+//! it. The absent default is the
 //! denying direction, so a re-read obligation is unresolved until its owner
 //! reattaches its receipt — and nothing in this workspace performs that attach
 //! today, so the gate denies every obligation it builds until the external
@@ -257,7 +264,12 @@ pub const IMPROVEMENT_MATERIAL_EQUALITY_DOMAIN: &str =
 /// current one and stays an unestablished observation.
 pub const IMPROVEMENT_MATERIAL_EQUALITY_ENCODING_VERSION: &str = "1";
 /// Wire revision of the improvement pipeline result and identity contracts.
-pub const IMPROVEMENT_PIPELINE_WIRE_REVISION: u32 = 7;
+///
+/// Compared against the revision a producer recorded, by
+/// [`check_handoff_wire_revision`]. A record stamped with any other value is a
+/// typed [`UncheckedWireRevision`]: the revision is never rounded to this one,
+/// never padded, and never read as if the current shape had produced it.
+pub const IMPROVEMENT_PIPELINE_WIRE_REVISION: u32 = 8;
 /// Maximum members in one declared set of the committed proposal.
 ///
 /// Matches the nearest existing declared-set ceiling in the repository
@@ -834,6 +846,15 @@ pub struct ImprovementCurrentProposal {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ImprovementCanaryHandoff {
+    /// Wire revision of the record shape this handoff was written under.
+    ///
+    /// The producer stamps [`IMPROVEMENT_PIPELINE_WIRE_REVISION`] here and a
+    /// consumer compares the recorded value against its own constant through
+    /// [`check_handoff_wire_revision`]. The value is never inferred from the
+    /// presence of a field, from a digest, or from the rest of the record, so a
+    /// handoff assembled under another wire revision cannot be read as a
+    /// current one.
+    pub wire_revision: u32,
     /// Proposal identity, kept separate from the candidate identity.
     pub proposal_id: String,
     /// The single commitment computed for the exact proposal bytes.
@@ -1464,6 +1485,23 @@ pub struct UncheckedRecordIdentity {
     pub expected: &'static str,
 }
 
+/// One wire-revision component of a record that this build does not read.
+///
+/// The wire revision describes the serialized SHAPE of the record, not the
+/// content it commits, so it needs its own named refusal: folding a `u32` into
+/// the string components of [`UncheckedRecordIdentity`] would render it as
+/// prose and let a reader guess which revision was meant. The value is carried
+/// whole, so a caller cannot repair the record by guessing, and no revision is
+/// substituted, padded, or rounded toward the one this build checks.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[error("checked wire revision mismatch: record carries {found}, this build checks {expected}")]
+pub struct UncheckedWireRevision {
+    /// The wire revision the record carries.
+    pub found: u32,
+    /// The wire revision this build checks.
+    pub expected: u32,
+}
+
 /// Typed pipeline failures. Malformed or unbound input never decides.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum PipelineError {
@@ -1544,6 +1582,10 @@ pub enum PipelineError {
     /// identity, so its digest is not a current commitment.
     #[error("improvement record identity is not the checked version: {0}")]
     UncheckedRecordIdentity(#[from] UncheckedRecordIdentity),
+    /// A record presented for reading was written under another wire revision,
+    /// so its serialized shape is not the one this build decodes.
+    #[error("improvement record wire revision is not the checked version: {0}")]
+    UncheckedWireRevision(#[from] UncheckedWireRevision),
     /// Governor admission refused the candidate with a typed failure.
     ///
     /// The admission error is carried whole, so an identity conflict stays an
@@ -1663,6 +1705,33 @@ pub fn check_checked_record_identity(
                 expected,
             });
         }
+    }
+    Ok(())
+}
+
+/// Refuses a handoff written under another wire revision of this record shape.
+///
+/// [`check_checked_record_identity`] compares the CONTENT identity a proposal
+/// commitment carries: its domain, encoding revision, and algorithm. The wire
+/// revision is a different identity and answers a different question — which
+/// serialized SHAPE the record was written under — so it is checked separately
+/// against the SAME constant the producer stamps into
+/// [`ImprovementCanaryHandoff::wire_revision`].
+///
+/// The comparison is against the ORIGINAL value the producer recorded. Nothing
+/// is recomputed, defaulted, rounded, or reinterpreted: a handoff carrying
+/// revision `7` is refused as revision `7`, is not padded to the current
+/// revision, and is not read as though the current shape had produced it. The
+/// refusal is typed and carries both revisions, so a caller cannot repair the
+/// record by guessing.
+pub fn check_handoff_wire_revision(
+    handoff: &ImprovementCanaryHandoff,
+) -> Result<(), UncheckedWireRevision> {
+    if handoff.wire_revision != IMPROVEMENT_PIPELINE_WIRE_REVISION {
+        return Err(UncheckedWireRevision {
+            found: handoff.wire_revision,
+            expected: IMPROVEMENT_PIPELINE_WIRE_REVISION,
+        });
     }
     Ok(())
 }
@@ -3075,6 +3144,11 @@ fn build_canary_handoff(
         })?
         .to_string();
     let handoff = ImprovementCanaryHandoff {
+        // The one place a wire revision is stamped onto the handoff. The
+        // serialized shape of this record IS this revision, so a record
+        // assembled under another one is refused by `check_handoff_wire_revision`
+        // before it leaves this module rather than read as a current handoff.
+        wire_revision: IMPROVEMENT_PIPELINE_WIRE_REVISION,
         proposal_id: joined.proposal.proposal_id.clone(),
         proposal_commitment: joined.current.commitment.clone(),
         proposal_discriminator: joined.current.discriminator.clone(),
@@ -3112,7 +3186,7 @@ fn build_canary_handoff(
         handoff_projection: String::new(),
         execution_authorized: false,
     };
-    Ok(ImprovementCanaryHandoff {
+    let handoff = ImprovementCanaryHandoff {
         handoff_projection: format!(
             "canary-handoff: proposal {} candidate {} campaign {} experiment {} admitted-scope {} budget {} deadline {} commitment {}/{} run {} revision {} verifier {} reviewer {} rollback-owner {}; #11 Kernel activation required, not executed here; not a permit",
             handoff.proposal_id,
@@ -3131,7 +3205,17 @@ fn build_canary_handoff(
             handoff.rollback_owner_id,
         ),
         ..handoff
-    })
+    };
+    // The wire boundary itself. This handoff is the serialized record the Kernel
+    // owner will later read, so its recorded wire revision is compared against
+    // the constant this build checks BEFORE it is returned, exactly as
+    // `check_checked_record_identity` compares the commitment's content identity
+    // before the current record is compared. A revision mismatch is the typed
+    // `UncheckedWireRevision` crossing this layer as itself: no revision is
+    // substituted, no legacy shape is padded to this one, and no handoff is
+    // emitted for a record this build cannot read as the current shape.
+    check_handoff_wire_revision(&handoff)?;
+    Ok(handoff)
 }
 
 /// Returns the complete normalized proposal whose exact bytes are committed.
