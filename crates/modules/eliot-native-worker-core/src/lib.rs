@@ -1619,8 +1619,12 @@ fn validate_grant_claim_binding(
 /// with the owner-produced expectation carried by the admitted grant
 /// (route, adapter, config, facet, grant revision, stream, nonce,
 /// invocation digest, owner digest, epoch, generation, fence, expiry, or
-/// revocation), or when the join disagrees with the owner-supplied
-/// `hello`/`process` (route, nonce, invocation digest). Checks follow the
+/// revocation), when the join disagrees with the owner-supplied
+/// `hello`/`process` (route, nonce, invocation digest), or when the join is
+/// addressed to another registration (capability cell, Module Catalog
+/// revision). A generation admitted under one cell or catalog revision never
+/// starts work bound to another: advancement needs a new admission, never a
+/// local repair. Checks follow the
 /// documented absent-input order (route, adapter, config, facet, grant,
 /// stream, nonce, invocation, digest, wire, epoch, generation, fence) so
 /// the first reported field is the first input callers must repair; later
@@ -1658,6 +1662,23 @@ fn require_claim_executable_binding(
     if join.process_invocation_digest != process.invocation_digest() {
         return Err(WorkerError::InvalidRequest(
             "executable_binding.process_invocation_digest",
+        ));
+    }
+    // Registration cross-binding (Implements #22 W7 cell identity and the
+    // W1 admitted-catalog dimension): the presenting registration states the
+    // exact cell and catalog revision this generation was admitted under, so
+    // a well-formed join minted for another cell or revision is refused here
+    // even when the (possibly echoed) owner expectation agrees with it. The
+    // owner advances either value through a new admission, never a local
+    // repair in the worker.
+    if join.capability_cell != claim.registration().capability_cell {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.capability_cell",
+        ));
+    }
+    if join.module_catalog_revision != claim.registration().module_catalog_revision {
+        return Err(WorkerError::InvalidRequest(
+            "executable_binding.module_catalog_revision",
         ));
     }
     Ok(())
