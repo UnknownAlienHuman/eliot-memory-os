@@ -40,8 +40,8 @@ use eliot_platform_windows::{
     WindowsPlatform,
 };
 use eliot_process::{
-    DispatchAuthorityId, DispatchValidationContext, FencingToken, Generation, KernelDispatchKey,
-    OperationId, OriginChallenge, OriginChallengeRequest, OriginControlGrant,
+    ActionLeaseRef, DispatchAuthorityId, DispatchValidationContext, FencingToken, Generation,
+    KernelDispatchKey, OperationId, OriginChallenge, OriginChallengeRequest, OriginControlGrant,
     OriginControlOperation, OriginControlPresentation, PermitIssuance, ProcessEvidence,
     ProcessEvidenceSink, ProcessExecutionAdmissionRequest, ProcessExecutionError, ProcessExecutor,
     ProcessLaunchAdmission, ProcessLifecycle, ProcessOwnerBinding, ProcessRequest,
@@ -102,11 +102,16 @@ struct OrsProcessReplayStore {
 /// This is formed from the admitted request and server-derived owner before a
 /// process can start. A source adapter must use it to select the governed
 /// attempt and tracked-resource baseline; executable, cwd, and exit status are
-/// deliberately absent as source-mutation evidence.
+/// deliberately absent as source-mutation evidence. The lease is the exact
+/// admitted `ActionLeaseRef` (I10.21 associated Session/ActionLease/tool
+/// operation/attempt); it is carried for adapter attribution and never
+/// re-derived, and the executor handoff invents no lease comparison because it
+/// carries no lease value to compare against.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GovernedProcessEffectBinding {
     operation_id: OperationId,
     session_id: SessionId,
+    action_lease_ref: ActionLeaseRef,
     state_fence: FencingToken,
     owner: ProcessOwnerBinding,
 }
@@ -133,6 +138,7 @@ impl GovernedProcessEffectBinding {
         Ok(Self {
             operation_id: intent.operation_id().clone(),
             session_id: intent.session_id().clone(),
+            action_lease_ref: admission.action_lease_ref().clone(),
             state_fence: admission.state_fence().clone(),
             owner: owner.clone(),
         })
@@ -185,9 +191,17 @@ pub(crate) enum GovernedProcessEffectPortError {}
 ///
 /// Implementations capture the complete tracked-source baseline before launch,
 /// independently read the terminal source state, attach actual diff and fence
-/// invalidation handles, and ingest only the validated receipt supplied back by
-/// Kernel. Returning an empty `changes` list is valid only after complete
-/// before/after readback; process success is never source evidence.
+/// invalidation handles, and ingest the validated receipt bound to the exact
+/// governed baseline Kernel retained for the operation. Kernel always supplies
+/// that baseline at ingest so the observation keeps its Session/operation/
+/// State-Fence attribution; process success is never source evidence.
+///
+/// STITCH (#1824, I10.21): no Governor-side implementor is attached. The
+/// designated `GovernedProcessEffectPort` implementor (Governor change-monitor
+/// adapter performing real content/Git readback) and the host/filesystem hint
+/// emitter do not exist yet, so `effect_port` stays `None` and execution runs
+/// unobserved. Kernel provides no fake-success implementor here; attaching one
+/// would invent source evidence.
 pub(crate) trait GovernedProcessEffectPort: Send + Sync {
     fn capture_before(
         &self,
@@ -202,6 +216,7 @@ pub(crate) trait GovernedProcessEffectPort: Send + Sync {
 
     fn ingest(
         &self,
+        baseline: &GovernedProcessEffectBaseline,
         receipt: &GovernedProcessChangeReceipt,
     ) -> Result<(), GovernedProcessEffectPortError>;
 }
@@ -1284,9 +1299,9 @@ impl ProcessExecutionGateway {
     }
 
     /// Reads the terminal source state against the retained pre-effect
-    /// baseline and ingests the validated receipt (I10.21 A1: exact
-    /// before/after revisions, diff handle, State-Fence invalidation; W2:
-    /// Git/content re-read confirmation).
+    /// baseline and ingests the validated receipt bound to that exact
+    /// baseline (I10.21 A1: exact before/after revisions, diff handle,
+    /// State-Fence invalidation; W2: Git/content re-read confirmation).
     ///
     /// Monitor-path failures are observed and never fail the reconcile: the
     /// reported terminal evidence stays the owner's.
@@ -1310,7 +1325,7 @@ impl ProcessExecutionGateway {
             return;
         };
         match port.read_after(&baseline, evidence) {
-            Ok(receipt) => match port.ingest(&receipt) {
+            Ok(receipt) => match port.ingest(&baseline, &receipt) {
                 Ok(()) => observe_process("kernel.process.effect_observed", "success"),
                 Err(error) => observe_process(
                     "kernel.process.effect_ingest_failed",
