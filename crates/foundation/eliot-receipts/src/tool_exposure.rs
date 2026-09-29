@@ -632,6 +632,87 @@ impl ToolExposureReceiptV2 {
                 Some(true)
             )
     }
+
+    /// Builds the per-evaluation admission skeleton for one authorized request.
+    ///
+    /// Only the stages this boundary observes are set: eligibility and
+    /// selection hold because the authorized request was presented for
+    /// dispatch and admitted. Registration, advertisement, call, transport,
+    /// retry, use, and terminal stages stay `None` (unobserved, never
+    /// inferred), delivery is `MISSING` with no digest or token cost, and no
+    /// representation evidence is attached. Measurement owners populate the
+    /// remaining stages; this constructor never invents them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an identity is blank.
+    pub fn admission_observed(
+        receipt_id: String,
+        tool_definition: String,
+        route_fingerprint: String,
+    ) -> Result<Self, ToolExposureError> {
+        let receipt = Self {
+            schema_version: TOOL_EXPOSURE_RECEIPT_V2_VERSION,
+            receipt_id,
+            tool_definition,
+            route_fingerprint,
+            registered: None,
+            advertised_to_route: None,
+            eligible_under_scope_policy_and_grant: Some(true),
+            selected_by_planner_or_model: Some(true),
+            called: None,
+            transport_completed: None,
+            result_delivery: ResultDelivery::Missing,
+            produced_result: None,
+            delivered_representation: None,
+            expanded_or_retried: None,
+            observably_used_in_decision_action_or_verifier: None,
+            terminal_task_or_product_outcome_ref: None,
+        };
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    /// Records a token-truncated delivery on an evaluated receipt.
+    ///
+    /// The completed call keeps `transport_completed` as `Some(true)` while
+    /// `result_delivery` becomes `TRUNCATED`, reusing the existing
+    /// [`ResultDelivery`] outcome rather than a new type. Produced identity
+    /// and the exact delivered representation (with its token observation)
+    /// must be supplied by their observation owners; nothing is inferred. A
+    /// truncated receipt never satisfies [`Self::is_delivered_full`] or
+    /// [`Self::is_evidence_used`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the receipt already records the call as
+    /// not-called, when transport is already recorded as not completed, or
+    /// when the resulting receipt is inconsistent.
+    pub fn record_truncated_delivery(
+        mut self,
+        produced: ProducedToolResultIdentity,
+        delivered: DeliveredToolRepresentation,
+    ) -> Result<Self, ToolExposureError> {
+        if matches!(self.called, Some(false)) {
+            return Err(ToolExposureError::InvalidField {
+                field: "receipt.called",
+                reason: "a truncated delivery requires an executed call",
+            });
+        }
+        if matches!(self.transport_completed, Some(false)) {
+            return Err(ToolExposureError::InvalidField {
+                field: "receipt.transport_completed",
+                reason: "a truncated delivery requires completed transport",
+            });
+        }
+        self.called = Some(true);
+        self.transport_completed = Some(true);
+        self.result_delivery = ResultDelivery::Truncated;
+        self.produced_result = Some(produced);
+        self.delivered_representation = Some(delivered);
+        self.validate()?;
+        Ok(self)
+    }
 }
 
 #[cfg(test)]

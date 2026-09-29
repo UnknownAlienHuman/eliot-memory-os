@@ -19,6 +19,8 @@
 //! host-request record owns lifecycle state, so eviction and retirement here
 //! only drop daemon-leg memory and never fabricate admission.
 
+use std::collections::BTreeMap;
+
 use eliot_ors::{HostRequestState, OperationIdentity, OrsError};
 use eliot_protocol::{
     FinishAttempt, FinishResultBody, HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope,
@@ -38,6 +40,32 @@ use super::{
     MAX_QUEUED_LOCAL_READS, StaleLocalReadObservation, StaleLocalReadReason,
     check_local_read_admission,
 };
+
+/// Refuses a campaign-packet staging candidate that repeats retained work.
+///
+/// I7.24 W3/A2: a materially repeated effect-capable call on unchanged
+/// inputs without a new expected delta is a loop/no-progress signal, not a
+/// fresh dispatch. Only campaign-packet pairs are compared; other lanes and
+/// unreconstructible pairs never match.
+fn refuse_campaign_staged_repeat(
+    index: &BTreeMap<String, Vec<HostRequestOperationRef>>,
+    envelope: &HostRequestEnvelope,
+    tool: &serde_json::Value,
+) -> Result<(), TransportError> {
+    let Some(current) = crate::tool_exposure::build_tool_call_request(envelope, tool) else {
+        return Ok(());
+    };
+    let retained = index.values().flatten().filter_map(|candidate| {
+        Some((
+            candidate.campaign_packet_envelope.as_ref()?,
+            candidate.campaign_packet_tool.as_ref()?,
+        ))
+    });
+    if crate::tool_exposure::staged_repeat_without_progress(retained, &current).is_some() {
+        return Err(TransportError::IdentityConflict);
+    }
+    Ok(())
+}
 
 impl KernelComposition {
     pub(super) fn enqueue_campaign_packet_pair_under_transition(
@@ -86,6 +114,7 @@ impl KernelComposition {
                 return Ok(());
             }
         }
+        refuse_campaign_staged_repeat(&index, envelope, tool)?;
         let queued = index
             .values()
             .flatten()
