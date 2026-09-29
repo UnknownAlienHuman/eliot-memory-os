@@ -4957,28 +4957,7 @@ impl InquiryGovernance {
                 });
             }
         }
-        if self.compilation_inputs.profile_digest != self.profile.integrity_digest
-            || self.compilation_inputs.evidence_set_id != self.evidence_set_id
-            || self.compilation_inputs.lane != self.profile.lane
-            || self.compilation_inputs.lane_registration_digest
-                != self
-                    .profile
-                    .independence_and_blinding_policy
-                    .lane_registration_digest
-        {
-            // The work graph receives the lane and the committed registration the
-            // work was compiled under, so a bundle that carried another lane or
-            // another registration would let queued execution and resume present
-            // a registration the profile does not hold. The registration identity
-            // is compared against the profile's own
-            // `independence_and_blinding_policy.lane_registration_digest`, which
-            // originates from the unforgeable `CommittedLaneRegistration`; the
-            // check is therefore on the registration itself, never on
-            // `registered_before_outcome_exposure` or on any timestamp.
-            return Err(InquiryError::IntegrityMismatch {
-                field: "inquiry.compilation_inputs",
-            });
-        }
+        self.validate_compilation_input_binding()?;
         self.validate_run_reference_manifest()?;
         if !self
             .profile
@@ -5070,6 +5049,40 @@ impl InquiryGovernance {
         if recorded != derived {
             return Err(InquiryError::IntegrityMismatch {
                 field: "inquiry.certified_obligations",
+            });
+        }
+        Ok(())
+    }
+
+    /// Re-proves that the work-graph compilation bundle this record carries was
+    /// compiled under this record's own inquiry, evidence set, profile revision
+    /// and lane registration.
+    ///
+    /// The work graph receives the lane and the committed registration the work
+    /// was compiled under, so a bundle that carried another lane or another
+    /// registration would let queued execution and resume present a registration
+    /// the profile does not hold. The registration identity is compared against
+    /// the profile's own `independence_and_blinding_policy.lane_registration_digest`,
+    /// which originates from the unforgeable `CommittedLaneRegistration`; the check
+    /// is therefore on the registration itself, never on
+    /// `registered_before_outcome_exposure` or on any timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::IntegrityMismatch`] naming
+    /// `inquiry.compilation_inputs` when any of the four bindings disagrees.
+    fn validate_compilation_input_binding(&self) -> Result<(), InquiryError> {
+        if self.compilation_inputs.profile_digest != self.profile.integrity_digest
+            || self.compilation_inputs.evidence_set_id != self.evidence_set_id
+            || self.compilation_inputs.lane != self.profile.lane
+            || self.compilation_inputs.lane_registration_digest
+                != self
+                    .profile
+                    .independence_and_blinding_policy
+                    .lane_registration_digest
+        {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "inquiry.compilation_inputs",
             });
         }
         Ok(())
@@ -5362,7 +5375,7 @@ impl std::fmt::Display for InquiryGovernance {
              observed_outside={} denominator_kind={} absence={} absence_reason={} \
              supported_precision={} precision_residue={} obligations={} \
              materialisable={} deferred={} certified={} compilation_inputs={} \
-             work_graph_lane={} work_graph_registration={} freeze={} \
+             {} freeze={} \
              lane_class={} lane_result={} lane_result_grade={} lane_result_lane={} \
              lane_delivered_handles={} lane_discipline={} \
              terminal_freeze={} terminal_claim_audit={} terminal_precision_residue={} \
@@ -5410,11 +5423,9 @@ impl std::fmt::Display for InquiryGovernance {
             self.compilation_inputs.deferred().len(),
             certified,
             self.compilation_inputs.digest,
-            self.compilation_inputs.lane.wire_name(),
-            self.compilation_inputs
-                .lane_registration_digest
-                .as_deref()
-                .unwrap_or("none"),
+            WorkGraphLaneProjection {
+                inputs: &self.compilation_inputs,
+            },
             self.freeze.digest,
             self.lane_discipline.evidence_class.wire_name(),
             self.lane_discipline.result_id,
@@ -7651,6 +7662,35 @@ fn member_list_wire(members: &[&str]) -> String {
         return "none".to_owned();
     }
     members.join(",")
+}
+
+/// The `work_graph_lane=` and `work_graph_registration=` values on the receipt
+/// line.
+///
+/// A named projection rather than two inline format arguments, so the receipt line
+/// keeps one field per value it publishes and the work-graph lane half is rendered
+/// in one place that cannot drift from the compilation bundle it reads. The lane
+/// is the closed wire name the work was compiled under and the registration is the
+/// committed registration digest the profile's own lane policy holds, or the
+/// honest `none` spelling for a run that commits no registration; no provider
+/// prose, payload body or credential is reproduced.
+struct WorkGraphLaneProjection<'a> {
+    /// The work-graph compilation bundle this record carries.
+    inputs: &'a TaskGraphCompilationInputs,
+}
+
+impl std::fmt::Display for WorkGraphLaneProjection<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "work_graph_lane={} work_graph_registration={}",
+            self.inputs.lane.wire_name(),
+            self.inputs
+                .lane_registration_digest
+                .as_deref()
+                .unwrap_or("none"),
+        )
+    }
 }
 
 /// The `claim_coverage=` value on the terminal receipt line.
