@@ -34,6 +34,16 @@
 //! model-generated description or an unestablished modality. Absent modality
 //! evidence therefore has one spelling on both records — explicitly `Unknown`,
 //! carrying its loss warning — and no path that reports it as a measurement.
+//!
+//! Continuity across the workflow handoff carries the SAME identity rather than
+//! a re-issued one. An [`ArtifactLineageEntry`] names the hypothesis it rests on
+//! and restates that hypothesis's basis on the hop, so the hop alone is a claim
+//! about its own evidence; [`WorkflowContinuity`] therefore carries the
+//! original admitted [`IdentityHypothesis`] set and the lineage gate resolves
+//! every hop against it, refusing an unresolvable id, a weak original, or a
+//! restated basis, subject or identity kind that disagrees with the record it
+//! names. A duplicated hop is refused by count, because comparing the hops as a
+//! set cannot see a member that appears twice.
 
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use schemars::JsonSchema;
@@ -884,10 +894,19 @@ pub struct ArtifactLineageEntry {
     /// Transform relating the predecessor to the subject.
     pub relation: ContinuityTransformKind,
     /// Admitted hypothesis the hop rests on, when one was proven.
+    ///
+    /// The id is resolved against the recorded
+    /// [`WorkflowContinuity::identity_hypotheses`], not against the hop's own
+    /// fields: an unresolvable id leaves the hop unproven.
     pub hypothesis_id: Option<String>,
     /// Where the hop's identity comes from.
     pub provenance: LineageProvenance,
-    /// Basis of the admitted hypothesis; absent for a step-declared hop.
+    /// Restatement of the admitted hypothesis's basis; absent for a
+    /// step-declared hop.
+    ///
+    /// This is never proof on its own. The gate compares it against the basis
+    /// of the hypothesis the hop actually names, and refuses the hop when the
+    /// two disagree.
     pub basis: Option<IdentityBasis>,
 }
 
@@ -951,6 +970,13 @@ impl RepresentationGap {
 /// representation gaps`, plus the typed step identity that anchors the record
 /// to the view's current or previous step. It duplicates no view field and
 /// adds no second canonical record family.
+///
+/// `identity_hypotheses` is the ORIGINAL admitted hypothesis set the lineage
+/// hops resolve against, reusing [`IdentityHypothesis`] rather than a
+/// lineage-local copy of it. A hop names its hypothesis by id and restates that
+/// hypothesis's basis on the hop itself; only the hypothesis record carries the
+/// admitted basis, so only it can be compared. Carrying the originals here is
+/// what makes the hop's claim the same identity rather than a re-issued one.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowContinuity {
@@ -958,6 +984,11 @@ pub struct WorkflowContinuity {
     pub workflow_id: String,
     /// Workflow step the record belongs to.
     pub step: WorkflowStepRef,
+    /// Admitted identity hypotheses the lineage hops resolve against.
+    ///
+    /// These are the recorded originals. A hop's own `basis` is the producer's
+    /// restatement of one of them and is never proof on its own.
+    pub identity_hypotheses: Vec<IdentityHypothesis>,
     /// Artifact lineage the workflow position depends on.
     pub artifact_lineage: Vec<ArtifactLineageEntry>,
     /// Representation gaps the workflow position does not resolve.
@@ -965,9 +996,12 @@ pub struct WorkflowContinuity {
 }
 
 impl WorkflowContinuity {
-    /// Validates shape, bounds, and the fail-closed continuity rules: no
-    /// lineage hop may rest on filename or similarity evidence alone, and no
-    /// unresolved gap may claim a status its evidence cannot support.
+    /// Validates shape, bounds, and the fail-closed continuity rules: the
+    /// recorded identity hypotheses must themselves be admitted, every lineage
+    /// hop must resolve against them on basis, subject and identity kind, no
+    /// hop may rest on filename or similarity evidence alone or repeat one
+    /// already listed, and no unresolved gap may claim a status its evidence
+    /// cannot support.
     pub fn validate(&self) -> Result<(), ContinuityError> {
         text(&self.workflow_id, "workflow_continuity.workflow_id")?;
         self.step.validate()?;
@@ -979,14 +1013,48 @@ impl WorkflowContinuity {
                 reason: "must equal workflow_continuity.workflow_id",
             });
         }
+        if self.identity_hypotheses.len() > MAX_IDENTITY_HYPOTHESES {
+            return Err(ContinuityError::Bounds {
+                field: "workflow_continuity.identity_hypotheses",
+            });
+        }
+        for hypothesis in &self.identity_hypotheses {
+            hypothesis.validate()?;
+        }
+        // The originals are judged by the same guard as an observation's own
+        // hypothesis set, so a workflow position cannot rest lineage on a weak
+        // basis that the observation path would already have refused. An empty
+        // set is left to the hop resolution below, which refuses a hop whose
+        // hypothesis resolves against nothing.
+        if !self.identity_hypotheses.is_empty() {
+            check_no_silent_merge(&self.identity_hypotheses)?;
+        }
         if self.artifact_lineage.len() > MAX_ARTIFACT_LINEAGE {
             return Err(ContinuityError::Bounds {
                 field: "workflow_continuity.artifact_lineage",
             });
         }
+        // A repeated hop is malformed input, not a second piece of lineage
+        // evidence. Comparing the hops as a set would not see it: a duplicated
+        // member satisfies every membership test, so the fold has to count the
+        // exact hop the caller supplied.
+        let mut hops: Vec<(&str, &str, IdentityKind, ContinuityTransformKind)> = Vec::new();
         for entry in &self.artifact_lineage {
             entry.validate()?;
-            check_lineage_provenance(entry)?;
+            let hop = (
+                entry.subject_ref.as_str(),
+                entry.predecessor_ref.as_str(),
+                entry.subject_kind,
+                entry.relation,
+            );
+            if hops.contains(&hop) {
+                return Err(ContinuityError::InvalidField {
+                    field: "workflow_continuity.artifact_lineage",
+                    reason: "must not repeat an artifact lineage hop",
+                });
+            }
+            hops.push(hop);
+            check_lineage_provenance(entry, &self.identity_hypotheses)?;
         }
         if self.unresolved_representation_gaps.len() > MAX_WORKFLOW_REPRESENTATION_GAPS {
             return Err(ContinuityError::Bounds {
@@ -1004,11 +1072,22 @@ impl WorkflowContinuity {
 /// Refuses an artifact lineage hop that no proven hypothesis stands behind.
 ///
 /// A hop is a continuity claim, and I12.35 admits none on filename or
-/// semantic similarity, so a hop whose only basis is a weak hint is the silent
-/// merge the canon forbids. A hop the owning step declared without a
-/// hypothesis is admitted as the weaker statement it is, and may not be
-/// dressed as an identity proof: it carries neither hypothesis nor basis.
-fn check_lineage_provenance(entry: &ArtifactLineageEntry) -> Result<(), ContinuityError> {
+/// semantic similarity. The hop names the hypothesis it rests on and restates
+/// that hypothesis's basis on itself, but a restatement is not evidence: the
+/// hop is admitted only when the id resolves in the ORIGINAL recorded
+/// [`IdentityHypothesis`] set and that record agrees with the hop about its
+/// basis, its subject and its identity kind. Comparing the hop against the
+/// hypothesis it names is the only comparison with an independent side; a rule
+/// that only read the hop's own `basis` was reading the producer's restatement
+/// of its own claim.
+///
+/// A hop the owning step declared without a hypothesis is admitted as the
+/// weaker statement it is, and may not be dressed as an identity proof: it
+/// carries neither hypothesis nor basis.
+fn check_lineage_provenance(
+    entry: &ArtifactLineageEntry,
+    hypotheses: &[IdentityHypothesis],
+) -> Result<(), ContinuityError> {
     if matches!(entry.provenance, LineageProvenance::DeclaredByStep) {
         if entry.hypothesis_id.is_some() || entry.basis.is_some() {
             return Err(ContinuityError::InvalidField {
@@ -1018,17 +1097,30 @@ fn check_lineage_provenance(entry: &ArtifactLineageEntry) -> Result<(), Continui
         }
         return Ok(());
     }
-    if entry.hypothesis_id.is_none() {
-        return Err(ContinuityError::LineageIdentityWithoutProof {
-            subject: entry.subject_ref.clone(),
-        });
+    let unproven = || ContinuityError::LineageIdentityWithoutProof {
+        subject: entry.subject_ref.clone(),
+    };
+    let Some(hypothesis_id) = entry.hypothesis_id.as_deref() else {
+        return Err(unproven());
+    };
+    let Some(original) = hypotheses
+        .iter()
+        .find(|hypothesis| hypothesis.hypothesis_id == hypothesis_id)
+    else {
+        return Err(unproven());
+    };
+    // The hop must restate the ORIGINAL admitted basis, not merely agree that
+    // both sides are non-weak. `entry.basis` is optional, so a hop that omits
+    // it entirely carries no basis claim at all and cannot be treated as
+    // matching: absence is a refusal, never a pass.
+    if original.basis.is_weak()
+        || entry.basis.as_ref() != Some(&original.basis)
+        || original.subject_ref != entry.subject_ref
+        || original.kind != entry.subject_kind
+    {
+        return Err(unproven());
     }
-    match entry.basis {
-        Some(basis) if !basis.is_weak() => Ok(()),
-        _ => Err(ContinuityError::LineageIdentityWithoutProof {
-            subject: entry.subject_ref.clone(),
-        }),
-    }
+    Ok(())
 }
 
 /// Refuses an unresolved representation gap whose status its evidence cannot
