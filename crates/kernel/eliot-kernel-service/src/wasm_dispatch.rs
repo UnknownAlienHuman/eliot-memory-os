@@ -2130,6 +2130,12 @@ fn validate_disposition_record(
     if record.request_commitment() != identity.envelope_digest {
         return Err(WasmDispatchError::DeliveryUnavailable);
     }
+    validate_disposition_custody(record)
+}
+
+fn validate_disposition_custody(
+    record: &WasmDeliveryDispositionRecord,
+) -> Result<(), WasmDispatchError> {
     match &record.disposition {
         WasmDeliveryDisposition::LaunchReserved {
             launch_incarnation: actual,
@@ -2146,7 +2152,7 @@ fn validate_disposition_record(
         | WasmDeliveryDisposition::Acknowledged {
             launch_incarnation: actual,
             ..
-        } if actual != &launch_incarnation(identity) => {
+        } if actual != &launch_incarnation(record.identity()) => {
             return Err(WasmDispatchError::DeliveryUnavailable);
         }
         WasmDeliveryDisposition::Ready { .. } | WasmDeliveryDisposition::LaunchReserved { .. } => {}
@@ -2435,6 +2441,7 @@ fn read_publication_snapshot(
     })
 }
 
+#[derive(Clone, Copy)]
 struct DeliveryReclaimAsideName<'a> {
     file_name: &'static str,
     generation: u64,
@@ -2560,10 +2567,8 @@ fn unique_delivery_row_index(
 ) -> Result<usize, WasmDispatchError> {
     let mut matched = None;
     for (index, (_, _, snapshot, _)) in rows.iter().enumerate() {
-        if matches_identity(snapshot.disposition.identity()) {
-            if matched.replace(index).is_some() {
-                return Err(WasmDispatchError::DeliveryUnavailable);
-            }
+        if matches_identity(snapshot.disposition.identity()) && matched.replace(index).is_some() {
+            return Err(WasmDispatchError::DeliveryUnavailable);
         }
     }
     matched.ok_or(WasmDispatchError::DeliveryUnavailable)
@@ -2618,7 +2623,7 @@ fn account_reclaim_aside(
     )],
     retained_bytes: &mut u64,
     path: &std::path::Path,
-    aside: DeliveryReclaimAsideName<'_>,
+    aside: &DeliveryReclaimAsideName<'_>,
 ) -> Result<(), WasmDispatchError> {
     let row_index = unique_delivery_row_index(rows, |identity| {
         identity.generation == aside.generation
@@ -2748,14 +2753,12 @@ fn account_delivery_root_files(
     }
     let entries =
         std::fs::read_dir(install_dir).map_err(|_| WasmDispatchError::DeliveryUnavailable)?;
-    let mut scanned_entries = 0_usize;
     let mut aside_entries = 0_usize;
     let mut fixed_files = Vec::with_capacity(3);
-    for entry in entries {
+    for (scanned_entries, entry) in entries.enumerate() {
         if scanned_entries >= MAX_DELIVERY_ROOT_SCAN_ENTRIES {
             return Err(WasmDispatchError::DeliveryUnavailable);
         }
-        scanned_entries += 1;
         let entry = entry.map_err(|_| WasmDispatchError::DeliveryUnavailable)?;
         let path = entry.path();
         let raw_name = entry.file_name();
@@ -2785,7 +2788,7 @@ fn account_delivery_root_files(
             .ok_or(WasmDispatchError::DeliveryUnavailable)?;
         let aside =
             parse_reclaim_aside_name(name)?.ok_or(WasmDispatchError::DeliveryUnavailable)?;
-        account_reclaim_aside(rows, retained_bytes, &path, aside)?;
+        account_reclaim_aside(rows, retained_bytes, &path, &aside)?;
     }
     account_fixed_delivery_files(rows, retained_bytes, &fixed_files)
 }
