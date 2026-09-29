@@ -3062,17 +3062,15 @@ async fn automation_normalization_payload(
     if let Some(row) =
         super::surreal_automation::read_revision_for_read(db, config, &automation_id, &revision)
             .await?
+        && row.automation_id == automation_id
+        && row.revision == revision
+        && row.state_fence == *state_fence
     {
-        if row.automation_id == automation_id
-            && row.revision == revision
-            && row.state_fence == *state_fence
-        {
-            envelopes.push(json!({
-                "automation_id": row.automation_id,
-                "revision": row.revision,
-                "envelope_json": row.normalization_envelope_json,
-            }));
-        }
+        envelopes.push(json!({
+            "automation_id": row.automation_id,
+            "revision": row.revision,
+            "envelope_json": row.normalization_envelope_json,
+        }));
     }
     Ok(json!({
         "normalization_envelopes": envelopes,

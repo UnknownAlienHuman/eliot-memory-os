@@ -1338,15 +1338,14 @@ impl PrepareContext<'_> {
                 normalization_envelope_json,
                 configuration_state,
             } => {
-                self.apply_create(
-                    writes,
+                let revision_row = self.revision_write(
                     automation_id,
                     revision,
                     revision_json,
                     normalization_envelope_json,
-                    configuration_state,
-                )
-                .await
+                );
+                self.apply_create(writes, revision_row, configuration_state)
+                    .await
             }
             DecodedAutomationMutation::Edit {
                 automation_id,
@@ -1356,16 +1355,14 @@ impl PrepareContext<'_> {
                 normalization_envelope_json,
                 configuration_state,
             } => {
-                self.apply_edit(
-                    writes,
+                let revision_row = self.revision_write(
                     automation_id,
-                    previous_revision,
                     revision,
                     revision_json,
                     normalization_envelope_json,
-                    configuration_state,
-                )
-                .await
+                );
+                self.apply_edit(writes, previous_revision, revision_row, configuration_state)
+                    .await
             }
             DecodedAutomationMutation::StateTransition {
                 automation_id,
@@ -1420,37 +1417,61 @@ impl PrepareContext<'_> {
         )
     }
 
-    /// Create leg: fresh revision row plus fresh current pointer.
-    async fn apply_create(
+    /// The immutable revision row one create or edit leg introduces.
+    ///
+    /// Both legs introduce a new immutable revision and both retain the
+    /// normalization envelope the automation leg minted for that revision's
+    /// compiled occurrence set (I05.19:96) — the edit leg mints its own over the
+    /// NEW revision, so the row that owns this transition retains that envelope
+    /// exactly as the create leg does for the revision it introduces. Binding the
+    /// row's two documents together here keeps the envelope attached to the
+    /// revision document it attests, rather than to a loose argument list where
+    /// one leg could be given one revision's envelope for another revision.
+    fn revision_write(
         &self,
-        writes: &mut AutomationWrites,
         automation_id: String,
         revision: String,
         revision_json: String,
         normalization_envelope_json: String,
-        configuration_state: String,
-    ) -> Result<(), AdapterError> {
-        require_absent_revision(self.db, self.config, &automation_id, &revision).await?;
-        require_absent_current(self.db, self.config, &automation_id).await?;
+    ) -> AutomationRevisionWrite {
         let (state_fence, scope_id, task_id) = self.provenance();
-        writes.revisions.push(AutomationRevisionWrite {
-            automation_id: automation_id.clone(),
-            revision: revision.clone(),
-            revision_json,
-            normalization_envelope_json,
-            state_fence: state_fence.clone(),
-            scope_id: scope_id.clone(),
-            task_id: task_id.clone(),
-        });
-        writes.currents.push(AutomationCurrentWrite {
+        AutomationRevisionWrite {
             automation_id,
             revision,
-            configuration_state,
+            revision_json,
+            normalization_envelope_json,
             state_fence,
             scope_id,
             task_id,
+        }
+    }
+
+    /// Create leg: fresh revision row plus fresh current pointer.
+    async fn apply_create(
+        &self,
+        writes: &mut AutomationWrites,
+        revision_row: AutomationRevisionWrite,
+        configuration_state: String,
+    ) -> Result<(), AdapterError> {
+        require_absent_revision(
+            self.db,
+            self.config,
+            &revision_row.automation_id,
+            &revision_row.revision,
+        )
+        .await?;
+        require_absent_current(self.db, self.config, &revision_row.automation_id).await?;
+        let current_row = AutomationCurrentWrite {
+            automation_id: revision_row.automation_id.clone(),
+            revision: revision_row.revision.clone(),
+            configuration_state,
+            state_fence: revision_row.state_fence.clone(),
+            scope_id: revision_row.scope_id.clone(),
+            task_id: revision_row.task_id.clone(),
             expected_revision: None,
-        });
+        };
+        writes.revisions.push(revision_row);
+        writes.currents.push(current_row);
         Ok(())
     }
 
@@ -1458,43 +1479,38 @@ impl PrepareContext<'_> {
     async fn apply_edit(
         &self,
         writes: &mut AutomationWrites,
-        automation_id: String,
         previous_revision: String,
-        revision: String,
-        revision_json: String,
-        normalization_envelope_json: String,
+        revision_row: AutomationRevisionWrite,
         configuration_state: String,
     ) -> Result<(), AdapterError> {
-        let current =
-            require_current_revision(self.db, self.config, &automation_id, &previous_revision)
-                .await?;
+        let current = require_current_revision(
+            self.db,
+            self.config,
+            &revision_row.automation_id,
+            &previous_revision,
+        )
+        .await?;
         if current.state_fence != self.transition.state_fence {
             return Err(AdapterError::Store(StoreError::FenceMismatch));
         }
-        require_absent_revision(self.db, self.config, &automation_id, &revision).await?;
-        let (state_fence, scope_id, task_id) = self.provenance();
-        writes.revisions.push(AutomationRevisionWrite {
-            automation_id: automation_id.clone(),
-            revision: revision.clone(),
-            revision_json,
-            // The edit leg mints its own normalization envelope over the NEW
-            // revision's compiled occurrence set, so the row that owns this
-            // transition retains that envelope (I05.19:96) exactly as the
-            // create leg does for the revision it introduces.
-            normalization_envelope_json,
-            state_fence: state_fence.clone(),
-            scope_id: scope_id.clone(),
-            task_id: task_id.clone(),
-        });
-        writes.currents.push(AutomationCurrentWrite {
-            automation_id,
-            revision,
+        require_absent_revision(
+            self.db,
+            self.config,
+            &revision_row.automation_id,
+            &revision_row.revision,
+        )
+        .await?;
+        let current_row = AutomationCurrentWrite {
+            automation_id: revision_row.automation_id.clone(),
+            revision: revision_row.revision.clone(),
             configuration_state,
-            state_fence,
-            scope_id,
-            task_id,
+            state_fence: revision_row.state_fence.clone(),
+            scope_id: revision_row.scope_id.clone(),
+            task_id: revision_row.task_id.clone(),
             expected_revision: Some(current.revision),
-        });
+        };
+        writes.revisions.push(revision_row);
+        writes.currents.push(current_row);
         Ok(())
     }
 
