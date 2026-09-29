@@ -1061,11 +1061,12 @@ mod lifecycle_proof_tests {
     use super::{
         BTreeMap, CapabilityId, ComponentEnginePort, CoreOutcome, DeterministicEchoCore,
         DivergenceKind, EffectProposal, EngineInvocation, EngineReport, EngineTermination,
-        ErrorClass, InFlightDisposition, LifecycleError, LifecycleProjectionInputs,
-        ModuleGenerationState, NativeCoreAdapter, PortError, RollbackRouteRequest, SemanticCore,
-        Sha256Digest, SnapshotStrategy, StateMigrationPlan, StateSnapshot, WasmCoreAdapter,
-        WasmLifecycleState, build_activation_record, canonical_digest, compare_conformance,
-        migrate_state, project_lifecycle, reconcile_shadow, route_rollback,
+        ErrorClass, GenerationCutoverRecord, InFlightDisposition, LifecycleError,
+        LifecycleProjectionInputs, ModuleGenerationState, NativeCoreAdapter, PortError,
+        RollbackRouteRequest, SemanticCore, Sha256Digest, SnapshotStrategy, StateMigrationPlan,
+        StateSnapshot, WasmCoreAdapter, WasmLifecycleState, build_activation_record,
+        canonical_digest, compare_conformance, migrate_state, project_lifecycle, reconcile_shadow,
+        route_rollback,
     };
     use eliot_observation_contracts::ObservationScope;
     use eliot_process::{
