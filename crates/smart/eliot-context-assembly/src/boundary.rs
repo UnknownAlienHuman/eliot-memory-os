@@ -12,15 +12,15 @@
 //! order. The role/provider/atom sort applied later during rendering is
 //! presentation order and is deliberately not recorded as source order.
 
-use eliot_contracts::{ArtifactId, ContractVersion, sha256_hex};
 use eliot_context_contracts::{
-    AdmissionDisposition, AdmittedAtom, AdmittedContextSet, BoundaryCompleteness,
-    BoundaryDenominator, BoundaryMember, BoundaryMemberCoverage, BoundaryMemberOrigin,
-    BoundaryMemberReference, BoundaryMemberRelation, BoundaryMemberRole, BoundaryMetadataEnvelope,
-    BoundaryMetadataSet, BoundaryPrecision, BoundaryTransformRelation, BoundaryTransformerRevision,
-    BoundaryUnitKind, BoundaryValidationLimits, ContextBinding, ContextError, ContextRecipe,
-    BOUNDARY_METADATA_SCHEMA_REVISION,
+    AdmissionDisposition, AdmittedAtom, AdmittedContextSet, BOUNDARY_METADATA_SCHEMA_REVISION,
+    BoundaryCompleteness, BoundaryDenominator, BoundaryMember, BoundaryMemberCoverage,
+    BoundaryMemberOrigin, BoundaryMemberReference, BoundaryMemberRelation, BoundaryMemberRole,
+    BoundaryMetadataEnvelope, BoundaryMetadataSet, BoundaryPrecision, BoundaryTransformRelation,
+    BoundaryTransformerRevision, BoundaryUnitKind, BoundaryValidationLimits, ContextBinding,
+    ContextError, ContextRecipe,
 };
+use eliot_contracts::{ArtifactId, ContractVersion, sha256_hex};
 
 /// Stable transformer identity for the A-18 admission-to-render projection.
 pub const BOUNDARY_ASSEMBLY_TRANSFORMER_ID: &str = "context.assembly.render";
@@ -58,13 +58,14 @@ pub fn project_assembly_boundaries(
 ) -> Result<BoundaryMetadataSet, ContextError> {
     let rendered = renderable_atoms(admitted);
     if rendered.is_empty() {
-        return BoundaryMetadataSet {
+        let empty = BoundaryMetadataSet {
             units: Vec::new(),
             transforms: Vec::new(),
             boundary_digest: String::new(),
         }
-        .bind_recorded_digest()?
-        .validate(&assembly_boundary_limits());
+        .bind_recorded_digest()?;
+        empty.validate(&assembly_boundary_limits())?;
+        return Ok(empty);
     }
 
     let mut units = Vec::with_capacity(rendered.len() + 1);
@@ -232,10 +233,7 @@ fn transformer_revision(recipe: &ContextRecipe) -> BoundaryTransformerRevision {
 ///
 /// It is deliberately distinct from every child unit identity, so a parent batch can
 /// never be mistaken for one of the units it references.
-fn batch_unit_id(
-    binding: &ContextBinding,
-    child_count: usize,
-) -> Result<ArtifactId, ContextError> {
+fn batch_unit_id(binding: &ContextBinding, child_count: usize) -> Result<ArtifactId, ContextError> {
     let raw = format!(
         "{BOUNDARY_ASSEMBLY_TRANSFORMER_ID}:{}:{}:{}:{child_count}",
         binding.task_id.as_str(),
