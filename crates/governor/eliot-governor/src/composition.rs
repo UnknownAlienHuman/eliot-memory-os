@@ -19,7 +19,10 @@ use crate::controlboard_projection::{
     ControlBoardGovernorSnapshot, ControlBoardProjectionParts, compile_controlboard_snapshot,
 };
 use crate::finish_attempt::{PreparedFinishDecision, PreparedKernelExchange};
-use crate::negative_memory_gate::{self, NegativeMemoryGateInput, evaluate_negative_memory_gate};
+use crate::negative_memory_gate::{
+    self, NegativeMemoryGateDecision, NegativeMemoryGateDisposition, NegativeMemoryGateInput,
+    evaluate_negative_memory_gate,
+};
 use crate::observation_reconciliation::GovernorObservationReconciliation;
 use crate::operator_reconciliation::GovernorOperatorReconciliation;
 use crate::owner_closure_feed::{
@@ -921,6 +924,16 @@ pub enum CompositionError {
     /// Kernel transition failed at the neutral port.
     #[error("Kernel transition: {0}")]
     Kernel(#[from] KernelPortError),
+}
+
+/// Canonical write result kept together with the negative-memory decision
+/// that admitted that exact request.
+#[derive(Clone, Debug)]
+pub struct NegativeMemoryGatedCommit {
+    /// Canonical receipt for the committed request.
+    pub receipt: WriteReceipt,
+    /// Bound decision used immediately before dispatch.
+    pub decision: NegativeMemoryGateDecision,
 }
 
 /// Exact current Canonical plan identity retained by the Governor owner.
@@ -5908,45 +5921,92 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .await
     }
 
-    /// Applies one Canonical-admitted transition only after the governed
-    /// negative-memory gate admits the effect (issue #1731 W4, I12.19).
+    /// Applies one canonical transition only after a bound negative-memory
+    /// decision admits the exact request (issue #1731 W4, I12.19).
     ///
-    /// This is the mechanical gate application I1.8 names for the semantic
-    /// layer: the Governor — the owner allowed to interpret policy — evaluates
-    /// the bounded pure matcher over the caller-resolved rule snapshot, and a
-    /// refusing decision fails the write **before** any `PreparedTransition` is
-    /// built or handed to Kernel. Nothing here is interpreted downstream: Kernel
-    /// still performs only its own mechanical authority/fence/order checks
-    /// (`crates/kernel/AGENTS.md`), and the store still persists only an already
-    /// prepared transition.
+    /// A refusal fails before any `PreparedTransition` is built or handed to
+    /// Kernel. The method requires the candidate read's exact request fence,
+    /// action operation identity, task/scope, effect ceiling and canonical
+    /// request digest to agree with the envelope. It then recomputes the full
+    /// decision binding immediately before canonical dispatch and returns that
+    /// binding with the write receipt.
     ///
-    /// The gate is evaluated through [`evaluate_negative_memory_gate`], which is
-    /// total and pure. Its inputs (`gate`) are the caller's own owner-resolved
-    /// snapshot, dispatch revalidation and admitted policies: this method
-    /// re-reads nothing and invents no rule, but it also **cannot** skip the
-    /// gate, because the gate input is a required parameter rather than an
-    /// option. A caller that has not resolved a rule snapshot therefore cannot
-    /// reach this method at all, and one that resolved an incomplete or
-    /// revision-moved snapshot is refused rather than allowed through.
+    /// The method accepts the typed read and policy snapshot as inputs and does
+    /// not perform a named read itself. Source tracing currently finds no
+    /// production caller of this gated wrapper; the external effect owners must
+    /// still supply the real bounded read and wire it before their dispatch.
+    /// The current #2568 WASM request loop and #1911 native worker own separate
+    /// effect paths, and Doctor repair execution has a distinct typed request.
     ///
-    /// A `Proceed` decision — including a near-match warning — returns without
-    /// error and lets the ordinary authorization path run unchanged; the warning
-    /// confers nothing and is available to the caller through `gate`'s own
-    /// subject. A `Block`, `RequireCheck` or `Unavailable` decision becomes a
-    /// typed [`CompositionError::Recovery`] carrying the exact rule revision,
-    /// admitted policy identity or required discriminating check, so the refusal
-    /// is never reduced to an opaque failure.
+    /// A `Proceed` decision — including a near-match warning — lets the ordinary
+    /// authorization path run unchanged; the warning confers nothing. The
+    /// returned [`NegativeMemoryGatedCommit`] keeps the outcome bound to the
+    /// operation, request digest, subject digest, scope, named read and fence.
+    /// A `Block`, `RequireCheck`, `Unavailable` or request-binding mismatch
+    /// becomes a typed [`CompositionError::Recovery`] before canonical dispatch.
     pub async fn commit_canonical_gated_by_negative_memory(
         &self,
         identity: &RequestIdentity,
         envelope: CanonicalWriteEnvelope,
         gate: &NegativeMemoryGateInput<'_>,
-    ) -> Result<WriteReceipt, CompositionError> {
-        let decision = evaluate_negative_memory_gate(gate);
+    ) -> Result<NegativeMemoryGatedCommit, CompositionError> {
+        let decision = evaluate_negative_memory_gate(gate, &envelope);
+        let source_ordering_head = if matches!(
+            decision.disposition(),
+            NegativeMemoryGateDisposition::Block { .. }
+                | NegativeMemoryGateDisposition::RequireCheck { .. }
+                | NegativeMemoryGateDisposition::Proceed {
+                    warning: Some(_),
+                }
+        ) {
+            Some(crate::observation_reconciliation::governor_ordering_head_expectation(
+                &envelope.expected_ordering_heads,
+                &identity.request.metadata.state_fence,
+            )?)
+        } else {
+            None
+        };
         if let Some(refusal) = negative_memory_gate::refusal_as_composition_error(&decision) {
+            if matches!(
+                decision.disposition(),
+                NegativeMemoryGateDisposition::Block { .. }
+                    | NegativeMemoryGateDisposition::RequireCheck { .. }
+            ) {
+                let source_ordering_head = source_ordering_head.as_ref().ok_or_else(|| {
+                    CompositionError::Recovery(
+                        "negative-memory refusal lacks its source ordering head".to_owned(),
+                    )
+                })?;
+                self.observation_reconciliation()
+                    .admit_negative_memory_gate_observation(
+                        identity,
+                        &decision,
+                        None,
+                        source_ordering_head,
+                    )
+                    .await?;
+            }
             return Err(refusal);
         }
-        self.commit_canonical(identity, envelope).await
+        decision
+            .validate_for_dispatch(gate, &envelope)
+            .map_err(|refusal| {
+                CompositionError::Recovery(format!(
+                    "negative-memory dispatch binding changed: {refusal:?}"
+                ))
+        })?;
+        let receipt = self.commit_canonical(identity, envelope).await?;
+        if let Some(source_ordering_head) = source_ordering_head.as_ref() {
+            self.observation_reconciliation()
+                .admit_negative_memory_gate_observation(
+                    identity,
+                    &decision,
+                    Some(&receipt),
+                    source_ordering_head,
+                )
+                .await?;
+        }
+        Ok(NegativeMemoryGatedCommit { receipt, decision })
     }
 
     /// Admits one scope-sensitive effect under material readiness
