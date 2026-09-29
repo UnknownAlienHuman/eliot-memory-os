@@ -334,7 +334,7 @@ fn validate_verification(verification: &HintVerification) -> Result<(), ChangeMo
         return Err(ChangeMonitorError::InvalidGitEvidence);
     }
     for read in [&verification.first_read, &verification.reread] {
-        if !is_sha256_hex(&read.sha256) {
+        if !is_sha256_hex(read.digest()) {
             return Err(ChangeMonitorError::InvalidGitEvidence);
         }
     }
