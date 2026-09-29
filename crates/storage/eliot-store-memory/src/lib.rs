@@ -24,8 +24,9 @@ use eliot_kernel_core::{
 };
 use eliot_store_api::epistemic_revision::{EpistemicCommit, position_key};
 use eliot_store_api::{
-    AUTOMATION_QUERY_CURRENT, AUTOMATION_QUERY_FAILURE, AUTOMATION_QUERY_HISTORY,
-    AUTOMATION_QUERY_INVOCATIONS, AUTOMATION_QUERY_LIST, AUTOMATION_STATE_RETIRED,
+    AUTOMATION_PARAM_RECEIPT_ID, AUTOMATION_PARAM_REVISION, AUTOMATION_QUERY_CURRENT,
+    AUTOMATION_QUERY_FAILURE, AUTOMATION_QUERY_HISTORY, AUTOMATION_QUERY_INVOCATIONS,
+    AUTOMATION_QUERY_LIST, AUTOMATION_QUERY_NORMALIZATION, AUTOMATION_STATE_RETIRED,
     CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, CommitId,
     DecodedAutomationMutation, DecodedNotificationMutation, DecodedReactiveMutation,
     ERASURE_PARAM_OPERATION_ID, ERASURE_PARAM_SUBJECT, ERASURE_PARAM_SURFACES,
@@ -1004,11 +1005,15 @@ fn dispatch_apply_automation_state(
                 automation_id,
                 revision,
                 revision_json,
+                normalization_envelope_json,
                 configuration_state,
             } => {
                 let key = automation_revision_key(&automation_id, &revision);
                 match state.automation_revisions.get(&key) {
-                    Some(existing) if existing.revision_json != revision_json => {
+                    Some(existing)
+                        if existing.revision_json != revision_json
+                            || existing.normalization_envelope_json != normalization_envelope_json =>
+                    {
                         return Err(StoreError::IdentityConflict);
                     }
                     Some(_) => {}
@@ -1019,6 +1024,7 @@ fn dispatch_apply_automation_state(
                                 automation_id: automation_id.clone(),
                                 revision: revision.clone(),
                                 revision_json: revision_json.clone(),
+                                normalization_envelope_json: normalization_envelope_json.clone(),
                                 state_fence: transition.state_fence.clone(),
                                 scope_id: transition.scope_id.to_string(),
                                 task_id: transition.task_id.clone(),
@@ -1048,6 +1054,7 @@ fn dispatch_apply_automation_state(
                 previous_revision,
                 revision,
                 revision_json,
+                normalization_envelope_json,
                 configuration_state,
             } => {
                 let current = state.automation_currents.get(&automation_id).ok_or(
@@ -1064,7 +1071,10 @@ fn dispatch_apply_automation_state(
                 }
                 let key = automation_revision_key(&automation_id, &revision);
                 match state.automation_revisions.get(&key) {
-                    Some(existing) if existing.revision_json != revision_json => {
+                    Some(existing)
+                        if existing.revision_json != revision_json
+                            || existing.normalization_envelope_json != normalization_envelope_json =>
+                    {
                         return Err(StoreError::IdentityConflict);
                     }
                     Some(_) => {}
@@ -1075,6 +1085,7 @@ fn dispatch_apply_automation_state(
                                 automation_id: automation_id.clone(),
                                 revision: revision.clone(),
                                 revision_json: revision_json.clone(),
+                                normalization_envelope_json: normalization_envelope_json.clone(),
                                 state_fence: transition.state_fence.clone(),
                                 scope_id: transition.scope_id.to_string(),
                                 task_id: transition.task_id.clone(),
@@ -2479,6 +2490,30 @@ fn automation_state_payload(
             automation_failure_payload(state, fence, &id)
                 .map_err(|error| StoreError::Serialization(error.to_string()))
         }
+        AUTOMATION_QUERY_NORMALIZATION => {
+            let id = decoded
+                .automation_id
+                .clone()
+                .ok_or(StoreError::InvalidField {
+                    field: "automation_id",
+                    reason: "exact automation selector is required",
+                })?;
+            let revision = decoded
+                .requested_revision
+                .as_deref()
+                .ok_or(StoreError::InvalidField {
+                    field: AUTOMATION_PARAM_REVISION,
+                    reason: "exact immutable revision selector is required",
+                })?;
+            let receipt_id = decoded
+                .requested_receipt_id
+                .as_deref()
+                .ok_or(StoreError::InvalidField {
+                    field: AUTOMATION_PARAM_RECEIPT_ID,
+                    reason: "exact receipt identity selector is required",
+                })?;
+            automation_normalization_envelopes_payload(state, fence, &id, revision, receipt_id)
+        }
         _ => Err(StoreError::InvalidField {
             field: "query",
             reason: "unknown automation query",
@@ -2730,6 +2765,51 @@ fn automation_invocations_payload(
         "revision": returned,
         "state_fence": fence,
         "completeness": completeness,
+    }))
+}
+
+/// Projects the retained normalization receipt envelopes the automation leg
+/// minted for one immutable revision under the request's exact fence.
+///
+/// The read is answered by the automation subsystem's OWN retained row, which
+/// is the subsystem that performed the normalization transition (I05.19:96).
+/// The returned bytes are the envelope exactly as it was minted; this contour
+/// re-derives nothing and revalidates nothing beyond parsing the envelope far
+/// enough to read its OWN content-derived identity.
+///
+/// Selection is by that parsed identity, not by a name: a retained envelope is
+/// returned only when its `identity.receipt_id` equals the requested receipt
+/// identity, so a caller that predicts a row name still reaches nothing. The
+/// fence gate is applied before the identity comparison, so an envelope
+/// retained under a different admission era is not answerable here at all.
+fn automation_normalization_envelopes_payload(
+    state: &MemoryState,
+    fence: &StateFence,
+    automation_id: &str,
+    revision: &str,
+    receipt_id: &str,
+) -> Result<Value, StoreError> {
+    let mut envelopes = Vec::new();
+    if let Some(row) = state
+        .automation_revisions
+        .get(&automation_revision_key(automation_id, revision))
+        .filter(|row| row.automation_id == automation_id && row.state_fence == *fence)
+    {
+        let retained: eliot_receipts::ReceiptEnvelope =
+            serde_json::from_str(&row.normalization_envelope_json)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        if retained.identity.receipt_id.as_str() == receipt_id {
+            envelopes.push(json!({
+                "automation_id": row.automation_id,
+                "revision": row.revision,
+                "receipt_id": retained.identity.receipt_id.as_str(),
+                "envelope_json": row.normalization_envelope_json,
+            }));
+        }
+    }
+    Ok(json!({
+        "normalization_envelopes": envelopes,
+        "state_fence": fence,
     }))
 }
 
@@ -5028,11 +5108,19 @@ struct CapabilityEvidenceRow {
 /// One immutable automation revision row: the verbatim Kernel-owned
 /// revision document for one automation + revision with its admission
 /// fence and task-binding provenance (issue #1779).
+///
+/// It also carries the VERBATIM `ReceiptEnvelope` the automation leg minted
+/// for that revision's compiled occurrence set. I05.19:96 makes the envelope
+/// the property of the subsystem that performed the transition, and the
+/// automation Store leg is that subsystem, so the envelope is retained here
+/// beside the revision it attests rather than in a second receipt store. The
+/// bytes are stored as issued; nothing on this contour re-derives them.
 #[derive(Clone, Debug, PartialEq)]
 struct AutomationRevisionRow {
     automation_id: String,
     revision: String,
     revision_json: String,
+    normalization_envelope_json: String,
     state_fence: StateFence,
     scope_id: String,
     task_id: Option<String>,
