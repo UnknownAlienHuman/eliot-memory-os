@@ -683,6 +683,23 @@ pub struct AntigravityOutputRedactionReceipt {
     pub retained_bytes: usize,
 }
 
+/// Field decoder for a required-nullable key.
+///
+/// `Option<T>` under derived `Deserialize` makes an absent key decode as
+/// `None`, so a documented "required on the wire, explicitly nullable" member
+/// would silently accept an incomplete or older record as a current one. A
+/// `deserialize_with` field without `serde(default)` makes the derived
+/// visitor reject the missing key first, while this body keeps handling a
+/// present value or an explicit `null` exactly as before.
+fn deserialize_required_nullable_model_observation<'de, D>(
+    deserializer: D,
+) -> Result<Option<AntigravityModelObservation>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<AntigravityModelObservation>::deserialize(deserializer)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AntigravitySafetyReceipt {
@@ -705,6 +722,7 @@ pub struct AntigravitySafetyReceipt {
     /// Required on the wire: this is the observation that distinguishes a
     /// model-bound run from a merely request-authorized one, so an absent key
     /// must not decode as "observed, and the answer was nothing".
+    #[serde(deserialize_with = "deserialize_required_nullable_model_observation")]
     pub model_observation: Option<AntigravityModelObservation>,
 }
 
