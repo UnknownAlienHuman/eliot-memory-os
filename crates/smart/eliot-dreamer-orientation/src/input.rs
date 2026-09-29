@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
-use eliot_dreamer_contracts::{DreamInputBundle, DreamJobAdmission, ValidatedCandidate};
+use eliot_dreamer_contracts::{DreamInputBundle, DreamJobAdmission};
 use eliot_epistemic_contracts::{CurrentEpistemicPosition, PositionId, PositionRevision};
 use eliot_evidence::EvidenceEnvelope;
 use schemars::JsonSchema;
@@ -653,6 +653,3 @@ pub enum OrientationError {
     #[error("internal projector failure")]
     Internal,
 }
-
-/// The aggregate supplied after A03 validation, under an orientation name.
-pub type ValidatedOrientationCandidate = ValidatedCandidate;

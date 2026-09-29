@@ -4,20 +4,23 @@ status = "PROTOTYPE_ASSIGNMENT_GATED"
 base_commit = "cdf4a29430e6ea51010e00a9b9301abda0b67895"
 normative_pair = "ELIOT Architecture 4.5-draft + Implementation 0.29-draft; English edition 2026-08-28"
 normative_pair_receipt = "docs/normative-pair.toml"
-pair_key = "sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea"
+normative_pair_authority = "docs/normative-pair.toml::pair_key"
+pair_key_copy_rule = "This catalogue does not restate the pair key. The key is read from docs/normative-pair.toml, which is the only owner of it; an earlier copy of the value into this header is removed rather than refreshed, because a second maintained copy is exactly the divergence this rule exists to prevent. Measured on the current base: the receipt now reads sha256:ab2011bd67557d89b2f094061d350a297389f7f57d0478be5e1ff8d2da8ed1c1, while the copy this header used to carry read sha256:3ea4dc3442f03d3a0020380854d45cdf20c9d5098197e0bfe1e80cf6f2b805ea, so the copy had already gone stale. No [[type_contract]] row, [[validation_gate]] rule or [[field_contract]] denominator depends on the key value, so removing the copy changes no contract."
+normative_pair_residual = "The repository-level contradiction is not repaired here and stays with its recorded owner: crates/smart/cognitive-wave-09.toml::pair_key and the preserved pre-sharding section of docs/ARCHITECTURE_CONTRACT.md still carry the superseded pre-#1980 pair, and the repair of those rows is recorded by CC-W2-NORMATIVE-PAIR-KEY in crates/smart/cognitive-contract-challenges.toml."
 purpose = "Freeze field-complete specialized semantic payload contracts for the ten Issue #262 Dreamer families by binding every row to a measured current defining Rust symbol. Reconciles the issue crate labels against measured physical crates; invents no crate, no order and no type."
 proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
 implementation_support = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
 integration_owner = "cognitive-wave-integrator"
 agent_rule = "One agent receives one module manifest, frozen one-hop contracts, exact write scope, proof ceiling and named Product Pulse or Edge proof."
-workspace_rule = "This catalogue is metadata only. It creates no crate, changes no Cargo membership, no Cargo.lock entry, no Rust source and no generated index. Every crate named here already exists as an admitted root workspace member or an explicitly named prototype."
+workspace_rule = "This catalogue is metadata only. It creates no crate, changes no Cargo membership, no Cargo.lock entry, no public type and no generated index. Every crate named here already exists as an admitted root workspace member or an explicitly named prototype. The one Rust change this work unit carries is the retirement of three alias spellings recorded in [[retired_name]]: it adds no type, no variant, no field, no dependency and no behaviour, and every call site of a retired alias is repointed at the single surviving owner of that concern."
 authority_rule = "No row here owns canonical state, runtime scheduling, evaluator state, policy, authority, finish or external effects."
 dependency_rule = "depends_on lists logical contract prerequisites; Cargo dependencies are narrower and exist only for public types actually imported."
 order_rule = "No order is created, renumbered or reused by this catalogue. Every [[assignment]] order and every [[assignment_ref]] order below is a value already measured in crates/smart/cognitive-crate-decisions.toml (orders 1-43), crates/smart/cognitive-wave-09.toml (orders 76-86), or a [package.metadata.eliot] agent_order read from the crate's own Cargo.toml."
 label_resolution_rule = "The Issue #262 body names ten crate labels. Six of them (eliot-dreamer-validation, eliot-dreamer-memory-models, eliot-dreamer-procedural, eliot-dreamer-diagnosis, eliot-dreamer-planning, and by extension any function-only package) do not name a physical crate on base cdf4a29. Each such label is resolved to the measured owning crate or crates in [[label_resolution]] and is never realized as a new crate."
 freeze_binding_rule = "crates/smart/cognitive-rev12-contract-schema-freeze.toml is NOT edited by this catalogue. Its exact bytes are pinned by REQUIRED_FREEZE_DIGEST over FREEZE_BYTES in crates/smart/eliot-dreamer-memory-revision/src/lib.rs, enforced by verify_freeze_binding() which propose() calls, and re-read by scripts/read_freeze_digest.py against the CC-W9-REV12-HANDOFF recorded digest and recorded byte length. Per that file's own [readback].rule a byte change is a new freeze candidate, not an edit. Promotion of this index into the freeze is the recorded CC-W2-FREEZE-REPIN handoff."
-disjointness_rule = "This catalogue does not modify bins/, 233 memory-curation/dreamer-cycle files, 246 cue normalizer/binding/index/activation files, retired eliot-understanding paths, root Cargo.toml/Cargo.lock, workflows, normative prose, generated indexes, or any other wave file."
+disjointness_rule = "This catalogue does not modify bins/, 246 cue normalizer/binding/index/activation files, retired eliot-understanding paths, root Cargo.toml/Cargo.lock, workflows, normative prose, generated indexes, or any other wave file. The only Rust files it edits are the three alias retirements in [[retired_name]]: crates/smart/eliot-dreamer-orientation/src/input.rs, crates/smart/eliot-dreamer-orientation/src/lib.rs, crates/smart/eliot-dreamer-concept/src/lib.rs, crates/smart/eliot-dreamer-concept/src/synthesis.rs, crates/smart/eliot-dreamer-cycle/src/durable.rs and crates/smart/eliot-dreamer-cycle/src/lib.rs. No other memory-curation or dreamer-cycle file is touched."
+single_ownership_rule = "A concern in this catalogue has exactly one live owner. A second name for a concern is a duplicate owner, not a convenience: an alias, a re-export or a compat spelling that keeps both names live is retired rather than kept, and the retirement is recorded once in [[retired_name]] with its single surviving owner. A re-export that exists only as a consumer boundary over a type the owning crate already declares is not a second owner and is not retired; the two cases are told apart by whether the second name defines anything. Two DISTINCT types that happen to share one name are also not duplicates and are never unified here."
 
 [[stage]]
 id = "W2_SEMANTIC_PAYLOAD_INDEX"
@@ -303,7 +306,7 @@ crate = "eliot-dreamer-orientation"
 functional_cell = "smart.dreamer.orientation"
 objective = "Project one candidate-only Orientation packet with exact source coverage, per-status anchored evidence, interpretation as hypothesis text, rival/dissent residue, hidden-relation residue, unknowns, inert probes, invalidation conditions and provenance that proves projection inputs only."
 write_scope = ["crates/smart/eliot-dreamer-orientation/src/**"]
-inputs = ["AdmittedOrientationJob", "bounded DreamInputBundle", "ValidatedOrientationCandidate", "CurrentEpistemicPositionHandle list", "OrientationPolicy"]
+inputs = ["AdmittedOrientationJob", "bounded DreamInputBundle", "eliot-dreamer-contracts ValidatedCandidate", "CurrentEpistemicPositionHandle list", "OrientationPolicy"]
 outputs = ["OrientationPacketCandidate"]
 forbidden = ["promoting a model recommendation to a typed plan", "upgrading OrientationResidue to an algorithmic relation", "promoting InertProbe to an effect", "a second ContextCompiler invocation", "an I9.5 DreamPacket type that does not exist in source"]
 stop_condition = "Stop and return ContractChallenge when coverage lacks an exact denominator, when a fence or scope identity disagrees, or when a closed OrientationSectionKind would have to be widened."
@@ -749,7 +752,7 @@ consumers = ["dispatch composition owner (candidate only)"]
 [[ownership]]
 public_type = "ProbePlan"
 rust_owner = "eliot-dreamer-probe-plan"
-defining_symbol = "crates/smart/eliot-dreamer-probe-plan/src/lib.rs::ProbePlan"
+defining_symbol = "crates/smart/eliot-dreamer-probe-plan/src/model.rs::ProbePlan"
 contract_index = "PlanningCandidateContract"
 functional_cells = ["smart.dreamer.probe_plan"]
 manifest = "crates/smart/eliot-dreamer-probe-plan/module.toml"
@@ -786,7 +789,9 @@ open_gap = "The exact A-14b carrier symbol name is not a top-level pub type in e
 # ---------------------------------------------------------------------------
 # Field-complete per-type rows. One disposition per load-bearing row.
 # disposition is exactly one of: reused_exact, corrected_static_description,
-# missing_contract_decision, retired_with_successor.
+# missing_contract_decision. A name that this catalogue retires is recorded once
+# in [[retired_name]], never as a fourth disposition value, so the retirement
+# mechanism has exactly one owner.
 # ---------------------------------------------------------------------------
 
 [[type_contract]]
@@ -794,6 +799,7 @@ id = "VAL-01"
 contract_index = "ValidationGroundingReceiptContract"
 crate = "eliot-dreamer-candidate-validation"
 rust_path = "crates/smart/eliot-dreamer-candidate-validation/src/error.rs"
+defining_refs = ["crates/smart/eliot-dreamer-candidate-validation/src/error.rs::CandidateValidationOutcome",]
 symbol = "CandidateValidationOutcome"
 kind = "enum"
 fields = ["Accepted(Box<ValidatedCandidate>)", "Rejected(Box<CandidateRejectionReport>)"]
@@ -812,6 +818,7 @@ id = "VAL-02"
 contract_index = "ValidationGroundingReceiptContract"
 crate = "eliot-dreamer-candidate-validation"
 rust_path = "crates/smart/eliot-dreamer-candidate-validation/src/error.rs"
+defining_refs = ["crates/smart/eliot-dreamer-candidate-validation/src/error.rs::CandidateRejectionReport",]
 symbol = "CandidateRejectionReport"
 kind = "struct"
 fields = ["job", "bundle", "model", "grounded", "preservation", "usage", "policy", "observation_time_ms", "cancellation_requested", "code", "detail", "input_digest"]
@@ -830,6 +837,7 @@ id = "VAL-03"
 contract_index = "ValidationGroundingReceiptContract"
 crate = "eliot-dreamer-candidate-validation"
 rust_path = "crates/smart/eliot-dreamer-candidate-validation/src/error.rs"
+defining_refs = ["crates/smart/eliot-dreamer-candidate-validation/src/error.rs::RejectionCode",]
 symbol = "RejectionCode"
 kind = "enum"
 fields = ["IdentityMismatch", "LineageMismatch", "DuplicateItem", "UnsupportedPrecision", "BudgetExceeded", "DeadlineExceeded", "Cancelled", "PreservationFailed", "UnsupportedJobShape"]
@@ -848,6 +856,9 @@ id = "VAL-04"
 contract_index = "ValidationGroundingReceiptContract"
 crate = "eliot-dreamer-candidate-validation"
 rust_path = "crates/smart/eliot-dreamer-candidate-validation/src/structured/mod.rs"
+defining_refs = ["crates/smart/eliot-dreamer-candidate-validation/src/structured/mod.rs::StructuredCandidateValidationOutcome",
+    "crates/smart/eliot-dreamer-candidate-validation/src/structured/mod.rs::StructuredCandidateRejectionReport",
+    ]
 symbol = "StructuredCandidateValidationOutcome and StructuredCandidateRejectionReport"
 kind = "enum plus struct"
 fields = ["StructuredCandidateValidationOutcome{Accepted(Box<ValidatedGroundingCandidate>), Rejected(Box<StructuredCandidateRejectionReport>)}", "StructuredCandidateRejectionReport{input, code, detail, input_digest}"]
@@ -866,6 +877,7 @@ id = "ORI-01"
 contract_index = "OrientationPacketContract"
 crate = "eliot-dreamer-orientation"
 rust_path = "crates/smart/eliot-dreamer-orientation/src/projection.rs"
+defining_refs = ["crates/smart/eliot-dreamer-orientation/src/projection.rs::OrientationPacketCandidate",]
 symbol = "OrientationPacketCandidate"
 kind = "struct"
 fields = ["schema_version", "packet_id", "job_id", "operation_id", "task_id", "scope_id", "question", "frame", "source_coverage", "source_materials", "omission_handles", "coverage_denominator", "resolved_epistemic_position_handles", "anchored_evidence_by_status", "synthesized_interpretations", "rival_models_and_dissent", "hidden_relation_candidates", "unknowns_and_gaps", "recommended_probes_or_next_actions", "architecture_implications", "model_routes_and_cost", "budget_usage", "invalidation_conditions", "provenance", "sections", "preservation", "upstream_preservation", "model_draft", "grounded_draft", "disposition", "input_digest", "output_digest"]
@@ -884,6 +896,9 @@ id = "ORI-02"
 contract_index = "OrientationPacketContract"
 crate = "eliot-dreamer-orientation"
 rust_path = "crates/smart/eliot-dreamer-orientation/src/projection.rs"
+defining_refs = ["crates/smart/eliot-dreamer-orientation/src/projection.rs::OrientationSectionKind",
+    "crates/smart/eliot-dreamer-orientation/src/projection.rs::OrientationSection",
+    ]
 symbol = "OrientationSectionKind and OrientationSection"
 kind = "enum plus struct"
 fields = ["IdentityTaskFrame", "Constraints", "EvidenceCoverage", "Positions", "InterpretationsRivalsDissent", "UnknownsGaps", "RelationCandidates", "InertProbes", "SafeExternalHandoff", "OmissionsExpansionFrontierInvalidation", "Preservation", "OrientationSection{kind, items, item_digests, digest, known, denominator}"]
@@ -902,6 +917,9 @@ id = "ORI-03"
 contract_index = "OrientationPacketContract"
 crate = "eliot-dreamer-orientation"
 rust_path = "crates/smart/eliot-dreamer-orientation/src/projection.rs"
+defining_refs = ["crates/smart/eliot-dreamer-orientation/src/projection.rs::OrientationResidue",
+    "crates/smart/eliot-dreamer-orientation/src/projection.rs::InertProbe",
+    ]
 symbol = "OrientationResidue and InertProbe"
 kind = "struct"
 fields = ["OrientationResidue{kind, text, source}", "InertProbe{text, status, result_space}"]
@@ -920,18 +938,25 @@ id = "ORI-04"
 contract_index = "OrientationPacketContract"
 crate = "eliot-dreamer-orientation"
 rust_path = "crates/smart/eliot-dreamer-orientation/src/result.rs"
-additional_rust_paths = ["crates/smart/eliot-dreamer-orientation/src/input.rs", "crates/smart/eliot-dreamer-orientation/src/policy.rs"]
+defining_refs = ["crates/smart/eliot-dreamer-orientation/src/result.rs::OrientationDisposition",
+    "crates/smart/eliot-dreamer-orientation/src/result.rs::OrientationResult",
+    "crates/smart/eliot-dreamer-orientation/src/input.rs::AdmittedOrientationJob",
+    "crates/smart/eliot-dreamer-orientation/src/input.rs::OrientationCoverageDenominator",
+    "crates/smart/eliot-dreamer-orientation/src/policy.rs::OrientationPolicy",
+    "crates/smart/eliot-dreamer-orientation/src/input.rs::LocalOrientationFrame",
+    "crates/smart/eliot-dreamer-orientation/src/input.rs::CurrentEpistemicPositionHandle",
+    ]
 symbol = "OrientationDisposition, OrientationResult, AdmittedOrientationJob, OrientationCoverageDenominator, OrientationPolicy, LocalOrientationFrame, CurrentEpistemicPositionHandle"
 kind = "enum, alias and structs"
-fields = ["OrientationDisposition", "OrientationResult", "LocalOrientationFrame", "AdmittedOrientationJob", "OrientationCoverageDenominator", "CoverageCepMember", "CoverageEvidenceMember", "CanonicalEvidenceHandle", "CurrentEpistemicPositionHandle", "OrientationError", "ValidatedOrientationCandidate"]
+fields = ["OrientationDisposition", "OrientationResult", "LocalOrientationFrame", "AdmittedOrientationJob", "OrientationCoverageDenominator", "CoverageCepMember", "CoverageEvidenceMember", "CanonicalEvidenceHandle", "CurrentEpistemicPositionHandle", "OrientationError"]
 wire_spelling = "as declared per item in the defining module"
 wire_boundary = "not applicable"
-required_optional_none = "ValidatedOrientationCandidate is a type alias over an already-validated input, so an Option would reintroduce an unvalidated path"
+required_optional_none = "the validated aggregate is eliot-dreamer-contracts ValidatedCandidate and is not Option-wrapped here, so an Option would reintroduce an unvalidated path"
 units_bounds = "seal and validate_for are the binding gates"
 identity_scope_fence = "OrientationPolicy seals a policy digest; CurrentEpistemicPositionHandle validates for material use"
 provenance_privacy = "not applicable"
 validation_error = "OrientationError with validate_material and validate_for gates"
-compatibility = "ValidatedOrientationCandidate is a re-exported alias, so the validation owner is the alias source, not this row"
+compatibility = "the validating aggregate is owned by eliot-dreamer-contracts; the orientation-local alias ValidatedOrientationCandidate was retired under W2-ONE-OWNER-PER-CONCERN and is recorded in [[retired_name]]"
 disposition = "reused_exact"
 
 [[type_contract]]
@@ -939,6 +964,7 @@ id = "SQ-01"
 contract_index = "SelfQueryBriefContract"
 crate = "eliot-dreamer-self-query"
 rust_path = "crates/smart/eliot-dreamer-self-query/src/lib.rs"
+defining_refs = ["crates/smart/eliot-dreamer-self-query/src/lib.rs::SelfQueryPoseReceipt",]
 symbol = "SelfQueryPoseReceipt"
 kind = "struct"
 fields = ["input_digest", "schema_version", "cited"]
@@ -957,6 +983,7 @@ id = "SQ-02"
 contract_index = "SelfQueryBriefContract"
 crate = "eliot-dreamer-self-query"
 rust_path = "crates/smart/eliot-dreamer-self-query/src/lib.rs"
+defining_refs = ["crates/smart/eliot-dreamer-self-query/src/lib.rs::CitedSource",]
 symbol = "CitedSource"
 kind = "struct"
 fields = ["handle", "revision", "digest"]
@@ -975,6 +1002,9 @@ id = "SQ-03"
 contract_index = "SelfQueryBriefContract"
 crate = "eliot-dreamer-self-query"
 rust_path = "crates/smart/eliot-dreamer-self-query/src/lib.rs"
+defining_refs = ["crates/smart/eliot-dreamer-self-query/src/lib.rs::FREEZE_ID",
+    "crates/smart/eliot-dreamer-self-query/src/lib.rs::OWNER_CONTRACT",
+    ]
 symbol = "FREEZE_ID and OWNER_CONTRACT"
 kind = "const"
 fields = ["FREEZE_ID", "OWNER_CONTRACT"]
@@ -985,7 +1015,7 @@ units_bounds = "not applicable"
 identity_scope_fence = "FREEZE_ID names the r6 freeze revision this prototype was built against; OWNER_CONTRACT names eliot.smart.dreamer.contracts"
 provenance_privacy = "not applicable"
 validation_error = "no runtime check; verify_freeze_binding lives in eliot-dreamer-memory-revision, not here"
-compatibility = "a freeze revision bump makes this string stale; it is covered by CC-W2-CONSUMER-REPIN"
+compatibility = "a freeze revision bump makes this string stale; it is covered by CC-W2-CONSUMER-REPIN. Measured drift, recorded and not repaired here: this constant still reads the superseded r6 identity while the freeze file declares r7 and the one enforcing pair in crates/smart/eliot-dreamer-memory-revision/src/lib.rs reads r7. This catalogue does not restate either identity, does not edit either constant, and does not open a second ledger for the repin: the single recorded owner of that repin is CC-W2-CONSUMER-REPIN. This row is a string pin and therefore not a second owner of the freeze bytes; the freeze identity is owned by verify_freeze_binding."
 disposition = "corrected_static_description"
 
 [[type_contract]]
@@ -993,6 +1023,7 @@ id = "RS-01"
 contract_index = "ResearchSynthesisBriefContract"
 crate = "eliot-dreamer-research-synthesis"
 rust_path = "crates/smart/eliot-dreamer-research-synthesis/src/model.rs"
+defining_refs = ["crates/smart/eliot-dreamer-research-synthesis/src/model.rs::ResearchBrief",]
 symbol = "ResearchBrief"
 kind = "struct"
 fields = ["brief_id", "pack_digest", "question", "claim_matrix", "rivals", "unknowns", "probes", "probe_residue", "concilium", "coverage", "dependence", "disposition", "preservation", "omitted", "raw_digest", "semantic_digest"]
@@ -1011,6 +1042,15 @@ id = "RS-02"
 contract_index = "ResearchSynthesisBriefContract"
 crate = "eliot-dreamer-research-synthesis"
 rust_path = "crates/smart/eliot-dreamer-research-synthesis/src/model.rs"
+defining_refs = ["crates/smart/eliot-dreamer-research-synthesis/src/model.rs::SynthesisRequest",
+    "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::ResearchPack",
+    "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::GroundedDraft",
+    "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::InputReceipt",
+    "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::SynthesisPolicy",
+    "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::SynthesisBounds",
+    "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::CancellationView",
+    "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::JobBinding",
+    ]
 symbol = "SynthesisRequest, ResearchPack, GroundedDraft, InputReceipt, SynthesisPolicy, SynthesisBounds, CancellationView, JobBinding"
 kind = "struct"
 fields = ["SynthesisRequest{schema_revision, binding, pack, draft, receipt, policy, bounds, cancellation}", "ResearchPack{pack_digest, question, task_id, scope_id, fence_epoch, fence_generation, bundle_digest, manifest_digest, sources, source_denominator, coverage_denominator, counter_search, missing_source_classes, omitted_sources}", "GroundedDraft{draft_digest, grounding_digest, task_id, scope_id, question, claims, rivals, unknowns, probes, concilium}"]
@@ -1029,6 +1069,23 @@ id = "RS-03"
 contract_index = "ResearchSynthesisBriefContract"
 crate = "eliot-dreamer-research-synthesis"
 rust_path = "crates/smart/eliot-dreamer-research-synthesis/src/model.rs"
+defining_refs = ["crates/smart/eliot-dreamer-research-synthesis/src/model.rs::EvidenceGrade",
+    "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::Freshness",
+    "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::Precision",
+    "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::PrecisionKind",
+    "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::ClaimKind",
+    "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::ClaimDisposition",
+    "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::SynthesisDisposition",
+    "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::PreservationDimension",
+    "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::DenominatorKind",
+    "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::CounterSearchStatus",
+    "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::SourceAuthority",
+    "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::RivalStance",
+    "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::ProbeResidueReason",
+    "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::OmissionKind",
+    "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::ProbeBasis",
+    "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::RequesterOrigin",
+    ]
 symbol = "closed enums: EvidenceGrade, Freshness, Precision, PrecisionKind, ClaimKind, ClaimDisposition, SynthesisDisposition, PreservationDimension, DenominatorKind, CounterSearchStatus, SourceAuthority, RivalStance, ProbeResidueReason, OmissionKind, ProbeBasis, RequesterOrigin"
 kind = "enum"
 fields = ["EvidenceGrade{E0,E1,E2,E3}", "Freshness{Fresh,Stale,Unknown}", "Precision{Exact,Qualified,Unsupported}", "PrecisionKind{Documentary,Numeric,Time,Version,Causal,General}", "ClaimKind{Factual,Numeric,Time,Version,Causal,Absence}", "ClaimDisposition{Supported,Contested,Unsupported,OutsideManifest,PrecisionLimited,AbsentScopeComplete,AbsentScopeIncomplete,DuplicateCollapsed,Withheld}", "SynthesisDisposition{Complete,Partial,Exhausted,Abstained,Blocked,Unsupported,Conflicted,Unknown}", "PreservationDimension{Coverage,Preservation,Faithfulness,Lineage,Reversibility,SourceAuthority,DependencyClosure}", "DenominatorKind{CompleteScope,Sampled,Unknown}", "CounterSearchStatus{Complete,Partial,NotRun}", "SourceAuthority{Authoritative,Competent,Limited,Unknown}", "RivalStance{Supports,Opposes,Alternative}", "ProbeResidueReason{Nondiscriminative,UnknownTarget,Unauthorized,Budget}", "OmissionKind{Claims,Rivals,References,Probes,Unknowns,Work,OutputBytes,Concilium}", "ProbeBasis{SuppliedDiscriminative,CanonicalTransform(String)}", "RequesterOrigin{Human,AdmittedAgent,SchedulePolicy}"]
@@ -1047,7 +1104,15 @@ id = "RS-04"
 contract_index = "ResearchSynthesisBriefContract"
 crate = "eliot-dreamer-research-synthesis"
 rust_path = "crates/smart/eliot-dreamer-research-synthesis/src/synthesize.rs"
-additional_rust_paths = ["crates/smart/eliot-dreamer-research-synthesis/src/digest.rs", "crates/smart/eliot-dreamer-research-synthesis/Cargo.toml"]
+defining_refs = ["crates/smart/eliot-dreamer-research-synthesis/src/synthesize.rs::synthesize",
+    "crates/smart/eliot-dreamer-research-synthesis/src/synthesize.rs::request_digest",
+    "crates/smart/eliot-dreamer-research-synthesis/src/synthesize.rs::request_semantic_digest",
+    "crates/smart/eliot-dreamer-research-synthesis/src/synthesize.rs::brief_semantic_digest",
+    "crates/smart/eliot-dreamer-research-synthesis/src/synthesize.rs::brief_raw_digest",
+    "crates/smart/eliot-dreamer-research-synthesis/src/synthesize.rs::terminal_digest",
+    "crates/smart/eliot-dreamer-research-synthesis/src/model.rs::pack_canonical_bytes",
+    "crates/smart/eliot-dreamer-research-synthesis/src/digest.rs::CanonicalWriter",
+    ]
 symbol = "synthesize, request_digest, request_semantic_digest, brief_semantic_digest, brief_raw_digest, terminal_digest, pack_canonical_bytes, CanonicalWriter; and the crate [package.metadata.eliot] agent_order"
 kind = "function set plus manifest metadata"
 fields = ["synthesize(&SynthesisRequest) -> Result<SynthesisOutcome, SynthesisError>"]
@@ -1066,7 +1131,18 @@ id = "MM-01"
 contract_index = "MemoryModelCandidateContract"
 crate = "eliot-dreamer-classification"
 rust_path = "crates/smart/eliot-dreamer-classification/src/result.rs"
-additional_rust_paths = ["crates/smart/eliot-dreamer-classification/src/selection.rs", "crates/smart/eliot-dreamer-classification/src/evidence.rs", "crates/smart/eliot-dreamer-classification/src/policy.rs"]
+defining_refs = ["crates/smart/eliot-dreamer-classification/src/result.rs::ClassificationResult",
+    "crates/smart/eliot-dreamer-classification/src/result.rs::ClassificationDisposition",
+    "crates/smart/eliot-dreamer-classification/src/selection.rs::CriterionResolution",
+    "crates/smart/eliot-dreamer-classification/src/selection.rs::SelectionReport",
+    "crates/smart/eliot-dreamer-classification/src/selection.rs::AlternativeTrace",
+    "crates/smart/eliot-dreamer-classification/src/result.rs::ClassificationConflict",
+    "crates/smart/eliot-dreamer-classification/src/evidence.rs::EvidenceTrace",
+    "crates/smart/eliot-dreamer-classification/src/policy.rs::EvidenceGradeBinding",
+    "crates/smart/eliot-dreamer-classification/src/policy.rs::ClassificationPolicy",
+    "crates/smart/eliot-dreamer-classification/src/policy.rs::BudgetReceipt",
+    "crates/smart/eliot-dreamer-classification/src/evidence.rs::EvidenceQuality",
+    ]
 symbol = "ClassificationResult, ClassificationDisposition, CriterionResolution, SelectionReport, AlternativeTrace, ClassificationConflict, EvidenceTrace, EvidenceGradeBinding, ClassificationPolicy, BudgetReceipt, EvidenceQuality"
 kind = "struct plus enums"
 fields = ["measured as present; the exact field list is owned by this crate and is not restated here"]
@@ -1085,7 +1161,17 @@ id = "MM-02"
 contract_index = "MemoryModelCandidateContract"
 crate = "eliot-dreamer-relation"
 rust_path = "crates/smart/eliot-dreamer-relation/src/result.rs"
-additional_rust_paths = ["crates/smart/eliot-dreamer-relation/src/selection.rs", "crates/smart/eliot-dreamer-relation/src/policy.rs", "crates/smart/eliot-dreamer-relation/src/draft.rs"]
+defining_refs = ["crates/smart/eliot-dreamer-relation/src/result.rs::RelationResult",
+    "crates/smart/eliot-dreamer-relation/src/selection.rs::Selection",
+    "crates/smart/eliot-dreamer-relation/src/policy.rs::EvidenceBinding",
+    "crates/smart/eliot-dreamer-relation/src/policy.rs::EvidenceBindingKind",
+    "crates/smart/eliot-dreamer-relation/src/policy.rs::CausalMaterialBinding",
+    "crates/smart/eliot-dreamer-relation/src/policy.rs::CausalPredicateBinding",
+    "crates/smart/eliot-dreamer-relation/src/policy.rs::PathRef",
+    "crates/smart/eliot-dreamer-relation/src/policy.rs::RelationPolicy",
+    "crates/smart/eliot-dreamer-relation/src/policy.rs::EvidenceGradeBinding",
+    "crates/smart/eliot-dreamer-relation/src/draft.rs::GroundedRelationDraft",
+    ]
 symbol = "RelationResult, Selection, EvidenceBinding, EvidenceBindingKind, CausalMaterialBinding, CausalPredicateBinding, PathRef, RelationPolicy, EvidenceGradeBinding, GroundedRelationDraft"
 kind = "struct plus enums"
 fields = ["measured as present; the exact field list is owned by this crate and is not restated here"]
@@ -1104,7 +1190,25 @@ id = "MM-03"
 contract_index = "MemoryModelCandidateContract"
 crate = "eliot-dreamer-episode"
 rust_path = "crates/smart/eliot-dreamer-episode/src/result.rs"
-additional_rust_paths = ["crates/smart/eliot-dreamer-episode/src/input.rs"]
+defining_refs = ["crates/smart/eliot-dreamer-episode/src/result.rs::EpisodeCandidate",
+    "crates/smart/eliot-dreamer-episode/src/input.rs::EpisodeOutcome",
+    "crates/smart/eliot-dreamer-episode/src/result.rs::ChronologyLink",
+    "crates/smart/eliot-dreamer-episode/src/result.rs::ChronologyRelation",
+    "crates/smart/eliot-dreamer-episode/src/result.rs::EpisodeBoundary",
+    "crates/smart/eliot-dreamer-episode/src/result.rs::EpisodeGap",
+    "crates/smart/eliot-dreamer-episode/src/result.rs::EpisodeCoverage",
+    "crates/smart/eliot-dreamer-episode/src/result.rs::OverlapAssessment",
+    "crates/smart/eliot-dreamer-episode/src/result.rs::EpisodeRollback",
+    "crates/smart/eliot-dreamer-episode/src/result.rs::EpisodeStatus",
+    "crates/smart/eliot-dreamer-episode/src/input.rs::BoundaryRule",
+    "crates/smart/eliot-dreamer-episode/src/input.rs::OverlapRule",
+    "crates/smart/eliot-dreamer-episode/src/result.rs::OverlapDisposition",
+    "crates/smart/eliot-dreamer-episode/src/input.rs::GroundedEventSet",
+    "crates/smart/eliot-dreamer-episode/src/input.rs::GroundedEvent",
+    "crates/smart/eliot-dreamer-episode/src/input.rs::EpisodeParticipant",
+    "crates/smart/eliot-dreamer-episode/src/input.rs::MaterialPreimage",
+    "crates/smart/eliot-dreamer-episode/src/input.rs::ValidatedCurationInput",
+    ]
 symbol = "EpisodeCandidate, EpisodeOutcome, ChronologyLink, ChronologyRelation, EpisodeBoundary, EpisodeGap, EpisodeCoverage, OverlapAssessment, EpisodeRollback, EpisodeStatus, BoundaryRule, OverlapRule, OverlapDisposition, GroundedEventSet, GroundedEvent, EpisodeParticipant, MaterialPreimage, ValidatedCurationInput"
 kind = "struct plus enums"
 fields = ["measured as present; the exact field list is owned by this crate and is not restated here"]
@@ -1123,7 +1227,10 @@ id = "MM-04"
 contract_index = "MemoryModelCandidateContract"
 crate = "eliot-dreamer-concept"
 rust_path = "crates/smart/eliot-dreamer-concept/src/evidence.rs"
-additional_rust_paths = ["crates/smart/eliot-dreamer-concept/src/policy.rs"]
+defining_refs = ["crates/smart/eliot-dreamer-concept/src/evidence.rs::EvidenceLedger",
+    "crates/smart/eliot-dreamer-concept/src/evidence.rs::EvidenceAssessment",
+    "crates/smart/eliot-dreamer-concept/src/policy.rs::ConceptPolicy",
+    ]
 symbol = "EvidenceLedger, EvidenceAssessment, ConceptPolicy"
 kind = "struct"
 fields = ["measured as present; the exact field list is owned by this crate and is not restated here"]
@@ -1134,7 +1241,7 @@ units_bounds = "not restated; owned by the defining module"
 identity_scope_fence = "not restated; owned by the defining module"
 provenance_privacy = "EvidenceLedger is the provenance surface for this kind"
 validation_error = "owned by the defining module"
-compatibility = "not determinable for a result type that does not exist"
+compatibility = "not determinable for a result type that does not exist. The alias ConceptDecision was retired under W2-ONE-OWNER-PER-CONCERN and is recorded in [[retired_name]]; the surviving name is eliot-dreamer-contracts ConceptDisposition, so retiring the alias does not decide the missing result type"
 disposition = "missing_contract_decision"
 
 [[type_contract]]
@@ -1142,7 +1249,15 @@ id = "MM-05"
 contract_index = "MemoryModelCandidateContract"
 crate = "eliot-dreamer-failure"
 rust_path = "crates/smart/eliot-dreamer-failure/src/assessment.rs"
-additional_rust_paths = ["crates/smart/eliot-dreamer-failure/src/result.rs", "crates/smart/eliot-dreamer-failure/src/policy.rs"]
+defining_refs = ["crates/smart/eliot-dreamer-failure/src/assessment.rs::FailureAssessment",
+    "crates/smart/eliot-dreamer-failure/src/result.rs::FailureHandlerDecision",
+    "crates/smart/eliot-dreamer-failure/src/policy.rs::FailurePolicy",
+    "crates/smart/eliot-dreamer-failure/src/assessment.rs::FailureCountSummary",
+    "crates/smart/eliot-dreamer-failure/src/assessment.rs::CausalLimits",
+    "crates/smart/eliot-dreamer-failure/src/assessment.rs::TriggerAssessment",
+    "crates/smart/eliot-dreamer-failure/src/assessment.rs::OutcomeAssessment",
+    "crates/smart/eliot-dreamer-failure/src/assessment.rs::ApplicabilityAssessment",
+    ]
 symbol = "FailureAssessment, FailureHandlerDecision, FailurePolicy, FailureCountSummary, CausalLimits, TriggerAssessment, OutcomeAssessment, ApplicabilityAssessment"
 kind = "struct plus enums"
 fields = ["measured as present; the exact field list is owned by this crate and is not restated here"]
@@ -1161,6 +1276,22 @@ id = "MM-06"
 contract_index = "MemoryModelCandidateContract"
 crate = "eliot-dreamer-structure-repair"
 rust_path = "crates/smart/eliot-dreamer-structure-repair/src/lib.rs"
+defining_refs = ["crates/smart/eliot-dreamer-structure-repair/src/lib.rs::StructureRepairCandidate",
+    "crates/smart/eliot-dreamer-structure-repair/src/lib.rs::RepairOutcome",
+    "crates/smart/eliot-dreamer-structure-repair/src/lib.rs::RepairSubtype",
+    "crates/smart/eliot-dreamer-structure-repair/src/lib.rs::EquivalenceReport",
+    "crates/smart/eliot-dreamer-structure-repair/src/lib.rs::RollbackPlan",
+    "crates/smart/eliot-dreamer-structure-repair/src/lib.rs::InvalidationPlan",
+    "crates/smart/eliot-dreamer-structure-repair/src/lib.rs::MemberDisposition",
+    "crates/smart/eliot-dreamer-structure-repair/src/lib.rs::DependentDisposition",
+    "crates/smart/eliot-dreamer-structure-repair/src/lib.rs::MemberDispositionKind",
+    "crates/smart/eliot-dreamer-structure-repair/src/lib.rs::DependentDispositionKind",
+    "crates/smart/eliot-dreamer-structure-repair/src/lib.rs::MemberRecord",
+    "crates/smart/eliot-dreamer-structure-repair/src/lib.rs::FrozenBundle",
+    "crates/smart/eliot-dreamer-structure-repair/src/lib.rs::PriorTransition",
+    "crates/smart/eliot-dreamer-structure-repair/src/lib.rs::StructureRepairPolicy",
+    "crates/smart/eliot-dreamer-structure-repair/src/lib.rs::StructureRepairError",
+    ]
 symbol = "StructureRepairCandidate, RepairOutcome, RepairSubtype, EquivalenceReport, RollbackPlan, InvalidationPlan, MemberDisposition, DependentDisposition, MemberDispositionKind, DependentDispositionKind, MemberRecord, FrozenBundle, PriorTransition, StructureRepairPolicy, StructureRepairError"
 kind = "struct plus enums"
 fields = ["measured as present; the exact field list is owned by this crate and is not restated here"]
@@ -1179,6 +1310,25 @@ id = "MM-07"
 contract_index = "MemoryModelCandidateContract"
 crate = "eliot-dreamer-reconsolidation"
 rust_path = "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs"
+defining_refs = ["crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::ReconsolidationResult",
+    "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::ReconsolidationOutcome",
+    "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::ReconsolidationRequest",
+    "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::ReconsolidationPolicy",
+    "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::ReconsolidationHandler",
+    "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::AddedProposition",
+    "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::ChildProposition",
+    "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::ParentRevision",
+    "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::ParentProposition",
+    "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::PropositionDelta",
+    "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::PropositionDisposition",
+    "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::ReactivationBinding",
+    "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::ReactivationEvidence",
+    "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::EvidenceIndependence",
+    "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::DependentOutcome",
+    "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::AxisOwnerRefs",
+    "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::PreservedSourceBinding",
+    "crates/smart/eliot-dreamer-reconsolidation/src/lib.rs::ChildAllocationRequest",
+    ]
 symbol = "ReconsolidationResult, ReconsolidationOutcome, ReconsolidationRequest, ReconsolidationPolicy, ReconsolidationHandler, AddedProposition, ChildProposition, ParentRevision, ParentProposition, PropositionDelta, PropositionDisposition, ReactivationBinding, ReactivationEvidence, EvidenceIndependence, DependentOutcome, AxisOwnerRefs, PreservedSourceBinding, ChildAllocationRequest"
 kind = "struct plus enums"
 fields = ["measured as present; the exact field list is owned by this crate and is not restated here"]
@@ -1197,6 +1347,27 @@ id = "MM-08"
 contract_index = "MemoryModelCandidateContract"
 crate = "eliot-dreamer-accessibility"
 rust_path = "crates/smart/eliot-dreamer-accessibility/src/lib.rs"
+defining_refs = ["crates/smart/eliot-dreamer-accessibility/src/lib.rs::AdjustmentProposal",
+    "crates/smart/eliot-dreamer-accessibility/src/lib.rs::AdjustmentRequest",
+    "crates/smart/eliot-dreamer-accessibility/src/lib.rs::AdjustmentOutcome",
+    "crates/smart/eliot-dreamer-accessibility/src/lib.rs::AdjustmentPolicy",
+    "crates/smart/eliot-dreamer-accessibility/src/lib.rs::Axis",
+    "crates/smart/eliot-dreamer-accessibility/src/lib.rs::AxisStateSnapshot",
+    "crates/smart/eliot-dreamer-accessibility/src/lib.rs::CurrentAxisProjection",
+    "crates/smart/eliot-dreamer-accessibility/src/lib.rs::AccessibilitySurface",
+    "crates/smart/eliot-dreamer-accessibility/src/lib.rs::AccessibilityChange",
+    "crates/smart/eliot-dreamer-accessibility/src/lib.rs::InfluenceChange",
+    "crates/smart/eliot-dreamer-accessibility/src/lib.rs::ProtectionAndNegativeMemory",
+    "crates/smart/eliot-dreamer-accessibility/src/lib.rs::NegativeMemoryEntry",
+    "crates/smart/eliot-dreamer-accessibility/src/lib.rs::LocalInfluenceClosure",
+    "crates/smart/eliot-dreamer-accessibility/src/lib.rs::AffectedPath",
+    "crates/smart/eliot-dreamer-accessibility/src/lib.rs::PathDisposition",
+    "crates/smart/eliot-dreamer-accessibility/src/lib.rs::AccessibilityStanding",
+    "crates/smart/eliot-dreamer-accessibility/src/lib.rs::InfluenceStanding",
+    "crates/smart/eliot-dreamer-accessibility/src/lib.rs::LocalClosureStanding",
+    "crates/smart/eliot-dreamer-accessibility/src/lib.rs::LocalRevocationClass",
+    "crates/smart/eliot-dreamer-accessibility/src/lib.rs::AccessibilityError",
+    ]
 symbol = "AdjustmentProposal, AdjustmentRequest, AdjustmentOutcome, AdjustmentPolicy, Axis, AxisStateSnapshot, CurrentAxisProjection, AccessibilitySurface, AccessibilityChange, InfluenceChange, ProtectionAndNegativeMemory, NegativeMemoryEntry, LocalInfluenceClosure, AffectedPath, PathDisposition, AccessibilityStanding, InfluenceStanding, LocalClosureStanding, LocalRevocationClass, AccessibilityError"
 kind = "struct plus enums"
 fields = ["measured as present; the exact field list is owned by this crate and is not restated here"]
@@ -1215,6 +1386,33 @@ id = "MM-09"
 contract_index = "MemoryModelCandidateContract"
 crate = "eliot-dreamer-memory-repair"
 rust_path = "crates/smart/eliot-dreamer-memory-repair/src/lib.rs"
+defining_refs = ["crates/smart/eliot-dreamer-memory-repair/src/lib.rs::MemoryRepairCandidate",
+    "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::MemoryRepairRequest",
+    "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::MemoryRepairHandler",
+    "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::RepairPolicy",
+    "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::RepairOutcome",
+    "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::RepairDefectKind",
+    "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::RepairOperationKind",
+    "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::RepairIdentity",
+    "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::TrajectoryEvidence",
+    "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::ThreatEvidence",
+    "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::CurrentMemoryProjection",
+    "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::AuthoritativeSourceLink",
+    "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::ProvenanceRepairSpec",
+    "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::ContaminationClosure",
+    "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::ContaminationAction",
+    "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::FalseRelationProposal",
+    "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::FalseRelationSpec",
+    "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::StaleViewSpec",
+    "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::RepresentationProposal",
+    "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::RepresentationSpec",
+    "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::AffectedMember",
+    "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::MemberDisposition",
+    "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::MemberDispositionKind",
+    "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::SourceAuthorityKind",
+    "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::SubjectKind",
+    "crates/smart/eliot-dreamer-memory-repair/src/lib.rs::RepairError",
+    ]
 symbol = "MemoryRepairCandidate, MemoryRepairRequest, MemoryRepairHandler, RepairPolicy, RepairOutcome, RepairDefectKind, RepairOperationKind, RepairIdentity, TrajectoryEvidence, ThreatEvidence, CurrentMemoryProjection, AuthoritativeSourceLink, ProvenanceRepairSpec, ContaminationClosure, ContaminationAction, FalseRelationProposal, FalseRelationSpec, StaleViewSpec, RepresentationProposal, RepresentationSpec, AffectedMember, MemberDisposition, MemberDispositionKind, SourceAuthorityKind, SubjectKind, RepairError"
 kind = "struct plus enums"
 fields = ["measured as present; the exact field list is owned by this crate and is not restated here"]
@@ -1233,6 +1431,7 @@ id = "MM-10"
 contract_index = "MemoryModelCandidateContract"
 crate = "eliot-dreamer-curation"
 rust_path = "crates/smart/eliot-dreamer-curation/src/lib.rs"
+defining_refs = ["crates/smart/eliot-dreamer-curation/src/lib.rs::NativeCurationHandler",]
 symbol = "NativeCurationHandler"
 kind = "re-export"
 fields = ["eliot_dreamer_contracts::NativeCurationHandler"]
@@ -1251,6 +1450,7 @@ id = "MM-11"
 contract_index = "MemoryModelCandidateContract"
 crate = "none"
 rust_path = "none"
+defining_refs = []
 symbol = "a shared MemoryModelCandidate family envelope"
 kind = "absent"
 fields = ["none"]
@@ -1269,6 +1469,7 @@ id = "PR-01"
 contract_index = "ProceduralCandidateContract"
 crate = "eliot-dreamer-procedure"
 rust_path = "crates/smart/eliot-dreamer-procedure/src/lib.rs"
+defining_refs = ["crates/smart/eliot-dreamer-procedure/src/lib.rs::ProcedureCandidate",]
 symbol = "ProcedureCandidate"
 kind = "struct"
 fields = ["outcome", "procedure_handle", "objective", "steps", "step_dispositions", "trigger_note", "applicability_note", "transfer", "verifier", "inverse_note", "forward_correction_note", "reopen_note", "unknown_handling_note", "candidate_digest", "note"]
@@ -1287,6 +1488,19 @@ id = "PR-02"
 contract_index = "ProceduralCandidateContract"
 crate = "eliot-dreamer-procedure"
 rust_path = "crates/smart/eliot-dreamer-procedure/src/lib.rs"
+defining_refs = ["crates/smart/eliot-dreamer-procedure/src/lib.rs::ProcedureStep",
+    "crates/smart/eliot-dreamer-procedure/src/lib.rs::StepDisposition",
+    "crates/smart/eliot-dreamer-procedure/src/lib.rs::EffectClass",
+    "crates/smart/eliot-dreamer-procedure/src/lib.rs::StepDispositionKind",
+    "crates/smart/eliot-dreamer-procedure/src/lib.rs::ProcedureOutcome",
+    "crates/smart/eliot-dreamer-procedure/src/lib.rs::ProcedureEvidence",
+    "crates/smart/eliot-dreamer-procedure/src/lib.rs::CapabilityEnvSnapshot",
+    "crates/smart/eliot-dreamer-procedure/src/lib.rs::ExistingProcedureSnapshot",
+    "crates/smart/eliot-dreamer-procedure/src/lib.rs::ProcedurePolicy",
+    "crates/smart/eliot-dreamer-procedure/src/lib.rs::TransferPlan",
+    "crates/smart/eliot-dreamer-procedure/src/lib.rs::compute_candidate_digest",
+    "crates/smart/eliot-dreamer-procedure/src/lib.rs::propose_procedure",
+    ]
 symbol = "ProcedureStep, StepDisposition, EffectClass, StepDispositionKind, ProcedureOutcome, ProcedureEvidence, CapabilityEnvSnapshot, ExistingProcedureSnapshot, ProcedurePolicy, TransferPlan, compute_candidate_digest, propose_procedure"
 kind = "struct plus enums plus functions"
 fields = ["ProcedureStep{step_id, owner, contract_ref, operation, inputs, precondition, dependencies, postcondition, verifier, effect, effect_boundary, budget_note, failure_note, cancel_note, reconcile_note, rollback_note, max_retries, timeout_ms, fanout}"]
@@ -1305,7 +1519,7 @@ id = "PR-03"
 contract_index = "ProceduralCandidateContract"
 crate = "eliot-dreamer-procedure"
 rust_path = "crates/smart/eliot-dreamer-procedure/Cargo.toml"
-additional_rust_paths = ["Cargo.toml"]
+defining_refs = []
 symbol = "crate admission and wave binding"
 kind = "manifest metadata"
 fields = ["prototype", "source_status", "workspace_admission", "functional_cell", "source_layer", "runtime_layer", "runtime_bundle", "agent_order"]
@@ -1324,6 +1538,7 @@ id = "MR-01"
 contract_index = "MemoryRevisionCandidateContract"
 crate = "eliot-dreamer-memory-revision"
 rust_path = "crates/smart/eliot-dreamer-memory-revision/src/lib.rs"
+defining_refs = ["crates/smart/eliot-dreamer-memory-revision/src/lib.rs::NegativeMemoryExtinctionCandidate",]
 symbol = "NegativeMemoryExtinctionCandidate"
 kind = "struct"
 fields = ["contract_version", "candidate_id", "observation_ref", "fingerprint", "query_digest", "narrowing", "disposition", "denominator", "state", "missing", "digest"]
@@ -1342,6 +1557,15 @@ id = "MR-02"
 contract_index = "MemoryRevisionCandidateContract"
 crate = "eliot-dreamer-memory-revision"
 rust_path = "crates/smart/eliot-dreamer-memory-revision/src/lib.rs"
+defining_refs = ["crates/smart/eliot-dreamer-memory-revision/src/lib.rs::AdvisoryNarrowing",
+    "crates/smart/eliot-dreamer-memory-revision/src/lib.rs::CandidateDisposition",
+    "crates/smart/eliot-dreamer-memory-revision/src/lib.rs::CandidateState",
+    "crates/smart/eliot-dreamer-memory-revision/src/lib.rs::ClosureDenominator",
+    "crates/smart/eliot-dreamer-memory-revision/src/lib.rs::RevisionIntake",
+    "crates/smart/eliot-dreamer-memory-revision/src/lib.rs::RevisionError",
+    "crates/smart/eliot-dreamer-memory-revision/src/lib.rs::compute_digest",
+    "crates/smart/eliot-dreamer-memory-revision/src/lib.rs::propose",
+    ]
 symbol = "AdvisoryNarrowing, CandidateDisposition, CandidateState, ClosureDenominator, RevisionIntake, RevisionError, compute_digest, propose"
 kind = "struct plus enums plus functions"
 fields = ["AdvisoryNarrowing{suppress_activation, quarantine, archive}", "CandidateDisposition{AdvisoryNarrow, MechanismReview}", "CandidateState{Complete, Inconclusive, Unsupported}", "ClosureDenominator{fence, enumerated, exclusions, recheck_digest, complete}", "RevisionIntake{observation, evidence, task, safety, query, sources, pose_digest, candidate_id}"]
@@ -1360,6 +1584,12 @@ id = "MR-03"
 contract_index = "MemoryRevisionCandidateContract"
 crate = "eliot-dreamer-memory-revision"
 rust_path = "crates/smart/eliot-dreamer-memory-revision/src/lib.rs"
+defining_refs = ["crates/smart/eliot-dreamer-memory-revision/src/lib.rs::FREEZE_ID",
+    "crates/smart/eliot-dreamer-memory-revision/src/lib.rs::FREEZE_BYTES",
+    "crates/smart/eliot-dreamer-memory-revision/src/lib.rs::REQUIRED_FREEZE_DIGEST",
+    "crates/smart/eliot-dreamer-memory-revision/src/lib.rs::verify_freeze_binding",
+    "crates/smart/eliot-dreamer-memory-revision/src/lib.rs::FreezeVerificationError",
+    ]
 symbol = "FREEZE_ID, FREEZE_BYTES, REQUIRED_FREEZE_DIGEST, verify_freeze_binding, FreezeVerificationError"
 kind = "const, byte slice, function and error enum"
 fields = ["FREEZE_ID", "FREEZE_BYTES", "REQUIRED_FREEZE_DIGEST", "verify_freeze_binding", "FreezeVerificationError"]
@@ -1378,7 +1608,7 @@ id = "MR-04"
 contract_index = "MemoryRevisionCandidateContract"
 crate = "eliot-dreamer-memory-revision"
 rust_path = "crates/smart/cognitive-wave-09.toml"
-additional_rust_paths = []
+defining_refs = []
 symbol = "the wave-09 NegativeMemoryExtinctionCandidate field family"
 kind = "prior static description"
 fields = ["revision_reactivation_trigger_and_task_scope", "revision_new_observation_outcome_or_prediction_error", "revision_old_and_new_epistemic_accessibility_and_influence_state", "revision_retained_narrowed_and_lost_distinctions", "revision_retrieval_downstream_use_interference_and_false_recall_checks", "revision_affected_procedures_views_and_dependency_closure", "revision_rollback_reopen_or_no_return_boundary", "revision_verifier_or_review_disposition", "extinction_evaluation_operation_equals_extinguish_with_evaluator_kind_and_subdimensions"]
@@ -1397,6 +1627,26 @@ id = "DX-01"
 contract_index = "DiagnosisCandidateContract"
 crate = "eliot-dreamer-development-diagnosis"
 rust_path = "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs"
+defining_refs = ["crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::DevelopmentDiagnosisCandidate",
+    "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::ProductGap",
+    "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::ProductGapKind",
+    "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::DiscriminatorEvidence",
+    "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::ControlledRepeat",
+    "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::RepairAttemptSummary",
+    "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::RepairHistory",
+    "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::FrozenConflictAnalysis",
+    "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::RivalMechanism",
+    "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::RivalStatus",
+    "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::CommonModeDisclosure",
+    "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::DiscriminatingExperiment",
+    "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::ExperimentOutcomeKind",
+    "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::DiagnosisPolicy",
+    "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::RivalAssessment",
+    "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::RepairRecommendation",
+    "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::DiagnosisOutcome",
+    "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::DiagnosisError",
+    "crates/smart/eliot-dreamer-development-diagnosis/src/lib.rs::diagnose_development_gap",
+    ]
 symbol = "DevelopmentDiagnosisCandidate, ProductGap, ProductGapKind, DiscriminatorEvidence, ControlledRepeat, RepairAttemptSummary, RepairHistory, FrozenConflictAnalysis, RivalMechanism, RivalStatus, CommonModeDisclosure, DiscriminatingExperiment, ExperimentOutcomeKind, DiagnosisPolicy, RivalAssessment, RepairRecommendation, DiagnosisOutcome, DiagnosisError, diagnose_development_gap"
 kind = "struct plus enums plus function"
 fields = ["outcome", "diagnosis_handle", "product_id", "source_revision", "objective_id", "gap_kind", "product_gap", "current_discriminator", "repair_history", "conflict_analysis", "rival_mechanisms", "experiment_alternatives", "policy", "rivals", "rivals_live", "rivals_falsified", "strongest_current", "strongest_limits_note", "common_mode", "recommended_experiment", "recommendation", "next_evidence_note", "preservation", "input_receipt_digest", "attempt_denominator", "experiments_considered", "candidate_digest", "note"]
@@ -1415,6 +1665,25 @@ id = "DX-02"
 contract_index = "DiagnosisCandidateContract"
 crate = "eliot-dreamer-conflict-analysis"
 rust_path = "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs"
+defining_refs = ["crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::ConflictAnalysisCandidate",
+    "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::ConflictAnalysisPolicy",
+    "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::LineageAttribution",
+    "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::SuppliedObjection",
+    "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::SuppliedProbe",
+    "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::ExternalResolution",
+    "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::ConflictSupplements",
+    "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::PositionAnalysis",
+    "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::LineageGroup",
+    "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::CommonModeRisk",
+    "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::RecommendedProbe",
+    "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::DecisionOwnerRecommendation",
+    "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::DimensionVerdict",
+    "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::PreservationReport",
+    "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::ConflictOutcome",
+    "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::PositionDispositionKind",
+    "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::DecisionOwnerKind",
+    "crates/smart/eliot-dreamer-conflict-analysis/src/lib.rs::ConflictAnalysisError",
+    ]
 symbol = "ConflictAnalysisCandidate, ConflictAnalysisPolicy, LineageAttribution, SuppliedObjection, SuppliedProbe, ExternalResolution, ConflictSupplements, PositionAnalysis, LineageGroup, CommonModeRisk, RecommendedProbe, DecisionOwnerRecommendation, DimensionVerdict, PreservationReport, ConflictOutcome, PositionDispositionKind, DecisionOwnerKind, ConflictAnalysisError"
 kind = "struct plus enums"
 fields = ["measured as present; the exact field list is owned by this crate and is not restated here"]
@@ -1433,6 +1702,29 @@ id = "PL-01"
 contract_index = "PlanningCandidateContract"
 crate = "eliot-dreamer-maintenance-plan"
 rust_path = "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs"
+defining_refs = ["crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::MaintenancePlanCandidate",
+    "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::MaintenanceObjective",
+    "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::TriggerEvidence",
+    "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::BudgetSlice",
+    "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::PlannedOperation",
+    "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::ExpectedDelta",
+    "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::SemanticVerifier",
+    "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::MaintenanceBoundary",
+    "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::MaintenancePolicy",
+    "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::HistoryAttempt",
+    "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::PriorHistory",
+    "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::MaintenanceOpKind",
+    "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::DeltaDimension",
+    "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::DeltaDirection",
+    "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::TriggerKind",
+    "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::CancellationHandling",
+    "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::PriorAttemptDisposition",
+    "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::PriorEffectState",
+    "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::RepeatJustification",
+    "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::MaintenanceOutcome",
+    "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::MaintenancePlanError",
+    "crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs::propose_maintenance_plan",
+    ]
 symbol = "MaintenancePlanCandidate, MaintenanceObjective, TriggerEvidence, BudgetSlice, PlannedOperation, ExpectedDelta, SemanticVerifier, MaintenanceBoundary, MaintenancePolicy, HistoryAttempt, PriorHistory, MaintenanceOpKind, DeltaDimension, DeltaDirection, TriggerKind, CancellationHandling, PriorAttemptDisposition, PriorEffectState, RepeatJustification, MaintenanceOutcome, MaintenancePlanError, propose_maintenance_plan"
 kind = "struct plus enums plus function"
 fields = ["outcome", "plan_handle", "objective_id", "objective_revision", "product_id", "owner", "decomposition_owners", "trigger_id", "operations", "deltas", "verifier_id", "rollback_steps", "required_decisions", "stop_summary", "preservation", "input_receipt_digest", "attempt_denominator", "candidate_digest", "note"]
@@ -1451,6 +1743,37 @@ id = "PL-02"
 contract_index = "PlanningCandidateContract"
 crate = "eliot-dreamer-configuration-plan"
 rust_path = "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs"
+defining_refs = ["crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::ConfigurationChangeCandidate",
+    "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::ConfigurationFieldSchema",
+    "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedConfigurationValue",
+    "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::SecretReference",
+    "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::ConfigurationFieldType",
+    "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::ConfigurationFieldMutability",
+    "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::ConfigurationUnit",
+    "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::ConfigurationFieldConstraint",
+    "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedConfigurationSnapshot",
+    "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedConfigurationSnapshotSet",
+    "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedConfigurationRequest",
+    "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedRequestedField",
+    "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedOperationIdentity",
+    "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedConfigurationChange",
+    "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedImpactClosure",
+    "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedImpactMember",
+    "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedImpactCompleteness",
+    "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedRolloutPlan",
+    "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedRollbackPlan",
+    "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedApproval",
+    "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedApprovalStatus",
+    "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedConfigurationBoundary",
+    "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedConfigurationPolicy",
+    "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedCandidateDetails",
+    "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::ConfigurationCeiling",
+    "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedHistoryDisposition",
+    "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedVerifierReading",
+    "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::TypedReplayDisposition",
+    "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::propose_configuration_change",
+    "crates/smart/eliot-dreamer-configuration-plan/src/lib.rs::propose_typed_configuration_change",
+    ]
 symbol = "ConfigurationChangeCandidate, ConfigurationFieldSchema, TypedConfigurationValue, SecretReference, ConfigurationFieldType, ConfigurationFieldMutability, ConfigurationUnit, ConfigurationFieldConstraint, TypedConfigurationSnapshot, TypedConfigurationSnapshotSet, TypedConfigurationRequest, TypedRequestedField, TypedOperationIdentity, TypedConfigurationChange, TypedImpactClosure, TypedImpactMember, TypedImpactCompleteness, TypedRolloutPlan, TypedRollbackPlan, TypedApproval, TypedApprovalStatus, TypedConfigurationBoundary, TypedConfigurationPolicy, TypedCandidateDetails, ConfigurationCeiling, TypedHistoryDisposition, TypedVerifierReading, TypedReplayDisposition, propose_configuration_change, propose_typed_configuration_change"
 kind = "struct plus enums plus functions"
 fields = ["outcome", "intent_handle", "primary_layer", "primary_owner", "base_digest", "candidate_digest", "base_revision", "changes", "impact", "boundary", "preservation", "input_receipt_digest", "attempt_denominator", "note", "details"]
@@ -1469,6 +1792,24 @@ id = "PL-03"
 contract_index = "PlanningCandidateContract"
 crate = "eliot-dreamer-orchestration-plan"
 rust_path = "crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs"
+defining_refs = ["crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs::WorkUnitDecomposition",
+    "crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs::AgentWorkUnitBrief",
+    "crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs::PlanObjective",
+    "crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs::PlanRequirement",
+    "crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs::PlanSurface",
+    "crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs::WorkUnitBudget",
+    "crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs::ReadinessEdge",
+    "crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs::RequirementExclusion",
+    "crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs::DecompositionPolicy",
+    "crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs::ContextEnvelopeSelectionReceipt",
+    "crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs::SurfaceKind",
+    "crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs::DependencyKind",
+    "crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs::ProofStatus",
+    "crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs::ContextMeasurementStatus",
+    "crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs::DecompositionOutcome",
+    "crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs::OrchestrationPlanError",
+    "crates/smart/eliot-dreamer-orchestration-plan/src/lib.rs::propose_work_unit_decomposition",
+    ]
 symbol = "WorkUnitDecomposition, AgentWorkUnitBrief, PlanObjective, PlanRequirement, PlanSurface, WorkUnitBudget, ReadinessEdge, RequirementExclusion, DecompositionPolicy, ContextEnvelopeSelectionReceipt, SurfaceKind, DependencyKind, ProofStatus, ContextMeasurementStatus, DecompositionOutcome, OrchestrationPlanError, propose_work_unit_decomposition"
 kind = "struct plus enums plus function"
 fields = ["plan_handle", "objective_id", "task_id", "scope_id", "units", "edges"]
@@ -1487,6 +1828,17 @@ id = "PL-04"
 contract_index = "PlanningCandidateContract"
 crate = "eliot-dreamer-probe-plan"
 rust_path = "crates/smart/eliot-dreamer-probe-plan/src/model.rs"
+defining_refs = ["crates/smart/eliot-dreamer-probe-plan/src/model.rs::ProbePlan",
+    "crates/smart/eliot-dreamer-probe-plan/src/model.rs::ProbeProposal",
+    "crates/smart/eliot-dreamer-probe-plan/src/model.rs::ProbeDimensions",
+    "crates/smart/eliot-dreamer-probe-plan/src/model.rs::ProbeOmission",
+    "crates/smart/eliot-dreamer-probe-plan/src/model.rs::ProbeTarget",
+    "crates/smart/eliot-dreamer-probe-plan/src/model.rs::ProbeRelationKind",
+    "crates/smart/eliot-dreamer-probe-plan/src/model.rs::ProbeObjectiveDispositionKind",
+    "crates/smart/eliot-dreamer-probe-plan/src/model.rs::ProbeObjectiveDisposition",
+    "crates/smart/eliot-dreamer-probe-plan/src/model.rs::OmissionKind",
+    "crates/smart/eliot-dreamer-probe-plan/src/model.rs::ProbePlanParams",
+    ]
 symbol = "ProbePlan, ProbeProposal, ProbeDimensions, ProbeOmission, ProbeTarget, ProbeRelationKind, ProbeObjectiveDispositionKind, ProbeObjectiveDisposition, OmissionKind, ProbePlanParams"
 kind = "struct plus enums"
 fields = ["measured as present; the exact field list is owned by this crate and is not restated here"]
@@ -1505,6 +1857,21 @@ id = "CY-01"
 contract_index = "DreamCycleCandidateContract"
 crate = "eliot-dreamer-cycle"
 rust_path = "crates/smart/eliot-dreamer-cycle/src/contract.rs"
+defining_refs = ["crates/smart/eliot-dreamer-cycle/src/contract.rs::DreamerCycleState",
+    "crates/smart/eliot-dreamer-cycle/src/contract.rs::CycleStep",
+    "crates/smart/eliot-dreamer-cycle/src/contract.rs::CyclePolicy",
+    "crates/smart/eliot-dreamer-cycle/src/contract.rs::PendingRequest",
+    "crates/smart/eliot-dreamer-cycle/src/contract.rs::ObservedOutcome",
+    "crates/smart/eliot-dreamer-cycle/src/contract.rs::InertOwnerRequest",
+    "crates/smart/eliot-dreamer-cycle/src/contract.rs::ExpectedArtifact",
+    "crates/smart/eliot-dreamer-cycle/src/contract.rs::CandidateEvidence",
+    "crates/smart/eliot-dreamer-cycle/src/contract.rs::PhasePolicyRule",
+    "crates/smart/eliot-dreamer-cycle/src/contract.rs::CyclePhase",
+    "crates/smart/eliot-dreamer-cycle/src/contract.rs::OutcomeDisposition",
+    "crates/smart/eliot-dreamer-cycle/src/contract.rs::RequestKind",
+    "crates/smart/eliot-dreamer-cycle/src/contract.rs::StepDisposition",
+    "crates/smart/eliot-dreamer-cycle/src/contract.rs::CYCLE_SCHEMA_VERSION",
+    ]
 symbol = "DreamerCycleState, CycleStep, CyclePolicy, PendingRequest, ObservedOutcome, InertOwnerRequest, ExpectedArtifact, CandidateEvidence, PhasePolicyRule, CyclePhase, OutcomeDisposition, RequestKind, StepDisposition, CYCLE_SCHEMA_VERSION"
 kind = "struct plus enums"
 fields = ["DreamerCycleState{schema_version, cycle_id, job, bundle_digest, policy_id, policy_revision, policy_digest, phase, controller_revision, predecessor_digest, pending, proposed_requests, outcomes, frontier, budget_usage, cancellation_requested, canonical_digest}", "CycleStep{predecessor_digest, next_state, requests, disposition, transition_digest}"]
@@ -1523,6 +1890,12 @@ id = "CY-02"
 contract_index = "DreamCycleCandidateContract"
 crate = "eliot-dreamer-cycle"
 rust_path = "crates/smart/eliot-dreamer-cycle/src/plan.rs"
+defining_refs = ["crates/smart/eliot-dreamer-cycle/src/plan.rs::CyclePlan",
+    "crates/smart/eliot-dreamer-cycle/src/plan.rs::ExperimentCandidate",
+    "crates/smart/eliot-dreamer-cycle/src/plan.rs::PlanHorizon",
+    "crates/smart/eliot-dreamer-cycle/src/plan.rs::ExperimentKind",
+    "crates/smart/eliot-dreamer-cycle/src/plan.rs::plan_cycle",
+    ]
 symbol = "CyclePlan, ExperimentCandidate, PlanHorizon, ExperimentKind, plan_cycle"
 kind = "struct plus enums plus function"
 fields = ["CyclePlan{schema_version, cycle_id, from_phase, to_phase, horizon, job_digest, bundle_digest, policy_digest, state_digest, sample_digest, experiments, requests, frontier, plan_digest}", "ExperimentCandidate{target, kind, horizon, reason}"]
@@ -1541,6 +1914,11 @@ id = "CY-03"
 contract_index = "DreamCycleCandidateContract"
 crate = "eliot-dreamer-cycle"
 rust_path = "crates/smart/eliot-dreamer-cycle/src/sample.rs"
+defining_refs = ["crates/smart/eliot-dreamer-cycle/src/sample.rs::CycleSample",
+    "crates/smart/eliot-dreamer-cycle/src/sample.rs::SampleDenominator",
+    "crates/smart/eliot-dreamer-cycle/src/sample.rs::SampleLimits",
+    "crates/smart/eliot-dreamer-cycle/src/sample.rs::sample_cycle",
+    ]
 symbol = "CycleSample, SampleDenominator, SampleLimits, sample_cycle"
 kind = "struct plus function"
 fields = ["CycleSample{schema_version, cycle_id, phase, job_digest, bundle_digest, policy_digest, state_digest, denominator, sampled_pending, sampled_proposed, sampled_outcomes, omitted_pending, omitted_proposed, omitted_outcomes, frontier, complete, coverage_digest}", "SampleDenominator{pending_total, proposed_total, outcomes_total, frontier_total}"]
@@ -1559,8 +1937,32 @@ id = "CY-04"
 contract_index = "DreamCycleCandidateContract"
 crate = "eliot-dreamer-cycle"
 rust_path = "crates/smart/eliot-dreamer-cycle/src/durable.rs"
-additional_rust_paths = ["crates/smart/eliot-dreamer-cycle/src/step.rs", "crates/smart/eliot-dreamer-cycle/Cargo.toml"]
-symbol = "DurableJobState, DurableTransition, DurableCommand, DurableEvent, StageResolution, OperationOutcome, DurableDisposition, InFlightOperation, SettledOperation, StageRequest, StageEvidence, StageReconciled, RestartEvidence, FenceEvidence, DeadlineEvidence, DeliveryEvidence, AckEvidence, ProposedStageTransition, AdvanceStageCommand, ReconcileCommand, EscalateCommand, DURABLE_SCHEMA_VERSION, step_durable_job, step_dreamer_cycle, step_dreamer_cycle_at; and the crate [package.metadata.eliot] block"
+defining_refs = ["crates/smart/eliot-dreamer-cycle/src/durable.rs::DurableJobState",
+    "crates/smart/eliot-dreamer-cycle/src/durable.rs::DurableTransition",
+    "crates/smart/eliot-dreamer-cycle/src/durable.rs::DurableCommand",
+    "crates/smart/eliot-dreamer-cycle/src/durable.rs::DurableEvent",
+    "crates/smart/eliot-dreamer-cycle/src/durable.rs::StageResolution",
+    "crates/smart/eliot-dreamer-cycle/src/durable.rs::OperationOutcome",
+    "crates/smart/eliot-dreamer-cycle/src/durable.rs::DurableDisposition",
+    "crates/smart/eliot-dreamer-cycle/src/durable.rs::InFlightOperation",
+    "crates/smart/eliot-dreamer-cycle/src/durable.rs::SettledOperation",
+    "crates/smart/eliot-dreamer-cycle/src/durable.rs::StageRequest",
+    "crates/smart/eliot-dreamer-cycle/src/durable.rs::StageEvidence",
+    "crates/smart/eliot-dreamer-cycle/src/durable.rs::StageReconciled",
+    "crates/smart/eliot-dreamer-cycle/src/durable.rs::RestartEvidence",
+    "crates/smart/eliot-dreamer-cycle/src/durable.rs::FenceEvidence",
+    "crates/smart/eliot-dreamer-cycle/src/durable.rs::DeadlineEvidence",
+    "crates/smart/eliot-dreamer-cycle/src/durable.rs::DeliveryEvidence",
+    "crates/smart/eliot-dreamer-cycle/src/durable.rs::AckEvidence",
+    "crates/smart/eliot-dreamer-cycle/src/durable.rs::ProposedStageTransition",
+    "crates/smart/eliot-dreamer-cycle/src/durable.rs::ReconcileCommand",
+    "crates/smart/eliot-dreamer-cycle/src/durable.rs::EscalateCommand",
+    "crates/smart/eliot-dreamer-cycle/src/durable.rs::DURABLE_SCHEMA_VERSION",
+    "crates/smart/eliot-dreamer-cycle/src/durable.rs::step_durable_job",
+    "crates/smart/eliot-dreamer-cycle/src/step.rs::step_dreamer_cycle",
+    "crates/smart/eliot-dreamer-cycle/src/step.rs::step_dreamer_cycle_at",
+    ]
+symbol = "DurableJobState, DurableTransition, DurableCommand, DurableEvent, StageResolution, OperationOutcome, DurableDisposition, InFlightOperation, SettledOperation, StageRequest, StageEvidence, StageReconciled, RestartEvidence, FenceEvidence, DeadlineEvidence, DeliveryEvidence, AckEvidence, ProposedStageTransition, ReconcileCommand, EscalateCommand, DURABLE_SCHEMA_VERSION, step_durable_job, step_dreamer_cycle, step_dreamer_cycle_at; and the crate [package.metadata.eliot] block"
 kind = "structs, enums, functions and manifest metadata"
 fields = ["measured as present; the exact field list is owned by this crate and is not restated here"]
 wire_spelling = "not restated; owned by the defining module"
@@ -1570,8 +1972,50 @@ units_bounds = "DURABLE_SCHEMA_VERSION 1, MAX_SETTLED_OPERATIONS 64, MAX_NO_PROG
 identity_scope_fence = "FenceEvidence, DeadlineEvidence and RestartEvidence are the per-transition binding surfaces"
 provenance_privacy = "DeliveryEvidence and AckEvidence keep acknowledgement distinct from use"
 validation_error = "CycleError"
-compatibility = "the crate declares no agent_order and no wave order on base cdf4a29; the durable leg projects an owner-owned DurableJobState and does not own a DurableJob"
+compatibility = "the crate declares no agent_order and no wave order on base cdf4a29; the durable leg projects an owner-owned DurableJobState and does not own a DurableJob. The alias AdvanceStageCommand was retired under W2-ONE-OWNER-PER-CONCERN; the DurableCommand::AdvanceStage variant and its wire spelling are unchanged and the payload is named ProposedStageTransition"
 disposition = "corrected_static_description"
+
+# ---------------------------------------------------------------------------
+# Retired alias spellings. One live owner per retired concern: the surviving
+# name below is the only name the concern has, and the retired spelling has
+# zero remaining Rust occurrences. A re-export or type alias that kept both
+# names live would be the duplicate this section exists to remove, so none is
+# listed here. Verified by an independent re-derivation of the file set from
+# the tree, not by copying the caller's own list.
+# ---------------------------------------------------------------------------
+
+[[retired_name]]
+name = "ValidatedOrientationCandidate"
+kind = "type alias over an imported owner type"
+retired_from = "crates/smart/eliot-dreamer-orientation/src/input.rs"
+successor = "eliot_dreamer_contracts::ValidatedCandidate"
+successor_owner = "eliot-dreamer-contracts"
+call_sites_repointed = ["crates/smart/eliot-dreamer-orientation/src/lib.rs::project_orientation"]
+wire_effect = "none: a type alias is erased before any serde or JsonSchema boundary, so no spelling and no schema changes"
+residual_hits_after_removal = "zero occurrences of the retired name anywhere under crates/"
+affected_row = "ORI-04"
+
+[[retired_name]]
+name = "ConceptDecision"
+kind = "type alias over an imported owner type"
+retired_from = "crates/smart/eliot-dreamer-concept/src/synthesis.rs"
+successor = "eliot_dreamer_contracts::ConceptDisposition"
+successor_owner = "eliot-dreamer-contracts"
+call_sites_repointed = []
+wire_effect = "none: a type alias is erased before any serde or JsonSchema boundary, so no spelling and no schema changes"
+residual_hits_after_removal = "zero occurrences of the retired name anywhere under crates/"
+affected_row = "MM-04"
+
+[[retired_name]]
+name = "AdvanceStageCommand"
+kind = "type alias over a same-crate struct"
+retired_from = "crates/smart/eliot-dreamer-cycle/src/durable.rs"
+successor = "crates/smart/eliot-dreamer-cycle/src/durable.rs::ProposedStageTransition"
+successor_owner = "eliot-dreamer-cycle"
+call_sites_repointed = ["crates/smart/eliot-dreamer-cycle/src/durable.rs::DurableCommand", "crates/smart/eliot-dreamer-cycle/src/durable.rs::step_durable_job"]
+wire_effect = "none: the DurableCommand variant name AdvanceStage, its SCREAMING_SNAKE_CASE spelling and its payload schema are unchanged; only the Rust spelling of the payload type changed, and eliot-dreamer-cycle/src/lib.rs now re-exports ProposedStageTransition so the payload stays publicly nameable"
+residual_hits_after_removal = "zero occurrences of the retired name anywhere under crates/"
+affected_row = "CY-04"
 
 # ---------------------------------------------------------------------------
 # The one semantic contract index.
@@ -1827,19 +2271,25 @@ evidence_execution_status = "NOT_EXECUTED"
 
 [[validation_gate]]
 id = "W2-NO-INVENTED-SYMBOL"
-rule = "Every rust_path and symbol in every [[type_contract]] and [[ownership]] row resolves to a public item in the named source file on the current base, or the row carries disposition missing_contract_decision. A guessed schema is never presented as frozen."
+rule = "Every identifier named in the symbol field of a [[type_contract]] row has exactly one entry in that row's defining_refs, and every defining_refs entry is a path::symbol whose file exists and defines that symbol on the current base, or the row carries disposition missing_contract_decision with an empty defining_refs. A row-level rust_path is the row's primary module and never the whole row's source reference. A guessed schema is never presented as frozen."
+status = "TARGET"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[validation_gate]]
+id = "W2-ONE-OWNER-PER-CONCERN"
+rule = "Exactly one live name owns a retired concern. Every name this catalogue retires appears once in [[retired_name]] with its single surviving owner, has zero remaining Rust occurrences across crates/ after the change, and is never kept as a re-export, type alias or compat spelling. A retired name is not a fourth disposition value: the retirement mechanism has one owner, [[retired_name]], and the disposition vocabulary stays at three values."
 status = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
 
 [[validation_gate]]
 id = "W2-ONE-DISPOSITION-PER-ROW"
-rule = "Every load-bearing row carries exactly one disposition from reused_exact, corrected_static_description, missing_contract_decision, retired_with_successor. No row is both reused and missing."
+rule = "Every load-bearing row carries exactly one disposition from reused_exact, corrected_static_description, missing_contract_decision. No row is both reused and missing."
 status = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
 
 [[validation_gate]]
 id = "W2-NO-FUNCTION-ONLY-PACKAGE"
-rule = "No crate is created. All twenty-four issue-named physical owners already exist as admitted root workspace members or as explicitly named prototypes; no Cargo.toml, Cargo.lock, .rs file, workflow or generated index is edited by this work unit."
+rule = "No crate is created. All twenty-four issue-named physical owners already exist as admitted root workspace members or as explicitly named prototypes; no Cargo.toml, Cargo.lock, workflow or generated index is edited by this work unit. The .rs edits it does carry are the three alias retirements in [[retired_name]], which add no crate, no type, no variant and no dependency."
 status = "TARGET"
 evidence_execution_status = "NOT_EXECUTED"
 
