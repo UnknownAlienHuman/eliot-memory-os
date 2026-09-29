@@ -176,9 +176,7 @@ impl ProhibitedEffectAttempt {
             signal_id: self.signal_id.clone(),
             subject: self.subject.clone(),
             reason: match self.class {
-                ProhibitedEffectClass::MemoryDelete => {
-                    "health_output_cannot_delete_memory"
-                }
+                ProhibitedEffectClass::MemoryDelete => "health_output_cannot_delete_memory",
                 ProhibitedEffectClass::PolicyAlter => "health_output_cannot_alter_policy",
                 ProhibitedEffectClass::WorkTerminate => "health_output_cannot_terminate_work",
             },
