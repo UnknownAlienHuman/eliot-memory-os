@@ -4978,6 +4978,7 @@ impl AgentBridgeCore {
         Ok(None)
     }
 
+    #[allow(clippy::result_large_err)]
     fn prepare_recovery_consumer_state(
         &self,
         binding: &AttachBinding,
@@ -5084,6 +5085,7 @@ impl AgentBridgeCore {
         Ok(state)
     }
 
+    #[allow(clippy::result_large_err)]
     fn validate_recovered_receiver_binding(
         binding: &AttachBinding,
         receipt: &RecoveredReceiverReceipt,
