@@ -9,6 +9,9 @@
 mod bridge_admission;
 pub use bridge_admission::*;
 
+mod handoff_capture;
+pub use handoff_capture::*;
+
 mod handoff_checkpoint;
 pub use handoff_checkpoint::*;
 

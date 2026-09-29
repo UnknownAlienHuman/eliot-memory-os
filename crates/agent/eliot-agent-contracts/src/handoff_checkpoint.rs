@@ -28,8 +28,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    AgentAttemptId, ContractError, HandoffAttemptIdentity, HandoffCausalLink, HandoffCheckpointId,
-    HandoffContinuity, PublicReference, RevisionId, WorkItemId, validate_collection, validate_text,
+    AgentAttemptId, ContractError, HandoffAttemptIdentity, HandoffCaptureBoundary,
+    HandoffCaptureError, HandoffCaptureLedger, HandoffCausalLink, HandoffCheckpointId,
+    HandoffContinuity, PublicReference, RevisionId, WorkItemId, validate_collection,
+    validate_text,
 };
 
 /// Stable contract name of the pre-compaction handoff checkpoint payload.
@@ -46,6 +48,22 @@ pub const HANDOFF_CHECKPOINT_CONTRACT_VERSION: ContractVersion = ContractVersion
 /// The reference locates a persisted checkpoint payload; it is neither the
 /// payload itself nor a persistence proof.
 pub const HANDOFF_CHECKPOINT_REFERENCE_KIND: &str = "handoff-checkpoint";
+
+/// Required [`PublicReference::kind`] of a reference that retains one in-flight
+/// operation identity across the boundary.
+///
+/// The reference names the operation, and its revision is the
+/// [`HandoffEffectDisposition::revision_text`] the payload recorded, so an
+/// effect is retained as the disposition it actually has.
+pub const HANDOFF_EFFECT_REFERENCE_KIND: &str = "handoff-effect";
+
+/// Revision text of an in-flight operation that was admitted but never
+/// dispatched.
+pub const HANDOFF_EFFECT_DISPOSITION_NOT_STARTED: &str = "not-started";
+
+/// Revision text of an in-flight operation whose external effect is
+/// unreconciled.
+pub const HANDOFF_EFFECT_DISPOSITION_OUTCOME_UNKNOWN: &str = "outcome-unknown";
 
 /// Typed disposition of a unit the checkpoint cannot present as exact.
 ///
@@ -300,6 +318,10 @@ impl HandoffCursors {
 /// that an effect stopped, so an unreconciled operation keeps its
 /// [`HandoffEffectDisposition::OutcomeUnknown`] disposition across the boundary
 /// (I7.15).
+///
+/// [`HandoffEffectDisposition::revision_text`] is the revision an in-flight
+/// operation is retained under, so a capture cannot retain an effect under one
+/// disposition and a resume cannot read it back under another.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum HandoffEffectDisposition {
@@ -318,6 +340,20 @@ pub enum HandoffEffectDisposition {
 }
 
 impl HandoffEffectDisposition {
+    /// The revision text this disposition is recorded under.
+    ///
+    /// A capture retains an in-flight operation by naming the same revision the
+    /// payload records, so an effect cannot be retained under one disposition
+    /// and resumed under another.
+    #[must_use]
+    pub fn revision_text(&self) -> &str {
+        match self {
+            Self::NotStarted => HANDOFF_EFFECT_DISPOSITION_NOT_STARTED,
+            Self::Completed { receipt_ref } => receipt_ref.revision.as_str(),
+            Self::OutcomeUnknown { .. } => HANDOFF_EFFECT_DISPOSITION_OUTCOME_UNKNOWN,
+        }
+    }
+
     fn validate(&self) -> Result<(), HandoffCheckpointError> {
         match self {
             Self::NotStarted => {}
@@ -499,6 +535,11 @@ impl HandoffCheckpoint {
     /// on continuity, source attempt, source session, source plan revision and
     /// state fence. A link whose `checkpoint_ref` merely points somewhere is
     /// not a bound checkpoint.
+    ///
+    /// Resume additionally requires the controlled-boundary capture that
+    /// persisted this payload; see
+    /// [`HandoffCheckpoint::validate_capture_binding`]. A link alone is never
+    /// a durable checkpoint.
     pub fn validate_binding(
         &self,
         link: &HandoffCausalLink,
@@ -527,6 +568,36 @@ impl HandoffCheckpoint {
             return Err(HandoffCheckpointError::StateFenceMismatch);
         }
         Ok(())
+    }
+
+    /// Binds this payload to a controlled-boundary capture and the link.
+    ///
+    /// This is the resume admission rule, and it reads the capture through the
+    /// [`HandoffCaptureLedger`] rather than accepting one from the caller. The
+    /// ledger is what makes a second checkpoint identity unrepresentable, so a
+    /// caller cannot present a hand-built capture that the boundary never
+    /// registered. The registered capture must name this exact payload and must
+    /// hold a durable readback of the stored bytes; without it the payload is a
+    /// well-formed record of nothing durable, and
+    /// [`HandoffCheckpointError::CaptureNotDurablyReadBack`] is returned
+    /// instead of an admitted resume.
+    pub fn validate_capture_binding(
+        &self,
+        ledger: &HandoffCaptureLedger,
+        boundary: HandoffCaptureBoundary,
+        link: &HandoffCausalLink,
+        attempt_identity: &HandoffAttemptIdentity,
+    ) -> Result<(), HandoffCheckpointError> {
+        let capture = ledger
+            .get(boundary, &self.source_attempt_id)
+            .ok_or(HandoffCheckpointError::CaptureNotRegistered { boundary })?;
+        capture
+            .bind_checkpoint(self)
+            .map_err(HandoffCheckpointError::Capture)?;
+        if !capture.admits_destructive_compaction() {
+            return Err(HandoffCheckpointError::CaptureNotDurablyReadBack);
+        }
+        self.validate_binding(link, attempt_identity)
     }
 }
 
@@ -632,4 +703,16 @@ pub enum HandoffCheckpointError {
     /// The link and the payload were captured under different state fences.
     #[error("the causal link was captured under a different state fence")]
     StateFenceMismatch,
+    /// The controlled-boundary capture refused to bind this payload.
+    #[error(transparent)]
+    Capture(#[from] HandoffCaptureError),
+    /// The capture exists but holds no durable readback of stored bytes.
+    #[error("the controlled-boundary capture holds no durable readback")]
+    CaptureNotDurablyReadBack,
+    /// No capture is registered for this boundary and source attempt.
+    #[error("no controlled-boundary capture is registered for {boundary:?}")]
+    CaptureNotRegistered {
+        /// Boundary that has no registered capture.
+        boundary: HandoffCaptureBoundary,
+    },
 }
