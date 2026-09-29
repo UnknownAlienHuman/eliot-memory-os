@@ -369,7 +369,9 @@ impl PreStageIdentityCache {
     /// is acknowledged; a read is never an acknowledgement.
     #[must_use]
     pub fn pending_journal_revision(&self) -> Option<u64> {
-        self.pending_journal.as_ref().map(|pending| pending.revision)
+        self.pending_journal
+            .as_ref()
+            .map(|pending| pending.revision)
     }
 
     /// Validates one durable journal snapshot without touching this cache.
@@ -397,7 +399,10 @@ impl PreStageIdentityCache {
                     reason: "entry hash must be the retained rejection canonical hash",
                 });
             }
-            if !snapshot.refused_operations.contains(&rejection.proposed_operation_id) {
+            if !snapshot
+                .refused_operations
+                .contains(&rejection.proposed_operation_id)
+            {
                 return Err(PreStageGateError::InvalidField {
                     field: "snapshot.refused_operations",
                     reason: "every retained refusal must record its rejected operation identity",
@@ -421,14 +426,20 @@ impl PreStageIdentityCache {
                     reason: "issued corrections must name a rejected operation and a rejection",
                 });
             }
-            if !snapshot.refused_operations.contains(&issued.rejected_operation_id) {
+            if !snapshot
+                .refused_operations
+                .contains(&issued.rejected_operation_id)
+            {
                 return Err(PreStageGateError::InvalidField {
                     field: "snapshot.issued_corrections",
                     reason: "every issued correction must name a retained refused operation",
                 });
             }
             if *corrected_operation_id
-                != derive_corrected_operation_id(&issued.rejected_operation_id, &issued.rejection_id)
+                != derive_corrected_operation_id(
+                    &issued.rejected_operation_id,
+                    &issued.rejection_id,
+                )
             {
                 return Err(PreStageGateError::InvalidField {
                     field: "snapshot.issued_corrections",
@@ -451,7 +462,11 @@ impl PreStageIdentityCache {
     pub fn restore(&mut self, snapshot: PreStageIdentitySnapshot) -> Result<(), PreStageGateError> {
         Self::validate_snapshot(&snapshot)?;
         for (key, record) in &snapshot.entries {
-            if self.entries.get(key).is_some_and(|retained| retained != record) {
+            if self
+                .entries
+                .get(key)
+                .is_some_and(|retained| retained != record)
+            {
                 return Err(PreStageGateError::InvalidField {
                     field: "snapshot.entries",
                     reason: "restored entry conflicts with a retained identity",
@@ -475,7 +490,9 @@ impl PreStageIdentityCache {
         }
         self.refused_operations.extend(snapshot.refused_operations);
         for (corrected_operation_id, issued) in snapshot.issued_corrections {
-            self.issued_corrections.entry(corrected_operation_id).or_insert(issued);
+            self.issued_corrections
+                .entry(corrected_operation_id)
+                .or_insert(issued);
         }
         Ok(())
     }
@@ -494,10 +511,10 @@ impl PreStageIdentityCache {
         if self.is_empty() {
             return None;
         }
-        if let Some(pending) = self.pending_journal.clone() {
-            if pending.revision == self.journal_revision {
-                return Some(pending);
-            }
+        if let Some(pending) = self.pending_journal.clone()
+            && pending.revision == self.journal_revision
+        {
+            return Some(pending);
         }
         if self.journal_revision == self.acked_journal_revision {
             return None;
@@ -514,7 +531,11 @@ impl PreStageIdentityCache {
     /// stale acknowledgement for an older revision retires nothing, so an
     /// older concurrent save can never discharge newer retained refusals.
     pub fn acknowledge_journal_save(&mut self, revision: u64) -> bool {
-        if self.pending_journal.as_ref().is_some_and(|pending| pending.revision == revision) {
+        if self
+            .pending_journal
+            .as_ref()
+            .is_some_and(|pending| pending.revision == revision)
+        {
             self.pending_journal = None;
             self.acked_journal_revision = revision;
             true
