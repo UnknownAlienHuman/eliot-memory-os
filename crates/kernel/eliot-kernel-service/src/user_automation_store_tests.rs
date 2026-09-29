@@ -555,7 +555,7 @@ async fn create_lists_and_reads_back_typed_revision() {
         &port,
         "op-port-create-1",
         UserAutomationOperation::Create {
-            revision: revision.clone(),
+            revision: Box::new(revision.clone()),
         },
     )
     .await;
@@ -642,7 +642,7 @@ async fn edit_pause_remove_move_lineage_with_typed_results() {
         &port,
         "op-port-create-2",
         UserAutomationOperation::Create {
-            revision: first.clone(),
+            revision: Box::new(first.clone()),
         },
     )
     .await;
@@ -652,8 +652,8 @@ async fn edit_pause_remove_move_lineage_with_typed_results() {
         &port,
         "op-port-edit-2",
         UserAutomationOperation::Edit {
-            previous_revision: first,
-            revision: second.clone(),
+            previous_revision: Box::new(first),
+            revision: Box::new(second.clone()),
         },
     )
     .await;
@@ -727,7 +727,7 @@ async fn run_now_projects_invocation_and_pending_wake() {
         &port,
         "op-port-create-3",
         UserAutomationOperation::Create {
-            revision: revision.clone(),
+            revision: Box::new(revision.clone()),
         },
     )
     .await;
@@ -832,7 +832,7 @@ async fn replay_reports_replayed_without_remutation() {
     let port = CanonicalUserAutomationStore::new(fake);
     let revision = valid_revision("auto-1", "r-1", UserAutomationConfigurationState::Active);
     let operation = UserAutomationOperation::Create {
-        revision: revision.clone(),
+        revision: Box::new(revision.clone()),
     };
     let first = admitted_response(&port, "op-port-replay-4", operation.clone()).await;
     let UserAutomationStoreOutcome::Committed { receipt, .. } = first.outcome else {
@@ -867,7 +867,7 @@ async fn divergent_identity_and_unknown_automation_fail_closed() {
         &port,
         "op-port-sealed-5",
         UserAutomationOperation::Create {
-            revision: revision.clone(),
+            revision: Box::new(revision.clone()),
         },
     )
     .await;
@@ -876,7 +876,9 @@ async fn divergent_identity_and_unknown_automation_fail_closed() {
     // checks the digest before the sealed identity.
     let mut other = revision.clone();
     other.natural_language_intent = "forged intent".to_owned();
-    let forged = UserAutomationOperation::Create { revision: other };
+    let forged = UserAutomationOperation::Create {
+        revision: Box::new(other),
+    };
     let draft = store_request("op-port-sealed-5", forged.clone());
     let observed = match port.execute_user_automation(draft).await {
         Err(StoreError::TransitionDigestMismatch { observed, .. }) => observed,
