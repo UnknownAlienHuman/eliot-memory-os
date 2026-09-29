@@ -1086,15 +1086,15 @@ public sealed class MainViewModel : INotifyPropertyChanged
         }
         try
         {
-            var requestEnvelope = isReconcile
-                ? ParseRetainedEnvelope(pending.EnvelopeJson)
-                : JsonSerializer.SerializeToElement(envelope);
+            // A first send transmits the typed envelope the action minted; a
+            // reconciliation resends the exact retained envelope bytes under
+            // the same operation identity, never a second mutation.
             JsonElement receipt = isReconcile
                 ? await _client.ReconcileAsync(
-                    requestEnvelope,
+                    ParseRetainedEnvelope(pending.EnvelopeJson),
                     _requestCancellation?.Token ?? CancellationToken.None)
                 : await _client.CommandAsync(
-                    requestEnvelope,
+                    envelope,
                     _requestCancellation?.Token ?? CancellationToken.None);
             bool accepted;
             bool executed;

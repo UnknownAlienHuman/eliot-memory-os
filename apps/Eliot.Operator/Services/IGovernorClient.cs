@@ -20,8 +20,14 @@ public interface IGovernorClient
         OperatorQueryRequest request,
         CancellationToken cancellationToken = default);
 
+    /// Sends one TYPED operator intent. The caller mints the envelope (and its
+    /// retry-stable operation identity) once per user action, so the journaled
+    /// request and the transmitted request are the same commitment. The
+    /// envelope travels to the broker-authenticated Governor connection
+    /// established by this client; reconciliations resend retained bytes via
+    /// ReconcileAsync under the same identity, never a second mutation.
     Task<JsonElement> CommandAsync(
-        object commandEnvelope,
+        OperatorIntentEnvelope commandEnvelope,
         CancellationToken cancellationToken = default);
 
     /// Reconciles the SAME operation after a lost response: resends the exact
