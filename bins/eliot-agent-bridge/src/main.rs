@@ -13,8 +13,7 @@ use eliot_agent_bridge::{
 use eliot_agent_bridge_core::{
     ACTIVATION_DISPOSITION_INVALID_REQUEST, ACTIVATION_DISPOSITION_STALE_OR_CONFLICT,
     ACTIVATION_DISPOSITION_UNAVAILABLE_OR_CAPACITY, AttachRequest, BridgeError, ConnectionId,
-    CoverageGap, DemandId, FencingToken, Generation, NormalizedHostEventEnvelope,
-    ReconnectRequest,
+    CoverageGap, DemandId, FencingToken, Generation, NormalizedHostEventEnvelope, ReconnectRequest,
     RecoveryProjectionPage, ResourceHandle, SessionId,
 };
 use eliot_contracts::{
