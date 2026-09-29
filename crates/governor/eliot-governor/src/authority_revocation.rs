@@ -33,12 +33,15 @@
 //!
 //! Validation order (fail-closed): admitted [`RequestIdentity`] shape and
 //! exact fence agreement first, then non-blank revocation binding fields
-//! with nonzero revision/count, then the closed typed parameters. Failure
-//! mapping reuses the existing [`CompositionError`] variants (no new
-//! variant is introduced so the closed matches elsewhere in this crate keep
-//! compiling): identity/fence/response-binding mismatches are
-//! [`CompositionError::Provider`]; every other deterministic admission
-//! refusal is [`CompositionError::Owner`].
+//! with nonzero revision/count, then the closed typed parameters. On the
+//! return path [`canonical_receipt_identity`] issues a receipt identity only
+//! from a write receipt that is itself `Committed` and whose receipt core
+//! reports `Success`, so a possible, partial or unknown commit never becomes
+//! the recorded revocation. Failure mapping reuses the existing
+//! [`CompositionError`] variants (no new variant is introduced so the closed
+//! matches elsewhere in this crate keep compiling):
+//! identity/fence/response-binding mismatches are [`CompositionError::Provider`];
+//! every other deterministic admission refusal is [`CompositionError::Owner`].
 //!
 //! Honest gaps: `RecordAuthorityRevocation` and
 //! `GetAuthorityRevocationHistory` are known-but-unsupported at the store
@@ -58,14 +61,16 @@ use eliot_contracts::{OperationId, canonical_json_bytes, sha256_hex};
 use eliot_kernel_core::GrantActivationPort;
 use eliot_ors::{GrantClosureProjection, OperationIdentity, OperationalRecoveryStore, OrsError};
 use eliot_protocol::RequestIdentity;
-use eliot_receipts::{GrantClosureReceipt, GrantClosureState, ReceiptIdentity};
+use eliot_receipts::{
+    GrantClosureReceipt, GrantClosureState, ReceiptDispositionKind, ReceiptIdentity,
+};
 use eliot_store_api::{
     EffectClass, EventProjectionRelationIntents, InfluenceDependencyClosure, InfluenceState,
     NamedMutationOperation, NamedMutationRequest, NamedReadOperation, NamedReadRequest,
     NamedReadResponse, OperationManifestDigest, OrderingHeadExpectation, OrderingScopeId,
     ReadConsistency, RecordedRevocationDisposition, RevocationReason, ScopeId, SecurityContext,
-    TransitionClass, WriteReceipt, generated_operation_manifests, operation_manifest_set_digest,
-    parse_revocation_history_payload,
+    TransitionClass, WriteReceipt, WriteReceiptStatus, generated_operation_manifests,
+    operation_manifest_set_digest, parse_revocation_history_payload,
 };
 
 use crate::{
@@ -239,12 +244,48 @@ pub fn authority_revocation_envelope(
 /// Returns the immutable canonical receipt identity produced by the Store
 /// receipt envelope. A transport receipt without its reconciliation envelope
 /// is not a source for a second-phase link.
+///
+/// The receipt is only evidence of a recorded revocation when the write it
+/// describes actually committed. Two terminal dispositions are therefore
+/// compared here, both against the ORIGINAL recorded values, before any
+/// [`ReceiptIdentity`] exists:
+///
+/// * the transport status must be [`WriteReceiptStatus::Committed`]. That is
+///   the one disposition the crate's own commit gate already requires
+///   (`capability_evidence_commit`, `experience_commit`,
+///   `learning_record_commit`) and the rule the Kernel's unknown-commit
+///   classifier states: only `Committed` reconciles as committed, every other
+///   terminal status is a known non-commit. `WriteReceipt::validate()` places
+///   no such invariant — it accepts a reconciliation envelope on a `Rejected`,
+///   `DeadLetter` or `Cancelled` receipt — so nothing downstream of this
+///   function would refuse a write that never recorded the revocation.
+/// * the receipt core's own disposition must be
+///   [`ReceiptDispositionKind::Success`]. That is the exact disposition the
+///   one store-owned issuer of a committed write's envelope
+///   (`eliot_store_api::issue_store_receipt_envelope`) stamps, and the same
+///   success-only rule `eliot_authority::effects` applies to a committed
+///   effect. `ReceiptEnvelope::validate()` accepts `Partial`, `Failure`,
+///   `Unknown` and `Cancelled` as internally well-formed, so a partial or
+///   unknown canonical outcome would otherwise be linked to the durable
+///   closure row and reported as a completed reconciliation.
+///
+/// A refusal here leaves the revocation saga's second phase unestablished, so
+/// the caller retains the pending canonical handoff and the record stays
+/// blocked. A possible commit can therefore never become a no-write, and a
+/// non-commit is never re-presented as this operation's recorded result.
 pub fn canonical_receipt_identity(
     receipt: &WriteReceipt,
 ) -> Result<ReceiptIdentity, CompositionError> {
     receipt.validate().map_err(|error| {
         identity_refused(format!("canonical write receipt is invalid: {error}"))
     })?;
+    if receipt.status != WriteReceiptStatus::Committed {
+        return Err(identity_refused(format!(
+            "canonical write receipt is not committed ({:?}); nothing was recorded under this \
+             operation identity",
+            receipt.status
+        )));
+    }
     let envelope = receipt.require_reconciliation_envelope().map_err(|error| {
         identity_refused(format!(
             "canonical write receipt has no exact reconciliation envelope: {error}"
@@ -257,6 +298,13 @@ pub fn canonical_receipt_identity(
         return Err(identity_refused(
             "canonical receipt envelope does not bind the durable write receipt".to_owned(),
         ));
+    }
+    if envelope.core.disposition.kind() != ReceiptDispositionKind::Success {
+        return Err(identity_refused(format!(
+            "canonical receipt envelope reports {:?}, not a committed outcome; a partial or \
+             unknown result is not a recorded revocation",
+            envelope.core.disposition.kind()
+        )));
     }
     Ok(envelope.identity.clone())
 }
