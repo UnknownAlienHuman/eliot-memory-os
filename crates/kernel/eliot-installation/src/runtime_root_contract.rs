@@ -503,14 +503,12 @@ impl RuntimeStateRoots {
                             field: "runtime_state_roots.user_data_root".to_owned(),
                             reason: error.to_string(),
                         })?;
-                let data_installations_root = PlatformHandle::new(joined_windows_path(
-                    data_root.as_str(),
-                    "installations",
-                ))
-                .map_err(|error| InstallationError::InvalidField {
-                    field: "runtime_state_roots.user_installations_root".to_owned(),
-                    reason: error.to_string(),
-                })?;
+                let data_installations_root =
+                    PlatformHandle::new(joined_windows_path(data_root.as_str(), "installations"))
+                        .map_err(|error| InstallationError::InvalidField {
+                        field: "runtime_state_roots.user_installations_root".to_owned(),
+                        reason: error.to_string(),
+                    })?;
                 let user_config_root =
                     PlatformHandle::new(joined_windows_path(profile_root.as_str(), "config"))
                         .map_err(|error| InstallationError::InvalidField {
@@ -723,10 +721,7 @@ impl RuntimeStateRoots {
             }
             InstallationProfile::PortableDev => {
                 let expected_installation = WindowsPathIdentity::parse_root(
-                    &joined_windows_path(
-                        self.profile_anchor_root.as_str(),
-                        ".eliot-dev\\state",
-                    ),
+                    &joined_windows_path(self.profile_anchor_root.as_str(), ".eliot-dev\\state"),
                     "runtime_state_roots.expected_portable_installation_root",
                 )?;
                 if !anchor.contains(&installation)
