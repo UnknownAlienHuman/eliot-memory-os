@@ -2127,6 +2127,33 @@ impl OwnerDeliveryIdentity {
         )?;
         Ok(())
     }
+
+    /// Builds the exact child-side lookup identity from this owner record.
+    /// This is used only during bounded recovery discovery; the owner marker
+    /// remains the source of every field and the directory remains a locator.
+    fn staged_identity(&self) -> Result<StagedDeliveryIdentity, MaterialError> {
+        self.validate()?;
+        Ok(StagedDeliveryIdentity {
+            claim_id: self.claim_id.clone(),
+            operation_id: self.operation_id.clone(),
+            generation: self.generation,
+            launch_nonce: self.launch_nonce.clone(),
+            grant_digest: self.grant_digest.clone(),
+            fence_generation: self.fence_generation,
+            artifact_digest: self.artifact_digest.clone(),
+            input_digest: self.input_digest.clone(),
+            admitted_at_unix_ms: self.admitted_at_unix_ms,
+            expires_at: self.expires_at,
+            authority_epoch_json: self.authority_epoch_json.clone(),
+            envelope_digest: hex_digest(&self.envelope_digest, "owner-delivery-envelope-digest")?,
+            host_artifact_digest: hex_digest(
+                &self.host_artifact_digest,
+                "owner-delivery-host-artifact-digest",
+            )?,
+            publication_incarnation: Some(self.publication_incarnation),
+            publication_revision: Some(self.publication_revision),
+        })
+    }
 }
 
 /// Owner publication state for one generation slot (#2786 steps 2/3/7):
@@ -2486,6 +2513,7 @@ fn delivery_slot_dir(
 }
 
 const OWNER_DISPOSITION_MAX_BYTES: usize = 32 * 1024;
+const MAX_OWNER_PUBLICATION_SCAN_ENTRIES: usize = 64;
 
 fn read_bounded_regular_file(
     path: &std::path::Path,
@@ -2661,6 +2689,93 @@ fn fail_ready_publication_for_material_gap_unlocked(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
         Err(error) => Err(MaterialError::Unreadable(error.kind().to_string())),
     }
+}
+
+/// Recovers the exact pre-claim publication when the fixed envelope itself
+/// is already missing at child entry. The bounded scan accepts only one
+/// owner-authored Ready slot whose disposition is still Ready or
+/// LaunchReserved; ambiguity or unreadable history fails closed. A Ready
+/// publication is marked Failed under the shared installation lock before
+/// the caller reports that no material was available.
+fn fail_missing_envelope_publication_unlocked(
+    install_dir: &std::path::Path,
+) -> Result<bool, MaterialError> {
+    let slots = install_dir.join(WASM_DELIVERY_SLOT_DIR_NAME);
+    let entries = match std::fs::read_dir(&slots) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(MaterialError::Unreadable(error.kind().to_string())),
+    };
+
+    let mut candidate: Option<StagedDeliveryIdentity> = None;
+    let mut scanned = 0_usize;
+    for entry in entries {
+        scanned += 1;
+        if scanned > MAX_OWNER_PUBLICATION_SCAN_ENTRIES {
+            return Err(MaterialError::Unreadable(
+                "delivery-publication-scan-limit".to_owned(),
+            ));
+        }
+        let entry = entry.map_err(|error| MaterialError::Unreadable(error.kind().to_string()))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| MaterialError::Unreadable(error.kind().to_string()))?;
+        if !file_type.is_dir() {
+            return Err(MaterialError::Malformed);
+        }
+
+        let marker_path = entry.path().join(WASM_DELIVERY_READY_FILE_NAME);
+        let marker_bytes =
+            match read_bounded_regular_file(&marker_path, OWNER_DISPOSITION_MAX_BYTES) {
+                Err(MaterialError::Missing) => continue,
+                Err(error) => return Err(error),
+                Ok(bytes) => bytes,
+            };
+        let publication: OwnerPublicationState =
+            serde_json::from_slice(&marker_bytes).map_err(|_| MaterialError::Malformed)?;
+        let OwnerPublicationState::Ready { identity } = publication else {
+            return Err(MaterialError::Malformed);
+        };
+        identity.validate()?;
+        let staged = identity.staged_identity()?;
+        if delivery_slot_dir(install_dir, &staged) != entry.path() {
+            return Err(MaterialError::Malformed);
+        }
+
+        // FAILED wins if a prior child committed failure but crashed before
+        // removing READY. Do not rewrite that already recoverable outcome.
+        match read_delivery_publication_unlocked(install_dir, &staged)? {
+            Some(OwnerPublicationState::Ready { identity: current }) if current == identity => {}
+            Some(OwnerPublicationState::Failed { .. }) => continue,
+            _ => return Err(MaterialError::DigestMismatch),
+        }
+
+        let disposition = read_owner_disposition_unlocked(install_dir, &staged)?;
+        if disposition.disposition.identity() != &identity
+            || disposition.disposition.request_commitment() != identity.envelope_digest.as_str()
+        {
+            return Err(MaterialError::DigestMismatch);
+        }
+        if !matches!(
+            &disposition.disposition,
+            OwnerDeliveryDisposition::Ready { .. }
+                | OwnerDeliveryDisposition::LaunchReserved { .. }
+        ) {
+            continue;
+        }
+
+        if candidate.is_some() {
+            return Err(MaterialError::Unreadable(
+                "ambiguous-ready-publication".to_owned(),
+            ));
+        }
+        candidate = Some(staged);
+    }
+
+    let Some(staged) = candidate else {
+        return Ok(false);
+    };
+    fail_ready_publication_for_material_gap_unlocked(install_dir, &staged, "fixed-material-missing")
 }
 
 fn read_owner_disposition_unlocked(
@@ -4165,28 +4280,120 @@ fn read_claimed_dispatch_material_unlocked(
 ) -> Result<Option<(DeliveryClaim, ValidatedDispatchMaterial)>, MaterialError> {
     let material_path = install_dir.join(WASM_HOST_MATERIAL_FILE_NAME);
     let envelope_bytes = match read_staged_bytes(&material_path) {
-        Err(MaterialError::Missing) => return Ok(None),
+        Err(MaterialError::Missing) => {
+            fail_missing_envelope_publication_unlocked(install_dir)?;
+            return Ok(None);
+        }
         Err(error) => return Err(error),
         Ok(bytes) => bytes,
     };
     let envelope_digest = Sha256Digest::of_bytes(&envelope_bytes);
     let mut input = parse_envelope(&envelope_bytes)?;
+    let staged_identity = staged_identity_from_input(&input, envelope_digest.clone())?;
     input.artifact_bytes =
-        read_staged_bytes(&install_dir.join(WASM_HOST_GUEST_ARTIFACT_FILE_NAME))?;
-    input.input_bytes = read_staged_bytes(&install_dir.join(WASM_HOST_GUEST_INPUT_FILE_NAME))?;
+        match read_staged_bytes(&install_dir.join(WASM_HOST_GUEST_ARTIFACT_FILE_NAME)) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                fail_ready_publication_for_material_gap_unlocked(
+                    install_dir,
+                    &staged_identity,
+                    fixed_material_gap_reason(&error),
+                )?;
+                return Err(error);
+            }
+        };
+    input.input_bytes = match read_staged_bytes(&install_dir.join(WASM_HOST_GUEST_INPUT_FILE_NAME))
+    {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            fail_ready_publication_for_material_gap_unlocked(
+                install_dir,
+                &staged_identity,
+                fixed_material_gap_reason(&error),
+            )?;
+            return Err(error);
+        }
+    };
     // Envelope re-confirm BEFORE binding: a replacement staged during the
     // payload reads aborts here, never executes — even when the payload
     // bytes are identical across generations. Any drift, disappearance,
     // or re-read fault is a torn set, never absence.
     match read_staged_bytes(&material_path) {
         Ok(current) if current == envelope_bytes => {}
-        _ => return Err(MaterialError::DigestMismatch),
+        Err(error) => {
+            fail_ready_publication_for_material_gap_unlocked(
+                install_dir,
+                &staged_identity,
+                fixed_material_gap_reason(&error),
+            )?;
+            return Err(error);
+        }
+        Ok(_) => {
+            let error = MaterialError::DigestMismatch;
+            fail_ready_publication_for_material_gap_unlocked(
+                install_dir,
+                &staged_identity,
+                fixed_material_gap_reason(&error),
+            )?;
+            return Err(error);
+        }
     }
-    let material = bind_dispatch_material(input)?;
+    let material = match bind_dispatch_material(input) {
+        Ok(material) => material,
+        Err(error) => {
+            fail_ready_publication_for_material_gap_unlocked(
+                install_dir,
+                &staged_identity,
+                fixed_material_gap_reason(&error),
+            )?;
+            return Err(error);
+        }
+    };
     Ok(Some((
         DeliveryClaim::from_material(&material, envelope_digest),
         material,
     )))
+}
+
+/// Extracts the exact claim fields from a parsed owner envelope before its
+/// payloads are opened. This temporary identity can only fail a matching
+/// owner publication; it cannot authorize a claim or guest execution.
+fn staged_identity_from_input(
+    input: &DispatchMaterialInput,
+    envelope_digest: Sha256Digest,
+) -> Result<StagedDeliveryIdentity, MaterialError> {
+    require_nonblank(&input.claim_id, "claim-id")?;
+    require_nonblank(&input.operation_id, "operation-id")?;
+    require_nonblank(&input.launch_nonce, "launch-nonce")?;
+    require_nonblank(&input.authority_epoch_json, "authority-epoch")?;
+    if input.generation == 0
+        || input.grant_fence_generation == 0
+        || input.admitted_at_unix_ms == 0
+        || input.grant_expires_at <= input.admitted_at_unix_ms
+    {
+        return Err(MaterialError::Malformed);
+    }
+    let grant_digest = hex_digest(&input.grant_digest, "grant-digest")?;
+    let artifact_digest = hex_digest(&input.ceilings.artifact_digest, "artifact-digest")?;
+    let input_digest = hex_digest(&input.ceilings.input_digest, "input-digest")?;
+    let host_artifact_digest = hex_digest(&input.host_artifact_digest, "host-artifact-digest")?;
+    Ok(StagedDeliveryIdentity {
+        claim_id: input.claim_id.clone(),
+        operation_id: input.operation_id.clone(),
+        generation: input.generation,
+        launch_nonce: input.launch_nonce.clone(),
+        grant_digest: grant_digest.as_str().to_owned(),
+        fence_generation: input.grant_fence_generation,
+        artifact_digest: artifact_digest.as_str().to_owned(),
+        input_digest: input_digest.as_str().to_owned(),
+        admitted_at_unix_ms: input.admitted_at_unix_ms,
+        expires_at: input.grant_expires_at,
+        authority_epoch_json: input.authority_epoch_json.clone(),
+        envelope_digest,
+        host_artifact_digest,
+        publication_incarnation: None,
+        publication_revision: None,
+    })
 }
 
 /// Claim-first read from the executable directory (`current_exe`, never

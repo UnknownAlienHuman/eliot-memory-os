@@ -5013,15 +5013,14 @@ pub enum OrdinaryDriveError {
     Loop(LoopError),
     /// The bounded request loop failed after producing an observation report.
     /// The report crosses the ordinary-driver boundary intact so the process
-    /// caller can recover the exact sequence even if stdout delivery and the
+    /// caller can inspect the exact sequence even if stdout delivery and the
     /// claim-bound result write both failed. This carries the existing report;
     /// it does not create another owner record or acknowledge the delivery.
     LoopFailed(RequestLoopReport),
 }
 
 impl OrdinaryDriveError {
-    /// Returns the full process-level report when a request-loop failure
-    /// crosses the ordinary-driver boundary.
+    /// Returns the full report attached to a failed ordinary request loop.
     #[must_use]
     pub fn request_loop_report(&self) -> Option<&RequestLoopReport> {
         match self {
