@@ -479,8 +479,7 @@ impl DaemonComposition {
             .map_err(MaintenanceDecisionCommitError::Daemon)?;
         // The decision must answer this exact retained trigger: identical
         // identity and scope. Changed content conflicts; it never re-binds.
-        if decision.trigger_id != record.trigger_id
-            || decision.scope_ref != record.scope.reference
+        if decision.trigger_id != record.trigger_id || decision.scope_ref != record.scope.reference
         {
             return Err(MaintenanceDecisionCommitError::Protocol(
                 ProtocolError::ReplayConflict,
@@ -499,20 +498,20 @@ impl DaemonComposition {
         // notification route and proves the canonical commit receipt in hand;
         // `Ok(None)` (automation off, record already standing) admits no
         // intent and therefore binds no receipt.
-        let committed = emit_blocked_automation_notification(
-            kernel,
-            live_fence,
-            &decision,
-            &evidence,
-        )
-        .await
-        .map_err(|error| match error {
-            NotificationEmitError::Store(error) => MaintenanceDecisionCommitError::Store(error),
-            NotificationEmitError::Admission(error) => {
-                MaintenanceDecisionCommitError::Admission(error)
-            }
-            NotificationEmitError::Kernel(error) => MaintenanceDecisionCommitError::Kernel(error),
-        })?;
+        let committed =
+            emit_blocked_automation_notification(kernel, live_fence, &decision, &evidence)
+                .await
+                .map_err(|error| match error {
+                    NotificationEmitError::Store(error) => {
+                        MaintenanceDecisionCommitError::Store(error)
+                    }
+                    NotificationEmitError::Admission(error) => {
+                        MaintenanceDecisionCommitError::Admission(error)
+                    }
+                    NotificationEmitError::Kernel(error) => {
+                        MaintenanceDecisionCommitError::Kernel(error)
+                    }
+                })?;
         let Some(NotificationStateEmit::Committed {
             notification_id,
             operation_id,
@@ -521,12 +520,43 @@ impl DaemonComposition {
         else {
             return Ok(None);
         };
+        Self::bind_committed_decision_receipt(
+            kernel,
+            record,
+            DecisionReceiptBindings {
+                claim_revision: claim.revision,
+                scope_ref: decision.scope_ref.clone(),
+                job_ref,
+                policy_revision: policy_revision(&evidence.policy),
+                notification_id,
+            },
+            operation_id,
+        )
+        .await
+    }
+
+    /// Binds the canonical commit receipt for an admitted downstream intent.
+    ///
+    /// The committed intent identity is looked up through the owning read
+    /// path rather than trusted from the request. Absence is the ambiguous
+    /// case — the commit may have happened across an outage boundary — so
+    /// this returns open instead of proof either way.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaintenanceDecisionCommitError`] for an unbound identity, a
+    /// refused or uncommitted receipt, or an unserializable receipt.
+    async fn bind_committed_decision_receipt(
+        kernel: &Arc<DaemonKernelClient>,
+        record: &MaintenanceTriggerRecord,
+        bindings: DecisionReceiptBindings,
+        operation_id: String,
+    ) -> Result<Option<MaintenanceTriggerDecisionReceipt>, MaintenanceDecisionCommitError> {
         // The exact canonical identity of the committed intent, looked up
         // through the owning read path rather than trusted from the request.
         // Absence here is the ambiguous case: the commit may have happened
         // across an outage boundary, so this returns open instead of proof.
-        let operation_id =
-            OperationId::new(operation_id).map_err(StoreError::Foundation)?;
+        let operation_id = OperationId::new(operation_id).map_err(StoreError::Foundation)?;
         let Some(receipt) = kernel.receipt(operation_id).await? else {
             return Ok(None);
         };
@@ -545,12 +575,12 @@ impl DaemonComposition {
             wire_version: MAINTENANCE_TRIGGER_DECISION_RECEIPT_WIRE_VERSION,
             trigger_id: record.trigger_id.clone(),
             operation_hash: record.operation_hash.clone(),
-            revision: claim.revision,
+            revision: bindings.claim_revision,
             evaluation_revision: format!("{CONTRACT_NAME}:{CONTRACT_VERSION}"),
-            policy_revision: policy_revision(&evidence.policy),
-            scope_ref: decision.scope_ref.clone(),
-            job_ref,
-            recommendation_ref: Some(notification_id),
+            policy_revision: bindings.policy_revision,
+            scope_ref: bindings.scope_ref,
+            job_ref: bindings.job_ref,
+            recommendation_ref: Some(bindings.notification_id),
             wake_ref: None,
             canonical_receipt_ref: receipt.operation_id.to_string(),
             receipt_digest: sha256_hex(&receipt_bytes),
@@ -558,6 +588,23 @@ impl DaemonComposition {
         decision_receipt.validate()?;
         Ok(Some(decision_receipt))
     }
+}
+
+/// Receipt bindings carried into [`DaemonComposition::bind_committed_decision_receipt`].
+///
+/// Bundled so the helper stays within the owner argument budget; every field
+/// is the exact value the receipt validator checks.
+struct DecisionReceiptBindings {
+    /// Claim row revision the decision commits under.
+    claim_revision: u64,
+    /// Affected scope the decision answers.
+    scope_ref: String,
+    /// Already-durable job reference, if the decision named one.
+    job_ref: Option<String>,
+    /// Policy revision resolved at decision time.
+    policy_revision: String,
+    /// Committed notification intent identity.
+    notification_id: String,
 }
 
 /// Renders the opaque policy revision resolved at decision time.
