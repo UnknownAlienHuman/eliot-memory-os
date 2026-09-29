@@ -77,6 +77,53 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-cargo-profile-mergecompile-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('rust-toolchain.toml', 'scripts/verify.ps1', '.github/workflows/ci.yml') }}-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'bins/**/Cargo.toml') }}-${{ github.event_name == 'workflow_dispatch' && 'manual' || github.event_name }}-${{ github.event.pull_request.head.repo.fork && 'untrusted-fork' || 'trusted' }}
           lookup-only: ${{ github.event.pull_request.head.repo.fork == true }}
 
+      # Clean-runner dependency-policy preparation (issues #3004/#1229/#1225):
+      # invoke #1229's input preparation on the clean runner before the
+      # read-only offline profile. The project-local Surreal provisioner
+      # materializes the approved evidence; locked prefetch warms exactly the
+      # pinned dependencies. This step records PREPARE_* outcomes and never
+      # writes locks, receipts, or verdicts: missing or substituted inputs
+      # fail the MergeCompile gate below with its own findings. Nothing here
+      # converts a failed policy into PASS or fabricates evidence.
+      - name: Prepare dependency-policy inputs
+        shell: pwsh
+        run: |
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '### Dependency-policy input preparation'
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '- Owner interfaces only: scripts/provision-surrealdb-release.py plus locked cargo prefetch; no lock/receipt writes, no verdict'
+          python scripts/provision-surrealdb-release.py --root .
+          $surrealPrepareExit = $LASTEXITCODE
+          Write-Host "PREPARE_SURREAL_PROVISIONER: exit=$surrealPrepareExit"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Surreal provisioner exit=$surrealPrepareExit (nonzero keeps the offline gate failed; the gate owns the verdict)"
+          cargo fetch --locked
+          $rootFetchExit = $LASTEXITCODE
+          Write-Host "PREPARE_ROOT_FETCH_LOCKED: exit=$rootFetchExit"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Root cargo fetch --locked exit=$rootFetchExit"
+          $standaloneList = @(& python scripts/verify-standalone-crates.py --root . --list 2>&1)
+          $standaloneListExit = $LASTEXITCODE
+          $standaloneCount = @($standaloneList | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }).Count
+          Write-Host "PREPARE_STANDALONE_DISCOVERY: exit=$standaloneListExit count=$standaloneCount"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Standalone discovery exit=$standaloneListExit count=$standaloneCount (prefetch only where an accepted adjacent lock exists)"
+          foreach ($standaloneLine in $standaloneList) {
+            $relativeDirectory = ([string]$standaloneLine).Trim()
+            if ([string]::IsNullOrWhiteSpace($relativeDirectory)) { continue }
+            if ($relativeDirectory.StartsWith('exclude: ', [StringComparison]::Ordinal)) {
+              Write-Host "PREPARE_STANDALONE_SKIPPED: $relativeDirectory reason=excluded leg is compiled by the gate from workspace discovery"
+              Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Standalone skipped: $relativeDirectory (excluded leg; gate-owned)"
+              continue
+            }
+            $manifestPath = "$relativeDirectory/Cargo.toml"
+            $lockPath = "$relativeDirectory/Cargo.lock"
+            if (-not (Test-Path -LiteralPath $lockPath -PathType Leaf)) {
+              Write-Host "PREPARE_STANDALONE_SKIPPED: $relativeDirectory reason=no accepted adjacent lock; standalone lock contract owned by #1229; offline gate reports source_only_incomplete"
+              Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Standalone skipped: $relativeDirectory (no accepted adjacent lock; #1229-owned)"
+              continue
+            }
+            cargo fetch --locked --manifest-path $manifestPath
+            $standaloneFetchExit = $LASTEXITCODE
+            Write-Host "PREPARE_STANDALONE_FETCH: $relativeDirectory exit=$standaloneFetchExit"
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Standalone prefetch: $relativeDirectory exit=$standaloneFetchExit"
+          }
+
       - name: Bind integration candidate identity
         shell: pwsh
         run: |
@@ -157,6 +204,9 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "### Merge Compile Run Manifest"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Repository: $env:GITHUB_REPOSITORY event=$env:GITHUB_EVENT_NAME ref=$env:GITHUB_REF Source SHA=$manifestSha"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Runner: os=$env:RUNNER_OS image=$env:ImageOS arch=$env:RUNNER_ARCH"
+          if ($env:GITHUB_EVENT_NAME -eq 'push') {
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '- Post-merge push run: diagnostic only for the exact landed SHA; never prevention for an already completed merge'
+          }
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Toolchain: $rustcIdentity / $cargoIdentity / dotnet $dotnetIdentity / $pythonIdentity"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Inputs: Cargo.lock=$lockHash rust-toolchain=$toolHash ci.yml=$ciHash verify.ps1=$profileHash"
           $gwfJson = Join-Path $env:RUNNER_TEMP 'gwf-actions.json'
