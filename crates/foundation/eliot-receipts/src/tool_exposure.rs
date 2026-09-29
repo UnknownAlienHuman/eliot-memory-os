@@ -241,12 +241,18 @@ pub enum LoopSignal {
     NoProgress,
 }
 
-/// Detects a materially repeated call without a new expected delta.
+/// Compares caller-declared expected-delta text for two otherwise identical calls.
 ///
 /// Returns a [`LoopSignal`] when tool definition, route fingerprint, and
-/// inputs digest are identical and the current call carries no new expected
-/// delta. A current call that introduces a fresh expected delta returns
-/// `None` and is treated as potential progress.
+/// inputs digest are identical and the current call carries no new
+/// expected-delta *text*. A current call whose delta text differs returns
+/// `None`, but that is undecided — not progress. A reworded delta alone is
+/// not new evidence, state transition, or effect, and this shape-only
+/// comparison observes none of those dimensions. Repeat detection that must
+/// treat a reworded delta as no-progress belongs to
+/// [`detect_repeat_without_progress_with_evidence`], which joins the actual
+/// source revision, pagination/poll cursor, and prior outcome before any
+/// delta counts as potential progress.
 #[must_use]
 pub fn detect_repeat_without_progress(
     previous: &ToolCallRequest,
@@ -273,6 +279,122 @@ pub fn detect_repeat_without_progress(
         }
         (Some(_), None) => Some(LoopSignal::NoProgress),
         (None | Some(_), Some(_)) => None,
+    }
+}
+
+/// Owner-observed evidence joined to one tool-call attempt for repeat detection.
+///
+/// The joined dimensions are the step-5 identity join minus the
+/// caller-declared delta already carried by [`ToolCallRequest`]: the actual
+/// source revision the attempt read, the pagination/poll cursor it consumed,
+/// and the prior attempt outcome it reconciles. `None` in any field means
+/// that dimension was unobserved for the attempt — never new evidence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttemptEvidence {
+    /// Actual source revision observed by the attempt, when known.
+    pub source_revision: Option<String>,
+    /// Pagination or poll cursor consumed by the attempt, when known.
+    pub poll_cursor: Option<String>,
+    /// Prior attempt outcome this attempt reconciles, when known.
+    pub prior_outcome: Option<String>,
+}
+
+impl AttemptEvidence {
+    /// Validates observed evidence text without executing anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an observed dimension is blank or carries
+    /// control characters.
+    pub fn validate(&self) -> Result<(), ToolExposureError> {
+        if let Some(revision) = &self.source_revision {
+            text(revision, "evidence.source_revision")?;
+        }
+        if let Some(cursor) = &self.poll_cursor {
+            text(cursor, "evidence.poll_cursor")?;
+        }
+        if let Some(outcome) = &self.prior_outcome {
+            text(outcome, "evidence.prior_outcome")?;
+        }
+        Ok(())
+    }
+}
+
+/// Detects a materially repeated call without new evidence or state.
+///
+/// The identity join comes first: tool definition, route fingerprint, and
+/// inputs digest must be identical or the calls are not repeats and this
+/// returns `None`. A repeat then emits a bounded [`LoopSignal`] unless the
+/// current attempt carries genuinely new evidence — an observed source
+/// revision, poll cursor, or prior outcome the previous attempt did not
+/// carry.
+///
+/// A reworded `expected_delta` alone is not progress: when the joined
+/// evidence dimensions are identical or unobserved on both sides, a changed
+/// delta string yields `Some(LoopSignal::NoProgress)`. Only advanced
+/// evidence returns `None`, and even then only as *potential* progress —
+/// each stage is reported separately, never inferred.
+///
+/// Exact-idempotent replay, required unknown-effect reconciliation, and
+/// admitted polling keep their own semantics at their owners; this signal is
+/// evidence for the caller to reconcile, not permission to execute again or
+/// to suppress a legitimate retry.
+#[must_use]
+pub fn detect_repeat_without_progress_with_evidence(
+    previous: &ToolCallRequest,
+    previous_evidence: &AttemptEvidence,
+    current: &ToolCallRequest,
+    current_evidence: &AttemptEvidence,
+) -> Option<LoopSignal> {
+    if previous.tool_definition != current.tool_definition
+        || previous.route_fingerprint != current.route_fingerprint
+        || previous.inputs_digest != current.inputs_digest
+    {
+        return None;
+    }
+    if evidence_advanced(previous_evidence, current_evidence) {
+        return None;
+    }
+    let previous_delta = previous
+        .intent
+        .as_ref()
+        .map(|intent| intent.expected_delta.as_str());
+    let current_delta = current
+        .intent
+        .as_ref()
+        .map(|intent| intent.expected_delta.as_str());
+    match (previous_delta, current_delta) {
+        (None, None) => Some(LoopSignal::Loop),
+        (Some(previous_text), Some(current_text)) if previous_text == current_text => {
+            Some(LoopSignal::Loop)
+        }
+        _ => Some(LoopSignal::NoProgress),
+    }
+}
+
+/// Returns whether the current attempt observed evidence the previous attempt
+/// did not carry: a new source revision, poll cursor, or prior outcome.
+fn evidence_advanced(previous: &AttemptEvidence, current: &AttemptEvidence) -> bool {
+    dimension_advanced(
+        previous.source_revision.as_ref(),
+        current.source_revision.as_ref(),
+    ) || dimension_advanced(previous.poll_cursor.as_ref(), current.poll_cursor.as_ref())
+        || dimension_advanced(
+            previous.prior_outcome.as_ref(),
+            current.prior_outcome.as_ref(),
+        )
+}
+
+/// One joined dimension counts as advanced only when the current attempt
+/// observed a value the previous attempt did not carry. An unobserved
+/// current dimension is never new evidence, even against an unobserved
+/// previous one.
+fn dimension_advanced(previous: Option<&String>, current: Option<&String>) -> bool {
+    match (previous, current) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(previous_value), Some(current_value)) => previous_value != current_value,
     }
 }
 

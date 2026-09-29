@@ -14,6 +14,8 @@
 use eliot_contracts::sha256_hex;
 use eliot_receipts::{LoopSignal, ToolCallClass, ToolCallIntent, ToolCallRequest};
 
+use super::host_request_route::LocalReadAdmission;
+
 /// Route fingerprint for tool calls admitted through the local-read boundary.
 fn route_fingerprint(envelope: &eliot_protocol::HostRequestEnvelope) -> String {
     let session = envelope
@@ -27,21 +29,19 @@ fn route_fingerprint(envelope: &eliot_protocol::HostRequestEnvelope) -> String {
     )
 }
 
-/// Derives the tool call class from the tool name.
-fn call_class(name: &str) -> Option<ToolCallClass> {
-    match name {
-        "eliot.query" => Some(ToolCallClass::BroadSearch),
-        "eliot.packet" => Some(ToolCallClass::EffectCapable),
-        name if is_expensive_skill_tool(name) => Some(ToolCallClass::Expensive),
-        _ => None,
+/// Derives the tool call class from the accepted Kernel admission.
+///
+/// Tool names, descriptions, and shell substrings never define call
+/// semantics: the class comes from the admitted method. The bounded evidence
+/// query is broad-search, an exact Skill lifecycle tool is expensive, and a
+/// task-bound campaign packet is effect-capable. A name outside the admitted
+/// set never reaches classification; admission fails closed first.
+pub(crate) fn call_class(admission: &LocalReadAdmission) -> ToolCallClass {
+    match admission {
+        LocalReadAdmission::Query(_) => ToolCallClass::BroadSearch,
+        LocalReadAdmission::Skill => ToolCallClass::Expensive,
+        LocalReadAdmission::CampaignPacket { .. } => ToolCallClass::EffectCapable,
     }
-}
-
-fn is_expensive_skill_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "skill.inject" | "skill.display" | "skill.activate" | "skill.execute"
-    )
 }
 
 /// Computes the SHA-256 digest over the canonical JSON form of the tool.
@@ -50,13 +50,18 @@ fn inputs_digest(tool: &serde_json::Value) -> Result<String, serde_json::Error> 
     Ok(sha256_hex(&bytes))
 }
 
-/// Builds a [`ToolCallRequest`] from the admitted envelope and tool.
+/// Builds a [`ToolCallRequest`] from the admitted envelope, tool, and accepted admission.
+///
+/// The cost/effect class derives from `admission` — the accepted method —
+/// never from the caller-supplied name string. The versioned tool definition
+/// identity still names the invoked tool; classification does not.
 pub(crate) fn build_tool_call_request(
     envelope: &eliot_protocol::HostRequestEnvelope,
     tool: &serde_json::Value,
+    admission: &LocalReadAdmission,
 ) -> Option<ToolCallRequest> {
     let name = tool.as_object()?.get("name")?.as_str()?.to_owned();
-    let class = call_class(&name)?;
+    let class = call_class(admission);
     let arguments = tool.as_object()?.get("arguments")?.as_object()?;
     let intent = build_tool_intent(arguments)?;
     let digest = inputs_digest(tool).ok()?;
@@ -121,9 +126,14 @@ pub(crate) fn authorize_pre_dispatch(
     eliot_receipts::authorize_pre_dispatch(request)
 }
 
-/// Returns whether the tool class requires an intent before dispatch.
-pub(crate) fn requires_intent(name: &str) -> bool {
-    call_class(name).is_some_and(eliot_receipts::ToolCallClass::requires_intent)
+/// Returns whether the accepted admission requires an intent before dispatch.
+///
+/// The answer reads off the admission-derived class, so cheap exact reads
+/// stay exempt by construction while every currently admitted method —
+/// broad-search query, expensive Skill lifecycle tool, effect-capable
+/// campaign packet — carries an intent.
+pub(crate) fn requires_intent(admission: &LocalReadAdmission) -> bool {
+    call_class(admission).requires_intent()
 }
 
 /// Reports a staging-time loop/no-progress signal for a materially repeated call.

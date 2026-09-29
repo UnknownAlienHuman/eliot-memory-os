@@ -7832,13 +7832,8 @@ pub(crate) fn local_read_admission_from_tool(
         .and_then(serde_json::Value::as_str)
         .ok_or(TransportError::SessionFenced)?;
     // I7.24: expensive-class calls require a valid intent before dispatch.
-    if super::tool_exposure::requires_intent(name) {
-        let request = super::tool_exposure::build_tool_call_request(envelope, tool)
-            .ok_or(TransportError::SessionFenced)?;
-        super::tool_exposure::authorize_pre_dispatch(&request)
-            .map_err(|_| TransportError::SessionFenced)?;
-    }
-    match name {
+    // The call class derives from the accepted admission, never the tool name.
+    let admission = match name {
         "eliot.packet" => campaign_packet_admission(envelope, tool),
         "eliot.query" => local_read_selectors_from_tool(envelope, tool)
             .map_err(|_| TransportError::SessionFenced)?
@@ -7848,7 +7843,14 @@ pub(crate) fn local_read_admission_from_tool(
             Ok(LocalReadAdmission::Skill)
         }
         _ => Err(TransportError::SessionFenced),
+    }?;
+    if super::tool_exposure::requires_intent(&admission) {
+        let request = super::tool_exposure::build_tool_call_request(envelope, tool, &admission)
+            .ok_or(TransportError::SessionFenced)?;
+        super::tool_exposure::authorize_pre_dispatch(&request)
+            .map_err(|_| TransportError::SessionFenced)?;
     }
+    Ok(admission)
 }
 
 /// Validates one local-read admission before any store read (no IO).
