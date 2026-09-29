@@ -22,7 +22,12 @@ logical ID and must not share plaintext credentials with another instance.
 
 ## Read-only verification
 
-Run these commands with the installed Governor and its active configuration:
+Run these commands with the installed Governor and its active configuration.
+The `credentials`, `daemon health`, and `security` command groups below are
+still served by the retained legacy facade binary (`crates/eliot-app`, not
+the production Governor composition root `bins/eliotd`). They move to the
+current operator CLI (`bins/eliot` + `crates/surfaces/eliot-cli`) under #18
+W11; this block is removed with that migration:
 
 ```powershell
 eliot-governor --config $env:LOCALAPPDATA\Eliot\config\governor.toml credentials validate

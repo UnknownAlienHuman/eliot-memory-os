@@ -1169,7 +1169,10 @@ pub fn daemon_error_owner(error: &DaemonError) -> OwningComponent {
         DaemonError::Composition(_)
         | DaemonError::Finish(_)
         | DaemonError::Maintenance(_)
-        | DaemonError::TaskBinding(_) => OwningComponent::Governor,
+        | DaemonError::TaskBinding(_)
+        // Issue #18: a diverged cell declaration refuses composition like a
+        // composition failure, so it reports to the same Governor owner.
+        | DaemonError::CellRegistry(_) => OwningComponent::Governor,
         // Issue #1115: a typed v2 receiver whose activation deadline elapsed is
         // a kernel lifecycle failure, so it reports with the kernel owner
         // instead of being folded into the Governor admission owner above.
@@ -1518,6 +1521,7 @@ impl ErrorRecord {
             // record carries the exact code the admission edge rejected with
             // and never a reworded or narrowed one.
             DaemonError::TaskBinding(_) => ("task-binding", error.to_string()),
+            DaemonError::CellRegistry(_) => ("cell-registry", error.to_string()),
         };
         Self::of(owner, code, &detail)
     }
