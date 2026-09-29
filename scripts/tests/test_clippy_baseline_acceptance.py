@@ -590,7 +590,12 @@ class ClippyBaselineAcceptance(unittest.TestCase):
         cls.rustc_version = rustc_v.strip()
         cls.clippy_version = clippy_v.strip()
         cls.head = git("rev-parse", "HEAD").strip()
-        cls.base = git("rev-parse", "origin/main").strip()
+        # The comparison base is the merge-base with the authority ref, not the
+        # authority ref itself: origin/main advances independently of this
+        # branch, so a raw `origin/main..HEAD` would attribute main's new
+        # commits to this branch's delta.
+        cls.base = git("merge-base", "origin/main", "HEAD").strip()
+        cls.origin_main = git("rev-parse", "origin/main").strip()
         cls.branch = git("rev-parse", "--abbrev-ref", "HEAD").strip()
         cls.lock_sha = hashlib.sha256((REPO_ROOT / "Cargo.lock").read_bytes()).hexdigest()
         cls.clippy_toml_sha = hashlib.sha256((REPO_ROOT / "clippy.toml").read_bytes()).hexdigest()
@@ -975,6 +980,15 @@ class ClippyBaselineAcceptance(unittest.TestCase):
         self.assertIn("clippy", self.clippy_version)
         self.assertRegex(self.head, r"^[0-9a-f]{40}$")
         self.assertRegex(self.base, r"^[0-9a-f]{40}$")
+        self.assertRegex(self.origin_main, r"^[0-9a-f]{40}$")
+        subprocess.run(
+            ["git", "merge-base", "--is-ancestor", self.base, "HEAD"],
+            cwd=REPO_ROOT, check=True, capture_output=True,
+        )
+        self.assertEqual(
+            self.base, git("merge-base", "origin/main", "HEAD").strip(),
+            "the comparison base is recorded from the current merge-base, not a moving ref",
+        )
         self.assertEqual(
             len(self.lock_sha), 64, "Cargo.lock identity is recorded as a SHA-256 over exact bytes"
         )
