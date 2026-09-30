@@ -18,7 +18,9 @@ use eliot_store_api::{
     verify_canonical_request_hash, verify_ordering_scope_binding,
 };
 
-use super::{FenceRecord, Idempotency, schema_contract::validate_fence_record, take_optional, take_vec};
+use super::{
+    FenceRecord, Idempotency, schema_contract::validate_fence_record, take_optional, take_vec,
+};
 
 /// Reads the canonical allocation cursor and its predecessor in one database
 /// read transaction, then derives the only causal projection the next apply
@@ -39,11 +41,8 @@ pub(super) async fn read_causal_allocation(
     let errors = response.take_errors();
     if !errors.is_empty() {
         if errors.iter().all(|error| client::is_absent_table(error)) {
-            let projection = CanonicalCausalProjection::from_store_readback(
-                expected_state_fence,
-                1,
-                None,
-            )?;
+            let projection =
+                CanonicalCausalProjection::from_store_readback(expected_state_fence, 1, None)?;
             return Ok((None, projection));
         }
         return Err(AdapterError::PartialOutcome);
@@ -162,9 +161,11 @@ pub(super) async fn read_receipt_by_operation(
     config: &SurrealAdapterConfig,
     operation_id: &OperationId,
 ) -> Result<Option<WriteReceipt>, AdapterError> {
-    Ok(read_receipt_with_causal_by_operation(db, config, operation_id)
-        .await?
-        .map(|(receipt, _)| receipt))
+    Ok(
+        read_receipt_with_causal_by_operation(db, config, operation_id)
+            .await?
+            .map(|(receipt, _)| receipt),
+    )
 }
 
 pub(super) async fn read_receipt_with_causal_by_operation(

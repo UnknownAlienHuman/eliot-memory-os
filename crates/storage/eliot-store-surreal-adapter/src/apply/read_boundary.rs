@@ -1188,8 +1188,11 @@ fn evidence_pack_payload(
     // receipt by operation_index.
     let mut ordered: Vec<&EvidenceReceiptRow> = rows.iter().collect();
     ordered.sort_by_key(|row| row.commit_sequence.unwrap_or(0));
-    let mut indexed: Vec<(u64, &EvidenceRecordRow, Option<eliot_store_api::TaskBinding>)> =
-        Vec::new();
+    let mut indexed: Vec<(
+        u64,
+        &EvidenceRecordRow,
+        Option<eliot_store_api::TaskBinding>,
+    )> = Vec::new();
     let mut operation_base: u64 = 0;
     for row in ordered {
         let mut records: Vec<&EvidenceRecordRow> = row
@@ -1215,11 +1218,7 @@ fn evidence_pack_payload(
             if binding.scope_id.as_str() == scope_id.as_str() {
                 (
                     true,
-                    receipt
-                        .require_reconciliation_envelope()?
-                        .core
-                        .task
-                        .clone(),
+                    receipt.require_reconciliation_envelope()?.core.task.clone(),
                 )
             } else {
                 (false, None)
@@ -1236,7 +1235,11 @@ fn evidence_pack_payload(
             operation_base.saturating_add(row.named_operation_count.unwrap_or(0) as u64);
     }
     // Exact subject match only — never substring, never a default.
-    let matched: Vec<(u64, &EvidenceRecordRow, Option<eliot_store_api::TaskBinding>)> = indexed
+    let matched: Vec<(
+        u64,
+        &EvidenceRecordRow,
+        Option<eliot_store_api::TaskBinding>,
+    )> = indexed
         .into_iter()
         .filter(|(_, record, _)| record.subject == subject)
         .collect();

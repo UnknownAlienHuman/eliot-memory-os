@@ -434,7 +434,7 @@ impl SurrealStoreAdapter {
     /// Inert-by-default guarantee: while disarmed, the attempt loop performs
     /// one uncontended `std` mutex lock plus an `is_none` check and returns
     /// without awaiting, allocating, logging, touching the provider, or
-    /// altering the error taxonomy — the canonical transaction path is
+    /// altering the error taxonomy â€” the canonical transaction path is
     /// byte-identical to the unhooked flow. The mutex is never held across an
     /// await and never contended in production, so disarmed writers neither
     /// block nor serialize on it.
@@ -590,7 +590,7 @@ impl SurrealStoreAdapter {
 
     /// Reads the exact committed receipt together with causal facts rebuilt
     /// from the canonical receipt row and its sequence-selected predecessor.
-    /// The binding is independently reread from SurrealDB and never copied
+    /// The binding is independently reread from `SurrealDB` and never copied
     /// from the returned receipt envelope.
     pub async fn receipt_with_causal(
         &self,
