@@ -14,12 +14,19 @@ use eliot_context_contracts::{
     MAX_SET_OMISSIONS, OmissionRecord, SafetyProjection, TaskProjection,
 };
 use eliot_contracts::fences_match_exact;
-use eliot_store_api::NamedReadOperation;
+use eliot_agent_api::RouteFingerprint;
+use eliot_dreamer_failure::NegativeMemoryDisposition;
+use eliot_read::{DeclaredResultSelector, ReadCoverage, ReadIdentity};
+use eliot_store_api::{NamedReadOperation, NamedReadRequest, ReadConsistency, ScopeRevisionView};
 use eliot_workscope::{ScopeBindingDisposition, WorkScopeBindingSnapshot};
 use serde_json::Value;
 
 use crate::canonical_projections::GovernorProjectionSet;
-use crate::context_inputs::{RoleAcquisition, SevenRoleInputs};
+use crate::context_inputs::{
+    ContextReconstructionRequest, RoleAcquisition, RetainedCapabilityEvidenceRecord,
+    SevenRoleInputs,
+};
+use crate::{CapabilityRegistry, RouteScopeFingerprint};
 
 /// Original owner values supplied to the projection join.
 #[derive(Clone, Copy, Debug)]
@@ -32,8 +39,16 @@ pub struct OrientationProjectionOwnerInput<'a> {
     pub work_scope: &'a WorkScopeBindingSnapshot,
     /// Existing seven-role payloads and retained read identities.
     pub role_inputs: &'a SevenRoleInputs,
+    /// Exact original request used to acquire those seven roles.
+    pub context_request: &'a ContextReconstructionRequest,
     /// Original owner-retained omission records; `None` means unavailable.
     pub omissions: Option<&'a [OmissionRecord]>,
+    /// Full original execution-observed physical route from the W3 owner.
+    pub original_route: Option<&'a RouteFingerprint>,
+    /// Current complete capability scope retained by the route admission owner.
+    pub current_route_scope: Option<&'a RouteScopeFingerprint>,
+    /// Current owner-supplied evaluation instant used by capability admission.
+    pub capability_now: Option<u64>,
 }
 
 /// Per-member completion retained when the all-members set is unavailable.
@@ -76,8 +91,19 @@ pub struct OrientationProjectionOwnerOutput<'a> {
     pub governor: &'a GovernorProjectionSet,
     /// Original seven-role states, payloads, heads, and read identities.
     pub role_inputs: &'a SevenRoleInputs,
+    /// Exact source snapshot observed before role acquisition; the retained
+    /// after-view is equal when the join accepts this lineage.
+    pub source_snapshot: &'a ScopeRevisionView,
+    /// Exact original request used to acquire those seven roles.
+    pub context_request: &'a ContextReconstructionRequest,
     /// Original retained omission records or explicit source absence.
     pub omissions: Option<&'a [OmissionRecord]>,
+    /// Full original execution-observed physical route from the W3 owner.
+    pub original_route: Option<&'a RouteFingerprint>,
+    /// Current complete capability scope retained by the route admission owner.
+    pub current_route_scope: Option<&'a RouteScopeFingerprint>,
+    /// Current owner-supplied evaluation instant used by capability admission.
+    pub capability_now: Option<u64>,
 }
 
 struct ProjectionParts {
@@ -102,12 +128,12 @@ pub fn bind_orientation_projections<'a>(
         continuity: ProjectionState::Missing,
         safety: role_disposition(
             &input.role_inputs.negative_memory,
-            NamedReadOperation::GetUnderstandingProjectionInputs,
+            NamedReadOperation::GetLearningRecordRange,
             input,
         ),
         affordance: role_disposition(
             &input.role_inputs.affordances,
-            NamedReadOperation::GetCapabilityEvidenceState,
+            NamedReadOperation::GetCapabilityEvidenceRecordRange,
             input,
         ),
         omissions: omission_disposition(input.omissions, input.binding),
@@ -133,26 +159,13 @@ pub fn bind_orientation_projections<'a>(
 
     let task_projection = task_projection(input, &mut members.task);
     let continuity_projection = continuity_projection(input, &mut members.continuity);
-
-    // Governor safety is retained from its observation-journal composer, but
-    // the seven-role read does not carry the exact journal identities that
-    // produced those triggers. Preserve it as unknown until that owner receipt
-    // is part of the read closure.
-    if is_complete(&members.safety) {
-        members.safety = ProjectionState::Unknown {
-            reason: "negative-memory owner record identities are absent from the retained read".to_owned(),
-        };
-    }
-    if is_complete(&members.affordance) {
-        members.affordance = ProjectionState::Unknown {
-            reason: "scope and instance identities do not establish allowed capabilities".to_owned(),
-        };
-    }
+    let safety_projection = safety_projection(input, &mut members.safety);
+    let affordance_projection = affordance_projection(input, &mut members.affordance);
     let parts = ProjectionParts {
         task: task_projection,
         continuity: continuity_projection,
-        safety: None,
-        affordance: None,
+        safety: safety_projection,
+        affordance: affordance_projection,
     };
     let projections = assemble_complete_set(input, &members, &parts);
     let disposition = if projections.is_some() {
@@ -186,7 +199,12 @@ fn output<'a>(
         work_scope: input.work_scope,
         governor: input.governor,
         role_inputs: input.role_inputs,
+        source_snapshot: &input.role_inputs.heads_before,
+        context_request: input.context_request,
         omissions: input.omissions,
+        original_route: input.original_route,
+        current_route_scope: input.current_route_scope,
+        capability_now: input.capability_now,
     }
 }
 
@@ -224,9 +242,12 @@ fn admitted_lineage_matches(input: &OrientationProjectionOwnerInput<'_>) -> bool
     let scope = input.work_scope;
     let governor = input.governor;
     binding.validate().is_ok()
+        && input.context_request.validate().is_ok()
         && scope.validate().is_ok()
         && governor.validate().is_ok()
-        && roles.scope_id == binding.scope_id
+        && input.context_request.task_id == binding.task_id.as_str()
+        && input.context_request.scope_id.as_str() == binding.scope_id.as_str()
+        && roles.scope_id.as_str() == binding.scope_id.as_str()
         && fences_match_exact(&roles.state_fence, &binding.state_fence)
         && roles.heads_before == roles.heads_after
         && roles.heads_before.scope_id == roles.scope_id
@@ -248,7 +269,7 @@ fn role_disposition(
     input: &OrientationProjectionOwnerInput<'_>,
 ) -> ProjectionState {
     match &role.state {
-        ProjectionState::Complete | ProjectionState::KnownEmpty
+        ProjectionState::Complete | ProjectionState::KnownEmpty | ProjectionState::Partial { .. }
             if !role_identity_matches(role, operation, input) =>
         {
             ProjectionState::Stale {
@@ -278,6 +299,7 @@ fn role_identity_matches(
         && identity.principal().task_id() == Some(&binding.task_id)
         && identity.scope_id() == Some(&roles.scope_id)
         && identity.state_fence() == &binding.state_fence
+        && role_source_request_matches(role, identity, operation, input)
         && role.revision_heads.as_slice() == roles.heads_before.revision_heads.as_slice()
         && identity.observed_revision_heads() == roles.heads_before.revision_heads.as_slice()
         && identity.declared_dependency_revisions().iter().all(|(key, revision)| {
@@ -296,6 +318,390 @@ fn role_identity_matches(
             .revision_heads
             .iter()
             .all(|head| fences_match_exact(&head.state_fence, &binding.state_fence))
+}
+
+fn role_source_request_matches(
+    role: &RoleAcquisition,
+    identity: &ReadIdentity,
+    operation: NamedReadOperation,
+    input: &OrientationProjectionOwnerInput<'_>,
+) -> bool {
+    if !matches!(
+        operation,
+        NamedReadOperation::GetLearningRecordRange
+            | NamedReadOperation::GetCapabilityEvidenceRecordRange
+    ) {
+        return role.source_request.is_none();
+    }
+    let Some(request) = role.source_request.as_ref() else {
+        return false;
+    };
+    if request.validate().is_err()
+        || request.operation != operation
+        || request.scope_id.as_ref() != Some(&input.role_inputs.scope_id)
+        || request.state_fence != input.binding.state_fence
+        || request.consistency != ReadConsistency::ExactFence
+        || request.parameters.len() != 2
+        || request.parameters.contains_key("cursor")
+    {
+        return false;
+    }
+    let max_records = match operation {
+        NamedReadOperation::GetLearningRecordRange => {
+            let Ok(decoded) = eliot_store_api::decode_learning_read(operation, &request.parameters)
+            else {
+                return false;
+            };
+            if decoded.record_kind
+                != Some(eliot_store_api::LearningRecordKind::ActivationReceipt)
+            {
+                return false;
+            }
+            decoded.max_records
+        }
+        NamedReadOperation::GetCapabilityEvidenceRecordRange => {
+            let Ok(decoded) =
+                eliot_store_api::decode_capability_evidence_read(operation, &request.parameters)
+            else {
+                return false;
+            };
+            if decoded.skill_id.is_none() {
+                return false;
+            }
+            decoded.max_records
+        }
+        _ => return false,
+    };
+    let expected_coverage = ReadCoverage::BoundedByDeclaredSelector {
+        selector: DeclaredResultSelector::MaxRecords,
+        declared_bound: u32::from(max_records),
+    };
+    if identity.coverage() != expected_coverage {
+        return false;
+    }
+    true
+}
+
+fn safety_projection(
+    input: &OrientationProjectionOwnerInput<'_>,
+    disposition: &mut ProjectionState,
+) -> Option<SafetyProjection> {
+    let role = &input.role_inputs.negative_memory;
+    if !is_complete(&role.state) {
+        return None;
+    }
+    if !role_identity_matches(role, NamedReadOperation::GetLearningRecordRange, input) {
+        *disposition = role_disposition(role, NamedReadOperation::GetLearningRecordRange, input);
+        return None;
+    }
+    let Some(owner_safety) = input.governor.safety.as_ref() else {
+        *disposition = ProjectionState::Missing;
+        return None;
+    };
+    if owner_safety.task_id != input.binding.task_id {
+        *disposition = ProjectionState::Stale {
+            reason: "safety projection belongs to another admitted task".to_owned(),
+        };
+        return None;
+    }
+    let (Some(records), Some(policies)) = (
+        role.retained_negative_memory_records.as_deref(),
+        role.retained_negative_memory_policies.as_deref(),
+    ) else {
+        *disposition = ProjectionState::Unknown {
+            reason: "activation receipt read did not retain its original typed rules and policies".to_owned(),
+        };
+        return None;
+    };
+    let Some(triggers) = negative_memory_triggers(role.payload.as_ref(), records, policies) else {
+        *disposition = ProjectionState::Unknown {
+            reason: "typed negative-memory rules differ from the original activation receipt rows".to_owned(),
+        };
+        return None;
+    };
+    if triggers.len() > MAX_PROJECTION_ENTRIES {
+        *disposition = ProjectionState::Unknown {
+            reason: "retained negative-memory trigger identities exceed the projection bound".to_owned(),
+        };
+        return None;
+    }
+    let projection = SafetyProjection {
+        schema_version: CANONICAL_PROJECTIONS_SCHEMA_VERSION,
+        binding: input.binding.clone(),
+        safety_note: owner_safety.safety_note.clone(),
+        negative_memory_triggers: triggers,
+    };
+    if projection.validate().is_err() {
+        *disposition = ProjectionState::Unknown {
+            reason: "retained safety sources fail the shared projection contract".to_owned(),
+        };
+        return None;
+    }
+    *disposition = if projection.negative_memory_triggers.is_empty() {
+        ProjectionState::KnownEmpty
+    } else {
+        ProjectionState::Complete
+    };
+    Some(projection)
+}
+
+fn negative_memory_triggers(
+    payload: Option<&Value>,
+    records: &[eliot_dreamer_failure::NegativeMemoryFingerprint],
+    policies: &[eliot_dreamer_failure::NegativeMemoryActionPolicy],
+) -> Option<Vec<String>> {
+    let Some(rows) = payload
+        .and_then(|payload| payload.get("records"))
+        .and_then(Value::as_array)
+    else {
+        return None;
+    };
+    if rows.len() != records.len() || records.len() != policies.len() {
+        return None;
+    }
+    let mut seen = BTreeSet::new();
+    let mut triggers = Vec::new();
+    for (row, (record, policy)) in rows.iter().zip(records.iter().zip(policies)) {
+        let Some(record_json) = row.get("record_json").and_then(Value::as_str) else {
+            return None;
+        };
+        let Ok(document) = serde_json::from_str::<crate::NegativeMemoryActivationDocument>(record_json) else {
+            return None;
+        };
+        let Some(handle) = row.get("handle").and_then(Value::as_str) else {
+            return None;
+        };
+        if row.get("record_kind").and_then(Value::as_str)
+            != Some(eliot_store_api::LearningRecordKind::ActivationReceipt.as_str())
+            || handle != document.handle()
+            || document.record != *record
+            || document.policy != *policy
+            || policy.binding.record_id != record.record_id
+            || policy.binding.rule_revision != record.rule_revision
+            || policy.binding.record_digest != record.record_digest
+        {
+            return None;
+        }
+        if record.has_admitted_trigger()
+            && policy.disposition != NegativeMemoryDisposition::Advisory
+        {
+            if handle.len() > MAX_PROJECTION_TEXT || !seen.insert(handle) {
+                return None;
+            }
+            triggers.push(handle.to_owned());
+        }
+    }
+    Some(triggers)
+}
+
+fn affordance_projection(
+    input: &OrientationProjectionOwnerInput<'_>,
+    disposition: &mut ProjectionState,
+) -> Option<AffordanceProjection> {
+    let records = retained_capability_records(input, disposition)?;
+    let skill_id = admitted_capability_skill(input, records, disposition)?;
+    let projection = AffordanceProjection {
+        schema_version: CANONICAL_PROJECTIONS_SCHEMA_VERSION,
+        binding: input.binding.clone(),
+        affordances: vec![skill_id.to_owned()],
+    };
+    if projection.validate().is_err() {
+        *disposition = ProjectionState::Unknown {
+            reason: "admitted capability fails the shared affordance projection contract".to_owned(),
+        };
+        return None;
+    }
+    *disposition = ProjectionState::Complete;
+    Some(projection)
+}
+
+fn retained_capability_records<'a>(
+    input: &OrientationProjectionOwnerInput<'a>,
+    disposition: &mut ProjectionState,
+) -> Option<&'a [RetainedCapabilityEvidenceRecord]> {
+    let role = &input.role_inputs.affordances;
+    if !is_complete(&role.state) {
+        return None;
+    }
+    if !role_identity_matches(
+        role,
+        NamedReadOperation::GetCapabilityEvidenceRecordRange,
+        input,
+    ) {
+        *disposition = role_disposition(
+            role,
+            NamedReadOperation::GetCapabilityEvidenceRecordRange,
+            input,
+        );
+        return None;
+    }
+    let (Some(records), Some(payload)) = (
+        role.retained_capability_records.as_deref(),
+        role.payload.as_ref(),
+    ) else {
+        *disposition = ProjectionState::Unknown {
+            reason: "capability range did not retain its original typed evidence rows".to_owned(),
+        };
+        return None;
+    };
+    let Some(request) = role.source_request.as_ref() else {
+        *disposition = ProjectionState::Unknown {
+            reason: "capability range did not retain its original selector request".to_owned(),
+        };
+        return None;
+    };
+    if !capability_rows_match(payload, records, request) {
+        *disposition = ProjectionState::Unknown {
+            reason: "typed capability evidence differs from the original range rows".to_owned(),
+        };
+        return None;
+    }
+    if records.is_empty() {
+        *disposition = ProjectionState::KnownEmpty;
+        return None;
+    }
+    Some(records)
+}
+
+fn admitted_capability_skill<'a>(
+    input: &OrientationProjectionOwnerInput<'_>,
+    records: &'a [RetainedCapabilityEvidenceRecord],
+    disposition: &mut ProjectionState,
+) -> Option<&'a str> {
+    let Some(route) = input.original_route else {
+        *disposition = ProjectionState::Unknown {
+            reason: "the full execution-observed route is absent from the owner join".to_owned(),
+        };
+        return None;
+    };
+    if route.validate().is_err() {
+        *disposition = ProjectionState::Unknown {
+            reason: "the execution-observed route failed its original validator".to_owned(),
+        };
+        return None;
+    }
+    let Some(current_scope) = input.current_route_scope else {
+        *disposition = ProjectionState::Unknown {
+            reason: "the route admission owner did not retain its complete current scope".to_owned(),
+        };
+        return None;
+    };
+    if !route_scope_is_complete(current_scope) {
+        *disposition = ProjectionState::Unknown {
+            reason: "the current capability route scope carries unknown dimensions".to_owned(),
+        };
+        return None;
+    }
+    if !route_matches_capability_scope(route, current_scope) {
+        *disposition = ProjectionState::Unknown {
+            reason: "current capability scope does not bind the full execution-observed route".to_owned(),
+        };
+        return None;
+    }
+    let Some(now) = input.capability_now else {
+        *disposition = ProjectionState::Unknown {
+            reason: "the route admission owner did not retain its evaluation instant".to_owned(),
+        };
+        return None;
+    };
+    if records.len() > MAX_PROJECTION_ENTRIES {
+        *disposition = ProjectionState::Unknown {
+            reason: "capability evidence exceeds the affordance projection bound".to_owned(),
+        };
+        return None;
+    }
+    let mut skills = BTreeSet::new();
+    let mut registry = CapabilityRegistry::new();
+    for retained in records {
+        skills.insert(retained.record.skill_id.as_str());
+        if !registry.insert(retained.record.clone(), retained.revision.clone()) {
+            *disposition = ProjectionState::Unknown {
+                reason: "capability evidence could not be retained by its bounded registry".to_owned(),
+            };
+            return None;
+        }
+    }
+    if skills.len() != 1 {
+        *disposition = ProjectionState::Unknown {
+            reason: "capability range contains more than one requested skill identity".to_owned(),
+        };
+        return None;
+    }
+    let Some(skill_id) = skills.into_iter().next() else {
+        *disposition = ProjectionState::Unknown {
+            reason: "capability range has no skill identity".to_owned(),
+        };
+        return None;
+    };
+    if !registry.admit_production_route(skill_id, current_scope, now) {
+        *disposition = ProjectionState::Blocked {
+            reason: "retained capability evidence does not admit the exact observed route".to_owned(),
+        };
+        return None;
+    }
+    Some(skill_id)
+}
+
+fn capability_rows_match(
+    payload: &Value,
+    retained: &[RetainedCapabilityEvidenceRecord],
+    request: &NamedReadRequest,
+) -> bool {
+    let Some(rows) = payload.get("records").and_then(Value::as_array) else {
+        return false;
+    };
+    if rows.len() != retained.len() {
+        return false;
+    }
+    rows.iter().zip(retained).all(|(row, retained)| {
+        let Some(record_json) = row.get("record_json").and_then(Value::as_str) else {
+            return false;
+        };
+        let Ok(record) = serde_json::from_str::<crate::CapabilityEvidenceRecord>(record_json) else {
+            return false;
+        };
+        record == retained.record
+            && row.get("skill_id").and_then(Value::as_str)
+                == request.parameters.get("skill_id").and_then(Value::as_str)
+            && row.get("skill_id").and_then(Value::as_str) == Some(retained.record.skill_id.as_str())
+            && row.get("scope_key").and_then(Value::as_str) == Some(retained.scope_key.as_str())
+            && row.get("record_digest").and_then(Value::as_str)
+                == Some(retained.revision.evidence_ref.as_str())
+            && row.get("revision").and_then(Value::as_u64) == Some(retained.revision.owner_revision)
+    })
+}
+
+fn route_scope_is_complete(scope: &RouteScopeFingerprint) -> bool {
+    [
+        scope.host_family.as_deref(),
+        scope.adapter_id.as_deref(),
+        scope.protocol_transport.as_deref(),
+        scope.runtime_hash.as_deref(),
+        scope.adapter_hash.as_deref(),
+        scope.os_architecture.as_deref(),
+        scope.auth_profile_class.as_deref(),
+        scope.provider_model_route.as_deref(),
+        scope.tool_call_id_and_role_ordering.as_deref(),
+        scope.reasoning_continuation_and_compaction.as_deref(),
+        scope.feature_flags_and_serializer.as_deref(),
+    ]
+    .into_iter()
+    .all(|field| {
+        field.is_some_and(|value| {
+            !value.trim().is_empty() && !value.chars().any(char::is_control)
+        })
+    })
+}
+
+fn route_matches_capability_scope(
+    route: &RouteFingerprint,
+    scope: &RouteScopeFingerprint,
+) -> bool {
+    Some(route.host_family.as_str()) == scope.host_family.as_deref()
+        && Some(route.adapter.as_str()) == scope.adapter_id.as_deref()
+        && Some(route.protocol_transport.as_str()) == scope.protocol_transport.as_deref()
+        && Some(route.runtime_hash.as_str()) == scope.runtime_hash.as_deref()
+        && Some(route.adapter_hash.as_str()) == scope.adapter_hash.as_deref()
 }
 
 fn task_projection(
@@ -442,39 +848,40 @@ fn continuity_projection(
         };
         return None;
     }
-    let payload = input
-        .role_inputs
-        .task_frame
-        .payload
-        .as_ref();
-    let Some(active) = payload.and_then(|payload| payload.get("active_decision_state")) else {
-        *disposition = ProjectionState::Missing;
-        return None;
-    };
-    let (Some(task_id), Some(action)) = (
-        active.get("task_id").and_then(Value::as_str),
-        active.get("next_allowed_action").and_then(Value::as_str),
-    ) else {
+    let Some(payload) = input.role_inputs.task_frame.payload.as_ref() else {
         *disposition = ProjectionState::Unknown {
-            reason: "retained active decision omits its task id or allowed action".to_owned(),
+            reason: "GetTaskState omitted its retained task event payload".to_owned(),
         };
         return None;
     };
-    if task_id != input.binding.task_id.as_str()
-        || action.trim().is_empty()
-        || action.chars().any(char::is_control)
-        || action.len() > MAX_PROJECTION_TEXT
-    {
+    let Ok(Some(task_contract)) = retained_task_contract(Some(payload)) else {
         *disposition = ProjectionState::Unknown {
-            reason: "retained active decision is malformed or belongs to another task".to_owned(),
+            reason: "active decision cannot bind to a retained native task-contract revision".to_owned(),
         };
         return None;
-    }
+    };
+    let Some(memory_revision) = task_contract.get("memory_revision").and_then(Value::as_u64) else {
+        *disposition = ProjectionState::Unknown {
+            reason: "retained task contract omits its original memory revision".to_owned(),
+        };
+        return None;
+    };
+    let continuity_note = match retained_active_decision_action(
+        payload,
+        &input.binding,
+        memory_revision,
+    ) {
+        Ok(action) => action,
+        Err(state) => {
+            *disposition = state;
+            return None;
+        }
+    };
     let projection = ContinuityProjection {
         schema_version: CANONICAL_PROJECTIONS_SCHEMA_VERSION,
         binding: input.binding.clone(),
         plan_state: owner_continuity.plan_state.clone(),
-        continuity_note: action.to_owned(),
+        continuity_note,
     };
     if projection.validate().is_err() {
         *disposition = ProjectionState::Unknown {
@@ -484,6 +891,132 @@ fn continuity_projection(
     }
     *disposition = ProjectionState::Complete;
     Some(projection)
+}
+
+fn retained_active_decision_action(
+    payload: &Value,
+    binding: &ContextBinding,
+    task_contract_revision: u64,
+) -> Result<String, ProjectionState> {
+    let current = payload.get("current").ok_or(ProjectionState::Missing)?;
+    let event_json = current
+        .get("task_event_json")
+        .and_then(Value::as_str)
+        .ok_or(ProjectionState::Missing)?;
+    let operation_id = current
+        .get("operation_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty() && !value.chars().any(char::is_control))
+        .ok_or_else(|| ProjectionState::Unknown {
+            reason: "latest task row omits its committed operation identity".to_owned(),
+        })?;
+    let _ = eliot_store_api::OperationId::new(operation_id.to_owned()).map_err(|_| {
+        ProjectionState::Unknown {
+            reason: "latest task row carries a malformed committed operation identity".to_owned(),
+        }
+    })?;
+    let expected_revision = current
+        .get("expected_revision")
+        .and_then(canonical_positive_revision)
+        .ok_or_else(|| ProjectionState::Unknown {
+            reason: "latest task row omits its persisted expected revision".to_owned(),
+        })?;
+    let resulting_revision = current
+        .get("resulting_revision")
+        .and_then(canonical_positive_revision)
+        .ok_or_else(|| ProjectionState::Unknown {
+            reason: "latest task row omits its persisted resulting revision".to_owned(),
+        })?;
+    let receipt_fence = current
+        .get("receipt_state_fence")
+        .cloned()
+        .ok_or_else(|| ProjectionState::Unknown {
+            reason: "latest task row omits its original receipt StateFence".to_owned(),
+        })?;
+    let receipt_fence: eliot_contracts::StateFence = serde_json::from_value(receipt_fence)
+        .map_err(|_| ProjectionState::Unknown {
+            reason: "latest task row has a malformed original receipt StateFence".to_owned(),
+        })?;
+    let event: eliot_task::TaskLifecycleEvent = serde_json::from_str(event_json).map_err(|_| {
+        ProjectionState::Unknown {
+            reason: "retained TaskController event does not decode as its original type".to_owned(),
+        }
+    })?;
+    let Some(eliot_task::TaskCommand::SetActiveDecisionState { decision }) = &event.command else {
+        return Err(ProjectionState::Missing);
+    };
+    let Some(active) = event.active_decision_state.as_ref() else {
+        return Err(ProjectionState::Unknown {
+            reason: "TaskController command omitted its retained active decision".to_owned(),
+        });
+    };
+    let resulting_from_expected = expected_revision.checked_add(1);
+    let current_task_revision = binding
+        .state_fence
+        .task_revision
+        .as_ref()
+        .map(|revision| revision.value());
+    if current.get("task_id").and_then(Value::as_str) != Some(binding.task_id.as_str())
+        || current.get("event_id").and_then(Value::as_str) != Some(event.event_id.as_str())
+        || current.get("actor_ref").and_then(Value::as_str) != Some(event.actor_ref.as_str())
+        || !task_state_row_matches_event(current, &event)
+        || event.task_id.as_str() != binding.task_id.as_str()
+        || decision.task_id.as_str() != binding.task_id.as_str()
+        || active != decision.as_ref()
+        || event.state_fence.validate().is_err()
+        || receipt_fence != event.state_fence
+        || !same_fence_lineage_except_task_revision(&event.state_fence, &binding.state_fence)
+        || event
+            .state_fence
+            .task_revision
+            .as_ref()
+            .is_none_or(|revision| revision.value() != expected_revision)
+        || event.from != Some(event.to)
+        || resulting_from_expected != Some(resulting_revision)
+        || current_task_revision != Some(resulting_revision)
+        || active.revision_fence.value() != task_contract_revision
+        || active.next_allowed_action.trim().is_empty()
+        || active.next_allowed_action.chars().any(char::is_control)
+        || active.next_allowed_action.len() > MAX_PROJECTION_TEXT
+    {
+        return Err(ProjectionState::Stale {
+            reason: "latest task decision fails its persisted transition, fence, or source-revision binding".to_owned(),
+        });
+    }
+    Ok(active.next_allowed_action.clone())
+}
+
+fn task_state_row_matches_event(
+    current: &Value,
+    event: &eliot_task::TaskLifecycleEvent,
+) -> bool {
+    let Ok(to) = serde_json::to_value(event.to) else {
+        return false;
+    };
+    if current.get("to") != Some(&to) {
+        return false;
+    }
+    match event.from {
+        Some(from) => serde_json::to_value(from)
+            .is_ok_and(|from| current.get("from") == Some(&from)),
+        None => current.get("from").is_none(),
+    }
+}
+
+fn canonical_positive_revision(value: &Value) -> Option<u64> {
+    let text = value.as_str()?;
+    let revision = text.parse::<u64>().ok()?;
+    (revision > 0 && revision.to_string() == text).then_some(revision)
+}
+
+fn same_fence_lineage_except_task_revision(
+    original: &eliot_contracts::StateFence,
+    current: &eliot_contracts::StateFence,
+) -> bool {
+    original.authority_epoch == current.authority_epoch
+        && original.resource_generation == current.resource_generation
+        && original.policy_revision == current.policy_revision
+        && original.integration_revision == current.integration_revision
 }
 
 fn omission_disposition(

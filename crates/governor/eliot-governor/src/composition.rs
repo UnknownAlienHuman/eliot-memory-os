@@ -10509,6 +10509,7 @@ mod tests {
                 from: None,
                 to: TaskState::ActionAuthorized,
                 command: None,
+                active_decision_state: None,
                 professional_execution: None,
                 state_fence: fence.clone(),
                 authority_epoch: fence.authority_epoch.clone(),

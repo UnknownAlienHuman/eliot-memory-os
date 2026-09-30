@@ -52,7 +52,7 @@ use eliot_store_api::{
 use schemars::JsonSchema;
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
 // `EVIDENCE_PACK_MAX_RECORDS` is the canonical bound owned by the
@@ -4017,6 +4017,7 @@ fn commit_transaction(
                 .into_iter()
                 .map(|operation| ScopedNamedOperation {
                     scope_id: transition.scope_id.clone(),
+                    operation_id: receipt.operation_id.clone(),
                     operation,
                 }),
         );
@@ -4602,7 +4603,7 @@ impl MemoryStore {
             });
         }
         let (max_records, limit) = Self::parse_max_records(query)?;
-        let matched: Vec<(usize, &eliot_store_api::NamedMutationRequest)> = state
+        let matched: Vec<(usize, &ScopedNamedOperation)> = state
             .named_operations
             .iter()
             .enumerate()
@@ -4616,20 +4617,41 @@ impl MemoryStore {
                         .and_then(Value::as_str)
                         == Some(task_id)
             })
-            .map(|(index, record)| (index, &record.operation))
+            .map(|(index, record)| (index, record))
             .collect();
         let matched_total = matched.len();
-        let current = matched
-            .last()
-            .map(|(_, operation)| operation.parameters.clone());
+        let current = if let Some((_, record)) = matched.last() {
+            let receipt = state
+                .receipts_by_operation
+                .get(record.operation_id.as_str())
+                .ok_or(StoreError::InvalidReceipt)?;
+            receipt.validate()?;
+            if receipt.status != WriteReceiptStatus::Committed
+                || receipt.operation_id != record.operation_id
+            {
+                return Err(StoreError::InvalidReceipt);
+            }
+            let mut current = Map::from_iter(record.operation.parameters.clone());
+            current.insert(
+                "operation_id".to_owned(),
+                json!(record.operation_id.as_str()),
+            );
+            current.insert(
+                "receipt_state_fence".to_owned(),
+                json!(&receipt.state_fence),
+            );
+            Some(Value::Object(current))
+        } else {
+            None
+        };
         let records: Vec<Value> = matched
             .into_iter()
             .take(limit)
-            .map(|(capture_index, operation)| {
+            .map(|(capture_index, record)| {
                 json!({
                     "capture_index": capture_index,
-                    "operation": named_mutation_operation_name(operation.operation),
-                    "parameters": operation.parameters,
+                    "operation": named_mutation_operation_name(record.operation.operation),
+                    "parameters": record.operation.parameters,
                 })
             })
             .collect();
@@ -5231,6 +5253,7 @@ fn genesis_receipt(
 #[derive(Clone, Debug, PartialEq)]
 struct ScopedNamedOperation {
     scope_id: ScopeId,
+    operation_id: OperationId,
     operation: eliot_store_api::NamedMutationRequest,
 }
 
