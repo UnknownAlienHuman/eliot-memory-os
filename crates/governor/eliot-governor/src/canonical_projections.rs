@@ -2,8 +2,8 @@
 //!
 //! `compose_canonical_projections` returns a `GovernorProjectionSet`, not
 //! the strict owner-neutral `CanonicalProjectionSet`. The Orientation join
-//! must validate it against retained source payloads, TaskCognition fields,
-//! WorkScope, and owner omissions before it can construct the canonical set.
+//! must validate it against retained source payloads, `TaskCognition` fields,
+//! `WorkScope`, and owner omissions before it can construct the canonical set.
 
 #![forbid(unsafe_code)]
 
