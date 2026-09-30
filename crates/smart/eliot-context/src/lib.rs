@@ -320,6 +320,27 @@ impl ContextAtom {
                 field: "atom.source_handles",
             });
         }
+        // `source_handles` is this unit's exact ordered source-member relation,
+        // so its declared length and the members it actually names are one
+        // claim and must agree. A repeated handle is refused here because every
+        // consumer of this list reads it as a set and silently collapses the
+        // repeat: `source_assertability_floors` keys a map, and
+        // `capped_assertability_for_atom` builds a distinct set to decide
+        // whether the unit is mixed-lineage. A unit declaring the same member
+        // twice would therefore be indistinguishable downstream from one
+        // declaring it once, and its declared member denominator would no
+        // longer equal its retained members — a plausible count standing in
+        // for an exact relation, which I12.13 forbids. The check is on the
+        // unit's own list rather than on any caller's, so it cannot inherit
+        // that caller's omissions.
+        let mut distinct_source_members = BTreeSet::new();
+        for handle in &self.source_handles {
+            if !distinct_source_members.insert(handle) {
+                return Err(ContextError::DuplicateIdentity {
+                    field: "atom.source_handles",
+                });
+            }
+        }
         self.state_fence
             .validate()
             .map_err(|_| ContextError::FenceMismatch)?;
