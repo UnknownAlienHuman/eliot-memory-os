@@ -59,6 +59,11 @@ $repo = Split-Path -Parent $PSScriptRoot
 # seam, and offline trust admission. It is dot-sourced beside this builder and
 # beside the finalizer; it is never part of the retiring facade package.
 . (Join-Path $PSScriptRoot 'lib/governor-retirement-approval.ps1')
+# Issue #1858 inventory/manifest slice: the exact-bytes entrypoint
+# inventory, the cutover-selection assertion, and the installed
+# invocation+readback mechanism. Dot-sourced beside this builder; it is
+# product code, not part of any staged payload.
+. (Join-Path $PSScriptRoot 'lib/entrypoint-inventory.ps1')
 $surrealCatalogRelativePath = 'docs/release/SURREALDB_WINDOWS_X64.lock.json'
 $runtimeArtifactDefinitions = @(
     [pscustomobject]@{
