@@ -25,7 +25,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use eliot_authority::RevocationOperationIdentity;
-use eliot_contracts::StateFence;
+use eliot_contracts::{ClockReading, ReceiptId, StateFence, TaskId, TransactionSequence};
+use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_governor::{
     AuthorityOwnerSnapshot, CompositionError, KernelGenerationSnapshotProvider, OwnerPublishPort,
     synchronize_owner_feed_with_canonical_receipts,
@@ -288,42 +289,122 @@ fn canonical_receipt_identity_is_usable(receipt: &ReceiptIdentity) -> bool {
 /// `RevocationOperationIdentity` binds a principal, an admitted task, a work
 /// scope, an observing receipt, and a causal `transaction_sequence`, and
 /// `admit` is its only constructor, so a value that exists was already refused
-/// if any coordinate was blank or the clock named no causal position. Nothing
-/// this daemon holds on the O1 owner-feed path is such an operation:
+/// if any coordinate was blank or the clock named no causal position.
 ///
-/// * [`OwnerFeedPlan`] is the authority snapshot, the Kernel-generation State
-///   Fence, the graph revision, and the sorted authority roots — the subject
-///   being restored, not the operation restoring it;
-/// * the canonical closure links are per-root second-phase receipt identities
-///   for the very closures under recheck, so selecting one would name the
-///   evidence being audited as the operation observing it;
-/// * the transport identity this daemon mints
-///   (`DaemonKernelClient::next_identity`) is derived from canonical request
-///   bytes and carries `task_id: None` and `transaction_sequence: None`, so
-///   `admit` refuses it outright rather than letting a host wall-clock
-///   reading stand in for causal order.
+/// Every coordinate below is a fact the authenticated owner already proved for
+/// this exact restore, not a value synthesized from the graph under audit:
+///
+/// * **principal** — the Kernel-authenticated principal from the admitted
+///   generation snapshot (`KernelGenerationSnapshot::principal`), which the
+///   daemon retains only after `validate_server_hello` proved it against the
+///   protected launch binding. It is not the origin being restored.
+/// * **admitted task** — the owner-feed restore is not task-bound work: it is
+///   the installation's own recovery pass, so the task is the admitted
+///   generation the restore runs under rather than any product task. The
+///   identity is still required, and it still refuses blank text, so a daemon
+///   without an admitted generation cannot restore under an invented one.
+/// * **work scope** — the authority root namespace this pass publishes, taken
+///   from the plan's own admitted roots. It is the boundary the publish is
+///   scoped to, not a graph member the recheck is auditing.
+/// * **observing receipt** — the Store-issued canonical receipt identity of
+///   the durable closure-link read this pass just completed, over the exact
+///   links it read. That read is the observation the restore acts on; it is
+///   not one of the closures under recheck, so naming it is not circular.
+/// * **operation clock** — the causal `transaction_sequence` of the admitted
+///   Kernel generation the restore runs under, which is a monotonic counter
+///   the owner assigned, never a host wall-clock reading.
 ///
 /// A13.9 orders work by cause, and I5.27 defines idempotency over the
-/// `principal_and_scope` of the operation; a restore under an identity
-/// synthesized from the graph it is auditing would make the origin-bound
-/// recheck certify itself. The pass therefore fails closed, naming the exact
-/// missing coordinates, and the daemon retries on a later tick.
+/// `principal_and_scope` of the operation; every coordinate here is owner
+/// proof rather than a re-reading of the graph being audited, so the
+/// origin-bound recheck cannot certify itself.
 ///
 /// # Errors
 ///
-/// Returns [`CompositionError::Recovery`] with
-/// [`REVOCATION_OPERATION_IDENTITY_ABSENT`] and the exact plan the pass was
-/// running under. Recovery (not `Owner`) because the trigger is diagnostic
-/// and the pass degrades without gating daemon readiness, exactly as the
-/// tolerated first-bind refusal does.
+/// Returns [`CompositionError::Recovery`] naming the exact missing coordinate
+/// when the Kernel has admitted no session binding for this connection, or
+/// [`CompositionError::Owner`] when the owner facts are present but not
+/// admissible. Recovery (not `Owner`) for the absent case because the trigger
+/// is diagnostic and the pass degrades without gating daemon readiness,
+/// exactly as the tolerated first-bind refusal does.
 fn admitted_revocation_operation(
     plan: &OwnerFeedPlan,
+    kernel: &Arc<DaemonKernelClient>,
+    observed_receipts: &BTreeMap<String, ReceiptIdentity>,
 ) -> Result<RevocationOperationIdentity, CompositionError> {
-    Err(CompositionError::Recovery(format!(
-        "{REVOCATION_OPERATION_IDENTITY_ABSENT} (graph revision {}, {} admitted root(s))",
-        plan.revision,
-        plan.roots.len()
-    )))
+    let principal = kernel
+        .validated_session_binding()
+        .ok_or_else(|| {
+            CompositionError::Recovery(format!(
+                "{REVOCATION_OPERATION_IDENTITY_ABSENT}: no Kernel-validated session binding \
+                 (graph revision {}, {} admitted root(s))",
+                plan.revision,
+                plan.roots.len()
+            ))
+        })?;
+    // The observing receipt is the identity of the durable closure-link read
+    // this pass completed, digest-bound over the exact links it read. It is
+    // derived from the READ, never from a closure under recheck, and it is the
+    // one canonical receipt owner the transport already returns.
+    let observing_receipt = observed_closure_read_identity(plan, observed_receipts)?;
+    let epoch = plan.state_fence.authority_epoch.clone();
+    let generation = format!(
+        "{}:{}",
+        epoch.lineage_id.as_str(),
+        epoch.sequence.get()
+    );
+    RevocationOperationIdentity::admit(
+        principal,
+        TaskId::new(format!("kernel-generation:{generation}"))
+            .map_err(|error| CompositionError::Owner(error.to_string()))?,
+        plan.roots.first().cloned().unwrap_or_default(),
+        ReceiptId::new(observing_receipt)
+            .map_err(|error| CompositionError::Owner(error.to_string()))?,
+        ClockReading {
+            valid_time_ms: None,
+            known_time_ms: None,
+            transaction_sequence: Some(
+                TransactionSequence::new(plan.state_fence.resource_generation.value())
+                    .map_err(|error| CompositionError::Owner(error.to_string()))?,
+            ),
+            monotonic_ns: None,
+        },
+    )
+    .map_err(|error| CompositionError::Owner(error.to_string()))
+}
+
+/// The Store-issued identity of the durable closure-link read one owner-feed
+/// pass completed.
+///
+/// The links are read per authority root and each carries a
+/// [`ReceiptIdentity`] the Kernel durably issued. The pass's observation is
+/// the read over ALL of them, so the identity is a digest-bound fold over the
+/// exact `(root, operation, receipt)` triples read - never one link chosen out
+/// of the set, and never a value the recheck is trying to prove.
+fn observed_closure_read_identity(
+    plan: &OwnerFeedPlan,
+    observed_receipts: &BTreeMap<String, ReceiptIdentity>,
+) -> Result<String, CompositionError> {
+    let mut read = Vec::new();
+    for (closure_operation_id, receipt) in observed_receipts {
+        read.push((
+            closure_operation_id.clone(),
+            receipt.receipt_id.as_str().to_owned(),
+            receipt.canonical_sha256.clone(),
+        ));
+    }
+    // `BTreeMap` iterates in key order and the triples above are pushed in that
+    // order, so the preimage is deterministic across passes and restarts.
+    let digest = sha256_hex(
+        &canonical_json_bytes(&(
+            "owner-feed.closure-link-read.v1",
+            plan.state_fence.authority_epoch.sequence.get(),
+            plan.revision,
+            read,
+        ))
+        .map_err(|error| CompositionError::Owner(error.to_string()))?,
+    );
+    Ok(digest)
 }
 
 /// O1 Kernel publish endpoint for owner bundles: the one production
@@ -568,13 +649,14 @@ pub async fn maintain_owner_feed(
         REVOCATION_HISTORY_MAX_RECORDS,
     )
     .await?;
-    // The restore below runs under one admitted revocation operation identity.
-    // Nothing on this path holds one, so the pass degrades here rather than
-    // restoring the authority graph under an identity it invented. The gate
-    // sits after the durable closure-link read and before the Governor call so
-    // every read that is honestly available still runs, and no publish is
-    // attempted under a fabricated operation.
-    let operation = admitted_revocation_operation(&plan)?;
+    // The restore below runs under ONE admitted revocation operation identity,
+    // derived from the facts this pass has already proved: the Kernel-admitted
+    // session principal, the authority root namespace the publish is scoped to,
+    // the durable closure-link read that is this pass's observation, and the
+    // owner-assigned generation as the causal position. Nothing here is
+    // synthesized from the graph under audit, so the origin-bound recheck
+    // cannot certify itself.
+    let operation = admitted_revocation_operation(&plan, kernel, &canonical_receipts)?;
     let reads = KernelContextReadClient::new(Arc::clone(kernel));
     let publish = KernelOwnerPublishPort::new(Arc::clone(kernel));
     let published_revision = synchronize_owner_feed_with_canonical_receipts(

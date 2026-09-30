@@ -1623,7 +1623,7 @@ impl DaemonKernelClient {
 
     /// Clones the retained validated binding string, if any. A poisoned slot
     /// reads as absent (fail-closed to "no live session"), never invented.
-    fn validated_session_binding(&self) -> Option<String> {
+    pub(super) fn validated_session_binding(&self) -> Option<String> {
         self.validated_session_binding
             .lock()
             .ok()
