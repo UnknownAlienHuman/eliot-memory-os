@@ -805,6 +805,7 @@ impl RedbInstallationRegistry {
         intent: UserModeTaskRunIntentProjection,
     ) -> Result<UserModeTaskRunRecord, InstallationError> {
         let current = self.load()?;
+        current.validate_active_user_mode_task_run_intent(&intent)?;
         if let Some(record) = current.user_mode_task_run_record()
             && record.intent() == &intent
         {
@@ -822,7 +823,6 @@ impl RedbInstallationRegistry {
         {
             return Err(InstallationError::IdentityConflict);
         }
-        current.validate_active_user_mode_task_run_intent(&intent)?;
         if current.revision() != expected_revision {
             return Err(InstallationError::CompareAndSaveConflict {
                 expected: expected_revision,
@@ -857,6 +857,7 @@ impl RedbInstallationRegistry {
             Ok(record) => Ok(record),
             Err(conflict @ InstallationError::CompareAndSaveConflict { .. }) => {
                 let latest = self.load()?;
+                latest.validate_active_user_mode_task_run_intent(&intent)?;
                 match latest.user_mode_task_run_record() {
                     Some(record) if record.intent() == &intent => Ok(record.clone()),
                     _ => Err(conflict),
@@ -908,9 +909,6 @@ impl RedbInstallationRegistry {
         if existing.intent() != &ack.intent {
             return Err(InstallationError::IdentityConflict);
         }
-        if existing.host_ack() == Some(&ack) {
-            return Ok(existing.clone());
-        }
         let active = current.validate_active_user_mode_task_run_intent(&ack.intent)?;
         if ack.evidence.host_process_id != std::process::id()
             || !eliot_platform_windows::windows_paths_equal(
@@ -929,6 +927,9 @@ impl RedbInstallationRegistry {
                 .runtime_state_roots
                 .host_state_root,
         )?;
+        if existing.host_ack() == Some(&ack) {
+            return Ok(existing.clone());
+        }
         if current.revision() != expected_revision {
             return Err(InstallationError::CompareAndSaveConflict {
                 expected: expected_revision,
@@ -973,6 +974,24 @@ impl RedbInstallationRegistry {
             Ok(record) => Ok(record),
             Err(conflict @ InstallationError::CompareAndSaveConflict { .. }) => {
                 let latest = self.load()?;
+                let active = latest.validate_active_user_mode_task_run_intent(&ack.intent)?;
+                if ack.evidence.host_process_id != std::process::id()
+                    || !eliot_platform_windows::windows_paths_equal(
+                        Path::new(&ack.evidence.host_process_image_path),
+                        Path::new(active.manifest.host_executable_path.as_str()),
+                    )
+                {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                self.validate_host_owner_binding_for_identity(
+                    host,
+                    &active.manifest.runtime_launch.installation_epoch.installation,
+                    &active
+                        .manifest
+                        .runtime_launch
+                        .runtime_state_roots
+                        .host_state_root,
+                )?;
                 match latest.user_mode_task_run_record() {
                     Some(record) if record.host_ack() == Some(&ack) => Ok(record.clone()),
                     _ => Err(conflict),
