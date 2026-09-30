@@ -4556,7 +4556,18 @@ impl KernelComposition {
         // graceful success. A retained drain halt reaches the requesting
         // owner as a typed failure; the Incomplete terminal above already
         // retains the exact residuals for recovery.
-        if let Err(halt) = drain.as_ref() {
+        Self::drain_process_outcome(&drain, runtime_outcome)
+    }
+
+    /// Maps the retained drain outcome to the process result the requesting
+    /// owner observes (#1686, I14.23). A halted drain is a typed failure even
+    /// though the executor/runtime above already stopped; a completed drain
+    /// returns the runtime outcome unchanged.
+    fn drain_process_outcome(
+        drain: &Result<DrainCommitDecision, DrainHalt>,
+        runtime_outcome: ShutdownOutcome,
+    ) -> Result<ShutdownOutcome, ProcessExecutionError> {
+        if let Err(halt) = drain {
             if halt.pending.is_empty() {
                 return Err(ProcessExecutionError::Unavailable(halt.reason.to_owned()));
             }
