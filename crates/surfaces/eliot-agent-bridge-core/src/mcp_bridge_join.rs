@@ -35,10 +35,12 @@
 //! which host event belongs to it, so requiring the caller to echo that digest
 //! back would compare a record against itself and pass for every candidate. The
 //! only thing that can attribute an event to one exact invocation is the
-//! event's own owner-validated observation, and that is what
+//! event's own owner-validated observation, read against the request identity
+//! the correlation itself recorded ([`RecordedInvocation`]), and that is what
 //! [`normalize_terminal_observation`] requires. An event that carries no
-//! invocation scope is refused, so no event can close a correlation merely
-//! because that correlation was the one still pending.
+//! invocation scope, or that names another invocation, is refused, so no event
+//! can close a correlation merely because that correlation was the one still
+//! pending.
 //!
 //! Contiguity is a property of the *owner journal*, not of any one
 //! invocation, so a proven interval is never coverage until it is bounded to
@@ -68,8 +70,8 @@ use crate::mcp_correlation::{
     sha256_hex,
 };
 use crate::mcp_host_observation::{
-    HostEventJoinKeys, HostObservationReject, HostOwnerBinding, check_event_replay,
-    normalize_terminal_observation,
+    HostEventJoinKeys, HostObservationReject, HostOwnerBinding, RecordedInvocation,
+    check_event_replay, normalize_terminal_observation,
 };
 use crate::{
     AgentBridgeCore, HostEventEnvelope, RouteFingerprint, TransportEdge, TransportEdgeKind,
@@ -360,12 +362,13 @@ pub struct TerminalReconcileRequest<'a> {
 ///    fingerprint must be the one the owner itself observed, so a restart or
 ///    session rotation cannot relabel an old observation as current;
 /// 3. **attribution** — the candidate's own owner-validated observation must
-///    name one exact invocation. This is the only step that can establish that
-///    the event is about *this* correlation: the recorded digest identifies the
-///    correlation but proves nothing about the event, and route, session, and
-///    generation are shared by every correlation on the route. A terminal
-///    payload carries no invocation scope, so it is refused here and the
-///    correlation stays pending;
+///    name one exact invocation, and that invocation must be the exact request
+///    identity this correlation itself recorded. This is the only step that can
+///    establish that the event is about *this* correlation: the recorded digest
+///    identifies the correlation but proves nothing about the event, and route,
+///    session, and generation are shared by every correlation on the route. A
+///    turn- or step-scoped terminal payload names no invocation and is refused
+///    here, and so the correlation stays pending;
 /// 4. **prior accepted evidence** — the same event identity may not reappear
 ///    for this correlation with any changed content, compared against the
 ///    evidence read back out of this correlation's own retained revisions.
@@ -384,14 +387,19 @@ pub fn reconcile_terminal_event(
     let recorded_digest = request.emission.identity.identity_digest.as_str();
     let journaled = journal_binding(inputs.history(), request.candidate)?;
     let owner = owner_binding(bridge, inputs.fingerprint())?;
-    // The recorded digest is passed down, never re-derived and never restated
-    // by the joining caller: the evidence must name the correlation this join
-    // actually holds, and the only claim it can make is that this event belongs
-    // to it. That claim is established by the candidate's own invocation scope
-    // inside `normalize_terminal_observation`, which refuses an event that
-    // names no invocation. Route, session, and generation are shared by every
-    // correlation on the route and can never establish it.
-    let host = normalize_terminal_observation(journaled, request.keys, &owner, recorded_digest)
+    // The recorded invocation is read back out of the correlation's own
+    // immutable identity here, so the joining caller cannot nominate either the
+    // correlation or the invocation it claims the event belongs to. The join
+    // holds exactly this emission observation, so this is a value against a
+    // value: the host's own minted invocation scope against the MCP request
+    // identity the serving boundary recorded.
+    let recorded = RecordedInvocation {
+        correlation_digest: recorded_digest.to_owned(),
+        request_id: request.emission.identity.mcp_request_id.clone(),
+        tool_name: request.emission.identity.tool_name.clone(),
+        session_id: request.emission.identity.session_id.clone(),
+    };
+    let host = normalize_terminal_observation(journaled, request.keys, &owner, &recorded)
         .map_err(ReconcileError::HostRejected)?;
     // An exact replay is idempotent: identical evidence re-derives the
     // identical assessment, so the correlation still closes exactly once, and a
