@@ -319,9 +319,7 @@ impl CanonicalEvidenceProvider for CanonicalStoreEvidence {
 
     fn verify_receipt(&self, receipt: &ReceiptEnvelope) -> Result<(), OrsError> {
         match self.active()? {
-            ScopedCanonicalEvidence::Receipt { envelope, .. }
-                if envelope.as_ref() == receipt =>
-            {
+            ScopedCanonicalEvidence::Receipt { envelope, .. } if envelope.as_ref() == receipt => {
                 Ok(())
             }
             _ => Err(OrsError::CanonicalEvidence(
