@@ -222,13 +222,17 @@ pub enum CampaignSourceRole {
     /// This source is read independently from the classification profile and
     /// deliberately is not part of the fixed campaign learning-view denominator.
     OrientationAdmission,
+    /// Original Governor-admitted cue bindings and closed snapshot for the
+    /// Orientation pipeline. This is independently read and is not one of the
+    /// fixed 26 campaign-view rows.
+    OrientationCueBindings,
 }
 
 impl CampaignSourceRole {
     /// Return every required closed source role a campaign recipe must enumerate once.
     ///
-    /// The separately-read `OrientationClassification` profile and
-    /// `OrientationAdmission` evidence are not rows in this fixed 26-role
+    /// The separately-read Orientation classification profile, admission
+    /// evidence, and cue bindings are not rows in this fixed 26-role
     /// learning-view denominator.
     #[must_use]
     pub const fn all() -> [Self; 26] {
