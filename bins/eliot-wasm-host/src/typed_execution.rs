@@ -2626,6 +2626,15 @@ fn call_admission(
             native_revision: raw.native_revision,
             abi_digest: raw.abi_digest,
         };
+        // P5.5 (#758): deny a lying descriptor before the domain export runs.
+        validate_descriptor(
+            TypedWorld::ContextAdmission,
+            &descriptor,
+            limits.max_output_bytes,
+        )
+        .map_err(|error| staged(TypedStage::Descriptor, error))?;
+        validate_descriptor_abi_digest(&descriptor)
+            .map_err(|error| staged(TypedStage::Descriptor, error))?;
         let called = interface
             .call_admit(&mut *store, request)
             .map_err(|error| {
@@ -2677,6 +2686,15 @@ fn call_assembly(
             native_revision: raw.native_revision,
             abi_digest: raw.abi_digest,
         };
+        // P5.5 (#758): deny a lying descriptor before the domain export runs.
+        validate_descriptor(
+            TypedWorld::ContextAssembly,
+            &descriptor,
+            limits.max_output_bytes,
+        )
+        .map_err(|error| staged(TypedStage::Descriptor, error))?;
+        validate_descriptor_abi_digest(&descriptor)
+            .map_err(|error| staged(TypedStage::Descriptor, error))?;
         let called = interface
             .call_assemble(&mut *store, request)
             .map_err(|error| {
@@ -2728,6 +2746,15 @@ fn call_cue_activation(
             native_revision: raw.native_revision,
             abi_digest: raw.abi_digest,
         };
+        // P5.5 (#758): deny a lying descriptor before the domain export runs.
+        validate_descriptor(
+            TypedWorld::CueActivation,
+            &descriptor,
+            limits.max_output_bytes,
+        )
+        .map_err(|error| staged(TypedStage::Descriptor, error))?;
+        validate_descriptor_abi_digest(&descriptor)
+            .map_err(|error| staged(TypedStage::Descriptor, error))?;
         let called = interface
             .call_activate(&mut *store, request)
             .map_err(|error| {
@@ -2779,6 +2806,15 @@ fn call_dreamer_handler(
             native_revision: raw.native_revision,
             abi_digest: raw.abi_digest,
         };
+        // P5.5 (#758): deny a lying descriptor before the domain export runs.
+        validate_descriptor(
+            TypedWorld::DreamerHandler,
+            &descriptor,
+            limits.max_output_bytes,
+        )
+        .map_err(|error| staged(TypedStage::Descriptor, error))?;
+        validate_descriptor_abi_digest(&descriptor)
+            .map_err(|error| staged(TypedStage::Descriptor, error))?;
         let called = interface
             .call_handle(&mut *store, request)
             .map_err(|error| {
@@ -2831,6 +2867,15 @@ fn call_memory_curation_screen(
             native_revision: raw.native_revision,
             abi_digest: raw.abi_digest,
         };
+        // P5.5 (#758): deny a lying descriptor before the domain export runs.
+        validate_descriptor(
+            TypedWorld::MemoryCurationScreen,
+            &descriptor,
+            limits.max_output_bytes,
+        )
+        .map_err(|error| staged(TypedStage::Descriptor, error))?;
+        validate_descriptor_abi_digest(&descriptor)
+            .map_err(|error| staged(TypedStage::Descriptor, error))?;
         let called = interface
             .call_screen(&mut *store, request)
             .map_err(|error| {
@@ -2882,6 +2927,15 @@ fn call_dreamer_cycle(
             native_revision: raw.native_revision,
             abi_digest: raw.abi_digest,
         };
+        // P5.5 (#758): deny a lying descriptor before the domain export runs.
+        validate_descriptor(
+            TypedWorld::DreamerCycle,
+            &descriptor,
+            limits.max_output_bytes,
+        )
+        .map_err(|error| staged(TypedStage::Descriptor, error))?;
+        validate_descriptor_abi_digest(&descriptor)
+            .map_err(|error| staged(TypedStage::Descriptor, error))?;
         let called = interface.call_step(&mut *store, request).map_err(|error| {
             staged(
                 TypedStage::Invoke,
