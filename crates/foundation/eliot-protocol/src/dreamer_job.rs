@@ -295,6 +295,10 @@ pub struct DurableJobRuntimeOwnerExecutionInput {
     pub work_scope: WorkScopeBinding,
     /// Explicit duplicate fence for child-side direct comparison.
     pub state_fence: StateFence,
+    /// Exact Kernel-issued native-worker claim ID returned by the original
+    /// native launch admission. It is the lookup key for the owner's current
+    /// prelaunch request/receipt/ORS readback.
+    pub native_worker_claim_id: String,
     /// Exact ContextInput value carried by the original authenticated
     /// TaskController invocation.
     pub context_input: serde_json::Value,
@@ -343,6 +347,8 @@ impl DurableJobRuntimeOwnerExecutionInput {
             || !self.context_input.is_object()
             || !self.context_campaign_recipe.is_object()
             || !self.context_campaign_recipe_catalogue.is_object()
+            || self.native_worker_claim_id.trim().is_empty()
+            || self.native_worker_claim_id.chars().any(char::is_control)
             || self.output_schema_recipe.schema_version == 0
             || self.output_schema_recipe.schema_digest != self.output_contract.sha256
             || self.output_contract.artifact_id.as_ref()
@@ -795,6 +801,7 @@ impl JobSubmission {
             || input.attempt_id != self.attempt_id
             || input.work_scope != self.work_scope
             || input.state_fence != self.work_scope.state_fence
+            || input.native_worker_claim_id.trim().is_empty()
             || input.semantic_source.expected_digest != self.semantic_input.sha256
             || input.semantic_source.expected_byte_length != self.semantic_input.byte_length
             || input.output_contract != self.output_contract
