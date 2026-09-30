@@ -8,6 +8,11 @@ on:
         required: false
         default: false
         type: boolean
+      operator_runtime_edges:
+        description: Restrict audit diagnostics to bounded Kernel shutdown and WASM runtime edges
+        required: false
+        default: false
+        type: boolean
       operator_linker_probe:
         description: Branch-only native toolchain and Operator UI diagnostics
         required: false
@@ -28,7 +33,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}${{ inputs.operator_linker_probe && '-linker-probe' || '' }}
+  group: ${{ github.workflow }}-${{ github.ref }}${{ inputs.operator_runtime_edges && '-runtime-edges' || inputs.operator_linker_probe && '-linker-probe' || '' }}
   cancel-in-progress: false
 
 env:
@@ -38,7 +43,7 @@ env:
 
 jobs:
   source-candidate-gate:
-    if: ${{ !inputs.operator_audit_diagnostic && !inputs.operator_linker_probe && !inputs.operator_ui_diagnostic }}
+    if: ${{ !inputs.operator_audit_diagnostic && !inputs.operator_linker_probe && !inputs.operator_ui_diagnostic && !inputs.operator_runtime_edges }}
     runs-on: windows-latest
     timeout-minutes: 180
 
@@ -402,7 +407,7 @@ jobs:
   operator-audit-diagnostic:
     if: ${{ inputs.operator_audit_diagnostic && !inputs.operator_linker_probe && !inputs.operator_ui_diagnostic && !inputs.require_live_windows_scenarios && github.ref == 'refs/heads/Operator_tests' }}
     runs-on: windows-latest
-    timeout-minutes: 180
+    timeout-minutes: ${{ inputs.operator_runtime_edges && 45 || 180 }}
     env:
       CARGO_INCREMENTAL: '0'
       CARGO_BUILD_JOBS: '2'
@@ -418,7 +423,7 @@ jobs:
         shell: pwsh
         run: |
           $env:CARGO_TARGET_DIR = Join-Path $env:RUNNER_TEMP 'eliot-operator-audit-target'
-          python scripts/operator-audit-diagnostic.py --output "$env:RUNNER_TEMP\eliot-operator-audit-evidence"
+          python scripts/operator-audit-diagnostic.py ${{ inputs.operator_runtime_edges && '--runtime-edges-only' || '' }} --output "$env:RUNNER_TEMP\eliot-operator-audit-evidence"
           exit $LASTEXITCODE
       - name: Preserve exact diagnostic commands, exits and logs
         if: always()
@@ -431,19 +436,19 @@ jobs:
           retention-days: 14
 
   operator-audit-ref-guard:
-    if: ${{ ((inputs.operator_audit_diagnostic || inputs.operator_linker_probe || inputs.operator_ui_diagnostic) && (github.ref != 'refs/heads/Operator_tests' || inputs.require_live_windows_scenarios)) || (inputs.operator_audit_diagnostic && inputs.operator_linker_probe) || (inputs.operator_ui_diagnostic && !inputs.operator_linker_probe) }}
+    if: ${{ ((inputs.operator_audit_diagnostic || inputs.operator_linker_probe || inputs.operator_ui_diagnostic || inputs.operator_runtime_edges) && (github.ref != 'refs/heads/Operator_tests' || inputs.require_live_windows_scenarios)) || (inputs.operator_audit_diagnostic && inputs.operator_linker_probe) || (inputs.operator_ui_diagnostic && !inputs.operator_linker_probe) || (inputs.operator_runtime_edges && !inputs.operator_audit_diagnostic) }}
     runs-on: windows-latest
     timeout-minutes: 2
     steps:
       - name: Reject diagnostics outside the explicitly authorized branch
         shell: pwsh
         run: |
-          Write-Error 'Operator diagnostics require Operator_tests, one diagnostic mode, and no live-scenario override.'
+          Write-Error 'Operator diagnostics require Operator_tests, one diagnostic mode, runtime edges only with audit mode, and no live-scenario override.'
           exit 1
 
 
   operator-linker-probe:
-    if: ${{ inputs.operator_linker_probe && !inputs.operator_audit_diagnostic && !inputs.require_live_windows_scenarios && github.ref == 'refs/heads/Operator_tests' }}
+    if: ${{ inputs.operator_linker_probe && !inputs.operator_audit_diagnostic && !inputs.operator_runtime_edges && !inputs.require_live_windows_scenarios && github.ref == 'refs/heads/Operator_tests' }}
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
@@ -467,7 +472,7 @@ jobs:
 
 
   operator-ui-diagnostic:
-    if: ${{ inputs.operator_linker_probe && inputs.operator_ui_diagnostic && !inputs.operator_audit_diagnostic && !inputs.require_live_windows_scenarios && github.ref == 'refs/heads/Operator_tests' }}
+    if: ${{ inputs.operator_linker_probe && inputs.operator_ui_diagnostic && !inputs.operator_audit_diagnostic && !inputs.operator_runtime_edges && !inputs.require_live_windows_scenarios && github.ref == 'refs/heads/Operator_tests' }}
     runs-on: windows-latest
     timeout-minutes: 30
     steps:

@@ -37,8 +37,18 @@ def stage(name, command, minutes=10, *, tests=False, expected_exit=0,
                 contains=contains, prerequisite=prerequisite)
 
 
-def plan(root, output, target):
+def plan(root, output, target, *, runtime_edges_only=False):
     cargo_test = ["cargo", "test", "--locked", "--no-fail-fast"]
+    if runtime_edges_only:
+        return [
+            stage("rustc-identity", ["rustc", "-vV"], 3, contains="host: x86_64-pc-windows-msvc"),
+            stage("cargo-identity", ["cargo", "--version"], 3),
+            stage("metadata", ["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"], 3),
+            stage("runtime-production-build-dev", ["cargo", "build", "--locked", "-p", "eliot-kernel", "-p", "eliot-wasm-host", "--lib", "--bins"], 20),
+            stage("kernel-shutdown-durability", cargo_test + ["-p", "eliot-kernel", "--lib", "shutdown_drain::shutdown_drain_tests"] + ["--", "--nocapture", "--test-threads=1"], 8, tests=True),
+            stage("kernel-running-hot-spine", cargo_test + ["-p", "eliot-kernel", "--lib", "hot_path_runtime::tests"] + ["--", "--nocapture", "--test-threads=1"], 3, tests=True),
+            stage("wasm-admitted-process-edge", cargo_test + ["-p", "eliot-wasm-host", "--test", "admitted_execution"] + ["--", "--nocapture", "--test-threads=1"], 8, tests=True),
+        ]
     selected = ["--workspace"]
     for package in COMPILE_BLOCKED:
         selected += ["--exclude", package]
@@ -207,7 +217,11 @@ def self_test():
         pass
     else:
         raise AssertionError("incomplete metadata must not reduce the denominator")
-    print("diagnostic runner self-test: 15 passed")
+    edge_plan = plan(Path("."), Path("."), Path("."), runtime_edges_only=True)
+    assert len(edge_plan) == 7
+    assert all("--workspace" not in row["command"] for row in edge_plan)
+    assert [row["name"] for row in edge_plan if row["tests"]] == ["kernel-shutdown-durability", "kernel-running-hot-spine", "wasm-admitted-process-edge"]
+    print("diagnostic runner self-test: 18 passed")
 
 
 def binary_inventory(target, source_sha, build_status):
@@ -230,6 +244,7 @@ def main():
     parser.add_argument("--output", type=Path)
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--runtime-edges-only", action="store_true")
     args = parser.parse_args()
     if args.self_test:
         self_test()
@@ -240,9 +255,12 @@ def main():
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     target = Path(os.environ.get("CARGO_TARGET_DIR", output / "target")).resolve()
-    specs = plan(root, output, target)
-    write_json(output / "plan.json", dict(ceiling=CEILING, profile="native Windows dev/test; not release", stages=specs, conditional_fallback=dict(condition=FALLBACK_CONDITION,
-               metadata_source="metadata.stdout.log", stages="resolved after metadata stage")))
+    specs = plan(root, output, target, runtime_edges_only=args.runtime_edges_only)
+    write_json(output / "plan.json", dict(ceiling=CEILING, profile="native Windows dev/test; not release", stages=specs, conditional_fallback=dict(
+               status="NOT_APPLICABLE" if args.runtime_edges_only else "CONDITIONAL",
+               condition=None if args.runtime_edges_only else FALLBACK_CONDITION,
+               metadata_source="metadata.stdout.log",
+               stages=[] if args.runtime_edges_only else "resolved after metadata stage")))
     if args.plan_only:
         return 0
     if os.name != "nt" or os.environ.get("GITHUB_REF") != "refs/heads/Operator_tests":
@@ -262,7 +280,8 @@ def main():
                   input_sha256={name: hashlib.sha256((root / name).read_bytes()).hexdigest()
                                 for name in ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "scripts/operator-audit-diagnostic.py")},
                   cargo_feature_pure="UNSET", started_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                  ignored_tests="not requested", stages=[], complete=False)
+                  ignored_tests="not requested", runtime_edges_only=args.runtime_edges_only,
+                  stages=[], complete=False)
     write_json(output / "results.json", report)
     skill_root = root / "integrations" / "agent-skills"
     payload = dict(schema_version="eliot.skill-pack-snapshot.v1",
@@ -274,12 +293,14 @@ def main():
     write_json(output / "skill-corrupt.json", payload)
     fallback_specs = None
     fallback_metadata_error = None
-    report["conditional_fallback"] = dict(condition=FALLBACK_CONDITION, status="NOT_NEEDED")
-    deadline = time.monotonic() + 165 * 60
+    report["conditional_fallback"] = dict(
+        condition=None if args.runtime_edges_only else FALLBACK_CONDITION,
+        status="NOT_APPLICABLE" if args.runtime_edges_only else "NOT_NEEDED")
+    deadline = time.monotonic() + (42 if args.runtime_edges_only else 165) * 60
     for spec in specs:
         result = execute(spec, output, root, deadline - time.monotonic())
         report["stages"].append(result)
-        if spec["name"] == "metadata":
+        if spec["name"] == "metadata" and not args.runtime_edges_only:
             try:
                 if result["status"] != "EXPECTED_OUTCOME":
                     raise ValueError("metadata stage did not succeed")
@@ -302,7 +323,7 @@ def main():
                     # Append after known blockers so their existing priority is retained.
                     specs.extend(fallback_specs)
                     write_json(output / "activated-fallback-plan.json", fallback_specs)
-        if spec["name"] == "production-build-dev":
+        if spec["name"] in ("production-build-dev", "runtime-production-build-dev"):
             inventory = binary_inventory(target, head, result["status"])
             write_json(output / "linked-binary-inventory.json", inventory)
             report["linked_binary_inventory"] = "linked-binary-inventory.json"

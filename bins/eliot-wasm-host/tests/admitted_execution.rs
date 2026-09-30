@@ -213,6 +213,126 @@ fn revisions() -> BTreeMap<String, String> {
     ])
 }
 
+/// Temporary diagnostic wrapper for the two observed native failures only.
+/// The real executor is called once. Error mapping is identical to the P03
+/// adapter; no verdict, budget, permit, retry, or admission is changed.
+struct DiagnosticProcessPort {
+    adapter: WasmP03ProcessAdapter,
+    executor: Arc<WindowsProcessExecutor>,
+    sink: Arc<dyn ProcessEvidenceSink>,
+}
+
+fn diagnostic_unavailable(reason: &str) -> &'static str {
+    // Closed labels only: never print a path, payload, nonce, or arbitrary error.
+    match reason {
+        "Windows adapter failure: InvalidInput" => "windows_invalid_input",
+        "Windows adapter failure: NotFound" => "windows_not_found",
+        "Windows adapter failure: AlreadyExists" => "windows_already_exists",
+        "Windows adapter failure: Unavailable" => "windows_unavailable",
+        "Windows adapter failure: PermissionDenied" => "windows_permission_denied",
+        "Windows adapter failure: Timeout" => "windows_timeout",
+        "Windows adapter failure: Failed" => "windows_failed",
+        "Windows adapter failure: IdentityMismatch" => "windows_identity_mismatch",
+        "Windows adapter failure: AclMismatch" => "windows_acl_mismatch",
+        "executable digest does not match ProcessRequest" => "executable_digest_mismatch",
+        "secret environment references require an admitted secret projection" => {
+            "secret_projection_missing"
+        }
+        _ => "other_redacted",
+    }
+}
+
+fn diagnostic_drive<F: std::future::Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    loop {
+        match future.as_mut().poll(&mut context) {
+            std::task::Poll::Ready(value) => return value,
+            std::task::Poll::Pending => std::thread::yield_now(),
+        }
+    }
+}
+
+impl P03ProcessPort for DiagnosticProcessPort {
+    fn prepare(
+        &mut self,
+        envelope: &eliot_wasm_runtime::ProcessLaunchEnvelope,
+    ) -> Result<ProcessRequest, PortError> {
+        let result = self.adapter.prepare(envelope);
+        eprintln!(
+            "WASM_DIAGNOSTIC stage=prepare error={:?}",
+            result.as_ref().err()
+        );
+        result
+    }
+
+    fn start(
+        &mut self,
+        request: ProcessRequest,
+    ) -> Result<eliot_process::ProcessStartReceipt, PortError> {
+        use eliot_process::ProcessExecutor;
+        // Exactly the adapter's start call, intercepted before its lossy map.
+        let result = diagnostic_drive(self.executor.start(request, Arc::clone(&self.sink)));
+        match &result {
+            Ok(receipt) => eprintln!(
+                "WASM_DIAGNOSTIC stage=start lifecycle={:?}",
+                receipt.lifecycle()
+            ),
+            Err(ProcessExecutionError::Unavailable(reason)) => eprintln!(
+                "WASM_DIAGNOSTIC stage=start error=Unavailable reason={}",
+                diagnostic_unavailable(reason)
+            ),
+            Err(error) => eprintln!(
+                "WASM_DIAGNOSTIC stage=start error_variant={:?}",
+                std::mem::discriminant(error)
+            ),
+        }
+        result.map_err(|error| match error {
+            ProcessExecutionError::Contract(_) => PortError::Denied,
+            ProcessExecutionError::Unavailable(_) => PortError::Unavailable,
+            ProcessExecutionError::NotFound
+            | ProcessExecutionError::EvidenceSink(_)
+            | ProcessExecutionError::UnknownOutcome => PortError::UnknownOutcome,
+        })
+    }
+
+    fn cancel(
+        &mut self,
+        binding: &ProcessBinding,
+    ) -> Result<eliot_process::CancellationReceipt, PortError> {
+        let result = self.adapter.cancel(binding);
+        eprintln!(
+            "WASM_DIAGNOSTIC stage=cancel error={:?}",
+            result.as_ref().err()
+        );
+        result
+    }
+
+    fn reconcile(&mut self, binding: &ProcessBinding) -> Result<ProcessEvidence, PortError> {
+        let result = self.adapter.reconcile(binding);
+        match &result {
+            Ok(evidence) => eprintln!(
+                "WASM_DIAGNOSTIC stage=reconcile lifecycle={:?}",
+                evidence.view().lifecycle()
+            ),
+            Err(error) => eprintln!("WASM_DIAGNOSTIC stage=reconcile error={error:?}"),
+        }
+        result
+    }
+}
+
+fn diagnostic_process_port(
+    adapter: WasmP03ProcessAdapter,
+    executor: &Arc<WindowsProcessExecutor>,
+    sink: &Arc<dyn ProcessEvidenceSink>,
+) -> Box<dyn P03ProcessPort> {
+    Box::new(DiagnosticProcessPort {
+        adapter,
+        executor: Arc::clone(executor),
+        sink: Arc::clone(sink),
+    })
+}
+
 struct FakePort {
     authority: Mutex<DispatchPermitAuthority>,
     context: DispatchValidationContext,
@@ -769,7 +889,7 @@ fn admitted_execution_succeeds_through_real_wasmtime() {
         Box::new(admission.clone()),
         Box::new(admission.clone()),
         Box::new(admission.clone()),
-        Box::new(process_port),
+        diagnostic_process_port(process_port, &executor, &sink_dyn),
         Box::new(verify_port),
         Box::new(slotted_engine),
     );
@@ -795,6 +915,23 @@ fn admitted_execution_succeeds_through_real_wasmtime() {
         Ok(result) => result,
         Err(error) => panic!("contour gate refused a WASM admission: {error}"),
     };
+    eprintln!(
+        "WASM_DIAGNOSTIC stage=result disposition={:?} error={:?} usage_present={}",
+        result.receipt.disposition,
+        result.receipt.error,
+        result.receipt.usage.is_some()
+    );
+    if let Ok((out, err)) = executor.captured_output(binding.operation_id()) {
+        eprintln!(
+            "WASM_DIAGNOSTIC stage=capture stdout_bytes={} stdout_complete={} stdout_truncated={} stderr_bytes={} stderr_complete={} stderr_truncated={}",
+            out.total_bytes,
+            out.complete,
+            out.truncated,
+            err.total_bytes,
+            err.complete,
+            err.truncated
+        );
+    }
     assert_eq!(
         result.receipt.disposition,
         InvocationDisposition::Succeeded,
@@ -966,6 +1103,12 @@ fn compose_negative(
         must(process_port.stage_admitted_request(staged));
     }
     let verify_port = WasmP03ProcessAdapter::new(Arc::clone(&executor), Arc::clone(&sink_dyn));
+    let process_port: Box<dyn P03ProcessPort> =
+        if stage_id.as_deref() == Some("join-1956-bare-corpus") {
+            diagnostic_process_port(process_port, &executor, &sink_dyn)
+        } else {
+            Box::new(process_port)
+        };
     let slot_digest = Sha256Digest::of_bytes(slot_artifact);
     let invoked_digest = Sha256Digest::of_bytes(invoked_artifact);
     let authority_box = authority_admission.unwrap_or_else(|| admission.clone());
@@ -985,7 +1128,7 @@ fn compose_negative(
             Box::new(authority_box),
             Box::new(source),
             Box::new(promotion),
-            Box::new(process_port),
+            process_port,
             Box::new(verify_port),
             Box::new(slot_engine),
         )
@@ -1004,7 +1147,7 @@ fn compose_negative(
             Box::new(authority_box),
             Box::new(source),
             Box::new(promotion),
-            Box::new(process_port),
+            process_port,
             Box::new(verify_port),
             Box::new(slot_engine),
         )
@@ -1446,6 +1589,12 @@ fn bare_corpus_against_framed_execution_is_rejected() {
         runner
             .execute_admitted(&admitted, request)
             .map_err(|error| format!("unexpected contour refusal: {error}")),
+    );
+    eprintln!(
+        "WASM_DIAGNOSTIC stage=result disposition={:?} error={:?} usage_present={}",
+        result.receipt.disposition,
+        result.receipt.error,
+        result.receipt.usage.is_some()
     );
     assert_eq!(result.receipt.disposition, InvocationDisposition::Rejected);
     assert_eq!(

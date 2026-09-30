@@ -118,7 +118,13 @@ static DRAIN_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn durable_replace(source: &Path, destination: &Path) -> io::Result<()> {
     fs::rename(source, destination)?;
-    File::open(destination)?.sync_all()?;
+    // Windows FlushFileBuffers requires a writable handle. Reopen the
+    // already-renamed file without creating or truncating its durable bytes.
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(destination)?
+        .sync_all()?;
     #[cfg(unix)]
     {
         let parent = destination.parent().unwrap_or_else(|| Path::new("."));
@@ -1891,6 +1897,34 @@ mod shutdown_drain_tests {
                 .record_phase(phase, format!("{}-evidence", phase.as_str()))
                 .expect("ordered pre-commit phase records");
         }
+    }
+
+    #[test]
+    fn durable_replace_flushes_fresh_and_replaced_destination() -> io::Result<()> {
+        let root = test_work_root("durable-replace");
+        let destination = root.join("state.json");
+        for (index, payload) in [b"first durable state".as_slice(), b"replacement".as_slice()]
+            .into_iter()
+            .enumerate()
+        {
+            let source = root.join(format!("staged-{index}.tmp"));
+            let mut staged = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&source)?;
+            staged.write_all(payload)?;
+            staged.sync_all()?;
+            drop(staged);
+            durable_replace(&source, &destination)?;
+            assert!(!source.exists(), "rename must consume the staging path");
+            assert_eq!(
+                fs::read(&destination)?,
+                payload,
+                "reopened bytes stay exact"
+            );
+        }
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[tokio::test]
