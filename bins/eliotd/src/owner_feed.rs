@@ -332,27 +332,21 @@ fn admitted_revocation_operation(
     kernel: &Arc<DaemonKernelClient>,
     observed_receipts: &BTreeMap<String, ReceiptIdentity>,
 ) -> Result<RevocationOperationIdentity, CompositionError> {
-    let principal = kernel
-        .validated_session_binding()
-        .ok_or_else(|| {
-            CompositionError::Recovery(format!(
-                "{REVOCATION_OPERATION_IDENTITY_ABSENT}: no Kernel-validated session binding \
+    let principal = kernel.validated_session_binding().ok_or_else(|| {
+        CompositionError::Recovery(format!(
+            "{REVOCATION_OPERATION_IDENTITY_ABSENT}: no Kernel-validated session binding \
                  (graph revision {}, {} admitted root(s))",
-                plan.revision,
-                plan.roots.len()
-            ))
-        })?;
+            plan.revision,
+            plan.roots.len()
+        ))
+    })?;
     // The observing receipt is the identity of the durable closure-link read
     // this pass completed, digest-bound over the exact links it read. It is
     // derived from the READ, never from a closure under recheck, and it is the
     // one canonical receipt owner the transport already returns.
     let observing_receipt = observed_closure_read_identity(plan, observed_receipts)?;
     let epoch = plan.state_fence.authority_epoch.clone();
-    let generation = format!(
-        "{}:{}",
-        epoch.lineage_id.as_str(),
-        epoch.sequence.get()
-    );
+    let generation = format!("{}:{}", epoch.lineage_id.as_str(), epoch.sequence.get());
     RevocationOperationIdentity::admit(
         principal,
         TaskId::new(format!("kernel-generation:{generation}"))
