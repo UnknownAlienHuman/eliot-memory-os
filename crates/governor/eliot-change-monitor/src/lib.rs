@@ -1426,10 +1426,7 @@ impl ChangeMonitor {
                 .before
                 .as_ref()
                 .map(|before| before.revision.clone()),
-            after_resource_revision: transfer
-                .after
-                .as_ref()
-                .map(|after| after.revision.clone()),
+            after_resource_revision: transfer.after.as_ref().map(|after| after.revision.clone()),
             diff_ref: transfer.git.diff_ref.clone(),
             changed_paths: transfer.git.changed_paths.clone(),
             renames: transfer.git.renames.clone(),
