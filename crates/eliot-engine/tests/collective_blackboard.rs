@@ -569,6 +569,7 @@ impl Fixture {
             work_item_id: self.work_item_id,
             base_commit: "collective-work-fixture".to_owned(),
             worktree_head: None,
+            source_snapshot: None,
             diff_hash: "collective-work-rejected".to_owned(),
             diff_ref: "candidate-diff:collective-work-rejected".to_owned(),
             changed_files: vec!["crates/eliot-engine/src/collective.rs".to_owned()],

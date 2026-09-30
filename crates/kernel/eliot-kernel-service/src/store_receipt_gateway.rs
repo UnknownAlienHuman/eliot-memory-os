@@ -19,7 +19,9 @@
 
 use eliot_contracts::{OperationId, StateFence};
 use eliot_ors::{ReservationRecord, WriterReservationToken};
-use eliot_store_api::{CanonicalStoreClient, ReservedWriteRequest, WriteReceipt};
+use eliot_store_api::{
+    CanonicalStoreClient, CausalWriteReceipt, ReservedWriteRequest, WriteReceipt,
+};
 
 use super::KernelStoreGateway;
 use crate::store_write_reservation::{
@@ -32,6 +34,16 @@ pub(super) async fn receipt(
     state_fence: &StateFence,
     operation_id: OperationId,
 ) -> Result<Option<WriteReceipt>, String> {
+    Ok(receipt_with_causal(gateway, state_fence, operation_id)
+        .await?
+        .map(|pair| pair.receipt))
+}
+
+pub(super) async fn receipt_with_causal(
+    gateway: &KernelStoreGateway,
+    state_fence: &StateFence,
+    operation_id: OperationId,
+) -> Result<Option<CausalWriteReceipt>, String> {
     let _flight = gateway.flight.enter()?;
     if gateway.is_fenced() {
         return Err("canonical-store gateway is fenced for rebind".to_owned());
@@ -41,7 +53,7 @@ pub(super) async fn receipt(
 
     let receipt_result = gateway
         .store
-        .receipt(operation_id.clone())
+        .receipt_with_causal(operation_id.clone())
         .await
         .map_err(|error| error.to_string());
 
@@ -51,9 +63,11 @@ pub(super) async fn receipt(
     gateway.validate_active_route(state_fence)?;
 
     let receipt = receipt_result?;
-    let Some(receipt) = receipt else {
+    let Some(pair) = receipt else {
         return Ok(None);
     };
+    pair.validate().map_err(|error| error.to_string())?;
+    let receipt = &pair.receipt;
     receipt.validate().map_err(|error| error.to_string())?;
     if receipt.operation_id != operation_id {
         return Err("Store receipt operation identity does not match request".to_owned());
@@ -61,7 +75,7 @@ pub(super) async fn receipt(
     if receipt.state_fence != *state_fence {
         return Err("Store receipt fence does not match request".to_owned());
     }
-    Ok(Some(receipt))
+    Ok(Some(pair))
 }
 
 /// Reconciles one reserved write by its exact admitted request and observed

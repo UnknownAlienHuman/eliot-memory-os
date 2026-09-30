@@ -7,19 +7,26 @@ license.workspace = true
 description = "One-shot rust-analyzer/SCIP semantic-navigation and diagnostics bridge with observation receipts"
 
 [dependencies]
+eliot-artifact = { path = "../../instrument/eliot-artifact", version = "0.1.0" }
+eliot-blob-api.workspace = true
+eliot-contracts.workspace = true
+eliot-git-bridge.workspace = true
 eliot-build-test-graph = { path = "../../instrument/eliot-build-test-graph", version = "0.1.0" }
 eliot-evidence.workspace = true
+eliot-instrument-api.workspace = true
+eliot-instrument-runner = { path = "../../instrument/eliot-instrument-runner", version = "0.1.0" }
 eliot-instrument-scip.workspace = true
 eliot-observability = { path = "../../instrument/eliot-observability", version = "0.1.0" }
+eliot-process-executor.workspace = true
+eliot-platform-windows.workspace = true
 eliot-process.workspace = true
+eliot-types = { path = "../../eliot-types", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-eliot-contracts.workspace = true
-eliot-instrument-api.workspace = true
 eliot-platform.workspace = true
 
 [lints]
