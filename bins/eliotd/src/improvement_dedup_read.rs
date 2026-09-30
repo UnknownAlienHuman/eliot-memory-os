@@ -81,8 +81,11 @@
 //!    identity the store keys rows by;
 //! 3. its document decodes to the committed artifact shape AND binds itself:
 //!    the brief and the owner decision must name the very candidate the
-//!    document carries, and the recorded decision owner must be the very owner
-//!    the candidate records;
+//!    document carries, the owner decision must name the very brief the
+//!    document carries, and the recorded decision owner must be a non-empty
+//!    principal — the principal that RECORDED the disposition, which is a
+//!    different fact from the candidate's ADMISSION authority and is therefore
+//!    not required to equal it;
 //! 4. the candidate itself passes [`ImprovementCandidate::validate`];
 //! 5. the owner-decided bound committed beside it must pass
 //!    [`CandidateBoundPolicy::validate`].
@@ -648,10 +651,10 @@ fn classify_row(row: &Value) -> Result<Row, ImprovementDedupReadError> {
                 "record is neither a committed candidate artifact, nor an archive receipt, nor a lineage merge receipt: {error}"
             ))
         })?;
-    // The document must bind ITSELF. A brief or an owner decision that names
-    // a different candidate, or a decision owner that disagrees with the one
-    // the candidate records, is a spliced document: reading its owner or its
-    // evidence refs as this candidate's would be trusting a string.
+    // The document must bind ITSELF. A brief or an owner decision that names a
+    // different candidate, or a decision that names a different brief, is a
+    // spliced document: reading its owner or its evidence refs as this
+    // candidate's would be trusting a string.
     let candidate_id = artifact.candidate.candidate_id.trim();
     if artifact.brief.candidate_id.trim() != candidate_id
         || artifact.owner_decision.candidate_id.trim() != candidate_id
@@ -660,13 +663,38 @@ fn classify_row(row: &Value) -> Result<Row, ImprovementDedupReadError> {
             "the committed brief or owner decision names a different candidate".to_owned(),
         ));
     }
-    if artifact.owner_decision.owner.trim()
-        != artifact.candidate.owner_and_decision_authority.trim()
-    {
+    if artifact.owner_decision.brief_id.trim() != artifact.brief.brief_id.trim() {
         return Err(refused(
-            "the recorded decision owner is not the owner the candidate records".to_owned(),
+            "the committed owner decision names a different brief".to_owned(),
         ));
     }
+    // The recorded decision owner is the principal that RECORDED this
+    // disposition, which is a different fact from the candidate's
+    // `owner_and_decision_authority` — the authority that ADMITTED the
+    // candidate, which `brief.rs` itself calls a separate owner decision and
+    // the thing that admits the candidate to the backlog. Requiring
+    // the two strings to be EQUAL therefore tested an accident, not an
+    // invariant: it held only because both were the same constant, and the
+    // first record written by a principal that actually selected a disposition
+    // would have been refused as spliced — and refused on every later pass too,
+    // because the registry re-reads the same durable rows each time. That is
+    // why the equality is not kept and only its property is.
+    //
+    // What this read still proves is that the owner is a real principal, and
+    // it proves it with the authority owner's own `PrincipalRef` constructor
+    // rather than a predicate written here: that constructor refuses a blank,
+    // whitespace-only or control-character value, and it is applied to the
+    // ORIGINAL recorded string, not to a trimmed copy of it. A caller-declared
+    // string is still not authority — admission is proved by `enforced_bound`
+    // against a Governor-minted permit, the restored entry's owner is the
+    // CANDIDATE's own authority and never this field, and the record's own
+    // digest already covers this string, so it cannot be altered inside the
+    // record without changing the revision identity the store keys the row by.
+    eliot_authority::PrincipalRef::new(artifact.owner_decision.owner.as_str()).map_err(|error| {
+        refused(format!(
+            "recorded decision owner is not a principal: {error}"
+        ))
+    })?;
     if artifact.governed_admission_digest.trim().is_empty() {
         return Err(refused(
             "record carries no owner-issued governed admission digest".to_owned(),
