@@ -203,6 +203,7 @@ class AdmissionDefect(str, enum.Enum):
     ADMISSION_ENTRYPOINT_ABSENT = "ADMISSION_ENTRYPOINT_ABSENT"
     ADMISSION_CONSUMER_ABSENT = "ADMISSION_CONSUMER_ABSENT"
     ADMISSION_MIGRATION_UNBOUNDED = "ADMISSION_MIGRATION_UNBOUNDED"
+    ADMISSION_MIGRATION_PREMISE_FALSE = "ADMISSION_MIGRATION_PREMISE_FALSE"
     ADMISSION_FIELD_MISMATCH = "ADMISSION_FIELD_MISMATCH"
 
 
@@ -1885,6 +1886,44 @@ def _future_date(value: str, as_of: date) -> date | None:
     return None
 
 
+def measure_consumer_evidence(
+    package: str,
+    packages: Sequence[Mapping[str, Any]],
+    source_files: Sequence[SourceFileEvidence],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Measure a package's Cargo reverse fan-out and production call sites.
+
+    I2.23 licenses the time-bounded migration-facade form only for a package
+    admitted *without* a real consumer or test seam, so the premise every
+    migration record asserts ("no first real consumer") is re-measured here
+    from the resolved Cargo graph and the scanned source tree. The measurement
+    never reads the record that asserts it: a record cannot vouch for itself.
+
+    Returns ``(dependents, production_call_sites)`` as sorted tuples of package
+    name and ``path::`` file path. The crate identifier is matched against
+    ``SourceFileEvidence.identifiers``, which excludes comment, doc and string
+    bodies, so a documentation-only mention is never a construction.
+    """
+    crate_identifier = package.replace("-", "_")
+    names = {str(item["package_key"]): str(item["name"]) for item in packages}
+    dependents: set[str] = set()
+    for item in packages:
+        if str(item["name"]) != package:
+            continue
+        for edge in item["reverse_dependency_edges"]:
+            dependent = names.get(str(edge["from_package"]))
+            if dependent is not None and dependent != package:
+                dependents.add(dependent)
+    call_sites = {
+        item.path
+        for item in source_files
+        if item.package_name != package
+        and item.scope == SourceScope.PRODUCTION.value
+        and crate_identifier in item.identifiers
+    }
+    return tuple(sorted(dependents)), tuple(sorted(call_sites))
+
+
 def check_admission_decisions(
     root: Path,
     runner: Runner,
@@ -1900,7 +1939,9 @@ def check_admission_decisions(
     existing: its target contour must be a real contour holding the package, its proof
     entrypoint must be a real symbol inside the package, and it must carry either a
     real external consumer reached through a real Cargo edge or an unexpired migration
-    expiry over a consumer the crate's own manifest declares.
+    expiry over a consumer the crate's own manifest declares. A migration expiry is
+    additionally re-measured against the tree, so a package that really has a Cargo
+    dependent or a production call site cannot buy the expiry arm with a false premise.
     """
     member_names = {str(item["name"]) for item in packages if item.get("workspace_member")}
     package_dir = {
@@ -1974,6 +2015,13 @@ def check_admission_decisions(
                     for name in declared["consumers"]
                 ):
                     defects.append(AdmissionDefect.ADMISSION_MIGRATION_UNBOUNDED.value)
+                # The migration arm is only licensed without a real consumer, so the
+                # premise that selects it is measured against the tree here. Without
+                # this a record could claim a false "no first real consumer" and the
+                # check above, which only reads the record, could not see the lie.
+                dependents, call_sites = measure_consumer_evidence(package, packages, source_files)
+                if dependents or call_sites:
+                    defects.append(AdmissionDefect.ADMISSION_MIGRATION_PREMISE_FALSE.value)
 
             functional_cell = str(
                 ((_read_toml(root, root / package_dir[package] / "Cargo.toml").get("package") or {}).get("metadata") or {})
