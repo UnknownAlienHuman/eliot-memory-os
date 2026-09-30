@@ -19,7 +19,7 @@ use eliot_blob::{
     DpapiUserKeyPort, WindowsBlobPlatform, ZstdBlobCompression,
 };
 use eliot_blob_api::{
-    BlobError, BlobId, BlobPolicyBinding, BlobReadRequest, BlobReceiptContext,
+    BlobError, BlobId, BlobPolicyBinding, BlobReadChunk, BlobReadRequest, BlobReceiptContext,
     ObjectResidencyKey, RetentionClass,
 };
 use eliot_governor::{
@@ -71,6 +71,10 @@ pub enum SourceArtifactOwnerError {
     Profile(#[from] SourceArtifactBlobProfileError),
     #[error("source artifact policy reference is invalid: {0}")]
     PolicyReference(#[from] eliot_platform::PortError),
+    #[error("captured source payload pointer is invalid: {0}")]
+    CapturedPayload(#[from] eliot_store_api::StoreError),
+    #[error("captured payload does not identify an LSP observation envelope")]
+    WrongCapturedPayloadKind,
     #[error("source artifact effect is not admitted for this operation")]
     WrongEffect,
 }
@@ -182,6 +186,61 @@ impl SourceArtifactOwner {
         }
     }
 
+    /// Reads the exact retained LSP observation payload named by its original
+    /// Store pointer. This path returns Blob's verified chunk directly and
+    /// does not mint an ArtifactIdentity for a non-Artifact observation
+    /// envelope.
+    pub fn read_captured_observation_payload(
+        &self,
+        admission: &SourceArtifactAdmission,
+        profile: &SourceArtifactBlobProfile,
+        payload: &eliot_store_api::CapturedBlobPayloadRefV1,
+    ) -> Result<BlobReadChunk, SourceArtifactOwnerError> {
+        if admission.operation().effect != EffectClass::Read {
+            return Err(SourceArtifactOwnerError::WrongEffect);
+        }
+        payload.validate()?;
+        if payload.receipt_kind != eliot_lsp_bridge::LSP_TOOL_OBSERVATION_RECEIPT_KIND {
+            return Err(SourceArtifactOwnerError::WrongCapturedPayloadKind);
+        }
+        profile.validate_for(admission, SOURCE_BLOB_KEY_LINEAGE, self.key_generation)?;
+        let policy = blob_policy_binding(profile)?;
+        let residency = blob_residency_domains(profile)?;
+        if !matches_residency_domains(&payload.locator.residency, &residency) {
+            return Err(BlobError::MetadataPayloadMismatch.into());
+        }
+
+        let context = receipt_context(admission);
+        let blob = self.blob_for_context(&context)?;
+        let root_lease = self.root_owner.lease_for_request(&context.request)?;
+        let chunk = blob.read_source(&BlobReadRequest {
+            context,
+            root_lease,
+            locator: payload.locator.clone(),
+            expected_metadata_sha256: payload.metadata_sha256.clone(),
+            expected_ready_receipt_id: payload.ready_receipt_id.clone(),
+            max_bytes: payload.plaintext_length,
+        })?;
+        chunk.validate()?;
+
+        let ready = chunk.ready_receipt();
+        if ready.locator() != &payload.locator
+            || ready.metadata_sha256() != payload.metadata_sha256.as_str()
+            || ready.receipt().identity.receipt_id.as_str()
+                != payload.ready_receipt_id.as_str()
+            || ready.policy() != &policy
+            || !matches_residency_domains(&ready.locator().residency, &residency)
+            || ready.plaintext_length() != payload.plaintext_length
+            || ready.plaintext_sha256() != payload.plaintext_sha256.as_str()
+            || chunk.bytes().len() as u64 != payload.plaintext_length
+            || eliot_contracts::sha256_hex(chunk.bytes()).as_str()
+                != payload.plaintext_sha256.as_str()
+        {
+            return Err(BlobError::MetadataPayloadMismatch.into());
+        }
+        Ok(chunk)
+    }
+
     fn blob_for_context(
         &self,
         context: &BlobReceiptContext,
@@ -223,7 +282,7 @@ impl ArtifactBlobReader for AdmissionBlobReader<'_> {
                 BlobError::InvalidContract(format!("artifact read request refused: {error}"))
             })?;
             let root_lease = self.root_owner.lease_for_request(&self.context.request)?;
-            let chunk = self.blob.read_source(BlobReadRequest {
+            let chunk = self.blob.read_source(&BlobReadRequest {
                 context: self.context.clone(),
                 root_lease,
                 locator: request.locator,
