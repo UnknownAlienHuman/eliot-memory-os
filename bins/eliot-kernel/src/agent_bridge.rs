@@ -1943,7 +1943,7 @@ impl KernelComposition {
         session: &Session,
     ) -> Result<ActiveAgentBridgeReadBinding, TransportError> {
         if session.state != SessionState::Open
-            || session.module_generation.module_id.as_str() != super::ACTIVE_DAEMON_CALLER
+            || session.module_generation.module_id.as_str() != AGENT_BRIDGE_MODULE_ID
         {
             return Err(TransportError::SessionFenced);
         }

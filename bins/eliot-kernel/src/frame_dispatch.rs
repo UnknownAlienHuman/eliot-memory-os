@@ -885,6 +885,16 @@ impl KernelComposition {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
                 .ok_or(TransportError::SessionFenced)?;
+            #[cfg(windows)]
+            if session
+                .module_generation
+                .module_id
+                .as_str()
+                == eliot_protocol::AGENT_BRIDGE_MODULE_ID
+                && operation == eliot_protocol::AGENT_BRIDGE_READINESS_STATUS_OPERATION
+            {
+                return dispatch_agent_bridge_readiness_status(self, session, frame, payload);
+            }
             if session.module_generation.module_id.as_str() == ACTIVE_DAEMON_CALLER
                 && is_daemon_operation(&operation)
             {
@@ -1406,6 +1416,58 @@ impl KernelComposition {
     }
 }
 
+#[cfg(windows)]
+fn dispatch_agent_bridge_readiness_status(
+    kernel: &KernelComposition,
+    session: &Session,
+    frame: &Frame,
+    payload: serde_json::Value,
+) -> Result<KernelFrameAction, TransportError> {
+    if session.module_generation.module_id.as_str() != eliot_protocol::AGENT_BRIDGE_MODULE_ID
+        || frame.kind != FrameKind::Request
+        || frame.message_type != MessageType::Execute
+        || frame.connection_id != session.connection_id
+    {
+        return Err(TransportError::SessionFenced);
+    }
+
+    let request_id = frame
+        .request_id
+        .clone()
+        .ok_or(TransportError::SessionFenced)?;
+    let identity = frame
+        .request_identity
+        .as_ref()
+        .ok_or(TransportError::SessionFenced)?;
+    identity
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    if identity.request.metadata.request_id != request_id
+        || identity.request.state_fence != session.module_generation.state_fence
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    if unix_ms() >= identity.deadline_unix_ms {
+        return Err(TransportError::Timeout);
+    }
+    if !probe_ready_state_admitted(
+        kernel
+            .service_state()
+            .map_err(|_| TransportError::SessionFenced)?,
+    ) {
+        return Err(TransportError::SessionFenced);
+    }
+
+    let status = kernel.agent_bridge_readiness_status_operation(session, &payload)?;
+    if unix_ms() >= identity.deadline_unix_ms {
+        return Err(TransportError::Timeout);
+    }
+    let mut reply = status_frame(session, FrameKind::Response, MessageType::Result, status)?;
+    reply.request_id = Some(request_id);
+    reply.validate()?;
+    Ok(KernelFrameAction::Reply(reply))
+}
+
 fn is_daemon_operation(operation: &str) -> bool {
     matches!(
         operation,
@@ -1503,11 +1565,6 @@ fn is_daemon_operation(operation: &str) -> bool {
             | "agent_host_request_cancel"
             | "agent_host_request_reconcile"
             | "agent_host_request_rehydrate"
-            // Issue #1790 W6: the observation-only post-ACK read is a
-            // separate Bridge-facing operation. It still enters the
-            // authenticated daemon gateway, which selects the ticket from
-            // the current retained Bridge Session rather than the request.
-            | eliot_protocol::AGENT_BRIDGE_READINESS_STATUS_OPERATION
             | "activate_grant"
             | "revoke_grant"
             | "activate_introduction"
