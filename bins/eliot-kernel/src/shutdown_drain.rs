@@ -433,6 +433,27 @@ struct DurableDrainState {
     committed: Option<DrainCommitDecision>,
     terminal: Option<ShutdownTerminal>,
     pending: Vec<String>,
+    /// Drain-generation-scoped admission snapshot: the pending-obligation set
+    /// frozen with the drain admission-to-gate-closure boundary (#1686 item 3,
+    /// I1.5 `lease_and_pending_operation_snapshot`).
+    ///
+    /// `request_shutdown` snapshots the scope carried into the generation;
+    /// recording `AdmissionsClosed` re-anchors it to the registry the gate
+    /// actually closed over, in the same durable write as the phase, so the
+    /// closure and the scope it closed over are atomic. Work registered
+    /// between the two is the explicitly accounted admitted race: it stays
+    /// retained and must still reconcile through the owner observation before
+    /// the linearization point.
+    ///
+    /// `#[serde(default)]` for the same compatibility reason
+    /// `fenced_activation_generations` below is: the field is additive, so a
+    /// state file written before it existed still decodes, and
+    /// `DRAIN_STATE_VERSION` did not have to move. The absent case is repaired
+    /// on load by re-anchoring to the recovered registry when the closure
+    /// phase is already recorded, which only ever *retains* scope, so a
+    /// pre-field file is accounted, not revived.
+    #[serde(default)]
+    admission_pending_snapshot: Vec<String>,
     /// Installation-scoped activation fence, keyed by journal lineage.
     ///
     /// `#[serde(default)]` for the same compatibility reason
@@ -456,6 +477,15 @@ struct CoordinatorState {
     committed: Option<DrainCommitDecision>,
     terminal: Option<ShutdownTerminal>,
     pending: BTreeSet<String>,
+    /// Drain-generation-scoped admission snapshot (see
+    /// [`DurableDrainState::admission_pending_snapshot`]): the obligation
+    /// scope at admission, re-anchored to the registry the
+    /// `AdmissionsClosed` gate transition closed over. Unlike the
+    /// installation-scoped activation fence below, this is reset by
+    /// [`Self::fresh`] and carried forward by
+    /// [`ShutdownDrainCoordinator::request_shutdown`]: each generation owns
+    /// its own admission scope.
+    admission_snapshot: BTreeSet<String>,
     /// Highest activation-generation sequence a linearized drain fenced per
     /// journal lineage. This is deliberately *not* drain-generation state: see
     /// [`Self::fresh`] and [`ShutdownDrainCoordinator::request_shutdown`].
@@ -482,6 +512,7 @@ impl CoordinatorState {
             committed: None,
             terminal: None,
             pending: BTreeSet::new(),
+            admission_snapshot: BTreeSet::new(),
             fenced_activation_generations: BTreeMap::new(),
         }
     }
@@ -784,6 +815,18 @@ fn validate_durable_state(durable: &DurableDrainState) -> Result<(), String> {
         return Err("shutdown state contains invalid pending identity".to_owned());
     }
 
+    // The admission snapshot is written only from pending-registry sets,
+    // which refuse blank identities; a blank entry on disk is corruption,
+    // never scope. A file written before the field existed decodes to the
+    // empty snapshot, which this check accepts.
+    if durable
+        .admission_pending_snapshot
+        .iter()
+        .any(|identity| identity.trim().is_empty())
+    {
+        return Err("shutdown state contains invalid admission snapshot identity".to_owned());
+    }
+
     if let Some(terminal) = &durable.terminal {
         if !durable.requested {
             return Err("shutdown state has a terminal without a request".to_owned());
@@ -849,7 +892,21 @@ impl ShutdownDrainCoordinator {
                 state.committed = durable.committed;
                 state.terminal = durable.terminal;
                 state.pending = durable.pending.into_iter().collect();
+                state.admission_snapshot = durable.admission_pending_snapshot.into_iter().collect();
                 state.fenced_activation_generations = durable.fenced_activation_generations;
+                // One-directional repair of a pre-field admission snapshot: a
+                // recovered drain whose closure phase is already recorded
+                // re-anchors the snapshot to the recovered registry, because
+                // that registry is the scope the gate closed over. Adding
+                // scope can only retain more, never admit more, so a file
+                // written before the field existed is accounted on read
+                // rather than reopened.
+                if state
+                    .phases
+                    .contains_key(&ShutdownPhase::AdmissionsClosed.order())
+                {
+                    state.admission_snapshot = state.pending.clone();
+                }
                 // One-directional repair of a pre-field state: a recovered
                 // linearization re-derives its own activation fence, because
                 // the durable `DrainCommitRecord` it hands back still states
@@ -903,6 +960,7 @@ impl ShutdownDrainCoordinator {
             committed: state.committed.clone(),
             terminal: state.terminal.clone(),
             pending: state.pending.iter().cloned().collect(),
+            admission_pending_snapshot: state.admission_snapshot.iter().cloned().collect(),
             fenced_activation_generations: state.fenced_activation_generations.clone(),
         };
         // The write path is held to the same contract the recovery read path
@@ -998,6 +1056,13 @@ impl ShutdownDrainCoordinator {
         let carried_fences = state.fenced_activation_generations.clone();
         let mut candidate = CoordinatorState::fresh(fresh_generation());
         candidate.requested = true;
+        // The admission snapshot is the scope this generation owns: every
+        // obligation carried in, retained so the gate closure below can tell
+        // work that entered between admission and closure (the admitted race)
+        // from work that was already in scope. Like `pending` it is
+        // drain-generation state, so a fresh generation snapshots its own
+        // carried set rather than inheriting the previous closure.
+        candidate.admission_snapshot = carried.clone();
         candidate.pending = carried;
         candidate.fenced_activation_generations = carried_fences;
         self.persist_state(&candidate)?;
@@ -1014,6 +1079,17 @@ impl ShutdownDrainCoordinator {
     /// Records one ordered phase with its evidence. Phases must arrive in
     /// order; identical repeats are idempotent. Only
     /// `IntentionalPublished` may follow the linearization point.
+    ///
+    /// Recording `AdmissionsClosed` atomically re-anchors the
+    /// drain-generation admission snapshot to the registry the gate closed
+    /// over, in the same durable write as the phase: the closure and the
+    /// scope it closed over are published together, never one without the
+    /// other. Obligations registered between admission and this transition
+    /// are the explicitly accounted admitted race — retained, observed, and
+    /// still required to reconcile through the owner observation before the
+    /// linearization point. Resolve/reconcile capacity is unchanged: this
+    /// transition adds no refusal, so checkpoint/cancel/reconcile requests
+    /// keep their protected path through the drain.
     ///
     /// # Errors
     ///
@@ -1058,8 +1134,34 @@ impl ShutdownDrainCoordinator {
         }
         let mut candidate = state.clone();
         candidate.phases.insert(phase.order(), evidence);
+        // New ordinary work cannot enter between the admission snapshot and
+        // this gate closure without being named: anything in the registry
+        // that the admission snapshot does not contain entered in that
+        // window. Re-anchor the snapshot to the closed-over registry and
+        // observe the delta with a bounded outcome, so the race is accounted
+        // in durable state and in evidence rather than revalidated away.
+        let admission_raced = if phase == ShutdownPhase::AdmissionsClosed {
+            let raced = candidate
+                .pending
+                .iter()
+                .any(|identity| !candidate.admission_snapshot.contains(identity));
+            candidate.admission_snapshot = candidate.pending.clone();
+            raced
+        } else {
+            false
+        };
         self.persist_state(&candidate)?;
         *state = candidate;
+        if phase == ShutdownPhase::AdmissionsClosed {
+            observe_shutdown(
+                "kernel.shutdown.admission_gate_closed",
+                if admission_raced {
+                    "race-accounted"
+                } else {
+                    "none"
+                },
+            );
+        }
         Ok(())
     }
 
