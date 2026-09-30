@@ -1293,3 +1293,185 @@ pub fn admit_exposure_history(
     }
     Ok(())
 }
+
+/// Revision lineage binding one advertised exposure-history entry to the
+/// durable observation/receipt path.
+///
+/// The lineage carries no payload of its own: `receipt_id` names this
+/// immutable revision, `prior_delivery_receipt_id` links it to the recorded
+/// prior (a later authorized expansion or redelivery), and `idempotency_key`
+/// is the dedupe identity the durable path replays on. All-`None` means no
+/// durable identity is bound yet - a visible pending obligation on the owning
+/// persistence seam, never a silent gap. This seam mints no identities and
+/// opens no second store: the values arrive from the owning caller and are
+/// validated for shape only.
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExposureRevisionLineage {
+    /// Stable identity of this immutable revision, when bound.
+    pub receipt_id: Option<String>,
+    /// Recorded prior revision this revision links to; requires `receipt_id`.
+    pub prior_delivery_receipt_id: Option<String>,
+    /// Idempotency key the durable path dedupes on, when bound.
+    pub idempotency_key: Option<String>,
+}
+
+/// One advertised exposure-history entry with its durable revision lineage.
+///
+/// The owning persistence seam keys its write on `lineage` through the
+/// existing observation/receipt path; this seam never persists.
+///
+/// STITCH(bridge/host projection + eliot.observe): no production caller binds
+/// this pair on main yet. The owning caller - the bridge/host projection that
+/// renders the advertised surface, joined with the execution/transport/retry/
+/// verifier owners for their stages - supplies the entry and persists the
+/// returned revision through the existing observation/receipt path
+/// (`eliot.observe` capture via ReceiptEnvelope/CausalBinding), keyed by the
+/// lineage. Lost acknowledgements reconcile the original event; unavailable
+/// writeback leaves the pending obligation visible on that seam.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdvertisedExposureHistory {
+    /// Owner-populated history entry: every applicable I7.24 field supplied
+    /// or explicitly unresolved, never omitted.
+    pub entry: ToolExposureHistoryEntry,
+    /// Lineage the durable path persists and replays on.
+    pub lineage: ExposureRevisionLineage,
+}
+
+/// Validates the revision lineage shape without minting identities.
+///
+/// # Errors
+///
+/// Returns an error when a carried identity is blank or carries control
+/// characters, or when a revision links to a recorded prior without carrying
+/// its own receipt identity.
+fn validate_revision_lineage(
+    lineage: &ExposureRevisionLineage,
+) -> Result<(), SurfaceDecisionError> {
+    if let Some(receipt) = &lineage.receipt_id {
+        bounded_text(receipt, "history.revision.receipt_id")?;
+    }
+    if let Some(prior) = &lineage.prior_delivery_receipt_id {
+        bounded_text(prior, "history.revision.prior_delivery_receipt_id")?;
+        if lineage.receipt_id.is_none() {
+            return Err(SurfaceDecisionError::InvalidField {
+                field: "history.revision.receipt_id",
+                reason: "a linked revision requires its own receipt identity",
+            });
+        }
+    }
+    if let Some(key) = &lineage.idempotency_key {
+        bounded_text(key, "history.revision.idempotency_key")?;
+    }
+    Ok(())
+}
+
+/// Replay disposition for two advertised exposure-history revisions on one lineage.
+///
+/// Returned by [`replay_exposure_history_revision`]: evidence for the owning
+/// persistence seam to reconcile through the existing observation/receipt
+/// path, never permission to execute - history publication executes nothing,
+/// so an [`ExposureHistoryRevisionSignal::IdempotentReplay`] retains the
+/// prior revision and reconciles the original event, while a
+/// [`ExposureHistoryRevisionSignal::SuccessorRevision`] persists alongside
+/// the retained prior. The recorded original is never rewritten.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ExposureHistoryRevisionSignal {
+    /// Same bound receipt identity with identical recorded entries: a
+    /// replayed publication or redelivery, not new work and not new use.
+    IdempotentReplay,
+    /// New bound receipt identity linked through the recorded
+    /// `prior_delivery_receipt_id` to the recorded prior on the same
+    /// versioned tool identity: a later revision that persists alongside the
+    /// retained prior.
+    SuccessorRevision,
+}
+
+/// Classifies a repeated exposure-history revision against the recorded prior
+/// for replay-safe persistence.
+///
+/// Both revisions validate as recorded first:
+/// [`ToolExposureHistoryEntry::validate`] checks the recorded owner facts and
+/// never re-resolves them, and the bound lineage validates shape without
+/// minting identities. Recorded content then decides, compared with this
+/// operation:
+/// - same bound `receipt_id` with identical recorded entries is
+///   [`ExposureHistoryRevisionSignal::IdempotentReplay`];
+/// - same bound `receipt_id` with divergent recorded entries is a typed
+///   conflict; the caller persists a linked revision through the existing
+///   observation/receipt path instead of rewriting, so a replay can produce
+///   neither duplicate execution nor false usage evidence;
+/// - a new bound identity linked through the recorded
+///   `prior_delivery_receipt_id` to the recorded prior on the same versioned
+///   tool identity yields
+///   [`ExposureHistoryRevisionSignal::SuccessorRevision`];
+/// - anything else is `Ok(None)`: not a replay pair, routed to its owners.
+///   Unbound lineages - a visible pending obligation, never a recorded
+///   revision - always route to the owning seam to bind identities first.
+///
+/// A signal is evidence for the caller to reconcile through the existing
+/// observation/receipt path; it is never permission to execute again.
+///
+/// STITCH(bridge/host projection + eliot.observe): no production caller
+/// exists on main at this seam. The owning caller - the bridge/host
+/// projection joined with the execution/transport/retry/verifier owners -
+/// persists the classified revision through the existing observation/receipt
+/// path (`eliot.observe` capture via ReceiptEnvelope/CausalBinding), keyed by
+/// the revision lineage: `IdempotentReplay` retains the prior and reconciles
+/// the original event, `SuccessorRevision` persists alongside the retained
+/// prior, and lost acknowledgements reconcile the original event while
+/// unavailable writeback leaves the pending obligation visible on that seam.
+///
+/// # Errors
+///
+/// Returns an error when either revision is inconsistent, its lineage is
+/// malformed or links without its own receipt identity, or one bound receipt
+/// identity carries conflicting recorded evidence.
+pub fn replay_exposure_history_revision(
+    previous: &AdvertisedExposureHistory,
+    current: &AdvertisedExposureHistory,
+) -> Result<Option<ExposureHistoryRevisionSignal>, SurfaceDecisionError> {
+    previous
+        .entry
+        .validate()
+        .map_err(|error| map_exposure_error(&error))?;
+    current
+        .entry
+        .validate()
+        .map_err(|error| map_exposure_error(&error))?;
+    validate_revision_lineage(&previous.lineage)?;
+    validate_revision_lineage(&current.lineage)?;
+    let (Some(previous_id), Some(current_id)) = (
+        previous.lineage.receipt_id.as_deref(),
+        current.lineage.receipt_id.as_deref(),
+    ) else {
+        return Ok(None);
+    };
+    if previous_id == current_id {
+        if previous == current {
+            return Ok(Some(ExposureHistoryRevisionSignal::IdempotentReplay));
+        }
+        return Err(SurfaceDecisionError::InvalidField {
+            field: "history.revision.receipt_id",
+            reason: "replayed revision identity carries conflicting recorded evidence; persist a linked revision instead of rewriting",
+        });
+    }
+    let linked = current.lineage.prior_delivery_receipt_id.as_deref() == Some(previous_id);
+    if linked && versioned_tool_agrees(&previous.entry, &current.entry) {
+        return Ok(Some(ExposureHistoryRevisionSignal::SuccessorRevision));
+    }
+    Ok(None)
+}
+
+/// Whether both revisions record the same versioned tool identity on the same
+/// recorded route scope.
+fn versioned_tool_agrees(
+    previous: &ToolExposureHistoryEntry,
+    current: &ToolExposureHistoryEntry,
+) -> bool {
+    previous.tool_definition == current.tool_definition
+        && previous.definition_version == current.definition_version
+        && previous.route_fingerprint == current.route_fingerprint
+}
