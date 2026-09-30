@@ -66,8 +66,11 @@
 //! ([`produce_and_commit_attention_evaluation`]) assembles caller-nominated
 //! reads into a candidate record and admits it through the commit gate; the
 //! Store-leg binder supplies the commit invocation for the admitted identity.
-//! No caller is wired here; every function is complete and independently
-//! checkable.
+//! [`admit_attention_invalidation`] builds the byte-preserving invalidation
+//! successor and admits it through the same gate for the authorized operator
+//! adapter; [`attention_evaluation_view_context`] derives the role-filtered
+//! view fields the sibling `ControlBoard` projection row consumes. No caller
+//! is wired here; every function is complete and independently checkable.
 //!
 //! Fail-closed order in [`validate_attention_evaluation_request`]: record
 //! structural validity, caller identity validity, revision/operation/
@@ -82,15 +85,17 @@ use eliot_contracts::{
     sha256_hex,
 };
 use eliot_evaluation_contracts::{
-    EvaluatorScopeUncertaintyInvalidation, HUMAN_ATTENTION_EVALUATION_CONTRACT_VERSION,
+    ComparisonBasis, EvaluatorScopeUncertaintyInvalidation, HUMAN_ATTENTION_EVALUATION_CONTRACT_VERSION,
     HumanAttentionApprovalEvidence, HumanAttentionAssemblyInput, HumanAttentionClaim,
     HumanAttentionDenominatorFraming, HumanAttentionEvaluation,
     HumanAttentionEvaluationRevisionRef, HumanAttentionEvidenceGap,
-    HumanAttentionHumanReportEvidence, HumanAttentionInterruptionEvidence, HumanAttentionMethod,
+    HumanAttentionHumanReportEvidence, HumanAttentionInterruptionEvidence, HumanAttentionInvalidation,
+    HumanAttentionMethod,
     HumanAttentionMetricGroup, HumanAttentionMetricValue, HumanAttentionNotificationEvidence,
     HumanAttentionObservationWindow, HumanAttentionPrivacyEvidence, HumanAttentionProfileEvidence,
     HumanAttentionRiskOutcomeEvidence, HumanAttentionTaskOutcomeEvidence,
-    HumanAttentionTaskVerifierEvidence, ProfileRevisionRef, assemble_human_attention_evidence,
+    HumanAttentionTaskVerifierEvidence, ProfileRevisionRef,
+    assemble_human_attention_evidence,
 };
 use eliot_protocol::RequestIdentity;
 use eliot_store_api::{
@@ -945,5 +950,163 @@ pub fn produce_and_commit_attention_evaluation(
         record_digest,
         evidence_refs,
         gaps: assembled.gaps,
+    })
+}
+
+/// Admitted-invalidation output for one evaluation revision.
+///
+/// The record is the byte-preserving successor of the presented prior: every
+/// byte except the revision linkage and the invalidation statement is
+/// identical, so history is retained, notification/approval obligations are
+/// untouched, and no policy changes. `record_digest` is the immutable
+/// revision identity and `evidence_refs` the manifest-bound servable
+/// references.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttentionEvaluationInvalidatedRecord {
+    /// The admitted invalidation revision, gated through the commit gate.
+    pub record: HumanAttentionEvaluation,
+    /// SHA-256 over the canonical bytes of the exact admitted revision.
+    pub record_digest: String,
+    /// Manifest-bound evidence references servable for the admitted revision.
+    pub evidence_refs: Vec<ArtifactId>,
+}
+
+/// Builds the linked invalidation successor of one persisted revision and
+/// admits it through the commit gate (issue #1784 item W5).
+///
+/// The revision starts as a clone of the presented prior, so history
+/// preservation holds by construction: only the revision, the predecessor
+/// link, and the invalidation statement may differ, and
+/// [`validate_attention_evaluation_request`] re-proves that agreement
+/// (adjacency, identity, operation, evidence commitment, idempotency, session,
+/// and evaluator-principal agreement) before anything is admitted. A blank
+/// reason, a duplicate scope ref, or any other malformed statement fails with
+/// the typed [`AttentionEvaluationCommitError::Record`] from record
+/// validation; a non-invalidation operation or a mismatched revision fails
+/// with the typed operation/revision error. Invalidation removes current
+/// applicability while retaining the record: notification/approval state keeps
+/// its existing owner and is never rewritten here (I11.7).
+///
+/// STITCH: the authorized operator adapter submits the closed
+/// [`AttentionEvaluationOperatorRequest`] with
+/// [`AttentionEvaluationOperation::Invalidate`]; the Store-leg binder carries
+/// the derived commit identity into the prepared canonical transition.
+pub fn admit_attention_invalidation(
+    prior: &HumanAttentionEvaluation,
+    request: &AttentionEvaluationOperatorRequest,
+    identity: &RequestIdentity,
+    invalidated_at: ClockReading,
+    reason: String,
+    affected_scope_refs: Vec<String>,
+    invalidation_evidence_refs: Vec<ArtifactId>,
+) -> Result<AttentionEvaluationInvalidatedRecord, AttentionEvaluationCommitError> {
+    if request.operation != AttentionEvaluationOperation::Invalidate {
+        return Err(AttentionEvaluationCommitError::Operation(
+            "invalidation admission requires the invalidate operation".to_owned(),
+        ));
+    }
+    let mut record = prior.clone();
+    record.revision = request.expected_revision;
+    record.evaluation_id.clone_from(&request.evaluation_id);
+    record.predecessor = Some(HumanAttentionEvaluationRevisionRef {
+        evaluation_id: request.evaluation_id.clone(),
+        revision: prior.revision,
+    });
+    record
+        .evaluator_scope_uncertainty_and_invalidation
+        .invalidation = Some(HumanAttentionInvalidation {
+        invalidated_at,
+        affected_scope_refs,
+        reason,
+        evidence_refs: invalidation_evidence_refs,
+    });
+    validate_attention_evaluation_request(&record, Some(prior), request, identity)?;
+    let record_digest = attention_record_digest(&record)?;
+    let evidence_refs = collect_attention_evidence_refs(&record);
+    Ok(AttentionEvaluationInvalidatedRecord {
+        record,
+        record_digest,
+        evidence_refs,
+    })
+}
+
+/// Role-filtered view fields for one persisted evaluation revision.
+///
+/// This is the data half of the W6 seam: identity, scope and window, the
+/// declared comparison basis with its comparator profiles, the explicit
+/// uncertainty limitations, the current-applicability verdict, the
+/// observed/unknown/not-applicable counts, and exactly the manifest-bound
+/// evidence references. It carries no aggregate score, no superiority badge,
+/// no visibility or privacy fact, and no Problem, approval, or policy
+/// outcome: a quieter profile renders alongside its missed-risk, harm, and
+/// false-block/task costs rather than as an automatic positive (I11.7), and a
+/// stale or invalidated revision is visibly unusable for current tuning. Role
+/// filtering itself stays with the single canonical read projection, rendered
+/// per role (I11.2).
+///
+/// STITCH: the sibling `ControlBoard` projection row
+/// (`controlboard_projection::project_attention_evaluation_row`, owned by the
+/// #1785 lane) consumes this context for the scope, limitation, and
+/// comparison-basis display fields.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct AttentionEvaluationViewContext {
+    /// Evaluation identity this revision belongs to.
+    pub evaluation_id: String,
+    /// Monotonic revision within the evaluation, starting at one.
+    pub revision: u64,
+    /// Observation window the record binds.
+    pub window_id: String,
+    /// Authorized scope references the record was evaluated under.
+    pub authorized_scope_refs: Vec<String>,
+    /// Declared comparison basis; comparative conclusions are conditional on it.
+    pub comparison_basis: ComparisonBasis,
+    /// Comparator profiles the record method declares.
+    pub comparator_profile_refs: Vec<String>,
+    /// Explicit uncertainty limitations carried by the record.
+    pub limitations: Vec<String>,
+    /// Current-applicability verdict at the supplied observation instant.
+    pub validity: AttentionEvaluationValidity,
+    /// Per-group observed/unknown/not-applicable counts; denominators for
+    /// display, never ranking inputs.
+    pub summary: AttentionUnknownSummary,
+    /// Manifest-bound evidence references, exactly as persisted.
+    pub evidence_refs: Vec<ArtifactId>,
+    /// True unless the revision is currently valid: expired and invalidated
+    /// revisions are retained for history but unusable for current tuning.
+    pub unusable_for_current_tuning: bool,
+}
+
+/// Derives the role-filtered view fields for one persisted revision.
+///
+/// The record is re-validated structurally, so malformed bytes never render;
+/// validity is evaluated against the caller-supplied observation instant so
+/// unknown expiry timing never silently passes. The derivation invents no
+/// visibility, privacy, role, score, or lifecycle fact.
+pub fn attention_evaluation_view_context(
+    record: &HumanAttentionEvaluation,
+    observed_now_ms: Option<i64>,
+) -> Result<AttentionEvaluationViewContext, AttentionEvaluationCommitError> {
+    record
+        .validate()
+        .map_err(|error| AttentionEvaluationCommitError::Record(error.to_string()))?;
+    let validity = attention_evaluation_validity(record, observed_now_ms);
+    let framing = &record.evaluator_scope_uncertainty_and_invalidation;
+    Ok(AttentionEvaluationViewContext {
+        evaluation_id: record.evaluation_id.as_str().to_owned(),
+        revision: record.revision,
+        window_id: record
+            .observation_window
+            .specification
+            .window_id
+            .as_str()
+            .to_owned(),
+        authorized_scope_refs: framing.authorized_scope.authorized_scope_refs.clone(),
+        comparison_basis: record.method.comparison_basis,
+        comparator_profile_refs: record.method.comparator_profile_refs.clone(),
+        limitations: framing.uncertainty.limitations.clone(),
+        unusable_for_current_tuning: validity != AttentionEvaluationValidity::Current,
+        validity,
+        summary: attention_unknown_summary(record),
+        evidence_refs: collect_attention_evidence_refs(record),
     })
 }
