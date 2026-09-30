@@ -156,6 +156,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_canonical::CanonicalWriteEnvelope;
+use eliot_canonical::write_envelope::{VersionedWriteSubmission, parse_agent_response_mode};
 use eliot_contracts::{
     ArtifactId, ClockReading, OperationId, SessionId, StateFence, TaskId, canonical_json_bytes,
     sha256_hex,
@@ -179,8 +180,8 @@ use eliot_session::{SessionLifecycleOwner, SessionState};
 use eliot_store_api::{
     CONTRACT_VERSION, EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
     NamedMutationRequest, NamedOperationManifest, OperationManifestDigest, OrderingHeadExpectation,
-    OrderingScopeId, RevisionHeadExpectation, RevisionKey, ScopeId, SecurityContext,
-    TransitionClass, WriteReceipt, WriteReceiptStatus,
+    OrderingScopeId, OriginalWriteSubmission, RevisionHeadExpectation, RevisionKey, ScopeId,
+    SecurityContext, TransitionClass, WriteReceipt, WriteReceiptStatus,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -670,6 +671,8 @@ pub struct McpObservationCaptureInput {
     pub operation_id: OperationId,
     /// Complete original MCP observation content object.
     pub original_content: serde_json::Value,
+    /// Exact versioned user/agent source values from this original capture.
+    pub original_write_submission: OriginalWriteSubmission,
     /// Capture clock returned by the retained Kernel/ORS metadata.
     pub capture_clock: ClockReading,
     /// Exact pre-persistence Policy/WorkScope owner projection. A host capture
@@ -803,6 +806,7 @@ struct ObservationContentWire {
     affected_resources: Vec<String>,
     #[serde(default)]
     source_handles: Vec<String>,
+    write_submission: OriginalWriteSubmission,
 }
 
 fn validate_observation_content(content: &ObservationContentWire) -> Result<(), CompositionError> {
@@ -992,6 +996,10 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
         &self,
         input: McpObservationCaptureInput,
     ) -> Result<PreparedMcpObservation, CompositionError> {
+        input
+            .original_write_submission
+            .validate()
+            .map_err(|error| owner_refused(format!("original write submission is invalid: {error}")))?;
         let (policy, current_scope) = self.validate_capture_owners(&input)?;
         let task_selection_evidence = capture_task_selection_evidence(&input, &current_scope)?;
         let submission = Self::build_mcp_observation_submission(
@@ -1010,12 +1018,31 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
             ordering_head.sequence,
             input.task_selection.as_ref(),
         )?;
-        let exchange =
-            crate::finish_attempt::prepare_exchange(self.canonical, &input.identity, envelope)
-                .map_err(|error| match error {
-                    FinishAttemptError::Composition(error) => error,
-                    other => owner_refused(other.to_string()),
-                })?;
+        let original = input.original_write_submission.clone();
+        let response_mode = parse_agent_response_mode(&original.response_mode)
+            .map_err(|error| owner_refused(error.to_string()))?;
+        let versioned = VersionedWriteSubmission::bind(
+            original.protocol_version,
+            original.write_intent_id.clone(),
+            envelope,
+            response_mode,
+        )
+        .map_err(|error| owner_refused(format!("versioned Observe write admission failed: {error}")))?;
+        if versioned.original_source() != original {
+            return Err(owner_refused(
+                "versioned Observe write source changed during canonical admission",
+            ));
+        }
+        let exchange = crate::finish_attempt::prepare_exchange_with_original_submission(
+            self.canonical,
+            &input.identity,
+            versioned.envelope,
+            versioned.original_source(),
+        )
+        .map_err(|error| match error {
+            FinishAttemptError::Composition(error) => error,
+            other => owner_refused(other.to_string()),
+        })?;
         let access = ObservationCaptureAccess {
             privacy: input.owner_binding.access.privacy,
             visibility: input.owner_binding.access.visibility,
@@ -1098,6 +1125,11 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
                 owner_refused(format!("MCP ObservationContent shape is invalid: {error}"))
             })?;
         validate_observation_content(&original_content)?;
+        if original_content.write_submission != input.original_write_submission {
+            return Err(owner_refused(
+                "Observe content write metadata differs from the explicit capture source",
+            ));
+        }
         let observed_delta = String::from_utf8(
             canonical_json_bytes(&input.original_content)
                 .map_err(|error| owner_refused(error.to_string()))?,

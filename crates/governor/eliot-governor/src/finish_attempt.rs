@@ -166,6 +166,7 @@ pub struct PreparedKernelExchange {
     expected_revision_heads: Vec<RevisionHeadExpectation>,
     expected_ordering_heads: Vec<OrderingHeadExpectation>,
     pre_commit_fence: StateFence,
+    original_write_submission: Option<eliot_store_api::OriginalWriteSubmission>,
 }
 
 impl PreparedKernelExchange {
@@ -203,6 +204,12 @@ impl PreparedKernelExchange {
         &self,
         port: &P,
     ) -> Result<WriteReceipt, FinishAttemptError> {
+        if self.original_write_submission.is_some() {
+            return Err(KernelPortError::NotAdmitted(
+                "versioned original-write submission requires its explicit port path".to_owned(),
+            )
+            .into());
+        }
         let Some(transition) = self.transition.clone() else {
             return self.reconcile_receipt(port).await;
         };
@@ -212,6 +219,43 @@ impl PreparedKernelExchange {
                 transition.clone(),
                 self.expected_revision_heads.clone(),
                 self.expected_ordering_heads.clone(),
+            )
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(KernelPortError::Unknown(_)) => return self.reconcile_receipt(port).await,
+            Err(error) => return Err(error.into()),
+        };
+        self.validate_receipt(&committed)?;
+        Ok(committed)
+    }
+
+    /// Runs a versioned original write through a port that preserves its
+    /// exact admitted source metadata alongside the same prepared transition.
+    pub async fn exchange_with_original_submission<P: KernelTransitionPort + ?Sized>(
+        &self,
+        port: &P,
+    ) -> Result<WriteReceipt, FinishAttemptError> {
+        let source = self.original_write_submission.clone().ok_or_else(|| {
+            FinishAttemptError::Kernel(KernelPortError::NotAdmitted(
+                "prepared exchange has no original versioned write source".to_owned(),
+            ))
+        })?;
+        source
+            .validate()
+            .map_err(|error| FinishAttemptError::Kernel(KernelPortError::Contract(error.to_string())))?;
+        let transition = self.transition.clone().ok_or_else(|| {
+            FinishAttemptError::Kernel(KernelPortError::NotAdmitted(
+                "versioned original-write exchange has no prepared transition".to_owned(),
+            ))
+        })?;
+        let committed = match port
+            .apply_prepared_with_original_submission(
+                &self.identity,
+                transition.clone(),
+                self.expected_revision_heads.clone(),
+                self.expected_ordering_heads.clone(),
+                source,
             )
             .await
         {
@@ -337,7 +381,24 @@ pub(crate) fn prepare_exchange(
         transition: Some(transition),
         expected_revision_heads: envelope.expected_revision_heads,
         expected_ordering_heads: envelope.expected_ordering_heads,
+        original_write_submission: None,
     })
+}
+
+/// Prepares the same canonical transition while retaining the exact explicit
+/// original source metadata for its versioned Kernel exchange.
+pub(crate) fn prepare_exchange_with_original_submission(
+    canonical: &CanonicalAdmissionOwner,
+    identity: &RequestIdentity,
+    envelope: CanonicalWriteEnvelope,
+    original_write_submission: eliot_store_api::OriginalWriteSubmission,
+) -> Result<PreparedKernelExchange, FinishAttemptError> {
+    original_write_submission
+        .validate()
+        .map_err(|error| FinishAttemptError::Composition(CompositionError::Provider(error.to_string())))?;
+    let mut exchange = prepare_exchange(canonical, identity, envelope)?;
+    exchange.original_write_submission = Some(original_write_submission);
+    Ok(exchange)
 }
 
 /// Prepares the receipt readback owed by a leg whose derived owner image is
@@ -358,6 +419,7 @@ fn prepare_receipt_readback(
         expected_revision_heads: Vec::new(),
         expected_ordering_heads: Vec::new(),
         pre_commit_fence: canonical.state_fence().clone(),
+        original_write_submission: None,
     }
 }
 

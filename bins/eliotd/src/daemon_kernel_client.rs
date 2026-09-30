@@ -1062,7 +1062,7 @@ pub struct ObserveClaimedPair {
     /// Original admitted host request envelope.
     pub envelope: HostRequestEnvelope,
     /// Original Governor request identity retained from the admitted Host
-    /// Request Frame, distinct from the flat HostRequestIdentity above.
+    /// Request Frame, distinct from the flat `HostRequestIdentity` above.
     pub source_request_identity: RequestIdentity,
     /// Exact original peer admission receipt retained by the ORS executable
     /// row, never reconstructed from the current daemon connection.
@@ -1072,7 +1072,7 @@ pub struct ObserveClaimedPair {
     /// Exact immutable activation result that admitted the retained policy
     /// projection for this Host origin.
     pub source_activation_result: eliot_protocol::AgentActivationResolutionResult,
-    /// Exact decoded original ToolRequest value retained by Kernel.
+    /// Exact decoded original `ToolRequest` value retained by Kernel.
     pub tool: serde_json::Value,
     /// Current Kernel-issued daemon claim capability.
     pub attempt: LocalReadAttempt,
@@ -1090,262 +1090,254 @@ pub fn parse_observe_claimed_pair(
         .ok_or_else(|| "Kernel semantic_observe_claim answer omits the pair".to_owned())?;
     match pair {
         serde_json::Value::Null => Ok(None),
-        serde_json::Value::Object(_) => {
-            let envelope_value = pair.get("envelope").cloned().ok_or_else(|| {
-                "Kernel semantic_observe_claim pair omits the envelope".to_owned()
-            })?;
-            let tool = pair
-                .get("tool")
-                .cloned()
-                .ok_or_else(|| "Kernel semantic_observe_claim pair omits the tool".to_owned())?;
-            let attempt_value = pair
-                .get("attempt")
-                .cloned()
-                .ok_or_else(|| "Kernel semantic_observe_claim pair omits the attempt".to_owned())?;
-            let record_value = pair.get("record").cloned().ok_or_else(|| {
-                "Kernel semantic_observe_claim pair omits the retained ORS record".to_owned()
-            })?;
-            let durable_attempt_value = pair.get("durable_attempt").cloned().ok_or_else(|| {
-                "Kernel semantic_observe_claim pair omits the retained ORS attempt".to_owned()
-            })?;
-            let envelope: HostRequestEnvelope =
-                serde_json::from_value(envelope_value).map_err(|error| {
-                    format!("Kernel semantic_observe_claim pair envelope does not decode: {error}")
-                })?;
-            envelope.validate().map_err(|error| {
-                format!(
-                    "Kernel semantic_observe_claim pair envelope is not admitted shape: {error}"
-                )
-            })?;
-            if envelope.identity.capability != "eliot.observe" {
-                return Err(
-                    "Kernel semantic_observe_claim pair is not the admitted observe capability"
-                        .to_owned(),
-                );
-            }
-            let attempt: LocalReadAttempt =
-                serde_json::from_value(attempt_value).map_err(|error| {
-                    format!("Kernel semantic_observe_claim pair attempt does not decode: {error}")
-                })?;
-            attempt.validate().map_err(|error| {
-                format!("Kernel semantic_observe_claim pair attempt is not bound shape: {error}")
-            })?;
-            if attempt.operation_id != host_request_operation_id(&envelope) {
-                return Err(
-                    "Kernel semantic_observe_claim pair attempt does not bind the envelope"
-                        .to_owned(),
-                );
-            }
-            let record: eliot_ors::HostRequestRecord = serde_json::from_value(record_value)
-                .map_err(|error| {
-                    format!("Kernel semantic_observe_claim ORS record does not decode: {error}")
-                })?;
-            record.validate().map_err(|error| {
-                format!("Kernel semantic_observe_claim ORS record is invalid: {error}")
-            })?;
-            let durable_attempt: eliot_ors::HostRequestAttempt =
-                serde_json::from_value(durable_attempt_value).map_err(|error| {
-                    format!("Kernel semantic_observe_claim ORS attempt does not decode: {error}")
-                })?;
-            let Some(executable_input) = record.executable_input.as_ref() else {
-                return Err(
-                    "Kernel semantic_observe_claim ORS record omits retained executable input"
-                        .to_owned(),
-                );
-            };
-            executable_input
-                .validate_for(&record)
-                .map_err(|error| format!("Kernel retained executable input is invalid: {error}"))?;
-            let observation_origin = executable_input
-                .application_binding
-                .observation_policy_binding
-                .get("origin")
-                .and_then(|origin| origin.get("kind"))
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| "retained observation owner origin is missing".to_owned())?;
-            let attempt_matches_owner = match observation_origin {
-                "HOST_PEER" => {
-                    attempt.wire_version
-                        == eliot_protocol::LOCAL_READ_ATTEMPT_HOST_ORIGIN_CONTRACT_VERSION
-                        && attempt.session_id.is_none()
-                        && record.scope_ref.as_ref().map(|scope| scope.as_str())
-                            == Some(attempt.scope_id.as_str())
-                }
-                "APPLICATION_SESSION" => {
-                    attempt.wire_version == LocalReadAttempt::CONTRACT_VERSION
-                        && attempt.session_id.as_deref()
-                            == executable_input
-                                .application_binding
-                                .session_ref
-                                .as_ref()
-                                .map(|session| session.as_str())
-                        && record.scope_ref.as_ref().map(|scope| scope.as_str())
-                            == Some(attempt.scope_id.as_str())
-                }
-                _ => false,
-            };
-            let source_request_identity: RequestIdentity = serde_json::from_value(
-                executable_input
-                    .application_binding
-                    .source_request_identity
-                    .clone(),
-            )
-            .map_err(|error| {
-                format!("Kernel original request identity does not decode: {error}")
-            })?;
-            source_request_identity
-                .validate()
-                .map_err(|error| format!("Kernel original request identity is invalid: {error}"))?;
-            if serde_json::to_value(&source_request_identity).map_err(|error| {
-                format!("Kernel original request identity cannot encode: {error}")
-            })? != executable_input.application_binding.source_request_identity
-            {
-                return Err(
-                    "Kernel original RequestIdentity differs from the retained ORS source"
-                        .to_owned(),
-                );
-            }
-            let peer_admission_receipt: eliot_protocol::AgentBridgePeerAdmissionReceipt =
-                serde_json::from_value(
-                    executable_input
-                        .application_binding
-                        .host_peer_admission_receipt
-                        .clone(),
-                )
-                .map_err(|error| format!("retained Host peer receipt does not decode: {error}"))?;
-            peer_admission_receipt
-                .validate()
-                .map_err(|error| format!("retained Host peer receipt is invalid: {error}"))?;
-            let source_activation_ticket: eliot_protocol::AgentActivationResolutionTicket =
-                serde_json::from_value(
-                    executable_input
-                        .application_binding
-                        .source_activation_ticket
-                        .clone(),
-                )
-                .map_err(|error| {
-                    format!("retained source activation ticket does not decode: {error}")
-                })?;
-            source_activation_ticket.validate().map_err(|error| {
-                format!("retained source activation ticket is invalid: {error}")
-            })?;
-            let source_activation_result: eliot_protocol::AgentActivationResolutionResult =
-                serde_json::from_value(
-                    executable_input
-                        .application_binding
-                        .source_activation_result
-                        .clone(),
-                )
-                .map_err(|error| {
-                    format!("retained source activation result does not decode: {error}")
-                })?;
-            source_activation_result
-                .validate_against(&source_activation_ticket)
-                .map_err(|error| {
-                    format!("retained source activation result is invalid: {error}")
-                })?;
-            if record.operation_id.as_str() != attempt.operation_id
-                || record.request_digest != envelope.envelope_sha256
-                || record.payload_digest != envelope.identity.payload_sha256
-                || record.state != eliot_ors::HostRequestState::Submitted
-                || record.result_digest.is_some()
-                || record.attempt.as_ref() != Some(&durable_attempt)
-                || durable_attempt.attempt_id.as_str() != attempt.attempt_id
-                || durable_attempt.generation != attempt.fencing_generation
-                || durable_attempt.input_commitment_sha256.as_deref()
-                    != Some(executable_input.commitment_sha256.as_str())
-                || executable_input.payload_sha256 != envelope.identity.payload_sha256
-                || !attempt_matches_owner
-                || durable_attempt.phase != eliot_ors::HostRequestAttemptPhase::Claimed
-                || attempt.authority_epoch != envelope.state_fence.authority_epoch
-                || attempt.facet_method != OBSERVE_CAPABILITY
-                || envelope.state_fence != executable_input.application_binding.state_fence
-                || envelope.connection_id != peer_admission_receipt.connection_id
-                || envelope.peer_admission_receipt_sha256 != peer_admission_receipt.receipt_sha256
-                || executable_input.peer_admission_receipt_sha256
-                    != peer_admission_receipt.receipt_sha256
-                || source_activation_ticket.peer_admission_receipt.as_ref()
-                    != Some(&peer_admission_receipt)
-                || source_activation_ticket.peer_admission_receipt_sha256
-                    != peer_admission_receipt.receipt_sha256
-                || source_activation_ticket.connection_id != envelope.connection_id
-                || source_activation_ticket.state_fence != envelope.state_fence
-                || source_activation_result.ticket_id != source_activation_ticket.ticket_id
-                || source_activation_result.ticket_state_fence
-                    != source_activation_ticket.state_fence
-                || !envelope.activation_binding.as_ref().is_some_and(|binding| {
-                    binding.ticket_id == source_activation_ticket.ticket_id
-                        && binding.ticket_sha256 == source_activation_ticket.ticket_sha256
-                        && binding.resolution_result_sha256
-                            == source_activation_result.result_sha256
-                })
-            {
-                return Err(
-                    "Kernel semantic_observe_claim ORS row is not the exact admitted pair"
-                        .to_owned(),
-                );
-            }
-            let retained_request_identity = &executable_input.application_binding.request_identity;
-            let original_request_identity = serde_json::to_value(&envelope.identity)
-                .map_err(|error| format!("original observe identity cannot encode: {error}"))?;
-            if retained_request_identity != &original_request_identity {
-                return Err(
-                    "Kernel retained observe identity differs from the original envelope"
-                        .to_owned(),
-                );
-            }
-            if source_request_identity.request.metadata.request_id != envelope.identity.request_id
-                || source_request_identity.idempotency_key != envelope.identity.idempotency_key
-                || source_request_identity.cancellation_id != envelope.identity.cancellation_id
-                || source_request_identity.deadline_unix_ms != envelope.identity.deadline_unix_ms
-                || !neutral_source_fence_matches_owner(
-                    &source_request_identity.request.state_fence,
-                    &executable_input.application_binding.state_fence,
-                )
-                || !neutral_source_fence_matches_owner(
-                    &source_request_identity.request.metadata.state_fence,
-                    &executable_input.application_binding.state_fence,
-                )
-                || source_request_identity
-                    .request
-                    .metadata
-                    .session_id
-                    .is_some()
-                || source_request_identity.request.metadata.task_id.is_some()
-            {
-                return Err(
-                    "Kernel original RequestIdentity differs from the admitted Host request"
-                        .to_owned(),
-                );
-            }
-            let tool_bytes = canonical_json_bytes(&tool)
-                .map_err(|error| format!("original observe tool cannot canonicalize: {error}"))?;
-            let tool_length = u64::try_from(tool_bytes.len())
-                .map_err(|_| "original observe tool length exceeds the ORS contract".to_owned())?;
-            if tool_length != executable_input.payload_length
-                || sha256_hex(&tool_bytes) != executable_input.payload_sha256
-            {
-                return Err(
-                    "Kernel retained executable input does not bind the decoded original tool"
-                        .to_owned(),
-                );
-            }
-            Ok(Some(ObserveClaimedPair {
-                envelope,
-                source_request_identity,
-                peer_admission_receipt,
-                source_activation_ticket,
-                source_activation_result,
-                tool,
-                attempt,
-                record,
-                durable_attempt,
-            }))
-        }
+        serde_json::Value::Object(_) => decode_observe_claimed_pair(pair).map(Some),
         _ => Err(
             "Kernel semantic_observe_claim pair is neither an admitted pair nor null".to_owned(),
         ),
     }
+}
+
+struct ObserveClaimParts {
+    envelope: HostRequestEnvelope,
+    tool: serde_json::Value,
+    attempt: LocalReadAttempt,
+    record: eliot_ors::HostRequestRecord,
+    durable_attempt: eliot_ors::HostRequestAttempt,
+}
+
+struct ObserveRetainedSources {
+    source_request_identity: RequestIdentity,
+    peer_admission_receipt: eliot_protocol::AgentBridgePeerAdmissionReceipt,
+    source_activation_ticket: eliot_protocol::AgentActivationResolutionTicket,
+    source_activation_result: eliot_protocol::AgentActivationResolutionResult,
+}
+
+fn decode_observe_claimed_pair(pair: &serde_json::Value) -> Result<ObserveClaimedPair, String> {
+    let parts = decode_observe_claim_parts(pair)?;
+    let executable_input = parts.record.executable_input.as_ref().ok_or_else(|| {
+        "Kernel semantic_observe_claim ORS record omits retained executable input".to_owned()
+    })?;
+    executable_input
+        .validate_for(&parts.record)
+        .map_err(|error| format!("Kernel retained executable input is invalid: {error}"))?;
+    let sources = decode_observe_retained_sources(executable_input)?;
+    validate_observe_claim_lineage(&parts, executable_input, &sources)?;
+    validate_observe_tool_commitment(&parts.tool, executable_input)?;
+    Ok(ObserveClaimedPair {
+        envelope: parts.envelope,
+        source_request_identity: sources.source_request_identity,
+        peer_admission_receipt: sources.peer_admission_receipt,
+        source_activation_ticket: sources.source_activation_ticket,
+        source_activation_result: sources.source_activation_result,
+        tool: parts.tool,
+        attempt: parts.attempt,
+        record: parts.record,
+        durable_attempt: parts.durable_attempt,
+    })
+}
+
+fn decode_observe_claim_parts(value: &serde_json::Value) -> Result<ObserveClaimParts, String> {
+    let envelope_value = required_observe_pair_field(value, "envelope")?;
+    let tool = required_observe_pair_field(value, "tool")?;
+    let attempt_value = required_observe_pair_field(value, "attempt")?;
+    let record_value = required_observe_pair_field(value, "record")?;
+    let durable_attempt_value = required_observe_pair_field(value, "durable_attempt")?;
+    let envelope: HostRequestEnvelope = serde_json::from_value(envelope_value)
+        .map_err(|error| format!("Kernel semantic_observe_claim envelope does not decode: {error}"))?;
+    envelope
+        .validate()
+        .map_err(|error| format!("Kernel semantic_observe_claim envelope is not admitted shape: {error}"))?;
+    if envelope.identity.capability != "eliot.observe" {
+        return Err("Kernel semantic_observe_claim pair is not the admitted observe capability".to_owned());
+    }
+    let attempt: LocalReadAttempt = serde_json::from_value(attempt_value)
+        .map_err(|error| format!("Kernel semantic_observe_claim attempt does not decode: {error}"))?;
+    attempt
+        .validate()
+        .map_err(|error| format!("Kernel semantic_observe_claim attempt is not bound shape: {error}"))?;
+    if attempt.operation_id != host_request_operation_id(&envelope) {
+        return Err("Kernel semantic_observe_claim attempt does not bind the envelope".to_owned());
+    }
+    let record: eliot_ors::HostRequestRecord = serde_json::from_value(record_value)
+        .map_err(|error| format!("Kernel semantic_observe_claim ORS record does not decode: {error}"))?;
+    record
+        .validate()
+        .map_err(|error| format!("Kernel semantic_observe_claim ORS record is invalid: {error}"))?;
+    let durable_attempt: eliot_ors::HostRequestAttempt =
+        serde_json::from_value(durable_attempt_value)
+            .map_err(|error| format!("Kernel semantic_observe_claim ORS attempt does not decode: {error}"))?;
+    Ok(ObserveClaimParts { envelope, tool, attempt, record, durable_attempt })
+}
+
+fn required_observe_pair_field(
+    value: &serde_json::Value,
+    field: &str,
+) -> Result<serde_json::Value, String> {
+    value
+        .get(field)
+        .cloned()
+        .ok_or_else(|| format!("Kernel semantic_observe_claim pair omits {field}"))
+}
+
+fn decode_observe_retained_sources(
+    executable_input: &eliot_ors::RetainedExecutableInput,
+) -> Result<ObserveRetainedSources, String> {
+    let binding = &executable_input.application_binding;
+    let source_request_identity: RequestIdentity = serde_json::from_value(
+        binding.source_request_identity.clone(),
+    )
+    .map_err(|error| format!("Kernel original request identity does not decode: {error}"))?;
+    source_request_identity
+        .validate()
+        .map_err(|error| format!("Kernel original request identity is invalid: {error}"))?;
+    if serde_json::to_value(&source_request_identity)
+        .map_err(|error| format!("Kernel original request identity cannot encode: {error}"))?
+        != binding.source_request_identity
+    {
+        return Err("Kernel original RequestIdentity differs from the retained ORS source".to_owned());
+    }
+    let peer_admission_receipt: eliot_protocol::AgentBridgePeerAdmissionReceipt =
+        serde_json::from_value(binding.host_peer_admission_receipt.clone())
+            .map_err(|error| format!("retained Host peer receipt does not decode: {error}"))?;
+    peer_admission_receipt
+        .validate()
+        .map_err(|error| format!("retained Host peer receipt is invalid: {error}"))?;
+    let source_activation_ticket: eliot_protocol::AgentActivationResolutionTicket =
+        serde_json::from_value(binding.source_activation_ticket.clone())
+            .map_err(|error| format!("retained source activation ticket does not decode: {error}"))?;
+    source_activation_ticket
+        .validate()
+        .map_err(|error| format!("retained source activation ticket is invalid: {error}"))?;
+    let source_activation_result: eliot_protocol::AgentActivationResolutionResult =
+        serde_json::from_value(binding.source_activation_result.clone())
+            .map_err(|error| format!("retained source activation result does not decode: {error}"))?;
+    source_activation_result
+        .validate_against(&source_activation_ticket)
+        .map_err(|error| format!("retained source activation result is invalid: {error}"))?;
+    Ok(ObserveRetainedSources {
+        source_request_identity,
+        peer_admission_receipt,
+        source_activation_ticket,
+        source_activation_result,
+    })
+}
+
+fn validate_observe_claim_lineage(
+    parts: &ObserveClaimParts,
+    executable_input: &eliot_ors::RetainedExecutableInput,
+    sources: &ObserveRetainedSources,
+) -> Result<(), String> {
+    let envelope = &parts.envelope;
+    let attempt = &parts.attempt;
+    let record = &parts.record;
+    let durable_attempt = &parts.durable_attempt;
+    let binding = &executable_input.application_binding;
+    let observation_origin = binding
+        .observation_policy_binding
+        .get("origin")
+        .and_then(|origin| origin.get("kind"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "retained observation owner origin is missing".to_owned())?;
+    let attempt_matches_owner = match observation_origin {
+        "HOST_PEER" => attempt.wire_version
+            == eliot_protocol::LOCAL_READ_ATTEMPT_HOST_ORIGIN_CONTRACT_VERSION
+            && attempt.session_id.is_none()
+            && record.scope_ref.as_ref().map(|scope| scope.as_str())
+                == Some(attempt.scope_id.as_str()),
+        "APPLICATION_SESSION" => attempt.wire_version == LocalReadAttempt::CONTRACT_VERSION
+            && attempt.session_id.as_deref()
+                == binding.session_ref.as_ref().map(|session| session.as_str())
+            && record.scope_ref.as_ref().map(|scope| scope.as_str())
+                == Some(attempt.scope_id.as_str()),
+        _ => false,
+    };
+    if record.operation_id.as_str() != attempt.operation_id
+        || record.request_digest != envelope.envelope_sha256
+        || record.payload_digest != envelope.identity.payload_sha256
+        || record.state != eliot_ors::HostRequestState::Submitted
+        || record.result_digest.is_some()
+        || record.attempt.as_ref() != Some(durable_attempt)
+        || durable_attempt.attempt_id.as_str() != attempt.attempt_id
+        || durable_attempt.generation != attempt.fencing_generation
+        || durable_attempt.input_commitment_sha256.as_deref()
+            != Some(executable_input.commitment_sha256.as_str())
+        || executable_input.payload_sha256 != envelope.identity.payload_sha256
+        || !attempt_matches_owner
+        || durable_attempt.phase != eliot_ors::HostRequestAttemptPhase::Claimed
+        || attempt.authority_epoch != envelope.state_fence.authority_epoch
+        || attempt.facet_method != OBSERVE_CAPABILITY
+        || envelope.state_fence != binding.state_fence
+    {
+        return Err("Kernel semantic_observe_claim ORS row is not the exact admitted pair".to_owned());
+    }
+    validate_observe_activation_lineage(envelope, binding, sources)
+        .and_then(|()| validate_observe_source_identity(envelope, binding, &sources.source_request_identity))
+}
+
+fn validate_observe_activation_lineage(
+    envelope: &HostRequestEnvelope,
+    binding: &eliot_ors::HostRequestApplicationBinding,
+    sources: &ObserveRetainedSources,
+) -> Result<(), String> {
+    let peer = &sources.peer_admission_receipt;
+    let ticket = &sources.source_activation_ticket;
+    let result = &sources.source_activation_result;
+    if envelope.connection_id != peer.connection_id
+        || envelope.peer_admission_receipt_sha256 != peer.receipt_sha256
+        || binding.peer_admission_receipt_sha256 != peer.receipt_sha256
+        || ticket.peer_admission_receipt.as_ref() != Some(peer)
+        || ticket.peer_admission_receipt_sha256 != peer.receipt_sha256
+        || ticket.connection_id != envelope.connection_id
+        || ticket.state_fence != envelope.state_fence
+        || result.ticket_id != ticket.ticket_id
+        || result.ticket_state_fence != ticket.state_fence
+        || !envelope.activation_binding.as_ref().is_some_and(|activation| {
+            activation.ticket_id == ticket.ticket_id
+                && activation.ticket_sha256 == ticket.ticket_sha256
+                && activation.resolution_result_sha256 == result.result_sha256
+        })
+    {
+        return Err("Kernel semantic_observe_claim ORS activation is not the exact admitted pair".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_observe_source_identity(
+    envelope: &HostRequestEnvelope,
+    binding: &eliot_ors::HostRequestApplicationBinding,
+    source: &RequestIdentity,
+) -> Result<(), String> {
+    let original_request_identity = serde_json::to_value(&envelope.identity)
+        .map_err(|error| format!("original observe identity cannot encode: {error}"))?;
+    if binding.request_identity != original_request_identity
+        || source.request.metadata.request_id != envelope.identity.request_id
+        || source.idempotency_key != envelope.identity.idempotency_key
+        || source.cancellation_id != envelope.identity.cancellation_id
+        || source.deadline_unix_ms != envelope.identity.deadline_unix_ms
+        || !neutral_source_fence_matches_owner(&source.request.state_fence, &binding.state_fence)
+        || !neutral_source_fence_matches_owner(&source.request.metadata.state_fence, &binding.state_fence)
+        || source.request.metadata.session_id.is_some()
+        || source.request.metadata.task_id.is_some()
+    {
+        return Err("Kernel original RequestIdentity differs from the admitted Host request".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_observe_tool_commitment(
+    tool: &serde_json::Value,
+    executable_input: &eliot_ors::RetainedExecutableInput,
+) -> Result<(), String> {
+    let tool_bytes = canonical_json_bytes(tool)
+        .map_err(|error| format!("original observe tool cannot canonicalize: {error}"))?;
+    let tool_length = u64::try_from(tool_bytes.len())
+        .map_err(|_| "original observe tool length exceeds the ORS contract".to_owned())?;
+    if tool_length != executable_input.payload_length
+        || sha256_hex(&tool_bytes) != executable_input.payload_sha256
+    {
+        return Err("Kernel retained executable input does not bind the decoded original tool".to_owned());
+    }
+    Ok(())
 }
 
 /// The Bridge Frame identity retains transport attribution and its neutral
