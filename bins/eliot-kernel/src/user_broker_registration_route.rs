@@ -38,6 +38,22 @@ pub(crate) const USER_BROKER_HEARTBEAT_OPERATION: &str = "eliot.user-broker.hear
 pub(crate) const USER_BROKER_FENCE_OPERATION: &str = "eliot.user-broker.fence";
 pub(crate) const USER_BROKER_VALIDATE_NATIVE_RESOURCE_SELECTION_CURRENT_OPERATION: &str =
     "eliot.user-broker.validate-native-resource-selection-current";
+/// The fifth closed User Broker operation: the fresh, short-lived Operator
+/// session token I11.8 requires on every `WinUI` binding (`#1777`).
+///
+/// The token is minted by the existing Kernel owner at
+/// `bins/eliot-kernel/src/daemon_request_dispatch.rs::operator_session_token_operation`
+/// and, beneath it, `eliot_kernel_service::bind_operator_session_token`. This
+/// matrix mints nothing: it admits the request onto that owner for a session
+/// the dedicated User Broker binder already proved from the live OS peer, and
+/// the owner re-proves the live session fence and Material authority itself.
+/// The selector is the one the broker presents on the wire, declared at
+/// `bins/eliot-user-broker/src/operation_identity.rs::OPERATOR_SESSION_TOKEN_OPERATION`;
+/// the two declarations are the same wire contract and are paired, in the same
+/// way each other `eliot.user-broker.*` selector is paired across the
+/// authenticated boundary.
+pub(crate) const USER_BROKER_BIND_OPERATOR_SESSION_TOKEN_OPERATION: &str =
+    "eliot.user-broker.operator-session-token";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -569,6 +585,18 @@ impl KernelComposition {
                 session, frame, &request, identity, now,
             )?;
             return serde_json::to_value(()).map_err(|_| TransportError::SessionFenced);
+        }
+        if operation == USER_BROKER_BIND_OPERATOR_SESSION_TOKEN_OPERATION {
+            // The Operator session token is minted by the existing Kernel owner
+            // (`operator_session_token_operation`), not here. This matrix only
+            // carries the closed request onto it for a session the dedicated
+            // User Broker binder already admitted from the live OS peer: the
+            // module id, the granted capability, the accepted session and
+            // `Ready` were all proved above, and the owner re-proves the live
+            // session fence and Material authority itself before it binds. No
+            // caller-asserted identity is accepted here; the exact binding
+            // evidence is closed payload evidence the owner re-proves.
+            return self.operator_session_token_operation(session, payload.clone());
         }
         if operation != USER_BROKER_REGISTER_OPERATION {
             return Err(TransportError::SessionFenced);

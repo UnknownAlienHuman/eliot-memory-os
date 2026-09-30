@@ -11,7 +11,8 @@
 //! authority, or persist canonical transitions.
 
 use super::user_broker_registration_route::{
-    USER_BROKER_FENCE_OPERATION, USER_BROKER_HEARTBEAT_OPERATION, USER_BROKER_REGISTER_OPERATION,
+    USER_BROKER_BIND_OPERATOR_SESSION_TOKEN_OPERATION, USER_BROKER_FENCE_OPERATION,
+    USER_BROKER_HEARTBEAT_OPERATION, USER_BROKER_REGISTER_OPERATION,
     USER_BROKER_VALIDATE_NATIVE_RESOURCE_SELECTION_CURRENT_OPERATION,
 };
 use super::*;
@@ -1360,6 +1361,13 @@ impl KernelComposition {
             USER_BROKER_HEARTBEAT_OPERATION,
             USER_BROKER_FENCE_OPERATION,
             USER_BROKER_VALIDATE_NATIVE_RESOURCE_SELECTION_CURRENT_OPERATION,
+            // I11.8 (#1777): the fresh short-lived Operator session token the
+            // WinUI client presents when it redeems its broker binding. It is
+            // admitted here like the other four: the exact closed selector
+            // must be the only entry this session may present, the binder
+            // re-proves the live fence and Material authority, and the token
+            // itself is minted by the Kernel owner, never by this session.
+            USER_BROKER_BIND_OPERATOR_SESSION_TOKEN_OPERATION,
         ];
 
         observe_front_door_session("kernel.front_door_user_broker_bind", "attempt");
