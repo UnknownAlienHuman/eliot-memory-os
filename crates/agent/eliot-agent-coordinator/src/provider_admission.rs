@@ -52,7 +52,12 @@ use eliot_kernel_service::{
 };
 
 use crate::core::{ProviderProofKind, ProviderVerifier};
-use crate::model::{CoordinatorError, ProviderBindingSnapshot, ProviderIdentity, validate_text};
+use crate::model::{
+    CoordinatorError, ProviderAdmissionReceipt, ProviderBindingSnapshot,
+    ProviderCancellationReconciliation, ProviderExecutionBindingSubmission, ProviderIdentity,
+    ProviderReassignmentReceipt, ProviderUnknownOutcomeReconciliation, ProviderWorkerFenceReceipt,
+    ResultSubmission, validate_text,
+};
 
 /// Ingress-presented claim material for one provider admission (T9-05
 /// presented half, issue #1108).
@@ -477,12 +482,14 @@ impl ProviderVerifier for KernelProviderVerifier {
         self.capability.check_currentness()?;
         let presented = &self.capability.presented;
         let currentness = &self.capability.currentness;
+        let (receipt_attempt_id, receipt_operation_id) =
+            receipt_proof_identity(kind, canonical_payload, &presented.operation_id)?;
         let fence_digest = presented.fence_digest()?;
         let live_fence_digest = currentness.live_fence_digest()?;
         let request = ProviderCapabilityRequest {
             claim_id: presented.claim_id.clone(),
-            attempt_id: presented.attempt_id.clone(),
-            operation_id: presented.operation_id.clone(),
+            attempt_id: receipt_attempt_id,
+            operation_id: receipt_operation_id,
             proof_kind: map_proof_kind(kind),
             proof_ref: proof_ref.to_owned(),
             canonical_payload_sha256: sha256_hex(canonical_payload.as_bytes()),
@@ -493,6 +500,12 @@ impl ProviderVerifier for KernelProviderVerifier {
             worker_generation: presented.worker_generation,
             fence_digest,
         };
+        // Validates the ORIGINAL assembled request via the existing owner
+        // validator before delegating: shape, revocation, exact
+        // receipt-versus-claim attempt/operation match, epoch currency,
+        // revision agreement, digest equality, generation and fence binding
+        // are all owner-checked below against the loaded claim row.
+        request.validate().map_err(map_capability_error)?;
         verify_provider_capability(
             &request,
             &currentness.expectation,
@@ -505,6 +518,109 @@ impl ProviderVerifier for KernelProviderVerifier {
             &currentness.live_epoch(),
         )
         .map_err(map_capability_error)
+    }
+}
+
+/// Reads the receipt-claimed attempt/operation identity for one proof kind
+/// from the receipt's ORIGINAL canonical bytes (issue #1108 A5).
+///
+/// Each kind names its exact identity fields explicitly through the existing
+/// typed receipt schemas (all `deny_unknown_fields`): admission binds every
+/// admitted lane attempt (one admission receipt under a single-attempt claim
+/// names one attempt; a receipt spreading lanes across attempts is an
+/// `IdentityConflict`, never silently narrowed to the first lane); binding,
+/// worker fence, result, and unknown-outcome bind the covered attempt;
+/// cancellation binds the covered attempt plus the requesting operation;
+/// reassignment binds the covered old attempt (the new identity is
+/// core-validated fresh, never claim-bound). Only cancellation receipts carry
+/// an operation identity (`request_operation_id`); no other receipt schema
+/// carries one, so those kinds ride the admitted claim's operation
+/// (`claim_operation_id`) explicitly and there is no receipt-side operation
+/// to drift. The returned pair feeds the owner request while the admitted
+/// claim rides as the loaded durable row, so a receipt naming an attempt or
+/// operation the claim never covered fails closed through the owner as
+/// `ForeignAttempt` / `ForeignOperation`.
+///
+/// # Errors
+///
+/// Returns [`CoordinatorError::InvalidField`] when the canonical bytes are
+/// not a receipt of the claimed kind or admit no lanes, or
+/// [`CoordinatorError::IdentityConflict`] when one admission receipt names
+/// attempts beyond a single identity.
+fn receipt_proof_identity(
+    kind: ProviderProofKind,
+    canonical_payload: &str,
+    claim_operation_id: &str,
+) -> Result<(String, String), CoordinatorError> {
+    match kind {
+        ProviderProofKind::Admission => {
+            let receipt = serde_json::from_str::<ProviderAdmissionReceipt>(canonical_payload)
+                .map_err(|_| CoordinatorError::InvalidField("canonical_payload"))?;
+            let first = receipt
+                .admitted_lanes
+                .first()
+                .ok_or(CoordinatorError::InvalidField("admitted_lanes"))?;
+            let attempt_id = first.attempt_id.as_str();
+            if receipt
+                .admitted_lanes
+                .iter()
+                .any(|lane| lane.attempt_id.as_str() != attempt_id)
+            {
+                return Err(CoordinatorError::IdentityConflict("admitted_lanes"));
+            }
+            Ok((attempt_id.to_owned(), claim_operation_id.to_owned()))
+        }
+        ProviderProofKind::Binding => {
+            let submission =
+                serde_json::from_str::<ProviderExecutionBindingSubmission>(canonical_payload)
+                    .map_err(|_| CoordinatorError::InvalidField("canonical_payload"))?;
+            Ok((
+                submission.binding.attempt_id.as_str().to_owned(),
+                claim_operation_id.to_owned(),
+            ))
+        }
+        ProviderProofKind::Cancellation => {
+            let receipt =
+                serde_json::from_str::<ProviderCancellationReconciliation>(canonical_payload)
+                    .map_err(|_| CoordinatorError::InvalidField("canonical_payload"))?;
+            Ok((
+                receipt.attempt_id.as_str().to_owned(),
+                receipt.request_operation_id.as_str().to_owned(),
+            ))
+        }
+        ProviderProofKind::WorkerFence => {
+            let receipt = serde_json::from_str::<ProviderWorkerFenceReceipt>(canonical_payload)
+                .map_err(|_| CoordinatorError::InvalidField("canonical_payload"))?;
+            Ok((
+                receipt.attempt_id.as_str().to_owned(),
+                claim_operation_id.to_owned(),
+            ))
+        }
+        ProviderProofKind::Reassignment => {
+            let receipt = serde_json::from_str::<ProviderReassignmentReceipt>(canonical_payload)
+                .map_err(|_| CoordinatorError::InvalidField("canonical_payload"))?;
+            Ok((
+                receipt.old_attempt_id.as_str().to_owned(),
+                claim_operation_id.to_owned(),
+            ))
+        }
+        ProviderProofKind::Result => {
+            let submission = serde_json::from_str::<ResultSubmission>(canonical_payload)
+                .map_err(|_| CoordinatorError::InvalidField("canonical_payload"))?;
+            Ok((
+                submission.result.attempt_id.as_str().to_owned(),
+                claim_operation_id.to_owned(),
+            ))
+        }
+        ProviderProofKind::UnknownOutcome => {
+            let receipt =
+                serde_json::from_str::<ProviderUnknownOutcomeReconciliation>(canonical_payload)
+                    .map_err(|_| CoordinatorError::InvalidField("canonical_payload"))?;
+            Ok((
+                receipt.attempt_id.as_str().to_owned(),
+                claim_operation_id.to_owned(),
+            ))
+        }
     }
 }
 
