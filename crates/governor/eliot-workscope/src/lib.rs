@@ -62,6 +62,7 @@ pub use resolver::{
 };
 pub use scanner::{
     AdapterEvidence, ArtifactDirEvidence, BootstrapDiscoveryInputs, BootstrapScanEvidence,
+    GoverningSourceCandidateEvidence,
     BootstrapScanOutcome, BootstrapScanner, ChangeSummary, DiscoveryLeaseKey,
     DiscoveryLeaseRequest, DiscoveryOperation, EditorWorkspaceEvidence, ExistingRecordEvidence,
     FileTypeCount, ForbiddenScanClass, LOOSE_SCAN_DISCLOSURE_PREFIX, LOOSE_SCAN_DISCLOSURE_SUFFIX,
