@@ -1213,6 +1213,393 @@ impl<S: MaintenanceStateStore> MaintenanceController<S> {
             durable_job_ref: None,
         }
     }
+
+    /// Checkpoints one running job for an idle-drain generation and reads the
+    /// checkpoint back from the durable store before returning (#1686 item 4,
+    /// I14.13 "checkpoint durable jobs", I14.23 "request jobs/modules
+    /// checkpoint/cancel").
+    ///
+    /// Eligibility is the owner's, not the caller's: only a job in
+    /// [`MaintenanceJobState::Running`] checkpoints, and only for the attempt
+    /// ordinal the execution owner actually began (`attempt` must equal the
+    /// job's admitted `attempts`), so a checkpoint can never bind a
+    /// not-started, already-terminal, or foreign attempt. `policy_ref` must
+    /// name the authorizing drain policy: the owner binds it into the returned
+    /// outcome but never invents one, so a policy-unauthorized checkpoint is
+    /// refused rather than recorded. The returned [`DrainCheckpointOutcome`]
+    /// is built from the revision the store served back after the save — never
+    /// from the request — so a planned reclamation or stop that consumes it
+    /// proceeds only on a durably read-back checkpoint artifact.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaintenanceError::InvalidField`] for a malformed request or a
+    /// wrong attempt ordinal, [`MaintenanceError::IllegalTransition`] when the
+    /// job is not running, and [`MaintenanceError::Store`] when the read-back
+    /// does not carry the saved checkpoint.
+    pub fn checkpoint_for_drain(
+        &mut self,
+        request: &DrainCheckpointRequest,
+        fence: &StateFence,
+    ) -> Result<DrainCheckpointOutcome, MaintenanceError> {
+        request.validate()?;
+        let current = self.load_checked(&request.job_id, fence)?;
+        if current.state != MaintenanceJobState::Running {
+            return Err(MaintenanceError::IllegalTransition {
+                from: current.state,
+                to: MaintenanceJobState::Checkpointed,
+            });
+        }
+        if current.attempts != request.attempt {
+            return Err(MaintenanceError::InvalidField("drain.attempt"));
+        }
+        let saved = self.checkpoint(&request.job_id, fence, request.checkpoint.clone())?;
+        self.read_back_drain_checkpoint(
+            &request.drain_generation,
+            &request.owner_ref,
+            &request.policy_ref,
+            &saved,
+            fence,
+        )
+    }
+
+    /// Reads one drain checkpoint back from the durable store and binds it to
+    /// the calling drain generation (#1686 item 4, I14.13 "require durable
+    /// checkpoint readback before planned reclamation/stop").
+    ///
+    /// `saved` is the revision the checkpoint call returned; the revision the
+    /// store serves back must equal it — same identity, same fence, same
+    /// checkpoint artifact, same `Checkpointed` state. Anything else (absent
+    /// revision, substituted job, lost artifact, advanced state) is refused
+    /// with [`MaintenanceError::Store`] and yields no outcome, so a planned
+    /// stop never consumes an unproven checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaintenanceError::InvalidField`] for a malformed binding, and
+    /// [`MaintenanceError::Store`] when the read-back does not equal the saved
+    /// revision or carries no checkpoint artifact.
+    pub fn read_back_drain_checkpoint(
+        &mut self,
+        drain_generation: &str,
+        owner_ref: &str,
+        policy_ref: &str,
+        saved: &MaintenanceJob,
+        fence: &StateFence,
+    ) -> Result<DrainCheckpointOutcome, MaintenanceError> {
+        text(drain_generation, "drain.generation")?;
+        text(owner_ref, "drain.owner_ref")?;
+        text(policy_ref, "drain.policy_ref")?;
+        let read_back = self.load_checked(&saved.job_id, fence)?;
+        if read_back != *saved {
+            return Err(MaintenanceError::Store(
+                "drain checkpoint read-back mismatch".to_owned(),
+            ));
+        }
+        let checkpoint = read_back.checkpoint.clone().ok_or(MaintenanceError::Store(
+            "drain checkpoint artifact absent on read-back".to_owned(),
+        ))?;
+        let outcome = DrainCheckpointOutcome {
+            drain_generation: drain_generation.to_owned(),
+            job_id: read_back.job_id.clone(),
+            attempt: read_back.attempts,
+            owner_ref: owner_ref.to_owned(),
+            policy_ref: policy_ref.to_owned(),
+            state_fence: read_back.state_fence.clone(),
+            checkpoint,
+            state: read_back.state,
+        };
+        outcome.validate()?;
+        Ok(outcome)
+    }
+
+    /// Cancels one drain-eligible job for an idle-drain generation (#1686 item
+    /// 4, I14.13 "cancel noncritical child tasks", I14.23 "request
+    /// jobs/modules checkpoint/cancel").
+    ///
+    /// The request must name the authorizing drain policy (`policy_ref`); the
+    /// owner binds it into the returned outcome but never invents one, so a
+    /// policy-unauthorized cancellation is refused rather than recorded.
+    /// Family criticality stays a policy input carried by that reference, not
+    /// an owner guess. Pre-effect eligibility is the state machine's:
+    /// [`MaintenanceJob::transition`] admits `Cancelled` only from `Admitted`,
+    /// `Running`, `Checkpointed` and `Deferred`, so a completed, failed,
+    /// quarantined (`RollbackRequired`) or still-unknown job is refused with
+    /// [`MaintenanceError::IllegalTransition`]. An unknown external effect
+    /// stays fenced and is never cancelled away, and a completed effect is
+    /// never rewritten as cancelled. The returned [`DrainCancelOutcome`]
+    /// carries the checkpoint and outcome references the persisted revision
+    /// retains, proving the cancellation claimed no rollback of an
+    /// already-executed effect.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaintenanceError::InvalidField`] for a malformed request,
+    /// [`MaintenanceError::IllegalTransition`] when the job is not in a
+    /// cancellable state, and [`MaintenanceError::Store`] when the persisted
+    /// revision does not retain the pre-cancel checkpoint and outcome
+    /// references.
+    pub fn cancel_for_drain(
+        &mut self,
+        request: &DrainCancelRequest,
+        fence: &StateFence,
+    ) -> Result<DrainCancelOutcome, MaintenanceError> {
+        request.validate()?;
+        let current = self.load_checked(&request.job_id, fence)?;
+        let retained_checkpoint = current.checkpoint.clone();
+        let retained_outcome_ref = current.outcome_ref.clone();
+        self.cancel(&request.job_id, fence)?;
+        let read_back = self.load_checked(&request.job_id, fence)?;
+        if read_back.state != MaintenanceJobState::Cancelled
+            || read_back.checkpoint != retained_checkpoint
+            || read_back.outcome_ref != retained_outcome_ref
+        {
+            return Err(MaintenanceError::Store(
+                "drain cancel read-back mismatch".to_owned(),
+            ));
+        }
+        let outcome = DrainCancelOutcome {
+            drain_generation: request.drain_generation.clone(),
+            job_id: read_back.job_id.clone(),
+            owner_ref: request.owner_ref.clone(),
+            policy_ref: request.policy_ref.clone(),
+            state_fence: read_back.state_fence.clone(),
+            state: read_back.state,
+            retained_checkpoint,
+            retained_outcome_ref,
+        };
+        outcome.validate()?;
+        Ok(outcome)
+    }
+
+    /// Acknowledges the Governor drain flush over outcome-observation coverage
+    /// for one declared job set (#1686 item 5, I14.23 "flush
+    /// audit/outbox/ORS").
+    ///
+    /// Declared revisions are read through the durable port, never rebuilt
+    /// from the obligation list: a declared job with no retained revision
+    /// becomes `RevisionUnavailable` inside the coverage call instead of
+    /// disappearing, so an unreadable revision keeps the acknowledgement
+    /// incomplete. `outstanding` preserves every pending delivery the contract
+    /// retains past durable handoff — delivery and durable handoff are
+    /// distinct, and this acknowledgement never clears an obligation because a
+    /// task stopped. `complete` is true only when nothing is outstanding; a
+    /// transport send, a daemon idle state, or a zero in-memory count never
+    /// sets it.
+    ///
+    /// # Errors
+    ///
+    /// Returns every [`MaintenanceError`] from the outcome-observation coverage
+    /// call, plus [`MaintenanceError::InvalidField`] for a malformed drain
+    /// binding and [`MaintenanceError::Store`] when the durable port refuses a
+    /// revision read.
+    pub fn drain_observation_flush_ack(
+        &mut self,
+        drain_generation: &str,
+        owner_ref: &str,
+        expected: &[ExpectedOutcomeObservation],
+        admitted: &[AdmittedObservationReceipt],
+    ) -> Result<DrainObservationFlushAck, MaintenanceError> {
+        text(drain_generation, "drain.generation")?;
+        text(owner_ref, "drain.owner")?;
+        let mut jobs = Vec::with_capacity(expected.len());
+        for entry in expected {
+            if let Some(job) = self.store.load(&entry.job_id)? {
+                jobs.push(job);
+            }
+        }
+        let coverage =
+            outcome_observation::outcome_observation_coverage(expected, &jobs, admitted)?;
+        Ok(DrainObservationFlushAck {
+            drain_generation: drain_generation.to_owned(),
+            owner_ref: owner_ref.to_owned(),
+            complete: coverage.is_complete(),
+            observed: coverage.observed,
+            outstanding: coverage.outstanding,
+        })
+    }
+}
+
+/// Drain-bound checkpoint request: one eligible job checkpoint for one drain
+/// generation (#1686 item 4, I14.13/I14.23).
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DrainCheckpointRequest {
+    /// Drain generation this checkpoint is bound to.
+    pub drain_generation: String,
+    /// Durable job identity to checkpoint.
+    pub job_id: String,
+    /// Attempt ordinal the execution owner began; must equal the job's
+    /// admitted `attempts`.
+    pub attempt: u32,
+    /// Drain owner presenting this request.
+    pub owner_ref: String,
+    /// Authorizing drain policy reference. The owner binds it into the outcome
+    /// but never invents one.
+    pub policy_ref: String,
+    /// Checkpoint artifact the execution owner persisted.
+    pub checkpoint: MaintenanceCheckpoint,
+}
+
+impl DrainCheckpointRequest {
+    /// Validates drain, job, owner, policy and checkpoint identities.
+    pub fn validate(&self) -> Result<(), MaintenanceError> {
+        text(&self.drain_generation, "drain.generation")?;
+        text(&self.job_id, "drain.job_id")?;
+        text(&self.owner_ref, "drain.owner_ref")?;
+        text(&self.policy_ref, "drain.policy_ref")?;
+        self.checkpoint.validate()?;
+        Ok(())
+    }
+}
+
+/// Bound owner outcome for one drain checkpoint (#1686 item 4).
+///
+/// Every field is read from the durable revision the store served back after
+/// the save, except `drain_generation`, `owner_ref` and `policy_ref`, which
+/// are the validated request bindings this outcome answers. A checkpoint the
+/// store did not durably retain produces no outcome.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DrainCheckpointOutcome {
+    /// Drain generation this outcome answers.
+    pub drain_generation: String,
+    /// Durable job identity that checkpointed.
+    pub job_id: String,
+    /// Attempt ordinal the checkpoint binds.
+    pub attempt: u32,
+    /// Drain owner that presented the request.
+    pub owner_ref: String,
+    /// Authorizing drain policy reference bound into the outcome.
+    pub policy_ref: String,
+    /// State fence the checkpointed revision carries.
+    pub state_fence: StateFence,
+    /// Durably read-back checkpoint artifact.
+    pub checkpoint: MaintenanceCheckpoint,
+    /// Lifecycle state on read-back; always `Checkpointed`.
+    pub state: MaintenanceJobState,
+}
+
+impl DrainCheckpointOutcome {
+    /// Validates the bound outcome; only a `Checkpointed` outcome is one.
+    pub fn validate(&self) -> Result<(), MaintenanceError> {
+        text(&self.drain_generation, "drain.generation")?;
+        text(&self.job_id, "drain.job_id")?;
+        text(&self.owner_ref, "drain.owner_ref")?;
+        text(&self.policy_ref, "drain.policy_ref")?;
+        self.checkpoint.validate()?;
+        if self.state != MaintenanceJobState::Checkpointed {
+            return Err(MaintenanceError::InvalidField("drain.state"));
+        }
+        Ok(())
+    }
+}
+
+/// Drain-bound cancellation request: one policy-authorized cancellation for
+/// one drain generation (#1686 item 4, I14.13).
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DrainCancelRequest {
+    /// Drain generation this cancellation is bound to.
+    pub drain_generation: String,
+    /// Durable job identity to cancel.
+    pub job_id: String,
+    /// Drain owner presenting this request.
+    pub owner_ref: String,
+    /// Authorizing drain policy reference. The owner binds it into the outcome
+    /// but never invents one.
+    pub policy_ref: String,
+}
+
+impl DrainCancelRequest {
+    /// Validates drain, job, owner and policy identities.
+    pub fn validate(&self) -> Result<(), MaintenanceError> {
+        text(&self.drain_generation, "drain.generation")?;
+        text(&self.job_id, "drain.job_id")?;
+        text(&self.owner_ref, "drain.owner_ref")?;
+        text(&self.policy_ref, "drain.policy_ref")?;
+        Ok(())
+    }
+}
+
+/// Bound owner outcome for one drain cancellation (#1686 item 4).
+///
+/// `retained_checkpoint` and `retained_outcome_ref` are the checkpoint and
+/// outcome references the persisted revision still carries after the cancel:
+/// cancellation claims no rollback of an already-persisted checkpoint and
+/// neither fabricates an outcome nor discards an already-recorded (completed
+/// or unknown) external effect.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DrainCancelOutcome {
+    /// Drain generation this outcome answers.
+    pub drain_generation: String,
+    /// Durable job identity that cancelled.
+    pub job_id: String,
+    /// Drain owner that presented the request.
+    pub owner_ref: String,
+    /// Authorizing drain policy reference bound into the outcome.
+    pub policy_ref: String,
+    /// State fence the cancelled revision carries.
+    pub state_fence: StateFence,
+    /// Lifecycle state on read-back; always `Cancelled`.
+    pub state: MaintenanceJobState,
+    /// Checkpoint artifact retained verbatim through the cancel, if any.
+    pub retained_checkpoint: Option<MaintenanceCheckpoint>,
+    /// Outcome evidence retained verbatim through the cancel, if any.
+    pub retained_outcome_ref: Option<String>,
+}
+
+impl DrainCancelOutcome {
+    /// Validates the bound outcome; only a `Cancelled` outcome with retained
+    /// references is one.
+    pub fn validate(&self) -> Result<(), MaintenanceError> {
+        text(&self.drain_generation, "drain.generation")?;
+        text(&self.job_id, "drain.job_id")?;
+        text(&self.owner_ref, "drain.owner_ref")?;
+        text(&self.policy_ref, "drain.policy_ref")?;
+        if let Some(checkpoint) = &self.retained_checkpoint {
+            checkpoint.validate()?;
+        }
+        if let Some(outcome) = &self.retained_outcome_ref {
+            text(outcome, "drain.retained_outcome_ref")?;
+        }
+        if self.state != MaintenanceJobState::Cancelled {
+            return Err(MaintenanceError::InvalidField("drain.state"));
+        }
+        Ok(())
+    }
+}
+
+/// Governor drain flush acknowledgement over outcome-observation coverage for
+/// one declared job set (#1686 item 5, I14.23 "flush audit/outbox/ORS").
+///
+/// `observed` is the exact covered range: every declared job whose owed
+/// observation the canonical route admitted, each with the store receipt that
+/// proves it. `outstanding` is the exact remaining obligation: every declared
+/// job not fully observed, including pending deliveries the contract retains
+/// past durable handoff. `complete` is true only when nothing is outstanding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DrainObservationFlushAck {
+    /// Drain generation this acknowledgement answers.
+    pub drain_generation: String,
+    /// Drain owner that presented the declared set.
+    pub owner_ref: String,
+    /// Declared jobs whose owed observation is admitted, with exact receipts.
+    pub observed: Vec<ObservedOutcomeObservation>,
+    /// Every declared job that is not fully observed, in declaration order.
+    pub outstanding: Vec<OutstandingOutcome>,
+    /// True only when `outstanding` is empty.
+    pub complete: bool,
+}
+
+impl DrainObservationFlushAck {
+    /// Whether the drain may treat the Governor observation flush as
+    /// discharged.
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        self.complete
+    }
 }
 
 /// Returns the stable contract identity for protocol/schema handshakes.

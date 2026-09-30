@@ -29426,6 +29426,69 @@ impl RedbRecoveryStore {
         Ok(snapshots)
     }
 
+    /// Reconciles staged generation cutovers for a drain and acknowledges the
+    /// exact remaining obligation (#1686 item 5, I14.23 "flush
+    /// audit/outbox/ORS").
+    ///
+    /// Runs [`Self::reconcile_staged_generation_cutovers`] under `limit`, then
+    /// rescans canonical current operational rows: rows the pass fenced into
+    /// `FailedRequiresForwardCutover` stay fenced evidence awaiting a forward
+    /// cutover and keep the acknowledgement incomplete, and any row still
+    /// `Armed`/`Reconciling` is an explicit remaining obligation. Unknown or
+    /// interrupted cutovers are never cleared because a task stopped; they are
+    /// counted here until a forward cutover resolves them.
+    pub fn drain_cutover_flush_ack(&self, limit: u16) -> Result<CutoverFlushAck, OrsError> {
+        let reconciled = self.reconcile_staged_generation_cutovers(limit)?;
+        let mut durable_cursor = reconciled
+            .iter()
+            .map(GenerationCutoverSnapshot::operation_order)
+            .max()
+            .unwrap_or(0);
+        let mut fenced_unresolved = 0u64;
+        for snapshot in &reconciled {
+            if snapshot.record.state == GenerationCutoverState::FailedRequiresForwardCutover {
+                fenced_unresolved += 1;
+            }
+        }
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(OPERATIONAL_CURRENT).map_err(storage)?;
+        let mut remaining_staged = 0u64;
+        let mut transition_rows_scanned = 0u64;
+        for row in table.iter().map_err(storage)? {
+            let (_, value) = row.map_err(storage)?;
+            let durable: DurableOperationalRecord =
+                decode_named(value.value(), "operational_current")?;
+            if durable.kind != OperationalKind::GenerationTransition {
+                continue;
+            }
+            transition_rows_scanned += 1;
+            durable_cursor = durable_cursor.max(durable.operation_order);
+            match durable.generation_cutover.as_ref() {
+                Some(record)
+                    if matches!(
+                        record.state,
+                        GenerationCutoverState::Armed | GenerationCutoverState::Reconciling
+                    ) =>
+                {
+                    remaining_staged += 1;
+                }
+                _ => {}
+            }
+        }
+        drop(table);
+        drop(read);
+        let complete = remaining_staged == 0 && fenced_unresolved == 0;
+        Ok(CutoverFlushAck {
+            reconciled,
+            fenced_unresolved,
+            remaining_staged,
+            transition_rows_scanned,
+            durable_cursor,
+            scan_limit: limit,
+            complete,
+        })
+    }
+
     /// Stages an enriched cutover candidate before the durable linearization
     /// point (I14.14 step 7: classify every in-flight request and persist the
     /// record). The staged candidate is durable but never an active route:
@@ -30184,6 +30247,48 @@ impl RedbRecoveryStore {
         }
         write.commit().map_err(storage)?;
         Self::grant_closure_projection_from_record(closure, Some(canonical_receipt.clone()))
+    }
+}
+
+/// Drain flush acknowledgement for staged ORS generation cutovers (#1686 item
+/// 5, I14.23 "flush audit/outbox/ORS").
+///
+/// Built by [`RedbRecoveryStore::drain_cutover_flush_ack`] from the reconcile
+/// pass plus a post-pass table rescan, so every count below is durable table
+/// evidence, not an in-memory count. `reconciled` carries the exact snapshots
+/// the pass fenced; `fenced_unresolved` counts reconciled rows still in
+/// `FailedRequiresForwardCutover` — fenced evidence awaiting a forward
+/// cutover that the drain must retain, never rows the pass cleared;
+/// `remaining_staged` counts rows still `Armed`/`Reconciling` after the pass.
+/// `durable_cursor` is the highest operational order observed across the
+/// reconciled snapshots and the rescan, and `transition_rows_scanned` is the
+/// number of generation-transition rows the rescan observed, so a complete
+/// acknowledgement over an empty table reads as "no transition rows remain"
+/// rather than as an unmeasured zero. `complete` is true only when nothing
+/// staged remains and nothing fenced awaits a forward cutover.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CutoverFlushAck {
+    /// Snapshots the reconcile pass fenced, in durable operation order.
+    pub reconciled: Vec<GenerationCutoverSnapshot>,
+    /// Reconciled rows still `FailedRequiresForwardCutover`: fenced, retained.
+    pub fenced_unresolved: u64,
+    /// Rows still `Armed`/`Reconciling` after the pass.
+    pub remaining_staged: u64,
+    /// Generation-transition rows the post-pass rescan observed.
+    pub transition_rows_scanned: u64,
+    /// Highest operational order observed; durable cursor into ORS order.
+    pub durable_cursor: u64,
+    /// Bounded scan limit the pass and rescan ran under.
+    pub scan_limit: u16,
+    /// True only when `remaining_staged` and `fenced_unresolved` are both zero.
+    pub complete: bool,
+}
+
+impl CutoverFlushAck {
+    /// Whether the drain may treat the ORS cutover flush as discharged.
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        self.complete
     }
 }
 
@@ -33942,6 +34047,12 @@ impl OrsCoordinator<RedbRecoveryStore> {
         Ok(Self {
             store: RedbRecoveryStore::open(path)?,
         })
+    }
+
+    /// Reconciles staged generation cutovers for a drain and acknowledges the
+    /// exact remaining obligation with its durable cursor (#1686 item 5).
+    pub fn drain_cutover_flush_ack(&self, limit: u16) -> Result<CutoverFlushAck, OrsError> {
+        self.store.drain_cutover_flush_ack(limit)
     }
 }
 
