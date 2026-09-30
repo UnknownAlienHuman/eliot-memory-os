@@ -76,18 +76,24 @@
 //!   derivation from the observation, the same standard the family match is held
 //!   to — and neither is filled from a substitute value.
 //!
-//! That is five of the ten connected. The other five are **EvaluatorVerdict**,
-//! **SecurityIncident**, **ImplementationDeviation**, **Complaint** and
-//! **Concilium**, and none of them is filled from a substitute value either. A
-//! family census shows the only families any production trigger site can name are
+//! Since #1867 W2/A1 **EvaluatorVerdict** is connected as well: a repeated
+//! verifier failure committed by the TestD terminal-owner lane is read from the
+//! canonical attempt records this same intake already reads, and enters through
+//! [`repeated_verifier_failure_evidence`]. See
+//! [`maintenance_evidence_source`] for the measured reason its arm fires.
+//!
+//! That is six of the ten connected. The other four are **SecurityIncident**,
+//! **ImplementationDeviation**, **Complaint** and **Concilium**, and none of
+//! them is filled from a substitute value either. A family census shows the only
+//! families any production trigger site can name are
 //! [`crate::SELF_OBSERVED_FAMILY`] and `MaintenanceFamily::DonorConformance`, so
 //! security incidents need a pinned-scanner receipt producer that does not exist
-//! (annotated at the arm); evaluator verdicts, accepted implementation
-//! deviations and complaints have no producer anywhere in this workspace to read
-//! (`eliot_problem::ImplementationDeviation` and `CoverageComplaint` each have no
-//! call site); and `Concilium` has no `MaintenanceTrigger` member to be carried
-//! on at all. The three no-producer cases are set out in full below, under "The
-//! three sources with no producer AT ALL".
+//! (annotated at the arm); accepted implementation deviations and complaints have
+//! no producer anywhere in this workspace to read (`eliot_problem::ImplementationDeviation`
+//! and `CoverageComplaint` each have no call site); and `Concilium` has no
+//! `MaintenanceTrigger` member to be carried on at all. The two remaining
+//! no-producer cases are set out in full below, under "The two sources with no
+//! producer AT ALL".
 //!
 //! The per-source remaining step for Watchdog and Dreamer differs sharply —
 //! Watchdog needs an existing origin ROUTED to this intake, Dreamer needs a new
@@ -474,7 +480,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::StateFence;
 use eliot_governor::{
@@ -491,6 +497,7 @@ use eliot_improvement::{
     ImprovementLifecycle, ImprovementSurface, OwnerDecision, OwnerDecisionKind, ReplayPlan,
     SafeBoundary, SourcedEvidence, brief_at_safe_boundary, candidate_from_evidence,
     check_class_gate, classify, require_matched_budget_for_promotion, sourced_evidence,
+    sourced_evidence_from_repeated_verifier_failure,
 };
 use eliot_maintenance::{
     IMPROVEMENT_ADMISSION_AUTHORITY, IMPROVEMENT_CANDIDATE_BOUNDS_REVISION,
@@ -721,6 +728,14 @@ pub fn assemble_improvement_artifact(
     let replay_plan = maintenance_replay_plan(decision, &decision_refs);
     let evidence_refs = closure_bound_evidence_refs(decision_refs, &observed);
     let admitted_scope = admitted_fence_ref(state_fence)?;
+    // A repeated verifier failure committed by the TestD terminal-owner lane is
+    // read from the SAME mutex-guarded image as `observed` above, under the
+    // same composition guard and with no `await` between the two reads, so the
+    // candidate's evidence and the brief it is gated on describe one image. An
+    // unreadable image is the same typed `UnsafeBoundary` refusal the closure
+    // read above returns for the same condition, never a substituted "no repeat
+    // observed".
+    let repeated_failure = newest_repeated_verifier_failure(observed_closures)?;
     let evidence = maintenance_sourced_evidence(
         decision,
         &observed,
@@ -728,6 +743,7 @@ pub fn assemble_improvement_artifact(
         &trace_refs,
         &trigger,
         &admitted_scope,
+        repeated_failure.as_ref(),
     )?;
 
     let mut candidate = candidate_from_evidence(
@@ -773,7 +789,7 @@ pub fn assemble_improvement_artifact(
     // `SafeBoundary::from_observed_closure` takes both values from a record the
     // Governor's learning-closure owner actually committed from owner-recorded
     // lifecycle activities (`crates/governor/eliot-governor/src/
-    // learning_closure.rs:483`), and that boundary is derived by
+    // learning_closure.rs:498`), and that boundary is derived by
     // `derive_boundaries`, which refuses an ordinary read and an empty activity
     // set before anything is committed, per I12.24:181.
     //
@@ -830,6 +846,29 @@ pub fn assemble_improvement_artifact(
     let principal = boundary.observed_principal_ref();
     let boundary_ref = boundary.observed_boundary_ref();
     let unknowns = observed_unknowns(&observed, decision.family);
+    // A recorded repeat is a fact the brief states in its own right, not a
+    // clause the owner has to infer from the trigger text: it is the reason this
+    // candidate exists on this pass, and I12.24:74 requires the evidence to be
+    // readable without searching raw metrics. `None` leaves every field exactly
+    // as it was, so a pass with no recorded repeat is unchanged.
+    let repeat_clause = repeated_failure.as_ref().map_or_else(String::new, |failure| {
+        format!(
+            "; verifier {} failed repeatedly on attempt {} of campaign {} and that repeat is \
+             retained in durable delta {} (digest {})",
+            failure.verifier_ref,
+            failure.attempt_id,
+            failure.campaign_id,
+            failure.lineage_artifact,
+            failure.lineage_digest,
+        )
+    });
+    let next_step_clause = repeated_failure.as_ref().map_or_else(String::new, |failure| {
+        format!(
+            " after triage: read the retained repeat of verifier {} on attempt {} of campaign \
+             {}, which is the recorded evidence this brief rests on",
+            failure.verifier_ref, failure.attempt_id, failure.campaign_id
+        )
+    });
 
     // Why the brief names the OBSERVED principal, and which brief fields the
     // closure record cannot supply, is stated in the module documentation
@@ -840,7 +879,7 @@ pub fn assemble_improvement_artifact(
             "{trigger}; the learning closure this brief is gated on committed durable delta \
              {observed_artifact} (digest {observed_digest}) for attempt {} of campaign {} on \
              route {}, at consequential boundary {boundary_ref} by principal {principal}, over {} \
-             observed evidence ref(s)",
+             observed evidence ref(s){repeat_clause}",
             observed.attempt_id,
             observed.campaign_id,
             observed.route_id,
@@ -861,7 +900,8 @@ pub fn assemble_improvement_artifact(
          cost, compute or Human-attention field, so the cost of the decision itself is the only \
          cost this brief can state",
         &format!(
-            "triage maintenance trigger {} against the observed boundary {boundary_ref}",
+            "triage maintenance trigger {} against the observed boundary \
+             {boundary_ref}{next_step_clause}",
             decision.trigger_id
         ),
         unknowns,
@@ -1189,6 +1229,124 @@ fn closure_bound_evidence_refs(
     evidence_refs
 }
 
+/// The newest committed closure record that records a REAL repeated verifier
+/// failure, when the canonical image holds one.
+///
+/// # What this observes and why it is not the dead end the prior lane measured
+///
+/// The second A1 disjunct was previously unreachable because it was looked for
+/// on the CAMPAIGN-CLOSURE ASSEMBLY path: `crates/meta/eliot-improvement/src/
+/// learning_closure.rs` returns a `ClosureAssembly::Disposition` for the
+/// repeated-failure-shaped cases and never a candidate, so no evidence could be
+/// raised there. That path is a pure function of a caller-supplied campaign
+/// episode and this daemon supplies no such episode, which is why it stayed
+/// dead.
+///
+/// The observation this reads instead is the durable ATTEMPT record the
+/// TestD terminal-owner lane already commits for every settled verifier attempt
+/// (`daemon_runtime::run_improvement_intake` reads that same image at
+/// `improvement_intake_artifact`). A repeated verifier failure is recorded there
+/// by the owner that can compare the two independent records it needs — the
+/// durable terminal job row's own attempt count and settled state, and the
+/// canonical verifier-execution fact's finished run, failed execution and
+/// `Fail` outcome — as
+/// [`eliot_learning_delta::REPEATED_VERIFIER_FAILURE_REF_PREFIX`] in that
+/// record's own `evidence_refs`.
+///
+/// So `None` here is the ordinary answer and the pass is unchanged: a first
+/// failed attempt, a repeated PASS, an unsettled/blocked/cancelled run and a row
+/// whose execution disagrees with the run all record no marker. Nothing is
+/// inferred from a count, an ordinal or a status this module holds, and this
+/// reads the SAME mutex-guarded image under the SAME composition guard as
+/// [`newest_observed_closure`] with no `await` between them.
+///
+/// The record TYPE is not named — neither `eliotd` nor `eliot-improvement` has
+/// an `eliot-learning-delta` edge — and none is added: the record's accessors
+/// and fields are read through inference and the results carried by value.
+#[derive(Clone, Debug)]
+struct RepeatedVerifierFailure {
+    /// Verifier identity the marker retained, read whole so an identity
+    /// containing `:` survives intact.
+    verifier_ref: String,
+    /// The attempt whose durable record carries the marker.
+    attempt_id: String,
+    /// The campaign that attempt belonged to.
+    campaign_id: String,
+    /// The durable record's own lineage handle and canonical digest.
+    failure_refs: Vec<String>,
+    /// Durable delta artifact identity of that same record, for the brief's
+    /// own prose. Carried by value for the same reason the refs are: the record
+    /// type is not nameable here.
+    lineage_artifact: String,
+    /// Canonical digest of exactly the bytes that handle names.
+    lineage_digest: String,
+    /// The raw trace, artifact and evaluator references that record retained.
+    trace_refs: Vec<String>,
+}
+
+/// Reads the newest committed repeated verifier failure, or `None`.
+fn newest_repeated_verifier_failure(
+    observed_closures: &eliot_governor::CanonicalLearningDeltaStore,
+) -> Result<Option<RepeatedVerifierFailure>, ImprovementError> {
+    let (observed_records, _observed_version) = observed_closures
+        .load()
+        .map_err(|_| ImprovementError::UnsafeBoundary)?;
+    Ok(observed_records.iter().rev().find_map(|record| {
+        let verifier_ref = record.repeated_verifier_failure_verifier()?;
+        let (lineage_artifact, lineage_digest) = record.lineage_ref();
+        Some(RepeatedVerifierFailure {
+            verifier_ref: verifier_ref.to_owned(),
+            attempt_id: record.attempt_id.as_str().to_owned(),
+            campaign_id: record.campaign_id.as_str().to_owned(),
+            failure_refs: vec![
+                format!("learning-closure:{lineage_artifact}"),
+                format!("learning-closure-digest:{lineage_digest}"),
+            ],
+            lineage_artifact: lineage_artifact.to_string(),
+            lineage_digest: lineage_digest.to_owned(),
+            trace_refs: record
+                .evidence_refs
+                .iter()
+                .map(|id| id.as_str().to_owned())
+                .collect(),
+        })
+    }))
+}
+
+/// The evaluator-verdict evidence for an observed repeated verifier failure.
+///
+/// This is the live call to
+/// [`eliot_improvement::sourced_evidence_from_repeated_verifier_failure`], which
+/// previously had zero production callers. Every argument is a value read from
+/// the committed record that carries the marker, none of them composed here: the
+/// verifier identity and the record's raw trace/artifact/evaluator references
+/// are the record's own, and the two failure refs are the durable delta handle
+/// and canonical digest the record itself committed through
+/// `StoredLearningDelta::lineage_ref`. The candidate's evidence lineage is
+/// therefore over the operation the evidence is bound to, which is what the
+/// deduplication comparison in `BoundedBacklog::merge_target` is then made
+/// against — against the registry RESTORED from the committed candidate records,
+/// never a copy of this pass's own list.
+///
+/// `trigger` is this observation's own trigger text and the owner is the
+/// maintenance (`G-19`) admission authority, exactly as the residual arm below
+/// passes them, so the two arms cannot disagree about who decides. The
+/// constructor derives this source's own validity scope from the verifier
+/// identity rather than from the admitted fence; the pass is still admitted
+/// under that fence at the admission seam, which is a separate check.
+fn repeated_verifier_failure_evidence(
+    failure: &RepeatedVerifierFailure,
+    trigger: &str,
+) -> Result<SourcedEvidence, ImprovementDispatchError> {
+    Ok(sourced_evidence_from_repeated_verifier_failure(
+        &failure.verifier_ref,
+        &failure.failure_refs,
+        &failure.trace_refs,
+        IMPROVEMENT_OWNER,
+        trigger,
+    )?)
+}
+
 /// The validated evidence bundle for this observation, over both bound sources.
 ///
 /// The bundle is selected by the DERIVED source, not asserted (issue #1867 W2).
@@ -1224,12 +1382,42 @@ fn maintenance_sourced_evidence(
     trace_refs: &[String],
     trigger: &str,
     validity_scope: &str,
+    repeated_failure: Option<&RepeatedVerifierFailure>,
 ) -> Result<SourcedEvidence, ImprovementDispatchError> {
-    match maintenance_evidence_source(decision) {
-        EvidenceSource::ConformanceDiagnosis => {
+    match (
+        maintenance_evidence_source(decision),
+        repeated_failure,
+    ) {
+        (EvidenceSource::ConformanceDiagnosis, _) => {
             conformance_diagnosis_evidence(decision, trigger, validity_scope, observed)
         }
-        source => sourced_evidence(
+        // A committed repeated verifier failure is I12.24's evaluator-verdict
+        // trigger and it is a DIFFERENT occurrence from the maintenance one, so
+        // it is selected by the same standard the conformance arm above is held
+        // to: the observation must be present in the canonical record, never
+        // inferred from the decision. The conformance arm keeps precedence
+        // because it is a routing-table handoff for THIS observation's family,
+        // while a repeated verifier failure may have been committed by an earlier
+        // attempt of the campaign.
+        (_, Some(failure)) => {
+            let mut evidence = repeated_verifier_failure_evidence(failure, trigger)?;
+            // The maintenance decision's own refs stay on the bundle: the
+            // candidate rests on the occurrence this intake evaluated AND on the
+            // recorded repeat, and the deduplication comparison is made over
+            // both. `evidence_refs` is closure-bound, so when the repeated
+            // failure IS the observed closure its two lineage refs are already
+            // present; only refs the constructor did not already carry are
+            // appended, so the bundle holds no repeat of one reference. The
+            // bundle is revalidated afterwards, so this composition cannot
+            // produce a bundle the constructor would have refused.
+            let already: BTreeSet<String> = evidence.evidence_refs.iter().cloned().collect();
+            evidence
+                .evidence_refs
+                .extend(evidence_refs.iter().filter(|r| !already.contains(r)).cloned());
+            evidence.validate()?;
+            Ok(evidence)
+        }
+        (source, None) => sourced_evidence(
             source,
             evidence_refs,
             trace_refs,
@@ -1343,7 +1531,7 @@ impl ObservedClosure {
     /// composes: `lineage_ref()` is the record's own accessor for the durable
     /// delta artifact and the canonical digest of exactly those bytes
     /// (`StoredLearningDelta::lineage_ref`,
-    /// `crates/smart/eliot-learning-delta/src/stored.rs:306`). The artifact
+    /// `crates/smart/eliot-learning-delta/src/stored.rs:327`). The artifact
     /// handle is namespaced so it cannot collide with a maintenance ref, and
     /// the digest is prefixed for the same reason and because the bare digest is
     /// not a resolvable handle on its own.
@@ -1693,35 +1881,37 @@ fn enforce_improvement_class_gate(
 ///   production request source), so a verdict has no path into
 ///   `assemble_improvement_artifact` at all.
 ///
-/// # The three sources with no producer AT ALL
+/// # `EvaluatorVerdict` is CONNECTED, through a producer this module did not
+/// # know existed (issue #1867 W2/A1)
 ///
-/// [`EvidenceSource::EvaluatorVerdict`],
-/// [`EvidenceSource::ImplementationDeviation`] and
-/// [`EvidenceSource::Complaint`] are the three variants this function still does
-/// not connect, and they are separated from the suggestion sources above because
-/// their gap is different in kind: not "a route is missing" but "no admitted
-/// owner produces the observation". Measured, not assumed:
+/// It used to head the no-producer list below and read, in full, "a constructor
+/// and no caller": [`eliot_improvement::sourced_evidence_from_repeated_verifier_failure`]
+/// had zero call sites, and this function refused to call it because a
+/// `verifier_ref` and a set of `failure_refs` would have had to be invented.
+/// It is called by [`repeated_verifier_failure_evidence`] on the intake path,
+/// and its input is read by [`newest_repeated_verifier_failure`] out of the
+/// durable attempt records the TestD terminal-owner lane commits for every
+/// settled verifier attempt. That lane — not the campaign-closure assembly,
+/// which dispositions every repeated-failure-shaped episode and never yields a
+/// candidate, which is why the second A1 disjunct stayed dead there — compares
+/// the durable terminal job row's own attempt count and settled state against
+/// the canonical verifier-execution fact's finished run, failed execution and
+/// `Fail` outcome, and records the verdict as
+/// `repeated-verifier-failure:<verifier>` in the record's own `evidence_refs`.
+/// So those values are now READ from a committed owner record. What remains
+/// unproven is the FREQUENCY: a repeat needs a productive verifier job that was
+/// physically attempted more than once and settled `Failed` with a finished,
+/// failed canonical run, and no part of this repository schedules those on
+/// demand.
 ///
-/// - `EvaluatorVerdict` has a constructor and no caller.
-///   [`eliot_improvement::sourced_evidence_from_repeated_verifier_failure`]
-///   exists and is re-exported (`evidence_sources.rs:118`, `lib.rs:424`). Its
-///   occurrences are that definition, that re-export, a prose mention in the
-///   improvement crate's own header (`lib.rs:181`), and citations in this
-///   comment — and ZERO call sites. That is the finding, and it is stated as a
-///   call-site count rather than as an exhaustive hit list deliberately: a hit
-///   list necessarily includes this comment, so no phrasing of one can return
-///   "nothing else" on any tree where the comment exists. The funnel
-///   already has the exact typed constructor for this source and zero producers
-///   of its input. That input is a REPEATED VERIFIER failure, and this daemon
-///   holds none: it has no verification owner on its dependency list
-///   (`git grep -n "eliot-verification\|verifier" -- bins/eliotd/Cargo.toml` is
-///   empty) and its only repeated-failure counter,
-///   [`crate::diagnostics::RepeatedFailureGuard`], is an output cap
-///   (`should_emit` stops emitting after a fixed count, `diagnostics.rs:1588`)
-///   and records no verifier, no attempt and no outcome. Calling the constructor
-///   would mean inventing a `verifier_ref` and a set of `failure_refs` this
-///   process never observed, which is precisely the fabrication this function
-///   exists to refuse.
+/// # The two sources with no producer AT ALL
+///
+/// [`EvidenceSource::ImplementationDeviation`] and [`EvidenceSource::Complaint`]
+/// are the two variants this function still does not connect, and they are
+/// separated from the suggestion sources above because their gap is different in
+/// kind: not "a route is missing" but "no admitted owner produces the
+/// observation". Measured, not assumed:
+///
 /// - `ImplementationDeviation` (I12.24:47, "accepted
 ///   `ImplementationDeviation`") names an ACCEPTED deviation, so the evidence
 ///   must be an accepted-deviation record. `eliot_problem::ImplementationDeviation`

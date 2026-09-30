@@ -17,6 +17,27 @@ use serde::{Deserialize, Serialize};
 use crate::boundary::ConsequentialBoundary;
 use crate::{LearningDeltaError, RetryReason};
 
+/// Canonical prefix of the durable marker one attempt record retains when its
+/// owners together prove a REPEATED verifier failure.
+///
+/// I12.24's second A1 trigger is a "real repeated verifier failure", and
+/// `StoredLearningDelta` is the only durable attempt record on this seam, so the
+/// repeat has to survive into it or no later reader can tell a repeated failure
+/// from a first one. The marker is an ordinary artifact handle in the record's
+/// own `evidence_refs` — no new field, no new record type — so the record's
+/// shape, its digest binding and its lineage comparison are unchanged, and the
+/// marker is admitted by the same non-empty, duplicate-free check every other
+/// retained reference is.
+///
+/// The marker is minted by the owner that can compare the two independent
+/// records the claim needs (the durable terminal job row and the canonical
+/// verifier-execution fact); this crate only owns the vocabulary, so no caller
+/// can spell a marker whose content was never compared against the run it
+/// names. [`StoredLearningDelta::repeated_verifier_failure_verifier`] is the only
+/// reader, and it returns the verifier identity as the whole remainder rather
+/// than splitting it, because a contract identity may itself contain the `:`.
+pub const REPEATED_VERIFIER_FAILURE_REF_PREFIX: &str = "repeated-verifier-failure:";
+
 /// Durable disposition vocabulary for a stored learning delta.
 ///
 /// Disposition vocabulary `LOCAL_UPDATE_ADMITTED` | `NEXT_PROBE_CHANGED` |
@@ -326,6 +347,22 @@ impl StoredLearningDelta {
         refs.sort_by(|left, right| left.as_str().cmp(right.as_str()));
         refs.dedup();
         refs
+    }
+
+    /// The verifier identity of the repeated verifier failure this record
+    /// retains, when it retains one.
+    ///
+    /// `None` means the owners did not record a repeat, which is the ordinary
+    /// case: this is a presence test over the record's own retained references,
+    /// not an inference from a count, an ordinal or a status the caller supplies.
+    /// The whole remainder of the marker is the verifier identity, so an identity
+    /// containing `:` is returned intact.
+    #[must_use]
+    pub fn repeated_verifier_failure_verifier(&self) -> Option<&str> {
+        self.evidence_refs.iter().find_map(|id| {
+            id.as_str()
+                .strip_prefix(REPEATED_VERIFIER_FAILURE_REF_PREFIX)
+        })
     }
 
     /// Report whether this record carries an admitted local update.
