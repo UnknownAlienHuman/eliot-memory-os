@@ -121,7 +121,8 @@ pub use status_projection::{
     SupervisionStatusReason,
 };
 pub use store::{
-    CanonicalEvidenceProvider, OperationalRecoveryStore, OrsCoordinator, RedbRecoveryStore,
+    CanonicalEvidenceProvider, OperationalRecoveryStore, OrsCoordinator, OrsStoreIdentity,
+    RedbRecoveryStore,
     RuntimeLeaseCensusRows, ScanDisclosureRecordOwner,
 };
 pub use user_broker::{UserBrokerHeartbeat, UserBrokerRegistrationSnapshot};

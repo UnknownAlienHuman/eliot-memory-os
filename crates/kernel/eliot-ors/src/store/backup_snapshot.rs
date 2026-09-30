@@ -2166,6 +2166,9 @@ struct StoreFenceObservation {
     /// and by `ensure_grant_closure_order_floor`, absent (read as `0`) on a store
     /// that never allocated one.
     high_water_order: u64,
+    /// ORS-owned installed identity and monotone generation observed through
+    /// the same transaction as the exported rows.
+    store_identity: super::StoreObjectIdentityRecord,
     /// Durable monotone revision of the process-stream recovery family.
     ///
     /// Named for one family, not for "the family revision": the second
@@ -2200,10 +2203,12 @@ fn capture_store_fence(read: &ReadTransaction) -> Result<StoreFenceObservation, 
             reason: error.to_string(),
         })?
         .unwrap_or(0);
+    let store_identity = super::read_store_object_identity(&meta)?;
     drop(meta);
     let family_revision = super::RedbRecoveryStore::process_stream_recovery_family_revision(read)?;
     Ok(StoreFenceObservation {
         high_water_order,
+        store_identity,
         family_revision,
     })
 }
@@ -2242,16 +2247,10 @@ fn capture_store_fence(read: &ReadTransaction) -> Result<StoreFenceObservation, 
 /// actually establish — its own ordering high-water mark and its own family
 /// revision. A real cross-owner dependency fence is not approximated here.
 ///
-/// ASSUMPTION: `installation_id` and `ors_generation` in
-/// [`crate::OrsBackupSourceIdentity`] cannot be compared. ORS has no durable
-/// installation-identity record and no store-wide generation counter, so the
-/// store has no owner-established counterpart to compare either against, and
-/// `BackupVerificationResultRecord::record_key` says normatively that "within one
-/// installation" is STRUCTURAL — a row is only ever read out of the file that
-/// owns it — not an in-band field. Inventing such a record would be new durable
-/// schema, which this issue does not authorise. Those two fields therefore remain
-/// caller-asserted and are disclosed rather than compared; the page token binds
-/// what the store observed, not what the caller claimed about its installation.
+/// The durable ORS identity row is the comparison source for
+/// `installation_id` and `ors_generation`. Unbound legacy opens cannot produce
+/// an installation-bound backup snapshot, and a stale generation or a request
+/// naming another installation fails closed.
 fn check_export_fence(
     request: &OrsBackupRequest,
     observation: &StoreFenceObservation,
@@ -2262,6 +2261,16 @@ fn check_export_fence(
                 "backup schema {} unsupported, expected {BACKUP_SNAPSHOT_SCHEMA_VERSION}",
                 request.source.schema_version
             ),
+        });
+    }
+    if observation.store_identity.installation_id.as_deref()
+        != Some(request.source.installation_id.as_str())
+        || observation.store_identity.ors_generation != request.source.ors_generation
+    {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "ors_store_object_identity",
+            reason: "backup source identity does not match the durable ORS object identity"
+                .to_owned(),
         });
     }
     if observation.high_water_order != request.fence.high_water_order {
@@ -3912,6 +3921,19 @@ pub(super) fn import_page_quarantined(
     // ONE read transaction for the whole entry loop: every entry is triaged
     // against the same durable state, so the outcome vector describes one moment.
     let read = database.begin_read().map_err(storage)?;
+    let destination_identity = {
+        let meta = read.open_table(super::META).map_err(storage)?;
+        super::read_store_object_identity(&meta)?
+    };
+    if destination_identity.installation_id.as_deref()
+        != Some(import.destination.installation_id.as_str())
+    {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "ors_store_object_identity",
+            reason: "backup destination identity does not match the durable ORS installation"
+                .to_owned(),
+        });
+    }
     // The DESTINATION's own row family census, before a single entry is triaged
     // (issue #953, A5). The issue requires that a family with no disposition
     // "cannot be silently exported, imported or counted", and this is the import
@@ -4218,6 +4240,19 @@ pub(super) fn reconcile_import_receipt(
 ) -> Result<OrsBackupImportReceipt, OrsError> {
     let expected_members = expected_import_roster(snapshot, import)?;
     let read = database.begin_read().map_err(storage)?;
+    let destination_identity = {
+        let meta = read.open_table(super::META).map_err(storage)?;
+        super::read_store_object_identity(&meta)?
+    };
+    if destination_identity.installation_id.as_deref()
+        != Some(import.destination.installation_id.as_str())
+    {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "ors_store_object_identity",
+            reason: "backup receipt destination does not match the durable ORS installation"
+                .to_owned(),
+        });
+    }
     let current_owner_validation = observe_current_owner_validation(
         &read,
         &import.snapshot_digest,
