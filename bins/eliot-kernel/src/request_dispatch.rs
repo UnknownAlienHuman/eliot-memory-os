@@ -10,9 +10,25 @@
 //! `code = plan_gap`), never as fake success and never silently.
 //!
 //! Why each refusal is honest rather than a validation gap:
-//! - `backup.create` admits bounded capture descriptors, then refuses naming
-//!   the capture owner (`backup-capture-owner (#959)`, open): admitting
-//!   capture here would invent authority.
+//! - `backup.create` admits bounded capture descriptors, then admits the caller
+//!   through the SAME front-door gate `backup.verify` uses
+//!   ([`admit_backup_caller`], the one reader of the platform-proved peer
+//!   identity plus this Kernel's own exact `daemon` front-door capability), and
+//!   only then refuses naming the capture owner (`backup-capture-owner (#959)`,
+//!   open). The refusal names the exact owner entry the request cannot reach
+//!   and the exact capability that entry is missing, so an operator is told
+//!   what has to exist rather than that "admitted capture is not implemented":
+//!   `KernelBackupCapture::capture` consumes a caller-issued
+//!   `CaptureCallerAuth`, a `PublicationPort` that publishes exactly once, and
+//!   an already-accepted `CaptureRequest` evidence bundle, and NEITHER the port
+//!   nor the bundle has a production producer on this tree (the port's only
+//!   implementation is `MemPublisher` inside
+//!   `bins/eliot-kernel/tests/backup_capture.rs`; `request_from_ports` and
+//!   `EbpCanonicalStoreClient::backup_begin`/`backup_page`/`backup_end` have no
+//!   production caller). Admitting capture here would invent authority, so the
+//!   item's "any missing capture-owner behavior remains with #959" holds and
+//!   this route refuses a typed owner-absence instead of a receipt for having
+//!   read its own arguments.
 //! - `backup.verify` admits the bounded inline bundle bytes, then decodes and
 //!   validates them through the real capture owner
 //!   ([`KernelBackupCapture::verify_only`], bound on the composition by #959
@@ -157,6 +173,16 @@ use super::{
 /// Closed backup create operation selector (mirrored by the operator CLI
 /// surface; the string only selects this entry, never authority).
 pub(crate) const BACKUP_CREATE_OPERATION: &str = "backup.create";
+/// The capture owner a create refusal names, in the exact spelling the operator
+/// surface checks (`crates/surfaces/eliot-cli/src/backup.rs`).
+///
+/// It names the ISSUE that owns the missing capture-owner behaviour, which is
+/// what a refusal for an absent owner must say. It is deliberately not an
+/// archive id, a manifest digest or a receipt id: this route issues none, and a
+/// value in one of those shapes here would be a fabricated owner result. The
+/// literal is stated in exactly one place on this side so the refusal, its
+/// documentation and the surface mirror cannot drift apart silently.
+pub(crate) const BACKUP_CREATE_MISSING_OWNER: &str = "backup-capture-owner (#959)";
 /// Closed backup verify operation selector (mirrored by the operator CLI
 /// surface).
 pub(crate) const BACKUP_VERIFY_OPERATION: &str = "backup.verify";
@@ -535,75 +561,144 @@ fn cancellation_reply(idempotency_key: &str, owner_reason: &str) -> Value {
     )
 }
 
-/// Handles one backup create frame: validates the bounded capture
-/// descriptors, then refuses with the exact missing capture owner.
+/// Handles one backup create frame: admits the bounded capture descriptors,
+/// admits the caller through the front-door gate the capture owner itself
+/// consumes, then returns the exact owner absence that keeps the archive out of
+/// this route's reach.
 ///
-/// Capture orchestration belongs to the #959 owner (open everywhere):
-/// admitting capture here would invent authority, so the only honest outcome
-/// is a typed `plan_gap` naming that owner. Shape failures refuse as
-/// `invalid` before any owner is named.
-fn handle_backup_create(payload: &Value, idempotency_key: &str) -> Value {
+/// # WHY THIS STILL REFUSES, AND WHAT IS DIFFERENT NOW
+///
+/// The item this implements asks for the REAL capture owner and forbids a
+/// descriptor-validation receipt in its place. Reaching
+/// [`KernelBackupCapture::capture`] needs three things this front door does not
+/// hold and must never manufacture:
+///
+/// 1. an already-accepted `CaptureRequest` evidence bundle — the coherent
+///    canonical export fence, its event/projection/receipt members, the sealed
+///    blob envelopes, the purge ledger plus the purge OWNER's own declared
+///    ledger-wide revision, the ORS snapshot fence, the Watchdog spool fence,
+///    the checksummed artifacts and the optional Host audit fence. There is no
+///    production producer of one: `request_from_ports` and
+///    `EbpCanonicalStoreClient::backup_begin`/`backup_page`/`backup_end` have no
+///    production caller, and the accepted read is ASYNC while
+///    `KernelComposition::dispatch_backup_frame` is the synchronous frame
+///    route.
+/// 2. a production `PublicationPort`. `capture` publishes exactly once through
+///    it and reconciles a lost response by operation identity through it; the
+///    only implementation in the repository is `MemPublisher` inside
+///    `bins/eliot-kernel/tests/backup_capture.rs`.
+/// 3. a `FrozenCapturePlan` whose `build_digest` and `policy_digest` are
+///    owner-ISSUED approved 64-hex digests. This route holds no such digest and
+///    will not synthesise one, because a plausible digest in that field is the
+///    laundered-absence this item names.
+///
+/// So the create arm does what the item says to do with an absent owner: it
+/// returns a TYPED FAILURE NAMING THE ABSENT OWNER BEHAVIOUR. It emits no
+/// archive id, no manifest digest and no receipt, and it never occupies the
+/// field an owner receipt belongs in — the reply carries `code`,
+/// `missing_owner` and `reason` only, which is why the operator surface admits
+/// exactly that key set for a create refusal.
+///
+/// # WHAT THE ROUTE DOES ADMIT, AND IN WHICH ORDER
+///
+/// Order is shape, then admission, then the owner attempt. That is the SAME
+/// order `handle_backup_verify` uses, deliberately: a shape failure is
+/// answerable without authority, and the front-door admission runs before the
+/// request could reach an owner at all.
+///
+/// - Shape: the payload is an object with exactly `scope_descriptor` and
+///   `class`; the scope descriptor is a bounded non-blank string; the class
+///   decodes through the protocol's own closed vocabulary (`backup_class`, the
+///   one decoder on this route).
+/// - Admission: [`admit_backup_caller`] projects this transport's own proved
+///   peer identity and this Kernel's exact `daemon` front-door capability into
+///   the capture owner's OWN `CaptureCallerAuth` — the value the owner's first
+///   operator `require_capture_admitted` consumes, and the same projection the
+///   verify arm hands to `verify_only`. A session that fails it is FENCED, not
+///   answered. Before this, `backup.create` was the one backup operation that
+///   answered a session the capture owner would refuse, and the backup arm in
+///   `frame_dispatch` has no module gate, so a specialised owner-session could
+///   reach it. Admitting here closes that and introduces no second gate.
+///
+/// No effect happens on this path, so the refusal is not an uncertain outcome
+/// and never needs reconciliation: nothing was published, nothing was mutated,
+/// and the reply carries the caller's own operation identity unchanged.
+fn handle_backup_create(
+    session: &Session,
+    payload: &Value,
+    idempotency_key: &str,
+) -> Result<Value, TransportError> {
     let Some(object) = payload.as_object() else {
-        return invalid_reply(
+        return Ok(invalid_reply(
             BACKUP_CREATE_OPERATION,
             idempotency_key,
             "backup.create",
             "payload must be a JSON object",
-        );
+        ));
     };
     if let Err(reason) = require_exact_keys(object, &["scope_descriptor", "class"]) {
-        return invalid_reply(
+        return Ok(invalid_reply(
             BACKUP_CREATE_OPERATION,
             idempotency_key,
             "backup.create",
             &reason,
-        );
+        ));
     }
     let scope = match get_str(object, "scope_descriptor") {
         Ok(scope) => scope,
         Err(reason) => {
-            return invalid_reply(
+            return Ok(invalid_reply(
                 BACKUP_CREATE_OPERATION,
                 idempotency_key,
                 "backup.scope_descriptor",
                 &reason,
-            );
+            ));
         }
     };
     if let Err(reason) = non_blank(scope, "backup.scope_descriptor") {
-        return invalid_reply(
+        return Ok(invalid_reply(
             BACKUP_CREATE_OPERATION,
             idempotency_key,
             "backup.scope_descriptor",
             &reason,
-        );
+        ));
     }
     let class = match get_str(object, "class") {
         Ok(class) => class,
         Err(reason) => {
-            return invalid_reply(
+            return Ok(invalid_reply(
                 BACKUP_CREATE_OPERATION,
                 idempotency_key,
                 "backup.class",
                 &reason,
-            );
+            ));
         }
     };
     if backup_class(class).is_none() {
-        return invalid_reply(
+        return Ok(invalid_reply(
             BACKUP_CREATE_OPERATION,
             idempotency_key,
             "backup.class",
             "must be full_recovery, canonical_only_degraded, or scope_export",
-        );
+        ));
     }
-    refused_reply(
+    // The front-door admission the capture owner consumes. Its RESULT is
+    // deliberately not bound: the owner cannot be entered on this tree, so
+    // nothing downstream would read it, and a binding nobody reads would be a
+    // fake caller. What matters is the gate's effect - an unadmitted session is
+    // FENCED here instead of being handed a create answer, which is the same
+    // admission verify already applied and the reason this arm is no longer the
+    // one backup operation that answers whoever asked.
+    admit_backup_caller(session)?;
+    Ok(refused_reply(
         BACKUP_CREATE_OPERATION,
         idempotency_key,
         "plan_gap",
-        "backup-capture-owner (#959)",
-        "admitted capture is not implemented; rehearsal-only paths cannot invent it",
-    )
+        BACKUP_CREATE_MISSING_OWNER,
+        "capture owner entry KernelBackupCapture::capture is unreachable: no \
+         production PublicationPort and no producer of the accepted \
+         CaptureRequest evidence; #959 owns both",
+    ))
 }
 
 /// Returns the authenticated `(user_identity, session_identity)` pair of one
@@ -665,6 +760,13 @@ fn authenticated_backup_principal(session: &Session) -> Result<(&str, &str), Tra
 /// would tell the operator to correct a field they do not control. This mirrors
 /// [`crate::dreamer_job_dispatch`]'s exact module-and-capability admission and
 /// the `daemon_request_dispatch` module gate.
+///
+/// This is the admission BOTH owner-reaching operations run, not only verify:
+/// it is the value the capture owner's first operator
+/// (`backup_capture_ports::require_capture_admitted`) consumes, so a create
+/// request that could reach the owner is gated by exactly the same value a
+/// verify request is. There is one gate on this route and both arms use it; a
+/// second one would be exactly the drift this close exists to prevent.
 fn admit_backup_caller(session: &Session) -> Result<CaptureCallerAuth, TransportError> {
     let (user_identity, session_identity) = authenticated_backup_principal(session)?;
     if session.capabilities.len() != 1 || session.capabilities[0] != DAEMON_FRONT_DOOR_CAPABILITY {
@@ -3188,8 +3290,11 @@ impl KernelComposition {
     /// The receiver is the composition, exactly like the sibling `TestD` and
     /// Dreamer route entries: `backup.verify` reaches the real capture owner held at
     /// [`KernelComposition::backup_capture`], and no second dispatch entry is
-    /// introduced. `backup.create` and `backup.restore-test` still refuse naming
-    /// their missing owners, so binding the receiver changes no other behaviour.
+    /// introduced. `backup.create` admits its caller through the same
+    /// [`admit_backup_caller`] gate and then returns a typed refusal naming the
+    /// exact absent capture-owner behaviour, and `backup.restore-test` still
+    /// refuses naming its missing owners, so binding the receiver changes no
+    /// other behaviour.
     ///
     /// Service-readiness and peer-authentication gates stay with the
     /// `frame_dispatch` backup arm, which owns the exact pre-dispatch binding
@@ -3253,7 +3358,7 @@ impl KernelComposition {
             other => other,
         };
         let reply = match operation.as_str() {
-            BACKUP_CREATE_OPERATION => handle_backup_create(&params, idempotency_key),
+            BACKUP_CREATE_OPERATION => handle_backup_create(session, &params, idempotency_key)?,
             BACKUP_VERIFY_OPERATION => {
                 self.handle_backup_verify(session, &params, idempotency_key)?
             }
