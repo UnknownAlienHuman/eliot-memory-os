@@ -1209,6 +1209,105 @@ pub async fn drive_solo_delegate_async(
     )))
 }
 
+/// Refuses when the consumed binding does not bind this exact intake.
+///
+/// A caller-claimed digest is never evidence: the binding the drive consumes
+/// must carry the same presented halves the intake claims, or the drive
+/// refuses with a typed identity conflict before any capability,
+/// reservation, or dispatch exists. The binding is currently derived from
+/// the queued intake itself, so this pins the invariant the poll path
+/// relies on; an owner-supplied binding takes the same parameter.
+fn check_verified_binds_intake(
+    intake: &SoloDelegateIntake,
+    material: &VerifiedProviderMaterial,
+) -> Result<(), DaemonError> {
+    let claimed = &intake.claimed;
+    if material.identity != claimed.identity
+        || material.claim_id != claimed.claim_id
+        || material.attempt_id != claimed.attempt_id
+        || material.operation_id != claimed.operation_id
+        || material.binding_digest != claimed.binding_digest
+        || material.executable_digest != claimed.executable_digest
+        || material.route_revision != claimed.route_revision
+        || material.capacity_revision != claimed.capacity_revision
+        || material.worker_generation != claimed.worker_generation
+        || !fences_match_exact(&material.presented_fence, &claimed.presented_fence)
+    {
+        return Err(DaemonError::ProviderAdmission(
+            FabricError::IdentityConflict(
+                "owner-verified binding does not bind this solo intake".to_owned(),
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Revalidates the launch gate immediately before dispatch.
+///
+/// Missing, substituted, moved-route, or stale-activation material refuses
+/// here, before the first possible external effect: the activation must
+/// address this exact admission and attempt (and belong to it), and the live
+/// fence/epoch must still match the activation fence/epoch.
+fn revalidate_launch_gate(
+    kernel: &Arc<DaemonKernelClient>,
+    admission: &FabricAdmission,
+    attempt_id: &AttemptId,
+    evidence: &ActivationEvidence,
+) -> Result<(), DaemonError> {
+    if evidence.admission_id != admission.admission_id
+        || evidence.attempt_id != *attempt_id
+        || !admission.attempt_ids.contains(attempt_id)
+    {
+        return Err(DaemonError::ProviderAdmission(FabricError::StaleAdmission(
+            "solo launch gate refuses activation for another admission or attempt".to_owned(),
+        )));
+    }
+    let live = kernel.kernel_fence();
+    if !fences_match_exact(&live, &evidence.fence) {
+        return Err(DaemonError::ProviderAdmission(FabricError::StaleFence(
+            "solo launch gate refuses a fence-moved activation".to_owned(),
+        )));
+    }
+    if !live.authority_epoch.is_same_authority(&evidence.epoch) {
+        return Err(DaemonError::ProviderAdmission(FabricError::StaleEpoch(
+            "solo launch gate refuses an epoch-moved activation".to_owned(),
+        )));
+    }
+    Ok(())
+}
+
+/// Cross-checks the dispatch record against the consumed binding and the
+/// live clock immediately before it is persisted.
+///
+/// The persisted record must carry the consumed operation/attempt/claim
+/// identities and digests (never caller-claimed substitutes), and the claim
+/// deadline must still be in the future at dispatch time: a deadline that
+/// elapsed during owner IO refuses instead of launching stale.
+fn check_dispatch_record(
+    record: &SoloDispatchRecord,
+    material: &VerifiedProviderMaterial,
+) -> Result<(), DaemonError> {
+    if record.operation_id != material.operation_id
+        || record.attempt_id != material.attempt_id
+        || record.claim_id != material.claim_id
+        || record.binding_digest != material.binding_digest
+        || record.executable_digest != material.executable_digest
+        || record.worker_generation != material.worker_generation
+    {
+        return Err(DaemonError::ProviderAdmission(
+            FabricError::IdentityConflict(
+                "solo dispatch record does not bind the consumed material".to_owned(),
+            ),
+        ));
+    }
+    if record.deadline_unix_ms == 0 || record.deadline_unix_ms <= crate::unix_ms() {
+        return Err(DaemonError::ProviderAdmission(FabricError::Contract(
+            "solo claim deadline elapsed before dispatch".to_owned(),
+        )));
+    }
+    Ok(())
+}
+
 /// Drives one admitted solo delegate intake through the verified async
 /// seam to a retained dispatch (issue #1108 W4/A2).
 ///
@@ -1238,12 +1337,43 @@ pub async fn drive_solo_delegate_async(
 /// The caller holds the composition guard across the seam await (see
 /// [`solo_poll_queue_async`]); this function takes `&DaemonComposition`
 /// like the sync drive and performs no locking of its own.
-#[allow(clippy::too_many_lines)]
-#[allow(clippy::needless_pass_by_value)]
 async fn drive_solo_delegate_verified_async(
     composition: &DaemonComposition,
     kernel: &Arc<DaemonKernelClient>,
     intake: SoloDelegateIntake,
+    now_unix_ms: u64,
+) -> Result<SoloDriveOutcome, DaemonError> {
+    let material = intake.claimed.material();
+    // The admitted-material future below is heap-pinned so the queue-poll
+    // future that awaits this wrapper stays small: the intake would
+    // otherwise be counted in both frames across the seam await.
+    Box::pin(drive_admitted_material_async(
+        composition,
+        kernel,
+        intake,
+        material,
+        now_unix_ms,
+    ))
+    .await
+}
+
+/// Drives one intake on its consumed binding through the verified async seam
+/// to a retained dispatch (issue #1108 W4/A2).
+///
+/// Prepare/IO/adopt: readiness, intake shape, solo recipe, binding
+/// cross-check, and single live slot are prepared under short borrows; the
+/// snapshot below is cloned before the seam await so the adopt step can
+/// revalidate the exact consumed revisions after owner IO; the fabric chain
+/// (`define_and_plan` -> `stage_reservation` -> `commit_admission` ->
+/// `activate` -> launch-gate revalidation -> `dispatch` -> persist ->
+/// frame) adopts the typed result only when every revision still binds.
+#[allow(clippy::too_many_lines)]
+#[allow(clippy::needless_pass_by_value)]
+async fn drive_admitted_material_async(
+    composition: &DaemonComposition,
+    kernel: &Arc<DaemonKernelClient>,
+    intake: SoloDelegateIntake,
+    material: VerifiedProviderMaterial,
     now_unix_ms: u64,
 ) -> Result<SoloDriveOutcome, DaemonError> {
     if composition.readiness() != CompositionReadiness::Ready {
@@ -1253,7 +1383,8 @@ async fn drive_solo_delegate_verified_async(
         .validate(now_unix_ms)
         .map_err(DaemonError::ProviderAdmission)?;
     guard_solo_plan(&intake.plan).map_err(DaemonError::ProviderAdmission)?;
-    let material = intake.claimed.material();
+    check_verified_binds_intake(&intake, &material)?;
+    let prepared = Box::new(material.clone());
     let operation_id = material.operation_id.clone();
     let attempt_id = AttemptId::new(material.attempt_id.clone())
         .map_err(|error| DaemonError::ProviderAdmission(contract(error)))?;
@@ -1301,6 +1432,15 @@ async fn drive_solo_delegate_verified_async(
     let mut fabric = composition
         .agent_fabric_new_verified_async(kernel, ports, material, &intake.claimed)
         .await?;
+    // AUD9: adopt revalidates the consumed revisions after owner IO, before
+    // touching the fabric. A fence that moved under the seam await refuses
+    // with a typed stale fence instead of adopting verified material under
+    // another generation; the queue head stays queued for a fresh evaluation.
+    if !fences_match_exact(&kernel.kernel_fence(), &prepared.presented_fence) {
+        return Err(DaemonError::ProviderAdmission(FabricError::StaleFence(
+            "solo adopt refuses a fence moved during owner IO".to_owned(),
+        )));
+    }
     // Issue #1702 W2: the drive runs against the daemon state root, so every
     // owner-separated revision published on this fabric is committed and
     // verified durably before anything reports it current. Attaching the store
@@ -1317,7 +1457,12 @@ async fn drive_solo_delegate_verified_async(
     let (definition, _) = fabric.define_and_plan(intake.plan.clone())?;
     let reservation = fabric.stage_reservation(&definition.definition_id)?;
     let admission = fabric.commit_admission(&reservation.reservation_id)?;
-    let _evidence = fabric.activate(&admission.admission_id, &attempt_id)?;
+    let activation = fabric.activate(&admission.admission_id, &attempt_id)?;
+    // AUD13: the launch gate is revalidated immediately before dispatch,
+    // after the last owner write and before the first possible external
+    // effect. Missing, substituted, moved-route, or stale-activation
+    // material refuses here instead of launching.
+    revalidate_launch_gate(kernel, &admission, &attempt_id, &activation)?;
     let dispatch_id = solo_dispatch_identity(attempt_id.as_str(), admission.admission_id.as_str());
     let intent = fabric.dispatch(&admission.admission_id, &attempt_id, &dispatch_id)?;
     let dispatch = SoloDispatchRecord {
@@ -1345,6 +1490,12 @@ async fn drive_solo_delegate_verified_async(
             "expected_result_schema_version".to_owned(),
         ],
     };
+    // AUD12/AUD13: the dispatch record is cross-checked against the consumed
+    // binding and the live clock immediately before it is persisted. The
+    // persisted identity below carries verified digests (never substitutes)
+    // and a still-live deadline; a mismatch refuses before any external
+    // effect instead of recording a stale launch.
+    check_dispatch_record(&dispatch, &prepared)?;
     let snapshot = fabric.snapshot()?;
     let projection = SoloPersistedAttempt {
         operation_id: operation_id.clone(),
