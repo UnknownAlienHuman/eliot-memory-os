@@ -1153,7 +1153,7 @@ pub fn parse_observe_claimed_pair(
                 || record.request_digest != envelope.envelope_sha256
                 || record.payload_digest != envelope.identity.payload_sha256
                 || !matches!(
-                    record.state,
+                    &record.state,
                     eliot_ors::HostRequestState::Admitted | eliot_ors::HostRequestState::Routed
                 )
                 || record.result_digest.is_some()
