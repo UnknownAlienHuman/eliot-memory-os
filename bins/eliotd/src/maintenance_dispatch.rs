@@ -543,7 +543,7 @@ pub fn admit_maintenance_trigger_intake(
     // exact replay converges on the owner's existing receipt; changed content
     // fails with a duplicate conflict. Any failure carries no receipt, so the
     // producer keeps its retry identity and its cursor must not advance.
-    stage_maintenance_trigger_intake(store, &staging).map_err(|source| {
+    let staged = stage_maintenance_trigger_intake(store, &staging).map_err(|source| {
         MaintenanceTriggerIntakeError::Staging {
             trigger_id: statement.trigger_id.clone(),
             operation_hash: statement.operation_hash.clone(),
@@ -551,10 +551,27 @@ pub fn admit_maintenance_trigger_intake(
         }
     })?;
     // Bind the owner-issued staging output before it may advance any cursor.
+    // The receipt echoes the committed obligation: a substituted answer
+    // naming a different trigger, hash, envelope, or digest conflicts here as
+    // changed content instead of replaying. The inbox order and state digest
+    // stay the ORS owner's internal durability evidence; the obligation the
+    // Kernel re-proves at admission is the envelope reference plus payload
+    // hash.
+    if staged.trigger_id != staging.trigger_id
+        || staged.operation_hash != staging.operation_hash
+        || staged.envelope_reference != staging.envelope_reference
+        || staged.payload_hash != staging.payload_hash
+    {
+        return Err(MaintenanceTriggerIntakeError::BindingConflict {
+            trigger_id: statement.trigger_id.clone(),
+            operation_hash: statement.operation_hash.clone(),
+            source: Box::new(ProtocolError::ReplayConflict),
+        });
+    }
     // A mismatch is changed content under this identity and conflicts instead
     // of replaying.
     let persist = statement
-        .bind_staging_proof(&staging.envelope_reference, &staging.payload_hash)
+        .bind_staging_proof(&staged.envelope_reference, &staged.payload_hash)
         .map_err(|source| {
             let source = match source {
                 MaintenanceError::IdentityConflict => ProtocolError::ReplayConflict,
