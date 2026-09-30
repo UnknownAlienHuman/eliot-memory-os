@@ -48,7 +48,9 @@ use super::{
     caller_binding, native_worker_reconcile_route::NATIVE_WORKER_RECONCILE_OPERATION, sha256_json,
     status_frame, unix_ms,
 };
-use eliot_contracts::{CapabilityCellId, EpochId, StateFence, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{
+    CapabilityCellId, EpochId, RequestId, StateFence, canonical_json_bytes, sha256_hex,
+};
 use eliot_ipc::{Session, TransportError};
 use eliot_kernel_service::{
     KernelServiceError, NATIVE_WORKER_CLAIM_WIRE_ID, NATIVE_WORKER_CLAIM_WIRE_VERSION,
@@ -360,6 +362,27 @@ struct NativeWorkerPresentedCurrentness {
     worker_generation: u64,
     state_fence: StateFence,
     registration: Option<serde_json::Value>,
+}
+
+struct NativeWorkerFrameContext {
+    request_id: RequestId,
+    identity_value: serde_json::Value,
+    presented_fence: StateFence,
+    payload: serde_json::Value,
+    operation: String,
+}
+
+struct NativeWorkerCellProofCheck<'a> {
+    session: &'a Session,
+    presented: &'a NativeWorkerPresentedCurrentness,
+    presented_fence: &'a StateFence,
+    process_start: &'a super::dispatch_launch::NativeWorkerProcessStartBinding,
+    peer: &'a eliot_ipc::ProcessBinding,
+    durable: &'a NativeWorkerClaimRecord,
+    registry_digest: &'a str,
+    claim_fence_digest: &'a str,
+    live_epoch: &'a EpochId,
+    live_activation_generation: u64,
 }
 
 fn native_worker_presented_currentness(
@@ -856,8 +879,18 @@ fn native_worker_operation_allows_degraded(operation: &str, payload: &serde_json
 impl KernelComposition {
     /// Awaits only the exact native-worker registration launch marker before
     /// synchronous frame dispatch. The marker is not authority: dispatch
-    /// still requires the completed ProcessExecutor receipt and exact peer.
-    pub(crate) async fn await_native_worker_registration_start(
+    /// still requires the completed `ProcessExecutor` receipt and exact peer.
+    ///
+    /// This is public so the sibling Kernel front-door binary can await the
+    /// launch marker before calling the synchronous dispatch boundary.
+    ///
+    /// # Errors
+    ///
+    /// For registration frames, returns `PeerIdentityUnavailable` when the
+    /// authenticated process binding is absent and `SessionFenced` when the
+    /// launch identity or completed start receipt cannot be verified. Other
+    /// operations return `Ok(())` without waiting.
+    pub async fn await_native_worker_registration_start(
         &self,
         session: &Session,
         frame: &Frame,
@@ -912,6 +945,51 @@ impl KernelComposition {
         session: &Session,
         frame: &Frame,
     ) -> Result<KernelFrameAction, TransportError> {
+        let context = self.native_worker_frame_context(session, frame)?;
+        let current_proof = self
+            .native_worker_cell_current_proof(
+                session,
+                &context.operation,
+                context.request_id.as_str(),
+                &context.payload,
+                &context.presented_fence,
+            )
+            .map_err(NativeWorkerRouteError::into_transport)?;
+        if context.operation == NATIVE_WORKER_RECONCILE_OPERATION {
+            let action = self.dispatch_native_worker_reconcile(session, frame)?;
+            return Self::attach_native_worker_proof_to_action(action, current_proof);
+        }
+        if context.operation == NATIVE_WORKER_CANCEL_OBSERVE_OPERATION {
+            let (operation_id, session_binding) = self
+                .stage_native_worker_cancellation(
+                    session,
+                    &context.identity_value,
+                    &context.payload,
+                )
+                .map_err(NativeWorkerRouteError::into_transport)?;
+            return Ok(KernelFrameAction::Process {
+                request_id: context.request_id,
+                request: ProcessExecutionRequest::Cancel { operation_id },
+                session_binding,
+            });
+        }
+        let receipt = self
+            .dispatch_native_worker_lifecycle_operation(&context)
+            .map_err(NativeWorkerRouteError::into_transport)?;
+        let receipt = Self::attach_native_worker_proof_to_receipt(receipt, current_proof)?;
+        let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, receipt)?;
+        frame.request_id = Some(context.request_id);
+        frame
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(KernelFrameAction::Reply(frame))
+    }
+
+    fn native_worker_frame_context(
+        &self,
+        session: &Session,
+        frame: &Frame,
+    ) -> Result<NativeWorkerFrameContext, TransportError> {
         session
             .peer
             .validate()
@@ -946,8 +1024,9 @@ impl KernelComposition {
         let operation = payload
             .get("operation")
             .and_then(serde_json::Value::as_str)
-            .ok_or(TransportError::SessionFenced)?;
-        if !is_native_worker_operation(operation) {
+            .ok_or(TransportError::SessionFenced)?
+            .to_owned();
+        if !is_native_worker_operation(&operation) {
             return Err(TransportError::SessionFenced);
         }
         let state = self
@@ -955,7 +1034,7 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?;
         if state != KernelServiceState::Ready
             && !(state == KernelServiceState::Degraded
-                && native_worker_operation_allows_degraded(operation, &payload))
+                && native_worker_operation_allows_degraded(&operation, &payload))
         {
             return Err(TransportError::SessionFenced);
         }
@@ -965,66 +1044,48 @@ impl KernelComposition {
                 .and_then(|value| value.get("kind"))
                 .and_then(serde_json::Value::as_str)
                 == Some("BLOCKED");
-        if native_worker_operation_requires_watchdog(operation) && !ready_is_blocked {
+        if native_worker_operation_requires_watchdog(&operation) && !ready_is_blocked {
             self.admit_material_authority_for_governor_issued_fence(&presented_fence)
                 .map_err(|_| TransportError::SessionFenced)?;
         }
-        let current_proof = self
-            .native_worker_cell_current_proof(
-                session,
-                operation,
-                request_id.as_str(),
-                &payload,
-                &presented_fence,
-            )
-            .map_err(NativeWorkerRouteError::into_transport)?;
-        if operation == NATIVE_WORKER_RECONCILE_OPERATION {
-            let action = self.dispatch_native_worker_reconcile(session, frame)?;
-            return Self::attach_native_worker_proof_to_action(action, current_proof);
-        }
-        if operation == NATIVE_WORKER_CANCEL_OBSERVE_OPERATION {
-            let (operation_id, session_binding) = self
-                .stage_native_worker_cancellation(session, &identity_value, &payload)
-                .map_err(NativeWorkerRouteError::into_transport)?;
-            return Ok(KernelFrameAction::Process {
-                request_id,
-                request: ProcessExecutionRequest::Cancel { operation_id },
-                session_binding,
-            });
-        }
-        let receipt = match operation {
+        Ok(NativeWorkerFrameContext {
+            request_id,
+            identity_value,
+            presented_fence,
+            payload,
+            operation,
+        })
+    }
+
+    fn dispatch_native_worker_lifecycle_operation(
+        &self,
+        context: &NativeWorkerFrameContext,
+    ) -> Result<serde_json::Value, NativeWorkerRouteError> {
+        match context.operation.as_str() {
             NATIVE_WORKER_REGISTRATION_OPERATION => {
-                self.handle_native_worker_registration(&identity_value, &payload)
+                self.handle_native_worker_registration(&context.identity_value, &context.payload)
             }
             NATIVE_WORKER_CLAIM_OPERATION => {
-                self.handle_native_worker_claim(&identity_value, &payload)
+                self.handle_native_worker_claim(&context.identity_value, &context.payload)
             }
             NATIVE_WORKER_READY_OPERATION => {
-                self.handle_native_worker_ready(&identity_value, &payload)
+                self.handle_native_worker_ready(&context.identity_value, &context.payload)
             }
             NATIVE_WORKER_HEARTBEAT_OPERATION => {
-                self.handle_native_worker_heartbeat(&identity_value, &payload)
+                self.handle_native_worker_heartbeat(&context.identity_value, &context.payload)
             }
             NATIVE_WORKER_CHECKPOINT_OPERATION => {
-                self.handle_native_worker_checkpoint(&identity_value, &payload)
+                self.handle_native_worker_checkpoint(&context.identity_value, &context.payload)
             }
             NATIVE_WORKER_RESULT_SUBMIT_OPERATION => {
-                self.handle_native_worker_result(&identity_value, &payload)
+                self.handle_native_worker_result(&context.identity_value, &context.payload)
             }
             _ => Err(NativeWorkerRouteError::Shape { field: "operation" }),
         }
-        .map_err(NativeWorkerRouteError::into_transport)?;
-        let receipt = Self::attach_native_worker_proof_to_receipt(receipt, current_proof)?;
-        let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, receipt)?;
-        frame.request_id = Some(request_id);
-        frame
-            .validate()
-            .map_err(|_| TransportError::SessionFenced)?;
-        Ok(KernelFrameAction::Reply(frame))
     }
 
     /// Joins a worker lifecycle presentation to its exact admitted claim,
-    /// retained ProcessExecutor start receipt, authenticated peer, and live
+    /// retained `ProcessExecutor` start receipt, authenticated peer, and live
     /// Kernel activation before any route handler can admit an effect.
     fn native_worker_cell_current_proof(
         &self,
@@ -1048,6 +1109,72 @@ impl KernelComposition {
         .map_err(|_| NativeWorkerRouteError::Fence {
             field: "process_start_receipt",
         })?;
+        let (registry_digest, claim_fence_digest) = self
+            .validate_native_worker_cell_currentness(
+                session,
+                &presented,
+                presented_fence,
+                &process_start,
+                peer,
+            )?;
+        let request = &process_start.request;
+        let claim_receipt = &process_start.claim_receipt;
+        let process_receipt = &process_start.receipt;
+        let process_identity = process_receipt.identity();
+        let physical = process_identity.physical();
+        let executable_binding =
+            request
+                .executable_binding
+                .as_ref()
+                .ok_or(NativeWorkerRouteError::Fence {
+                    field: "executable_binding",
+                })?;
+        let proof_body = serde_json::json!({
+            "kind": "native_worker_capability_cell_process_proof",
+            "operation": operation,
+            "request_id": request_id,
+            "connection_id": session.connection_id,
+            "session_epoch": session.session_epoch,
+            "claim_id": request.claim_id,
+            "claim_request_digest": request.request_digest,
+            "claim_binding_digest": request.binding_digest,
+            "claim_receipt_digest": claim_receipt.receipt_digest,
+            "state_fence_digest": claim_fence_digest,
+            "authority_epoch": request.authority_epoch,
+            "worker_generation": request.worker_generation,
+            "capability_cell": executable_binding.capability_cell,
+            "capability_cell_registry_digest": registry_digest,
+            "registry_resolution": "validated_kernel_embedded_registry",
+            "launch_nonce": process_start.launch_nonce,
+            "process_operation_id": process_receipt.operation_id().as_str(),
+            "process_request_digest": process_receipt.request_digest(),
+            "owner_process_invocation_digest": executable_binding.process_invocation_digest,
+            "activation_epoch": process_start.activation_epoch,
+            "activation_generation": process_start.activation_generation.get(),
+            "artifact_sha256": request.worker_artifact_digest,
+            "process_executable_sha256": process_identity.executable_sha256(),
+            "process_id": physical.process_id(),
+            "process_start_100ns": physical.start_time_100ns(),
+            "process_image_path": physical.image_path(),
+            "launch_executable_file_identity": process_start.executable_file_identity,
+            "peer_executable_file_identity": peer.executable_file_identity(),
+        });
+        let proof_digest = sha256_json(&proof_body).map_err(|_| NativeWorkerRouteError::Shape {
+            field: "capability_cell_proof",
+        })?;
+        let mut proof = proof_body;
+        proof["proof_digest"] = serde_json::Value::String(proof_digest);
+        Ok(proof)
+    }
+
+    fn validate_native_worker_cell_currentness(
+        &self,
+        session: &Session,
+        presented: &NativeWorkerPresentedCurrentness,
+        presented_fence: &StateFence,
+        process_start: &super::dispatch_launch::NativeWorkerProcessStartBinding,
+        peer: &eliot_ipc::ProcessBinding,
+    ) -> Result<(String, String), NativeWorkerRouteError> {
         let request = &process_start.request;
         let claim_receipt = &process_start.claim_receipt;
         let process_receipt = &process_start.receipt;
@@ -1092,50 +1219,19 @@ impl KernelComposition {
                 .map_or(0, |receipt| receipt.generation.value());
             (live_epoch, live_activation_generation)
         };
-        if presented
-            .claim_id
-            .as_deref()
-            .is_some_and(|claim_id| claim_id != request.claim_id)
-            || presented.worker_generation != request.worker_generation
-            || presented.state_fence != request.state_fence
-            || *presented_fence != request.state_fence
-            || session.authority_epoch != request.authority_epoch
-            || session.module_generation.module_id.as_str()
-                != super::front_door_session::NATIVE_MODULE_ID
-            || session.module_generation.generation.value() != request.worker_generation
-            || session.module_generation.artifact_id.as_str() != request.worker_artifact_digest
-            || session.module_generation.state_fence != request.state_fence
-            || session.launch_nonce != process_start.launch_nonce
-            || process_start.launch_nonce != executable_binding.launch_nonce
-            || process_start.activation_epoch != request.authority_epoch
-            || !process_start
-                .activation_epoch
-                .is_same_authority(&live_epoch)
-            || process_start.activation_generation.get() != live_activation_generation
-            || live_activation_generation == 0
-            || peer.process_id() != physical.process_id()
-            || peer.start_time_100ns() != physical.start_time_100ns()
-            || peer.executable_file_identity() != Some(process_start.executable_file_identity)
-            || !peer
-                .image_path()
-                .eq_ignore_ascii_case(physical.image_path())
-            || process_identity.executable_sha256() != request.worker_artifact_digest
-            || durable.claim_id.as_str() != request.claim_id
-            || durable.registration_id.as_str() != request.registration_id
-            || durable.attempt_id.as_str() != request.attempt_id
-            || durable.operation_id.as_str() != request.operation_id
-            || durable.worker_generation != request.worker_generation
-            || durable.authority_epoch != request.authority_epoch.sequence.get()
-            || durable.fence_digest != claim_fence_digest
-            || durable.binding_digest != request.binding_digest
-            || durable.request_digest != request.request_digest
-            || durable.receipt_digest.as_deref() != Some(claim_receipt.receipt_digest.as_str())
-            || durable.state == NativeWorkerClaimState::Requested
-            || durable.capability_cell.as_ref().map(|cell| cell.as_str())
-                != Some(executable_binding.capability_cell.as_str())
-            || durable.capability_cell_registry_digest.as_deref() != Some(registry_digest.as_str())
-            || executable_binding.capability_cell_registry_digest != registry_digest
-        {
+        let check = NativeWorkerCellProofCheck {
+            session,
+            presented,
+            presented_fence,
+            process_start,
+            peer,
+            durable: &durable,
+            registry_digest: &registry_digest,
+            claim_fence_digest: &claim_fence_digest,
+            live_epoch: &live_epoch,
+            live_activation_generation,
+        };
+        if !Self::native_worker_cell_currentness_matches(&check) {
             return Err(NativeWorkerRouteError::Fence {
                 field: "native_worker_cell_process_currentness",
             });
@@ -1151,42 +1247,70 @@ impl KernelComposition {
                 });
             }
         }
-        let proof_body = serde_json::json!({
-            "kind": "native_worker_capability_cell_process_proof",
-            "operation": operation,
-            "request_id": request_id,
-            "connection_id": session.connection_id,
-            "session_epoch": session.session_epoch,
-            "claim_id": request.claim_id,
-            "claim_request_digest": request.request_digest,
-            "claim_binding_digest": request.binding_digest,
-            "claim_receipt_digest": claim_receipt.receipt_digest,
-            "state_fence_digest": claim_fence_digest,
-            "authority_epoch": request.authority_epoch,
-            "worker_generation": request.worker_generation,
-            "capability_cell": executable_binding.capability_cell,
-            "capability_cell_registry_digest": registry_digest,
-            "registry_resolution": "validated_kernel_embedded_registry",
-            "launch_nonce": process_start.launch_nonce,
-            "process_operation_id": process_receipt.operation_id().as_str(),
-            "process_request_digest": process_receipt.request_digest(),
-            "owner_process_invocation_digest": executable_binding.process_invocation_digest,
-            "activation_epoch": process_start.activation_epoch,
-            "activation_generation": process_start.activation_generation.get(),
-            "artifact_sha256": request.worker_artifact_digest,
-            "process_executable_sha256": process_identity.executable_sha256(),
-            "process_id": physical.process_id(),
-            "process_start_100ns": physical.start_time_100ns(),
-            "process_image_path": physical.image_path(),
-            "launch_executable_file_identity": process_start.executable_file_identity,
-            "peer_executable_file_identity": peer.executable_file_identity(),
-        });
-        let proof_digest = sha256_json(&proof_body).map_err(|_| NativeWorkerRouteError::Shape {
-            field: "capability_cell_proof",
-        })?;
-        let mut proof = proof_body;
-        proof["proof_digest"] = serde_json::Value::String(proof_digest);
-        Ok(proof)
+        Ok((registry_digest, claim_fence_digest))
+    }
+
+    fn native_worker_cell_currentness_matches(check: &NativeWorkerCellProofCheck<'_>) -> bool {
+        let session = check.session;
+        let presented = check.presented;
+        let presented_fence = check.presented_fence;
+        let process_start = check.process_start;
+        let peer = check.peer;
+        let durable = check.durable;
+        let registry_digest = check.registry_digest;
+        let claim_fence_digest = check.claim_fence_digest;
+        let live_epoch = check.live_epoch;
+        let live_activation_generation = check.live_activation_generation;
+        let request = &process_start.request;
+        let claim_receipt = &process_start.claim_receipt;
+        let process_identity = process_start.receipt.identity();
+        let physical = process_identity.physical();
+        let Some(executable_binding) = request.executable_binding.as_ref() else {
+            return false;
+        };
+        !presented
+            .claim_id
+            .as_deref()
+            .is_some_and(|claim_id| claim_id != request.claim_id)
+            && presented.worker_generation == request.worker_generation
+            && presented.state_fence == request.state_fence
+            && *presented_fence == request.state_fence
+            && session.authority_epoch == request.authority_epoch
+            && session.module_generation.module_id.as_str()
+                == super::front_door_session::NATIVE_MODULE_ID
+            && session.module_generation.generation.value() == request.worker_generation
+            && session.module_generation.artifact_id.as_str() == request.worker_artifact_digest
+            && session.module_generation.state_fence == request.state_fence
+            && session.launch_nonce == process_start.launch_nonce
+            && process_start.launch_nonce == executable_binding.launch_nonce
+            && process_start.activation_epoch == request.authority_epoch
+            && process_start
+                .activation_epoch
+                .is_same_authority(live_epoch)
+            && process_start.activation_generation.get() == live_activation_generation
+            && live_activation_generation != 0
+            && peer.process_id() == physical.process_id()
+            && peer.start_time_100ns() == physical.start_time_100ns()
+            && peer.executable_file_identity() == Some(process_start.executable_file_identity)
+            && peer
+                .image_path()
+                .eq_ignore_ascii_case(physical.image_path())
+            && process_identity.executable_sha256() == request.worker_artifact_digest
+            && durable.claim_id.as_str() == request.claim_id
+            && durable.registration_id.as_str() == request.registration_id
+            && durable.attempt_id.as_str() == request.attempt_id
+            && durable.operation_id.as_str() == request.operation_id
+            && durable.worker_generation == request.worker_generation
+            && durable.authority_epoch == request.authority_epoch.sequence.get()
+            && durable.fence_digest == claim_fence_digest
+            && durable.binding_digest == request.binding_digest
+            && durable.request_digest == request.request_digest
+            && durable.receipt_digest.as_deref() == Some(claim_receipt.receipt_digest.as_str())
+            && durable.state != NativeWorkerClaimState::Requested
+            && durable.capability_cell.as_deref()
+                == Some(executable_binding.capability_cell.as_str())
+            && durable.capability_cell_registry_digest.as_deref() == Some(registry_digest)
+            && executable_binding.capability_cell_registry_digest == registry_digest
     }
 
     fn attach_native_worker_proof_to_receipt(
