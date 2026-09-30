@@ -2296,6 +2296,92 @@ impl AdmittedStage {
         grant.grant_digest = grant.digest();
         Ok(grant)
     }
+
+    /// Refuses new admission when the live registry replaced the admitted
+    /// spec, parser, supply-chain receipt, or route (I10.8.3).
+    ///
+    /// Replacement ships as a new registry generation: the live spec digest,
+    /// parser identity/generation, receipt digest, and stage route must still
+    /// equal this compiled admission, or new launches fail closed here.
+    /// Historical run evidence is untouched: verdicts never call this path,
+    /// so an older permitted attempt keeps its sealed grant and receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdmissionError::UnknownKind`] when the live registry no
+    /// longer admits the spec, or [`AdmissionError::InvalidRequest`] when the
+    /// spec, parser, receipt, or route was replaced since compilation.
+    pub fn refuse_if_revoked(&self, registry: &InstrumentRegistry) -> Result<(), AdmissionError> {
+        let Some(live) = registry.spec(self.spec.as_str()) else {
+            return Err(AdmissionError::UnknownKind {
+                instrument: self.spec.as_str().to_owned(),
+            });
+        };
+        if live.digest() != self.spec_digest {
+            return Err(AdmissionError::InvalidRequest {
+                detail: "admitted spec was replaced since compilation".to_owned(),
+            });
+        }
+        if live.parser.as_str() != self.parser.as_str()
+            || live.parser_generation != self.parser_generation
+        {
+            return Err(AdmissionError::InvalidRequest {
+                detail: "admitted parser was replaced since compilation".to_owned(),
+            });
+        }
+        let live_supply = registry
+            .supply_chain(self.spec.as_str())
+            .map(SupplyChainReceipt::digest)
+            .unwrap_or_default();
+        let admitted_supply = self
+            .supply_receipt
+            .as_ref()
+            .map(SupplyChainReceipt::digest)
+            .unwrap_or_default();
+        if live_supply != admitted_supply {
+            return Err(AdmissionError::InvalidRequest {
+                detail: "admitted supply-chain receipt was replaced since compilation".to_owned(),
+            });
+        }
+        let route_live = registry
+            .admitted(&self.profile, self.profile_revision)
+            .ok()
+            .and_then(|profile| {
+                profile.dag.topological_order().into_iter().find(|stage| {
+                    stage.stage_id == self.stage_id && stage.spec.as_str() == self.spec.as_str()
+                })
+            })
+            .is_some();
+        if !route_live {
+            return Err(AdmissionError::InvalidRequest {
+                detail: "admitted route was replaced since compilation".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Admits one typed invocation against the live registry before process
+    /// creation.
+    ///
+    /// This is the shared pre-launch admission boundary over a registry the
+    /// composition root still holds: a replaced spec, parser, receipt, or
+    /// route fails closed through [`AdmittedStage::refuse_if_revoked`], and
+    /// the surviving admission seals through [`AdmittedStage::admit`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`AdmittedStage::refuse_if_revoked`] and
+    /// [`AdmittedStage::admit`] failures.
+    pub fn admit_live(
+        &self,
+        registry: &InstrumentRegistry,
+        request: &InstrumentAdmissionRequest,
+        observed: Option<&ResolvedExecutableIdentity>,
+        profile_revision: u64,
+    ) -> Result<InstrumentAdmissionGrant, AdmissionError> {
+        self.refuse_if_revoked(registry)?;
+        self.admit(request, observed, profile_revision)
+    }
 }
 
 /// The governed output of [`ProfileCompiler::compile`].
@@ -2309,6 +2395,10 @@ pub struct AdmittedProfile {
     pub name: String,
     /// Exact admitted revision.
     pub revision: u64,
+    /// Registry generation the admission was compiled against.
+    pub registry_generation: u64,
+    /// Registry digest the admission was compiled against.
+    pub registry_digest: String,
     /// Profile definition digest.
     pub profile_digest: String,
     /// Stage DAG digest.
@@ -2502,6 +2592,8 @@ impl<'a> ProfileCompiler<'a> {
         Ok(AdmittedProfile {
             name: admitted.name.clone(),
             revision: admitted.revision,
+            registry_generation: self.registry.generation(),
+            registry_digest: self.registry.digest(),
             profile_digest: admitted.digest(),
             dag_digest: admitted.dag.digest(),
             kinds: admitted.kinds.clone(),
