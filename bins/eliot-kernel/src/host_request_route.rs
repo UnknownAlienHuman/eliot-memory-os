@@ -8046,8 +8046,19 @@ pub(crate) fn local_read_admission_from_tool(
     if super::tool_exposure::requires_intent(&admission) {
         let request = super::tool_exposure::build_tool_call_request(envelope, tool, &admission)
             .ok_or(TransportError::SessionFenced)?;
-        super::tool_exposure::authorize_pre_dispatch(&request)
-            .map_err(|_| TransportError::SessionFenced)?;
+        // I7.24 W4: the orchestration boundary records the per-evaluation
+        // exposure skeleton for every admitted expensive-class call. The
+        // pre-dispatch gate runs inside the recording call; the receipt id
+        // is infrastructure identity (the host-request operation id), never
+        // caller prose. Route fingerprint and tool definition ride the
+        // request's admission-derived identities; delivery stays MISSING
+        // and unobserved stages stay unobserved until their measurement
+        // owners advance them through the validated record_* transitions.
+        let _receipt = super::tool_exposure::observe_authorized_admission(
+            &request,
+            host_request_operation_id(envelope),
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
     }
     Ok(admission)
 }
