@@ -49,32 +49,36 @@
 //! not the resolver output, because the two vocabularies are deliberately
 //! distinct.
 
-use eliot_context_assembly::{AssemblyPolicy, assemble_active_view};
+use eliot_context_assembly::{
+    ActiveUnderstandingViewResult, AssemblyPolicy, assemble_active_view,
+};
 use eliot_context_candidates::{
     AttentionInput, CandidatePolicy, CandidateRequest, CanonicalProjectionInput, CueInput,
-    EpistemicInput, EvidenceInput, MemberMeasurement, construct_context_candidates_with_canonical,
+    ContextCandidateSetResult, EpistemicInput, EvidenceInput, MemberMeasurement,
+    construct_context_candidates_with_canonical,
 };
 use eliot_context_contracts::{
     AdmittedContextSet, CanonicalProjectionSet, ContextError, ContextRecipe, QualityScorecard,
     SerializedContextMeasurement,
 };
 use eliot_contracts::StateFence;
-use eliot_cue_activation::{ActivationProfile, evaluate_activation};
+use eliot_cue_activation::{ActivationProfile, CueActivationEvaluation, evaluate_activation};
 use eliot_cue_contracts::{ActivationRequest, CueSnapshotBuildCandidate};
 use eliot_dreamer_claim_grounding::{GroundingRequest, ground_draft_with_controls};
-use eliot_dreamer_classification::{ClassificationPolicy, classify};
+use eliot_dreamer_classification::{ClassificationPolicy, ClassificationResult, classify};
 use eliot_dreamer_conflict_analysis::{
-    ConflictAnalysisPolicy, ConflictSupplements, analyze_conflict,
+    ConflictAnalysisCandidate, ConflictAnalysisPolicy, ConflictSupplements, analyze_conflict,
 };
 use eliot_dreamer_contracts::{
     ClassificationInput, CurationAcceptanceCtx, DreamInputBundle, GroundedDreamDraft,
     ModelRouteDisposition, ModelRouteOutcome, ValidatedCurationItem, ValidatedDreamDraft,
     ValidatedGroundingCandidate, bundle_digest_of, canonical_bytes, digest_hex,
 };
+use eliot_dreamer_contracts::grounding::GroundedDreamDraft as StructuredGroundedDreamDraft;
 use eliot_dreamer_orientation::OrientationError;
-use eliot_dreamer_probe_plan::{ProbePlanParams, plan_discriminative_probes};
-use eliot_dreamer_rival_model::{RivalPolicy, structure_rival_models};
-use eliot_epistemic::{PositionRequest, resolve};
+use eliot_dreamer_probe_plan::{ProbePlan, ProbePlanParams, plan_discriminative_probes};
+use eliot_dreamer_rival_model::{RivalModelSet, RivalPolicy, structure_rival_models};
+use eliot_epistemic::{CurrentEpistemicPosition, PositionRequest, resolve};
 use eliot_epistemic_contracts::{ConflictSet, CurrentEpistemicPosition as AdmittedPosition};
 
 use crate::OrientationStageDisposition;
@@ -356,16 +360,29 @@ pub(crate) struct PulseStage {
     pub output_commitment: Option<String>,
     /// Static reason naming the missing owner value or refusal.
     pub reason: Option<&'static str>,
+    /// Exact typed value returned by the named owner, retained for the joined
+    /// Orientation projection.
+    pub owner_output: Option<StageOwnerOutput>,
+    /// Owner-canonical bytes, when the native output contract exposes them.
+    pub canonical_output: Option<Vec<u8>>,
 }
 
 impl PulseStage {
-    fn executed(id: PulseStageId, output_commitment: Option<String>) -> Self {
+    fn executed(
+        id: PulseStageId,
+        input_commitment: String,
+        output_commitment: String,
+        owner_output: StageOwnerOutput,
+        canonical_output: Option<Vec<u8>>,
+    ) -> Self {
         Self {
             id,
             disposition: OrientationStageDisposition::Executed,
-            input_commitment: Some(id.expected_input().to_owned()),
-            output_commitment,
+            input_commitment: Some(input_commitment),
+            output_commitment: Some(output_commitment),
             reason: None,
+            owner_output: Some(owner_output),
+            canonical_output,
         }
     }
 
@@ -380,6 +397,8 @@ impl PulseStage {
             input_commitment: None,
             output_commitment: None,
             reason: Some(reason),
+            owner_output: None,
+            canonical_output: None,
         }
     }
 
@@ -391,8 +410,23 @@ impl PulseStage {
             input_commitment: None,
             output_commitment: None,
             reason: Some(reason),
+            owner_output: None,
+            canonical_output: None,
         }
     }
+}
+
+/// Native result values returned by the mandatory stage owners.
+pub(crate) enum StageOwnerOutput {
+    Classification(ClassificationResult),
+    CueActivation(CueActivationEvaluation),
+    EpistemicPosition(CurrentEpistemicPosition),
+    Understanding(ActiveUnderstandingViewResult),
+    Grounding(StructuredGroundedDreamDraft),
+    Rivals(RivalModelSet),
+    Conflict(ConflictAnalysisCandidate),
+    Probes(ProbePlan),
+    Candidates(ContextCandidateSetResult),
 }
 
 /// Canonical content digest over one owner output value.
@@ -400,7 +434,15 @@ impl PulseStage {
 /// Returns `None` only when canonical serialization fails, which the caller
 /// treats as an owner defect.
 pub(crate) fn output_digest<T: serde::Serialize>(value: &T) -> Option<String> {
-    canonical_bytes(value).ok().map(|bytes| digest_hex(&bytes))
+    canonical_owner_output(value).map(|(digest, _)| digest)
+}
+
+/// Returns the exact canonical output bytes and their existing owner
+/// commitment in one serialization pass.
+pub(crate) fn canonical_owner_output<T: serde::Serialize>(value: &T) -> Option<(String, Vec<u8>)> {
+    canonical_bytes(value)
+        .ok()
+        .map(|bytes| (digest_hex(&bytes), bytes))
 }
 
 /// Fail-closed pulse error with bounded static refusal fields.
@@ -530,10 +572,14 @@ pub(crate) fn run_classification_stage(
         |inputs| {
             let output = classify(inputs.input, inputs.context, inputs.policy)
                 .map_err(|_| PulseError::Classification)?;
-            let commitment = output_digest(&output).ok_or(PulseError::Classification)?;
+            let (commitment, canonical) =
+                canonical_owner_output(&output).ok_or(PulseError::Classification)?;
             Ok(PulseStage::executed(
                 PulseStageId::Classification,
-                Some(commitment),
+                PulseStageId::Classification.expected_input().to_owned(),
+                commitment,
+                StageOwnerOutput::Classification(output),
+                Some(canonical),
             ))
         },
     )
@@ -545,10 +591,14 @@ pub(crate) fn run_cue_stage(stage: Option<&CueActivationStage>) -> Result<PulseS
         |inputs| {
             let output = evaluate_activation(inputs.candidate, inputs.request, inputs.profile)
                 .map_err(|_| PulseError::CueActivation)?;
-            let commitment = output_digest(&output).ok_or(PulseError::CueActivation)?;
+            let (commitment, canonical) =
+                canonical_owner_output(&output).ok_or(PulseError::CueActivation)?;
             Ok(PulseStage::executed(
                 PulseStageId::CueActivation,
-                Some(commitment),
+                PulseStageId::CueActivation.expected_input().to_owned(),
+                commitment,
+                StageOwnerOutput::CueActivation(output),
+                Some(canonical),
             ))
         },
     )
@@ -561,10 +611,14 @@ pub(crate) fn run_epistemic_stage(
         || Ok(PulseStage::pending(PulseStageId::EpistemicPosition)),
         |inputs| {
             let output = resolve(inputs).map_err(|_| PulseError::Epistemic)?;
-            let commitment = output_digest(&output).ok_or(PulseError::Epistemic)?;
+            let (commitment, canonical) =
+                canonical_owner_output(&output).ok_or(PulseError::Epistemic)?;
             Ok(PulseStage::executed(
                 PulseStageId::EpistemicPosition,
-                Some(commitment),
+                PulseStageId::EpistemicPosition.expected_input().to_owned(),
+                commitment,
+                StageOwnerOutput::EpistemicPosition(output),
+                Some(canonical),
             ))
         },
     )
@@ -589,10 +643,14 @@ where
             .map_err(|_| PulseError::Understanding)?;
             // The owner result carries no Serialize form; commit the exact
             // owner-produced serialized bytes instead.
-            let commitment = digest_hex(&output.serialized_bytes);
+            let canonical = output.serialized_bytes.clone();
+            let commitment = digest_hex(&canonical);
             Ok(PulseStage::executed(
                 PulseStageId::Understanding,
-                Some(commitment),
+                PulseStageId::Understanding.expected_input().to_owned(),
+                commitment,
+                StageOwnerOutput::Understanding(output),
+                Some(canonical),
             ))
         },
     )
@@ -606,10 +664,14 @@ pub(crate) fn run_grounding_stage(
         |inputs| {
             let output =
                 ground_draft_with_controls(inputs.clone()).map_err(|_| PulseError::Grounding)?;
-            let commitment = output_digest(&output).ok_or(PulseError::Grounding)?;
+            let (commitment, canonical) =
+                canonical_owner_output(&output).ok_or(PulseError::Grounding)?;
             Ok(PulseStage::executed(
                 PulseStageId::Grounding,
-                Some(commitment),
+                PulseStageId::Grounding.expected_input().to_owned(),
+                commitment,
+                StageOwnerOutput::Grounding(output),
+                Some(canonical),
             ))
         },
     )
@@ -626,8 +688,15 @@ pub(crate) fn run_rival_stage(stage: Option<&RivalStage>) -> Result<PulseStage, 
                 inputs.policy,
             )
             .map_err(|_| PulseError::Rivals)?;
-            let commitment = output_digest(&output).ok_or(PulseError::Rivals)?;
-            Ok(PulseStage::executed(PulseStageId::Rivals, Some(commitment)))
+            let (commitment, canonical) =
+                canonical_owner_output(&output).ok_or(PulseError::Rivals)?;
+            Ok(PulseStage::executed(
+                PulseStageId::Rivals,
+                PulseStageId::Rivals.expected_input().to_owned(),
+                commitment,
+                StageOwnerOutput::Rivals(output),
+                Some(canonical),
+            ))
         },
     )
 }
@@ -651,7 +720,10 @@ pub(crate) fn run_conflict_stage(stage: Option<&ConflictStage>) -> Result<PulseS
             let commitment = output.candidate_digest.clone();
             Ok(PulseStage::executed(
                 PulseStageId::Conflict,
-                Some(commitment),
+                PulseStageId::Conflict.expected_input().to_owned(),
+                commitment,
+                StageOwnerOutput::Conflict(output),
+                None,
             ))
         },
     )
@@ -664,8 +736,15 @@ pub(crate) fn run_probe_stage(
         || Ok(PulseStage::pending(PulseStageId::Probes)),
         |inputs| {
             let output = plan_discriminative_probes(inputs).map_err(|_| PulseError::Probes)?;
-            let commitment = output_digest(&output).ok_or(PulseError::Probes)?;
-            Ok(PulseStage::executed(PulseStageId::Probes, Some(commitment)))
+            let (commitment, canonical) =
+                canonical_owner_output(&output).ok_or(PulseError::Probes)?;
+            Ok(PulseStage::executed(
+                PulseStageId::Probes,
+                PulseStageId::Probes.expected_input().to_owned(),
+                commitment,
+                StageOwnerOutput::Probes(output),
+                Some(canonical),
+            ))
         },
     )
 }
@@ -696,10 +775,14 @@ pub(crate) fn run_candidate_stage(
                 inputs.policy,
             )
             .map_err(|_| PulseError::Candidates)?;
-            let commitment = output_digest(&output).ok_or(PulseError::Candidates)?;
+            let (commitment, canonical) =
+                canonical_owner_output(&output).ok_or(PulseError::Candidates)?;
             Ok(PulseStage::executed(
                 PulseStageId::Candidates,
-                Some(commitment),
+                PulseStageId::Candidates.expected_input().to_owned(),
+                commitment,
+                StageOwnerOutput::Candidates(output),
+                Some(canonical),
             ))
         }
         (None, Some(_)) => Ok(PulseStage::pending_reason(
