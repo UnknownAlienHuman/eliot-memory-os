@@ -21,6 +21,8 @@
 //!   Managed Agent session; it becomes a `Rehydrated` attempt."
 //! - I10.7 generic minimum: "working root/scope and route fingerprint".
 
+use crate::route_registry::RetainedRouteLaunch;
+use eliot_agent_bridge_core::AttachView;
 use eliot_governor::{
     CapabilityRouteRegistry, RouteBehaviorFingerprint, RouteInstallationIdentity,
     RouteRegistryError, RuntimeRoute,
@@ -67,11 +69,14 @@ pub fn admit_bridge_route_launch(
 ///
 /// The fingerprints are the complete W3 material, so any local/managed
 /// adapter move, any service/interactive identity move, and any distinct
-/// account-mode move diverge them. An unchanged fingerprint keeps native
-/// resume; any divergence is an explicit
+/// account-mode move presented here diverge them. An unchanged fingerprint
+/// keeps native resume; any divergence is an explicit
 /// [`ContinuityKind::Rehydrated`](eliot_protocol::ContinuityKind) new
 /// attempt — I10.5's "it becomes a `Rehydrated` attempt" — never silent
-/// continuity under the previous session identity.
+/// continuity under the previous session identity. The bound is the
+/// session's launch fingerprint compared with the material presented for this
+/// operation: a move the caller never presents is the caller's join (see
+/// [`classify_bridge_route_reconnect`]), never continuity granted here.
 #[must_use]
 pub fn classify_bridge_route_resume(
     prior: &RouteBehaviorFingerprint,
@@ -84,35 +89,62 @@ pub fn classify_bridge_route_resume(
     }
 }
 
-/// Classifies a reconnect against the Governor-retained route definition (W4).
+/// Classifies a reconnect against the sealed launch and the Governor-retained receipt (W4).
 ///
-/// The `prior` fingerprint is the launch admission retained at attach; the
-/// live side is re-derived from the route definition the registry retains
-/// under the same `route_id` — the `derive_admission`
-/// (`route_registry.rs:1268`) pattern of comparing against the earlier
-/// retained receipt (`:1249-1252`) instead of recomputing over one
-/// constructor-fixed field pair. A revised retained definition — a
-/// local/managed adapter move, a service/interactive identity move, or a
-/// distinct account-mode move — diverges the fingerprints, so the resume
-/// classifies as an explicit
+/// The bound is the sealed launch [`RetainedRouteLaunch`] that the attach
+/// path sealed after the core attach succeeded: the W3 launch fingerprint in
+/// `prior` is cross-checked against the seal, so two retained stores must
+/// agree with each other. The live side is derived fresh for this operation:
+/// `live_route`/`live_installation` are the contour declaration re-derived
+/// from the live profile — fingerprinted through the owner's
+/// [`RouteBehaviorFingerprint::of`] over the originals, never a digest of a
+/// digest — and `live` is a fresh read of the current attach binding.
+/// Completeness is judged against the registry's independent receipt set: the
+/// retained receipt for the sealed route identity must agree with both the
+/// bound and the live fingerprint. That is the owner's `derive_admission`
+/// pattern — comparing against the earlier retained receipt rather than the
+/// defined intent — with a real production producer: the attach path records
+/// the receipt from the genuine attach observation.
+///
+/// Any local/managed adapter move, any service/interactive identity move, and
+/// any distinct account-mode move presented here diverge the complete W3
+/// material, and any session or activation-generation move diverges the launch
+/// authority, so the resume classifies as an explicit
 /// [`ContinuityKind::Rehydrated`](eliot_protocol::ContinuityKind) new
 /// attempt — I10.5's "it becomes a `Rehydrated` attempt" — never silent
-/// continuity under the previous session identity. A retained definition
-/// identical to launch keeps native resume, which stays only the
-/// single-compatible-fingerprint optimization. When the registry retains no
-/// definition for the route, the live declaration itself is fingerprinted,
-/// preserving the launch-equality comparison without inventing retained
-/// content.
+/// continuity under the previous launch. When the registry retains no receipt
+/// for the route, the sealed/live comparison alone applies.
+///
+/// STITCH (proven contour invariant, not a gap): one contour process derives
+/// every presentation from the same fixed declaration source the seal
+/// recorded, so the material and authority arms agree on every legitimate
+/// path and the guard passes without false refusals. The arms are still
+/// genuine violation conditions over distinct independently-acquired objects
+/// — the sealed record, the fresh derivation, the fresh binding read, and the
+/// production-recorded receipt — so any presenter or registry divergence
+/// refuses instead of continuing silently.
 #[must_use]
 pub fn classify_bridge_route_reconnect(
-    registry: &CapabilityRouteRegistry,
+    sealed: &RetainedRouteLaunch,
     prior: &RouteBehaviorFingerprint,
-    route: &RuntimeRoute,
-    installation: &RouteInstallationIdentity,
+    registry: &CapabilityRouteRegistry,
+    live_route: &RuntimeRoute,
+    live_installation: &RouteInstallationIdentity,
+    live: &AttachView,
 ) -> ContinuityKind {
-    let next = match registry.route(&route.route_id) {
-        Some(retained) => RouteBehaviorFingerprint::of(retained, installation),
-        None => RouteBehaviorFingerprint::of(route, installation),
-    };
-    classify_bridge_route_resume(prior, &next)
+    let live_fingerprint = RouteBehaviorFingerprint::of(live_route, live_installation);
+    let bound_intact = prior == sealed.fingerprint();
+    let material_moved = classify_bridge_route_resume(sealed.fingerprint(), &live_fingerprint)
+        == ContinuityKind::Rehydrated;
+    let live_binding = live.binding();
+    let authority_moved = sealed.launch_session() != live_binding.session_id().as_str()
+        || sealed.launch_generation() != live_binding.activation_generation();
+    let retained_diverged = registry.receipt(sealed.route_id()).is_some_and(|receipt| {
+        receipt.requested_fingerprint != *prior || receipt.requested_fingerprint != live_fingerprint
+    });
+    if !bound_intact || material_moved || authority_moved || retained_diverged {
+        ContinuityKind::Rehydrated
+    } else {
+        ContinuityKind::NativeResume
+    }
 }
