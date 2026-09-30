@@ -64,6 +64,15 @@
 //!   terms yet). Structural validation of request-supplied
 //!   `TaskSelectionEvidence` is never sufficient.
 //!
+//! - [`require_material_bootstrap_for_task_bound`] — the W5/A4 join
+//!   (issue #1746): a sealed [`DispatchedBinding`] proceeds toward the #1742
+//!   Material gate only on a `Material` [`BootstrapAdmission`] naming the
+//!   same task/scope/fence/receipt-revision/governance profile. A diagnostic
+//!   bootstrap (always the no-task case) is never Material authority.
+//!   Designated caller (STITCH, daemon composition lane):
+//!   [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition),
+//!   between the admission projection and the #1742 material gate.
+//!
 //! No entry creates a second write path, re-derives a downstream layer's
 //! decision, or accepts a task the caller did not name.
 //!
@@ -77,6 +86,10 @@
 //!   [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition).
 //!   An earlier revision of this file recorded *zero* call sites for it; that
 //!   was false and is corrected here.
+//! - [`require_material_bootstrap_for_task_bound`] has **zero call sites**: the
+//!   designated caller is the same composition, between the admission
+//!   projection and the #1742 material gate, passing the bootstrap admitted
+//!   for the same lease at the write fence.
 //! - `DaemonComposition::commit_canonical_and_refresh` itself has **zero**
 //!   production call sites — its only in-tree mentions are documentation and a
 //!   source-string assertion in `bins/eliotd/tests/agent_fabric_wiring.rs`. It
@@ -1879,7 +1892,8 @@ pub struct MaterialBootstrap {
 /// compiled [`OnboardingReadinessReceipt`], the [`IntegrationCoverageProfile`],
 /// and the derived [`GovernanceProfile`], all bound to the same
 /// session/scope/task-or-selection-state and source revisions: receipt/lease,
-/// principal/session, scope/instance/lineage, task binding, state fence,
+/// principal/session, scope/descriptor-revision/instance/lineage,
+/// scope-resolution state, task binding, state fence,
 /// governing-source set/generation, governance/route profile refs, receipt
 /// revision, and projection source/generation must name the same values on
 /// both sides, or the join fails closed with `TASK_SCOPE_INCOMPATIBLE`.
@@ -1967,6 +1981,15 @@ pub fn admit_bootstrap_context(
     bound("principal", &receipt.principal_ref, &surface.principal_ref)?;
     bound("session", &receipt.session_ref, &surface.session_ref)?;
     bound("scope", &receipt.scope.scope_ref, &surface.scope.scope_ref)?;
+    // Issue #1746, W3: the scope descriptor revision is part of the bound
+    // scope identity (I4.2.1 `session_task_and_expected_scope_revision`). A
+    // surface projected for another descriptor revision is another scope
+    // binding, never silently adopted under this receipt.
+    if receipt.scope_descriptor_revision != surface.scope_descriptor_revision {
+        return Err(TaskBindingError::scope_incompatible(
+            "bootstrap surface names another scope descriptor revision",
+        ));
+    }
     bound(
         "instance",
         &receipt.instance.instance_ref,
@@ -1991,6 +2014,14 @@ pub fn admit_bootstrap_context(
     if !eliot_contracts::fences_match_exact(&receipt.state_fence, &surface.state_fence) {
         return Err(TaskBindingError::scope_incompatible(
             "bootstrap surface was projected at another fence",
+        ));
+    }
+    // Issue #1746, W5: the scope resolution state is owner-issued on both
+    // sides for this same receipt/projection. A surface disagreeing on whether
+    // the scope is authenticated withholds instead of admitting.
+    if receipt.scope_resolution != surface.scope_resolution {
+        return Err(TaskBindingError::scope_incompatible(
+            "bootstrap surface names another scope resolution state",
         ));
     }
     bound(
@@ -2122,6 +2153,83 @@ pub fn admit_bootstrap_context(
             }))
         }
     }
+}
+
+/// Requires one sealed task-bound dispatch identity to rest on its
+/// owner-evidenced Material bootstrap (issue #1746, W5/A4; I7.8 step 4).
+///
+/// Joins the [`TaskBindingAdmission::TaskBound`] identity
+/// ([`admit_canonical_write`]) to the [`BootstrapAdmission`] assembled from
+/// the real owners ([`admit_bootstrap_context`]): a task-bound effect proceeds
+/// toward the #1742 Material gate
+/// (`GovernorComposition::commit_canonical_with_readiness`) only when the
+/// bootstrap is `Material` and names the same admitted task, `WorkScope`,
+/// presented fence, receipt revision, governance profile reference, and
+/// projection generation as the sealed binding. Anything else fails closed
+/// with a typed error and admits nothing: `Diagnostic` (including a bootstrap
+/// without a task, which always lands there) withholds with
+/// `TASK_SCOPE_INCOMPATIBLE` — a diagnostic bootstrap is never Material
+/// authority — and `IntakeRequired` withholds with `TASK_SELECTION_REQUIRED`.
+/// A moved task, scope, fence, bootstrap/profile revision, or re-projected
+/// bootstrap conflicts for rebind; it is never rewritten
+/// under the old operation identity.
+///
+/// Cold/unbound and non-task-relative admissions carry no sealed identity and
+/// pass through untouched. This entry mints nothing and selects nothing.
+///
+/// Designated caller (STITCH, daemon composition lane):
+/// [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition),
+/// between the admission projection and the #1742 material gate, passing the
+/// admitted binding and the bootstrap admitted for the same lease at the write
+/// fence.
+pub fn require_material_bootstrap_for_task_bound(
+    binding: &DispatchedBinding,
+    bootstrap: &BootstrapAdmission,
+) -> Result<(), TaskBindingError> {
+    let material = match bootstrap {
+        BootstrapAdmission::Material(material) => material,
+        BootstrapAdmission::Diagnostic { reason, .. } => {
+            return Err(TaskBindingError::scope_incompatible(format!(
+                "task-bound dispatch rests on a diagnostic bootstrap, never Material authority: {reason}"
+            )));
+        }
+        BootstrapAdmission::IntakeRequired(_) => {
+            return Err(TaskBindingError::selection_required(
+                "task-bound dispatch has no selected task; answer with the bounded intake shape",
+            ));
+        }
+    };
+    if material.task.task_ref != binding.admitted_task_ref {
+        return Err(TaskBindingError::scope_incompatible(
+            "task-bound dispatch bootstrap names another task than the admitted binding; rebind, no rewrite",
+        ));
+    }
+    if material.scope_ref != binding.scope_ref {
+        return Err(TaskBindingError::scope_incompatible(
+            "task-bound dispatch bootstrap names another WorkScope than the admitted binding; rebind, no rewrite",
+        ));
+    }
+    if !eliot_contracts::fences_match_exact(&material.state_fence, &binding.presented_fence) {
+        return Err(TaskBindingError::scope_incompatible(
+            "task-bound dispatch bootstrap was assembled at another fence; rebind at the live fence, no silent rebind",
+        ));
+    }
+    if material.receipt_revision != binding.receipt_revision
+        || material.governance_profile_ref != binding.governance_profile_ref
+    {
+        return Err(TaskBindingError::scope_incompatible(
+            "task-bound dispatch bootstrap/profile revision moved before effect; rebind at the live revision, no silent rebind",
+        ));
+    }
+    // A re-projected bootstrap under the same receipt revision still conflicts
+    // for rebind: the admitted projection is never silently adopted under the
+    // old operation identity.
+    if material.projection_generation != binding.projection_generation {
+        return Err(TaskBindingError::scope_incompatible(
+            "task-bound dispatch bootstrap was re-projected before effect; rebind at the live projection, no silent adoption",
+        ));
+    }
+    Ok(())
 }
 
 /// Computes the `TaskContract` compatibility disposition for one write from
