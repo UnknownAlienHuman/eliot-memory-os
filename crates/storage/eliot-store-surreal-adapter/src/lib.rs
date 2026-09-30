@@ -63,6 +63,7 @@ use eliot_store_api::{
     StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
     generated_operation_manifests, operation_manifest_set_digest,
 };
+use eliot_contracts::ResourceGeneration;
 pub use error::AdapterError;
 pub use health::{AdapterAvailability, AdapterHealth, ProviderHealth};
 
@@ -166,6 +167,16 @@ impl SurrealStoreAdapter {
         config: SurrealAdapterConfig,
         provider_process_lease: RetainedProcessPathLease,
     ) -> Result<Self, AdapterError> {
+        Self::new_with_limits(config, provider_process_lease, ClientSetLimits::compatibility())
+    }
+
+    /// Builds the canonical adapter with the exact bounded client profile
+    /// supplied by its composition owner.
+    pub fn new_with_limits(
+        config: SurrealAdapterConfig,
+        provider_process_lease: RetainedProcessPathLease,
+        client_limits: ClientSetLimits,
+    ) -> Result<Self, AdapterError> {
         config
             .validate()
             .map_err(|error| AdapterError::Config(error.to_string()))?;
@@ -195,7 +206,7 @@ impl SurrealStoreAdapter {
             tx_rendezvous: std::sync::Mutex::new(None),
             execution: std::sync::Mutex::new(None),
             operation_manifest,
-            client_limits: ClientSetLimits::compatibility(),
+            client_limits,
         })
     }
 
@@ -288,7 +299,7 @@ impl SurrealStoreAdapter {
         lanes: NonZeroUsize,
         max_pending: NonZeroUsize,
         observed_generation: SchemaGeneration,
-        kernel_generation: String,
+        kernel_generation: ResourceGeneration,
         state_fence: StateFence,
     ) -> Result<(), AdapterError> {
         let evidence = ConcurrentEvidence {

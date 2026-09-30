@@ -125,6 +125,9 @@ pub struct CanarySourceBundleMaterializeInput {
     /// any input whose two statements of it differ, so the restatement can
     /// never become a second, unvalidated staging root.
     pub staging_root: PlatformHandle,
+    /// Optional explicit Store reserved-write scheduler queue bound. `None`
+    /// preserves legacy bytes and does not grant the reserved-write capability.
+    pub store_write_max_pending: Option<usize>,
 }
 
 /// One receipt fact for a published source role.
@@ -1057,6 +1060,7 @@ fn build_typed_bundle_with_selection(
         // Cross-scope mechanical line (installer lane file): new optional
         // bridge knob defaults to the I5.7 desktop default; behavior unchanged.
         store_transaction_limit: None,
+        store_write_max_pending: input.store_write_max_pending,
         schema_generation: "1.0.0".to_owned(),
         blob_root: Path::new(roots.store_data_root.as_str())
             .join("blob")
@@ -2154,6 +2158,7 @@ mod tests {
             },
             transaction_id: handle("transaction:test"),
             staging_root,
+            store_write_max_pending: None,
         }
     }
 

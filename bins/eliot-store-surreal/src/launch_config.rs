@@ -58,6 +58,10 @@ pub struct StoreLaunchConfig {
     /// unset knob identically, so legacy approvals stay byte-stable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_transaction_limit: Option<usize>,
+    /// Explicit reserved-write scheduler queue bound. Absent legacy configs
+    /// keep ordinary writes and do not install/advertise reserved execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_write_max_pending: Option<usize>,
     pub schema_generation: String,
     pub blob_root: String,
     pub instance_id: String,
@@ -163,6 +167,9 @@ impl StoreLaunchConfig {
         }
         if self.store_transaction_limit == Some(0) {
             return Err("store_transaction_limit must be non-zero".to_owned());
+        }
+        if self.store_write_max_pending == Some(0) {
+            return Err("store_write_max_pending must be non-zero".to_owned());
         }
         SchemaGeneration::new(self.schema_generation.as_str())
             .map_err(|error| format!("invalid schema_generation: {error}"))?;
@@ -332,6 +339,8 @@ pub fn launch_config_digest(config: &StoreLaunchConfig) -> Result<String, String
         // projection (`PlannerOperationalConfig`).
         #[serde(skip_serializing_if = "Option::is_none")]
         store_transaction_limit: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        store_write_max_pending: Option<usize>,
         schema_generation: &'a str,
         blob_root: &'a str,
         instance_id: &'a str,
@@ -354,6 +363,7 @@ pub fn launch_config_digest(config: &StoreLaunchConfig) -> Result<String, String
         connect_timeout_ms: config.connect_timeout_ms,
         query_timeout_ms: config.query_timeout_ms,
         store_transaction_limit: config.store_transaction_limit,
+        store_write_max_pending: config.store_write_max_pending,
         schema_generation: &config.schema_generation,
         blob_root: &config.blob_root,
         instance_id: &config.instance_id,
