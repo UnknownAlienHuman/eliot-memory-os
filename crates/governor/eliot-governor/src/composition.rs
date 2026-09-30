@@ -6993,17 +6993,15 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 KernelPortError::TaskSelectionRequired,
             ));
         }
-        self.observation_capture_owner_binding_for_refs(
-            ObservationCaptureSessionOwnerRequest {
-                authenticated_principal_ref,
-                session_id,
-                request_fence,
-                session_task_ref: session_task_ref.as_deref(),
-                task_selection: None,
-                expected_task_ref: None,
-                expected_scope_ref: None,
-            },
-        )
+        self.observation_capture_owner_binding_for_refs(ObservationCaptureSessionOwnerRequest {
+            authenticated_principal_ref,
+            session_id,
+            request_fence,
+            session_task_ref: session_task_ref.as_deref(),
+            task_selection: None,
+            expected_task_ref: None,
+            expected_scope_ref: None,
+        })
     }
 
     /// Reads the request owner projection with task applicability from the
@@ -7055,17 +7053,15 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .task_id
             .as_ref()
             .map(TaskId::as_str);
-        self.observation_capture_owner_binding_for_refs(
-            ObservationCaptureSessionOwnerRequest {
-                authenticated_principal_ref,
-                session_id,
-                request_fence,
-                session_task_ref: session_task_ref.as_deref(),
-                task_selection: Some(selection),
-                expected_task_ref: request_task_ref,
-                expected_scope_ref: None,
-            },
-        )
+        self.observation_capture_owner_binding_for_refs(ObservationCaptureSessionOwnerRequest {
+            authenticated_principal_ref,
+            session_id,
+            request_fence,
+            session_task_ref: session_task_ref.as_deref(),
+            task_selection: Some(selection),
+            expected_task_ref: request_task_ref,
+            expected_scope_ref: None,
+        })
     }
 
     /// Reads observation policy and `WorkScope` from the exact current activated
@@ -7129,17 +7125,15 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             })?
             .task_scope
             .clone();
-        self.observation_capture_owner_binding_for_refs(
-            ObservationCaptureSessionOwnerRequest {
-                authenticated_principal_ref,
-                session_id,
-                request_fence: state_fence,
-                session_task_ref: session_task_ref.as_deref(),
-                task_selection: None,
-                expected_task_ref: None,
-                expected_scope_ref: None,
-            },
-        )
+        self.observation_capture_owner_binding_for_refs(ObservationCaptureSessionOwnerRequest {
+            authenticated_principal_ref,
+            session_id,
+            request_fence: state_fence,
+            session_task_ref: session_task_ref.as_deref(),
+            task_selection: None,
+            expected_task_ref: None,
+            expected_scope_ref: None,
+        })
     }
 
     /// Reads current `Policy` and `WorkScope` owners for a cold Host capture from
@@ -7239,17 +7233,15 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let session_id = SessionId::new(activation.session_id.clone()).map_err(|error| {
             CompositionError::Provider(format!("activated Observe session is invalid: {error}"))
         })?;
-        self.observation_capture_owner_binding_for_refs(
-            ObservationCaptureSessionOwnerRequest {
-                authenticated_principal_ref: &activation.principal_id,
-                session_id: &session_id,
-                request_fence: fence,
-                session_task_ref: Some(activation.task_id.as_str()),
-                task_selection,
-                expected_task_ref: task_selection.map(|_| activation.task_id.as_str()),
-                expected_scope_ref: Some(&activation.work_scope_id),
-            },
-        )
+        self.observation_capture_owner_binding_for_refs(ObservationCaptureSessionOwnerRequest {
+            authenticated_principal_ref: &activation.principal_id,
+            session_id: &session_id,
+            request_fence: fence,
+            session_task_ref: Some(activation.task_id.as_str()),
+            task_selection,
+            expected_task_ref: task_selection.map(|_| activation.task_id.as_str()),
+            expected_scope_ref: Some(&activation.work_scope_id),
+        })
     }
 
     /// Reads an activated owner projection with task applicability only when
@@ -7318,9 +7310,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         }
         if let Some(selection) = task_selection {
             let evidence = selection.evidence();
-            evidence
-                .validate()
-                .map_err(CompositionError::from)?;
+            evidence.validate().map_err(CompositionError::from)?;
             let work_scope = self.current_work_scope_binding_at_retained_fence()?;
             if expected_task_ref != Some(selection.task_ref())
                 || selection.task_ref() != evidence.task_ref

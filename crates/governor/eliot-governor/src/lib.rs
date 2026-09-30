@@ -232,12 +232,12 @@ pub use migration_inventory::{
     impact_entry_node, impact_node, lookup_by_package, migration_inventory_guard, resolve,
 };
 pub use observation_reconciliation::{
-    GovernorObservationReconciliation, McpObservationCaptureInput, NegativeMemoryGateObservation,
-    NegativeMemoryGateOutcome, ObservationCaptureAccess, ObservationCaptureOwnerBinding,
-    ObservationCaptureOwnerOrigin, ObservationCaptureHostOriginDomain,
-    ObservationCapturePolicyAccess, ObservationCaptureVisibility, ObservationIngressPolicyBinding,
-    McpObservationCompletion, PreparedMcpObservation,
-    WatchdogAdmittedEntry, WatchdogEntryAdmission, WatchdogEntryKind,
+    GovernorObservationReconciliation, McpObservationCaptureInput, McpObservationCompletion,
+    NegativeMemoryGateObservation, NegativeMemoryGateOutcome, ObservationCaptureAccess,
+    ObservationCaptureHostOriginDomain, ObservationCaptureOwnerBinding,
+    ObservationCaptureOwnerOrigin, ObservationCapturePolicyAccess, ObservationCaptureVisibility,
+    ObservationIngressPolicyBinding, PreparedMcpObservation, WatchdogAdmittedEntry,
+    WatchdogEntryAdmission, WatchdogEntryKind,
 };
 pub use opencode_action_gate::{
     GovernorActionGateRefusal, GovernorActionGateRequest, GovernorActionGateVerdict,

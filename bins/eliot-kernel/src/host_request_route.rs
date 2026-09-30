@@ -66,16 +66,17 @@ use eliot_ipc::PeerIdentity;
 use eliot_kernel_service::{AgentBridgeAdmissionDescriptor, KernelServiceState};
 use eliot_observability_runtime::{ModuleIdentity, WorkClass};
 use eliot_ors::{
-    CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestAttempt, HostRequestAttemptPhase,
-    HostRequestEffectEvidence, HostRequestObserveResult,
-    HostRequestApplicationBinding, HostRequestExecutableInput,
-    HostRequestExecutableInputEncoding,
-    HostRequestKind as OrsHostRequestKind, HostRequestRecord, HostRequestRetainedLineage,
-    HostRequestRetainedResultClass, HostRequestRetainedSourceRevision, HostRequestState,
-    EpochIdentity, EpochLineage, OpaqueLabel, OperationIdentity, OrsError, RecoveryAccessClass,
+    CONTRACT_VERSION as ORS_CONTRACT_VERSION, EpochIdentity, EpochLineage,
+    HostRequestApplicationBinding, HostRequestAttempt, HostRequestAttemptPhase,
+    HostRequestEffectEvidence, HostRequestExecutableInput, HostRequestExecutableInputEncoding,
+    HostRequestKind as OrsHostRequestKind, HostRequestObserveResult, HostRequestRecord,
+    HostRequestRetainedLineage, HostRequestRetainedResultClass, HostRequestRetainedSourceRevision,
+    HostRequestState, OpaqueLabel, OperationIdentity, OrsError, RecoveryAccessClass,
     RecoveryEnvelopeContext, RecoveryPayload, RecoveryPayloadEnvelope, RedbRecoveryStore,
     StateFenceSnapshot,
 };
+use eliot_platform::SecretReference;
+use eliot_platform_windows::ProtectedSecret;
 use eliot_protocol::{
     AGENT_BRIDGE_PROCESS_BINDING_WIRE_ID, AGENT_HOST_REQUEST_FAILURE_WIRE_ID,
     AgentActivationResolutionResult, AgentBridgePeerAdmissionReceipt, AgentBridgeProcessBinding,
@@ -83,13 +84,10 @@ use eliot_protocol::{
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HOST_REQUEST_PAYLOAD_SCHEMA_ID,
     HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestAdmissionReceipt, HostRequestEnvelope,
     HostRequestInvokeReadPayload, HostRequestKind, HostRequestResultBody, LocalReadAttempt,
-    RequestIdentity,
-    WatchdogIntentKind, WatchdogSpoolIntentBatchPayload, WatchdogSpoolIntentSubmission,
-    host_request_operation_id,
+    RequestIdentity, WatchdogIntentKind, WatchdogSpoolIntentBatchPayload,
+    WatchdogSpoolIntentSubmission, host_request_operation_id,
 };
 use eliot_runtime_contracts::RecoveryDirective;
-use eliot_platform::SecretReference;
-use eliot_platform_windows::ProtectedSecret;
 use eliot_store_api::{
     CampaignLearningStateViewPublication, EVIDENCE_PACK_MAX_RECORDS, RevisionHead, RevisionKey,
     ScopeId, WriteReceipt,
@@ -757,10 +755,9 @@ impl KernelComposition {
                 .as_ref()
                 .and_then(|record| record.executable_input.as_ref());
             if let Some(retained_input) = retained_input {
-                let (retained_envelope, retained_tool) =
-                    self.read_observe_executable_input(existing.as_ref().ok_or(
-                        TransportError::SessionFenced,
-                    )?)?;
+                let (retained_envelope, retained_tool) = self.read_observe_executable_input(
+                    existing.as_ref().ok_or(TransportError::SessionFenced)?,
+                )?;
                 if retained_envelope != *envelope || retained_tool != *tool {
                     return Err(TransportError::IdentityConflict);
                 }
@@ -775,10 +772,7 @@ impl KernelComposition {
                     return Err(TransportError::IdentityConflict);
                 }
                 requested.executable_input = Some(retained_input.clone());
-                requested.scope_ref = retained_input
-                    .application_binding
-                    .scope_ref
-                    .clone();
+                requested.scope_ref = retained_input.application_binding.scope_ref.clone();
                 requested.task_ref = retained_input.application_binding.task_ref.clone();
             } else if existing.is_some() {
                 // Never attach fresh plaintext to a legacy digest-only row.
@@ -2074,7 +2068,9 @@ impl KernelComposition {
             let (Some(readback), Some(receipt)) = (host_policy, host_receipt) else {
                 return Err(TransportError::SessionFenced);
             };
-            readback.validate().map_err(|_| TransportError::SessionFenced)?;
+            readback
+                .validate()
+                .map_err(|_| TransportError::SessionFenced)?;
             if envelope.state_fence != receipt.state_fence
                 || envelope.identity.session_id.is_some()
                 || envelope.identity.task_id.is_some()
@@ -3066,14 +3062,15 @@ impl KernelComposition {
                 let (Some(readback), Some(receipt)) = (host_policy, host_receipt) else {
                     return Ok(false);
                 };
-                let scope_mismatch = envelope
-                    .identity
-                    .work_scope_id
-                    .as_deref()
-                    .is_some_and(|claimed| {
-                        observation_owner_scope_ref(&readback.owner_projection_value)
-                            .map_or(true, |scope| scope != claimed)
-                    });
+                let scope_mismatch =
+                    envelope
+                        .identity
+                        .work_scope_id
+                        .as_deref()
+                        .is_some_and(|claimed| {
+                            observation_owner_scope_ref(&readback.owner_projection_value)
+                                .map_or(true, |scope| scope != claimed)
+                        });
                 if readback.validate().is_err()
                     || envelope.state_fence != receipt.state_fence
                     || envelope.identity.session_id.is_some()
@@ -3087,8 +3084,8 @@ impl KernelComposition {
                     .owner_projection_value
                     .get("origin")
                     .and_then(|origin| origin.get("peer_admission_receipt"));
-                let exact_receipt = serde_json::to_value(&receipt)
-                    .map_err(|_| TransportError::SessionFenced)?;
+                let exact_receipt =
+                    serde_json::to_value(&receipt).map_err(|_| TransportError::SessionFenced)?;
                 return Ok(owner_receipt == Some(&exact_receipt));
             }
             if task_relative
@@ -4417,7 +4414,9 @@ pub(crate) fn check_observe_tool_linkage(
     observe_tool_requires_exact_task_binding(tool)
 }
 
-fn observation_owner_scope_ref(owner_projection: &serde_json::Value) -> Result<&str, TransportError> {
+fn observation_owner_scope_ref(
+    owner_projection: &serde_json::Value,
+) -> Result<&str, TransportError> {
     let scope_ref = owner_projection
         .get("authenticated_scope_ref")
         .and_then(serde_json::Value::as_str)
@@ -4638,7 +4637,8 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         let bytes = canonical_json_bytes(tool).map_err(|_| TransportError::SessionFenced)?;
-        let payload_length = u64::try_from(bytes.len()).map_err(|_| TransportError::SessionFenced)?;
+        let payload_length =
+            u64::try_from(bytes.len()).map_err(|_| TransportError::SessionFenced)?;
         if bytes.is_empty()
             || bytes.len() > MAX_OBSERVE_TOOL_BYTES
             || payload_length > eliot_ors::MAX_INLINE_RECOVERY_BYTES
@@ -4675,137 +4675,191 @@ impl KernelComposition {
         if retained_receipt != *receipt {
             return Err(TransportError::IdentityConflict);
         }
-        let (policy_value, policy_owner_sha256, principal_ref, session_ref, task_ref, scope_ref,
-            task_revision, resolved_binding, resolved_binding_sha256, owner_evidence,
-            owner_evidence_sha256, activation_result_sha256, source_activation_result,
+        let (
+            policy_value,
+            policy_owner_sha256,
+            principal_ref,
+            session_ref,
+            task_ref,
+            scope_ref,
+            task_revision,
+            resolved_binding,
+            resolved_binding_sha256,
+            owner_evidence,
+            owner_evidence_sha256,
+            activation_result_sha256,
+            source_activation_result,
             source_activation_ticket,
-            p07_owner) =
-            if let Some(retained) = retained {
-                if retained.activation_state_fence != envelope.state_fence {
-                    return Err(TransportError::IdentityConflict);
-                }
-                retained
-                    .activation_result
-                    .validate_against(&retained.activation_ticket)
-                    .map_err(|_| TransportError::SessionFenced)?;
-                let policy = retained
-                    .activation_owner_readback
-                    .observation_policy
-                    .as_ref()
-                    .ok_or(TransportError::SessionFenced)?;
-                policy
-                    .validate_against(&retained.resolved_binding, &retained.activation_state_fence)
-                    .map_err(|_| TransportError::SessionFenced)?;
-                let (policy_principal, policy_session, policy_task) = policy
-                    .application_identity()
-                    .map_err(|_| TransportError::SessionFenced)?;
-                if policy_principal != retained.principal_id
-                    || policy_session != retained.session_id
-                    || policy.authenticated_scope_ref != retained.work_scope_id
-                    || policy.state_fence != envelope.state_fence
-                    || envelope
-                        .identity
-                        .session_id
-                        .as_deref()
-                        .is_some_and(|session| session != retained.session_id)
-                    || envelope
-                        .identity
-                        .work_scope_id
-                        .as_deref()
-                        .is_some_and(|scope| scope != policy.authenticated_scope_ref)
-                    || envelope
-                        .identity
-                        .task_id
-                        .as_deref()
-                        .is_some_and(|task| task != retained.task_id)
-                {
-                    return Err(TransportError::IdentityConflict);
-                }
-                let (value, digest) = policy
-                    .validated_owner_projection()
-                    .map_err(|_| TransportError::SessionFenced)?;
-                (
-                    value.clone(),
-                    digest.to_owned(),
-                    Some(OpaqueLabel::new(retained.principal_id.clone()).map_err(|_| TransportError::SessionFenced)?),
-                    Some(OpaqueLabel::new(retained.session_id.clone()).map_err(|_| TransportError::SessionFenced)?),
-                    policy_task.map(|task| OpaqueLabel::new(task.to_owned())).transpose().map_err(|_| TransportError::SessionFenced)?,
-                    Some(OpaqueLabel::new(policy.authenticated_scope_ref.clone()).map_err(|_| TransportError::SessionFenced)?),
-                    policy_task.map(|_| retained.task_revision.value()),
-                    Some(serde_json::to_value(&retained.resolved_binding).map_err(|_| TransportError::SessionFenced)?),
-                    Some(retained.activation_owner_evidence.binding_sha256.clone()),
-                    Some(serde_json::to_value(&retained.activation_owner_evidence).map_err(|_| TransportError::SessionFenced)?),
-                    Some(sha256_hex(&canonical_json_bytes(&retained.activation_owner_evidence).map_err(|_| TransportError::SessionFenced)?)),
-                    Some(retained.resolution_result_sha256.clone()),
-                    serde_json::to_value(&retained.activation_result)
+            p07_owner,
+        ) = if let Some(retained) = retained {
+            if retained.activation_state_fence != envelope.state_fence {
+                return Err(TransportError::IdentityConflict);
+            }
+            retained
+                .activation_result
+                .validate_against(&retained.activation_ticket)
+                .map_err(|_| TransportError::SessionFenced)?;
+            let policy = retained
+                .activation_owner_readback
+                .observation_policy
+                .as_ref()
+                .ok_or(TransportError::SessionFenced)?;
+            policy
+                .validate_against(&retained.resolved_binding, &retained.activation_state_fence)
+                .map_err(|_| TransportError::SessionFenced)?;
+            let (policy_principal, policy_session, policy_task) = policy
+                .application_identity()
+                .map_err(|_| TransportError::SessionFenced)?;
+            if policy_principal != retained.principal_id
+                || policy_session != retained.session_id
+                || policy.authenticated_scope_ref != retained.work_scope_id
+                || policy.state_fence != envelope.state_fence
+                || envelope
+                    .identity
+                    .session_id
+                    .as_deref()
+                    .is_some_and(|session| session != retained.session_id)
+                || envelope
+                    .identity
+                    .work_scope_id
+                    .as_deref()
+                    .is_some_and(|scope| scope != policy.authenticated_scope_ref)
+                || envelope
+                    .identity
+                    .task_id
+                    .as_deref()
+                    .is_some_and(|task| task != retained.task_id)
+            {
+                return Err(TransportError::IdentityConflict);
+            }
+            let (value, digest) = policy
+                .validated_owner_projection()
+                .map_err(|_| TransportError::SessionFenced)?;
+            (
+                value.clone(),
+                digest.to_owned(),
+                Some(
+                    OpaqueLabel::new(retained.principal_id.clone())
                         .map_err(|_| TransportError::SessionFenced)?,
-                    serde_json::to_value(&retained.activation_ticket)
+                ),
+                Some(
+                    OpaqueLabel::new(retained.session_id.clone())
                         .map_err(|_| TransportError::SessionFenced)?,
-                    eliot_protocol::AgentActivationKernelOwnerReadback::new(retained.kernel_owner_revision, retained.kernel_owner_bundle_sha256.clone()).map_err(|_| TransportError::SessionFenced)?,
+                ),
+                policy_task
+                    .map(|task| OpaqueLabel::new(task.to_owned()))
+                    .transpose()
+                    .map_err(|_| TransportError::SessionFenced)?,
+                Some(
+                    OpaqueLabel::new(policy.authenticated_scope_ref.clone())
+                        .map_err(|_| TransportError::SessionFenced)?,
+                ),
+                policy_task.map(|_| retained.task_revision.value()),
+                Some(
+                    serde_json::to_value(&retained.resolved_binding)
+                        .map_err(|_| TransportError::SessionFenced)?,
+                ),
+                Some(retained.activation_owner_evidence.binding_sha256.clone()),
+                Some(
+                    serde_json::to_value(&retained.activation_owner_evidence)
+                        .map_err(|_| TransportError::SessionFenced)?,
+                ),
+                Some(sha256_hex(
+                    &canonical_json_bytes(&retained.activation_owner_evidence)
+                        .map_err(|_| TransportError::SessionFenced)?,
+                )),
+                Some(retained.resolution_result_sha256.clone()),
+                serde_json::to_value(&retained.activation_result)
+                    .map_err(|_| TransportError::SessionFenced)?,
+                serde_json::to_value(&retained.activation_ticket)
+                    .map_err(|_| TransportError::SessionFenced)?,
+                eliot_protocol::AgentActivationKernelOwnerReadback::new(
+                    retained.kernel_owner_revision,
+                    retained.kernel_owner_bundle_sha256.clone(),
                 )
-            } else {
-                if envelope.identity.session_id.is_some() || envelope.identity.task_id.is_some()
-                    || envelope.state_fence != retained_receipt.state_fence
-                {
-                    return Err(TransportError::IdentityConflict);
-                }
-                let readback = host_policy.ok_or(TransportError::SessionFenced)?;
-                let result = host_result.ok_or(TransportError::SessionFenced)?;
-                let ticket = host_ticket.ok_or(TransportError::SessionFenced)?;
-                readback.validate().map_err(|_| TransportError::SessionFenced)?;
-                ticket.validate().map_err(|_| TransportError::SessionFenced)?;
-                result
-                    .validate_against(&ticket)
-                    .map_err(|_| TransportError::SessionFenced)?;
-                if ticket.peer_admission_receipt.as_ref() != Some(&retained_receipt)
-                    || ticket.peer_admission_receipt_sha256 != retained_receipt.receipt_sha256
-                    || ticket.state_fence != envelope.state_fence
-                    || result.observation_host_policy_readback.as_ref() != Some(&readback)
-                {
-                    return Err(TransportError::IdentityConflict);
-                }
-                let owner_receipt = readback.owner_projection_value.get("origin")
-                    .and_then(|origin| origin.get("peer_admission_receipt"))
-                    .ok_or(TransportError::SessionFenced)?;
-                let exact_receipt = serde_json::to_value(&retained_receipt).map_err(|_| TransportError::SessionFenced)?;
-                if owner_receipt != &exact_receipt || readback.kernel_owner != self.current_kernel_owner_readback().map_err(|_| TransportError::SessionFenced)? {
-                    return Err(TransportError::IdentityConflict);
-                }
-                let scope = observation_owner_scope_ref(&readback.owner_projection_value)?;
-                let owner_scope = OpaqueLabel::new(scope.to_owned())
-                    .map_err(|_| TransportError::SessionFenced)?;
-                if envelope.identity.work_scope_id.as_deref().is_some_and(|claimed| claimed != scope) {
-                    return Err(TransportError::IdentityConflict);
-                }
-                (
-                    readback.owner_projection_value,
-                    readback.owner_projection_sha256,
-                    None,
-                    None,
-                    None,
-                    Some(owner_scope),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    serde_json::to_value(&result).map_err(|_| TransportError::SessionFenced)?,
-                    serde_json::to_value(&ticket).map_err(|_| TransportError::SessionFenced)?,
-                    readback.kernel_owner,
-                )
-            };
-        let request_identity = serde_json::to_value(&envelope.identity)
-            .map_err(|_| TransportError::SessionFenced)?;
-        let request_identity_bytes = canonical_json_bytes(&request_identity)
-            .map_err(|_| TransportError::SessionFenced)?;
+                .map_err(|_| TransportError::SessionFenced)?,
+            )
+        } else {
+            if envelope.identity.session_id.is_some()
+                || envelope.identity.task_id.is_some()
+                || envelope.state_fence != retained_receipt.state_fence
+            {
+                return Err(TransportError::IdentityConflict);
+            }
+            let readback = host_policy.ok_or(TransportError::SessionFenced)?;
+            let result = host_result.ok_or(TransportError::SessionFenced)?;
+            let ticket = host_ticket.ok_or(TransportError::SessionFenced)?;
+            readback
+                .validate()
+                .map_err(|_| TransportError::SessionFenced)?;
+            ticket
+                .validate()
+                .map_err(|_| TransportError::SessionFenced)?;
+            result
+                .validate_against(&ticket)
+                .map_err(|_| TransportError::SessionFenced)?;
+            if ticket.peer_admission_receipt.as_ref() != Some(&retained_receipt)
+                || ticket.peer_admission_receipt_sha256 != retained_receipt.receipt_sha256
+                || ticket.state_fence != envelope.state_fence
+                || result.observation_host_policy_readback.as_ref() != Some(&readback)
+            {
+                return Err(TransportError::IdentityConflict);
+            }
+            let owner_receipt = readback
+                .owner_projection_value
+                .get("origin")
+                .and_then(|origin| origin.get("peer_admission_receipt"))
+                .ok_or(TransportError::SessionFenced)?;
+            let exact_receipt = serde_json::to_value(&retained_receipt)
+                .map_err(|_| TransportError::SessionFenced)?;
+            if owner_receipt != &exact_receipt
+                || readback.kernel_owner
+                    != self
+                        .current_kernel_owner_readback()
+                        .map_err(|_| TransportError::SessionFenced)?
+            {
+                return Err(TransportError::IdentityConflict);
+            }
+            let scope = observation_owner_scope_ref(&readback.owner_projection_value)?;
+            let owner_scope =
+                OpaqueLabel::new(scope.to_owned()).map_err(|_| TransportError::SessionFenced)?;
+            if envelope
+                .identity
+                .work_scope_id
+                .as_deref()
+                .is_some_and(|claimed| claimed != scope)
+            {
+                return Err(TransportError::IdentityConflict);
+            }
+            (
+                readback.owner_projection_value,
+                readback.owner_projection_sha256,
+                None,
+                None,
+                None,
+                Some(owner_scope),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                serde_json::to_value(&result).map_err(|_| TransportError::SessionFenced)?,
+                serde_json::to_value(&ticket).map_err(|_| TransportError::SessionFenced)?,
+                readback.kernel_owner,
+            )
+        };
+        let request_identity =
+            serde_json::to_value(&envelope.identity).map_err(|_| TransportError::SessionFenced)?;
+        let request_identity_bytes =
+            canonical_json_bytes(&request_identity).map_err(|_| TransportError::SessionFenced)?;
         let source_request_identity_value = serde_json::to_value(source_request_identity)
             .map_err(|_| TransportError::SessionFenced)?;
         let source_request_identity_bytes = canonical_json_bytes(&source_request_identity_value)
             .map_err(|_| TransportError::SessionFenced)?;
         let captured_at_unix_ms = unix_ms();
-        let known_time_ms = i64::try_from(captured_at_unix_ms)
-            .map_err(|_| TransportError::SessionFenced)?;
+        let known_time_ms =
+            i64::try_from(captured_at_unix_ms).map_err(|_| TransportError::SessionFenced)?;
         let app_binding = HostRequestApplicationBinding {
             wire_version: eliot_ors::HOST_REQUEST_EXECUTABLE_INPUT_CONTRACT_VERSION,
             request_identity,
@@ -4847,7 +4901,9 @@ impl KernelComposition {
                 .ok_or(TransportError::SessionFenced)?,
         )
         .map_err(|_| TransportError::SessionFenced)?;
-        access.validate().map_err(|_| TransportError::SessionFenced)?;
+        access
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
         let epoch = envelope.state_fence.authority_epoch.sequence.get();
         let lineage_id = OpaqueLabel::new(
             envelope
@@ -4911,7 +4967,9 @@ impl KernelComposition {
         envelope: &HostRequestEnvelope,
         source: &RequestIdentity,
     ) -> Result<(), TransportError> {
-        source.validate().map_err(|_| TransportError::SessionFenced)?;
+        source
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
         let metadata = &source.request.metadata;
         if metadata.request_id != envelope.identity.request_id
             || source.idempotency_key != envelope.identity.idempotency_key
@@ -4943,7 +5001,9 @@ impl KernelComposition {
             .executable_input
             .as_ref()
             .ok_or(TransportError::SessionFenced)?;
-        record.validate().map_err(|_| TransportError::SessionFenced)?;
+        record
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
         input
             .validate_for(record)
             .map_err(|_| TransportError::SessionFenced)?;
@@ -4973,14 +5033,12 @@ impl KernelComposition {
         if canonical_json_bytes(&tool).map_err(|_| TransportError::SessionFenced)? != bytes {
             return Err(TransportError::SessionFenced);
         }
-        let state_fence: eliot_contracts::StateFence = serde_json::from_str(
-            &input.protected_envelope.state_fence.canonical_json,
-        )
-        .map_err(|_| TransportError::SessionFenced)?;
-        let identity: eliot_protocol::HostRequestIdentity = serde_json::from_value(
-            input.application_binding.request_identity.clone(),
-        )
-        .map_err(|_| TransportError::SessionFenced)?;
+        let state_fence: eliot_contracts::StateFence =
+            serde_json::from_str(&input.protected_envelope.state_fence.canonical_json)
+                .map_err(|_| TransportError::SessionFenced)?;
+        let identity: eliot_protocol::HostRequestIdentity =
+            serde_json::from_value(input.application_binding.request_identity.clone())
+                .map_err(|_| TransportError::SessionFenced)?;
         let envelope = HostRequestEnvelope {
             wire_id: eliot_protocol::HOST_REQUEST_WIRE_ID.to_owned(),
             wire_version: HostRequestEnvelope::CONTRACT_VERSION,
@@ -5003,13 +5061,12 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         check_observe_tool_linkage(&envelope, &tool)?;
-        let source_identity: RequestIdentity = serde_json::from_value(
-            input.application_binding.source_request_identity.clone(),
-        )
-        .map_err(|_| TransportError::SessionFenced)?;
+        let source_identity: RequestIdentity =
+            serde_json::from_value(input.application_binding.source_request_identity.clone())
+                .map_err(|_| TransportError::SessionFenced)?;
         Self::validate_source_request_identity(&envelope, &source_identity)?;
-        let source_identity_bytes = canonical_json_bytes(&source_identity)
-            .map_err(|_| TransportError::SessionFenced)?;
+        let source_identity_bytes =
+            canonical_json_bytes(&source_identity).map_err(|_| TransportError::SessionFenced)?;
         if sha256_hex(&source_identity_bytes)
             != input.application_binding.source_request_identity_sha256
         {
@@ -5045,12 +5102,13 @@ impl KernelComposition {
             )
         };
         let receipt = receipt.ok_or(TransportError::SessionFenced)?;
-        let identity_value = serde_json::to_value(&envelope.identity)
-            .map_err(|_| TransportError::SessionFenced)?;
+        let identity_value =
+            serde_json::to_value(&envelope.identity).map_err(|_| TransportError::SessionFenced)?;
         let identity_sha = sha256_hex(
             &canonical_json_bytes(&identity_value).map_err(|_| TransportError::SessionFenced)?,
         );
-        let exact_receipt = serde_json::to_value(&receipt).map_err(|_| TransportError::SessionFenced)?;
+        let exact_receipt =
+            serde_json::to_value(&receipt).map_err(|_| TransportError::SessionFenced)?;
         if app.host_peer_admission_receipt != exact_receipt
             || app.request_identity != identity_value
             || app.request_identity_sha256 != identity_sha
@@ -5078,18 +5136,17 @@ impl KernelComposition {
                 &canonical_json_bytes(&owner_evidence_value)
                     .map_err(|_| TransportError::SessionFenced)?,
             );
-            let (_, _, policy_task) = policy.application_identity()
+            let (_, _, policy_task) = policy
+                .application_identity()
                 .map_err(|_| TransportError::SessionFenced)?;
             if record.scope_ref.as_ref().map(OpaqueLabel::as_str)
                 != Some(policy.authenticated_scope_ref.as_str())
-                || record.task_ref.as_ref().map(OpaqueLabel::as_str)
-                    != policy_task
+                || record.task_ref.as_ref().map(OpaqueLabel::as_str) != policy_task
                 || app.principal_ref.as_ref().map(OpaqueLabel::as_str)
                     != Some(retained.principal_id.as_str())
                 || app.session_ref.as_ref().map(OpaqueLabel::as_str)
                     != Some(retained.session_id.as_str())
-                || app.task_ref.as_ref().map(OpaqueLabel::as_str)
-                    != policy_task
+                || app.task_ref.as_ref().map(OpaqueLabel::as_str) != policy_task
                 || app.scope_ref.as_ref().map(OpaqueLabel::as_str)
                     != Some(policy.authenticated_scope_ref.as_str())
                 || app.resolved_application_binding.as_ref() != Some(&binding_value)
@@ -5118,13 +5175,15 @@ impl KernelComposition {
             let readback = host_policy.ok_or(TransportError::SessionFenced)?;
             let result = host_result.ok_or(TransportError::SessionFenced)?;
             let ticket = host_ticket.ok_or(TransportError::SessionFenced)?;
-            readback.validate().map_err(|_| TransportError::SessionFenced)?;
+            readback
+                .validate()
+                .map_err(|_| TransportError::SessionFenced)?;
             result
                 .validate_against(&ticket)
                 .map_err(|_| TransportError::SessionFenced)?;
             let scope = observation_owner_scope_ref(&readback.owner_projection_value)?;
-            let exact_receipt = serde_json::to_value(&receipt)
-                .map_err(|_| TransportError::SessionFenced)?;
+            let exact_receipt =
+                serde_json::to_value(&receipt).map_err(|_| TransportError::SessionFenced)?;
             if ticket.peer_admission_receipt.as_ref() != Some(&receipt)
                 || ticket.state_fence != envelope.state_fence
                 || result.observation_host_policy_readback.as_ref() != Some(&readback)
@@ -5163,8 +5222,12 @@ impl KernelComposition {
         descriptor: &AgentBridgeAdmissionDescriptor,
         receipt: &AgentBridgePeerAdmissionReceipt,
     ) -> Result<(), TransportError> {
-        receipt.validate().map_err(|_| TransportError::SessionFenced)?;
-        if receipt.compute_digest().map_err(|_| TransportError::SessionFenced)?
+        receipt
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if receipt
+            .compute_digest()
+            .map_err(|_| TransportError::SessionFenced)?
             != receipt.receipt_sha256
             || receipt.connection_id != envelope.connection_id
             || receipt.descriptor_sha256 != descriptor.descriptor_sha256
@@ -5194,7 +5257,10 @@ impl KernelComposition {
                 && session_identity == &receipt.observed_session_id.to_string()
                 && process.process_id() == receipt.observed_process_id
                 && process.start_time_100ns() == receipt.observed_process_start_time_100ns
-                && process.image_path() == receipt.observed_image_path => Ok(()),
+                && process.image_path() == receipt.observed_image_path =>
+            {
+                Ok(())
+            }
             _ => Err(TransportError::SessionFenced),
         }
     }
@@ -5385,20 +5451,20 @@ impl KernelComposition {
             && current.result_digest.is_some()
             && current.result_response.is_some();
         if executable {
-            let (durable_envelope, durable_tool) = match self.read_observe_executable_input(&current)
-            {
-                Ok(pair) => pair,
-                Err(error) => {
-                    drop(admission_owner);
-                    self.rollback_observe_reservation(
-                        admitted.1.operation_id.as_str(),
-                        &envelope.envelope_sha256,
-                        token,
-                        had_reference,
-                    );
-                    return Err(error);
-                }
-            };
+            let (durable_envelope, durable_tool) =
+                match self.read_observe_executable_input(&current) {
+                    Ok(pair) => pair,
+                    Err(error) => {
+                        drop(admission_owner);
+                        self.rollback_observe_reservation(
+                            admitted.1.operation_id.as_str(),
+                            &envelope.envelope_sha256,
+                            token,
+                            had_reference,
+                        );
+                        return Err(error);
+                    }
+                };
             if durable_envelope != *envelope || durable_tool != *tool {
                 drop(admission_owner);
                 self.rollback_observe_reservation(
@@ -5587,7 +5653,8 @@ impl KernelComposition {
                 // bytes conflicts instead of replacing the admitted operation.
                 // No durably bound bytes means not executable: prune the
                 // unbound pair; the waiter reconciles via the durable record.
-                let (durable_envelope, durable_tool) = self.read_observe_executable_input(&stored)?;
+                let (durable_envelope, durable_tool) =
+                    self.read_observe_executable_input(&stored)?;
                 if durable_envelope != *envelope || durable_tool != *tool {
                     return Err(TransportError::IdentityConflict);
                 }
@@ -5601,7 +5668,10 @@ impl KernelComposition {
                         .ok()
                     })
                     .ok_or(TransportError::SessionFenced)?;
-                Self::validate_source_request_identity(&durable_envelope, &source_request_identity)?;
+                Self::validate_source_request_identity(
+                    &durable_envelope,
+                    &source_request_identity,
+                )?;
                 let envelope = durable_envelope;
                 let durable_attempt = self.persist_observe_claim_attempt(
                     &operation_id,
@@ -5667,7 +5737,8 @@ impl KernelComposition {
                 // one-shot CAS before publishing any executable bytes to the
                 // daemon; recovery treats Submitted as ambiguous and never
                 // republishes it automatically.
-                let submitted_record = self.generation_gateway
+                let submitted_record = self
+                    .generation_gateway
                     .ors
                     .begin_host_request_observe_pair(
                         &operation_id,
@@ -5690,8 +5761,7 @@ impl KernelComposition {
                     .load_host_request(&operation_id, &request_digest)
                     .map_err(|_| TransportError::SessionFenced)?
                     .ok_or(TransportError::UnknownRequest)?;
-                if current_record != submitted_record
-                {
+                if current_record != submitted_record {
                     return Err(TransportError::SessionFenced);
                 }
                 return Ok(Some(ClaimedObservePair {
@@ -5821,10 +5891,7 @@ impl KernelComposition {
                 // This read-only path deliberately does not rely on the
                 // volatile claim map, which may have been retired after the
                 // first completion.
-                let presented = body
-                    .attempt
-                    .as_ref()
-                    .ok_or(TransportError::SessionFenced)?;
+                let presented = body.attempt.as_ref().ok_or(TransportError::SessionFenced)?;
                 let durable = stored
                     .attempt
                     .as_ref()
@@ -5862,7 +5929,11 @@ impl KernelComposition {
                     || presented.expires_at_unix_ms != stored.deadline_unix_ms
                     || presented.facet_method != stored.capability_ref.as_str()
                     || presented.scope_id
-                        != stored.scope_ref.as_ref().map(OpaqueLabel::as_str).unwrap_or_default()
+                        != stored
+                            .scope_ref
+                            .as_ref()
+                            .map(OpaqueLabel::as_str)
+                            .unwrap_or_default()
                     || !presented
                         .authority_epoch
                         .is_same_authority(&stored.authority_epoch)
@@ -6057,10 +6128,7 @@ impl KernelComposition {
                 .and_then(|candidate| candidate.observe_envelope.clone())
         };
         if let Some(envelope) = queued_envelope.as_ref() {
-            let capability = body
-                .attempt
-                .as_ref()
-                .ok_or(TransportError::SessionFenced)?;
+            let capability = body.attempt.as_ref().ok_or(TransportError::SessionFenced)?;
             let executable_input = stored
                 .executable_input
                 .as_ref()
@@ -6134,13 +6202,10 @@ impl KernelComposition {
                         capability.attempt_id == attempt.attempt_id.as_str()
                             && capability.fencing_generation == attempt.generation
                     })
-                    && stored
-                        .executable_input
-                        .as_ref()
-                        .is_some_and(|input| {
-                            attempt.input_commitment_sha256.as_deref()
-                                == Some(input.commitment_sha256.as_str())
-                        })
+                    && stored.executable_input.as_ref().is_some_and(|input| {
+                        attempt.input_commitment_sha256.as_deref()
+                            == Some(input.commitment_sha256.as_str())
+                    })
             })
             .cloned()
             .ok_or(TransportError::SessionFenced)?;
@@ -6148,23 +6213,24 @@ impl KernelComposition {
             .result_lineage
             .as_ref()
             .ok_or(TransportError::SessionFenced)?;
-        let prepared_transition_sha256 =
-            self.validate_observe_result_against_staged_plan(&stored, &body.response, result_lineage)?;
+        let prepared_transition_sha256 = self.validate_observe_result_against_staged_plan(
+            &stored,
+            &body.response,
+            result_lineage,
+        )?;
         let persisted = self
             .generation_gateway
             .ors
-            .persist_host_request_observe_result(
-                HostRequestObserveResult {
-                    operation_id: &operation_id,
-                    request_digest: &body.request_sha256,
-                    attempt: &durable_attempt,
-                    result_digest: &body.result_digest,
-                    result_response: &body.response,
-                    result_evidence: retained.effect_evidence.as_ref(),
-                    result_lineage: Some(result_lineage),
-                    prepared_transition_sha256: &prepared_transition_sha256,
-                },
-            )
+            .persist_host_request_observe_result(HostRequestObserveResult {
+                operation_id: &operation_id,
+                request_digest: &body.request_sha256,
+                attempt: &durable_attempt,
+                result_digest: &body.result_digest,
+                result_response: &body.response,
+                result_evidence: retained.effect_evidence.as_ref(),
+                result_lineage: Some(result_lineage),
+                prepared_transition_sha256: &prepared_transition_sha256,
+            })
             .map_err(|error| match error {
                 OrsError::HostRequestIdentityConflict { .. } => TransportError::IdentityConflict,
                 _ => TransportError::SessionFenced,
@@ -6269,7 +6335,7 @@ impl KernelComposition {
             .ok_or(TransportError::SessionFenced)?;
         let staged_fence: eliot_contracts::StateFence =
             serde_json::from_str(&write_binding.state_fence.canonical_json)
-            .map_err(|_| TransportError::SessionFenced)?;
+                .map_err(|_| TransportError::SessionFenced)?;
         if staged.operation_or_checkpoint_id != operation_identity
             || staged.privacy_and_visibility_class
                 != input.protected_envelope.privacy_and_visibility_class
@@ -6279,7 +6345,10 @@ impl KernelComposition {
             || write_binding.idempotency_key.as_str() != record.idempotency_key.as_str()
             || staged_fence != input.application_binding.state_fence
             || write_binding.payload_expires_at_ms
-                != Some(i64::try_from(record.deadline_unix_ms).map_err(|_| TransportError::SessionFenced)?)
+                != Some(
+                    i64::try_from(record.deadline_unix_ms)
+                        .map_err(|_| TransportError::SessionFenced)?,
+                )
         {
             return Err(TransportError::IdentityConflict);
         }
@@ -6317,10 +6386,9 @@ impl KernelComposition {
         }
         let prepared_transition_sha256 = token.prepared_transition_sha256.clone();
 
-        let original_source: RequestIdentity = serde_json::from_value(
-            input.application_binding.source_request_identity.clone(),
-        )
-        .map_err(|_| TransportError::SessionFenced)?;
+        let original_source: RequestIdentity =
+            serde_json::from_value(input.application_binding.source_request_identity.clone())
+                .map_err(|_| TransportError::SessionFenced)?;
         let request = &receipt_envelope.core.request;
         let operation = &receipt_envelope.core.operation;
         let work_scope = &receipt_envelope.core.work_scope;
@@ -6343,9 +6411,12 @@ impl KernelComposition {
                 .is_same_authority(&original_source.request.state_fence.authority_epoch)
             || transition.state_fence.resource_generation
                 != original_source.request.state_fence.resource_generation
-            || transition.scope_id.as_str() != record.scope_ref.as_ref()
-                .map(OpaqueLabel::as_str)
-                .ok_or(TransportError::SessionFenced)?
+            || transition.scope_id.as_str()
+                != record
+                    .scope_ref
+                    .as_ref()
+                    .map(OpaqueLabel::as_str)
+                    .ok_or(TransportError::SessionFenced)?
             || request.state_fence != transition.state_fence
             || operation.state_fence != transition.state_fence
             || work_scope.state_fence != transition.state_fence
@@ -6360,8 +6431,16 @@ impl KernelComposition {
             || request.metadata.product_id != original_source.request.metadata.product_id
             || request.metadata.source_id != original_source.request.metadata.source_id
             || request.metadata.clock != original_source.request.metadata.clock
-            || request.metadata.session_id.as_ref().map(|session| session.as_str())
-                != input.application_binding.session_ref.as_ref().map(OpaqueLabel::as_str)
+            || request
+                .metadata
+                .session_id
+                .as_ref()
+                .map(|session| session.as_str())
+                != input
+                    .application_binding
+                    .session_ref
+                    .as_ref()
+                    .map(OpaqueLabel::as_str)
             || request.metadata.task_id.as_ref().map(|task| task.as_str())
                 != transition.task_id.as_deref()
             || actual_task.map(|task| task.task_id.as_str()) != transition.task_id.as_deref()
@@ -6369,8 +6448,16 @@ impl KernelComposition {
                 task.state_fence != transition.state_fence
                     || Some(task.task_revision) != transition.state_fence.task_revision
             })
-            || receipt_envelope.core.session.as_ref().map(|session| session.session_id.as_str())
-                != input.application_binding.session_ref.as_ref().map(OpaqueLabel::as_str)
+            || receipt_envelope
+                .core
+                .session
+                .as_ref()
+                .map(|session| session.session_id.as_str())
+                != input
+                    .application_binding
+                    .session_ref
+                    .as_ref()
+                    .map(OpaqueLabel::as_str)
             || receipt_envelope
                 .core
                 .session
