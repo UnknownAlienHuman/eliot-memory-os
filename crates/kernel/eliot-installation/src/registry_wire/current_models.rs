@@ -17,6 +17,7 @@
 use eliot_platform_windows::profile_supervision::ProfileSelectionReceipt;
 use serde::Deserialize;
 
+use super::super::approved_generation_registry::UserModeTaskRunRecord;
 use super::super::{
     ActivationCommitFence, ActivePhaseBRebind, ActivePhaseBRebindIntent, ActivePhaseBRebindReceipt,
     ActivePhaseBRebindRecovery, AgentBridgeStagePrepared, ApprovedGeneration,
@@ -194,7 +195,7 @@ impl ActivePhaseBRebindWireV11 {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct RegistryWireV11 {
+pub(super) struct RegistryWireV12 {
     pub(super) registry_wire_version: ContractVersion,
     pub(super) revision: u64,
     generations: Vec<ApprovedGenerationWire>,
@@ -214,6 +215,7 @@ pub(super) struct RegistryWireV11 {
     /// migration.
     #[serde(default)]
     committed_cutover_activation: Option<CommittedCutoverActivation>,
+    user_mode_task_run_record: RequiredOption<UserModeTaskRunRecord>,
 }
 
 /// An optional wire member whose presence is mandatory.  Explicit `null` is
@@ -233,7 +235,7 @@ where
     }
 }
 
-impl RegistryWireV11 {
+impl RegistryWireV12 {
     pub(super) fn into_registry(self) -> ApprovedGenerationRegistry {
         ApprovedGenerationRegistry {
             registry_wire_version: self.registry_wire_version,
@@ -262,6 +264,7 @@ impl RegistryWireV11 {
                 .0
                 .map(ActivePhaseBRebindWireV11::into_rebind),
             committed_cutover_activation: self.committed_cutover_activation,
+            user_mode_task_run_record: self.user_mode_task_run_record.0,
         }
     }
 }
