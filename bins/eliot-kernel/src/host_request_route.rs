@@ -239,25 +239,6 @@ pub(crate) const AGENT_BRIDGE_EVENT_RECONCILE_OPERATION: &str = "agent_bridge_ev
 /// names this adapter's own revision, never a producer-side version the
 /// Kernel cannot observe.
 const BRIDGE_EVENT_ADAPTER_VERSION: &str = "eliot.bridge-event.kernel-ingest.v1";
-/// Closed disclosure verdict the privacy owner emits for a bridge event
-/// (issue #1934, I7.23). The verdict is the OWNER's: the Kernel resolves it
-/// from the owner evidence the live transport carries and never mints an
-/// admission. An owner that has not decided these exact bytes emits the
-/// rejection, which routes the event to the deterministic redacted
-/// representation plus its redaction receipt. This is the same closed
-/// vocabulary `eliot-ors` validates (`admitted` | `rejected`).
-const BRIDGE_EVENT_PRIVACY_VERDICT_REJECTED: &str = "rejected";
-/// Withheld scope recorded when the retained session's recipient grant admits
-/// no privacy class at all (issue #1934, I7.23): the session owner admitted
-/// nothing, so raw persistence is withheld on the recipient side. This is the
-/// owner's own out-of-scope label, never a claim about scanned content.
-const BRIDGE_EVENT_WITHHELD_RECIPIENT_GRANT_EMPTY: &str = "recipient_grant_admits_no_class";
-/// Withheld scope recorded when the session grant names admittable classes
-/// but the event proves none of them (issue #1934, I7.23): `EventEnvelope`
-/// carries no source privacy class or provider-restriction field, so no
-/// disclosure class is proven for these exact bytes and no grant membership
-/// can hold. Raw persistence is withheld on the source side.
-const BRIDGE_EVENT_WITHHELD_SOURCE_CLASS_UNADMITTED: &str = "source_class_not_admitted";
 
 /// Bound on queued local-read pairs for the outbound-only eliotd poller.
 ///
@@ -3612,6 +3593,27 @@ impl KernelComposition {
                     DaemonReadQueue::CampaignPacket => candidate.campaign_packet_envelope.clone(),
                 })
         };
+        // I7.24 (#1945): the retained tool bytes for the same pair. The
+        // queue owner holds the exact admitted envelope+tool per durable
+        // operation id; the exposure lifecycle below re-establishes its
+        // skeleton from these retained inputs rather than a parallel store.
+        let queued_tool = {
+            let index = self
+                .host_request_connection_index
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            index
+                .values()
+                .flatten()
+                .find(|candidate| {
+                    candidate.operation_id == body.operation_id
+                        && candidate.request_digest == body.request_sha256
+                })
+                .and_then(|candidate| match queue {
+                    DaemonReadQueue::LocalRead => candidate.local_read_tool.clone(),
+                    DaemonReadQueue::CampaignPacket => candidate.campaign_packet_tool.clone(),
+                })
+        };
         validate_campaign_view_result(&stored, queued_envelope.as_ref(), &body.response)?;
         if let Some(envelope) = queued_envelope.as_ref() {
             if !session
@@ -3728,6 +3730,28 @@ impl KernelComposition {
         if submitted_ok && bound_ok {
             self.clear_pending_result_binding(&body.operation_id);
         }
+        // I7.24 (#1945): advance the evaluated exposure receipt through its
+        // measured stages for this persisted completion, and retain the
+        // completed receipt on the durable operation row it evidences —
+        // never dropped. Observational only: every missing input, failed
+        // transition, or failed attach inside the two calls leaves the
+        // submit disposition and the durability contract unchanged, so they
+        // never gain a receipt-shaped failure mode.
+        if let Some(receipt) = advance_tool_exposure_receipt_for_persisted_result(
+            queue,
+            queued_envelope.as_ref(),
+            queued_tool.as_ref(),
+            &persisted,
+        ) {
+            let _ = self
+                .generation_gateway
+                .ors
+                .record_host_request_tool_exposure_receipt(
+                    &operation_id,
+                    &persisted.request_digest,
+                    &receipt,
+                );
+        }
         // The single completion consumes the attempt use budget: retire the
         // pair in the same queue ledger that authorized it so no later claim
         // or submit can reuse this generation.
@@ -3747,6 +3771,86 @@ impl KernelComposition {
         }
         Ok(LocalReadSubmitDisposition::Persisted(Box::new(persisted)))
     }
+}
+
+/// Advances the per-evaluation tool-exposure receipt for one persisted
+/// local-read or campaign-packet completion (I7.24, #1945).
+///
+/// The queue owner retains the exact admitted envelope+tool per durable
+/// operation id; this leg re-establishes the admission skeleton from those
+/// retained inputs (never a parallel receipt store) and advances it with
+/// evidence measured here: delivery from the persisted record's own
+/// digest-bound bytes via
+/// [`super::tool_exposure::observe_persisted_delivery`], observable use only
+/// when the campaign lane fed result content into its owner verifier, and
+/// the terminal outcome from the durable completion coordinates. Query and
+/// Skill lanes record no observable use: the Kernel serves their bytes
+/// without deciding from content. Truncation has no owner signal on this
+/// path (oversize bodies are rejected, never cut), so only the complete
+/// delivery is recorded; a token-truncated outcome stays unwired until the
+/// route tokenizer owner exists.
+///
+/// Observational only and infallible by construction: every missing input
+/// or failed transition returns `None`, so the submit disposition and the
+/// durability contract never gain a receipt-shaped failure mode. A returned
+/// receipt is passed by the caller into the durable operation row it
+/// evidences — never dropped.
+/// Returns the completed receipt for retention, or `None` when there is
+/// nothing to retain.
+fn advance_tool_exposure_receipt_for_persisted_result(
+    queue: DaemonReadQueue,
+    envelope: Option<&HostRequestEnvelope>,
+    tool: Option<&serde_json::Value>,
+    persisted: &HostRequestRecord,
+) -> Option<eliot_receipts::ToolExposureReceiptV2> {
+    let (Some(envelope), Some(tool)) = (envelope, tool) else {
+        return None;
+    };
+    let Ok(admission) = check_local_read_admission(envelope, tool) else {
+        return None;
+    };
+    let request = super::tool_exposure::build_tool_call_request(envelope, tool, &admission)?;
+    let operation = persisted.operation_id.as_str();
+    let (Some(digest), Some(response)) = (
+        persisted.result_digest.as_deref(),
+        persisted.result_response.as_ref(),
+    ) else {
+        return None;
+    };
+    let Ok(delivered) = super::tool_exposure::observe_persisted_delivery(
+        &request,
+        operation.to_owned(),
+        digest,
+        response,
+        operation.to_owned(),
+    ) else {
+        return None;
+    };
+    // Observable use is lane-measured: only the campaign-packet lane feeds
+    // result content into an owner decision (the campaign-view verification
+    // that gated this persist; a failure there returns before persisting, so
+    // a present view reached here verified). A present-but-null or absent
+    // view means nothing was consumed beyond transport.
+    let used = match queue {
+        DaemonReadQueue::LocalRead => delivered,
+        DaemonReadQueue::CampaignPacket => {
+            let view_verified = response
+                .get("campaign_learning_state_view")
+                .is_some_and(|view| !view.is_null());
+            if view_verified {
+                let unmarked = delivered.clone();
+                delivered.record_observable_use().unwrap_or(unmarked)
+            } else {
+                delivered
+            }
+        }
+    };
+    // Terminal outcome names the durable completion coordinates from the
+    // ORS owner's persisted record, never caller prose. The completed
+    // receipt is returned for retention on the durable operation row —
+    // never dropped.
+    let terminal_ref = format!("host-request-result-received:{operation}:{digest}");
+    used.record_terminal_outcome(terminal_ref).ok()
 }
 
 /// Closed capability admitted to the observe queue (issue #2565: one
@@ -5757,17 +5861,19 @@ impl KernelComposition {
                         &event,
                         &identity.request.state_fence,
                         identity.deadline_unix_ms,
+                        None,
                     )?
                 } else {
                     self.with_live_bridge_application_binding(
                         session,
                         &identity.request.state_fence,
-                        || {
+                        |binding| {
                             self.admit_bridge_event_envelope(
                                 session,
                                 &event,
                                 &identity.request.state_fence,
                                 identity.deadline_unix_ms,
+                                Some(binding.work_scope_id.as_str()),
                             )
                         },
                     )?
@@ -5786,7 +5892,7 @@ impl KernelComposition {
                 self.with_live_bridge_application_binding(
                     session,
                     &identity.request.state_fence,
-                    || self.admit_bridge_event_gap(session, &gap, &identity.request.state_fence),
+                    |_| self.admit_bridge_event_gap(session, &gap, &identity.request.state_fence),
                 )?
             }
             AGENT_BRIDGE_EVENT_RECONCILE_OPERATION => {
@@ -5794,7 +5900,7 @@ impl KernelComposition {
                 self.with_live_bridge_application_binding(
                     session,
                     &identity.request.state_fence,
-                    || {
+                    |_| {
                         self.answer_bridge_event_reconcile_under_transition(
                             session,
                             &scope,
@@ -5832,7 +5938,7 @@ impl KernelComposition {
         &self,
         session: &Session,
         frame_fence: &eliot_contracts::StateFence,
-        operation: impl FnOnce() -> Result<T, TransportError>,
+        operation: impl FnOnce(&super::ActivatedApplicationBinding) -> Result<T, TransportError>,
     ) -> Result<T, TransportError> {
         let _transition = self.agent_bridge_transition_read()?;
         let (retained, _pending) =
@@ -5882,7 +5988,7 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
 
-        operation()
+        operation(&retained)
     }
 
     /// Reads the exact accepted activation and proves its fence is still
@@ -5961,19 +6067,26 @@ impl KernelComposition {
     /// observation only).
     ///
     /// Privacy (I7.23) is decided before persistence: the disclosure
-    /// decision over the canonical envelope bytes is computed through the
-    /// ORS persistence owner and carried into the staged row, so denied
+    /// verdict over the canonical envelope bytes is resolved through the
+    /// `WorkScope` privacy owner and carried into the staged row, so denied
     /// content stages as the deterministic redacted projection plus its
     /// redaction receipt — never as verbatim raw. The handoff (I5(i)) is the
     /// persisted leg of the intake conversion the Governor/coordinator
     /// intake consumes on recovery: it binds the staged envelope digest and
     /// is later reconciled by [`Self::answer_bridge_event_reconcile`].
+    ///
+    /// `work_scope_id` is the Governor-resolved scope from the retained
+    /// activation binding; durable delivery always rides
+    /// [`Self::with_live_bridge_application_binding`], so it is always
+    /// present there. Best-effort telemetry carries no durability claim and
+    /// persists nothing, so it takes no scope and resolves no verdict.
     fn admit_bridge_event_envelope(
         &self,
         session: &Session,
         event: &EventEnvelope,
         frame_fence: &eliot_contracts::StateFence,
         deadline_unix_ms: u64,
+        work_scope_id: Option<&str>,
     ) -> Result<serde_json::Value, TransportError> {
         // Authority check against the retained Session, never caller text:
         // the event must cohere with the presenting live fence (same
@@ -6000,31 +6113,11 @@ impl KernelComposition {
         // reconcile, but a fresh event still requires the live producer
         // generation above — never a relabeled old one. Best-effort
         // telemetry carries no durability claim and needs no owner bind.
-        let envelope_bytes = eliot_contracts::canonical_json_bytes(event)
-            .map_err(|_| TransportError::SessionFenced)?;
-        let envelope_sha = eliot_contracts::sha256_hex(&envelope_bytes);
-        // Privacy decision precedes persistence: the ORS owner decides the
-        // disclosure disposition over these exact bytes, and the stage entry
-        // re-verifies the presented decision before any durable write. The
-        // decision object travels into the durable stage below.
         //
-        // Issue #1934: the ORS owner no longer DECIDES, and neither does this
-        // route. Disclosure is resolved by the privacy owner over the
-        // `WorkScope` / source / recipient / provider policy and must arrive
-        // bound to these exact source bytes, the scope, and the policy revision
-        // it was decided at. No such owner decision reaches this live route
-        // (see [`Self::bridge_event_privacy_authorization`]), so the resolution
-        // is a rejection: the event stages as the deterministic redacted
-        // representation plus its redaction receipt and never as verbatim raw.
-        // The ORS deny scan stays a conservative detector that can only deny.
-        let privacy_authorization =
-            Self::bridge_event_privacy_authorization(session, frame_fence, event, &envelope_bytes)?;
-        let privacy = RedbRecoveryStore::bridge_event_privacy_decision(
-            &envelope_bytes,
-            Some(&privacy_authorization),
-        );
-        let now = unix_ms();
-        let expired = activation_deadline_expired(now, deadline_unix_ms);
+        // Issue #1934: privacy is resolved only on the persisting path below.
+        // The canonical bytes, the owner verdict over them, and the deadline
+        // are all durable-stage inputs; best-effort telemetry persists
+        // nothing, so it computes none of them.
         // `Ready` admits delivery; `Degraded` keeps only recovery (gap and
         // reconcile) while delivery sheds load with typed backpressure, so
         // the producer retries instead of losing the event. This mirrors the
@@ -6041,6 +6134,30 @@ impl KernelComposition {
                         eliot_ipc::BACKPRESSURE_KERNEL_DEGRADED,
                     ));
                 }
+                let work_scope_id = work_scope_id.ok_or(TransportError::SessionFenced)?;
+                let envelope_bytes = eliot_contracts::canonical_json_bytes(event)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let envelope_sha = eliot_contracts::sha256_hex(&envelope_bytes);
+                // Privacy verdict precedes persistence: the `WorkScope`
+                // privacy owner resolves the disclosure verdict over these
+                // exact bytes inside the Governor-resolved scope, and the
+                // stage entry re-verifies the presented verdict through the
+                // same owner before any durable write. The verdict object
+                // travels into the durable stage below. The ORS deny scan
+                // stays a conservative detector that can only deny.
+                let privacy_authorization = Self::bridge_event_privacy_authorization(
+                    session,
+                    frame_fence,
+                    event,
+                    &envelope_bytes,
+                    work_scope_id,
+                )?;
+                let privacy = RedbRecoveryStore::bridge_event_privacy_decision(
+                    &envelope_bytes,
+                    Some(&privacy_authorization),
+                );
+                let now = unix_ms();
+                let expired = activation_deadline_expired(now, deadline_unix_ms);
                 let evidence = bridge_owner_evidence(session, frame_fence)?;
                 self.stage_bridge_event_durable(
                     session,
@@ -6067,117 +6184,88 @@ impl KernelComposition {
         }
     }
 
-    /// Resolves the privacy owner's disclosure verdict for one bridge event's
-    /// exact source bytes (issue #1934, I7.23).
+    /// Resolves the `WorkScope` privacy owner's disclosure verdict for one
+    /// bridge event's exact source bytes (issue #1934, I7.23).
     ///
     /// I7.23: "Secret values, provider-forbidden hidden reasoning and data
     /// outside the `WorkScope` privacy boundary are never persisted merely to
-    /// preserve 'rawness'." The decision that answers that belongs to the
-    /// disclosure owner: I5.26 makes `DisclosureDependencyClosure` and
-    /// `DisclosureDecision` Governor-owned canonical state, and this subtree's
-    /// instructions say Kernel "does not reinterpret policy, `WorkScope`,
-    /// task, plan, verifier or finish". This entry is therefore a resolution of
-    /// the owner verdict, never a mint of it.
+    /// preserve 'rawness'." The verdict is the owner's, never this route's:
+    /// [`eliot_workscope::resolve_bridge_ingest_disclosure`] evaluates the
+    /// evidence below under the owner's rule, and this entry only serializes
+    /// the returned verdict bound to these exact bytes, the scope, and the
+    /// owner's policy revision. This subtree's instructions say Kernel "does
+    /// not reinterpret policy, `WorkScope`, task, plan, verifier or finish",
+    /// so no branch here chooses a verdict, a class, or a revision.
     ///
-    /// What the live transport does carry, and what this entry therefore binds
-    /// (issue #2729 owner read, unchanged):
+    /// The evidence this entry threads in (issue #2729 owner read, unchanged):
     ///
     /// - the immutable source digest of the canonical envelope bytes;
-    /// - the retained `Session`'s owner evidence — principal, authority
-    ///   lineage, connection, launch nonce, session epoch — through
-    ///   [`bridge_owner_evidence`], the same owner legs the stage entry
-    ///   persists;
-    /// - the scope the ORS stage entry is about to bind for this stream,
-    ///   derived through the owner's own namespace digest;
-    /// - the privacy policy revision: the presenting live generation, already
-    ///   required nonzero and equal on the event, its state fence, and the
-    ///   retained session.
+    /// - the Governor-resolved `work_scope_id` from the retained activation
+    ///   binding — the scope this verdict is authorized within;
+    /// - the retained `Session`'s negotiated `privacy_classes` grant, read
+    ///   from the retained session, never assumed (`eliot-ipc`'s
+    ///   `Session::establish_agent_bridge`, the only constructor on this
+    ///   route, negotiates it empty — but a class-bearing session resolves
+    ///   through its real grant);
+    /// - the event's proven source class: none — `EventEnvelope`
+    ///   (`crates/foundation/eliot-protocol/src/lib.rs`) carries no source
+    ///   privacy class, source/recipient class, or provider-retention field,
+    ///   so no disclosure class is proven for these exact bytes and no grant
+    ///   membership can hold for them. No grant is invented to fill the gap.
     ///
-    /// What the transport does NOT carry is the positive privacy grant, and it
-    /// was measured rather than assumed. `EventEnvelope`
-    /// (`crates/foundation/eliot-protocol/src/lib.rs`) has no field carrying a
-    /// `WorkScope`, a privacy class, a source/recipient class, or a provider
-    /// retention constraint; and the Governor-owned `DisclosureDecision` has no
-    /// producer, store, or wire leg that reaches this entry. There is
-    /// consequently no owner that can present a positive verdict bound to these
-    /// exact bytes, this scope, and this policy revision.
-    ///
-    /// What the transport DOES carry is the recipient side of the admission
-    /// evidence, and the resolution below evaluates it for THIS event instead
-    /// of assuming it: the retained `Session`'s negotiated `privacy_classes`
-    /// grant is the session owner's recipient-class admission evidence
-    /// (`eliot-ipc`'s `Session::establish_agent_bridge`, the only constructor
-    /// on this route, negotiates it empty — but the verdict reads the retained
-    /// session, so a class-bearing session would resolve through its real
-    /// grant rather than this route's usual one). The event's own disclosure
-    /// class is unproven for these exact bytes — the envelope names no source
-    /// class — so no grant membership can hold for it.
-    ///
-    /// Absent evidence is UNRESOLVED, never permission. The resolution is
-    /// therefore [`BRIDGE_EVENT_PRIVACY_VERDICT_REJECTED`], with the
-    /// `declared_class` naming the withholding the evaluated evidence
-    /// determined: an empty recipient grant withholds on the recipient side,
-    /// while a non-empty grant still withholds because the event proves no
-    /// admittable source class. [`RedbRecoveryStore::bridge_event_privacy_decision`]
-    /// takes the rejection arm, the event stages as the deterministic redacted
-    /// representation plus its redaction receipt, and the conservative
-    /// seven-token deny scan still runs inside the ORS owner — where it can
-    /// only narrow the recorded reason and classes, never grant. Ingestion
-    /// stays available; no unproven byte is persisted, and the store's
-    /// re-verification of the presented verdict can no longer be satisfied by
-    /// an echo of its own derivation.
-    ///
-    /// The `admitted` arm is deliberately unreachable here and is not a
-    /// placeholder for a future one: emitting it requires an owner decision
-    /// that does not exist on this path, and inventing a substitute grant would
-    /// reintroduce exactly the defect this removes. A caller cannot reach the
-    /// verbatim path at all while this holds, which is the fail-closed answer
-    /// I7.23 requires until the disclosure owner is wired to this route.
+    /// Absent evidence is UNRESOLVED, never permission: the owner withholds
+    /// raw persistence and names the side the evaluated evidence determined,
+    /// so the event stages as the deterministic redacted representation plus
+    /// its redaction receipt. The conservative seven-token deny scan still
+    /// runs inside the ORS owner — where it can only narrow the recorded
+    /// reason and classes, never grant. The ORS stage entry re-verifies the
+    /// presented verdict through the same owner query over the staged
+    /// evidence, so a verdict that does not match the owner rule for these
+    /// exact bytes, this scope, and this policy revision fails closed before
+    /// any durable write.
     fn bridge_event_privacy_authorization(
         session: &Session,
         frame_fence: &eliot_contracts::StateFence,
         event: &EventEnvelope,
         envelope_bytes: &[u8],
+        work_scope_id: &str,
     ) -> Result<serde_json::Value, TransportError> {
         let source_sha256 = eliot_contracts::sha256_hex(envelope_bytes);
-        // The scope is the very owner namespace the ORS stage entry binds for
-        // this stream, derived through the owner's own namespace digest so the
-        // recorded verdict and the row it describes cannot drift.
+        // The scope commits to the Governor-resolved scope as well as the
+        // owner namespace the ORS stage entry binds for this stream, derived
+        // through the owner's own namespace digest: the recorded verdict and
+        // the row it describes cannot drift, and two events identical except
+        // for their scope resolve to different authorizations.
         let evidence = bridge_owner_evidence(session, frame_fence)?;
         let scope = RedbRecoveryStore::bridge_event_privacy_scope(
             &evidence.authority_lineage,
             &evidence.principal,
             &event.producer_id,
             &event.stream_id,
+            work_scope_id,
         )
         .map_err(|_| TransportError::SessionFenced)?;
-        // The retained session's own generation is the privacy policy revision
-        // the verdict is recorded against; zero is never an admissible
-        // revision, and the caller above already refused a zero generation, so
-        // a zero here is a fence failure rather than a silent downgrade.
-        let policy_revision = frame_fence.resource_generation.value();
-        if policy_revision == 0 {
-            return Err(TransportError::SessionFenced);
-        }
-        // Resolve the withholding through the actual admission evidence for
-        // THIS event. The session owner's recipient grant admits a class only
-        // by name; the event proves no source class for these exact bytes, so
-        // no membership holds — but WHICH side withholds is read, not
-        // assumed: an empty grant withholds every class on the recipient side,
-        // while a class-bearing grant still withholds this classless event on
-        // the source side. Either way raw persistence is not admitted, and the
-        // recorded class tells the receipt which evidence determined that.
-        let declared_class = if session.privacy_classes.is_empty() {
-            BRIDGE_EVENT_WITHHELD_RECIPIENT_GRANT_EMPTY
-        } else {
-            BRIDGE_EVENT_WITHHELD_SOURCE_CLASS_UNADMITTED
-        };
+        // The verdict is the owner's evaluation over the evidence for THIS
+        // event: the retained session's recipient grant and the (unproven)
+        // source class of these exact bytes inside the Governor-resolved
+        // scope. The policy revision recorded alongside it is the owner's own
+        // rule revision — never the fencing generation, which measures
+        // liveness rather than policy.
+        let disclosure = eliot_workscope::resolve_bridge_ingest_disclosure(
+            work_scope_id,
+            None,
+            &session.privacy_classes,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
         Ok(serde_json::json!({
-            "verdict": BRIDGE_EVENT_PRIVACY_VERDICT_REJECTED,
+            "verdict": disclosure.verdict(),
             "source_sha256": source_sha256,
             "scope": scope,
-            "policy_revision": policy_revision,
-            "declared_class": declared_class,
+            "policy_revision": eliot_workscope::BRIDGE_INGEST_PRIVACY_POLICY_REVISION,
+            "declared_class": disclosure.declared_class().map_or(serde_json::Value::Null, serde_json::Value::from),
+            "scope_ref": work_scope_id,
+            "source_class": serde_json::Value::Null,
+            "recipient_grant": &session.privacy_classes,
         }))
     }
 
@@ -8081,6 +8169,14 @@ pub(crate) fn local_read_admission_from_tool(
     if super::tool_exposure::requires_intent(&admission) {
         let request = super::tool_exposure::build_tool_call_request(envelope, tool, &admission)
             .ok_or(TransportError::SessionFenced)?;
+        // I7.24 (#1945): the pre-dispatch gate for every admitted
+        // expensive-class call. The gate authorizes here; the per-evaluation
+        // exposure lifecycle runs at the submit leg
+        // ([`advance_tool_exposure_receipt_for_persisted_result`]), which
+        // re-establishes the skeleton from the queue owner's retained
+        // envelope+tool under the durable operation id and advances it with
+        // owner-measured evidence, so a constructed receipt always flows
+        // into its transitions instead of being dropped here.
         super::tool_exposure::authorize_pre_dispatch(&request)
             .map_err(|_| TransportError::SessionFenced)?;
     }

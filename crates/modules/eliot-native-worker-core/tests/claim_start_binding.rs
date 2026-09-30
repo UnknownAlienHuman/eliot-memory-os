@@ -428,6 +428,19 @@ fn valid_join(
         expires_at_unix_ms: 9_500,
         executable_wire_version: NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION,
         executable_binding_digest: owner_issued_digest(),
+        // The owner-admitted lifecycle joins this join carries alongside the
+        // cell, in the same shape the owner crate's own `claim_join` and
+        // `single_shape_constructors` fixtures use (see the sibling fixtures in
+        // `src/tests.rs` and `src/ports.rs`). Worker-side this join is the
+        // presenter, so the values are carried and shape-checked, not derived.
+        capability_cell_registry_digest: "1".repeat(64),
+        kernel_execution_manifest_digest: "2".repeat(64),
+        job_object_lineage_ref: "job-lineage-1".to_owned(),
+        resource_limits_digest: "3".repeat(64),
+        cancellation_policy_ref: "cancel-policy-1".to_owned(),
+        checkpoint_policy_digest: "4".repeat(64),
+        drain_policy_ref: "drain-policy-1".to_owned(),
+        restart_policy_digest: "5".repeat(64),
     }
 }
 

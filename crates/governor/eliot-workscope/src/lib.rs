@@ -777,6 +777,111 @@ impl PrivacyProfile {
     }
 }
 
+/// Revision of the bridge-ingest disclosure rule below, named by the owner.
+///
+/// Every verdict [`resolve_bridge_ingest_disclosure`] decides is recorded at
+/// this revision; a verdict naming another revision was decided under another
+/// policy and never authorizes persistence. This names the privacy rule
+/// version — never a fencing, transport, or resource generation, which measure
+/// liveness rather than policy.
+pub const BRIDGE_INGEST_PRIVACY_POLICY_REVISION: u64 = 1;
+
+/// Verdict spelling [`resolve_bridge_ingest_disclosure`] emits for an admitted
+/// ingest: the exact source bytes may persist verbatim.
+pub const BRIDGE_INGEST_VERDICT_ADMITTED: &str = "admitted";
+
+/// Verdict spelling it emits for a withheld ingest: only the deterministic
+/// redacted projection plus its redaction receipt may persist.
+pub const BRIDGE_INGEST_VERDICT_REJECTED: &str = "rejected";
+
+/// Withholding side recorded when the session owner's recipient grant admits
+/// no privacy class at all: the session owner admitted nothing, so raw
+/// persistence is withheld on the recipient side.
+pub const BRIDGE_INGEST_WITHHELD_RECIPIENT_GRANT_EMPTY: &str = "recipient_grant_admits_no_class";
+
+/// Withholding side recorded when the grant names admittable classes but the
+/// event proves none of them for its exact bytes: no grant membership can
+/// hold, so raw persistence is withheld on the source side.
+pub const BRIDGE_INGEST_WITHHELD_SOURCE_CLASS_UNADMITTED: &str = "source_class_not_admitted";
+
+/// Owner-resolved disclosure verdict for one bridge-ingest candidate (issue
+/// #1934, I7.23).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BridgeIngestDisclosure {
+    /// A proven source class explicitly named by the recipient grant: the
+    /// exact bytes may persist verbatim at
+    /// [`BRIDGE_INGEST_PRIVACY_POLICY_REVISION`].
+    Admitted,
+    /// Raw persistence is withheld; `side` names the withholding the evaluated
+    /// evidence determined. Only the deterministic redacted projection plus
+    /// its receipt may persist.
+    Withheld {
+        /// One of [`BRIDGE_INGEST_WITHHELD_RECIPIENT_GRANT_EMPTY`] or
+        /// [`BRIDGE_INGEST_WITHHELD_SOURCE_CLASS_UNADMITTED`].
+        side: &'static str,
+    },
+}
+
+impl BridgeIngestDisclosure {
+    /// Closed verdict spelling the persistence owner validates.
+    #[must_use]
+    pub fn verdict(self) -> &'static str {
+        match self {
+            Self::Admitted => BRIDGE_INGEST_VERDICT_ADMITTED,
+            Self::Withheld { .. } => BRIDGE_INGEST_VERDICT_REJECTED,
+        }
+    }
+
+    /// Withholding side for the redaction receipt; `None` when admitted.
+    #[must_use]
+    pub fn declared_class(self) -> Option<&'static str> {
+        match self {
+            Self::Admitted => None,
+            Self::Withheld { side } => Some(side),
+        }
+    }
+}
+
+/// Resolves whether one bridge event's exact bytes may persist verbatim
+/// inside one Governor-resolved scope (issue #1934, I7.23).
+///
+/// I7.23: secret values, provider-forbidden hidden reasoning, and data outside
+/// the `WorkScope` privacy boundary are never persisted merely to preserve
+/// "rawness". Admission is therefore membership, mirroring
+/// [`PrivacyProfile::admits`]: a source privacy class proven for these exact
+/// bytes and explicitly named by the session owner's recipient grant. Absent
+/// evidence is unresolved, never permission: an unproven source class, or a
+/// proven one the grant does not name, withholds raw persistence, naming the
+/// side the evaluated evidence determined.
+///
+/// The scope boundary profile, provider retention constraints, and the
+/// Governor's `DisclosureDecision` do not reach this query — no caller on the
+/// bridge-ingest path carries them — so nothing here can admit what those legs
+/// would deny; events requiring them stay withheld until decided through the
+/// Governor path that presents them.
+pub fn resolve_bridge_ingest_disclosure(
+    scope_ref: &str,
+    source_class: Option<&str>,
+    recipient_grant: &[String],
+) -> Result<BridgeIngestDisclosure, WorkScopeError> {
+    text(scope_ref, "scope_ref")?;
+    for granted in recipient_grant {
+        text(granted, "recipient_grant")?;
+    }
+    if let Some(class) = source_class {
+        text(class, "source_class")?;
+        if recipient_grant.iter().any(|granted| granted == class) {
+            return Ok(BridgeIngestDisclosure::Admitted);
+        }
+    }
+    let side = if recipient_grant.is_empty() {
+        BRIDGE_INGEST_WITHHELD_RECIPIENT_GRANT_EMPTY
+    } else {
+        BRIDGE_INGEST_WITHHELD_SOURCE_CLASS_UNADMITTED
+    };
+    Ok(BridgeIngestDisclosure::Withheld { side })
+}
+
 impl GoverningSourceSet {
     /// Normalizes source order and rejects duplicate source identities.
     ///

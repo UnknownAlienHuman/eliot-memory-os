@@ -212,11 +212,11 @@ source_ref = "Own module.toml consumers=[TaskGraphCompiler, Governor, Agent Coor
 [[decision]]
 package = "eliot-epistemic-context-provider"
 disposition = "Connect"
-rationale = "Own module.toml consumers=[eliot-context-candidates] (root member, R5); issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table). Edge unwired as of registry revision: no Cargo edge and no production source-construction site exists today (measured: reverse edges 0, production source_consumers 0). This row is the wiring promise, not the wire."
+rationale = "Own module.toml consumers=[eliot-context-candidates] (root member, R5); issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table). Edge WIRED as of this registry revision at the SOURCE level: the declared consumer crates/smart/eliot-context-candidates declares the Cargo dependency, and its declared canonical path crates/smart/eliot-context-candidates/src/mapper.rs::collect_epistemic invokes the capability through crates/smart/eliot-context-candidates/src/provider_registry.rs::registered_slot_for (impl) and EpistemicContextContribution::from_position (caller) on an admitted Current Epistemic Position. The RUNTIME INVOCATION IS NOT YET REACHED BY ANY BINARY, measured: bins/eliotd/src/kernel_context_read_client.rs::optional_role cannot return Some for the epistemic role (it yields RoleConversionMissing for Complete/Partial/Stale and None otherwise), so mapper.rs::collect_epistemic returns AtomAvailability::Missing before the provider call; and bins/eliot-dreamer's pulse stage is reached only through production_orientation::resolve_production_inputs returning Ok, which requires an OrientationSupply, and OrientationSupplySource has zero implementors workspace-wide. The declared consumer is a Cargo dependency of both bins, so the crate is linked into them, but no production call site can currently supply the epistemic input. This row records the measured source-level wire, NOT a proven runtime wire."
 declared_consumer = "eliot-context-candidates"
 declared_bundle = "eliotd"
 review_owner = "Workspace topology and C4 composition owners (issue #1720)"
-source_ref = "Own module.toml consumers=[eliot-context-candidates] (root member, R5); issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table)"
+source_ref = "Own module.toml consumers=[eliot-context-candidates] (root member, R5); issue #1720 controller wiring map (2026-09-16 comment: per-crate declared-consumer table); wire measured in crates/smart/eliot-context-candidates/Cargo.toml and crates/smart/eliot-context-candidates/src/mapper.rs::collect_epistemic"
 
 [[decision]]
 package = "eliot-dreamer-research-synthesis"

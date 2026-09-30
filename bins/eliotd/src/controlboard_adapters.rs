@@ -473,6 +473,24 @@ pub fn controlboard_result_body(
         ControlBoardError::Provider(format!("controlboard outcome digest: {error}"))
     })?;
     let result_digest = sha256_hex(&bytes);
+    // The result class follows the OUTCOME, not the fact that this function
+    // built a body (issue #1809 item 1). A served `View` is a read of
+    // already-retained evidence under the admitted attempt, with its actual
+    // revision (I1.8 read path). A `Refused` outcome is not a read at all: no
+    // evidence was read and nothing was committed, so calling it an
+    // existing-evidence read would upgrade a refusal into a claim about
+    // retained content. It is a retained response record for an
+    // already-completed operation: it records that these bytes were produced
+    // and admits nothing about any content behind them. Neither class may
+    // carry a semantic receipt, and both commit nothing.
+    let result_class = match outcome {
+        ControlBoardReadOutcome::View { .. } => {
+            eliot_protocol::HostRequestResultClass::ExistingEvidenceRead
+        }
+        ControlBoardReadOutcome::Refused { .. } => {
+            eliot_protocol::HostRequestResultClass::RetainedDeliveryRecord
+        }
+    };
     let body = HostRequestResultBody {
         wire_id: HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
         wire_version: HostRequestResultBody::CONTRACT_VERSION,
@@ -481,13 +499,9 @@ pub fn controlboard_result_body(
         result_digest: result_digest.clone(),
         response,
         attempt: Some(attempt.clone()),
-        // The board owner served this view from already-retained evidence under
-        // the admitted attempt, so the bytes are a read with their actual
-        // revision, not a new record (I1.8 read path). It commits nothing, so
-        // it carries NO semantic receipt. Source revisions stay unknown: this
-        // owner projects retained rows it does not re-observe a head for, and
-        // naming the request fence would claim a revision this leg did not
-        // observe.
+        // Source revisions stay unknown on both arms: this owner projects
+        // retained rows it does not re-observe a head for, and naming the
+        // request fence would claim a revision this leg did not observe.
         lineage: Some(HostRequestResultLineage {
             output_artifact_ref: None,
             output_digest: result_digest,
@@ -500,7 +514,7 @@ pub fn controlboard_result_body(
             policy_fence: None,
             origin_evidence_refs: None,
             semantic_receipt_ref: None,
-            result_class: eliot_protocol::HostRequestResultClass::ExistingEvidenceRead,
+            result_class,
             proof_ceiling: None,
             influence_state: eliot_security_contracts::InfluenceState::Unknown,
             instruction_taint: None,
@@ -587,10 +601,33 @@ fn controlboard_unbound_refusal_body(
         wire_version: HostRequestResultBody::CONTRACT_VERSION,
         operation_id: attempt.operation_id.clone(),
         request_sha256: envelope.envelope_sha256.clone(),
-        result_digest,
+        result_digest: result_digest.clone(),
         response,
         attempt: Some(attempt.clone()),
-        lineage: None,
+        // This arm settles a pair whose outcome could not be bound through
+        // `controlboard_result_body`, so the lineage is spelled out here rather
+        // than left absent: the bytes are a retained response record for an
+        // already-completed operation and nothing else. `None` would decode as
+        // `Unclassified`, which is also a refusal at the Bridge — so this
+        // records the class the owner actually knows, and it carries no
+        // semantic receipt, so it can never be read back as admitted content.
+        lineage: Some(HostRequestResultLineage {
+            output_artifact_ref: None,
+            output_digest: result_digest,
+            producer_ref: None,
+            source_revisions: None,
+            source_state_fence: None,
+            input_refs: None,
+            transformation_lineage: None,
+            closure_refs: None,
+            policy_fence: None,
+            origin_evidence_refs: None,
+            semantic_receipt_ref: None,
+            result_class: eliot_protocol::HostRequestResultClass::RetainedDeliveryRecord,
+            proof_ceiling: None,
+            influence_state: eliot_security_contracts::InfluenceState::Unknown,
+            instruction_taint: None,
+        }),
         // Issue #1838 residual: no execution evidence on the unbound refusal
         // body; the sealed manifest lists it as missing parts.
         evidence: None,

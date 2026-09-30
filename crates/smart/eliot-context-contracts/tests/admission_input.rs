@@ -253,6 +253,7 @@ fn complete_result(input: &AdmissionInput) -> AdmissionResult {
             route_capacity: 100,
         },
         recipe_digest: input.recipe.recipe_sha256.clone(),
+        policy_sha256: input.recipe.decision.policy_sha256.clone(),
         receipt_digest: digest(),
     };
     let mut admitted = AdmittedContextSet {

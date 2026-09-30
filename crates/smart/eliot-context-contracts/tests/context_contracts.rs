@@ -256,6 +256,7 @@ fn admitted_set(candidate: ContextCandidate) -> AdmittedContextSet {
             route_capacity: 100_000,
         },
         recipe_digest: digest(),
+        policy_sha256: digest(),
         receipt_digest: digest(),
     };
     let mut admitted = AdmittedContextSet {
@@ -652,6 +653,7 @@ fn economy_requires_exact_requested_admitted_displaced_conservation() {
             route_capacity: 10,
         },
         recipe_digest: digest(),
+        policy_sha256: digest(),
         receipt_digest: digest(),
     };
     receipt
@@ -758,10 +760,20 @@ fn admitted_view_preserves_protected_fields_and_rejects_injected_content() {
     let mut measurement = exact_measurement(&context);
     measurement.envelope_digest = output_digest.clone();
     measurement.rendered_utf8_bytes = rendered_bytes;
+    let execution = eliot_context_contracts::ContextExecutionIdentity {
+        ordering_revision: "a18.role-provider-atom.v1".to_owned(),
+        serializer_id: measurement.serializer_id.clone(),
+        serializer_version: measurement.serializer_version.clone(),
+        serializer_options_digest: measurement.serializer_options_digest.clone(),
+        route_id: measurement.route_id.clone(),
+        model_id: measurement.model_id.clone(),
+        measurement_status: measurement.status,
+    };
     let mut view = ActiveUnderstandingView::assemble(
         &admitted,
         quality(&context),
         measurement,
+        execution,
         output_digest.clone(),
         recipe_digest,
         fence_digest,

@@ -80,11 +80,14 @@
 #   exists, so exactly one run wins the name. A plain `USE NS x DB y` is not a
 #   claim -- in SurrealDB 3.x regular mode it CREATES a missing namespace or
 #   database and silently adopts an existing one, which would let a run proceed
-#   on another run's namespace. The exclusive create this run won is recorded
-#   per run, so a later handshake or fixture step of the SAME run is a
-#   recognized re-entry, and any namespace or database already present without
-#   that record is refused as foreign (STORE-NAMESPACE-FOREIGN) rather than
-#   adopted. Process-alive,
+#   on another run's namespace. Each name this run wins is recorded SEPARATELY,
+#   at the instant its own exclusive create wins that name, so a later handshake
+#   or fixture step of the SAME run is a recognized re-entry for that name alone,
+#   and any namespace or database already present without this run's own record
+#   for THAT name is refused as foreign (STORE-NAMESPACE-FOREIGN) rather than
+#   adopted. One record never vouches for the other: winning the namespace does
+#   not claim a database this run never created, and an unproven name is never
+#   adopted on the strength of a proven neighbour. Process-alive,
 #   TCP-open, authenticated, schema-ready, and fixture-ready are separate
 #   receipts; schema-ready is true only when the observed client schemaDigest
 #   equals the expected receipt identity, and liveness without auth is not
@@ -4252,21 +4255,34 @@ function New-StoreDefaultStoreClient {
             # create seen again on a later step, or a name this run never won, is
             # decided by the ownership record alone and never by the wording of
             # the server's error: unproven ownership is refused, not adopted.
-            $holdsNames = $false
+            # Re-entry is recognized per NAME, never as one claim covering both.
+            # A single blanket flag would let winning the namespace vouch for a
+            # database this run never created, so a name whose own exclusive
+            # create is still unproven stays unproven and is refused.
+            $holdsNamespace = $false
+            $holdsDatabase = $false
             if ($namespaceOwners.ContainsKey($runId)) {
                 $held = $namespaceOwners[$runId]
-                $holdsNames = ([string]$held['namespace'] -ceq $namespace -and [string]$held['database'] -ceq $database)
-                if (-not $holdsNames) {
+                $heldNamespace = [string]$held['namespace']
+                $heldDatabase = [string]$held['database']
+                if (($heldNamespace.Length -gt 0 -and $heldNamespace -cne $namespace) -or
+                    ($heldDatabase.Length -gt 0 -and $heldDatabase -cne $database)) {
                     throw [System.InvalidOperationException]::new('STORE-NAMESPACE-FOREIGN: this run already owns a different namespace/database than the one presented.')
                 }
+                $holdsNamespace = ($heldNamespace -ceq $namespace)
+                $holdsDatabase = ($heldDatabase -ceq $database)
             }
             $defineNamespaceBody = (& $sendSql $defineNamespace)
             if ($defineNamespaceBody -match '"status"\s*:\s*"ERR"') {
-                if (-not $holdsNames) {
+                if (-not $holdsNamespace) {
                     throw [System.InvalidOperationException]::new('STORE-NAMESPACE-FOREIGN: the namespace was not created by this run''s exclusive create.')
                 }
             } else {
-                $namespaceOwners[$runId] = @{ namespace = $namespace; database = $database }
+                # The record is written for the namespace ONLY, at the moment its
+                # own exclusive create won. The database stays unclaimed until its
+                # own create wins it, so a refused database define can never be
+                # mistaken for this run's own create seen again.
+                $namespaceOwners[$runId] = @{ namespace = $namespace; database = '' }
             }
             $selectNamespaceBody = (& $sendSql ('USE NS {0};' -f $namespace))
             if ($selectNamespaceBody -match '"status"\s*:\s*"ERR"') {
@@ -4274,9 +4290,11 @@ function New-StoreDefaultStoreClient {
             }
             $defineDatabaseBody = (& $sendSql $defineDatabase)
             if ($defineDatabaseBody -match '"status"\s*:\s*"ERR"') {
-                if (-not $holdsNames) {
+                if (-not $holdsDatabase) {
                     throw [System.InvalidOperationException]::new('STORE-NAMESPACE-FOREIGN: the database was not created by this run''s exclusive create.')
                 }
+            } else {
+                $namespaceOwners[$runId] = @{ namespace = $namespace; database = $database }
             }
             $useBody = (& $sendSql $usePrefix)
             if ($useBody -match '"status"\s*:\s*"ERR"') {

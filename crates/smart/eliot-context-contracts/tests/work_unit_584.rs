@@ -1170,6 +1170,7 @@ fn admitted_single() -> AdmittedContextSet {
             route_capacity: 100_000,
         },
         recipe_digest: digest(),
+        policy_sha256: digest(),
         receipt_digest: digest(),
     };
     let mut admitted = AdmittedContextSet {
@@ -2329,6 +2330,30 @@ fn passing_dimension_result(
     }
 }
 
+/// Intrinsically well-formed output binding, in the same shape the sibling
+/// fixtures use (`crates/smart/eliot-context-contracts/tests/context_contracts.rs`,
+/// `.../support/reactive.rs` and `crates/smart/eliot-context-assembly/tests/assembly.rs`).
+///
+/// `QualityOutputBinding::validate` checks the intrinsic shape only - that each
+/// digest is a real digest and each revision field is distinct - so a fixture
+/// card that is graded for its twelve dimensions does not need to name one
+/// packet's exact output. A card bound to a real packet's output is built by
+/// that packet's owner.
+fn fixture_output_binding() -> QualityOutputBinding {
+    QualityOutputBinding {
+        recipe_digest: digest(),
+        fence_digest: digest(),
+        admitted_digest: digest(),
+        rendered_digest: digest(),
+        serializer_id: "fixture-serde-v1".to_owned(),
+        serializer_version: "1".to_owned(),
+        serializer_options_digest: digest(),
+        route_id: "fixture-route".to_owned(),
+        evidence_revisions: Vec::new(),
+        omission_handles: Vec::new(),
+    }
+}
+
 fn full_quality_scorecard(context: &ContextBinding) -> QualityScorecard {
     let dimensions = all_quality_dimensions();
     let results = dimensions
@@ -2339,7 +2364,9 @@ fn full_quality_scorecard(context: &ContextBinding) -> QualityScorecard {
         })
         .collect();
     QualityScorecard {
+        schema_version: QUALITY_SCORECARD_SCHEMA_VERSION,
         binding: context.clone(),
+        output: fixture_output_binding(),
         applicability: resolved_applicability(),
         results,
     }
@@ -2374,10 +2401,20 @@ fn assembled_view() -> (AdmittedContextSet, ActiveUnderstandingView) {
     let mut measurement = exact_measurement(&admitted.binding);
     measurement.envelope_digest.clone_from(&output_digest);
     measurement.rendered_utf8_bytes = rendered_bytes;
+    let execution = eliot_context_contracts::ContextExecutionIdentity {
+        ordering_revision: "a18.role-provider-atom.v1".to_owned(),
+        serializer_id: measurement.serializer_id.clone(),
+        serializer_version: measurement.serializer_version.clone(),
+        serializer_options_digest: measurement.serializer_options_digest.clone(),
+        route_id: measurement.route_id.clone(),
+        model_id: measurement.model_id.clone(),
+        measurement_status: measurement.status,
+    };
     let view = ActiveUnderstandingView::assemble(
         &admitted,
         quality,
         measurement,
+        execution,
         output_digest,
         recipe_digest,
         fence_digest,
@@ -3260,6 +3297,7 @@ fn displacement_conservation_rejects_bare_claims_and_accepts_complete_receipt() 
         applied_rule: id("economy-rule"),
         allocations,
         recipe_digest: digest(),
+        policy_sha256: digest(),
         receipt_digest: "0".repeat(64),
     };
     let mut unsigned = receipt.clone();

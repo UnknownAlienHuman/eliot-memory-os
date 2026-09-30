@@ -29,17 +29,35 @@
 //! exact rule revision the effect was decided under, and a warning is never
 //! presented as governing authority.
 //!
+//! # W5/A1: grading the card is not the same as reading it
+//!
+//! Grading the negative-memory axis above writes one dimension. It does not by
+//! itself say anything about whether the card may enable this effect, so
+//! `require_effect_ready` asks the contract owner's one readiness rule
+//! ([`QualityScorecard::suitability`], the same entry point the other migrated
+//! scorecard consumers apply) for the `DependentAction` verdict, and
+//! [`commit_gated_action`] refuses the write before it happens when a required
+//! dimension is not a current pass. The refusal is typed and names the operation,
+//! the blocking dimension results and any unresolved applicability input, and a
+//! granted verdict grants no authority and no task Finish — it only removes one
+//! way for the effect to proceed.
+//!
 //! [`GetLearningRecordRange`]: eliot_store_api::NamedReadOperation::GetLearningRecordRange
 //! [`commit_canonical_gated_by_negative_memory`]:
 //!     eliot_governor::GovernorComposition::commit_canonical_gated_by_negative_memory
 //! [`NegativeMemoryRuleProjection`]: eliot_governor::NegativeMemoryRuleProjection
+//! [`QualityScorecard::suitability`]:
+//!     eliot_context_contracts::QualityScorecard::suitability
 
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
 
 use eliot_canonical::CanonicalWriteEnvelope;
-use eliot_context_contracts::QualityScorecard;
+use eliot_context_contracts::{
+    QualityApplicabilityInput, QualityDimensionResult, QualityOperation, QualityRefusalKind,
+    QualityScorecard,
+};
 use eliot_dreamer_failure::{
     FailureAction, FailureApplicability, FailureCoverage, FailureDimension, FailureEnvironment,
     NegativeMemoryHorizonDomain, NegativeMemoryHorizonDomainKind, NegativeMemoryMatchBound,
@@ -103,6 +121,40 @@ pub enum NegativeMemoryActionError {
     /// The matched outcome could not be appended to the observation path.
     #[error("negative-memory matched outcome could not be appended: {0}")]
     Observation(String),
+    /// The action's own packet scorecard refused the dependent effect.
+    ///
+    /// This is not the negative-memory gate's refusal and it is not a generic
+    /// quality error: the rule that produced it is
+    /// `QualityScorecard::suitability`, which is the one readiness rule every
+    /// other migrated consumer of a `QualityScorecard` already applies. A card
+    /// that was structurally valid but whose grades do not enable this operation
+    /// stops the effect here, and this variant carries the exact cause rather
+    /// than a string a caller would have to re-derive.
+    #[error(
+        "quality refused the dependent effect: operation {operation:?}, kind {kind:?}, \
+         blocking {blocking:?}, unresolved applicability {unresolved_applicability:?}"
+    )]
+    QualityNotReady {
+        /// The dependent operation that was refused, always named.
+        operation: QualityOperation,
+        /// Which of the rule's three causes refused it.
+        kind: QualityRefusalKind,
+        /// The exact dimension results that block it, in canonical dimension
+        /// order.
+        ///
+        /// These are the caller's own `QualityDimensionResult` values, so the
+        /// state, the failed invariant, the missing/stale members and the
+        /// invalidation handle each blocking dimension carries all travel with
+        /// the refusal instead of being reduced to a dimension name. A
+        /// dimension that is merely unknown, degraded or policy-not-applicable
+        /// appears here too, because the rule refuses it for exactly the same
+        /// reason it refuses a failure.
+        blocking: Vec<QualityDimensionResult>,
+        /// The applicability inputs no owner ever answered. Empty unless
+        /// `kind` is `ApplicabilityUnknown`, in which case this is the whole
+        /// cause and `blocking` is empty.
+        unresolved_applicability: Vec<QualityApplicabilityInput>,
+    },
 }
 
 /// The owner-issued identity of one pending action, as the daemon holds it.
@@ -528,6 +580,73 @@ const fn observation_outcome(
     }
 }
 
+/// Refuse this dependent effect unless the action's own scorecard says it is
+/// ready, using the one shared readiness rule.
+///
+/// # Why this exists, and what it deliberately is not
+///
+/// Before this, `commit_gated_action` graded the card at
+/// `project_action_response` and then committed the effect without ever reading
+/// the grade. That made the scoring write-only: a card whose
+/// `ExactAnchorProvenanceCoverage`, `InstructionSufficiency` or
+/// `VerifierActionReadiness` axis was `Failed`, `Unknown`, `Degraded`,
+/// `NotApplicable` or invalidated still produced a committed canonical effect,
+/// which is precisely the acceptance row "a packet with high relevance but a
+/// missing exact anchor, active directive or required verifier **cannot enable
+/// its dependent action**".
+///
+/// This is not a second rule. It asks
+/// [`QualityScorecard::suitability`](eliot_context_contracts::QualityScorecard::suitability) —
+/// the same entry point `assemble_active_view`, the reactive delivery closure,
+/// `ActiveUnderstandingView::suitability` and the understanding-assessment
+/// gate already apply — and it deliberately re-derives nothing locally:
+///
+/// * the required set is the operation's closed `required_dimensions()` unioned
+///   with `additional_required` *inside the rule*, so passing an empty
+///   `additional_required` here can only ever fail to add a blocker. There is no
+///   argument, flag or code path on which this caller supplies a reduced set,
+///   because the mandatory set is not an input to this function at all;
+/// * the rule runs `self.validate()` first and reports a card that does not
+///   describe a gradeable packet as `InvalidScorecard`, so a deserialized or
+///   default-constructed card cannot reach the commit by satisfying structure;
+/// * the operation is `DependentAction`, so this refuses *this* operation and
+///   nothing else. `DiagnosticDisplay` still returns a value carrying its
+///   limitations, and a packet that cannot act can still be shown.
+///
+/// # What a pass does and does not mean here
+///
+/// A granted suitability grants no authority, no task Finish and no admission to
+/// the negative-memory gate: it says only that this card's required dimensions
+/// are current observed passes. Every other refusal on this path — the gate's
+/// own `Block`, the probe demand, the Governor's commit — still applies
+/// unchanged, and this function only ever adds a way for the path to stop.
+///
+/// # Errors
+///
+/// Returns [`NegativeMemoryActionError::QualityNotReady`] carrying the operation,
+/// the refusal class, the blocking dimension results and the unresolved
+/// applicability inputs. The cause is kept whole rather than stringified, so
+/// nothing downstream has to re-derive which dimension lacks which evidence.
+fn require_effect_ready(
+    scorecard: Option<&QualityScorecard>,
+) -> Result<(), NegativeMemoryActionError> {
+    // An action with no packet scorecard has nothing to grade against. This is
+    // the pre-existing shape of the parameter — the gate grades a card when the
+    // caller holds one — and this function does not invent a card to grade, so a
+    // cardless action reaches the negative-memory gate exactly as it did before.
+    let Some(card) = scorecard else {
+        return Ok(());
+    };
+    card.suitability(QualityOperation::DependentAction, &[])
+        .map_err(|refusal| NegativeMemoryActionError::QualityNotReady {
+            operation: refusal.operation,
+            kind: refusal.kind,
+            blocking: refusal.blocking,
+            unresolved_applicability: refusal.unresolved_applicability,
+        })?;
+    Ok(())
+}
+
 /// Commits one canonical action under the negative-memory gate.
 ///
 /// This is the production caller of
@@ -536,6 +655,19 @@ const fn observation_outcome(
 /// re-read the scope revision head for the dispatch revalidation, evaluate the
 /// gate, append the matched outcome, and only then commit. A refusing decision
 /// is appended as a refusal and never dispatches.
+///
+/// # W5/A1: the scorecard's own verdict is read before the effect
+///
+/// This is the only live production effect consumer that touches a
+/// `QualityScorecard`, and until now it graded the card and committed the effect
+/// without ever consulting the grade: `project_action_response` writes the
+/// negative-memory axis and returns `Ok(())`, so a card carrying
+/// `ExactAnchorProvenanceCoverage`, `InstructionSufficiency` or
+/// `VerifierActionReadiness` in any non-`Passed` state was still committed as an
+/// effect and the grading was write-only. `require_effect_ready` now asks the
+/// one shared readiness rule what this operation requires and refuses the write
+/// with a typed cause naming the operation and the exact missing evidence, so a
+/// visible dimension failure stops its dependent action.
 ///
 /// # Errors
 ///
@@ -568,7 +700,16 @@ pub async fn commit_gated_action<P: KernelGenerationPort + ?Sized>(
         probe_admission: None,
     };
     let decision = evaluate_negative_memory_gate(&input);
-    let projection = project_action_response(action, &resolved, scorecard)?;
+    // The card is graded first and read back second, so the verdict covers the
+    // negative-memory axis this dispatch produced rather than the card as it
+    // arrived. The caller's `Option<&mut _>` is reborrowed once, mutably, for
+    // the grading call; the readiness call then reborrows that same `&mut` as a
+    // shared reference. Both therefore see ONE card, and the caller's binding
+    // is left intact because the reborrow never moves out of the parameter.
+    let mut card = scorecard;
+    let projection =
+        project_action_response(action, &resolved, card.as_deref_mut().map(|it| &mut *it))?;
+    require_effect_ready(card.as_deref())?;
     let probe = probe_for(&decision, &resolved)?;
     if let Some(refusal) = negative_memory_gate_refusal_message(&decision) {
         let _ = append_matched_outcome(

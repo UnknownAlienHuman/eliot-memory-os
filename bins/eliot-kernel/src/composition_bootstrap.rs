@@ -1253,7 +1253,19 @@ impl KernelComposition {
             .supervision_lease_authority
             .clone()
             .map(|authority| {
-                KernelSupervisionLeaseAuthority::new(Arc::clone(&ors), work_root.clone(), authority)
+                let profile = config.supervision_installation_profile.ok_or_else(|| {
+                    KernelBuildError::Service(
+                        "supervision authority requires the retained installation profile"
+                            .to_owned(),
+                    )
+                })?;
+                KernelSupervisionLeaseAuthority::new(
+                    Arc::clone(&ors),
+                    work_root.clone(),
+                    profile,
+                    config.portable_dev_repository_root.clone(),
+                    authority,
+                )
             })
             .transpose()?;
         let _ = &platform;
@@ -1284,6 +1296,35 @@ impl KernelComposition {
                 requirement.state_fence.resource_generation,
             ),
         };
+        // I5.11 stage 8 / #1872: the durable `canonical_store` route owner must
+        // name a generation BEFORE any Store gateway exists, or "no committed
+        // cutover for this scope" stays indistinguishable from "any generation
+        // may serve" — which is the initial state of every installation, and the
+        // window an approved-but-uncommitted candidate bridge would serve
+        // canonical reads and writes through. Composition is therefore the owner
+        // of the *initial* owner only, and it records it exactly once: the
+        // Kernel Generation Registry ingress owns every later change, through a
+        // committed cutover for the same scope.
+        //
+        // The read comes first and is the whole guard. Once a committed cutover
+        // names an owner, or an owner was already established, nothing is written
+        // here at all: re-establishing from a Host descriptor is exactly the
+        // configuration flip this closes, so the writer is only ever reached on
+        // an installation that has neither.
+        if eliot_kernel_service::canonical_store_route_owner(&ors)
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?
+            .is_none()
+        {
+            eliot_kernel_service::establish_canonical_store_route_owner(&ors, generation)
+                .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+            observe_entrypoint_with_detail(
+                EntrypointStage::Composition,
+                &format!(
+                    "kernel.composition.canonical_store_owner_established:generation={}",
+                    generation.value()
+                ),
+            );
+        }
         let mut generations = GenerationRouter::at_epoch(canonical_epoch.clone());
         generations
             .register(

@@ -1218,9 +1218,10 @@ mod gateway_cases {
     use eliot_ipc::{NamedPipeServer, NamedPipeTransport, PeerIdentity, server_hello_frame};
     use eliot_kernel_core::{GenerationRoute, RouteScope};
     use eliot_kernel_service::{
-        HostFileIdentity, HostJobBinding, HostJobIdentity, HostJobRoot, HostKernelCandidateBinding,
-        HostProcessBinding, KernelActivationPermit, KernelControlCommand, KernelReadyReceipt,
-        KernelService, KernelServiceState, KernelStoreGateway, ProcessObservation, RestartBudget,
+        CommitRecoveryError, DreamerJobGatewayError, HostFileIdentity, HostJobBinding,
+        HostJobIdentity, HostJobRoot, HostKernelCandidateBinding, HostProcessBinding,
+        KernelActivationPermit, KernelControlCommand, KernelReadyReceipt, KernelService,
+        KernelServiceState, KernelStoreGateway, ProcessObservation, RestartBudget,
     };
     use eliot_platform::KernelActivationNonce;
     use eliot_runtime_contracts::{
@@ -1756,7 +1757,16 @@ mod gateway_cases {
             .dreamer_job(&edge.ctx, edge.request)
             .await
             .expect_err("779/20 fenced gateway must reject");
-        assert!(error.contains("fenced"), "779/20 got {error:?}");
+        // `DreamerJobGatewayError` is typed: a fence refusal travels as
+        // `GatewayRefusal`, whose documented contract is that its text is
+        // preserved exactly and never reinterpreted on the way out, so the
+        // owner-issued refusal text is what this assertion reads. A typed
+        // `Commit` or `Uncertain` variant would be a different disposition
+        // entirely and must not satisfy a fence-refusal expectation.
+        let DreamerJobGatewayError::GatewayRefusal(refusal) = error else {
+            panic!("779/20 expected a gateway refusal, got {error:?}");
+        };
+        assert!(refusal.contains("fenced"), "779/20 got {refusal:?}");
         let (dreamer, receipt) = {
             let log = setup.log.lock().expect("loopback log");
             (log.dreamer.clone(), log.receipt.clone())
@@ -1787,9 +1797,16 @@ mod gateway_cases {
             .dreamer_job(&edge.ctx, edge.request)
             .await
             .expect_err("779/21 foreign lineage must fail the route gate");
+        // As above: the route gate refuses with `GatewayRefusal`, and that
+        // variant's text is the owner's own preserved refusal message.
+        let DreamerJobGatewayError::GatewayRefusal(refusal) = error else {
+            panic!("779/21 expected a gateway refusal, got {error:?}");
+        };
         assert!(
-            error.contains("epoch") || error.contains("generation") || error.contains("route"),
-            "779/21 got {error:?}"
+            refusal.contains("epoch")
+                || refusal.contains("generation")
+                || refusal.contains("route"),
+            "779/21 got {refusal:?}"
         );
         let dreamer = { setup.log.lock().expect("loopback log").dreamer.clone() };
         assert!(dreamer.is_empty(), "779/21 no ledger frame");
@@ -1809,10 +1826,13 @@ mod gateway_cases {
             .dreamer_job(&edge.ctx, edge.request)
             .await
             .expect_err("779/22 denied role must fail");
-        assert!(error.contains("role"), "779/22 got {error:?}");
+        let DreamerJobGatewayError::GatewayRefusal(refusal) = error else {
+            panic!("779/22 expected a gateway refusal, got {error:?}");
+        };
+        assert!(refusal.contains("role"), "779/22 got {refusal:?}");
         assert!(
-            !error.contains("eliotd") && !error.contains("daemon"),
-            "779/22 caller rule must not be a source check, got {error:?}"
+            !refusal.contains("eliotd") && !refusal.contains("daemon"),
+            "779/22 caller rule must not be a source check, got {refusal:?}"
         );
         let dreamer = { setup.log.lock().expect("loopback log").dreamer.clone() };
         assert!(dreamer.is_empty(), "779/22 no ledger frame");
@@ -1856,7 +1876,10 @@ mod gateway_cases {
             .dreamer_job(&edge.ctx, edge.request)
             .await
             .expect_err("779/23 split fence must fail");
-        assert!(error.contains("fence"), "779/23 got {error:?}");
+        let DreamerJobGatewayError::GatewayRefusal(refusal) = error else {
+            panic!("779/23 expected a gateway refusal, got {error:?}");
+        };
+        assert!(refusal.contains("fence"), "779/23 got {refusal:?}");
         let dreamer = { setup.log.lock().expect("loopback log").dreamer.clone() };
         assert!(dreamer.is_empty(), "779/23 no ledger frame");
         finish_loopback(setup).await;
@@ -1874,7 +1897,19 @@ mod gateway_cases {
             .dreamer_job(&edge.ctx, edge.request)
             .await
             .expect_err("779/24 unknown answer must stay unknown");
-        assert!(error.contains("receipt"), "779/24 got {error:?}");
+        // "Unknown answer must stay unknown" is a statement about the
+        // disposition, and the disposition is now a typed variant. Matching
+        // `UnknownCommitOpen` is strictly stronger than the substring it
+        // replaces: it proves the outcome is recorded as an open unknown commit
+        // with its preservation and paused scopes, not merely that some message
+        // happened to contain the word "receipt".
+        assert!(
+            matches!(
+                error,
+                DreamerJobGatewayError::Commit(CommitRecoveryError::UnknownCommitOpen { .. })
+            ),
+            "779/24 expected an open unknown-commit refusal, got {error:?}"
+        );
         let (dreamer, receipt) = {
             let log = setup.log.lock().expect("loopback log");
             (log.dreamer.clone(), log.receipt.clone())

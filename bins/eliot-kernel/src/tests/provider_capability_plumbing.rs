@@ -70,6 +70,21 @@ fn identity(value: &str) -> OperationIdentity {
     OperationIdentity::new(value).expect("operation identity")
 }
 
+/// The worker cell this Kernel admits, named once so the staged rows below
+/// carry the same cell identity the admission gate binds.
+fn test_capability_cell() -> eliot_contracts::CapabilityCellId {
+    eliot_contracts::CapabilityCellId::new("native-worker-core").expect("cell id")
+}
+
+/// The generated #13 capability-cell registry digest, resolved through the same
+/// owner the admission gate reads it through. Never a canned constant: the
+/// durable cell proof refuses a row whose registry digest is not this value.
+fn test_capability_cell_registry_digest() -> String {
+    crate::composition_bootstrap::native_worker_cell_registry_digest(&test_capability_cell())
+        .expect("generated capability-cell registry resolves the worker cell")
+        .to_owned()
+}
+
 fn candidate_binding(sequence: u64) -> HostKernelCandidateBinding {
     use eliot_kernel_service::{HostFileIdentity, HostJobIdentity, HostJobRoot, RestartBudget};
     HostKernelCandidateBinding {
@@ -256,6 +271,12 @@ fn stage_row(
         execution_unit_schema_version: 1,
         predecessor_revision: label("predecessor-t904"),
         resource_envelope_digest: "f".repeat(63) + "0",
+        // Production binds both from the presented executable join
+        // (`native_worker_claim_staged_record`); this row stands in for a
+        // wire-v2 admitted claim, so it carries the same cell pair rather than
+        // the legacy-joinless `None` pair.
+        capability_cell: Some(label(test_capability_cell().as_str())),
+        capability_cell_registry_digest: Some(test_capability_cell_registry_digest()),
         state: NativeWorkerClaimState::Admitted,
         receipt_digest: Some("d".repeat(64)),
         admitted_at_unix_ms: Some(1_700_000_000_000),

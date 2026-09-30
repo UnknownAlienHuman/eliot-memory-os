@@ -32,29 +32,32 @@ const HOST_COMPOSITION_REQUESTER: &str = "host-composition";
 /// it, while a plain SCM demand-start has no approved transaction to name and
 /// stays the Host lifecycle opening its own control contour.
 ///
-/// Both drive the same capability requirement. I1.5 starts the Kernel and the
-/// independent Watchdog as sibling activation branches of the control contour,
-/// and the Host readiness fence refuses `ControlReady` without a proven Store
-/// branch, so a generation that is about to run that fence requires all three
-/// capabilities. A narrower observable-use class contributes its own set later,
-/// through the `ActivationTriggerClass` vocabulary.
+/// Each arm records the capability set of the admission it actually holds.
+/// The installer-pending arm records the admitted
+/// [`ActivationTriggerClass::ApprovedMaintenanceJob`] set — the authenticated
+/// request the pending transaction carries — not the bootstrap full contour,
+/// so a generation created for that request is never bound to a broader
+/// requirement no admitted request stated. The bare SCM arm has no admitted
+/// request to record, so it keeps the bootstrap control contour the Host
+/// readiness fence needs; narrower or broader observable-use classes that join
+/// later contribute their own [`ActivationTriggerClass::requested_capabilities`]
+/// set through the coalescing append path, which only ever unions admitted
+/// trigger sets into the durable record and never rewrites this creation
+/// ingress.
 fn activation_ingress(
     pending: Option<&eliot_installation::PendingActivation>,
 ) -> ActivationIngress {
-    let (trigger_class, requester) = match pending {
-        Some(pending) => (
-            ActivationTriggerClass::ApprovedMaintenanceJob.as_str(),
-            format!("pending-activation:{}", pending.transaction_id.as_str()),
-        ),
-        None => (
-            HOST_LIFECYCLE_TRIGGER_CLASS,
-            HOST_COMPOSITION_REQUESTER.to_owned(),
-        ),
-    };
-    ActivationIngress {
-        trigger_class,
-        requester,
-        capabilities: control_contour_capabilities(),
+    match pending {
+        Some(pending) => ActivationIngress {
+            trigger_class: ActivationTriggerClass::ApprovedMaintenanceJob.as_str(),
+            requester: format!("pending-activation:{}", pending.transaction_id.as_str()),
+            capabilities: ActivationTriggerClass::ApprovedMaintenanceJob.requested_capabilities(),
+        },
+        None => ActivationIngress {
+            trigger_class: HOST_LIFECYCLE_TRIGGER_CLASS,
+            requester: HOST_COMPOSITION_REQUESTER.to_owned(),
+            capabilities: control_contour_capabilities(),
+        },
     }
 }
 
@@ -203,6 +206,27 @@ pub(super) fn persist_pending_recovery(
     reason: &str,
 ) -> Result<(), HostError> {
     host_epoch_observe("host.epoch pending recovery requested");
+    pending
+        .manifest
+        .runtime_launch
+        .validate()
+        .map_err(HostError::Installation)?;
+    if !crate::windows_paths_equal(
+        Path::new(
+            pending
+                .manifest
+                .runtime_launch
+                .runtime_state_roots
+                .host_state_root
+                .as_str(),
+        ),
+        host_state_root,
+    ) {
+        return Err(HostError::ProcessContour(
+            "pending recovery profile does not bind the selected Host root".to_owned(),
+        ));
+    }
+    let profile = pending.manifest.runtime_launch.profile;
     let expected_revision = registry.revision();
     let expected_post_revision = if registry.pending_activation().is_some_and(|current| {
         current.approval == pending.approval
@@ -224,7 +248,7 @@ pub(super) fn persist_pending_recovery(
         // #1339, A13.9: short-lived open-use-drop CAS; the handle is dropped
         // before the readback open below, so concurrent Watchdog/installer
         // readers never observe a Host-held exclusive lock.
-        let store = crate::open_registry_store_at(host_state_root)?;
+        let store = crate::open_registry_store_at_profile(host_state_root, profile)?;
         store.mark_pending_recovery(
             host_capability,
             expected_revision,
@@ -233,7 +257,7 @@ pub(super) fn persist_pending_recovery(
         )
     };
     let durable = {
-        let store = crate::open_registry_store_at(host_state_root)?;
+        let store = crate::open_registry_store_at_profile(host_state_root, profile)?;
         store.load().map_err(|readback_error| {
             HostError::RecoveryRequired(format!(
                 "{reason}; recovery disposition outcome is unknown and registry readback failed: {readback_error}"
@@ -281,6 +305,10 @@ pub(super) fn persist_pending_recovery(
 pub(super) fn open_production_epoch(
     path: &Path,
     installation: PlatformHandle,
+    profile: eliot_installation::InstallationProfile,
+    profile_selection: Option<
+        &eliot_platform_windows::profile_supervision::ProfileSelectionReceipt,
+    >,
     pending: Option<&eliot_installation::PendingActivation>,
     active_phase_b_rebind: Option<&eliot_installation::ActivePhaseBRebind>,
     store_recovery_fences: &[StoreRecoveryReopenFence],
@@ -296,7 +324,44 @@ pub(super) fn open_production_epoch(
     HostError,
 > {
     host_epoch_observe("host.epoch production open requested");
-    let backend = RedbJournalBackend::open_at(path).map_err(JournalError::Backend)?;
+    let backend = match profile {
+        eliot_installation::InstallationProfile::SystemService => {
+            if profile_selection.is_some() {
+                return Err(HostError::ProcessContour(
+                    "SystemService journal reopen cannot accept a current-user root receipt"
+                        .to_owned(),
+                ));
+            }
+            RedbJournalBackend::open_at(path)
+        }
+        eliot_installation::InstallationProfile::UserMode
+        | eliot_installation::InstallationProfile::PortableDev => {
+            let selection = profile_selection.ok_or_else(|| {
+                HostError::ProcessContour(
+                    "current-user journal reopen requires the descriptor-validated root receipt"
+                        .to_owned(),
+                )
+            })?;
+            let profile_matches_selection = matches!(
+                (profile, selection.profile),
+                (
+                    eliot_installation::InstallationProfile::UserMode,
+                    eliot_platform_windows::profile_supervision::ProfileSelection::UserMode
+                ) | (
+                    eliot_installation::InstallationProfile::PortableDev,
+                    eliot_platform_windows::profile_supervision::ProfileSelection::PortableDev
+                )
+            );
+            if !profile_matches_selection {
+                return Err(HostError::ProcessContour(
+                    "current-user journal root receipt does not match the selected profile"
+                        .to_owned(),
+                ));
+            }
+            RedbJournalBackend::open_user_owned_at(path, selection)
+        }
+    }
+    .map_err(JournalError::Backend)?;
     host_epoch_observe("host.epoch backend open observed");
     open_production_epoch_from_backend(
         backend,

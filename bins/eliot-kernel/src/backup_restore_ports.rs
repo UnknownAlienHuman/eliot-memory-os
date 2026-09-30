@@ -402,6 +402,20 @@ pub enum KernelRestoreError {
     JournalBindingConflict,
     /// The isolated destination is invalid or escapes the work root.
     DestinationInvalid(String),
+    /// The recovery import's target is not an owner-admitted isolated
+    /// destination of THIS operation (issue #955, A11).
+    ///
+    /// This is deliberately not [`DestinationInvalid`](Self::DestinationInvalid)
+    /// and not [`TargetFailed`](Self::TargetFailed): a caller deciding whether
+    /// to clear the isolated area, re-run the command, or escalate to the
+    /// destination owner is deciding on different facts in the three cases and
+    /// must be able to tell them apart. A destination that is malformed or
+    /// escapes the work root is `DestinationInvalid`; a destination whose bytes
+    /// are simply not this operation's to write into is this refusal; an engine
+    /// failure that already ran is `TargetFailed`. It is raised before any
+    /// destination byte is staged and never downgraded to a no-op, an in-memory
+    /// substitute, or a formatted string.
+    DestinationNotAdmitted,
     /// The Kernel fence does not admit this archive.
     FenceMismatch(String),
     /// The archive or its class denominator is invalid.
@@ -454,6 +468,10 @@ impl std::fmt::Display for KernelRestoreError {
             Self::DestinationInvalid(detail) => {
                 write!(formatter, "isolated destination invalid: {detail}")
             }
+            Self::DestinationNotAdmitted => write!(
+                formatter,
+                "recovery import target is not an owner-admitted isolated destination of this operation"
+            ),
             Self::FenceMismatch(detail) => {
                 write!(formatter, "kernel fence does not admit archive: {detail}")
             }
@@ -553,6 +571,7 @@ pub fn kernel_to_backup(error: KernelRestoreError) -> BackupError {
         KernelRestoreError::StagedCleanupIncomplete { primary, .. } => primary,
         KernelRestoreError::CutoverNotAuthorized => BackupError::CutoverNotAuthorized,
         KernelRestoreError::DestinationInvalid(_)
+        | KernelRestoreError::DestinationNotAdmitted
         | KernelRestoreError::FenceMismatch(_)
         | KernelRestoreError::ArchiveInvalid(_)
         | KernelRestoreError::CapabilityMissing { .. }
@@ -591,9 +610,17 @@ pub fn require_production_admitted(
 /// itself is NOT carried here: it is injected as `J: RestoreJournalPort`
 /// (see [`require_production_admitted`]) so no substitute can hide inside
 /// this bundle. Owner channels that are not yet bound here (canonical Store,
-/// ORS recovery, Watchdog spool, Blob, installation identity) arrive as
-/// evidence obligations in the finalized receipt, never as live handles in
-/// this struct. The issues that delivered those owner sides — #952 (PR #3881),
+/// ORS recovery, the #955 Watchdog reconciliation channel, Blob, installation
+/// identity) arrive as evidence obligations in the finalized receipt, never as
+/// live handles in this struct.
+///
+/// The #955 side is bound only as far as the ARCHIVE allows: the mandatory
+/// `watchdog_spool` member is now read and its unresolved critical signals are
+/// carried as suspended historical evidence, so the member is neither dropped
+/// nor published as reconciled. Reconciliation is the #955 owner's own decision
+/// and no Watchdog authority is ever activated here, so `watchdog_signals`
+/// stays an unsatisfied obligation. The issues that delivered those owner
+/// sides — #952 (PR #3881),
 /// #953 (PR #3833), #955 (PR #2716), #956 (PR #2435) and #958 (PR #3879, whose
 /// destination-evidence producer this file now carries) — are
 /// coordination history, not code in this repository: what is absent is the
@@ -896,13 +923,17 @@ pub struct PinnedDestinationAdmission {
 // `RedbRecoveryStore` that production composition already owns.
 // ---------------------------------------------------------------------------
 
-/// Owner-derived identity of one ORS restore-journal stream family.
+/// Identity of one ORS restore-journal stream family, of which exactly one
+/// field — `installation_ref` — is owner-derived from live composition.
 ///
-/// Every field is an exact owner fact taken from live composition, every field
-/// is private, and there is exactly one constructor
+/// Every field is private and there is exactly one constructor
 /// ([`OrsRestoreBinding::from_composition`]): a caller cannot build this value
 /// field by field, name its own installation, or write a blank or malformed
-/// value that a placeholder would then have to replace.
+/// value that a placeholder would then have to replace. The other three fields
+/// are the archive's own manifest facts, this Kernel's own writer identity, and
+/// the DECLARED destination of the execution being bound — each field's own doc
+/// states exactly which of those it is, and which of them the owner re-proves
+/// rather than the constructor accepting.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OrsRestoreBinding {
     /// Exact source archive identity under restore.
@@ -910,13 +941,27 @@ pub struct OrsRestoreBinding {
     /// Exact archive class of that source. A class is never silently changed
     /// to make an effect admissible.
     archive_class: RestoreJournalArchiveClass,
-    /// Exact isolated destination identity, declared by live composition.
+    /// Exact isolated destination identity this restore is bound to.
     ///
-    /// It is checked against the destination this execution constructs and
-    /// against the destination the ORS owner durably bound to the stream, so a
-    /// binding that names another destination refuses on read and on append. It
-    /// is a composition-declared owner fact like `writer_id`, not a value taken
-    /// from a request.
+    /// It is checked against the destination this execution constructs
+    /// (`check_ors_journal_binding`, `backup_restore.rs`) and against the
+    /// destination the ORS owner durably bound to the stream, so a binding that
+    /// names another destination refuses on read and on append.
+    ///
+    /// It is NOT a field no request can reach, and this doc does not claim it is.
+    /// On the production front door
+    /// (`request_dispatch::handle_backup_restore_test`) the constructor is given
+    /// the DECLARED `RestoreContext::target_id` of the request's typed target,
+    /// because the owner-issued PREPARED, UNACTIVATED destination admission —
+    /// `PinnedDestinationAdmission` (#958), pinned at prepare from
+    /// `RestorePorts::manifest_evidence` — has no channel on that front door to
+    /// issue one. What stands behind the value is therefore the owner's re-proof
+    /// named above and the owner's refusal, not a sanitiser in this constructor:
+    /// a declaration that disagrees with the destination the engine constructs,
+    /// or with the durable row, is refused by the owner. Callers that can obtain
+    /// Host admission pin it instead and are still structurally unable to
+    /// become a cutover candidate, because the pin carries the rehearsal
+    /// posture beside the evidence.
     destination_ref: String,
     /// Exact Kernel writer identity that owns the stream.
     writer_id: String,
@@ -2037,6 +2082,7 @@ pub fn ors_to_backup(error: OrsError) -> BackupError {
             },
         },
         OrsError::Contract(detail) => BackupError::Foundation(detail),
+        OrsError::StoreContract(source) => BackupError::Store(*source),
         OrsError::AuthorityHandoffNotFresh
         | OrsError::StaleWriterEpoch
         | OrsError::RecoveryOwnerMismatch => BackupError::FenceMismatch {

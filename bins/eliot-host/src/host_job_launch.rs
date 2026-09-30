@@ -31,6 +31,9 @@ use eliot_platform_windows::{
     JobObjectIdentity, JobObjectLimits, PinnedRuntimeFile, RunningJobChild, SuspendedJobChild,
     SuspendedLaunchSpec, TcpListenerOwnerError, UserOwnedRootLease,
     observe_loopback_tcp_listener_owner,
+    profile_supervision::{
+        ProfileRootPaths, ProfileRootRequest, ProfileSelection, ProfileSelectionReceipt,
+    },
 };
 
 #[cfg(windows)]
@@ -333,7 +336,9 @@ pub(super) fn ensure_store_endpoint_available(
 /// Checks a pre-recovery endpoint while the retained, independently verified
 /// old Store child may still own its listener. The caller must prove the old
 /// child's Job membership and committed predecessor binding before passing
-/// its PID; this observation grants no ownership to any other listener.
+/// its PID; this observation grants no ownership to any other listener. A
+/// degenerate retained claim (PID 0) and a corrupt owner observation (PID 0)
+/// each fail closed before any admission or directive.
 ///
 /// A preflight port check is not sufficient on its own: the occupant can
 /// change between this read and the real connection. This function therefore
@@ -365,7 +370,34 @@ pub(super) fn ensure_store_endpoint_available_or_owned(
         AdmittedCollisionOperation::FreshDependencyStart
     };
 
+    // Issue #1775 (A-stale): a degenerate retained claim fails before any
+    // observation is admitted or directed. PID 0 is never a real child
+    // process, so a caller projecting its exact-identity proof to PID 0
+    // proves no retained child; admitting it on a free endpoint would let an
+    // unproven caller proceed toward termination and relaunch. The production
+    // reconnect caller refuses a zero PID before calling, so this fires only
+    // on caller error, never on a genuine owned reconnect.
+    if retained_old_child_pid == Some(0) {
+        host_launch_observe("host.launch retained child identity degenerate");
+        return Err(HostError::ProcessContour(
+            "retained owned child has no observable process identity".to_owned(),
+        ));
+    }
+
     match store_endpoint_foreign_occupant(endpoint) {
+        // Issue #1775 (A-stale): PID 0 can never own a socket, so an owner
+        // observation of PID 0 is corrupt rather than an occupant. It is
+        // refused as an untrustworthy read instead of being recorded into a
+        // directive or admitted against the retained child; a corrupt read is
+        // not absence, so the start/reconnect defers.
+        StoreEndpointObservation::Occupied {
+            owner_process_id: 0,
+        } => {
+            host_launch_observe("host.launch store endpoint owner unobservable");
+            Err(HostError::StoreEndpointOwnerUnreadable(format!(
+                "planned Store endpoint {endpoint} owner observation is not a real process; a corrupt read is not absence, so the start/reconnect defers until exact installation ownership is observable"
+            )))
+        }
         StoreEndpointObservation::Occupied { owner_process_id }
             if Some(owner_process_id) == retained_old_child_pid =>
         {
@@ -608,6 +640,8 @@ impl HostJobBranches {
         working_directory: &Path,
         kernel_launch_binding: Option<&KernelLaunchBinding>,
         receipt_binding: Option<(&Path, &Path, &Path, &PlatformHandle)>,
+        installation_profile: Option<InstallationProfile>,
+        profile_root_binding: Option<(&ProfileRootRequest, &ProfileSelectionReceipt)>,
     ) -> Result<RunningJobChild<PlatformHandle>, HostError> {
         // WORK_UNIT_CASE: 978/1 — launch requested, distinct from process/readiness.
         // WORK_UNIT_CASE: 978/4 — request precedes process identity and admitted launch.
@@ -618,6 +652,23 @@ impl HostJobBranches {
             return Err(HostError::ProcessContour(
                 "launch locator is not bound to its retained protected file".to_owned(),
             ));
+        }
+        if let Some((request, expected_selection)) = profile_root_binding {
+            let retained =
+                eliot_platform_windows::profile_supervision::open_profile_root_leases(request)
+                    .map_err(|error| {
+                        HostError::ProcessContour(format!("reopen Kernel profile roots: {error}"))
+                    })?;
+            if retained.selection() != expected_selection {
+                return Err(HostError::ProcessContour(
+                    "Kernel profile roots changed before child launch".to_owned(),
+                ));
+            }
+            retained.verify_stable_identity().map_err(|error| {
+                HostError::ProcessContour(format!(
+                    "Kernel profile roots changed before child launch: {error}"
+                ))
+            })?;
         }
         // WORK_UNIT_CASE: 978/3 — retained lease bound, distinct from image name below.
         host_launch_observe("host.launch retained lease bound");
@@ -663,6 +714,87 @@ impl HostJobBranches {
             host_launch_observe("host.launch substitution preserved");
             HostError::ProcessContour(error.to_string())
         })?;
+        let mut environment = Self::environment(
+            host,
+            generation,
+            config_digest,
+            artifact,
+            config_path,
+            identity,
+            kernel_launch_binding,
+            receipt_binding,
+        );
+        if let Some(profile) = installation_profile {
+            let profile_name = match profile {
+                InstallationProfile::SystemService => "system_service",
+                InstallationProfile::UserMode => "user_mode",
+                InstallationProfile::PortableDev => "portable_dev",
+            };
+            environment.push((
+                OsString::from("ELIOT_INSTALLATION_PROFILE"),
+                OsString::from(profile_name),
+            ));
+            match (profile, profile_root_binding) {
+                (InstallationProfile::SystemService, None) => {}
+                (InstallationProfile::SystemService, Some(_)) => {
+                    return Err(HostError::ProcessContour(
+                        "SystemService launch cannot receive current-user root authority"
+                            .to_owned(),
+                    ));
+                }
+                (
+                    InstallationProfile::UserMode | InstallationProfile::PortableDev,
+                    Some((request, selection)),
+                ) => {
+                    let expected = match profile {
+                        InstallationProfile::UserMode => ProfileSelection::UserMode,
+                        InstallationProfile::PortableDev => ProfileSelection::PortableDev,
+                        InstallationProfile::SystemService => {
+                            return Err(HostError::ProcessContour(
+                                "SystemService launch cannot receive current-user root authority"
+                                    .to_owned(),
+                            ));
+                        }
+                    };
+                    if request.profile != expected || selection.profile != expected {
+                        return Err(HostError::ProcessContour(
+                            "Kernel launch profile does not match its retained root binding"
+                                .to_owned(),
+                        ));
+                    }
+                    let request = serde_json::to_string(request).map_err(|error| {
+                        HostError::ProcessContour(format!(
+                            "serialize Kernel profile roots: {error}"
+                        ))
+                    })?;
+                    let selection = serde_json::to_string(selection).map_err(|error| {
+                        HostError::ProcessContour(format!(
+                            "serialize Kernel profile selection: {error}"
+                        ))
+                    })?;
+                    environment.extend([
+                        (
+                            OsString::from("ELIOT_PROFILE_ROOT_REQUEST"),
+                            OsString::from(request),
+                        ),
+                        (
+                            OsString::from("ELIOT_PROFILE_ROOT_SELECTION"),
+                            OsString::from(selection),
+                        ),
+                    ]);
+                }
+                (InstallationProfile::UserMode | InstallationProfile::PortableDev, None) => {
+                    return Err(HostError::ProcessContour(
+                        "current-user Kernel launch is missing its retained root binding"
+                            .to_owned(),
+                    ));
+                }
+            }
+        } else if profile_root_binding.is_some() {
+            return Err(HostError::ProcessContour(
+                "non-Kernel process cannot receive a Kernel profile root binding".to_owned(),
+            ));
+        }
         let spec = SuspendedLaunchSpec::new(
             executable.to_path_buf(),
             arguments
@@ -670,16 +802,7 @@ impl HostJobBranches {
                 .map(|argument| OsString::from(argument.as_str()))
                 .collect(),
             working_directory,
-            Self::environment(
-                host,
-                generation,
-                config_digest,
-                artifact,
-                config_path,
-                identity,
-                kernel_launch_binding,
-                receipt_binding,
-            ),
+            environment,
         )
         .map_err(|error| {
             // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
@@ -999,6 +1122,23 @@ impl HostJobBranches {
                 host_launch_observe("host.launch typed rejection");
                 HostError::ProcessContour(error.to_string())
             })?;
+        let profile_root_binding = if matches!(
+            launch.profile,
+            InstallationProfile::UserMode | InstallationProfile::PortableDev
+        ) {
+            let request = profile_root_request(launch)?;
+            let leases =
+                eliot_platform_windows::profile_supervision::open_profile_root_leases(&request)
+                    .map_err(|error| {
+                        host_launch_observe("host.launch profile roots rejected");
+                        HostError::ProcessContour(format!(
+                            "profile-governed roots could not be retained: {error}"
+                        ))
+                    })?;
+            Some((request, leases))
+        } else {
+            None
+        };
         let portable_root = if launch.profile == InstallationProfile::PortableDev {
             let root = PathBuf::from(
                 launch
@@ -1151,6 +1291,8 @@ impl HostJobBranches {
                     &store_working_directory,
                     None,
                     None,
+                    None,
+                    None,
                 )
             },
             |store| -> Result<(), StoreLivenessEvidence> {
@@ -1202,6 +1344,10 @@ impl HostJobBranches {
                         watchdog_anchor_root,
                         &launch.runtime_state_roots.roots_digest,
                     )),
+                    Some(launch.profile),
+                    profile_root_binding
+                        .as_ref()
+                        .map(|(request, leases)| (request, leases.selection())),
                 )
             },
             |mut store| {
@@ -1306,6 +1452,97 @@ impl HostJobBranches {
             }
         }
     }
+}
+
+#[cfg(windows)]
+pub(super) fn profile_root_request(
+    launch: &RuntimeLaunchDescriptor,
+) -> Result<ProfileRootRequest, HostError> {
+    launch
+        .validate()
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let profile = match launch.profile {
+        InstallationProfile::UserMode => ProfileSelection::UserMode,
+        InstallationProfile::PortableDev => ProfileSelection::PortableDev,
+        InstallationProfile::SystemService => {
+            return Err(HostError::ProcessContour(
+                "current-user root adapter cannot admit SystemService".to_owned(),
+            ));
+        }
+    };
+    let governed = &launch.profile_governed_roots;
+    if governed.runtime_state_roots != launch.runtime_state_roots {
+        return Err(HostError::ProcessContour(
+            "runtime roots differ from the digest-bound profile root set".to_owned(),
+        ));
+    }
+    let runtime = &governed.runtime_state_roots;
+    let runtime_state_roots = [
+        (
+            "runtime_state_roots.profile_anchor_root",
+            &runtime.profile_anchor_root,
+        ),
+        (
+            "runtime_state_roots.installation_root",
+            &runtime.installation_root,
+        ),
+        (
+            "runtime_state_roots.host_state_root",
+            &runtime.host_state_root,
+        ),
+        (
+            "runtime_state_roots.kernel_ors_root",
+            &runtime.kernel_ors_root,
+        ),
+        (
+            "runtime_state_roots.kernel_work_root",
+            &runtime.kernel_work_root,
+        ),
+        (
+            "runtime_state_roots.store_data_root",
+            &runtime.store_data_root,
+        ),
+        (
+            "runtime_state_roots.store_work_root",
+            &runtime.store_work_root,
+        ),
+        (
+            "runtime_state_roots.store_temp_root",
+            &runtime.store_temp_root,
+        ),
+        (
+            "runtime_state_roots.watchdog_state_root",
+            &runtime.watchdog_state_root,
+        ),
+    ]
+    .into_iter()
+    .map(|(role, path)| (role.to_owned(), PathBuf::from(path.as_str())))
+    .collect();
+    Ok(ProfileRootRequest {
+        profile,
+        installation_id: launch.installation_epoch.installation.as_str().to_owned(),
+        installation_key: launch
+            .profile_installation_key
+            .as_ref()
+            .map(|key| key.as_str().to_owned()),
+        component: launch.profile_component.as_str().to_owned(),
+        version: launch.profile_version.as_str().to_owned(),
+        generation: launch.generation.as_str().to_owned(),
+        authority_descriptor_path: PathBuf::from(launch.authority_descriptor_path.as_str()),
+        authority_descriptor_sha256: launch.authority_descriptor_digest.as_str().to_owned(),
+        authority_generation: launch.authority_generation.value(),
+        roots: ProfileRootPaths {
+            immutable_binaries: PathBuf::from(governed.immutable_binaries.as_str()),
+            durable_data: PathBuf::from(governed.durable_data.as_str()),
+            user_config: PathBuf::from(governed.user_config.as_str()),
+            user_cache: PathBuf::from(governed.user_cache.as_str()),
+            runtime_state_roots,
+        },
+        repository_root: launch
+            .portable_root
+            .as_ref()
+            .map(|root| PathBuf::from(root.as_str())),
+    })
 }
 
 #[cfg(all(test, windows))]

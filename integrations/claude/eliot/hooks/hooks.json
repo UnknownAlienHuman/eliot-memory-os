@@ -1,22 +1,12 @@
 {
-  "_legacy_compatibility": {
-    "scope": "compatibility_fixture_only",
-    "owning_issue": 18,
-    "consumer": "Claude Code plugin lifecycle hooks",
-    "legacy_command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
-    "target_current_owner": "bins/eliot-agent-bridge + crates/surfaces/*",
-    "missing_protocol": "hook <event> (session-start, pre-tool-use, post-tool-use, subagent-start, subagent-stop, pre-compact, stop) and host event --host claude --event <event>",
-    "owner_gap": "eliot-agent-bridge requires --profile/--transport/--client-declaration (bins/eliot-agent-bridge/src/cli_contract.rs) and implements no hook/host-event argv",
-    "expiry": "remove when hooks route through bins/eliot-agent-bridge and crates/surfaces/* under #13"
-  },
-  "description": "[LEGACY COMPATIBILITY FIXTURE #18: commands below invoke the eliot-governor facade pending migration to bins/eliot-agent-bridge; not the production hook owner.] Two enforcement points and the session events that carry real ELIOT evidence. Events that change no ELIOT state are deliberately absent: this plugin is installed at user scope, so every hook here fires in every Claude session on the machine. Enforcement runs through `hook <event>`, which emits the exact per-event decision schema and defers when the session is not attached to an ELIOT task. Pure observation is `async` so it cannot hold up a turn; SessionStart is not, because its context has to arrive before the first model request.",
+  "description": "Two enforcement points and the session events that carry real ELIOT evidence. Events that change no ELIOT state are deliberately absent: this plugin is installed at user scope, so every hook here fires in every Claude session on the machine. Enforcement runs through `hook <event>`, which emits the exact per-event decision schema and defers when the session is not attached to an ELIOT task. Pure observation is `async` so it cannot hold up a turn; SessionStart is not, because its context has to arrive before the first model request.",
   "hooks": {
     "SessionStart": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-agent-bridge.exe",
             "args": [
               "hook",
               "session-start"
@@ -32,7 +22,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-agent-bridge.exe",
             "args": [
               "hook",
               "pre-tool-use"
@@ -48,31 +38,10 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-agent-bridge.exe",
             "args": [
               "hook",
               "post-tool-use"
-            ],
-            "timeout": 10,
-            "async": true
-          }
-        ]
-      }
-    ],
-    "PostToolUseFailure": [
-      {
-        "matcher": "Bash|Edit|Write|NotebookEdit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
-            "args": [
-              "host",
-              "event",
-              "--host",
-              "claude",
-              "--event",
-              "PostToolUseFailure"
             ],
             "timeout": 10,
             "async": true
@@ -85,7 +54,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-agent-bridge.exe",
             "args": [
               "hook",
               "subagent-start"
@@ -101,7 +70,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-agent-bridge.exe",
             "args": [
               "hook",
               "subagent-stop"
@@ -117,7 +86,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-agent-bridge.exe",
             "args": [
               "hook",
               "pre-compact"
@@ -132,32 +101,12 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-agent-bridge.exe",
             "args": [
               "hook",
               "stop"
             ],
             "timeout": 10
-          }
-        ]
-      }
-    ],
-    "SessionEnd": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe",
-            "args": [
-              "host",
-              "event",
-              "--host",
-              "claude",
-              "--event",
-              "SessionEnd"
-            ],
-            "timeout": 10,
-            "async": true
           }
         ]
       }

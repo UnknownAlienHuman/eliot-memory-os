@@ -50,6 +50,14 @@
 //! ORS suspension ........... ORS owner (`suspended_recovery_entries`,
 //!                              persisted as suspended evidence, never
 //!                              runnable);
+//! Watchdog spool fence ..... #955 owner, archive side only
+//!                              (`suspended_watchdog_signal_entries`: the
+//!                              archive's mandatory unresolved critical
+//!                              signals are read and persisted as SUSPENDED
+//!                              forensic evidence, never as supervision and
+//!                              never as a reconciliation claim, so the
+//!                              `watchdog_signals` obligation stays
+//!                              unsatisfied);
 //! ```
 //!
 //! Effects whose bindings are absent refuse fail-closed with the exact
@@ -118,7 +126,7 @@ use eliot_backup::{
     RestoreOwnerObligation, RestorePhase, RestorePlan, RestoreReceipt, RestoreReconciliation,
     RestoreStep, RestoreTarget, RestoredFence, RestoredSealedBlob, WRITE_RECEIPT_RECORD_TYPE,
     WrappedKeyManifest, issue_restoration_receipts, suspended_recovery_entries,
-    verify_portable_key_material,
+    suspended_watchdog_signal_entries, verify_portable_key_material,
 };
 use eliot_backup::{ObservedLineageLimit, OwnerTrustBinding, RestoreProvenance};
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
@@ -1349,6 +1357,13 @@ impl KernelBackupRestore {
             ports.rehearsal,
             ports.manifest_evidence.as_ref(),
         )?;
+        // Third axis, and the one the two above cannot reach: the CONSTRUCTED
+        // root must still RESOLVE to `<work_root>/.eliot/restore-isolated/<label>`.
+        // The label is the request's own `target_id`, so a directory already
+        // carrying that name can be a reparse point, and a lexical containment
+        // check passes straight through one. This is the same link-resolved
+        // rule the bounded cleanup of this owner's own staging already applies.
+        Self::refuse_destination_outside_isolated_area(&destination, &self.work_root)?;
         let receipts = match ports.keys {
             Some(manifest) => issue_restoration_receipts(
                 bundle.manifest.backup_id.as_str(),
@@ -1378,7 +1393,12 @@ impl KernelBackupRestore {
         receipt
             .validate()
             .map_err(KernelRestoreError::TargetFailed)?;
-        let suspended = suspended_entries(bundle)?;
+        // The caller's own classification is preserved: this site has always
+        // reported a bad ORS suspension as `ArchiveInvalid`, so the read of the
+        // archive's two mandatory fences keeps that class rather than widening
+        // to the generic target failure.
+        let suspended = historical_authority(bundle)
+            .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
         let evidence = target_impl
             .final_evidence
             .clone()
@@ -1401,6 +1421,79 @@ impl KernelBackupRestore {
         })
     }
 
+    /// Refuses a recovery import whose constructed destination root does not
+    /// still resolve to `<work_root>/.eliot/restore-isolated/<label>` (issue
+    /// #955, A11).
+    ///
+    /// A11's guarantee is "recovery import targets only the externally admitted
+    /// isolated new installation", and its negative direction is that the
+    /// recovery path must not be steerable at anything else. The two axes that
+    /// already hold are the identity axis — [`RestorePlan::compile`] refuses
+    /// `target_id == bundle.manifest.backup_id`, the ARCHIVE's own owner-issued
+    /// identity — and the path axis: `KernelIsolatedDestination::open` accepts
+    /// only a bounded label and CONSTRUCTS
+    /// `<work_root>/.eliot/restore-isolated/<label>`, never a presented path.
+    ///
+    /// Neither of those is the whole answer, and the reason is exactly the
+    /// reason the bounded cleanup of this owner's own staging already carries a
+    /// `StagedCleanupRefusal::OutsideIsolatedArea` reason: the label is the
+    /// REQUEST's own `target_id`
+    /// (`restore_target_shape`, `request_dispatch.rs`), so
+    /// `<work_root>/.eliot/restore-isolated/<label>` is a name a caller chooses,
+    /// and on Windows a directory carrying that name can be a reparse point. A
+    /// junction at the label resolves every subsequent write — canonical events,
+    /// receipts, projections, blobs, the pinned admission and the final
+    /// `evidence.json` — outside the isolated area and into whatever it names,
+    /// while every lexical check above still passes. The import would then be
+    /// steered at a store that is not the admitted isolated destination, which
+    /// is the failure this refusal exists to make impossible.
+    ///
+    /// So the import now applies, BEFORE the first destination byte is staged,
+    /// the same link-resolved containment rule the cleanup path already applies
+    /// after a failure: both the isolated area and the destination root are
+    /// resolved, the resolved root must be strictly inside the resolved area,
+    /// and its final component must still be the admitted label. Nothing is
+    /// compared against the caller's own copy of a path — the caller supplies a
+    /// label, and what is proved is the resolved topology of the root this owner
+    /// constructed.
+    ///
+    /// An absent or unresolvable root is a typed destination failure, never a
+    /// silent pass: the destination was constructed by this owner moments
+    /// earlier, so a root that cannot be resolved is a broken or replaced
+    /// contour, not a reason to import into an unproved location.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelRestoreError::DestinationNotAdmitted`] when the resolved
+    /// destination root is the isolated area itself, lies outside it, or no
+    /// longer ends in the admitted label; and
+    /// [`KernelRestoreError::DestinationInvalid`] when the isolated area or the
+    /// destination root cannot be resolved at all.
+    fn refuse_destination_outside_isolated_area(
+        destination: &KernelIsolatedDestination,
+        work_root: &Path,
+    ) -> Result<(), KernelRestoreError> {
+        let area = work_root.join(".eliot").join(RESTORE_ISOLATED_AREA);
+        let resolved_area = std::fs::canonicalize(&area).map_err(|error| {
+            KernelRestoreError::DestinationInvalid(format!(
+                "isolated restore area could not be resolved: {error}"
+            ))
+        })?;
+        let resolved_root = std::fs::canonicalize(destination.root()).map_err(|error| {
+            KernelRestoreError::DestinationInvalid(format!(
+                "isolated destination root could not be resolved: {error}"
+            ))
+        })?;
+        let admitted_label = destination.label();
+        if resolved_root == resolved_area
+            || !resolved_root.starts_with(&resolved_area)
+            || resolved_root.file_name().and_then(|name| name.to_str()) != Some(admitted_label)
+        {
+            return Err(KernelRestoreError::DestinationNotAdmitted);
+        }
+        Ok(())
+    }
+
     /// Refuses a destination pinned to a different transaction, target,
     /// rehearsal posture, or manifest evidence, and corrupt pinned
     /// admissions.
@@ -1412,8 +1505,11 @@ impl KernelBackupRestore {
     /// decides whether the destination may ever be qualified for cutover: a
     /// rehearsal-prepared root is never continued by a production run, and a
     /// production-prepared root is never downgraded to a rehearsal. An
-    /// unpinned destination proceeds: it is either fresh or a pre-prepare
-    /// crash whose byte staging the engine re-applies idempotently.
+    /// unpinned destination proceeds past THIS check when it is fresh or a
+    /// pre-prepare crash whose byte staging the engine re-applies idempotently;
+    /// that this root resolves to the admitted isolated location at all is
+    /// decided separately, against the resolved filesystem topology, by
+    /// [`Self::refuse_destination_outside_isolated_area`].
     fn refuse_foreign_destination(
         destination: &KernelIsolatedDestination,
         transaction_id: &str,
@@ -1667,14 +1763,53 @@ fn require_operational_validation(evidence: &RestoreEvidence) -> Result<(), Kern
     Ok(())
 }
 
-fn suspended_entries(
+/// Reads BOTH mandatory recovery fences of the archive into the evidence's
+/// historical authority list.
+///
+/// This is the read of the archive's `watchdog_spool` member, which
+/// `BackupBundle::validate_class_requirements` makes mandatory for a
+/// `full_recovery` archive and which the finalize phase previously dropped
+/// unread: the published obligation was then one constant whether the fence
+/// named zero unreconciled critical Watchdog signals or a thousand. I05.13
+/// requires the receipt to carry them, so the member is now read here and each
+/// declared digest becomes one suspended `WatchdogSignal` historical entry.
+///
+/// Three properties are load-bearing and are what this function is for:
+///
+/// - **Nothing is activated.** Every entry is `suspended: true`, and
+///   `RestoreHistoricalAuthority::validate` refuses any entry that is not.
+///   I05.13 requires Watchdog operational snapshots to restore "only as
+///   forensic/suspended evidence and never as active supervision or
+///   authority"; a restore that reactivated Watchdog supervision would be worse
+///   than one that does not restore it.
+/// - **Nothing is reconciled.** Reading the fence is not the #955 owner's
+///   reconciliation, so the `watchdog_signals` obligation keeps its
+///   unsatisfied state below. Suspension is not resolution.
+/// - **Nothing is claimed beyond the archive.** The expected set is the
+///   archive's own declared list, because the archive is the only carrier of
+///   the fence. This is preservation evidence, not an independent completeness
+///   denominator.
+///
+/// A member the archive does not carry contributes nothing and asserts
+/// nothing: the obligation then reports the unbound-owner marker, exactly as it
+/// did before, and no evidence entry is invented for evidence that is absent.
+/// The `watchdog_signals` slot stays unsatisfied in BOTH cases, because the
+/// read is preservation and reconciliation is the owner's.
+fn historical_authority(
     bundle: &BackupBundle,
-) -> Result<Vec<RestoreHistoricalAuthority>, KernelRestoreError> {
-    match &bundle.ors_snapshot {
-        Some(snapshot) => suspended_recovery_entries(snapshot)
-            .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string())),
-        None => Ok(Vec::new()),
+) -> Result<Vec<RestoreHistoricalAuthority>, BackupError> {
+    // The ORS half is the archive's own `suspended_recovery_entries` read, the
+    // one this site performed inline before the Watchdog half was added; the
+    // `BackupError` is what that call site already raised, so its typed
+    // classification is unchanged here.
+    let mut entries = match &bundle.ors_snapshot {
+        Some(snapshot) => suspended_recovery_entries(snapshot)?,
+        None => Vec::new(),
+    };
+    if let Some(fence) = bundle.watchdog_spool.as_ref() {
+        entries.extend(suspended_watchdog_signal_entries(fence)?);
     }
+    Ok(entries)
 }
 
 /// Requires the validation denominator for cutover qualification: every
@@ -1737,6 +1872,14 @@ fn require_cutover_obligations(
             owners::RECONCILIATION,
             true,
         ),
+        // Still unconditionally applicable, and that is now deliberate rather
+        // than a leftover. Reading the archive's fence — which the finalize
+        // phase does, and which the evidence's historical authority carries —
+        // RECONCILES nothing: reconciliation is the #955 owner's own decision
+        // and no Watchdog channel is bound in this composition. Excusing this
+        // slot on "the archive carried no fence" would let a restore qualify for
+        // cutover having consulted no Watchdog owner at all, which is the
+        // substitution this gate exists to refuse.
         (&obligations.watchdog_signals, owners::WATCHDOG, true),
         (
             &obligations.external_source_revalidation,
@@ -3294,7 +3437,35 @@ impl<'a> KernelRestoreTarget<'a> {
                 "kernel-restore:reconciliation-denominator-absent".to_owned(),
                 RestoreObligationState::Unknown,
             ),
-            watchdog_signals: missing(owners::WATCHDOG),
+            // The state stays `MissingCapability`, and that is the point of the
+            // read above rather than a leftover: reading the archive's fence
+            // RECONCILES nothing. Reconciliation is the #955 owner's decision
+            // and no Watchdog channel is bound here, so nothing in this
+            // composition can attest the signals were resolved, and I05.13 is
+            // explicit that suspension is not resolution. Marking this slot
+            // `Satisfied` on the strength of a member the restore merely read
+            // would publish exactly the false readiness the obligation
+            // vocabulary exists to prevent.
+            //
+            // What the read DOES change is the evidence: the published
+            // evidence_ref now names the fence this restore actually read, and
+            // its unresolved signals are carried as suspended historical
+            // entries. It was one constant before, byte-identical for a fence
+            // naming zero unreconciled critical signals and for one naming a
+            // thousand, so a reader could not tell a read archive from a
+            // dropped one.
+            watchdog_signals: Self::obligation(
+                owners::WATCHDOG,
+                match &bundle.watchdog_spool {
+                    Some(fence) => format!(
+                        "kernel-restore:watchdog-spool-read:{}:{}",
+                        fence.fence_id,
+                        fence.unresolved_signal_digests.len()
+                    ),
+                    None => format!("kernel-restore:unbound:{}", owners::WATCHDOG),
+                },
+                RestoreObligationState::MissingCapability,
+            ),
             external_source_revalidation: missing(owners::EXTERNAL_SOURCE),
             runtime_invalidation: missing(owners::RUNTIME),
             session_invalidation: missing(owners::SESSION),
@@ -3359,10 +3530,7 @@ impl<'a> KernelRestoreTarget<'a> {
             owner_epoch: None,
             reconciliation_denominator: None,
             operational_validation: None,
-            historical_authority: match &bundle.ors_snapshot {
-                Some(snapshot) => suspended_recovery_entries(snapshot)?,
-                None => Vec::new(),
-            },
+            historical_authority: historical_authority(bundle)?,
             archive_disposition: RestoreArchiveDisposition {
                 disposition: RestoreArchiveDispositionKind::Current,
                 compatibility_ref: "ecxf-1-current".to_owned(),

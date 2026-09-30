@@ -2188,8 +2188,17 @@ impl WindowsProcessExecutor {
                     "secret environment references require an admitted secret projection",
                 ));
             }
-            let executable = Path::new(request.executable());
-            let digest = sha256_file(executable).map_err(unavailable)?;
+            // Admission revalidation at spawn (issue #1814): canonicalize
+            // the sealed executable name at use, hash that same canonical
+            // object against the sealed digest, and create the child from
+            // it — never an unrelated `PATH`/symlink resolution that
+            // happens to share a name. Any skew fails closed here as a
+            // typed executor refusal before any child process exists; the
+            // runner surfaces it as a missing run. The sealed argv and
+            // permit binding are already covered by `request.validate()`
+            // above (the self-seal digest spans the whole intent).
+            let executable = std::fs::canonicalize(request.executable()).map_err(unavailable)?;
+            let digest = sha256_file(&executable).map_err(unavailable)?;
             if !digest.eq_ignore_ascii_case(request.executable_sha256()) {
                 return Err(unavailable(
                     "executable digest does not match ProcessRequest",
@@ -2202,7 +2211,7 @@ impl WindowsProcessExecutor {
                 .map(|(name, value)| (name.clone().into(), value.clone().into()))
                 .collect::<Vec<_>>();
             let spec = SuspendedLaunchSpec::new(
-                executable,
+                &executable,
                 request.argv().iter().cloned().map(Into::into).collect(),
                 request.working_directory(),
                 environment,

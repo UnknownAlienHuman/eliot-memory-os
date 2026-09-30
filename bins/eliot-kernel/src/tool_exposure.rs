@@ -11,11 +11,13 @@
 
 #![forbid(unsafe_code)]
 
-use eliot_contracts::sha256_hex;
+use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_receipts::{
-    LoopSignal, ToolCallClass, ToolCallIntent, ToolCallRequest,
+    LoopSignal, ToolCallClass, ToolCallIntent, ToolCallRequest, ToolExposureError,
+    ToolExposureReceiptV2,
     tool_exposure::{
-        AttemptEvidence, EXPOSURE_HISTORY_VERSION, OwnerStageFact,
+        AttemptEvidence, DeliveredToolRepresentation, EXPOSURE_HISTORY_VERSION, OwnerStageFact,
+        ProducedToolResultIdentity, TokenCountObservation, TokenCountUnavailableReason,
         detect_repeat_without_progress_with_evidence,
     },
 };
@@ -174,6 +176,102 @@ pub(crate) fn authorize_pre_dispatch(
     request: &ToolCallRequest,
 ) -> Result<(), eliot_receipts::ToolExposureError> {
     eliot_receipts::authorize_pre_dispatch(request)
+}
+
+/// Records the per-evaluation receipt skeleton for one authorized request.
+///
+/// This is the production recording call at the orchestration boundary: it
+/// runs the real pre-dispatch gate ([`authorize_pre_dispatch`]) and, only on
+/// success, stages the [`eliot_receipts::ToolExposureReceiptV2`] admission
+/// skeleton from the request's own admission-derived identities (tool
+/// definition, route fingerprint). Eligibility and selection hold because the
+/// gated request was presented for dispatch and admitted; every unobserved
+/// stage stays `None`, delivery stays `MISSING`, and no representation
+/// evidence is attached. Measurement owners populate the rest through the
+/// `record_*` transitions; nothing is invented here. `receipt_id` must be
+/// infrastructure identity (for example the host-request operation id),
+/// never caller prose.
+///
+/// # Errors
+///
+/// Returns [`eliot_receipts::ToolExposureError`] when the request fails the
+/// pre-dispatch gate or an identity is malformed.
+pub(crate) fn observe_authorized_admission(
+    request: &ToolCallRequest,
+    receipt_id: String,
+) -> Result<ToolExposureReceiptV2, ToolExposureError> {
+    authorize_pre_dispatch(request)?;
+    ToolExposureReceiptV2::admission_observed(
+        receipt_id,
+        request.tool_definition.clone(),
+        request.route_fingerprint.clone(),
+    )
+}
+
+/// Measures the exact delivered representation for one persisted result and
+/// advances its evaluated receipt to a complete delivery.
+///
+/// This is the delivery owner's transition driver: it re-establishes the
+/// admission skeleton from the request's own admission-derived identities
+/// ([`observe_authorized_admission`]), measures the delivered bytes itself
+/// with [`canonical_json_bytes`], and refuses a produced digest that does
+/// not bind those exact bytes. Digest and byte count are never copied from
+/// caller values; a mismatch fails typed instead of recording.
+///
+/// Byte-completeness holds by construction on this path: the protocol bounds
+/// the response ceiling and rejects an oversize body instead of cutting it,
+/// so a persisted digest-bound body is the whole body. Token completeness is
+/// explicitly unobserved instead: no route tokenizer exists on this path, so
+/// the token observation stays
+/// [`TokenCountUnavailableReason::MeasurementUnavailable`] rather than a
+/// zero that would read as measured. A token-truncated delivery has no owner
+/// signal here and is never inferred; only the future tokenizer owner can
+/// drive [`ToolExposureReceiptV2::record_truncated_delivery`].
+///
+/// # Errors
+///
+/// Returns [`ToolExposureError`] when the request fails the pre-dispatch
+/// gate, the response is not canonicalizable, the produced digest does not
+/// bind the exact delivered bytes, or the resulting receipt is inconsistent.
+pub(crate) fn observe_persisted_delivery(
+    request: &ToolCallRequest,
+    receipt_id: String,
+    result_digest: &str,
+    response: &serde_json::Value,
+    representation_source_handle: String,
+) -> Result<ToolExposureReceiptV2, ToolExposureError> {
+    let skeleton = observe_authorized_admission(request, receipt_id)?;
+    let bytes = canonical_json_bytes(response).map_err(|_| ToolExposureError::InvalidField {
+        field: "receipt.delivered_representation.representation_digest",
+        reason: "delivered response is not canonicalizable",
+    })?;
+    let measured = sha256_hex(&bytes);
+    if measured != result_digest {
+        return Err(ToolExposureError::InvalidField {
+            field: "receipt.produced_result.result_digest",
+            reason: "produced digest does not bind the exact delivered bytes",
+        });
+    }
+    let byte_count = u64::try_from(bytes.len()).map_err(|_| ToolExposureError::InvalidField {
+        field: "receipt.delivered_representation.byte_count",
+        reason: "delivered byte count exceeds the addressable bound",
+    })?;
+    skeleton.record_full_delivery(
+        ProducedToolResultIdentity {
+            result_digest: measured.clone(),
+            artifact_ref: None,
+            source_handle: Some(representation_source_handle.clone()),
+        },
+        DeliveredToolRepresentation {
+            representation_digest: measured,
+            source_handle: representation_source_handle,
+            byte_count,
+            token_observation: TokenCountObservation::Unavailable {
+                reason: TokenCountUnavailableReason::MeasurementUnavailable,
+            },
+            prior_delivery_receipt_id: None,
+        },
+    )
 }
 
 /// Returns whether the accepted admission requires an intent before dispatch.

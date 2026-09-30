@@ -35,13 +35,13 @@ use eliot_contracts::{
     ProductId, RequestId, ResourceGeneration, SourceId, StateFence,
 };
 use eliot_installation::{
-    InstallationEpoch, InstallationProfile, RuntimeLaunchDescriptor, RuntimeStateRoots,
-    SupervisionAuthorityBinding,
+    INSTALLATION_ROOT_BINDING_VERSION, InstallationEpoch, InstallationProfile, InstallationRoots,
+    RuntimeLaunchDescriptor, RuntimeStateRoots, SupervisionAuthorityBinding,
 };
 use eliot_ipc::{DeliveryOutcome, TransportLimits};
 use eliot_kernel_service::{
     EbpCanonicalStoreClient, EbpStoreTransport, HostStoreBootstrapRequirement,
-    STORE_MODULE_IDENTITY, StoreClientError,
+    STORE_MODULE_IDENTITY, StoreBackupClientError, StoreClientError,
 };
 use eliot_platform::PlatformHandle;
 use eliot_protocol::{
@@ -415,6 +415,18 @@ fn runtime_state_roots() -> RuntimeStateRoots {
     roots
 }
 
+fn system_profile_roots(roots: &RuntimeStateRoots) -> InstallationRoots {
+    let installer_user_root = r"C:\Users\eliot-installer\AppData\Local\Eliot";
+    InstallationRoots {
+        binding_version: INSTALLATION_ROOT_BINDING_VERSION,
+        immutable_binaries: r"C:\Program Files\Eliot\eliot\test-version".to_owned(),
+        durable_data: roots.installation_root.as_str().to_owned(),
+        user_config: installer_user_root.to_owned(),
+        user_cache: installer_user_root.to_owned(),
+        runtime_state_roots: roots.clone(),
+    }
+}
+
 fn runtime_launch() -> RuntimeLaunchDescriptor {
     let roots = runtime_state_roots();
     let config_path = handle(r"C:\ProgramData\Eliot\generation.json");
@@ -422,6 +434,18 @@ fn runtime_launch() -> RuntimeLaunchDescriptor {
     let authority_state_fence = StateFence::new(test_epoch(1), authority_generation);
     let mut descriptor = RuntimeLaunchDescriptor {
         profile: InstallationProfile::SystemService,
+        profile_component: handle("eliot"),
+        profile_version: handle("test-version"),
+        profile_installation_key: Some(handle(
+            roots
+                .installation_root
+                .as_str()
+                .rsplit('\\')
+                .next()
+                .unwrap()
+                .to_owned(),
+        )),
+        profile_governed_roots: system_profile_roots(&roots),
         portable_root: None,
         installation_epoch: InstallationEpoch {
             installation: handle("installation-test"),
@@ -1413,7 +1437,13 @@ async fn pre_send_refusal_is_distinct_from_post_send_possible_effect() {
         .backup_begin(&refused_context, begin.clone())
         .await
         .expect_err("fence-diverged context is refused before send");
-    assert_eq!(refused, StoreError::FenceMismatch);
+    assert!(
+        matches!(
+            refused,
+            StoreBackupClientError::Store(StoreError::FenceMismatch)
+        ),
+        "fence-diverged context is refused as a fence mismatch, got {refused:?}"
+    );
     assert_eq!(
         sent_backup_requests(&log).len(),
         baseline,
@@ -1433,7 +1463,13 @@ async fn pre_send_refusal_is_distinct_from_post_send_possible_effect() {
         .backup_begin(&backup_context("request-975-a8-unknown"), begin.clone())
         .await
         .expect_err("unknown delivery is possible effect, never success");
-    assert_eq!(unknown, StoreError::MissingReceiptEnvelope);
+    assert!(
+        matches!(
+            unknown,
+            StoreBackupClientError::Store(StoreError::MissingReceiptEnvelope)
+        ),
+        "unknown delivery is a missing receipt envelope, got {unknown:?}"
+    );
     assert_eq!(
         sent_backup_requests(&unknown_log).len() - unknown_baseline,
         1,
@@ -1452,7 +1488,13 @@ async fn pre_send_refusal_is_distinct_from_post_send_possible_effect() {
         .backup_begin(&backup_context("request-975-a8-dropped"), begin.clone())
         .await
         .expect_err("disconnect after send is unknown, never success");
-    assert_eq!(dropped, StoreError::MissingReceiptEnvelope);
+    assert!(
+        matches!(
+            dropped,
+            StoreBackupClientError::Store(StoreError::MissingReceiptEnvelope)
+        ),
+        "disconnect after send is a missing receipt envelope, got {dropped:?}"
+    );
     assert_eq!(
         sent_backup_requests(&dropped_log).len() - dropped_baseline,
         1
@@ -1478,7 +1520,13 @@ async fn unknown_effect_triggers_no_new_operation_or_retry() {
         .backup_begin(&backup_context("request-975-a9"), begin.clone())
         .await
         .expect_err("unknown stays unknown");
-    assert_eq!(outcome, StoreError::MissingReceiptEnvelope);
+    assert!(
+        matches!(
+            outcome,
+            StoreBackupClientError::Store(StoreError::MissingReceiptEnvelope)
+        ),
+        "the projected outcome is a missing receipt envelope, got {outcome:?}"
+    );
     let mutating = sent_backup_requests(&log)
         .into_iter()
         .filter(|(_, _, request)| {
@@ -1704,7 +1752,10 @@ async fn verify_and_status_paths_cannot_restore_cut_over_or_unblock() {
     )
     .await
     .expect_err("default validate performs no restore");
-    assert_eq!(refused, StoreError::Unavailable);
+    assert!(
+        matches!(refused, StoreError::Unavailable),
+        "the default validate refuses as unavailable, got {refused:?}"
+    );
     // The mutating entries refuse the same way: no alternate path imports.
     assert_eq!(
         IsolatedRestorePort::prepare_isolated_destination(

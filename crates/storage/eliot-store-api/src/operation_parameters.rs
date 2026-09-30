@@ -1213,6 +1213,26 @@ static APPLY_SWARM_OWNER_REVISION_PARAMETERS: [ParameterDeclaration; 1] = [Param
     shape: ParameterShape::SwarmOwnerRevision,
     required: true,
 }];
+/// Exact owner-acceptance selectors for `GetTaskContractAcceptanceSet`
+/// (issue #1741, I7.9).
+///
+/// The read is addressed by the exact `task_id` plus the exact `task_revision`
+/// the caller was admitted against, carried as its decimal string exactly like
+/// the other owner-issued revision selectors, so the owner can refuse a
+/// denominator the caller was not admitted for instead of serving whatever is
+/// current.
+static GET_TASK_CONTRACT_ACCEPTANCE_SET_PARAMETERS: [ParameterDeclaration; 2] = [
+    ParameterDeclaration {
+        name: "task_id",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "task_revision",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+];
 static BLACKBOARD_ITEM_LOOKUP_PARAMETERS: [ParameterDeclaration; 2] = [
     ParameterDeclaration {
         name: "task_id",
@@ -1265,6 +1285,7 @@ pub const fn named_read_operation_name(operation: NamedReadOperation) -> &'stati
         NamedReadOperation::ResolveWriteReceipt => "ResolveWriteReceipt",
         NamedReadOperation::GetAuthorityRevocationHistory => "GetAuthorityRevocationHistory",
         NamedReadOperation::GetCapabilityEvidenceRecordRange => "GetCapabilityEvidenceRecordRange",
+        NamedReadOperation::GetTaskContractAcceptanceSet => "GetTaskContractAcceptanceSet",
     }
 }
 
@@ -1305,6 +1326,7 @@ pub const fn named_read_operation_by_name(name: &str) -> Option<NamedReadOperati
         b"GetCapabilityEvidenceRecordRange" => {
             Some(NamedReadOperation::GetCapabilityEvidenceRecordRange)
         }
+        b"GetTaskContractAcceptanceSet" => Some(NamedReadOperation::GetTaskContractAcceptanceSet),
         _ => None,
     }
 }
@@ -1408,6 +1430,8 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
 /// through the typed `scope_id` request field, mirroring `GetEvidencePack`);
 /// `GetAuditRange` declares the optional opaque `cursor` continuation
 /// selector (issue #223; absent cursors read from the start);
+/// `GetTaskContractAcceptanceSet` declares the exact `task_id` plus the exact
+/// `task_revision` the caller was admitted against (issue #1741, I7.9);
 /// every other variant declares none, so any supplied parameter fails closed. Variants without a catalogue entry never
 /// reach this table: they fail as [`StoreError::UnknownOperation`] first.
 #[must_use]
@@ -1444,6 +1468,9 @@ pub const fn declared_read_parameters(
             &GET_CAPABILITY_EVIDENCE_RECORD_RANGE_PARAMETERS
         }
         NamedReadOperation::GetAuditRange => &GET_AUDIT_RANGE_PARAMETERS,
+        NamedReadOperation::GetTaskContractAcceptanceSet => {
+            &GET_TASK_CONTRACT_ACCEPTANCE_SET_PARAMETERS
+        }
         NamedReadOperation::GetRevisionHeads
         | NamedReadOperation::GetScopeRevisionView
         | NamedReadOperation::GetOrderingHeads

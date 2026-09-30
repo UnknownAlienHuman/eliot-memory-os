@@ -7,6 +7,7 @@ use crate::{
     },
 };
 use anyhow::{Context, Result};
+use eliot_context_measurement::{MAX_MEASUREMENT_BYTES, stu_for_bytes, validate_envelope};
 use eliot_engine::host::ActiveRoleAuthorityCheck;
 use eliot_engine::{
     AdapterMemoryWriter, AdapterObservationBridge, AdapterObservationReport, AdapterRegistry,
@@ -278,25 +279,23 @@ pub(crate) fn part_e_surface_report(profile: &str) -> Result<Value> {
         anyhow::bail!("Part-E report requires a bounded cognitive profile");
     }
     let tools = tool_definitions_for_profile(profile);
-    let entries = tools
-        .iter()
-        .map(|tool| {
-            let name = tool.get("name").and_then(Value::as_str).unwrap_or_default();
-            let description = tool
-                .get("description")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            json!({
-                "name": name,
-                "description_ul_tokens": description.chars().count().div_ceil(4),
-            })
-        })
-        .collect::<Vec<_>>();
-    let combined_ul_tokens = tools
-        .iter()
-        .filter_map(|tool| tool.get("description").and_then(Value::as_str))
-        .map(|description| description.chars().count().div_ceil(4))
-        .sum::<usize>();
+    let mut entries = Vec::with_capacity(tools.len());
+    let mut combined_serialized = Vec::new();
+    for tool in &tools {
+        let name = tool.get("name").and_then(Value::as_str).unwrap_or_default();
+        let description = tool
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let measurement = canonical_serialized_measurement(description.as_bytes())?;
+        combined_serialized.extend_from_slice(description.as_bytes());
+        entries.push(json!({
+            "name": name,
+            "description_ul_tokens": measurement.stu_estimate,
+        }));
+    }
+    let combined = canonical_serialized_measurement(&combined_serialized)?;
+    let combined_ul_tokens = combined.stu_estimate;
     Ok(json!({
         "profile": profile.as_str(),
         "tool_count": tools.len(),
@@ -2210,6 +2209,61 @@ fn sha256_json<T: serde::Serialize>(value: &T) -> Result<String> {
 
 fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Exact measurement evidence for one final serialized UTF-8 payload.
+///
+/// `byte_len` is the exact serialized length; `stu_estimate` is the
+/// normative unvalidated #704 planning estimate over exactly those bytes.
+struct CanonicalMeasurement {
+    byte_len: u64,
+    stu_estimate: u64,
+}
+
+/// The single #704 measurement owner for every `eliot-app` MCP measurement
+/// consumer.
+///
+/// The exact final serialized UTF-8 bytes are hashed with the crate's one
+/// digest scheme, re-validated by the canonical `eliot-context-measurement`
+/// envelope owner, and turned into the normative
+/// `STU = ceil(UTF-8 bytes / 3)` estimate. There is no character basis, no
+/// `/4` fallback, no minimum-one estimate and no per-field rounding here.
+///
+/// `stu_estimate` is unvalidated #704 planning evidence: no route tokenizer
+/// ran here, so it is never an actual token count and never proves route fit.
+/// No `tokenizer` observation is reported, so the actual count stays unknown
+/// rather than becoming zero, one or a cheap value.
+///
+/// The envelope digest is computed and checked inside `validate_envelope`,
+/// which refuses a digest that does not match the exact bytes. That binds
+/// serializer, schema, profile and content identity: any change to the
+/// serialized bytes yields a different digest and invalidates the derived
+/// estimate. Valid empty bytes measure zero; invalid, non-UTF-8 or oversized
+/// bytes are a typed failure that reaches the caller instead of degrading to a
+/// character, zero or one fallback.
+fn canonical_serialized_measurement(serialized: &[u8]) -> Result<CanonicalMeasurement> {
+    let byte_len = u64::try_from(serialized.len()).context("serialized length exceeds u64")?;
+    let digest = sha256_bytes(serialized);
+    let envelope = validate_envelope(serialized, byte_len, &digest, MAX_MEASUREMENT_BYTES)
+        .context("canonical context measurement envelope")?;
+    let stu_estimate = stu_for_bytes(envelope.byte_len).context("canonical STU estimate")?;
+    Ok(CanonicalMeasurement {
+        byte_len: envelope.byte_len,
+        stu_estimate,
+    })
+}
+
+/// Measure one final serialized memory payload in canonical bytes.
+///
+/// The single owner is [`canonical_serialized_measurement`]; this entry
+/// exists so the memory seam reads as measurement rather than as a local
+/// byte count. The payload is the exact `serde_json` serialization the
+/// candidate carries.
+fn canonical_memory_payload_measurement<T: serde::Serialize + ?Sized>(
+    payload: &T,
+) -> Result<CanonicalMeasurement> {
+    let serialized = serde_json::to_vec(payload).context("serialize canonical memory payload")?;
+    canonical_serialized_measurement(&serialized)
 }
 
 #[derive(serde::Serialize)]

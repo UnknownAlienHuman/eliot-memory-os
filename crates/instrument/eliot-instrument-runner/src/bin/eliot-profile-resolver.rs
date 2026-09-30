@@ -11,6 +11,18 @@
 //! schema, and the fail-closed identity/provenance checks are all decided by
 //! the same code on either side of the network boundary.
 //!
+//! "local profile revision == CI profile revision" is decided by that same code
+//! rather than asserted in prose. Given `--compare-against <receipt.json>`, this
+//! entry deserialises the counterpart `VerificationProfileReceipt` and hands
+//! both receipts to the one owner [`verify_profile_parity`], which refuses a
+//! changed profile revision, a divergent schema/definition/stage-graph digest, a
+//! missing declared environment dependency, a divergent tool identity, and a CI
+//! verifier command the local receipt never declared. A refused comparison is
+//! this entry's fail-closed nonzero exit, never a warning or a run that
+//! proceeds anyway. The comparison is not implicit: a run that supplies no
+//! `--compare-against` performs none, because the counterpart artifact is the
+//! caller's exactly as `--receipt-out` is.
+//!
 //! Everything the receipt records is machine-observed or registry-admitted:
 //!
 //! - the route is named by a closed [`PROFILE_ALIASES`] entry and resolved
@@ -30,7 +42,9 @@
 //!   executed rather than from a value it was handed. The `--version` read that
 //!   pins each tool's identity is launched the same way, under its own one-shot
 //!   permit, so this entry has no launch of any kind outside that single
-//!   executor. That stage launch is gated by
+//!   executor. Each such child is observed to a terminal lifecycle before its
+//!   evidence is read, because the executor's `reconcile` is terminal-only: see
+//!   [`await_terminal_view`]. That stage launch is gated by
 //!   `StageOrchestrator::launch_plan_live`, which refuses to launch a plan
 //!   compiled against a replaced registry generation and admits each stage
 //!   through `AdmittedStage::admit_live` against the live [`InstrumentRegistry`]
@@ -54,8 +68,13 @@
 //! ```text
 //! eliot-profile-resolver --alias package-verification --source-root <abs> \
 //!     --target-root <abs> --cache-root <abs> [--declared-environment NAME]... \
-//!     [--receipt-out <path>]
+//!     [--receipt-out <path>] [--compare-against <counterpart-receipt.json>]
 //! ```
+//!
+//! `--compare-against` is the caller's counterpart receipt — the artifact the
+//! other side of the network boundary produced with the same alias. It is
+//! compared by the shared [`verify_profile_parity`] owner, so the revision
+//! equality is a computed verdict and a divergence refuses the run.
 //!
 //! Value discipline: `--alias` is matched exactly against the closed table
 //! rather than normalized; the three roots must be existing absolute,
@@ -78,6 +97,7 @@ use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use eliot_contracts::{
     ClockReading, ContractId, EpochContractError, EpochId, EpochLineageId, ProductId, RequestId,
@@ -86,12 +106,12 @@ use eliot_contracts::{
 use eliot_instrument_api::{InstrumentContractError, InstrumentInvocation};
 use eliot_instrument_runner::{
     ADMITTED_SCOPE_CLASS, AdmittedProfile, DeclaredEnvironmentDependency, ISOLATED_PROCESS_CLASS,
-    InstrumentRegistry, InstrumentRequestPort, InstrumentRunner, InstrumentSpec, PlannedStage,
-    ProfileAggregate, ProfileCompiler, RunnerError, StageEnvironment, StageLauncher,
+    InstrumentRegistry, InstrumentRequestPort, InstrumentRunner, InstrumentSpec, ParityVerdict,
+    PlannedStage, ProfileAggregate, ProfileCompiler, RunnerError, StageEnvironment, StageLauncher,
     StageOrchestrator, SupplyChainReceipt, TargetLayout, VerificationProfileReceipt,
-    VerificationRouteRequest, WorkScope, admitted_profile_for_alias,
+    VerificationRouteRequest, WorkScope, admitted_profile_for_alias, parity_summary,
     profile::{PROFILE_ALIASES, builtin_specs},
-    resolve_verification_route,
+    resolve_verification_route, verify_profile_parity,
 };
 use eliot_process::{
     ActionLeaseRef, CancellationReceipt, DispatchAuthorityId, DispatchPermitAuthority,
@@ -181,6 +201,25 @@ const VERSION_STDOUT_BYTES: u64 = 64 * 1024;
 /// descendant tree than [`STAGE_MAX_DESCENDANTS`] is not a normal observation.
 const VERSION_MAX_DESCENDANTS: u32 = 8;
 
+/// Bound on waiting for the permit-bound `--version` child to settle.
+///
+/// Set equal to [`VERSION_WALL_TIMEOUT_MS`], the wall bound that child was
+/// sealed with, because that deadline is what makes the wait finite: the
+/// executor's own operation-bound deadline watcher terminates the version child
+/// at it, so the view reaches a terminal lifecycle at or before this bound and
+/// this constant invents no timing policy of its own. A child still not settled
+/// at the bound is refused, never reported.
+const VERSION_OBSERVE_TIMEOUT: Duration = Duration::from_millis(VERSION_WALL_TIMEOUT_MS);
+
+/// Cadence for observing the permit-bound `--version` child's lifecycle.
+///
+/// Reused rather than introduced: the same 25ms bound is the executor's own
+/// terminal-wait poll, and the same cadence the two existing production callers
+/// of a real child already poll [`ProcessExecutor::inspect`] at — the
+/// `RECONCILE_OBSERVE_POLL` of `wasm_p03_adapter.rs` and `BOUND_RUN_POLL` of
+/// `eliot-git-bridge`.
+const VERSION_OBSERVE_POLL: Duration = Duration::from_millis(25);
+
 /// The exact invocation this binary reads.
 struct Request {
     /// Closed profile alias naming the route to resolve.
@@ -195,6 +234,9 @@ struct Request {
     declared_environments: Vec<String>,
     /// Caller-chosen receipt path, when the caller wants the receipt on disk.
     receipt_out: Option<PathBuf>,
+    /// Caller-chosen counterpart receipt this run compares against, when the
+    /// caller has one.
+    compare_against: Option<PathBuf>,
 }
 
 /// Fail-closed refusals of the verification-route resolution entry.
@@ -312,6 +354,23 @@ fn run() -> i32 {
             return EXIT_REFUSED;
         }
     };
+    // The comparison is part of this run's outcome, not a side report: when the
+    // caller supplied a counterpart receipt, the shared parity owner decides
+    // whether this run may proceed, and a refusal exits here.
+    //
+    // Ordering note, stated because it is load-bearing for the caller: this run's
+    // OWN receipt has already been persisted by `resolve_route` (it writes
+    // `--receipt-out` before returning), and it is retained on refusal on
+    // purpose — the receipt is this run's admission evidence and records what was
+    // actually observed, so destroying it would discard evidence of the very run
+    // whose parity was refused. A parity refusal therefore still leaves a receipt
+    // on disk alongside a nonzero exit, which is why `verify.ps1` discriminates
+    // the two refusals on this entry's `PARITY_PASS`/`PARITY_NON_PASS` verdict
+    // line rather than on the exit code or the receipt's existence.
+    if let Err(error) = require_receipt_parity(&request, &receipt) {
+        eprintln!("{error}");
+        return EXIT_REFUSED;
+    }
     match serde_json::to_string_pretty(&receipt) {
         Ok(json) => println!("{json}"),
         Err(error) => {
@@ -328,6 +387,56 @@ fn run() -> i32 {
         EXIT_PASS
     } else {
         EXIT_REFUSED
+    }
+}
+
+/// Requires this run's receipt and the caller's counterpart receipt to agree.
+///
+/// The comparison itself belongs to [`verify_profile_parity`]; this only reads
+/// the counterpart artifact the caller named and routes its verdict. A run with
+/// no `--compare-against` compares nothing — the counterpart receipt is the
+/// caller's exactly as the receipt path is — and a caller that wants I18.21's
+/// "local profile revision == CI profile revision" checked must therefore name
+/// it. Deserialization is the only thing this adds: a receipt read off disk
+/// bypassed every check in the issuance builder, and [`verify_profile_parity`]
+/// already runs `VerificationProfileReceipt::validate()` on both sides, so
+/// there is deliberately no second validation layer here.
+///
+/// # Errors
+///
+/// Returns a [`CliError::Contract`] refusal when the counterpart receipt cannot
+/// be read, is not a `VerificationProfileReceipt`, is internally inconsistent,
+/// or diverges from this run's receipt. Every one of those is a refusal that
+/// becomes [`EXIT_REFUSED`] in [`run`], never a warning and never a run that
+/// proceeds as if parity had held.
+fn require_receipt_parity(
+    request: &Request,
+    receipt: &VerificationProfileReceipt,
+) -> Result<(), CliError> {
+    let Some(path) = request.compare_against.as_deref() else {
+        return Ok(());
+    };
+    let bytes = std::fs::read(path).map_err(|error| {
+        CliError::Contract(format!(
+            "counterpart receipt {} is unreadable: {error}",
+            path.display()
+        ))
+    })?;
+    let counterpart: VerificationProfileReceipt =
+        serde_json::from_slice(&bytes).map_err(|error| {
+            CliError::Contract(format!(
+                "counterpart receipt {} is not a VerificationProfileReceipt: {error}",
+                path.display()
+            ))
+        })?;
+    let verdict = verify_profile_parity(receipt, &counterpart)?;
+    println!("{}", parity_summary(&verdict));
+    match verdict {
+        ParityVerdict::Pass { .. } => Ok(()),
+        ParityVerdict::NonPass { reason } => Err(CliError::Contract(format!(
+            "local/CI profile parity refused against '{}': {reason}",
+            path.display()
+        ))),
     }
 }
 
@@ -421,7 +530,7 @@ fn resolve_route(request: &Request) -> Result<VerificationProfileReceipt, CliErr
 
     let cell = Arc::new(DispatchCell::activate()?);
     let port = StagePort::seal_all(&cell, &epoch, &layout, &admitted)?;
-    let runner = InstrumentRunner::new(Arc::new(StageExecutor::with(Arc::clone(&cell))));
+    let runner = InstrumentRunner::new(Arc::new(StageExecutor::with(&cell)));
     let launcher = StageRoute {
         epoch,
         clock,
@@ -626,6 +735,47 @@ fn file_digest(path: &Path) -> Result<String, CliError> {
     Ok(sha256_hex(&bytes))
 }
 
+/// The `--version` child through this ONE executor, bounded-poll until it settles.
+///
+/// `ProcessExecutor::reconcile` is TERMINAL-ONLY: `reconcile_inner` calls
+/// `join_streams` unconditionally (`eliot-process-executor/src/lib.rs`), which
+/// cancels the still-running capture thread's IO and can therefore quarantine
+/// this operation. `start` returns at child-CREATE, so the version child is
+/// still driving when the very next call lands — calling `reconcile` there is
+/// destructive, not merely early. So this wait observes the child the way the
+/// two existing production callers of a real child already do: bounded-poll the
+/// NON-DESTRUCTIVE `inspect` view of THIS operation on the executor that
+/// recorded the `start`, then perform the single terminal `reconcile`. Nothing
+/// here launches, cancels, re-permits, or retries anything, and the existing
+/// operation registry is the only state involved.
+///
+/// The bound is [`VERSION_OBSERVE_TIMEOUT`] and the cadence is
+/// [`VERSION_OBSERVE_POLL`]; both are justified on their constants. This returns
+/// only a TERMINAL view — the refusal is its own return type, so no caller can
+/// read an exit observation off a child that has not finished.
+fn await_terminal_view(
+    executor: &WindowsProcessExecutor,
+    operation: &OperationId,
+    executable: &Path,
+) -> Result<ProcessExecutionView, CliError> {
+    let started = Instant::now();
+    loop {
+        let view = block_on(executor.inspect(operation.clone()))?;
+        if view.lifecycle().is_terminal() {
+            return Ok(view);
+        }
+        if started.elapsed() >= VERSION_OBSERVE_TIMEOUT {
+            return Err(CliError::Contract(format!(
+                "tool {} was still {:?} after {}ms of governed observation; its version is unknown rather than unobserved",
+                executable.display(),
+                view.lifecycle(),
+                VERSION_OBSERVE_TIMEOUT.as_millis()
+            )));
+        }
+        std::thread::sleep(VERSION_OBSERVE_POLL);
+    }
+}
+
 /// Observes one tool's reported version by really running that tool.
 ///
 /// `ExecutableObservation::is_complete` refuses an identity that carries no
@@ -656,19 +806,20 @@ fn observed_tool_version(executable: &Path, epoch: &EpochId) -> Result<String, C
     // validation context. It is still the same authority composition, the same
     // epoch, and the same generation, so this run has exactly one epoch.
     let cell = Arc::new(DispatchCell::activate()?);
-    let executor = StageExecutor::with(Arc::clone(&cell));
+    // ONE executor for the whole lifecycle of this read. Its registry is an
+    // instance field, so the `inspect` below must cross the same instance the
+    // `start` registered on; a second executor would read an empty registry and
+    // refuse `NotFound`, which says nothing about the operation.
+    let executor = StageExecutor::with(&cell);
     let request = seal_version_request(&cell, epoch, executable)?;
     let receipt = block_on(executor.start(
         request,
         Arc::new(RetainedEvidenceSink::default()) as Arc<dyn ProcessEvidenceSink>,
     ))?;
-    let view = block_on(executor.inspect(receipt.operation_id().clone()))?;
-    if !view.lifecycle().is_terminal() {
-        return Err(CliError::Contract(format!(
-            "tool {} version read did not reach a terminal state",
-            executable.display()
-        )));
-    }
+    // Settle first, then read the exit, then reconcile: the exit observation is
+    // only meaningful once the tree is closed, and the reconcile is the single
+    // terminal call the poll above was waiting to make safe.
+    let view = await_terminal_view(executor.executor(), receipt.operation_id(), executable)?;
     // `ExitDisposition::Completed` is the executor's own observed terminal
     // classification, so this is the governed equivalent of the old
     // `output.status.success()` test: a signalled, resource-limited, cancelled,
@@ -809,6 +960,7 @@ fn read_request() -> Result<Request, CliError> {
     let mut cache_root = None;
     let mut declared_environments = Vec::new();
     let mut receipt_out = None;
+    let mut compare_against = None;
     while let Some(option) = args.next() {
         let mut value = |option: &str| {
             args.next()
@@ -823,6 +975,9 @@ fn read_request() -> Result<Request, CliError> {
                 declared_environments.push(value("--declared-environment")?);
             }
             "--receipt-out" => receipt_out = Some(PathBuf::from(value("--receipt-out")?)),
+            "--compare-against" => {
+                compare_against = Some(PathBuf::from(value("--compare-against")?));
+            }
             other => return Err(CliError::Usage(format!("unknown option '{other}'"))),
         }
     }
@@ -842,6 +997,7 @@ fn read_request() -> Result<Request, CliError> {
             .ok_or_else(|| CliError::Usage("--cache-root is required".to_owned()))?,
         declared_environments,
         receipt_out,
+        compare_against,
     })
 }
 
@@ -1099,17 +1255,38 @@ impl DispatchValidationPort for DispatchCell {
 /// every child this entry starts — the version probes and the stages alike —
 /// crosses the one executor composition below.
 struct StageExecutor {
-    cell: Arc<DispatchCell>,
+    /// The ONE physical executor every lifecycle call of this owner crosses.
+    ///
+    /// `WindowsProcessExecutor` owns the operation registry as an instance
+    /// field, so the registry that records a `start` must be the same instance
+    /// a later `inspect`, `cancel` or `reconcile` reads. Constructing one per
+    /// call discards the registration with the temporary, and the follow-up
+    /// call is then refused as `NotFound` against an empty registry — which is
+    /// a true statement about the wrong executor, not about the operation.
+    ///
+    /// The cell reaches this owner through this one field: the executor holds
+    /// the `Arc<dyn DispatchValidationPort>` built from it, so the port the
+    /// executor validates against and the cell this owner's caller sealed its
+    /// one-shot permits under are the same value.
+    executor: WindowsProcessExecutor,
 }
 
 impl StageExecutor {
-    fn with(cell: Arc<DispatchCell>) -> Self {
-        Self { cell }
+    fn with(cell: &Arc<DispatchCell>) -> Self {
+        Self {
+            executor: WindowsProcessExecutor::new(
+                Arc::clone(cell) as Arc<dyn DispatchValidationPort>
+            ),
+        }
     }
 
     /// The P-07 authority composition every lifecycle call crosses.
-    fn executor(&self) -> WindowsProcessExecutor {
-        WindowsProcessExecutor::new(Arc::clone(&self.cell) as Arc<dyn DispatchValidationPort>)
+    ///
+    /// Borrowed by [`await_terminal_view`] so the version probe's bounded
+    /// inspect-poll observes THIS executor's registry — the one the `start`
+    /// registered on — rather than a second executor that never saw the child.
+    fn executor(&self) -> &WindowsProcessExecutor {
+        &self.executor
     }
 }
 

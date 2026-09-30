@@ -12,6 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_receipts::ProofCeiling;
+use eliot_receipts::tool_exposure::{OwnerStageFact, ToolExposureError, ToolExposureHistoryEntry};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -364,6 +365,70 @@ impl SemanticRegistry {
                     version: definition_version.to_owned(),
                 })?;
         self.resolve(canonical, definition_version)
+    }
+
+    /// Owner-supplied registration fact for one versioned method identity.
+    ///
+    /// A live binding supplies `true` with the bound
+    /// `canonical_name@profile_version` as its owner source reference — the
+    /// same revision naming the publish seam records. A live lookup miss is
+    /// explicitly unresolved: this registry binds nothing for the queried
+    /// identity, while another owner (provider/native catalogue,
+    /// `FacetManifest`) may still own its registration. Unknown stays unknown
+    /// and is never coerced to `false`, and no other stage is inferred.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a queried identity is blank or carries control
+    /// characters, or when the bound owner source reference is malformed.
+    pub fn registration_fact(
+        &self,
+        canonical_name: &str,
+        definition_version: &str,
+    ) -> Result<OwnerStageFact, SemanticProfileError> {
+        non_blank(canonical_name, "history.tool_definition")?;
+        non_blank(definition_version, "history.definition_version")?;
+        match self.resolve(canonical_name, definition_version) {
+            Ok(profile) => OwnerStageFact::supplied(
+                true,
+                format!(
+                    "{}@{}",
+                    profile.method.canonical_name, profile.profile_version
+                ),
+            )
+            .map_err(|error| map_fact_error(&error)),
+            Err(SemanticProfileError::MissingProfile { .. }) => Ok(OwnerStageFact::unresolved()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Populates the `registered` stage of an exposure-history entry from this registry.
+    ///
+    /// The entry's own tool identity selects the live binding through
+    /// [`Self::registration_fact`]; every other stage is left verbatim, so
+    /// recorded evidence is never overwritten and unknown stays unknown. The
+    /// publish seam is the STITCH caller: it joins this owner fact with its
+    /// advertised/eligible evidence before the revision persists through the
+    /// observation/receipt/outbox path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an identity is blank, the `registered` stage is
+    /// already recorded, or the resulting entry is inconsistent.
+    pub fn apply_registered_fact(
+        &self,
+        mut entry: ToolExposureHistoryEntry,
+    ) -> Result<ToolExposureHistoryEntry, SemanticProfileError> {
+        if entry.registered.observed.is_some() {
+            return Err(SemanticProfileError::ProjectionDisagreement {
+                field: "history.registered",
+                reason: "recorded stage evidence is never overwritten; persist a successor revision",
+            });
+        }
+        entry.registered =
+            self.registration_fact(&entry.tool_definition, &entry.definition_version)?;
+        entry.validate().map_err(|error| map_fact_error(&error))?;
+        Ok(entry)
     }
 
     /// Material surface: only identities with a registered profile are
@@ -1042,6 +1107,23 @@ fn canonical_profiles() -> Vec<ToolSemanticProfile> {
             invalidation_set: InvalidationSet::full(),
         },
     ]
+}
+
+/// Maps an exposure-history validation failure into this crate's typed error.
+///
+/// [`ToolExposureError::InvalidField`] carries its stable field path and reason
+/// across the boundary losslessly; unreachable variants fail closed on the
+/// `registered` stage instead of inventing a mapping.
+fn map_fact_error(error: &ToolExposureError) -> SemanticProfileError {
+    match error {
+        ToolExposureError::InvalidField { field, reason } => {
+            SemanticProfileError::ProjectionDisagreement { field, reason }
+        }
+        _ => SemanticProfileError::ProjectionDisagreement {
+            field: "history.registered",
+            reason: "exposure history fact failed its owner validation",
+        },
+    }
 }
 
 fn non_blank(value: &str, field: &'static str) -> Result<(), SemanticProfileError> {

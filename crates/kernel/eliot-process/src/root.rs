@@ -29,6 +29,15 @@ pub use origin_challenge::{
     OriginGrantEffectOutcome,
 };
 
+mod operation_owner_map;
+pub use operation_owner_map::{
+    ADOPT_BLOCKED_ROW, ATTACH_CREDENTIAL_BLOCKED_ROW, CHALLENGE_KILL_ROW,
+    DAEMON_RECOVERY_CANCEL_ROW, FRESH_STORE_LAUNCH_ROW, FROZEN_OPERATION_OWNER_MAP,
+    HOST_TERMINATE_ROW, MUTATE_BLOCKED_ROW, NATIVE_WORKER_CANCEL_ROW, OWNED_RECONNECT_ROW,
+    OperationOwnerRecord, OwnerAdmission, WIRE_CANCEL_ROW, admitted_challenge_operations,
+    bootstrap_rows, frozen_operation_owner_map, is_documented_production_caller, owner_record_for,
+};
+
 mod stream_sink;
 pub use stream_sink::{
     PROCESS_STREAM_SINK_SCHEMA_VERSION, ProcessStreamDigestAlgorithm, ProcessStreamSinkAbortReason,

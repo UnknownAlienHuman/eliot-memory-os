@@ -267,7 +267,10 @@ impl RuntimeStateRoots {
     ];
 
     /// Derives `SystemService` or `UserMode` roots from an explicit OS-validated
-    /// profile anchor and a lowercase SHA-256 installation key.
+    /// profile anchor and a lowercase SHA-256 installation key. Both runtime
+    /// topologies are refined beneath the profile's I3.1 durable-data root:
+    /// `SystemService` uses `%ProgramData%\Eliot\installations\<key>` and
+    /// `UserMode` uses `%LocalAppData%\Eliot\data\installations\<key>`.
     pub fn derive_profiled(
         profile: InstallationProfile,
         profile_anchor_root: PlatformHandle,
@@ -280,14 +283,25 @@ impl RuntimeStateRoots {
         }
         Self::validate_profile_anchor_path_os(profile, &profile_anchor_root)?;
         validate_installation_key(installation_key)?;
-        let installation_root = PlatformHandle::new(joined_windows_path(
-            profile_anchor_root.as_str(),
-            &format!("Eliot\\installations\\{installation_key}"),
-        ))
-        .map_err(|error| InstallationError::InvalidField {
-            field: "runtime_state_roots.installation_root".to_owned(),
-            reason: error.to_string(),
-        })?;
+        let suffix = match profile {
+            InstallationProfile::SystemService => {
+                format!("Eliot\\installations\\{installation_key}")
+            }
+            InstallationProfile::UserMode => {
+                format!("Eliot\\data\\installations\\{installation_key}")
+            }
+            InstallationProfile::PortableDev => {
+                return Err(InstallationError::ProfileViolation(
+                    "portable_dev requires derive_portable with one retained root".to_owned(),
+                ));
+            }
+        };
+        let installation_root =
+            PlatformHandle::new(joined_windows_path(profile_anchor_root.as_str(), &suffix))
+                .map_err(|error| InstallationError::InvalidField {
+                    field: "runtime_state_roots.installation_root".to_owned(),
+                    reason: error.to_string(),
+                })?;
         Self::derived(profile, profile_anchor_root, installation_root)
     }
 

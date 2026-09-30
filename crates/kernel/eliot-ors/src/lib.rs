@@ -25,6 +25,7 @@ mod snapshot_model;
 mod status;
 mod status_projection;
 mod store;
+mod store_route_ownership;
 mod user_broker;
 mod versioned_artifact;
 
@@ -34,18 +35,23 @@ pub mod test_support;
 pub use admission_reservation::{
     ActiveAdmissionReservation, AdmissionReservationActivatedOutcome,
     AdmissionReservationActivationEvidence, AdmissionReservationActivationRequest,
-    AdmissionReservationClaimRef, AdmissionReservationClaims, AdmissionReservationDisposition,
+    AdmissionReservationCanonicalAdmission, AdmissionReservationClaimRef,
+    AdmissionReservationClaims, AdmissionReservationDisposition,
     AdmissionReservationLaunchPrerequisite, AdmissionReservationRecord,
     AdmissionReservationSnapshot, AdmissionReservationStage, AdmissionReservationState,
     AdmissionReservationTransitionRequest, verify_admission_reservation_launch_prerequisite,
 };
 pub use admission_reservation_stage::{
     ADMISSION_RESERVATION_STAGE_VERSION, AdmissionReservationIdentityInput,
-    AdmissionReservationStageRequest, AdmissionReservationStagedOutcome, StagedClaimRole,
-    activate_admission_reservation_from_owner_evidence, activation_operation_identity,
-    admission_reservation_identity, epoch_lineage_for, proposed_attempt_identity,
-    reload_staged_admission_reservation, stage_admission_reservation_inactive,
-    stage_operation_identity, verify_staged_claim_completeness,
+    AdmissionReservationStageRequest, AdmissionReservationStagedOutcome, CanonicalAdmissionCommit,
+    CanonicalAdmissionResolution, CanonicalAdmissionUnknownReason, CanonicalLaunchOutboxIntent,
+    ProvenCanonicalAdmission, StagedClaimRole, activate_admission_reservation_from_owner_evidence,
+    activation_operation_identity, admission_reservation_identity,
+    canonical_admission_from_owner_commit, epoch_lineage_for, launch_outbox_readback,
+    proposed_attempt_identity, prove_canonical_admission_for_reservation,
+    reconcile_canonical_admission, reload_staged_admission_reservation,
+    stage_admission_reservation_inactive, stage_operation_identity, verify_launch_outbox_intent,
+    verify_staged_claim_completeness,
 };
 pub use backup_snapshot::{
     BACKUP_SNAPSHOT_SCHEMA_VERSION, BackupCompleteness, BackupPartialReason, MAX_BACKUP_BYTES,
@@ -133,8 +139,9 @@ pub use status_projection::{
 pub use store::{
     CanonicalEvidenceProvider, ColdStartReadinessRecordOwner, OperationalRecoveryStore,
     OrsCoordinator, OrsStoreIdentity, RedbRecoveryStore, RuntimeLeaseCensusRows,
-    ScanDisclosureRecordOwner,
+    ScanDisclosureRecordOwner, StoreStopObligationCensus, StoreStopObligationCounts,
 };
+pub use store_route_ownership::CanonicalStoreRouteOwnership;
 pub use user_broker::{
     UserBrokerHeartbeat, UserBrokerRegistrationSnapshot, UserBrokerResourceSelectionSnapshot,
 };

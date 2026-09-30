@@ -342,7 +342,7 @@ async fn skill_execution_proof_and_influence_report_write_through_writer_actor()
         included: vec![skill.skill_id],
         executed: vec![skill.skill_id],
         execution_proofs: vec![proof.proof_id.clone()],
-        estimated_context_cost: 128,
+        measured_skills: Some(vec![skill.clone()]),
     });
     let influence_receipt =
         SkillInfluenceService::write_report(&handle, &WriteAdmissionService, &mut influence)

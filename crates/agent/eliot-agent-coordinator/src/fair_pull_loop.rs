@@ -70,6 +70,14 @@
 //! authorizes nothing: provider execution binding is a later, separately proven
 //! step ([`AgentCoordinator::bind_provider_execution`]).
 //!
+//! That transition is also where the selection is revalidated and its
+//! reservation re-checked (issue #1683 W3). It re-presents the item's own
+//! stored admission receipt to the sealed provider verifier and re-checks the
+//! route's capacity reservation against the live view, both before any state
+//! moves, so a drive never spends a selection on the snapshot it was taken from
+//! and a selection that went stale between the pull and the start is refused
+//! rather than launched. See [`AgentCoordinator::start_attempt`].
+//!
 //! # Production reachability
 //!
 //! Reachable in a non-test build, and the two arms are separate callers:

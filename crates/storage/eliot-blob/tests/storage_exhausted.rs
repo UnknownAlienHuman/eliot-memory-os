@@ -1168,6 +1168,14 @@ fn exhaustion_or_unknown_durability_issues_no_ready_write_or_gc_evidence() {
             attempted_bytes: None,
             effect: BlobCapacityEffect::DurabilityUnconfirmed {
                 state: PublishState::Ready,
+                // Durability and effect certainty are independent axes. This
+                // fixture pairs an unconfirmed durability boundary with
+                // `ReconcileSameOperationThenRevalidate` below, and that
+                // disposition is the one issued when a physical effect may
+                // already be installed -- so the effect axis is the possible
+                // one. Recording `false` here would pair "no possible effect"
+                // with an instruction to reconcile one.
+                possible_effect: true,
             },
         },
         cas_request: None,

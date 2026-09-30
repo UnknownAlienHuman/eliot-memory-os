@@ -6298,6 +6298,33 @@ mod tests {
         eliot_contracts::sha256_hex(&bytes)
     }
 
+    /// The generated #13 capability-cell registry digest, read through the same
+    /// owner the admission gate reads it through.
+    ///
+    /// `build_executable_expectation` refuses any presented join whose
+    /// `capability_cell_registry_digest` is not this exact value, so a canned
+    /// constant here would be a fixture that only compiles. Resolved from
+    /// Kernel's independently generated registry on every call.
+    fn native_test_capability_cell_registry_digest() -> String {
+        crate::composition_bootstrap::native_worker_cell_registry_digest(
+            &eliot_contracts::CapabilityCellId::new("native-worker-core").expect("cell id"),
+        )
+        .expect("generated capability-cell registry resolves the worker cell")
+        .to_owned()
+    }
+
+    /// The seven lifecycle joins the worker/Governor owner admits alongside the
+    /// cell.
+    ///
+    /// Kernel carries them into the expectation verbatim and never re-derives
+    /// them (`NativeWorkerLifecycleBinding`: "it does not derive substitutes"),
+    /// and no owner that issues them exists in this test context, so they are
+    /// deterministic stand-ins over stable seed bytes through the real
+    /// canonical hash procedure, exactly as the digests above.
+    fn native_test_lifecycle_owner_digest(seed: &[u8]) -> String {
+        eliot_contracts::sha256_hex(seed)
+    }
+
     fn native_executable_join_for(
         claim_id: &str,
         operation_id: &str,
@@ -6318,8 +6345,24 @@ mod tests {
             facet_manifest_ref: "facet-manifest-7".to_owned(),
             capability_cell: eliot_contracts::CapabilityCellId::new("native-worker-core")
                 .expect("cell id"),
+            capability_cell_registry_digest: native_test_capability_cell_registry_digest(),
             grant_graph_revision: 5,
             module_catalog_revision: 7,
+            kernel_execution_manifest_digest: native_test_lifecycle_owner_digest(
+                b"t9-02 dispatch admitted kernel execution manifest",
+            ),
+            job_object_lineage_ref: "job-object-lineage-t9-02-dispatch-1".to_owned(),
+            resource_limits_digest: native_test_lifecycle_owner_digest(
+                b"t9-02 dispatch admitted resource limits projection",
+            ),
+            cancellation_policy_ref: "cancel-policy-t9-02-dispatch-1".to_owned(),
+            checkpoint_policy_digest: native_test_lifecycle_owner_digest(
+                b"t9-02 dispatch admitted checkpoint policy",
+            ),
+            drain_policy_ref: "drain-policy-t9-02-dispatch-1".to_owned(),
+            restart_policy_digest: native_test_lifecycle_owner_digest(
+                b"t9-02 dispatch admitted restart policy",
+            ),
             replay_stream_id: "stream-claim-t9-02-1/gen-1".to_owned(),
             launch_nonce: nonce.to_owned(),
             process_invocation_digest: invocation_digest,

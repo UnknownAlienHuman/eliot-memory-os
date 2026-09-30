@@ -17,6 +17,79 @@ pub enum MeasurementStatus {
     Unavailable,
 }
 
+/// The revisions that produced one serialized Context output.
+///
+/// #1724 W4/W5: the rendered-ordering revision, the serializer identity and
+/// options digest, the route and model identity, and the measurement status all
+/// change what bytes leave this compilation, and none of them was named by any
+/// delivered record: two compilations of the same admitted set under different
+/// ordering or serializer revisions produced two byte-identical views. This
+/// record is what the executing path states it applied, so the output identity
+/// a consumer re-checks includes the execution that produced it.
+///
+/// The values are the executing path's own, never a caller's claim about
+/// another path: the assembly owner fills this from the ordering revision it
+/// compiled in and the policy it validated, and
+/// [`ContextExecutionIdentity::binds_measurement`] compares it against the
+/// independently recorded [`SerializedContextMeasurement`] of the same view.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ContextExecutionIdentity {
+    /// Stable ordering revision the rendered projection was produced under.
+    pub ordering_revision: String,
+    /// Serializer identity that produced the delivered bytes.
+    pub serializer_id: String,
+    /// Serializer revision that produced the delivered bytes.
+    pub serializer_version: String,
+    /// Serializer-options digest the delivered bytes were produced with.
+    pub serializer_options_digest: String,
+    /// Route identity the delivered bytes were produced for.
+    pub route_id: String,
+    /// Model/tokenizer route identity the delivered bytes were produced for.
+    pub model_id: String,
+    /// Measurement status qualified for this route.
+    pub measurement_status: MeasurementStatus,
+}
+
+impl ContextExecutionIdentity {
+    /// Validate the closed execution record.
+    pub fn validate(&self) -> Result<(), ContextError> {
+        validate_text(&self.ordering_revision, "execution.ordering_revision")?;
+        validate_text(&self.serializer_id, "execution.serializer_id")?;
+        validate_text(&self.serializer_version, "execution.serializer_version")?;
+        validate_text(&self.route_id, "execution.route_id")?;
+        validate_text(&self.model_id, "execution.model_id")?;
+        validate_digest(
+            &self.serializer_options_digest,
+            "execution.serializer_options_digest",
+        )
+    }
+
+    /// Require that the independently recorded measurement is this execution's.
+    ///
+    /// The ORIGINAL recorded values of both records are compared. No digest is
+    /// recomputed to stand in for the measurement, and this execution identity
+    /// is not an input to any digest the measurement is checked against, so the
+    /// comparison cannot be satisfied by a record describing itself.
+    pub fn binds_measurement(
+        &self,
+        measurement: &SerializedContextMeasurement,
+    ) -> Result<(), ContextError> {
+        self.validate()?;
+        measurement.validate()?;
+        if self.serializer_id != measurement.serializer_id
+            || self.serializer_version != measurement.serializer_version
+            || self.serializer_options_digest != measurement.serializer_options_digest
+            || self.route_id != measurement.route_id
+            || self.model_id != measurement.model_id
+            || self.measurement_status != measurement.status
+        {
+            return Err(ContextError::IdentityConflict);
+        }
+        Ok(())
+    }
+}
+
 /// Conservative Source Token Unit estimate. It never proves route fit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

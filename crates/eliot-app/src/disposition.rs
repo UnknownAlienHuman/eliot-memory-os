@@ -86,9 +86,23 @@ const CLAUDE_PLUGIN_HOOKS: &str =
 const CLAUDE_PLUGIN_MCP: &str = include_str!("../../../integrations/claude/eliot/.mcp.json");
 const CLAUDE_DESKTOP_MCPB: &str =
     include_str!("../../../integrations/claude/claude-desktop/mcpb/manifest.json");
+const CLAUDE_DESKTOP_README: &str =
+    include_str!("../../../integrations/claude/claude-desktop/README.md");
+const CLAUDE_DESKTOP_MCPB_README: &str =
+    include_str!("../../../integrations/claude/claude-desktop/mcpb/README.md");
 const OPENCODE_CONFIG: &str = include_str!("../../../integrations/opencode/opencode.json");
 const OPENCODE_PLUGIN: &str = include_str!("../../../integrations/opencode/plugins/eliot.js");
 const CODEX_MARKETPLACE: &str = include_str!("../../../integrations/codex/marketplace.json");
+const CODEX_PLUGIN_METADATA: &str =
+    include_str!("../../../plugin/eliot-governor/.codex-plugin/plugin.json");
+const OPERATOR_CONTRACTS: &str =
+    include_str!("../../../apps/Eliot.Operator/Protocol/OperatorContracts.cs");
+const OPERATOR_INTENT: &str =
+    include_str!("../../../apps/Eliot.Operator/Protocol/OperatorIntent.cs");
+const OPERATOR_RESPONSE_BOUNDS: &str =
+    include_str!("../../../apps/Eliot.Operator/Protocol/OperatorResponseBounds.cs");
+const OPERATOR_README: &str = include_str!("../../../apps/Eliot.Operator/README.md");
+const OPERATOR_TESTS: &str = include_str!("../../../tests/Eliot.Operator.Tests/Program.cs");
 const WINDOWS_RELEASE_BUILD: &str =
     include_str!("../../../scripts/build-eliot-windows-x64-release.ps1");
 const CLAUDE_DESKTOP_BUILD: &str =
@@ -106,6 +120,11 @@ const HOST_BUNDLE_MANIFEST: &str =
     include_str!("../../../integrations/agent-runtimes/host-bundle.manifest.json");
 const CODEX_ROUTE_PROFILE: &str = include_str!("../../../integrations/codex/route-profile.json");
 const CLAUDE_CONNECTOR_TEST: &str = include_str!("../../../scripts/test-claude-connector.ps1");
+const MCP_REFERENCE_CLIENT: &str = include_str!("../../../scripts/eliot-mcp-reference-client.ps1");
+const OPENCODE_PLUGIN_TEST: &str =
+    include_str!("../../../integrations/opencode/tests/eliot-plugin.test.mjs");
+const TRUSTED_CLI_LIVE_SIGNING_TEST: &str =
+    include_str!("../../../tests/release-security/trusted-cli-live-signing-tests.ps1");
 
 /// Every declared install/launch/advertisement surface of the legacy binary.
 ///
@@ -113,16 +132,6 @@ const CLAUDE_CONNECTOR_TEST: &str = include_str!("../../../scripts/test-claude-c
 /// inventory entry whose `proof` is not one of these paths, so the inventory
 /// cannot silently fall behind the declared consumer set.
 pub const CONSUMER_SURFACES: &[ConsumerSurface] = &[
-    ConsumerSurface {
-        path: "plugin/eliot-governor/hooks/hooks.json",
-        live_reference: "${PLUGIN_ROOT}\\\\bin\\\\eliot-governor.exe",
-        body: CODEX_PLUGIN_HOOKS,
-    },
-    ConsumerSurface {
-        path: "integrations/claude/eliot/hooks/hooks.json",
-        live_reference: "\"command\": \"${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe\"",
-        body: CLAUDE_PLUGIN_HOOKS,
-    },
     ConsumerSurface {
         path: "integrations/opencode/opencode.json",
         live_reference: "\"{env:ELIOT_GOVERNOR_EXE}\"",
@@ -137,6 +146,11 @@ pub const CONSUMER_SURFACES: &[ConsumerSurface] = &[
         path: "integrations/codex/marketplace.json",
         live_reference: "\"installation\": \"INSTALLED_BY_DEFAULT\"",
         body: CODEX_MARKETPLACE,
+    },
+    ConsumerSurface {
+        path: "plugin/eliot-governor/.codex-plugin/plugin.json",
+        live_reference: "\"name\": \"eliot-governor\"",
+        body: CODEX_PLUGIN_METADATA,
     },
     ConsumerSurface {
         path: "scripts/build-eliot-windows-x64-release.ps1",
@@ -192,6 +206,758 @@ pub const CONSUMER_SURFACES: &[ConsumerSurface] = &[
         path: "scripts/test-claude-connector.ps1",
         live_reference: "'release\\eliot-governor.exe'",
         body: CLAUDE_CONNECTOR_TEST,
+    },
+    ConsumerSurface {
+        path: "integrations/claude/claude-desktop/README.md",
+        live_reference: "cargo build --release -p eliot-app",
+        body: CLAUDE_DESKTOP_README,
+    },
+    ConsumerSurface {
+        path: "integrations/claude/claude-desktop/mcpb/README.md",
+        live_reference: "`eliot-governor.exe`",
+        body: CLAUDE_DESKTOP_MCPB_README,
+    },
+    ConsumerSurface {
+        path: "apps/Eliot.Operator/Protocol/OperatorContracts.cs",
+        live_reference: "crates/eliot-app/src/mcp_stdio/catalog.rs",
+        body: OPERATOR_CONTRACTS,
+    },
+    ConsumerSurface {
+        path: "apps/Eliot.Operator/Protocol/OperatorIntent.cs",
+        live_reference: "crates/eliot-app/src/mcp_stdio.rs",
+        body: OPERATOR_INTENT,
+    },
+    ConsumerSurface {
+        path: "apps/Eliot.Operator/Protocol/OperatorResponseBounds.cs",
+        live_reference: "crates/eliot-app/src/mcp_stdio/operator.rs",
+        body: OPERATOR_RESPONSE_BOUNDS,
+    },
+    ConsumerSurface {
+        path: "apps/Eliot.Operator/README.md",
+        live_reference: "The `eliot_operator_*` tools are served by `crates/eliot-app`",
+        body: OPERATOR_README,
+    },
+    ConsumerSurface {
+        path: "tests/Eliot.Operator.Tests/Program.cs",
+        live_reference: "crates/eliot-app/src/mcp_stdio/operator.rs",
+        body: OPERATOR_TESTS,
+    },
+    ConsumerSurface {
+        path: "scripts/eliot-mcp-reference-client.ps1",
+        live_reference: "'codex_controller'",
+        body: MCP_REFERENCE_CLIENT,
+    },
+    ConsumerSurface {
+        path: "integrations/opencode/tests/eliot-plugin.test.mjs",
+        live_reference: "process.env.ELIOT_GOVERNOR_EXE",
+        body: OPENCODE_PLUGIN_TEST,
+    },
+    ConsumerSurface {
+        path: "tests/release-security/trusted-cli-live-signing-tests.ps1",
+        live_reference: "eliot-governor.exe",
+        body: TRUSTED_CLI_LIVE_SIGNING_TEST,
+    },
+];
+
+/// A token-bearing repository artifact whose exact path has been inspected
+/// and whose semantic relationship to the Governor executable is classified.
+/// These rows close the scanner denominator; `reference_only` rows do not
+/// create a live executable consumer, while `live_consumer` rows stay in the
+/// independently derived migration/equivalence proof denominator.
+pub struct ClosedReferenceRole {
+    /// Exact repository-relative path. No directory or extension rule applies.
+    pub path: &'static str,
+    /// Closed semantic role parsed by the release closure verifier.
+    pub role: &'static str,
+    /// Why the token is present and how retirement affects this exact artifact.
+    pub basis: &'static str,
+}
+
+/// Exact non-surface references found by the tracked-token scan. Existing
+/// `CONSUMER_SURFACES` and `MIGRATED_CONSUMER_EDGES` remain the independent
+/// live/migrated owner declarations; any unlisted new reference remains
+/// unknown. In particular, a path merely being documentation, a test, or a
+/// script never grants it a role.
+pub const CLOSED_REFERENCE_ROLES: &[ClosedReferenceRole] = &[
+    // Current build and test entrypoints still consume the facade/package.
+    ClosedReferenceRole {
+        path: "Justfile",
+        role: "live_consumer:build",
+        basis: "sync-skills invokes cargo run -p eliot-app; retain explicit migration/equivalence proof",
+    },
+    ClosedReferenceRole {
+        path: "scripts/run-isolated-tests.ps1",
+        role: "live_consumer:test",
+        basis: "the default TestPackage selects eliot-app for actual isolated test execution",
+    },
+    ClosedReferenceRole {
+        path: "tests/release-security/trusted-cli-launch-tests.ps1",
+        role: "live_consumer:test",
+        basis: "launch contract fixture executes and verifies the selected release CLI identity",
+    },
+    ClosedReferenceRole {
+        path: "Cargo.lock",
+        role: "live_consumer:workspace_lock",
+        basis: "locked workspace package identity used by Cargo resolution; keep in the current build proof denominator",
+    },
+    // Current Governor-config protocol, distinct from ELIOT_GOVERNOR_EXE.
+    ClosedReferenceRole {
+        path: "scripts/integration/IntegrationHarness.Runtime.psm1",
+        role: "reference_only:current_configuration",
+        basis: "ELIOT_GOVERNOR_CONFIG is a run-local protected config receipt, not an executable launch variable",
+    },
+    ClosedReferenceRole {
+        path: "scripts/tests/IntegrationHarness.Runtime.Tests.ps1",
+        role: "reference_only:current_configuration",
+        basis: "fixtures exercise the current ELIOT_GOVERNOR_CONFIG receipt protocol and reject ambient values",
+    },
+    // Historical work units, migration maps, and decision records.
+    ClosedReferenceRole {
+        path: ".github/work-units/context-measurement-inventory.toml",
+        role: "reference_only:historical_record",
+        basis: "work-unit source inventory records package tokens for context accounting",
+    },
+    ClosedReferenceRole {
+        path: ".github/work-units/context-measurement-owner-map.toml",
+        role: "reference_only:historical_record",
+        basis: "work-unit ownership map records the facade as a measured source boundary",
+    },
+    ClosedReferenceRole {
+        path: "T11.md",
+        role: "reference_only:historical_record",
+        basis: "historical task record cites the legacy package as migration context",
+    },
+    ClosedReferenceRole {
+        path: "T12.md",
+        role: "reference_only:historical_record",
+        basis: "historical task record cites the legacy package as migration context",
+    },
+    ClosedReferenceRole {
+        path: "T9.md",
+        role: "reference_only:historical_record",
+        basis: "historical task record cites the legacy package as migration context",
+    },
+    ClosedReferenceRole {
+        path: "docs/ADR/0001-phase-a-dependency-boundaries.md",
+        role: "reference_only:decision_record",
+        basis: "accepted dependency decision documents the former aggregate crate boundary",
+    },
+    ClosedReferenceRole {
+        path: "docs/ADR/0004-l3-owned-user-mode-dogfood-runtime.md",
+        role: "reference_only:decision_record",
+        basis: "accepted runtime decision records historical facade/runtime separation",
+    },
+    ClosedReferenceRole {
+        path: "docs/ADR/0005-l3-isolated-codex-clone.md",
+        role: "reference_only:decision_record",
+        basis: "accepted isolation decision records the legacy Codex clone context",
+    },
+    ClosedReferenceRole {
+        path: "docs/ADR/0006-l7-lossless-opencode-jsonc-ownership.md",
+        role: "reference_only:decision_record",
+        basis: "accepted OpenCode decision records a former host integration reference",
+    },
+    ClosedReferenceRole {
+        path: "docs/DEPENDENCY_POLICY.md",
+        role: "reference_only:policy_history",
+        basis: "dependency-policy narrative records legacy package identity, not an executable command",
+    },
+    ClosedReferenceRole {
+        path: "docs/PROJECT_MAP.md",
+        role: "reference_only:project_map",
+        basis: "navigation map points to the facade owner path without invoking it",
+    },
+    ClosedReferenceRole {
+        path: "docs/architecture/I02-01-primary-decision-crate-rich-process-sparse-owner-sparse.md",
+        role: "reference_only:architecture_history",
+        basis: "architecture evidence records an earlier package topology",
+    },
+    ClosedReferenceRole {
+        path: "docs/architecture/I10-08-12-source-ownership-and-first-crate-extraction-wave.md",
+        role: "reference_only:architecture_history",
+        basis: "migration evidence records the original aggregate crate extraction path",
+    },
+    ClosedReferenceRole {
+        path: "docs/architecture/I19-03-component-disposition.md",
+        role: "reference_only:migration_policy",
+        basis: "migration contract names the facade as a disposition target",
+    },
+    ClosedReferenceRole {
+        path: "docs/architecture/ROUTES.md",
+        role: "reference_only:navigation",
+        basis: "documentation route index preserves a legacy source link",
+    },
+    ClosedReferenceRole {
+        path: "docs/architecture/route-rules.toml",
+        role: "reference_only:documentation_configuration",
+        basis: "reader route examples mention the legacy path as repository content",
+    },
+    ClosedReferenceRole {
+        path: "docs/integrations/claude/CLAUDE_INTEGRATION_SECURITY.md",
+        role: "reference_only:security_guidance",
+        basis: "security guidance describes the old launcher as a migration boundary",
+    },
+    ClosedReferenceRole {
+        path: "docs/migration/1860-dispositions.md",
+        role: "reference_only:migration_inventory",
+        basis: "generated migration disposition records a package retirement row",
+    },
+    ClosedReferenceRole {
+        path: "docs/migration/1860-impact-graph.md",
+        role: "reference_only:migration_inventory",
+        basis: "generated impact graph records the package node and edge set",
+    },
+    ClosedReferenceRole {
+        path: "docs/operations/AGENT_DELIVERY_GUIDE.md",
+        role: "live_consumer:build",
+        basis: "the Windows release copies docs/operations verbatim and this operator guide tells recipients the Governor host route is current",
+    },
+    ClosedReferenceRole {
+        path: "workstreams/T13.md",
+        role: "reference_only:workstream_record",
+        basis: "retirement workstream records the facade migration sequence",
+    },
+    ClosedReferenceRole {
+        path: "workstreams/T7.md",
+        role: "reference_only:workstream_record",
+        basis: "retirement workstream records the facade migration sequence",
+    },
+    ClosedReferenceRole {
+        path: "workstreams/configuration/assignments/1219-legacy-config-retirement.toml",
+        role: "reference_only:workstream_record",
+        basis: "configuration assignment records a retired config filename that shares the token",
+    },
+    ClosedReferenceRole {
+        path: "workstreams/core-daemons/AGENTS.md",
+        role: "reference_only:owner_instruction",
+        basis: "owner instructions describe facade references as migration work",
+    },
+    ClosedReferenceRole {
+        path: "workstreams/core-daemons/T1.md",
+        role: "reference_only:workstream_record",
+        basis: "workstream record cites the facade owner boundary",
+    },
+    ClosedReferenceRole {
+        path: "workstreams/core-daemons/T2.md",
+        role: "reference_only:workstream_record",
+        basis: "workstream record cites the facade owner boundary",
+    },
+    ClosedReferenceRole {
+        path: "workstreams/core-daemons/assignments/018-governor-ownership-boundary.toml",
+        role: "reference_only:workstream_record",
+        basis: "#18 assignment inventories the facade for migration and retirement",
+    },
+    ClosedReferenceRole {
+        path: "workstreams/core-daemons/assignments/077-agent-bridge-host-request-port.toml",
+        role: "reference_only:workstream_record",
+        basis: "host-request assignment records the old MCP entrypoint as a replaced route",
+    },
+    ClosedReferenceRole {
+        path: "workstreams/core-daemons/capability-cell-registry.contract.toml",
+        role: "reference_only:owner_registry",
+        basis: "capability registry records migration ownership, not an executable invocation",
+    },
+    ClosedReferenceRole {
+        path: "workstreams/core-daemons/inventory.json",
+        role: "reference_only:owner_registry",
+        basis: "daemon inventory records the legacy facade as a migration boundary",
+    },
+    ClosedReferenceRole {
+        path: "workstreams/github/assignments/1225-manual-workflow-reproducibility.toml",
+        role: "reference_only:workstream_record",
+        basis: "workflow assignment cites repository paths for reproducibility context",
+    },
+    ClosedReferenceRole {
+        path: "workstreams/integration/assignments/1217-host-dispositions.toml",
+        role: "reference_only:workstream_record",
+        basis: "host disposition assignment tracks legacy integration references",
+    },
+    ClosedReferenceRole {
+        path: "workstreams/integration/assignments/911-isolated-runtime-provider.toml",
+        role: "reference_only:workstream_record",
+        basis: "runtime-provider assignment cites facade history",
+    },
+    ClosedReferenceRole {
+        path: "workstreams/integrations/assignments/1217-agent-host-integrations.toml",
+        role: "reference_only:workstream_record",
+        basis: "integration assignment records legacy host path identities",
+    },
+    ClosedReferenceRole {
+        path: "workstreams/legacy/assignments/1189-legacy-core-retirement.toml",
+        role: "reference_only:workstream_record",
+        basis: "#1189 assignment is the retirement ledger for the aggregate crate",
+    },
+    ClosedReferenceRole {
+        path: "workstreams/legacy/retirement-1189.toml",
+        role: "reference_only:workstream_record",
+        basis: "#1189 retirement ledger records source paths for deletion sequencing",
+    },
+    ClosedReferenceRole {
+        path: "workstreams/regressions/assignments/007-claude-completion-reconciliation.toml",
+        role: "reference_only:workstream_record",
+        basis: "regression assignment cites a historical compatibility route",
+    },
+    ClosedReferenceRole {
+        path: "workstreams/regressions/assignments/008-agent-context-attach.toml",
+        role: "reference_only:workstream_record",
+        basis: "regression assignment cites a historical compatibility route",
+    },
+    ClosedReferenceRole {
+        path: "workstreams/regressions/assignments/009-antigravity-terminal-reduction.toml",
+        role: "reference_only:workstream_record",
+        basis: "regression assignment cites a historical compatibility route",
+    },
+    ClosedReferenceRole {
+        path: "workstreams/release/assignments/1227-release-current-generation.toml",
+        role: "reference_only:workstream_record",
+        basis: "release assignment inventories the old bundle path as a removal condition",
+    },
+    ClosedReferenceRole {
+        path: "workstreams/surfaces/assignments/1137-operator-winui-runtime.toml",
+        role: "reference_only:workstream_record",
+        basis: "surface assignment maps the legacy operator protocol to its owner",
+    },
+    // Generated code-navigation projections bind text, not runtime callers.
+    ClosedReferenceRole {
+        path: "docs/code-navigation/PACKAGE_DOCS_INDEX.md",
+        role: "reference_only:generated_projection",
+        basis: "generated package index links to the migration facade documentation",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/agent-bridge-core/context_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated context capsule contains a source inventory token",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/agent-bridge-core/test_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated test capsule contains a source inventory token",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/foundation.authority.epoch-identity/context_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated context capsule contains a source inventory token",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/foundation.authority.epoch-identity/test_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated test capsule contains a source inventory token",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/foundation.contracts.primitives/context_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated context capsule contains a source inventory token",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/foundation.contracts.primitives/test_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated test capsule contains a source inventory token",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/governor.daemon.capability-admission/context_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated context capsule describes current daemon migration closure",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/governor.daemon.capability-admission/contract_kit.json",
+        role: "reference_only:generated_projection",
+        basis: "generated contract projection describes current daemon migration closure",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/governor.daemon.composition/context_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated context capsule describes current daemon migration closure",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/governor.daemon.composition/contract_kit.json",
+        role: "reference_only:generated_projection",
+        basis: "generated contract projection describes current daemon migration closure",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/governor.daemon.kernel-transport/context_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated context capsule describes current daemon migration closure",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/governor.daemon.kernel-transport/contract_kit.json",
+        role: "reference_only:generated_projection",
+        basis: "generated contract projection describes current daemon migration closure",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/governor.daemon.learning-closure/context_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated context capsule describes current daemon migration closure",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/governor.daemon.learning-closure/contract_kit.json",
+        role: "reference_only:generated_projection",
+        basis: "generated contract projection describes current daemon migration closure",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/governor.daemon.operator-replay/context_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated context capsule describes current daemon migration closure",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/governor.daemon.operator-replay/contract_kit.json",
+        role: "reference_only:generated_projection",
+        basis: "generated contract projection describes current daemon migration closure",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/governor.daemon.poll-contour/context_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated context capsule describes current daemon migration closure",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/governor.daemon.poll-contour/contract_kit.json",
+        role: "reference_only:generated_projection",
+        basis: "generated contract projection describes current daemon migration closure",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/governor.daemon.skill-catalogue/context_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated context capsule describes current daemon migration closure",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/governor.daemon.skill-catalogue/contract_kit.json",
+        role: "reference_only:generated_projection",
+        basis: "generated contract projection describes current daemon migration closure",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/governor.daemon.startup-binding/context_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated context capsule describes current daemon migration closure",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/governor.daemon.startup-binding/contract_kit.json",
+        role: "reference_only:generated_projection",
+        basis: "generated contract projection describes current daemon migration closure",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/governor.observation.admission/context_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated context capsule contains migration package identity",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/governor.observation.admission/test_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated test capsule contains migration package identity",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/governor.observation.classifier/context_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated context capsule contains migration package identity",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/governor.observation.classifier/test_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated test capsule contains migration package identity",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/governor.observation.journal_projection/context_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated context capsule contains migration package identity",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/governor.observation.journal_projection/test_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated test capsule contains migration package identity",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/governor.observation.plan_compilation/context_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated context capsule contains migration package identity",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/governor.observation.plan_compilation/test_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated test capsule contains migration package identity",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/governor_read/context_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated context capsule contains migration package identity",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/governor_read/test_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated test capsule contains migration package identity",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/index.json",
+        role: "reference_only:generated_projection",
+        basis: "generated capsule index records source package links",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/kernel-core/context_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated context capsule records a migration source edge",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/kernel-core/test_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated test capsule records a migration source edge",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/maintenance/context_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated context capsule records a migration source edge",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/maintenance/test_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated test capsule records a migration source edge",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/meta.improvement/context_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated context capsule records a migration source edge",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/meta.learning.activation_assessment/context_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated context capsule records a migration source edge",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/meta.learning.activation_assessment/test_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated test capsule records a migration source edge",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/observation-contracts/context_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated context capsule records a migration source edge",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/observation-contracts/test_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated test capsule records a migration source edge",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/operational-recovery-state/context_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated context capsule records a migration source edge",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/operational-recovery-state/test_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated test capsule records a migration source edge",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/runtime-contracts/context_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated context capsule records a migration source edge",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/runtime-contracts/test_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated test capsule records a migration source edge",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/smart.context.candidates/context_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated context capsule contains a source inventory token",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/smart.context.candidates/test_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated test capsule contains a source inventory token",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/smart.context.contracts/context_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated context capsule contains a source inventory token",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/smart.context.contracts/test_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated test capsule contains a source inventory token",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/smart.context.reactive_delivery_plan/context_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated context capsule contains a source inventory token",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/smart.context.reactive_delivery_plan/test_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated test capsule contains a source inventory token",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/smart.cue.contracts/context_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated context capsule contains a source inventory token",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/smart.cue.contracts/test_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated test capsule contains a source inventory token",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/smart.cue.index/context_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated context capsule contains a source inventory token",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/smart.cue.index/test_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated test capsule contains a source inventory token",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/smart.dreamer.failure/context_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated context capsule contains a source inventory token",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/smart.dreamer.failure/test_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated test capsule contains a source inventory token",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/smart.epistemic.contracts/context_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated context capsule contains a source inventory token",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/smart.epistemic.contracts/test_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated test capsule contains a source inventory token",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/smart.epistemic.position/context_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated context capsule contains a source inventory token",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/smart.epistemic.position/test_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated test capsule contains a source inventory token",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/smart.learning.contracts/context_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated context capsule contains a source inventory token",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/smart.learning.contracts/test_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated test capsule contains a source inventory token",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/smart.learning.delta/context_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated context capsule contains a source inventory token",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/smart.learning.delta/test_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated test capsule contains a source inventory token",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/wasm-runtime/context_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated context capsule contains a source inventory token",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/capsules/wasm-runtime/test_capsule.json",
+        role: "reference_only:generated_projection",
+        basis: "generated test capsule contains a source inventory token",
+    },
+    ClosedReferenceRole {
+        path: "docs/code-navigation/logical-blocks.toml",
+        role: "reference_only:generated_projection",
+        basis: "generated source ownership projection includes a legacy symbol match",
+    },
+    // Exact audit, migration, test-data, and repository-control fixtures.
+    ClosedReferenceRole {
+        path: ".gitignore",
+        role: "reference_only:repository_hygiene",
+        basis: "ignore pattern prevents a local legacy data directory from entering Git",
+    },
+    ClosedReferenceRole {
+        path: "scripts/audit-architecture-boundaries.py",
+        role: "reference_only:audit_fixture",
+        basis: "architecture audit scans names as static boundary evidence",
+    },
+    ClosedReferenceRole {
+        path: "scripts/audit_cue_kind_retirement.py",
+        role: "reference_only:audit_fixture",
+        basis: "cue-kind retirement audit carries facade text only in its inventory corpus",
+    },
+    ClosedReferenceRole {
+        path: "scripts/code_navigation_lib/common.py",
+        role: "reference_only:navigation_configuration",
+        basis: "skip-name set excludes local legacy data from generated navigation",
+    },
+    ClosedReferenceRole {
+        path: "scripts/context_measurement_inventory.py",
+        role: "reference_only:measurement_inventory",
+        basis: "context measurement inventories source tokens without invoking the executable",
+    },
+    ClosedReferenceRole {
+        path: "scripts/migration_inventory_1860.py",
+        role: "reference_only:migration_inventory",
+        basis: "migration inventory assigns the facade RETIRE disposition and records owners",
+    },
+    ClosedReferenceRole {
+        path: "scripts/testdata/crate-reachability/crate_extraction_decisions.toml",
+        role: "reference_only:audit_fixture",
+        basis: "fixture exercises static crate reachability disposition parsing",
+    },
+    ClosedReferenceRole {
+        path: "scripts/tests/test_cue_kind_retirement.py",
+        role: "reference_only:audit_fixture",
+        basis: "test exercises cue-kind inventory and retirement parsing",
+    },
+    ClosedReferenceRole {
+        path: "scripts/verify-core-daemon-inventory.py",
+        role: "reference_only:migration_verifier",
+        basis: "verifier checks the facade registry and retirement status; it does not launch the command",
+    },
+    ClosedReferenceRole {
+        path: "scripts/verify-github-workflows.py",
+        role: "reference_only:audit_fixture",
+        basis: "workflow verifier checks cache-key fixture strings containing the package token",
+    },
+    ClosedReferenceRole {
+        path: "scripts/verify-legacy-config-retirement.py",
+        role: "reference_only:migration_verifier",
+        basis: "verifier's config filename and negative fixtures share the token; it does not launch the Governor",
+    },
+    ClosedReferenceRole {
+        path: "scripts/work_unit_gate/doc_read_evidence.py",
+        role: "reference_only:audit_fixture",
+        basis: "documentation evidence schema cites a source path as data",
+    },
+    ClosedReferenceRole {
+        path: "tests/cognitive/memory-curation/cases.json",
+        role: "reference_only:test_data",
+        basis: "cognitive fixture carries legacy source text as evaluation data",
+    },
+    ClosedReferenceRole {
+        path: "tests/cognitive/memory-curation/curation-corpus.json",
+        role: "reference_only:test_data",
+        basis: "curation corpus stores a historical path mention as input data",
+    },
+    ClosedReferenceRole {
+        path: "tests/release-security/build-sandbox-cache-tests.ps1",
+        role: "reference_only:audit_fixture",
+        basis: "sandbox cache test uses the name in a synthetic path fixture, not as an executable",
+    },
+    ClosedReferenceRole {
+        path: "workspace/tools/eliot-runtime-compiler/src/lib.rs",
+        role: "reference_only:migration_compiler_input",
+        basis: "MIG-05 binds a migration cell to the facade path for analysis, not runtime invocation",
+    },
+    ClosedReferenceRole {
+        path: "integrations/agent-skills/skill-pack.manifest.json",
+        role: "live_consumer:build",
+        basis: "eliot-skills validates derived_packages and SkillPackService::sync writes the declared plugin/eliot-governor/skills package",
+    },
+    ClosedReferenceRole {
+        path: "plugin/eliot-antigravity-official/shared/ELIOT_TOOL_USAGE.md",
+        role: "reference_only:skill_guidance",
+        basis: "shared skill text mentions the old integration as migration guidance",
     },
 ];
 
@@ -358,20 +1124,6 @@ const INVENTORY_REVISION: &str = "2026-09-25";
 pub fn current_consumer_inventory() -> &'static [ConsumerEntry] {
     &[
         ConsumerEntry {
-            consumer: "Codex plugin lifecycle hooks",
-            proof: "plugin/eliot-governor/hooks/hooks.json",
-            live_reference: "${PLUGIN_ROOT}\\\\bin\\\\eliot-governor.exe",
-            disposition: Disposition::ExtractToCurrentOwner,
-            expiry: "remove when hooks route through bins/eliot-agent-bridge and crates/surfaces/* under #13",
-        },
-        ConsumerEntry {
-            consumer: "Claude Code plugin lifecycle hooks",
-            proof: "integrations/claude/eliot/hooks/hooks.json",
-            live_reference: "\"command\": \"${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe\"",
-            disposition: Disposition::ExtractToCurrentOwner,
-            expiry: "remove when hooks route through bins/eliot-agent-bridge and crates/surfaces/* under #13",
-        },
-        ConsumerEntry {
             consumer: "OpenCode MCP server registration",
             proof: "integrations/opencode/opencode.json",
             live_reference: "\"{env:ELIOT_GOVERNOR_EXE}\"",
@@ -384,6 +1136,13 @@ pub fn current_consumer_inventory() -> &'static [ConsumerEntry] {
             live_reference: "\"installation\": \"INSTALLED_BY_DEFAULT\"",
             disposition: Disposition::ExtractToCurrentOwner,
             expiry: "remove when the default-installed Codex plugin is a current root plugin under #13",
+        },
+        ConsumerEntry {
+            consumer: "Codex plugin identity manifest",
+            proof: "plugin/eliot-governor/.codex-plugin/plugin.json",
+            live_reference: "\"name\": \"eliot-governor\"",
+            disposition: Disposition::TemporaryFixture,
+            expiry: "remove with the Codex Governor plugin subtree after accepted #18 consumer and retirement evidence under #1719",
         },
         ConsumerEntry {
             consumer: "OpenCode host integration",
@@ -469,6 +1228,76 @@ pub fn current_consumer_inventory() -> &'static [ConsumerEntry] {
             disposition: Disposition::TemporaryFixture,
             expiry: "remove by 2026-12-31, when connector tests target the current root server binary under #11",
         },
+        ConsumerEntry {
+            consumer: "Claude Desktop package build instructions",
+            proof: "integrations/claude/claude-desktop/README.md",
+            live_reference: "cargo build --release -p eliot-app",
+            disposition: Disposition::TemporaryFixture,
+            expiry: "remove by 2026-12-31, when the package instructions build and stage the current owner server under #11/#18",
+        },
+        ConsumerEntry {
+            consumer: "Claude Desktop MCPB package instructions",
+            proof: "integrations/claude/claude-desktop/mcpb/README.md",
+            live_reference: "`eliot-governor.exe`",
+            disposition: Disposition::TemporaryFixture,
+            expiry: "remove by 2026-12-31, when the MCPB guide names only the current owner server under #11/#18",
+        },
+        ConsumerEntry {
+            consumer: "Legacy UL cross-agent reference MCP client",
+            proof: "scripts/eliot-mcp-reference-client.ps1",
+            live_reference: "'codex_controller'",
+            disposition: Disposition::TemporaryFixture,
+            expiry: "remove when the UL runner and codex_controller profile use the admitted current MCP owner under #18 and its owner track",
+        },
+        ConsumerEntry {
+            consumer: "OpenCode legacy executable fallback fixture",
+            proof: "integrations/opencode/tests/eliot-plugin.test.mjs",
+            live_reference: "process.env.ELIOT_GOVERNOR_EXE",
+            disposition: Disposition::TemporaryFixture,
+            expiry: "remove when the OpenCode integration no longer accepts the legacy executable fallback under #18",
+        },
+        ConsumerEntry {
+            consumer: "Windows x64 live signing retained-Governor fixture",
+            proof: "tests/release-security/trusted-cli-live-signing-tests.ps1",
+            live_reference: "eliot-governor.exe",
+            disposition: Disposition::TemporaryFixture,
+            expiry: "update after #18 admits retirement so the signing fixture matches the selected bundle denominator",
+        },
+        ConsumerEntry {
+            consumer: "Operator compatibility query contract",
+            proof: "apps/Eliot.Operator/Protocol/OperatorContracts.cs",
+            live_reference: "crates/eliot-app/src/mcp_stdio/catalog.rs",
+            disposition: Disposition::ExtractToCurrentOwner,
+            expiry: "remove when LegacyOperatorAdapter consumes the current query contract without the facade MCP catalog under #18",
+        },
+        ConsumerEntry {
+            consumer: "Operator compatibility mutation contract",
+            proof: "apps/Eliot.Operator/Protocol/OperatorIntent.cs",
+            live_reference: "crates/eliot-app/src/mcp_stdio.rs",
+            disposition: Disposition::ExtractToCurrentOwner,
+            expiry: "remove when LegacyOperatorAdapter uses the current typed Operator-intent route without facade MCP dispatch under #18",
+        },
+        ConsumerEntry {
+            consumer: "Operator compatibility response contract",
+            proof: "apps/Eliot.Operator/Protocol/OperatorResponseBounds.cs",
+            live_reference: "crates/eliot-app/src/mcp_stdio/operator.rs",
+            disposition: Disposition::ExtractToCurrentOwner,
+            expiry: "remove when Operator response bounds are verified against the current owner contract without facade emissions under #18",
+        },
+        ConsumerEntry {
+            consumer: "Operator LegacyOperatorAdapter",
+            proof: "apps/Eliot.Operator/README.md",
+            live_reference: "The `eliot_operator_*` tools are served by `crates/eliot-app`",
+            disposition: Disposition::ExtractToCurrentOwner,
+            expiry: "remove when the adapter is replaced by current ControlBoard/runtime-status reads and typed intent writes under #18",
+        },
+        ConsumerEntry {
+            consumer: "Operator legacy-contract regression fixture",
+            proof: "tests/Eliot.Operator.Tests/Program.cs",
+            live_reference: "crates/eliot-app/src/mcp_stdio/operator.rs",
+            disposition: Disposition::TemporaryFixture,
+            expiry: "remove after the Operator adapter test asserts the current owner contract and no longer references facade output under #18",
+        },
     ]
 }
 
@@ -526,6 +1355,22 @@ pub const MIGRATED_CONSUMER_EDGES: &[MigratedConsumerEdge] = &[
         current_owner: "bins/eliot-agent-bridge (SPINE_FUNCTIONAL contour)",
         evidence: "bridge argv mcp --profile SPINE_FUNCTIONAL --transport stdio --client-declaration <installation-owned agent-bridge/client-declaration-v2.json>; the admitted contour the facade's unconditional Bridge redirect already serves for the claude host (crates/eliot-app/src/main.rs::delegate_host_mcp_to_agent_bridge); served through the Kernel front door with no Governor, Store, WAL, or writer construction",
     },
+    MigratedConsumerEdge {
+        consumer: "Codex plugin lifecycle hooks",
+        proof: "plugin/eliot-governor/hooks/hooks.json",
+        legacy_reference: "${PLUGIN_ROOT}\\\\bin\\\\eliot-governor.exe",
+        current_owner_reference: "${PLUGIN_ROOT}\\\\bin\\\\eliot-agent-bridge.exe\\\" hook",
+        current_owner: "bins/eliot-agent-bridge hook intake (evaluation in crates/eliot-engine EliotHookService)",
+        evidence: "bridge argv hook <event> (bins/eliot-agent-bridge/src/hook_intake.rs::run_hook_intake): per-event argv preserved (session-start, pre-tool-use, post-tool-use, pre-compact, post-compact, stop); host hook JSON stdin incl. empty-input {}, ELIOT_TASK_ID attach, and decision.stdout evaluated through eliot_engine::EliotHookService::for_session().process, the existing owner (crates/eliot-engine/src/plugin.rs), under the retired run_hook contract (crates/eliot-app/src/commands/execution.rs:305); no profile/transport/declaration flags; MCP front door untouched",
+    },
+    MigratedConsumerEdge {
+        consumer: "Claude Code plugin lifecycle hooks",
+        proof: "integrations/claude/eliot/hooks/hooks.json",
+        legacy_reference: "\"command\": \"${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe\"",
+        current_owner_reference: "\"command\": \"${CLAUDE_PLUGIN_ROOT}/bin/eliot-agent-bridge.exe\"",
+        current_owner: "bins/eliot-agent-bridge hook intake (evaluation in crates/eliot-engine EliotHookService)",
+        evidence: "bridge argv hook <event> (bins/eliot-agent-bridge/src/hook_intake.rs::run_hook_intake): per-event argv preserved (session-start, pre-tool-use, post-tool-use, subagent-start, subagent-stop, pre-compact, stop); host hook JSON stdin incl. empty-input {}, ELIOT_TASK_ID attach, and decision.stdout evaluated through eliot_engine::EliotHookService::for_session().process, the existing owner (crates/eliot-engine/src/plugin.rs), under the retired run_hook contract (crates/eliot-app/src/commands/execution.rs:305); the two host event --host claude --event rows (PostToolUseFailure, SessionEnd) are removed from this edge because record_event lease-gating plus reports/host-events writes are host-runtime behavior owned by the #77 host-request protocol migration and are not servable by the hook intake; host-observable output is unchanged (continue/suppress ack either way) and no current reader consumes reports/host-events",
+    },
 ];
 
 /// Baked bytes of a migrated edge proof.
@@ -534,6 +1379,8 @@ fn migrated_proof_body(path: &str) -> Option<&'static str> {
         "plugin/eliot-governor/.mcp.json" => Some(CODEX_PLUGIN_MCP),
         "integrations/claude/claude-desktop/mcpb/manifest.json" => Some(CLAUDE_DESKTOP_MCPB),
         "integrations/claude/eliot/.mcp.json" => Some(CLAUDE_PLUGIN_MCP),
+        "plugin/eliot-governor/hooks/hooks.json" => Some(CODEX_PLUGIN_HOOKS),
+        "integrations/claude/eliot/hooks/hooks.json" => Some(CLAUDE_PLUGIN_HOOKS),
         _ => None,
     }
 }

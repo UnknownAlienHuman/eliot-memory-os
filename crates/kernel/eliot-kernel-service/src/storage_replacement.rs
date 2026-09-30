@@ -80,8 +80,8 @@
 //!   a module id no live route carries still declares cleanly, but its
 //!   `route_scope_hash` is then a key no committed cutover row could ever carry,
 //!   [`committed_canonical_store_cutovers`] drops every real store cutover when
-//!   filtering on it, [`active_canonical_store_generation`] answers `None` even
-//!   after a genuine cutover committed, and the gateway's route gate admits the
+//!   filtering on it, [`canonical_store_route_owner`] answers `None` even after
+//!   a genuine cutover committed, and the gateway's route gate admits the
 //!   incumbent unchanged. Pinning the coordinate to the real route identity is
 //!   what makes the gate below bind to the route rather than to a scope of this
 //!   module's own invention.
@@ -106,16 +106,33 @@
 //!   cutover receipt binds that transfer, so a cutover cannot be proven against
 //!   bytes the coordinator never saw.
 //! - After a committed cutover, the Store gateway admits nothing against the
-//!   incumbent generation. [`active_canonical_store_generation`] is the read
-//!   side of the same committed row, and
+//!   incumbent generation. [`canonical_store_route_owner`] is the read side of
+//!   the same committed row, and
 //!   `KernelStoreGateway::require_active_store_generation` refuses every Store
 //!   read and write — including the two that carry no caller fence and the
 //!   borrowed client contour that reaches the retained client directly — unless
-//!   this gateway's generation *is* the durable route's active generation. A
-//!   gateway for a non-active generation can therefore be built and retained by
+//!   this gateway's generation *is* the durable route's owner. A
+//!   gateway for a non-owner generation can therefore be built and retained by
 //!   any composition path, but it is not a writer or a reader of the canonical
 //!   store, so the incumbent is served by nobody while the `I5.11` stage-10
 //!   window is open, and only another committed cutover can serve it again.
+//! - **Before** any cutover is committed, the durable owner still names one
+//!   generation. The composition root establishes that owner once, through
+//!   [`establish_canonical_store_route_owner`], before any Store gateway
+//!   exists, so the initial state of every installation means "only the
+//!   recorded initial generation" rather than "anything goes". That is what
+//!   closes the configuration and restart legs of the negative in the
+//!   pre-first-commit window: once the row exists, an operator who installs and
+//!   activates an approved package generation carrying a NEW store bridge still
+//!   reaches a gateway whose generation the durable owner does not name, and it
+//!   is refused canonical reads and writes by the same gate that refuses a
+//!   cut-over incumbent. Be precise about the one step in front of that: the
+//!   writer is only reached when the durable owner answers `None`, so on an
+//!   installation whose ORS predates this record the first composition writes
+//!   whatever generation the Host descriptor then names. There is no earlier
+//!   durable evidence to migrate that answer from, and the writer is
+//!   write-once, so from the second composition onward the recorded name is the
+//!   only one that can serve.
 //!
 //! **Not** established by this module, and stated here so no reader mistakes
 //! this file for a safety net it is not:
@@ -126,20 +143,18 @@
 //!   and that rebind path mints its own unrelated `StoreRebindReceipt` without
 //!   consulting this module. What the route gate closes is the consequence: a
 //!   gateway composed for a generation the durable `canonical_store` route does
-//!   not name is refused every read and write, so a rebind to a candidate that
-//!   has no committed cutover cannot serve as a second canonical writer *once a
-//!   cutover exists*. What it does **not** do is stop such a gateway from being
-//!   constructed. The gate binds as soon as one cutover is committed for this
-//!   route, and the row that names the active generation is written by the Kernel
-//!   Generation Registry ingress
+//!   not name is refused every read and write, so neither a direct construction
+//!   nor a rebind to a candidate that has no committed cutover can serve as a
+//!   second canonical writer. What it does **not** do is stop such a gateway
+//!   from being constructed. The row that names the owner after a cutover is
+//!   written by the Kernel Generation Registry ingress
 //!   (`bins/eliot-kernel/src/generation_control.rs::apply_authenticated_generation_cutover`)
 //!   for exactly a completed replacement this coordinator re-derives through
 //!   [`StorageReplacement::replay_recorded_stages`] and then re-derives its
 //!   receipt from through [`StorageReplacement::commit_canonical_store_route_cutover`].
-//!   Before that first commit the durable owner still names no active generation
-//!   at all, so the composition's own ordering argument is what keeps the initial
-//!   generation the one served. Telling those two apart is the composition root's
-//!   own decision, not this module's.
+//!   The owner a composition establishes before that first cutover names no
+//!   stage, no epoch transition and no receipt, and is replaced by that cutover
+//!   and by nothing else.
 //! - A cutover is still *committed* by the Kernel Generation Registry's owner,
 //!   which writes the ORS `CUTOVER_OWNERSHIP` row — for this route, that owner is
 //!   the admitted cutover ingress
@@ -198,9 +213,9 @@ use std::fmt;
 
 use eliot_contracts::ResourceGeneration;
 use eliot_ors::{
-    CapabilityRouteScope, CutoverRouteSnapshot, GenerationCutoverOwnership,
-    GenerationCutoverOwnershipReceipt, MAX_RECOVERY_PAGE, OrsError, RedbRecoveryStore,
-    StateMigrationDecision,
+    CanonicalStoreRouteOwnership, CapabilityRouteScope, CutoverRouteSnapshot,
+    GenerationCutoverOwnership, GenerationCutoverOwnershipReceipt, MAX_RECOVERY_PAGE, OrsError,
+    RedbRecoveryStore, StateMigrationDecision,
 };
 use eliot_runtime_contracts::GenerationCutoverState;
 use schemars::JsonSchema;
@@ -270,10 +285,10 @@ pub fn canonical_store_route_scope() -> Result<CapabilityRouteScope, KernelServi
     .map_err(|error| ors_refusal(&error))
 }
 
-/// Resolves the store generation that currently owns the pinned
-/// `canonical_store` capability route.
+/// Resolves the store generation a committed `I5.11` stage-8 cutover left
+/// owning the pinned `canonical_store` capability route.
 ///
-/// This is the read side of the `I5.11` stage-8 cutover. It answers through the
+/// This is the read side of the stage-8 cutover alone. It answers through the
 /// *existing* admitted owner rather than a rule of its own: the committed ORS
 /// `CUTOVER_OWNERSHIP` rows are handed to [`CutoverRouteSnapshot::rebuild`], the
 /// same reconstruction the Kernel's own recovery performs
@@ -283,13 +298,16 @@ pub fn canonical_store_route_scope() -> Result<CapabilityRouteScope, KernelServi
 /// as `I14.14` requires ("rollback is another cutover with a newer epoch; an old
 /// epoch is never reactivated"), and a pre-commit `Armed` candidate cannot
 /// appear because the listing itself returns committed rows only. `None` means
-/// no committed cutover has ever switched this route, so the composition's own
-/// route is still the active one and this module imposes nothing.
+/// no committed cutover has ever switched this route — not that this route has
+/// no owner. The owner in every installation state is
+/// [`canonical_store_route_owner`], which falls back to the established owner of
+/// this scope so that the pre-first-commit window is decided by durable evidence
+/// rather than by the composition's own ordering argument.
 ///
-/// Every Store read and write is admitted against this answer rather than a
+/// Every Store read and write is admitted against that owner rather than a
 /// composition-fixed route snapshot. After a committed cutover the incumbent
-/// generation is therefore no longer the active generation, and the governed
-/// path can neither read nor write it — which is what lets the old store stay
+/// generation is therefore no longer the owner, and the governed path can
+/// neither read nor write it — which is what lets the old store stay
 /// read-only for the `I5.11` stage-10 rollback window.
 ///
 /// The read is bounded by [`MAX_RECOVERY_PAGE`], the bound ORS itself applies
@@ -355,6 +373,98 @@ fn is_absent_cutover_ownership_table(error: &OrsError) -> bool {
         OrsError::Storage(message)
             if message.contains("Table 'ors_cutover_ownership_v1' does not exist")
     )
+}
+
+/// Whether an ORS refusal is only the absence of the optional established
+/// route-owner table in a database that predates it.
+///
+/// The same compatibility reading as
+/// [`is_absent_cutover_ownership_table`], for the same stated reason: the table
+/// is materialised by the first composition that establishes the owner, so its
+/// absence is a fact about the database and means only that no owner was ever
+/// established. Every other storage refusal and every typed ORS class still
+/// reaches the caller unchanged.
+fn is_absent_route_ownership_table(error: &OrsError) -> bool {
+    matches!(
+        error,
+        OrsError::Storage(message)
+            if message.contains("Table 'ors_canonical_store_route_ownership_v1' does not exist")
+    )
+}
+
+/// The generation that owns the pinned `canonical_store` capability route.
+///
+/// This is the question `I5.11` stage 8 decides and the question every Store
+/// read and write is admitted against. It is answered through the existing
+/// admitted owner and through nothing else:
+///
+/// 1. a committed `I5.11` stage-8 cutover for the pinned route scope, read
+///    exactly as [`active_canonical_store_generation`] reads it — the strictly
+///    newest committed epoch wins, and a pre-commit `Armed` candidate cannot
+///    appear because the listing returns committed rows only; then
+/// 2. the established owner of that same route scope,
+///    [`CanonicalStoreRouteOwnership`], which is the record of the generation
+///    the scope started at.
+///
+/// The second answer is what closes the pre-first-commit window. Without it,
+/// "no committed cutover" is indistinguishable from "any generation may serve",
+/// and that is the initial state of every installation, so an approved but
+/// uncommitted candidate bridge could serve canonical reads and writes with no
+/// stage evidence at all. With it, the initial state names exactly one
+/// generation, and the only thing that may replace that name is a committed
+/// `I5.11` stage-8 cutover — the one transition this coordinator exists to
+/// govern.
+///
+/// `Ok(None)` now means only that no owner was ever established AND no cutover
+/// was ever committed for this scope, which is the state of a database that has
+/// not been composed by this build yet. It is not reachable on a composed
+/// installation, because composition establishes the owner before any Store
+/// gateway exists.
+pub fn canonical_store_route_owner(
+    ors: &RedbRecoveryStore,
+) -> Result<Option<ResourceGeneration>, KernelServiceError> {
+    if let Some(active) = active_canonical_store_generation(ors)? {
+        return Ok(Some(active));
+    }
+    let scope = canonical_store_route_scope()?;
+    let recorded = match ors.load_canonical_store_route_ownership(scope.route_scope_hash.as_str()) {
+        Ok(recorded) => recorded,
+        Err(error) if is_absent_route_ownership_table(&error) => None,
+        Err(error) => return Err(ors_refusal(&error)),
+    };
+    Ok(recorded.map(|record| record.initial_generation))
+}
+
+/// Records, exactly once, that `initial_generation` is the approved initial
+/// owner of the pinned `canonical_store` capability route scope.
+///
+/// This is the composition's half of the pre-first-commit window, and it is
+/// deliberately write-once. The row it writes names a route scope that has never
+/// been switched, so it carries no epoch transition, no in-flight disposition
+/// set and no linearization identity, and it is not a cutover receipt. The
+/// [`RedbRecoveryStore::commit_canonical_store_route_ownership`] writer refuses
+/// a *different* generation for the same scope, so a configuration change or a
+/// restart cannot move the owner of an un-cut-over route: re-presenting the
+/// identical row is idempotent, and only a committed `I5.11` stage-8 cutover for
+/// the same scope can change the answer [`canonical_store_route_owner`] gives.
+///
+/// The scope is this module's own pinned
+/// [`canonical_store_route_scope`], and the writer re-validates its recorded
+/// `route_scope_hash` against the key it is stored under, so no caller supplies
+/// a scope and no scope hash is hand-computed.
+pub fn establish_canonical_store_route_owner(
+    ors: &RedbRecoveryStore,
+    initial_generation: ResourceGeneration,
+) -> Result<ResourceGeneration, KernelServiceError> {
+    let scope = canonical_store_route_scope()?;
+    scope.validate().map_err(|error| ors_refusal(&error))?;
+    let record = CanonicalStoreRouteOwnership {
+        route_scope_hash: scope.route_scope_hash,
+        initial_generation,
+    };
+    ors.commit_canonical_store_route_ownership(&record)
+        .map_err(|error| ors_refusal(&error))?;
+    Ok(initial_generation)
 }
 
 /// One recorded `I5.10` exchange into the candidate store.
@@ -1257,8 +1367,19 @@ fn validate_digest(value: &str, field: &'static str) -> Result<(), KernelService
 ///
 /// The match is exhaustive by construction: a new ORS class is a compile error
 /// here rather than a silently stringified refusal.
+fn store_contract_refusal(source: &eliot_store_api::StoreError) -> KernelServiceError {
+    KernelServiceError::Core(eliot_kernel_core::KernelError::RecoveryState(
+        OrsError::StoreContract(Box::new(source.clone())),
+    ))
+}
+
+fn legacy_host_refusal() -> KernelServiceError {
+    invalid_field("host_request_legacy_correlation")
+}
+
 fn ors_refusal(error: &OrsError) -> KernelServiceError {
     match error {
+        OrsError::StoreContract(source) => store_contract_refusal(source),
         // The presented ORS state does not match the required authority,
         // fence, owner or durable head.
         OrsError::FenceMismatch => mismatch("authority_epoch_fence"),
@@ -1330,9 +1451,7 @@ fn ors_refusal(error: &OrsError) -> KernelServiceError {
         OrsError::SupervisionLeaseTicketAlreadyCommitted => invalid_field("lease_ticket_committed"),
         OrsError::InvalidSupervisionLeaseHistoryLimit => invalid_field("lease_history_limit"),
         OrsError::HostRequestIdentityConflict { .. } => invalid_field("host_request_identity"),
-        OrsError::HostRequestLegacyCorrelationUnresolved => {
-            invalid_field("host_request_legacy_correlation")
-        }
+        OrsError::HostRequestLegacyCorrelationUnresolved => legacy_host_refusal(),
         OrsError::HostRequestAttemptLimitExceeded => invalid_field("host_request_attempt_limit"),
         OrsError::HostRequestAttemptExpired => invalid_field("host_request_attempt_expired"),
         OrsError::CampaignLearningStateViewConflict { .. } => {

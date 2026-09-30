@@ -49,15 +49,19 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use eliot_platform::PlatformHandle;
+use eliot_runtime_contracts::Ed25519SupervisionLeaseSigner;
 use sha2::{Digest, Sha256};
 
 const HOST_CREDENTIAL_MUTEX_PREFIX: &str = "Global\\Eliot-Host-Credential-";
+const CURRENT_USER_CREDENTIAL_MUTEX_PREFIX: &str = "Global\\Eliot-User-Credential-";
 
 #[cfg(windows)]
 pub(crate) const HOST_CREDENTIAL_INTERLOCK_TIMEOUT_MS: u32 = 30_000;
 
 pub(crate) const INSTALLER_CREDENTIAL_TARGET_PREFIX: &str = "eliot/installer-root/v1/";
 pub(crate) const STORE_CREDENTIAL_TARGET_PREFIX: &str = "eliot/store/v1/";
+const USER_MODE_SUPERVISION_CREDENTIAL_TARGET_PREFIX: &str =
+    "eliot/supervision-authority/user-mode/v1/";
 
 /// User-scoped DPAPI ciphertext.  The bytes carry no authority and are not
 /// serializable by this crate.
@@ -315,6 +319,278 @@ impl WindowsInstallerSecretProvider {
             return Err(crate::WindowsAdapterError::InvalidInput);
         }
         credential_delete(reference.as_str())
+    }
+}
+
+/// Receipt for one current-token `UserMode` supervision-key write and exact
+/// Credential Manager readback. It is provider evidence only; installation
+/// transaction progress and the public authority receipt remain the authority
+/// owners.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CurrentUserSupervisionCredentialWriteReceipt {
+    pub(crate) owner_sid: PlatformHandle,
+    pub(crate) target: PlatformHandle,
+}
+
+/// Read-only observation of one purpose-bound current-user supervision key.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CurrentUserSupervisionCredentialObservation {
+    /// The exact target is absent under the observed current-user token.
+    Absent {
+        owner_sid: PlatformHandle,
+        target: PlatformHandle,
+    },
+    /// The exact target is present; secret bytes remain inside the provider.
+    Present {
+        owner_sid: PlatformHandle,
+        target: PlatformHandle,
+    },
+}
+
+/// Result after the provider has attempted the one exact `WinCred` write.
+///
+/// A mutation error or failed post-write readback cannot establish that the
+/// target stayed absent. `Unknown` therefore carries the exact transaction
+/// target for durable recovery inspection and must never be treated as a
+/// retry authorization.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CurrentUserSupervisionCredentialProvisionOutcome {
+    /// The write and exact secret readback both succeeded.
+    Created(CurrentUserSupervisionCredentialWriteReceipt),
+    /// A write was attempted, but no positive receipt can be returned.
+    Unknown {
+        owner_sid: PlatformHandle,
+        target: PlatformHandle,
+    },
+}
+
+/// Current-token Credential Manager primitive for the `UserMode` supervision
+/// signing seed. Its target namespace is purpose-separated from installer-root
+/// HMAC keys, Store credentials, and `LocalService` credential targets.
+///
+/// Credential Manager has no atomic create-only API. The provider serializes
+/// cooperating callers with a mutex ACL'd to the exact current SID, requires
+/// absence under that token, writes once, and verifies exact immediate
+/// readback. A same-user process that bypasses this adapter can still race the
+/// write; this is the explicit current-user trust boundary, not an atomic
+/// ownership proof. Installation may report a provisioned authority only after
+/// it persists this positive write/readback receipt in the original effect
+/// progress.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct WindowsCurrentUserSupervisionCredentialProvider;
+
+#[allow(
+    clippy::unused_self,
+    reason = "the provider methods are kept as an opaque instance boundary"
+)]
+impl WindowsCurrentUserSupervisionCredentialProvider {
+    /// Creates a provider without opening or changing Credential Manager.
+    #[must_use]
+    pub(crate) const fn new() -> Self {
+        Self
+    }
+
+    /// Returns the exact current process-token SID.
+    ///
+    /// This is an associated function, not a method: the value comes from the
+    /// live process token, and the provider carries no fields or resources that
+    /// a caller-supplied instance could contribute.
+    pub(crate) fn principal_sid() -> Result<PlatformHandle, crate::WindowsAdapterError> {
+        let sid =
+            crate::current_process_sid().map_err(|_| crate::WindowsAdapterError::Unavailable)?;
+        PlatformHandle::new(sid).map_err(|_| crate::WindowsAdapterError::InvalidInput)
+    }
+
+    /// Derives the one current-user key target from immutable installation and
+    /// effect identities. Callers must persist these identities before write.
+    pub(crate) fn target_for_effect(
+        self,
+        installation_id: &str,
+        transaction_id: &str,
+        effect_id: &str,
+        owner_sid: &PlatformHandle,
+    ) -> Result<PlatformHandle, crate::WindowsAdapterError> {
+        let live_sid = Self::principal_sid()?;
+        if live_sid != *owner_sid
+            || [installation_id, transaction_id, effect_id]
+                .iter()
+                .any(|value| {
+                    value.is_empty()
+                        || *value != value.trim()
+                        || value.chars().any(char::is_control)
+                })
+        {
+            return Err(crate::WindowsAdapterError::IdentityMismatch);
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"eliot-user-mode-supervision-credential-target-v1\0");
+        for value in [
+            installation_id,
+            transaction_id,
+            effect_id,
+            owner_sid.as_str(),
+        ] {
+            let length =
+                u64::try_from(value.len()).map_err(|_| crate::WindowsAdapterError::InvalidInput)?;
+            digest.update(length.to_le_bytes());
+            digest.update(value.as_bytes());
+        }
+        let target = format!(
+            "{USER_MODE_SUPERVISION_CREDENTIAL_TARGET_PREFIX}{}",
+            hex_lower(&digest.finalize())
+        );
+        PlatformHandle::new(target).map_err(|_| crate::WindowsAdapterError::InvalidInput)
+    }
+
+    /// Observes one exact target under the expected current-user SID.
+    pub(crate) fn inspect(
+        self,
+        target: &PlatformHandle,
+        expected_owner_sid: &PlatformHandle,
+    ) -> Result<CurrentUserSupervisionCredentialObservation, crate::WindowsAdapterError> {
+        self.validate_binding(target, expected_owner_sid)?;
+        match credential_read_optional(target.as_str())? {
+            Some(secret) if secret.expose().len() == 32 => {
+                Ok(CurrentUserSupervisionCredentialObservation::Present {
+                    owner_sid: expected_owner_sid.clone(),
+                    target: target.clone(),
+                })
+            }
+            Some(_) => Err(crate::WindowsAdapterError::IdentityMismatch),
+            None => Ok(CurrentUserSupervisionCredentialObservation::Absent {
+                owner_sid: expected_owner_sid.clone(),
+                target: target.clone(),
+            }),
+        }
+    }
+
+    /// Writes one 256-bit seed only after exact-target absence and returns only
+    /// after its immediate current-token readback matches byte-for-byte.
+    ///
+    /// Once `credential_write` is invoked, every provider error or failed
+    /// readback is returned as `Unknown`: `WinCred` may have accepted the bytes
+    /// before the error became visible. The caller must persist that result
+    /// against the original transaction/effect and inspect this same target
+    /// before any later action. It must not infer absence or retry from an
+    /// error.
+    pub(crate) fn write_exact_if_absent(
+        self,
+        target: &PlatformHandle,
+        expected_owner_sid: &PlatformHandle,
+        secret: CredentialSecret,
+    ) -> Result<CurrentUserSupervisionCredentialProvisionOutcome, crate::WindowsAdapterError> {
+        self.validate_binding(target, expected_owner_sid)?;
+        if secret.expose().len() != 32 {
+            return Err(crate::WindowsAdapterError::IdentityMismatch);
+        }
+        let _interlock =
+            HostCredentialInterlock::acquire_current_user(target, expected_owner_sid.as_str())?;
+        if credential_read_optional(target.as_str())?.is_some() {
+            return Err(crate::WindowsAdapterError::AlreadyExists);
+        }
+        if credential_write(target.as_str(), secret.expose()).is_err() {
+            drop(secret);
+            return Ok(CurrentUserSupervisionCredentialProvisionOutcome::Unknown {
+                owner_sid: expected_owner_sid.clone(),
+                target: target.clone(),
+            });
+        }
+        let Ok(readback) = credential_read_optional(target.as_str()) else {
+            drop(secret);
+            return Ok(CurrentUserSupervisionCredentialProvisionOutcome::Unknown {
+                owner_sid: expected_owner_sid.clone(),
+                target: target.clone(),
+            });
+        };
+        if require_exact_credential_readback(
+            secret.expose(),
+            readback.as_ref().map(CredentialSecret::expose),
+        )
+        .is_err()
+        {
+            drop(readback);
+            drop(secret);
+            return Ok(CurrentUserSupervisionCredentialProvisionOutcome::Unknown {
+                owner_sid: expected_owner_sid.clone(),
+                target: target.clone(),
+            });
+        }
+        drop(readback);
+        let receipt = CurrentUserSupervisionCredentialWriteReceipt {
+            owner_sid: expected_owner_sid.clone(),
+            target: target.clone(),
+        };
+        drop(secret);
+        Ok(CurrentUserSupervisionCredentialProvisionOutcome::Created(
+            receipt,
+        ))
+    }
+
+    /// Reads one exact 256-bit seed only in the bound current-user token.
+    pub(crate) fn read(
+        self,
+        target: &PlatformHandle,
+        expected_owner_sid: &PlatformHandle,
+    ) -> Result<CredentialSecret, crate::WindowsAdapterError> {
+        self.validate_binding(target, expected_owner_sid)?;
+        let secret = credential_read(target.as_str())?;
+        if secret.expose().len() != 32 {
+            return Err(crate::WindowsAdapterError::IdentityMismatch);
+        }
+        Ok(secret)
+    }
+
+    /// Deletes only a seed that derives the exact public key in the original
+    /// transaction receipt, then proves target absence.
+    pub(crate) fn delete_if_signing_key_matches(
+        self,
+        target: &PlatformHandle,
+        expected_owner_sid: &PlatformHandle,
+        signer_id: &str,
+        key_id: &str,
+        expected_public_key: &[u8],
+    ) -> Result<(), crate::WindowsAdapterError> {
+        self.validate_binding(target, expected_owner_sid)?;
+        if signer_id.is_empty() || key_id.is_empty() || expected_public_key.len() != 32 {
+            return Err(crate::WindowsAdapterError::InvalidInput);
+        }
+        let _interlock =
+            HostCredentialInterlock::acquire_current_user(target, expected_owner_sid.as_str())?;
+        let secret = credential_read(target.as_str())?;
+        if secret.expose().len() != 32 {
+            return Err(crate::WindowsAdapterError::IdentityMismatch);
+        }
+        let mut seed = [0_u8; 32];
+        seed.copy_from_slice(secret.expose());
+        let signer_result = Ed25519SupervisionLeaseSigner::from_secret_key(
+            signer_id.to_owned(),
+            key_id.to_owned(),
+            seed,
+        );
+        seed.fill(0);
+        let signer = signer_result.map_err(|_| crate::WindowsAdapterError::IdentityMismatch)?;
+        if signer.public_key().as_slice() != expected_public_key {
+            return Err(crate::WindowsAdapterError::IdentityMismatch);
+        }
+        credential_delete(target.as_str())?;
+        if credential_read_optional(target.as_str())?.is_some() {
+            return Err(crate::WindowsAdapterError::IdentityMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_binding(
+        self,
+        target: &PlatformHandle,
+        expected_owner_sid: &PlatformHandle,
+    ) -> Result<(), crate::WindowsAdapterError> {
+        if !valid_user_mode_supervision_credential_target(target.as_str()) {
+            return Err(crate::WindowsAdapterError::InvalidInput);
+        }
+        if Self::principal_sid()? != *expected_owner_sid {
+            return Err(crate::WindowsAdapterError::IdentityMismatch);
+        }
+        Ok(())
     }
 }
 
@@ -601,6 +877,47 @@ impl HostCredentialInterlock {
             Err(crate::WindowsAdapterError::Unavailable)
         }
     }
+
+    fn acquire_current_user(
+        target: &PlatformHandle,
+        owner_sid: &str,
+    ) -> Result<Self, crate::WindowsAdapterError> {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+            use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+            let digest = Sha256::digest(format!("{owner_sid}\0{}", target.as_str()).as_bytes());
+            let suffix = hex_lower(&digest);
+            let name = format!("{CURRENT_USER_CREDENTIAL_MUTEX_PREFIX}{suffix}");
+            let wide_name = crate::nul_terminated_wide(std::ffi::OsStr::new(&name))
+                .map_err(|_| crate::WindowsAdapterError::InvalidInput)?;
+            let descriptor =
+                crate::OwnedSecurityDescriptor::for_user_owned_storage(owner_sid, false)?;
+            let attributes = SECURITY_ATTRIBUTES {
+                nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>())
+                    .map_err(|_| crate::WindowsAdapterError::InvalidInput)?,
+                lpSecurityDescriptor: descriptor.raw,
+                bInheritHandle: 0,
+            };
+            let handle = unsafe { CreateMutexW(&raw const attributes, 0, wide_name.as_ptr()) };
+            if handle.is_null() {
+                return Err(crate::last_windows_adapter_error());
+            }
+            let wait = unsafe { WaitForSingleObject(handle, HOST_CREDENTIAL_INTERLOCK_TIMEOUT_MS) };
+            match classify_host_credential_interlock_wait(wait) {
+                Ok(()) => Ok(Self { handle }),
+                Err(error) => {
+                    let _ = unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+                    Err(error)
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (target, owner_sid);
+            Err(crate::WindowsAdapterError::Unavailable)
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -677,7 +994,7 @@ impl crate::WindowsPlatform {
         key: &str,
         secret: &[u8],
     ) -> Result<(), crate::WindowsAdapterError> {
-        if installer_credential_target(key) {
+        if reserved_credential_target(key) {
             return Err(crate::WindowsAdapterError::InvalidInput);
         }
         credential_write(key, secret)
@@ -691,7 +1008,7 @@ impl crate::WindowsPlatform {
         &self,
         key: &str,
     ) -> Result<CredentialSecret, crate::WindowsAdapterError> {
-        if installer_credential_target(key) {
+        if reserved_credential_target(key) {
             return Err(crate::WindowsAdapterError::InvalidInput);
         }
         credential_read(key)
@@ -703,7 +1020,7 @@ impl crate::WindowsPlatform {
     /// # Errors
     /// Returns a typed adapter error when the key is invalid, absent or inaccessible.
     pub fn delete_credential(&self, key: &str) -> Result<(), crate::WindowsAdapterError> {
-        if installer_credential_target(key) {
+        if reserved_credential_target(key) {
             return Err(crate::WindowsAdapterError::InvalidInput);
         }
         credential_delete(key)
@@ -838,6 +1155,24 @@ pub(crate) fn valid_credential_key(value: &str) -> bool {
 
 pub(crate) fn installer_credential_target(value: &str) -> bool {
     value.starts_with(INSTALLER_CREDENTIAL_TARGET_PREFIX)
+}
+
+fn reserved_credential_target(value: &str) -> bool {
+    installer_credential_target(value)
+        || value.starts_with(USER_MODE_SUPERVISION_CREDENTIAL_TARGET_PREFIX)
+}
+
+fn valid_user_mode_supervision_credential_target(value: &str) -> bool {
+    value
+        .strip_prefix(USER_MODE_SUPERVISION_CREDENTIAL_TARGET_PREFIX)
+        .is_some_and(is_sha256_hex)
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 pub(crate) fn valid_installer_credential_target(value: &str) -> bool {

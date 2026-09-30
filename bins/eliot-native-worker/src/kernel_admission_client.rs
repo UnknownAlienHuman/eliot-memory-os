@@ -2031,6 +2031,20 @@ mod tests {
             expires_at_unix_ms: now.saturating_add(300_000),
             executable_wire_version: NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION,
             executable_binding_digest: sha256_hex(b"eliot-native-worker-live-owner-digest"),
+            // The owner-admitted lifecycle joins this live join carries
+            // alongside the cell, in the same shape the Kernel claim protocol's
+            // own `valid_join` fixture uses
+            // (`crates/kernel/eliot-kernel-service/src/protocol/native_worker_claim.rs`).
+            // This is the worker's live-bound contour, so they are carried and
+            // shape-checked on the wire, not derived here.
+            capability_cell_registry_digest: "e".repeat(64),
+            kernel_execution_manifest_digest: "f".repeat(64),
+            job_object_lineage_ref: "job-lineage-1".to_owned(),
+            resource_limits_digest: "1".repeat(64),
+            cancellation_policy_ref: "cancel-policy-1".to_owned(),
+            checkpoint_policy_digest: "2".repeat(64),
+            drain_policy_ref: "drain-policy-1".to_owned(),
+            restart_policy_digest: "3".repeat(64),
         };
         live(
             NativeWorkerClaim {

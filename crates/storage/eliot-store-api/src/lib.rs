@@ -3776,6 +3776,214 @@ pub enum NamedReadOperation {
     /// bounded page with a fence-bound keyset continuation cursor, so a
     /// complete hydration drains it to exhaustion.
     GetCapabilityEvidenceRecordRange,
+    /// Exact `TaskContract` acceptance-item enumeration of one task at one
+    /// owner revision (issue #1741, I7.9).
+    ///
+    /// I7.9 requires the Finish service to rehydrate the current
+    /// `TaskContract` and its acceptance items, and a plan's declared
+    /// `required_acceptance_item_ids` is a plan's own list rather than the
+    /// contract owner's enumeration, so the denominator needs its own read.
+    ///
+    /// Known-but-unsupported until a store-owned task-contract slice activates
+    /// its catalogue row with a proven handler. The typed parameters
+    /// (`task_id`, `task_revision`) and the payload contract
+    /// ([`TaskContractAcceptanceSet`]) are already closed, so a consumer may
+    /// already build and submit the read through
+    /// [`task_contract_acceptance_read_request`]; until the row is activated
+    /// every admission path refuses it with [`StoreError::UnknownOperation`],
+    /// and no consumer may synthesize the set locally.
+    GetTaskContractAcceptanceSet,
+}
+
+/// Schema identifier of the neutral `TaskContract` acceptance-set payload.
+pub const TASK_CONTRACT_ACCEPTANCE_SET_SCHEMA_V1: &str = "eliot.task-contract.acceptance-set.v1";
+
+/// Closed neutral vocabulary for the evidence an enumerated acceptance
+/// obligation requires.
+///
+/// The wire spellings are exactly the contract owner's own `observation` /
+/// `verification` members, so the neutral payload is a faithful projection of
+/// the owner's record rather than a second evidence identity. Neither this
+/// crate nor the Governor depends on the legacy `eliot-types` acceptance
+/// vocabulary, so the two members are carried here rather than re-declared
+/// under a third, unrelated scheme.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskContractAcceptanceEvidence {
+    Observation,
+    Verification,
+}
+
+/// One enumerated acceptance obligation of a `TaskContract`, projected into the
+/// neutral wire shape.
+///
+/// Only the obligation itself travels. A persisted `satisfied` flag is a
+/// submitter-shaped claim, not coverage truth, so it is deliberately absent
+/// from this contract: a consumer that needs to know whether an obligation is
+/// covered must join owner-bound evidence to this item, and cannot read a flag
+/// as an answer.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskContractAcceptanceItem {
+    /// Owner-issued identity of this obligation, unique within the set.
+    pub item_id: String,
+    /// Owner-issued statement of what the obligation requires.
+    pub description: String,
+    /// The evidence class this obligation requires.
+    pub required_evidence: TaskContractAcceptanceEvidence,
+}
+
+/// The current `TaskContract` acceptance item set of one task, read at an exact
+/// task id and an exact task revision by the owner that holds the contract.
+///
+/// The obligation list is enumerated item by item. No digest, count or other
+/// summary stands in for it, because a summary cannot make an omitted
+/// obligation visible. `acceptance_digest` is the owner's OWN recorded
+/// acceptance identity for this set; it is never recomputed here and never
+/// accepted from a caller, so a consumer proves it against the enumeration
+/// beside it with its own existing validator rather than by re-deriving the
+/// owner's value from a list it also supplied.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskContractAcceptanceSet {
+    /// Closed schema identifier of this payload.
+    pub schema: String,
+    /// Exact State Fence the owner read this set under.
+    pub read_state_fence: StateFence,
+    /// Task whose contract owns this obligation set.
+    pub task_id: TaskId,
+    /// Exact task revision the set was read at.
+    pub task_revision: u64,
+    /// The owner's own recorded acceptance identity for this enumeration.
+    pub acceptance_digest: String,
+    /// Every obligation the current contract requires, in owner order.
+    pub items: Vec<TaskContractAcceptanceItem>,
+}
+
+impl TaskContractAcceptanceSet {
+    /// Returns the exact obligation identifiers this set enumerates.
+    ///
+    /// This is the denominator's membership and nothing more: it says which
+    /// obligations exist, never whether any of them is satisfied.
+    #[must_use]
+    pub fn item_ids(&self) -> BTreeSet<String> {
+        self.items.iter().map(|item| item.item_id.clone()).collect()
+    }
+
+    /// Validates the closed owner payload: the exact task id and a non-zero
+    /// task revision, a fence-bound read, a well-formed owner acceptance
+    /// identity, and a non-empty enumeration of uniquely identified
+    /// obligations.
+    ///
+    /// A missing record, a malformed digest, an empty obligation list, or an
+    /// obligation whose id is blank or repeated is an error, never a smaller
+    /// or empty success: a denominator that shrinks without refusing is exactly
+    /// the defect this read exists to close.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        if self.schema != TASK_CONTRACT_ACCEPTANCE_SET_SCHEMA_V1 {
+            return Err(StoreError::InvalidField {
+                field: "task_contract_acceptance_set.schema",
+                reason: "does not name the closed acceptance-set schema",
+            });
+        }
+        self.read_state_fence
+            .validate()
+            .map_err(StoreError::Foundation)?;
+        if self.task_id.as_str().trim().is_empty() {
+            return Err(StoreError::InvalidField {
+                field: "task_contract_acceptance_set.task_id",
+                reason: "must be a non-blank task identity",
+            });
+        }
+        if self.task_revision == 0 {
+            return Err(StoreError::InvalidField {
+                field: "task_contract_acceptance_set.task_revision",
+                reason: "must be a non-zero task revision",
+            });
+        }
+        validate_digest(
+            &self.acceptance_digest,
+            "task_contract_acceptance_set.acceptance_digest",
+        )?;
+        if self.items.is_empty() {
+            return Err(StoreError::InvalidField {
+                field: "task_contract_acceptance_set.items",
+                reason: "an absent obligation list is not an empty obligation set",
+            });
+        }
+        let mut item_ids = BTreeSet::new();
+        for item in &self.items {
+            validate_text(&item.item_id, "task_contract_acceptance_item.item_id")?;
+            validate_text(
+                &item.description,
+                "task_contract_acceptance_item.description",
+            )?;
+            if !item_ids.insert(item.item_id.clone()) {
+                return Err(StoreError::InvalidField {
+                    field: "task_contract_acceptance_item.item_id",
+                    reason: "must be unique within the owner's obligation set",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Builds the exact closed named read for one task's owner acceptance set.
+///
+/// The revision travels as its decimal string beside the exact task id, so a
+/// caller cannot be admitted against a revision it did not ask for and the
+/// owner refuses a set that is not current at it. The read addresses no scope:
+/// the obligation set belongs to the task's contract, not to a caller's scope.
+pub fn task_contract_acceptance_read_request(
+    task_id: &TaskId,
+    task_revision: u64,
+    state_fence: &StateFence,
+) -> Result<NamedReadRequest, StoreError> {
+    if task_revision == 0 {
+        return Err(StoreError::InvalidField {
+            field: "task_contract_acceptance_read.task_revision",
+            reason: "must be a non-zero task revision",
+        });
+    }
+    state_fence.validate().map_err(StoreError::Foundation)?;
+    let parameters = BTreeMap::from([
+        (
+            "task_id".to_owned(),
+            Value::String(task_id.as_str().to_owned()),
+        ),
+        (
+            "task_revision".to_owned(),
+            Value::String(task_revision.to_string()),
+        ),
+    ]);
+    Ok(NamedReadRequest {
+        operation: NamedReadOperation::GetTaskContractAcceptanceSet,
+        scope_id: None::<ScopeId>,
+        consistency: ReadConsistency::ExactFence,
+        state_fence: state_fence.clone(),
+        parameters,
+    })
+}
+
+/// Decodes the closed owner acceptance set from one named read response.
+///
+/// The response must be this exact read at this exact fence; a substituted
+/// operation, a changed fence, an absent payload, or a payload that does not
+/// validate is refused. The returned set is validated, never repaired.
+pub fn decode_task_contract_acceptance_set(
+    response: &NamedReadResponse,
+) -> Result<TaskContractAcceptanceSet, StoreError> {
+    if response.operation != NamedReadOperation::GetTaskContractAcceptanceSet {
+        return Err(StoreError::UnknownOperation);
+    }
+    let set: TaskContractAcceptanceSet = serde_json::from_value(response.payload.clone())
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    set.validate()?;
+    if set.read_state_fence != response.state_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    Ok(set)
 }
 
 /// Closed mutation catalogue activated by the current contract catalogue.
@@ -5139,6 +5347,82 @@ pub enum OutboxState {
     Unknown,
     ReadbackConfirmed,
     Irreconcilable,
+}
+
+/// What one committed outbox row exists to hand off (issue #1678 W3/A3).
+///
+/// A launch outbox is not a second outbox scheme and not a second table: it is
+/// the SAME `OutboxIntent` row, committed in the SAME store transaction as the
+/// `ADMITTED` decision and its `WriteReceipt`, distinguished only by this
+/// closed naming so a launch reader can select on it. Every other producer —
+/// the event-projection planners in the adapters — names its rows exactly as
+/// before; this adds no field, no table, no persistence layer and no digest to
+/// `OutboxIntent`, so no existing producer or stored row changes shape.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum OutboxIntentKind {
+    /// The existing default: one intent per canonical event, projected to
+    /// downstream consumers. Unchanged by issue #1678.
+    EventProjection,
+    /// The launch intent I10.15 step 3 and I14.6 name alongside the canonical
+    /// `ADMITTED` transition: "canonical state records `ADMITTED` and the
+    /// launch outbox". Exactly one launch intent is committed per canonical
+    /// admission operation, under that operation's own identity, and it is the
+    /// row the reservation saga reads back before activation.
+    Launch,
+}
+
+impl OutboxIntentKind {
+    /// Closed, store-owned spelling of one outbox row's outbox-id prefix.
+    ///
+    /// A launch reader selects on this prefix, so the kind lives inside the
+    /// type that names outbox rows rather than in a planner's format string:
+    /// the store plan that commits a launch row and the reservation saga that
+    /// reads it back cannot drift on the spelling, and an event-projection row
+    /// can never be mistaken for a launch row because its prefix differs.
+    pub const fn id_prefix(self) -> &'static str {
+        match self {
+            Self::EventProjection => "outbox",
+            Self::Launch => "launch-outbox",
+        }
+    }
+
+    /// Names one outbox row of this kind under its committed operation.
+    ///
+    /// This is the one spelling of an outbox id, used by the store plan that
+    /// commits the row and by the reservation saga that reads it back, so a
+    /// launch row is found under the identity the commit actually used rather
+    /// than under a spelling the reader re-invented.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidField`] when the derived label is not a
+    /// usable `OutboxId`; no row is named that the owner could not store.
+    pub fn outbox_id(self, operation_key: &str, index: usize) -> Result<OutboxId, StoreError> {
+        OutboxId::new(format!("{}-{operation_key}-{index}", self.id_prefix()))
+    }
+
+    /// Classifies one committed outbox row by its store-owned id spelling.
+    ///
+    /// This is the inverse of [`Self::outbox_id`]: a reader that already holds
+    /// a row asks which kind it is, and a row whose id carries no known prefix
+    /// is `None` rather than a guessed kind. Classification is therefore by
+    /// content the owner itself wrote, never by a caller assertion.
+    #[must_use]
+    pub fn of(outbox_id: &OutboxId) -> Option<Self> {
+        let text = outbox_id.as_str();
+        // The prefix must be followed by the `-` that separates it from the
+        // operation key, so an id merely CONTAINING the word is not classified
+        // as a launch row.
+        [Self::Launch, Self::EventProjection]
+            .into_iter()
+            .find(|kind| {
+                let prefix = kind.id_prefix();
+                text.len() > prefix.len()
+                    && text.starts_with(prefix)
+                    && text.as_bytes()[prefix.len()] == b'-'
+            })
+    }
 }
 
 /// One atomic outbox intent linked to the canonical transition.

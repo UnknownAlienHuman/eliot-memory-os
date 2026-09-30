@@ -23,6 +23,7 @@ eliot-agent-bridge-core.workspace = true
 eliot-agent-opencode.workspace = true
 eliot-context-contracts = { path = "../../crates/smart/eliot-context-contracts", version = "0.1.0" }
 eliot-contracts.workspace = true
+eliot-engine.workspace = true
 eliot-governor.workspace = true
 eliot-integration-coverage.workspace = true
 eliot-ipc.workspace = true
@@ -34,6 +35,7 @@ eliot-protocol.workspace = true
 eliot-reactive-context-plan = { path = "../../crates/smart/eliot-reactive-context-plan", version = "0.1.0" }
 eliot-receipts.workspace = true
 eliot-runtime.workspace = true
+eliot-types.workspace = true
 eliot-user-broker-core.workspace = true
 eliot-workscope.workspace = true
 secrecy.workspace = true

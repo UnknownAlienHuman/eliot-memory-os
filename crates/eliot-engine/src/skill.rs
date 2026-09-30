@@ -1,4 +1,6 @@
 use crate::{EngineError, WriteAdmissionService, WriterHandle};
+use eliot_context_contracts::{ContextError, MeasurementStatus, StuEstimate};
+use eliot_context_measurement::{MAX_MEASUREMENT_BYTES, stu_for_bytes, validate_envelope};
 use eliot_types::{
     AgentId, CommandContext, EpistemicStatus, ExperienceMaturityState, ExperiencePattern,
     ForgettingOperator, ForgettingPolicy, ForgettingReason, LifecycleStatus, MemoryEcologyDecision,
@@ -206,6 +208,20 @@ impl SkillLifecycleService {
         skill: &SkillCardV2,
         demotion_reason: Option<String>,
     ) -> SkillLifecycleRecord {
+        let measurement = measure_skill_context_envelope(skill).ok();
+        let mut local_check_refs: Vec<String> = skill
+            .applies_when
+            .iter()
+            .flat_map(|rule| rule.required_evidence_refs.clone())
+            .collect();
+        // The canonical measurement identity travels with the record so the
+        // recorded `context_cost` is always traceable to exact Skill bytes,
+        // serializer/profile and content digest.
+        local_check_refs.extend(
+            measurement
+                .iter()
+                .map(SkillContextEnvelopeMeasurement::measurement_evidence_ref),
+        );
         SkillLifecycleRecord {
             record_id: format!("skill-lifecycle-{}", WriteId::new_v7()),
             skill_ref: skill.skill_id,
@@ -213,7 +229,12 @@ impl SkillLifecycleService {
             uses: skill.success_count.saturating_add(skill.failure_count),
             successes: skill.success_count,
             failures: skill.failure_count,
-            context_cost: Some(estimated_skill_context_cost(skill)),
+            // A serialization or measurement failure leaves the canonical cost
+            // unknown (`None`). It never becomes zero, a minimum-one estimate,
+            // or any local `/4` ratio.
+            context_cost: measurement
+                .as_ref()
+                .map(SkillContextEnvelopeMeasurement::estimated_context_cost),
             last_verified: skill.last_verified_at,
             where_applies: skill.applies_when.clone(),
             where_not_apply: skill.does_not_apply_when.clone(),
@@ -221,11 +242,7 @@ impl SkillLifecycleService {
             source_case_refs: Vec::new(),
             source_pattern_refs: Vec::new(),
             mechanism_refs: Vec::new(),
-            local_check_refs: skill
-                .applies_when
-                .iter()
-                .flat_map(|rule| rule.required_evidence_refs.clone())
-                .collect(),
+            local_check_refs,
             transfer_evidence_refs: skill.replay_result_refs.clone(),
             holdout_evidence_refs: Vec::new(),
             negative_transfer_refs: Vec::new(),
@@ -528,9 +545,19 @@ impl SkillNeedEstimator {
         } else {
             0.0
         };
-        let context_cost =
-            f64::from(u32::try_from(estimated_skill_context_cost(skill)).unwrap_or(u32::MAX));
-        let cost_penalty = (context_cost / 2000.0).min(0.25);
+        // The canonical unvalidated STU of the exact serialized Skill envelope.
+        // Unknown measurement evidence is never zero, cheap or preferred: an
+        // unavailable canonical measurement takes the maximum risk penalty and
+        // cannot lower `distractor_risk` below what an unknown cost may allow.
+        let cost_penalty = match measure_skill_context_envelope(skill) {
+            Ok(measurement) => {
+                let context_cost = f64::from(
+                    u32::try_from(measurement.estimated_context_cost()).unwrap_or(u32::MAX),
+                );
+                (context_cost / 2000.0).min(0.25)
+            }
+            Err(_) => 0.25,
+        };
         let verifier_bonus = if missing_verifier(skill, context) {
             -0.20
         } else {
@@ -714,10 +741,51 @@ pub struct SkillInfluenceReportInput {
     pub included: Vec<SkillId>,
     pub executed: Vec<SkillId>,
     pub execution_proofs: Vec<String>,
-    pub estimated_context_cost: u64,
+    /// Exact `SkillCardV2` envelopes whose canonical #704 measurements back
+    /// `SkillInfluenceReport::estimated_context_cost`.
+    ///
+    /// A bare caller-supplied integer is no longer accepted: the report's
+    /// context cost is the sum of the canonical unvalidated STU over these
+    /// exact serialized bytes. `None` means the measurement is unknown or
+    /// unavailable, never zero and never a caller-declared value.
+    pub measured_skills: Option<Vec<SkillCardV2>>,
+}
+
+impl SkillInfluenceReportInput {
+    /// Canonical aggregate context cost for the reported Skill set.
+    ///
+    /// Every measured Skill contributes its own canonical record, so the same
+    /// Skill revision always contributes the same amount. `Ok(None)` means no
+    /// Skill bytes were supplied (measurement absent); a serialization or
+    /// measurement failure is a typed `Err` rather than a silent drop that
+    /// would report a cheaper value.
+    fn canonical_context_cost(&self) -> Result<Option<u64>, EngineError> {
+        let Some(skills) = self.measured_skills.as_ref() else {
+            return Ok(None);
+        };
+        let mut total = 0_u64;
+        for skill in skills {
+            let measurement = measure_skill_context_envelope(skill)?;
+            total = total
+                .checked_add(measurement.estimated_context_cost())
+                .ok_or(ContextError::Overflow)?;
+        }
+        Ok(Some(total))
+    }
 }
 
 impl SkillInfluenceService {
+    /// Builds the influence report from canonical #704 measurements only.
+    ///
+    /// `SkillInfluenceReport::estimated_context_cost` is the sum of the exact
+    /// serialized envelope measurements of `input.measured_skills`. Absent
+    /// Skill bytes or a serialization/measurement failure is an explicitly
+    /// unavailable cost: the report is never produced with a zero, a
+    /// caller-declared or a `/4` cost. `SkillInfluenceReport` carries no
+    /// `Option`/`Result` on this field and its consumers are non-fallible, so
+    /// the unavailable state is reported as the typed sentinel
+    /// [`CONTEXT_COST_UNAVAILABLE`] rather than as a measurement that could be
+    /// mistaken for a real one.
     pub fn report(input: SkillInfluenceReportInput) -> SkillInfluenceReport {
         let included_set = input.included.iter().copied().collect::<BTreeSet<_>>();
         let excluded = input
@@ -726,6 +794,11 @@ impl SkillInfluenceService {
             .copied()
             .filter(|skill_id| !included_set.contains(skill_id))
             .collect();
+        let estimated_context_cost = input
+            .canonical_context_cost()
+            .ok()
+            .flatten()
+            .unwrap_or(CONTEXT_COST_UNAVAILABLE);
         SkillInfluenceReport {
             report_id: format!("skill-influence-{}", WriteId::new_v7()),
             project_id: input.project_id,
@@ -736,7 +809,7 @@ impl SkillInfluenceService {
             skills_excluded: excluded,
             skills_executed: input.executed,
             execution_proofs: input.execution_proofs,
-            estimated_context_cost: input.estimated_context_cost,
+            estimated_context_cost,
             observed_decision_delta: None,
             created_at: OffsetDateTime::now_utc(),
             write_receipt: None,
@@ -891,8 +964,136 @@ fn known_failure_active(skill: &SkillCardV2, context: &SkillActivationContext) -
     })
 }
 
-fn estimated_skill_context_cost(skill: &SkillCardV2) -> u64 {
-    serde_json::to_string(skill).map_or(0, |text| text.len().div_ceil(4) as u64)
+/// Canonical #704 measurement of one `SkillCardV2` envelope.
+///
+/// The serialized `SkillCardV2` bytes are the exact payload: there is one
+/// serializer/profile and one binding for every consumer, so `skill.rs` and
+/// `skill_curator.rs` reach the same measurement identity and value for the
+/// same Skill revision. `div_ceil(4)`, character counts, `serde_json` failure
+/// fallback and minimum-one estimates do not exist here; valid empty bytes
+/// measure zero and invalid bytes are a typed error.
+///
+/// `actual_tokens` is deliberately absent: no route/model/tokenizer
+/// observation is bound to these bytes, so the record stays
+/// `ConservativeStu` with `empirical: false` and is never a current token
+/// count. The status therefore cannot activate, promote, retire, quarantine,
+/// suppress or grant authority for a Skill.
+#[must_use = "a canonical skill-context measurement is evidence, not advice: discarding it leaves the caller unmeasured"]
+pub(crate) fn measure_skill_context_envelope(
+    skill: &SkillCardV2,
+) -> Result<SkillContextEnvelopeMeasurement, EngineError> {
+    const SERIALIZER_ID: &str = "serde_json";
+    const SERIALIZER_VERSION: &str = "eliot-skill-card-v2/v1";
+    const SERIALIZER_OPTIONS: &[u8] =
+        b"serde_json::to_vec(SkillCardV2); compact JSON; default serializer options; UTF-8";
+
+    let serialized = serde_json::to_vec(skill)?;
+    let declared_len = u64::try_from(serialized.len()).map_err(|_| ContextError::Overflow)?;
+    let content_digest = eliot_contracts::sha256_hex(&serialized);
+    let envelope = validate_envelope(
+        &serialized,
+        declared_len,
+        &content_digest,
+        MAX_MEASUREMENT_BYTES,
+    )?;
+    let value = stu_for_bytes(envelope.byte_len)?;
+    let serializer_options_digest = eliot_contracts::sha256_hex(SERIALIZER_OPTIONS);
+    let serializer_profile_digest = eliot_contracts::sha256_hex(
+        format!("{SERIALIZER_ID}\0{SERIALIZER_VERSION}\0{serializer_options_digest}").as_bytes(),
+    );
+    Ok(SkillContextEnvelopeMeasurement {
+        skill_ref: skill.skill_id.to_string(),
+        skill_version: skill.version.clone(),
+        rendered_utf8_bytes: envelope.byte_len,
+        stu_estimate: StuEstimate {
+            value,
+            empirical: false,
+        },
+        serializer_id: SERIALIZER_ID.to_owned(),
+        serializer_version: SERIALIZER_VERSION.to_owned(),
+        serializer_options_digest,
+        serializer_profile_digest,
+        content_digest: envelope.digest,
+        measurement_status: MeasurementStatus::ConservativeStu,
+        actual_tokens: None,
+    })
+}
+
+/// Reported aggregate context cost when no canonical measurement exists.
+///
+/// This is a sentinel, not a measurement: it is deliberately outside the range
+/// any real STU total can occupy, so a consumer comparing a reported cost
+/// against a budget can never mistake "unmeasured" for "free" or for a small
+/// number. It is only used where the owning type cannot express absence
+/// (`SkillInfluenceReport::estimated_context_cost` is a plain `u64` consumed by
+/// non-fallible callers); every path that CAN express absence uses `None` or a
+/// typed error instead.
+pub(crate) const CONTEXT_COST_UNAVAILABLE: u64 = u64::MAX;
+
+/// Deterministic #704 measurement record for one Skill revision.
+///
+/// Every field is a pure function of the Skill ID/version and the exact
+/// serialized bytes, so both engine consumers derive the identical record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SkillContextEnvelopeMeasurement {
+    pub(crate) skill_ref: String,
+    pub(crate) skill_version: String,
+    pub(crate) rendered_utf8_bytes: u64,
+    pub(crate) stu_estimate: StuEstimate,
+    pub(crate) serializer_id: String,
+    pub(crate) serializer_version: String,
+    pub(crate) serializer_options_digest: String,
+    pub(crate) serializer_profile_digest: String,
+    pub(crate) content_digest: String,
+    pub(crate) measurement_status: MeasurementStatus,
+    pub(crate) actual_tokens: Option<u64>,
+}
+
+impl SkillContextEnvelopeMeasurement {
+    /// Canonical unvalidated planning estimate; never a current token count.
+    #[must_use]
+    pub(crate) fn estimated_context_cost(&self) -> u64 {
+        self.stu_estimate.value
+    }
+
+    /// Full canonical binding for one measured Skill revision.
+    ///
+    /// Binds Skill ID/version, serializer ID/version/options/profile, exact
+    /// content digest, rendered byte length, the unvalidated-STU status and the
+    /// absent-vs-observed actual-token status, so two consumers of the same
+    /// bytes produce the identical reference.
+    #[must_use]
+    pub(crate) fn measurement_evidence_ref(&self) -> String {
+        format!(
+            "skill-context-measurement:{}@{}:{}:{}:{}:{}:{}:{}:{}",
+            self.skill_ref,
+            self.skill_version,
+            self.serializer_id,
+            self.serializer_version,
+            self.serializer_options_digest,
+            self.serializer_profile_digest,
+            self.content_digest,
+            self.rendered_utf8_bytes,
+            self.actual_vs_estimated_status(),
+        )
+    }
+
+    /// Explicit actual-versus-estimated status.
+    ///
+    /// Without a bound route/model/tokenizer observation over these exact
+    /// bytes, the value is always the explicitly permitted unvalidated STU
+    /// and never a current token count.
+    #[must_use]
+    pub(crate) fn actual_vs_estimated_status(&self) -> String {
+        if self.actual_tokens.is_some() {
+            format!("actual_tokenizer_tokens:{:?}", self.measurement_status)
+        } else {
+            format!(
+                "unvalidated_stu_actual_unknown:{:?}",
+                self.measurement_status
+            )
+        }
+    }
 }
 
 async fn write_skill_observation<T>(

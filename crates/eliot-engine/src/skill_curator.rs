@@ -1,3 +1,4 @@
+use crate::skill::measure_skill_context_envelope;
 use crate::{
     EngineError, ForgettingPolicyService, SkillActivationContext, SkillDistractorFilterService,
     SkillLifecycleService, WriteAdmissionService, WriterHandle,
@@ -55,7 +56,7 @@ impl SkillCuratorService {
             usage_sources: vec![
                 "skill_lifecycle_record.success_count".to_owned(),
                 "skill_lifecycle_record.failure_count".to_owned(),
-                "skill_context_cost_estimate".to_owned(),
+                "canonical_skill_context_measurement".to_owned(),
                 "skill_scope_rules".to_owned(),
             ],
             proposals,
@@ -646,8 +647,24 @@ fn duplicate_skill_groups(skills: &[SkillCardV2]) -> Vec<Vec<SkillId>> {
         .collect()
 }
 
+/// Canonical measured Skill context cost in unvalidated STU.
+///
+/// Delegates to the single #704 owner in `skill.rs`, so the curator and
+/// `skill.rs` yield the identical measurement for the same Skill revision and
+/// serialized bytes. A serialization or measurement failure is not a small
+/// cost: it yields `None`, which every caller below treats as "cost unknown",
+/// never as zero, cheap or preferred.
+fn measured_skill_context_cost(skill: &SkillCardV2) -> Option<u64> {
+    measure_skill_context_envelope(skill)
+        .ok()
+        .map(|measurement| measurement.estimated_context_cost())
+}
+
 fn low_utility_high_cost(skill: &SkillCardV2) -> bool {
-    skill.failure_count > skill.success_count && estimated_skill_context_cost(skill) >= 180
+    // Unchanged threshold. Unknown canonical evidence does not prove a high
+    // cost, so it does not open an archive proposal on cost grounds.
+    skill.failure_count > skill.success_count
+        && measured_skill_context_cost(skill).is_some_and(|cost| cost >= 180)
 }
 
 fn negative_transfer(skill: &SkillCardV2) -> bool {
@@ -690,7 +707,12 @@ fn expected_utility_delta(action: SkillCurationAction) -> f64 {
 }
 
 fn expected_context_delta(action: SkillCurationAction, skill: &SkillCardV2) -> i64 {
-    let cost = i64::try_from(estimated_skill_context_cost(skill)).unwrap_or(i64::MAX);
+    // Unchanged divisors and thresholds. Unknown canonical evidence yields no
+    // claimed saving: the delta stays zero rather than an invented reduction.
+    let Some(cost) = measured_skill_context_cost(skill) else {
+        return 0;
+    };
+    let cost = i64::try_from(cost).unwrap_or(i64::MAX);
     match action {
         SkillCurationAction::Keep | SkillCurationAction::Promote => 0,
         SkillCurationAction::Patch => -cost / 10,
@@ -716,10 +738,6 @@ fn verifier_refs(skill: &SkillCardV2) -> Vec<String> {
         .iter()
         .map(|verifier| verifier.command_display.clone())
         .collect()
-}
-
-fn estimated_skill_context_cost(skill: &SkillCardV2) -> u64 {
-    serde_json::to_string(skill).map_or(0, |text| text.len().div_ceil(4) as u64)
 }
 
 fn decision_with_reason(

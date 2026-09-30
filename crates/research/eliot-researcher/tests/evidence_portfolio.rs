@@ -23,6 +23,16 @@ const DIGEST_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 const EXPECTED_GRADE_ORDER: [&str; 4] = ["ORIENTING", "GROUNDED", "CORROBORATED", "SCIENCE_GRADE"];
 const EXPECTED_DENOMINATOR_SIZE: usize = 4;
 
+/// The manifest revision the absence fixture freezes and the evaluation names.
+///
+/// `AuthorizedManifest` keeps `revision` private and exposes no accessor for it,
+/// so the fixture cannot read it back off the frozen value. It names the
+/// revision it freezes here instead, in one place, and the join is still
+/// enforced by the owner: `NoMatchEvaluationIssuer::issue_for` refuses a
+/// manifest whose revision differs from the one the evaluation carries, so a
+/// drifting constant fails the fixture instead of quietly passing it.
+const ABSENCE_MANIFEST_REVISION: u64 = 1;
+
 fn fence() -> StateFence {
     let epoch = EpochId::new(
         EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage"),
@@ -179,9 +189,11 @@ const ASSESSMENT_MS: i64 = 1_700_000_300_000;
 ///   `check_scope_binding` compares the issuer against itself rather than against
 ///   a caller-selected one. It is the digest of the frozen scope snapshot this
 ///   evaluation is bounded to, which is what the scope-binding check means;
-/// * `denominator_digest`, `manifest_digest` and `manifest_revision` are read off
-///   the very [`AuthorizedManifest`] the evaluation is presented with, so
-///   `check_manifest_binding` measures the issuer against that manifest;
+/// * `denominator_digest` and `manifest_digest` are read off the very
+///   [`AuthorizedManifest`] the evaluation is presented with, and
+///   `manifest_revision` is the revision this fixture freezes for that same
+///   manifest, so `check_manifest_binding` measures the issuer against that
+///   manifest and refuses the pair if the two ever disagree;
 /// * the per-member results are minted by `issue_for` itself, which joins each
 ///   closed member's handle, vetted record, currentness, manifest allowlist,
 ///   manifest record binding and observation order before a result exists, so
@@ -214,7 +226,7 @@ fn issued_evaluation(
         scope_revision: "scope-700.1".to_owned(),
         denominator_digest: inquiry_denominator_digest(),
         manifest_digest: manifest.canonical_digest().expect("manifest commitment"),
-        manifest_revision: manifest.revision,
+        manifest_revision: ABSENCE_MANIFEST_REVISION,
         index_revision: "index-700.1".to_owned(),
         source_revision: "corpus-700.1".to_owned(),
         // At or after every record's retrieval time and at or before the
@@ -312,7 +324,7 @@ fn proven_absence() -> (
         revoked: Vec::new(),
         disclosure: DisclosureClass::ProjectBound,
         expires_ms: 1_900_000_000_000,
-        revision: 1,
+        revision: ABSENCE_MANIFEST_REVISION,
     })
     .expect("authorized manifest");
     let evaluation =

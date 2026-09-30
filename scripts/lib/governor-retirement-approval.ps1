@@ -13,14 +13,14 @@
         -> the release builder verifies R(C) before omitting any artifact
         -> the staged bundle carries the approval reference and digest
         -> the finalizer independently re-verifies R(C)
-        -> install/readback verifies the same approval and exact candidate
+        -> install/readback verifies the original source approval and separately bound release candidate
 
     Three defects are corrected here.
 
     1. No tracked file is ever the approval instance. The pre-image digest of
-       `GovernorRetirementApprovalV1` covers the candidate commit AND the
-       candidate tree object, so an approval is never part of the tree it
-       certifies and no commit-fixed-point search is required. A tracked source
+       `GovernorRetirementApprovalV1` covers historical source C and its tree; the later release candidate D is
+       separately bound in release evidence. The detached approval is outside
+       C, so no commit-fixed-point search is required. A tracked source
        file may describe the expected contract, but a tracked approval whose
        digest cannot match the tree it lives in is a shape error.
 
@@ -73,14 +73,20 @@ $script:GovernorRetirementApprovalDomain = 'eliot-governor-retirement-approval-p
 $script:GovernorRetirementRetainedEvidenceDomain = 'eliot-governor-disposition-v1'
 $script:GovernorRetirementClosureDomain = 'eliot-governor-retirement-closure-v1'
 $script:GovernorRetirementClosureSchema = 'eliot-governor-retirement-closure-v1'
-$script:GovernorRetirementTrustSchema = 'eliot-governor-retirement-approval-trust-v1'
+$script:GovernorRetirementTrustSchema = 'eliot-governor-retirement-approval-trust-v2'
 $script:GovernorRetirementFreezeSchema = 'eliot-governor-retirement-receipt-v1'
 $script:GovernorRetirementFreezeKind = 'detached-approval-pointer'
 $script:GovernorRetirementBundleTrustFile = 'GOVERNOR_RETIREMENT_APPROVAL_TRUST.json'
 $script:GovernorRetirementBundleApprovalFile = 'GOVERNOR_RETIREMENT_APPROVAL.json'
 $script:GovernorRetirementTrustPolicyPath = 'scripts/lib/governor-retirement-approval-trust.json'
 $script:GovernorRetirementApprovalRole = 'retirement-approval'
-$script:GovernorRetirementClosureRuleSet = 'tracked-legacy-reference-closure-v1'
+$script:GovernorRetirementClosureRuleSetV1 = 'tracked-legacy-reference-closure-v1'
+$script:GovernorRetirementClosureRuleSetV2 = 'tracked-legacy-reference-closure-v2'
+$script:GovernorRetirementClosureRuleSet = $script:GovernorRetirementClosureRuleSetV2
+$script:GovernorRetirementClosureRuleSets = @(
+    $script:GovernorRetirementClosureRuleSetV1
+    $script:GovernorRetirementClosureRuleSetV2
+)
 $script:GovernorRetirementLegacyRepository = 'UnknownAlienHuman/eliot-memory-os'
 $script:GovernorRetirementProduct = 'eliot'
 $script:GovernorRetirementProductContract = 'eliot-wicket'
@@ -330,13 +336,39 @@ function Get-GovernorRetirementCandidateTree([string]$Repo, [string]$SourceCommi
     return $tree
 }
 
-function Get-GovernorRetirementNormativePairRevision([string]$Repo) {
-    $path = Join-Path $Repo 'docs/normative-pair.toml'
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-        throw 'tracked normative pair receipt is missing: docs/normative-pair.toml'
+function Get-GovernorRetirementNormativePairRevision([string]$Repo, [string]$SourceCommit) {
+    $relativePath = 'docs/normative-pair.toml'
+    $blob = Get-GovernorRetirementTrackedPathDigest $Repo $SourceCommit $relativePath
+    if (-not $blob) {
+        throw "tracked normative pair receipt is missing at $SourceCommit`: $relativePath"
     }
-    $bytes = [System.IO.File]::ReadAllBytes($path)
-    $text = [System.Text.Encoding]::UTF8.GetString($bytes).TrimStart([char]0xFEFF)
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = 'git'
+    $psi.Arguments = "-C `"$Repo`" cat-file blob $blob"
+    $psi.RedirectStandardOutput = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $process = [System.Diagnostics.Process]::Start($psi)
+    $memory = [System.IO.MemoryStream]::new()
+    try {
+        $process.StandardOutput.BaseStream.CopyTo($memory)
+        $process.WaitForExit()
+        if ($process.ExitCode -ne 0) {
+            throw "failed to read the pinned normative pair blob $blob at $SourceCommit"
+        }
+        $bytes = $memory.ToArray()
+    }
+    finally {
+        $process.StandardOutput.Close()
+        $memory.Dispose()
+        $process.Dispose()
+    }
+    try {
+        $text = [System.Text.UTF8Encoding]::new($false, $true).GetString($bytes).TrimStart([char]0xFEFF)
+    }
+    catch {
+        throw "pinned normative pair receipt at $SourceCommit is not valid UTF-8: $([string]$_.Exception.Message)"
+    }
     $revision = $null
     $pairKey = $null
     foreach ($line in ($text -split "`r?`n")) {
@@ -389,8 +421,12 @@ function Get-GovernorRetirementTrackedBlobMap([string]$Repo, [string]$SourceComm
         $path = ([string]$row).Substring($tab + 1)
         if (-not $wanted.Contains($path)) { continue }
         $fields = @($meta -split ' ')
-        if ($fields.Count -lt 3) { continue }
+        if ($fields.Count -lt 3 -or $fields[1] -cne 'blob') { continue }
         $map[$path] = [string]$fields[2]
+    }
+    $missingPaths = @($wanted | Where-Object { -not $map.ContainsKey([string]$_) })
+    if ($missingPaths.Count -gt 0) {
+        throw "tracked retirement input is missing or is not a blob in the pinned tree: $([string]::Join(',', $missingPaths))"
     }
     return $map
 }
@@ -406,7 +442,8 @@ function Get-GovernorRetirementTrackedBlobsText([string]$Repo, [string]$SourceCo
     if ($blobs.Count -eq 0) {
         return $result
     }
-    $input = (@($blobs.GetEnumerator() | ForEach-Object { $_.Value }) -join "`n")
+    $requestedOids = @($blobs.Values | Sort-Object -Unique)
+    $input = (($requestedOids -join "`n") + "`n")
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName = 'git'
     $psi.Arguments = "-C `"$Repo`" cat-file --batch"
@@ -417,20 +454,38 @@ function Get-GovernorRetirementTrackedBlobsText([string]$Repo, [string]$SourceCo
     $psi.CreateNoWindow = $true
     $process = [System.Diagnostics.Process]::Start($psi)
     try {
-        $process.StandardInput.Write($input)
-        $process.StandardInput.Write("`n")
-        $process.StandardInput.Close()
+        # Feed requests asynchronously while draining stdout. cat-file emits
+        # one potentially large object per request; writing the entire batch
+        # first can deadlock when stdout fills before stdin has been consumed.
+        $writer = $process.StandardInput.WriteAsync($input)
         $standardOutput = $process.StandardOutput.BaseStream
-        $byOid = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::Ordinal)
-        foreach ($pair in $blobs.GetEnumerator()) { $byOid[[string]$pair.Value] = [string]$pair.Key }
+        $byOid = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.List[string]]]::new([System.StringComparer]::Ordinal)
+        foreach ($pair in $blobs.GetEnumerator()) {
+            $oid = [string]$pair.Value
+            if (-not $byOid.ContainsKey($oid)) {
+                $byOid[$oid] = [System.Collections.Generic.List[string]]::new()
+            }
+            [void]$byOid[$oid].Add([string]$pair.Key)
+        }
         $buffer = [byte[]]::new(65536)
         $pending = [System.Collections.Generic.List[byte]]::new()
         $header = [System.Text.StringBuilder]::new()
         $stage = 'header'
         $currentOid = $null
         $remaining = 0
+        $responses = 0
+        $readFailures = [System.Collections.Generic.List[string]]::new()
+        $seenOids = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+        $inputClosed = $false
         while ($true) {
-            $read = $standardOutput.Read($buffer, 0, $buffer.Length)
+            $readTask = $standardOutput.ReadAsync($buffer, 0, $buffer.Length)
+            $null = [System.Threading.Tasks.Task]::WhenAny($writer, $readTask).GetAwaiter().GetResult()
+            if ($writer.IsCompleted -and -not $inputClosed) {
+                [void]$writer.GetAwaiter().GetResult()
+                $process.StandardInput.Close()
+                $inputClosed = $true
+            }
+            $read = $readTask.GetAwaiter().GetResult()
             if ($read -le 0) { break }
             $offset = 0
             while ($offset -lt $read) {
@@ -440,16 +495,37 @@ function Get-GovernorRetirementTrackedBlobsText([string]$Repo, [string]$SourceCo
                         $offset++
                         if ($byte -eq 0x0A) {
                             $line = $header.ToString()
-                            $header.Clear()
+                            [void]$header.Clear()
                             $fields = @($line -split ' ')
-                            if ($fields.Count -ge 3 -and $fields[1] -ceq 'blob') {
+                            if ($fields.Count -eq 2 -and $fields[1] -ceq 'missing') {
+                                $responses++
+                                [void]$readFailures.Add("tracked object is missing: $([string]$fields[0])")
+                                $stage = 'header'
+                            }
+                            elseif ($fields.Count -ge 3 -and $fields[2] -match '^\d+$') {
                                 $currentOid = [string]$fields[0]
-                                $remaining = [int]$fields[2]
-                                $pending.Clear()
-                                $stage = 'content'
+                                $remaining = [int64]$fields[2]
+                                $responses++
+                                if ($fields[1] -cne 'blob') {
+                                    [void]$readFailures.Add("tracked object is not a blob: $currentOid ($([string]$fields[1]))")
+                                    $stage = if ($remaining -eq 0) { 'trailing' } else { 'skipcontent' }
+                                }
+                                elseif (-not $byOid.ContainsKey($currentOid)) {
+                                    [void]$readFailures.Add("cat-file returned an unrequested object: $currentOid")
+                                    $stage = if ($remaining -eq 0) { 'trailing' } else { 'skipcontent' }
+                                }
+                                elseif (-not $seenOids.Add($currentOid)) {
+                                    [void]$readFailures.Add("cat-file returned a duplicate object: $currentOid")
+                                    $stage = if ($remaining -eq 0) { 'trailing' } else { 'skipcontent' }
+                                }
+                                else {
+                                    $pending.Clear()
+                                    $stage = if ($remaining -eq 0) { 'content' } else { 'content' }
+                                }
                             }
                             else {
-                                # "<oid> missing" or a non-blob object: skip it.
+                                $responses++
+                                [void]$readFailures.Add("cat-file returned a malformed response header: $line")
                                 $stage = 'skipheader'
                             }
                             break
@@ -458,16 +534,18 @@ function Get-GovernorRetirementTrackedBlobsText([string]$Repo, [string]$SourceCo
                     }
                 }
                 elseif ($stage -eq 'content') {
-                    $take = [Math]::Min($remaining, $read - $offset)
+                    $take = [int][Math]::Min($remaining, [int64]($read - $offset))
                     for ($i = 0; $i -lt $take; $i++) { $pending.Add($buffer[$offset + $i]) }
                     $offset += $take
                     $remaining -= $take
                     if ($remaining -eq 0) {
                         $bytes = $pending.ToArray()
                         if ($byOid.ContainsKey($currentOid)) {
-                            $result[[string]$byOid[$currentOid]] = [pscustomobject]@{
-                                blob = [string]$currentOid
-                                text = [System.Text.Encoding]::UTF8.GetString($bytes)
+                            foreach ($path in $byOid[$currentOid]) {
+                                $result[[string]$path] = [pscustomobject]@{
+                                    blob = [string]$currentOid
+                                    text = [System.Text.Encoding]::UTF8.GetString($bytes)
+                                }
                             }
                         }
                         $pending.Clear()
@@ -475,18 +553,35 @@ function Get-GovernorRetirementTrackedBlobsText([string]$Repo, [string]$SourceCo
                         $stage = 'trailing'
                     }
                 }
+                elseif ($stage -eq 'skipcontent') {
+                    $take = [int][Math]::Min($remaining, [int64]($read - $offset))
+                    $offset += $take
+                    $remaining -= $take
+                    if ($remaining -eq 0) { $stage = 'trailing' }
+                }
                 elseif ($stage -eq 'trailing') {
                     # exactly one LF after the object content
                     while ($offset -lt $read) {
                         $byte = $buffer[$offset]
                         $offset++
                         if ($byte -eq 0x0A) { $stage = 'header'; break }
+                        [void]$readFailures.Add('cat-file object response is missing its trailing LF')
                     }
                 }
                 else {
                     $offset = $read
                 }
             }
+        }
+        if (-not $inputClosed) {
+            [void]$writer.GetAwaiter().GetResult()
+            $process.StandardInput.Close()
+            $inputClosed = $true
+        }
+        $process.WaitForExit()
+        if ($process.ExitCode -ne 0 -or $responses -ne $requestedOids.Count -or $result.Count -ne $blobs.Count -or $readFailures.Count -gt 0) {
+            $failureDetails = [string]::Join('; ', @($readFailures | Select-Object -First 8))
+            throw "tracked retirement blob read was incomplete (exit=$($process.ExitCode) expected=$($requestedOids.Count) responses=$responses read=$($result.Count) paths=$($blobs.Count) failures=$failureDetails)"
         }
     }
     finally {
@@ -569,6 +664,63 @@ function Get-GovernorRetirementCandidateInventorySurfaces([string]$Repo, [string
     return [pscustomobject]@{ blob = [string]$inventory.blob; surfaces = @($surfaces) }
 }
 
+function Get-GovernorRetirementCandidateMigratedEdgeProofPaths([string]$Repo, [string]$SourceCommit) {
+    # Exact owner evidence for already-migrated consumer edges. These paths are
+    # not live CONSUMER_SURFACES, but their independent owner guard pins the old
+    # invocation as absent and the replacement route as present.
+    $inventory = Get-GovernorRetirementTrackedPathText $Repo $SourceCommit $script:GovernorRetirementDispositionInventoryPath
+    if (-not $inventory) { return @() }
+    $table = [regex]::Match([string]$inventory.text, 'pub const MIGRATED_CONSUMER_EDGES:\s*&\[MigratedConsumerEdge\]\s*=\s*&\[\s*(?<body>.*?)\r?\n\];', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+    if (-not $table.Success) { return @() }
+    $paths = [System.Collections.Generic.List[string]]::new()
+    foreach ($match in [regex]::Matches([string]$table.Groups['body'].Value, 'proof:\s*"([^"]+)"')) {
+        $path = ([string]$match.Groups[1].Value).Replace('\', '/')
+        if (-not [string]::IsNullOrWhiteSpace($path)) { [void]$paths.Add($path) }
+    }
+    return @($paths | Sort-Object -Unique)
+}
+
+function Get-GovernorRetirementCandidateClosedReferenceRoles([string]$Repo, [string]$SourceCommit) {
+    # Exact path roles are declared by the #18 semantic inventory. They close
+    # references that name history, generated projections, migration/audit
+    # evidence, or the separate current Governor-config contract without
+    # pretending those strings launch the retiring executable. The source
+    # inventory blob is part of the tracked closure and the declaration is
+    # parsed from that pinned blob, never from the mutable worktree.
+    $inventory = Get-GovernorRetirementTrackedPathText $Repo $SourceCommit $script:GovernorRetirementDispositionInventoryPath
+    if (-not $inventory) { return @() }
+    $table = [regex]::Match([string]$inventory.text, 'pub const CLOSED_REFERENCE_ROLES:\s*&\[ClosedReferenceRole\]\s*=\s*&\[\s*(?<body>.*?)\r?\n\];', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+    if (-not $table.Success) { return @() }
+    $allowedRoles = @(
+        'live_consumer:build', 'live_consumer:test', 'live_consumer:workspace_lock',
+        'reference_only:historical_record', 'reference_only:decision_record', 'reference_only:policy_history',
+        'reference_only:project_map', 'reference_only:architecture_history', 'reference_only:migration_policy',
+        'reference_only:navigation', 'reference_only:documentation_configuration', 'reference_only:security_guidance',
+        'reference_only:migration_inventory', 'reference_only:operator_history', 'reference_only:workstream_record',
+        'reference_only:owner_instruction', 'reference_only:owner_registry', 'reference_only:generated_projection',
+        'reference_only:current_configuration', 'reference_only:repository_hygiene', 'reference_only:audit_fixture',
+        'reference_only:navigation_configuration', 'reference_only:measurement_inventory',
+        'reference_only:migration_verifier', 'reference_only:test_data', 'reference_only:migration_compiler_input',
+        'reference_only:skill_manifest', 'reference_only:skill_guidance'
+    )
+    $roles = [System.Collections.Generic.List[object]]::new()
+    foreach ($match in [regex]::Matches([string]$table.Groups['body'].Value, 'path:\s*"([^"]+)"\s*,\s*role:\s*"([^"]+)"\s*,\s*basis:\s*"([^"]+)"')) {
+        $path = ([string]$match.Groups[1].Value).Replace('\', '/')
+        $role = [string]$match.Groups[2].Value
+        $basis = [string]$match.Groups[3].Value
+        if ([string]::IsNullOrWhiteSpace($path) -or $path.Contains('*') -or $path.Contains('?') -or
+            $path.StartsWith('/', [System.StringComparison]::Ordinal) -or $path.Split('/') -contains '..' -or
+            [string]::IsNullOrWhiteSpace($basis) -or $allowedRoles -cnotcontains $role) {
+            throw "closed reference role declaration is malformed at $path ($role)"
+        }
+        [void]$roles.Add([pscustomobject]@{ path = $path; role = $role; basis = $basis })
+    }
+    if ($roles.Count -eq 0) { throw 'closed reference role table is empty or malformed' }
+    $duplicates = @($roles | Group-Object -Property path | Where-Object Count -ne 1)
+    if ($duplicates.Count -gt 0) { throw "closed reference role table repeats path(s): $([string]::Join(',', @($duplicates | ForEach-Object Name)))" }
+    return @($roles | Sort-Object -Property path)
+}
+
 function Get-GovernorRetirementClosureClass([string]$RelativePath) {
     # Path-family classification. The five families are the closure's
     # denominator contract: an owner closure that never classified a family is
@@ -590,7 +742,13 @@ function Get-GovernorRetirementClosureClass([string]$RelativePath) {
     return 'source_and_automation'
 }
 
-function Get-GovernorRetirementClosureClassification([string]$RelativePath, [string[]]$Tokens) {
+function Get-GovernorRetirementClosureClassification(
+    [string]$RelativePath,
+    [string[]]$Tokens,
+    [string]$RuleSet = $script:GovernorRetirementClosureRuleSetV1,
+    [System.Collections.Generic.HashSet[string]]$ConsumerSurfacePaths = $null,
+    [System.Collections.Generic.HashSet[string]]$MigratedConsumerProofPaths = $null,
+    [System.Collections.Generic.Dictionary[string, string]]$ClosedReferenceRoles = $null) {
     # Evidence-class classification for one tracked reference. Returns the
     # verifier rules that cover this path, or the single real class 'unknown'
     # when no rule covers it. 'unknown' is a class, not an absence: the caller
@@ -600,6 +758,9 @@ function Get-GovernorRetirementClosureClassification([string]$RelativePath, [str
     # denominator but never stands in for a covering verifier rule.
     $path = ([string]$RelativePath).Replace('\', '/')
     $classes = [System.Collections.Generic.List[string]]::new()
+    if ($script:GovernorRetirementClosureRuleSets -cnotcontains $RuleSet) {
+        throw "unsupported Governor retirement closure rule set: $RuleSet"
+    }
     foreach ($token in @($Tokens)) {
         if ($path -ceq $token -or $path.EndsWith("/$token", [System.StringComparison]::Ordinal) -or
             $path.StartsWith("$token/", [System.StringComparison]::Ordinal)) {
@@ -620,13 +781,50 @@ function Get-GovernorRetirementClosureClassification([string]$RelativePath, [str
     if ($path.StartsWith('.github/workflows/', [System.StringComparison]::Ordinal)) {
         [void]$classes.Add('continuous_integration')
     }
+    if ($RuleSet -ceq $script:GovernorRetirementClosureRuleSetV2) {
+        # Closed semantic owner declarations. CONSUMER_SURFACES remains
+        # evidence for only its exact proof paths; it does not define the
+        # tracked-file/token denominator below, so undeclared references stay
+        # unknown.
+        if ($ConsumerSurfacePaths -and $ConsumerSurfacePaths.Contains($path)) {
+            [void]$classes.Add('owner_declared_consumer_surface')
+        }
+        if ($MigratedConsumerProofPaths -and $MigratedConsumerProofPaths.Contains($path)) {
+            [void]$classes.Add('owner_declared_migrated_consumer_edge')
+        }
+        if ($ClosedReferenceRoles -and $ClosedReferenceRoles.ContainsKey($path)) {
+            [void]$classes.Add("owner_declared_$($ClosedReferenceRoles[$path].Replace(':', '_'))")
+        }
+        # The release guide and owner inventory describe active build edges.
+        # These exact roles are grounded by the production finalizer/readback
+        # contract and the builder's dot-source/call chain; no path-wide
+        # documentation or script class is inferred.
+        if ($path -ceq 'scripts/finalize-eliot-windows-x64-release.ps1' -or
+            $path -ceq 'scripts/lib/governor-retirement-approval.ps1') {
+            [void]$classes.Add('release_retirement_verifier')
+        }
+        if ($path -ceq 'scripts/lib/governor-retirement-approval-trust.json') {
+            [void]$classes.Add('release_authority_policy')
+        }
+        if ($path -ceq 'scripts/lib/entrypoint-inventory.ps1') {
+            [void]$classes.Add('release_entrypoint_inventory')
+        }
+        if ($path -ceq 'scripts/invoke-eliot-windows-x64-production.ps1') {
+            [void]$classes.Add('release_workflow_coordinator')
+        }
+    }
     if ($classes.Count -eq 0) {
         return @('unknown')
     }
     return @($classes | Sort-Object -Unique)
 }
 
-function Get-GovernorRetirementConsumerClosure([string]$Repo, [string]$SourceCommit) {
+function Get-GovernorRetirementConsumerClosure(
+    [string]$Repo,
+    [string]$SourceCommit,
+    [switch]$AllowMissingFamilies,
+    [string]$RuleSet = $script:GovernorRetirementClosureRuleSetV1,
+    [string]$ReferenceDeclarationCommit = $SourceCommit) {
     # Independent closure over the tracked tree of C (issue #2968 section D).
     # Enumerates every tracked file and records every file that names the
     # retiring surface: files covered by a verifier rule are classified, and
@@ -635,7 +833,32 @@ function Get-GovernorRetirementConsumerClosure([string]$Repo, [string]$SourceCom
     # own disposition table, so a candidate can neither shrink the table and
     # the verifier together, nor make an unclassified reference disappear:
     # any 'unknown' reference makes the closure INCOMPLETE and blocks approval.
+    if ($script:GovernorRetirementClosureRuleSets -cnotcontains $RuleSet) {
+        throw "unsupported Governor retirement closure rule set: $RuleSet"
+    }
     $tokens = @($script:GovernorRetirementClosureTokens)
+    $consumerSurfacePaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    $migratedConsumerProofPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    $closedReferenceRoles = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::Ordinal)
+    if ($RuleSet -ceq $script:GovernorRetirementClosureRuleSetV2) {
+        $ownerSurfaces = Get-GovernorRetirementCandidateInventorySurfaces $Repo $ReferenceDeclarationCommit
+        foreach ($surface in @($ownerSurfaces.surfaces)) {
+            $ownerPath = ([string]$surface.path).Replace('\', '/')
+            if (-not [string]::IsNullOrWhiteSpace($ownerPath)) {
+                [void]$consumerSurfacePaths.Add($ownerPath)
+            }
+        }
+        foreach ($ownerPath in @(Get-GovernorRetirementCandidateMigratedEdgeProofPaths $Repo $ReferenceDeclarationCommit)) {
+            [void]$migratedConsumerProofPaths.Add([string]$ownerPath)
+        }
+        foreach ($role in @(Get-GovernorRetirementCandidateClosedReferenceRoles $Repo $ReferenceDeclarationCommit)) {
+            $ownerPath = [string]$role.path
+            if ($consumerSurfacePaths.Contains($ownerPath) -or $migratedConsumerProofPaths.Contains($ownerPath)) {
+                throw "closed reference role overlaps a declared live or migrated consumer proof: $ownerPath"
+            }
+            $closedReferenceRoles.Add($ownerPath, [string]$role.role)
+        }
+    }
     $tracked = @(& git -C $Repo ls-tree -r --name-only $SourceCommit)
     if ($LASTEXITCODE -ne 0) {
         throw "failed to enumerate the tracked closure denominator at $SourceCommit"
@@ -658,7 +881,7 @@ function Get-GovernorRetirementConsumerClosure([string]$Repo, [string]$SourceCom
         $text = $contents[[string]$relative]
         $family = Get-GovernorRetirementClosureClass $relative
         [void]$families.Add($family)
-        $classes = Get-GovernorRetirementClosureClassification ([string]$relative) $tokens
+        $classes = Get-GovernorRetirementClosureClassification ([string]$relative) $tokens $RuleSet $consumerSurfacePaths $migratedConsumerProofPaths $closedReferenceRoles
         $hits = @($tokens | Where-Object { ([string]$text.text).Contains($_) } | Sort-Object -Unique)
         if ($hits.Count -eq 0 -and -not ($classes -contains 'release_role_registry')) {
             continue
@@ -677,23 +900,44 @@ function Get-GovernorRetirementConsumerClosure([string]$Repo, [string]$SourceCom
                 })
             continue
         }
+        $proofRequired = $hits.Count -gt 0
+        if ($closedReferenceRoles.ContainsKey([string]$relative) -and $closedReferenceRoles[[string]$relative].StartsWith('reference_only:', [System.StringComparison]::Ordinal)) {
+            $proofRequired = $false
+        }
+        if ($consumerSurfacePaths.Contains([string]$relative) -or $migratedConsumerProofPaths.Contains([string]$relative)) {
+            $proofRequired = $true
+        }
         [void]$classified.Add([pscustomobject]@{
                 path = [string]$relative
                 blob = [string]$text.blob
                 classes = @((@($classes) + "family:$family") | Sort-Object -Unique)
                 tokens = @($hits)
+                consumer_proof_required = [bool]$proofRequired
             })
     }
     $sorted = @($classified | Sort-Object -Property path)
     $lines = [System.Collections.Generic.List[string]]::new()
     [void]$lines.Add((Get-GovernorApprovalDomainSeparatedLine 'domain' $script:GovernorRetirementClosureDomain))
-    [void]$lines.Add((Get-GovernorApprovalDomainSeparatedLine 'rule_set' $script:GovernorRetirementClosureRuleSet))
+    [void]$lines.Add((Get-GovernorApprovalDomainSeparatedLine 'rule_set' $RuleSet))
     [void]$lines.Add((Get-GovernorApprovalDomainSeparatedLine 'candidate_commit' $SourceCommit))
     [void]$lines.Add((Get-GovernorApprovalDomainSeparatedLine 'candidate_tree' (Get-GovernorRetirementCandidateTree $Repo $SourceCommit)))
     [void]$lines.Add((Get-GovernorApprovalDomainSeparatedLine 'tracked_file_count' $tracked.Count))
     [void]$lines.Add((Get-GovernorApprovalDomainSeparatedLine 'path_family' $script:GovernorRetirementClosurePathFamilies))
+    if ($AllowMissingFamilies) {
+        # The historical owner receipt still requires every source family. A
+        # post-deletion candidate may intentionally remove the legacy plugin
+        # family, so that mode binds a distinct candidate-only closure digest.
+        [void]$lines.Add((Get-GovernorApprovalDomainSeparatedLine 'candidate_closure_mode' 'post-deletion-cleanliness-v1'))
+    }
     foreach ($entry in $sorted) {
-        [void]$lines.Add("closure=$([string]$entry.path)|blob=$([string]$entry.blob)|classes=$([string]::Join(',', @($entry.classes)))|tokens=$([string]::Join(',', @($entry.tokens)))")
+        if ($RuleSet -ceq $script:GovernorRetirementClosureRuleSetV2) {
+            [void]$lines.Add("closure=$([string]$entry.path)|blob=$([string]$entry.blob)|classes=$([string]::Join(',', @($entry.classes)))|tokens=$([string]::Join(',', @($entry.tokens)))|consumer_proof_required=$([int][bool]$entry.consumer_proof_required)")
+        }
+        else {
+            # Historical v1 canonical bytes remain immutable: no new role or
+            # denominator field is serialized into its original digest.
+            [void]$lines.Add("closure=$([string]$entry.path)|blob=$([string]$entry.blob)|classes=$([string]::Join(',', @($entry.classes)))|tokens=$([string]::Join(',', @($entry.tokens)))")
+        }
     }
     foreach ($entry in @($unknownEntries | Sort-Object -Property path)) {
         [void]$lines.Add("unclassified=$([string]$entry.path)|blob=$([string]$entry.blob)|family=$([string]$entry.family)|tokens=$([string]::Join(',', @($entry.tokens)))")
@@ -701,13 +945,19 @@ function Get-GovernorRetirementConsumerClosure([string]$Repo, [string]$SourceCom
     $canonical = (@($lines) -join "`n")
     $familyList = @($families | Sort-Object)
     $missingFamilies = @($script:GovernorRetirementClosurePathFamilies | Where-Object { -not $families.Contains($_) })
+    $blockingMissingFamilies = if ($AllowMissingFamilies) {
+        @($missingFamilies | Where-Object { $_ -cne 'retiring_plugin_tree' })
+    }
+    else {
+        @($missingFamilies)
+    }
     $status = if ($unclassified.Count -gt 0) { 'INCOMPLETE' }
-    elseif ($missingFamilies.Count -gt 0) { 'INCOMPLETE' }
+    elseif ($blockingMissingFamilies.Count -gt 0) { 'INCOMPLETE' }
     else { 'COMPLETE' }
     [pscustomobject]@{
         schema = $script:GovernorRetirementClosureSchema
         status = $status
-        rule_set = $script:GovernorRetirementClosureRuleSet
+        rule_set = $RuleSet
         verifier = $MyInvocation.MyCommand.Name  # unqualified: the computing function in every session (matches the trust policy's pinned verifier); the $script: form would name the hosting script per session and break issuance-to-binding agreement
         candidate_commit = $SourceCommit
         candidate_tree = (Get-GovernorRetirementCandidateTree $Repo $SourceCommit)
@@ -721,9 +971,58 @@ function Get-GovernorRetirementConsumerClosure([string]$Repo, [string]$SourceCom
     }
 }
 
+function Get-GovernorRetirementExpectedConsumerProofs([object]$Closure) {
+    # The independent scanner, not the owner-authored approval list or the
+    # legacy crate's CONSUMER_SURFACES table, defines which tracked proof files
+    # need an owner disposition. The returned token set is closed per path so
+    # an owner proof for one string cannot silently leave a second tracked
+    # Governor reference in that same file outside the approved denominator.
+    $proofs = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
+    foreach ($entry in @($Closure.entries)) {
+        $path = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $entry 'path')
+        $tokens = @((Read-GovernorApprovalField $entry 'tokens') | ForEach-Object { [string]$_ } | Sort-Object -Unique)
+        $proofRequired = Read-GovernorApprovalField $entry 'consumer_proof_required'
+        $ruleSet = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Closure 'rule_set')
+        $includeProof = if ($ruleSet -ceq $script:GovernorRetirementClosureRuleSetV1) { $tokens.Count -gt 0 }
+        else { $tokens.Count -gt 0 -and $proofRequired -is [bool] -and $proofRequired }
+        if ($includeProof) {
+            if ([string]::IsNullOrWhiteSpace($path) -or $proofs.ContainsKey($path)) {
+                throw "independent retirement closure contains an empty or duplicate proof path: $path"
+            }
+            $proofs[$path] = [pscustomobject]@{ path = $path; tokens = @($tokens) }
+        }
+    }
+    return @($proofs.Values | Sort-Object -Property path)
+}
+
 
 function Get-GovernorRetirementPolicyRevision([object]$TrustPolicy) {
     return ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $TrustPolicy 'release_policy_revision')
+}
+
+function Get-GovernorRetirementClosurePolicyRevision([object]$TrustPolicy, [string]$RuleSet) {
+    $schema = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $TrustPolicy 'schema')
+    if ($script:GovernorRetirementClosureRuleSets -cnotcontains $RuleSet) {
+        throw "approval closure rule set is not supported by this verifier: $RuleSet"
+    }
+    if ($schema -ceq 'eliot-governor-retirement-approval-trust-v1') {
+        if ($RuleSet -cne $script:GovernorRetirementClosureRuleSetV1 -or
+            (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $TrustPolicy 'closure_rule_set')) -cne $RuleSet) {
+            throw 'historical trust-v1 only admits the original v1 source and candidate closure rule'
+        }
+        return Get-GovernorRetirementPolicyRevision $TrustPolicy
+    }
+    if ($schema -cne $script:GovernorRetirementTrustSchema) {
+        throw "retirement trust policy schema cannot bind closure policy: $schema"
+    }
+    $matches = @(@(Read-GovernorApprovalField $TrustPolicy 'closure_policies') | Where-Object {
+            (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $_ 'owner_source_rule_set')) -ceq $RuleSet -and
+            (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $_ 'release_candidate_rule_set')) -ceq $RuleSet
+        })
+    if ($matches.Count -ne 1) {
+        throw "retirement trust policy does not bind one matching source/C and candidate/D rule pair for $RuleSet"
+    }
+    return ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $matches[0] 'approval_release_policy_revision')
 }
 
 function Test-GovernorRetirementApprovalShape(
@@ -735,7 +1034,7 @@ function Test-GovernorRetirementApprovalShape(
     [string]$ReleasePolicyRevision) {
     # Decoding plus schema validation. SHAPE ONLY: returns a result whose
     # `admissible` bit is true when the body is a well-formed GovernorRetirement
-    # ApprovalV1 bound to this exact candidate, closure and policy. It grants
+    # ApprovalV1 bound to historical source C, its closure and policy. It grants
     # nothing; only verified issuer evidence makes the approval actionable.
     $rejected = {
         param([string]$Reason)
@@ -805,6 +1104,11 @@ function Test-GovernorRetirementApprovalShape(
         if ($normativeDigest -cnotmatch '^[0-9a-f]{64}$') {
             return (& $rejected "APPROVAL_NORMATIVE_PAIR_DIGEST_MALFORMED (value=$normativeDigest)")
         }
+        $sourceNormativePair = Get-GovernorRetirementNormativePairRevision $Repo $SourceCommit
+        if ($normativeRevision -cne [string]$sourceNormativePair.revision -or
+            $normativeDigest -cne [string]$sourceNormativePair.sha256) {
+            return (& $rejected "APPROVAL_NORMATIVE_PAIR_MISMATCH (approved=$normativeRevision/$normativeDigest source=$([string]$sourceNormativePair.revision)/$([string]$sourceNormativePair.sha256))")
+        }
         $configPolicy = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Approval 'config_policy_revision')
         if ([string]::IsNullOrWhiteSpace($configPolicy)) {
             return (& $rejected 'APPROVAL_CONFIG_POLICY_REVISION_MISSING')
@@ -819,8 +1123,12 @@ function Test-GovernorRetirementApprovalShape(
             (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Approval 'legacy_plugin_path')) -cne $script:GovernorRetirementPlugin) {
             return (& $rejected 'APPROVAL_LEGACY_TARGET_IDENTITY_MISMATCH')
         }
-        if ((ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Approval 'closure_rule_set')) -cne $script:GovernorRetirementClosureRuleSet) {
-            return (& $rejected "APPROVAL_CLOSURE_RULE_SET_MISMATCH (approved=$(ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Approval 'closure_rule_set')) current=$($script:GovernorRetirementClosureRuleSet))")
+        $approvedClosureRuleSet = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Approval 'closure_rule_set')
+        if ($script:GovernorRetirementClosureRuleSets -cnotcontains $approvedClosureRuleSet) {
+            return (& $rejected "APPROVAL_CLOSURE_RULE_SET_NOT_ADMITTED (approved=$approvedClosureRuleSet)")
+        }
+        if ($approvedClosureRuleSet -cne (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Closure 'rule_set'))) {
+            return (& $rejected "APPROVAL_CLOSURE_RULE_SET_MISMATCH (approved=$approvedClosureRuleSet recomputed=$(ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Closure 'rule_set')))")
         }
         if ((ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Approval 'closure_verifier')) -cne [string]$Closure.verifier) {
             return (& $rejected "APPROVAL_CLOSURE_VERIFIER_MISMATCH (approved=$(ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Approval 'closure_verifier')) current=$([string]$Closure.verifier))")
@@ -899,7 +1207,25 @@ function Test-GovernorRetirementApprovalShape(
         if ($consumers.Count -eq 0) {
             return (& $rejected 'APPROVAL_NAMES_NO_CONSUMER_DISPOSITION')
         }
+        $expectedProofs = @(Get-GovernorRetirementExpectedConsumerProofs $Closure)
+        if ($expectedProofs.Count -eq 0) {
+            return (& $rejected 'APPROVAL_CONSUMER_DENOMINATOR_EMPTY')
+        }
+        $expectedPathSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+        $expectedTokensByPath = [System.Collections.Generic.Dictionary[string, string[]]]::new([System.StringComparer]::Ordinal)
+        $expectedProofPairs = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+        foreach ($proof in $expectedProofs) {
+            $proofPath = [string]$proof.path
+            [void]$expectedPathSet.Add($proofPath)
+            $expectedTokensByPath[$proofPath] = [string[]]@($proof.tokens)
+            foreach ($token in @($proof.tokens)) {
+                $tokenText = [string]$token
+                [void]$expectedProofPairs.Add("$($proofPath.Length):$proofPath|$($tokenText.Length):$tokenText")
+            }
+        }
         $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+        $seenProofReferences = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+        $approvedProofPairs = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
         # One batched read of every consumer proof path. The per-consumer
         # per-path subprocess form was the remaining hot spot in this gate.
         $proofPaths = @(@($consumers) | ForEach-Object {
@@ -916,6 +1242,24 @@ function Test-GovernorRetirementApprovalShape(
             }
             if (-not $seen.Add("$name|$proofPath|$reference")) {
                 return (& $rejected "APPROVAL_CONSUMER_ENTRY_DUPLICATED (consumer=$name)")
+            }
+            $proofReferenceKey = "$($proofPath.Length):$proofPath|$($reference.Length):$reference"
+            if (-not $seenProofReferences.Add($proofReferenceKey)) {
+                return (& $rejected "APPROVAL_CONSUMER_PROOF_DUPLICATED (consumer=$name proof=$proofPath)")
+            }
+            if (-not $expectedPathSet.Contains($proofPath)) {
+                return (& $rejected "APPROVAL_CONSUMER_PROOF_OUTSIDE_INDEPENDENT_DENOMINATOR (consumer=$name proof=$proofPath)")
+            }
+            $matchesClosureToken = $false
+            foreach ($token in $expectedTokensByPath[$proofPath]) {
+                $tokenText = [string]$token
+                if ($reference.Contains($tokenText)) {
+                    $matchesClosureToken = $true
+                    [void]$approvedProofPairs.Add("$($proofPath.Length):$proofPath|$($tokenText.Length):$tokenText")
+                }
+            }
+            if (-not $matchesClosureToken) {
+                return (& $rejected "APPROVAL_CONSUMER_REFERENCE_NOT_IN_INDEPENDENT_DENOMINATOR (consumer=$name proof=$proofPath)")
             }
             if ($script:GovernorRetirementDispositionAdmitted -cnotcontains $disposition) {
                 return (& $rejected "APPROVAL_CONSUMER_DISPOSITION_NOT_ADMITTED (consumer=$name disposition=$disposition)")
@@ -936,6 +1280,10 @@ function Test-GovernorRetirementApprovalShape(
             elseif ([string]::IsNullOrWhiteSpace((ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $consumer 'removal_decision')))) {
                 return (& $rejected "APPROVAL_CONSUMER_REMOVAL_DECISION_MISSING (consumer=$name)")
             }
+        }
+        if ($approvedProofPairs.Count -ne $expectedProofPairs.Count) {
+            $missing = @($expectedProofPairs | Where-Object { -not $approvedProofPairs.Contains([string]$_) } | Sort-Object)
+            return (& $rejected "APPROVAL_CONSUMER_DENOMINATOR_MISMATCH (approved=$($approvedProofPairs.Count) expected=$($expectedProofPairs.Count) missing=$([string]::Join(',', $missing)))")
         }
         $declared = Get-GovernorApprovalSha256 (Get-GovernorApprovalCanonicalPreimage $Approval)
         $admitted = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Approval 'content_sha256')
@@ -1120,6 +1468,90 @@ function Resolve-GovernorRetirementIssuer([object]$TrustPolicy) {
     }
 }
 
+function Test-GovernorRetirementCandidateTransition(
+    [string]$Repo,
+    [string]$CandidateCommit,
+    [string]$OwnerSourceCommit,
+    [object]$CandidateIdentity,
+    [object]$SourceClosure,
+    [object]$CandidateClosure,
+    [object[]]$ApprovedConsumers) {
+    # The detached owner approval remains bound to its original source C. The
+    # release candidate D is checked independently: it must descend from C,
+    # remove the legacy crate, add no independently scanned path/token pair,
+    # and remove every owner-approved live_reference string from its proof
+    # path. Existing scanned pairs remain bound by D's closure, but only the
+    # exact owner-approved consumer references are required to disappear. The
+    # independent scan is the fixed closed-rule contract; no filename-only or
+    # inferred live-edge classifier is added.
+    $null = & git -C $Repo merge-base --is-ancestor $OwnerSourceCommit $CandidateCommit 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        return [pscustomobject]@{ admitted = $false; reason = 'APPROVAL_OWNER_SOURCE_NOT_ANCESTOR' }
+    }
+    if ([string]$CandidateClosure.status -cne 'COMPLETE') {
+        return [pscustomobject]@{ admitted = $false; reason = "APPROVAL_CANDIDATE_CLOSURE_INCOMPLETE (status=$([string]$CandidateClosure.status))" }
+    }
+    if ([string]$CandidateIdentity.status -cne 'absent') {
+        return [pscustomobject]@{ admitted = $false; reason = "APPROVAL_CURRENT_LEGACY_IDENTITY_NOT_ABSENT (status=$([string]$CandidateIdentity.status))" }
+    }
+    $workspace = Get-GovernorRetirementTrackedPathText $Repo $CandidateCommit $script:GovernorRetirementWorkspaceManifestPath
+    if (-not $workspace) {
+        return [pscustomobject]@{ admitted = $false; reason = 'APPROVAL_CURRENT_WORKSPACE_MANIFEST_MISSING' }
+    }
+    $memberListed = $false
+    $inMembers = $false
+    foreach ($line in @(([string]$workspace.text) -split '\r?\n')) {
+        if (-not $inMembers -and $line -match '^\s*members\s*=\s*\[') { $inMembers = $true }
+        if ($inMembers) {
+            if ($line -match '"crates/eliot-app"') { $memberListed = $true }
+            if ($line -match '\]') { break }
+        }
+    }
+    if ($memberListed) {
+        return [pscustomobject]@{ admitted = $false; reason = 'APPROVAL_CURRENT_WORKSPACE_STILL_LISTS_LEGACY_PACKAGE' }
+    }
+    $legacyPaths = @(& git -C $Repo ls-tree -r --name-only $CandidateCommit -- 'crates/eliot-app' 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+        return [pscustomobject]@{ admitted = $false; reason = 'APPROVAL_CURRENT_LEGACY_PACKAGE_TREE_UNREADABLE' }
+    }
+    if ($legacyPaths.Count -gt 0) {
+        return [pscustomobject]@{ admitted = $false; reason = 'APPROVAL_CURRENT_LEGACY_PACKAGE_TREE_STILL_TRACKED' }
+    }
+
+    $sourcePairs = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    foreach ($entry in @($SourceClosure.entries)) {
+        $path = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $entry 'path')
+        foreach ($token in @(Read-GovernorApprovalField $entry 'tokens')) {
+            $tokenText = [string]$token
+            [void]$sourcePairs.Add("$($path.Length):$path|$($tokenText.Length):$tokenText")
+        }
+    }
+    foreach ($entry in @($CandidateClosure.entries)) {
+        $path = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $entry 'path')
+        foreach ($token in @(Read-GovernorApprovalField $entry 'tokens')) {
+            $tokenText = [string]$token
+            $pair = "$($path.Length):$path|$($tokenText.Length):$tokenText"
+            if (-not $sourcePairs.Contains($pair)) {
+                return [pscustomobject]@{ admitted = $false; reason = "APPROVAL_CANDIDATE_REFERENCE_NOT_IN_SOURCE_CLOSURE (path=$path token=$tokenText)" }
+            }
+        }
+    }
+    $proofPaths = @($ApprovedConsumers | ForEach-Object {
+            ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $_ 'proof_path')
+        } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+    $candidateProofContents = Get-GovernorRetirementTrackedBlobsText $Repo $CandidateCommit $proofPaths
+    foreach ($consumer in @($ApprovedConsumers)) {
+        $name = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $consumer 'consumer')
+        $proofPath = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $consumer 'proof_path')
+        $reference = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $consumer 'live_reference')
+        if ($candidateProofContents.ContainsKey($proofPath) -and
+            ([string]$candidateProofContents[$proofPath].text).Contains($reference)) {
+            return [pscustomobject]@{ admitted = $false; reason = "APPROVAL_CONSUMER_REFERENCE_STILL_LIVE_IN_CANDIDATE (consumer=$name proof=$proofPath)" }
+        }
+    }
+    [pscustomobject]@{ admitted = $true; reason = $null }
+}
+
 function Test-GovernorRetirementTrustPolicyShape([object]$TrustPolicy) {
     # The root-owned trust policy is the ONLY thing that can admit a retirement
     # approval issuer. It is a shape gate only: the issuer decision is made by
@@ -1127,8 +1559,23 @@ function Test-GovernorRetirementTrustPolicyShape([object]$TrustPolicy) {
     if (-not $TrustPolicy) {
         throw 'retirement approval trust policy is missing'
     }
-    if ((ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $TrustPolicy 'schema')) -cne $script:GovernorRetirementTrustSchema) {
-        throw "retirement approval trust policy schema must be $($script:GovernorRetirementTrustSchema)"
+    $trustSchema = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $TrustPolicy 'schema')
+    if ($trustSchema -cne $script:GovernorRetirementTrustSchema -and
+        $trustSchema -cne 'eliot-governor-retirement-approval-trust-v1') {
+        throw "retirement approval trust policy schema is not supported: $trustSchema"
+    }
+    if ($trustSchema -ceq $script:GovernorRetirementTrustSchema) {
+        $supportedFields = @(
+            'schema', 'release_policy', 'release_product', 'release_policy_revision',
+            'closure_verifier', 'closure_rule_set', 'closure_policies', 'revocation_source',
+            'admitted_issuers', 'issuer_state', 'issuer_state_reason',
+            'authenticode_code_signing_policy', 'content_sha256'
+        )
+        foreach ($property in $TrustPolicy.PSObject.Properties) {
+            if ($supportedFields -cnotcontains [string]$property.Name) {
+                throw "retirement approval trust policy field is not in the closed v2 contract: $([string]$property.Name)"
+            }
+        }
     }
     $policy = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $TrustPolicy 'release_policy')
     if ($policy -cne $script:GovernorRetirementLegacyRepository -or
@@ -1138,8 +1585,50 @@ function Test-GovernorRetirementTrustPolicyShape([object]$TrustPolicy) {
     if ((ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $TrustPolicy 'closure_verifier')) -cne 'Get-GovernorRetirementConsumerClosure') {
         throw "retirement approval trust policy names a closure verifier this release does not implement: $(ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $TrustPolicy 'closure_verifier'))"
     }
-    if ((ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $TrustPolicy 'closure_rule_set')) -cne $script:GovernorRetirementClosureRuleSet) {
-        throw "retirement approval trust policy names a closure rule set this release does not implement: $(ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $TrustPolicy 'closure_rule_set'))"
+    $trustRuleSet = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $TrustPolicy 'closure_rule_set')
+    if ($trustSchema -ceq 'eliot-governor-retirement-approval-trust-v1') {
+        if ($trustRuleSet -cne $script:GovernorRetirementClosureRuleSetV1) {
+            throw "historical v1 trust policy must retain its original closure rule set: $trustRuleSet"
+        }
+    }
+    else {
+        if ($trustRuleSet -cne $script:GovernorRetirementClosureRuleSetV2) {
+            throw "current trust policy must select the current closure rule set $($script:GovernorRetirementClosureRuleSetV2): $trustRuleSet"
+        }
+        $policyRevision = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $TrustPolicy 'release_policy_revision')
+        $policies = @(Read-GovernorApprovalField $TrustPolicy 'closure_policies')
+        if ($policies.Count -ne $script:GovernorRetirementClosureRuleSets.Count) {
+            throw 'current retirement trust policy must record exactly the v1 and v2 closure compatibility pairs'
+        }
+        $expectedPolicies = @(
+            [pscustomobject]@{
+                owner_source_rule_set = $script:GovernorRetirementClosureRuleSetV1
+                release_candidate_rule_set = $script:GovernorRetirementClosureRuleSetV1
+                approval_release_policy_revision = '1.0.0'
+            },
+            [pscustomobject]@{
+                owner_source_rule_set = $script:GovernorRetirementClosureRuleSetV2
+                release_candidate_rule_set = $script:GovernorRetirementClosureRuleSetV2
+                approval_release_policy_revision = $policyRevision
+            }
+        )
+        for ($i = 0; $i -lt $expectedPolicies.Count; $i++) {
+            $policyFields = @('owner_source_rule_set', 'release_candidate_rule_set', 'approval_release_policy_revision')
+            foreach ($property in $policies[$i].PSObject.Properties) {
+                if ($policyFields -cnotcontains [string]$property.Name) {
+                    throw "current retirement trust policy closure pair has an unsupported field: $([string]$property.Name)"
+                }
+            }
+            if (@($policies[$i].PSObject.Properties).Count -ne $policyFields.Count) {
+                throw "current retirement trust policy closure pair at index $i is incomplete"
+            }
+            foreach ($field in $policyFields) {
+                if ((ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $policies[$i] $field)) -cne
+                    (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $expectedPolicies[$i] $field))) {
+                    throw "current retirement trust policy has invalid v1/v2 continuity pair at index $i field $field"
+                }
+            }
+        }
     }
     foreach ($field in @('release_policy_revision', 'content_sha256')) {
         if ([string]::IsNullOrWhiteSpace((ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $TrustPolicy $field)))) {
@@ -1158,6 +1647,11 @@ function Get-GovernorRetirementTrustPolicyPreimage([object]$TrustPolicy) {
             'closure_verifier', 'closure_rule_set', 'revocation_source')) {
         [void]$lines.Add((Get-GovernorApprovalDomainSeparatedLine $field (Read-GovernorApprovalField $TrustPolicy $field)))
     }
+    if ((ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $TrustPolicy 'schema')) -ceq $script:GovernorRetirementTrustSchema) {
+        foreach ($policy in @(Read-GovernorApprovalField $TrustPolicy 'closure_policies')) {
+            [void]$lines.Add("closure_policy=$([string](Read-GovernorApprovalField $policy 'owner_source_rule_set'))|candidate=$([string](Read-GovernorApprovalField $policy 'release_candidate_rule_set'))|approval_release_policy_revision=$([string](Read-GovernorApprovalField $policy 'approval_release_policy_revision'))")
+        }
+    }
     foreach ($issuer in @(Read-GovernorApprovalField $TrustPolicy 'admitted_issuers')) {
         [void]$lines.Add("issuer=$([string](Read-GovernorApprovalField $issuer 'issuer'))|role=$([string](Read-GovernorApprovalField $issuer 'role'))|authority=$([string](Read-GovernorApprovalField $issuer 'authority'))|receipt_kind=$([string](Read-GovernorApprovalField $issuer 'receipt_kind'))|authenticode_code_signing_thumbprint=$([string](Read-GovernorApprovalField $issuer 'authenticode_code_signing_thumbprint'))")
     }
@@ -1171,11 +1665,13 @@ function New-GovernorRetirementCandidateFreeze(
     [string]$OutputPath) {
     $repoFull = [System.IO.Path]::GetFullPath($Repo)
     $candidateTree = Get-GovernorRetirementCandidateTree $Repo $SourceCommit
-    $closure = Get-GovernorRetirementConsumerClosure $Repo $SourceCommit
+    $closure = Get-GovernorRetirementConsumerClosure $Repo $SourceCommit -RuleSet $script:GovernorRetirementClosureRuleSet
     if ([string]$closure.status -cne 'COMPLETE') {
         throw "retirement freeze refused: the independent consumer closure over $SourceCommit is $($closure.status), unclassified=$([string]::Join(',', @($closure.unclassified_paths)))"
     }
-    $inventory = Get-GovernorRetirementCandidateInventorySurfaces $Repo $SourceCommit
+    $consumerProofs = @(Get-GovernorRetirementExpectedConsumerProofs $closure)
+    $consumerProofCount = 0
+    foreach ($proof in $consumerProofs) { $consumerProofCount += @($proof.tokens).Count }
     if ([string]::IsNullOrWhiteSpace($OutputPath) -or -not [System.IO.Path]::IsPathRooted($OutputPath)) {
         throw 'retirement freeze requires the detached freeze record path as an explicit absolute path outside the candidate tree'
     }
@@ -1196,7 +1692,7 @@ function New-GovernorRetirementCandidateFreeze(
         closure_verifier = 'Get-GovernorRetirementConsumerClosure'
         closure_digest_sha256 = [string]$closure.digest_sha256
         trust_policy = [string]$script:GovernorRetirementTrustPolicyPath
-        consumer_count = @($inventory.surfaces).Count
+        consumer_count = $consumerProofCount
         approval = $null
         replay_conflict = 'EXACT_REPLAY_SAME_DECISION; CHANGED_SAME_OPERATION_CONTENT_CONFLICTS'
         self_certification = 'FORBIDDEN: this receipt never asserts identity with its own HEAD; the candidate is frozen first and the approval R(C) is issued afterwards outside the certified commit'
@@ -1220,7 +1716,7 @@ function New-GovernorRetirementCandidateFreeze(
         candidate_commit = [string]$SourceCommit
         candidate_tree = [string]$candidateTree
         closure_digest_sha256 = [string]$closure.digest_sha256
-        consumer_count = @($inventory.surfaces).Count
+        consumer_count = $consumerProofCount
     }
 }
 
@@ -1293,18 +1789,19 @@ function New-GovernorRetirementApproval(
     if ([string]::IsNullOrWhiteSpace($issuerReceiptKind)) {
         throw 'the admitted retirement-approval issuer entry names no receipt_kind'
     }
-    $closure = Get-GovernorRetirementConsumerClosure $Repo $SourceCommit
+    $closureRuleSet = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $trustPolicy.body 'closure_rule_set')
+    $releasePolicyRevision = Get-GovernorRetirementClosurePolicyRevision $trustPolicy.body $closureRuleSet
+    $closure = Get-GovernorRetirementConsumerClosure $Repo $SourceCommit -RuleSet $closureRuleSet
     if ([string]$closure.status -cne 'COMPLETE') {
         $blocking = @(@($closure.unclassified_path_families) + @($closure.unclassified_paths) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
         throw "retirement approval issuance refuses an incomplete independent closure: $([string]::Join(', ', $blocking))"
     }
     $candidateTree = Get-GovernorRetirementCandidateTree $Repo $SourceCommit
-    $normativePair = Get-GovernorRetirementNormativePairRevision $Repo
+    $normativePair = Get-GovernorRetirementNormativePairRevision $Repo $SourceCommit
     $declarationBlob = Get-GovernorRetirementTrackedPathDigest $Repo $SourceCommit $script:GovernorRetirementDispositionInventoryPath
     if (-not $declarationBlob) {
         throw "the closure declaration inventory is not tracked at candidate ${SourceCommit}: $($script:GovernorRetirementDispositionInventoryPath)"
     }
-    $releasePolicyRevision = Get-GovernorRetirementPolicyRevision $trustPolicy.body
     $repoFull = (Resolve-Path -LiteralPath $Repo).Path.TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
     if ([string]::IsNullOrWhiteSpace($OwnerReceiptPath) -or -not [System.IO.Path]::IsPathRooted($OwnerReceiptPath)) {
         throw 'retirement approval issuance requires the owner receipt as an explicit absolute path outside the candidate tree'
@@ -1504,23 +2001,54 @@ function Resolve-GovernorRetirementApprovalBinding(
     [object]$Approval,
     [object]$TrustPolicy,
     [object]$Issuer) {
-    # One typed binding result. Never throws for a rejection outcome: the caller
-    # maps a non-admitted binding to Retained (legacy source still valid) or to
-    # a blocked/malformed abort. A candidate JSON body alone is never enough:
-    # an admitted issuer, an admitted trust policy and a matching independently
-    # recomputed closure are all required.
+    # R(C) remains the original owner-issued approval for historical source C.
+    # D is the release candidate. Select the closure version recorded in R(C),
+    # recompute C under that exact historical/current rule, and select the
+    # trust-policy pair that independently binds D under the same rule. No
+    # field in R(C) is rewritten or re-digested to make it name D.
     $candidateTree = Get-GovernorRetirementCandidateTree $Repo $SourceCommit
-    $normativePair = Get-GovernorRetirementNormativePairRevision $Repo
-    $legacyIdentity = Get-GovernorRetirementPinnedLegacyIdentity $Repo $SourceCommit
-    $closure = Get-GovernorRetirementConsumerClosure $Repo $SourceCommit
-    $declarationBlob = Get-GovernorRetirementTrackedPathDigest $Repo $SourceCommit $script:GovernorRetirementDispositionInventoryPath
-    $closure | Add-Member -MemberType NoteProperty -Name declaration_path -Value $script:GovernorRetirementDispositionInventoryPath
-    $closure | Add-Member -MemberType NoteProperty -Name declaration_blob -Value $declarationBlob
+    $normativePair = Get-GovernorRetirementNormativePairRevision $Repo $SourceCommit
+    $candidateIdentity = Get-GovernorRetirementPinnedLegacyIdentity $Repo $SourceCommit
+    $approvedClosureRuleSet = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Approval 'closure_rule_set')
+    $selectedClosureRuleSet = if ($script:GovernorRetirementClosureRuleSets -ccontains $approvedClosureRuleSet) {
+        $approvedClosureRuleSet
+    }
+    else {
+        $script:GovernorRetirementClosureRuleSet
+    }
+    $ownerSourceCommit = (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Approval 'candidate_commit')).ToLowerInvariant()
+    # v2 role/inventory declarations are owned by the approved source C. Keep
+    # using those exact declarations when scanning D after the facade subtree
+    # (and its Rust inventory) has been deleted. D's token denominator remains
+    # independently scanned from D itself.
+    $candidateClosure = Get-GovernorRetirementConsumerClosure $Repo $SourceCommit -AllowMissingFamilies -RuleSet $selectedClosureRuleSet -ReferenceDeclarationCommit $ownerSourceCommit
+    $ownerSourceTree = $null
+    $ownerIdentity = [pscustomobject]@{ status = 'absent'; reason = 'owner approval source commit is missing or malformed'; workspace_blob = $null; facade_blob = $null; plugin_blob = $null }
+    $ownerClosure = $null
+    $ownerDeclarationBlob = $null
+    $ownerSourceError = $null
+    if ($ownerSourceCommit -cmatch '^[0-9a-f]{40}$') {
+        try {
+            $ownerSourceTree = Get-GovernorRetirementCandidateTree $Repo $ownerSourceCommit
+            $ownerIdentity = Get-GovernorRetirementPinnedLegacyIdentity $Repo $ownerSourceCommit
+            $ownerClosure = Get-GovernorRetirementConsumerClosure $Repo $ownerSourceCommit -RuleSet $selectedClosureRuleSet
+            $ownerDeclarationBlob = Get-GovernorRetirementTrackedPathDigest $Repo $ownerSourceCommit $script:GovernorRetirementDispositionInventoryPath
+            $ownerClosure | Add-Member -MemberType NoteProperty -Name declaration_path -Value $script:GovernorRetirementDispositionInventoryPath
+            $ownerClosure | Add-Member -MemberType NoteProperty -Name declaration_blob -Value $ownerDeclarationBlob
+        }
+        catch {
+            $ownerSourceError = [string]$_.Exception.Message
+        }
+    }
     # The revision lives in the pinned policy BODY (path/blob/sha256/bytes/body
     # wrapper); reading the wrapper would bind the empty string instead of the
     # admitted revision the plan reports.
-    $releasePolicyRevision = Get-GovernorRetirementPolicyRevision $TrustPolicy.body
-    $shape = Test-GovernorRetirementApprovalShape $Approval $SourceCommit $candidateTree $closure $Repo $releasePolicyRevision
+    $releasePolicyRevision = Get-GovernorRetirementClosurePolicyRevision $TrustPolicy.body $selectedClosureRuleSet
+    $shape = $null
+    if ($ownerClosure -and $ownerSourceTree) {
+        $shape = Test-GovernorRetirementApprovalShape $Approval $ownerSourceCommit $ownerSourceTree $ownerClosure $Repo $releasePolicyRevision
+    }
+    $closureForDiagnostics = if ($ownerClosure) { $ownerClosure } else { $candidateClosure }
     $rejected = {
         param([string]$NonAdmission, [string]$Reason, [string]$State = 'REJECTED')
         [pscustomobject]@{
@@ -1530,17 +2058,22 @@ function Resolve-GovernorRetirementApprovalBinding(
             non_admission_reason = $NonAdmission
             candidate_commit = $SourceCommit
             candidate_tree = $candidateTree
-            closure_rule_set = [string]$closure.rule_set
-            closure_verifier = [string]$closure.verifier
-            closure_digest_sha256 = [string]$closure.digest_sha256
-            closure_count = [int]$closure.classified_count
-            closure_status = [string]$closure.status
+            owner_candidate_commit = $ownerSourceCommit
+            owner_candidate_tree = [string]$ownerSourceTree
+            candidate_closure_digest_sha256 = [string]$candidateClosure.digest_sha256
+            candidate_closure_count = [int]$candidateClosure.classified_count
+            candidate_closure_status = [string]$candidateClosure.status
+            closure_rule_set = [string]$closureForDiagnostics.rule_set
+            closure_verifier = [string]$closureForDiagnostics.verifier
+            closure_digest_sha256 = if ($ownerClosure) { [string]$ownerClosure.digest_sha256 } else { $null }
+            closure_count = if ($ownerClosure) { [int]$ownerClosure.classified_count } else { 0 }
+            closure_status = [string]$closureForDiagnostics.status
             closure_declaration_path = $script:GovernorRetirementDispositionInventoryPath
-            closure_declaration_blob = $declarationBlob
-            legacy_identity = [string]$legacyIdentity.status
-            legacy_package_manifest_blob = [string]$legacyIdentity.workspace_blob
-            legacy_facade_manifest_blob = [string]$legacyIdentity.facade_blob
-            legacy_plugin_manifest_blob = [string]$legacyIdentity.plugin_blob
+            closure_declaration_blob = $ownerDeclarationBlob
+            legacy_identity = [string]$candidateIdentity.status
+            legacy_package_manifest_blob = [string]$candidateIdentity.workspace_blob
+            legacy_facade_manifest_blob = [string]$candidateIdentity.facade_blob
+            legacy_plugin_manifest_blob = [string]$candidateIdentity.plugin_blob
             normative_pair_revision = [string]$normativePair.revision
             release_policy_revision = $releasePolicyRevision
             content_sha256 = $null
@@ -1551,20 +2084,40 @@ function Resolve-GovernorRetirementApprovalBinding(
             proof_ceiling = $script:GovernorRetirementProofCeiling
         }
     }
-    if ([string]$legacyIdentity.status -cne 'present') {
-        # Source absence stays fail closed. A checkout without the retiring
-        # package/target/plugin is broken or blocked, never retired: no approval
-        # can certify a source object that no longer exists.
-        return (& $rejected 'APPROVAL_CANDIDATE_MISMATCH' "the retiring package/target/plugin is absent from the candidate ($([string]$legacyIdentity.reason)); source absence is not authority to retire")
+    if ($ownerSourceCommit -cnotmatch '^[0-9a-f]{40}$') {
+        return (& $rejected 'APPROVAL_OWNER_SOURCE_IDENTITY_MISSING' 'the detached approval does not name an exact historical 40-hex candidate commit C')
     }
-    if ([string]$closure.status -cne 'COMPLETE') {
-        return (& $rejected 'APPROVAL_CLOSURE_INCOMPLETE' "the independent consumer closure over this candidate is incomplete: $([string]::Join(', ', @($closure.unclassified_path_families + @($closure.unclassified_paths) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })))")
+    if ($ownerSourceError) {
+        return (& $rejected 'APPROVAL_OWNER_SOURCE_UNAVAILABLE' "the approval's historical source C cannot be independently scanned: $ownerSourceError")
     }
     if (-not [bool]$shape.admitted) {
         return (& $rejected 'APPROVAL_SHAPE_REJECTED' ([string]$shape.reason))
     }
+    if ([string]$ownerIdentity.status -cne 'present') {
+        return (& $rejected 'APPROVAL_OWNER_SOURCE_MISMATCH' "the owner approval's historical source C does not bind the legacy package/target/plugin identity ($([string]$ownerIdentity.reason))")
+    }
+    if ([string]$ownerClosure.status -cne 'COMPLETE') {
+        return (& $rejected 'APPROVAL_CLOSURE_INCOMPLETE' "the independent historical consumer closure over C is incomplete: $([string]::Join(', ', @($ownerClosure.unclassified_path_families + @($ownerClosure.unclassified_paths) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })))")
+    }
+    if ([string]$candidateClosure.status -cne 'COMPLETE') {
+        return (& $rejected 'APPROVAL_CANDIDATE_CLOSURE_INCOMPLETE' "the independent release-candidate closure over D is incomplete: $([string]::Join(', ', @($candidateClosure.unclassified_path_families + @($candidateClosure.unclassified_paths) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })))")
+    }
+    if ([string]$candidateClosure.rule_set -cne [string]$ownerClosure.rule_set) {
+        return (& $rejected 'APPROVAL_CLOSURE_RULE_CONTINUITY_REJECTED' "R(C) source rule $([string]$ownerClosure.rule_set) differs from release candidate D rule $([string]$candidateClosure.rule_set)")
+    }
+    $transition = Test-GovernorRetirementCandidateTransition `
+        $Repo `
+        $SourceCommit `
+        $ownerSourceCommit `
+        $candidateIdentity `
+        $ownerClosure `
+        $candidateClosure `
+        @($shape.consumers)
+    if (-not [bool]$transition.admitted) {
+        return (& $rejected 'APPROVAL_CANDIDATE_TRANSITION_REJECTED' ([string]$transition.reason))
+    }
     if ([string]$Issuer.state -cne 'ISSUER_AVAILABLE') {
-        return (& $rejected 'APPROVAL_ISSUER_UNAVAILABLE' "no owner-issued detached approval R(C) exists for candidate ${SourceCommit}: $([string]$Issuer.reason)" 'ISSUER_UNAVAILABLE')
+        return (& $rejected 'APPROVAL_ISSUER_UNAVAILABLE' "the detached approval R(C) cannot be admitted for release candidate D=${SourceCommit}: $([string]$Issuer.reason)" 'ISSUER_UNAVAILABLE')
     }
     $boundIssuer = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Approval 'issuer')
     if ($boundIssuer -cne [string]$Issuer.issuer_identity) {
@@ -1577,17 +2130,22 @@ function Resolve-GovernorRetirementApprovalBinding(
         non_admission_reason = $null
         candidate_commit = $SourceCommit
         candidate_tree = $candidateTree
-        closure_rule_set = [string]$closure.rule_set
-        closure_verifier = [string]$closure.verifier
-        closure_digest_sha256 = [string]$closure.digest_sha256
-        closure_count = [int]$closure.classified_count
-        closure_status = [string]$closure.status
+        owner_candidate_commit = $ownerSourceCommit
+        owner_candidate_tree = [string]$ownerSourceTree
+        candidate_closure_digest_sha256 = [string]$candidateClosure.digest_sha256
+        candidate_closure_count = [int]$candidateClosure.classified_count
+        candidate_closure_status = [string]$candidateClosure.status
+        closure_rule_set = [string]$ownerClosure.rule_set
+        closure_verifier = [string]$ownerClosure.verifier
+        closure_digest_sha256 = [string]$ownerClosure.digest_sha256
+        closure_count = [int]$ownerClosure.classified_count
+        closure_status = [string]$ownerClosure.status
         closure_declaration_path = $script:GovernorRetirementDispositionInventoryPath
-        closure_declaration_blob = $declarationBlob
-        legacy_identity = [string]$legacyIdentity.status
-        legacy_package_manifest_blob = [string]$legacyIdentity.workspace_blob
-        legacy_facade_manifest_blob = [string]$legacyIdentity.facade_blob
-        legacy_plugin_manifest_blob = [string]$legacyIdentity.plugin_blob
+        closure_declaration_blob = $ownerDeclarationBlob
+        legacy_identity = [string]$candidateIdentity.status
+        legacy_package_manifest_blob = [string]$ownerIdentity.workspace_blob
+        legacy_facade_manifest_blob = [string]$ownerIdentity.facade_blob
+        legacy_plugin_manifest_blob = [string]$ownerIdentity.plugin_blob
         normative_pair_revision = [string]$normativePair.revision
         release_policy_revision = $releasePolicyRevision
         issuer = $boundIssuer
@@ -1608,7 +2166,8 @@ function Resolve-GovernorRetirementApprovalBinding(
 function New-GovernorRetirementApprovalReference([object]$Binding, [string]$ApprovalFileSha256, [string]$TrustFileSha256) {
     # The single approval identity carried by the plan, the staged payload
     # manifest, RELEASE.json, SHA256SUMS.json and the signed finalization
-    # evidence. One approval identity, bound to one exact candidate.
+    # evidence. The original v1 owner approval remains bound to C; this release
+    # reference separately binds the independently checked D candidate.
     [ordered]@{
         schema = $script:GovernorRetirementApprovalSchema
         state = [string]$Binding.state
@@ -1617,6 +2176,10 @@ function New-GovernorRetirementApprovalReference([object]$Binding, [string]$Appr
         operation_id = [string]$Binding.operation_id
         candidate_commit = [string]$Binding.candidate_commit
         candidate_tree = [string]$Binding.candidate_tree
+        owner_candidate_commit = [string]$Binding.owner_candidate_commit
+        owner_candidate_tree = [string]$Binding.owner_candidate_tree
+        candidate_closure_digest_sha256 = [string]$Binding.candidate_closure_digest_sha256
+        candidate_closure_count = [int]$Binding.candidate_closure_count
         repository = $script:GovernorRetirementLegacyRepository
         product = $script:GovernorRetirementProduct
         product_contract = $script:GovernorRetirementProductContract
@@ -1648,31 +2211,26 @@ function New-GovernorRetirementApprovalReference([object]$Binding, [string]$Appr
 }
 
 function New-GovernorRetirementReplayRecord([object]$Reference, [object]$ApprovalBody) {
-    # Exact replay under one approval operation (issue #2968 step 11). The
-    # canonical request hash deliberately covers the requested ACTION - the
-    # candidate commit and tree, the independently approved denominator, the
-    # consumer dispositions, the replacement/removal decisions, the legacy
-    # target identity, the policy revisions and the rollback/reopen conditions
-    # - and deliberately EXCLUDES the owner evidence (issuer receipt, issuance
-    # instant, approver principal, file content digest). Therefore:
-    #   * the same operation over the same candidate re-derives byte-identical
-    #     operation and request identities, so an exact replay returns the same
-    #     decision instead of a second one; and
-    #   * any changed candidate, denominator or disposition set under the same
-    #     operation yields a DIFFERENT canonical request hash, which the shape
-    #     gate refuses (APPROVAL_CANONICAL_REQUEST_HASH_MISMATCH). Changed
-    #     same-operation content therefore conflicts and is never replayed.
+    # Exact owner-decision replay under one operation (issue #2968 step 11).
+    # The unchanged v1 request hash covers historical source C and its approved
+    # denominator, dispositions, target identity, policy revisions and
+    # rollback/reopen conditions. It excludes owner evidence as before. The
+    # later release candidate D is separately recorded in the release binding;
+    # moving D changes that binding without re-issuing or re-digesting R(C).
     $canonical = Get-GovernorApprovalCanonicalPreimage $ApprovalBody
     [ordered]@{
         operation_id = [string]$Reference.operation_id
         idempotency_namespace = (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $ApprovalBody 'idempotency_namespace'))
         idempotency_retention_hours = (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $ApprovalBody 'idempotency_retention_hours'))
         canonical_request_hash = (Get-GovernorApprovalSha256 $canonical)
-        approved_candidate_commit = [string]$Reference.candidate_commit
-        approved_candidate_tree = [string]$Reference.candidate_tree
+        approved_owner_candidate_commit = [string]$Reference.owner_candidate_commit
+        approved_owner_candidate_tree = [string]$Reference.owner_candidate_tree
+        release_candidate_commit = [string]$Reference.candidate_commit
+        release_candidate_tree = [string]$Reference.candidate_tree
         approved_denominator = [int]$Reference.closure_count
+        release_candidate_denominator = [int]$Reference.candidate_closure_count
         approved_content_sha256 = [string]$Reference.content_sha256
-        replay_semantics = 'EXACT_REPLAY_SAME_DECISION; CHANGED_SAME_OPERATION_CONTENT_CONFLICTS'
+        replay_semantics = 'EXACT_REPLAY_SAME_OWNER_DECISION; RELEASE_CANDIDATE_D_IS_SEPARATELY_BOUND'
     }
 }
 
@@ -1686,14 +2244,16 @@ function Get-GovernorRetirementEvidenceDigest([string]$Canonical) {
     }
 }
 function New-GovernorRetiredGovernorEvidence([string]$SourceCommit, [object]$Reference) {
-    # One canonical evidence digest over the admitted approval identity. Any
-    # change of candidate, tree, denominator, dispositions, issuer or policy
-    # under the same release operation changes this digest and conflicts.
-    $canonical = "$($script:GovernorRetirementApprovalDomain)|retired|$SourceCommit|$([string]$Reference.candidate_tree)|$([string]$Reference.content_sha256)|$([string]$Reference.closure_digest_sha256)|$([string]$Reference.canonical_request_hash)|$([string]$Reference.issuer_evidence_sha256)|$([string]$Reference.release_policy_revision)"
+    # The evidence names both time points: the owner digest remains the v1
+    # approval for historical C, while the release binding identifies exact D
+    # and its independently recomputed candidate closure.
+    $canonical = "$($script:GovernorRetirementApprovalDomain)|retired|$SourceCommit|$([string]$Reference.candidate_tree)|$([string]$Reference.owner_candidate_commit)|$([string]$Reference.owner_candidate_tree)|$([string]$Reference.content_sha256)|$([string]$Reference.closure_digest_sha256)|$([string]$Reference.candidate_closure_digest_sha256)|$([string]$Reference.candidate_closure_count)|$([string]$Reference.canonical_request_hash)|$([string]$Reference.issuer_evidence_sha256)|$([string]$Reference.release_policy_revision)"
     [ordered]@{
         kind = 'retired'
         source_commit = $SourceCommit
         candidate_tree = [string]$Reference.candidate_tree
+        owner_candidate_commit = [string]$Reference.owner_candidate_commit
+        owner_candidate_tree = [string]$Reference.owner_candidate_tree
         approval_content_sha256 = [string]$Reference.content_sha256
         approval_canonical_request_hash = [string]$Reference.canonical_request_hash
         approval_operation_id = [string]$Reference.operation_id
@@ -1705,6 +2265,8 @@ function New-GovernorRetiredGovernorEvidence([string]$SourceCommit, [object]$Ref
         closure_rule_set = [string]$Reference.closure_rule_set
         closure_digest_sha256 = [string]$Reference.closure_digest_sha256
         denominator_consumers = [int]$Reference.closure_count
+        candidate_closure_digest_sha256 = [string]$Reference.candidate_closure_digest_sha256
+        candidate_closure_count = [int]$Reference.candidate_closure_count
         evidence_sha256 = Get-GovernorRetirementEvidenceDigest $canonical
     }
 }

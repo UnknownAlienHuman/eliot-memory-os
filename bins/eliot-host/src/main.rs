@@ -2,6 +2,8 @@
 
 mod host_console_protocol;
 
+#[cfg(windows)]
+use std::ffi::OsString;
 use std::io::{self, BufRead, Write};
 use std::sync::OnceLock;
 
@@ -22,9 +24,13 @@ use eliot_host::{
 };
 use eliot_host_state::HostState;
 #[cfg(windows)]
-use eliot_host_state::WakeDisposition;
+use eliot_host_state::{ActivationState, WakeDisposition};
+#[cfg(windows)]
+use eliot_installation::InstallationProfile;
 #[cfg(windows)]
 use eliot_platform::PlatformHandle;
+#[cfg(windows)]
+use eliot_platform_windows::profile_supervision::USER_MODE_SUPERVISOR_SWITCH;
 use host_console_protocol::{Request, Response, write_response};
 
 static PROCESS_BOOTSTRAP: OnceLock<Result<HostLaunchOptions, String>> = OnceLock::new();
@@ -144,6 +150,9 @@ fn host_error_variant(error: &HostError) -> &'static str {
         HostError::WatchdogCoverageUnavailable(_) => "watchdog_coverage_unavailable",
         HostError::OwnerLeaseHeld => "owner_lease_held",
         HostError::OwnerLeaseRecovery(_) => "owner_lease_recovery",
+        HostError::StoreCensusKernel(_) => "store_census_kernel",
+        HostError::StoreCensusTransport(_) => "store_census_transport",
+        HostError::StoreCensusIo(_) => "store_census_runtime",
     }
 }
 
@@ -295,8 +304,43 @@ fn console_process_exit_code() -> i32 {
 // B13 terminal exit codes (`console_process_exit_code`): unchanged.
 // B14 start-failure capsule/stderr/SCM status: untouched receipt owners.
 
+/// Reads the admitted current-user supervisor switch from the process
+/// arguments, leaving every other launch argument untouched.
+///
+/// Only the one admitted `UserMode` supervisor is supported; an unrecognised
+/// value under that switch is refused rather than silently ignored, because the
+/// switch selects the supervision path the process will commit to.
+#[cfg(windows)]
+fn profile_supervisor_selection_from_args(
+    process_args: &[std::ffi::OsString],
+) -> Option<InstallationProfile> {
+    match process_args.first().and_then(|argument| argument.to_str()) {
+        Some(USER_MODE_SUPERVISOR_SWITCH) => {
+            match process_args.get(1).and_then(|argument| argument.to_str()) {
+                Some("user_mode") => Some(InstallationProfile::UserMode),
+                _ => {
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "eliot-host: only the admitted UserMode supervisor is supported"
+                    );
+                    std::process::exit(HOST_CONSOLE_PROCESS_EXIT_CODE);
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
 fn main() {
-    let _ = PROCESS_BOOTSTRAP.set(parse_process_bootstrap(std::env::args_os().skip(1)));
+    let mut process_args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    #[cfg(windows)]
+    let profile_supervisor_selection = profile_supervisor_selection_from_args(&process_args);
+    #[cfg(not(windows))]
+    let profile_supervisor_selection: Option<()> = None;
+    if profile_supervisor_selection.is_some() {
+        process_args.drain(0..2);
+    }
+    let _ = PROCESS_BOOTSTRAP.set(parse_process_bootstrap(process_args.clone()));
     // HOST-0 (issue #889): best-effort diagnostics install; never gates startup.
     let _ = eliot_host::host_diagnostics::install_host_diagnostics();
     // One bounded Event Log worker owns the potentially blocking OS call.
@@ -311,15 +355,34 @@ fn main() {
     );
     // #889 projection: serving process started for the start operation.
     // Process id and operation only; never launch material (B1).
-    observe_host_request(
-        &HostRequestProjection::process_started(
-            eliot_host::host_diagnostics::EntrypointStage::Startup,
-            std::process::id(),
-        )
-        .with_operation(AdmittedEvent::ServiceStart),
+    let process_started = HostRequestProjection::process_started(
+        eliot_host::host_diagnostics::EntrypointStage::Startup,
+        std::process::id(),
     );
+    observe_host_request(&if profile_supervisor_selection.is_some() {
+        process_started
+    } else {
+        process_started.with_operation(AdmittedEvent::ServiceStart)
+    });
     #[cfg(windows)]
-    match run_as_scm_service() {
+    if let Some(profile) = profile_supervisor_selection {
+        let result = run_profile_supervisor(process_args, profile);
+        eliot_host::host_diagnostics::shutdown_event_log_reporting();
+        if let Err(error) = result {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "eliot-host: UserMode supervisor failed: {error}"
+            );
+            std::process::exit(HOST_CONSOLE_PROCESS_EXIT_CODE);
+        }
+        return;
+    }
+    #[cfg(windows)]
+    match if is_nonce_free_host_bootstrap(&process_args) {
+        Ok(false)
+    } else {
+        run_as_scm_service()
+    } {
         Ok(true) => {
             eliot_host::host_diagnostics::shutdown_event_log_reporting();
             return;
@@ -329,7 +392,11 @@ fn main() {
             // fallback, recorded distinctly from dispatcher failure below.
             eliot_host::host_diagnostics::observe_entrypoint_with_detail(
                 eliot_host::host_diagnostics::EntrypointStage::ScmDispatch,
-                "console_fallback",
+                if is_nonce_free_host_bootstrap(&process_args) {
+                    "current_user_profile_launcher"
+                } else {
+                    "console_fallback"
+                },
             );
         }
         Err(error) => {
@@ -574,6 +641,149 @@ fn run_console() -> (bool, Option<HostLaunchOptions>) {
     (drained, Some(launch_options))
 }
 
+#[cfg(windows)]
+fn run_profile_supervisor(
+    arguments: Vec<OsString>,
+    profile: InstallationProfile,
+) -> Result<(), HostError> {
+    use std::sync::atomic::Ordering;
+
+    if profile != InstallationProfile::UserMode {
+        return Err(HostError::ProcessContour(
+            "current-user supervisor handoff is supported only for UserMode".to_owned(),
+        ));
+    }
+    STOP_REQUESTED.store(false, Ordering::Release);
+    let launch_options = HostLaunchOptions::parse(arguments)?;
+    if launch_options.registration_nonce().is_some() {
+        return Err(HostError::ProcessContour(
+            "current-user profile action must not carry a SystemService nonce".to_owned(),
+        ));
+    }
+    let mut host = HostComposition::open_for_profile(launch_options.clone(), profile)?;
+    let active = host.registry().active().ok_or_else(|| {
+        HostError::ProcessContour(format!(
+            "{profile:?} supervisor has no active approved generation"
+        ))
+    })?;
+    if active.manifest.runtime_launch.profile != profile {
+        let _ = host.stop();
+        return Err(HostError::ProcessContour(
+            "profile supervisor selector differs from the active approved profile".to_owned(),
+        ));
+    }
+    // Opening Host already executes its authenticated child process handshake.
+    // Require the retained liveness/readiness contour to confirm that evidence
+    // before this scheduler-launched process enters its long-running loop.
+    let readiness_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if !host.running() {
+            let _ = host.stop();
+            return Err(HostError::ProcessContour(
+                "profile Host stopped before authenticated readiness".to_owned(),
+            ));
+        }
+        match run_scm_contour_tick(&mut host)? {
+            ScmContourTickOutcome::LeasePreserved
+            | ScmContourTickOutcome::Reconciled(HostBranchDisposition::Healthy) => break,
+            ScmContourTickOutcome::ReadinessRetryPending
+            | ScmContourTickOutcome::Reconciled(
+                HostBranchDisposition::LiveAwaitingReadiness
+                | HostBranchDisposition::ReadinessDegraded,
+            ) if std::time::Instant::now() < readiness_deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            ScmContourTickOutcome::ReadinessRetryPending | ScmContourTickOutcome::Reconciled(_) => {
+                let _ = host.stop();
+                return Err(HostError::ProcessContour(
+                    "profile Host authenticated readiness was not established".to_owned(),
+                ));
+            }
+        }
+    }
+
+    // UserMode never enters the SystemService credential-control endpoint,
+    // which requires Administrators and opens ProgramData. `open_for_profile`
+    // has bound this launch descriptor to the approved UserMode generation
+    // and retained the current user's descriptor-bound roots before startup.
+    let runtime_control = match host.runtime_control() {
+        Ok(control) => control,
+        Err(error) => {
+            STOP_REQUESTED.store(true, Ordering::Release);
+            let _ = host.stop();
+            return Err(error);
+        }
+    };
+    let runtime_queue = runtime_control.queue();
+    let runtime_thread = match spawn_runtime_control(runtime_control) {
+        Ok(thread) => thread,
+        Err(error) => {
+            STOP_REQUESTED.store(true, Ordering::Release);
+            let _ = host.stop();
+            return Err(error);
+        }
+    };
+
+    let mut idle_drain = HostIdleDrainSupervisor::new();
+    let mut loop_failure = None;
+    while !STOP_REQUESTED.load(Ordering::Acquire) && host.running() {
+        let durable_fence = match host.has_durable_branch_fence() {
+            Ok(fenced) => fenced,
+            Err(error) => {
+                loop_failure = Some(error);
+                break;
+            }
+        };
+        if !durable_fence && host.has_process_contour() {
+            match run_scm_contour_tick(&mut host) {
+                Ok(outcome) => {
+                    let reconciled = match outcome {
+                        ScmContourTickOutcome::Reconciled(disposition) => Some(disposition),
+                        ScmContourTickOutcome::LeasePreserved
+                        | ScmContourTickOutcome::ReadinessRetryPending => None,
+                    };
+                    report_scm_tick(outcome);
+                    if let Some(disposition) = reconciled {
+                        idle_drain.observe_readiness(&mut host, disposition);
+                    }
+                }
+                Err(error) => {
+                    loop_failure = Some(error);
+                    break;
+                }
+            }
+        }
+        // I1.5: classification and durable admission run ahead of dispatch
+        // inside `process_runtime_control_requests` (activation ->
+        // readiness/lease admission -> governed work), so no effect runs
+        // before its own trigger is recorded and no failed admission is
+        // answered with success.
+        process_runtime_control_requests(&mut host, &runtime_queue, &mut idle_drain);
+        process_user_automation_owner_requests(&host);
+        if !durable_fence {
+            let drain_tick = idle_drain.evaluate(&mut host, std::time::Instant::now());
+            report_activation_diagnostics(&host, &idle_drain.last_census);
+            if drain_tick == IdleDrainTick::CommitDue {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    STOP_REQUESTED.store(true, Ordering::Release);
+    let _ = runtime_thread.join();
+    if host.running() {
+        host.stop()?;
+    } else if host.shutdown_failed() {
+        return Err(HostError::ProcessContour(
+            "profile Host stopped with a durable recovery obligation".to_owned(),
+        ));
+    }
+    if let Some(error) = loop_failure {
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn parse_process_bootstrap<I, S>(args: I) -> Result<HostLaunchOptions, String>
 where
     I: IntoIterator<Item = S>,
@@ -595,6 +805,22 @@ fn captured_process_bootstrap() -> Result<HostLaunchOptions, HostError> {
 
 fn open_host(launch_options: HostLaunchOptions) -> Result<HostComposition, HostError> {
     HostComposition::open(launch_options)
+}
+
+#[cfg(windows)]
+fn is_nonce_free_host_bootstrap(arguments: &[OsString]) -> bool {
+    const FLAGS: [&str; 5] = [
+        "--config-descriptor",
+        "--config-descriptor-sha256",
+        "--installation-id",
+        "--tx-plan-generation",
+        "--host-state-root",
+    ];
+    arguments.len() == 10
+        && FLAGS
+            .iter()
+            .enumerate()
+            .all(|(index, flag)| arguments[index * 2].to_str() == Some(*flag))
 }
 
 /// #889 projection: status-query outcome at this journal state.
@@ -1203,9 +1429,12 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
         // I1.5: an authenticated request on the runtime-control plane is an
         // observable-use trigger. It both restarts the idle grace and may
         // cancel a pre-linearization drain.
-        for (trigger, evidence) in process_runtime_control_requests(&mut host, &runtime_queue) {
-            idle_drain.note_observable_use(&mut host, trigger, &evidence);
-        }
+        // I1.5: classification and durable admission run ahead of dispatch
+        // inside `process_runtime_control_requests` (activation ->
+        // readiness/lease admission -> governed work), so no effect runs
+        // before its own trigger is recorded and no failed admission is
+        // answered with success.
+        process_runtime_control_requests(&mut host, &runtime_queue, &mut idle_drain);
         // One bounded sweep of the authenticated `UserAutomation` owner queue.
         // The dedicated execution pipe blocks until this drain answers, so it
         // must run from the service loop rather than from the pipe server.
@@ -1568,68 +1797,153 @@ fn runtime_control_trigger_class(
     }
 }
 
-/// Serves every queued authenticated runtime-control request and returns the
-/// proven ingress of every request admitted in this pass.
+/// Serves every queued authenticated runtime-control request admissions-first.
 ///
-/// I1.5 makes an authenticated Kernel/CLI/UI/bridge request an activation
+/// I1.5 makes an authenticated request on this plane an observable-use
 /// trigger, and the same request must be able to cancel a pre-linearization
-/// drain. Returning the trigger class next to the evidence — instead of
-/// leaving the trigger implicit in the request handler — lets
-/// [`HostComposition::note_observable_use`] record the real class and its
-/// capability set durably.
+/// drain. The mandatory order is `create/join activation -> readiness/lease
+/// admission -> governed work`: each request is classified and durably
+/// admitted through [`HostIdleDrainSupervisor::note_observable_use`] BEFORE
+/// its operation dispatches, so no restart/recovery/context/automation effect
+/// runs while the durable activation is still `Draining`, and drain
+/// cancellation with return to `ACTIVE` lands before the client receives the
+/// operation response.
+///
+/// A failed admission refuses (or, past `DrainCommitRecord`, queues) the
+/// operation instead of answering success first: the refusal carries the
+/// post-admission snapshot when one is readable, so a request never receives
+/// `Restarted`, `StoreRecovered`, reactive-context delivery, or automation
+/// admission for a trigger the current activation generation refused.
 ///
 /// A3 projection path: the requester-visible answer travels only on the
 /// existing wire (`HostRuntimeControlResponse`) via `envelope.respond`, whose
 /// `Restarted`/`StoreRecovered` receipts already bind the serving generations
 /// (`old/new_kernel_generation`, `store_fence`, `activation_receipt_digest`,
 /// `ready_receipt_digest`). The generation-bound admission projection of the
-/// same durable snapshot is [`HostComposition::activation_admission`],
-/// reported every service-loop tick by `report_activation_diagnostics`. A
-/// typed admission member on the response itself belongs to the wire owner
+/// same durable snapshot is [`HostComposition::activation_admission_wire`],
+/// attached post-admission by `with_post_admission_snapshot` below. A typed
+/// admission member on the response itself belongs to the wire owner
 /// (`crates/kernel/eliot-host-service/src/runtime_control.rs`) as STITCH work;
 /// this plane adds no second spelling.
 #[cfg(windows)]
 fn process_runtime_control_requests(
     host: &mut HostComposition,
     queue: &eliot_host::HostRuntimeControlQueue,
-) -> Vec<(ActivationTriggerClass, PlatformHandle)> {
-    let mut observed = Vec::new();
+    idle_drain: &mut HostIdleDrainSupervisor,
+) {
     loop {
         let request = match queue.lock() {
             Ok(mut q) => q.pop_front(),
             Err(_) => None,
         };
         let Some(envelope) = request else { break };
+        // Classify the trigger first: the class is derived from the request
+        // that actually arrived on the authenticated front door, so the
+        // durable `trigger_class` / `required_capabilities` of this
+        // generation reflect the real ingress.
         let trigger = runtime_control_trigger_class(&envelope.request().operation);
-        let response = match runtime_control_dispatch(&envelope.request().operation) {
-            RuntimeControlDispatch::Kernel => {
-                host.handle_kernel_restart_request(envelope.request())
-            }
-            RuntimeControlDispatch::Store => host.handle_store_recovery_request(envelope.request()),
-            RuntimeControlDispatch::ReactiveContext => {
-                process_reactive_context_request(host, envelope.request())
-            }
-            RuntimeControlDispatch::UserAutomation => {
-                process_user_automation_request(host, envelope.request())
-            }
-        };
         // The authenticated request digest is the durable trigger evidence; the
         // endpoint already proved the peer before queueing this envelope.
-        // I1.5 acceptance: the same authenticated request returns an
-        // admission result tied to the current generations. The admission is
-        // a read-only projection of the durable journal snapshot carrying
-        // activation state, generation, governance profile, held lease state
-        // and drain disposition with the operation answer. When no activation
-        // record exists yet the bare operation answer still flows, so the
-        // trigger that creates the record is never blocked.
-        let response = match host.activation_admission_wire() {
-            Ok(admission) => response.with_activation_admission(admission),
-            Err(_) => response,
+        let evidence = envelope.request().request_digest.clone();
+        // Admit second, before any governed effect: create/join activation,
+        // then readiness/lease admission (including the cancelled-drain return
+        // to `ACTIVE` after revalidation).
+        let admission = idle_drain.note_observable_use(host, trigger, &evidence);
+        let response = match admission {
+            // Post-linearization: the trigger is durably queued as the next
+            // activation generation. The effect stays queued with it instead
+            // of running under the committed generation.
+            Ok(DrainWakeOutcome::QueueNextGeneration) => with_post_admission_snapshot(
+                host,
+                HostRuntimeControlResponse::unknown_for(
+                    envelope.request(),
+                    eliot_host_service::runtime_control::operation_unknown_ref(
+                        &envelope.request().operation,
+                        "queue-response",
+                        envelope.request(),
+                    ),
+                ),
+            ),
+            Ok(_) if activation_admits_governed_work(host) => {
+                let response = match runtime_control_dispatch(&envelope.request().operation) {
+                    RuntimeControlDispatch::Kernel => {
+                        host.handle_kernel_restart_request(envelope.request())
+                    }
+                    RuntimeControlDispatch::Store => {
+                        host.handle_store_recovery_request(envelope.request())
+                    }
+                    RuntimeControlDispatch::ReactiveContext => {
+                        process_reactive_context_request(host, envelope.request())
+                    }
+                    RuntimeControlDispatch::UserAutomation => {
+                        process_user_automation_request(host, envelope.request())
+                    }
+                };
+                // I1.5 acceptance: the same authenticated request returns an
+                // admission result tied to the current generations. The
+                // admission is the post-admission snapshot — the generation
+                // the trigger just joined, read after admission (and after
+                // the governed effect) — never the pre-trigger projection.
+                with_post_admission_snapshot(host, response)
+            }
+            // Failed activation/readiness/lease admission, or a post-admission
+            // activation state that admits no governed work (still `Draining`,
+            // or a terminal generation): refuse the operation. The failure
+            // reaches the response with the post-admission snapshot instead
+            // of hiding behind an already-sent success.
+            _ => with_post_admission_snapshot(
+                host,
+                HostRuntimeControlResponse::unknown_for(
+                    envelope.request(),
+                    eliot_host_service::runtime_control::operation_unknown_ref(
+                        &envelope.request().operation,
+                        "validation",
+                        envelope.request(),
+                    ),
+                ),
+            ),
         };
-        observed.push((trigger, envelope.request().request_digest.clone()));
         let _ = envelope.respond(response);
     }
-    observed
+}
+
+/// Whether the post-admission activation state admits governed effects.
+///
+/// The admitted set is exactly the live set
+/// [`HostComposition::note_observable_use`] coalesces a trigger behind
+/// (`Stopped | Starting | ControlReady | Active`). A generation that is still
+/// `Draining` — or already terminal — admits no restart/recovery/context/
+/// automation effect, so the dispatch loop refuses instead of running one.
+#[cfg(windows)]
+fn activation_admits_governed_work(host: &HostComposition) -> bool {
+    host.activation_admission()
+        .map(|admission| {
+            matches!(
+                admission.state,
+                ActivationState::Stopped
+                    | ActivationState::Starting
+                    | ActivationState::ControlReady
+                    | ActivationState::Active
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Attaches the post-admission snapshot to a runtime-control response.
+///
+/// The generation-bound `AdmissionProjected` wrapper reflects the state the
+/// admitted trigger produced, not the pre-trigger projection. When no
+/// activation record is readable the bare answer still flows, so a refusal is
+/// never silently dropped; it just carries no admission it cannot prove.
+#[cfg(windows)]
+fn with_post_admission_snapshot(
+    host: &HostComposition,
+    response: HostRuntimeControlResponse,
+) -> HostRuntimeControlResponse {
+    match host.activation_admission_wire() {
+        Ok(admission) => response.with_activation_admission(admission),
+        Err(_) => response,
+    }
 }
 
 #[cfg(windows)]
@@ -1800,9 +2114,17 @@ impl HostIdleDrainSupervisor {
         }
     }
 
-    /// One authenticated observable-use trigger was admitted. I1.5: a trigger
-    /// before the durable drain linearization point cancels drain and returns
-    /// the same generation to `ACTIVE` after readiness revalidation.
+    /// Admits one authenticated observable-use trigger and reports whether the
+    /// governed operation may run.
+    ///
+    /// I1.5: a trigger before the durable drain linearization point cancels
+    /// drain and returns the same generation to `ACTIVE` after readiness
+    /// revalidation. The returned [`DrainWakeOutcome`] is the durable verdict
+    /// the dispatch loop decides on: a failed activation/readiness/lease
+    /// admission — including a cancelled-drain resume that could not return
+    /// the generation to `ACTIVE` — is an `Err` here, so the failure reaches
+    /// the response as a refusal instead of hiding behind an already-sent
+    /// success.
     ///
     /// `trigger` is the class of the request that actually arrived, so the
     /// durable `trigger_class` / `required_capabilities` of this generation
@@ -1812,7 +2134,7 @@ impl HostIdleDrainSupervisor {
         host: &mut HostComposition,
         trigger: ActivationTriggerClass,
         evidence: &PlatformHandle,
-    ) {
+    ) -> Result<DrainWakeOutcome, HostError> {
         self.idle_since = None;
         self.precommit_opened_at = None;
         match host.note_observable_use(trigger, evidence) {
@@ -1830,6 +2152,7 @@ impl HostIdleDrainSupervisor {
                             io::stderr().lock(),
                             "eliot-host: observable use cancelled the pre-commit drain and returned the same activation generation to ACTIVE after readiness revalidation"
                         );
+                        Ok(DrainWakeOutcome::CancelDrain)
                     }
                     Ok(false) => {
                         self.invalidate_census();
@@ -1837,6 +2160,11 @@ impl HostIdleDrainSupervisor {
                             io::stderr().lock(),
                             "eliot-host: observable use cancelled the pre-commit drain; the same generation did not resume on this trigger"
                         );
+                        // The generation is still `Draining` (or terminal):
+                        // the dispatch loop refuses the effect on the
+                        // post-admission state instead of running it under an
+                        // unrestored drain.
+                        Ok(DrainWakeOutcome::CancelDrain)
                     }
                     Err(error) => {
                         self.invalidate_census();
@@ -1844,6 +2172,7 @@ impl HostIdleDrainSupervisor {
                             io::stderr().lock(),
                             "eliot-host: observable use cancelled the pre-commit drain but readiness revalidation failed: {error}"
                         );
+                        Err(error)
                     }
                 }
             }
@@ -1852,6 +2181,7 @@ impl HostIdleDrainSupervisor {
                     io::stderr().lock(),
                     "eliot-host: observable use arrived after DrainCommitRecord and was queued as the next activation generation"
                 );
+                Ok(DrainWakeOutcome::QueueNextGeneration)
             }
             Ok(DrainWakeOutcome::ReplayAlreadyConsumed) => {
                 // A delayed trigger of an already-consumed attempt is neither
@@ -1860,15 +2190,19 @@ impl HostIdleDrainSupervisor {
                     io::stderr().lock(),
                     "eliot-host: observable use repeated a trigger the current drain attempt already consumed; it did not cancel the attempt"
                 );
+                Ok(DrainWakeOutcome::ReplayAlreadyConsumed)
             }
-            Ok(DrainWakeOutcome::Proceed) => {}
+            Ok(DrainWakeOutcome::Proceed) => Ok(DrainWakeOutcome::Proceed),
             Err(error) => {
                 // A fresh authenticated trigger the current generation could
                 // not admit (for example, `Draining` with an already
                 // `Cancelled` drain) is still demand: retry the trigger-driven
                 // resume before reporting, so a failed probe never strands the
                 // generation. The resume admits only the `Draining` +
-                // `Cancelled` state and stays shut otherwise.
+                // `Cancelled` state and stays shut otherwise. The admission
+                // failure itself still reaches the caller: this trigger was
+                // never recorded, so the operation is refused and the client
+                // retries against the restored generation.
                 match host.resume_cancelled_drain_on_observable_use() {
                     Ok(true) => {
                         self.idle_since = Some(std::time::Instant::now());
@@ -1877,18 +2211,21 @@ impl HostIdleDrainSupervisor {
                             io::stderr().lock(),
                             "eliot-host: observable use was not admitted, but the trigger returned the same activation generation to ACTIVE after readiness revalidation"
                         );
+                        Err(error)
                     }
                     Ok(false) => {
                         let _ = writeln!(
                             io::stderr().lock(),
                             "eliot-host: observable use was not admitted by the current activation generation: {error}"
                         );
+                        Err(error)
                     }
                     Err(resume_error) => {
                         let _ = writeln!(
                             io::stderr().lock(),
                             "eliot-host: observable use was not admitted by the current activation generation: {error}; cancelled-drain resume also failed: {resume_error}"
                         );
+                        Err(error)
                     }
                 }
             }

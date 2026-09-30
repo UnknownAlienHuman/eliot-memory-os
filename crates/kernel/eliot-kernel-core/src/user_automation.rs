@@ -3822,7 +3822,7 @@ mod tests {
         use eliot_receipts::{
             ArtifactBinding, AuthorityBinding, CausalBinding, EffectClass, OperationBinding,
             ProofCeiling, ReceiptCore, ReceiptDisposition, ReceiptKind, RequestBinding,
-            VerifierBinding, WorkScopeBinding,
+            WorkScopeBinding,
         };
 
         let state_fence = fence();
@@ -3988,7 +3988,7 @@ mod tests {
             role: eliot_receipts::ReceiptKind::Artifact,
             source_revision: Some(PINNED_ZONE_DATABASE_REVISION.to_owned()),
         }];
-        normalization_core.verifier = Some(VerifierBinding {
+        normalization_core.verifier = Some(eliot_receipts::VerifierBinding {
             verifier_id: eliot_contracts::ContractId::new(
                 USER_AUTOMATION_NORMALIZATION_VERIFIER_ID,
             )
