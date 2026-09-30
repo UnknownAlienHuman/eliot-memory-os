@@ -129,9 +129,7 @@ impl UnitGroupBinding {
             let group: BTreeSet<ArtifactId> = members
                 .iter()
                 .map(|member| match &member.reference {
-                    BoundaryMemberReference::SourceMember { member_id, .. } => {
-                        member_id.clone()
-                    }
+                    BoundaryMemberReference::SourceMember { member_id, .. } => member_id.clone(),
                     BoundaryMemberReference::ChildUnit { unit_id } => unit_id.clone(),
                 })
                 .collect();
@@ -164,11 +162,15 @@ impl UnitGroupBinding {
                 && envelope.disposition.is_none();
             let handle_only = envelope
                 .disposition
+                .as_ref()
                 .is_some_and(|record| record.disposition == BoundaryDisposition::ExactHandleOnly);
             units.insert(
                 candidate.atom_id.clone(),
                 AtomUnit {
-                    group: declared.get(&candidate.atom_id).cloned().unwrap_or_default(),
+                    group: declared
+                        .get(&candidate.atom_id)
+                        .cloned()
+                        .unwrap_or_default(),
                     complete,
                     handle_only,
                     expansion_refs: envelope.expansion_refs.iter().cloned().collect(),
@@ -197,14 +199,20 @@ impl UnitGroupBinding {
             | RepresentationKind::Extractive
             | RepresentationKind::Summary => unit.complete,
             RepresentationKind::Handle => {
-                unit.complete || self.establishes_handle(candidate, unit)
+                unit.complete || Self::establishes_handle(candidate, unit)
             }
         }
     }
 
-    /// Whether the owner envelope names the candidate's own handle as the exact
-    /// way this unit may be reopened.
-    fn establishes_handle(&self, candidate: &ContextCandidate, unit: &AtomUnit) -> bool {
+    /// Whether the owner envelope names the candidate's own handle as the exact way
+    /// this unit may be reopened.
+    ///
+    /// A handle is admitted as the whole unit only when the owner itself recorded
+    /// the unit as `ExactHandleOnly` AND named this exact handle among its expansion
+    /// references. A `WHOLE`-labelled fragment with no envelope behind it is not a
+    /// unit, and a unit the owner did not mark handle-only is never reopened through
+    /// a handle.
+    fn establishes_handle(candidate: &ContextCandidate, unit: &AtomUnit) -> bool {
         let AtomRepresentation::Handle { handle } = &candidate.representation else {
             return false;
         };
