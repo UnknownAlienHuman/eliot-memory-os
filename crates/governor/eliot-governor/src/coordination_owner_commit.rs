@@ -50,7 +50,7 @@ use eliot_coordination::{
 use eliot_protocol::RequestIdentity;
 use eliot_store_api::{
     EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
-    OperationManifestDigest, SecurityContext, ScopeId, TransitionClass, WriteReceipt,
+    OperationManifestDigest, ScopeId, SecurityContext, TransitionClass, WriteReceipt,
     generated_operation_manifests, operation_manifest_set_digest,
 };
 use thiserror::Error;
