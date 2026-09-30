@@ -1158,8 +1158,8 @@ impl ImprovementUnknownEffect {
         }
         if !Self::binds_effect_fence(authorized, observed) {
             return Err(UnboundOwnerOutcome::DivergentStateFence {
-                authorized: authorized.state_fence.clone(),
-                observed: observed.state_fence.clone(),
+                authorized: Box::new(authorized.state_fence.clone()),
+                observed: Box::new(observed.state_fence.clone()),
             });
         }
         self.owner_outcome = Some(Box::new(receipt));
@@ -1398,9 +1398,16 @@ pub enum UnboundOwnerOutcome {
     )]
     DivergentStateFence {
         /// Fence the authorized effect was admitted under.
-        authorized: StateFence,
+        ///
+        /// Boxed for the same storage reason `owner_outcome` is: two whole
+        /// fences inline made this error enum larger than every other value on
+        /// the reconciliation seam, and the two are only ever read together
+        /// through a reference. This is a storage detail — the comparison that
+        /// produces them is unchanged and both recorded values are still
+        /// carried whole.
+        authorized: Box<StateFence>,
         /// Fence the retained canonical receipt was recorded under.
-        observed: StateFence,
+        observed: Box<StateFence>,
     },
 }
 
