@@ -65,9 +65,9 @@ use crate::{
     ApprovedGenerationRegistry, CommittedCutoverActivation, HostPhaseBMaterializationIntent,
     HostPhaseBMaterializationReceipt, HostPhaseBPreparedMaterialization, HostPhaseBPreparedReceipt,
     InstallationActivationApproval, InstallationError, PendingActivation,
-    PendingActivationAbortReceipt, PreparedDestinationAdmission, PreparedDestinationMaterialisation,
-    WindowsPathIdentity, activation_terminal_digest, candidate_manifest_digest,
-    valid_installation_key,
+    PendingActivationAbortReceipt, PreparedDestinationAdmission,
+    PreparedDestinationMaterialisation, WindowsPathIdentity, activation_terminal_digest,
+    candidate_manifest_digest, valid_installation_key,
 };
 
 pub(super) const REGISTRY_TABLE: TableDefinition<&str, &[u8]> =
