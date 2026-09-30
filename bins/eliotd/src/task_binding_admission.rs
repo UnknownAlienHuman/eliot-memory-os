@@ -127,7 +127,7 @@
 //!   against the live Governor kernel-snapshot fence. Its caller seals through
 //!   [`admit_canonical_write`], so the fence leg of the W6/A5 dispatch
 //!   revalidation runs on the direct-internal entrypoint. The fuller
-//!   [`revalidate_dispatched_binding`] (live task/scope plus bootstrap/profile
+//!   [`revalidate_dispatched_binding`] (live task/scope plus bootstrap/profile/projection
 //!   revision plus the `MaterialEffect` scope-identity legs over the
 //!   gate-supplied retained/observed bindings and source closure) stays STITCH:
 //!   no live caller passes that retained/observed pair — the daemon holds no
@@ -2880,11 +2880,11 @@ fn material_effect_guard_detail(report: &eliot_workscope::TriggerReport) -> Stri
 /// envelope scope, the readiness fence as presented, and the live Governor
 /// kernel-snapshot fence as live. Callers holding a sealed [`DispatchedBinding`]
 /// prefer [`revalidate_dispatched_binding`], which checks the carried
-/// task/scope/bootstrap revision first, runs the `MaterialEffect`
+/// task/scope/bootstrap/profile/projection revision first, runs the `MaterialEffect`
 /// scope-identity legs over the gate-supplied retained/observed bindings,
 /// and delegates here for the fence leg; that fuller entry stays STITCH
 /// until the effect gate passes the retained/observed pair with source
-/// closure without invention.
+/// closure and the live projection generation without invention.
 pub fn revalidate_task_bound_for_effect(
     evidence: &TaskSelectionEvidence,
     admitted_task_ref: Option<&str>,
