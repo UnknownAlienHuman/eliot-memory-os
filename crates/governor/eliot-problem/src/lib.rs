@@ -1482,7 +1482,9 @@ pub enum IncidentReason {
 /// deterministic policy or authorized Human finds" the reason. A
 /// `ModelRecommendation` is deliberately NOT a variant, so a Signal labelled
 /// `IncidentCandidate` or a model confidence score has no way to name itself
-/// as the opening authority at all.
+/// as the opening authority at all. Naming a rule is not on its own an
+/// authority either: [`Self::validate_against`] requires the `DeterministicPolicy`
+/// rule to be the one the requesting Signal actually fired, on a `Known` finding.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum PromotionAuthority {
@@ -1506,6 +1508,40 @@ impl PromotionAuthority {
             Self::AuthorizedHuman { decision_ref } => text(decision_ref, "promotion.decision_ref"),
         }
     }
+
+    /// Checks that this authority is admissible for `request`.
+    ///
+    /// I13.10 admits promotion when "deterministic policy or authorized Human
+    /// *finds*" the reason, and closes with "Watchdog model opinion alone
+    /// cannot open Incident". A nameable rule is therefore not enough on its
+    /// own: a deterministic policy promotion must name the rule the requesting
+    /// Signal actually fired, and must rest on a finding rather than a
+    /// hypothesis. `Suspected`/`Unknown` attribution is a hypothesis, which is
+    /// why a model assessment cannot name itself the deciding policy.
+    ///
+    /// An authorized Human decision needs no such axis. A Human may decide on a
+    /// suspected effect, and the decision — not the Signal's confidence — is
+    /// what admits the promotion.
+    pub fn validate_against(&self, request: &IncidentReviewRequest) -> Result<(), ProblemError> {
+        match self {
+            Self::DeterministicPolicy { rule_id } => {
+                if rule_id != &request.signal_rule_id {
+                    return Err(ProblemError::InvalidField {
+                        field: "promotion.authority.rule_id",
+                        reason: "must be the rule the requesting signal fired",
+                    });
+                }
+                if request.signal_attribution != SignalAttribution::Known {
+                    return Err(ProblemError::InvalidField {
+                        field: "promotion.authority",
+                        reason: "deterministic policy requires a known finding, not a suspected or unknown attribution",
+                    });
+                }
+                Ok(())
+            }
+            Self::AuthorizedHuman { .. } => Ok(()),
+        }
+    }
 }
 
 /// A closed request to review a candidate as an Incident.
@@ -1527,15 +1563,25 @@ pub struct IncidentReviewRequest {
     pub evidence_refs: Vec<ArtifactId>,
     /// The requesting Signal's severity, read from the Signal itself.
     pub signal_severity: SignalSeverity,
+    /// The rule the requesting Signal actually fired. A deterministic policy
+    /// promotion must name this exact rule, so the deciding rule is the one
+    /// that produced the evidence rather than a label supplied at promotion.
+    pub signal_rule_id: String,
+    /// The requesting Signal's attribution, read from the Signal itself.
+    /// `Suspected`/`Unknown` is a hypothesis; only `Known` can be the finding
+    /// I13.10 admits as a deterministic-policy basis.
+    pub signal_attribution: SignalAttribution,
 }
 
 impl IncidentReviewRequest {
     /// Validates the request's identity and its bound evidence.
     ///
     /// `source` is the Signal the request claims to come from. The evidence
-    /// list is compared with `source.evidence_handles` and the severity with
-    /// `source.severity`, so a request cannot restate another Signal's severity
-    /// or borrow unrelated evidence.
+    /// list is compared with `source.evidence_handles`, the severity with
+    /// `source.severity`, the rule id with `source.rule_id` and the attribution
+    /// with `source.attribution`, so a request cannot restate another Signal's
+    /// severity, borrow unrelated evidence, or claim a rule and a confidence
+    /// the Signal never carried.
     pub fn validate(&self, source: &Signal) -> Result<(), ProblemError> {
         if self.signal_id != source.signal_id {
             return Err(ProblemError::InvalidField {
@@ -1547,6 +1593,19 @@ impl IncidentReviewRequest {
             return Err(ProblemError::InvalidField {
                 field: "review_request.signal_severity",
                 reason: "must restate the source signal's own severity",
+            });
+        }
+        if self.signal_attribution != source.attribution {
+            return Err(ProblemError::InvalidField {
+                field: "review_request.signal_attribution",
+                reason: "must restate the source signal's own attribution",
+            });
+        }
+        text(&self.signal_rule_id, "review_request.signal_rule_id")?;
+        if self.signal_rule_id != source.rule_id {
+            return Err(ProblemError::InvalidField {
+                field: "review_request.signal_rule_id",
+                reason: "must be the rule the source signal fired",
             });
         }
         nonempty(&self.evidence_refs, "review_request.evidence_refs")?;
@@ -1592,6 +1651,11 @@ pub struct Incident {
 }
 
 /// The committed promotion decision: reason plus the admitting authority.
+///
+/// `request_signal` is mandatory rather than optional, so a committed promotion
+/// always names the retained review request it decided on and
+/// [`Incident::validate`] can re-check the authority against that request
+/// instead of taking the record's own word for it.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IncidentPromotion {
@@ -1599,8 +1663,11 @@ pub struct IncidentPromotion {
     pub reason: IncidentReason,
     /// The authority that admitted the promotion.
     pub authority: PromotionAuthority,
-    /// The Signal the promotion was requested from, when it came from one.
-    pub request_signal: Option<SignalId>,
+    /// The Signal the retained review request came from. A committed promotion
+    /// always has one: it is the receipt the promotion decided on, and
+    /// [`Self::validate`] is the check that refuses a promotion naming no
+    /// request.
+    pub request_signal: SignalId,
 }
 
 impl IncidentPromotion {
@@ -1653,6 +1720,27 @@ impl Incident {
                     reason: "structural corruption requires a retained review request that found it",
                 });
             }
+            // The admitting authority is re-checked against the retained review
+            // request here too, so a record rebuilt from state alone cannot
+            // present a rule identity or a confidence the requesting Signal
+            // never carried. A `DeterministicPolicy` promotion whose retained
+            // request is `Suspected`/`Unknown` is exactly the model-only
+            // assessment I13.10 refuses, so validation and promotion agree.
+            let request = self
+                .review_requests
+                .iter()
+                .find(|request| request.signal_id == promotion.request_signal)
+                .ok_or(ProblemError::InvalidField {
+                    field: "promotion.request_signal",
+                    reason: "must name a retained review request",
+                })?;
+            if request.reason != promotion.reason {
+                return Err(ProblemError::InvalidField {
+                    field: "promotion.reason",
+                    reason: "must be the reason the retained review request observed",
+                });
+            }
+            promotion.authority.validate_against(request)?;
         }
         let expected = self
             .expected_resolution
@@ -1757,13 +1845,17 @@ impl Incident {
     /// Promotion is a separate governed decision: it requires one of the seven
     /// closed reasons, a named deterministic policy rule or authorized Human
     /// decision, and the source Problem link. A model-only request cannot reach
-    /// this entry at all, because [`PromotionAuthority`] has no model variant.
+    /// this entry at all, because [`PromotionAuthority`] has no model variant
+    /// and its `DeterministicPolicy` arm additionally requires the retained
+    /// request to rest on a `Known` finding rather than a `Suspected`/`Unknown`
+    /// attribution — so a confidence score cannot decide its own promotion.
     ///
     /// The request must already be retained by [`Self::request_review`], so
     /// promotion decides on a request that a Signal actually made rather than
-    /// one a caller assembles at the moment of opening. The candidate is built
-    /// and validated before it is committed, so a refused promotion leaves the
-    /// record exactly as it was.
+    /// one a caller assembles at the moment of opening, and the authority is
+    /// checked against that retained request rather than against itself. The
+    /// candidate is built and validated before it is committed, so a refused
+    /// promotion leaves the record exactly as it was.
     pub fn promote(
         &mut self,
         expected_fence: &StateFence,
@@ -1788,6 +1880,7 @@ impl Incident {
                 reason: "promotion must decide on a retained review request",
             });
         }
+        authority.validate_against(request)?;
         let revision = next_revision(self.revision)?;
         let mut candidate = self.clone();
         for evidence in &request.evidence_refs {
@@ -1799,7 +1892,7 @@ impl Incident {
         candidate.promotion = Some(IncidentPromotion {
             reason: request.reason,
             authority,
-            request_signal: Some(request.signal_id.clone()),
+            request_signal: request.signal_id.clone(),
         });
         candidate.state = IncidentState::Open;
         candidate.acknowledged_by = None;
