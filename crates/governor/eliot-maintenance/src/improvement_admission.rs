@@ -28,6 +28,7 @@ use super::improvement_pipeline::{
     ProposalCommitment, RetainedImprovementProposal, UncheckedRecordIdentity,
     UnestablishedPriorCause, assess_improvement_progress,
 };
+use super::AutomationDecision;
 
 /// Improvement closure cell identity (mirrors `meta.learning.closure`).
 pub const IMPROVEMENT_CLOSURE_MODULE: &str = "meta.learning.closure";
@@ -436,6 +437,223 @@ pub struct ImprovementAdmissionPolicy {
     /// [`ImprovementBoundError::NoBoundForSurface`] is how the absence
     /// surfaces — never a default.
     pub candidate_bounds: Vec<ImprovementSurfaceBound>,
+}
+
+/// Closed NON-MUTATING disposition vocabulary this owner may select over one
+/// improvement brief (issue #1867 A2).
+///
+/// I12.24:65 places "decision owner selects reject / investigate / work item /
+/// experiment" AFTER the brief reaches an owner, and the two MUTATING kinds in
+/// that list each need something this owner does not hold: a work item, or an
+/// experiment with a matched budget. So the two non-mutating kinds are the WHOLE
+/// vocabulary here rather than a subset of a wider one, and a mutating kind is
+/// UNREPRESENTABLE in this type — a stronger guarantee than a runtime check a
+/// future caller could route around by naming a different enum. I12.24:82 states
+/// the consequence the two kinds share: "advisory … default; changes nothing
+/// until owner acts", so neither authorizes any effect.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ImprovementBriefDisposition {
+    /// The owner declines the proposal. Nothing changes.
+    Reject,
+    /// The owner takes the occurrence for examination. Nothing changes.
+    Investigate,
+}
+
+/// Typed failures of the owner's own non-mutating disposition selection.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum ImprovementDispositionError {
+    /// The admission policy record carries no owner identity, operation, or
+    /// idempotency key, so it is not an owner-issued record and selects nothing.
+    ///
+    /// A blank field is never a default owner: the same three fields are what
+    /// [`resolve_candidate_surface_bound`] already requires before an owner
+    /// bound may be read, so an unissued or half-filled record cannot select a
+    /// disposition either.
+    #[error("improvement disposition policy record is not owner-issued: {0} is missing")]
+    PolicyNotOwnerIssued(&'static str),
+    /// The brief or candidate identity the selection must bind is missing.
+    #[error("improvement disposition identity is missing: {0}")]
+    MissingIdentity(&'static str),
+    /// The selection does not bind the exact brief and candidate presented to
+    /// it, so it authorizes nothing over either.
+    #[error("improvement disposition selection does not bind this brief and candidate")]
+    SelectionNotBound,
+}
+
+/// One owner-issued, non-mutating disposition selection over one improvement
+/// brief (issue #1867 A2, I11.3, I12.24:65).
+///
+/// # Why this is a state-owner capability and not a named string
+///
+/// I11.3 requires that "Improvement Candidate disposition … [is] allowed only
+/// when the caller holds the corresponding task, budget, policy or
+/// state-owner capability". This type is that capability, and it is
+/// constructible ONLY by [`select_non_mutating_disposition`], which reads this
+/// owner's OWN recorded state: the [`ImprovementAdmissionPolicy`] record it
+/// already owns, and the [`AutomationDecision`] it already recorded for the
+/// observation. Every field is copied from one of those two records.
+///
+/// The fields are PRIVATE and there is no `Deserialize`: a caller cannot spell
+/// this value, re-spell an owner's identity into it, or rebuild it from bytes.
+/// A12.02:3 — "Identity is not a model's self-declared string" — is therefore
+/// discharged by the construction seam rather than by a note. A selection also
+/// binds one exact `brief_id` and `candidate_id`, and [`Self::bind`] re-checks
+/// both by CONTENT before the caller may use it, so one owner's selection can
+/// never be replayed onto another brief.
+///
+/// # What it does NOT establish
+///
+/// It records that this owner selected a disposition for this brief. It does not
+/// establish that the owner read the brief, and it performs nothing: both kinds
+/// are non-mutating by construction. The improvement owner's own
+/// `OwnerDecision::is_non_mutating` is re-checked at the recording seam, so a
+/// value that somehow became mutating is refused before it is committed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnerDispositionSelection {
+    decision_authority: String,
+    operation_ref: String,
+    idempotency_key: String,
+    brief_id: String,
+    candidate_id: String,
+    disposition: ImprovementBriefDisposition,
+    owner_verdict: AutomationDecision,
+}
+
+impl OwnerDispositionSelection {
+    /// The principal that selected, read from the owner's own policy record.
+    #[must_use]
+    pub fn decision_authority(&self) -> &str {
+        &self.decision_authority
+    }
+
+    /// The owner's own admitted operation this selection is bound to.
+    #[must_use]
+    pub fn operation_ref(&self) -> &str {
+        &self.operation_ref
+    }
+
+    /// The owner's own idempotency key for that operation.
+    #[must_use]
+    pub fn idempotency_key(&self) -> &str {
+        &self.idempotency_key
+    }
+
+    /// The exact brief identity this selection was issued over.
+    #[must_use]
+    pub fn brief_id(&self) -> &str {
+        &self.brief_id
+    }
+
+    /// The exact candidate identity this selection was issued over.
+    #[must_use]
+    pub fn candidate_id(&self) -> &str {
+        &self.candidate_id
+    }
+
+    /// The selected non-mutating disposition.
+    #[must_use]
+    pub const fn disposition(&self) -> ImprovementBriefDisposition {
+        self.disposition
+    }
+
+    /// The owner's own recorded verdict the disposition was derived from.
+    #[must_use]
+    pub const fn owner_verdict(&self) -> AutomationDecision {
+        self.owner_verdict
+    }
+
+    /// Re-proves that this selection binds the exact brief and candidate a
+    /// caller is about to record it against.
+    ///
+    /// A CONTENT comparison on both identities, not a presence check: a
+    /// selection issued for another brief, or for a superseded candidate
+    /// revision's brief, is refused rather than applied.
+    pub fn bind(
+        &self,
+        brief_id: &str,
+        candidate_id: &str,
+    ) -> Result<(), ImprovementDispositionError> {
+        if self.brief_id != brief_id || self.candidate_id != candidate_id {
+            return Err(ImprovementDispositionError::SelectionNotBound);
+        }
+        Ok(())
+    }
+}
+
+/// Selects one non-mutating disposition over one improvement brief, from this
+/// owner's own recorded state (issue #1867 A2).
+///
+/// `policy` is the [`ImprovementAdmissionPolicy`] record this owner issued —
+/// the same record the bound is read from and the same record whose
+/// `external_owner_id` is the candidate's `owner_and_decision_authority`
+/// (I12.24:31). `verdict` is the [`AutomationDecision`] this owner recorded for
+/// the observation the brief rests on. Nothing here is caller-authored: the
+/// selecting principal, the operation, and the idempotency key all come from the
+/// policy record, and the disposition comes from the owner's own verdict.
+///
+/// # The disposition is DERIVED, never chosen by the caller
+///
+/// [`ImprovementBriefDisposition`] has exactly two members, so no caller can
+/// reach a mutating kind, and the choice between them is a function of the
+/// owner's recorded verdict:
+///
+/// - [`AutomationDecision::Block`] is "Policy, route, budget or session
+///   requirements deny execution" — the owner denied this work, so declining the
+///   proposal built on it is the truthful record and is
+///   [`ImprovementBriefDisposition::Reject`].
+/// - every other verdict, INCLUDING [`AutomationDecision::Escalate`] which hands
+///   the occurrence to a Human or recovery owner, is "the owner was given the
+///   problem and has not resolved it" and is
+///   [`ImprovementBriefDisposition::Investigate`]. `Reject` there would claim a
+///   resolution nobody reached.
+pub fn select_non_mutating_disposition(
+    policy: &ImprovementAdmissionPolicy,
+    brief_id: &str,
+    candidate_id: &str,
+    verdict: AutomationDecision,
+) -> Result<OwnerDispositionSelection, ImprovementDispositionError> {
+    for (value, field) in [
+        (&policy.external_owner_id, "external_owner_id"),
+        (&policy.operation_ref, "operation_ref"),
+        (&policy.idempotency_key, "idempotency_key"),
+    ] {
+        if value.trim().is_empty() {
+            return Err(ImprovementDispositionError::PolicyNotOwnerIssued(field));
+        }
+    }
+    for (value, field) in [
+        (brief_id, "brief_id"),
+        (candidate_id, "candidate_id"),
+    ] {
+        if value.trim().is_empty() {
+            return Err(ImprovementDispositionError::MissingIdentity(field));
+        }
+    }
+    Ok(OwnerDispositionSelection {
+        decision_authority: policy.external_owner_id.clone(),
+        operation_ref: policy.operation_ref.clone(),
+        idempotency_key: policy.idempotency_key.clone(),
+        brief_id: brief_id.to_owned(),
+        candidate_id: candidate_id.to_owned(),
+        disposition: non_mutating_disposition_for(verdict),
+        owner_verdict: verdict,
+    })
+}
+
+/// Maps one owner-recorded verdict onto the non-mutating kind that states it.
+///
+/// The mapping is total over [`AutomationDecision`] and is the only place a
+/// disposition is chosen, so no caller can select a kind directly.
+fn non_mutating_disposition_for(verdict: AutomationDecision) -> ImprovementBriefDisposition {
+    match verdict {
+        AutomationDecision::Block => ImprovementBriefDisposition::Reject,
+        AutomationDecision::Start
+        | AutomationDecision::Suggest
+        | AutomationDecision::Defer
+        | AutomationDecision::SuppressDuplicate
+        | AutomationDecision::Escalate => ImprovementBriefDisposition::Investigate,
+    }
 }
 
 /// Owner-defined cause of a rejected improvement candidate.

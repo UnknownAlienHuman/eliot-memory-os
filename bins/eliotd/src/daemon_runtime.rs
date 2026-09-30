@@ -5699,6 +5699,22 @@ fn improvement_intake_artifact(
     let fence = composition
         .notification_state_admission_fence()
         .map_err(|error| error.to_string())?;
+    // The G-19 admission policy record, read through the EXISTING maintenance
+    // owner and read BEFORE the assembly, in the same guarded phase, because it
+    // is the owner's OWN record the recorded disposition is ISSUED FROM: the
+    // assembly presents it to `eliot_maintenance::select_non_mutating_disposition`
+    // (issue #1867 A2), the issuer inside the owner crate, which copies the
+    // selecting principal out of it. It was previously read immediately afterwards
+    // for the bound alone; both reads are of the same live owner under the same
+    // guard, so only the order changed. The operation and idempotency key bind
+    // this exact observation, so the policy a candidate is admitted under and the
+    // policy its disposition is issued from are the same owner record.
+    let policy = composition
+        .maintenance_improvement_admission_policy(
+            &eliotd::improvement_intake_dispatch::improvement_bound_operation(decision),
+            &eliotd::improvement_intake_dispatch::improvement_bound_idempotency_key(decision),
+        )
+        .map_err(|error| error.to_string())?;
     // The brief's safe boundary is observed here, under the composition guard
     // the caller already holds: `learning_closure()` is the daemon's single
     // Governor-owned closure image, and `store()` hands back the canonical
@@ -5708,17 +5724,9 @@ fn improvement_intake_artifact(
         decision,
         &fence,
         composition.learning_closure().store(),
+        &policy,
     )
     .map_err(|error| error.to_string())?;
-    // The G-19 decision record, read through the EXISTING maintenance owner.
-    // The operation and idempotency key bind this exact observation, so the
-    // policy a candidate is admitted under names the observation it belongs to.
-    let policy = composition
-        .maintenance_improvement_admission_policy(
-            &eliotd::improvement_intake_dispatch::improvement_bound_operation(decision),
-            &eliotd::improvement_intake_dispatch::improvement_bound_idempotency_key(decision),
-        )
-        .map_err(|error| error.to_string())?;
     Ok((artifact, policy, fence))
 }
 
