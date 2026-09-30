@@ -56,7 +56,10 @@
 //! are computed here with [`crate::sha256_hex`] over the exact bytes the
 //! trusted readback caller supplies, and every record is keyed by its own
 //! exact hint or operation identity: a lease/session/operation bound to
-//! one operation is never reused for another.
+//! one operation is never reused for another. Recorded before/after
+//! revisions are bound to those same computed content digests, so a
+//! governed record always names the mutated tracked source's identity,
+//! never the tool executable image's.
 
 use std::collections::{BTreeMap, btree_map::Entry};
 use std::path::{Path, PathBuf};
@@ -358,7 +361,11 @@ pub(crate) struct HintVerification {
 /// the exact transition digest for `(change_id, before, after)` — a copied
 /// unrelated digest does not resolve and is refused. The fence fields must
 /// be the joined generation and the invalidation outcome the producing lane
-/// actually observed. A lane that observed only its own IPC envelope
+/// actually observed. `before_revision`/`after_revision` must be the
+/// ledger-computed before/after content digests (`None` exactly where the
+/// matching bytes are `None`), so the recorded identity is the mutated
+/// tracked source's, never the tool executable image's (audit 5910747803
+/// AUD1). A lane that observed only its own IPC envelope
 /// (request/result digests, no tracked-source bytes) cannot satisfy this
 /// contract; its record is refused, never stored as source identity.
 ///
@@ -989,7 +996,11 @@ fn close_gaps_from_proven_before(
 /// exact bytes supplied; the bytes are dropped and only digests retained.
 /// A creation carries `before_bytes: None`, a deletion carries
 /// `after_bytes: None`; a record with neither side, or with agreeing
-/// present sides, proves no transition and is refused. The diff handle
+/// present sides, proves no transition and is refused. The recorded
+/// revisions must equal those computed digests (`None` exactly where the
+/// matching bytes are `None`), so the before/after identity is the mutated
+/// tracked source's, never the tool executable image's (audit 5910747803
+/// AUD1). The diff handle
 /// must resolve to the exact recorded transition through the ledger's own
 /// transition binder (shared with `confirm_hint` and the finish-leg
 /// reconciliation, never a second resolver). A byte copy of an unrelated
@@ -1044,6 +1055,14 @@ pub(crate) fn record_governed_tool_change(
         return Err(ChangeMonitorError::InvalidGovernedChange);
     }
     if before_digest.is_some() && before_digest == after_digest {
+        return Err(ChangeMonitorError::InvalidGovernedChange);
+    }
+    // I10.21 A1 (audit 5910747803 AUD1): the recorded before/after
+    // revisions must be the mutated tracked source's own content identity —
+    // exactly the digests just computed over the supplied tracked-source
+    // bytes — never an unrelated identity such as the tool executable
+    // image. A lane naming any other revision is refused, never stored.
+    if change.before_revision != before_digest || change.after_revision != after_digest {
         return Err(ChangeMonitorError::InvalidGovernedChange);
     }
     // I10.21 A1: the diff handle must resolve to the exact recorded
@@ -1364,6 +1383,14 @@ fn validate_imported_ledger(ledger: &KernelChangeLedger) -> Result<(), ChangeMon
             record.after_digest.as_deref(),
         );
         if record.diff_handle != transition {
+            return Err(ChangeMonitorError::SidecarCorrupt);
+        }
+        // Audit 5910747803 AUD1: a durable record must carry the same
+        // revision binding the live ingress enforces — revisions are the
+        // tracked source's own content digests, never the tool image's.
+        if record.before_revision != record.before_digest
+            || record.after_revision != record.after_digest
+        {
             return Err(ChangeMonitorError::SidecarCorrupt);
         }
     }
