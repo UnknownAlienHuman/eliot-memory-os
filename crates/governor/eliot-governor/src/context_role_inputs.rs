@@ -141,7 +141,6 @@ pub enum RoleInputError {
 /// missing measurement itself (`ContextError::MissingField`) rather than this
 /// decoder inventing a serializer identity. Manufacturing that record here would
 /// be the substitution this module exists to prevent.
-#[must_use]
 pub fn decode_epistemic_role(
     role: &RoleAcquisition,
     binding: &ContextBinding,
