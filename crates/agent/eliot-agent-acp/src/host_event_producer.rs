@@ -423,11 +423,8 @@ pub fn produce_execution_unit_redacted<O: HostEventPersistenceOwner>(
     sorted.dedup();
     let class_refs: Vec<&str> = sorted.iter().map(String::as_str).collect();
     let projection = deterministic_redacted_bytes(&transport_hash, &class_refs);
-    let envelope = normalize_execution_unit_event(
-        frame,
-        &projection,
-        HostEventPrivacyClass::RedactedSummary,
-    )?;
+    let envelope =
+        normalize_execution_unit_event(frame, &projection, HostEventPrivacyClass::RedactedSummary)?;
     let request = StageRedacted::execution_unit(
         frame.stream_id,
         frame.stream_sequence,
