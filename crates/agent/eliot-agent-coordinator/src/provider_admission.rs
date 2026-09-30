@@ -34,13 +34,13 @@
 //! evidence.
 //!
 //! Residual STITCH (issue #1108 A5): the loaded legs passed to the pure owner
-//! verifier in KernelProviderVerifier::verify alias the presented half
+//! verifier in [`KernelProviderVerifier::verify`] alias the presented half
 //! (attempt, operation, digests, generation); only the fence leg rides
 //! owner-observed evidence (the live-fence digest) while attempt/operation
 //! mismatch is caught receipt-side from the ORIGINAL bytes. Binding the
 //! digest legs against the durable row per effecting operation demands the
 //! factory-witnessed row retained in this capability (producer:
-//! AdmittedProviderFactory::admit) plus a daemon row source that no seam
+//! [`AdmittedProviderFactory::admit`]) plus a daemon row source that no seam
 //! returns today. Until both land, the owner digest/generation gates re-prove
 //! construction-time coherence, not a fresh row read.
 //!
