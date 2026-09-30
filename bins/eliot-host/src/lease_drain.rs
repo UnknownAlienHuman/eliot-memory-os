@@ -109,15 +109,6 @@ impl HostComposition {
                     .to_owned(),
             ));
         };
-        let kernel = self.jobs.kernel.as_ref().ok_or_else(|| {
-            HostError::ProcessContour(
-                "Store-owner census requires the live authenticated Kernel process".to_owned(),
-            )
-        })?;
-        let kernel_process = kernel.evidence().process().clone();
-        let expected_kernel_image = self.jobs.kernel_executable.as_ref().ok_or_else(|| {
-            HostError::ProcessContour("approved Kernel image is missing".to_owned())
-        })?;
         let query = eliot_kernel_service::RuntimeLeaseCensusQuery {
             state_fence: state_fence.clone(),
             supervision_lease_id: supervision_lease_ref.as_str().to_owned(),
@@ -131,46 +122,7 @@ impl HostComposition {
             KernelControlCommand::ReadRuntimeLeaseCensus(query),
             1,
         )?;
-        let connection_id = format!(
-            "host-store-census:{}:{}",
-            activation.activation_id.as_str(),
-            state_fence.resource_generation.value()
-        );
-        let request_frame = eliot_kernel_service::control_request_frame(connection_id, &request)
-            .map_err(HostError::StoreCensusTransport)?;
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(HostError::StoreCensusIo)?;
-        let response = runtime.block_on(async {
-            let mut transport =
-                connect_authenticated_kernel_front_door(candidate, &kernel_process).await?;
-            validate_authenticated_kernel_peer(
-                transport.peer_identity(),
-                kernel_process.process_id,
-                kernel_process.start_time_100ns,
-                expected_kernel_image,
-            )?;
-            let limits = TransportLimits::default();
-            match transport
-                .send_frame(&request_frame, limits)
-                .await
-                .map_err(HostError::StoreCensusTransport)?
-            {
-                eliot_ipc::DeliveryOutcome::Delivered => {}
-                eliot_ipc::DeliveryOutcome::UnknownOutcome => {
-                    return Err(HostError::RecoveryRequired(
-                        "Kernel Store-owner census delivery outcome is unknown".to_owned(),
-                    ));
-                }
-            }
-            let frame = transport
-                .receive_frame(limits)
-                .await
-                .map_err(HostError::StoreCensusTransport)?;
-            eliot_kernel_service::decode_control_response_frame(&frame)
-                .map_err(|error| HostError::RecoveryRequired(error.to_string()))
-        })?;
+        let response = self.exchange_store_census(candidate, &request, activation, &state_fence)?;
         response
             .validate()
             .map_err(|error| HostError::StoreCensusKernel(Box::new(error)))?;
@@ -214,6 +166,65 @@ impl HostComposition {
             ));
         }
         Ok(census)
+    }
+
+    /// Exchanges one exact census request with the authenticated original Kernel owner.
+    fn exchange_store_census(
+        &self,
+        candidate: &eliot_kernel_service::HostKernelCandidateBinding,
+        request: &KernelControlRequest,
+        activation: &EliotActivationRecord,
+        state_fence: &StateFence,
+    ) -> Result<eliot_kernel_service::KernelControlResponse, HostError> {
+        let kernel = self.jobs.kernel.as_ref().ok_or_else(|| {
+            HostError::ProcessContour(
+                "Store-owner census requires the live authenticated Kernel process".to_owned(),
+            )
+        })?;
+        let kernel_process = kernel.evidence().process().clone();
+        let expected_kernel_image = self.jobs.kernel_executable.as_ref().ok_or_else(|| {
+            HostError::ProcessContour("approved Kernel image is missing".to_owned())
+        })?;
+        let connection_id = format!(
+            "host-store-census:{}:{}",
+            activation.activation_id.as_str(),
+            state_fence.resource_generation.value()
+        );
+        let request_frame = eliot_kernel_service::control_request_frame(connection_id, request)
+            .map_err(HostError::StoreCensusTransport)?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(HostError::StoreCensusIo)?;
+        runtime.block_on(async {
+            let mut transport =
+                connect_authenticated_kernel_front_door(candidate, &kernel_process).await?;
+            validate_authenticated_kernel_peer(
+                transport.peer_identity(),
+                kernel_process.process_id,
+                kernel_process.start_time_100ns,
+                expected_kernel_image,
+            )?;
+            let limits = TransportLimits::default();
+            match transport
+                .send_frame(&request_frame, limits)
+                .await
+                .map_err(HostError::StoreCensusTransport)?
+            {
+                eliot_ipc::DeliveryOutcome::Delivered => {}
+                eliot_ipc::DeliveryOutcome::UnknownOutcome => {
+                    return Err(HostError::RecoveryRequired(
+                        "Kernel Store-owner census delivery outcome is unknown".to_owned(),
+                    ));
+                }
+            }
+            let frame = transport
+                .receive_frame(limits)
+                .await
+                .map_err(HostError::StoreCensusTransport)?;
+            eliot_kernel_service::decode_control_response_frame(&frame)
+                .map_err(HostError::StoreCensusTransport)
+        })
     }
 
     /// Persists a protected recovery gap bound to the current activation and

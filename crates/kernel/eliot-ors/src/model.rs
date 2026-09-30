@@ -4469,7 +4469,7 @@ pub enum OrsError {
     #[error("foundation contract rejected ORS input: {0}")]
     Contract(String),
     #[error("Store contract rejected ORS input: {0}")]
-    StoreContract(#[from] eliot_store_api::StoreError),
+    StoreContract(#[from] Box<eliot_store_api::StoreError>),
     #[error("unsupported recovery envelope contract version {0}")]
     UnsupportedContractVersion(u16),
     #[error("payload length exceeds the supported counter")]
@@ -4704,6 +4704,12 @@ pub enum OrsError {
         "staged opaque payload for operation {operation_id} failed validation; a durable Recovery Problem is retained for disposition, plaintext fallback and silent deletion are forbidden"
     )]
     RecoveryProblemRetained { operation_id: String },
+}
+
+impl From<eliot_store_api::StoreError> for OrsError {
+    fn from(source: eliot_store_api::StoreError) -> Self {
+        Self::StoreContract(Box::new(source))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]

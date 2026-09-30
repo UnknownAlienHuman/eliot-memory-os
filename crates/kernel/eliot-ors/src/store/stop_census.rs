@@ -287,6 +287,12 @@ pub(super) fn census_in_read(
 
     observe_supervision_lease_staged(read, &mut builder)?;
 
+    // Reservation identity indexes and scope terminal receipts are part of
+    // the same owner snapshot: dangling or missing primary rows must not
+    // disappear behind a zero count.
+    super::validate_write_reservation_inventory_in_read(read, &mut |family, key, value| {
+        builder.observe(family, key, value);
+    })?;
     observe_reservations(read, &mut builder)?;
 
     observe_unknown_commit_recovery(read, &mut builder)?;

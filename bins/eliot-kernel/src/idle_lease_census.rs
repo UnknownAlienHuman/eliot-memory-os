@@ -165,11 +165,12 @@ pub(crate) struct KernelIdleLeaseCensus {
 impl KernelIdleLeaseCensus {
     /// Whether the ordered drain sequence may proceed.
     pub(crate) fn admits_drain(&self) -> bool {
-        matches!(self.disposition, KernelIdleLeaseDisposition::Idle)
+        let complete_zero = matches!(self.disposition, KernelIdleLeaseDisposition::Idle)
             && self
                 .store_stop_obligations
                 .as_ref()
-                .is_some_and(eliot_ors::StoreStopObligationCensus::is_known_zero)
+                .is_some_and(eliot_ors::StoreStopObligationCensus::is_known_zero);
+        crate::shutdown_drain::ShutdownDrainCoordinator::check_lease_zero(!complete_zero).is_ok()
     }
 
     /// Bounded observation code for the Kernel diagnostics facade

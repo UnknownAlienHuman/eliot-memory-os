@@ -1259,7 +1259,7 @@ fn validate_digest(value: &str, field: &'static str) -> Result<(), KernelService
 /// here rather than a silently stringified refusal.
 fn store_contract_refusal(source: &eliot_store_api::StoreError) -> KernelServiceError {
     KernelServiceError::Core(eliot_kernel_core::KernelError::RecoveryState(
-        OrsError::StoreContract(source.clone()),
+        OrsError::StoreContract(Box::new(source.clone())),
     ))
 }
 
