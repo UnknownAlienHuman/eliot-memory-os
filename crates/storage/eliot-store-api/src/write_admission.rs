@@ -219,6 +219,7 @@
 //! | `UpdateTaskState` | F2 | `TaskControl` | `ReversibleMutation` | 4 |
 //! | `ApplyLifecyclePolicy` | F8 | `LifecyclePolicy` | `ReversibleMutation` | 4 |
 //! | `ReconcileRecovery` | F8 | `RecoverySchema` | `ReversibleMutation` | 4 |
+//! | `ApplyProblemOwnerState` | F8 | `RecoverySchema` | `ReversibleMutation` | 4 |
 //! | `ApplyErasure` | F8 | `Erasure` | `ReversibleMutation` | 4 |
 //! | `ApplyUserAutomationState` | F8 | `UserAutomation` | `ReversibleMutation` | 4 |
 //! | `RecordFinishDecision` | F5 | `RecoverySchema` | `ReversibleMutation` | 4 |

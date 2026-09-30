@@ -471,7 +471,7 @@ struct ActivatedMutationDescriptor {
 /// activated mutation rows address no store scope, mirroring the scope-free read
 /// descriptors. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 19] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 20] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],
@@ -521,6 +521,15 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 19] = [
         // Owner snapshots are bounded at 512 KiB. The existing 2 MiB bulk
         // parameter bound covers canonical JSON string escaping and the
         // remaining fixed parameters without broadening the payload bound.
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::ApplyProblemOwnerState,
+        transition_classes: &[TransitionClass::RecoverySchema],
+        maximum_effect: EffectClass::ReversibleMutation,
+        // Problem candidates are bounded like the other owner snapshots: a
+        // Problem record is one symptom, its bounded dependency/evidence sets
+        // and its retained history, not a bulk payload.
         max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
     },
     ActivatedMutationDescriptor {
@@ -815,7 +824,8 @@ pub fn validate_read_against_catalogue(
 /// `ApplyEpistemicRevision`, `ApplyErasure`, `ApplyNotificationState`,
 /// `ApplyReactiveInjectionState`, `ApplyResourceSnapshot`,
 /// `CommitExperienceBank`, `CommitAgentFeedback`,
-/// `RecordLearningRecord`, `RecordCapabilityEvidenceRecord`, and
+/// `RecordLearningRecord`, `RecordCapabilityEvidenceRecord`,
+/// `ApplyProblemOwnerState`, and
 /// `RecordModuleCatalogSnapshot` have activated
 /// mutation entries; any other named
 /// command fails closed here until a later slice proves its handler, schema,
@@ -914,6 +924,10 @@ pub fn validate_transition_against_catalogue(
             }
             NamedMutationOperation::RecordAuthorityRevocation => {
                 return Err(StoreError::UnknownOperation);
+            }
+            NamedMutationOperation::ApplyProblemOwnerState => {
+                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+                crate::decode_problem_owner_state_mutation(&command.parameters).map(|_| ())?;
             }
         }
         validate_parameter_size(&command.parameters, entry.max_input_bytes)?;

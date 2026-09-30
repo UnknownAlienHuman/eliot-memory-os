@@ -20,7 +20,8 @@ mod ownership;
 pub use ownership::{
     AssignedOwnership, AuthenticatedOwnerLease, AuthorizedWaiver, ClosureEvidence, LeaseIdentity,
     OwnerLeaseGrant, OwnerLeaseIssuer, OwnerLeaseLoss, OwnerLossReason, OwnerRoute, Ownership,
-    OwnershipObligation, UnassignedOwnership, WaiverRecord, obligation_id,
+    OwnershipObligation, Supersession, SupersessionRecord, UnassignedOwnership, WaiverRecord,
+    obligation_id,
 };
 
 /// Stable package identity.
@@ -1229,6 +1230,124 @@ impl Problem {
         candidate.validate()?;
         *self = candidate;
         Ok(())
+    }
+
+    /// Reaches `I13.9` `superseded` under an accepted replacement obligation.
+    ///
+    /// I13.7 closes blocking on "verified resolution, authorized waiver or
+    /// supersession", and I13.9 names `superseded` as its own terminal state
+    /// beside `resolved` and `accepted_risk`. A bare
+    /// [`Self::transition`] refuses every terminal target, so this is the only
+    /// path to that state and it cannot be spelled as an ordinary update: the
+    /// replacement obligation is validated against this record first, so a
+    /// cycle or a nonexistent reference is refused rather than committed. The
+    /// retained [`SupersessionRecord`] is returned for the caller to persist
+    /// with the state change, exactly as [`Self::accept_risk`] returns its
+    /// [`WaiverRecord`]. The candidate is validated before it replaces the live
+    /// record, so a refused supersession leaves the record unchanged.
+    pub fn supersede(
+        &mut self,
+        expected_fence: &StateFence,
+        supersession: &Supersession,
+    ) -> Result<SupersessionRecord, ProblemError> {
+        same_fence(expected_fence, &self.state_fence)?;
+        supersession.validate(self.problem_id.as_str())?;
+        if !self.state.can_transition_to(ProblemState::Superseded) {
+            return Err(ProblemError::IllegalTransition {
+                from: format!("{:?}", self.state),
+                to: "SUPERSEDED".to_owned(),
+            });
+        }
+        let revision = next_revision(self.revision)?;
+        let record = SupersessionRecord {
+            replacement_obligation_ref: supersession.replacement_obligation_ref.clone(),
+            replacement_holder: supersession.replacement_holder.clone(),
+            evidence: supersession.evidence.clone(),
+        };
+        // The retained record is checked against the same contract the input
+        // faced before it leaves this crate, so a reloaded supersession is held
+        // to the admission it was admitted under.
+        record.validate()?;
+        let mut candidate = self.clone();
+        candidate.observed_evidence =
+            merge_evidence(&candidate.observed_evidence, &supersession.evidence);
+        candidate.state = ProblemState::Superseded;
+        candidate.revision = revision;
+        candidate.validate()?;
+        *self = candidate;
+        Ok(record)
+    }
+
+    /// Escalates the outstanding reassignment/escalation obligation.
+    ///
+    /// I13.9 says an owner loss leaves ownership `unassigned` "until reassigned
+    /// to an eligible successor **or escalated through Critical Attention**", so
+    /// losing the owner and escalating the consequence are two distinct steps:
+    /// [`Self::record_owner_loss`] performs the first and this the second. It is
+    /// therefore admitted only on an already-unassigned record — an assigned
+    /// record has no outstanding obligation to escalate, and clearing its
+    /// assignment is a loss, not an escalation — and an already-terminal record
+    /// is preserved rather than escalated back into work.
+    ///
+    /// The obligation identity is re-derived from the record's own class route
+    /// and the fenced ownership epoch rather than minted here, so a replayed or
+    /// repeated escalation converges on the identical obligation instead of
+    /// producing an escalation storm of new identities. The escalation evidence
+    /// is merged into the observed evidence and the record advances to a new
+    /// revision, which is what makes each attempt durable and readable back
+    /// while the obligation itself stays one.
+    pub fn escalate_obligation(
+        &mut self,
+        expected_fence: &StateFence,
+        evidence: Vec<ArtifactId>,
+    ) -> Result<OwnershipObligation, ProblemError> {
+        same_fence(expected_fence, &self.state_fence)?;
+        nonempty(&evidence, "escalation.evidence")?;
+        let evidence_text = evidence
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        unique_text(&evidence_text, "escalation.evidence")?;
+        let Ownership::Unassigned(unassigned) = &self.ownership else {
+            return Err(ProblemError::IllegalTransition {
+                from: format!("{:?}", self.ownership),
+                to: "ESCALATE".to_owned(),
+            });
+        };
+        if matches!(
+            self.state,
+            ProblemState::Resolved
+                | ProblemState::AcceptedRisk
+                | ProblemState::Superseded
+                | ProblemState::Quarantined
+        ) {
+            return Err(ProblemError::ImmutableState);
+        }
+        let route = self.default_owner_route();
+        let obligation = OwnershipObligation {
+            obligation_id: obligation_id(
+                self.problem_id.as_str(),
+                route,
+                unassigned.ownership_epoch,
+            )?,
+            route,
+            lost_lease: unassigned.lost_lease.clone(),
+            ownership_epoch: unassigned.ownership_epoch,
+            raised_at_revision: self.revision,
+        };
+        if obligation != unassigned.obligation {
+            return Err(ProblemError::InvalidField {
+                field: "obligation",
+                reason: "an escalation may only restate the obligation the owner loss raised",
+            });
+        }
+        let revision = next_revision(self.revision)?;
+        let mut candidate = self.clone();
+        candidate.observed_evidence = merge_evidence(&candidate.observed_evidence, &evidence);
+        candidate.revision = revision;
+        candidate.validate()?;
+        *self = candidate;
+        Ok(obligation)
     }
 
     /// Returns whether evidence-backed terminal resolution was reached.

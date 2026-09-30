@@ -1287,8 +1287,9 @@ fn record_operation_count(
 /// bytes; the closed parameter shapes plus the receipt transition class
 /// discriminate exactly one activated mutation per class on base
 /// (`TaskControl` → `UpdateTaskState`, `LifecyclePolicy` →
-/// `ApplyLifecyclePolicy`, `RecoverySchema` → `ReconcileRecovery`,
-/// `CaptureCandidate` → `CaptureObservation`/`AppendAuditEvent`,
+/// `ApplyLifecyclePolicy`, `RecoverySchema` → `ApplyProblemOwnerState` when the
+/// named-transition discriminator is present and `ReconcileRecovery`
+/// otherwise, `CaptureCandidate` → `CaptureObservation`/`AppendAuditEvent`,
 /// `Epistemic` → `ApplyEpistemicRevision`). Anything else fails closed.
 fn infer_authority_operation(
     transition_class: eliot_store_api::TransitionClass,
@@ -1303,6 +1304,13 @@ fn infer_authority_operation(
         }
         TransitionClass::LifecyclePolicy if parameters.contains_key("skill_id") => {
             Ok(NamedMutationOperation::ApplyLifecyclePolicy)
+        }
+        // The named owner transitions are discriminated first: they are also
+        // `RecoverySchema` and also carry `problem_id`, so without this arm a
+        // committed `ApplyProblemOwnerState` row would be read back under
+        // `ReconcileRecovery`'s name and its verb would be lost.
+        TransitionClass::RecoverySchema if parameters.contains_key("transition") => {
+            Ok(NamedMutationOperation::ApplyProblemOwnerState)
         }
         TransitionClass::RecoverySchema if parameters.contains_key("problem_id") => {
             Ok(NamedMutationOperation::ReconcileRecovery)
@@ -1341,6 +1349,9 @@ struct IndexedAuthority {
 /// length/bytes-vs-parameters) and its receipt is validated (committed
 /// status, envelope, command-count agreement); any mismatch fails closed.
 /// Scope comes from the validated receipt envelope, never from the caller.
+///
+/// Only `Committed` receipts contribute, so every record this returns is state
+/// the store actually committed.
 fn indexed_authorities(rows: &[AuthorityReceiptRow]) -> Result<Vec<IndexedAuthority>, StoreError> {
     let mut ordered: Vec<&AuthorityReceiptRow> = rows.iter().collect();
     ordered.sort_by_key(|row| row.commit_sequence.unwrap_or(0));
@@ -1522,7 +1533,11 @@ fn attention_problems_payload(
         .iter()
         .filter(|record| {
             record.scope_id == scope_id.as_str()
-                && record.operation == eliot_store_api::NamedMutationOperation::ReconcileRecovery
+                && matches!(
+                    record.operation,
+                    eliot_store_api::NamedMutationOperation::ReconcileRecovery
+                        | eliot_store_api::NamedMutationOperation::ApplyProblemOwnerState
+                )
                 && problem_id.is_none_or(|wanted| {
                     record.parameters.get("problem_id").and_then(Value::as_str) == Some(wanted)
                 })

@@ -680,6 +680,85 @@ impl WaiverRecord {
     }
 }
 
+/// The accepted replacement obligation an `I13.9` `superseded` Problem points at.
+///
+/// I13.7 closes blocking only on "verified resolution, authorized waiver or
+/// supersession", so supersession is a third, distinct terminal route beside
+/// resolution and waiver. A supersession is only meaningful when it names an
+/// obligation some other authority actually accepted, so the reference is
+/// compared against the Problem being superseded here: a replacement equal to
+/// this record is a cycle, and a reference that names no accepted obligation
+/// lets blocking disappear into a nonexistent identity.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Supersession {
+    /// The accepted replacement obligation this Problem is superseded by.
+    pub replacement_obligation_ref: String,
+    /// The principal that accepted the replacement obligation.
+    pub replacement_holder: OwnerRef,
+    /// Evidence backing that acceptance.
+    pub evidence: Vec<ArtifactId>,
+}
+
+impl Supersession {
+    /// Validates the replacement reference, its accepting holder and evidence.
+    ///
+    /// `superseded` names the Problem being superseded so the cycle refusal is
+    /// exact: a replacement obligation that is this Problem would leave the
+    /// blocking obligation pointing back at itself with nothing behind it.
+    pub fn validate(&self, superseded: &str) -> Result<(), ProblemError> {
+        crate::text(
+            &self.replacement_obligation_ref,
+            "supersession.replacement_obligation_ref",
+        )?;
+        if self.replacement_obligation_ref == superseded {
+            return Err(ProblemError::InvalidField {
+                field: "supersession.replacement_obligation_ref",
+                reason: "a problem cannot be superseded by its own obligation",
+            });
+        }
+        self.replacement_holder.validate()?;
+        crate::nonempty(&self.evidence, "supersession.evidence")?;
+        let evidence = self
+            .evidence
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        crate::unique_text(&evidence, "supersession.evidence")
+    }
+}
+
+/// The retained record of an applied supersession.
+///
+/// Returned by the supersession transition to the caller, which persists it in
+/// the same committed transition as the state change. It is deliberately not a
+/// `Problem` field: `accept_risk` returns its [`WaiverRecord`] the same way, and
+/// the committed transition history is where both closures are read back from.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupersessionRecord {
+    /// The accepted replacement obligation this Problem is superseded by.
+    pub replacement_obligation_ref: String,
+    /// The principal that accepted the replacement obligation.
+    pub replacement_holder: OwnerRef,
+    /// Evidence backing that acceptance.
+    pub evidence: Vec<ArtifactId>,
+}
+
+impl SupersessionRecord {
+    /// Validates the retained supersession against the same rules the input
+    /// faced, so a reloaded record is held to the admission it was admitted
+    /// under.
+    pub fn validate(&self) -> Result<(), ProblemError> {
+        Supersession {
+            replacement_obligation_ref: self.replacement_obligation_ref.clone(),
+            replacement_holder: self.replacement_holder.clone(),
+            evidence: self.evidence.clone(),
+        }
+        .validate("")
+    }
+}
+
 /// The stable obligation identity for one lost assignment.
 ///
 /// The identity binds the subject, the route and the ownership epoch the

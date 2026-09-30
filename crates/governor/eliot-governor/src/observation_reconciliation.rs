@@ -135,6 +135,16 @@
 //! pre-fixed `expected_resolution`, and raising any Problem or Incident needs
 //! an `AuthenticatedOwnerLease` from a real issuer. Both belong to the lease
 //! owner and the Problem owner respectively, not to this Governor.
+//!
+//! The nine named owner transitions (issue #1759 I2) are now prepared and
+//! committed from this owner through
+//! [`GovernorObservationReconciliation::commit_problem_owner_transition`], which
+//! reuses this same gateway and the same `problem:{problem_id}` revision-head
+//! namespace. The same named prerequisite applies unchanged: that entry takes an
+//! `AuthenticatedOwnerLease`, so it is type-sound and production-unreachable
+//! until the lease owner issues one. It is stated here rather than worked
+//! around — no principal string is accepted on that path, and no Problem or
+//! Incident literal is constructed in this module.
 
 #![forbid(unsafe_code)]
 
@@ -168,6 +178,10 @@ use eliot_store_api::{
 use crate::{
     CanonicalAdmissionOwner, CompositionError, CompositionReadiness, KernelPortError,
     KernelTransitionPort,
+};
+use crate::problem_owner_transitions::{
+    ProblemOwnerTransitionBody, ProblemOwnerTransitionOutcome, prepare_problem_owner_transition,
+    problem_owner_operation_id,
 };
 
 /// Production adapter manifest name from the Surreal adapter.
@@ -2108,6 +2122,147 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
             &manifest_digest,
         )
         .await
+    }
+
+    /// Commits one named Problem owner transition (issue #1759 I2).
+    ///
+    /// This is the production entry for the nine named transitions. It adds no
+    /// preparation path and no transaction API: the transition is prepared once
+    /// by [`crate::prepare_problem_owner_transition`], converted to the one
+    /// `PreparedTransition` by the existing envelope, and committed through
+    /// [`CanonicalAdmissionOwner::commit`], the same gateway every other
+    /// canonical write on this owner uses.
+    ///
+    /// The four bindings are compared, not carried: the source Signal is checked
+    /// against the admitted fence and against the candidate's retained
+    /// `signal_refs`; the verb and the candidate `record_digest` are inside the
+    /// canonical request hash; the expected record revision is compared with the
+    /// record here and travels as the `problem:{problem_id}` revision-head
+    /// expectation the store arbitrates; and the presented
+    /// [`AuthenticatedOwnerLease`](eliot_problem::AuthenticatedOwnerLease) is
+    /// re-proved against the lease owner's own commitment and required to be
+    /// exactly the lease identity the candidate retains.
+    ///
+    /// A lost commit response reconciles the original receipt through the
+    /// neutral port instead of committing a second transition, so a retry of the
+    /// same transition never produces a second Problem or a second escalation.
+    ///
+    /// The returned [`ProblemOwnerTransitionOutcome`] reports the committed
+    /// candidate, the retained closure of a `Waive`/`Supersede` transition, and
+    /// the store's own receipt. No production
+    /// [`OwnerLeaseIssuer`](eliot_problem::OwnerLeaseIssuer) exists in this tree,
+    /// so no caller can currently present an
+    /// [`AuthenticatedOwnerLease`](eliot_problem::AuthenticatedOwnerLease):
+    /// every verb is type-sound here and production-unreachable until the lease
+    /// owner issues one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError`] when readiness or fence agreement fails, the
+    /// expected record revision does not match the committed record, the source
+    /// Signal or presented authorization does not hold, the state machine refuses
+    /// the verb, or the canonical commit cannot be completed or reconciled.
+    pub async fn commit_problem_owner_transition(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        base_operation_id: &OperationId,
+        current: Option<&eliot_problem::Problem>,
+        expected_revision: u64,
+        source_signal: &eliot_problem::Signal,
+        lease: &eliot_problem::AuthenticatedOwnerLease,
+        now_ms: u64,
+        body: &ProblemOwnerTransitionBody,
+    ) -> Result<ProblemOwnerTransitionOutcome, CompositionError> {
+        self.validate_capture_identity_fence(identity)?;
+        let manifest_digest = production_manifest_digest()?;
+        let problem_id = match (current, body) {
+            (Some(record), _) => record.problem_id.as_str().to_owned(),
+            (None, ProblemOwnerTransitionBody::Create { problem_id, .. }) => {
+                problem_id.as_str().to_owned()
+            }
+            (None, _) => {
+                return Err(owner_refused(
+                    "a problem owner transition needs the committed record it advances, or a create body"
+                        .to_owned(),
+                ));
+            }
+        };
+        let operation_id = problem_owner_operation_id(
+            base_operation_id,
+            &problem_id,
+            source_signal.signal_id.as_str(),
+            body.transition(),
+            expected_revision,
+        )?;
+        let per_transition_identity = eliot_protocol::RequestIdentity {
+            request: identity.request.clone(),
+            idempotency_key: format!(
+                "{}:problem-owner:{}:{}:{expected_revision}",
+                identity.idempotency_key,
+                problem_id,
+                body.transition().as_str(),
+            ),
+            deadline_unix_ms: identity.deadline_unix_ms,
+            cancellation_id: identity.cancellation_id.clone(),
+        };
+        let prepared = prepare_problem_owner_transition(
+            &per_transition_identity,
+            &operation_id,
+            &manifest_digest,
+            current,
+            expected_revision,
+            source_signal,
+            lease,
+            now_ms,
+            body,
+        )?;
+        let expected_hash = prepared
+            .envelope
+            .canonical_request_hash()
+            .map_err(CompositionError::Canonical)?;
+        // The proactive same-operation receipt check is the lost-acknowledgement
+        // readback: an identical replay returns the original receipt instead of
+        // executing a second transition, and the same operation with different
+        // canonical bytes fails closed here.
+        let reconciled = match self.kernel.receipt(operation_id.clone()).await? {
+            Some(receipt) => {
+                check_receipt(
+                    &receipt,
+                    &operation_id,
+                    &per_transition_identity,
+                    &expected_hash,
+                    TransitionClass::RecoverySchema,
+                    &manifest_digest,
+                )?;
+                receipt
+            }
+            None => {
+                self.commit_problem_leg(
+                    &per_transition_identity,
+                    &operation_id,
+                    prepared.envelope,
+                    &expected_hash,
+                    &manifest_digest,
+                )
+                .await?
+            }
+        };
+        // Only a committed receipt is a readback of committed state; a rejected
+        // or unknown outcome is reported as such rather than dressed up as the
+        // record having moved.
+        if reconciled.status != WriteReceiptStatus::Committed {
+            return Err(owner_refused(format!(
+                "problem owner transition {} was not committed: {:?}",
+                prepared.transition.as_str(),
+                reconciled.status
+            )));
+        }
+        Ok(ProblemOwnerTransitionOutcome {
+            transition: prepared.transition,
+            problem: prepared.candidate,
+            closure: prepared.closure,
+            receipt: reconciled,
+        })
     }
 
     /// Admits one independently verified Doctor result into canonical Problem

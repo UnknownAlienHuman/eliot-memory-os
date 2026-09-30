@@ -52,6 +52,7 @@ pub mod learning_store;
 mod named_mutation_receipt;
 mod notification_state;
 mod payload_authority;
+mod problem_owner_state;
 mod reactive_state;
 mod request_hash;
 mod store_failure;
@@ -127,6 +128,17 @@ pub use payload_authority::{
     HistoricalRecordDisposition, HistoricalRecordProvenance, MAX_EXACT_JSON_BYTES,
     PAYLOAD_AUTHORITY_VERSION, PayloadEncoding, PayloadSource, dispose_historical_record,
     json_shape_name, number_token_would_narrow, reject_control_parameter_name,
+};
+
+pub use problem_owner_state::{
+    DecodedProblemOwnerState, PROBLEM_OWNER_STATE_MUTATION_NAME, PROBLEM_OWNER_STATE_SCHEMA_V1,
+    PROBLEM_PARAM_AUTHORIZATION_DIGEST, PROBLEM_PARAM_EXPECTED_REVISION, PROBLEM_PARAM_PROBLEM_ID,
+    PROBLEM_PARAM_RECORD_DIGEST, PROBLEM_PARAM_RECORD_JSON, PROBLEM_PARAM_SOURCE_SIGNAL_ID,
+    PROBLEM_PARAM_TRANSITION, PROBLEM_TRANSITION_ASSIGN, PROBLEM_TRANSITION_CREATE,
+    PROBLEM_TRANSITION_ESCALATE, PROBLEM_TRANSITION_REOPEN, PROBLEM_TRANSITION_RESOLVE,
+    PROBLEM_TRANSITION_SUPERSEDE, PROBLEM_TRANSITION_UNASSIGN, PROBLEM_TRANSITION_UPDATE,
+    PROBLEM_TRANSITION_WAIVE, ProblemOwnerTransition, decode_problem_owner_state_mutation,
+    problem_owner_state_mutation_request, problem_revision_key, validate_problem_owner_state_params,
 };
 
 pub use reactive_state::{
@@ -3891,6 +3903,19 @@ pub enum NamedMutationOperation {
     /// Governor registry re-evaluates through its own exact-fingerprint,
     /// freshness, invalidation, and requalification predicates.
     RecordCapabilityEvidenceRecord,
+    /// Canonical problem owner-state transaction (issue #1759 I2, I13.9/I13.7).
+    ///
+    /// Durable Problem-registry ownership and lifecycle only: the prepared
+    /// transition must carry [`TransitionClass::RecoverySchema`], the declared
+    /// reversible-mutation ceiling, one closed named owner transition
+    /// (`CREATE`, `UPDATE`, `ASSIGN`, `UNASSIGN`, `ESCALATE`, `RESOLVE`,
+    /// `WAIVE`, `SUPERSEDE`, `REOPEN`), the source-Signal identity, the
+    /// re-proved current-authorization digest, the expected record revision and
+    /// the complete candidate record with its presented digest. The store
+    /// bridge compares the candidate record against those bindings and
+    /// arbitrates the revision-head compare-and-swap; it never derives a
+    /// Problem transition, an owner, or a closure.
+    ApplyProblemOwnerState,
 }
 
 impl NamedMutationOperation {
@@ -3911,7 +3936,8 @@ impl NamedMutationOperation {
             | Self::RecordFinishDecision
             | Self::RecordFinishEvidence
             | Self::RecordModuleCatalogSnapshot
-            | Self::RecordAuthorityRevocation => TransitionClass::RecoverySchema,
+            | Self::RecordAuthorityRevocation
+            | Self::ApplyProblemOwnerState => TransitionClass::RecoverySchema,
             Self::ApplyErasure => TransitionClass::Erasure,
             Self::ApplyNotificationState => TransitionClass::NotificationState,
             Self::ApplyReactiveInjectionState | Self::ApplyResourceSnapshot => {
