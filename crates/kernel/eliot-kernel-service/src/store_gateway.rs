@@ -2526,10 +2526,9 @@ impl KernelStoreGateway {
         // travel through the borrowed client, which bypasses `Self::apply`,
         // so the entry refuses a `shadow_no_authority` candidate itself. The
         // typed `Rejected` refusal proves nothing was admitted: no UnknownOutcome.
-        self.refuse_shadow_mutation()
-            .map_err(|error| {
-                UserAutomationExecutionError::Runtime(UserAutomationRuntimeError::Rejected(error))
-            })?;
+        self.refuse_shadow_mutation().map_err(|error| {
+            UserAutomationExecutionError::Runtime(UserAutomationRuntimeError::Rejected(error))
+        })?;
         Self::validate_user_automation_request(&request)?;
         let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(self));
         // The sealed request is the one value this frame must keep across every
