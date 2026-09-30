@@ -289,17 +289,18 @@ impl IdleLeaseCensus {
 /// [`eliot_host_service::runtime_control::HostRuntimeControlResponse::AdmissionProjected`]
 /// (see [`HostComposition::activation_admission_wire`]).
 /// STITCH (dispatch site, second-writer scope — this file must not touch
-/// `main.rs`): the manager/integrator attaches the projection in
-/// `process_runtime_control_requests` (`bins/eliot-host/src/main.rs`), after
-/// `runtime_control_dispatch` produces the operation `response` and before
-/// `envelope.respond(response)` (today `main.rs:1619`):
+/// `main.rs`): the manager/integrator admits the trigger ahead of dispatch in
+/// `process_runtime_control_requests` (`bins/eliot-host/src/main.rs`) and
+/// attaches the post-admission projection to the response before
+/// `envelope.respond(response)`:
 /// `let response = match host.activation_admission_wire() { Ok(admission) =>
 /// response.with_activation_admission(admission), Err(_) => response };`
 /// so every authenticated answer carries the generation-bound admission when
-/// an activation record exists, while the bare operation answer still flows
-/// otherwise and the creating trigger is never blocked. Until that lands,
-/// the wire member plus the producer below are constructible but unemitted —
-/// never faked from liveness.
+/// an activation record exists. A trigger the current generation refuses
+/// (failed activation/readiness/lease admission, or a state admitting no
+/// governed work) refuses the operation instead of flowing as an unadmitted
+/// success; only an unreadable record flows bare. The projection is emitted
+/// per request from the durable snapshot — never faked from liveness.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ActivationAdmission {
     /// Durable activation identity of the joined generation.
