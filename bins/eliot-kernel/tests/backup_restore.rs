@@ -484,7 +484,8 @@ fn absent_provider_cannot_produce_ok_or_known_zero() {
     // The receipt names the plan the engine ran under, and that plan carries the
     // correlated operation identity in its `plan_id`. The comparison here is
     // exact agreement, so it must present that same bound plan.
-    KernelBackupRestore::bind_plan_operation(&mut plan, OPERATION_ID).expect("plan binds operation");
+    KernelBackupRestore::bind_plan_operation(&mut plan, OPERATION_ID)
+        .expect("plan binds operation");
     let auth = CutoverAuthorization {
         plan_id: plan.plan_id.clone(),
         bundle_sha256: plan.bundle_sha256.clone(),
