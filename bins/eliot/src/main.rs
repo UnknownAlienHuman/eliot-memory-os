@@ -10,6 +10,7 @@ use eliot_cli::{
     user_automation_route_payload,
 };
 use eliot_doctor::integration;
+use eliot_engine::SkillPackService;
 use eliot_host::{NotifyFallbackSetupInputs, setup_notify_fallback_per_user};
 use eliot_installation::{
     ActivationCommitFence, ApprovedGenerationRegistry, CandidateManifest,
@@ -138,6 +139,13 @@ enum Command {
     Doctor {
         #[command(subcommand)]
         command: DoctorCommand,
+    },
+    /// Host skill-pack maintenance served by the owner skill service
+    /// (issue #18 W11). This front door owns no skill semantics and keeps
+    /// no pack state; sync and lint both run in `eliot_engine`.
+    Host {
+        #[command(subcommand)]
+        command: HostCommand,
     },
     /// Release-generation surfaces owned by the installation front door.
     Release {
@@ -655,6 +663,21 @@ enum DoctorCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum HostCommand {
+    /// Rewrite every derived host skill package from the canonical bodies
+    /// (`integrations/agent-skills`), then lint the pack and fail closed
+    /// when it is invalid. Byte contract mirrors the facade arm
+    /// (`crates/eliot-app/src/host_runtime/event_and_authority.rs`):
+    /// sync first, lint second, invalid-after-sync prints the lint report
+    /// and fails, otherwise the sync report prints on stdout.
+    SkillSync {
+        /// Absolute repository root containing `integrations/agent-skills`.
+        #[arg(long, value_parser = absolute_path)]
+        repo_root: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum ReleaseCommand {
     /// Generate and publish exactly one immutable `ReleaseSurfaceManifest` for
     /// one installable release (I19.8).
@@ -967,6 +990,7 @@ fn run() -> Result<i32> {
         Command::Setup { command } => run_setup(command),
         Command::Plugin { command } => run_plugin(command),
         Command::Doctor { command } => run_doctor(command),
+        Command::Host { command } => run_host(command),
         Command::Release { command } => run_release(command),
         Command::ControlBoard { command } => run_controlboard(command),
         Command::Dashboard => dashboard::run_dashboard(),
@@ -1194,6 +1218,24 @@ fn run_doctor(command: DoctorCommand) -> Result<i32> {
                     Ok(INVALID_REQUEST_EXIT)
                 }
             }
+        }
+    }
+}
+
+fn run_host(command: HostCommand) -> Result<i32> {
+    match command {
+        HostCommand::SkillSync { repo_root } => {
+            let sync = SkillPackService.sync(&repo_root)?;
+            let report = SkillPackService.lint(&repo_root)?;
+            if !report.valid {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                anyhow::bail!(
+                    "ELIOT skill pack is invalid after sync: {}",
+                    report.errors.join("; ")
+                );
+            }
+            println!("{}", serde_json::to_string_pretty(&sync)?);
+            Ok(0)
         }
     }
 }

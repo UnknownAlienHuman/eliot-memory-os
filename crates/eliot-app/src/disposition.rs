@@ -281,11 +281,6 @@ pub struct ClosedReferenceRole {
 pub const CLOSED_REFERENCE_ROLES: &[ClosedReferenceRole] = &[
     // Current build and test entrypoints still consume the facade/package.
     ClosedReferenceRole {
-        path: "Justfile",
-        role: "live_consumer:build",
-        basis: "sync-skills invokes cargo run -p eliot-app; retain explicit migration/equivalence proof",
-    },
-    ClosedReferenceRole {
         path: "scripts/run-isolated-tests.ps1",
         role: "live_consumer:test",
         basis: "the default TestPackage selects eliot-app for actual isolated test execution",
