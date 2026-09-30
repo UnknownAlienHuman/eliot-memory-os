@@ -1,0 +1,168 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.24
+    Checking typenum v1.20.1
+   Compiling serde_core v1.0.229
+   Compiling version_check v0.9.5
+    Checking cfg-if v1.0.4
+   Compiling zmij v1.0.23
+   Compiling serde v1.0.229
+   Compiling serde_json v1.0.151
+    Checking itoa v1.0.18
+    Checking memchr v2.8.3
+    Checking cpufeatures v0.2.17
+   Compiling thiserror v2.0.20
+   Compiling getrandom v0.4.3
+   Compiling ref-cast v1.0.27
+    Checking dyn-clone v1.0.20
+    Checking cpufeatures v0.3.1
+    Checking subtle v2.6.1
+   Compiling semver v1.0.28
+    Checking zeroize v1.9.0
+    Checking signature v3.0.0
+    Checking winnow v1.0.4
+    Checking toml_writer v1.1.2+spec-1.1.0
+   Compiling shlex v2.0.1
+   Compiling find-msvc-tools v0.1.12
+    Checking arrayvec v0.7.8
+    Checking constant_time_eq v0.4.2
+    Checking windows-link v0.2.1
+    Checking windows-link v0.1.3
+    Checking pin-project-lite v0.2.17
+    Checking bytes v1.12.1
+   Compiling redb v4.1.0
+    Checking base64 v0.22.1
+    Checking once_cell v1.21.4
+    Checking regex-syntax v0.8.11
+   Compiling generic-array v0.14.7
+    Checking opaque-debug v0.3.1
+    Checking time-core v0.1.9
+    Checking windows-result v0.3.4
+    Checking windows-strings v0.4.2
+    Checking windows-sys v0.61.2
+    Checking ed25519 v3.0.0
+    Checking windows-threading v0.1.0
+    Checking powerfmt v0.2.0
+    Checking lazy_static v1.5.0
+    Checking log v0.4.34
+    Checking num-conv v0.2.2
+    Checking thread_local v1.1.10
+    Checking smallvec v1.16.1
+   Compiling rustc_version v0.4.1
+    Checking getrandom v0.2.17
+    Checking tracing-core v0.1.36
+    Checking sharded-slab v0.1.7
+    Checking toml_parser v1.1.3+spec-1.1.0
+   Compiling cc v1.4.6
+   Compiling curve25519-dalek v5.0.0
+    Checking tracing-log v0.2.0
+    Checking hybrid-array v0.4.15
+    Checking regex-automata v0.4.18
+   Compiling syn v3.0.5
+   Compiling syn v2.0.119
+    Checking crypto-common v0.1.7
+    Checking block-buffer v0.10.4
+    Checking inout v0.1.4
+    Checking block-buffer v0.12.1
+    Checking crypto-common v0.2.2
+    Checking universal-hash v0.5.1
+    Checking aead v0.5.2
+    Checking cipher v0.4.4
+    Checking digest v0.10.7
+    Checking polyval v0.6.2
+   Compiling blake3 v1.8.7
+    Checking sha2 v0.10.9
+    Checking aes v0.8.4
+    Checking ctr v0.9.2
+    Checking ghash v0.5.1
+    Checking digest v0.11.3
+    Checking aes-gcm v0.10.3
+    Checking sha2 v0.11.0
+    Checking uuid v1.26.1
+    Checking serde_spanned v1.1.1
+    Checking toml_datetime v1.1.1+spec-1.1.0
+    Checking deranged v0.5.8
+    Checking toml v1.1.6+spec-1.1.0
+    Checking matchers v0.2.0
+   Compiling serde_derive_internals v0.30.0
+    Checking time v0.3.55
+   Compiling serde_derive v1.0.229
+   Compiling thiserror-impl v2.0.20
+   Compiling ref-cast-impl v1.0.27
+   Compiling tokio-macros v2.7.2
+   Compiling schemars_derive v1.2.2
+   Compiling curve25519-dalek-derive v0.1.1
+   Compiling windows-implement v0.60.2
+   Compiling windows-interface v0.59.3
+   Compiling tracing-attributes v0.1.31
+    Checking windows-core v0.61.2
+    Checking tracing v0.1.44
+    Checking windows-numerics v0.2.0
+    Checking windows-collections v0.2.0
+    Checking windows-future v0.2.1
+    Checking windows v0.61.3
+    Checking ed25519-dalek v3.0.0
+    Checking schemars v1.2.2
+    Checking eliot-conformance-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\foundation\eliot-conformance-contracts)
+    Checking tracing-serde v0.2.0
+    Checking eliot-build-test-graph v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\instrument\eliot-build-test-graph)
+    Checking eliot-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\foundation\eliot-contracts)
+    Checking eliot-source-assurance v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\security\eliot-source-assurance)
+    Checking mio v1.2.3
+    Checking socket2 v0.6.5
+    Checking nu-ansi-term v0.50.3
+    Checking tracing-subscriber v0.3.23
+    Checking tokio v1.53.1
+    Checking eliot-windows-ipc v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\eliot-windows-ipc)
+    Checking eliot-receipts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\foundation\eliot-receipts)
+    Checking eliot-evidence v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\foundation\eliot-evidence)
+    Checking eliot-runtime-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\foundation\eliot-runtime-contracts)
+    Checking eliot-instrument-api v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\instrument\eliot-instrument-api)
+    Checking eliot-agent-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\agent\eliot-agent-contracts)
+    Checking eliot-doctor-core v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\meta\eliot-doctor-core)
+    Checking eliot-observability v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\instrument\eliot-observability)
+    Checking eliot-security-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\foundation\eliot-security-contracts)
+    Checking eliot-epistemic-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\smart\eliot-epistemic-contracts)
+    Checking eliot-learning-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\smart\eliot-learning-contracts)
+    Checking eliot-cue-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\smart\eliot-cue-contracts)
+    Checking eliot-influence v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\security\eliot-influence)
+    Checking eliot-epistemic v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\smart\eliot-epistemic)
+    Checking eliot-platform v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\kernel\eliot-platform)
+    Checking eliot-observation-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\foundation\eliot-observation-contracts)
+    Checking eliot-protocol v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\foundation\eliot-protocol)
+    Checking eliot-rules v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\foundation\eliot-rules)
+    Checking eliot-config v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\governor\eliot-config)
+    Checking eliot-authority v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\governor\eliot-authority)
+    Checking eliot-skills v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\surfaces\eliot-skills)
+    Checking eliot-process v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\kernel\eliot-process)
+    Checking eliot-platform-windows v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\kernel\eliot-platform-windows)
+    Checking eliot-blob-api v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\storage\eliot-blob-api)
+    Checking eliot-agent-api v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\agent\eliot-agent-api)
+    Checking eliot-runtime v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\kernel\eliot-runtime)
+    Checking eliot-wasm-runtime v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\modules\eliot-wasm-runtime)
+    Checking eliot-observability-runtime v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\instrument\eliot-observability-runtime)
+    Checking eliot-process-executor v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\instrument\eliot-process-executor)
+    Checking eliot-context-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\smart\eliot-context-contracts)
+    Checking eliot-bootstrap v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\foundation\eliot-bootstrap)
+    Checking eliot-ipc v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\kernel\eliot-ipc)
+    Checking eliot-testd-core v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\instrument\eliot-testd-core)
+    Checking eliot-installation v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\kernel\eliot-installation)
+    Checking eliot-workscope v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\governor\eliot-workscope)
+    Checking eliot-reactive-context-plan v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\smart\eliot-reactive-context-plan)
+    Checking eliot-store-api v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\storage\eliot-store-api)
+    Checking eliot-ors v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\kernel\eliot-ors)
+    Checking eliot-skill v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\governor\eliot-skill)
+    Checking eliot-ecxf v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\storage\eliot-ecxf)
+    Checking eliot-backup v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\storage\eliot-backup)
+    Checking eliot-kernel-core v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\kernel\eliot-kernel-core)
+    Checking eliot-mcp v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\surfaces\eliot-mcp)
+    Checking eliot-kernel-service v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\crates\kernel\eliot-kernel-service)
+    Checking eliot-kernel v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1733\bins\eliot-kernel)
+bins\eliot-kernel\src\control_plane.rs:455:31: error: large future with a size of 16432 bytes
+bins\eliot-kernel\src\testd_terminal_completion_route.rs:72:5: error: field name starts with the struct's name
+bins\eliot-kernel\src\daemon_request_dispatch.rs:4505:13: error: deref which would be done by auto-deref: help: try: `&gateway`
+bins\eliot-kernel\src\daemon_request_dispatch.rs:4621:17: error: deref which would be done by auto-deref: help: try: `&gateway`
+bins\eliot-kernel\src\daemon_request_dispatch.rs:5844:46: error: deref which would be done by auto-deref: help: try: `&gateway`
+bins\eliot-kernel\src\daemon_request_dispatch.rs:9084:9: error: these match arms have identical bodies
+bins\eliot-kernel\src\dispatch_launch.rs:1663:1: error: this function has too many lines (164/100)
+error: could not compile `eliot-kernel` (lib) due to 7 previous errors
