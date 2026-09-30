@@ -236,12 +236,19 @@ pub enum ActivationTriggerClass {
     /// No UI ingress reaches Host in-tree (verified: no UI listener under
     /// `bins/eliot-host`, and `HostRuntimeControlRequest` carries no
     /// caller/principal field that could attribute a carrier to a UI session),
-    /// so this class has no producer here: STITCH caller is the
-    /// ControlBoard/Operator contract owner (`crates/agent`,
-    /// `crates/governor`), which must propagate the authenticated UI identity
-    /// onto a Host-visible envelope. A `Human`-origin automation carrier must
-    /// never be minted as this class: it is CLI-or-UI ambiguous, so that
-    /// attribution would fabricate the trigger.
+    /// so this class has no producer here. The attested half has landed: the
+    /// Operator contract carries the versioned UI-session attestation
+    /// (`crates/governor/eliot-governor/src/operator_intent.rs::OperatorIntentUiSessionAttestation`,
+    /// stamped only from authenticated UI sessions, fail-closed absence), and
+    /// [`ActivationTriggerClass::ui_request_from_attested_ui_session`] derives
+    /// this class from that attestation alone. STITCH remainder: the
+    /// Host-visible envelope passthrough (wire owner
+    /// `crates/kernel/eliot-host-service/src/runtime_control.rs`) and the
+    /// one-line classifier hookup
+    /// (`bins/eliot-host/src/main.rs::runtime_control_request_trigger_class`).
+    /// A `Human`-origin automation carrier must never be minted as this class:
+    /// it is CLI-or-UI ambiguous, so that attribution would fabricate the
+    /// trigger.
     UiRequest,
     /// Agent bridge / MCP attach or tool call.
     AgentBridgeAttach,
@@ -317,6 +324,44 @@ impl ActivationTriggerClass {
             ],
         }
     }
+
+    /// Derives [`Self::UiRequest`] from an attested UI-session identity.
+    ///
+    /// `Some` attestation mints `UiRequest`; `None` (the envelope carries no
+    /// UI attestation) yields `None`: absence is not a UI request and is
+    /// never inferred. The attestation is the only input: a `Human`-origin
+    /// automation carrier carries none of these bindings (it is CLI-or-UI
+    /// ambiguous), so it must never be converted into
+    /// [`AttestedUiSessionIdentity`]; that conversion would fabricate the
+    /// trigger.
+    #[must_use]
+    pub fn ui_request_from_attested_ui_session(
+        attestation: Option<&AttestedUiSessionIdentity>,
+    ) -> Option<Self> {
+        attestation.map(|_| Self::UiRequest)
+    }
+}
+
+/// Attested UI-session identity a Host-visible envelope carries for one
+/// request.
+///
+/// This is the Host-side reading of the ControlBoard/Operator contract's
+/// versioned UI-session attestation
+/// (`crates/governor/eliot-governor/src/operator_intent.rs::OperatorIntentUiSessionAttestation`):
+/// the authenticated UI principal, session, and authentication receipt the
+/// surface owner bound to this exact request. Every member is a validated
+/// [`PlatformHandle`], so no blank or control-character value can reach the
+/// derivation. It is populated only from authenticated UI sessions — never
+/// defaulted, never cloned from a CLI carrier — and its absence means the
+/// request is not a UI request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttestedUiSessionIdentity {
+    /// Authenticated UI principal, bound to the request's receipt.
+    pub ui_principal_ref: PlatformHandle,
+    /// Authenticated UI session, equal to the candidate's session claim.
+    pub ui_session_id: PlatformHandle,
+    /// Authentication evidence handle the surface owner bound to this request.
+    pub ui_authentication_receipt_ref: PlatformHandle,
 }
 
 /// Classification of one observable-use trigger against the durable drain

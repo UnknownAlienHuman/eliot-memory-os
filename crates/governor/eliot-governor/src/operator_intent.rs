@@ -26,6 +26,15 @@ use thiserror::Error;
 pub const OPERATOR_INTENT_CONTRACT_NAME: &str = "eliot.governor.operator-intent";
 /// Initial wire version for candidate and plan fields in this contract.
 pub const OPERATOR_INTENT_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
+/// Additive wire version admitting the UI-session attestation extension.
+///
+/// A `1.0.0` candidate carries no `ui_session` field; a `1.1.0` candidate may
+/// carry it, still optional. A `1.0.0` candidate that carries the field, or
+/// any other version, is rejected fail-closed by
+/// [`OperatorIntentCandidate::validate`]; absence on either version means the
+/// request is not attributable to a UI session.
+pub const OPERATOR_INTENT_CONTRACT_VERSION_UI_SESSION: ContractVersion =
+    ContractVersion::new(1, 1, 0);
 
 /// Stable request/message identity paired with its intended episode identity.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -51,6 +60,55 @@ pub struct OperatorIntentAuthenticationBinding {
     pub requested_role_refs: Vec<ArtifactId>,
     /// Requested capability handles; references do not grant those capabilities.
     pub requested_capability_refs: Vec<ArtifactId>,
+}
+
+/// Attested UI-session identity bound to one operator candidate.
+///
+/// The native UI surface stamps this only for sessions it authenticated over
+/// the UI channel; stamping is that surface owner's act, and this shape-only
+/// contract never authenticates by itself (see the module docs). The three
+/// claims must equal the candidate's own `authentication` binding, so the
+/// attestation can only repeat the session the candidate already presents:
+/// it is never defaulted (no `Default` impl; the candidate field stays
+/// `Option`) and never grafted from another session or a CLI carrier.
+/// Absent means the request is not attributable to a UI session: the Host
+/// trigger classifier must read absence as not-`UiRequest`, never infer it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorIntentUiSessionAttestation {
+    /// Version of this attestation wire shape.
+    pub contract_version: ContractVersion,
+    /// UI principal claim, equal to the candidate's authenticated principal.
+    pub ui_principal_ref: String,
+    /// UI session claim, equal to the candidate's authenticated session.
+    pub ui_session_id: SessionId,
+    /// Authentication evidence handle, equal to the candidate's receipt ref.
+    pub ui_authentication_receipt_ref: ReceiptId,
+}
+
+impl OperatorIntentUiSessionAttestation {
+    /// Stamps the attestation from an already-authenticated binding.
+    ///
+    /// Copies only the principal, session, and receipt the binding already
+    /// carries, so no new identity is invented here. The caller must be the
+    /// UI surface owner acting on a session it authenticated over the UI
+    /// channel; cross-binding equality is enforced by
+    /// [`OperatorIntentCandidate::validate`].
+    pub fn from_authenticated_binding(
+        authentication: &OperatorIntentAuthenticationBinding,
+    ) -> Result<Self, OperatorIntentValidationError> {
+        PrincipalRef::new(authentication.principal_ref.clone()).map_err(|_| {
+            OperatorIntentValidationError::InvalidField {
+                field: "ui_session.ui_principal_ref",
+            }
+        })?;
+        Ok(Self {
+            contract_version: OPERATOR_INTENT_CONTRACT_VERSION_UI_SESSION,
+            ui_principal_ref: authentication.principal_ref.clone(),
+            ui_session_id: authentication.session_id.clone(),
+            ui_authentication_receipt_ref: authentication.authentication_receipt_ref.clone(),
+        })
+    }
 }
 
 /// Stable reference to the immediately preceding plan revision.
@@ -292,6 +350,13 @@ pub struct OperatorIntentCandidate {
     pub identity: OperatorIntentIdentity,
     /// Authentication evidence handle and claims to be checked by its owner.
     pub authentication: OperatorIntentAuthenticationBinding,
+    /// Attested UI-session identity, present only when the authenticated
+    /// session arrived over the native UI surface (see
+    /// [`OperatorIntentUiSessionAttestation`]). Absent on `1.0.0` candidates
+    /// and on any request no UI surface attested: absence is not a UI
+    /// request and must never be inferred as one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_session: Option<OperatorIntentUiSessionAttestation>,
     /// Session, authority epoch, and fence claims supplied by the public surface.
     pub session: SessionBinding,
     /// Original public request, preserved separately from its interpretation.
@@ -304,8 +369,11 @@ impl OperatorIntentCandidate {
     /// Validates shape and cross-links while making no authority claim.
     pub fn validate(&self) -> Result<(), OperatorIntentValidationError> {
         if self.contract_version != OPERATOR_INTENT_CONTRACT_VERSION
-            || self.plan.contract_version != OPERATOR_INTENT_CONTRACT_VERSION
+            && self.contract_version != OPERATOR_INTENT_CONTRACT_VERSION_UI_SESSION
         {
+            return Err(OperatorIntentValidationError::UnsupportedVersion);
+        }
+        if self.plan.contract_version != OPERATOR_INTENT_CONTRACT_VERSION {
             return Err(OperatorIntentValidationError::UnsupportedVersion);
         }
         if self.identity != self.plan.identity {
@@ -343,6 +411,35 @@ impl OperatorIntentCandidate {
             return Err(OperatorIntentValidationError::InvalidField {
                 field: "session.state_fence.authority_epoch",
             });
+        }
+        if let Some(attestation) = &self.ui_session {
+            if self.contract_version != OPERATOR_INTENT_CONTRACT_VERSION_UI_SESSION {
+                return Err(OperatorIntentValidationError::InvalidField {
+                    field: "ui_session",
+                });
+            }
+            if attestation.contract_version != OPERATOR_INTENT_CONTRACT_VERSION_UI_SESSION {
+                return Err(OperatorIntentValidationError::InvalidField {
+                    field: "ui_session.contract_version",
+                });
+            }
+            if attestation.ui_principal_ref != self.authentication.principal_ref {
+                return Err(OperatorIntentValidationError::InvalidField {
+                    field: "ui_session.ui_principal_ref",
+                });
+            }
+            if attestation.ui_session_id != self.authentication.session_id {
+                return Err(OperatorIntentValidationError::InvalidField {
+                    field: "ui_session.ui_session_id",
+                });
+            }
+            if attestation.ui_authentication_receipt_ref
+                != self.authentication.authentication_receipt_ref
+            {
+                return Err(OperatorIntentValidationError::InvalidField {
+                    field: "ui_session.ui_authentication_receipt_ref",
+                });
+            }
         }
         required_text(&self.original_public_request, "original_public_request")?;
         self.plan.validate()
