@@ -1594,40 +1594,24 @@ impl DaemonComposition {
     /// caller of the ingress's own closed-shape check and a caller cannot reach
     /// the owner with a field the ingress would have refused.
     ///
-    /// # Not yet reached (issue #370 R1)
+    /// # Production caller (issue #370 R1)
     ///
-    /// The durable route above is real and complete at every layer, but this
-    /// entry still has no live caller, and the measured blocker is upstream of
-    /// it: no owner issues a coordination `work_item_id`/`lease_id`. Measured on
-    /// this tree, not inferred —
+    /// The issuer this entry was missing now exists:
+    /// [`eliot_governor::issue_coordination_work`] derives the coordination
+    /// `work_item_id`, `lease_id`, and `result_id` from the Kernel-issued
+    /// `TaskControllerAttempt`, and
+    /// [`Self::commit_coordination_candidate_lifecycle`] drives all four durable
+    /// legs from it. This single-leg entry remains the result leg that lifecycle
+    /// entry funnels into, and it is still the only place in `eliotd` that can
+    /// admit one candidate result.
     ///
-    /// - `CoordinationOwner::register_work`, `acquire_work`, and
-    ///   `acquire_work_with_issuance` have no non-test caller anywhere in the
-    ///   workspace, so no work item ever reaches `Claimed`/`Running`/
-    ///   `Checkpointed`/`Reassigned` and there is no admitted lease, session and
-    ///   item to build a draft from;
-    /// - `NativeWorkerExecutableBinding` already carries `work_unit_id` and
-    ///   `lease_id`, but as *presented* parameters with no writer:
-    ///   `publish_native_worker_binding` takes both as `&str` arguments and its
-    ///   only non-test construction is the test at
-    ///   `crates/governor/eliot-governor/tests/native_worker_binding.rs`;
-    /// - the live Task Controller poll does supply a Kernel-issued
-    ///   `TaskControllerAttempt` with a real `session_id`, `task_id`,
-    ///   `scope_id`, `state_fence`, and `authority_epoch`, but no work-item or
-    ///   lease identity;
-    /// - the durable route deliberately stops short of the claim. It commits a
-    ///   session, a work registration, and a result admission, and has no
-    ///   durable `acquire_work` leg, so a work item cannot reach `Claimed` in
-    ///   the persisted image even once a producer exists. That leg is not added
-    ///   here because it would have no production caller, which would be a
-    ///   second uncalled entry rather than a driver.
-    ///
-    /// The legitimate caller is therefore the session/work-item driver, and its
-    /// issuer is whoever first registers a work item — not this entry. Deriving
-    /// a `work_item_id` or `lease_id` here would fabricate exactly the
-    /// coordination authority the owner validates on the way in, so it was not
-    /// done. See [`crate::coordination_owner_ingress`] for the ingress shape a
-    /// driver must supply.
+    /// What is still absent, and is not claimed here: the coordination draft
+    /// carries no provider, execution-unit, or physical-route identity, so an
+    /// admitted coordination receipt is a candidate *reference* for one admitted
+    /// attempt and cannot bind the #361 execution unit or the #369 route receipt.
+    /// The architecture contract's `agent.coordinator.attempt-reconciliation`
+    /// entrypoint owns that typed provider result, and this crate does not reach
+    /// it.
     pub async fn commit_coordination_candidate_result(
         &mut self,
         identity: &eliot_protocol::RequestIdentity,
@@ -1663,6 +1647,156 @@ impl DaemonComposition {
             self.view_stale = true;
         }
         Ok(committed)
+    }
+
+    /// Drives the complete coordination lifecycle for one owner-issued work
+    /// identity and returns the admitted candidate result (issue #370 R1).
+    ///
+    /// The four legs run in the only order the coordination owner admits:
+    /// session, ready work item, fenced lease, then the candidate result. The
+    /// lease leg is what moves the item to `WorkState::Claimed`, and
+    /// `admit_candidate_result` refuses anything that is not in a submittable
+    /// state, so a result cannot be admitted through this entry without a real
+    /// session, work item, and lease behind it.
+    ///
+    /// Each leg reads its own compare-and-set predecessor from the
+    /// refresh-consistent named read of `owner/coordination` immediately before
+    /// building its image, and refreshes from the Kernel immediately after its
+    /// commit. That refresh is what makes each leg durable rather than
+    /// in-process: the committed image is re-read through the named read and
+    /// rehydrated by `CoordinationOwner::from_snapshot_at`, so the next leg
+    /// builds on the persisted predecessor instead of the in-memory owner, and a
+    /// leg whose image the owner itself would refuse fails closed at the same
+    /// boundary that guards every other owner.
+    ///
+    /// The four leg identities come from
+    /// [`eliot_governor::IssuedCoordinationWork`](eliot_governor::IssuedCoordinationWork),
+    /// the Governor's issuer, which derives every `work_item_id`, `lease_id`,
+    /// `result_id`, request id, operation id, and idempotency key from the
+    /// Kernel-issued attempt. This entry issues nothing: it receives the issued
+    /// identity and the closed result ingress and commits them.
+    ///
+    /// Each leg carries its own idempotency key because the three images differ;
+    /// a shared key would make the store read the second leg as a conflicting
+    /// replay of the first.
+    ///
+    /// The admitted receipt stays capped at `CandidateArtifact`. Nothing on this
+    /// route decides a Task outcome, satisfies an acceptance item, or closes a
+    /// Task.
+    pub async fn commit_coordination_candidate_lifecycle(
+        &mut self,
+        issued: eliot_governor::IssuedCoordinationWork,
+        ingress: crate::coordination_owner_ingress::CoordinationResultIngress,
+    ) -> Result<
+        (
+            eliot_governor::CommittedCoordinationResult,
+            eliot_governor::CommittedCoordinationLease,
+        ),
+        DaemonError,
+    > {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        let eliot_governor::IssuedCoordinationWork {
+            session_leg,
+            work_leg,
+            lease_leg,
+            result_leg,
+            session,
+            work_item,
+            lease,
+            result_id: _,
+            observed_clock,
+        } = issued;
+        let draft = ingress
+            .into_draft()
+            .map_err(DaemonError::Composition)?;
+        // The work registration records the registered coordination session as
+        // its registrant, so the persisted event names the actor that owns the
+        // item rather than a label. Read before `session` is moved into the
+        // session leg.
+        let work_actor_id = session.session_id.clone();
+        let work_request_id = work_leg.request_id.as_str().to_owned();
+
+        let session_revision = self
+            .governor
+            .coordination_owner_readback()
+            .map_err(DaemonError::Coordination)?
+            .1;
+        self.governor
+            .commit_coordination_session(
+                &session_leg.identity,
+                session_leg.operation_id,
+                session_revision,
+                session,
+            )
+            .await
+            .map_err(DaemonError::Coordination)?;
+        if self.governor.refresh_from_kernel().is_err() {
+            self.view_stale = true;
+        }
+
+        let work_revision = self
+            .governor
+            .coordination_owner_readback()
+            .map_err(DaemonError::Coordination)?
+            .1;
+        self.governor
+            .commit_coordination_work(
+                &work_leg.identity,
+                work_leg.operation_id,
+                work_revision,
+                work_item,
+                eliot_governor::CoordinationEventContext {
+                    request_id: work_request_id,
+                    actor_id: work_actor_id,
+                    observed_at: observed_clock,
+                },
+            )
+            .await
+            .map_err(DaemonError::Coordination)?;
+        if self.governor.refresh_from_kernel().is_err() {
+            self.view_stale = true;
+        }
+
+        let lease_revision = self
+            .governor
+            .coordination_owner_readback()
+            .map_err(DaemonError::Coordination)?
+            .1;
+        let committed_lease = self
+            .governor
+            .commit_coordination_lease(
+                &lease_leg.identity,
+                lease_leg.operation_id,
+                lease_revision,
+                lease,
+            )
+            .await
+            .map_err(DaemonError::Coordination)?;
+        if self.governor.refresh_from_kernel().is_err() {
+            self.view_stale = true;
+        }
+
+        let result_revision = self
+            .governor
+            .coordination_owner_readback()
+            .map_err(DaemonError::Coordination)?
+            .1;
+        let committed = self
+            .governor
+            .commit_coordination_candidate_result(
+                &result_leg.identity,
+                result_leg.operation_id,
+                result_revision,
+                draft,
+            )
+            .await
+            .map_err(DaemonError::Coordination)?;
+        if self.governor.refresh_from_kernel().is_err() {
+            self.view_stale = true;
+        }
+        Ok((committed, committed_lease))
     }
 
     /// Returns the retained owner receipt for an already-committed
