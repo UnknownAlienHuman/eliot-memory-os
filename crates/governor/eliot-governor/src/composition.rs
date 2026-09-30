@@ -2613,8 +2613,7 @@ impl ContractAcceptanceDenominator {
     /// complete. The digest is load-bearing, not a label: it is rehydrated from
     /// the task-selection owner, not from the plan.
     fn admits(&self, verifier_plan: &CanonicalVerifierPlanBinding) -> bool {
-        verifier_plan.task_acceptance_digest == self.acceptance_digest
-            && !self.item_ids.is_empty()
+        verifier_plan.task_acceptance_digest == self.acceptance_digest && !self.item_ids.is_empty()
     }
 }
 
@@ -2937,10 +2936,8 @@ impl CanonicalFinishEvidence {
         // and must name this exact task revision. A missing or drifted
         // contract acceptance set is a recovery gap, never an empty
         // obligation set that would let the coverage gate read as complete.
-        self.contract_acceptance.validate(
-            &self.evidence.task_id,
-            self.evidence.current_task_revision,
-        )?;
+        self.contract_acceptance
+            .validate(&self.evidence.task_id, self.evidence.current_task_revision)?;
         if self.finish_authority_ref.trim().is_empty()
             || self.finish_authority_ref.chars().any(char::is_control)
         {
