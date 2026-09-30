@@ -3743,17 +3743,14 @@ impl KernelComposition {
             queued_tool.as_ref(),
             &persisted,
         ) {
-            match self
+            let _ = self
                 .generation_gateway
                 .ors
                 .record_host_request_tool_exposure_receipt(
                     &operation_id,
                     &persisted.request_digest,
                     &receipt,
-                ) {
-                Ok(_) => {}
-                Err(_) => {}
-            }
+                );
         }
         // The single completion consumes the attempt use budget: retire the
         // pair in the same queue ledger that authorized it so no later claim
@@ -3812,10 +3809,7 @@ fn advance_tool_exposure_receipt_for_persisted_result(
     let Ok(admission) = check_local_read_admission(envelope, tool) else {
         return None;
     };
-    let Some(request) = super::tool_exposure::build_tool_call_request(envelope, tool, &admission)
-    else {
-        return None;
-    };
+    let request = super::tool_exposure::build_tool_call_request(envelope, tool, &admission)?;
     let operation = persisted.operation_id.as_str();
     let (Some(digest), Some(response)) = (
         persisted.result_digest.as_deref(),
@@ -3843,11 +3837,11 @@ fn advance_tool_exposure_receipt_for_persisted_result(
             let view_verified = response
                 .get("campaign_learning_state_view")
                 .is_some_and(|view| !view.is_null());
-            if !view_verified {
-                delivered
-            } else {
+            if view_verified {
                 let unmarked = delivered.clone();
                 delivered.record_observable_use().unwrap_or(unmarked)
+            } else {
+                delivered
             }
         }
     };
