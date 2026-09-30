@@ -59,13 +59,13 @@ use eliot_runtime_contracts::{
 use eliot_store_api::{
     CanonicalRequestView, CanonicalRestoreBatch, CanonicalStoreClient, CanonicalValidationSnapshot,
     NamedReadRequest, NamedReadResponse, OperationIdentity, OrderingHead, OrderingHeadExpectation,
-    OrderingHeadReadback,
-    OrderingScopeId, OriginalWriteSubmission, PreparedTransition, RecoveryRecord, RecoveryRecordKey, RequestMeta,
-    ReservedWriteRequest, RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation,
-    RevisionKey, ScopeId, ScopeRevisionView, StoreError, StoreGenesisRequest, StoreHealth,
-    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, WriteReceiptStatus, WriteSubmission,
-    admit_write_submission, canonical_request_hash, dreamer_job_queue_key,
-    generated_operation_manifests, operation_manifest_set_digest, verify_canonical_request_hash,
+    OrderingHeadReadback, OrderingScopeId, OriginalWriteSubmission, PreparedTransition,
+    RecoveryRecord, RecoveryRecordKey, RequestMeta, ReservedWriteRequest, RestoreValidationReceipt,
+    RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, StoreError,
+    StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
+    WriteReceiptStatus, WriteSubmission, admit_write_submission, canonical_request_hash,
+    dreamer_job_queue_key, generated_operation_manifests, operation_manifest_set_digest,
+    verify_canonical_request_hash,
 };
 use serde::{Deserialize, Serialize};
 
@@ -923,8 +923,7 @@ fn validate_staged_request_binding(
         || binding.idempotency_key.as_str() != request.transition.identity.idempotency_key.as_str()
         || binding.canonical_request_sha256.as_str()
             != request.transition.identity.canonical_request_hash.as_str()
-        || binding.prepared_transition_sha256.as_str()
-            != token.prepared_transition_sha256.as_str()
+        || binding.prepared_transition_sha256.as_str() != token.prepared_transition_sha256.as_str()
         || binding.admission_contract_set_digest.as_str()
             != request.transition.admission_contract_set_digest.as_str()
         || binding.operation_manifest_digest.as_str()
@@ -954,9 +953,11 @@ fn validate_staged_request_binding(
         .map(|scope| scope.as_str().to_owned())
         .collect::<Vec<_>>();
     if expected_scopes != bound_scopes {
-        return Err("durable write binding scopes differ from the exact transition scopes"
-            .to_owned()
-            .into());
+        return Err(
+            "durable write binding scopes differ from the exact transition scopes"
+                .to_owned()
+                .into(),
+        );
     }
     Ok(())
 }
@@ -993,9 +994,11 @@ fn validate_staged_protected_envelope(
         {
             Ok(())
         }
-        _ => Err("protected ORS payload does not match the original write binding"
-            .to_owned()
-            .into()),
+        _ => Err(
+            "protected ORS payload does not match the original write binding"
+                .to_owned()
+                .into(),
+        ),
     }
 }
 

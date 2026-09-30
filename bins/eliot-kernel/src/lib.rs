@@ -2360,14 +2360,9 @@ impl KernelComposition {
                 ));
             }
         }
-        let evidence = self
-            .canonical_store_evidence
-            .clone()
-            .ok_or_else(|| {
-                KernelBuildError::Service(
-                    "canonical Store evidence provider is unavailable".to_owned(),
-                )
-            })?;
+        let evidence = self.canonical_store_evidence.clone().ok_or_else(|| {
+            KernelBuildError::Service("canonical Store evidence provider is unavailable".to_owned())
+        })?;
         let gateway = std::sync::Arc::new(KernelStoreGateway::new_with_evidence(
             self.service.clone(),
             std::sync::Arc::new(client),
