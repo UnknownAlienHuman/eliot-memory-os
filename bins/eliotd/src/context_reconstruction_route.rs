@@ -33,8 +33,10 @@
 //! - **Dependency heads** are the revision head this daemon OBSERVED on the
 //!   store's own `GetRevisionHeads` read for that scope, taken under the same
 //!   retained Kernel fence. They are never synthesized, and no other response
-//!   on this route can supply them: the campaign-source lookup this route also
-//!   performs returns an empty head list.
+//!   on this route can supply them: both campaign reads this route also
+//!   performs (`GetCampaignSourceRevision` and
+//!   `GetCampaignLearningStateView`) are Kernel-served and return an empty
+//!   head list.
 //! - **The five remaining selectors** are the owner-declared members of the
 //!   authenticated Task Controller `TaskPlan` recipe's slot denominator; the
 //!   exact per-member mapping is documented on
@@ -72,8 +74,8 @@ use eliot_protocol::{
 };
 use eliot_store_api::{
     CampaignSourceDocumentSchema, CampaignSourceReadStatus, CampaignSourceRevisionLookup,
-    CampaignSourceRevisionRead, CanonicalReadClient, EVIDENCE_PACK_MAX_RECORDS,
-    NamedReadOperation, NamedReadRequest, ReadConsistency, RevisionKey, ScopeId,
+    CampaignSourceRevisionRead, CanonicalReadClient, EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation,
+    NamedReadRequest, ReadConsistency, RevisionKey, ScopeId,
 };
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -256,13 +258,13 @@ pub async fn serve_context_reconstruction(
     //
     // `GetCampaignSourceRevision` is a Kernel-served operation whose
     // `NamedReadResponse` is built with an EMPTY `revision_heads` list
-    // (`bins/eliot-kernel/src/daemon_request_dispatch.rs::store_named_response`
-    // arm for that operation hardcodes `revision_heads: Vec::new()`), so the
-    // heads that came back with the recipe read were never observations at all.
-    // Reading them here meant `observed_scope_head` could only ever match zero
-    // heads and return `DependencyHeadUnavailable`, so no
-    // `ContextReconstructionRequest` was ever constructed and
-    // `reconstruct` stayed unreachable from any admitted request.
+    // (`bins/eliot-kernel/src/daemon_request_dispatch.rs` arm for that
+    // operation hardcodes `revision_heads: Vec::new()`), so the heads that came
+    // back with the recipe read were never observations at all. Before this
+    // read replaced it, `observed_scope_head` could therefore match zero heads
+    // and return `DependencyHeadUnavailable` on every execution — so the
+    // `ContextReconstructionRequest` below was never constructed and
+    // `reconstruct` was unreachable from every admitted request.
     //
     // The head's owner is `CanonicalReadClient::revision_heads`, the one
     // catalogue-activated `GetRevisionHeads` read the sibling daemon legs
