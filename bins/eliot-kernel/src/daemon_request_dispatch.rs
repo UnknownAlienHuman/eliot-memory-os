@@ -284,7 +284,7 @@ pub(crate) const STORAGE_REPLACEMENT_OPERATION: &str = "daemon_storage_replaceme
 /// from the front door until `frame_dispatch::is_daemon_operation` lists it.
 pub(crate) const STORAGE_REPLACEMENT_RESUME_OPERATION: &str = "daemon_storage_replacement_resume";
 
-/// Authenticated daemon operation that answers one I5.14 rollback request for a
+/// Authenticated daemon operation that answers one I5.11 rollback request for a
 /// committed I5.11 replacement.
 ///
 /// Separate from the reconstruction above because the answer differs: this one
@@ -2173,6 +2173,19 @@ struct StorageReplacementResumeRequest {
     /// validates it and re-derives it from the ORS row it names, so a
     /// hand-built receipt cannot survive the reconstruction.
     receipt: StorageReplacementCutoverReceipt,
+    /// Irreversible migrations/external effects issued AFTER the committed
+    /// cutover. They cannot appear in the receipt, whose ledger was fixed at the
+    /// linearization point, so they are named here and each one is written to
+    /// ORS by [`StorageReplacement::declare_irreversible_effect`] BEFORE any
+    /// post-cutover stage is recorded — a durable write-ahead, so a restart
+    /// between issuing the effect and recording the stage cannot lose it.
+    ///
+    /// `default` means "none declared", which is what a request that observed no
+    /// post-cutover effect says; it is not a way to erase a declaration, because
+    /// the coordinator reads the durable rows back from ORS and unions them into
+    /// the ledger on every reconstruction.
+    #[serde(default)]
+    irreversible_effects: BTreeSet<IrreversibleStorageEffect>,
     /// The post-cutover I5.11 stages, in the order their owners reached them.
     stages: Vec<StorageReplacementStageEvidence>,
 }
@@ -2180,7 +2193,7 @@ struct StorageReplacementResumeRequest {
 /// Exact request payload for [`STORAGE_REPLACEMENT_ROLLBACK_OPERATION`].
 ///
 /// The caller names the replacement identity, the two store generations, and the
-/// cutover receipt. It carries no stage evidence and no disposition: the I5.14
+/// cutover receipt. It carries no stage evidence and no disposition: the I5.11
 /// decision is the coordinator's, reloaded from the durable ORS row the receipt
 /// names.
 #[derive(Deserialize)]
@@ -2219,7 +2232,7 @@ struct StorageReplacementResumption {
     receipt: StorageReplacementCutoverReceipt,
 }
 
-/// The I5.14 rollback answer projected on the admitted reply.
+/// The I5.11 rollback answer projected on the admitted reply.
 ///
 /// `disposition` is the coordinator's own stable disposition name, so the reply
 /// carries the decision rather than a re-derivation of it here.
@@ -2256,7 +2269,7 @@ struct StorageReplacementOutcome {
     /// The cutover receipt, present only once the `canonical_store` route
     /// cutover committed.
     cutover_receipt: Option<StorageReplacementCutoverReceipt>,
-    /// The I5.14 rollback answer, present only for the rollback operation.
+    /// The I5.11 rollback answer, present only for the rollback operation.
     rollback: Option<StorageRollbackAnswer>,
 }
 
@@ -2465,9 +2478,17 @@ impl KernelComposition {
     /// the coordinator's own reconstruction: the presented receipt is validated
     /// and then re-derived from the ORS row it names, so it cannot be asserted.
     /// The reconstructed replacement starts at the stage after the committed
-    /// cutover and carries the irreversible-effect ledger the receipt fixed at
-    /// the cutover, so a post-cutover request cannot silently reopen a
-    /// generation rollback either.
+    /// cutover, and its irreversible-effect ledger is the union of what the
+    /// receipt fixed at the cutover and what is durably declared on ORS for that
+    /// same cutover, so a post-cutover request cannot silently reopen a
+    /// generation rollback either — including across a restart, which is exactly
+    /// where the in-memory ledger used to run out.
+    ///
+    /// The irreversible effects this request names are declared durably BEFORE
+    /// any post-cutover stage is recorded. That ordering is the guarantee: an
+    /// effect issued after the linearization point is in no committed cutover
+    /// row, so the declaration is the only record of it, and it is written
+    /// first.
     fn storage_replacement_resume_operation(
         &self,
         session: &Session,
@@ -2497,13 +2518,33 @@ impl KernelComposition {
             }
         };
         let mut terminal_code = None;
-        for stage_evidence in &request.stages {
-            if let Err(error) = record_storage_replacement_stage(&mut replacement, stage_evidence) {
-                // The post-cutover stages already recorded are still reported:
-                // an effect that may have happened must not collapse into an
-                // effect-free refusal.
+        // Durable write-ahead, BEFORE any post-cutover stage is recorded. An
+        // irreversible effect issued after the linearization point is in no
+        // committed cutover row, so the only record that can survive a restart is
+        // one written here first; a stage recorded ahead of it would let a
+        // restart lose the effect and permit a rollback over it. A refused write
+        // stops the stage machine rather than continuing without it, because the
+        // effect may already have happened and reporting progress past it would
+        // be the effect-free success this path must never produce.
+        for effect in &request.irreversible_effects {
+            if let Err(error) =
+                replacement.declare_irreversible_effect(self.p07_ors.as_ref(), *effect)
+            {
                 terminal_code = Some(storage_replacement_terminal_code(&error));
                 break;
+            }
+        }
+        if terminal_code.is_none() {
+            for stage_evidence in &request.stages {
+                if let Err(error) =
+                    record_storage_replacement_stage(&mut replacement, stage_evidence)
+                {
+                    // The post-cutover stages already recorded are still reported:
+                    // an effect that may have happened must not collapse into an
+                    // effect-free refusal.
+                    terminal_code = Some(storage_replacement_terminal_code(&error));
+                    break;
+                }
             }
         }
         Ok(storage_replacement_response(&storage_replacement_outcome(
@@ -2513,7 +2554,7 @@ impl KernelComposition {
         )))
     }
 
-    /// Answers one I5.14 rollback request for an already-committed I5.11
+    /// Answers one I5.11 rollback request for an already-committed I5.11
     /// replacement.
     ///
     /// The decision is the coordinator's own and is not re-derived here:
@@ -2560,7 +2601,7 @@ impl KernelComposition {
                 }),
                 None,
             ),
-            // The I5.14 refusal: an irreversible migration or external effect is
+            // The I5.11 refusal: an irreversible migration or external effect is
             // recorded, so the request is refused as a generation rollback and
             // the disposition names the forward-repair state that follows. The
             // state is the coordinator's own classification, read back from it.

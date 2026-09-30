@@ -94,8 +94,8 @@
 //! not refused. The census names the store's tables by referencing `store.rs`'s
 //! own constants, so a renamed table cannot drift from its entry, and it compares
 //! that list with the tables redb reports for the file being read, under the same
-//! transaction as the pages. Counted at the time of writing: 74 distinct declared
-//! tables, 45 backing a dispositioned row family and 29 carrying an explicit
+//! transaction as the pages. Counted at the time of writing: 75 distinct declared
+//! tables, 45 backing a dispositioned row family and 30 carrying an explicit
 //! source-bound nonrestorable/forensic exclusion with the reason written next to
 //! it; 43 dispositioned families, each bound to at least one table, so none is
 //! excused from having one. A table with no disposition is refused with
@@ -915,8 +915,8 @@ struct DispositionedTable {
 /// and there it comes from redb, not from this file.
 ///
 /// Counted against `store.rs`, `store/restore_journal.rs` and `status.rs` at the
-/// time of writing: 75 distinct declared tables, of which 46 back a dispositioned
-/// row family and 29 are explicit source-bound exclusions.
+/// time of writing: 76 distinct declared tables, of which 46 back a dispositioned
+/// row family and 30 are explicit source-bound exclusions.
 /// `row_family_denominator` carries 43 families and every one of them is now bound
 /// to a table by this census.
 ///
@@ -934,7 +934,7 @@ struct DispositionedTable {
 /// in this issue. Until it exists, a table added to `store.rs` is on the author.
 ///
 /// Split in four so no half can grow past the point where a reader stops
-/// checking it: 46 table-backed tables and 28 source-bound exclusions.
+/// checking it: 46 table-backed tables and 29 source-bound exclusions.
 fn dispositioned_tables() -> Vec<DispositionedTable> {
     let mut tables = family_backed_tables();
     tables.extend(source_bound_exclusions());
@@ -1142,7 +1142,7 @@ fn restore_journal_family_tables() -> Vec<DispositionedTable> {
     ]
 }
 
-/// The 28 tables that are explicitly NOT backup row families, each with the
+/// The 29 tables that are explicitly NOT backup row families, each with the
 /// disposition and the reason that excludes it.
 ///
 /// Grouped by what makes a table un-restorable rather than alphabetically, so
@@ -1190,6 +1190,19 @@ fn owner_state_exclusions() -> Vec<DispositionedTable> {
             super::CANONICAL_STORE_ROUTE_OWNERSHIP,
             RowDisposition::NonrestorableHistorical,
             "the established owner of a capability route scope is installation-bound generation authority naming the generation that scope started at; recovery must not resurrect another installation's initial route owner",
+        ),
+        // #1872: an irreversible migration or external effect already declared
+        // on this installation's canonical_store route. It is a write-ahead
+        // declaration bound to one committed cutover's own ORS linearization
+        // identity, and both halves of that binding are installation-bound: a
+        // restored row would name a cutover the destination's own committed
+        // lineage does not carry, so it could not be honoured, and the
+        // destination must reach its own forward-repair decision from its own
+        // effects rather than from this installation's (I5.11 / I14.14).
+        excluded(
+            super::IRREVERSIBLE_STORAGE_EFFECTS,
+            RowDisposition::NonrestorableHistorical,
+            "a declared irreversible storage effect is installation-bound generation authority about what this installation already did to its own canonical store; a restored row names a cutover of the source installation's committed lineage and would either be unprovable here or refuse a rollback for an effect this installation never issued",
         ),
         // Not a row family: the durable operation index is re-derived by the
         // canonical ordering owner from the operational history it admits, so a
@@ -1521,7 +1534,7 @@ fn purge_ledger_exclusions() -> Vec<DispositionedTable> {
 ///    advertise a quarantined import path for a table that has no family and
 ///    therefore no import path.
 ///
-/// Cost is one `list_tables` plus a 71-entry linear scan, both bounded and both
+/// Cost is one `list_tables` plus a 72-entry linear scan, both bounded and both
 /// independent of store size: it is a schema census, not a data scan. It runs
 /// once per export entrypoint and once per quarantined import, never per page.
 ///

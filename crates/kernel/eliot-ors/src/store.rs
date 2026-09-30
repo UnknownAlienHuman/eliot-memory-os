@@ -60,6 +60,7 @@ pub use stop_census::{StoreStopObligationCensus, StoreStopObligationCounts};
 use crate::cutover_ownership::{
     GenerationCutoverOwnership, GenerationCutoverOwnershipReceipt, StoredCutoverOwnership,
 };
+use crate::irreversible_effect::IrreversibleStorageEffectRecord;
 use crate::{
     AcceptedPending, ActivationLifecycleRecord, ActivationLifecycleState,
     ActivationRecoverySnapshot, ActivationResultRetentionPhase, ActivationResultRetentionRecord,
@@ -458,6 +459,21 @@ const CUTOVER_OWNERSHIP: TableDefinition<&str, &str> =
 /// a cutover.
 const CANONICAL_STORE_ROUTE_OWNERSHIP: TableDefinition<&str, &str> =
     TableDefinition::new("ors_canonical_store_route_ownership_v1");
+/// Durable irreversible storage-effect declarations (issue #1872; I5.11,
+/// I14.14).
+///
+/// One row per `(route scope, committed cutover, effect)`, write-once by
+/// content. The committed `CUTOVER_OWNERSHIP` row's `migration` decision is
+/// fixed at the linearization point, so an effect issued after that point is in
+/// no row of that family; this is where it is recorded instead. The writer
+/// derives the cutover's linearization identity from the committed row inside
+/// the same transaction rather than accepting one, and mints the declaration's
+/// own from the store's operational order, so a caller can assert neither. This
+/// is one more table in the existing ORS table family, owned by the same
+/// `RedbRecoveryStore` and written through the same `persistence_codec`; it is
+/// not a second route owner, a second cutover machine or a second store.
+const IRREVERSIBLE_STORAGE_EFFECTS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_irreversible_storage_effects_v1");
 const HOST_REQUESTS: TableDefinition<&str, &str> = TableDefinition::new("ors_host_requests_v1");
 /// Durable evaluated tool-exposure receipts, one per completed host-request
 /// operation (issue #1945, I7.24).
@@ -30631,6 +30647,203 @@ impl RedbRecoveryStore {
                 Ok(record)
             })
             .transpose()
+    }
+
+    /// Records that an irreversible migration or external effect occurred on
+    /// one `canonical_store` route scope under one committed cutover (issue
+    /// #1872; I5.11, I14.14).
+    ///
+    /// This is the family's only write path, and it is the durable linearization
+    /// point of a *declaration*: the single `write.commit()` is what makes the
+    /// effect irreversible to every later reader, so a caller must reach this
+    /// and get `Ok` BEFORE it issues the effect it is about to issue. A crash
+    /// after this commit but before the effect leaves a declaration with no
+    /// effect, which refuses a rollback that might have been permitted — the
+    /// fail-closed direction, and the one `I5.11` names when it says forward
+    /// repair follows. A crash before this commit means the effect was never
+    /// authorized, so the reverse defect — an effect issued with no durable
+    /// record of it — is not reachable through this writer.
+    ///
+    /// Three things are proved here rather than accepted, and each is proved
+    /// against the ORIGINAL recorded value:
+    ///
+    /// 1. the named `cutover_id` is a row this store holds and its state is
+    ///    `Committed`, so a declaration cannot be attached to a staged
+    ///    candidate or to a cutover that never happened;
+    /// 2. that row's own `scope.route_scope_hash` is the presented scope, so a
+    ///    declaration cannot move irreversibility onto a route it did not
+    ///    occur on;
+    /// 3. that row's own `linearization_record_id` is the presented
+    ///    `cutover_linearization_record_id`, so a declaration is bound to the
+    ///    exact durable switch rather than to a label.
+    ///
+    /// The declaration's own `linearization_record_id` is refused if presented
+    /// and minted here from the store's operational order, so no caller can
+    /// claim a durable position. The row is write-once by content under a key
+    /// derived from the whole owner-bound content: an exact replay is
+    /// idempotent, and a different declaration under the same key is refused
+    /// rather than overwriting an effect that already occurred.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the family's write path proves the cutover binding, write-once content and owner-minted linearization identity atomically"
+    )]
+    pub fn commit_irreversible_storage_effect(
+        &self,
+        declaration: &IrreversibleStorageEffectRecord,
+    ) -> Result<IrreversibleStorageEffectRecord, OrsError> {
+        declaration.validate()?;
+        if declaration.linearization_record_id.is_some() {
+            return Err(OrsError::InvalidField {
+                field: "irreversible_storage_effect_linearization",
+                reason: "the declaration's own linearization identity is assigned by this store, never presented",
+            });
+        }
+        let key = declaration.key()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        {
+            let cutovers = write.open_table(CUTOVER_OWNERSHIP).map_err(storage)?;
+            let Some(existing) = cutovers
+                .get(declaration.cutover_id.as_str())
+                .map_err(storage)?
+            else {
+                return Err(OrsError::InvalidField {
+                    field: "irreversible_storage_effect_cutover_id",
+                    reason: "an irreversible effect is declared only under a committed cutover this store holds",
+                });
+            };
+            let stored: StoredCutoverOwnership =
+                decode_named(existing.value(), "cutover_ownership")?;
+            if stored.record.state != GenerationCutoverState::Committed {
+                return Err(OrsError::InvalidTransition);
+            }
+            if stored.record.scope.route_scope_hash != declaration.route_scope_hash {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "irreversible_storage_effect",
+                    reason: "the named cutover switched a different capability route scope"
+                        .to_owned(),
+                });
+            }
+            let Some(linearization) = stored.record.linearization_record_id.clone() else {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "cutover_ownership",
+                    reason: "committed cutover has no linearization identity".to_owned(),
+                });
+            };
+            if declaration.cutover_linearization_record_id != linearization {
+                return Err(OrsError::InvalidField {
+                    field: "irreversible_storage_effect_cutover_linearization",
+                    reason: "must be the committed cutover row's own ORS linearization identity",
+                });
+            }
+        }
+        {
+            let declared = write
+                .open_table(IRREVERSIBLE_STORAGE_EFFECTS)
+                .map_err(storage)?;
+            if let Some(existing) = declared.get(key.as_str()).map_err(storage)? {
+                let stored: IrreversibleStorageEffectRecord =
+                    decode_named(existing.value(), "irreversible_storage_effect")?;
+                if stored.same_declaration(declaration) {
+                    return Ok(stored);
+                }
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "irreversible_storage_effect",
+                    reason: "an irreversible effect that occurred is write-once by content and is never re-described"
+                        .to_owned(),
+                });
+            }
+        }
+        let order = Self::next_operational_order(&write)?;
+        let committed = IrreversibleStorageEffectRecord {
+            linearization_record_id: Some(format!(
+                "ors:irreversible-storage-effect:{key}#{order}"
+            )),
+            ..declaration.clone()
+        };
+        committed.validate()?;
+        {
+            let mut declared = write
+                .open_table(IRREVERSIBLE_STORAGE_EFFECTS)
+                .map_err(storage)?;
+            declared
+                .insert(key.as_str(), encode(&committed)?.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(committed)
+    }
+
+    /// Returns the irreversible effects durably declared on one capability route
+    /// scope, each re-proved against the committed cutover row it names.
+    ///
+    /// The binding is checked here, in the transaction that reads both tables,
+    /// and against the ORIGINAL recorded cutover row: a declaration survives
+    /// only while the cutover it names is still a `Committed` row of the same
+    /// route scope carrying the same linearization identity. A row that names a
+    /// cutover this store does not hold, or one that is no longer committed for
+    /// that scope, is an `IntegrityProblem` rather than a row that is quietly
+    /// dropped — dropping it would read an irreversible effect as an absence.
+    ///
+    /// `Ok(vec![])` is the absence of the optional table in a database that
+    /// predates it, which means no effect was ever declared. Every other storage
+    /// refusal and every typed ORS class reaches the caller unchanged.
+    pub fn irreversible_storage_effects(
+        &self,
+        route_scope_hash: &str,
+        limit: u16,
+    ) -> Result<Vec<IrreversibleStorageEffectRecord>, OrsError> {
+        crate::model::validate_digest(
+            route_scope_hash,
+            "irreversible_storage_effect_route_scope_hash",
+        )?;
+        if limit == 0 || limit > crate::MAX_RECOVERY_PAGE {
+            return Err(OrsError::InvalidCursorLimit);
+        }
+        let read = self.database.begin_read().map_err(storage)?;
+        let declared = read
+            .open_table(IRREVERSIBLE_STORAGE_EFFECTS)
+            .map_err(storage)?;
+        let cutovers = read.open_table(CUTOVER_OWNERSHIP).map_err(storage)?;
+        let mut bound: Vec<IrreversibleStorageEffectRecord> = Vec::new();
+        for row in declared.iter().map_err(storage)? {
+            let (key, value) = row.map_err(storage)?;
+            let record: IrreversibleStorageEffectRecord =
+                decode_named(value.value(), "irreversible_storage_effect")?;
+            if record.route_scope_hash != route_scope_hash {
+                continue;
+            }
+            if record.key()? != key.value() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "irreversible_storage_effect",
+                    reason: "the stored declaration does not match the key it is filed under"
+                        .to_owned(),
+                });
+            }
+            let Some(existing) = cutovers.get(record.cutover_id.as_str()).map_err(storage)? else {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "irreversible_storage_effect",
+                    reason: "the declaration names a cutover this store does not hold".to_owned(),
+                });
+            };
+            let stored: StoredCutoverOwnership =
+                decode_named(existing.value(), "cutover_ownership")?;
+            if stored.record.state != GenerationCutoverState::Committed
+                || stored.record.scope.route_scope_hash != record.route_scope_hash
+                || stored.record.linearization_record_id.as_deref()
+                    != Some(record.cutover_linearization_record_id.as_str())
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "irreversible_storage_effect",
+                    reason: "the declaration is not bound to a committed cutover of its own route scope"
+                        .to_owned(),
+                });
+            }
+            if bound.len() == usize::from(limit) {
+                return Err(OrsError::ProjectionLimitExceeded);
+            }
+            bound.push(record);
+        }
+        Ok(bound)
     }
 
     /// Loads one ownership record by cutover identity.

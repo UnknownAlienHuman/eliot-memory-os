@@ -188,11 +188,12 @@
 //! recorded irreversible effects. [`StorageReplacement::request_rollback`]
 //! enforces it, and it does not decide from that ledger alone: it reloads the
 //! ORS-committed cutover ownership row its own receipt names, requires that row
-//! to be the newest cutover committed for the pinned scope, and reads the
-//! `migration` decision of *every* committed cutover of that scope, so the
-//! durable record of irreversibility is the authority and the caller cannot
-//! obtain a permitted generation rollback by declining to record an effect or by
-//! presenting a receipt for a switch that has since been superseded. While no
+//! to be the newest cutover committed for the pinned scope, reads the
+//! `migration` decision of *every* committed cutover of that scope, and reads
+//! the scope's durably declared effects from ORS. The durable record of
+//! irreversibility is the authority and the caller cannot obtain a permitted
+//! generation rollback by declining to record an effect or by presenting a
+//! receipt for a switch that has since been superseded. While no
 //! irreversible effect is recorded the generation rollback is admitted (and the
 //! route switch itself is another committed cutover with a newer epoch, never a
 //! local flag flip); once one is recorded the request is refused as
@@ -206,16 +207,21 @@
 //! rebuilt through, and it refuses a candidate generation that is not newer
 //! than the newest generation this route has committed whenever a committed
 //! cutover of the pinned scope records
-//! [`StateMigrationDecision::ForwardRepairRequired`] — read from those rows,
+//! [`StateMigrationDecision::ForwardRepairRequired`] **or** the scope carries a
+//! durably declared irreversible effect — read from those rows and from ORS,
 //! never from the presented ledger. A forward replacement is not gated, so the
 //! forward repair the refusal names stays reachable on the same route.
 //!
 //! A post-cutover irreversible effect is issued after the linearization point,
 //! so no committed row of the scope carries it and the in-memory ledger does not
-//! survive a restart; that residual gap is stated on
-//! [`StorageReplacement::request_rollback`] and named there as the `I5.14`
-//! durable-effect-ledger owner's, because inventing a second durable store for
-//! it here would be a second canonical path beside the one that already exists.
+//! survive a restart. It is closed by [`StorageReplacement::declare_irreversible_effect`]:
+//! the ORS owner records the declaration in one write transaction BEFORE the
+//! effect may be issued, and both rollback decision points —
+//! [`StorageReplacement::request_rollback`] and
+//! [`refuse_unproven_generation_rollback`] — read those durable rows rather than
+//! the in-memory ledger, so a restart cannot lose one. This is the same ORS
+//! owner, the same table family and the same codec as the cutover rows it sits
+//! beside, not a second canonical path.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -223,14 +229,25 @@ use std::fmt;
 use eliot_contracts::ResourceGeneration;
 use eliot_ors::{
     CanonicalStoreRouteOwnership, CapabilityRouteScope, CutoverRouteSnapshot,
-    GenerationCutoverOwnership, GenerationCutoverOwnershipReceipt, MAX_RECOVERY_PAGE, OrsError,
-    RedbRecoveryStore, StateMigrationDecision,
+    GenerationCutoverOwnership, GenerationCutoverOwnershipReceipt, IrreversibleStorageEffectRecord,
+    MAX_RECOVERY_PAGE, OrsError, RedbRecoveryStore, StateMigrationDecision,
 };
 use eliot_runtime_contracts::GenerationCutoverState;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{KernelServiceError, validate_text};
+
+/// The one irreversible-effect vocabulary, owned by the durable store.
+///
+/// `I5.11`: "Rollback switches generation back only if no irreversible
+/// migration/effect occurred; otherwise uses forward repair." The class is
+/// declared once, beside the [`StateMigrationDecision`] the same rule reads at
+/// the cutover, because it is now a field of a durable ORS row as well as of
+/// this coordinator's ledger. Re-exporting the owner's type rather than
+/// declaring a second one is what keeps the in-memory ledger and the durable
+/// record from drifting into two spellings of the same fact.
+pub use eliot_ors::IrreversibleStorageEffect;
 
 /// The capability whose route this coordinator is bound to.
 ///
@@ -531,34 +548,94 @@ fn committed_canonical_store_cutovers(
 /// [`ResourceGeneration`] is the monotonic counter `I14.14` numbers generations
 /// with, so a candidate that is not strictly newer than the newest generation
 /// this route has already committed is a return to a generation the route has
-/// left. Its permission is then read from those same committed rows — a
-/// [`StateMigrationDecision::ForwardRepairRequired`] on any committed cutover of
-/// this route is the durable record that an irreversible migration or external
-/// effect occurred, and it refuses the rollback with
-/// [`KernelServiceError::GenerationFenced`] whatever the in-process ledger or the
-/// request payload says. A forward replacement, whose candidate is strictly
-/// newer than every generation this route has committed, is not a rollback and
-/// is not gated here, so the forward repair the refusal names stays reachable on
-/// this same route and scope.
+/// left. Its permission is then read from durable state on this scope, and there
+/// are now TWO durable sources, because they answer two different halves of the
+/// same `I5.11` rule:
+///
+/// 1. a [`StateMigrationDecision::ForwardRepairRequired`] on any committed
+///    cutover of this route — what the `I5.11` stage-8 linearization point
+///    fixed, covering every effect observed BEFORE that point;
+/// 2. a durably declared [`IrreversibleStorageEffectRecord`] on this scope —
+///    what covers every effect issued AFTER that point, which by construction is
+///    in no committed cutover row. These rows are written by the existing ORS
+///    owner before the effect may be issued (see
+///    [`StorageReplacement::declare_irreversible_effect`]) and are read here
+///    from ORS, so a restart cannot lose them the way it loses the in-memory
+///    ledger.
+///
+/// Either refuses with [`KernelServiceError::GenerationFenced`] whatever the
+/// in-process ledger or the request payload says. A forward replacement, whose
+/// candidate is strictly newer than every generation this route has committed,
+/// is not a rollback and is not gated here, so the forward repair the refusal
+/// names stays reachable on this same route and scope.
 fn refuse_unproven_generation_rollback(
     committed: &[GenerationCutoverOwnership],
+    declared: &[IrreversibleStorageEffectRecord],
     candidate_generation: ResourceGeneration,
 ) -> Result<(), KernelServiceError> {
     let Some(newest) = committed.iter().map(|record| record.new_generation).max() else {
         // This route has never switched, so it has left no generation to return
-        // to and there is no committed record that could prove anything.
+        // to and there is no committed record that could prove anything. A
+        // durable declaration cannot exist either: the ORS writer refuses to
+        // declare one against a cutover this store does not hold as committed.
         return Ok(());
     };
     if candidate_generation > newest {
         return Ok(());
     }
-    if committed
-        .iter()
-        .any(|record| record.migration == StateMigrationDecision::ForwardRepairRequired)
+    if !declared.is_empty()
+        || committed
+            .iter()
+            .any(|record| record.migration == StateMigrationDecision::ForwardRepairRequired)
     {
         return Err(KernelServiceError::GenerationFenced);
     }
     Ok(())
+}
+
+/// The irreversible effects durably DECLARED on the pinned `canonical_store`
+/// route scope, read from ORS rather than from any in-process ledger.
+///
+/// This is the read that closes the restart hole. The committed cutover rows'
+/// `migration` decision is fixed at the linearization point, so an effect issued
+/// after it is in no committed row of that family; the durable declarations are
+/// where such an effect is recorded, and they survive the process that wrote
+/// them. Every row comes back re-proved against the committed
+/// [`GenerationCutoverOwnership`] row it names, in the same ORS read
+/// transaction, so a row that does not bind to a committed cutover of this
+/// scope is an [`OrsError::IntegrityProblem`] rather than a row that is quietly
+/// dropped — dropping it would read a real irreversible effect as an absence.
+///
+/// A database that predates the optional table has declared nothing, and ORS
+/// exposes that absence only as its typed storage text, so it is read the same
+/// way [`is_absent_cutover_ownership_table`] reads the cutover table's absence.
+/// Every other storage refusal and every typed ORS class reaches the caller
+/// unchanged.
+fn declared_irreversible_effects(
+    ors: &RedbRecoveryStore,
+    scope: &CapabilityRouteScope,
+) -> Result<Vec<IrreversibleStorageEffectRecord>, KernelServiceError> {
+    match ors.irreversible_storage_effects(&scope.route_scope_hash, MAX_RECOVERY_PAGE) {
+        Ok(declared) => Ok(declared),
+        Err(error) if is_absent_irreversible_effects_table(&error) => Ok(Vec::new()),
+        Err(error) => Err(ors_refusal(&error)),
+    }
+}
+
+/// Whether an ORS refusal is only the absence of the optional irreversible
+/// storage-effect table in a database that predates it.
+///
+/// Same compatibility reading and same stated reason as
+/// [`is_absent_cutover_ownership_table`]: the table is materialised by the first
+/// declaration, so its absence is a fact about the database and means only that
+/// no irreversible effect was ever declared here. A present table whose contents
+/// fail validation is not this, and stays a refusal.
+fn is_absent_irreversible_effects_table(error: &OrsError) -> bool {
+    matches!(
+        error,
+        OrsError::Storage(message)
+            if message.contains("Table 'ors_irreversible_storage_effects_v1' does not exist")
+    )
 }
 
 /// Whether an ORS refusal is only the absence of the optional cutover
@@ -849,34 +926,6 @@ impl fmt::Display for StorageReplacementStage {
     }
 }
 
-/// One irreversible occurrence that closes the generation-rollback path.
-///
-/// `I5.11` allows switching generation back only when no irreversible
-/// migration/effect occurred. These are the two occurrences the issue names;
-/// the coordinator records them as an append-only set and never clears one,
-/// because an observed irreversible effect cannot be un-observed.
-#[derive(
-    Clone, Copy, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum IrreversibleStorageEffect {
-    /// The candidate's imported state cannot be reconciled back into the
-    /// incumbent store, so a generation switch back would lose canonical data.
-    IrreversibleMigration,
-    /// A canonical or external effect was already issued through the candidate
-    /// route, so the effect must be reconciled forward rather than undone.
-    ExternalEffectIssued,
-}
-
-impl fmt::Display for IrreversibleStorageEffect {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::IrreversibleMigration => "irreversible_migration",
-            Self::ExternalEffectIssued => "external_effect_issued",
-        })
-    }
-}
-
 /// The disposition of one rollback request against the `canonical_store` route.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StorageRollbackDisposition {
@@ -1056,7 +1105,12 @@ impl StorageReplacement {
                 reason: "the candidate generation already owns the canonical_store route through a committed cutover, so the replacement must be resumed from its durable cutover receipt",
             });
         }
-        refuse_unproven_generation_rollback(&committed, candidate_generation)?;
+        // The durable irreversible-effect declarations are read here, before the
+        // gate and before any ORS write, so a restarted process reaches the same
+        // refusal a live one would. That is the whole point: the in-memory
+        // ledger is gone after a restart, so the gate must not be reading it.
+        let declared = declared_irreversible_effects(ors, &scope)?;
+        refuse_unproven_generation_rollback(&committed, &declared, candidate_generation)?;
         Ok(Self {
             replacement_id,
             scope,
@@ -1073,14 +1127,23 @@ impl StorageReplacement {
     }
 
     /// Reconstructs a replacement after a restart from its durable material:
-    /// the cutover receipt and the ORS-committed cutover record it names.
+    /// the cutover receipt, the ORS-committed cutover record it names, and the
+    /// irreversible effects durably declared on that cutover.
     ///
     /// The receipt is validated and then re-derived from ORS, so a receipt that
     /// does not match the durable row is refused. The reconstructed replacement
-    /// starts at the stage after the committed cutover, carries the
-    /// irreversible-effect ledger the receipt fixed at the cutover, and holds no
-    /// per-stage evidence: evidence recorded before the cutover is not durable
-    /// material.
+    /// starts at the stage after the committed cutover, and holds no per-stage
+    /// evidence: evidence recorded before the cutover is not durable material.
+    ///
+    /// The irreversible-effect ledger it comes back with is the UNION of two
+    /// durable sources, and that union is the restart fix. The receipt carries
+    /// the ledger as it stood at the linearization point, which by construction
+    /// excludes every effect issued after it; the durable declarations carry
+    /// exactly those post-cutover effects, and they are read here from ORS
+    /// rather than reconstructed from anything the caller presented. Restoring
+    /// only the receipt's set is what previously let a restarted process answer
+    /// `GenerationRollbackPermitted` after an effect the committed row could not
+    /// name.
     pub fn resume_after_committed_cutover(
         ors: &RedbRecoveryStore,
         replacement_id: impl Into<String>,
@@ -1114,6 +1177,17 @@ impl StorageReplacement {
                 field: "storage_replacement_cutover_receipt_binding",
             });
         }
+        // Post-linearization effects are read from ORS, not from the receipt,
+        // and each one is bound to the committed cutover row above rather than
+        // to this replacement's own claims: a declaration naming another cutover
+        // of the same scope is a different switch and is not this replacement's
+        // ledger.
+        let mut irreversible_effects = receipt.irreversible_effects.clone();
+        for declared in declared_irreversible_effects(ors, &receipt.route_scope)? {
+            if declared.cutover_id == receipt.committed_cutover.cutover_id {
+                irreversible_effects.insert(declared.effect);
+            }
+        }
         Ok(Self {
             replacement_id,
             scope: receipt.route_scope.clone(),
@@ -1123,7 +1197,7 @@ impl StorageReplacement {
             evidence: BTreeMap::new(),
             snapshot_import: None,
             event_tail: Some(receipt.transfer.clone()),
-            irreversible_effects: receipt.irreversible_effects.clone(),
+            irreversible_effects,
             cutover: Some(record),
             receipt: Some(receipt.clone()),
         })
@@ -1411,19 +1485,118 @@ impl StorageReplacement {
         Ok(receipt)
     }
 
-    /// Records that an irreversible migration or external effect occurred.
+    /// Records a PRE-CUTOVER irreversible migration or external effect.
     ///
     /// The ledger only grows: an observed irreversible effect can never be
     /// un-observed, so this closes the generation-rollback path for the rest of
     /// the replacement's life.
     ///
-    /// This records an observation; it is not itself the durable proof. The
-    /// durable record of irreversibility is the committed ORS
-    /// `GenerationCutoverOwnership` row's `migration` decision, and
-    /// [`Self::request_rollback`] reads that row rather than trusting this
-    /// in-memory set alone.
+    /// This is the pre-linearization observation, and its durable authority is
+    /// the committed ORS `GenerationCutoverOwnership` row's `migration`
+    /// decision: [`Self::commit_canonical_store_route_cutover`] refuses unless
+    /// that decision names forward repair exactly when this set is non-empty,
+    /// so a pre-cutover effect is fixed into durable state at the `I5.11`
+    /// stage-8 linearization point and cannot be un-recorded by declining to
+    /// call this again.
+    ///
+    /// An effect issued AFTER that point is deliberately not this method,
+    /// because no committed row of the cutover family can carry it — the
+    /// `migration` decision is fixed at the linearization point, which is what a
+    /// linearization point means. That case is
+    /// [`Self::declare_irreversible_effect`], which commits the durable
+    /// declaration BEFORE the effect may be issued.
     pub fn record_irreversible_effect(&mut self, effect: IrreversibleStorageEffect) {
         self.irreversible_effects.insert(effect);
+    }
+
+    /// Declares an irreversible migration or external effect issued AFTER the
+    /// `I5.11` stage-8 linearization point, durably, before it is issued.
+    ///
+    /// This is the write-ahead half of the `I5.11` rule. The committed cutover
+    /// row's `migration` decision is fixed at the linearization point, so an
+    /// effect issued after it is in no committed row of that family and the
+    /// coordinator's in-memory ledger does not survive a restart. The single
+    /// `write.commit()` inside [`RedbRecoveryStore::commit_irreversible_storage_effect`]
+    /// is therefore the durable linearization point of the DECLARATION, and the
+    /// ordering this method imposes is: the declaration is durable, then the
+    /// effect may be issued.
+    ///
+    /// Why that ordering cannot be raced, stated in both directions:
+    ///
+    /// - A crash after the declaration commits but before the effect is issued
+    ///   leaves a declaration with no effect. That over-refuses — a rollback
+    ///   that might have been permitted is refused — which is the fail-closed
+    ///   direction and the one `I5.11` names when it says forward repair
+    ///   follows. It loses no canonical data.
+    /// - A crash before the declaration commits means this method never
+    ///   returned `Ok`, so the effect was never authorized through this
+    ///   coordinator. The dangerous direction — an effect issued with no
+    ///   durable record of it — is not reachable through this writer, because
+    ///   the record is written first and cannot lag.
+    ///
+    /// The record is bound to this replacement, not accepted from a caller: the
+    /// route scope, the cutover identity and the cutover's ORS linearization
+    /// identity are all taken from this coordinator's own committed receipt,
+    /// and the ORS owner re-derives the linearization identity from the
+    /// committed cutover row itself and refuses a presented value that differs
+    /// from it. A declaration for a cutover that is not committed, or for
+    /// another route scope, is refused rather than recorded.
+    ///
+    /// Refused unless this replacement holds a committed cutover: before the
+    /// linearization point the durable record is the committed row's `migration`
+    /// decision and this method has nothing to bind to, so a pre-cutover effect
+    /// is [`Self::record_irreversible_effect`].
+    ///
+    /// Stated boundary, so no reader mistakes this for more than it is: the
+    /// physical external or canonical effect is issued by the Store and
+    /// candidate-bridge owners, which are outside this crate, so nothing here
+    /// interposes on that issuance. What is enforced here is the half that was
+    /// missing and that this crate does own — the DECLARATION is durable before
+    /// the coordinator admits the post-cutover work that follows the effect, and
+    /// every rollback decision reads that durable record rather than process
+    /// memory, so a restart can no longer turn a declared irreversible effect
+    /// into a permitted generation rollback. An effect that is issued and never
+    /// declared at all is not something any ledger can recover; it is named here
+    /// rather than implied closed.
+    pub fn declare_irreversible_effect(
+        &mut self,
+        ors: &RedbRecoveryStore,
+        effect: IrreversibleStorageEffect,
+    ) -> Result<IrreversibleStorageEffectRecord, KernelServiceError> {
+        let Some(receipt) = self.receipt.as_ref() else {
+            return Err(KernelServiceError::InvalidField {
+                field: "storage_replacement_irreversible_effect_cutover",
+                reason: "an irreversible effect issued after the linearization point is declared only against this replacement's own committed cutover",
+            });
+        };
+        // `GenerationCutoverOwnershipReceipt` is minted only by
+        // `from_committed`, so its linearization identity is never absent: an
+        // empty one would mean the receipt did not come from a committed row.
+        let cutover_linearization_record_id =
+            receipt.committed_cutover.linearization_record_id.clone();
+        if cutover_linearization_record_id.is_empty() {
+            return Err(KernelServiceError::InvalidField {
+                field: "storage_replacement_irreversible_effect_linearization",
+                reason: "a committed cutover receipt always names its ORS linearization identity",
+            });
+        }
+        let declaration = IrreversibleStorageEffectRecord {
+            route_scope_hash: self.scope.route_scope_hash.clone(),
+            cutover_id: receipt.committed_cutover.cutover_id.clone(),
+            cutover_linearization_record_id,
+            effect,
+            linearization_record_id: None,
+        };
+        // The durable write is the ordering. The in-memory ledger is only
+        // updated after it commits, so nothing in this process can observe the
+        // effect before it is durable — and the refusal is propagated, so a
+        // caller that could not make the declaration durable does not proceed
+        // to record post-cutover stages as if it had.
+        let committed = ors
+            .commit_irreversible_storage_effect(&declaration)
+            .map_err(|error| ors_refusal(&error))?;
+        self.irreversible_effects.insert(effect);
+        Ok(committed)
     }
 
     /// Classifies a rollback request without changing any state.
@@ -1472,14 +1645,15 @@ impl StorageReplacement {
     /// same durable record, so a fresh replacement with an empty presented
     /// ledger cannot buy the switch this request refuses.
     ///
-    /// A post-cutover irreversible effect is the one case this cannot prove: it
-    /// is issued after the linearization point, so no committed row of this scope
-    /// carries it, and the `I5.11` documents name no durable record for an effect
-    /// issued after that point. The ledger still refuses the request in this
-    /// process, and a restart that loses it is a gap the owner of the `I5.14`
-    /// durable effect ledger has to close; it is named here rather than papered
-    /// over with a second durable store for irreversibility beside the one that
-    /// already owns it.
+    /// A post-cutover irreversible effect is durably covered too. It is issued
+    /// after the linearization point, so it is in no committed row of the cutover
+    /// family, and the in-memory ledger cannot hold it across a restart; the ORS
+    /// owner writes it through
+    /// [`StorageReplacement::declare_irreversible_effect`] BEFORE the effect is
+    /// issued, and this decision reads those rows from ORS directly. The
+    /// declaration and this read are the same store, so nothing can be lost
+    /// between them: either the row committed before the effect was authorized —
+    /// and this sees it — or the effect was never authorized here.
     pub fn request_rollback(
         &self,
         ors: &RedbRecoveryStore,
@@ -1520,11 +1694,16 @@ impl StorageReplacement {
             // receipt names: a cutover committed on this route before this one
             // already recorded that an irreversible migration or external effect
             // occurred, and the route cannot return to a generation it has left
-            // while that record stands.
+            // while that record stands. The durably DECLARED effects are read
+            // from ORS here rather than from this coordinator's ledger, because
+            // the ledger is exactly what a restart loses and the declarations
+            // are the durable half that a restart keeps.
+            let declared = declared_irreversible_effects(ors, &self.scope)?;
             if self.irreversible_effects.is_empty()
-                && scope_committed.iter().any(|committed| {
-                    committed.migration == StateMigrationDecision::ForwardRepairRequired
-                })
+                && (!declared.is_empty()
+                    || scope_committed.iter().any(|committed| {
+                        committed.migration == StateMigrationDecision::ForwardRepairRequired
+                    }))
             {
                 return Err(KernelServiceError::GenerationFenced);
             }

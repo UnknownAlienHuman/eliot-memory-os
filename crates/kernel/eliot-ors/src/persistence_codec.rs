@@ -21,6 +21,7 @@ use crate::AuthorityHandoffRecord;
 use crate::CanonicalDisposition;
 use crate::CanonicalStoreRouteOwnership;
 use crate::EffectOperationLease;
+use crate::IrreversibleStorageEffectRecord;
 use crate::KernelExecutionManifest;
 use crate::KernelReconciliationItem;
 use crate::OpaqueLabel;
@@ -904,6 +905,14 @@ impl PersistedValue for KernelExecutionManifest {
 
 impl PersistedValue for CanonicalStoreRouteOwnership {
     const RECORD_TYPE: &'static str = "canonical_store_route_ownership";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl PersistedValue for IrreversibleStorageEffectRecord {
+    const RECORD_TYPE: &'static str = "irreversible_storage_effect";
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()

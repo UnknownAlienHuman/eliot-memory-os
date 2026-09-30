@@ -232,7 +232,7 @@ pub struct GenerationCutoverOutcome {
     /// carries no receipt. It rides on a refused live swap too, because it
     /// evidences the durable ORS cutover and says nothing about the in-memory
     /// route swap, which `terminal_code` alone answers. The post-cutover `I5.11`
-    /// stages and the `I5.14` rollback answer are both reached by presenting this
+    /// stages and the `I5.11` rollback answer are both reached by presenting this
     /// value back to the coordinator, which re-derives it from ORS rather than
     /// accepting it.
     pub cutover_receipt: Option<StorageReplacementCutoverReceipt>,

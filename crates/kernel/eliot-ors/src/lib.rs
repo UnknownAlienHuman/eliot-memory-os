@@ -16,6 +16,7 @@ mod cutover_ownership;
 mod doctor;
 mod effect_operation_lease;
 mod execution_manifest;
+mod irreversible_effect;
 mod maintenance_trigger_staging;
 mod model;
 mod process_stream_recovery;
@@ -97,6 +98,7 @@ pub use execution_manifest::{
     ManifestResourceLimits, ManifestRestartBudget, RestartAuthorizationClass,
     RevocationAcknowledgement, verify_kernel_execution_restart,
 };
+pub use irreversible_effect::{IrreversibleStorageEffect, IrreversibleStorageEffectRecord};
 pub use maintenance_trigger_staging::{
     MaintenanceTriggerStagingPayload, MaintenanceTriggerStagingPosition,
     MaintenanceTriggerStagingReceipt, MaintenanceTriggerStagingRequest,
