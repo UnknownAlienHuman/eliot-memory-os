@@ -604,8 +604,7 @@ fn run_console() -> (bool, Option<HostLaunchOptions>) {
             Ok(line) if line.trim().is_empty() => continue,
             Ok(line) => {
                 #[cfg(windows)]
-                let served =
-                    serve_console_line(&mut host, &mut idle_drain, &line, &launch_options);
+                let served = serve_console_line(&mut host, &mut idle_drain, &line, &launch_options);
                 #[cfg(not(windows))]
                 let served = dispatch(&mut host, &line, &launch_options);
                 served
