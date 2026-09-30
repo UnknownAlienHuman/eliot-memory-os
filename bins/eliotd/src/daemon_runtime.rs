@@ -2313,6 +2313,10 @@ async fn evaluate_and_emit_maintenance_notification(
 /// its own store and is retried, so a publication outage degrades the
 /// self-observation surface without becoming a daemon-killing error and without
 /// disappearing behind exit code zero.
+#[allow(
+    clippy::too_many_lines,
+    reason = "publication, durable receipt settlement and independent coverage evaluation stay in one explicit order so an admitted observation is never reported as an outstanding obligation, or the reverse"
+)]
 async fn publish_maintenance_source_results(
     composition: &SharedComposition,
     decision: &eliot_maintenance::AutomationTriggerDecision,
@@ -2397,7 +2401,7 @@ async fn publish_maintenance_source_results(
                         observation_receipt_ref: receipt.operation_id.as_str().to_owned(),
                     };
                     let settlement = {
-                        let guard = composition.lock().await;
+                        let mut guard = composition.lock().await;
                         guard.admit_maintenance_observation_receipt(
                             job_ref,
                             &admitted_receipt.publication_id,
@@ -2464,7 +2468,7 @@ async fn publish_maintenance_source_results(
                         ),
                     ),
                     eliot_maintenance::OutstandingOutcome::RevisionUnavailable { job_ref } => (
-                        job_ref.clone(),
+                        job_ref,
                         String::new(),
                         "the retained durable job revision is unavailable, so its owed observation is unverified"
                             .to_owned(),

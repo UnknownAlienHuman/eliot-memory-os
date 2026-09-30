@@ -204,7 +204,7 @@ impl OutcomeObservationCoverage {
     /// unreadable revision keeps it false, so an unavailable read cannot be
     /// reported as complete coverage.
     #[must_use]
-    pub const fn is_complete(&self) -> bool {
+    pub fn is_complete(&self) -> bool {
         self.outstanding.is_empty()
     }
 }

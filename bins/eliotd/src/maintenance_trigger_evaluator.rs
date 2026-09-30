@@ -552,7 +552,7 @@ impl DaemonComposition {
     /// dangling publication identity stays distinguishable from a transport
     /// failure.
     pub fn admit_maintenance_observation_receipt(
-        &self,
+        &mut self,
         job_id: &str,
         publication_id: &str,
         observation_receipt_ref: &str,

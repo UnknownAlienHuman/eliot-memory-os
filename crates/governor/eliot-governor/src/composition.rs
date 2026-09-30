@@ -4788,14 +4788,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// # Errors
     ///
     /// Returns [`CompositionError::NotReady`] when the composition is not
-    /// ready, [`CompositionError::Kernel`] with the transport's own
-    /// [`KernelPortError`] when the durable-job read or write is refused, and
-    /// [`CompositionError::Recovery`] when the maintenance owner refuses the
-    /// receipt — an unknown publication identity, a conflicting second receipt
-    /// under one identity, an already-unavailable delivery, or a retained
-    /// revision that fails its own validation.
+    /// ready, and [`CompositionError::Recovery`] when the maintenance owner
+    /// refuses the receipt — an unknown publication identity, a conflicting
+    /// second receipt under one identity, an already-unavailable delivery, a
+    /// job that is not retained, or a stale fence. The owner's own
+    /// [`MaintenanceError`] is preserved in the detail so a dangling
+    /// publication identity stays distinguishable from a transport failure.
     pub fn admit_maintenance_observation_receipt(
-        &self,
+        &mut self,
         job_id: &str,
         publication_id: &str,
         observation_receipt_ref: &str,
@@ -4803,32 +4803,19 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
         }
+        // The maintenance owner performs the read, the settlement and the
+        // single durable write through the same Kernel durable-job ledger its
+        // lifecycle transitions already use. This seam exists only because the
+        // owner set is otherwise immutable to `eliotd` callers.
         let fence = self.snapshot.state_fence();
-        let job = self
-            .kernel
-            .load_durable_job(job_id, &fence)
-            .map_err(CompositionError::Kernel)?
-            .ok_or_else(|| {
+        self.owners
+            .maintenance
+            .admit_observation_receipt(job_id, &fence, publication_id, observation_receipt_ref)
+            .map_err(|error| {
                 CompositionError::Recovery(format!(
-                    "durable maintenance job is not retained, so its observation receipt cannot be admitted: {job_id}"
+                    "maintenance observation receipt was not admitted: {error}"
                 ))
-            })?;
-        let next = eliot_maintenance::admit_observation_delivery(
-            &job,
-            publication_id,
-            observation_receipt_ref,
-        )
-        .map_err(|error| {
-            CompositionError::Recovery(format!(
-                "maintenance observation receipt was not admitted: {error}"
-            ))
-        })?;
-        if next != job {
-            self.kernel
-                .save_durable_job(&next)
-                .map_err(CompositionError::Kernel)?;
-        }
-        Ok(next)
+            })
     }
 
     /// Returns the retained durable maintenance job for one exact job identity.
