@@ -8121,7 +8121,29 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                     .task_selection_evidence
                     .as_ref()
                     .ok_or(CompositionError::ActivationStaleFence)?;
+                let TaskBindingState::CurrentTaskContract {
+                    task_ref,
+                    task_revision,
+                    acceptance_digest,
+                    selection_source_ref,
+                    evidence_ref,
+                } = &receipt.task_binding
+                else {
+                    return Err(CompositionError::ActivationStaleFence);
+                };
                 let activation = self.read_unique_agent_activation(now)?;
+                let work_scope_owner = self
+                    .owners
+                    .work_scope
+                    .as_ref()
+                    .ok_or(CompositionError::ActivationScopeSelectionRequired)?;
+                let work_scope = work_scope_owner
+                    .read_current(&live_fence)
+                    .map_err(map_activation_scope_error)?;
+                ensure_snapshot_fresh(
+                    &work_scope,
+                    "task-selection WorkScope is not freshly matched",
+                )?;
                 if selection.receipt_ref() != receipt.receipt_ref
                     || selection.lease_ref() != receipt.lease_ref
                     || selection.principal_ref() != receipt.principal_ref
@@ -8132,11 +8154,17 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                     || selection.governing_source_generation()
                         != receipt.governing_source_generation
                     || !fences_match_exact(selection.state_fence(), &receipt.state_fence)
+                    || task_ref != selection.task_ref()
+                    || *task_revision != selection.task_revision()
+                    || acceptance_digest != selection.acceptance_digest()
                     || evidence.task_ref != selection.task_ref()
                     || evidence.task_revision != selection.task_revision()
                     || evidence.acceptance_digest != selection.acceptance_digest()
                     || evidence.work_scope_ref != selection.work_scope_ref()
+                    || evidence.selection_source_ref != selection_source_ref.as_str()
+                    || evidence.evidence_ref != evidence_ref.as_str()
                     || evidence.is_contaminated()
+                    || !fences_match_exact(&work_scope.state_fence, selection.state_fence())
                     || !fences_match_exact(selection.state_fence(), &live_fence)
                     || !fences_match_exact(selection.state_fence(), &activation.state_fence)
                     || !fences_match_exact(&activation.state_fence, &live_fence)
@@ -8146,6 +8174,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                     || selection.session_ref() != activation.session_id
                     || receipt.scope.scope_ref != activation.work_scope_id
                     || selection.work_scope_ref() != activation.work_scope_id
+                    || work_scope.binding.scope != receipt.scope
+                    || work_scope.binding.governing_source_generation
+                        != receipt.governing_source_generation
+                    || work_scope.binding.scope.scope_ref != selection.work_scope_ref()
                     || selection.task_ref() != activation.task_id.as_str()
                     || selection.task_revision() != activation.task_revision
                 {
