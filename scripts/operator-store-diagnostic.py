@@ -123,7 +123,9 @@ def plan(root, output, install):
         a.stage('existing-909-provider-verifier', ['pwsh', '-NoProfile', '-File', str(output / 'verify-provider.ps1')], 1),
         a.stage('store-target-compile-test-profile', base + ['--no-run'], 20),
         a.stage('store-smoke-cleanup', base + [SMOKE, '--', '--exact', '--nocapture', '--test-threads=1'], 5, tests=True, contains='SCONC-994 case=18 cleanup ok'),
-        a.stage('store-sixteen-cases', base + ['--no-fail-fast', '--', '--nocapture', '--test-threads=1'], 12, tests=True),
+        # First real smoke took 97.66s: allow the 16-case target up to 30min,
+        # still bounded by the unchanged 42min global ceiling and cleanup reserve.
+        a.stage('store-sixteen-cases', base + ['--no-fail-fast', '--', '--nocapture', '--test-threads=1'], 30, tests=True),
     ]
 
 
@@ -176,6 +178,7 @@ def self_test():
             self.assertIn('--exact', rows[6]['command'])
             self.assertIn(SMOKE, rows[6]['command'])
             self.assertNotIn(SMOKE, rows[7]['command'])
+            self.assertEqual(rows[7]['timeout_seconds'], 30 * 60)
             self.assertTrue(all('--ignored' not in x['command'] for x in rows))
         def test_catalog_pin_gate(self):
             root = Path(__file__).resolve().parents[1]

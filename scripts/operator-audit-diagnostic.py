@@ -47,6 +47,7 @@ def plan(root, output, target, *, runtime_edges_only=False):
             stage("runtime-production-build-dev", ["cargo", "build", "--locked", "-p", "eliot-kernel", "-p", "eliot-wasm-host", "--lib", "--bins"], 20),
             stage("kernel-shutdown-durability", cargo_test + ["-p", "eliot-kernel", "--lib", "shutdown_drain::shutdown_drain_tests"] + ["--", "--nocapture", "--test-threads=1"], 8, tests=True),
             stage("kernel-running-hot-spine", cargo_test + ["-p", "eliot-kernel", "--lib", "hot_path_runtime::tests"] + ["--", "--nocapture", "--test-threads=1"], 3, tests=True),
+            stage("wasm-provider-table-metering", cargo_test + ["-p", "eliot-wasm-host", "--lib", "fresh_store_table_"] + ["--", "--nocapture", "--test-threads=1"], 8, tests=True),
             stage("wasm-admitted-process-edge", cargo_test + ["-p", "eliot-wasm-host", "--test", "admitted_execution"] + ["--", "--nocapture", "--test-threads=1"], 8, tests=True),
         ]
     selected = ["--workspace"]
@@ -218,9 +219,9 @@ def self_test():
     else:
         raise AssertionError("incomplete metadata must not reduce the denominator")
     edge_plan = plan(Path("."), Path("."), Path("."), runtime_edges_only=True)
-    assert len(edge_plan) == 7
+    assert len(edge_plan) == 8
     assert all("--workspace" not in row["command"] for row in edge_plan)
-    assert [row["name"] for row in edge_plan if row["tests"]] == ["kernel-shutdown-durability", "kernel-running-hot-spine", "wasm-admitted-process-edge"]
+    assert [row["name"] for row in edge_plan if row["tests"]] == ["kernel-shutdown-durability", "kernel-running-hot-spine", "wasm-provider-table-metering", "wasm-admitted-process-edge"]
     print("diagnostic runner self-test: 18 passed")
 
 
