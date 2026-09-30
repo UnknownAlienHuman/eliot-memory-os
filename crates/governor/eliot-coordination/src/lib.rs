@@ -1735,11 +1735,16 @@ impl CoordinationOwner {
     /// (lease/session/epoch/fence checks, idempotent commit, ceiling stamp).
     /// The admitted reference stays a candidate event: see
     /// [`ResultAdmissionCeiling`].
-    /// STITCH (#370 W8/W28): the future live caller is the session/work-item
-    /// driver passing a real [`AgentResultDraft`] built from admitted
-    /// work-item/session material; BLOCKED-BY the integration-lane driver
-    /// (no live draft producer exists). Forbidden: a draft built from
-    /// fabricated or test-only input to manufacture a caller.
+    /// STITCH (#370 W8/W28): there is still no live caller, and the measured
+    /// blocker is upstream of the draft. A live `CoordinationOwner` exists
+    /// (`eliot-governor`'s `GovernorOwners::coordination`), but production
+    /// reaches only its read projections; `register_session`, `acquire_work`
+    /// and `acquire_work_with_issuance` have no non-test caller anywhere in the
+    /// workspace. No work item therefore ever reaches `Claimed`/`Running`/
+    /// `Checkpointed`/`Reassigned`, so there is no admitted lease, session and
+    /// item to build a real [`AgentResultDraft`] from, and a live
+    /// session/work-item driver is the prerequisite. Forbidden: a draft built
+    /// from fabricated or test-only input to manufacture a caller.
     pub fn admit_candidate_result(
         &mut self,
         draft: AgentResultDraft,
