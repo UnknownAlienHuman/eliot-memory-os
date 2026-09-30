@@ -8662,9 +8662,9 @@ impl KernelComposition {
         // presented digest is still shape-checked by the binder.
         let mut found = None;
         for value in records {
-            let Ok(record) = serde_json::from_value::<eliot_kernel_core::Notification>(
-                value.clone(),
-            ) else {
+            let Ok(record) =
+                serde_json::from_value::<eliot_kernel_core::Notification>(value.clone())
+            else {
                 continue;
             };
             if record.notification_id.as_str() != notification_id {

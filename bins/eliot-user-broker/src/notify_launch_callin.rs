@@ -594,9 +594,7 @@ pub fn stage_normal_notify_launch(
     match std::fs::metadata(&path) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return BrokerNotifyLaunchAuthority::unstaged(
-                NotifyLaunchStage::SkippedNoDeclaration,
-            );
+            return BrokerNotifyLaunchAuthority::unstaged(NotifyLaunchStage::SkippedNoDeclaration);
         }
         Err(_) => {
             return BrokerNotifyLaunchAuthority::unstaged(NotifyLaunchStage::Deferred {
