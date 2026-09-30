@@ -11,6 +11,7 @@ mod admission;
 mod admission_input;
 mod atom;
 mod boundary;
+mod campaign_view;
 mod canonical_projections;
 mod decision_lineage;
 mod economy;
@@ -52,6 +53,7 @@ pub use boundary::{
     BoundaryTransformerRevision, BoundaryUnitKind, BoundaryValidationLimits, ExactSourceRange,
 };
 
+pub use campaign_view::{CampaignOwnerRevisionBinding, CampaignViewBinding};
 pub use canonical_projections::{
     AffordanceProjection, CANONICAL_PROJECTIONS_SCHEMA_VERSION, CanonicalProjectionSet,
     ContinuityProjection, MAX_PROJECTION_ENTRIES, MAX_PROJECTION_TEXT, MAX_SET_OMISSIONS,

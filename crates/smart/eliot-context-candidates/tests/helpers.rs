@@ -19,11 +19,11 @@ use eliot_context_candidates::{
 };
 use eliot_context_contracts::{
     AtomAvailability, AttentionAcknowledgement, AttentionInfluence, AttentionOwnerClosure,
-    AttentionResolution, AuthorityClass, CONTEXT_CONTRACT_VERSION, CapacityLimits, ContextBinding,
-    ContextRecipe, CriticalAttentionMember, CriticalAttentionProjection, DecisionRevision,
-    LossPolicy, MeasurementRef, PrivacyClass, ProofBinding, ProviderDisposition, ProviderId,
-    ProviderRole, ProviderRoleDenominator, RepresentationKind, RoleLossRule, SemanticRole,
-    SourceSnapshot,
+    AttentionResolution, AuthorityClass, CONTEXT_CONTRACT_VERSION, CampaignOwnerRevisionBinding,
+    CampaignViewBinding, CapacityLimits, ContextBinding, ContextRecipe, CriticalAttentionMember,
+    CriticalAttentionProjection, DecisionRevision, LossPolicy, MeasurementRef, PrivacyClass,
+    ProofBinding, ProviderDisposition, ProviderId, ProviderRole, ProviderRoleDenominator,
+    RepresentationKind, RoleLossRule, SemanticRole, SourceSnapshot,
 };
 use eliot_contracts::{
     ArtifactId, ContractId, ContractIdentity, ContractVersion, DecisionId, EpochId, EpochLineageId,
@@ -117,6 +117,28 @@ pub fn request_for(binding: &ContextBinding) -> CandidateRequest {
         binding: binding.clone(),
         request_id: RequestId::new("request-604").expect("fixture request"),
         idempotency_key: "idem-604".to_owned(),
+        campaign_view: campaign_view_for(binding),
+    }
+}
+
+/// Fixture campaign view bound to the same compilation as the request.
+///
+/// The load-bearing revision set is one owner-issued entry, which is the
+/// smallest denominator `CampaignViewBinding::validate` accepts.
+pub fn campaign_view_for(binding: &ContextBinding) -> CampaignViewBinding {
+    CampaignViewBinding {
+        schema_version: CONTEXT_CONTRACT_VERSION,
+        view_id: ArtifactId::new("campaign-view-604").expect("fixture campaign view"),
+        campaign_id: "campaign-604".to_owned(),
+        view_digest: digest(),
+        binding: binding.clone(),
+        load_bearing_revisions: vec![CampaignOwnerRevisionBinding {
+            role: "TASK_PLAN".to_owned(),
+            owner: "owner:task-controller".to_owned(),
+            record_id: "{\"Task\":\"task-604\"}".to_owned(),
+            revision: "{\"Task\":7}".to_owned(),
+            content_digest: digest(),
+        }],
     }
 }
 

@@ -20,6 +20,7 @@
 mod assemble;
 mod boundary;
 mod bounds;
+mod campaign_view;
 mod cite;
 mod error;
 #[cfg(not(target_arch = "wasm32"))]
@@ -36,6 +37,7 @@ pub use boundary::{
     assembly_boundary_limits, boundary_binding_digest, project_assembly_boundaries,
     read_back_boundaries, verify_boundary_binding,
 };
+pub use campaign_view::check_campaign_view_for_assembly;
 pub use cite::project_citation;
 pub use error::AssemblyError;
 #[cfg(not(target_arch = "wasm32"))]

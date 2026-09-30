@@ -6,13 +6,23 @@
 //! snapshot before any named owner read is made.
 //!
 //! The packet's product is one immutable campaign learning-state view, and
-//! the current owner pipeline decides whether it may be used:
+//! the current owner pipeline decides whether it may be used.
 //! `eliot_learning_state_view::validate_campaign_learning_state_view_current`
-//! owns the load-bearing revision and State Fence checks against a fresh
-//! authenticated owner-read set. The `#40`-frozen
-//! `eliot_context::ContextCompiler` is deliberately not called here: the
-//! frozen donor surface takes no new caller, and no legacy-only helper may
-//! accept a view the current owner refused.
+//! first proves the view is current against a fresh authenticated owner-read
+//! set; the validated view and its exact load-bearing owner revisions then
+//! enter the CURRENT owner cells as a `CampaignViewBinding` and each of them
+//! owns its own join:
+//!
+//! - candidate: `CandidateRequest::campaign_view`, checked by
+//!   `CandidateRequest::validate`;
+//! - admission: `eliot_context_admission::check_campaign_view_for_admission`;
+//! - assembly: `eliot_context_assembly::check_campaign_view_for_assembly`.
+//!
+//! The joins are per cell on purpose: a view that binds one compilation must
+//! still be shown to bind the next, so no cell inherits another's verdict.
+//! The `#40`-frozen `eliot_context::ContextCompiler` is deliberately not
+//! called here: the frozen donor surface takes no new caller, and no
+//! legacy-only helper may accept a view the current owner cells refused.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,8 +30,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use eliot_context::campaign_publication::{
     ContextCampaignRecipeBody, context_delivery_body_digest, context_recipe_body_digest,
 };
+use eliot_context_admission::check_campaign_view_for_admission;
+use eliot_context_assembly::check_campaign_view_for_assembly;
 use eliot_context_candidates::CandidateRequest;
-use eliot_context_contracts::{ContextRecipe, ProjectedCitation, SessionDeliverySnapshot};
+use eliot_context_contracts::{
+    CONTEXT_CONTRACT_VERSION, CampaignOwnerRevisionBinding, CampaignViewBinding, ContextBinding,
+    ContextRecipe, ProjectedCitation, SessionDeliverySnapshot,
+};
 use eliot_contracts::{
     ArtifactId, RequestId, StateFence, TaskId, canonical_json_bytes, sha256_hex,
 };
@@ -120,6 +135,11 @@ pub enum CampaignPacketError {
     /// task, scope and fence.
     #[error("campaign Context recipe does not match the admitted task, scope and fence")]
     UnboundContextRecipe,
+    /// The validated campaign view does not carry the complete load-bearing
+    /// owner revision set the Task Controller declared, or a current owner cell
+    /// refused the view for this exact compilation.
+    #[error("campaign learning-state view is not bound to this compilation")]
+    CampaignViewUnbound,
 }
 
 struct ResolvedCampaignSources {
@@ -192,6 +212,18 @@ enum CampaignPacketGapCode {
     /// stale, missing, invalidated, or partial across a load-bearing slot,
     /// owner revision, State Fence, or `RetrievalPlan` history.
     CampaignViewNotCurrent,
+    /// A current owner cell refused the campaign view for this compilation.
+    ///
+    /// The view itself passed
+    /// `validate_campaign_learning_state_view_current`, but one of the current
+    /// cells that must own the load-bearing revision and State Fence joins —
+    /// candidate (`CandidateRequest::validate`), admission
+    /// (`eliot_context_admission::check_campaign_view_for_admission`), or
+    /// assembly (`eliot_context_assembly::check_campaign_view_for_assembly`) —
+    /// compared the view against the compilation it is bound to and refused it.
+    /// The three checks are independent: passing one is never evidence for
+    /// another, so a refusal here names a cell refusal and not a stale view.
+    OwnerCellRefusedCampaignView,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -449,6 +481,102 @@ pub fn validate_campaign_packet_pair(
     ))
 }
 
+/// Projects one validated immutable campaign view into the owner cells' input.
+///
+/// The result is the neutral [`CampaignViewBinding`] the candidate, admission
+/// and assembly cells each compare against the compilation they run under.
+/// Nothing here decides anything: the view identity and its canonical digest
+/// are the immutable view's own recorded values, and the load-bearing
+/// revisions are the exact owner records the view itself froze, taken from the
+/// view's own provenance rather than re-resolved.
+///
+/// The load-bearing denominator is the Task Controller's declared set — the
+/// recipe's `source_requirements` that are `load_bearing` — and completeness
+/// is checked against that independent expected set, never against the list
+/// this function happens to produce. A declared load-bearing role with no
+/// current owner record, or a recorded record the recipe does not declare, is
+/// a mismatch and fails closed, so a view cannot enter the cells with a
+/// silently shortened revision set.
+fn campaign_view_binding(
+    view: &CampaignLearningStateView,
+    recipe: &LearningStateViewRecipe,
+    compilation: &ContextBinding,
+) -> Result<CampaignViewBinding, CampaignPacketError> {
+    let mut load_bearing_revisions = Vec::new();
+    for requirement in &recipe.source_requirements {
+        if !requirement.load_bearing {
+            continue;
+        }
+        let resolution = view
+            .provenance
+            .source_resolutions
+            .iter()
+            .find(|resolution| resolution.role == requirement.role)
+            .ok_or(CampaignPacketError::CampaignViewUnbound)?;
+        let reference = resolution
+            .reference
+            .as_ref()
+            .ok_or(CampaignPacketError::CampaignViewUnbound)?;
+        if resolution.status != CampaignSourceResolutionStatus::Current
+            || reference.role != requirement.role
+            || reference.owner != requirement.owner
+        {
+            return Err(CampaignPacketError::CampaignViewUnbound);
+        }
+        load_bearing_revisions.push(CampaignOwnerRevisionBinding {
+            role: source_role_label(requirement.role),
+            owner: reference.owner.as_str().to_owned(),
+            record_id: owner_record_id_text(&reference.record_id),
+            revision: owner_revision_text(&reference.revision),
+            content_digest: reference.content_digest.clone(),
+        });
+    }
+    if load_bearing_revisions.is_empty() {
+        return Err(CampaignPacketError::CampaignViewUnbound);
+    }
+    let binding = CampaignViewBinding {
+        schema_version: CONTEXT_CONTRACT_VERSION,
+        view_id: view.view_id.clone(),
+        campaign_id: view.campaign_id.as_str().to_owned(),
+        view_digest: view.canonical_digest.clone(),
+        binding: compilation.clone(),
+        load_bearing_revisions,
+    };
+    binding
+        .validate()
+        .map_err(|_| CampaignPacketError::CampaignViewUnbound)?;
+    Ok(binding)
+}
+
+/// Renders one closed campaign source role as its owner-facing label.
+///
+/// The label is the role's own closed wire spelling, produced by the same
+/// `SCREAMING_SNAKE_CASE` representation the campaign source documents use, so
+/// the text a cell compares is the text the owner published rather than a
+/// Rust variant name.
+fn source_role_label(role: CampaignSourceRole) -> String {
+    serde_json::to_value(role)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+/// Renders one owner-native record identity verbatim and losslessly.
+///
+/// The closed `CampaignOwnerRecordId` form is serialized in full, so the
+/// comparison a cell performs is over the whole record identity including its
+/// variant, never over a collapsed string that two different variants could
+/// share.
+fn owner_record_id_text(record_id: &CampaignOwnerRecordId) -> String {
+    serde_json::to_string(record_id).unwrap_or_default()
+}
+
+/// Renders one owner-native revision verbatim and losslessly, for the same
+/// reason as [`owner_record_id_text`].
+fn owner_revision_text(revision: &CampaignOwnerRevision) -> String {
+    serde_json::to_string(revision).unwrap_or_default()
+}
+
 /// Binds the admitted packet to the current compiler's request identity.
 ///
 /// Validation by construction for the #2564 packet-compile edge
@@ -459,17 +587,17 @@ pub fn validate_campaign_packet_pair(
 /// is the deterministic Kernel operation handle and the idempotency key is
 /// the Kernel-minted boot-unique attempt identity — never a caller selector.
 ///
-/// The returned request is the proof artifact the compile edge will consume
-/// once its remaining owner suppliers land (STITCH-2564-PACKET-SUPPLY: seven
-/// roles, candidate policy, admission bundle pieces, quality card, assembly
-/// policy, measurement). Today only its success signal gates the product
-/// path: the value proves the owner recipe binds the admitted packet, and a
-/// failure takes the typed context-recipe gap below.
+/// #1862: the request also carries the validated immutable campaign view, so
+/// the candidate cell owns the load-bearing revision and State Fence join
+/// itself through `CandidateRequest::validate`. A view bound to another
+/// compilation fails closed here, at the candidate boundary, rather than
+/// reaching admission or assembly as an unchecked input.
 fn candidate_request_for_packet(
     envelope: &HostRequestEnvelope,
     attempt: &LocalReadAttempt,
     recipe: &ContextRecipe,
     binding: &CampaignPacketBinding,
+    campaign_view: &CampaignViewBinding,
 ) -> Result<CandidateRequest, CampaignPacketError> {
     recipe
         .validate()
@@ -485,10 +613,11 @@ fn candidate_request_for_packet(
         request_id: RequestId::new(host_request_operation_id(envelope))
             .map_err(|_| CampaignPacketError::InvalidInvocation)?,
         idempotency_key: attempt.attempt_id.clone(),
+        campaign_view: campaign_view.clone(),
     };
     request
         .validate()
-        .map_err(|_| CampaignPacketError::InvalidInvocation)?;
+        .map_err(|_| CampaignPacketError::CampaignViewUnbound)?;
     Ok(request)
 }
 
@@ -1036,24 +1165,66 @@ async fn resolve_compile_and_bind_result(
             ),
         );
     }
-    // Issue #2564 I2: bind the admitted packet to the current compiler's
-    // request identity before the product path continues. The owner recipe
-    // must bind the admitted task, scope and fence exactly; a substituted
-    // recipe fails closed through the same context-recipe gap above rather
-    // than supporting a compiled packet. The request itself is consumed by
-    // the future compile edge (STITCH-2564-PACKET-SUPPLY), so only its
-    // success signal gates this path today and the product below is
-    // unchanged.
-    if candidate_request_for_packet(envelope, attempt, &context_recipe_body.recipe, &binding)
-        .is_err()
-    {
+    // #1862: the validated immutable campaign view and its exact load-bearing
+    // owner revisions now enter the CURRENT owner cells, not a frozen donor
+    // helper. The binding is projected from the published view's own recorded
+    // provenance — the same bytes `validate_campaign_learning_state_view_current`
+    // just accepted — and is then checked by each cell against the exact
+    // compilation that cell runs under:
+    //
+    // - candidate: `CandidateRequest::validate`, inside the request built below;
+    // - admission: `check_campaign_view_for_admission`, against the recipe
+    //   binding the admission input validates under;
+    // - assembly: `check_campaign_view_for_assembly`, against that same binding,
+    //   which assembly additionally forces to equal the admitted set's.
+    //
+    // The three checks are independent by construction, so a view that binds
+    // the candidate stage but not admission (or assembly) is still refused at
+    // that cell. No cell inherits another's verdict, and no legacy-only helper
+    // can accept what the current pipeline refused.
+    let campaign_view = match campaign_view_binding(
+        &publication.view,
+        &recipe,
+        &context_recipe_body.recipe.binding,
+    ) {
+        Ok(campaign_view) => campaign_view,
+        Err(_) => {
+            return campaign_packet_result_body(
+                envelope,
+                attempt,
+                context_blocked_response(
+                    publication,
+                    CampaignPacketGapCode::OwnerCellRefusedCampaignView,
+                    None,
+                    &resolved.resolutions,
+                    prior.is_some() && !prior_is_current,
+                ),
+            );
+        }
+    };
+    let cells_accept_campaign_view = candidate_request_for_packet(
+        envelope,
+        attempt,
+        &context_recipe_body.recipe,
+        &binding,
+        &campaign_view,
+    )
+    .is_ok()
+        && check_campaign_view_for_admission(
+            &campaign_view,
+            &context_recipe_body.recipe.binding,
+        )
+        .is_ok()
+        && check_campaign_view_for_assembly(&campaign_view, &context_recipe_body.recipe.binding)
+            .is_ok();
+    if !cells_accept_campaign_view {
         return campaign_packet_result_body(
             envelope,
             attempt,
             context_blocked_response(
                 publication,
-                CampaignPacketGapCode::ContextRecipeUnavailable,
-                Some(CampaignSourceRole::ContextRecipe),
+                CampaignPacketGapCode::OwnerCellRefusedCampaignView,
+                None,
                 &resolved.resolutions,
                 prior.is_some() && !prior_is_current,
             ),

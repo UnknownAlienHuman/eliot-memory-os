@@ -17,6 +17,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod campaign_view;
 pub mod closure;
 pub mod decision;
 #[cfg(not(target_arch = "wasm32"))]
@@ -24,6 +25,7 @@ pub mod learning_gate;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod material_floor;
 
+pub use campaign_view::check_campaign_view_for_admission;
 pub use closure::{ClosureParts, assemble_closure};
 
 pub use decision::{
@@ -278,6 +280,16 @@ fn validate_admission_contract(input: &AdmissionInput) -> Result<(), ContextErro
 /// blocked on the missing admission-bundle owner; the missing link is that
 /// owner, not a supplier here. Read this as a measured absence, not as a
 /// scheduled M2/O1 tick.
+///
+/// #1862 re-measurement: the live `eliot.packet` route now reaches this crate,
+/// but through [`check_campaign_view_for_admission`] and not yet through
+/// [`admit_context`]. `campaign_packet::resolve_compile_and_bind_result`
+/// projects the validated immutable campaign view into a `CampaignViewBinding`
+/// and hands it to this owner, which compares the view's own load-bearing
+/// revisions and State Fence against the exact binding the decision would run
+/// under. That is the revision/State-Fence join this cell owns; the admission
+/// *decision* is still blocked on the same missing admission-bundle owner, so
+/// the measured absence above is unchanged for `admit_context` itself.
 pub fn admit_context_traced(
     input: &AdmissionInput,
 ) -> Result<(AdmissionResult, Vec<MaterialRankTrace>), ContextError> {

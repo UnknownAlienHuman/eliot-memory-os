@@ -31,9 +31,9 @@
 //! opaque path stays for owners that supply opaque snapshots.
 
 use eliot_context_contracts::{
-    AtomAvailability, AuthorityClass, CanonicalProjectionSet, ContextBinding, ContextError,
-    ContextRecipe, MeasurementRef, PrivacyClass, ProofBinding, ProviderId, ProviderRole,
-    SemanticRole, SourceSnapshot,
+    AtomAvailability, AuthorityClass, CampaignViewBinding, CanonicalProjectionSet, ContextBinding,
+    ContextError, ContextRecipe, MeasurementRef, PrivacyClass, ProofBinding, ProviderId,
+    ProviderRole, SemanticRole, SourceSnapshot,
 };
 use eliot_contracts::{
     ArtifactId, ContractVersion, RequestId, StateFence, TaskId, fences_match_exact,
@@ -88,6 +88,17 @@ pub struct CandidateRequest {
     pub request_id: RequestId,
     /// Caller idempotency key for this compilation.
     pub idempotency_key: String,
+    /// The validated immutable campaign learning-state view this compilation
+    /// is bound to, carrying its exact load-bearing owner revisions and State
+    /// Fence (I12.24).
+    ///
+    /// The candidate cell owns the join: `validate` compares this binding
+    /// against the compilation the mapper is about to run, so a view validated
+    /// for another task, attempt, scope, decision or State Fence — or one
+    /// whose load-bearing revision set is empty, malformed or ambiguously
+    /// keyed — refuses before a single atom is produced. A legacy-only helper
+    /// that never saw this field cannot support a candidate set.
+    pub campaign_view: CampaignViewBinding,
 }
 
 impl CandidateRequest {
@@ -95,7 +106,7 @@ impl CandidateRequest {
     pub fn validate(&self) -> Result<(), ContextError> {
         self.binding.validate()?;
         check_text(&self.idempotency_key, "request.idempotency_key")?;
-        Ok(())
+        self.campaign_view.check_compilation(&self.binding)
     }
 }
 
