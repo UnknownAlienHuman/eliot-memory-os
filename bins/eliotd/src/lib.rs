@@ -279,7 +279,7 @@ pub use governor_observe_serve::{
     observe_suboperation_owner, serve_admitted_observe,
 };
 pub use improvement_candidate_dispatch::{
-    ImprovementRouteOutcome, dispatch_improvement_candidate_route,
+    ImprovementRouteDispatch, ImprovementRouteOutcome, dispatch_improvement_candidate_route,
 };
 pub use improvement_candidate_route::{
     ImprovementRouteRequest, assess_improvement_repeat, check_improvement_handoff_identity,

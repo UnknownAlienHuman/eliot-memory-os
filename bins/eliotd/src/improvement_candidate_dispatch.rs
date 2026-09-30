@@ -5,19 +5,20 @@
 //! BORROWED Governor-owned records, so it can only be built by a caller that
 //! already holds the matching proposal, experiment plan, activation evidence,
 //! rollback contract, candidate view, evidence view and admission policy. Until
-//! this module existed, nothing in `eliotd` held any of them, so
-//! `route_improvement_candidate` had no caller at all and the whole
-//! candidate → experiment → evaluation → admission path was unreachable from the
-//! daemon.
+//! this module existed, nothing in `eliotd` held any of them, so neither
+//! `route_improvement_candidate` nor `assess_improvement_repeat` had a caller at
+//! all and the whole candidate → experiment → evaluation → admission → repeat
+//! path was unreachable from the daemon.
 //!
 //! This module is that caller. It takes the ONE observation the daemon already
 //! produced this pass — the advisory improvement artifact
 //! ([`ImprovementArtifact`]), the `G-19` improvement admission policy read from
 //! the live maintenance owner, and the admitted Kernel fence — and assembles the
 //! seven borrowed records out of their OWN fields, then hands them to
-//! [`route_improvement_candidate`]. Each record is built by its own
-//! `route_*` helper so that the reasoning for a field stays attached to the
-//! field, and so a reader auditing one record never has to read the other six.
+//! [`route_improvement_candidate`] and, on the admitted branch, to
+//! [`assess_improvement_repeat`]. Each record is built by its own `route_*`
+//! helper so that the reasoning for a field stays attached to the field, and so
+//! a reader auditing one record never has to read the other six.
 //!
 //! # Every value is a function of what the daemon already observed
 //!
@@ -155,34 +156,37 @@
 //! [`crate::DaemonComposition::commit_learning_record`] seam in
 //! `daemon_runtime::run_improvement_intake`.
 //!
-//! # What is still not wired
+//! # The repeat assessment, and what it honestly reports
 //!
-//! [`crate::improvement_candidate_route::assess_improvement_repeat`] still has
-//! no caller, and this change does not give it one. Both of its arguments are
-//! records no public entry point in the Governor crate produces for a daemon:
-//! `ImprovementCurrentProposal` has exactly one producer, the pipeline's
-//! PRIVATE `current_proposal_of`, and neither
-//! `run_improvement_candidate_pipeline` nor `compare_improvement_commitments`
-//! hands one out. The public `assess_improvement_replay` builds one internally
-//! and returns an assessment rather than the record, so reaching it would mean
-//! re-committing the proposal — a second digest over the same bytes, which is
-//! precisely what this issue removed.
+//! [`crate::improvement_candidate_route::assess_improvement_repeat`] is called on
+//! the `CanaryAdmitted` branch only. That branch is the ONLY one that publishes
+//! a checked current record: the pipeline's `ImprovementCanaryHandoff` carries
+//! its own `proposal_commitment`, `proposal_discriminator` and
+//! `proposal_material_equality`, so the comparison runs against the pipeline's
+//! checked content rather than a digest recomputed here. `retained` is the
+//! pipeline's own record from an earlier ADMITTED pass, carried by the caller in
+//! the run loop's single-owner intake flight; it is `None` on the first pass and
+//! after a restart.
 //!
-//! The other half is the retained record. This daemon's durable improvement
-//! records are `ImprovementCandidate` artifacts, archive receipts and
-//! lineage-merge receipts, read back by `improvement_dedup_read`; none of them
-//! is a `RetainedImprovementProposal`, and no owner in this repository retains
-//! one. Manufacturing either argument would mean inventing a record to feed a
-//! comparison, and the retained side of a comparison is caller-supplied, so a
-//! fabricated one would silently decide the question the comparison exists to
-//! answer. That is a different act from the identity read above: the
-//! `ImprovementCurrentProposal` view assembled for
-//! [`check_improvement_handoff_identity`] carries a handoff's OWN recorded
-//! commitment, discriminator and material-equality key and is used only to reach
-//! the existing identity check — it is never compared against anything and
-//! never stored. A record built to be compared would be a second claim. The
-//! forwarder therefore stays honestly unreachable and is named here rather than
-//! faked.
+//! The current record it is compared against is read out of that handoff AFTER
+//! [`check_handoff_consumable`] has refused anything this build cannot read, so
+//! a record under a foreign wire revision or content identity never reaches a
+//! comparison. The two `ImprovementCurrentProposal` views this module assembles —
+//! the one for the identity check and the one for the comparison — are the same
+//! read of the handoff's OWN recorded components: neither is derived, neither is
+//! stored, and the retained side is always a record the pipeline itself committed
+//! on an earlier admitted pass, never a manufactured one.
+//!
+//! On this workspace the branch is not taken: the execution gate refuses first
+//! (see above), so `repeat` is `None` and `retained_next` is `None` on every
+//! live pass today. That is the honest live report, not missing coverage. Two
+//! prerequisites this daemon cannot supply are named rather than faked: the
+//! INDEPENDENT EXECUTED EVALUATION only the Instrument verifier owner family
+//! (`#20`/`#1111`) can produce, and a DURABLE owner for
+//! `RetainedImprovementProposal` (the run-loop flight is process-local, so the
+//! record does not survive a restart). Neither is stubbed here, and an absent
+//! record is passed to the pipeline as no record at all, which it disposes as
+//! `NoRetainedPrior` — never as novelty.
 //!
 //! The identity check added here also stops at this boundary. The Kernel `#11`
 //! owner that independently authorizes and EXECUTES canary activation is a
@@ -197,79 +201,203 @@
 use eliot_contracts::StateFence;
 use eliot_improvement::ImprovementCandidate;
 use eliot_improvement::candidate_bounds::{canonical_evidence_lineage, evidence_lineage_digest};
+use eliot_maintenance::improvement_pipeline::{
+    ImprovementCurrentProposal, RetainedImprovementProposal,
+};
 use eliot_maintenance::{
     ActivationEvidence, ExperimentPlan, IMPROVEMENT_CANDIDATE_BOUNDS_REVISION,
     IMPROVEMENT_EFFECT_CEILING, IMPROVEMENT_PROOF_CEILING, IMPROVEMENT_REQUESTED_EFFECT,
     IMPROVEMENT_RISK_CEILING_BOUNDED, ImprovementAdmissionPolicy, ImprovementCandidateView,
     ImprovementEvidenceExecution, ImprovementEvidenceView, ImprovementProposal,
-    ImprovementPulseOutcome, ImprovementTerminalDisposition, MechanismDeclaration, PipelineError,
-    RollbackContract, TESTD_OWNER, VERIFIER_OWNER_FAMILY,
+    ImprovementPulseOutcome, ImprovementReplayAssessment, ImprovementTerminalDisposition,
+    MechanismDeclaration, PipelineError, RollbackContract, TESTD_OWNER, VERIFIER_OWNER_FAMILY,
 };
 
 use super::improvement_candidate_route::{
-    ImprovementRouteRequest, check_improvement_handoff_identity, route_improvement_candidate,
+    ImprovementRouteRequest, assess_improvement_repeat, check_improvement_handoff_identity,
+    route_improvement_candidate,
 };
 use super::improvement_intake_dispatch::ImprovementArtifact;
 
-/// One real dispatch, with the exact records this run committed it over.
+/// The one bounded route step this daemon performs over one real observation.
 ///
-/// The terminal disposition alone would leave a consumer unable to bind a
-/// returned handoff to the experiment that produced it: the handoff carries the
-/// commitment, the discriminator projection and the material-equality key, but
-/// not the full experiment plan those keys were derived from. Carrying the plan
-/// this same call passed to the pipeline — the identical value, never a second
-/// construction — is what lets
+/// Every borrowed value is something the caller already holds from the SAME
+/// maintenance pass, so the request is assembled and consumed here with no
+/// exchange, lock or scheduler involved: the route is a pure function of these
+/// values.
+///
+/// `retained` is the pipeline's own checked current record from an earlier
+/// ADMITTED pass, or `None` when this process holds none (the first pass, or any
+/// pass after a restart). Absence is the denying direction and is presented to
+/// the pipeline as no retained record at all, which it disposes as its own
+/// `NoRetainedPrior` case; it is never read as novelty.
+#[derive(Clone, Copy, Debug)]
+pub struct ImprovementRouteDispatch<'a> {
+    /// The advisory candidate/brief/owner-decision artifact this daemon
+    /// assembled and durably committed for the current maintenance observation.
+    pub artifact: &'a ImprovementArtifact,
+    /// The `G-19` improvement admission policy read from the live maintenance
+    /// owner for that same observation.
+    pub policy: &'a ImprovementAdmissionPolicy,
+    /// The Kernel fence the observation was admitted under.
+    pub state_fence: &'a StateFence,
+    /// The pipeline's checked current record from an earlier admitted pass.
+    pub retained: Option<&'a RetainedImprovementProposal>,
+}
+
+/// What one bounded route step actually produced.
+///
+/// The optional fields are absent for the honest reason in each case, never
+/// dropped: `repeat` exists only when a checked current record was compared
+/// against a retained prior record, and `retained_next` exists only when the
+/// disposition carried the canary handoff that publishes that record.
+/// `experiment` is the exact plan this run passed to the pipeline: the terminal
+/// disposition and the repeat assessment alone would leave a consumer unable to
+/// bind a returned handoff to the experiment that produced it, because the
+/// handoff carries the commitment, the discriminator projection and the
+/// material-equality key but not the full plan those keys were derived from.
+/// Carrying the plan this same call passed to the pipeline — the identical
+/// value, never a second construction — is what lets
 /// [`check_improvement_handoff_identity`] reach the Governor-owned
 /// content-identity check on the handoff's OWN recorded components. It is a
 /// read binding, not a second commitment, a second digest, or a stored record.
+#[derive(Clone, Debug)]
 pub struct ImprovementRouteOutcome {
     /// The pipeline's own advisory-only terminal disposition.
     pub disposition: ImprovementTerminalDisposition,
     /// The exact experiment plan this run passed to the pipeline, held so a
     /// returned handoff is checked against the record that produced it.
     pub experiment: ExperimentPlan,
+    /// The pipeline-derived repeat assessment, when a checked current record and
+    /// a retained prior record both existed.
+    pub repeat: Option<ImprovementReplayAssessment>,
+    /// The record the NEXT pass must retain for its own repeat assessment.
+    ///
+    /// The same checked record, re-projected into the retained shape. `None`
+    /// whenever the pass was not admitted, so an unadmitted pass never
+    /// accumulates a record to compare against.
+    pub retained_next: Option<RetainedImprovementProposal>,
 }
 
-/// Builds the Governor improvement-candidate request from one real maintenance
-/// observation and runs the production route over it.
+/// Routes one real maintenance observation through the Governor-owned
+/// improvement pipeline.
 ///
-/// `artifact` is the advisory candidate/brief/owner-decision artifact this
-/// daemon assembled and durably committed for the current maintenance
-/// observation, `policy` is the `G-19` improvement admission policy read from
-/// the live maintenance owner for that same observation, and `state_fence` is
-/// the Kernel fence the observation was admitted under. All three are real
-/// daemon-held values; the seven records this assembles are functions of their
-/// own fields, as the module documentation states field by field.
+/// `dispatch.artifact` is the advisory candidate/brief/owner-decision artifact
+/// this daemon assembled and durably committed for the current maintenance
+/// observation, `dispatch.policy` is the `G-19` improvement admission policy
+/// read from the live maintenance owner for that same observation, and
+/// `dispatch.state_fence` is the Kernel fence the observation was admitted
+/// under. All three are real daemon-held values; the seven records this
+/// assembles are functions of their own fields, as the module documentation
+/// states field by field.
 ///
-/// Returns the pipeline's own advisory-only terminal disposition together with
-/// the exact experiment plan the run committed it over, or the typed
-/// [`PipelineError`] the pipeline refused with. It never promotes, activates,
-/// installs, completes, or issues authority, and it performs no durability of
-/// its own: the caller commits through the existing
-/// [`crate::DaemonComposition::commit_learning_record`] seam.
+/// This module is the only place in the repository that constructs an
+/// [`ImprovementRouteRequest`], and this function is its production caller: it
+/// forwards to [`route_improvement_candidate`], and on the admitted branch to
+/// [`assess_improvement_repeat`]. Both are pure delegations: no proposal digest
+/// is computed here, no fallback, empty or legacy value is substituted, and the
+/// typed [`PipelineError`] the Governor returns — today a refusal, because this
+/// daemon holds no independent executed evaluation — crosses this boundary as
+/// itself.
+///
+/// It returns the pipeline's own advisory-only terminal disposition, the exact
+/// experiment plan the run committed it over, and the repeat assessment the
+/// admitted branch derived — or the typed [`PipelineError`] the pipeline refused
+/// with. It never promotes, activates, installs, completes, or issues authority,
+/// and it performs no durability of its own: the caller commits through the
+/// existing [`crate::DaemonComposition::commit_learning_record`] seam and
+/// retains the next pass's record in the intake flight it already owns.
+///
+/// The route is bounded and non-looping: one call, one decision, per pass. It
+/// never promotes, activates, installs, completes, or issues authority, and a
+/// `CanaryAdmitted` result is only recorded here as a non-authorizing handoff
+/// for the Kernel owner (`#11`) to authorize independently.
 pub fn dispatch_improvement_candidate_route(
-    artifact: &ImprovementArtifact,
-    policy: &ImprovementAdmissionPolicy,
-    state_fence: &StateFence,
+    dispatch: ImprovementRouteDispatch<'_>,
 ) -> Result<ImprovementRouteOutcome, PipelineError> {
-    let candidate = &artifact.candidate;
-    // Bound once, so the plan the request borrows and the plan the consumer
-    // binds the returned handoff to are the same value rather than two
-    // constructions that could drift.
-    let experiment = route_experiment(candidate, policy);
+    let candidate = &dispatch.artifact.candidate;
+    // Bound once, so the plan the request borrows, the plan the returned handoff
+    // is checked against, and the plan the outcome carries are the same value
+    // rather than two constructions that could drift.
+    let experiment = route_experiment(candidate, dispatch.policy);
+    let proposal = route_proposal(candidate, dispatch.policy, dispatch.state_fence);
     let disposition = route_improvement_candidate(ImprovementRouteRequest {
-        proposal: &route_proposal(candidate, policy, state_fence),
+        proposal: &proposal,
         experiment: &experiment,
         evidence: &route_activation_evidence(candidate),
-        rollback: &route_rollback_contract(candidate, policy),
-        candidate: &route_candidate_view(candidate, policy),
-        admission_evidence: &route_admission_evidence(candidate, policy),
-        policy,
+        rollback: &route_rollback_contract(candidate, dispatch.policy),
+        candidate: &route_candidate_view(candidate, dispatch.policy),
+        admission_evidence: &route_admission_evidence(
+            candidate,
+            dispatch.policy,
+            dispatch.retained,
+        ),
+        policy: dispatch.policy,
     })?;
+    // The handoff is consumed under this build's identity BEFORE anything reads
+    // its progress out of it, so the record the repeat assessment compares is
+    // always one this build was able to read. A refusal crosses as the typed
+    // `PipelineError` those checks produce, with no disposition returned at all.
     check_handoff_consumable(&disposition, &experiment)?;
+
+    // The pipeline publishes its own checked current record inside the canary
+    // handoff precisely so a consumer compares progress against the checked
+    // content instead of recomputing it. Every identity below is COPIED from
+    // that handoff; the only other input is the very `ExperimentPlan` this
+    // dispatch submitted and the pipeline joined, held here unchanged. Nothing is
+    // derived, so this cannot disagree with the record the pipeline committed.
+    let current = checked_current_record(&disposition, &experiment);
+    let repeat = match (dispatch.retained, current.as_ref()) {
+        (Some(retained), Some(current)) => Some(assess_improvement_repeat(retained, current)?),
+        _ => None,
+    };
+    let retained_next = current.as_ref().map(retained_record_of);
     Ok(ImprovementRouteOutcome {
         disposition,
         experiment,
+        repeat,
+        retained_next,
+    })
+}
+
+/// Re-projects one pipeline-checked current record into the retained shape the
+/// NEXT pass compares against.
+///
+/// A field-for-field copy of the pipeline's own commitment, discriminator
+/// projection, material-equality key and joined experiment plan. It derives
+/// nothing, so a retained record can never carry an identity the pipeline did not
+/// commit.
+fn retained_record_of(current: &ImprovementCurrentProposal) -> RetainedImprovementProposal {
+    RetainedImprovementProposal {
+        commitment: current.commitment.clone(),
+        discriminator: current.discriminator.clone(),
+        material_equality: current.material_equality.clone(),
+        experiment_plan: current.experiment_plan.clone(),
+    }
+}
+
+/// The pipeline's own checked current record, read out of its canary handoff.
+///
+/// `None` for every disposition that does not publish the record, which is every
+/// outcome except `CanaryAdmitted`. Nothing is recomputed: the commitment,
+/// discriminator projection and material-equality key are the pipeline's own
+/// values, and the experiment plan is the one this dispatch submitted and the
+/// pipeline joined. This is the same read of the handoff's own recorded
+/// components that [`check_improvement_handoff_identity`] makes, and it is only
+/// reached once that check has refused a record this build cannot read.
+fn checked_current_record(
+    disposition: &ImprovementTerminalDisposition,
+    experiment: &ExperimentPlan,
+) -> Option<ImprovementCurrentProposal> {
+    let ImprovementTerminalDisposition::CanaryAdmitted { handoff } = disposition else {
+        return None;
+    };
+    Some(ImprovementCurrentProposal {
+        candidate_id: handoff.candidate_id.clone(),
+        commitment: handoff.proposal_commitment.clone(),
+        discriminator: handoff.proposal_discriminator.clone(),
+        material_equality: handoff.proposal_material_equality.clone(),
+        experiment_plan: experiment.clone(),
     })
 }
 
@@ -632,6 +760,7 @@ fn route_candidate_view(
 fn route_admission_evidence(
     candidate: &ImprovementCandidate,
     policy: &ImprovementAdmissionPolicy,
+    retained: Option<&RetainedImprovementProposal>,
 ) -> ImprovementEvidenceView {
     let candidate_id = candidate.candidate_id.as_str();
     ImprovementEvidenceView {
@@ -666,10 +795,11 @@ fn route_admission_evidence(
         reopen_ref: None,
         rollback_owner_id: policy.rollback_owner_id.clone(),
         expiry_ref: None,
-        // This daemon retains no prior proposal record, so no retained record is
-        // presented. Absence establishes nothing: the Governor gate derives its
-        // own no-progress outcome from the absent record rather than reading
-        // novelty into it.
-        retained_prior_proposal: None,
+        // The caller's own checked prior record, or the pipeline's own
+        // no-retained-record case. This is a record, never a verdict: the gate
+        // derives its own no-progress outcome from it, so nothing here can assert
+        // a repeat, a new discriminator, or progress. Absence establishes
+        // nothing either — it is never read as novelty.
+        retained_prior_proposal: retained.cloned(),
     }
 }

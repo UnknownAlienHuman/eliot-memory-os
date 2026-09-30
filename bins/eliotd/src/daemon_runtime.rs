@@ -1658,7 +1658,7 @@ async fn run_loop(
     // Governor `RecordLearningRecord` seam. Its lock wait stays in this
     // independently polled flight so a cadence handler never suspends polling
     // of the owner-feed lock holder.
-    let mut improvement_intake_flight = ImprovementIntakeFlight::Idle;
+    let mut improvement_intake_flight = ImprovementIntakeFlight::Idle { retained: None };
     // Issue #2559: one cadence observation may wait for the composition lock,
     // but its wait remains in this independently polled flight. A later tick
     // cannot replace the observation already retained here.
@@ -3218,7 +3218,10 @@ async fn drain_flights_on_shutdown(
             && matches!(owner_feed_flight, OwnerFeedFlight::Idle)
             && matches!(governor_authority_flight, GovernorAuthorityFlight::Idle)
             && matches!(maintenance_flight, MaintenanceFlight::Idle)
-            && matches!(improvement_intake_flight, ImprovementIntakeFlight::Idle)
+            && matches!(
+                improvement_intake_flight,
+                ImprovementIntakeFlight::Idle { .. }
+            )
             && matches!(health_heartbeat_flight, HealthHeartbeatFlight::Idle)
             && matches!(solo_poll_flight, SoloPollFlight::Idle)
         {
@@ -3352,7 +3355,12 @@ async fn drain_flights_on_shutdown(
                 *owner_feed_flight = OwnerFeedFlight::Idle;
                 *governor_authority_flight = GovernorAuthorityFlight::Idle;
                 *maintenance_flight = MaintenanceFlight::Idle;
-                *improvement_intake_flight = ImprovementIntakeFlight::Idle;
+                // The in-flight step is dropped here, so this process holds no
+                // record it could honestly retain: the record a dropped step was
+                // carrying died with the future, and inventing one would be a
+                // fabricated prior. `None` is the denying direction the pipeline
+                // already reads as "no retained record".
+                *improvement_intake_flight = ImprovementIntakeFlight::Idle { retained: None };
                 *health_heartbeat_flight = HealthHeartbeatFlight::Idle;
                 *solo_poll_flight = SoloPollFlight::Idle;
                 *supervision_progress = None;
@@ -4968,7 +4976,11 @@ enum TestdOwnerFlight {
 
 /// Completion of one in-flight improvement-intake step.
 enum ImprovementIntakeCompletion {
-    Settled(Result<(), String>),
+    /// The pipeline-checked current record the route admitted, which the NEXT
+    /// pass compares against for its own repeat assessment. `None` on any pass
+    /// that was not admitted, so an unadmitted pass never accumulates a record to
+    /// compare against.
+    Settled(Option<eliot_maintenance::RetainedImprovementProposal>),
 }
 
 struct ImprovementIntakeFlightState {
@@ -4984,8 +4996,18 @@ struct ImprovementIntakeFlightState {
 /// unreachable. `Idle` means no dispatch is outstanding; `InFlight` holds
 /// the one pending bounded step. No second owner and no second concurrent
 /// dispatch exist.
+///
+/// `Idle` carries the pipeline's own checked current record from the last
+/// ADMITTED pass, which the next pass presents as its retained prior record so
+/// `assess_improvement_repeat` compares checked content instead of a recomputed
+/// digest. It is process-local and is lost on restart, which is stated rather
+/// than papered over: no durable owner of a `RetainedImprovementProposal` exists
+/// in this workspace, so an absent record is passed to the pipeline as no record
+/// at all and it disposes of that as its own `NoRetainedPrior` case.
 enum ImprovementIntakeFlight {
-    Idle,
+    Idle {
+        retained: Option<eliot_maintenance::RetainedImprovementProposal>,
+    },
     InFlight(ImprovementIntakeFlightState),
 }
 
@@ -5118,11 +5140,12 @@ fn admit_over_restored_registry(
 
 /// Runs one improvement-intake step: evaluate and assemble the artifact over a
 /// real observation, read the deduplication registry back from the durable
-/// candidate records, admit into it through the governed path, and commit the
+/// candidate records, admit into it through the governed path, commit the
 /// artifact — and every archive receipt the admission produced — durably
-/// through the Governor `RecordLearningRecord` seam.
+/// through the Governor `RecordLearningRecord` seam, and route the committed
+/// artifact through the Governor improvement pipeline.
 ///
-/// Four phases, and the lock is held for three of them:
+/// Five phases, and the lock is held for three of them:
 ///
 /// 1. guarded: evaluate the observation, capture the admitted fence, assemble
 ///    the artifact, read the `G-19` admission policy;
@@ -5132,12 +5155,17 @@ fn admit_over_restored_registry(
 ///    acceptance and evidence reads are run;
 /// 3. guarded: re-check the fence, rebuild the bounded backlog from those
 ///    records, and run the governed admission against it;
-/// 4. guarded: commit.
+/// 4. guarded: commit;
+/// 5. UNGUARDED and pure: route the committed artifact through the Governor
+///    improvement pipeline (`improvement_candidate_dispatch`), which is where
+///    `ImprovementRouteRequest` is constructed and `route_improvement_candidate`
+///    is called.
 ///
-/// A refused or unexhausted phase-2 read is a typed error and the pass STOPS.
-/// It is never treated as an empty registry: admitting against "nothing was
-/// there" is precisely the failure this read exists to prevent, because it
-/// makes a repeat of the same evidence lineage look like a first observation.
+/// A refused or unexhausted phase-2 read is this phase's own diagnostic and the
+/// pass STOPS. It is never treated as an empty registry: admitting against
+/// "nothing was there" is precisely the failure this read exists to prevent,
+/// because it makes a repeat of the same evidence lineage look like a first
+/// observation.
 ///
 /// The durable write is owned entirely by
 /// [`eliotd::DaemonComposition::commit_learning_record`], the one
@@ -5147,11 +5175,18 @@ fn admit_over_restored_registry(
 /// a typed diagnostic rather than a loop failure — exactly the discipline
 /// [`evaluate_and_emit_maintenance_notification`] already uses for the
 /// notification leg.
+///
+/// The return value is the pipeline-checked record the NEXT pass retains for its
+/// own repeat assessment, or `None` when this pass was not admitted. Every
+/// refusal above returns the record it was handed rather than clearing it: a
+/// refused pass produced no new record, and that is not evidence the last
+/// admitted one stopped existing.
 async fn run_improvement_intake(
     kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
     observation: MaintenanceObservation,
-) -> Result<(), String> {
+    retained: Option<eliot_maintenance::RetainedImprovementProposal>,
+) -> Option<eliot_maintenance::RetainedImprovementProposal> {
     let prepared = {
         let guard = composition.lock().await;
         improvement_intake_artifact(&guard, observation)
@@ -5165,16 +5200,34 @@ async fn run_improvement_intake(
                 &error,
             )
             .emit();
-            return Ok(());
+            // A pass that never assembled a candidate reached no route, so it
+            // retains nothing new; the prior admitted record stays.
+            return retained;
         }
     };
     // The deduplication registry, read back from the records this daemon
     // committed, at the fence this pass admitted under. Unguarded: the read is
     // an authenticated Kernel exchange and the composition guard is not held
     // across it.
-    let rows = eliotd::improvement_dedup_read::read_candidate_scope(kernel, &fence)
-        .await
-        .map_err(|error| error.to_string())?;
+    //
+    // A refused or unexhausted read is this phase's own diagnostic, exactly as
+    // the three phases below treat their refusals, so every phase of this step
+    // reports at its own site rather than one of them reporting as another's. The
+    // pass STOPS here: it is never treated as an empty registry, because
+    // admitting against "nothing was there" is precisely the failure this read
+    // exists to prevent.
+    let rows = match eliotd::improvement_dedup_read::read_candidate_scope(kernel, &fence).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            let _ = eliotd::diagnostics::ErrorRecord::of(
+                eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                "improvement-dedup-read",
+                &error.to_string(),
+            )
+            .emit();
+            return retained;
+        }
+    };
     let restored = rows.len();
     let admitted = {
         let guard = composition.lock().await;
@@ -5189,7 +5242,10 @@ async fn run_improvement_intake(
                 &error,
             )
             .emit();
-            return Ok(());
+            // The route step is not attempted: it routes the artifact this pass
+            // was about to admit, and nothing was admitted. The prior admitted
+            // record stays.
+            return retained;
         }
     };
     let committed = {
@@ -5258,13 +5314,22 @@ async fn run_improvement_intake(
     // It is pure with respect to the Kernel — no exchange, no write — so it
     // needs no guard and adds no fifth phase of durability. The outcome is read
     // and recorded by [`report_improvement_candidate_route`], which is where a
-    // canary handoff is checked against this build's identity and where an
-    // unresolved external effect is named instead of dropped.
+    // canary handoff is checked against this build's identity, where an
+    // unresolved external effect is named instead of dropped, and where the
+    // record the NEXT pass compares against is settled.
     let routed = eliotd::improvement_candidate_dispatch::dispatch_improvement_candidate_route(
-        &artifact, &policy, &fence,
+        eliotd::improvement_candidate_dispatch::ImprovementRouteDispatch {
+            artifact: &artifact,
+            policy: &policy,
+            state_fence: &fence,
+            retained: retained.as_ref(),
+        },
     );
-    report_improvement_candidate_route(&artifact.candidate.candidate_id, routed);
-    Ok(())
+    report_improvement_candidate_route(
+        &artifact.candidate.candidate_id,
+        routed,
+        retained,
+    )
 }
 
 /// Reads one improvement-candidate route outcome and records what it actually
@@ -5299,7 +5364,15 @@ async fn run_improvement_intake(
 ///   exhaustively by `improvement_dedup_read::classify_row`, which refuses any
 ///   document shape beyond the three it knows, so a fourth `Candidate` document
 ///   would stop every later pass.
+/// - The `CanaryAdmitted` arm also names the repeat assessment the pipeline
+///   derived against the retained prior record, so an absent assessment is
+///   visibly the denial it is rather than a silent omission.
 /// - Every other terminal disposition keeps the verbatim record it always had.
+///
+/// The return value is the pipeline-checked current record the NEXT pass
+/// compares against, or the record this call was handed when the pass was not
+/// admitted. A refusal is not evidence that the last admitted record stopped
+/// existing, so the `Err` arm settles on the record the flight already held.
 ///
 /// A typed `PipelineError` from the route or from the identity check is a
 /// diagnostic under the same discipline as the other refusals in the pass, never
@@ -5314,77 +5387,93 @@ fn report_improvement_candidate_route(
         eliotd::improvement_candidate_dispatch::ImprovementRouteOutcome,
         eliot_maintenance::PipelineError,
     >,
-) {
+    retained: Option<eliot_maintenance::RetainedImprovementProposal>,
+) -> Option<eliot_maintenance::RetainedImprovementProposal> {
     match routed {
-        Ok(outcome) => match outcome.disposition {
-            // The identity check is NOT repeated here. `dispatch_improvement_candidate_route`
-            // already ran `check_handoff_consumable`, which applies both
-            // Governor-owned checks against the handoff's OWN recorded wire
-            // revision, commitment, discriminator and material-equality key, bound
-            // to the exact experiment plan this run passed to the pipeline. A
-            // `CanaryAdmitted` disposition therefore arrives here only if that
-            // record passed, and a refusal crossed as the typed `PipelineError`
-            // in the `Err` arm below with no disposition returned at all. Running
-            // the same check twice would be a second opinion about one record.
-            eliot_maintenance::ImprovementTerminalDisposition::CanaryAdmitted { handoff } => {
-                tracing::info!(
+        Ok(outcome) => {
+            match outcome.disposition {
+                // The identity check is NOT repeated here. `dispatch_improvement_candidate_route`
+                // already ran `check_handoff_consumable`, which applies both
+                // Governor-owned checks against the handoff's OWN recorded wire
+                // revision, commitment, discriminator and material-equality key, bound
+                // to the exact experiment plan this run passed to the pipeline. A
+                // `CanaryAdmitted` disposition therefore arrives here only if that
+                // record passed, and a refusal crossed as the typed `PipelineError`
+                // in the `Err` arm below with no disposition returned at all. Running
+                // the same check twice would be a second opinion about one record.
+                eliot_maintenance::ImprovementTerminalDisposition::CanaryAdmitted { handoff } => {
+                    tracing::info!(
+                        target: "eliotd::diagnostics",
+                        event = "eliotd.improvement_canary_handoff_checked",
+                        candidate_id = %handoff.candidate_id,
+                        proposal_id = %handoff.proposal_id,
+                        experiment_id = %handoff.experiment_id,
+                        operation_ref = %handoff.operation_ref,
+                        idempotency_key = %handoff.idempotency_key,
+                        // The identity this build checked and read, named so the
+                        // record's version is visible next to the disposition
+                        // rather than buried in an opaque projection string.
+                        wire_revision = handoff.wire_revision,
+                        commitment_domain = %handoff.proposal_commitment.domain,
+                        commitment_encoding_version = %handoff.proposal_commitment.encoding_version,
+                        commitment_algorithm = %handoff.proposal_commitment.algorithm,
+                        // The recorded digest, read as recorded. This is the
+                        // value the pipeline committed, not one derived here.
+                        proposal_commitment = %handoff.proposal_commitment.digest,
+                        discriminator_domain = %handoff.proposal_discriminator.domain,
+                        material_equality_domain = %handoff.proposal_material_equality.domain,
+                        // Always false: a handoff is a request for the Kernel
+                        // owner to authorize, never an authorization.
+                        execution_authorized = handoff.execution_authorized,
+                        activation_owner_id = %handoff.activation_owner_id,
+                        // The repeat assessment the pipeline derived against the
+                        // retained prior record, when both records existed. `None`
+                        // on every pass that was not admitted, which is every pass on
+                        // this workspace: the execution gate refuses first, so no
+                        // current record is ever published. Recorded so an absent
+                        // assessment is visibly the denial it is rather than a silent
+                        // omission.
+                        repeat = ?outcome.repeat,
+                    );
+                }
+                eliot_maintenance::ImprovementTerminalDisposition::UnknownRequiresReconciliation {
+                    obligation,
+                } => tracing::warn!(
                     target: "eliotd::diagnostics",
-                    event = "eliotd.improvement_canary_handoff_checked",
-                    candidate_id = %handoff.candidate_id,
-                    proposal_id = %handoff.proposal_id,
-                    experiment_id = %handoff.experiment_id,
-                    operation_ref = %handoff.operation_ref,
-                    idempotency_key = %handoff.idempotency_key,
-                    // The identity this build checked and read, named so the
-                    // record's version is visible next to the disposition
-                    // rather than buried in an opaque projection string.
-                    wire_revision = handoff.wire_revision,
-                    commitment_domain = %handoff.proposal_commitment.domain,
-                    commitment_encoding_version = %handoff.proposal_commitment.encoding_version,
-                    commitment_algorithm = %handoff.proposal_commitment.algorithm,
-                    // The recorded digest, read as recorded. This is the
-                    // value the pipeline committed, not one derived here.
-                    proposal_commitment = %handoff.proposal_commitment.digest,
-                    discriminator_domain = %handoff.proposal_discriminator.domain,
-                    material_equality_domain = %handoff.proposal_material_equality.domain,
-                    // Always false: a handoff is a request for the Kernel
-                    // owner to authorize, never an authorization.
-                    execution_authorized = handoff.execution_authorized,
-                    activation_owner_id = %handoff.activation_owner_id,
-                );
+                    event = "eliotd.improvement_unknown_effect_outstanding",
+                    // Read first, from the effect owner's own stored value and never
+                    // asserted here: the gate denies until that owner settles the
+                    // effect. The identity fields below are then named verbatim.
+                    retry_permitted = obligation.retry_permitted(),
+                    candidate_id = %obligation.candidate_id,
+                    experiment_id = %obligation.experiment_id,
+                    commitment_domain = %obligation.commitment.domain,
+                    commitment_encoding_version = %obligation.commitment.encoding_version,
+                    commitment_algorithm = %obligation.commitment.algorithm,
+                    proposal_commitment = %obligation.commitment.digest,
+                    owner_id = %obligation.owner_id,
+                    forward_repair_ref = %obligation.forward_repair_ref,
+                    invalidation_targets = ?obligation.invalidation_set,
+                    // Stated, not implied: this debt is NAMED here, not stored.
+                    durable = false,
+                ),
+                disposition => {
+                    tracing::info!(
+                        target: "eliotd::diagnostics",
+                        event = "eliotd.improvement_candidate_routed",
+                        candidate_id,
+                        // The pipeline's own advisory-only terminal disposition,
+                        // recorded verbatim.
+                        disposition = ?disposition,
+                    );
+                }
             }
-            eliot_maintenance::ImprovementTerminalDisposition::UnknownRequiresReconciliation {
-                obligation,
-            } => tracing::warn!(
-                target: "eliotd::diagnostics",
-                event = "eliotd.improvement_unknown_effect_outstanding",
-                // Read first, from the effect owner's own stored value and never
-                // asserted here: the gate denies until that owner settles the
-                // effect. The identity fields below are then named verbatim.
-                retry_permitted = obligation.retry_permitted(),
-                candidate_id = %obligation.candidate_id,
-                experiment_id = %obligation.experiment_id,
-                commitment_domain = %obligation.commitment.domain,
-                commitment_encoding_version = %obligation.commitment.encoding_version,
-                commitment_algorithm = %obligation.commitment.algorithm,
-                proposal_commitment = %obligation.commitment.digest,
-                owner_id = %obligation.owner_id,
-                forward_repair_ref = %obligation.forward_repair_ref,
-                invalidation_targets = ?obligation.invalidation_set,
-                // Stated, not implied: this debt is NAMED here, not stored.
-                durable = false,
-            ),
-            disposition => {
-                tracing::info!(
-                    target: "eliotd::diagnostics",
-                    event = "eliotd.improvement_candidate_routed",
-                    candidate_id,
-                    // The pipeline's own advisory-only terminal disposition,
-                    // recorded verbatim.
-                    disposition = ?disposition,
-                );
-            }
-        },
+            // Only an ADMITTED pass publishes a checked current record, so only
+            // an admitted pass replaces what the next pass compares against.
+            // Every other outcome — including the refusal below — settles on the
+            // record the flight already held.
+            outcome.retained_next
+        }
         Err(error) => {
             let _ = eliotd::diagnostics::ErrorRecord::of(
                 eliotd::diagnostics::OwningComponent::DaemonRuntime,
@@ -5392,6 +5481,11 @@ fn report_improvement_candidate_route(
                 &error.to_string(),
             )
             .emit();
+            // A refusal produced no checked record, so the pass retains nothing
+            // NEW. The previously retained record stays in the flight: a refused
+            // pass is not evidence that the prior admitted record stopped
+            // existing.
+            retained
         }
     }
 }
@@ -5469,6 +5563,12 @@ fn improvement_intake_observation(
 /// performs an authenticated named read — the deduplication-registry read-back
 /// — as well as the durable write. It is the same retained transport every
 /// other read in this loop uses, not a second client.
+///
+/// The retained prior record is CLONED into the future rather than moved, because
+/// the flight keeps holding it until this very step settles: a step that fails
+/// or refuses still leaves the last admitted record in place for the pass after
+/// it. Only settlement replaces it, and only with a record the pipeline itself
+/// committed on an admitted pass.
 fn maybe_start_improvement_intake(
     kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
@@ -5476,16 +5576,18 @@ fn maybe_start_improvement_intake(
     startup_readiness: &StartupReadinessProjection,
     flight: &mut ImprovementIntakeFlight,
 ) {
-    if !matches!(flight, ImprovementIntakeFlight::Idle) {
-        return;
-    }
+    let retained = match flight {
+        ImprovementIntakeFlight::Idle { retained } => retained.clone(),
+        ImprovementIntakeFlight::InFlight(_) => return,
+    };
     let observation = improvement_intake_observation(activation_flight, startup_readiness);
     let kernel = Arc::clone(kernel);
     let composition = Arc::clone(composition);
     *flight = ImprovementIntakeFlight::InFlight(ImprovementIntakeFlightState {
         future: Box::pin(async move {
-            let result = run_improvement_intake(&kernel, &composition, observation).await;
-            ImprovementIntakeCompletion::Settled(result)
+            let retained_next =
+                run_improvement_intake(&kernel, &composition, observation, retained).await;
+            ImprovementIntakeCompletion::Settled(retained_next)
         }),
     });
 }
@@ -5496,29 +5598,24 @@ async fn next_improvement_intake_completion(
     flight: &mut ImprovementIntakeFlight,
 ) -> ImprovementIntakeCompletion {
     match flight {
-        ImprovementIntakeFlight::Idle => std::future::pending().await,
+        ImprovementIntakeFlight::Idle { .. } => std::future::pending().await,
         ImprovementIntakeFlight::InFlight(state) => (&mut state.future).await,
     }
 }
 
 /// Releases a completed improvement-intake flight so a later cadence
 /// observation can start. Settlement itself is synchronous and cannot block
-/// the run loop; the step never fails the loop, so every outcome idles. The
-/// settled result is consumed here so a step that did not complete is still
-/// recorded as a diagnostic rather than dropped.
+/// the run loop; the step never fails the loop, so every outcome idles.
+///
+/// The record the step retained goes back into `Idle` and is the input to the
+/// NEXT pass's repeat assessment. It is the pipeline's own checked record, not a
+/// recomputation; see [`ImprovementIntakeFlight`].
 fn settle_improvement_intake_completion(
     flight: &mut ImprovementIntakeFlight,
     completion: ImprovementIntakeCompletion,
 ) {
-    if let ImprovementIntakeCompletion::Settled(Err(error)) = completion {
-        let _ = eliotd::diagnostics::ErrorRecord::of(
-            eliotd::diagnostics::OwningComponent::DaemonRuntime,
-            "improvement-intake-settle",
-            &error,
-        )
-        .emit();
-    }
-    *flight = ImprovementIntakeFlight::Idle;
+    let ImprovementIntakeCompletion::Settled(retained) = completion;
+    *flight = ImprovementIntakeFlight::Idle { retained };
 }
 
 /// Pure tick gate: the `TestD` owner timer starts work only when the flight
