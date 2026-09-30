@@ -51,25 +51,34 @@ const USER_BROKER_REGISTRATION_OPERATION: &str = "eliot.user-broker.register";
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserBrokerProtectedPaths {
+    /// Protected immutable installation profile path.
+    pub profile_path: PlatformHandle,
     /// Protected immutable client declaration template path.
     pub client_declaration_path: PlatformHandle,
 }
 
-/// Derives the protected broker declaration record path below an explicit Host
-/// root.
+/// Derives the protected broker profile/declaration record pair below an
+/// explicit Host root.
+///
+/// Both leaves are installation-owned names derived from the same protected
+/// root, exactly as the agent bridge's pair is, so the publisher never invents
+/// a destination and a predictable name is never mistaken for ownership.
 pub fn derive_user_broker_protected_paths(
     host_state_root: &PlatformHandle,
 ) -> Result<UserBrokerProtectedPaths, InstallationError> {
     let root = Path::new(host_state_root.as_str());
     validate_absolute_root(root, "user_broker.host_state_root")?;
+    let profile = root.join("user-broker").join("profile-v1.json");
     let declaration = root.join("user-broker").join("client-declaration-v1.json");
-    if !declaration.starts_with(root) {
+    if !profile.starts_with(root) || !declaration.starts_with(root) {
         return Err(InstallationError::InvalidField {
             field: "user_broker.host_state_root".to_owned(),
             reason: "derived profile paths escaped the Host state root".to_owned(),
         });
     }
     Ok(UserBrokerProtectedPaths {
+        profile_path: PlatformHandle::new(profile.to_string_lossy().into_owned())
+            .map_err(|error| InstallationError::Platform(error.to_string()))?,
         client_declaration_path: PlatformHandle::new(declaration.to_string_lossy().into_owned())
             .map_err(|error| InstallationError::Platform(error.to_string()))?,
     })

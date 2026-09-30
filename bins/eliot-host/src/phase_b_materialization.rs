@@ -8,6 +8,7 @@ use eliot_installation::{
     AGENT_BRIDGE_MODULE_ID, AgentBridgeInstallationProfile, AgentBridgePhaseBBinding,
     AgentBridgePreparedBinding, AgentBridgeSourceMaterializationPlan, AgentBridgeStagePrepared,
     HostPhaseBMaterializationIntent, InstallationProfile, UserBrokerInstallationProfile,
+    UserBrokerPreparedBinding,
 };
 use eliot_kernel_service::{
     AGENT_BRIDGE_ADMISSION_DESCRIPTOR_WIRE_ID, AGENT_BRIDGE_ADMISSION_DESCRIPTOR_WIRE_VERSION,
@@ -273,7 +274,9 @@ pub(super) struct AgentBridgePreparedMaterialization {
 /// serving Kernel admits exactly. That declaration is installation-owned: this
 /// record carries the canonical profile bytes, the canonical declaration bytes,
 /// and the SHA-256 of each, recomputed here from those bytes rather than copied
-/// from the profile's own field.
+/// from the profile's own field, plus the durable
+/// [`UserBrokerPreparedBinding`] that a later generation cutover reads to admit
+/// only the previous installation's own bytes for replacement.
 #[cfg(windows)]
 pub(super) struct UserBrokerClientMaterialization {
     /// Installation-owned static profile that carries the declaration.
@@ -286,6 +289,30 @@ pub(super) struct UserBrokerClientMaterialization {
     pub declaration_bytes: Vec<u8>,
     /// Lowercase SHA-256 over the canonical client declaration bytes.
     pub declaration_digest: PlatformHandle,
+    /// Durable protected-pair proof carried on the Phase-B binding.
+    pub binding: UserBrokerPreparedBinding,
+}
+
+/// Builds the durable protected-pair binding from the materialised bytes.
+///
+/// This is the only producer. The paths are the installation-derived
+/// `protected_paths` of the profile itself, never Host-supplied names, and both
+/// digests are the ones just recomputed from the canonical bytes.
+#[cfg(windows)]
+fn user_broker_prepared_binding(
+    profile: &UserBrokerInstallationProfile,
+    profile_digest: &PlatformHandle,
+    declaration_digest: &PlatformHandle,
+) -> Result<UserBrokerPreparedBinding, HostError> {
+    UserBrokerPreparedBinding::new(
+        profile.installation_id.clone(),
+        profile.profile_id.clone(),
+        profile.protected_paths.profile_path.clone(),
+        profile_digest.clone(),
+        profile.protected_paths.client_declaration_path.clone(),
+        declaration_digest.clone(),
+    )
+    .map_err(HostError::Installation)
 }
 
 /// Materialises the User Broker client declaration for one approved Phase-B
@@ -331,6 +358,7 @@ pub(super) fn materialize_user_broker_client_declaration(
                 .to_owned(),
         ));
     }
+    let binding = user_broker_prepared_binding(&profile, &profile_digest, &declaration_digest)?;
     // WORK_UNIT_CASE: 1777/W1 — declaration materialised and its digest
     // recomputed from the canonical bytes; classification only.
     phase_b_materialization_observe_bound(&MaterializationObservation::for_user_broker(
@@ -345,7 +373,154 @@ pub(super) fn materialize_user_broker_client_declaration(
         profile_digest,
         declaration_bytes,
         declaration_digest,
+        binding,
     })
+}
+
+/// Publishes the protected User Broker profile/declaration pair and proves the
+/// committed bytes by exact readback.
+///
+/// The pair is written through the same retained path-lease owner the Agent
+/// Bridge pair uses, into the child directory this operation itself creates and
+/// retains ([`eliot_platform_windows::ensure_user_broker_directory`]); the
+/// predictable leaf name is therefore never treated as ownership. Any existing
+/// bytes at either leaf must be one of `allowed_*_digests`, so a generation
+/// cutover admits only the previous installation's own recorded record and
+/// unrelated bytes remain a hard recovery failure.
+#[cfg(windows)]
+pub(super) fn publish_user_broker_client(
+    profile: InstallationProfile,
+    portable_root: Option<&UserOwnedRootLease>,
+    materialization: &UserBrokerClientMaterialization,
+    allowed_profile_digests: &[&PlatformHandle],
+    allowed_declaration_digests: &[&PlatformHandle],
+) -> Result<(), HostError> {
+    // WORK_UNIT_CASE: 1777/W1 — broker front-door publication requested; the
+    // committed pair is observed only after exact readback below.
+    let generation = materialization
+        .profile
+        .module_generation
+        .generation
+        .value()
+        .to_string();
+    phase_b_materialization_observe_bound(&MaterializationObservation::for_user_broker(
+        "host.phase-b-broker pair publish requested",
+        materialization.profile.installation_id.as_str(),
+        &generation,
+        materialization.binding.declaration_digest.as_str(),
+    ));
+    let binding = &materialization.binding;
+    let host_state_root = Path::new(binding.declaration_path.as_str())
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| {
+            HostError::RecoveryRequired("User Broker declaration has no Host state root".to_owned())
+        })?;
+    eliot_platform_windows::ensure_user_broker_directory(host_state_root).map_err(|error| {
+        HostError::RecoveryRequired(format!("create User Broker directory: {error}"))
+    })?;
+    phase_b_materialize_file(
+        profile,
+        portable_root,
+        Path::new(binding.profile_path.as_str()),
+        &materialization.profile_bytes,
+        allowed_profile_digests,
+        "User Broker installation profile",
+    )?;
+    phase_b_materialize_file(
+        profile,
+        portable_root,
+        Path::new(binding.declaration_path.as_str()),
+        &materialization.declaration_bytes,
+        allowed_declaration_digests,
+        "User Broker client declaration",
+    )?;
+    verify_user_broker_pair_readback(&materialization.binding)?;
+    // WORK_UNIT_CASE: 1777/W1 — pair publication observed committed by exact
+    // readback; the request above stays distinct.
+    phase_b_materialization_observe_bound(&MaterializationObservation::for_user_broker(
+        "host.phase-b-broker pair publish observed commit",
+        materialization.profile.installation_id.as_str(),
+        &generation,
+        materialization.binding.declaration_digest.as_str(),
+    ));
+    Ok(())
+}
+
+/// Reopens the exact protected User Broker pair and refuses any leaf whose
+/// bytes are not the ones the durable binding records.
+///
+/// This is the readback half of the publication: the freshly recomputed digest
+/// never substitutes for the recorded one, and a missing, truncated, or
+/// substituted leaf is a recovery failure rather than a silent republish.
+#[cfg(windows)]
+pub(super) fn verify_user_broker_pair_readback(
+    binding: &UserBrokerPreparedBinding,
+) -> Result<(), HostError> {
+    binding.validate().map_err(HostError::Installation)?;
+    let profile_bytes = read_protected_record_leaf(
+        Path::new(binding.profile_path.as_str()),
+        "User Broker installation profile",
+    )?;
+    if phase_b_bytes_digest(&profile_bytes)? != binding.profile_digest {
+        return Err(HostError::RecoveryRequired(
+            "User Broker profile readback digest differs from durable binding".to_owned(),
+        ));
+    }
+    let profile: UserBrokerInstallationProfile =
+        serde_json::from_slice(&profile_bytes).map_err(|error| {
+            HostError::RecoveryRequired(format!("decode User Broker profile: {error}"))
+        })?;
+    profile.validate().map_err(HostError::Installation)?;
+    if profile.installation_id != binding.installation_id
+        || profile.profile_id != binding.profile_id
+        || profile.protected_paths.profile_path != binding.profile_path
+        || profile.protected_paths.client_declaration_path != binding.declaration_path
+        || profile.client_declaration.declaration_sha256 != binding.declaration_digest.as_str()
+    {
+        return Err(HostError::RecoveryRequired(
+            "User Broker profile is not bound to the exact durable record pair".to_owned(),
+        ));
+    }
+    let declaration_bytes = read_protected_record_leaf(
+        Path::new(binding.declaration_path.as_str()),
+        "User Broker client declaration",
+    )?;
+    if phase_b_bytes_digest(&declaration_bytes)? != binding.declaration_digest {
+        return Err(HostError::RecoveryRequired(
+            "User Broker declaration readback digest differs from durable binding".to_owned(),
+        ));
+    }
+    let declaration: eliot_protocol::UserBrokerClientDeclaration =
+        serde_json::from_slice(&declaration_bytes).map_err(|error| {
+            HostError::RecoveryRequired(format!("decode User Broker declaration: {error}"))
+        })?;
+    declaration.validate().map_err(|error| {
+        HostError::RecoveryRequired(format!("validate User Broker declaration: {error}"))
+    })?;
+    if declaration != profile.client_declaration
+        || declaration
+            .compute_digest()
+            .map_err(|error| {
+                HostError::RecoveryRequired(format!("digest User Broker declaration: {error}"))
+            })?
+            .as_str()
+            != binding.declaration_digest.as_str()
+    {
+        return Err(HostError::RecoveryRequired(
+            "User Broker declaration is not bound to the retained profile".to_owned(),
+        ));
+    }
+    // WORK_UNIT_CASE: 1777/W1 — pair readback is exact against the durable
+    // binding; classification only, no publication here.
+    let generation = profile.module_generation.generation.value().to_string();
+    phase_b_materialization_observe_bound(&MaterializationObservation::for_user_broker(
+        "host.phase-b-broker pair readback exact",
+        binding.installation_id.as_str(),
+        &generation,
+        binding.declaration_digest.as_str(),
+    ));
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -606,15 +781,15 @@ pub(super) fn verify_agent_bridge_pair_readback(
         (
             binding.profile_path.as_str(),
             &binding.profile_digest,
-            "profile",
+            "Agent Bridge profile",
         ),
         (
             binding.declaration_path.as_str(),
             &binding.declaration_digest,
-            "declaration",
+            "Agent Bridge declaration",
         ),
     ] {
-        let (_, bytes) = read_agent_bridge_leaf(Path::new(path))?;
+        let bytes = read_protected_record_leaf(Path::new(path), label)?;
         if phase_b_bytes_digest(&bytes)? != *expected {
             return Err(HostError::RecoveryRequired(format!(
                 "Agent Bridge {label} readback digest differs from durable binding"
@@ -631,30 +806,30 @@ pub(super) fn verify_agent_bridge_pair_readback(
 }
 
 #[cfg(windows)]
-fn read_agent_bridge_leaf(path: &Path) -> Result<(FileIdentity, Vec<u8>), HostError> {
-    let (identity, mut file) = eliot_platform_windows::open_no_follow_file(path)
-        .map_err(|error| HostError::RecoveryRequired(format!("open Agent Bridge leaf: {error}")))?;
+fn read_protected_record_leaf(path: &Path, label: &str) -> Result<Vec<u8>, HostError> {
+    let (_, mut file) = eliot_platform_windows::open_no_follow_file(path)
+        .map_err(|error| HostError::RecoveryRequired(format!("open {label} leaf: {error}")))?;
     let length = file
         .metadata()
-        .map_err(|error| HostError::RecoveryRequired(format!("stat Agent Bridge leaf: {error}")))?
+        .map_err(|error| HostError::RecoveryRequired(format!("stat {label} leaf: {error}")))?
         .len();
     if length == 0 || length > 16 * 1024 * 1024 {
-        return Err(HostError::RecoveryRequired(
-            "Agent Bridge leaf has an invalid bounded size".to_owned(),
-        ));
+        return Err(HostError::RecoveryRequired(format!(
+            "{label} leaf has an invalid bounded size"
+        )));
     }
     let capacity = usize::try_from(length).map_err(|_| {
-        HostError::RecoveryRequired("Agent Bridge leaf size exceeds addressable memory".to_owned())
+        HostError::RecoveryRequired(format!("{label} leaf size exceeds addressable memory"))
     })?;
     let mut bytes = Vec::with_capacity(capacity);
     file.read_to_end(&mut bytes)
-        .map_err(|error| HostError::RecoveryRequired(format!("read Agent Bridge leaf: {error}")))?;
+        .map_err(|error| HostError::RecoveryRequired(format!("read {label} leaf: {error}")))?;
     if bytes.len() as u64 != length {
-        return Err(HostError::RecoveryRequired(
-            "Agent Bridge leaf changed while being read".to_owned(),
-        ));
+        return Err(HostError::RecoveryRequired(format!(
+            "{label} leaf changed while being read"
+        )));
     }
-    Ok((identity, bytes))
+    Ok(bytes)
 }
 
 #[cfg(windows)]

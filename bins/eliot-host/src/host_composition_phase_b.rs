@@ -6,9 +6,9 @@ use super::launch_descriptor_validation::verify_user_broker_artifact;
 #[cfg(windows)]
 use super::phase_b_materialization::{
     materialize_user_broker_client_declaration, prepare_agent_bridge_materialization,
-    publish_agent_bridge_pair, rehydrate_agent_bridge_binding,
+    publish_agent_bridge_pair, publish_user_broker_client, rehydrate_agent_bridge_binding,
     rehydrate_agent_bridge_binding_from_pending, retain_agent_bridge_profile,
-    rollback_agent_bridge_pair, rollback_agent_bridge_stage,
+    rollback_agent_bridge_pair, rollback_agent_bridge_stage, verify_user_broker_pair_readback,
 };
 #[cfg(windows)]
 use eliot_platform_windows::reconcile_agent_bridge_stage;
@@ -748,6 +748,22 @@ impl HostComposition {
         let mut agent_bridge_materialization = None;
         #[cfg(windows)]
         let mut agent_bridge_binding = None;
+        // The protected User Broker front-door pair is installation-derived, not
+        // generation-derived: a Host-epoch rebind republishes the same contour
+        // and therefore carries the committed pair forward instead of minting a
+        // new one. The carried binding is re-proved against the live leaves
+        // below, so a rebind can never keep a record that is no longer exact.
+        #[cfg(windows)]
+        let carried_user_broker = durable_prior_binding
+            .and_then(|binding| binding.user_broker.as_ref())
+            .cloned();
+        #[cfg(windows)]
+        let mut user_broker_binding = Some(user_broker_client.binding.clone());
+        // Only the pending (generation cutover) contour publishes the pair. An
+        // active rebind republishes the same contour under a fresh Host epoch,
+        // so it re-proves the committed leaves above instead of writing again.
+        #[cfg(windows)]
+        let mut publish_user_broker_pair = true;
         let prepared = if let Some(pending) = pending.as_ref() {
             let intent = pending.phase_b_intent.as_ref().ok_or_else(|| {
                 HostError::RecoveryRequired(
@@ -848,6 +864,7 @@ impl HostComposition {
                 semantic_config_hash: semantic_config_hash.clone(),
                 launch: launch.clone(),
                 agent_bridge: agent_bridge_binding.clone(),
+                user_broker: user_broker_binding.clone(),
                 prepared_digest: PlatformHandle::new("pending")
                     .map_err(|error| HostError::Platform(error.to_string()))?,
             };
@@ -872,6 +889,13 @@ impl HostComposition {
                         .map(|final_binding| final_binding.prepared)
                 })
                 .transpose()?;
+            // A rebind does not re-derive the broker front door: it re-proves
+            // the committed pair against the live leaves and carries it forward.
+            user_broker_binding = carried_user_broker;
+            publish_user_broker_pair = false;
+            if let Some(carried) = user_broker_binding.as_ref() {
+                verify_user_broker_pair_readback(carried)?;
+            }
             let mut prepared = HostPhaseBPreparedMaterialization {
                 wire: PlatformHandle::new(HostPhaseBPreparedMaterialization::WIRE)
                     .map_err(|error| HostError::Platform(error.to_string()))?,
@@ -910,6 +934,7 @@ impl HostComposition {
                 semantic_config_hash: semantic_config_hash.clone(),
                 launch: launch.clone(),
                 agent_bridge: agent_bridge_binding.clone(),
+                user_broker: user_broker_binding.clone(),
                 prepared_digest: PlatformHandle::new("pending")
                     .map_err(|error| HostError::Platform(error.to_string()))?,
             };
@@ -1035,6 +1060,41 @@ impl HostComposition {
                 &bridge_allowed_declaration_digests,
             )?;
         }
+        if publish_user_broker_pair {
+            // The broker front door is always materialised for this contour, so
+            // the pair is always published and always read back. Only the
+            // previous committed installation's own recorded digests may be
+            // replaced; an unrelated leaf is a hard recovery failure.
+            let mut broker_allowed_profile_digests =
+                vec![&user_broker_client.binding.profile_digest];
+            let mut broker_allowed_declaration_digests =
+                vec![&user_broker_client.binding.declaration_digest];
+            if let Some(previous_broker) = self
+                .registry
+                .last_committed_activation_fence()
+                .and_then(|fence| fence.phase_b_live_binding.as_ref())
+                .and_then(|binding| binding.user_broker.as_ref())
+            {
+                previous_broker
+                    .validate()
+                    .map_err(HostError::Installation)?;
+                if previous_broker.installation_id != user_broker_client.binding.installation_id {
+                    return Err(HostError::RecoveryRequired(
+                        "prior User Broker record pair belongs to a different installation"
+                            .to_owned(),
+                    ));
+                }
+                broker_allowed_profile_digests.push(&previous_broker.profile_digest);
+                broker_allowed_declaration_digests.push(&previous_broker.declaration_digest);
+            }
+            publish_user_broker_client(
+                profile,
+                portable_root.as_ref(),
+                &user_broker_client,
+                &broker_allowed_profile_digests,
+                &broker_allowed_declaration_digests,
+            )?;
+        }
         let receipt = HostPhaseBMaterialization {
             transaction_id: None,
             effect_id: None,
@@ -1060,6 +1120,7 @@ impl HostComposition {
             ],
             agent_bridge: agent_bridge_binding,
             agent_bridge_final: None,
+            user_broker: user_broker_binding,
             launch,
         };
         self.phase_b = Some(receipt.clone());
@@ -1581,6 +1642,7 @@ impl HostComposition {
             eliotd_descriptor_digest: prepared.eliotd_descriptor_digest.clone(),
             agent_bridge,
             agent_bridge_final,
+            user_broker: prepared.user_broker.clone(),
             request_digest: Some(prepared.request_digest.clone()),
             public_receipt_digest,
             file_identities: [

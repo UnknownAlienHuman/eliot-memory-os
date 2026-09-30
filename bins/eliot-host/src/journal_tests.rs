@@ -993,6 +993,7 @@ fn active_startup_prior_binding(
             manifest.runtime_launch.authority_generation,
         ),
         agent_bridge: None,
+        user_broker: None,
     }
 }
 
@@ -2576,6 +2577,7 @@ fn production_host_journal_crash_retry_substitution_and_reset_negatives() -> Tes
             ResourceGeneration::genesis(),
         ),
         agent_bridge: None,
+        user_broker: None,
     };
     let fresh_intent = ActivePhaseBRebindIntent::new(
         handle(&"b".repeat(64))?,
