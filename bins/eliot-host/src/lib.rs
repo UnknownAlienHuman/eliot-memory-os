@@ -6816,8 +6816,8 @@ impl HostComposition {
                 .to_owned()
         })?;
         let capability = self.owner_lease.activation_capability();
-        if let Ok((retained, materialisation)) = store
-            .read_prepared_isolated_destination_creation(&capability, &facts.operation_id)
+        if let Ok((retained, materialisation)) =
+            store.read_prepared_isolated_destination_creation(&capability, &facts.operation_id)
         {
             if retained.archive_id != facts.archive_id
                 || retained.archive_digest != facts.archive_digest
@@ -6889,12 +6889,11 @@ impl HostComposition {
         // record: nothing is retained, and a publication that committed without a
         // readable identity leaves the created root preserved, never removed by
         // path name.
-        let materialisation =
-            eliot_installation::materialise_prepared_isolated_destination(
-                &allocation.admission,
-                &area_lease,
-            )
-            .map_err(Self::isolated_destination_reason)?;
+        let materialisation = eliot_installation::materialise_prepared_isolated_destination(
+            &allocation.admission,
+            &area_lease,
+        )
+        .map_err(Self::isolated_destination_reason)?;
 
         // One compare-and-swap writes the admission and its materialisation
         // together, under the registry CAS revision fence and the live exclusive
