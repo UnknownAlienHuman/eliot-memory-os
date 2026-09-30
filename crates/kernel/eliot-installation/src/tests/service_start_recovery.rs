@@ -263,6 +263,7 @@ fn race_rollback_inputs(
                 credential_receipt: None,
                 staging_receipt: None,
                 phase_b_receipt: None,
+                system_service_host_root_receipt: None,
                 service_runtime_lineage: None,
             },
         ));
@@ -333,6 +334,7 @@ fn start_service_race_already_running_never_becomes_owned_or_stopped() {
                 credential_receipt: None,
                 staging_receipt: None,
                 phase_b_receipt: None,
+                system_service_host_root_receipt: None,
                 service_runtime_lineage: None,
             },
         )],

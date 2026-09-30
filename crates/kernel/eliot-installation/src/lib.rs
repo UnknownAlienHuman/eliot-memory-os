@@ -3984,6 +3984,15 @@ pub enum InstallationEffectObservation {
         /// Box the wire receipt so one large typed observation does not inflate
         /// every provider-neutral observation value in memory.
         phase_b_receipt: Option<Box<HostPhaseBMaterializationReceipt>>,
+        /// Original Host-root identity captured by a MAC-verified
+        /// `SystemService` `CreateRoot` readback. The coordinator accepts it
+        /// only when this exact effect's planned root is the candidate
+        /// manifest Host-state root, then compares it with a retained live
+        /// lease before persisting it with the `Applied` transition. This is
+        /// transient port readback data; only the typed transaction receipt is
+        /// persisted, and no serialized observation is read back from older
+        /// transaction state.
+        system_service_host_root_receipt: Option<SystemServiceHostRootReceipt>,
         /// Provider-authenticated process lineage for a matching `StartService`
         /// readback; absent for all non-service effects.
         service_runtime_lineage: Option<InstallationServiceProcessLineage>,
@@ -4154,6 +4163,16 @@ impl InstallationEffectObservation {
                 "Phase-B matching readback requires its typed receipt".to_owned(),
             ));
         }
+        if let Self::Matching {
+            system_service_host_root_receipt: Some(receipt),
+            ..
+        } = self
+        {
+            if !matches!(effect, InstallerEffectPlan::CreateRoot { .. }) {
+                return Err(InstallationError::IdentityConflict);
+            }
+            receipt.validate()?;
+        }
         if !matches!(effect, InstallerEffectPlan::StartService { .. })
             && matches!(
                 self,
@@ -4226,6 +4245,7 @@ impl InstallationEffectObservation {
                 credential_receipt,
                 staging_receipt,
                 phase_b_receipt,
+                system_service_host_root_receipt,
                 service_runtime_lineage,
                 ..
             } => {
@@ -4257,6 +4277,9 @@ impl InstallationEffectObservation {
                     }
                 }
                 if let Some(receipt) = phase_b_receipt {
+                    receipt.validate()?;
+                }
+                if let Some(receipt) = system_service_host_root_receipt {
                     receipt.validate()?;
                 }
                 if let Some(lineage) = service_runtime_lineage {
@@ -4535,6 +4558,34 @@ pub(crate) trait InstallationEffectPort: Send {
     }
 }
 
+fn is_first_install_host_root_create_effect(
+    transaction: &InstallationTransaction,
+    index: usize,
+) -> bool {
+    if transaction.profile != InstallationProfile::SystemService
+        || transaction.current_active_manifest.is_some()
+        || transaction.system_service_host_root_receipt().is_some()
+    {
+        return false;
+    }
+    let Some(InstallerEffectPlan::CreateRoot { root, .. }) =
+        transaction.installer_effects.get(index)
+    else {
+        return false;
+    };
+    eliot_platform_windows::windows_paths_equal(
+        Path::new(root.as_str()),
+        Path::new(
+            transaction
+                .candidate_manifest
+                .runtime_launch
+                .runtime_state_roots
+                .host_state_root
+                .as_str(),
+        ),
+    )
+}
+
 /// Sealed production Windows adapter. Only [`WindowsInstallationCoordinator`]
 /// can construct or mutably use this capability.
 struct CredentialHostConnection {
@@ -4746,6 +4797,7 @@ impl WindowsInstallationEffectPort {
                     credential_receipt: None,
                     staging_receipt: None,
                     phase_b_receipt: None,
+                    system_service_host_root_receipt: None,
                     service_runtime_lineage: None,
                 })
             }
@@ -4881,6 +4933,7 @@ impl WindowsInstallationEffectPort {
                     credential_receipt: None,
                     staging_receipt: None,
                     phase_b_receipt: None,
+                    system_service_host_root_receipt: None,
                     service_runtime_lineage: None,
                 })
             }
@@ -4976,6 +5029,7 @@ impl WindowsInstallationEffectPort {
                     credential_receipt: None,
                     staging_receipt: None,
                     phase_b_receipt: None,
+                    system_service_host_root_receipt: None,
                     service_runtime_lineage: None,
                 })
             }
@@ -6440,6 +6494,7 @@ impl WindowsInstallationEffectPort {
             credential_receipt: None,
             staging_receipt: None,
             phase_b_receipt: None,
+            system_service_host_root_receipt: None,
             service_runtime_lineage,
         })
     }
@@ -7060,6 +7115,7 @@ impl WindowsInstallationEffectPort {
                     credential_receipt: Some(identity_receipt.clone()),
                     staging_receipt: None,
                     phase_b_receipt: None,
+                    system_service_host_root_receipt: None,
                     service_runtime_lineage: None,
                 })
             }
@@ -8630,6 +8686,7 @@ fn matching_preexisting(
         credential_receipt: None,
         staging_receipt: None,
         phase_b_receipt: None,
+        system_service_host_root_receipt: None,
         service_runtime_lineage: None,
     })
 }
@@ -8664,6 +8721,23 @@ fn matching_created(
         .map_err(|_| PortError::InvalidRequestMetadata)?,
     ))
     .map_err(|_| PortError::InvalidRequestMetadata)?;
+    let host_root_receipt_candidate = match (&request.plan, request.profile, request.action) {
+        (
+            InstallerEffectPlan::CreateRoot { root: planned_root, .. },
+            InstallationProfile::SystemService,
+            InstallationEffectAction::Apply,
+        ) => Some(
+            SystemServiceHostRootReceipt::from_verified_create_root_snapshot(
+                planned_root.as_str(),
+                FileIdentity {
+                    volume_serial_number: root.volume_serial_number,
+                    file_index: root.file_index,
+                },
+            )
+            .map_err(|_| PortError::InvalidRequestMetadata)?,
+        ),
+        _ => None,
+    };
     Ok(InstallationEffectObservation::Matching {
         disposition: InstallationEffectDisposition::CreatedByTransaction,
         external_identity,
@@ -8675,6 +8749,7 @@ fn matching_created(
         credential_receipt: None,
         staging_receipt: None,
         phase_b_receipt: None,
+        system_service_host_root_receipt: host_root_receipt_candidate,
         service_runtime_lineage: None,
     })
 }
@@ -8971,6 +9046,7 @@ fn service_matching_observation(
         credential_receipt: None,
         staging_receipt: None,
         phase_b_receipt: None,
+        system_service_host_root_receipt: None,
         service_runtime_lineage: None,
     })
 }
@@ -9016,8 +9092,9 @@ fn installer_root_reference(stage: InstallerRootStage, code: u32) -> PlatformHan
 const INSTALLER_ROOT_UNKNOWN_REFERENCE_PREFIX: &str = "installer-root-unknown-v1:";
 
 /// Accepts only the exact request-correlated installer-root unknown grammar:
-/// the request identity digest, then the same `<stage>:<code>` cause the
-/// uncorrelated [`is_typed_installer_root_reference`] grammar carries.
+/// the request identity digest, then either the same `<stage>:<code>` cause
+/// the uncorrelated [`is_typed_installer_root_reference`] grammar carries or
+/// one closed Host-root receipt reconciliation cause.
 fn is_typed_installer_root_unknown_reference(value: &str) -> bool {
     let Some(rest) = value.strip_prefix(INSTALLER_ROOT_UNKNOWN_REFERENCE_PREFIX) else {
         return false;
@@ -9029,6 +9106,57 @@ fn is_typed_installer_root_unknown_reference(value: &str) -> bool {
         return false;
     }
     is_typed_installer_root_reference(&format!("installer-root-win32-v2:{cause}"))
+        || is_typed_host_root_receipt_unknown_cause(cause)
+}
+
+fn is_typed_host_root_receipt_unknown_cause(value: &str) -> bool {
+    matches!(
+        value,
+        "host-root-receipt:effect-role-changed"
+            | "host-root-receipt:identity-changed-before-applied-cas"
+            | "host-root-receipt:identity-mismatch"
+            | "host-root-receipt:not-transaction-created"
+            | "host-root-receipt:receipt-missing"
+            | "host-root-receipt:retained-root-unavailable"
+    )
+}
+
+fn system_service_host_root_receipt_unknown_reference(
+    transaction: &InstallationTransaction,
+    index: usize,
+    cause: &str,
+) -> Result<PlatformHandle, InstallationError> {
+    if !is_typed_host_root_receipt_unknown_cause(cause)
+        || !matches!(
+            transaction.installer_effects.get(index),
+            Some(InstallerEffectPlan::CreateRoot { .. })
+        )
+    {
+        return Err(InstallationError::IdentityConflict);
+    }
+    let progress = transaction
+        .effect_progress
+        .get(index)
+        .ok_or(InstallationError::IdentityConflict)?;
+    let InstallationEffectProgressState::IntentCommitted { attempt, .. } = &progress.state else {
+        return Err(InstallationError::IdentityConflict);
+    };
+    let request = effect_request(
+        transaction,
+        index,
+        *attempt,
+        InstallationEffectAction::Apply,
+        None,
+    )?;
+    let intent_digest = request.intent_digest()?;
+    let reference = format!(
+        "{INSTALLER_ROOT_UNKNOWN_REFERENCE_PREFIX}{}:{cause}",
+        intent_digest.as_str()
+    );
+    if !is_typed_installer_root_unknown_reference(&reference) {
+        return Err(InstallationError::IdentityConflict);
+    }
+    PlatformHandle::new(reference).map_err(|error| platform_error(&error))
 }
 
 /// Whether `reference` is the typed installer-root unknown reference that was
@@ -9834,6 +9962,10 @@ pub(crate) const SERVICE_START_TIMEOUT_PENDING_REF: &str = "timeout:service-star
 /// registry projection failure instead of reading a sibling's reference.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PostBootstrapRejectionClass {
+    /// The Host bootstrap prefix was already persisted without the original
+    /// first-install Host-root receipt. Recovery must not recapture whichever
+    /// object now occupies the planned path.
+    HostRootReceiptMissing,
     /// `E3`: the retained per-installation Host root could not be reopened
     /// after the Host bootstrap prefix applied. No registry projection was
     /// attempted, so the reference must not name one.
@@ -9849,6 +9981,7 @@ impl PostBootstrapRejectionClass {
     #[must_use]
     pub const fn pending_ref_prefix(self) -> &'static str {
         match self {
+            Self::HostRootReceiptMissing => "pending:host-root-receipt-missing:",
             Self::HostRootReopen => "pending:host-root-reopen:",
             Self::RegistryProjection => "pending:registry-projection:",
         }
@@ -9872,7 +10005,8 @@ pub fn post_bootstrap_rejection_pending_ref(
         PostBootstrapRejectionClass::RegistryProjection => {
             registry_projection_pending_ref(transaction_id)
         }
-        PostBootstrapRejectionClass::HostRootReopen => PlatformHandle::new(format!(
+        PostBootstrapRejectionClass::HostRootReceiptMissing
+        | PostBootstrapRejectionClass::HostRootReopen => PlatformHandle::new(format!(
             "{}{}",
             class.pending_ref_prefix(),
             transaction_id.as_str()
@@ -10714,6 +10848,7 @@ where
                 credential_receipt,
                 staging_receipt,
                 phase_b_receipt,
+                system_service_host_root_receipt,
                 service_runtime_lineage,
             } => {
                 if matches!(
@@ -10894,6 +11029,7 @@ where
                     credential_receipt,
                     staging_receipt,
                     phase_b_receipt.map(|receipt| *receipt),
+                    system_service_host_root_receipt,
                 )
             }
             InstallationEffectObservation::Mismatch { pending_ref } => {
@@ -11786,6 +11922,7 @@ where
                         credential_receipt,
                         staging_receipt,
                         phase_b_receipt,
+                        system_service_host_root_receipt,
                         service_runtime_lineage: reconciled_service_runtime_lineage,
                     } => {
                         if let Some(expected_identity) =
@@ -11894,6 +12031,7 @@ where
                                 credential_receipt,
                                 staging_receipt,
                                 phase_b_receipt.map(|receipt| *receipt),
+                                system_service_host_root_receipt,
                             )
                         } else {
                             self.persist_unknown(
@@ -12479,8 +12617,62 @@ where
         credential_receipt: Option<CredentialAccessReceipt>,
         staging_receipt: Option<StagingReceipt>,
         phase_b_receipt: Option<HostPhaseBMaterializationReceipt>,
+        system_service_host_root_receipt: Option<SystemServiceHostRootReceipt>,
     ) -> Result<InstallationStepOutcome, InstallationError> {
         let expected = TransactionVersion::of(&transaction)?;
+        let mut host_root_receipt_fallback = None;
+        if is_first_install_host_root_create_effect(&transaction, index) {
+            let fallback_transaction = transaction.clone();
+            if disposition != InstallationEffectDisposition::CreatedByTransaction {
+                let pending_ref = system_service_host_root_receipt_unknown_reference(
+                    &transaction,
+                    index,
+                    "host-root-receipt:not-transaction-created",
+                )?;
+                return self.persist_unknown(transaction, index, pending_ref);
+            }
+            let Some(receipt) = system_service_host_root_receipt.as_ref() else {
+                let pending_ref = system_service_host_root_receipt_unknown_reference(
+                    &transaction,
+                    index,
+                    "host-root-receipt:receipt-missing",
+                )?;
+                return self.persist_unknown(transaction, index, pending_ref);
+            };
+            let InstallerEffectPlan::CreateRoot { root, .. } =
+                &transaction.installer_effects[index]
+            else {
+                let pending_ref = system_service_host_root_receipt_unknown_reference(
+                    &transaction,
+                    index,
+                    "host-root-receipt:effect-role-changed",
+                )?;
+                return self.persist_unknown(transaction, index, pending_ref);
+            };
+            let host_root = match ProtectedRootLease::open_existing(Path::new(root.as_str())) {
+                Ok(root) => root,
+                Err(_) => {
+                    let pending_ref = system_service_host_root_receipt_unknown_reference(
+                        &transaction,
+                        index,
+                        "host-root-receipt:retained-root-unavailable",
+                    )?;
+                    return self.persist_unknown(transaction, index, pending_ref);
+                }
+            };
+            if transaction
+                .record_system_service_host_root_receipt_from_created_effect(receipt, &host_root)
+                .is_err()
+            {
+                let pending_ref = system_service_host_root_receipt_unknown_reference(
+                    &transaction,
+                    index,
+                    "host-root-receipt:identity-mismatch",
+                )?;
+                return self.persist_unknown(transaction, index, pending_ref);
+            }
+            host_root_receipt_fallback = Some((fallback_transaction, host_root));
+        }
         match (
             &transaction.installer_effects[index],
             &service_control_grant,
@@ -12580,6 +12772,16 @@ where
         } else {
             increment_revision(&mut transaction)?;
             transaction.validate()?;
+        }
+        if let Some((fallback_transaction, root)) = host_root_receipt_fallback.as_ref()
+            && root.verify_stable_identity().is_err()
+        {
+            let pending_ref = system_service_host_root_receipt_unknown_reference(
+                fallback_transaction,
+                index,
+                "host-root-receipt:identity-changed-before-applied-cas",
+            )?;
+            return self.persist_unknown(fallback_transaction.clone(), index, pending_ref);
         }
         self.store.compare_and_save(expected, &transaction)?;
         Ok(InstallationStepOutcome::Applied {

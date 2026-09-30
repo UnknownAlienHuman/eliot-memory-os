@@ -183,8 +183,9 @@ pub struct RetainedProfileAnchor {
 pub const SYSTEM_SERVICE_HOST_ROOT_RECEIPT_VERSION: u32 = 1;
 
 /// Original no-follow identity of one `SystemService` installation's Host-state
-/// root. The receipt is captured from a retained protected-root lease and is
-/// carried by both the installation transaction and approved-generation
+/// root. The first-install receipt comes from a MAC-verified `CreateRoot`
+/// readback and is compared against a retained protected-root lease before it
+/// is carried by both the installation transaction and approved-generation
 /// registry; a path string alone is never used to recreate this identity.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -195,25 +196,19 @@ pub struct SystemServiceHostRootReceipt {
 }
 
 impl SystemServiceHostRootReceipt {
-    fn from_lease(root: &ProtectedRootLease) -> Result<Self, InstallationError> {
-        root.verify_stable_identity()
-            .map_err(|error| InstallationError::Platform(error.to_string()))?;
-        let canonical_path = root
-            .canonical_path()
-            .map_err(|error| InstallationError::Platform(error.to_string()))?
-            .into_os_string()
-            .into_string()
-            .map_err(|_| InstallationError::InvalidField {
-                field: "system_service_host_root_receipt.canonical_path".to_owned(),
-                reason: "canonical Host root path is not valid Unicode".to_owned(),
-            })?;
+    /// Builds the transient receipt candidate carried by an ownership-marker
+    /// validated `CreateRoot` readback. The caller must compare this identity
+    /// and the planned path with a live retained root lease before persisting
+    /// the receipt.
+    pub(crate) fn from_verified_create_root_snapshot(
+        planned_root_path: &str,
+        identity: FileIdentity,
+    ) -> Result<Self, InstallationError> {
         let receipt = Self {
             binding_version: SYSTEM_SERVICE_HOST_ROOT_RECEIPT_VERSION,
-            canonical_path,
-            identity: root.identity(),
+            canonical_path: planned_root_path.to_owned(),
+            identity,
         };
-        root.verify_stable_identity()
-            .map_err(|error| InstallationError::Platform(error.to_string()))?;
         receipt.validate()?;
         Ok(receipt)
     }
@@ -1044,23 +1039,6 @@ impl InstallationTransaction {
         self.system_service_host_root_receipt.as_ref()
     }
 
-    /// Records the original `SystemService` Host-state root while its protected
-    /// directory lease is held. A later observation may confirm the same
-    /// object, but can never replace the original path or file identity.
-    pub(crate) fn record_system_service_host_root_receipt(
-        &mut self,
-        root: &ProtectedRootLease,
-    ) -> Result<(), InstallationError> {
-        if self.current_active_manifest.is_some() && self.system_service_host_root_receipt.is_none() {
-            return Err(InstallationError::MigrationRequired {
-                reason: "an update cannot capture a replacement SystemService Host-root identity; rehydrate the registry receipt first"
-                    .to_owned(),
-            });
-        }
-        let receipt = SystemServiceHostRootReceipt::from_lease(root)?;
-        self.bind_system_service_host_root_receipt(receipt, root)
-    }
-
     /// Binds the original registry-owned receipt to a new or resumed
     /// `SystemService` transaction after comparing it with the held Host-root
     /// lease and the immutable transaction descriptor.
@@ -1100,6 +1078,45 @@ impl InstallationTransaction {
         candidate.validate()?;
         *self = candidate;
         Ok(())
+    }
+
+    /// Captures the original Host-root receipt from a CreateRoot readback in
+    /// the caller's existing effect compare-and-save. The observation's
+    /// identity came from the MAC-verified ownership marker; the live lease
+    /// comparison prevents a changed path from being adopted before the
+    /// applied effect and receipt are persisted together.
+    pub(crate) fn record_system_service_host_root_receipt_from_created_effect(
+        &mut self,
+        observed: &SystemServiceHostRootReceipt,
+        root: &ProtectedRootLease,
+    ) -> Result<(), InstallationError> {
+        if self.profile != InstallationProfile::SystemService {
+            return Err(InstallationError::ProfileViolation(
+                "SystemService Host-root receipts are not valid for current-user profiles"
+                    .to_owned(),
+            ));
+        }
+        if self.current_active_manifest.is_some() {
+            return Err(InstallationError::MigrationRequired {
+                reason: "an update cannot capture a replacement SystemService Host-root identity; rehydrate the registry receipt first"
+                    .to_owned(),
+            });
+        }
+        let expected_host_state_root = self
+            .candidate_manifest
+            .runtime_launch
+            .runtime_state_roots
+            .host_state_root
+            .as_str();
+        observed.validate_against(root, expected_host_state_root)?;
+        match self.system_service_host_root_receipt.as_ref() {
+            Some(existing) if existing == observed => Ok(()),
+            Some(_) => Err(InstallationError::IdentityConflict),
+            None => {
+                self.system_service_host_root_receipt = Some(observed.clone());
+                Ok(())
+            }
+        }
     }
 
     /// Returns the exact source-publication-time profile anchor pair.
