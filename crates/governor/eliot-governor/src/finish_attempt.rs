@@ -10,7 +10,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_canonical::{CanonicalWriteEnvelope, FinishAttemptDraft, FinishEvidence};
+use eliot_canonical::{
+    AdmittedAcceptanceDenominator, CanonicalWriteEnvelope, FinishAttemptDraft, FinishEvidence,
+    RequiredAcceptanceItem,
+};
 use eliot_change_monitor::ChangeMonitor;
 use eliot_contracts::{
     OperationId, StateFence, TaskId, canonical_json_bytes, fences_match_exact, sha256_hex,
@@ -450,7 +453,17 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
             )));
         }
 
-        let acceptance = acceptance_coverage_from_verifier_fact(plan, &verifier_fact)?;
+        let coverage_rows = acceptance_coverage_from_verifier_fact(plan, &verifier_fact)?;
+        // Issue #325 P1: enumerate the admitted acceptance denominator
+        // before joining any executed run, artifact, or effect evidence, and
+        // never shrink the task denominator to the selected test list. The
+        // join keeps explicit uncovered rows and fails closed on missing or
+        // unsupported coverage; see `admitted_acceptance_denominator` for the
+        // residual plan-owner seam.
+        let denominator = admitted_acceptance_denominator(task_id, task.revision, plan)?;
+        let acceptance = denominator
+            .join_coverage_rows(&coverage_rows)
+            .map_err(|error| FinishAttemptError::Finish(FinishError::from(error)))?;
         let stale_verifier_run_refs = if verifier_fact.certifies_completion() {
             Vec::new()
         } else {
@@ -506,6 +519,59 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
             snapshot,
         })
     }
+}
+
+/// Resolves the admitted TaskContract acceptance denominator through the
+/// existing canonical plan owner at the exact task revision (issue #325 P1,
+/// I7.9).
+///
+/// The item set is the plan-bound `required_acceptance_item_ids` read from
+/// the canonical owner at the current fence, and the digest is the
+/// owner-bound `verifier_config_hash`, which the plan owner computes over
+/// the denominator and its explicit acceptance-to-test join (the
+/// `VerifierInvocationConfig` shape in `composition.rs`), so a substituted
+/// item set cannot reuse a stale digest. The verifier requirement per item
+/// uses the same rule as the canonical row producer: only an explicit empty
+/// mapping declares a non-test obligation, while a missing mapping stays
+/// verifier-bound so absent coverage fails closed downstream.
+///
+/// Residual seam, named exactly: the correspondence between this plan-bound
+/// denominator and the admitted TaskContract acceptance set is published by
+/// the canonical plan owner in `composition.rs` (plan publication, issue
+/// #1115; TaskContract acceptance rehydration, issue #1741). The task owner
+/// here exposes opaque `Frame` references only, so TaskContract content
+/// itself is resolved beyond this seam, not in it. What this seam
+/// guarantees instead is denominator-first joining with typed fail-closed
+/// coverage: every required item is enumerated before any executed run,
+/// artifact, or effect evidence is joined, and missing or unsupported rows
+/// never reach the finish service.
+fn admitted_acceptance_denominator(
+    task_id: &TaskId,
+    task_revision: u64,
+    plan: &CanonicalPlanBinding,
+) -> Result<AdmittedAcceptanceDenominator, FinishAttemptError> {
+    let verifier_plan = plan.verifier.as_ref().ok_or_else(|| {
+        FinishAttemptError::Composition(CompositionError::Recovery(
+            "canonical finish plan has no verifier item bindings".to_owned(),
+        ))
+    })?;
+    let items = verifier_plan
+        .required_acceptance_item_ids
+        .iter()
+        .map(|item_id| RequiredAcceptanceItem {
+            item_id: item_id.clone(),
+            requires_verifier: !matches!(
+                verifier_plan.acceptance_verifier_map.get(item_id),
+                Some(tests) if tests.is_empty()
+            ),
+        })
+        .collect();
+    Ok(AdmittedAcceptanceDenominator {
+        task_id: task_id.as_str().to_owned(),
+        task_revision,
+        acceptance_digest: verifier_plan.planned.verifier_config_hash.clone(),
+        items,
+    })
 }
 
 fn matches_plan(

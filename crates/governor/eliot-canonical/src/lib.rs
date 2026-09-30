@@ -1057,6 +1057,109 @@ impl FinishEvidence {
     }
 }
 
+/// One required acceptance obligation in the admitted finish denominator.
+///
+/// The identity is the TaskContract acceptance identity, never a verifier
+/// test id. Many acceptance items may map to many tests, one item may map
+/// to no test at all, and the coverage join matches rows by this identity
+/// only, so the selected test inventory can never substitute for the
+/// denominator.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequiredAcceptanceItem {
+    /// TaskContract acceptance item identity.
+    pub item_id: String,
+    /// Whether the item requires an executed verifier run. A `false` value
+    /// marks a non-test obligation that executed verifier runs alone cannot
+    /// satisfy; the joined rows keep it visible either way and only the
+    /// canonical derivation decides its disposition.
+    pub requires_verifier: bool,
+}
+
+/// Independently resolved acceptance denominator for one finish evaluation
+/// (issue #325 P1, I7.9).
+///
+/// The denominator is resolved through the existing owner at the exact task
+/// revision and bound by the owner's acceptance digest. It is an independent
+/// input to the coverage join below — never derived from the coverage rows
+/// themselves — so a substituted or stale item set fails closed instead of
+/// shrinking the task to the selected test list.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmittedAcceptanceDenominator {
+    /// Task identity the denominator was resolved for.
+    pub task_id: String,
+    /// Exact task revision the denominator was resolved at.
+    pub task_revision: u64,
+    /// Owner-bound digest covering the admitted item set.
+    pub acceptance_digest: String,
+    /// Every required acceptance item, enumerated before any evidence join.
+    pub items: Vec<RequiredAcceptanceItem>,
+}
+
+impl AdmittedAcceptanceDenominator {
+    /// Validates the denominator shape before it admits any coverage join.
+    /// A blank identity, a zero revision, a non-digest binding, an empty
+    /// item set, or a duplicated item identity fails closed here.
+    pub fn validate(&self) -> Result<(), CanonicalError> {
+        text(&self.task_id, "finish.denominator.task_id")?;
+        if self.task_revision == 0 {
+            return Err(CanonicalError::InvalidField {
+                field: "finish.denominator.task_revision",
+                reason: "must be non-zero",
+            });
+        }
+        digest(&self.acceptance_digest, "finish.denominator.acceptance_digest")?;
+        if self.items.is_empty() {
+            return Err(CanonicalError::Empty {
+                field: "finish.denominator.items",
+            });
+        }
+        unique(
+            self.items.iter().map(|item| item.item_id.clone()),
+            "finish.denominator.items",
+        )?;
+        for item in &self.items {
+            text(&item.item_id, "finish.denominator.item_id")?;
+        }
+        Ok(())
+    }
+
+    /// Joins rehydrated coverage rows onto the admitted denominator and
+    /// returns them in denominator order.
+    ///
+    /// Every required item is enumerated first: an item with no coverage row
+    /// is missing evidence and fails closed, and a row outside the admitted
+    /// set is unsupported evidence and fails closed with the same typed
+    /// error. Rows are matched by acceptance identity only — test ids never
+    /// identify acceptance — and a row whose verifier requirement disagrees
+    /// with the admitted item is a skewed join and fails closed as well.
+    /// Uncovered rows (unsatisfied, unmapped, or verifier-gapped) are kept
+    /// explicit in the returned set; only the canonical derivation decides
+    /// their disposition, so a partial join can never read as complete.
+    pub fn join_coverage_rows(
+        &self,
+        rows: &[AcceptanceCoverage],
+    ) -> Result<Vec<AcceptanceCoverage>, CanonicalError> {
+        self.validate()?;
+        let mut joined = Vec::with_capacity(self.items.len());
+        for required in &self.items {
+            let row = rows
+                .iter()
+                .find(|row| row.item_id == required.item_id)
+                .ok_or(CanonicalError::InsufficientFinishEvidence)?;
+            if row.requires_verifier != required.requires_verifier {
+                return Err(CanonicalError::InsufficientFinishEvidence);
+            }
+            joined.push(row.clone());
+        }
+        if rows.len() != joined.len() {
+            return Err(CanonicalError::InsufficientFinishEvidence);
+        }
+        Ok(joined)
+    }
+}
+
 /// Derived proof record.  It is produced by the Governor and cannot be
 /// supplied by a caller.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
