@@ -1030,20 +1030,30 @@ public sealed class MainViewModel : INotifyPropertyChanged
             {
                 ResultSummary += " The owner truncated this page: the rendering is incomplete.";
             }
+            // The rotation notice is a statement about the binding, not about
+            // completeness, so it is reported on EVERY banner. A rotation that
+            // happened to arrive on a truncated or degraded page is still a
+            // rotation, and withholding the word there would leave the operator
+            // reading a stale page as if nothing had been dropped. The
+            // invalidation itself happened above, before this page was used;
+            // this only names it.
+            var rotationNotice = rotated
+                ? " Runtime rotated: dependent state was invalidated before use."
+                : string.Empty;
             if (degraded.Count == 0 && !page.Truncated)
             {
                 SetBanner(
                     "Connected",
-                    rotated
-                        ? $"Runtime {page.RuntimeId}; auth generation {page.AuthGeneration}; typed {page.Projection} projection. Runtime rotated: dependent state was invalidated before use."
-                        : $"Runtime {page.RuntimeId}; auth generation {page.AuthGeneration}; typed {page.Projection} projection.",
+                    $"Runtime {page.RuntimeId}; auth generation {page.AuthGeneration}; typed {page.Projection} projection."
+                        + rotationNotice,
                     OperatorBannerSeverity.Success);
             }
             else if (page.Truncated && degraded.Count == 0)
             {
                 SetBanner(
                     "Projection truncated",
-                    $"Runtime {page.RuntimeId} truncated the {page.Projection} page: {Records.Count} record(s) shown, completeness not claimed. Narrow the scope or filters for a whole page.",
+                    $"Runtime {page.RuntimeId} truncated the {page.Projection} page: {Records.Count} record(s) shown, completeness not claimed. Narrow the scope or filters for a whole page."
+                        + rotationNotice,
                     OperatorBannerSeverity.Warning);
             }
             else
@@ -1061,7 +1071,8 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 SetBanner(
                     severe ? "Degraded backend capability" : "Operational notices need attention",
                     $"Runtime {page.RuntimeId} reports {incidentCount} open incident(s) and {backupCount} backup concern(s): {detail}. " +
-                    "Full evidence and recovery references stay expandable on each record.",
+                    "Full evidence and recovery references stay expandable on each record."
+                        + rotationNotice,
                     OperatorBannerSeverity.Warning);
             }
         }
