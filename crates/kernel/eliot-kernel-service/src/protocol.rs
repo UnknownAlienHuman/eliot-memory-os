@@ -16,7 +16,8 @@ use eliot_protocol::{
     HostRequestEnvelope, MessageType, ProtocolPayload, ProtocolVersion, RequestIdentity,
 };
 use eliot_runtime_contracts::{
-    HealthVector, RuntimeLease, ServiceProcessState, SupervisionLeaseIncarnationBinding,
+    HealthVector, RestartPolicyV1, RuntimeLease, ServiceProcessState,
+    SupervisionLeaseIncarnationBinding,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -84,6 +85,12 @@ pub const KERNEL_CONTROL_PIPE: &str = r"\\.\pipe\eliot\kernel\frontdoor";
 pub const ELIOTD_LAUNCH_DESCRIPTOR_WIRE_ID: &str = "eliot.kernel.eliotd-launch";
 /// Version of the exact `eliotd` child launch contract.
 pub const ELIOTD_LAUNCH_DESCRIPTOR_WIRE_VERSION: u16 = 2;
+/// Exact module identity of the Kernel-supervised `eliotd` child.
+///
+/// A restart policy admitted on the launch descriptor must name this child: a
+/// declaration naming a different module would supply another child's restart
+/// class, intensity window and quarantine threshold to this child's recovery.
+pub const ELIOTD_RESTART_POLICY_SUBJECT_ID: &str = "eliotd";
 /// Stable identity for the Host-owned agent-bridge admission descriptor.
 pub const AGENT_BRIDGE_ADMISSION_DESCRIPTOR_WIRE_ID: &str = "eliot.kernel.agent-bridge-admission";
 /// Version of the immutable agent-bridge admission contract.
@@ -568,6 +575,27 @@ pub struct EliotdLaunchDescriptor {
     pub authority_epoch: EpochId,
     /// Kernel resource generation bound to this child generation.
     pub generation: ResourceGeneration,
+    /// The one versioned restart policy admitted for this child (I14.10, I8.12).
+    ///
+    /// Host owns the restart authority for this Kernel-owned child, so the
+    /// admitted declaration travels on the same Host-approved, digest-bound
+    /// descriptor that admits the launch. It is the shared
+    /// `eliot_runtime_contracts::RestartPolicyV1` value: restart class, group
+    /// ID and strategy, typed dependency edges with their exact invalidation
+    /// triggers, the bounded attempt window/backoff/jitter/cooldown, the
+    /// continuously-healthy reset condition, the quarantine threshold and
+    /// escalation target, and the source manifest/profile revisions it was read
+    /// from. I8.12 keeps every number in the approved config/fault profile, so
+    /// none is declared here.
+    ///
+    /// Absence is preserved exactly on the wire and in the descriptor digest
+    /// (the same optional-carrier discipline as `agent_bridge_admission`). It is
+    /// the fail-closed disposition, not a permissive default: no admitted
+    /// declaration means no automatic restart at all for this child. It is
+    /// never read as an unlimited budget and never widens the child's effect
+    /// ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_policy: Option<RestartPolicyV1>,
     /// Lowercase SHA-256 digest over all descriptor fields except this field.
     pub descriptor_sha256: String,
 }
@@ -672,6 +700,27 @@ impl EliotdLaunchDescriptor {
                 field: "eliotd.generation",
                 reason: "generation and authority epoch must be non-zero",
             });
+        }
+        // An admitted restart policy is proved here, once, by the shared
+        // contract's OWN validator, and must name this exact child. A
+        // declaration this contract does not admit, or one admitted for a
+        // different child, is refused at admission rather than discovered at
+        // the first failed restart. An absent declaration stays absent and
+        // withholds automatic restart; it is never widened into an unlimited
+        // budget.
+        if let Some(policy) = &self.restart_policy {
+            policy
+                .validate()
+                .map_err(|error| KernelServiceError::InvalidField {
+                    field: "eliotd.restart_policy",
+                    reason: error.to_string(),
+                })?;
+            if policy.subject_id != ELIOTD_RESTART_POLICY_SUBJECT_ID {
+                return Err(KernelServiceError::InvalidField {
+                    field: "eliotd.restart_policy.subject_id",
+                    reason: "admitted restart policy names a different supervised child",
+                });
+            }
         }
         if self.compute_digest()? != self.descriptor_sha256 {
             return Err(KernelServiceError::InvalidField {
@@ -3616,6 +3665,7 @@ mod tests {
             launch_nonce: handle_value(nonce),
             authority_epoch: test_epoch(1),
             generation: ResourceGeneration::new(1).expect("generation"),
+            restart_policy: None,
             descriptor_sha256: String::new(),
         }
         .with_computed_digest()
