@@ -135,8 +135,13 @@ pub fn enumerate_pending_for_reconnect(
     now_unix_ms: u64,
 ) -> Result<MaintenanceTriggerPage, MaintenanceTriggerDeliveryError> {
     let session = bind_session(service, principal_ref)?;
-    let page =
-        handle_maintenance_trigger_pending_page(service, &session, ledger, continuation, now_unix_ms)?;
+    let page = handle_maintenance_trigger_pending_page(
+        service,
+        &session,
+        ledger,
+        continuation,
+        now_unix_ms,
+    )?;
     page.validate()?;
     Ok(page)
 }
