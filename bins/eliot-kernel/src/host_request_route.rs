@@ -6176,7 +6176,14 @@ impl KernelComposition {
         let staged = gateway
             .verify_staged_envelope(&input.application_binding.state_fence, &operation_identity)
             .map_err(|_| TransportError::SessionFenced)?;
-        let write_binding = staged
+        let reservation = self
+            .generation_gateway
+            .ors
+            .load_write_reservation_by_operation(&operation_identity)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::SessionFenced)?;
+        let token = &reservation.token;
+        let write_binding = token
             .write_binding
             .as_ref()
             .ok_or(TransportError::SessionFenced)?;
@@ -6186,6 +6193,8 @@ impl KernelComposition {
         if staged.operation_or_checkpoint_id != operation_identity
             || staged.privacy_and_visibility_class
                 != input.protected_envelope.privacy_and_visibility_class
+            || token.operation_id != operation_identity
+            || token.state_fence != write_binding.state_fence
             || write_binding.operation_id != operation_identity
             || write_binding.idempotency_key.as_str() != record.idempotency_key.as_str()
             || staged_fence != input.application_binding.state_fence
@@ -6218,11 +6227,15 @@ impl KernelComposition {
         transition
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
-        let prepared_transition_sha256 = eliot_store_api::prepared_transition_digest(&transition)
-            .map_err(|_| TransportError::SessionFenced)?;
-        if prepared_transition_sha256 != write_binding.prepared_transition_sha256 {
+        let computed_prepared_transition_sha256 =
+            eliot_store_api::prepared_transition_digest(&transition)
+                .map_err(|_| TransportError::SessionFenced)?;
+        if computed_prepared_transition_sha256 != token.prepared_transition_sha256
+            || computed_prepared_transition_sha256 != write_binding.prepared_transition_sha256
+        {
             return Err(TransportError::IdentityConflict);
         }
+        let prepared_transition_sha256 = token.prepared_transition_sha256.clone();
 
         let original_source: RequestIdentity = serde_json::from_value(
             input.application_binding.source_request_identity.clone(),
