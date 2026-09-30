@@ -1178,7 +1178,6 @@ impl KernelComposition {
         let request = &process_start.request;
         let claim_receipt = &process_start.claim_receipt;
         let process_receipt = &process_start.receipt;
-        let process_identity = process_receipt.identity();
         let executable_binding =
             request
                 .executable_binding
