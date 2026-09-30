@@ -566,6 +566,54 @@ impl DaemonComposition {
             .admit_maintenance_observation_receipt(job_id, publication_id, observation_receipt_ref)
             .map_err(|error| MaintenanceResultPublishError::Daemon(DaemonError::Composition(error)))
     }
+
+    /// Records the explicit coverage gap for one maintenance result writeback
+    /// the canonical route refused with a terminal non-committed receipt.
+    ///
+    /// This is the production call that keeps a refused writeback from
+    /// disappearing. The obligation is already durable on the maintenance
+    /// store, so nothing is lost either way — but a `Pending` obligation is
+    /// indistinguishable from one that was never attempted, and the daemon has
+    /// no other durable place to say "the store refused this exact publication
+    /// and here is the gap". This settles that on the same Kernel durable-job
+    /// ledger the transitions already write through.
+    ///
+    /// `refused_operation_id` and `refused_status` must be the exact values
+    /// [`MaintenanceResultPublishError::NotAdmitted`] carries. A readiness or
+    /// transport refusal produced no terminal receipt and must not call this:
+    /// the owner has no `Committed` member in its refusal vocabulary precisely
+    /// so an admission cannot be recorded twice, once as a receipt and once as
+    /// a gap.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaintenanceResultPublishError::Daemon`] with
+    /// [`DaemonError::Composition`] when the composition is not ready or the
+    /// retained-job write is refused. The maintenance owner's own refusal
+    /// travels unchanged inside that variant, so a dangling publication
+    /// identity and an already-admitted observation stay distinguishable from a
+    /// transport failure.
+    pub fn record_maintenance_observation_gap(
+        &mut self,
+        job_id: &str,
+        publication_id: &str,
+        refused_operation_id: &str,
+        refused_status: eliot_maintenance::RefusedReceiptStatus,
+    ) -> Result<eliot_maintenance::MaintenanceJob, MaintenanceResultPublishError> {
+        if self.readiness() != eliot_governor::CompositionReadiness::Ready {
+            return Err(MaintenanceResultPublishError::Daemon(
+                DaemonError::Composition(CompositionError::NotReady),
+            ));
+        }
+        self.governor
+            .record_maintenance_observation_gap(
+                job_id,
+                publication_id,
+                refused_operation_id,
+                refused_status,
+            )
+            .map_err(|error| MaintenanceResultPublishError::Daemon(DaemonError::Composition(error)))
+    }
 }
 
 /// Builds the affected-scope identity from the live admitted fence.

@@ -32,9 +32,11 @@ mod trigger_intake;
 
 pub use outcome_observation::{
     AdmittedObservationReceipt, ExpectedOutcomeObservation, MaintenanceOutcomeDisposition,
-    OUTCOME_OBSERVATION_OWNER, OUTCOME_OBSERVATION_RESOLUTION, ObservedOutcomeObservation,
-    OutcomeObservationCoverage, OutstandingOutcome, OutstandingOutcomeObligation,
+    OBSERVATION_GAP_PROFILE, OBSERVATION_GAP_REASON, OUTCOME_OBSERVATION_OWNER,
+    OUTCOME_OBSERVATION_RESOLUTION, ObservedOutcomeObservation, OutcomeObservationCoverage,
+    OutstandingOutcome, OutstandingOutcomeObligation, RefusedReceiptStatus,
     admit_observation_delivery, outcome_observation_coverage, outcome_observation_disposition,
+    record_observation_gap,
 };
 
 pub use result_obligation::{
@@ -1085,6 +1087,54 @@ impl<S: MaintenanceStateStore> MaintenanceController<S> {
             &job,
             publication_id,
             observation_receipt_ref,
+        )?;
+        if next == job {
+            return Ok(job);
+        }
+        self.store.save(&next)?;
+        Ok(next)
+    }
+
+    /// Records that the canonical observation route returned a terminal
+    /// non-committed receipt for one result this job owed an observation for,
+    /// and persists that disposition on the job revision.
+    ///
+    /// This is W5's gap disposition: the store issued a receipt and that receipt
+    /// did not commit, so the writeback is unavailable rather than pending.
+    /// Leaving it `Pending` would report a rejection or an outage as though the
+    /// observation had merely not been attempted yet, and would keep
+    /// re-presenting it with no visible consequence.
+    ///
+    /// It writes through the same [`MaintenanceStateStore::save`] every
+    /// lifecycle transition and every receipt admission uses, so the gap and
+    /// the revision it covers stay in one store with one atomic boundary. It
+    /// appends no obligation and enters no producer, so recording a gap cannot
+    /// recursively create another maintenance result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaintenanceError::InvalidField`] when an identity is empty,
+    /// when this job owes no result observation under `publication_id`, or when
+    /// a different gap is already recorded there;
+    /// [`MaintenanceError::IdentityConflict`] when a store receipt is already
+    /// admitted under that identity; [`MaintenanceError::FenceMismatch`] for a
+    /// stale or mismatched fence; and [`MaintenanceError::Store`] when the port
+    /// refuses the write. Re-recording the same gap is a reconciliation and
+    /// persists nothing.
+    pub fn record_observation_gap(
+        &mut self,
+        job_id: &str,
+        fence: &StateFence,
+        publication_id: &str,
+        refused_operation_id: &str,
+        status: RefusedReceiptStatus,
+    ) -> Result<MaintenanceJob, MaintenanceError> {
+        let job = self.load_checked(job_id, fence)?;
+        let next = outcome_observation::record_observation_gap(
+            &job,
+            publication_id,
+            refused_operation_id,
+            status,
         )?;
         if next == job {
             return Ok(job);

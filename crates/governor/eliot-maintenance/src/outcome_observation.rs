@@ -34,6 +34,16 @@
 //!   the durable trigger and decision records; it is never rebuilt from the
 //!   obligations a coverage pass happens to be walking. A job in that set with
 //!   no retained revision is unavailable, not observed.
+//! * **A refused writeback is recorded, not retried silently.** When the store
+//!   returns a terminal non-committed receipt for an exact publication
+//!   identity, the owner settles that obligation's delivery into
+//!   [`MaintenanceDeliveryState::Unavailable`] on the same atomic revision the
+//!   transition already wrote, so the gap is durable, visible and owned rather
+//!   than a diagnostic line. A refusal the owner may retry — a readiness or
+//!   transport refusal that produced no terminal receipt — leaves the
+//!   obligation `Pending`, because an outage is not a refusal. Recording a gap
+//!   never appends an obligation and never re-enters the result producer, so
+//!   gap reporting cannot recursively manufacture another maintenance result.
 
 use eliot_observation_contracts::{MaintenanceDeliveryState, MaintenanceExecutionOutcome};
 
@@ -56,6 +66,76 @@ pub const OUTCOME_OBSERVATION_OWNER: &str = crate::CONTRACT_NAME;
 /// discharge nothing.
 pub const OUTCOME_OBSERVATION_RESOLUTION: &str =
     "the canonical observation route returns a store receipt for this exact publication identity";
+
+/// The named reason a refused writeback records on the durable obligation.
+///
+/// I14.24: "self-observation journal/experience import unavailable or under
+/// pressure | preserve a minimal event or protected coverage-gap record; stop
+/// claiming complete self-observation". The refusal reason is named and
+/// versioned rather than left blank, so a reader can tell a store refusal from
+/// a lost transport without inspecting the store.
+pub const OBSERVATION_GAP_REASON: &str =
+    "eliot.governor.maintenance:observation-writeback-unavailable";
+
+/// The obligation profile a refused maintenance writeback gap belongs to.
+///
+/// The gap is not a free-floating note: it is an explicit entry against the
+/// named profile of the result-to-observation obligations this owner owes, so
+/// it inherits that profile's coverage consequence instead of inventing one.
+pub const OBSERVATION_GAP_PROFILE: &str = "eliot.governor.maintenance:result-observation";
+
+/// A terminal store receipt status that proves a result writeback was refused.
+///
+/// `Committed` has no member here, and that absence is the rule rather than an
+/// oversight: a committed receipt is an admission, and
+/// [`admit_observation_delivery`](crate::admit_observation_delivery) is the only
+/// transition that may record one. One store receipt therefore carries exactly
+/// one disposition — an admission or a gap — and never both.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RefusedReceiptStatus {
+    /// The store refused this record; it was not admitted.
+    Rejected,
+    /// The store dead-lettered this record.
+    DeadLettered,
+    /// The record was cancelled before it committed.
+    Cancelled,
+}
+
+impl RefusedReceiptStatus {
+    /// Stable text recorded inside the gap identity.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rejected => "REJECTED",
+            Self::DeadLettered => "DEAD_LETTERED",
+            Self::Cancelled => "CANCELLED",
+        }
+    }
+}
+
+/// The stable identity of the coverage gap one refused publication owes.
+///
+/// Bound to the exact publication identity, the exact store operation whose
+/// terminal receipt refused it, and that receipt's refusal class, so the gap is
+/// owned by a refusal that really happened rather than by a predictable name any
+/// caller could supply. Neither the attempt time nor a counter enters it, and the
+/// store's operation identity for one publication is itself a pure function of
+/// that publication, so re-presenting the same refused result names the same gap
+/// instead of accumulating one per retry, while two different refusals can never
+/// collide.
+///
+/// Private to this owner on purpose: a caller cannot choose the name of a gap it
+/// did not earn, and a reader learns the gap from the retained obligation itself.
+fn observation_gap_ref(
+    publication_id: &str,
+    refused_operation_id: &str,
+    status: RefusedReceiptStatus,
+) -> String {
+    format!(
+        "maintenance-observation-gap:{publication_id}:{refused_operation_id}:{}",
+        status.as_str()
+    )
+}
 
 /// One observation the canonical observation route actually admitted.
 ///
@@ -108,6 +188,15 @@ pub struct OutstandingOutcomeObligation {
     pub obligation_owner: String,
     /// The exact condition that discharges it.
     pub resolution_condition: String,
+    /// The durable coverage gap the owner already recorded for this writeback,
+    /// when the canonical route returned a terminal non-committed receipt for
+    /// it.
+    ///
+    /// `None` means the writeback is still pending, not that it succeeded. A
+    /// readiness or transport refusal produces no terminal receipt, so the
+    /// obligation stays `Pending` and the result is re-presented later; only a
+    /// receipt the store actually issued settles a gap.
+    pub coverage_gap_ref: Option<String>,
 }
 
 /// What is durably known about the observation one maintenance job owes.
@@ -170,7 +259,10 @@ pub struct ObservedOutcomeObservation {
 /// reconciled result. One is an explicit obligation over work that really
 /// happened, one is a revision that could not be read at all, and one is a
 /// declared job that has not reached a result state — its owed outcome does not
-/// exist yet rather than having been lost.
+/// exist yet rather than having been lost. An obligation whose writeback the
+/// owner already recorded a coverage gap for is still the first arm: a gap says
+/// the observation could not be written back, never that it was written, and
+/// [`OutcomeObservationCoverage::is_complete`] stays false either way.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OutstandingOutcome {
     /// The job performed work and no observation was admitted for it.
@@ -211,6 +303,20 @@ impl OutcomeObservationCoverage {
     }
 }
 
+/// The coverage gap the owner itself recorded for one settled writeback, if it
+/// recorded one.
+///
+/// Read from the obligation's own delivery, never inferred from the mere absence
+/// of an admitted receipt: an outage is not a refusal, and a gap this module
+/// could derive from a missing receipt would report the one as the other. An
+/// admission is not a gap either, so a published writeback carries none.
+fn recorded_coverage_gap(delivery: &MaintenanceDeliveryState) -> Option<String> {
+    if let MaintenanceDeliveryState::Unavailable { coverage_gap_ref } = delivery {
+        return Some(coverage_gap_ref.clone());
+    }
+    None
+}
+
 /// The result this job's own current state owes an observation for, as the
 /// publication identity that owes it and the work that was performed.
 ///
@@ -219,14 +325,23 @@ impl OutcomeObservationCoverage {
 /// result-bearing state whose obligation was never recorded still owes one,
 /// and that is exactly the case this derivation exists to keep visible: a
 /// completed job with no obligation is not a job with nothing to observe.
-fn owed_result(job: &MaintenanceJob) -> Option<(String, MaintenanceExecutionOutcome)> {
+fn owed_result(
+    job: &MaintenanceJob,
+) -> Option<(String, MaintenanceExecutionOutcome, Option<String>)> {
     if let Some(latest) = job.result_obligations.last() {
-        return Some((latest.publication_id.clone(), latest.execution_outcome));
+        return Some((
+            latest.publication_id.clone(),
+            latest.execution_outcome,
+            recorded_coverage_gap(&latest.delivery),
+        ));
     }
+    // A result-bearing state whose obligation was never recorded still owes one
+    // and has no settled delivery, so it carries no gap: nothing refused it.
     result_outcome(job.state).map(|outcome| {
         (
             publication_id_for(&job.job_id, job.state, job.attempts),
             outcome,
+            None,
         )
     })
 }
@@ -240,6 +355,13 @@ fn owed_result(job: &MaintenanceJob) -> Option<(String, MaintenanceExecutionOutc
 /// it is a reference the transition recorded, and a dangling reference is a
 /// broken link rather than evidence that an observation exists.
 ///
+/// An unadmitted result that already carries a recorded coverage gap is still
+/// [`MaintenanceOutcomeDisposition::ObservationOwed`] — the gap is a fact about
+/// the writeback's availability, not an admission, so it never turns an owed
+/// observation into an observed one. It is reported on the obligation so the
+/// caller states the writeback as unavailable rather than as unstarted, and the
+/// coverage result stays incomplete either way.
+///
 /// # Errors
 ///
 /// Returns [`MaintenanceError`] when the retained job revision fails its own
@@ -252,7 +374,7 @@ pub fn outcome_observation_disposition(
     for receipt in admitted {
         receipt.validate()?;
     }
-    let Some((publication_id, work_performed)) = owed_result(job) else {
+    let Some((publication_id, work_performed, coverage_gap_ref)) = owed_result(job) else {
         return Ok(MaintenanceOutcomeDisposition::NoResultDeclared);
     };
     // The admission test: an entry in the receipt set whose publication
@@ -274,6 +396,7 @@ pub fn outcome_observation_disposition(
                 work_performed,
                 obligation_owner: OUTCOME_OBSERVATION_OWNER.to_owned(),
                 resolution_condition: OUTCOME_OBSERVATION_RESOLUTION.to_owned(),
+                coverage_gap_ref,
             },
         )),
     }
@@ -409,6 +532,84 @@ pub fn admit_observation_delivery(
     }
     obligation.delivery = MaintenanceDeliveryState::Published {
         observation_receipt_ref: observation_receipt_ref.to_owned(),
+    };
+    next.validate()?;
+    Ok(next)
+}
+
+/// Records that the canonical observation route returned a terminal
+/// non-committed receipt for one result this job owed an observation for.
+///
+/// This is the gap disposition of W5 and I14.24's "preserve a minimal event or
+/// protected coverage-gap record; stop claiming complete self-observation". The
+/// store issued a receipt, and that receipt did not commit; the writeback is
+/// therefore unavailable rather than pending, and leaving it `Pending` would
+/// report an outage or a rejection as though it were an unstarted attempt.
+///
+/// The gap identity is derived from the publication identity this owner itself
+/// declared, so re-presenting the same refused result names the same gap instead
+/// of appending a new one per retry, and two refused results can never collide.
+/// Re-recording the same gap is a reconciliation and returns the retained
+/// revision unchanged.
+///
+/// A commitment is never a gap. The caller must present a
+/// [`RefusedReceiptStatus`] the canonical route actually returned; a readiness
+/// or transport refusal produced no receipt and has no such status, so it must
+/// leave the obligation `Pending` for a later retry rather than manufacture a
+/// refusal. The transition also touches nothing but this one obligation's
+/// delivery: the lifecycle state, the outcome reference and every earlier
+/// obligation are untouched, so a gap cannot rewrite the execution history it
+/// covers, and it appends no obligation and re-enters no producer, so gap
+/// reporting cannot recursively create another maintenance result.
+///
+/// # Errors
+///
+/// Returns [`MaintenanceError::InvalidField`] when either identity is empty or
+/// carries a control character, when this job owes no result observation under
+/// the named publication identity, or when a *different* gap is already recorded
+/// under that identity; [`MaintenanceError::IdentityConflict`] when a store
+/// receipt is already admitted under that identity, because an admitted
+/// observation is not a gap.
+pub fn record_observation_gap(
+    job: &MaintenanceJob,
+    publication_id: &str,
+    refused_operation_id: &str,
+    status: RefusedReceiptStatus,
+) -> Result<MaintenanceJob, MaintenanceError> {
+    text(publication_id, "observation_gap.publication_id")?;
+    text(refused_operation_id, "observation_gap.refused_operation_id")?;
+    let Some(index) = job
+        .result_obligations
+        .iter()
+        .position(|obligation| obligation.publication_id == publication_id)
+    else {
+        return Err(MaintenanceError::InvalidField(
+            "observation_gap.publication_id",
+        ));
+    };
+    let gap_ref = observation_gap_ref(publication_id, refused_operation_id, status);
+    let mut next = job.clone();
+    let obligation = &mut next.result_obligations[index];
+    match &obligation.delivery {
+        MaintenanceDeliveryState::Published { .. } => {
+            // The observation was admitted. Refusing to un-admit it keeps a
+            // later refusal from erasing a real store receipt.
+            return Err(MaintenanceError::IdentityConflict);
+        }
+        MaintenanceDeliveryState::Unavailable {
+            coverage_gap_ref: settled,
+        } => {
+            if settled == &gap_ref {
+                return Ok(job.clone());
+            }
+            return Err(MaintenanceError::InvalidField(
+                "observation_gap.coverage_gap_ref",
+            ));
+        }
+        MaintenanceDeliveryState::Pending { .. } => {}
+    }
+    obligation.delivery = MaintenanceDeliveryState::Unavailable {
+        coverage_gap_ref: gap_ref,
     };
     next.validate()?;
     Ok(next)
