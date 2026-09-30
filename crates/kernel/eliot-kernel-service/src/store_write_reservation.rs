@@ -150,7 +150,6 @@ use eliot_ors::{
 };
 use eliot_platform::SecretReference;
 use eliot_receipts::ReceiptDispositionKind;
-use eliot_security_contracts::{InstructionTaint, PrivacyClass};
 use eliot_store_api::{
     CAPABILITY_RESERVED_WRITE, CanonicalRequestView, OperationId, OrderingHeadExpectation,
     OrderingScopeId, PreparedTransition, ReceiptEnvelope, ReservedScopeBinding,
@@ -183,8 +182,9 @@ pub const RESERVATION_KEY_PROVIDER: &str = "kernel-reservation-key";
 /// when the installation secret provider resolves it, never from the string
 /// itself.
 pub const RESERVATION_KEY_NAME: &str = "store-write-reservation-v1";
-/// Visibility label preserved on every reservation envelope without
-/// interpretation by ORS.
+/// Owner-only visibility label retained for the established reservation test
+/// fixture. Production callers provide the complete admitted class through
+/// [`ReservationSeed::recovery_access_class`].
 pub const RESERVATION_VISIBILITY: &str = "owner-only";
 /// Reason label recorded when a send resolves to a still-unknown outcome.
 pub const UNKNOWN_OUTCOME_REASON: &str = "store-unknown-outcome";
@@ -429,8 +429,9 @@ pub struct ReservationSeed {
     pub key_provider: String,
     /// Key name label under that provider (no secret bytes).
     pub key_name: String,
-    /// Visibility label preserved without interpretation.
-    pub visibility: String,
+    /// Exact privacy, visibility, and instruction-taint verdict admitted by
+    /// the owner for this pending payload. Reservation preserves it unchanged.
+    pub recovery_access_class: RecoveryAccessClass,
     /// Owner creation time in Unix milliseconds.
     pub created_at_ms: i64,
     /// Owner known time in Unix milliseconds; must not precede creation.
@@ -458,7 +459,9 @@ impl ReservationSeed {
         label(&self.recovery_owner, "recovery_owner")?;
         label(&self.key_provider, "key_provider")?;
         label(&self.key_name, "key_name")?;
-        label(&self.visibility, "visibility")?;
+        self.recovery_access_class
+            .validate()
+            .map_err(ReservationWriteError::Ors)?;
         if self.operation_id != operation_id {
             return Err(ReservationWriteError::Binding {
                 operation_id: operation_id.to_owned(),
@@ -671,43 +674,6 @@ fn refuse_plaintext_payload(
     Ok(())
 }
 
-/// Reduces the admitted per-source instruction taint to the single scalar that
-/// travels with the pending payload.
-///
-/// The value is real admitted metadata, not a default: I5.6 step 8 attaches
-/// instruction-taint metadata to the transition before staging and names the
-/// carried member `privacy_origin_taint_metadata`. This repository spells that
-/// member as per-source
-/// [`SourceAssurance`](eliot_store_api::SourceAssurance) records on the
-/// admitted transition's `security: SecurityContext`, and this read consumes
-/// their `instruction_taint`. The admitted context is already validated by
-/// `validate_admitted` (`PreparedTransition::validate` checks every
-/// `SourceAssurance` against the admitted fence) and is hash-bound by the
-/// canonical request view, so the value cannot be edited after admission.
-///
-/// I5.2 requires that "original privacy, visibility, taint and retention travel
-/// with the pending payload". Staged opaque bytes are at most as clean as the
-/// least clean admitted source they were built from, so the reduction is the
-/// maximum declared taint, taken from the total order `InstructionTaint`
-/// derives. ORS records the admitted verdict and never re-derives or downgrades
-/// it (I5.2: ORS "never parses that payload as project meaning").
-///
-/// An empty `source_assurance` list is constructible and legal here:
-/// `SecurityContext` derives `Default` and no admitted gate requires a source, so
-/// the reduction can face a transition carrying no taint evidence at all. It then
-/// fails closed at the highest taint rather than asserting `Cleared`.
-fn admitted_instruction_taint(transition: &PreparedTransition) -> InstructionTaint {
-    transition
-        .security
-        .source_assurance
-        .iter()
-        .map(|source| source.instruction_taint)
-        .max()
-        // Conservative, not admitted: no source declares taint, so nothing
-        // supports a clean claim and the payload fails closed.
-        .unwrap_or(InstructionTaint::CommandLike)
-}
-
 /// Atomically reserves every admitted scope through the actual ORS operation,
 /// or none.
 ///
@@ -723,11 +689,9 @@ fn admitted_instruction_taint(transition: &PreparedTransition) -> InstructionTai
 /// before anything is staged, so `accepted_pending` is never backed by a
 /// payload ORS was told was encrypted and was not.
 ///
-/// The envelope carries the admitted instruction taint from
-/// [`admitted_instruction_taint`]; `PrivacyClass::Private` beside it is the
-/// composition's fixed staging floor, not a per-transition admitted class —
-/// [`eliot_security_contracts::PrivacyClass`] declares no severity order, so no
-/// reduction over the admitted per-source classes is derivable here.
+/// The exact owner-admitted privacy, visibility, and instruction-taint class
+/// travels with the payload. This reservation layer neither derives nor changes
+/// those values from the prepared transition.
 pub fn reserve_for_transition(
     owner: &CompositionReservation,
     seed: &ReservationSeed,
@@ -771,12 +735,7 @@ pub fn reserve_for_transition(
         RecoveryEnvelopeContext {
             operation_or_checkpoint_id: OrsOperationIdentity::new(&seed.operation_id)
                 .map_err(ReservationWriteError::Ors)?,
-            privacy_and_visibility_class: RecoveryAccessClass {
-                privacy: PrivacyClass::Private,
-                visibility: OpaqueLabel::new(seed.visibility.clone())
-                    .map_err(ReservationWriteError::Ors)?,
-                instruction_taint: admitted_instruction_taint(transition),
-            },
+            privacy_and_visibility_class: seed.recovery_access_class.clone(),
             authority_epoch: owner.writer_epoch.clone(),
             state_fence: fence_snapshot,
             created_at_ms: seed.created_at_ms,
@@ -1358,6 +1317,8 @@ pub fn recovery_page(
 /// forbids and which `refuse_plaintext_payload` still refuses independently
 /// before any ORS mutation. This revision adds no cipher, no key material and
 /// no second encoding.
+/// The caller supplies the exact admitted recovery access class; this function
+/// does not derive or default its privacy, visibility, or instruction taint.
 ///
 /// The operation identity is the admitted one, byte for byte, and the ORS
 /// reservation label is derived from that same identity rather than supplied
@@ -1375,19 +1336,6 @@ pub fn recovery_page(
 /// never downgrades the envelope to the root-transition-only
 /// `RecoveryPayload::CanonicalRequest` variant.
 ///
-/// This producer has no production caller, and that is recorded rather than
-/// worked around: the only route that consumes a seed is
-/// `KernelStoreGateway::apply_reserved`, which no live route reaches, and
-/// `ReservationSeed { .. }` is constructed nowhere else in production. It is
-/// kept honest here so that when the reserved route becomes reachable the
-/// producer is already correct rather than a refusal. The four searched
-/// negatives that keep the route unreachable — the Store's uninstalled
-/// reserved-write execution generation, the unadvertised
-/// `CAPABILITY_RESERVED_WRITE`, the missing production source for
-/// [`ObservedHead::expected_head_digest`], and ORS's unbound
-/// `CanonicalEvidenceProvider` — are each cited with file and line at the live
-/// canonical write call site in
-/// `bins/eliot-kernel/src/daemon_request_dispatch.rs`.
 pub fn gateway_seed(
     platform: &eliot_platform_windows::WindowsPlatform,
     transition: &PreparedTransition,
@@ -1395,6 +1343,7 @@ pub fn gateway_seed(
     created_at_ms: i64,
     known_at_ms: i64,
     expires_at_ms: i64,
+    recovery_access_class: RecoveryAccessClass,
     heads: &[ObservedHead],
 ) -> Result<ReservationSeed, ReservationWriteError> {
     let operation_id = transition.identity.operation_id.as_str().to_owned();
@@ -1424,7 +1373,7 @@ pub fn gateway_seed(
         payload_bytes: protected.as_bytes().to_vec(),
         key_provider: RESERVATION_KEY_PROVIDER.to_owned(),
         key_name: RESERVATION_KEY_NAME.to_owned(),
-        visibility: RESERVATION_VISIBILITY.to_owned(),
+        recovery_access_class,
         created_at_ms,
         known_at_ms,
         expires_at_ms,

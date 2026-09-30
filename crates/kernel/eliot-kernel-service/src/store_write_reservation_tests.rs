@@ -569,7 +569,12 @@ fn seed_with_heads_with(
         payload_bytes: payload.into_bytes(),
         key_provider: fixture.key_provider.clone(),
         key_name: fixture.key_name.clone(),
-        visibility: fixture.visibility.clone(),
+        recovery_access_class: eliot_ors::RecoveryAccessClass {
+            privacy: eliot_security_contracts::PrivacyClass::Private,
+            visibility: OpaqueLabel::new(fixture.visibility.clone())
+                .expect("992 fixture visibility is a valid owner label"),
+            instruction_taint: eliot_security_contracts::InstructionTaint::CommandLike,
+        },
         created_at_ms: fixture.created_at_ms,
         known_at_ms: fixture.known_at_ms,
         expires_at_ms: fixture.expires_at_ms,
