@@ -442,9 +442,14 @@
 //! owner can act on it. So this module states the gap and stops.
 //!
 //! What I12.24:82 already guarantees keeps this honest in the meantime: the
-//! recorded disposition is `Investigate`, one of the kinds `is_non_mutating`
-//! admits, so nothing here changes a surface while the publication contour is
-//! absent.
+//! recorded disposition is one of the kinds `is_non_mutating` admits — and which
+//! one is measured rather than assumed. On this tree it is always
+//! [`OwnerDecisionKind::Reject`], because every decision this daemon's
+//! maintenance evaluator produces is `AutomationDecision::Block`; the
+//! `Investigate` arm is present and correct but unreachable until a mode owner
+//! publishes a decision that is not `Block`. See "MEASURED" on
+//! [`daemon_disposition_kind`]. Either way nothing here changes a surface while
+//! the publication contour is absent.
 //!
 //! # Archive receipts are durable dispositions, not diagnostics (W3)
 //!
@@ -920,6 +925,40 @@ pub fn assemble_improvement_artifact(
 ///   "investigate" is the truthful record and "reject" would claim a resolution
 ///   nobody reached.
 ///
+/// # MEASURED: on this tree `Investigate` is UNREACHABLE, and `Reject` is
+/// # therefore the only kind this function can return
+///
+/// The mapping above is correct as a mapping, but only one of its two arms is
+/// reachable today, and the honest statement is which. Measured, not assumed:
+///
+/// - `AutomationDecision::Escalate` has ZERO producers. Its only occurrences
+///   workspace-wide are two match arms and one spelling — this file's
+///   [`conformance_priority`], `maintenance_dispatch.rs:200`, and the
+///   `Display` arm at `eliot-maintenance/src/lib.rs:591`. `evaluate_trigger`
+///   never returns it.
+/// - every value `evaluate_trigger` CAN return on this tree is `Block`. There is
+///   exactly one `MaintenanceTriggerInput` construction site
+///   (`maintenance_trigger_evaluator.rs:266`), it sets `mode: policy.mode()`
+///   (`:271`) from `MaintenancePolicyEvidence::unpublished(entry.mode, ..)`, and
+///   the catalog macro assigns `mode: UNRESOLVED_POLICY_MODE` to every one of
+///   its fifteen entries (`maintenance_family_catalog.rs:1245`), where
+///   `UNRESOLVED_POLICY_MODE` is `MaintenanceAutomationMode::Off`
+///   (`:93`). `Off` is the FIRST arm of the decision match and returns
+///   `(Block, AutomationOff)` (`eliot-maintenance/src/lib.rs:821-822`), so no
+///   later arm is reached. `active_job_id` is a literal `None`
+///   (`maintenance_trigger_evaluator.rs:286`), so `SuppressDuplicate` cannot
+///   fire either, and `safety_required` is `false` because
+///   `MaintenanceSafetyEvidence::unpublished()` records `required: false`
+///   (`:265`, `eliot-maintenance/src/lib.rs:1456`).
+///
+/// So `daemon_disposition_kind` returns [`OwnerDecisionKind::Reject`] on every
+/// live pass, and the `Investigate` arm is retained for the first decision that
+/// is not `Block` rather than removed: the mode owner that would produce one
+/// does not exist yet, and deleting the arm would make the refusal silent the
+/// moment that owner appears instead of recording a truthful triage. Stated
+/// because the alternative reading — "both kinds are derived from content" —
+/// is what makes a reader believe `Investigate` is exercised, and it is not.
+///
 /// # What this is NOT
 ///
 /// The principal recorded against the decision is still the DAEMON
@@ -946,10 +985,13 @@ fn daemon_disposition_kind(
 /// assembled, and names it as such.
 ///
 /// This is the production caller of the bridge's `record_brief_decision`, which
-/// previously had none, and it is still non-mutating: `Investigate` is one of the
-/// two kinds `is_non_mutating` admits, and recording it changes no surface, which
-/// is I12.24:82's "advisory … default; changes nothing until owner acts"
-/// observed rather than asserted.
+/// previously had none, and it is still non-mutating: the recorded kind is one
+/// of the two kinds `is_non_mutating` admits, and recording it changes no
+/// surface, which is I12.24:82's "advisory … default; changes nothing until
+/// owner acts" observed rather than asserted. Which of the two it is on this
+/// tree is measured under "MEASURED" on [`daemon_disposition_kind`] above: it is
+/// `Reject` on every live pass, because every decision this daemon's evaluator
+/// produces is `Block`.
 ///
 /// # The owner is the daemon, and deliberately NOT `IMPROVEMENT_OWNER`
 ///
@@ -1583,12 +1625,15 @@ fn enforce_improvement_class_gate(
 ///   residual resolves to `SelfQualityDebt` and to nothing else, which is the
 ///   measured reason the remaining I12.24 sources have no arm here rather than
 ///   a judgement about them. What the residual covers is the DECISION, not the
-///   family: `AutomationDecision::Start` admits the job, `Suggest` preserves a
-///   recommendation instead, `Defer` holds it for a later eligible window,
-///   `Block` and `Escalate` deny or escalate it, and `SuppressDuplicate`
-///   records that equivalent work is already active. Each of those is an
-///   outcome this daemon itself produced, and none of them is a Watchdog
-///   suggestion.
+///   family: the vocabulary defines `AutomationDecision::Start` (admits the
+///   job), `Suggest` (preserves a recommendation), `Defer` (holds it for a later
+///   eligible window), `Block` (denies), `Escalate` (hands it to a Human or
+///   recovery owner) and `SuppressDuplicate` (records that equivalent work is
+///   already active). On this tree exactly ONE of those is reachable —
+///   `Block` — because every family's mode is `Off` and `active_job_id` is a
+///   literal `None`; the measurement is under "MEASURED" on
+///   [`daemon_disposition_kind`]. None of the six is a Watchdog suggestion, and
+///   the one that is reachable is a policy occurrence.
 ///
 /// # Why no decision reaching this function is a `Watchdog` observation
 ///
