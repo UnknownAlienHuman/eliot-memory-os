@@ -286,30 +286,59 @@ impl ProposedRestorationRequirements {
             })?;
         let requires_source_key_material =
             matches!(facts.archive_class, BackupClassWire::FullRecovery);
-        let mut requirements = Self {
+        // The commitment is computed over those values BEFORE the record exists,
+        // from the same field-only seam the recomputation in `validate` uses, so
+        // the record is never constructed with a placeholder digest that a later
+        // step has to overwrite.
+        let admitted_classes = vec![facts.archive_class];
+        let requirements_digest = Self::digest_over_fields(
+            &wire,
+            &admitted_classes,
+            max_restore_bytes,
+            &target_schema_digest,
+            requires_source_key_material,
+        )?;
+        let requirements = Self {
             wire,
-            admitted_classes: vec![facts.archive_class],
+            admitted_classes,
             max_restore_bytes,
             target_schema_digest,
             requires_source_key_material,
-            // The commitment is recomputed from the fields immediately below and
-            // then re-validated, so the placeholder here is overwritten before
-            // this value is ever returned or compared against.
-            requirements_digest: String::new(),
+            requirements_digest,
         };
-        requirements.requirements_digest = requirements.computed_digest()?;
         requirements.validate()?;
         Ok(requirements)
     }
 
     /// Recomputes the domain-separated requirements digest.
     pub fn computed_digest(&self) -> Result<PlatformHandle, InstallationError> {
-        let bytes = canonical_json_bytes(&(
-            Self::WIRE,
+        Self::digest_over_fields(
+            &self.wire,
             &self.admitted_classes,
             self.max_restore_bytes,
-            self.target_schema_digest.as_str(),
+            &self.target_schema_digest,
             self.requires_source_key_material,
+        )
+    }
+
+    /// Digests exactly the five committed requirement fields, with no `Self`.
+    ///
+    /// This is the single seam both the issuer and [`Self::validate`]'s
+    /// recomputation go through, so the recorded digest and the compared digest
+    /// cannot be produced by different code over different field sets.
+    fn digest_over_fields(
+        wire: &PlatformHandle,
+        admitted_classes: &[BackupClassWire],
+        max_restore_bytes: u64,
+        target_schema_digest: &PlatformHandle,
+        requires_source_key_material: bool,
+    ) -> Result<PlatformHandle, InstallationError> {
+        let bytes = canonical_json_bytes(&(
+            Self::WIRE,
+            admitted_classes,
+            max_restore_bytes,
+            target_schema_digest.as_str(),
+            requires_source_key_material,
         ))
         .map_err(|error| InstallationError::InvalidField {
             field: "prepared_destination.requirements.requirements_digest".to_owned(),
