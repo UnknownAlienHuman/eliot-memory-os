@@ -1,4 +1,10 @@
 //! Serde and JSON Schema contract types shared by MCP and EBP callers.
+//!
+//! This module is the decode-and-validate boundary: it carries the closed
+//! caller intent and the exact selectors its read plans accept, and it carries
+//! no dimension that no plan reads. Closed time, branch/environment, freshness
+//! and assurance semantics are read policy owned by the Governor read facade
+//! and resolved there against the request fence; they are not declared here.
 
 use std::collections::BTreeSet;
 
@@ -218,35 +224,37 @@ impl PacketInput {
     }
 }
 
-/// The assurance semantics of a broad query.
+/// Declared intent of an `eliot.query` request.
+///
+/// The architecture contract's `QueryIntent` names five dimensions and states
+/// that it "determines stale and assurance semantics" (`I10-08-17`). This
+/// surface models exactly one of them, [`QueryIntent::mode`]: it is the only
+/// dimension a caller can enforce here, and both query plans fail closed on it
+/// before any read is planned.
+///
+/// Time scope, branch/environment scope, freshness policy and required
+/// assurance are deliberately absent rather than carried as free strings. This
+/// surface previously required all four as non-blank strings and no plan read
+/// one of them, so any prose produced an identical plan: a required field
+/// promising a selector that nothing selects. Their canonical typed forms are
+/// closed enums owned by the Governor read facade, which resolves them against
+/// the request fence. That facade's `QueryIntent` has no live construction site
+/// on any current path, so binding this surface to it would trade a working
+/// admission for an unreachable one.
 #[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueryIntent {
-    /// Semantic query mode.
+    /// Semantic query mode; the only enforced dimension of this intent.
     pub mode: QueryMode,
-    /// Exact time window or named temporal scope.
-    pub time_scope: String,
-    /// Branch and environment scope.
-    pub branch_environment_scope: String,
-    /// Required freshness behavior.
-    pub freshness_policy: String,
-    /// Required assurance/proof behavior.
-    pub required_assurance: String,
 }
 
-impl QueryIntent {
-    fn validate(&self) -> Result<(), ContractViolation> {
-        non_blank(&self.time_scope, "query.intent.time_scope")?;
-        non_blank(
-            &self.branch_environment_scope,
-            "query.intent.branch_environment_scope",
-        )?;
-        non_blank(&self.freshness_policy, "query.intent.freshness_policy")?;
-        non_blank(&self.required_assurance, "query.intent.required_assurance")
-    }
-}
-
-/// Closed query modes from the architecture contract.
+/// Closed query modes this surface admits.
+///
+/// The seven modes the architecture contract names for `QueryIntent.mode`
+/// (`I10-08-17`), spelled as the Governor read facade's closed `QueryMode`
+/// spells them. This surface keeps its own declaration because it is a
+/// decode-and-validate boundary, not the read owner: it must fail closed on a
+/// mode before any read reaches an owner.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryMode {
@@ -270,7 +278,8 @@ pub enum QueryMode {
 #[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueryInput {
-    /// Explicit semantics for broad or mutable queries.
+    /// Closed declared intent; see [`QueryIntent`] for the dimensions this
+    /// surface models and the ones it deliberately does not.
     pub intent: QueryIntent,
     /// Query text or exact selector.
     pub query: String,
@@ -280,7 +289,6 @@ pub struct QueryInput {
 
 impl QueryInput {
     fn validate(&self) -> Result<(), ContractViolation> {
-        self.intent.validate()?;
         non_blank(&self.query, "query.query")?;
         optional_non_blank(
             self.exact_resource_uri.as_deref(),

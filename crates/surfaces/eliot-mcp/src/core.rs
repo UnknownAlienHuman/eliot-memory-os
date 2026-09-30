@@ -3041,13 +3041,7 @@ mod evidence_pack_query_plan_tests {
     use crate::{QueryInput, QueryIntent};
 
     fn verification_intent(mode: QueryMode) -> QueryIntent {
-        QueryIntent {
-            mode,
-            time_scope: "evidence window for verification".to_owned(),
-            branch_environment_scope: "test branch and environment".to_owned(),
-            freshness_policy: "exact captured records only".to_owned(),
-            required_assurance: "verifier evidence read".to_owned(),
-        }
+        QueryIntent { mode }
     }
 
     fn input(mode: QueryMode, query: &str) -> QueryInput {
@@ -3189,13 +3183,7 @@ mod context_reconstruction_query_plan_tests {
     use crate::{QueryInput, QueryIntent};
 
     fn reconstruction_intent(mode: QueryMode) -> QueryIntent {
-        QueryIntent {
-            mode,
-            time_scope: "task window for reconstruction".to_owned(),
-            branch_environment_scope: "test branch and environment".to_owned(),
-            freshness_policy: "exact admitted generation only".to_owned(),
-            required_assurance: "reconstruction input read".to_owned(),
-        }
+        QueryIntent { mode }
     }
 
     fn input(mode: QueryMode, query: &str) -> QueryInput {
