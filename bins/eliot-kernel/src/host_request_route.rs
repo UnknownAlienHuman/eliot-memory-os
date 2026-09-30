@@ -3737,7 +3737,7 @@ impl KernelComposition {
         // transition, or failed attach inside the two calls leaves the
         // submit disposition and the durability contract unchanged, so they
         // never gain a receipt-shaped failure mode.
-        if let Some(receipt) = advance_tool_exposure_receipt_for_persisted_result(
+        if let Some((request, receipt)) = advance_tool_exposure_receipt_for_persisted_result(
             queue,
             queued_envelope.as_ref(),
             queued_tool.as_ref(),
@@ -3751,6 +3751,26 @@ impl KernelComposition {
                     &persisted.request_digest,
                     &receipt,
                 );
+            // Issue #1745 R7 completion tail: the completion-owned exposure
+            // evidence (called/transport/delivery from the measured
+            // completion, use/outcome where lane-measured; every other stage
+            // explicitly unresolved) persists through the existing observation
+            // path under the same operation:digest idempotency lineage as the
+            // dispatch draft. Observational only: a populate failure is
+            // terminal-visible but never changes the submit disposition or the
+            // durability contract.
+            let campaign_lane = matches!(queue, DaemonReadQueue::CampaignPacket);
+            if let Some(envelope) = queued_envelope.as_ref() {
+                super::tool_exposure::observe_completion_exposure(
+                    envelope,
+                    &request,
+                    &receipt,
+                    campaign_lane,
+                    |draft| {
+                        self.audit_observe(draft);
+                    },
+                );
+            }
         }
         // The single completion consumes the attempt use budget: retire the
         // pair in the same queue ledger that authorized it so no later claim
@@ -3795,14 +3815,19 @@ impl KernelComposition {
 /// durability contract never gain a receipt-shaped failure mode. A returned
 /// receipt is passed by the caller into the durable operation row it
 /// evidences — never dropped.
-/// Returns the completed receipt for retention, or `None` when there is
-/// nothing to retain.
+/// Returns the admitted request with the completed receipt for retention, or
+/// `None` when there is nothing to retain. The request travels with the
+/// receipt so the completion-owned exposure draft joins the same evaluated
+/// tool and route without re-deriving admission.
 fn advance_tool_exposure_receipt_for_persisted_result(
     queue: DaemonReadQueue,
     envelope: Option<&HostRequestEnvelope>,
     tool: Option<&serde_json::Value>,
     persisted: &HostRequestRecord,
-) -> Option<eliot_receipts::ToolExposureReceiptV2> {
+) -> Option<(
+    eliot_receipts::ToolCallRequest,
+    eliot_receipts::ToolExposureReceiptV2,
+)> {
     let (Some(envelope), Some(tool)) = (envelope, tool) else {
         return None;
     };
@@ -3850,7 +3875,9 @@ fn advance_tool_exposure_receipt_for_persisted_result(
     // receipt is returned for retention on the durable operation row —
     // never dropped.
     let terminal_ref = format!("host-request-result-received:{operation}:{digest}");
-    used.record_terminal_outcome(terminal_ref).ok()
+    used.record_terminal_outcome(terminal_ref)
+        .ok()
+        .map(|receipt| (request, receipt))
 }
 
 /// Closed capability admitted to the observe queue (issue #2565: one

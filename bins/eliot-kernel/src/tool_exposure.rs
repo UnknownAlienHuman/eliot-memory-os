@@ -13,7 +13,7 @@
 
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_receipts::{
-    LoopSignal, ToolCallClass, ToolCallIntent, ToolCallRequest, ToolExposureError,
+    LoopSignal, ResultDelivery, ToolCallClass, ToolCallIntent, ToolCallRequest, ToolExposureError,
     ToolExposureReceiptV2,
     tool_exposure::{
         AttemptEvidence, DeliveredToolRepresentation, EXPOSURE_HISTORY_VERSION, OwnerStageFact,
@@ -488,6 +488,171 @@ pub(crate) fn observe_dispatch_exposure(
     emit: impl FnOnce(AuditEventDraft),
 ) {
     match dispatch_exposure_draft(envelope, tool, admission) {
+        Ok(draft) => emit(draft),
+        Err(_) => crate::kernel_diagnostics::observe_terminal_error(
+            crate::kernel_audit::KERNEL_AUDIT_APPEND_TERMINAL_CODE,
+        ),
+    }
+}
+
+/// Populates the completion-seam-owned exposure evidence for one persisted
+/// result and seals it as the durable observation draft.
+///
+/// Only the stages this boundary observes are supplied, each from its own
+/// owner evidence carried by the completed receipt:
+/// - `called` and `transport_completed` hold because the receipt retains a
+///   produced result with digest-bound delivered representation: the queued
+///   pair executed and its result persisted through the Kernel transport leg.
+///   Both bind the `host-request-persisted-completion` coordinates, never
+///   caller prose;
+/// - `result_delivery` is `FULL` with the produced digest and the delivery
+///   owner's measured source handle. Only digest-bound full delivery is
+///   observable here: the protocol rejects oversize bodies instead of cutting
+///   them, and token measurement has no owner on this path, so token
+///   observations stay absent rather than zero;
+/// - observable use holds only on the campaign lane when the completed
+///   receipt records it (the lane verifier consumed the verified view),
+///   bound to the `campaign-packet-verified-view` evidence. Query and Skill
+///   lanes serve bytes without deciding from content, so their use stays
+///   explicitly unresolved — never `false`;
+/// - the terminal outcome carries the receipt's recorded reference verbatim.
+///
+/// Registration, advertisement, eligibility, selection, and retry stay
+/// explicitly `null`: unresolved unknown owned elsewhere, never `false`,
+/// never inferred from a neighbouring stage, and never overwritten — the
+/// dispatch seam already recorded its own stages in its own draft under the
+/// same idempotency lineage. Turn, run, and attempt identities likewise stay
+/// unresolved; the surface identity is the admission-derived route, exactly
+/// like the dispatch draft, so both drafts join one revision lineage. The
+/// Tool Definition version stays explicitly `null`: the definition owner
+/// lives on the publish side and this seam never mints or guesses it.
+///
+/// The `idempotency_key` repeats the dispatch construction
+/// (`operation:envelope-sha256`), so a repeated completion reconciles the
+/// recorded original instead of persisting a second revision.
+///
+/// Reads only, never stages, never executes. Observation never changes the
+/// persisted completion.
+///
+/// # Errors
+///
+/// Returns [`eliot_receipts::ToolExposureError`] when the receipt is
+/// inconsistent, joins a different tool or route than the admitted request,
+/// names a different operation than the presenting envelope, records anything
+/// but digest-bound full delivery, or carries unbound digests.
+pub(crate) fn completion_exposure_draft(
+    envelope: &eliot_protocol::HostRequestEnvelope,
+    request: &ToolCallRequest,
+    receipt: &ToolExposureReceiptV2,
+    campaign_lane: bool,
+) -> Result<AuditEventDraft, eliot_receipts::ToolExposureError> {
+    receipt.validate()?;
+    if request.tool_definition != receipt.tool_definition {
+        return Err(eliot_receipts::ToolExposureError::InvalidField {
+            field: "history.tool_definition",
+            reason: "exposure draft joins the wrong evaluated tool",
+        });
+    }
+    if request.route_fingerprint != receipt.route_fingerprint {
+        return Err(eliot_receipts::ToolExposureError::InvalidField {
+            field: "history.route_fingerprint",
+            reason: "exposure draft joins the wrong evaluated route",
+        });
+    }
+    let operation = eliot_protocol::host_request_operation_id(envelope);
+    if operation != receipt.receipt_id {
+        return Err(eliot_receipts::ToolExposureError::InvalidField {
+            field: "history.identities",
+            reason: "exposure draft names a different operation than its envelope",
+        });
+    }
+    if !matches!(receipt.result_delivery, ResultDelivery::Full) {
+        return Err(eliot_receipts::ToolExposureError::InvalidField {
+            field: "history.result_delivery",
+            reason: "completion seam observes only digest-bound full delivery",
+        });
+    }
+    let produced = receipt.produced_result.as_ref().ok_or(
+        eliot_receipts::ToolExposureError::InvalidField {
+            field: "history.result_delivery",
+            reason: "completion delivery requires the produced result it evidences",
+        },
+    )?;
+    let delivered = receipt.delivered_representation.as_ref().ok_or(
+        eliot_receipts::ToolExposureError::InvalidField {
+            field: "history.delivery_source_ref",
+            reason: "full delivery requires rendered representation evidence",
+        },
+    )?;
+    if produced.result_digest != delivered.representation_digest {
+        return Err(eliot_receipts::ToolExposureError::InvalidField {
+            field: "history.delivery_source_ref",
+            reason: "produced digest does not bind the delivered representation",
+        });
+    }
+    let coordinates = format!(
+        "host-request-persisted-completion:{}:{}",
+        receipt.receipt_id, produced.result_digest
+    );
+    let called = OwnerStageFact::supplied(true, coordinates.clone())?;
+    let transport = OwnerStageFact::supplied(true, coordinates)?;
+    let used = match (campaign_lane, receipt.is_evidence_used()) {
+        (true, true) => Some(OwnerStageFact::supplied(
+            true,
+            format!(
+                "campaign-packet-verified-view:{}:{}",
+                receipt.receipt_id, produced.result_digest
+            ),
+        )?),
+        _ => None,
+    };
+    let delivery = serde_json::to_value(ResultDelivery::Full).map_err(|_| {
+        eliot_receipts::ToolExposureError::InvalidField {
+            field: "history.result_delivery",
+            reason: "full delivery is not serializable",
+        }
+    })?;
+    let body = serde_json::json!({
+        "tool_definition": request.tool_definition,
+        "definition_version": null,
+        "route_fingerprint": request.route_fingerprint,
+        "surface_ref": request.route_fingerprint,
+        "turn_ref": null,
+        "run_ref": null,
+        "attempt_ref": null,
+        "registered": null,
+        "advertised_to_route": null,
+        "eligible_under_scope_policy_and_grant": null,
+        "selected_by_planner_or_model": null,
+        "called": called,
+        "transport_completed": transport,
+        "result_delivery": delivery,
+        "result_digest": produced.result_digest,
+        "delivery_source_ref": delivered.source_handle,
+        "expanded_or_retried": null,
+        "observably_used_in_decision_action_or_verifier": used,
+        "terminal_task_or_product_outcome_ref": receipt.terminal_task_or_product_outcome_ref,
+        "exposure_history_version": EXPOSURE_HISTORY_VERSION,
+        "idempotency_key": format!("{operation}:{}", envelope.envelope_sha256),
+    });
+    Ok(AuditEventDraft::receipt_exposure_recorded(envelope, body))
+}
+
+/// Emits one completion-owned exposure draft through the existing observation
+/// path (issue #1745, R7 completion tail).
+///
+/// Best-effort like every observation: a populate failure is terminal-visible
+/// but never changes the persisted completion. Callers invoke this only for a
+/// freshly persisted completion alongside the retained receipt; replays
+/// reconcile the recorded original upstream.
+pub(crate) fn observe_completion_exposure(
+    envelope: &eliot_protocol::HostRequestEnvelope,
+    request: &ToolCallRequest,
+    receipt: &ToolExposureReceiptV2,
+    campaign_lane: bool,
+    emit: impl FnOnce(AuditEventDraft),
+) {
+    match completion_exposure_draft(envelope, request, receipt, campaign_lane) {
         Ok(draft) => emit(draft),
         Err(_) => crate::kernel_diagnostics::observe_terminal_error(
             crate::kernel_audit::KERNEL_AUDIT_APPEND_TERMINAL_CODE,
