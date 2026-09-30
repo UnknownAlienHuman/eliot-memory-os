@@ -27,6 +27,49 @@ use eliot_protocol::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Exact query-owned inputs for reading captured LSP Blobs under the current
+/// reconstruction request. These values are copied from authenticated
+/// envelope/readback paths and are not themselves an admission.
+#[derive(Clone, Debug)]
+pub(crate) struct CapturedLspReadContext {
+    pub(crate) envelope: eliot_protocol::HostRequestEnvelope,
+    pub(crate) attempt: eliot_protocol::LocalReadAttempt,
+    pub(crate) request_metadata: eliot_contracts::RequestMetadata,
+    pub(crate) holder: eliot_authority::PrincipalRef,
+    pub(crate) task_frame_readback: eliot_read::ReadIdentity,
+    pub(crate) causal_binding: eliot_store_api::CausalBinding,
+    pub(crate) now: eliot_authority::LogicalTime,
+}
+
+/// Typed failures from the live captured-LSP source read and semantic adoption.
+#[derive(Debug, Error)]
+pub enum CapturedLspAdoptionError {
+    /// The authenticated Kernel principal could not be represented as a holder.
+    #[error("authenticated Kernel principal is invalid: {0}")]
+    Holder(#[from] eliot_authority::AuthorityError),
+    /// The Governor could not issue a read admission from its current owners.
+    #[error("source-artifact read admission failed: {0}")]
+    Admission(#[from] eliot_governor::SourceArtifactAdmissionError),
+    /// The current recovered Policy owner is absent.
+    #[error("source-artifact Policy owner is unavailable")]
+    MissingPolicyOwner,
+    /// The Policy owner refused the current read profile.
+    #[error("source-artifact Policy profile failed: {0}")]
+    Profile(#[from] eliot_governor::SourceArtifactBlobProfileError),
+    /// The daemon Blob owner refused the authenticated read.
+    #[error("source-artifact Blob read failed: {0}")]
+    SourceOwner(#[from] SourceArtifactOwnerError),
+    /// Governor/CodeCortex rejected the authenticated evidence join.
+    #[error("captured LSP semantic adoption failed: {0}")]
+    Semantic(#[from] eliot_governor::CapturedLspEvidenceError),
+    /// Independently admitted reads observed different current Task bindings.
+    #[error("current task binding changed across captured LSP reads")]
+    CurrentTaskChanged,
+    /// The current Store causal projection differed from the admitted read.
+    #[error("current Store causal binding changed across captured LSP reads")]
+    CurrentCausalChanged,
+}
+
 #[cfg(test)]
 use eliot_contracts::RequestId;
 #[cfg(test)]
@@ -1880,6 +1923,69 @@ impl DaemonComposition {
     #[must_use]
     pub const fn source_artifact_owner(&self) -> &SourceArtifactOwner {
         &self.source_artifact_owner
+    }
+
+    /// Admits and reads each exact captured LSP Blob under the current query,
+    /// then passes the authenticated chunks to Governor's stale-only semantic
+    /// consumer. Historical capture task bindings remain separate from the
+    /// current query Task/causal bindings.
+    pub(crate) fn consume_captured_lsp_payloads(
+        &mut self,
+        context: CapturedLspReadContext,
+        payloads: Vec<(
+            eliot_store_api::CapturedBlobPayloadRefV1,
+            eliot_store_api::TaskBinding,
+        )>,
+    ) -> Result<Vec<eliot_instrument_api::NormalizedEvidence>, CapturedLspAdoptionError> {
+        let mut current_task_binding = None;
+        let mut observations = Vec::with_capacity(payloads.len());
+        for (reference, historical_task_binding) in payloads {
+            let request = eliot_governor::SourceArtifactReadRequest {
+                envelope: context.envelope.clone(),
+                attempt: context.attempt.clone(),
+                request_metadata: context.request_metadata.clone(),
+                holder: context.holder.clone(),
+                task_frame_readback: context.task_frame_readback.clone(),
+                causal_binding: context.causal_binding.clone(),
+                payload_ref: reference.clone(),
+                now: context.now,
+            };
+            let admission = self.governor.admit_source_artifact_read(request)?;
+            if admission.causal() != &context.causal_binding {
+                return Err(CapturedLspAdoptionError::CurrentCausalChanged);
+            }
+            let admitted_task = admission.task().clone();
+            if current_task_binding
+                .as_ref()
+                .is_some_and(|current| current != &admitted_task)
+            {
+                return Err(CapturedLspAdoptionError::CurrentTaskChanged);
+            }
+            current_task_binding.get_or_insert(admitted_task);
+            let profile = self
+                .policy_owner()
+                .ok_or(CapturedLspAdoptionError::MissingPolicyOwner)?
+                .source_artifact_blob_profile(&admission)?;
+            let readback = self.source_artifact_owner.read_captured_observation_payload(
+                &admission,
+                &profile,
+                &reference,
+            )?;
+            observations.push(eliot_governor::CapturedLspObservation::new(
+                reference,
+                readback,
+                historical_task_binding,
+            ));
+        }
+        let Some(current_task_binding) = current_task_binding else {
+            return Ok(Vec::new());
+        };
+        self.governor.consume_captured_lsp_observations(
+            current_task_binding,
+            context.causal_binding,
+            observations,
+        )
+        .map_err(CapturedLspAdoptionError::from)
     }
 
     /// Computes the digest of the provider-owned recovery snapshot admitted at
