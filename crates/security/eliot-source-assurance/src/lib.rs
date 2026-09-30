@@ -148,6 +148,11 @@ pub enum AxisStatus {
 }
 
 /// Privacy boundary attached to source material.
+///
+/// Distinct from `eliot_security_contracts::PrivacyClass`: the canonical
+/// class `UserPrivate` is spelled `Private` there, and the two orderings are
+/// independent. This is the admission cell's own ladder; see
+/// [`SourceAssurance`] for why the two are not merged.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PrivacyClass {
@@ -159,6 +164,15 @@ pub enum PrivacyClass {
 }
 
 /// Ingress instruction-taint state. Taint is never cleared by transformation.
+///
+/// Distinct from `eliot_security_contracts::InstructionTaint`. This ladder is
+/// about *which ingress channel* material arrived on, so it carries an
+/// `Unknown` variant that `admit` reports as
+/// [`AssuranceFinding::AxisUnknown`]. The canonical ladder is a monotonic
+/// taint severity (`Cleared`/`DataOnly`/`Untrusted`/`CommandLike`) with no
+/// unknown state, and a use boundary compares against it. Substituting one for
+/// the other would either invent an unknown severity or drop the
+/// report-the-unknown admission finding; see [`SourceAssurance`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum InstructionTaint {
@@ -193,6 +207,14 @@ pub enum QuarantineStatus {
 }
 
 /// A source snapshot bound to an exact source set and state fence.
+///
+/// `state_fence` is an opaque fence reference the owner policy supplies
+/// ([`SourceAssurancePolicy::expected_source_state_fence`]) and `admit`
+/// compares for exact equality. It is deliberately not
+/// `eliot_contracts::StateFence`: this cell makes no generation or revision
+/// claim of its own and asserts no authority, so it must not construct a typed
+/// fence. The typed fence is owned at the use boundary by
+/// `eliot_security_contracts::SourceAssurance::state_fence`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SourceSnapshotBinding {
     pub snapshot_id: String,
@@ -245,6 +267,13 @@ pub enum AdmissibleUse {
 
 /// Maximum effect a Q-01-admitted source may have. Q-02 is responsible for
 /// applying influence/disclosure decisions downstream.
+///
+/// Distinct from `eliot_security_contracts::EffectCeiling`, which is the
+/// declared ceiling set a consumer may propose from (`ReadOnly`,
+/// `CandidateOnly`, `NoExternalEffect`) and which `eliot-authority` and
+/// `eliot-user-broker-core` already rank. This cell carries only the two
+/// admission-relevant ceilings: no effect at all, or a read-only candidate.
+/// See [`SourceAssurance`] for why the two are not merged.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum EffectCeiling {
@@ -253,6 +282,34 @@ pub enum EffectCeiling {
 }
 
 /// Complete Q-01 assurance record.
+///
+/// This is the admission cell's own record and is NOT
+/// `eliot_security_contracts::SourceAssurance`, despite the shared name. The
+/// two are different concepts and neither is a value of the other:
+///
+/// - This record is the Q-01 admission *input*: a governing source **set** with
+///   per-member identity/digest, plus the snapshot, frontier and scope bindings
+///   that [`AdmissionExpectation`] is checked against, plus the requested use
+///   and effect ceiling. It carries the decision surface (`admit`,
+///   `admit_with_policy`, `admit_optional`) that yields an
+///   [`AdmissionOutcome`].
+/// - `eliot_security_contracts::SourceAssurance` is the per-source
+///   **declaration** that crosses a use boundary: identity, integrity,
+///   freshness, competence, independence, privacy, taint, permitted
+///   epistemic uses/effects, verifier and quarantine, bound to a typed
+///   `eliot_contracts::StateFence`.
+///
+/// `eliot-security-contracts` owns the shared source-use vocabulary named in
+/// #1760 (A12.4/I8.7); the I8.7 `SourceSecurityAssessment` is built on it and
+/// must not introduce a parallel taint/authority ladder. The types below
+/// (`PrivacyClass`, `InstructionTaint`, `EffectCeiling`) are this cell's own
+/// trust-axis ladder, not re-exports: it is finer-grained where admission needs
+/// it (an `Unknown` taint that is itself a finding, and an `NoEffect` ceiling
+/// distinct from a read-only candidate), and the canonical ladder has no
+/// equivalent. Forcing the two onto one type would drop a guarantee the
+/// admission decision depends on.
+///
+/// Do not pass a value of one across where the other is expected.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SourceAssurance {
     pub schema_version: String,

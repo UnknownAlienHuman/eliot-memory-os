@@ -5,6 +5,23 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Origin and use assurance for one immutable source observation.
+///
+/// This is the canonical owner of the source-use vocabulary named in #1760
+/// (A12.4/I8.7): `PrivacyClass`, `InstructionTaint`, `EpistemicUse`,
+/// `EffectCeiling` and `QuarantineState`, together with the typed
+/// [`eliot_contracts::StateFence`]. I8.7 assessment shapes such as
+/// [`SourceSecurityAssessment`] are built on this record and must reference
+/// these fields rather than introduce a parallel taint/authority ladder with
+/// conflicting meanings.
+///
+/// The admission cell crate `eliot-source-assurance` defines a second type
+/// also named `SourceAssurance`, plus its own `PrivacyClass`,
+/// `InstructionTaint` and `EffectCeiling`. Those are a different concept (a
+/// governing-source-set admission input, not a per-source declaration) with
+/// deliberately different variants, and it is deliberately not a dependency of
+/// this crate; do not treat the two as interchangeable. See
+/// `crates/security/eliot-source-assurance/src/lib.rs::SourceAssurance` for the
+/// admission-side statement.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SourceAssurance {
