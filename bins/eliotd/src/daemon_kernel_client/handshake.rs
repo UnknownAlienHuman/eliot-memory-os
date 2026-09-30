@@ -43,9 +43,13 @@ pub(crate) enum KernelClientError {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum WireOutcome {
     Known {
+        value: serde_json::Value,
+        recovery: Option<serde_json::Value>,
+    },
+    AcceptedPending {
         value: serde_json::Value,
         recovery: Option<serde_json::Value>,
     },

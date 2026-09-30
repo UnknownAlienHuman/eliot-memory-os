@@ -20,15 +20,16 @@ use eliot_protocol::RequestIdentity;
 use eliot_store_api::{
     CampaignSourceHead, CampaignSourceReadStatus, CampaignSourceRevisionLookup,
     CampaignSourceRevisionRead, CanonicalRequestView, NamedReadOperation, NamedReadRequest,
-    OrderingHeadExpectation, OriginalWriteSubmission, PreparedTransition, ReadConsistency,
-    RevisionHeadExpectation, ScopeId, StoreHealth, TaskContractAcceptanceSet, WriteReceipt,
-    decode_task_contract_acceptance_set, generated_operation_manifests,
-    task_contract_acceptance_read_request, validate_store_receipt_envelope,
-    verify_canonical_request_hash,
+    OrderingHeadExpectation, OriginalWriteSubmission, PreparedTransition, PreparedWriteOutcome,
+    ReadConsistency, RevisionHeadExpectation, ScopeId, StoreHealth, TaskContractAcceptanceSet,
+    WriteReceipt,
+    decode_task_contract_acceptance_set,
+    generated_operation_manifests, task_contract_acceptance_read_request,
+    validate_store_receipt_envelope, verify_canonical_request_hash,
 };
 use tracing::Instrument as _;
 
-use super::{DaemonKernelClient, kernel_port_error, kind_value};
+use super::{DaemonKernelClient, KernelClientError, WireOutcome, kernel_port_error, kind_value};
 
 struct OwnerSelectionContext<'a> {
     request_identity: (&'a str, &'a str, &'a str, &'a str),
@@ -261,7 +262,8 @@ impl DaemonKernelClient {
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
         task_selection: Option<OwnerSelectionContext<'a>>,
         original_write_submission: Option<OriginalWriteSubmission>,
-    ) -> KernelPortFuture<'a, WriteReceipt> {
+    ) -> KernelPortFuture<'a, PreparedWriteOutcome> {
+        let has_original_submission = original_write_submission.is_some();
         let identity = identity.clone();
         let span = tracing::info_span!(
             "eliotd.transition_handoff",
@@ -308,25 +310,20 @@ impl DaemonKernelClient {
                     request["original_write_submission"] = serde_json::to_value(source)
                         .map_err(|error| KernelPortError::Contract(error.to_string()))?;
                 }
-                let value = self
-                    .transact_async_with_identity("apply_prepared", request, identity.clone())
+                let wire_outcome = self
+                    .transact_async_with_identity_outcome(
+                        "apply_prepared",
+                        request,
+                        identity.clone(),
+                    )
                     .await
                     .map_err(kernel_port_error)?;
-                let value = kind_value(&value, "write_receipt")?;
-                let receipt: WriteReceipt = serde_json::from_value(value)
-                    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
-                validate_store_receipt_envelope(
-                    &identity.request.metadata,
+                decode_reserved_apply_outcome(
+                    wire_outcome,
+                    has_original_submission,
+                    &identity,
                     &expected_transition,
-                    &receipt,
                 )
-                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
-                let _ = super::diagnostics::emit_handoff(
-                    super::diagnostics::HandoffKind::Committed,
-                    identity.idempotency_key.as_str(),
-                    receipt.operation_id.as_str(),
-                );
-                Ok(receipt)
             }
             .instrument(span),
         )
@@ -340,7 +337,7 @@ impl DaemonKernelClient {
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
         task_selection: OwnerSelectionContext<'a>,
         original_write_submission: Option<OriginalWriteSubmission>,
-    ) -> KernelPortFuture<'a, WriteReceipt> {
+    ) -> KernelPortFuture<'a, PreparedWriteOutcome> {
         self.apply_prepared_with_admission_context(
             identity,
             transition,
@@ -352,6 +349,90 @@ impl DaemonKernelClient {
     }
 }
 
+fn decode_reserved_apply_outcome(
+    outcome: WireOutcome,
+    has_original_submission: bool,
+    identity: &RequestIdentity,
+    transition: &PreparedTransition,
+) -> Result<PreparedWriteOutcome, KernelPortError> {
+    match outcome {
+        WireOutcome::Known { value, recovery } => {
+            if recovery.is_some() {
+                return Err(KernelPortError::Contract(
+                    "known reserved-write response unexpectedly carries recovery".to_owned(),
+                ));
+            }
+            let payload = closed_typed_value(&value, "write_receipt")?;
+            let receipt: WriteReceipt = serde_json::from_value(payload)
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            validate_store_receipt_envelope(&identity.request.metadata, transition, &receipt)
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            Ok(PreparedWriteOutcome::Receipt(Box::new(receipt)))
+        }
+        WireOutcome::AcceptedPending { value, recovery } => {
+            if !has_original_submission || recovery.is_some() {
+                return Err(KernelPortError::Contract(
+                    "accepted-pending response is not admitted for this exact versioned write"
+                        .to_owned(),
+                ));
+            }
+            let payload = closed_typed_value(&value, "write_submission")?;
+            let submission: eliot_store_api::WriteSubmission = serde_json::from_value(payload)
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            submission
+                .validate()
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            if submission.operation_id != transition.identity.operation_id
+                || submission.request_hash != transition.identity.canonical_request_hash
+            {
+                return Err(KernelPortError::Contract(
+                    "staged submission differs from the exact admitted operation and request"
+                        .to_owned(),
+                ));
+            }
+            Ok(PreparedWriteOutcome::Staged(Box::new(submission)))
+        }
+        WireOutcome::Error { code, reason } => Err(kernel_port_error(
+            KernelClientError::Contract(format!("{code}: {reason}")),
+        )),
+        WireOutcome::Partial { reason, .. } | WireOutcome::Unknown { reason } => {
+            Err(kernel_port_error(KernelClientError::Unknown(reason)))
+        }
+    }
+}
+
+fn closed_typed_value(
+    value: &serde_json::Value,
+    expected_kind: &str,
+) -> Result<serde_json::Value, KernelPortError> {
+    let object = value.as_object().ok_or_else(|| {
+        KernelPortError::Contract("Kernel typed application value is not an object".to_owned())
+    })?;
+    if object.len() != 2
+        || object.get("kind").and_then(serde_json::Value::as_str) != Some(expected_kind)
+    {
+        return Err(KernelPortError::Contract(format!(
+            "Kernel returned an unexpected or open application value; expected closed {expected_kind}"
+        )));
+    }
+    object.get("value").cloned().ok_or_else(|| {
+        KernelPortError::Contract("Kernel typed value is missing payload".to_owned())
+    })
+}
+
+fn require_write_receipt<'a>(
+    future: KernelPortFuture<'a, PreparedWriteOutcome>,
+) -> KernelPortFuture<'a, WriteReceipt> {
+    Box::pin(async move {
+        match future.await? {
+            PreparedWriteOutcome::Receipt(receipt) => Ok(*receipt),
+            PreparedWriteOutcome::Staged(_) => Err(KernelPortError::Contract(
+                "legacy prepared-write port received a staged outcome".to_owned(),
+            )),
+        }
+    })
+}
+
 impl KernelTransitionPort for DaemonKernelClient {
     fn apply_prepared<'a>(
         &'a self,
@@ -360,14 +441,14 @@ impl KernelTransitionPort for DaemonKernelClient {
         expected_revision_heads: Vec<RevisionHeadExpectation>,
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     ) -> KernelPortFuture<'a, WriteReceipt> {
-        self.apply_prepared_with_admission_context(
+        require_write_receipt(self.apply_prepared_with_admission_context(
             identity,
             transition,
             expected_revision_heads,
             expected_ordering_heads,
             None,
             None,
-        )
+        ))
     }
 
     fn apply_prepared_with_original_submission<'a>(
@@ -377,7 +458,7 @@ impl KernelTransitionPort for DaemonKernelClient {
         expected_revision_heads: Vec<RevisionHeadExpectation>,
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
         original_write_submission: OriginalWriteSubmission,
-    ) -> KernelPortFuture<'a, WriteReceipt> {
+    ) -> KernelPortFuture<'a, PreparedWriteOutcome> {
         self.apply_prepared_with_admission_context(
             identity,
             transition,
@@ -583,14 +664,14 @@ impl KernelTransitionPort for OwnerSelectionKernelPort<'_> {
             observed_scope: self.observed_scope,
             live_fence: self.live_fence,
         };
-        self.kernel.apply_prepared_with_owner_selection(
+        require_write_receipt(self.kernel.apply_prepared_with_owner_selection(
             identity,
             transition,
             expected_revision_heads,
             expected_ordering_heads,
             task_selection,
             None,
-        )
+        ))
     }
 
     fn apply_prepared_with_original_submission<'a>(
@@ -600,7 +681,7 @@ impl KernelTransitionPort for OwnerSelectionKernelPort<'_> {
         expected_revision_heads: Vec<RevisionHeadExpectation>,
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
         original_write_submission: OriginalWriteSubmission,
-    ) -> KernelPortFuture<'a, WriteReceipt> {
+    ) -> KernelPortFuture<'a, PreparedWriteOutcome> {
         let task_selection = OwnerSelectionContext {
             request_identity: self.request_identity,
             owner: self.owner,

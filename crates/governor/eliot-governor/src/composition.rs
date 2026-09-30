@@ -248,7 +248,7 @@ pub trait KernelTransitionPort: Send + Sync {
         _expected_revision_heads: Vec<RevisionHeadExpectation>,
         _expected_ordering_heads: Vec<OrderingHeadExpectation>,
         _original_write_submission: eliot_store_api::OriginalWriteSubmission,
-    ) -> KernelPortFuture<'a, WriteReceipt> {
+    ) -> KernelPortFuture<'a, eliot_store_api::PreparedWriteOutcome> {
         Box::pin(async {
             Err(KernelPortError::NotAdmitted(
                 "versioned original-write submission is not admitted".to_owned(),
