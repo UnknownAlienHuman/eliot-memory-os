@@ -214,12 +214,10 @@ fn build_context_tool_policy_publication(
 
 /// Exact Context owner rows ready for the authenticated Kernel publication
 /// transition. The owner validators run before any row is constructed.
-pub fn build_context_owner_publications(
+pub fn build_context_recipe_and_tool_policy_publications(
     recipe_body: &ContextCampaignRecipeBody,
-    prior_delivery: &SessionDeliverySnapshot,
     expected_recipe_head: Option<CampaignSourceHead>,
     expected_tool_policy_head: Option<CampaignSourceHead>,
-    expected_delivery_head: Option<CampaignSourceHead>,
     read_state_fence: &StateFence,
 ) -> Result<Vec<CampaignSourcePublication>, ContextPublicationError> {
     let recipe_owner = context_recipe_publication_with_compiler_suppliers(
@@ -228,7 +226,6 @@ pub fn build_context_owner_publications(
         &recipe_body.compiler_input,
         recipe_body.compiler_suppliers.as_ref(),
     )?;
-    let delivery_owner = context_delivery_publication(&recipe_body.recipe, prior_delivery)?;
     let required_references = context_required_references(recipe_body);
     let recipe_record = build_context_recipe_record(&recipe_owner, required_references.clone())?;
     let tool_policy_publication = build_context_tool_policy_publication(
@@ -238,7 +235,6 @@ pub fn build_context_owner_publications(
         expected_tool_policy_head,
         read_state_fence,
     )?;
-    let delivery_record = build_context_delivery_record(&delivery_owner)?;
     let recipe_publication = CampaignSourcePublication::from_observed_head(
         CampaignSourcePublisher::ContextRecipe,
         recipe_record,
@@ -248,6 +244,27 @@ pub fn build_context_owner_publications(
     .map_err(|_| ContextPublicationError::BindingMismatch {
         field: "context_recipe.publication",
     })?;
+    Ok(vec![recipe_publication, tool_policy_publication])
+}
+
+/// Exact Context owner rows ready for the authenticated Kernel publication
+/// transition. The owner validators run before any row is constructed.
+pub fn build_context_owner_publications(
+    recipe_body: &ContextCampaignRecipeBody,
+    prior_delivery: &SessionDeliverySnapshot,
+    expected_recipe_head: Option<CampaignSourceHead>,
+    expected_tool_policy_head: Option<CampaignSourceHead>,
+    expected_delivery_head: Option<CampaignSourceHead>,
+    read_state_fence: &StateFence,
+) -> Result<Vec<CampaignSourcePublication>, ContextPublicationError> {
+    let mut publications = build_context_recipe_and_tool_policy_publications(
+        recipe_body,
+        expected_recipe_head,
+        expected_tool_policy_head,
+        read_state_fence,
+    )?;
+    let delivery_owner = context_delivery_publication(&recipe_body.recipe, prior_delivery)?;
+    let delivery_record = build_context_delivery_record(&delivery_owner)?;
     let delivery_publication = CampaignSourcePublication::from_observed_head(
         CampaignSourcePublisher::ContextDelivery,
         delivery_record,
@@ -257,11 +274,8 @@ pub fn build_context_owner_publications(
     .map_err(|_| ContextPublicationError::BindingMismatch {
         field: "context_delivery.publication",
     })?;
-    Ok(vec![
-        recipe_publication,
-        tool_policy_publication,
-        delivery_publication,
-    ])
+    publications.push(delivery_publication);
+    Ok(publications)
 }
 
 /// Validate the exact Context owner bodies against a campaign source fence
