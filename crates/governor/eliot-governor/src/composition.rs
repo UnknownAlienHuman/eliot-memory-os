@@ -93,7 +93,7 @@ use eliot_maintenance::{
 };
 use eliot_module_registry::ModuleCatalog;
 use eliot_module_registry::ModuleCatalogSnapshot;
-use eliot_observation::{ObservationJournal, ObservationJournalEntry};
+use eliot_observation::{ObservationJournal, ObservationJournalEntry, TaskSelectionEvidence};
 use eliot_ors::{
     ColdStartReadinessClaim, ColdStartReadinessOrsRecord, ColdStartReadinessOwnerKey,
     ColdStartReadinessRecordOwner, ColdStartReadinessStageOutcome,
@@ -1366,6 +1366,25 @@ pub enum CompositionError {
     /// Kernel transition failed at the neutral port.
     #[error("Kernel transition: {0}")]
     Kernel(#[from] KernelPortError),
+    /// The exact `TaskContract` acceptance set read for task-selection evidence
+    /// was malformed or did not validate at its owner boundary.
+    #[error("TaskContract acceptance set: {0}")]
+    TaskContractAcceptance(Box<eliot_store_api::StoreError>),
+    /// Owner-issued task-selection evidence did not satisfy its closed schema.
+    #[error("task-selection evidence: {0}")]
+    TaskSelectionEvidence(Box<eliot_observation::GovernorObservationError>),
+}
+
+impl From<eliot_store_api::StoreError> for CompositionError {
+    fn from(error: eliot_store_api::StoreError) -> Self {
+        Self::TaskContractAcceptance(Box::new(error))
+    }
+}
+
+impl From<eliot_observation::GovernorObservationError> for CompositionError {
+    fn from(error: eliot_observation::GovernorObservationError) -> Self {
+        Self::TaskSelectionEvidence(Box::new(error))
+    }
 }
 
 /// Exact current Canonical plan identity retained by the Governor owner.
@@ -3472,6 +3491,123 @@ pub struct GovernorActivationSnapshot {
     pub task_revision: u64,
     pub plan_id: String,
     pub plan_revision: String,
+}
+
+/// Owner-issued evidence and independent owner bindings for one explicit
+/// authenticated Task Controller request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskSelectionAdmissionBinding {
+    /// Immutable task-selection evidence derived from the retained lease,
+    /// work item, and original `TaskContract` acceptance record.
+    evidence: TaskSelectionEvidence,
+    /// Principal taken from the authenticated retained active session.
+    principal_ref: String,
+    /// Session proven by the retained active lease/work-item join.
+    session_ref: String,
+    /// Explicit request task, matched to the retained active work item.
+    task_ref: String,
+    /// Original current `TaskContract` revision.
+    task_revision: u64,
+    /// Original acceptance digest independently retained from the owner read.
+    acceptance_digest: String,
+    /// Independent current `WorkScope` snapshot at the request fence.
+    work_scope: WorkScopeBindingSnapshot,
+    /// Exact retained active-work selection source and evidence record ids.
+    selection_source_ref: String,
+    evidence_ref: String,
+    /// Exact request/owner state fence.
+    state_fence: StateFence,
+}
+
+impl TaskSelectionAdmissionBinding {
+    /// Exact owner-issued task-selection evidence.
+    #[must_use]
+    pub fn evidence(&self) -> &TaskSelectionEvidence {
+        &self.evidence
+    }
+
+    /// Principal from the authenticated active session.
+    #[must_use]
+    pub fn principal_ref(&self) -> &str {
+        &self.principal_ref
+    }
+
+    /// Session from the retained active lease/work-item join.
+    #[must_use]
+    pub fn session_ref(&self) -> &str {
+        &self.session_ref
+    }
+
+    /// Explicit task matched to the retained active work item.
+    #[must_use]
+    pub fn task_ref(&self) -> &str {
+        &self.task_ref
+    }
+
+    /// Exact task revision read from the canonical acceptance owner.
+    #[must_use]
+    pub const fn task_revision(&self) -> u64 {
+        self.task_revision
+    }
+
+    /// Original digest reported by the exact `TaskContract` acceptance read.
+    #[must_use]
+    pub fn acceptance_digest(&self) -> &str {
+        &self.acceptance_digest
+    }
+
+    /// Independent current `WorkScope` owner snapshot.
+    #[must_use]
+    pub const fn work_scope(&self) -> &WorkScopeBindingSnapshot {
+        &self.work_scope
+    }
+
+    /// Exact immutable selection source handle.
+    #[must_use]
+    pub fn selection_source_ref(&self) -> &str {
+        &self.selection_source_ref
+    }
+
+    /// Exact immutable retained evidence record handle.
+    #[must_use]
+    pub fn evidence_ref(&self) -> &str {
+        &self.evidence_ref
+    }
+
+    /// Exact request and owner fence.
+    #[must_use]
+    pub const fn state_fence(&self) -> &StateFence {
+        &self.state_fence
+    }
+}
+
+/// Non-forgeable owner snapshot token held across the external Kernel read.
+/// The fields are private so a caller cannot invent selection provenance.
+pub struct PendingTaskSelectionRequest {
+    now: u64,
+    activation: GovernorActivationSnapshot,
+    selected: ActiveWorkLeaseProjection,
+    work_scope: WorkScopeBindingSnapshot,
+}
+
+impl PendingTaskSelectionRequest {
+    /// Exact task id to pass to the Kernel acceptance-set read.
+    #[must_use]
+    pub const fn task_id(&self) -> &TaskId {
+        &self.activation.task_id
+    }
+
+    /// Exact `TaskContract` revision to pass to the Kernel acceptance-set read.
+    #[must_use]
+    pub const fn task_revision(&self) -> u64 {
+        self.activation.task_revision
+    }
+
+    /// Exact state fence to pass to the Kernel acceptance-set read.
+    #[must_use]
+    pub const fn state_fence(&self) -> &StateFence {
+        &self.activation.state_fence
+    }
 }
 
 impl CanonicalAdmissionOwner {
@@ -10106,6 +10242,179 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         &self,
         now: u64,
     ) -> Result<GovernorActivationSnapshot, CompositionError> {
+        self.read_unique_agent_activation_with_selection(now)
+            .map(|(snapshot, _)| snapshot)
+    }
+
+    /// Issues selection evidence directly for one explicit authenticated
+    /// Task Controller request, without requiring a cold-start readiness
+    /// receipt.
+    ///
+    /// The request must name the session, task, `WorkScope`, and exact current
+    /// fence. Governor independently reads the unique active `WorkLease` and
+    /// linked `WorkItem`, obtains the principal from their authenticated active
+    /// session, and reads the current `WorkScope` binding and `TaskContract`
+    /// acceptance set at that same fence. The acceptance digest and revision
+    /// are copied from the canonical owner record unchanged. No latest-task,
+    /// open-task, or caller-supplied provenance fallback is used.
+    ///
+    /// The returned `WorkScope` snapshot is an independent expected binding for
+    /// the caller's Host observation. Coordination's `WorkItem` and `WorkLease`
+    /// records do not contain an operating-system workspace locator.
+    pub async fn task_selection_evidence_for_request(
+        &self,
+        now: u64,
+        authenticated_principal_ref: &str,
+        request_session_ref: &str,
+        request_task_ref: &str,
+        request_scope_ref: &str,
+        request_fence: &StateFence,
+    ) -> Result<TaskSelectionAdmissionBinding, CompositionError> {
+        let pending = self.prepare_task_selection_for_request(
+            now,
+            authenticated_principal_ref,
+            request_session_ref,
+            request_task_ref,
+            request_scope_ref,
+            request_fence,
+        )?;
+        let acceptance = self
+            .kernel
+            .task_contract_acceptance_set(
+                pending.task_id(),
+                pending.task_revision(),
+                pending.state_fence(),
+            )
+            .await?;
+        self.finish_task_selection_for_request(pending, now, acceptance)
+    }
+
+    /// Captures the validated owner selection before the caller performs the
+    /// asynchronous canonical acceptance-set read.
+    pub fn prepare_task_selection_for_request(
+        &self,
+        now: u64,
+        authenticated_principal_ref: &str,
+        request_session_ref: &str,
+        request_task_ref: &str,
+        request_scope_ref: &str,
+        request_fence: &StateFence,
+    ) -> Result<PendingTaskSelectionRequest, CompositionError> {
+        request_fence
+            .validate()
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        let live_fence = self.snapshot.state_fence();
+        if !fences_match_exact(&live_fence, request_fence) {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+
+        let (activation, selected) = self.read_unique_agent_activation_with_selection(now)?;
+        if !fences_match_exact(&activation.state_fence, request_fence)
+            || activation.principal_id != authenticated_principal_ref
+            || activation.session_id != request_session_ref
+            || activation.task_id.as_str() != request_task_ref
+            || activation.work_scope_id != request_scope_ref
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+
+        let work_scope = self
+            .owners
+            .work_scope
+            .as_ref()
+            .ok_or(CompositionError::ActivationScopeSelectionRequired)?
+            .read_current(request_fence)
+            .map_err(CompositionError::ScanDisclosure)?;
+        ensure_snapshot_fresh(
+            &work_scope,
+            "Task Controller WorkScope is not freshly matched",
+        )?;
+        if work_scope.binding.scope.scope_ref != request_scope_ref {
+            return Err(CompositionError::ActivationScopeSelectionRequired);
+        }
+
+        Ok(PendingTaskSelectionRequest {
+            now,
+            activation,
+            selected,
+            work_scope,
+        })
+    }
+
+    /// Completes a pending request using the exact canonical owner-read result.
+    /// A second live owner read rejects any selection/scope/fence change that
+    /// occurred while the caller awaited the Kernel.
+    pub fn finish_task_selection_for_request(
+        &self,
+        pending: PendingTaskSelectionRequest,
+        now: u64,
+        acceptance: TaskContractAcceptanceSet,
+    ) -> Result<TaskSelectionAdmissionBinding, CompositionError> {
+        if now < pending.now {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        let (activation, selected) = self.read_unique_agent_activation_with_selection(now)?;
+        let current_scope = self
+            .owners
+            .work_scope
+            .as_ref()
+            .ok_or(CompositionError::ActivationScopeSelectionRequired)?
+            .read_current(&pending.activation.state_fence)
+            .map_err(CompositionError::ScanDisclosure)?;
+        ensure_snapshot_fresh(
+            &current_scope,
+            "Task Controller WorkScope changed during acceptance read",
+        )?;
+        if activation != pending.activation
+            || selected != pending.selected
+            || current_scope != pending.work_scope
+            || !fences_match_exact(&self.snapshot.state_fence(), &pending.activation.state_fence)
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        acceptance.validate()?;
+        if acceptance.task_id != activation.task_id
+            || acceptance.task_revision != activation.task_revision
+            || !fences_match_exact(&acceptance.read_state_fence, &activation.state_fence)
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+
+        let acceptance_digest = acceptance.acceptance_digest.clone();
+        let evidence = TaskSelectionEvidence {
+            task_ref: activation.task_id.to_string(),
+            task_revision: activation.task_revision,
+            acceptance_digest: acceptance.acceptance_digest,
+            work_scope_ref: activation.work_scope_id.clone(),
+            selection_source_ref: selected.lease.lease_id.clone(),
+            evidence_ref: selected.work_item.work_item_id.clone(),
+            contamination_flags: Vec::new(),
+        };
+        evidence.validate()?;
+        Ok(TaskSelectionAdmissionBinding {
+            selection_source_ref: evidence.selection_source_ref.clone(),
+            evidence_ref: evidence.evidence_ref.clone(),
+            evidence,
+            principal_ref: activation.principal_id,
+            session_ref: activation.session_id,
+            task_ref: activation.task_id.to_string(),
+            task_revision: activation.task_revision,
+            acceptance_digest,
+            work_scope: pending.work_scope,
+            state_fence: activation.state_fence,
+        })
+    }
+
+    /// Reads the validated activation together with the exact retained
+    /// coordination records that established its unique task selection.
+    ///
+    /// The lease and work-item handles are taken from the same owner projection
+    /// whose session/task/scope join is checked below; callers must not rebuild
+    /// them from a task id or a request label.
+    fn read_unique_agent_activation_with_selection(
+        &self,
+        now: u64,
+    ) -> Result<(GovernorActivationSnapshot, ActiveWorkLeaseProjection), CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
         }
@@ -10114,18 +10423,19 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let task_id = self.admit_activation_lifecycle_session(now, &state_fence, &work)?;
         let task = self.admit_activation_task(&task_id, &state_fence)?;
         let (work_scope_id, plan) = self.admit_activation_plan(&task_id, &state_fence)?;
-        Ok(GovernorActivationSnapshot {
+        let activation = GovernorActivationSnapshot {
             state_fence,
             owner_revision: self.owners.canonical.owner_revision(),
-            principal_id: work.session.principal_id,
-            session_id: work.session.session_id,
+            principal_id: work.session.principal_id.clone(),
+            session_id: work.session.session_id.clone(),
             task_id,
-            work_unit_id: work.work_item.work_item_id,
+            work_unit_id: work.work_item.work_item_id.clone(),
             work_scope_id,
             task_revision: task.revision,
             plan_id: plan.plan_id,
             plan_revision: plan.plan_revision,
-        })
+        };
+        Ok((activation, work))
     }
 
     /// Proves exactly one live work lease for this exact fence.
