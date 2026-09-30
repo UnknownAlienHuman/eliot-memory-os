@@ -59,6 +59,7 @@ use std::collections::BTreeMap;
 
 use eliot_canonical::CanonicalWriteEnvelope;
 use eliot_contracts::{OperationId, SessionId, canonical_json_bytes, sha256_hex};
+use eliot_evaluation_contracts::HumanAttentionEvaluation;
 use eliot_protocol::RequestIdentity;
 use eliot_store_api::{
     CONTRACT_VERSION, EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
@@ -425,6 +426,54 @@ impl<P: KernelTransitionPort + ?Sized> GovernorOperatorReconciliation<'_, P> {
             .await?;
         Ok(receipt)
     }
+
+    /// Admits one closed attention-evaluation operator request and returns
+    /// only the exact issued receipt.
+    ///
+    /// The caller presents the exact [`HumanAttentionEvaluation`] revision
+    /// alongside the bindings of [`AttentionEvaluationCommandParams`]; the
+    /// revision's expected revision, operation identity, and exact evidence
+    /// commitment travel in those bindings. Fail-closed order:
+    /// - the record is validated by the owning evaluation contracts first, so
+    ///   a comparative conclusion without its declared matched/paired
+    ///   profile, applicable task-risk/exposure context, preserved selection
+    ///   bias, censoring, intervention effect, and alternative explanations
+    ///   fails here, as does any aggregate `better` score, any prevented
+    ///   harm inferred from no harm after blocking, and any suppression
+    ///   false-negative rate inferred from fewer emitted alerts;
+    /// - the bindings are cross-checked against the presented record by
+    ///   `check_attention_record_binding`, so a substituted evaluation
+    ///   identity, revision, predecessor link, evaluator, manifest, record
+    ///   digest, or invalidation reason fails before any envelope is built;
+    /// - the envelope built by [`attention_evaluation_command_envelope`]
+    ///   commits through [`Self::admit_operator_command`], so the same
+    ///   operation identity with identical bytes replays the stored receipt
+    ///   (one accepted revision; a lost commit acknowledgement reconciles
+    ///   the original operation through the receipt route), while changed
+    ///   bytes under the same identity conflict and commit nothing.
+    ///
+    /// Corrections append the next linked revision preserving the original
+    /// evidence, method, and result; invalidation appends the linked revision
+    /// carrying its scope/evidence/policy reason and prevents current use
+    /// without deleting history. Nothing here resolves a Problem, grants an
+    /// approval, changes policy, or rewrites notification state.
+    pub async fn admit_attention_evaluation_command(
+        &self,
+        identity: &RequestIdentity,
+        operation_id: &OperationId,
+        session_id: &str,
+        record: &HumanAttentionEvaluation,
+        params: AttentionEvaluationCommandParams<'_>,
+    ) -> Result<WriteReceipt, CompositionError> {
+        record
+            .validate()
+            .map_err(|error| owner_refused(error.to_string()))?;
+        check_attention_record_binding(record, &params)?;
+        let envelope =
+            attention_evaluation_command_envelope(identity, operation_id, session_id, params)?;
+        self.admit_operator_command(identity, operation_id, envelope)
+            .await
+    }
 }
 
 /// Closed attention-evaluation command actions bound into the canonical envelope.
@@ -456,9 +505,10 @@ fn validates_as_lower_attention_digest(value: &str) -> bool {
 /// Attention-specific command bindings carried into
 /// [`attention_evaluation_command_envelope`].
 ///
-/// Bundles the ten attention bindings (access digest, action literal,
-/// evaluator, evaluation, revision link, record and evidence digests, and the
-/// evidence manifest identity) so the envelope adapter takes four arguments.
+/// Bundles the eleven attention bindings (access digest, action literal,
+/// evaluator, evaluation, revision link, record and evidence digests, the
+/// evidence manifest identity, and the invalidation reason) so the envelope
+/// adapter takes four arguments.
 /// Identity (`identity`), operation identity (`operation_id`), and the
 /// operator session (`session_id`) stay separate arguments because admission
 /// checks them against the admitted request before any attention binding.
@@ -484,6 +534,9 @@ pub struct AttentionEvaluationCommandParams<'a> {
     pub manifest_id: &'a str,
     /// Evidence manifest revision bound by the record.
     pub manifest_revision: &'a str,
+    /// Reason naming the affected scope/evidence/policy cause. Present exactly
+    /// on `invalidate`; absent on `create` and `correct`.
+    pub invalidation_reason: Option<&'a str>,
 }
 
 /// Fail-closed identity, fence, and session checks for the attention adapter.
@@ -526,10 +579,12 @@ fn check_attention_identity(
 
 /// Fail-closed attention binding checks: access digest, action literal,
 /// non-blank evaluator/evaluation/manifest bindings, non-zero revision, exact
-/// predecessor linkage, and well-formed digests.
+/// predecessor linkage, invalidation reason present exactly on `invalidate`,
+/// and well-formed digests.
 ///
-/// Behavior-identical extract of the middle of
-/// [`attention_evaluation_command_envelope`]; refusal strings are unchanged.
+/// Middle of [`attention_evaluation_command_envelope`]: the attention
+/// binding checks in envelope order, including the invalidation reason
+/// present exactly on `invalidate`.
 fn check_attention_command(
     params: &AttentionEvaluationCommandParams<'_>,
 ) -> Result<(), CompositionError> {
@@ -575,6 +630,28 @@ fn check_attention_command(
         return Err(owner_refused(
             "attention evaluation revision link does not match the action".to_owned(),
         ));
+    }
+    let is_invalidate = params.action == ATTENTION_EVALUATION_ACTION_INVALIDATE;
+    match params.invalidation_reason {
+        Some(reason) if is_invalidate => {
+            if reason.trim().is_empty() || reason.chars().any(char::is_control) {
+                return Err(owner_refused(
+                    "attention evaluation invalidation reason is blank or contains control characters"
+                        .to_owned(),
+                ));
+            }
+        }
+        Some(_) => {
+            return Err(owner_refused(
+                "attention evaluation invalidation reason requires the invalidate action".to_owned(),
+            ));
+        }
+        None if is_invalidate => {
+            return Err(owner_refused(
+                "attention evaluation invalidate requires an invalidation reason".to_owned(),
+            ));
+        }
+        None => {}
     }
     for (field, value) in [
         ("record digest", params.record_digest),
@@ -641,7 +718,88 @@ fn attention_command_parameters(
             serde_json::Value::String(predecessor.to_string()),
         );
     }
+    if let Some(reason) = params.invalidation_reason {
+        parameters.insert(
+            "attention_evaluation.invalidation_reason".to_owned(),
+            serde_json::Value::String(reason.to_owned()),
+        );
+    }
     parameters
+}
+
+/// Fail-closed cross-check of the operator bindings against the presented record.
+///
+/// Every bound claim (evaluation identity, revision, predecessor link,
+/// evaluator principal, evidence manifest identity and revision, and the
+/// record digest re-derived with the same canonical scheme the projection
+/// readback uses) must equal the record the caller presents, so a substituted
+/// record, manifest, or revision link fails before any envelope is built. The
+/// action must also agree with the record invalidation state: `create` and
+/// `correct` carry no invalidation statement, while `invalidate` carries one
+/// whose reason equals the bound reason. The evidence commitment itself is
+/// bound opaquely by [`attention_evaluation_command_envelope`]; its truth
+/// stays with the commit validator and is never re-derived here.
+fn check_attention_record_binding(
+    record: &HumanAttentionEvaluation,
+    params: &AttentionEvaluationCommandParams<'_>,
+) -> Result<(), CompositionError> {
+    if params.evaluation_id != record.evaluation_id.as_str() {
+        return Err(owner_refused(
+            "attention evaluation identity does not match the presented record".to_owned(),
+        ));
+    }
+    if params.revision != record.revision {
+        return Err(owner_refused(
+            "attention evaluation revision does not match the presented record".to_owned(),
+        ));
+    }
+    if params.predecessor_revision != record.predecessor.as_ref().map(|link| link.revision) {
+        return Err(owner_refused(
+            "attention evaluation predecessor link does not match the presented record".to_owned(),
+        ));
+    }
+    let flags = &record.evaluator_scope_uncertainty_and_invalidation;
+    if params.evaluator_principal_id != flags.evaluator.principal_id.as_str() {
+        return Err(owner_refused(
+            "attention evaluation evaluator does not match the presented record".to_owned(),
+        ));
+    }
+    if params.manifest_id != record.evidence_manifest.manifest_id.as_str()
+        || params.manifest_revision != record.evidence_manifest.revision.as_str()
+    {
+        return Err(owner_refused(
+            "attention evaluation evidence manifest does not match the presented record".to_owned(),
+        ));
+    }
+    let record_bytes = canonical_json_bytes(record).map_err(|error| {
+        owner_refused(format!("cannot canonicalize attention evaluation record: {error}"))
+    })?;
+    if sha256_hex(&record_bytes) != params.record_digest {
+        return Err(owner_refused(
+            "attention evaluation record digest does not match the presented record".to_owned(),
+        ));
+    }
+    let is_create_or_correct = params.action == ATTENTION_EVALUATION_ACTION_CREATE
+        || params.action == ATTENTION_EVALUATION_ACTION_CORRECT;
+    let is_invalidate = params.action == ATTENTION_EVALUATION_ACTION_INVALIDATE;
+    match &flags.invalidation {
+        None if is_create_or_correct => {}
+        Some(invalidation) if is_invalidate => {
+            if params.invalidation_reason != Some(invalidation.reason.as_str()) {
+                return Err(owner_refused(
+                    "attention evaluation invalidation reason does not match the presented record"
+                        .to_owned(),
+                ));
+            }
+        }
+        _ => {
+            return Err(owner_refused(
+                "attention evaluation action does not match the presented record invalidation state"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Builds the canonical envelope binding one authorized attention-evaluation command.
@@ -665,19 +823,31 @@ fn attention_command_parameters(
 /// accepted revision; lost acknowledgements reconcile through the receipt
 /// route), while changed bytes under the same identity conflict and commit
 /// nothing. History is append-only by construction: corrections link their
-/// predecessor and invalidation carries its reason, and no code path here can
-/// delete a revision.
+/// predecessor and invalidation carries its scope/evidence/policy reason, and
+/// no code path here can delete a revision.
+///
+/// Comparative conditionality travels inside the bound record bytes: the
+/// record digest covers the record's declared comparison basis, matched
+/// profile, applicability, caveats, and claims, and this path adds no score
+/// or ranking. Structural and claim gating is enforced by record validation
+/// at
+/// [`GovernorOperatorReconciliation::admit_attention_evaluation_command`],
+/// which refuses a record the owning evaluation contracts reject.
 ///
 /// Evaluator role and scope authority are enforced by admission and the commit
 /// validator, not here; this adapter binds the claims (`session_id`,
-/// `evaluator_principal_id`, the exact revision link, and the exact digests)
-/// so a substituted claim fails closed before any commit.
+/// `evaluator_principal_id`, the exact revision link, the invalidation
+/// reason, and the exact digests) so a substituted claim fails closed before
+/// any commit. The evidence commitment is bound opaquely; its truth stays
+/// with the commit validator, which re-derives it from the presented
+/// revision.
 ///
 /// Fail-closed order mirrors [`operator_command_envelope`], then the attention
 /// binding: the action literal, non-blank evaluator/evaluation/manifest
 /// bindings, a non-zero revision, the exact predecessor linkage (`create`
 /// requires revision one with no predecessor; `correct` and `invalidate`
-/// require `predecessor + 1 == revision`), and well-formed digests.
+/// require `predecessor + 1 == revision`), the invalidation reason present
+/// exactly on `invalidate`, and well-formed digests.
 pub fn attention_evaluation_command_envelope(
     identity: &RequestIdentity,
     operation_id: &OperationId,
@@ -698,6 +868,7 @@ pub fn attention_evaluation_command_envelope(
         params.evidence_commitment,
         params.manifest_id,
         params.manifest_revision,
+        params.invalidation_reason,
         operation_id.as_str(),
         identity.idempotency_key.clone(),
     ))?;
