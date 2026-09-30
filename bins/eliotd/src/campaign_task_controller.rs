@@ -560,9 +560,9 @@ async fn task_controller_selection_admission(
     let fence = &claimed.envelope.state_fence;
     let now = u64::try_from(
         SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| TaskControllerSelectionError::Required)?
-        .as_millis(),
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| TaskControllerSelectionError::Required)?
+            .as_millis(),
     )
     .map_err(|_| TaskControllerSelectionError::Required)?;
     let pending = {
@@ -591,9 +591,9 @@ async fn task_controller_selection_admission(
         .map_err(TaskControllerSelectionError::Kernel)?;
     let now_after_kernel_read = u64::try_from(
         SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| TaskControllerSelectionError::Required)?
-        .as_millis(),
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| TaskControllerSelectionError::Required)?
+            .as_millis(),
     )
     .map_err(|_| TaskControllerSelectionError::Required)?;
     let (owner, explicit_root, live_fence) = {
@@ -610,11 +610,9 @@ async fn task_controller_selection_admission(
             .map_err(TaskControllerSelectionError::Binding)?;
         (owner, explicit_root, live_fence)
     };
-    let observed_scope = crate::task_binding_admission::observe_explicit_workspace(
-        &explicit_root,
-        &live_fence,
-    )
-    .map_err(TaskControllerSelectionError::Binding)?;
+    let observed_scope =
+        crate::task_binding_admission::observe_explicit_workspace(&explicit_root, &live_fence)
+            .map_err(TaskControllerSelectionError::Binding)?;
     Ok(TaskControllerSelectionAdmission {
         owner,
         observed_scope,
@@ -637,12 +635,8 @@ impl TaskControllerSelectionError {
             Self::Required => Some("TASK_SELECTION_REQUIRED"),
             Self::ScopeIncompatible => Some("TASK_SCOPE_INCOMPATIBLE"),
             Self::Composition(error) => task_selection_composition_reason_code(error),
-            Self::Kernel(KernelPortError::TaskSelectionRequired) => {
-                Some("TASK_SELECTION_REQUIRED")
-            }
-            Self::Kernel(KernelPortError::TaskScopeIncompatible) => {
-                Some("TASK_SCOPE_INCOMPATIBLE")
-            }
+            Self::Kernel(KernelPortError::TaskSelectionRequired) => Some("TASK_SELECTION_REQUIRED"),
+            Self::Kernel(KernelPortError::TaskScopeIncompatible) => Some("TASK_SCOPE_INCOMPATIBLE"),
             Self::Kernel(_) => None,
             Self::Binding(error) => Some(error.code()),
         }
@@ -658,9 +652,7 @@ fn task_selection_composition_reason_code(
             Some("TASK_SELECTION_REQUIRED")
         }
         eliot_governor::CompositionError::ActivationScopeSelectionRequired
-        | eliot_governor::CompositionError::ActivationStaleFence => {
-            Some("TASK_SCOPE_INCOMPATIBLE")
-        }
+        | eliot_governor::CompositionError::ActivationStaleFence => Some("TASK_SCOPE_INCOMPATIBLE"),
         _ => None,
     }
 }
@@ -757,25 +749,25 @@ pub fn prepare_task_controller_transition(
             }))
         }
         Err(eliot_governor::TaskLifecycleError::Composition(error)) => {
-            let code = task_selection_composition_reason_code(&error)
-                .unwrap_or("transition_rejected");
+            let code =
+                task_selection_composition_reason_code(&error).unwrap_or("transition_rejected");
             match task_controller_rejection(&claimed, code) {
                 Ok(body) => TaskControllerTransitionPreparation::Rejected(Box::new(body)),
                 Err(error) => TaskControllerTransitionPreparation::Failed(error),
             }
         }
-        Err(eliot_governor::TaskLifecycleError::Kernel(
-            KernelPortError::TaskSelectionRequired,
-        )) => match task_controller_rejection(&claimed, "TASK_SELECTION_REQUIRED") {
-            Ok(body) => TaskControllerTransitionPreparation::Rejected(Box::new(body)),
-            Err(error) => TaskControllerTransitionPreparation::Failed(error),
-        },
-        Err(eliot_governor::TaskLifecycleError::Kernel(
-            KernelPortError::TaskScopeIncompatible,
-        )) => match task_controller_rejection(&claimed, "TASK_SCOPE_INCOMPATIBLE") {
-            Ok(body) => TaskControllerTransitionPreparation::Rejected(Box::new(body)),
-            Err(error) => TaskControllerTransitionPreparation::Failed(error),
-        },
+        Err(eliot_governor::TaskLifecycleError::Kernel(KernelPortError::TaskSelectionRequired)) => {
+            match task_controller_rejection(&claimed, "TASK_SELECTION_REQUIRED") {
+                Ok(body) => TaskControllerTransitionPreparation::Rejected(Box::new(body)),
+                Err(error) => TaskControllerTransitionPreparation::Failed(error),
+            }
+        }
+        Err(eliot_governor::TaskLifecycleError::Kernel(KernelPortError::TaskScopeIncompatible)) => {
+            match task_controller_rejection(&claimed, "TASK_SCOPE_INCOMPATIBLE") {
+                Ok(body) => TaskControllerTransitionPreparation::Rejected(Box::new(body)),
+                Err(error) => TaskControllerTransitionPreparation::Failed(error),
+            }
+        }
         Err(_) => match task_controller_rejection(&claimed, "transition_rejected") {
             Ok(body) => TaskControllerTransitionPreparation::Rejected(Box::new(body)),
             Err(error) => TaskControllerTransitionPreparation::Failed(error),
@@ -809,12 +801,12 @@ pub async fn exchange_task_controller_transition(
     };
     let receipt = match receipt {
         Ok(receipt) => receipt,
-        Err(eliot_governor::TaskLifecycleError::Kernel(
-            KernelPortError::TaskSelectionRequired,
-        )) => return task_controller_rejection(&execution.claimed, "TASK_SELECTION_REQUIRED"),
-        Err(eliot_governor::TaskLifecycleError::Kernel(
-            KernelPortError::TaskScopeIncompatible,
-        )) => return task_controller_rejection(&execution.claimed, "TASK_SCOPE_INCOMPATIBLE"),
+        Err(eliot_governor::TaskLifecycleError::Kernel(KernelPortError::TaskSelectionRequired)) => {
+            return task_controller_rejection(&execution.claimed, "TASK_SELECTION_REQUIRED");
+        }
+        Err(eliot_governor::TaskLifecycleError::Kernel(KernelPortError::TaskScopeIncompatible)) => {
+            return task_controller_rejection(&execution.claimed, "TASK_SCOPE_INCOMPATIBLE");
+        }
         Err(_) => return task_controller_rejection(&execution.claimed, "transition_rejected"),
     };
     task_controller_result_body(
