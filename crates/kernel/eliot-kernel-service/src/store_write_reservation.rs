@@ -329,6 +329,20 @@ impl CompositionReservation {
         &self.writer_epoch
     }
 
+    /// Revalidates and returns the exact staged envelope for one operation.
+    ///
+    /// This is an identity-keyed read only. The ORS owner checks its recorded
+    /// digest and all envelope bindings before returning the original payload;
+    /// this layer never interprets or decrypts those bytes.
+    pub fn verify_staged_envelope(
+        &self,
+        operation_id: &OrsOperationIdentity,
+    ) -> Result<RecoveryPayloadEnvelope, ReservationWriteError> {
+        self.ors
+            .verify_staged_envelope(operation_id)
+            .map_err(ReservationWriteError::Ors)
+    }
+
     /// Returns the exact current writer identity checked at every lifecycle step.
     fn writer_identity(&self) -> &EpochIdentity {
         &self.writer_epoch.current

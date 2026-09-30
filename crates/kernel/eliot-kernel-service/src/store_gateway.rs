@@ -36,7 +36,8 @@ use eliot_ors::{
     HostRequestAttemptPhase, HostRequestDeliveryReceipt, HostRequestKind, HostRequestNoSendProof,
     HostRequestOwnerReadbackEvidence, HostRequestRecord, HostRequestResponseSource,
     HostRequestState, HostRequestTransportBoundary, HostRequestTransportObservation, OpaqueLabel,
-    RedbRecoveryStore, ReservationRecord, UnknownCommitOutcome, UnknownCommitRecord,
+    OperationIdentity as OrsOperationIdentity, RedbRecoveryStore, RecoveryPayloadEnvelope,
+    ReservationRecord, UnknownCommitOutcome, UnknownCommitRecord,
     WriterReservationToken,
 };
 use eliot_ors::{OrsError, prove_maintenance_trigger_staging};
@@ -1805,6 +1806,33 @@ impl KernelStoreGateway {
             ));
         }
         Ok(())
+    }
+
+    /// Reads the verified staged envelope for one exact operation identity.
+    ///
+    /// This is the counterpart for a producer that must validate the original
+    /// plan after a possibly-unknown Store effect. It returns only the
+    /// ORS-verified original envelope; the payload remains opaque here and is
+    /// never decoded or decrypted by the gateway. The active generation and
+    /// complete fence must match the retained ORS composition.
+    pub fn verify_staged_envelope(
+        &self,
+        fence: &StateFence,
+        operation_id: &OrsOperationIdentity,
+    ) -> Result<RecoveryPayloadEnvelope, String> {
+        let _flight = self.flight.enter()?;
+        if self.is_fenced() {
+            return Err("canonical-store gateway is fenced for rebind".to_owned());
+        }
+        self.require_active_store_generation()
+            .map_err(|error| error.to_string())?;
+        let commit_ors = self.commit_ors.clone().ok_or_else(|| {
+            "staged envelope read requires the composition-bound ORS".to_owned()
+        })?;
+        let owner = self.bind_reservation_owner_for_fence(&commit_ors, fence)?;
+        owner
+            .verify_staged_envelope(operation_id)
+            .map_err(|error| error.to_string())
     }
 
     /// Enumerates and reconciles the durable staged write envelopes in the
