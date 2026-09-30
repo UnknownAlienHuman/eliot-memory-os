@@ -1,6 +1,6 @@
 //! Application-class boundaries for improvement delivery.
 //!
-//! Enforces `docs/architecture/I12-24-meta-learning-and-improvement-delivery.md`
+//! Implements `docs/architecture/I12-24-meta-learning-and-improvement-delivery.md`
 //! I12.24:78-95: advisory output is the default; pre-authorized reversible
 //! tuning is bounded with one experiment per control surface plus automatic
 //! rollback, and never covers authority/privacy/finish/verifier/durability/
@@ -9,15 +9,21 @@
 //! Architecture/forgetting changes require an explicit owner decision with a
 //! migration/proof record.
 //!
+//! That paragraph restates what the document requires; it is NOT a claim that
+//! every clause is enforced today. Two of them are not, because the owner
+//! records they rest on do not exist in this repository — "Which classes are
+//! reachable, and which clauses are therefore enforced" below says which two,
+//! and why.
+//!
 //! Also upholds I12.24:3: improvement output never silently rewrites code,
 //! policy, or memory authority. Every gate below is fail-closed and records
 //! nothing / mutates nothing on its own; callers attach the returned decision
 //! to the normal Governor/Architecture promotion path.
 //!
-//! # Which classes a candidate descriptor can actually reach
+//! # Which classes are reachable, and which clauses are therefore enforced
 //!
-//! [`classify`] reads four fields, and only two of them are evidence a
-//! candidate can supply today:
+//! [`classify`] reads four fields, and only two of them are evidence that
+//! exists to be read today:
 //!
 //! - `target_surface` is recorded on every [`crate::ImprovementCandidate`].
 //! - `touches_protected` is [`is_prohibited_tuning_surface`] over that recorded
@@ -27,23 +33,73 @@
 //!   or tuning/work-item flags contradict its recorded surface, so the class a
 //!   descriptor reaches cannot be one its surface forbids.
 //! - `bounded_tuning` stands for the DECLARED SAFE RANGE of I12.24:85, and the
-//!   I12.24:20-38 candidate schema lists no such field. A descriptor therefore
-//!   cannot honestly assert it.
+//!   I12.24:20-38 candidate schema lists no such field.
 //! - `has_work_item_ref` stands for a REAL work item, and I12.24:65 places
 //!   that work item after "decision owner selects reject / investigate / work
 //!   item / experiment" — downstream of the candidate, not on it.
 //!
-//! [`ChangeDescriptor::from_recorded_surface`] is how a production intake path
-//! builds its descriptor, and it exposes no parameter for the last two flags.
-//! (The other builder, `intake::prepare_intake`, takes all three flags from an
-//! [`IntakeRequest`](crate::IntakeRequest) supplied by the caller; that entry
-//! has no production request source, and its fields are the same unanswered
-//! question, not an answer to it.) A descriptor built here always classifies as
-//! [`ApplicationClass::Advisory`] or [`ApplicationClass::Protected`];
-//! [`ApplicationClass::PreAuthorizedTuning`] and
-//! [`ApplicationClass::CodeModuleConfig`] are unreachable until an owner
-//! supplies the safe range or the work item they rest on. That unreachability
-//! is a stated ceiling, not a gap to be papered over with an invented `true`.
+//! [`ChangeDescriptor::from_recorded_surface`] is the only descriptor builder
+//! in the repository: both production sites, `intake::prepare_intake` and
+//! `bins/eliotd/src/improvement_intake_dispatch.rs`, call it, and neither takes
+//! a flag through any other route. It exposes no parameter for the last two
+//! flags, so a descriptor built anywhere classifies as
+//! [`ApplicationClass::Advisory`] or [`ApplicationClass::Protected`], and a
+//! `Protected` one is refused with
+//! [`ImprovementError::ApplicationClassViolation`].
+//!
+//! ## The measured absence behind the two unreachable classes (issue #1867 W5)
+//!
+//! The two middle classes are unreachable because the owner records they stand
+//! for do not exist in this repository, which was measured rather than assumed:
+//!
+//! - **No declared safe range.** `git grep -rln "safe_range|declared_range|
+//!   tuning_range|authorized_range|pre_authorized_range|tuning_authoriz"` over
+//!   `*.rs`, `*.toml`, `*.md`, `*.json` and `*.yaml` returns no file. The
+//!   nearest existing records were checked and none is one: `ContextRecipe`
+//!   (`eliot-context-contracts`) is an immutable compilation recipe with a
+//!   canonical digest and no interval over a tunable value; `CapacityLimits`
+//!   is a route-capacity budget, not a safe range; and `eliot-maintenance`'s
+//!   `improvement_pipeline` records — `ExperimentPlan`, `RollbackContract`,
+//!   `AdmittedResourceCeiling`, `AdmittedScopeRefinement` — are a different
+//!   crate's contract that this crate does not depend on, whose
+//!   `effect_ceiling` is fixed at `advisory-only`
+//!   (`IMPROVEMENT_EFFECT_CEILING`) and which therefore cannot express a
+//!   tuning or delivery class at all.
+//! - **No real work item.** Every candidate-shaped record reachable from this
+//!   crate was checked and none carries one. `ImprovementCandidate`
+//!   (I12.24:20-38) has no work-item field: its `delivery_target` is the
+//!   free-form string "work item / module / config path" and names nothing;
+//!   `OwnerDecisionKind::WorkItem` is a decision-OWNER selection recorded by
+//!   [`record_owner_decision`](crate::record_owner_decision), which this
+//!   crate's own callers document as a pure constructor that "cannot tell a
+//!   real principal from a fabricated one" — so sourcing the flag from it
+//!   would be the fabricated `true` this module exists to prevent; and
+//!   `ImprovementCandidate` carries no impact tests, immutable candidate or
+//!   canary record either, which are the rest of I12.24:91.
+//!
+//! ## What that costs, stated plainly
+//!
+//! Two I12.24:78-95 clauses are therefore live code with no live caller, and
+//! this module claims no enforcement for them:
+//!
+//! - I12.24:86 "one experiment per control surface, automatic rollback". The
+//!   `live_experiments_on_surface` argument of [`check_class_gate`] is read
+//!   only in the two arms that `classify` cannot return, so no call site reads
+//!   it.
+//! - I12.24:90-91, the normal work item with impact tests, immutable candidate,
+//!   canary and rollback, and with it the automatic-rollback requirement that
+//!   rides on the tuning arm.
+//!
+//! The per-surface concurrency bound that IS enforced in this crate is a
+//! different rule with a different owner:
+//! [`CandidateBoundPolicy::max_active`](crate::candidate_bounds::CandidateBoundPolicy),
+//! applied by the bounded backlog at admission. Naming that here is not a
+//! substitute for I12.24:86 and must not be read as one.
+//!
+//! This unreachability is a stated ceiling, not a gap to be papered over with
+//! an invented `true`. Closing it requires an owner to issue the declared safe
+//! range and the real work item as records this crate can read; it is not
+//! closed by widening a parameter list.
 
 use serde::{Deserialize, Serialize};
 
@@ -60,6 +116,13 @@ pub enum ApplicationClass {
 }
 
 /// Minimal descriptor used to classify and gate a proposed change.
+///
+/// No constructor in this repository builds a value with `bounded_tuning` or
+/// `has_work_item_ref` set to `true`, because the owner records those two flags
+/// stand for do not exist here; the module header records the measured absence.
+/// The fields stay public so [`Self::validate`] can be applied to a
+/// hand-built descriptor and refuse one that disagrees with its recorded
+/// surface.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ChangeDescriptor {
     pub target_surface: ImprovementSurface,
@@ -94,6 +157,11 @@ impl ChangeDescriptor {
     /// two evidence-bound classes stay unreachable until a candidate carries
     /// that evidence. Because every field is the closed rule over the recorded
     /// surface, a descriptor built here also passes [`Self::validate`].
+    ///
+    /// This is the ONLY descriptor builder in the repository. `git grep` finds
+    /// exactly two call sites, `intake::prepare_intake` and
+    /// `bins/eliotd/src/improvement_intake_dispatch.rs`, and no `ChangeDescriptor`
+    /// struct literal anywhere, so no path exists that sets either flag.
     pub fn from_recorded_surface(target_surface: ImprovementSurface) -> Self {
         Self {
             target_surface,
@@ -149,7 +217,12 @@ impl ChangeDescriptor {
 /// selects code/module/config delivery; anything else stays advisory.
 ///
 /// The two middle flags are evidence claims, and the module documentation
-/// records which of them a candidate can actually make.
+/// records which of them a candidate can actually make. As measured there,
+/// neither can be made by any descriptor this repository can build, so this
+/// function returns [`ApplicationClass::Advisory`] or
+/// [`ApplicationClass::Protected`] in practice. The middle arms are kept
+/// because the owner records they need are a missing prerequisite, not a
+/// rejected requirement.
 pub fn classify(change: &ChangeDescriptor) -> ApplicationClass {
     if change.touches_protected {
         ApplicationClass::Protected
@@ -184,6 +257,18 @@ pub fn is_prohibited_tuning_surface(surface: ImprovementSurface) -> bool {
 /// reference and a non-empty rollback reference. Protected changes require
 /// explicit owner approval plus a present non-empty migration/proof
 /// reference.
+///
+/// # Which of those clauses a call site actually reaches
+///
+/// `live_experiments_on_surface` is read ONLY in the
+/// [`ApplicationClass::PreAuthorizedTuning`] and
+/// [`ApplicationClass::CodeModuleConfig`] arms, and no descriptor
+/// [`ChangeDescriptor::from_recorded_surface`] can build selects either. Both
+/// call sites therefore pass a value that is provably never read, and neither
+/// enforces I12.24:86. See the module header for the measured absence and for
+/// the per-surface bound that IS enforced elsewhere. `rollback_ref` is a
+/// caller-authored reference string that nothing in this crate resolves, so a
+/// non-empty value is a shape requirement, not a rollback capability.
 ///
 /// [`ChangeDescriptor::validate`] runs first, so a descriptor inconsistent
 /// with its recorded surface is refused for every class, including

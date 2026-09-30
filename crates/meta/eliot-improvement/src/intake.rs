@@ -45,16 +45,12 @@
 //!
 //! [`IntakeRequest`] carries no class flag, so the class gate
 //! ([`check_class_gate`], I12.24:78-95) cannot be talked into a class by the
-//! party presenting the evidence. Every value it reads is derived:
+//! party presenting the evidence:
 //!
 //! - the descriptor is [`ChangeDescriptor::from_recorded_surface`] over the
 //!   candidate's OWN recorded surface, so `touches_protected` is the crate's
 //!   closed prohibited-surface rule and `bounded_tuning` / `has_work_item_ref`
 //!   have no parameter to be set through;
-//! - the live-experiment count is [`BoundedBacklog::active_for`] on that same
-//!   recorded surface, which is the entry set the backlog already bounds and
-//!   archives (I12.24:86 "one experiment per control surface");
-//! - the rollback reference is the candidate's own recorded `rollback`;
 //! - `work_item_ref` is `None`, `owner_approved` is `false` and
 //!   `migration_proof_ref` is `None` because no owner-issued work-item,
 //!   owner-decision or migration/proof record exists to read.
@@ -64,9 +60,36 @@
 //! [`ApplicationClass::Protected`](crate::ApplicationClass::Protected), and a
 //! `Protected` one is REFUSED with
 //! [`ImprovementError::ApplicationClassViolation`]. That is a typed refusal,
-//! not a downgrade: an owner claim is never read as `false` to let a gate
-//! pass, and the two evidence-bound classes stay unreachable rather than
-//! reachable through an unverifiable flag.
+//! not a downgrade: an owner claim is never read as `false` to let a gate pass,
+//! and the two evidence-bound classes stay unreachable rather than reachable
+//! through an unverifiable flag.
+//!
+//! ## What this entry therefore does NOT enforce (issue #1867 W5)
+//!
+//! Two clauses of I12.24:78-95 are live code with no live caller, and this
+//! module does not claim otherwise:
+//!
+//! - I12.24:86 "one experiment per control surface, automatic rollback". The
+//!   only gate arms that read `live_experiments_on_surface` are the
+//!   pre-authorized-tuning and code/module/config arms of [`check_class_gate`],
+//!   and no descriptor any constructor in this repository can build selects
+//!   either: [`ChangeDescriptor::from_recorded_surface`] takes no parameter for
+//!   `bounded_tuning` or `has_work_item_ref`, and those two flags are the ONLY
+//!   things that select those classes. `prepare_intake` therefore passes `0`,
+//!   and that value is provably not read on this path. The surface-concurrency
+//!   bound that IS enforced here is a different rule with a different owner:
+//!   [`CandidateBoundPolicy::max_active`](crate::candidate_bounds::CandidateBoundPolicy),
+//!   applied by [`BoundedBacklog::admit`].
+//! - I12.24:90-91, the normal work item with impact tests, immutable candidate,
+//!   canary and rollback. No such record exists on `ImprovementCandidate`
+//!   (I12.24:20-38) or anywhere else in this repository, so the arm has
+//!   nothing to read.
+//!
+//! The reason is a missing owner record, not a missing check: I12.24:85 admits
+//! pre-authorized tuning only "inside a declared safe range", and no declared
+//! safe range record exists here to source the flag from. The ceiling is
+//! therefore stated rather than papered over — see the
+//! `application_class` module header for the measured absence.
 
 use crate::application_class::{ChangeDescriptor, check_class_gate, classify};
 use crate::brief::{ImprovementBrief, SafeBoundary, brief_at_safe_boundary};
@@ -152,7 +175,8 @@ pub struct RetainedReusableClosure {
 ///   record behind it. The descriptor is built by
 ///   [`ChangeDescriptor::from_recorded_surface`], which exposes no parameter
 ///   for them precisely because the evidence does not exist, and states the
-///   unreachability instead of minting a `true`.
+///   unreachability instead of minting a `true`. The measured absence of both
+///   owner records is recorded in the `application_class` module header.
 /// - `owner_approved` and `migration_proof_ref` — the EXPLICIT OWNER DECISION
 ///   and MIGRATION/PROOF of I12.24:93-94 — are gone for the same reason: no
 ///   owner-issued owner-decision or migration/proof record exists on main that
@@ -160,10 +184,14 @@ pub struct RetainedReusableClosure {
 ///   change whose recorded surface is prohibited classifies `Protected` and
 ///   `check_class_gate` refuses it with
 ///   [`ImprovementError::ApplicationClassViolation`].
-/// - `live_experiments_on_surface` is gone because "one experiment per control
-///   surface" (I12.24:86) is COUNTED by `prepare_intake` from the bounded
-///   backlog's own retained entries. The requester cannot state the count, so
-///   it cannot state it is zero.
+/// - `live_experiments_on_surface` is gone, and `prepare_intake` no longer
+///   counts it either: the count is read only by the two class arms that no
+///   descriptor here can reach, so counting it would have been an unread
+///   computation behind a comment claiming enforcement (issue #1867 W5). The
+///   surface-concurrency rule that IS enforced on this path is
+///   `CandidateBoundPolicy::max_active`, applied inside
+///   [`BoundedBacklog::admit`] and reported by
+///   [`BoundedBacklog::admit_reporting_pressure`].
 ///
 /// What remains here is content: the evidence, the brief text, the recorded
 /// delivery/canary/rollback/stop condition, the owner-assessed value and owner,
@@ -261,13 +289,8 @@ struct PreparedIntake {
 /// Run the pre-admission intake gates shared by both entries: build the
 /// evidence-bound candidate, move it to `Triaged`, produce the
 /// owner-actionable brief at the safe boundary, enforce the application-class
-/// gate, and require matched budget evidence. Nothing here mutates the
-/// backlog; it is read only to count the live experiments already running on
-/// the candidate's own target surface.
-fn prepare_intake(
-    backlog: &BoundedBacklog,
-    request: IntakeRequest,
-) -> Result<PreparedIntake, ImprovementError> {
+/// gate, and require matched budget evidence. Nothing here touches the backlog.
+fn prepare_intake(request: IntakeRequest) -> Result<PreparedIntake, ImprovementError> {
     let IntakeRequest {
         project_id,
         target_surface,
@@ -339,26 +362,27 @@ fn prepare_intake(
     //   unreachable here rather than assertable.
     let change = ChangeDescriptor::from_recorded_surface(candidate.target_surface);
     let class = classify(&change);
-    // I12.24:86 "one experiment per control surface": the count is READ from the
-    // backlog's own active entries for the recorded surface, which is the same
-    // set `BoundedBacklog` bounds and archives, so a second concurrent
-    // experiment cannot be admitted by asserting the count is zero.
-    let live_experiments_on_surface = backlog.active_for(candidate.target_surface).len();
-    // The rollback reference the gate reads is the CANDIDATE's own recorded
-    // `rollback` — the same string `candidate_from_evidence` wrote onto it and
-    // `ImprovementCandidate::validate` required non-empty — not a free
-    // parameter that could name a rollback the admitted candidate does not
-    // carry. It is read off the candidate rather than off the destructured
-    // request so the two cannot drift.
-    check_class_gate(
-        class,
-        &change,
-        live_experiments_on_surface,
-        &candidate.rollback,
-        None,
-        false,
-        None,
-    )?;
+    // Both non-derived arguments below are honest absences, not enforcement:
+    //
+    // - `0` is the live-experiment count I12.24:86 asks for. It is NOT read on
+    //   this path: `check_class_gate` reads that argument only in its
+    //   pre-authorized-tuning and code/module/config arms, `classify` cannot
+    //   return either from a `from_recorded_surface` descriptor, and this is a
+    //   literal rather than a derived count precisely so no comment here can
+    //   claim an enforcement those arms do not perform. The per-surface
+    //   concurrency bound that IS enforced is `CandidateBoundPolicy::max_active`,
+    //   inside the backlog admission below, which is a different rule with a
+    //   different owner and not a substitute for I12.24:86.
+    // - `rollback` is the candidate's own recorded value, i.e. the same string
+    //   `candidate_from_evidence` wrote onto it from this request. It is a
+    //   caller-AUTHORED reference that `ImprovementCandidate::validate`
+    //   requires non-empty and that nothing in this crate resolves (see the
+    //   crate root: `canary_plan`, `rollback` and `stop_condition` are
+    //   "String REFERENCES ... never resolves them"). It is therefore NOT
+    //   evidence that a rollback path exists, and it is not the "automatic
+    //   rollback" of I12.24:86 — no rollback is performed, scheduled or proven
+    //   here. It is not read on this path either, for the same reason as `0`.
+    check_class_gate(class, &change, 0, &rollback, None, false, None)?;
     require_matched_budget_for_promotion(Some(&budget_proof))?;
     Ok(PreparedIntake {
         candidate,
@@ -389,7 +413,7 @@ pub fn intake_from_evidence(
     backlog: &mut BoundedBacklog,
     request: IntakeRequest,
 ) -> Result<IntakeOutcome, ImprovementError> {
-    let prepared = prepare_intake(backlog, request)?;
+    let prepared = prepare_intake(request)?;
     let outcome = backlog
         .admit(prepared.candidate, prepared.value, prepared.owner)
         .map_err(|e| ImprovementError::BacklogRefused(e.to_string()))?;
@@ -520,7 +544,7 @@ pub fn intake_from_evidence_governed(
         Some(candidate_id) => Some(backlog.active_reusable(candidate_id, verified)?.clone()),
         None => None,
     };
-    let prepared = prepare_intake(backlog, request)?;
+    let prepared = prepare_intake(request)?;
     let report = backlog.admit_reporting_pressure(
         prepared.candidate,
         prepared.value,
