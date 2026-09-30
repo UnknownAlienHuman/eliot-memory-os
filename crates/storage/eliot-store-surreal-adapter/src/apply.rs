@@ -1812,6 +1812,25 @@ fn validate_transition(
     if ctx.state_fence != transition.state_fence {
         return Err(AdapterError::Store(StoreError::FenceMismatch));
     }
+    // Issue #1702: bind the owner-revision authorization to the AUTHENTICATED
+    // request source. The plan check inside `transition.validate()` can only
+    // compare the presented lease with the record's own owner fields, because a
+    // `PreparedTransition` is a semantic plan and carries no transport identity.
+    // This is the separate act that compares the presenter with `ctx.source_id`,
+    // so a caller relabelling its own role fails closed here, before any
+    // provider I/O, receipt or fence advance.
+    for operation in &transition.named_operations {
+        if operation.operation == eliot_store_api::NamedMutationOperation::ApplySwarmOwnerRevisions
+        {
+            let batch = eliot_store_api::decode_swarm_owner_revisions(
+                operation.operation,
+                &operation.parameters,
+            )
+            .map_err(AdapterError::Store)?;
+            eliot_store_api::validate_swarm_owner_revision_authorization(&batch.record, ctx)
+                .map_err(AdapterError::Store)?;
+        }
+    }
     Ok(())
 }
 

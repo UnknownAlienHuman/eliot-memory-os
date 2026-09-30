@@ -1095,12 +1095,14 @@ fn append_experience_statements(
     Ok(())
 }
 
-/// Appends owner-separated swarm records and revision heads when the named
-/// operation is activated after its semantic-owner gate is available (#1702).
+/// Appends the owner-separated swarm record and revision head when the named
+/// operation is present in the transition (#1702).
 ///
 /// Immutable record bytes, owner-head CAS and the canonical receipt commit in
-/// this one transaction. The operation remains unactivated by the catalogue,
-/// so normal transition validation rejects it before this writer is reached.
+/// this one transaction. The operation is activated by the catalogue and its
+/// owner-specific authorization is verified by `PreparedTransition::validate`
+/// before this writer is reached, so these statements only ever persist the row
+/// an already-authorized transition names.
 fn append_swarm_owner_revision_statements(
     sql: &mut String,
     bindings: &mut Map<String, Value>,
