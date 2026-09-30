@@ -84,8 +84,11 @@
 //! security incidents need a pinned-scanner receipt producer that does not exist
 //! (annotated at the arm); evaluator verdicts, accepted implementation
 //! deviations and complaints have no producer anywhere in this workspace to read
-//! (`eliot_problem::ImplementationDeviation` and `CoverageComplaint` each have no
-//! call site); and `Concilium` has no `MaintenanceTrigger` member to be carried
+//! (`eliot_problem::ImplementationDeviation` and
+//! `FeedbackClass::CoverageComplaint` — the real type, not the
+//! `ExperienceEventKind` this header previously named, which exists in no Rust
+//! source — each have no call site); and `Concilium` has no `MaintenanceTrigger`
+//! member to be carried
 //! on at all. The three no-producer cases are set out in full below, under "The
 //! three sources with no producer AT ALL".
 //!
@@ -1741,15 +1744,125 @@ fn enforce_improvement_class_gate(
 ///   outside this file and outside the two files this item owns.
 /// - `Complaint` (I12.24:48, "Human/agent complaint") would need a complaint
 ///   observation. The only carrier in the repository is the
-///   `ExperienceEventKind::CoverageComplaint` enum member
+///   `FeedbackClass::CoverageComplaint` enum member
 ///   (`crates/foundation/eliot-observation-contracts/src/experience/records.rs:157`),
-///   a vocabulary entry with no writer: its occurrences are that declaration, the
-///   doc comment above it (`records.rs:143-144`), and citations in this comment, with
-///   no call site. There is no authenticated Human or agent ingress on this daemon
+///   a vocabulary entry with no writer. CORRECTION: this comment previously
+///   named the type `ExperienceEventKind::CoverageComplaint`. No such type
+///   exists — `git grep -n "ExperienceEventKind" -- .` returns exactly one hit,
+///   this sentence. The real type is `FeedbackClass`, declared at
+///   `records.rs:149` and carrying `CoverageComplaint` as its fourth member at
+///   `:157`, per the doc comment at `records.rs:141-146` ("`UsefulnessSignal`
+///   and `CoverageComplaint` carry the I16-23 counter-metric subjects
+///   (acknowledged usefulness/decision delta and wrong-scope/context
+///   complaints with resolution latency)"). It is the `class` field of
+///   `AgentFeedbackRecord` (`records.rs:413`), which is the only shape that can
+///   carry it.
+///   There is no authenticated Human or agent ingress on this daemon
 ///   that could raise one (the ingress census is in this module's header: zero
 ///   listeners, sockets or stdin readers under `bins/eliotd`, and the only
 ///   transport is the outbound authenticated Kernel client), so a complaint has
 ///   no route to this process even in principle.
+///
+/// # The `Complaint` ingress census, and the exact earliest link that cannot fire
+///
+/// Measured on this tree with `git grep`, not assumed. EVERY surface a Human or
+/// agent could conceivably file a complaint through:
+///
+/// | surface | exists | reaches `eliotd` | wired |
+/// |---|---|---|---|
+/// | operator app, C# | YES — `apps/Eliot.Operator/**` (29 files) | NO | NO. `git grep -rni "complaint" -- apps/` is EMPTY. Its only mutation routes are `OperatorCommand` and `UserAutomation` (`Protocol/OperatorIntent.cs:96-97`) |
+/// | ControlBoard | YES — `crates/surfaces/eliot-controlboard/src/lib.rs` | NO | NO. `Self::submit` (`:1555`) takes a `CommandRequest` against an `OperatorCommandPort`; no complaint action exists in the closed vocabulary |
+/// | doctor | YES — `bins/eliot-doctor/src/**` | NO | NO. `git grep -rni "feedback\|complaint" -- bins/eliot-doctor/src/` is EMPTY |
+/// | MCP surface | YES — `eliot.observe` is live and published (`crates/eliot-app/src/mcp_stdio.rs:314`, catalogue `catalog.rs:1177`) | NO | NO. See below |
+/// | user broker / automation store | YES — `bins/eliot-user-broker/`, `crates/surfaces/eliot-user-broker-core/` | NO | NO. `git grep -rni "complaint\|feedback"` over both trees is EMPTY. `DecideImprovementBrief` is refused at both ends, per this module's header |
+/// | file/directory drop | NO | — | No drop convention exists for complaints. The only `Inbox` found is `NotifyStdinRequest::ReadInbox` (`bins/eliot-notify/src/lib.rs:106`), a READ of the notification inbox, and it is not a complaint ingress |
+///
+/// The MCP surface is the closest and is the one worth being precise about,
+/// because I07.28 makes it the architecturally designated complaint ingress and
+/// it is genuinely live. It still cannot deliver a `CoverageComplaint`:
+///
+/// 1. `eliot.observe` reaches `eliotd` as a PAIR, and the daemon-side decoder
+///    REFUSES to interpret it. `ObserveSuboperation`
+///    (`bins/eliotd/src/governor_observe_serve.rs:38-49`) is a closed
+///    five-member vocabulary — `observation`, `decision`, `failure`, `outcome`,
+///    `influence_ack` (`:150-157`) — and NO member is a complaint. Every served
+///    pair returns an `ObserveDeferral` (`:168`, `serve_admitted_observe` at
+///    `:187`) naming a missing owner admission; the module header records that
+///    "every served pair defers: no effect is produced and none is claimed."
+/// 2. Even upstream, the wire type cannot name a complaint. `ObserveInput`
+///    (`crates/eliot-types/src/mcp_contract.rs:394-437`) has fields
+///    `text_or_structured_payload`, `hint`, `task_id`, `affected_resources`,
+///    `source_handles`, `expected_reuse_note`, `write_id`, `schema_version`.
+///    There is no `FeedbackClass`, no `disposition` (I7.28's
+///    `wrong_scope | scope_ambiguous | ...` enumeration has NO Rust type — see
+///    below) and no `AgentFeedbackReceipt` subtype (also no Rust type:
+///    `git grep -rn "struct AgentFeedbackReceipt" -- .` is EMPTY; the name
+///    appears only in `docs/architecture/` and in
+///    `crates/smart/cognitive-wave-09.toml` / `eliot-cognitive-quality/module.toml`
+///    as a projection INPUT string).
+/// 3. `eliot.observe` does not reach the canonical observation journal at all.
+///    `dispatch_observe` (`crates/eliot-app/src/mcp_stdio/verification.rs:21`)
+///    ends in `SemanticCommand::ClaimPropose` (`:96`) writing an
+///    `observation_candidate` claim card — candidate-only memory, not a
+///    `SystemObservationJournal` event. `git grep -n
+///    "EliotSystemObservation\|observation_journal" -- crates/eliot-app/src/` is
+///    EMPTY. Without a journal event there is no `ObservationKind`, and
+///    `ObservationKind` is what the feedback producer keys on.
+///
+/// **The earliest link that cannot fire** is therefore NOT the ingress. It is
+/// one step further in, and it is a HARD BLOCKER with no owner willing to move
+/// it: the closed journal-kind-to-feedback-class map
+/// `feedback_class_for_kind`
+/// (`crates/governor/eliot-observation/src/bank_admission.rs:555-571`). It is
+/// exhaustive over all THIRTEEN `ObservationKind` members
+/// (`crates/foundation/eliot-observation-contracts/src/lib.rs:112-126`) and
+/// yields `Some` for exactly three — `AgentFeedback`→`UsefulnessSignal` (`:557`),
+/// `ProductOutcome`→`OutcomeDelta` (`:558`), `UserCorrection`→`UserCorrection`
+/// (`:559`) — and `None` for the other ten (`:560-569`).
+/// `FeedbackClass::CoverageComplaint` is UNREACHABLE from that function by
+/// construction: there is no `ObservationKind` arm that can return it, and no
+/// member of the thirteen names a complaint.
+///
+/// So there are TWO independent dead links, and the inner one is the binding
+/// one:
+///
+/// - outer: no ingress can raise a complaint (§ the census table above);
+/// - inner: even if one did, and even if a journal event arrived, the class
+///   cannot be produced, because the closed 13-member map has no arm for it.
+///
+/// The inner blocker is a CONTRACT change in two foundation/Governor files that
+/// this slice does not own (`eliot-observation-contracts` and
+/// `eliot-observation`), and it is not a mapping bug: `ObservationKind` is a
+/// closed serde enum that is a published boundary
+/// (`crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml:237393`
+/// pins `records.rs:FeedbackClass:147` as a shipped boundary), so adding a
+/// member is a schema/authority change requiring explicit owner decision and
+/// migration/proof under I12.24:93-94. Inventing a class value here would put
+/// fabricated user testimony into an evidence pipeline, which is the outcome
+/// this whole refusal exists to prevent.
+///
+/// ONE MORE MEASURED FACT, and it is the reason the outer link cannot be closed
+/// quickly either: the function that would consume the class,
+/// `produce_feedback_from_journal`
+/// (`crates/governor/eliot-observation/src/bank_admission.rs:604`), has ZERO
+/// CALLERS ANYWHERE — `git grep -n "produce_feedback_from_journal" -- .`
+/// returns three hits, all inside its own module: two doc comments (`:21`,
+/// `:59`) and the definition (`:604`). Not one `#[cfg(test)]` caller, not one
+/// production caller, and nothing in `bins/eliotd` calls it or
+/// `admit_feedback_record` (`git grep` over `bins/eliotd/` for all three of
+/// `produce_feedback_from_journal` / `admit_feedback_record` /
+/// `feedback_class_for_kind` is EMPTY). So NO `FeedbackClass` value of ANY
+/// kind — including the three that ARE mappable — is produced anywhere in the
+/// workspace. The complaint is not the only unwired class; the whole feedback
+/// production lane is unclaimed. That is the honest ceiling: the missing
+/// producer is not a complaint-specific one, it is the Governor observation
+/// owner's feedback admission (integration #18, the same residual owner
+/// `observe_suboperation_owner` already names at
+/// `bins/eliotd/src/governor_observe_serve.rs:93` and `:98`), which must both
+/// CONNECT this existing producer to a real journal supply AND widen the
+/// closed class map. Neither half is this dispatch layer's to do, and doing
+/// either partially would produce a candidate whose `class` was chosen by the
+/// author rather than observed from a filer.
 ///
 /// # The campaign-closure source is bound, not labelled
 ///
