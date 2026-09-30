@@ -526,7 +526,7 @@ use eliot_improvement::{
 };
 use eliot_maintenance::{
     IMPROVEMENT_ADMISSION_AUTHORITY, IMPROVEMENT_CANDIDATE_BOUNDS_REVISION,
-    ImprovementAdmissionPolicy, ImprovementBriefDisposition, ImprovementBoundError,
+    ImprovementAdmissionPolicy, ImprovementBoundError, ImprovementBriefDisposition,
     ImprovementSurfaceBound, ImprovementTargetSurface, MaintenanceTrigger,
     resolve_candidate_surface_bound, select_non_mutating_disposition,
 };
@@ -889,10 +889,10 @@ pub fn assemble_improvement_artifact(
     // repeat is unchanged.
     let repeat_clause = repeated_failure
         .as_ref()
-        .map_or_else(String::new, |failure| failure.brief_evidence_clause());
+        .map_or_else(String::new, RepeatedVerifierFailure::brief_evidence_clause);
     let next_step_clause = repeated_failure
         .as_ref()
-        .map_or_else(String::new, |failure| failure.brief_next_step_clause());
+        .map_or_else(String::new, RepeatedVerifierFailure::brief_next_step_clause);
 
     // Why the brief names the OBSERVED principal, and which brief fields the
     // closure record cannot supply, is stated in the module documentation
