@@ -1,6 +1,6 @@
 //! Bounded readback of the original Kernel process executor's retained bytes.
 //!
-//! This module is deliberately not a durable BlobStore reader. The current
+//! This module is deliberately not a durable `BlobStore` reader. The current
 //! P-03 gateway constructs its original executor without a stream sink, so the
 //! only complete source it can truthfully serve is the original P-04 capture
 //! when it retained every byte through EOF. Prefix previews and captures that
