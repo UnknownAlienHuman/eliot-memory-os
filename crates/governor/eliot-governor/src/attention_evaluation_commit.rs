@@ -62,8 +62,10 @@
 //! readback verification in this module are the stable contract that Store leg
 //! must reuse byte-for-byte.
 //!
-//! Production caller status: the sibling Governor producer (W3/W4) supplies
-//! assembled records; the Store-leg binder supplies the commit invocation.
+//! Production caller status: the producer join
+//! ([`produce_and_commit_attention_evaluation`]) assembles caller-nominated
+//! reads into a candidate record and admits it through the commit gate; the
+//! Store-leg binder supplies the commit invocation for the admitted identity.
 //! No caller is wired here; every function is complete and independently
 //! checkable.
 //!
@@ -76,11 +78,19 @@
 #![forbid(unsafe_code)]
 
 use eliot_contracts::{
-    ArtifactId, ContractId, OperationId, SessionId, StateFence, canonical_json_bytes, sha256_hex,
+    ArtifactId, ClockReading, ContractId, OperationId, SessionId, StateFence, canonical_json_bytes,
+    sha256_hex,
 };
 use eliot_evaluation_contracts::{
-    HumanAttentionEvaluation, HumanAttentionEvaluationRevisionRef, HumanAttentionMetricGroup,
-    HumanAttentionMetricValue,
+    EvaluatorScopeUncertaintyInvalidation, HUMAN_ATTENTION_EVALUATION_CONTRACT_VERSION,
+    HumanAttentionApprovalEvidence, HumanAttentionAssemblyInput, HumanAttentionClaim,
+    HumanAttentionDenominatorFraming, HumanAttentionEvaluation,
+    HumanAttentionEvaluationRevisionRef, HumanAttentionEvidenceGap,
+    HumanAttentionHumanReportEvidence, HumanAttentionInterruptionEvidence, HumanAttentionMethod,
+    HumanAttentionMetricGroup, HumanAttentionMetricValue, HumanAttentionNotificationEvidence,
+    HumanAttentionObservationWindow, HumanAttentionPrivacyEvidence, HumanAttentionProfileEvidence,
+    HumanAttentionRiskOutcomeEvidence, HumanAttentionTaskOutcomeEvidence,
+    HumanAttentionTaskVerifierEvidence, ProfileRevisionRef, assemble_human_attention_evidence,
 };
 use eliot_protocol::RequestIdentity;
 use eliot_store_api::{
@@ -744,4 +754,160 @@ pub fn check_attention_commit_receipt(
 /// per call against the presented record, never cached into a wider grant.
 pub fn collect_attention_evidence_refs(record: &HumanAttentionEvaluation) -> Vec<ArtifactId> {
     record.evidence_manifest.evidence_refs.clone()
+}
+
+/// Assembled-then-admitted produce-and-commit output for one evaluation revision.
+///
+/// The record embeds every assembled group verbatim; `gaps` preserves the
+/// exact assembly gaps, so a non-empty gap list marks the record
+/// partial/inconclusive: unavailable evidence stays unknown with reasons,
+/// never synthetic zeros. `record_digest` is the immutable revision identity
+/// and `evidence_refs` the manifest-bound servable references. The output
+/// carries no score and supports no ranking.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttentionEvaluationProducedRecord {
+    /// The produced record revision, admitted through the commit gate.
+    pub record: HumanAttentionEvaluation,
+    /// SHA-256 over the canonical bytes of the exact produced revision.
+    pub record_digest: String,
+    /// Manifest-bound evidence references servable for the produced record.
+    pub evidence_refs: Vec<ArtifactId>,
+    /// Exact assembly gaps; non-empty marks the record partial/inconclusive.
+    pub gaps: Vec<HumanAttentionEvidenceGap>,
+}
+
+/// Produces one evaluation revision from caller-nominated evidence reads and
+/// admits it through the commit gate (issue #1784 item W3).
+///
+/// This is the narrow Governor producer/assembly join: it performs no owner
+/// reads itself — every nomination below is caller-asserted data, and
+/// nomination authorizes no access and establishes no completeness. Named
+/// reads arrive as the per-read nomination structs
+/// (notification delivery/disposition, exact expiring approvals,
+/// task/verifier/outcome, risk, Human-report, interruption, privacy, and
+/// profile evidence); the function builds the [`HumanAttentionAssemblyInput`]
+/// from them with one consistently bound observation window and one
+/// authorized scope shared with the record envelope, calls
+/// [`assemble_human_attention_evidence`], embeds the assembled groups into a
+/// candidate record, then runs [`validate_attention_evaluation_request`],
+/// [`attention_record_digest`], and [`collect_attention_evidence_refs`] over
+/// the produced record. Assembly, record, and commit-gate failures all return
+/// the typed [`AttentionEvaluationCommitError`]; unavailable evidence yields a
+/// partial record with exact gaps, never synthetic zeros, and no claim or
+/// score is minted here.
+///
+/// Invalidation is refused: it preserves the prior revision bytes apart from
+/// the statement, so it cannot be assembled from fresh nominations — persist
+/// it through the commit gate directly. Identity, session, revision linkage,
+/// and evidence-commitment authority stay with the owners and the commit
+/// gate; this function mints none.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the producer join binds every nominated read and envelope coordinate explicitly"
+)]
+pub fn produce_and_commit_attention_evaluation(
+    observation_window: HumanAttentionObservationWindow,
+    manifest_id: ContractId,
+    manifest_revision: String,
+    notification: HumanAttentionNotificationEvidence,
+    approvals: HumanAttentionApprovalEvidence,
+    task_outcomes: HumanAttentionTaskOutcomeEvidence,
+    task_verifier: HumanAttentionTaskVerifierEvidence,
+    risk_outcomes: HumanAttentionRiskOutcomeEvidence,
+    human_reports: HumanAttentionHumanReportEvidence,
+    interruptions: HumanAttentionInterruptionEvidence,
+    privacy: HumanAttentionPrivacyEvidence,
+    profiles: HumanAttentionProfileEvidence,
+    task_denominator: HumanAttentionDenominatorFraming,
+    risk_denominator: HumanAttentionDenominatorFraming,
+    risk_absence_evidence_refs: Vec<ArtifactId>,
+    risk_unavailable_reason: Option<String>,
+    framing: EvaluatorScopeUncertaintyInvalidation,
+    policy_revision: ProfileRevisionRef,
+    notification_revision: ProfileRevisionRef,
+    approval_revision: ProfileRevisionRef,
+    telemetry_revision: ProfileRevisionRef,
+    method: HumanAttentionMethod,
+    claims: Vec<HumanAttentionClaim>,
+    created_at: ClockReading,
+    expires_at: ClockReading,
+    prior: Option<&HumanAttentionEvaluation>,
+    request: &AttentionEvaluationOperatorRequest,
+    identity: &RequestIdentity,
+) -> Result<AttentionEvaluationProducedRecord, AttentionEvaluationCommitError> {
+    if request.operation == AttentionEvaluationOperation::Invalidate {
+        return Err(AttentionEvaluationCommitError::Operation(
+            "invalidation preserves prior bytes and cannot be assembled from fresh nominations"
+                .to_owned(),
+        ));
+    }
+    let assembly_input = HumanAttentionAssemblyInput {
+        observation_window: observation_window.clone(),
+        evaluation_scope: framing.authorized_scope.clone(),
+        manifest_id,
+        manifest_revision,
+        notification,
+        approvals,
+        task_outcomes,
+        task_verifier,
+        risk_outcomes,
+        human_reports,
+        interruptions,
+        privacy,
+        profiles,
+        task_denominator,
+        risk_denominator,
+        risk_absence_evidence_refs,
+        risk_unavailable_reason,
+    };
+    let assembled = assemble_human_attention_evidence(&assembly_input)
+        .map_err(|error| AttentionEvaluationCommitError::Record(error.to_string()))?;
+    let predecessor = prior.map(|prior_record| HumanAttentionEvaluationRevisionRef {
+        evaluation_id: request.evaluation_id.clone(),
+        revision: prior_record.revision,
+    });
+    let record = HumanAttentionEvaluation {
+        contract_version: HUMAN_ATTENTION_EVALUATION_CONTRACT_VERSION,
+        evaluation_id: request.evaluation_id.clone(),
+        revision: request.expected_revision,
+        evaluator_scope_uncertainty_and_invalidation: framing,
+        policy_revision,
+        notification_revision,
+        approval_revision,
+        telemetry_revision,
+        observation_window,
+        evidence_manifest: assembled.evidence_manifest,
+        method,
+        policy_and_task_risk_profile: assembled.policy_and_task_risk_profile,
+        notification_approval_and_telemetry_profile: assembled
+            .notification_approval_and_telemetry_profile,
+        missed_critical_and_false_critical_counts: assembled
+            .missed_critical_and_false_critical_counts,
+        pre_exposure_prevention_and_conditional_intervention: assembled
+            .pre_exposure_prevention_and_conditional_intervention,
+        final_harm_and_residual_risk: assembled.final_harm_and_residual_risk,
+        benign_false_blocks_and_abandoned_work: assembled
+            .benign_false_blocks_and_abandoned_work,
+        interruption_and_resumption_time_quality: assembled
+            .interruption_and_resumption_time_quality,
+        task_correctness_rework_and_human_attention: assembled
+            .task_correctness_rework_and_human_attention,
+        overtrust_undertrust_and_recoverability_observations: assembled
+            .overtrust_undertrust_and_recoverability_observations,
+        privacy_purpose_retention_and_disclosure_cost: assembled
+            .privacy_purpose_retention_and_disclosure_cost,
+        claims,
+        created_at,
+        expires_at,
+        predecessor,
+    };
+    validate_attention_evaluation_request(&record, prior, request, identity)?;
+    let record_digest = attention_record_digest(&record)?;
+    let evidence_refs = collect_attention_evidence_refs(&record);
+    Ok(AttentionEvaluationProducedRecord {
+        record,
+        record_digest,
+        evidence_refs,
+        gaps: assembled.gaps,
+    })
 }
