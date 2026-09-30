@@ -28,6 +28,7 @@ mod plan;
 mod readiness;
 mod schema;
 mod schema_inventory;
+mod source_artifact_context;
 mod write_execution;
 mod write_scheduler;
 
