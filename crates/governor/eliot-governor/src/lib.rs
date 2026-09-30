@@ -301,6 +301,7 @@ pub use swarm_plan_attachment_service::{
 };
 pub use task_lifecycle::{
     GovernorTaskLifecycle, GuardedTaskCommand, PreparedTaskTransition, TaskLifecycleError,
+    TaskSelectionTransitionInput,
 };
 pub use wasm_resolution::{
     CONFORMANCE_COMPONENT, CONFORMANCE_INPUT, CONFORMANCE_SEED, ContourAdmission,
