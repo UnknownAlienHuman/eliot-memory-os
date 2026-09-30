@@ -31,7 +31,8 @@
 //! - [`HandoffRecoveryFinish`] binds the observed outcome to the existing
 //!   [`HandoffCausalLink`](crate::HandoffCausalLink) and the attempt-bound
 //!   intent only after the required checks, reconciling repeats instead of
-//!   launching another worker;
+//!   launching another worker, and advances the intent to executed only when
+//!   the bound worker actually executes;
 //! - [`recover_handoff`] runs these owners in order so every helper has a
 //!   real caller: registry permit, evidence, gate, dispatcher, effect
 //!   reconciliation, rebuild request, and finish.
@@ -515,6 +516,26 @@ pub enum HandoffResumeAdmission {
     },
 }
 
+/// Requires the resume intent to name the handoff and target attempt the
+/// retained link binds.
+///
+/// A crossed intent — the right target under the wrong handoff, or a stale
+/// target — is refused as a stale resume request before any authority,
+/// dispatch, or binding step can act on it, so it can never launch another
+/// worker.
+fn require_intent_for_link(
+    intent: &HandoffResumeIntent,
+    link: &HandoffCausalLink,
+) -> Result<(), HandoffRecoveryError> {
+    if intent.handoff_id != link.handoff_id || intent.target_attempt_id != link.target_attempt_id {
+        return Err(HandoffCheckpointError::StaleResumeRequest {
+            handoff_id: intent.handoff_id.as_str().to_owned(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 /// Resume/revalidation owner (I12.17, I7.15).
 ///
 /// The gate consumes the complete retained payload with its carried
@@ -537,6 +558,7 @@ impl HandoffResumeGate {
         intent.validate()?;
         let retained = evidence.retained()?;
         retained.validate()?;
+        require_intent_for_link(intent, &retained.link)?;
         if !observations.authority_readback_available {
             return Err(HandoffRecoveryError::AuthorityReadbackUnavailable);
         }
@@ -956,6 +978,7 @@ impl HandoffRecoveryFinish {
     ) -> Result<Option<HandoffCausalLink>, HandoffRecoveryError> {
         retained.validate()?;
         intent.reconcile(request)?;
+        require_intent_for_link(intent, &retained.link)?;
         if !matches!(
             observed,
             HandoffResumeStatus::ResumeAdmitted | HandoffResumeStatus::ResumedExecution
@@ -984,6 +1007,28 @@ impl HandoffRecoveryFinish {
                 Ok(Some(bound))
             }
         }
+    }
+
+    /// Advances an admitted intent to executed when the bound worker actually
+    /// executes.
+    ///
+    /// The transition reconciles the same target intent, so a repeated
+    /// execution report observes the recorded stage instead of launching
+    /// again, and a stale request naming another target is refused. Only an
+    /// admitted intent advances: every earlier state has no launched worker
+    /// to report, and an already-executing intent admits no second launch.
+    pub fn mark_executed(
+        intent: &mut HandoffResumeIntent,
+        request: &HandoffResumeIntent,
+    ) -> Result<(), HandoffRecoveryError> {
+        intent.reconcile(request)?;
+        if !intent.admits_execution() {
+            return Err(HandoffRecoveryError::OutcomeNotAdmissible {
+                status: intent.status,
+            });
+        }
+        intent.advance(HandoffResumeStatus::ResumedExecution)?;
+        Ok(())
     }
 }
 
@@ -1087,7 +1132,8 @@ fn advance_floor(
 /// outcome to the causal link and intent. The bound status is
 /// [`HandoffResumeStatus::ResumeAdmitted`]: the bound worker may be launched,
 /// and the resume owner advances the intent to
-/// [`HandoffResumeStatus::ResumedExecution`] only when the worker actually
+/// [`HandoffResumeStatus::ResumedExecution`] through
+/// [`HandoffRecoveryFinish::mark_executed`] only when the worker actually
 /// executes, so admitted and executed resumes stay distinct. A blocked
 /// dependent action returns a diagnostic admission with no dispatch, no
 /// rebuild, and no bound link.

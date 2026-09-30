@@ -30,9 +30,10 @@
 //!   but are not I12.17 handoffs and are not registered here.
 //!
 //! The draft's `request_id` is the owner idempotency key and the capture
-//! operation identity at once: a retry after commit-response loss replays the
-//! identical draft under the same key, so the owner returns the exact prior
-//! receipt instead of minting a second checkpoint identity, and
+//! operation identity at once: a retry after commit-response loss reads the
+//! stored event back under the same key and returns the exact prior receipt
+//! instead of minting a second checkpoint identity, while a different draft
+//! under the same key fails with the owner's idempotency conflict, and
 //! [`reconcile_handoff_capture`] fails closed to
 //! [`HandoffCaptureAcceptance::Unknown`](eliot_agent_contracts::HandoffCaptureAcceptance)
 //! while no committed event reads back. A transport acknowledgement or a
@@ -49,7 +50,9 @@ use eliot_agent_contracts::{
 use eliot_contracts::OperationId;
 use thiserror::Error;
 
-use super::{CheckpointReceipt, CoordinationError, CoordinationEventKind, CoordinationOwner, WorkCheckpoint};
+use super::{
+    CheckpointReceipt, CoordinationError, CoordinationEventKind, CoordinationOwner, WorkCheckpoint,
+};
 
 /// Failure of the canonical handoff persistence call.
 ///
@@ -113,8 +116,8 @@ fn check_capture_binding(
     checkpoint: &HandoffCheckpoint,
     draft: &WorkCheckpoint,
 ) -> Result<OperationId, HandoffPersistenceError> {
-    let operation_id =
-        OperationId::new(draft.request_id.clone()).map_err(HandoffCheckpointError::Contract)?;
+    let operation_id = OperationId::new(draft.request_id.clone())
+        .map_err(|_| CoordinationError::InvalidField("handoff_capture.request_id"))?;
     if draft.checkpoint_id != checkpoint.checkpoint_id.as_str() {
         return Err(CoordinationError::InvalidField("handoff_capture.checkpoint_id").into());
     }
@@ -136,10 +139,12 @@ fn check_capture_binding(
 /// (registering the same checkpoint under another operation is refused),
 /// commits through the owner, reads the committed event back out of the
 /// owner, reconciles the same operation to durable acceptance, and admits
-/// the compaction permit. Repeating the call with the identical draft after
-/// commit-response loss returns the exact prior receipt; repeating it with a
-/// different draft under the same request identity fails with the owner's
-/// idempotency conflict instead of minting a second checkpoint.
+/// the compaction permit. A retry that already committed under this request
+/// identity reads the stored event back instead of committing again, so
+/// repeating the call with the identical draft after commit-response loss
+/// returns the exact prior receipt; repeating it with a different draft
+/// under the same request identity fails with the owner's idempotency
+/// conflict instead of minting a second checkpoint.
 pub fn capture_handoff_checkpoint(
     owner: &mut CoordinationOwner,
     registry: &mut HandoffCaptureRegistry,
@@ -147,7 +152,7 @@ pub fn capture_handoff_checkpoint(
     draft: WorkCheckpoint,
 ) -> Result<CheckpointReceipt, HandoffPersistenceError> {
     checkpoint.validate()?;
-    let operation_id = check_capture_binding(checkpoint, draft.clone())?;
+    let operation_id = check_capture_binding(checkpoint, &draft)?;
     match registry.operation(&checkpoint.checkpoint_id) {
         None => registry.register(HandoffCaptureOperation::new(
             operation_id.clone(),
@@ -156,15 +161,25 @@ pub fn capture_handoff_checkpoint(
                 cause: "capture commit not yet observed".to_owned(),
             },
         )?)?,
-        Some(existing)
-            if existing.operation_id.as_str() != operation_id.as_str() =>
-        {
+        Some(existing) if existing.operation_id.as_str() != operation_id.as_str() => {
             return Err(HandoffRecoveryError::DuplicateCaptureRegistration {
                 checkpoint_id: checkpoint.checkpoint_id.as_str().to_owned(),
             }
             .into());
         }
         Some(_) => {}
+    }
+    if let Some(receipt) = readback_committed_capture(owner, checkpoint, &draft) {
+        let receipt = receipt?;
+        registry.reconcile_commit(
+            &operation_id,
+            &checkpoint.checkpoint_id,
+            HandoffCaptureAcceptance::DurablyStored {
+                receipt_ref: capture_receipt_ref(checkpoint)?,
+            },
+        )?;
+        registry.require_compaction_permit(&checkpoint.checkpoint_id)?;
+        return Ok(receipt);
     }
     let receipt = owner.checkpoint(draft)?;
     if !owner.events().contains(&receipt.event) {
@@ -179,6 +194,40 @@ pub fn capture_handoff_checkpoint(
     )?;
     registry.require_compaction_permit(&checkpoint.checkpoint_id)?;
     Ok(receipt)
+}
+
+/// Reads the already-committed capture event for one draft back out of the
+/// owner without committing again.
+///
+/// The owner assigns a fresh causal sequence to every committed event, so a
+/// retried draft can never replay its commit through the owner: the owner
+/// would refuse the stale predecessor. The retry therefore reads the stored
+/// `Checkpointed` event under this request identity instead. A stored event
+/// whose digest or subject differs from this draft is a different input under
+/// the same key and fails with the owner's idempotency conflict; no match
+/// means the first commit never landed and the caller proceeds to commit.
+fn readback_committed_capture(
+    owner: &CoordinationOwner,
+    checkpoint: &HandoffCheckpoint,
+    draft: &WorkCheckpoint,
+) -> Option<Result<CheckpointReceipt, HandoffPersistenceError>> {
+    let stored = owner.events().iter().find(|event| {
+        event.kind == CoordinationEventKind::Checkpointed
+            && event.idempotency_key == draft.request_id
+    })?;
+    if stored.payload_digest != handoff_checkpoint_ref_text(checkpoint)
+        || stored.subject_id != draft.work_item_id
+    {
+        return Some(Err(CoordinationError::IdempotencyConflict(
+            draft.request_id.clone(),
+        )
+        .into()));
+    }
+    Some(Ok(CheckpointReceipt {
+        checkpoint_id: draft.checkpoint_id.clone(),
+        work_item_id: draft.work_item_id.clone(),
+        event: stored.clone(),
+    }))
 }
 
 /// Reconciles a lost capture-commit response against the same operation.
