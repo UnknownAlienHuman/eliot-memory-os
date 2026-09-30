@@ -118,6 +118,42 @@
 //! newer catalogue produces a different `resolution_sha256` rather than
 //! restamping the old one.
 //!
+//! # W3k9 — the completed section budget contract
+//!
+//! #1725 implementation step 1 completes [`ContextSectionBudget`] rather than
+//! adding a second budget type. The record now states, for each semantic role,
+//! the whole-unit boundary kind, the minimum whole-unit count AND the exact
+//! identities that count is about, the planning maximum with the route profile
+//! it is expressed in, the permitted loss/handle representation, the
+//! whole-unit degradation disposition and the feature-disable rule.
+//!
+//! Three refusals carry that completion:
+//!
+//! 1. two budgets for one semantic role are refused on the role alone, so an
+//!    identical repeat is not silently merged either, and a disagreement with
+//!    the compilation-bound instance's own
+//!    [`RoleLossRule`](crate::RoleLossRule) for that role is refused in
+//!    [`ContextRecipePolicy::binds_recipe`] rather than resolved by preferring
+//!    one record;
+//! 2. [`ContextSectionBudget::validate_admitted_section`] checks membership of
+//!    the exact required references AND the independent whole-unit floor against
+//!    the observed admitted set, so a count can never stand in for membership
+//!    and neither is derived from the other;
+//! 3. that same check admits a required reference only in a representation the
+//!    role's `omission_or_handle_policy` permits, reusing the crate's single
+//!    [`LossPolicy::allows`] rule — `NON_DROPPABLE` admits `WHOLE` only, so a
+//!    handle never becomes the whole unit.
+//!
+//! The policy is inside the existing digest: [`ContextRecipePolicy`] serializes
+//! its whole approved content into
+//! [`CONTEXT_RECIPE_POLICY_DIGEST_DOMAIN`](crate::CONTEXT_RECIPE_POLICY_DIGEST_DOMAIN),
+//! so changing any of these fields changes `policy_sha256`, and
+//! `DecisionRevision::policy_sha256` binds the compilation to it. No second
+//! digest and no change to an existing domain or to the compilation-bound
+//! instance's own `canonical_policy_digest`. The shape change is the explicit
+//! versioned migration recorded on
+//! [`CONTEXT_RECIPE_POLICY_SCHEMA_VERSION`].
+//!
 //! # W6 — recipes change only through the existing improvement gate
 //!
 //! I12.13: "It may be changed only as an Improvement Candidate through replay,
@@ -177,10 +213,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    BoundaryDisposition, BoundaryTransformerRevision, BoundaryUnitKind, ContextError,
-    ContextRecipe, DecisionSafetyFloor, LossPolicy, NonRecoverableReason, OmissionReason,
-    QUALITY_DIMENSIONS, QualityApplicability, QualityApplicabilityInput, QualityDimension,
-    SemanticRole, validate_digest, validate_text,
+    AdmittedContextSet, BoundaryDisposition, BoundaryTransformerRevision, BoundaryUnitKind,
+    ContextError, ContextRecipe, DecisionSafetyFloor, LossPolicy, NonRecoverableReason,
+    OmissionReason, QUALITY_DIMENSIONS, QualityApplicability, QualityApplicabilityInput,
+    QualityDimension, RepresentationKind, SemanticRole, validate_digest, validate_text,
 };
 
 /// Wire revision of the reusable recipe policy definition.
@@ -193,7 +229,20 @@ use crate::{
 /// definition therefore cannot decode into it, which is the versioned
 /// migration — the old accepted bytes stay with the old instance shape rather
 /// than being read as a policy that declares nothing.
-pub const CONTEXT_RECIPE_POLICY_SCHEMA_VERSION: u32 = 1;
+///
+/// #1725 W3k9 raised this from `1` to `2`. Revision `2` adds the required
+/// [`ContextSectionBudget`] members `required_exact_references` and
+/// `planning_route_profile`; revision `1` carried only a whole-unit count and a
+/// bare planning figure. Nothing is defaulted and nothing is reinterpreted:
+/// `required_exact_references` has no `#[serde(default)]`, so a revision-`1`
+/// payload cannot decode into a revision-`2` policy, and `validate()` refuses a
+/// `policy_schema_version` that is not this exact constant. An approved
+/// revision-`1` policy stays readable as revision-`1` bytes under its own
+/// recorded `policy_sha256`; re-issuing it as revision `2` is a new owner
+/// decision naming the exact required identities and the route profile its
+/// planning maximum is expressed in, because revision `1` never said which
+/// whole units were required or in which profile.
+pub const CONTEXT_RECIPE_POLICY_SCHEMA_VERSION: u32 = 2;
 
 /// Digest domain separator for the reusable recipe policy.
 ///
@@ -376,6 +425,16 @@ impl RecipeAdmissionPolicy {
 /// object, URL, source identity, tool call/result pair or evidence edge is
 /// never divided to make a budget fit. The budget algorithm itself is not here
 /// and is not reimplemented here.
+///
+/// #1725 W3k9 completed the record. It already carried the semantic role, the
+/// unit boundary kind, a minimum whole-unit count, a planning maximum, a
+/// loss/handle policy, a degradation disposition and the feature-disable rule;
+/// what it could not state was WHICH units the count refers to and in which
+/// route profile the planning maximum is expressed. A count is not membership:
+/// N admitted units of the right role say nothing about which N they are, so
+/// `required_exact_references` is a separate required member and
+/// [`ContextSectionBudget::validate_admitted_section`] checks the two
+/// independently rather than deriving one from the other.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ContextSectionBudget {
@@ -384,12 +443,40 @@ pub struct ContextSectionBudget {
     /// Whole-unit boundary kind of this section.
     pub unit_boundary_kind: BoundaryUnitKind,
     /// Minimum complete units retained for this role.
+    ///
+    /// The independent whole-unit floor. It is never satisfied by
+    /// `required_exact_references`: that list is the set of exact identities,
+    /// and this figure is the count that must be reached in the admitted set.
     pub minimum_required_whole_units: u64,
+    /// Exact identities this section must contain, by role.
+    ///
+    /// Required and non-empty: a section that names no exact required identity
+    /// could only ever be checked by count, which is exactly the gap #1725
+    /// closes. These are unit identities — an EvidenceAtom, ClaimCard,
+    /// ToolDefinition, source-catalog entry, WorkItem, completed causal stage or
+    /// normative anchor — and a JSON object, URL, source identity, call/result
+    /// pair or evidence edge is never a member of this set, because none of
+    /// them is one whole unit. A genuine set: order carries no meaning and it
+    /// is sorted for the policy digest.
+    pub required_exact_references: Vec<ArtifactId>,
     /// Owner proof references for this section's protected floor.
     pub protected_floor_refs: Vec<ArtifactId>,
-    /// Planning maximum, in the same whole units.
+    /// Planning maximum, in the whole units of `unit_boundary_kind`.
     pub planning_maximum_whole_units: u64,
+    /// Route profile the planning maximum is expressed in.
+    ///
+    /// The maximum is a planning figure for one named profile, not a universal
+    /// one, so it names the profile it is valid for. It must be a profile this
+    /// revision's own `applicability.route_profiles` declares; a maximum
+    /// measured for a profile the revision does not apply to describes nothing
+    /// this revision runs.
+    pub planning_route_profile: String,
     /// Permitted omission/handle policy for this section.
+    ///
+    /// This is also the handle rule: a handle may satisfy one of
+    /// `required_exact_references` only where this policy permits
+    /// [`RepresentationKind::Handle`], so a `NON_DROPPABLE` section can never be
+    /// satisfied by a handle standing in for the complete unit.
     pub omission_or_handle_policy: LossPolicy,
     /// Whole-unit degradation applied when the section cannot be preserved.
     pub degradation_behavior: BoundaryDisposition,
@@ -404,9 +491,11 @@ impl ContextSectionBudget {
                 "section_budget.minimum_required_whole_units",
             ));
         }
+        Self::validate_required_references()?;
         if self.planning_maximum_whole_units < self.minimum_required_whole_units {
             return Err(ContextError::CapacityExceeded);
         }
+        validate_text(&self.planning_route_profile, "section_budget.planning_route_profile")?;
         if self.protected_floor_refs.len() > 64 {
             return Err(ContextError::Bounds {
                 field: "section_budget.protected_floor_refs",
@@ -420,6 +509,94 @@ impl ContextSectionBudget {
                     "section_budget.protected_floor_refs",
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// The exact required identities of this section, distinct and bounded.
+    ///
+    /// Absent or empty is refused: the required member is what makes membership
+    /// checkable at all, and a budget that carries only a whole-unit count
+    /// cannot be checked against the identities the floor names.
+    fn validate_required_references(&self) -> Result<(), ContextError> {
+        if self.required_exact_references.is_empty() {
+            return Err(ContextError::MissingField(
+                "section_budget.required_exact_references",
+            ));
+        }
+        if self.required_exact_references.len() > 64 {
+            return Err(ContextError::Bounds {
+                field: "section_budget.required_exact_references",
+            });
+        }
+        let mut seen = BTreeSet::new();
+        for reference in &self.required_exact_references {
+            validate_text(reference.as_str(), "section_budget.required_exact_references")?;
+            if !seen.insert(reference.clone()) {
+                return Err(ContextError::Duplicate(
+                    "section_budget.required_exact_references",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate one compiled section against this budget on the OBSERVED
+    /// admitted set.
+    ///
+    /// Two independent checks, and neither can stand in for the other:
+    ///
+    /// * membership — every identity in `required_exact_references` is present
+    ///   among the admitted records of this section's semantic role. The
+    ///   comparison is against the admitted records themselves, so a section
+    ///   that admits the wrong units while meeting the count is refused by name
+    ///   instead of being counted as satisfied.
+    /// * the independent floor — the number of distinct admitted whole units of
+    ///   this role reaches `minimum_required_whole_units`. The count is taken
+    ///   from the admitted records and never from `required_exact_references`,
+    ///   so a policy cannot meet its own floor by naming its membership list.
+    ///
+    /// Each required reference must additionally be carried in a representation
+    /// this role's `omission_or_handle_policy` permits. That is the handle rule
+    /// and it is not derived from the floor or from the count: under
+    /// [`LossPolicy::NonDroppable`] only [`RepresentationKind::Whole`] is
+    /// permitted, so a handle can never satisfy a required reference of a
+    /// non-droppable section.
+    ///
+    /// The observed set is an input, never derived here: this function reads the
+    /// admitted records and this budget's own declarations and compares them to
+    /// each other, so it does not certify an admission decision of its own.
+    pub fn validate_admitted_section(
+        &self,
+        admitted: &AdmittedContextSet,
+    ) -> Result<(), ContextError> {
+        let mut admitted_units: BTreeMap<&ArtifactId, RepresentationKind> = BTreeMap::new();
+        for record in &admitted.records {
+            if record.candidate.provider_role.role != self.semantic_role {
+                continue;
+            }
+            let atom_id = &record.candidate.atom_id;
+            if admitted_units
+                .insert(atom_id, record.candidate.representation.kind())
+                .is_some()
+            {
+                // One identity counted once: a repeated identity cannot stand in
+                // for a second whole unit in the floor below.
+                return Err(ContextError::Duplicate("admitted.atom_id"));
+            }
+        }
+        for reference in &self.required_exact_references {
+            let representation = admitted_units
+                .get(reference)
+                .ok_or(ContextError::MissingFloor)?;
+            if !self.omission_or_handle_policy.allows(*representation) {
+                return Err(ContextError::WholeUnitRequired);
+            }
+        }
+        let admitted_whole_units = u64::try_from(admitted_units.len())
+            .map_err(|_| ContextError::Overflow)?;
+        if admitted_whole_units < self.minimum_required_whole_units {
+            return Err(ContextError::MissingFloor);
         }
         Ok(())
     }
@@ -1104,6 +1281,19 @@ impl ContextRecipePolicy {
         canonical
             .section_budgets
             .sort_by_key(|budget| budget.semantic_role);
+        // The section policy itself is inside this digest, not beside it: every
+        // `ContextSectionBudget` member — the semantic role, the unit kind, the
+        // minimum whole-unit count, the exact required references, the planning
+        // maximum and its route profile, the permitted loss/handle policy, the
+        // degradation disposition and the feature-disable rule — is covered
+        // because the whole approved content is what is serialized. Ordering
+        // normalization is the only thing added: `required_exact_references` is
+        // a genuine set, so two revisions that name the same units in a
+        // different order are the same policy, and `semantic_role` is unique
+        // per budget after `validate()` refused a duplicate role.
+        for budget in &mut canonical.section_budgets {
+            budget.required_exact_references.sort();
+        }
         canonical
             .layout
             .role_positions
@@ -1176,6 +1366,16 @@ impl ContextRecipePolicy {
     /// not make itself applicable by dropping a mandatory role, adding a
     /// feature the policy does not configure, or declaring a mandatory role
     /// suppressible.
+    ///
+    /// One semantic role has one permitted-loss policy across the two records.
+    /// A section budget's `omission_or_handle_policy` and the instance's
+    /// [`RoleLossRule`](crate::RoleLossRule) `loss_policy` are two policies for
+    /// the same role, and a disagreement is refused rather than resolved by
+    /// preferring one: this is the check that makes `NON_DROPPABLE` unable to
+    /// become `HANDLE_ONLY` by being written in the record the other validator
+    /// does not read. The refusal is
+    /// [`ContextError::WholeUnitRequired`], the same typed failure the role's
+    /// own representation rule raises, because that is exactly what it is.
     pub fn binds_recipe(&self, recipe: &ContextRecipe) -> Result<(), ContextError> {
         self.validate()?;
         recipe.validate()?;
@@ -1198,6 +1398,26 @@ impl ContextRecipePolicy {
                 return Err(ContextError::MissingField(
                     "recipe_policy.candidate_features",
                 ));
+            }
+        }
+        self.require_consistent_role_policies(recipe)
+    }
+
+    /// Refuse two role policies for one semantic role that disagree.
+    fn require_consistent_role_policies(
+        &self,
+        recipe: &ContextRecipe,
+    ) -> Result<(), ContextError> {
+        for budget in &self.section_budgets {
+            let Some(rule) = recipe
+                .role_policies
+                .iter()
+                .find(|rule| rule.role == budget.semantic_role)
+            else {
+                continue;
+            };
+            if rule.loss_policy != budget.omission_or_handle_policy {
+                return Err(ContextError::WholeUnitRequired);
             }
         }
         Ok(())
@@ -1314,6 +1534,18 @@ impl ContextRecipePolicy {
         Ok(())
     }
 
+    /// Validate every section budget of this revision.
+    ///
+    /// Two budgets may not claim the same semantic role. The refusal is on the
+    /// role alone, so an IDENTICAL repeat is refused exactly like a conflicting
+    /// one: two budgets for one role are two policies for one role, and neither
+    /// merging them nor keeping one of them is a decision this validator is
+    /// allowed to make silently. The conflict that survives past this check —
+    /// one role, one section budget but a different permitted loss policy in the
+    /// compilation-bound instance's own
+    /// [`RoleLossRule`](crate::RoleLossRule) — is refused where both records are
+    /// read together, in
+    /// [`ContextRecipePolicy::binds_recipe`].
     fn validate_section_budgets(
         &self,
         features: &BTreeSet<SemanticRole>,
@@ -1336,6 +1568,15 @@ impl ContextRecipePolicy {
                 ));
             }
             budget.validate()?;
+            if !self
+                .applicability
+                .route_profiles
+                .contains(&budget.planning_route_profile)
+            {
+                return Err(ContextError::MissingField(
+                    "recipe_policy.applicability.route_profiles",
+                ));
+            }
         }
         Ok(())
     }
