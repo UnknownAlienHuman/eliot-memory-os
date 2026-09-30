@@ -3593,6 +3593,27 @@ impl KernelComposition {
                     DaemonReadQueue::CampaignPacket => candidate.campaign_packet_envelope.clone(),
                 })
         };
+        // I7.24 (#1945): the retained tool bytes for the same pair. The
+        // queue owner holds the exact admitted envelope+tool per durable
+        // operation id; the exposure lifecycle below re-establishes its
+        // skeleton from these retained inputs rather than a parallel store.
+        let queued_tool = {
+            let index = self
+                .host_request_connection_index
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            index
+                .values()
+                .flatten()
+                .find(|candidate| {
+                    candidate.operation_id == body.operation_id
+                        && candidate.request_digest == body.request_sha256
+                })
+                .and_then(|candidate| match queue {
+                    DaemonReadQueue::LocalRead => candidate.local_read_tool.clone(),
+                    DaemonReadQueue::CampaignPacket => candidate.campaign_packet_tool.clone(),
+                })
+        };
         validate_campaign_view_result(&stored, queued_envelope.as_ref(), &body.response)?;
         if let Some(envelope) = queued_envelope.as_ref() {
             if !session
@@ -3709,6 +3730,28 @@ impl KernelComposition {
         if submitted_ok && bound_ok {
             self.clear_pending_result_binding(&body.operation_id);
         }
+        // I7.24 (#1945): advance the evaluated exposure receipt through its
+        // measured stages for this persisted completion, and retain the
+        // completed receipt on the durable operation row it evidences —
+        // never dropped. Observational only: every missing input, failed
+        // transition, or failed attach inside the two calls leaves the
+        // submit disposition and the durability contract unchanged, so they
+        // never gain a receipt-shaped failure mode.
+        if let Some(receipt) = advance_tool_exposure_receipt_for_persisted_result(
+            queue,
+            queued_envelope.as_ref(),
+            queued_tool.as_ref(),
+            &persisted,
+        ) {
+            let _ = self
+                .generation_gateway
+                .ors
+                .record_host_request_tool_exposure_receipt(
+                    &operation_id,
+                    &persisted.request_digest,
+                    &receipt,
+                );
+        }
         // The single completion consumes the attempt use budget: retire the
         // pair in the same queue ledger that authorized it so no later claim
         // or submit can reuse this generation.
@@ -3728,6 +3771,86 @@ impl KernelComposition {
         }
         Ok(LocalReadSubmitDisposition::Persisted(Box::new(persisted)))
     }
+}
+
+/// Advances the per-evaluation tool-exposure receipt for one persisted
+/// local-read or campaign-packet completion (I7.24, #1945).
+///
+/// The queue owner retains the exact admitted envelope+tool per durable
+/// operation id; this leg re-establishes the admission skeleton from those
+/// retained inputs (never a parallel receipt store) and advances it with
+/// evidence measured here: delivery from the persisted record's own
+/// digest-bound bytes via
+/// [`super::tool_exposure::observe_persisted_delivery`], observable use only
+/// when the campaign lane fed result content into its owner verifier, and
+/// the terminal outcome from the durable completion coordinates. Query and
+/// Skill lanes record no observable use: the Kernel serves their bytes
+/// without deciding from content. Truncation has no owner signal on this
+/// path (oversize bodies are rejected, never cut), so only the complete
+/// delivery is recorded; a token-truncated outcome stays unwired until the
+/// route tokenizer owner exists.
+///
+/// Observational only and infallible by construction: every missing input
+/// or failed transition returns `None`, so the submit disposition and the
+/// durability contract never gain a receipt-shaped failure mode. A returned
+/// receipt is passed by the caller into the durable operation row it
+/// evidences — never dropped.
+/// Returns the completed receipt for retention, or `None` when there is
+/// nothing to retain.
+fn advance_tool_exposure_receipt_for_persisted_result(
+    queue: DaemonReadQueue,
+    envelope: Option<&HostRequestEnvelope>,
+    tool: Option<&serde_json::Value>,
+    persisted: &HostRequestRecord,
+) -> Option<eliot_receipts::ToolExposureReceiptV2> {
+    let (Some(envelope), Some(tool)) = (envelope, tool) else {
+        return None;
+    };
+    let Ok(admission) = check_local_read_admission(envelope, tool) else {
+        return None;
+    };
+    let request = super::tool_exposure::build_tool_call_request(envelope, tool, &admission)?;
+    let operation = persisted.operation_id.as_str();
+    let (Some(digest), Some(response)) = (
+        persisted.result_digest.as_deref(),
+        persisted.result_response.as_ref(),
+    ) else {
+        return None;
+    };
+    let Ok(delivered) = super::tool_exposure::observe_persisted_delivery(
+        &request,
+        operation.to_owned(),
+        digest,
+        response,
+        operation.to_owned(),
+    ) else {
+        return None;
+    };
+    // Observable use is lane-measured: only the campaign-packet lane feeds
+    // result content into an owner decision (the campaign-view verification
+    // that gated this persist; a failure there returns before persisting, so
+    // a present view reached here verified). A present-but-null or absent
+    // view means nothing was consumed beyond transport.
+    let used = match queue {
+        DaemonReadQueue::LocalRead => delivered,
+        DaemonReadQueue::CampaignPacket => {
+            let view_verified = response
+                .get("campaign_learning_state_view")
+                .is_some_and(|view| !view.is_null());
+            if view_verified {
+                let unmarked = delivered.clone();
+                delivered.record_observable_use().unwrap_or(unmarked)
+            } else {
+                delivered
+            }
+        }
+    };
+    // Terminal outcome names the durable completion coordinates from the
+    // ORS owner's persisted record, never caller prose. The completed
+    // receipt is returned for retention on the durable operation row —
+    // never dropped.
+    let terminal_ref = format!("host-request-result-received:{operation}:{digest}");
+    used.record_terminal_outcome(terminal_ref).ok()
 }
 
 /// Closed capability admitted to the observe queue (issue #2565: one
@@ -8046,6 +8169,14 @@ pub(crate) fn local_read_admission_from_tool(
     if super::tool_exposure::requires_intent(&admission) {
         let request = super::tool_exposure::build_tool_call_request(envelope, tool, &admission)
             .ok_or(TransportError::SessionFenced)?;
+        // I7.24 (#1945): the pre-dispatch gate for every admitted
+        // expensive-class call. The gate authorizes here; the per-evaluation
+        // exposure lifecycle runs at the submit leg
+        // ([`advance_tool_exposure_receipt_for_persisted_result`]), which
+        // re-establishes the skeleton from the queue owner's retained
+        // envelope+tool under the durable operation id and advances it with
+        // owner-measured evidence, so a constructed receipt always flows
+        // into its transitions instead of being dropped here.
         super::tool_exposure::authorize_pre_dispatch(&request)
             .map_err(|_| TransportError::SessionFenced)?;
     }

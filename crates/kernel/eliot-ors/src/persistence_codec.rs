@@ -424,6 +424,15 @@ impl PersistedValue for CampaignLearningStateViewPublication {
     }
 }
 
+impl PersistedValue for eliot_receipts::ToolExposureReceiptV2 {
+    const RECORD_TYPE: &'static str = "host_request_tool_exposure_receipt";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))
+    }
+}
+
 impl PersistedValue for CampaignSourceHead {
     const RECORD_TYPE: &'static str = "campaign_source_head";
 

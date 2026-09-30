@@ -442,6 +442,21 @@ impl OrsStoreIdentity {
 const CUTOVER_OWNERSHIP: TableDefinition<&str, &str> =
     TableDefinition::new("ors_cutover_ownership_v1");
 const HOST_REQUESTS: TableDefinition<&str, &str> = TableDefinition::new("ors_host_requests_v1");
+/// Durable evaluated tool-exposure receipts, one per completed host-request
+/// operation (issue #1945, I7.24).
+///
+/// One row per evaluated completion, keyed exactly like its host-request row
+/// (`operation_id::request_digest`), holding the completed
+/// [`eliot_receipts::ToolExposureReceiptV2`] the Kernel measured for that
+/// completion. The receipt evidences the persisted result, so it is recorded
+/// after the result it observes — never before it, and never for an operation
+/// that carries no result. The first retained receipt stands: a replay can
+/// neither replace nor erase it. This is one more table in the existing ORS
+/// table family, owned by the same `RedbRecoveryStore` and written through
+/// the same `persistence_codec`; it is not a second receipt store or a second
+/// table owner.
+const HOST_REQUEST_TOOL_EXPOSURE_RECEIPTS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_host_request_tool_exposure_receipts_v1");
 /// Durable versioned-artifact registry rows (issue #1971; I1.6, I1.12, I14.14).
 ///
 /// One row per versioned-artifact registry entry, keyed
@@ -11127,6 +11142,96 @@ impl RedbRecoveryStore {
         }
         write.commit().map_err(storage)?;
         Ok(Some(next))
+    }
+
+    /// Retains one evaluated tool-exposure receipt on its durable host-request
+    /// operation (issue #1945, I7.24).
+    ///
+    /// The evaluated receipt evidences the persisted completion, so it is
+    /// recorded after the result it observes: the owning row must already
+    /// carry the exact result digest the receipt binds. A row that carries no
+    /// result at all fails with [`OrsError::InvalidTransition`]; a receipt
+    /// whose identity is not this operation, or whose produced digest is not
+    /// this row's retained `result_digest`, fails with
+    /// [`OrsError::HostRequestIdentityConflict`]. An unknown operation returns
+    /// `Ok(None)` and never invents state.
+    ///
+    /// The first retained receipt stands: an at-least-once replay of the same
+    /// evaluated completion returns the existing row unchanged and can neither
+    /// replace nor erase the retained receipt, exactly like the retained
+    /// evidence and lineage written with the result.
+    pub fn record_host_request_tool_exposure_receipt(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        receipt: &eliot_receipts::ToolExposureReceiptV2,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        receipt.validate().map_err(|error| match error {
+            eliot_receipts::ToolExposureError::InvalidField { field, reason } => {
+                OrsError::InvalidField { field, reason }
+            }
+            other => OrsError::Contract(other.to_string()),
+        })?;
+        if receipt.receipt_id != operation_id.as_str() {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+        let produced = receipt
+            .produced_result
+            .as_ref()
+            .ok_or(OrsError::InvalidField {
+                field: "host_request_tool_exposure_receipt",
+                reason: "retained receipt must bind the produced result it evidences",
+            })?;
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing: Option<crate::HostRequestRecord> = {
+            let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode::<crate::HostRequestRecord>(value.value()))
+                .transpose()?
+        };
+        let Some(existing) = existing else {
+            return Ok(None);
+        };
+        existing.validate()?;
+        let retained_digest = existing
+            .result_digest
+            .as_deref()
+            .ok_or(OrsError::InvalidTransition)?;
+        if retained_digest != produced.result_digest.as_str() {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+        // First retained receipt stands: a replay of the same evaluated
+        // completion reads back the existing row instead of rewriting or
+        // erasing the observation the operation already recorded.
+        let already_retained = {
+            let table = write
+                .open_table(HOST_REQUEST_TOOL_EXPOSURE_RECEIPTS)
+                .map_err(storage)?;
+            table.get(key.as_str()).map_err(storage)?.is_some()
+        };
+        if already_retained {
+            return Ok(Some(existing));
+        }
+        let payload = encode(receipt)?;
+        {
+            let mut table = write
+                .open_table(HOST_REQUEST_TOOL_EXPOSURE_RECEIPTS)
+                .map_err(storage)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(Some(existing))
     }
 
     // Bridge-event disclosure gate (I7.23 owner authorization before
@@ -26589,6 +26694,16 @@ impl RedbRecoveryStore {
         // reads authoritatively empty instead of failing on a missing table.
         // No row is backfilled or inferred here.
         drop(write.open_table(VERSIONED_ARTIFACTS).map_err(storage)?);
+        // #1945: the evaluated tool-exposure receipt table is part of the base
+        // ORS table family for the same reason: materialized empty on every
+        // open, so a store that never evaluated a tool call reads
+        // authoritatively empty instead of failing on a missing table. No row
+        // is backfilled or inferred here.
+        drop(
+            write
+                .open_table(HOST_REQUEST_TOOL_EXPOSURE_RECEIPTS)
+                .map_err(storage)?,
+        );
         drop(write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?);
         drop(
             write

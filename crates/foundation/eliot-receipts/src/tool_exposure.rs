@@ -1011,6 +1011,59 @@ impl ToolExposureReceiptV2 {
         expanded.validate()?;
         Ok(expanded)
     }
+
+    /// Records observable downstream use of the delivered result.
+    ///
+    /// Sets `observably_used_in_decision_action_or_verifier` without touching
+    /// delivery: marking a truncated or missing delivery as used never makes
+    /// [`Self::is_delivered_full`] or [`Self::is_evidence_used`] hold. Only a
+    /// delivered-full result that was observably used counts as evidence-used.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the receipt is inconsistent, or when recorded
+    /// non-use would be rewritten as use; observations are monotonic.
+    pub fn record_observable_use(mut self) -> Result<Self, ToolExposureError> {
+        self.validate()?;
+        if matches!(
+            self.observably_used_in_decision_action_or_verifier,
+            Some(false)
+        ) {
+            return Err(ToolExposureError::InvalidField {
+                field: "receipt.observably_used_in_decision_action_or_verifier",
+                reason: "recorded non-use is never rewritten as use",
+            });
+        }
+        self.observably_used_in_decision_action_or_verifier = Some(true);
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Records the terminal task or product outcome reference.
+    ///
+    /// The reference is carried verbatim; only its presence is observed here.
+    /// Recording a terminal outcome never changes delivery or use.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the receipt is inconsistent, the reference is
+    /// blank, or a recorded reference would be overwritten.
+    pub fn record_terminal_outcome(
+        mut self,
+        outcome_ref: String,
+    ) -> Result<Self, ToolExposureError> {
+        self.validate()?;
+        text(&outcome_ref, "receipt.terminal_task_or_product_outcome_ref")?;
+        if self.terminal_task_or_product_outcome_ref.is_some() {
+            return Err(ToolExposureError::InvalidField {
+                field: "receipt.terminal_task_or_product_outcome_ref",
+                reason: "a recorded terminal outcome is never overwritten",
+            });
+        }
+        self.terminal_task_or_product_outcome_ref = Some(outcome_ref);
+        self.validate()?;
+        Ok(self)
+    }
 }
 
 /// Wire version for [`ToolExposureHistoryEntry`].

@@ -915,7 +915,7 @@ struct DispositionedTable {
 /// and there it comes from redb, not from this file.
 ///
 /// Counted against `store.rs`, `store/restore_journal.rs` and `status.rs` at the
-/// time of writing: 73 distinct declared tables, of which 45 back a dispositioned
+/// time of writing: 74 distinct declared tables, of which 46 back a dispositioned
 /// row family and 28 are explicit source-bound exclusions.
 /// `row_family_denominator` carries 43 families and every one of them is now bound
 /// to a table by this census.
@@ -934,7 +934,7 @@ struct DispositionedTable {
 /// in this issue. Until it exists, a table added to `store.rs` is on the author.
 ///
 /// Split in four so no half can grow past the point where a reader stops
-/// checking it: 45 table-backed tables and 28 source-bound exclusions.
+/// checking it: 46 table-backed tables and 28 source-bound exclusions.
 fn dispositioned_tables() -> Vec<DispositionedTable> {
     let mut tables = family_backed_tables();
     tables.extend(source_bound_exclusions());
@@ -1032,6 +1032,13 @@ fn canonical_family_tables() -> Vec<DispositionedTable> {
         ),
         family(super::CUTOVER_OWNERSHIP, RowFamilyKind::CutoverOwnership),
         family(super::HOST_REQUESTS, RowFamilyKind::HostRequests),
+        // #1945: evaluated tool-exposure receipts are operation-bound evidence
+        // of past completions, never re-dispatchable routes, so they ride the
+        // host-requests family beside the rows they evidence.
+        family(
+            super::HOST_REQUEST_TOOL_EXPOSURE_RECEIPTS,
+            RowFamilyKind::HostRequests,
+        ),
         family(
             super::VERSIONED_ARTIFACTS,
             RowFamilyKind::VersionedArtifacts,
@@ -1503,7 +1510,7 @@ fn purge_ledger_exclusions() -> Vec<DispositionedTable> {
 ///    advertise a quarantined import path for a table that has no family and
 ///    therefore no import path.
 ///
-/// Cost is one `list_tables` plus a 70-entry linear scan, both bounded and both
+/// Cost is one `list_tables` plus a 71-entry linear scan, both bounded and both
 /// independent of store size: it is a schema census, not a data scan. It runs
 /// once per export entrypoint and once per quarantined import, never per page.
 ///
