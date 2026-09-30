@@ -1999,6 +1999,12 @@ pub struct RecoveryWriteBinding {
     pub operation_id: OperationIdentity,
     /// Stable logical intent carried across correction/retry submissions.
     pub write_intent_id: OpaqueLabel,
+    /// Original canonical response mode from the admitted submission.
+    ///
+    /// Absent only on legacy retained bindings that predate source retention;
+    /// new write reservations require the original value.
+    #[serde(default)]
+    pub write_response_mode: Option<String>,
     /// Retry identity from the admitted canonical write envelope.
     pub idempotency_key: OpaqueLabel,
     /// Canonical request digest computed by the canonical write-envelope owner.
@@ -2038,6 +2044,14 @@ impl RecoveryWriteBinding {
             ));
         }
         self.recovery_access_class.validate()?;
+        if self.write_response_mode.as_deref().is_some_and(|mode| {
+            !matches!(mode, "wait_for_commit" | "accept_after_stage")
+        }) {
+            return Err(OrsError::InvalidField {
+                field: "write_response_mode",
+                reason: "must be wait_for_commit or accept_after_stage when present",
+            });
+        }
         if self.payload_known_at_ms < self.payload_created_at_ms
             || self
                 .payload_expires_at_ms
@@ -2104,6 +2118,7 @@ impl RecoveryWriteBinding {
             && self.payload_expires_at_ms == other.payload_expires_at_ms
             && self.operation_id == other.operation_id
             && self.write_intent_id == other.write_intent_id
+            && self.write_response_mode == other.write_response_mode
             && self.idempotency_key == other.idempotency_key
             && self.canonical_request_sha256 == other.canonical_request_sha256
             && self.prepared_transition_sha256 == other.prepared_transition_sha256
