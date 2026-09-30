@@ -275,6 +275,10 @@ struct ColdStartReadinessOwnerRpcRequest<'a> {
 
 #[derive(serde::Serialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(
+    clippy::enum_variant_names,
+    reason = "wire action names must match the authenticated Kernel readiness route"
+)]
 enum ColdStartReadinessOwnerRpcAction<'a> {
     ReadinessClaim {
         claim: &'a ColdStartReadinessClaim,
@@ -310,7 +314,7 @@ enum ColdStartReadinessOwnerRpcResult {
         outcome: ColdStartReadinessStageOutcome,
     },
     ReadinessRecord {
-        record: Option<ColdStartReadinessOrsRecord>,
+        record: Option<Box<ColdStartReadinessOrsRecord>>,
     },
 }
 
@@ -595,7 +599,7 @@ impl ColdStartReadinessRecordOwner for KernelColdStartReadinessRecordOwner {
     ) -> Result<ColdStartReadinessStageOutcome, OrsError> {
         match self.request(ColdStartReadinessOwnerRpcAction::ReadinessClaim { claim })? {
             ColdStartReadinessOwnerRpcResult::ReadinessClaimed { outcome } => Ok(outcome),
-            _ => Err(OrsError::Contract(
+            ColdStartReadinessOwnerRpcResult::ReadinessRecord { .. } => Err(OrsError::Contract(
                 "Kernel returned an invalid cold-start readiness claim result".to_owned(),
             )),
         }
@@ -618,8 +622,10 @@ impl ColdStartReadinessRecordOwner for KernelColdStartReadinessRecordOwner {
             receipt_ref,
             receipt_bytes,
         })? {
-            ColdStartReadinessOwnerRpcResult::ReadinessRecord { record } => Ok(record),
-            _ => Err(OrsError::Contract(
+            ColdStartReadinessOwnerRpcResult::ReadinessRecord { record } => {
+                Ok(record.map(|value| *value))
+            }
+            ColdStartReadinessOwnerRpcResult::ReadinessClaimed { .. } => Err(OrsError::Contract(
                 "Kernel returned an invalid cold-start readiness publish result".to_owned(),
             )),
         }
@@ -630,8 +636,10 @@ impl ColdStartReadinessRecordOwner for KernelColdStartReadinessRecordOwner {
         record_key: &str,
     ) -> Result<Option<ColdStartReadinessOrsRecord>, OrsError> {
         match self.request(ColdStartReadinessOwnerRpcAction::ReadinessLoad { record_key })? {
-            ColdStartReadinessOwnerRpcResult::ReadinessRecord { record } => Ok(record),
-            _ => Err(OrsError::Contract(
+            ColdStartReadinessOwnerRpcResult::ReadinessRecord { record } => {
+                Ok(record.map(|value| *value))
+            }
+            ColdStartReadinessOwnerRpcResult::ReadinessClaimed { .. } => Err(OrsError::Contract(
                 "Kernel returned an invalid cold-start readiness load result".to_owned(),
             )),
         }
@@ -644,8 +652,10 @@ impl ColdStartReadinessRecordOwner for KernelColdStartReadinessRecordOwner {
         match self
             .request(ColdStartReadinessOwnerRpcAction::ReadinessLoadForBinding { binding_digest })?
         {
-            ColdStartReadinessOwnerRpcResult::ReadinessRecord { record } => Ok(record),
-            _ => Err(OrsError::Contract(
+            ColdStartReadinessOwnerRpcResult::ReadinessRecord { record } => {
+                Ok(record.map(|value| *value))
+            }
+            ColdStartReadinessOwnerRpcResult::ReadinessClaimed { .. } => Err(OrsError::Contract(
                 "Kernel returned an invalid cold-start readiness binding read result".to_owned(),
             )),
         }
