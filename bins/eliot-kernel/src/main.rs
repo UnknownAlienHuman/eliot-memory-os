@@ -178,19 +178,10 @@ async fn main() {
     let authority_path = options.authority_descriptor.clone();
     let authority_contour = startup_binding::authority_contour(&options.work_root, &authority_path);
     #[cfg(windows)]
-    let (supervision_profile, portable_dev_repository_root) = startup_binding
-        .supervision_profile_binding(profile_root_leases.as_ref())
-        .unwrap_or_else(|error| exit_error("PRINCIPAL_FAILURE", &error));
-    #[cfg(windows)]
-    if supervision_profile == eliot_installation::InstallationProfile::SystemService
-        && matches!(
-            &authority_contour,
-            eliot_kernel::AuthorityDescriptorContour::ProgramData
-        )
-    {
-        // This fixed event says only that the validated SystemService Kernel
-        // entered startup. Its queue admission is independent of readiness and
-        // cannot replace a later lifecycle result or failure.
+    if startup_binding.is_system_service() {
+        // This fixed event records an entered startup attempt under the parsed
+        // Host-selected profile. It proves neither descriptor ownership nor
+        // readiness and never changes a later lifecycle validation result.
         let _ = eliot_kernel::windows_event_log::start_and_enqueue_startup();
     }
     // Issue #1836 (W1): install the shared observability runtime from the
@@ -223,6 +214,9 @@ async fn main() {
         KernelConfig::new(options.work_root.clone()).require_descriptor_supervision_authority();
     #[cfg(windows)]
     {
+        let (supervision_profile, portable_dev_repository_root) = startup_binding
+            .supervision_profile_binding(profile_root_leases.as_ref())
+            .unwrap_or_else(|error| exit_error("PRINCIPAL_FAILURE", &error));
         kernel_config = kernel_config.with_supervision_installation_profile(
             supervision_profile,
             portable_dev_repository_root,
