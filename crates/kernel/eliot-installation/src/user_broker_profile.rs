@@ -19,9 +19,7 @@
 
 use std::path::{Component, Path};
 
-use eliot_contracts::{
-    ArtifactId, ContractId, ContractVersion, canonical_json_bytes, sha256_hex,
-};
+use eliot_contracts::{ArtifactId, ContractId, ContractVersion, canonical_json_bytes, sha256_hex};
 use eliot_protocol::{
     ProtocolRange, ProtocolVersion, USER_BROKER_CLIENT_DECLARATION_WIRE_ID,
     USER_BROKER_CLIENT_DECLARATION_WIRE_VERSION, USER_BROKER_FRONT_DOOR_OPERATIONS,
@@ -150,12 +148,12 @@ impl UserBrokerInstallationProfile {
             protected_paths: derive_user_broker_protected_paths(&host_state_root)?,
             profile_sha256: PlatformHandle::new("pending")
                 .map_err(|error| InstallationError::Platform(error.to_string()))?,
-            client_declaration: declaration
-                .with_computed_digest()
-                .map_err(|error| InstallationError::InvalidField {
+            client_declaration: declaration.with_computed_digest().map_err(|error| {
+                InstallationError::InvalidField {
                     field: "user_broker.client_declaration".to_owned(),
                     reason: error.to_string(),
-                })?,
+                }
+            })?,
         };
         profile.bind_derived_digests()?;
         Ok(profile)
@@ -367,12 +365,12 @@ impl UserBrokerInstallationProfile {
                 field: "user_broker.client_declaration".to_owned(),
                 reason: error.to_string(),
             })?;
-        self.profile_sha256 = self
-            .compute_digest()
-            .map_err(|error| InstallationError::InvalidField {
-                field: "user_broker.profile_sha256".to_owned(),
-                reason: error.to_string(),
-            })?;
+        self.profile_sha256 =
+            self.compute_digest()
+                .map_err(|error| InstallationError::InvalidField {
+                    field: "user_broker.profile_sha256".to_owned(),
+                    reason: error.to_string(),
+                })?;
         self.validate()?;
         Ok(())
     }
@@ -395,12 +393,13 @@ fn user_broker_client_declaration(
             reason: error.to_string(),
         }
     })?;
-    let artifact_id = ArtifactId::new(launch.user_broker_artifact_digest.as_str()).map_err(
-        |error| InstallationError::InvalidField {
-            field: "user_broker.module_contract.artifact_id".to_owned(),
-            reason: error.to_string(),
-        },
-    )?;
+    let artifact_id =
+        ArtifactId::new(launch.user_broker_artifact_digest.as_str()).map_err(|error| {
+            InstallationError::InvalidField {
+                field: "user_broker.module_contract.artifact_id".to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
     let operations: Vec<String> = USER_BROKER_FRONT_DOOR_OPERATIONS
         .iter()
         .map(|operation| (*operation).to_owned())

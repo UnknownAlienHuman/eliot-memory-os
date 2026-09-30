@@ -731,8 +731,7 @@ impl HostComposition {
             != user_broker_client.profile_digest
             || phase_b_bytes_digest(&user_broker_client.declaration_bytes)?
                 != user_broker_client.declaration_digest
-            || user_broker_client.profile.installation_id
-                != launch.installation_epoch.installation
+            || user_broker_client.profile.installation_id != launch.installation_epoch.installation
             || user_broker_client.profile.broker_artifact_sha256
                 != launch.user_broker_artifact_digest
             || user_broker_client.profile.broker_executable_path
