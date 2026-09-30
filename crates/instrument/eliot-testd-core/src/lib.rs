@@ -1138,6 +1138,17 @@ pub fn issue_process_admission(
     {
         return Err(TestdError::InvalidBinding);
     }
+    // Fixed-argv refusal (issue #1814 W1): the probe and productive
+    // profiles take no caller arguments, so a non-empty invocation
+    // argument vector fails before any grant exists. This mirrors the
+    // drive lane's closed-profile gate: issuance never silently drops
+    // agent-provided arguments off a fixed template. Slotted profiles
+    // keep carrying their validated slot suffix below.
+    if !is_slotted_testd_profile(&request.invocation.profile)
+        && !request.invocation.arguments.is_empty()
+    {
+        return Err(TestdError::InvalidBinding);
+    }
     // Closed-template argv gate (issue #1814 W1): the sealed process argv
     // must equal the fixed argv the closed testd binding seals for the
     // requested profile and slot suffix. Identity, fence, roots, and

@@ -1188,6 +1188,45 @@ fn check_drive_closed_argv(
     Ok(())
 }
 
+/// Revalidates the sealed executable object against the platform file at
+/// dispatch, immediately before process creation.
+///
+/// The intent must name a resolved absolute path, the path must
+/// canonicalize to a real file, and the file bytes must re-hash to the
+/// sealed executable digest. A substituted file, or a request that names
+/// an unrelated `PATH` object after the owner hashed the admitted tool,
+/// fails closed here with a typed admission failure and never reaches
+/// the executor.
+fn check_drive_executable_object(process: &ProcessRequest) -> Result<(), TestdIpcError> {
+    let executable = process.intent().executable();
+    if !std::path::Path::new(executable).is_absolute() {
+        return Err(TestdIpcError::Contract(
+            "testd process executable is not a resolved absolute tool path".to_owned(),
+        ));
+    }
+    let canonical = std::fs::canonicalize(executable).map_err(|_| {
+        TestdIpcError::Contract(
+            "testd process executable does not resolve to a platform file".to_owned(),
+        )
+    })?;
+    if !canonical.is_file() {
+        return Err(TestdIpcError::Contract(
+            "testd process executable is not an installed tool file".to_owned(),
+        ));
+    }
+    let bytes = std::fs::read(&canonical).map_err(|_| {
+        TestdIpcError::Contract(
+            "testd process executable bytes cannot be reread before start".to_owned(),
+        )
+    })?;
+    if eliot_testd_core::sha256_hex(&bytes) != process.executable_sha256() {
+        return Err(TestdIpcError::Contract(
+            "testd process executable changed after admission".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Drives exactly one admitted one-shot admission to exactly one typed
 /// outcome.
 ///
@@ -1293,6 +1332,7 @@ where
         });
     }
     check_drive_closed_argv(&invocation, &process)?;
+    check_drive_executable_object(&process)?;
     match executor.start(process, sink).await {
         Ok(_receipt) => Ok(TestdDriveOutcome::Completed {
             job_id: request.job_id.clone(),
