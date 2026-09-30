@@ -970,6 +970,133 @@ enum RunNowPreflightAssembly {
     Unavailable(String),
 }
 
+/// Typed refusal of the retained wake-horizon publication route, carrying the
+/// exact durable record that exists — or the exact fact that none does.
+///
+/// **The defect this type closes.** The route used to return a bare `String` on
+/// every failure, so a step that failed AFTER
+/// [`KernelStoreGateway::settle_wake_horizon_acknowledgement`] had already
+/// written the owner's answer as the record's retained body threw away the only
+/// handle to a durable record that provably existed. The caller could report a
+/// horizon it could not name, or name nothing at all while a record waited for a
+/// reconciliation nothing could reach. That is the same defect class this issue
+/// keeps producing: an answer that cannot be reached from the place the question
+/// is asked.
+///
+/// **No identity is minted here.** The carried obligation is the one
+/// `retained_user_automation_obligation` already derived from the EXISTING
+/// `runtime_obligation_operation_id(kind, parent, subject_ids)` and the route
+/// already settled. `Retained` is therefore reachable only from a failure site
+/// that holds that value; a step that fails before the identity exists reports
+/// [`Self::NothingRetained`] and must not construct one to look reportable.
+///
+/// **What a caller must do with each arm.**
+/// * [`Self::Retained`] — a durable record exists under
+///   `owner_operation_id`. Report that obligation beside the failure, never
+///   re-issue the slice, and reconcile under that ORIGINAL owner operation
+///   identity (I14.21: query by the original identity; no blind duplicate
+///   effect). The record is already answered when this arm is produced, so the
+///   reconciliation is a readback of the owner's retained body, not a resend.
+/// * [`Self::NothingRetained`] — no record was written and nothing was issued,
+///   so there is nothing to reconcile and the slice may still be issued later
+///   under the same identity. This arm must never be read as "the record was
+///   deleted": nothing was ever created.
+///
+/// **The two arms render differently, and that is load-bearing.** Before this
+/// type existed, both rendered as the same bare reason, so a caller that
+/// rendered the reason and dropped the payload produced a status line asserting
+/// "no obligation was retained" while a durable record sat behind it — the exact
+/// unreconcilable-loss defect this type exists to remove. A `Retained` rendering
+/// therefore ends with the owner operation identity the record lives under, so
+/// that a consumer which still renders only this text states the retained record
+/// rather than denying it.
+///
+/// [`Self::into_reason`] is the one projection that is byte-identical to the text
+/// this route produced before it was typed, on BOTH arms: the operator route
+/// calls it, its result is a bare reason, and no operator-visible message moves.
+/// [`Self::into_retained_obligation`] is the projection that closes the defect —
+/// it is what the due-wake consumer's call site must consume in place of a
+/// hand-written `None`.
+#[derive(Debug)]
+pub enum UserAutomationHorizonPublicationRefusal {
+    /// The route failed before the obligation identity existed, so no durable
+    /// record was written and no owner was asked.
+    NothingRetained {
+        /// Closed reason the slice could not even be bound and named coherently.
+        reason: String,
+    },
+    /// The owner operation identity was established and the durable record was
+    /// written, and a later step of the same route failed.
+    Retained {
+        /// The obligation that was actually written, under its original owner
+        /// operation identity. Boxed so a refusal value stays small enough to
+        /// return by value from every entry point.
+        obligation: Box<UserAutomationRuntimeObligation>,
+        /// Closed reason the projection failed after the record was written.
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for UserAutomationHorizonPublicationRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NothingRetained { reason } => formatter.write_str(reason),
+            Self::Retained {
+                obligation,
+                reason,
+            } => write!(
+                formatter,
+                "{reason}; this bounded slice IS durably retained under owner operation identity \
+                 {} and must be reported and reconciled under that original identity rather than \
+                 re-issued",
+                obligation.owner_operation_id
+            ),
+        }
+    }
+}
+
+impl std::error::Error for UserAutomationHorizonPublicationRefusal {}
+
+impl UserAutomationHorizonPublicationRefusal {
+    /// Arms the pre-retention arm from its closed reason.
+    pub fn nothing_retained(reason: String) -> Self {
+        Self::NothingRetained { reason }
+    }
+
+    /// Arms the post-retention arm from the obligation that was really written.
+    pub fn retained(obligation: UserAutomationRuntimeObligation, reason: String) -> Self {
+        Self::Retained {
+            obligation: Box::new(obligation),
+            reason,
+        }
+    }
+
+    /// Consumes the refusal and yields the retained obligation, for a caller that
+    /// reports it in place of a re-derived one.
+    ///
+    /// This hands back the EXACT record this route wrote. It never derives an
+    /// identity: a caller holding `NothingRetained` gets `None` and must say so
+    /// rather than construct a substitute.
+    #[must_use]
+    pub fn into_retained_obligation(self) -> Option<UserAutomationRuntimeObligation> {
+        match self {
+            Self::NothingRetained { .. } => None,
+            Self::Retained { obligation, .. } => Some(*obligation),
+        }
+    }
+
+    /// Consumes the refusal and yields its closed reason, which is what the
+    /// operator route reports in its `String` result.
+    ///
+    /// The reason is preserved verbatim, so typing this route changes no operator
+    /// visible text; only the typed arm the caller can now read changes.
+    pub fn into_reason(self) -> String {
+        match self {
+            Self::NothingRetained { reason } | Self::Retained { reason, .. } => reason,
+        }
+    }
+}
+
 impl KernelStoreGateway {
     /// Constructs the gateway from the Kernel-approved service and Store client.
     #[doc(hidden)]
@@ -5658,9 +5785,24 @@ impl KernelStoreGateway {
             None,
         )
         .map_err(|error| error.to_string())?;
+        // The operator route reports a bare refusal reason and its result envelope is
+        // only composed on the success arm, so the typed arm is projected back to
+        // the identical text here. That mapping is the honest reading of the
+        // operator route's own contract — its caller receives a reason, not an
+        // obligation — and it is NAMED rather than left implicit: a
+        // post-retention refusal on this leg still drops the obligation, exactly
+        // as it did before, because `execute_user_automation_operation` returns
+        // `Err` here and never reaches the orchestration composition. Closing
+        // that leg means typing `execute_user_automation_operation`'s own error
+        // and giving the operator envelope a field for a retained-but-unprojectable
+        // obligation; that is a wider `crates/**` + `bins/**` contract change
+        // than this residual, and it is reported as such rather than half-done
+        // here. The arm is NOT dropped for the due-wake consumer, whose own entry
+        // point returns it unchanged.
         let (obligation, phase) = self
             .retain_and_publish_wake_horizon(sealed, revision, &publication, runtime)
-            .await?;
+            .await
+            .map_err(UserAutomationHorizonPublicationRefusal::into_reason)?;
         obligations.extend(obligation);
         Ok(Some(phase))
     }
@@ -5687,20 +5829,41 @@ impl KernelStoreGateway {
     /// The returned obligation is present exactly when a durable record backs
     /// this publication. `None` is a pre-retention answer — nothing was retained
     /// and nothing was issued, so there is no record a reconciliation could read.
+    ///
+    /// The `Err` is typed rather than a bare reason, so a step that fails AFTER
+    /// the record was durably settled hands the caller the obligation that was
+    /// actually written instead of dropping the only handle to it. See
+    /// [`UserAutomationHorizonPublicationRefusal`]. The obligation in that arm is
+    /// the one `retained_user_automation_obligation` already derived from the
+    /// existing `runtime_obligation_operation_id(kind, parent, subject_ids)`; no
+    /// identity is minted on the error path, and a step that fails before that
+    /// identity exists reports
+    /// [`UserAutomationHorizonPublicationRefusal::NothingRetained`] instead of
+    /// constructing one to look reportable.
     async fn retain_and_publish_wake_horizon<R>(
         &self,
         sealed: &UserAutomationServiceRequest,
         revision: &UserAutomationRevision,
         publication: &UserAutomationWakeHorizonPublication,
         runtime: Option<&R>,
-    ) -> Result<(Option<UserAutomationRuntimeObligation>, UserAutomationHorizonPhase), String>
+    ) -> Result<
+        (
+            Option<UserAutomationRuntimeObligation>,
+            UserAutomationHorizonPhase,
+        ),
+        UserAutomationHorizonPublicationRefusal,
+    >
     where
         R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
     {
+        // This is the first `?` of the route and it runs before the obligation
+        // identity exists, so it is a pre-retention refusal and is named as one.
         let requested_occurrence_ids = publication.requested_occurrence_ids();
         let retry_handle = publication
             .retry_handle(&requested_occurrence_ids)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| {
+                UserAutomationHorizonPublicationRefusal::nothing_retained(error.to_string())
+            })?;
         // Revalidate principal, revision, State Fence, and owner denominator
         // against the live owner before any owner call (issue #2806 item 2).
         // The committed document proves what this identity committed; only the
@@ -5837,21 +6000,46 @@ impl KernelStoreGateway {
     /// The returned obligation is present exactly when a durable record backs
     /// this publication. `None` is a pre-retention answer — nothing was retained
     /// and nothing was issued, so there is no record a reconciliation could read.
-    /// The returned `Err` is a slice this boundary cannot even bind or name
-    /// coherently, which the caller must project as an unknown outcome rather
-    /// than as a clean absence of work.
+    ///
+    /// **The returned `Err` distinguishes the two cases a bare reason string could
+    /// not.** The binding checks below fail before the obligation identity exists,
+    /// so they report [`UserAutomationHorizonPublicationRefusal::NothingRetained`]
+    /// and the caller may state that no record exists. A step that fails AFTER
+    /// [`Self::settle_wake_horizon_acknowledgement`] has written the owner's
+    /// answer reports [`UserAutomationHorizonPublicationRefusal::Retained`] and
+    /// hands back that exact obligation, so the caller can report and later
+    /// reconcile the record under its ORIGINAL owner operation identity instead
+    /// of dropping the only handle to it. The caller must still project either
+    /// arm as an unknown outcome rather than as a clean absence of work; what it
+    /// may no longer do is claim that nothing was retained while a record exists.
+    ///
+    /// No identity is minted on either arm. The retained obligation is the one
+    /// `retained_user_automation_obligation` already derived from the existing
+    /// `runtime_obligation_operation_id(kind, parent, subject_ids)`; a caller that
+    /// wants an identity for a `NothingRetained` refusal must say it has none
+    /// rather than construct one.
     pub async fn publish_due_wake_horizon_advance<R>(
         &self,
         request: &UserAutomationRuntimeAdmission,
         resolution: &UserAutomationDueWakeResolution,
         publication: &UserAutomationWakeHorizonPublication,
         runtime: &R,
-    ) -> Result<(Option<UserAutomationRuntimeObligation>, UserAutomationHorizonPhase), String>
+    ) -> Result<
+        (
+            Option<UserAutomationRuntimeObligation>,
+            UserAutomationHorizonPhase,
+        ),
+        UserAutomationHorizonPublicationRefusal,
+    >
     where
         R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
     {
         let sealed = Self::due_wake_horizon_parent_request(request, resolution);
-        Self::validate_due_wake_horizon_advance(&sealed, resolution, publication)?;
+        // Every check in `validate_due_wake_horizon_advance` runs before the
+        // obligation identity is derived and before any durable write, so its
+        // refusals are named as pre-retention rather than left ambiguous.
+        Self::validate_due_wake_horizon_advance(&sealed, resolution, publication)
+            .map_err(UserAutomationHorizonPublicationRefusal::nothing_retained)?;
         self.retain_and_publish_wake_horizon(
             &sealed,
             &resolution.revision,
@@ -6018,6 +6206,12 @@ impl KernelStoreGateway {
     ///
     /// `None` means this obligation is not in the classification this reconciles
     /// and the caller must run the ordinary path.
+    ///
+    /// The only step here that can fail is the projection, and it runs AFTER
+    /// `settle_wake_horizon_acknowledgement` has written the owner's answer as the
+    /// row's durable retained body. That is why the refusal carries the settled
+    /// obligation: the row provably exists and is provably answered, so dropping
+    /// its handle here would leave a durable record that nothing can name.
     async fn reconcile_wake_horizon_possible_effect<R>(
         &self,
         runtime: Option<&R>,
@@ -6025,7 +6219,7 @@ impl KernelStoreGateway {
         publication: &UserAutomationWakeHorizonPublication,
         requested_occurrence_ids: &[String],
         retry_handle: &str,
-    ) -> Result<Option<UserAutomationHorizonPhase>, String>
+    ) -> Result<Option<UserAutomationHorizonPhase>, UserAutomationHorizonPublicationRefusal>
     where
         R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
     {
@@ -6089,11 +6283,26 @@ impl KernelStoreGateway {
             }
         };
         obligation.disposition = disposition;
-        Ok(Some(acknowledged_horizon_phase(
+        // The owner's answer is the row's durable retained body from here on, so a
+        // projection failure is a post-retention refusal that must hand back the
+        // obligation it settled. `obligation` is the very record that was written:
+        // its `Answered` disposition came from `settle_wake_horizon_acknowledgement`
+        // and its `owner_operation_id` came from
+        // `runtime_obligation_operation_id`, neither of which is recomputed here.
+        let phase = match acknowledged_horizon_phase(
             publication,
             requested_occurrence_ids,
             &acknowledgement,
-        )?))
+        ) {
+            Ok(phase) => phase,
+            Err(reason) => {
+                return Err(UserAutomationHorizonPublicationRefusal::retained(
+                    obligation.clone(),
+                    reason,
+                ));
+            }
+        };
+        Ok(Some(phase))
     }
 
     /// Issues one bounded wake horizon under a durably routed obligation and
@@ -6114,6 +6323,14 @@ impl KernelStoreGateway {
     /// The `Unavailable` arm is the one that pays for that rule with real
     /// availability, and it documents its own lumped producers rather than
     /// leaving a reader to assume a clean no-send.
+    ///
+    /// The only `Err` this reaches is the projection below, and it is reached
+    /// ONLY after `settle_wake_horizon_acknowledgement` wrote the owner's answer
+    /// as the record's durable retained body. The refusal therefore carries
+    /// `settled`: the obligation this route actually settled, under its original
+    /// owner operation identity. Every other outcome here is an `Ok` whose phase
+    /// names the exact remaining set and replay handle, including the arms where
+    /// the row is armed and stays reconciling.
     async fn issue_wake_horizon<R>(
         &self,
         obligation: &UserAutomationRuntimeObligation,
@@ -6121,7 +6338,10 @@ impl KernelStoreGateway {
         publication: &UserAutomationWakeHorizonPublication,
         requested_occurrence_ids: &[String],
         retry_handle: String,
-    ) -> Result<(UserAutomationRuntimeObligation, UserAutomationHorizonPhase), String>
+    ) -> Result<
+        (UserAutomationRuntimeObligation, UserAutomationHorizonPhase),
+        UserAutomationHorizonPublicationRefusal,
+    >
     where
         R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
     {
@@ -6182,14 +6402,25 @@ impl KernelStoreGateway {
                         ));
                     }
                 };
-                Ok((
-                    settled,
-                    acknowledged_horizon_phase(
-                        publication,
-                        requested_occurrence_ids,
-                        &acknowledgement,
-                    )?,
-                ))
+                // The owner's acknowledgement is now the row's durable retained
+                // body and `settled` carries that `Answered` disposition, so a
+                // projection failure below must hand the caller the record it
+                // wrote instead of a bare reason. `settled` is moved into the
+                // refusal on that arm and returned on this one, so it is consumed
+                // exactly once.
+                let phase = match acknowledged_horizon_phase(
+                    publication,
+                    requested_occurrence_ids,
+                    &acknowledgement,
+                ) {
+                    Ok(phase) => phase,
+                    Err(reason) => {
+                        return Err(UserAutomationHorizonPublicationRefusal::retained(
+                            settled, reason,
+                        ));
+                    }
+                };
+                Ok((settled, phase))
             }
             // `Unavailable` is a LUMPED owner answer, NOT a "nothing was sent"
             // proof, and this branch must not read it as one. It is produced
