@@ -81,6 +81,15 @@ public sealed class RuntimeDiscoveryService
                     $"{OperatorFaultReason.EndpointUnreadable}: encoded endpoint exceeds the closed endpoint bound");
             }
 
+            // Decode and bind are two separately-redacted phases, not one. They
+            // differ in what can raise: the decode phase raises framework
+            // `JsonException` plus the guard's own `OperatorProtocolException`,
+            // while the bind phase raises only locally authored refusals that
+            // name a binding axis and never the value refused. Sharing one
+            // handler across both forced the safe, useful local reasons to be
+            // redacted as if they were framework text, and left the one genuinely
+            // caller-supplied string (the guard reason) published unchanged.
+            OperatorEndpoint endpoint;
             try
             {
                 // Closed decode first: the broker-issued endpoint has exactly six
@@ -93,14 +102,9 @@ public sealed class RuntimeDiscoveryService
                     OperatorProtocol.MaxControlDepth,
                     OperatorProtocol.MaxControlTokens,
                     "endpoint");
-                var endpoint = JsonSerializer.Deserialize<OperatorEndpoint>(encoded, OperatorJson.Reader)
+                endpoint = JsonSerializer.Deserialize<OperatorEndpoint>(encoded, OperatorJson.Reader)
                     ?? throw new RuntimeDiscoveryException("endpoint_unreadable", OperatorFaultReason.EndpointUnreadable);
                 ValidateEndpoint(endpoint);
-                _inheritedHandoff = OperatorHandoff.Bind(
-                    endpoint,
-                    OperatorProcessIdentityProvider.Current,
-                    DateTimeOffset.UtcNow);
-                return Task.FromResult(_inheritedHandoff);
             }
             catch (JsonException)
             {
@@ -108,26 +112,39 @@ public sealed class RuntimeDiscoveryService
             }
             catch (OperatorProtocolException error)
             {
+                // Kept verbatim, and this is the deliberate A11 call. The guard
+                // states its own intent: "Only the shape name and reason travel;
+                // values never do", and "Only the property names of a rejection
+                // are reported; values are never echoed". A reason is therefore a
+                // closed guard code plus, for `duplicate:` / `unknown:` only, a
+                // member name — a length-capped protocol token, not a value: no
+                // pipe name, nonce, credential or body can reach it, because the
+                // guard refuses the name on `MaxControlStringChars` against the
+                // raw `ValueSpan` before `GetString` allocates and never reads a
+                // member value at all. A11 forbids a nonce, endpoint,
+                // credential, body or protected record content; a JSON key is
+                // none of those. The leak direction is also not the one A11
+                // guards: an attacker who can set the inherited endpoint already
+                // chooses that text, so publishing it exposes the attacker's own
+                // input, never a secret this process holds. `OperatorFaultReason
+                // .ForException` already publishes this same reason as a closed
+                // code, so this path is the established convention, not a new one.
                 throw Latch(
                     "endpoint_unreadable",
                     $"{OperatorFaultReason.EndpointUnreadable}: {error.Reason}");
             }
-            catch (OperatorProcessIdentityException error)
-            {
-                throw Latch("endpoint_invalid", error.Message);
-            }
-            // Framework text never becomes a latched message. The bytes decoded
-            // here are the endpoint object, whose members include the pipe name
-            // and the handoff nonce, and a framework `ArgumentException` or
-            // `InvalidOperationException` raised by the closed decode can echo a
-            // fragment of them. The message is replayed verbatim for the life of
-            // the process, so a bounded closed code is the whole diagnostic.
             catch (ArgumentException)
             {
+                // Framework text never becomes a latched message.
                 throw Latch("endpoint_invalid", OperatorFaultReason.EndpointInvalid);
             }
             catch (InvalidOperationException)
             {
+                // Unreachable on this path: `OperatorProtocolException` derives
+                // from `InvalidOperationException` and is caught above, and the
+                // guard raises nothing else. Kept as a fail-closed net so that no
+                // future framework text reaches a latch that is replayed for the
+                // life of the process.
                 throw Latch("endpoint_invalid", OperatorFaultReason.EndpointInvalid);
             }
             catch (RuntimeDiscoveryException error)
@@ -137,6 +154,44 @@ public sealed class RuntimeDiscoveryService
                 // by the shape handlers above.
                 throw Latch(error.Code, error.Message);
             }
+
+            try
+            {
+                _inheritedHandoff = OperatorHandoff.Bind(
+                    endpoint,
+                    OperatorProcessIdentityProvider.Current,
+                    DateTimeOffset.UtcNow);
+            }
+            catch (OperatorProcessIdentityException error)
+            {
+                // `Observe` substitutes a locally authored sentence for every
+                // framework message it catches, so `error.Message` here is never
+                // framework text.
+                throw Latch("endpoint_invalid", error.Message);
+            }
+            catch (ArgumentException)
+            {
+                // `Bind` guards both references with `ThrowIfNull`. That is
+                // framework text and stays a bare closed code.
+                throw Latch("endpoint_invalid", OperatorFaultReason.EndpointInvalid);
+            }
+            catch (InvalidOperationException error)
+            {
+                // The locally authored refusal, latched again. Everything between
+                // this handler and `OperatorHandoff.Bind` that raises
+                // `InvalidOperationException` is one of three fixed sentences in
+                // `OperatorIdentityFields.RequireText`, `OperatorProcessIdentity
+                // .Validate` and `OperatorHandoff.Bind` itself. Each names a
+                // binding axis ("installation_id", "pipe_name",
+                // "handoff_nonce", "broker_epoch", ...) interpolated from a local
+                // constant, and none echoes the value it refused — so this is not
+                // framework text and is not caller-supplied. Redacting it left
+                // `endpoint_invalid` as the only bare code in this method, and the
+                // operator could no longer tell a zero registration epoch from a
+                // blank nonce, a blank session id or an unproven identity.
+                throw Latch("endpoint_invalid", $"{OperatorFaultReason.EndpointInvalid}: {error.Message}");
+            }
+            return Task.FromResult(_inheritedHandoff);
         }
     }
 
@@ -145,10 +200,11 @@ public sealed class RuntimeDiscoveryService
     /// never becomes a shared stack trace.
     ///
     /// The latched message is replayed verbatim for the life of the process, so
-    /// only a closed [`OperatorFaultReason`] code or a locally authored bounded
-    /// refusal may be passed here. Framework exception text must never be
-    /// latched: a decode failure over the endpoint object can echo the pipe
-    /// name or the handoff nonce inside it.
+    /// only a closed [`OperatorFaultReason`] code, a locally authored bounded
+    /// refusal, or a guard reason may be passed here. Framework exception text
+    /// must never be latched; the phases above separate the two so that the
+    /// safe local reasons stay distinguishable without opening a path for
+    /// framework text.
     private RuntimeDiscoveryException Latch(string code, string message)
     {
         _terminalRefusal = (code, message);
