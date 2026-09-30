@@ -31,7 +31,7 @@ use crate::AssemblyError;
 /// The sequence below is the `SemanticRole` declaration order, so the bytes
 /// this path emits today are unchanged; what changes is that the order is a
 /// stated execution fact rather than a property of a derived `Ord`.
-pub const EXECUTED_CONTEXT_ROLE_ORDER: [SemanticRole; 15] = [
+pub const EXECUTED_CONTEXT_ROLE_ORDER: [SemanticRole; 14] = [
     SemanticRole::Authority,
     SemanticRole::Goal,
     SemanticRole::Scope,
