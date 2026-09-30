@@ -1256,7 +1256,7 @@ fn finish_candidate_resources(tool: Option<&serde_json::Value>) -> Vec<String> {
 /// relative names, blanks, control-carrying values, or `..` escapes past
 /// the root — is `None`: this submit leg holds no job/operation record
 /// that could resolve such a handle to declared resource identity (the
-/// TestD job row lives daemon-side), so the caller keeps the global
+/// `TestD` job row lives daemon-side), so the caller keeps the global
 /// acceptance gate instead of comparing a handle against absolute-path
 /// identity by `==` and silently passing. Total: no I/O, no panics, and
 /// unrelated lanes are untouched.
