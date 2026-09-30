@@ -94,7 +94,7 @@ use eliot_maintenance::{
 };
 use eliot_module_registry::ModuleCatalog;
 use eliot_module_registry::ModuleCatalogSnapshot;
-use eliot_observation::{ObservationJournal, ObservationJournalEntry};
+use eliot_observation::{ObservationJournal, ObservationJournalEntry, TaskSelectionEvidence};
 use eliot_ors::{
     ColdStartReadinessClaim, ColdStartReadinessOrsRecord, ColdStartReadinessOwnerKey,
     ColdStartReadinessRecordOwner, ColdStartReadinessStageOutcome,
@@ -1357,6 +1357,13 @@ pub enum CompositionError {
     /// Kernel transition failed at the neutral port.
     #[error("Kernel transition: {0}")]
     Kernel(#[from] KernelPortError),
+    /// The exact TaskContract acceptance set read for task-selection evidence
+    /// was malformed or did not validate at its owner boundary.
+    #[error("TaskContract acceptance set: {0}")]
+    TaskContractAcceptance(#[from] eliot_store_api::StoreError),
+    /// Owner-issued task-selection evidence did not satisfy its closed schema.
+    #[error("task-selection evidence: {0}")]
+    TaskSelectionEvidence(#[from] eliot_observation::GovernorObservationError),
 }
 
 /// The Task Controller's verifier decision for one current plan revision.
@@ -7425,6 +7432,117 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         }
     }
 
+    /// Reissues the exact selection evidence retained by one durable readiness
+    /// receipt after joining it to the live activation and current TaskContract
+    /// owner record.
+    ///
+    /// This returns no evidence for legacy receipts or non-current selections.
+    /// For a current selection, the retained evidence must equal the value
+    /// derived from the exact active WorkLease/WorkItem and the owner-recorded
+    /// acceptance digest at the same fence. Caller-supplied source handles and
+    /// digests are never adopted.
+    pub async fn task_selection_evidence_for_claim(
+        &self,
+        now: u64,
+        claim: &ColdStartReadinessClaim,
+    ) -> Result<Option<TaskSelectionEvidence>, CompositionError> {
+        let (activation, receipt) = self.current_task_selection_for_claim(now, claim)?;
+        let Some(activation) = activation else {
+            return Ok(None);
+        };
+        let retained = receipt
+            .task_selection_evidence
+            .as_ref()
+            .ok_or(CompositionError::ActivationTaskSelectionRequired)?;
+        let evidence = self
+            .issue_task_selection_evidence_for_binding(
+                now,
+                &receipt.principal_ref,
+                &receipt.session_ref,
+                &receipt.scope.scope_ref,
+                &receipt.state_fence,
+                activation.task_id.as_str(),
+                activation.task_revision,
+            )
+            .await?;
+        if &evidence != retained {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        Ok(Some(evidence))
+    }
+
+    /// Produces immutable task-selection evidence from the exact unique active
+    /// owner selection and the TaskContract acceptance record at that fence.
+    ///
+    /// The WorkLease is the selection source and its linked WorkItem is the
+    /// retained evidence handle. Both are returned by the same validated
+    /// coordination read that joins the authenticated principal/session to
+    /// the task and WorkScope. The owner's recorded acceptance digest is
+    /// copied verbatim; it is never recomputed from caller data or a task id.
+    async fn issue_task_selection_evidence_for_binding(
+        &self,
+        now: u64,
+        principal_ref: &str,
+        session_ref: &str,
+        work_scope_ref: &str,
+        state_fence: &StateFence,
+        task_ref: &str,
+        task_revision: u64,
+    ) -> Result<TaskSelectionEvidence, CompositionError> {
+        let (activation, selected) = self.read_unique_agent_activation_with_selection(now)?;
+        if !fences_match_exact(&activation.state_fence, state_fence)
+            || !fences_match_exact(&self.snapshot.state_fence(), state_fence)
+            || activation.principal_id != principal_ref
+            || activation.session_id != session_ref
+            || activation.task_id.as_str() != task_ref
+            || activation.task_revision != task_revision
+            || state_fence
+                .task_revision
+                .as_ref()
+                .map(|revision| revision.value())
+                != Some(task_revision)
+            || activation.work_scope_id != work_scope_ref
+            || selected.work_item.work_item_id != activation.work_unit_id
+            || selected.work_item.task_id != activation.task_id.as_str()
+            || selected.work_item.state_fence != activation.state_fence
+            || selected.work_item.owner_session_id.as_deref()
+                != Some(activation.session_id.as_str())
+            || selected.lease.work_item_id != selected.work_item.work_item_id
+            || selected.lease.holder_session_id != activation.session_id
+            || selected.lease.state_fence != activation.state_fence
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+
+        let acceptance = self
+            .kernel
+            .task_contract_acceptance_set(
+                &activation.task_id,
+                activation.task_revision,
+                &activation.state_fence,
+            )
+            .await?;
+        acceptance.validate()?;
+        if acceptance.task_id != activation.task_id
+            || acceptance.task_revision != activation.task_revision
+            || !fences_match_exact(&acceptance.read_state_fence, &activation.state_fence)
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+
+        let evidence = TaskSelectionEvidence {
+            task_ref: activation.task_id.to_string(),
+            task_revision: activation.task_revision,
+            acceptance_digest: acceptance.acceptance_digest,
+            work_scope_ref: activation.work_scope_id,
+            selection_source_ref: selected.lease.lease_id,
+            evidence_ref: selected.work_item.work_item_id,
+            contamination_flags: Vec::new(),
+        };
+        evidence.validate()?;
+        Ok(evidence)
+    }
+
     /// Admits one scope-sensitive canonical write whose observed binding and
     /// source closure the caller already holds (issue #1787).
     pub fn check_canonical_write_work_scope(
@@ -8027,7 +8145,13 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// and publishes it as the lease terminal, so compatible concurrent
     /// attaches receive the same receipt and no worker independently creates
     /// a second `WorkScope` or "latest task" while the lease is active. The
-    /// terminal receipt always references the exact durable scan receipt
+    /// `Current` task input is accepted only when it agrees with the exact
+    /// unique active WorkLease/WorkItem joined to the authenticated
+    /// principal/session/scope/fence; the TaskContract owner's recorded
+    /// acceptance digest and those retained owner handles become the receipt's
+    /// immutable `TaskSelectionEvidence`.
+    ///
+    /// The terminal receipt also references the exact durable scan receipt
     /// that fed the compilation: the caller supplies the installation-bound
     /// scan store, the owner binding admitted for this trigger, and the
     /// durable handle the trigger scan returned, and this entry reads the
@@ -8050,7 +8174,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         clippy::too_many_lines,
         reason = "cold-start compilation joins every frozen receipt field and the durable terminal in one owner-checked entry"
     )]
-    pub fn compile_cold_start_at_trigger(
+    pub async fn compile_cold_start_at_trigger(
         &mut self,
         trigger: ColdStartTrigger,
         discovery_lease: &DiscoveryReadLease,
@@ -8162,6 +8286,47 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 WorkScopeError::ScanReceiptReplaced,
             ));
         }
+        let task = match task {
+            TaskBindingInput::Current {
+                task_ref,
+                task_revision,
+                ..
+            } => {
+                let evidence = self
+                    .issue_task_selection_evidence_for_binding(
+                        now,
+                        principal_ref,
+                        session_ref,
+                        &scope.scope_ref,
+                        state_fence,
+                        &task_ref,
+                        task_revision,
+                    )
+                    .await?;
+                if evidence.task_ref != task_ref || evidence.task_revision != task_revision {
+                    return Err(CompositionError::ActivationStaleFence);
+                }
+                TaskBindingInput::Selected(evidence)
+            }
+            TaskBindingInput::Selected(supplied) => {
+                let evidence = self
+                    .issue_task_selection_evidence_for_binding(
+                        now,
+                        principal_ref,
+                        session_ref,
+                        &scope.scope_ref,
+                        state_fence,
+                        &supplied.task_ref,
+                        supplied.task_revision,
+                    )
+                    .await?;
+                if evidence != supplied {
+                    return Err(CompositionError::ActivationStaleFence);
+                }
+                TaskBindingInput::Selected(evidence)
+            }
+            other => other,
+        };
         let mut receipt = ColdStartController
             .compile(
                 receipt_ref,
@@ -10439,6 +10604,20 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         &self,
         now: u64,
     ) -> Result<GovernorActivationSnapshot, CompositionError> {
+        self.read_unique_agent_activation_with_selection(now)
+            .map(|(snapshot, _)| snapshot)
+    }
+
+    /// Reads the validated activation together with the exact retained
+    /// coordination records that established its unique task selection.
+    ///
+    /// The lease and work-item handles are taken from the same owner projection
+    /// whose session/task/scope join is checked below; callers must not rebuild
+    /// them from a task id or a request label.
+    fn read_unique_agent_activation_with_selection(
+        &self,
+        now: u64,
+    ) -> Result<(GovernorActivationSnapshot, ActiveWorkLeaseProjection), CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
         }
@@ -10447,7 +10626,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let task_id = self.admit_activation_lifecycle_session(now, &state_fence, &work)?;
         let task = self.admit_activation_task(&task_id, &state_fence)?;
         let (work_scope_id, plan) = self.admit_activation_plan(&task_id, &state_fence)?;
-        Ok(GovernorActivationSnapshot {
+        let activation = GovernorActivationSnapshot {
             state_fence,
             owner_revision: self.owners.canonical.owner_revision(),
             principal_id: work.session.principal_id,
@@ -10458,7 +10637,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             task_revision: task.revision,
             plan_id: plan.plan_id,
             plan_revision: plan.plan_revision,
-        })
+        };
+        Ok((activation, work))
     }
 
     /// Proves exactly one live work lease for this exact fence.
