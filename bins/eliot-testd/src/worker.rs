@@ -347,22 +347,21 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
     // the same typed pattern as a seal refusal. The admitted stage is kept:
     // its matched spec digest, profile revision, and parser
     // identity/generation are recorded in the launch receipt below.
-    let admitted =
-        match admit_sealed_drive_claim(&job.invocation, permit.request()) {
-            Ok(admitted) => admitted,
-            Err(error) => {
-                finish_unknown(
-                    store,
-                    job,
-                    lease,
-                    &EvidenceCollector::default(),
-                    format!("shared admission refused without executing: {error}"),
-                )?;
-                return Ok(crate::receipt(&store.get(&job.job_id)?.ok_or_else(
-                    || TestdError::Corrupt("job disappeared after admission refusal".to_owned()),
-                )?));
-            }
-        };
+    let admitted = match admit_sealed_drive_claim(&job.invocation, permit.request()) {
+        Ok(admitted) => admitted,
+        Err(error) => {
+            finish_unknown(
+                store,
+                job,
+                lease,
+                &EvidenceCollector::default(),
+                format!("shared admission refused without executing: {error}"),
+            )?;
+            return Ok(crate::receipt(&store.get(&job.job_id)?.ok_or_else(
+                || TestdError::Corrupt("job disappeared after admission refusal".to_owned()),
+            )?));
+        }
+    };
     let collector = Arc::new(EvidenceCollector::default());
     if eliot_testd_core::is_productive_testd_profile(&job.invocation.profile) {
         let observation = match observe_tool_identity(permit.request(), &admitted) {

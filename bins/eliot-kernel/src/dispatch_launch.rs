@@ -102,6 +102,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use eliot_contracts::{ArtifactId, EpochId, StateFence, canonical_json_bytes, sha256_hex};
+use eliot_instrument_runner::{AdmittedStage, ResolvedExecutableIdentity};
 use eliot_ipc::ProcessBinding;
 use eliot_kernel_service::{
     AuthenticatedDoctorSession, AuthenticatedTestdSession, ComposedDoctorFrontDoor,
@@ -131,7 +132,6 @@ use eliot_testd_core::{
     issue_process_admission, testd_profile_binding, verification_receipt_sha256,
     verify_envelope_layout_binding,
 };
-use eliot_instrument_runner::{AdmittedStage, ResolvedExecutableIdentity};
 use serde::{Deserialize, Serialize};
 
 /// Protected Dreamer dispatch-launch material and launch lineage (T12-09).

@@ -567,8 +567,7 @@ impl GovernedProfileService {
                 )
             })?;
         }
-        let runs =
-            StageOrchestrator::launch_plan_live(runner, &registry, &plan, launcher).await;
+        let runs = StageOrchestrator::launch_plan_live(runner, &registry, &plan, launcher).await;
         render_resolved_report(&resolved, &admitted, &plan, runs, blob_store)
     }
 

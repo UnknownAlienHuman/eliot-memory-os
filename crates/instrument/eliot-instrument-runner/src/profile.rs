@@ -2467,22 +2467,17 @@ impl AdmittedStage {
             });
         }
         let expected_argv: Vec<String> = if slotted {
-            let slots =
-                parse_testd_slot_suffix(&invocation.profile, &invocation.arguments).map_err(
-                    |error| AdmissionError::ArgumentMismatch {
-                        detail: error.to_string(),
-                    },
-                )?;
+            let slots = parse_testd_slot_suffix(&invocation.profile, &invocation.arguments)
+                .map_err(|error| AdmissionError::ArgumentMismatch {
+                    detail: error.to_string(),
+                })?;
             render_testd_slotted_argv(&invocation.profile, &slots).map_err(|error| {
                 AdmissionError::ArgumentMismatch {
                     detail: error.to_string(),
                 }
             })?
         } else if invocation.profile == TESTD_ADMITTED_PROFILE {
-            TESTD_PROFILE_ARGV
-                .iter()
-                .map(ToString::to_string)
-                .collect()
+            TESTD_PROFILE_ARGV.iter().map(ToString::to_string).collect()
         } else {
             TESTD_PRODUCTIVE_PROFILE_ARGV
                 .iter()
@@ -2502,12 +2497,11 @@ impl AdmittedStage {
         .map_err(|error| AdmissionError::InvalidRequest {
             detail: error.to_string(),
         })?;
-        let credential_policy =
-            ContractId::new(ISOLATED_CREDENTIAL_POLICY).map_err(|error| {
-                AdmissionError::InvalidRequest {
-                    detail: error.to_string(),
-                }
-            })?;
+        let credential_policy = ContractId::new(ISOLATED_CREDENTIAL_POLICY).map_err(|error| {
+            AdmissionError::InvalidRequest {
+                detail: error.to_string(),
+            }
+        })?;
         let network_policy = ContractId::new(ISOLATED_NETWORK_POLICY).map_err(|error| {
             AdmissionError::InvalidRequest {
                 detail: error.to_string(),
