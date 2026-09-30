@@ -1,7 +1,7 @@
 //! Kernel-owned Operator session token for one authenticated local UI
 //! binding (issue #1777, I11.8).
 //!
-//! I11.8 requires the WinUI operational binding to carry "a short-lived
+//! I11.8 requires the `WinUI` operational binding to carry "a short-lived
 //! Kernel challenge/session token". This module is the Kernel owner of that
 //! value and has the same shape, and the same preconditions, as the normal
 //! Notify launch grant in `notify_grant.rs`: it reads live Kernel admission
