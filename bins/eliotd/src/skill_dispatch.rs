@@ -946,7 +946,14 @@ fn commit_activation_candidate(
     composition: &mut DaemonComposition,
     candidate: &ActivationCandidate,
 ) -> SkillResultEnvelope {
-    let unpublished = if candidate.ingest_attempt_id.trim().is_empty() {
+    let unpublished = if let Err(error) = candidate.receipt.validate() {
+        // Bridge validation leg (issue #1882 W2, I7.13): the presented
+        // receipt is shape-validated before any of its fields is compared
+        // below or admitted for Material use, mirroring the owner
+        // admission's own receipt check — an unvalidated receipt cannot
+        // reach the fence/route/retained-row legs on a stored-status pass.
+        Some(SkillResultEnvelope::refused(&error))
+    } else if candidate.ingest_attempt_id.trim().is_empty() {
         Some(SkillResultEnvelope::refused(
             &eliot_skill::SkillError::InvalidField {
                 field: "ingest_attempt_id",
