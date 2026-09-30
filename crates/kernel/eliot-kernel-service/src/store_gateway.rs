@@ -72,7 +72,6 @@ use eliot_protocol::{
     MaintenanceTriggerRevocation, MaintenanceTriggerRoutingClass,
     MaintenanceTriggerTerminalDisposition, MaintenanceTriggerTerminalKind, ProtocolError,
 };
-};
 use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, NamedReadRequest,
     NamedReadResponse, OperationIdentity, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
@@ -4252,14 +4251,23 @@ impl KernelStoreGateway {
             .collect()
     }
 
-    /// Fails closed until a downstream owner can authenticate and bind
+    /// Enforces the W7 retention preconditions against the retained lifecycle,
+    /// then fails closed until a downstream owner can authenticate and bind
     /// retention evidence to the durable effect.
+    ///
+    /// The presented proof must already be well-shaped, name the retained
+    /// trigger, and arrive only after acknowledgement or terminal disposition
+    /// with a retained downstream intent. Those checks run before the owner
+    /// seam so a malformed or premature proof keeps its exact typed failure
+    /// instead of collapsing into the missing-owner error. Persistence itself
+    /// still waits for the owner seam: this composition cannot verify who
+    /// issued the proof, so caller-supplied evidence is never stored here.
     #[cfg(windows)]
     pub fn record_maintenance_trigger_retention(
         &self,
         active_state_fence: &StateFence,
-        _trigger_id: &str,
-        _proof: &MaintenanceTriggerDownstreamRetentionProof,
+        trigger_id: &str,
+        proof: &MaintenanceTriggerDownstreamRetentionProof,
     ) -> Result<MaintenanceTriggerLifecycleRecord, MaintenanceTriggerLifecycleFailure> {
         let _flight = self
             .flight
@@ -4272,6 +4280,25 @@ impl KernelStoreGateway {
             .map_err(|_| MaintenanceTriggerLifecycleFailure::ShadowMutationRefused)?;
         self.validate_active_route(active_state_fence)
             .map_err(|_| MaintenanceTriggerLifecycleFailure::ActiveRouteMismatch)?;
+        proof
+            .validate()
+            .map_err(MaintenanceTriggerLifecycleFailure::from_ors_read_error)?;
+        let ors = self
+            .commit_ors
+            .as_deref()
+            .ok_or(MaintenanceTriggerLifecycleFailure::OrsUnavailable)?;
+        let (_, trigger, lifecycle) = load_maintenance_trigger_context(ors, trigger_id)?;
+        if trigger.trigger_id != trigger_id
+            || !matches!(
+                lifecycle.phase,
+                MaintenanceTriggerLifecyclePhase::Acknowledged
+                    | MaintenanceTriggerLifecyclePhase::Expired
+                    | MaintenanceTriggerLifecyclePhase::Superseded
+            )
+            || lifecycle.downstream_intent_record.is_none()
+        {
+            return Err(MaintenanceTriggerLifecycleFailure::RecordBindingMismatch);
+        }
         // The ORS type proves only shape and digest. This composition has no
         // downstream owner contract that verifies who issued the proof or
         // binds its retention horizon to the exact durable effect. The W7
@@ -4280,13 +4307,21 @@ impl KernelStoreGateway {
         Err(MaintenanceTriggerLifecycleFailure::DownstreamRetentionOwnerBindingUnavailable)
     }
 
-    /// Fails closed because ORS compaction trusts a retention horizon that this
-    /// composition cannot authenticate or bind to the durable effect.
+    /// Enforces the W7 compaction preconditions against the retained
+    /// lifecycle, then fails closed because ORS compaction trusts a retention
+    /// horizon that this composition cannot authenticate or bind to the
+    /// durable effect.
+    ///
+    /// Compaction is allowed only after exact ack/terminal disposition with a
+    /// retained downstream retention proof. An already-compacted lifecycle
+    /// replays its retained row without another mutation; every other
+    /// satisfied-precondition call still fails closed on the missing
+    /// downstream owner seam instead of invoking ORS compaction.
     #[cfg(windows)]
     pub fn compact_maintenance_trigger_payload(
         &self,
         active_state_fence: &StateFence,
-        _trigger_id: &str,
+        trigger_id: &str,
     ) -> Result<MaintenanceTriggerLifecycleRecord, MaintenanceTriggerLifecycleFailure> {
         let _flight = self
             .flight
@@ -4299,6 +4334,25 @@ impl KernelStoreGateway {
             .map_err(|_| MaintenanceTriggerLifecycleFailure::ShadowMutationRefused)?;
         self.validate_active_route(active_state_fence)
             .map_err(|_| MaintenanceTriggerLifecycleFailure::ActiveRouteMismatch)?;
+        let ors = self
+            .commit_ors
+            .as_deref()
+            .ok_or(MaintenanceTriggerLifecycleFailure::OrsUnavailable)?;
+        let (_, _, lifecycle) = load_maintenance_trigger_context(ors, trigger_id)?;
+        if lifecycle.trigger_id != trigger_id
+            || !matches!(
+                lifecycle.phase,
+                MaintenanceTriggerLifecyclePhase::Acknowledged
+                    | MaintenanceTriggerLifecyclePhase::Expired
+                    | MaintenanceTriggerLifecyclePhase::Superseded
+            )
+            || lifecycle.downstream_retention.is_none()
+        {
+            return Err(MaintenanceTriggerLifecycleFailure::RecordBindingMismatch);
+        }
+        if lifecycle.payload_compacted_at_ms.is_some() {
+            return Ok(lifecycle);
+        }
         // Compaction trusts the persisted retention horizon. Because this
         // composition cannot verify the downstream owner proof, it cannot
         // safely invoke ORS compaction even for proof rows written earlier.
