@@ -38,12 +38,12 @@ use eliot_runtime_contracts::RestartPolicyV1;
 /// `ShadowCandidate` is the restricted I14.16 step-2/3 posture: the startup
 /// selects only immutable/read-only snapshot access plus the Host-injected
 /// candidate pipe, and refuses every authority-bearing input before any ORS
-/// open, migration, or durable session state exists. The same
-/// [`KernelService`](eliot_kernel_service::KernelService) lifecycle owner
-/// carries the composition afterwards — there is no second Kernel service
-/// implementation — and Host drives it from `Cold` through `Reconciling` to
-/// `ShadowNoAuthority` through the existing transition boundary once the
-/// candidate is reconciled, so the activation flow needs no new edge.
+/// open, migration, or durable session state exists. The same `KernelService`
+/// lifecycle owner carries the composition afterwards — there is no second
+/// Kernel service implementation — and Host drives it from `Cold` through
+/// `Reconciling` to `ShadowNoAuthority` through the existing transition
+/// boundary once the candidate is reconciled, so the activation flow needs
+/// no new edge.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KernelStartupMode {
     /// Normal authority-bearing construction.
