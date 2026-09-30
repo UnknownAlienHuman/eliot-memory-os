@@ -606,6 +606,47 @@ function Get-GovernorRetirementCandidateMigratedEdgeProofPaths([string]$Repo, [s
     return @($paths | Sort-Object -Unique)
 }
 
+function Get-GovernorRetirementCandidateClosedReferenceRoles([string]$Repo, [string]$SourceCommit) {
+    # Exact path roles are declared by the #18 semantic inventory. They close
+    # references that name history, generated projections, migration/audit
+    # evidence, or the separate current Governor-config contract without
+    # pretending those strings launch the retiring executable. The source
+    # inventory blob is part of the tracked closure and the declaration is
+    # parsed from that pinned blob, never from the mutable worktree.
+    $inventory = Get-GovernorRetirementTrackedPathText $Repo $SourceCommit $script:GovernorRetirementDispositionInventoryPath
+    if (-not $inventory) { return @() }
+    $table = [regex]::Match([string]$inventory.text, 'pub const CLOSED_REFERENCE_ROLES:\s*&\[ClosedReferenceRole\]\s*=\s*&\[\s*(?<body>.*?)\r?\n\];', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+    if (-not $table.Success) { return @() }
+    $allowedRoles = @(
+        'live_consumer:build', 'live_consumer:test', 'live_consumer:workspace_lock',
+        'reference_only:historical_record', 'reference_only:decision_record', 'reference_only:policy_history',
+        'reference_only:project_map', 'reference_only:architecture_history', 'reference_only:migration_policy',
+        'reference_only:navigation', 'reference_only:documentation_configuration', 'reference_only:security_guidance',
+        'reference_only:migration_inventory', 'reference_only:operator_history', 'reference_only:workstream_record',
+        'reference_only:owner_instruction', 'reference_only:owner_registry', 'reference_only:generated_projection',
+        'reference_only:current_configuration', 'reference_only:repository_hygiene', 'reference_only:audit_fixture',
+        'reference_only:navigation_configuration', 'reference_only:measurement_inventory',
+        'reference_only:migration_verifier', 'reference_only:test_data', 'reference_only:migration_compiler_input',
+        'reference_only:skill_manifest', 'reference_only:skill_guidance'
+    )
+    $roles = [System.Collections.Generic.List[object]]::new()
+    foreach ($match in [regex]::Matches([string]$table.Groups['body'].Value, 'path:\s*"([^"]+)"\s*,\s*role:\s*"([^"]+)"\s*,\s*basis:\s*"([^"]+)"')) {
+        $path = ([string]$match.Groups[1].Value).Replace('\', '/')
+        $role = [string]$match.Groups[2].Value
+        $basis = [string]$match.Groups[3].Value
+        if ([string]::IsNullOrWhiteSpace($path) -or $path.Contains('*') -or $path.Contains('?') -or
+            $path.StartsWith('/', [System.StringComparison]::Ordinal) -or $path.Split('/') -contains '..' -or
+            [string]::IsNullOrWhiteSpace($basis) -or $allowedRoles -cnotcontains $role) {
+            throw "closed reference role declaration is malformed at $path ($role)"
+        }
+        [void]$roles.Add([pscustomobject]@{ path = $path; role = $role; basis = $basis })
+    }
+    if ($roles.Count -eq 0) { throw 'closed reference role table is empty or malformed' }
+    $duplicates = @($roles | Group-Object -Property path | Where-Object Count -ne 1)
+    if ($duplicates.Count -gt 0) { throw "closed reference role table repeats path(s): $([string]::Join(',', @($duplicates | ForEach-Object Name)))" }
+    return @($roles | Sort-Object -Property path)
+}
+
 function Get-GovernorRetirementClosureClass([string]$RelativePath) {
     # Path-family classification. The five families are the closure's
     # denominator contract: an owner closure that never classified a family is
@@ -632,7 +673,8 @@ function Get-GovernorRetirementClosureClassification(
     [string[]]$Tokens,
     [string]$RuleSet = $script:GovernorRetirementClosureRuleSetV1,
     [System.Collections.Generic.HashSet[string]]$ConsumerSurfacePaths = $null,
-    [System.Collections.Generic.HashSet[string]]$MigratedConsumerProofPaths = $null) {
+    [System.Collections.Generic.HashSet[string]]$MigratedConsumerProofPaths = $null,
+    [System.Collections.Generic.Dictionary[string, string]]$ClosedReferenceRoles = $null) {
     # Evidence-class classification for one tracked reference. Returns the
     # verifier rules that cover this path, or the single real class 'unknown'
     # when no rule covers it. 'unknown' is a class, not an absence: the caller
@@ -676,6 +718,9 @@ function Get-GovernorRetirementClosureClassification(
         if ($MigratedConsumerProofPaths -and $MigratedConsumerProofPaths.Contains($path)) {
             [void]$classes.Add('owner_declared_migrated_consumer_edge')
         }
+        if ($ClosedReferenceRoles -and $ClosedReferenceRoles.ContainsKey($path)) {
+            [void]$classes.Add("owner_declared_$($ClosedReferenceRoles[$path].Replace(':', '_'))")
+        }
         # The release guide and owner inventory describe active build edges.
         # These exact roles are grounded by the production finalizer/readback
         # contract and the builder's dot-source/call chain; no path-wide
@@ -704,7 +749,8 @@ function Get-GovernorRetirementConsumerClosure(
     [string]$Repo,
     [string]$SourceCommit,
     [switch]$AllowMissingFamilies,
-    [string]$RuleSet = $script:GovernorRetirementClosureRuleSetV1) {
+    [string]$RuleSet = $script:GovernorRetirementClosureRuleSetV1,
+    [string]$ReferenceDeclarationCommit = $SourceCommit) {
     # Independent closure over the tracked tree of C (issue #2968 section D).
     # Enumerates every tracked file and records every file that names the
     # retiring surface: files covered by a verifier rule are classified, and
@@ -719,16 +765,24 @@ function Get-GovernorRetirementConsumerClosure(
     $tokens = @($script:GovernorRetirementClosureTokens)
     $consumerSurfacePaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
     $migratedConsumerProofPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    $closedReferenceRoles = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::Ordinal)
     if ($RuleSet -ceq $script:GovernorRetirementClosureRuleSetV2) {
-        $ownerSurfaces = Get-GovernorRetirementCandidateInventorySurfaces $Repo $SourceCommit
+        $ownerSurfaces = Get-GovernorRetirementCandidateInventorySurfaces $Repo $ReferenceDeclarationCommit
         foreach ($surface in @($ownerSurfaces.surfaces)) {
             $ownerPath = ([string]$surface.path).Replace('\', '/')
             if (-not [string]::IsNullOrWhiteSpace($ownerPath)) {
                 [void]$consumerSurfacePaths.Add($ownerPath)
             }
         }
-        foreach ($ownerPath in @(Get-GovernorRetirementCandidateMigratedEdgeProofPaths $Repo $SourceCommit)) {
+        foreach ($ownerPath in @(Get-GovernorRetirementCandidateMigratedEdgeProofPaths $Repo $ReferenceDeclarationCommit)) {
             [void]$migratedConsumerProofPaths.Add([string]$ownerPath)
+        }
+        foreach ($role in @(Get-GovernorRetirementCandidateClosedReferenceRoles $Repo $ReferenceDeclarationCommit)) {
+            $ownerPath = [string]$role.path
+            if ($consumerSurfacePaths.Contains($ownerPath) -or $migratedConsumerProofPaths.Contains($ownerPath)) {
+                throw "closed reference role overlaps a declared live or migrated consumer proof: $ownerPath"
+            }
+            $closedReferenceRoles.Add($ownerPath, [string]$role.role)
         }
     }
     $tracked = @(& git -C $Repo ls-tree -r --name-only $SourceCommit)
@@ -753,7 +807,7 @@ function Get-GovernorRetirementConsumerClosure(
         $text = $contents[[string]$relative]
         $family = Get-GovernorRetirementClosureClass $relative
         [void]$families.Add($family)
-        $classes = Get-GovernorRetirementClosureClassification ([string]$relative) $tokens $RuleSet $consumerSurfacePaths $migratedConsumerProofPaths
+        $classes = Get-GovernorRetirementClosureClassification ([string]$relative) $tokens $RuleSet $consumerSurfacePaths $migratedConsumerProofPaths $closedReferenceRoles
         $hits = @($tokens | Where-Object { ([string]$text.text).Contains($_) } | Sort-Object -Unique)
         if ($hits.Count -eq 0 -and -not ($classes -contains 'release_role_registry')) {
             continue
@@ -772,11 +826,19 @@ function Get-GovernorRetirementConsumerClosure(
                 })
             continue
         }
+        $proofRequired = $hits.Count -gt 0
+        if ($closedReferenceRoles.ContainsKey([string]$relative) -and $closedReferenceRoles[[string]$relative].StartsWith('reference_only:', [System.StringComparison]::Ordinal)) {
+            $proofRequired = $false
+        }
+        if ($consumerSurfacePaths.Contains([string]$relative) -or $migratedConsumerProofPaths.Contains([string]$relative)) {
+            $proofRequired = $true
+        }
         [void]$classified.Add([pscustomobject]@{
                 path = [string]$relative
                 blob = [string]$text.blob
                 classes = @((@($classes) + "family:$family") | Sort-Object -Unique)
                 tokens = @($hits)
+                consumer_proof_required = [bool]$proofRequired
             })
     }
     $sorted = @($classified | Sort-Object -Property path)
@@ -794,7 +856,14 @@ function Get-GovernorRetirementConsumerClosure(
         [void]$lines.Add((Get-GovernorApprovalDomainSeparatedLine 'candidate_closure_mode' 'post-deletion-cleanliness-v1'))
     }
     foreach ($entry in $sorted) {
-        [void]$lines.Add("closure=$([string]$entry.path)|blob=$([string]$entry.blob)|classes=$([string]::Join(',', @($entry.classes)))|tokens=$([string]::Join(',', @($entry.tokens)))")
+        if ($RuleSet -ceq $script:GovernorRetirementClosureRuleSetV2) {
+            [void]$lines.Add("closure=$([string]$entry.path)|blob=$([string]$entry.blob)|classes=$([string]::Join(',', @($entry.classes)))|tokens=$([string]::Join(',', @($entry.tokens)))|consumer_proof_required=$([int][bool]$entry.consumer_proof_required)")
+        }
+        else {
+            # Historical v1 canonical bytes remain immutable: no new role or
+            # denominator field is serialized into its original digest.
+            [void]$lines.Add("closure=$([string]$entry.path)|blob=$([string]$entry.blob)|classes=$([string]::Join(',', @($entry.classes)))|tokens=$([string]::Join(',', @($entry.tokens)))")
+        }
     }
     foreach ($entry in @($unknownEntries | Sort-Object -Property path)) {
         [void]$lines.Add("unclassified=$([string]$entry.path)|blob=$([string]$entry.blob)|family=$([string]$entry.family)|tokens=$([string]::Join(',', @($entry.tokens)))")
@@ -838,7 +907,11 @@ function Get-GovernorRetirementExpectedConsumerProofs([object]$Closure) {
     foreach ($entry in @($Closure.entries)) {
         $path = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $entry 'path')
         $tokens = @((Read-GovernorApprovalField $entry 'tokens') | ForEach-Object { [string]$_ } | Sort-Object -Unique)
-        if ($tokens.Count -gt 0) {
+        $proofRequired = Read-GovernorApprovalField $entry 'consumer_proof_required'
+        $ruleSet = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Closure 'rule_set')
+        $includeProof = if ($ruleSet -ceq $script:GovernorRetirementClosureRuleSetV1) { $tokens.Count -gt 0 }
+        else { $tokens.Count -gt 0 -and $proofRequired -is [bool] -and $proofRequired }
+        if ($includeProof) {
             if ([string]::IsNullOrWhiteSpace($path) -or $proofs.ContainsKey($path)) {
                 throw "independent retirement closure contains an empty or duplicate proof path: $path"
             }
@@ -1864,8 +1937,12 @@ function Resolve-GovernorRetirementApprovalBinding(
     else {
         $script:GovernorRetirementClosureRuleSet
     }
-    $candidateClosure = Get-GovernorRetirementConsumerClosure $Repo $SourceCommit -AllowMissingFamilies -RuleSet $selectedClosureRuleSet
     $ownerSourceCommit = (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Approval 'candidate_commit')).ToLowerInvariant()
+    # v2 role/inventory declarations are owned by the approved source C. Keep
+    # using those exact declarations when scanning D after the facade subtree
+    # (and its Rust inventory) has been deleted. D's token denominator remains
+    # independently scanned from D itself.
+    $candidateClosure = Get-GovernorRetirementConsumerClosure $Repo $SourceCommit -AllowMissingFamilies -RuleSet $selectedClosureRuleSet -ReferenceDeclarationCommit $ownerSourceCommit
     $ownerSourceTree = $null
     $ownerIdentity = [pscustomobject]@{ status = 'absent'; reason = 'owner approval source commit is missing or malformed'; workspace_blob = $null; facade_blob = $null; plugin_blob = $null }
     $ownerClosure = $null
