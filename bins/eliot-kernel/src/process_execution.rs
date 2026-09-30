@@ -1519,6 +1519,55 @@ impl ProcessExecutionGateway {
             .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))
     }
 
+    /// Reconciles one grant-funded effect after crash or lost response
+    /// without duplicating it (issue #1775 A-crash).
+    ///
+    /// The reconciliation query path: the presented owner is authorized
+    /// against the retained operation record first — a changed connection
+    /// owner fails here before any read — then the original admitted
+    /// target/operation for the consumed one-shot nonce is read through the
+    /// durable authority journal. A grant decided for another operation class
+    /// cannot reconcile this operation. An unproven (`Unknown`) effect
+    /// returns reconciliation-required instead of re-executing or minting a
+    /// fresh nonce; a separately admitted new proof for a proven remaining
+    /// action goes through the normal decide path. A proven (`Effected`)
+    /// effect takes the exact-replay path for the original operation.
+    pub(crate) async fn reconcile_origin_grant_effect(
+        &self,
+        owner: &ProcessOwnerBinding,
+        operation_id: eliot_process::OperationId,
+        request_nonce: &str,
+    ) -> Result<eliot_process::ProcessEvidence, ProcessExecutionError> {
+        observe_process("kernel.process.grant_reconcile_requested", "attempt");
+        if let Err(error) = self.authorize_operation(owner, &operation_id) {
+            observe_process("kernel.process.grant_reconcile_rejected", "fenced");
+            super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
+            return Err(error);
+        }
+        let source = self
+            .controller
+            .lock()
+            .map_err(|_| {
+                ProcessExecutionError::Unavailable("process authority lock poisoned".to_owned())
+            })?
+            .origin_grant_reconciliation_source(request_nonce, &self.snapshot_binding)
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        if source.operation() != OriginControlOperation::Kill {
+            observe_process("kernel.process.grant_reconcile_rejected", "fenced");
+            return Err(ProcessExecutionError::Contract(
+                eliot_process::ContractError::DispatchBindingMismatch,
+            ));
+        }
+        if source.effect_outcome() == OriginGrantEffectOutcome::Unknown {
+            observe_process("kernel.process.grant_reconcile_unknown", "unknown");
+            super::kernel_diagnostics::observe_terminal_error(process_terminal_code(
+                &ProcessExecutionError::UnknownOutcome,
+            ));
+            return Err(ProcessExecutionError::UnknownOutcome);
+        }
+        self.reconcile(owner, operation_id).await
+    }
+
     #[cfg(windows)]
     pub(crate) fn attach_canonical_store(
         &self,
