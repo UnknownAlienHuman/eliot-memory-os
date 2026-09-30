@@ -286,13 +286,14 @@ True(OperatorDiagnostics.ShouldRotate(OperatorDiagnostics.MaxLogBytes + 1), "log
 True(!OperatorDiagnostics.ShouldRotate(0), "empty log does not rotate");
 
 // The live probe runs AFTER every conformance assertion, and its failure is
-// bounded to one typed line. A run that reaches here has already executed and
-// passed every assertion above; a live probe that throws must not turn that
-// into a lost terminal receipt, and it must not be able to hide a conformance
-// block for a red conformance verdict — a probe line is a probe outcome, never
-// the run's verdict, and the verdict is printed last, after this block. The
-// live line is NOT an assertion and adds none: it reports a probe outcome, and
-// the executed count above is unchanged by it.
+// bounded to one typed line. A run that reaches here has already EXECUTED
+// every assertion above - not necessarily passed them; a red run reaches this
+// block by design, and the failures it recorded are already on stdout. A live
+// probe that throws must not turn that into a lost terminal receipt, and it
+// must not be able to hide a conformance failure - a probe line is a probe
+// outcome, never the run's verdict, and the verdict is printed last, after this
+// block. The live line is NOT an assertion and adds none: it reports a probe
+// outcome, and the executed count above is unchanged by it.
 //
 // Redaction: one bounded line carrying the stage and the exception TYPE only.
 // No message, no stack trace, no endpoint, pipe name, nonce, credential or
@@ -319,18 +320,20 @@ if (args.Contains("--live", StringComparer.Ordinal))
     }
 }
 
-// The terminal receipt, and the last line of the run. Every failing assertion
-// is named first — the labels are harness-owned constants carrying no runtime
-// values — and then one bounded verdict line. A green run prints the same
-// single passed line it always printed, unchanged. A red run prints the same
-// receipt with an explicit failed verdict and exits non-zero: a caller reading
-// only the receipt learns the same thing either way, and a caller reading only
-// the exit code cannot mistake a red run for a green one.
-foreach (var failure in failures)
-{
-    Console.WriteLine($"ELIOT_OPERATOR_CONFORMANCE_FAILURE {failure}");
-}
-
+// The terminal receipt, and the last line of the run. The verdict is printed
+// here, after every assertion and after the live probe, so a probe line can
+// never be mistaken for the run's outcome. A green run prints the same single
+// passed line it always printed, unchanged. A red run prints an explicit failed
+// verdict and exits non-zero: a caller reading only the receipt learns the same
+// thing either way, and a caller reading only the exit code cannot mistake a
+// red run for a green one.
+//
+// The individual failure lines are NOT printed here. They are printed by the
+// helpers at the moment each one is recorded, because a buffered list is lost
+// if anything between the first failure and this block throws - and three
+// assertions in this file dereference the very subject the preceding assertion
+// checks, so that is reachable rather than hypothetical. Printing at record
+// time means a crash still leaves every failure already observed on stdout.
 if (failures.Count == 0)
 {
     Console.WriteLine(
@@ -343,22 +346,52 @@ else
     Environment.ExitCode = 1;
 }
 
-// The only two places the executed count moves. Both record a failure instead
-// of throwing, so a failing run still reaches the receipt above and the
-// executed count is observable for a red run exactly as it is for a green one.
-// Recording never weakens an assertion: the label is reported verbatim either
-// way and the exit code is non-zero.
+// The only two places the executed count moves, and both also report a failure
+// the instant it is observed. They record instead of throwing so a failing run
+// still reaches the receipt above and the executed count is observable for a
+// red run exactly as it is for a green one. Recording never weakens an
+// assertion: the label is reported verbatim either way and the exit code is
+// non-zero.
+//
+// Reporting is bounded by the SAME constant the diagnostics path uses
+// (OperatorDiagnostics.MaxRecordChars), so a failure line cannot become an
+// unbounded dump the way an interpolated `expected`/`actual` pair otherwise
+// could. The bound is applied here rather than by widening
+// OperatorDiagnostics.Bound, which is deliberately private: exposing it would
+// change a production type's surface to serve a test harness. The LABEL is a
+// harness-owned constant and is never bounded away; only the two value fields
+// are, because only those carry runtime data.
+static string BoundedValue(object? value)
+{
+    var text = (value?.ToString() ?? string.Empty).Trim();
+    var filtered = new string(text.Where(character => !char.IsControl(character)).ToArray());
+    return filtered.Length <= OperatorDiagnostics.MaxRecordChars
+        ? filtered
+        : filtered[..OperatorDiagnostics.MaxRecordChars];
+}
+
 void True(bool condition, string label)
 {
     executedAssertions++;
-    if (!condition) failures.Add($"assertion failed: {label}");
+    if (condition)
+    {
+        return;
+    }
+    failures.Add(label);
+    Console.WriteLine($"ELIOT_OPERATOR_CONFORMANCE_FAILURE assertion failed: {label}");
 }
 
 void Equal<T>(T expected, T actual, string label)
 {
     executedAssertions++;
-    if (!EqualityComparer<T>.Default.Equals(expected, actual))
-        failures.Add($"assertion failed: {label}; expected={expected}; actual={actual}");
+    if (EqualityComparer<T>.Default.Equals(expected, actual))
+    {
+        return;
+    }
+    failures.Add(label);
+    Console.WriteLine(
+        $"ELIOT_OPERATOR_CONFORMANCE_FAILURE assertion failed: {label}; "
+        + $"expected={BoundedValue(expected)}; actual={BoundedValue(actual)}");
 }
 
 bool EndpointInvalid(OperatorEndpoint candidate)
