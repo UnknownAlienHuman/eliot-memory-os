@@ -326,6 +326,13 @@ async fn serve_connection(
             session.fence();
             return Ok(());
         };
+        if let Err(error) = kernel
+            .await_native_worker_registration_start(&session, &frame)
+            .await
+        {
+            session.fence();
+            return Err(error);
+        }
         let action = match kernel.dispatch_frame(&session, &frame) {
             Ok(action) => action,
             Err(error) => {
@@ -641,6 +648,13 @@ async fn serve_admitted_bridge_host_requests(
                 return Err(error);
             }
         };
+        if let Err(error) = kernel
+            .await_native_worker_registration_start(&session, &frame)
+            .await
+        {
+            kernel.revoke_agent_bridge(&connection_id);
+            return Err(error);
+        }
         let action = match kernel.dispatch_frame(&session, &frame) {
             Ok(action) => action,
             Err(
