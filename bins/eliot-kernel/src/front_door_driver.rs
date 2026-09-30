@@ -678,6 +678,30 @@ async fn serve_admitted_bridge_host_requests(
                 let signal = error
                     .backpressure_signal()
                     .unwrap_or(eliot_ipc::BACKPRESSURE_BRIDGE_DISPATCH);
+                // STITCH (reserve owner): the whole-or-null versioned I14
+                // backpressure response for this shed frame. The dispatch
+                // seam carries only the triple-string `BackpressureSignal`
+                // — no disposition, no bottleneck observation, no profile
+                // revision, no operation identity — and
+                // `KernelComposition::dispatch_frame`
+                // (bins/eliot-kernel/src/frame_dispatch.rs::dispatch_frame)
+                // returns exactly that error shape, so mapping the three
+                // strings to a disposition here would fabricate a
+                // directive. The only leg that may supply the whole
+                // `eliot_runtime_contracts::I14BackpressureResponseV1`
+                // (contract version, closed disposition, complete recovery
+                // directive) is the reserve owner that reads the live
+                // partition (`FrontDoor::normal_saturation_response`,
+                // `FrontDoor::protected_exhaustion_response`,
+                // `FrontDoor::guarantee_lost_response` in
+                // crates/kernel/eliot-kernel-core/src/control_reserve_rejection.rs),
+                // threaded through the dispatch error channel. Until that
+                // leg lands, the slot stays null — never partial. The key
+                // sits beside `value`, never inside it: `value` still
+                // decodes whole into `BridgeTransportBackpressure` (which
+                // denies unknown fields), so the existing triple-string
+                // signal parses exactly as before.
+                let directive: Option<eliot_runtime_contracts::I14BackpressureResponseV1> = None;
                 let reply = eliot_protocol::Frame {
                     protocol_version: session.protocol_version,
                     encoding_profile: eliot_protocol::EncodingProfile::JsonV1,
@@ -695,6 +719,7 @@ async fn serve_admitted_bridge_host_requests(
                             "shed_work": signal.shed_work,
                             "outcome": "unknown",
                         },
+                        "directive": directive,
                     })),
                     trace_context: std::collections::BTreeMap::new(),
                 };
