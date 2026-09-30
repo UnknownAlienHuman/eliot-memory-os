@@ -165,8 +165,8 @@ pub(crate) struct ProductionOrientationInputs<'a> {
 /// CC-002 outcome carries provider text and observed usage that live outside
 /// this binary, the CC-004 set is composed by
 /// `eliot_governor::GovernorComposition::canonical_projections`, and every
-/// stage input
-/// is an owner-built record. This is the one shape that carries all of them
+/// stage input is an owner-built record. This is the one shape that carries
+/// all of them
 /// across the process boundary, mirroring the Curation
 /// [`CurationExecutionCarrier`](crate::dispatch_stage::CurationExecutionCarrier)
 /// exactly: an owned value the source hands out per admission, which the
