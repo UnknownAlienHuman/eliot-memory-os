@@ -61,9 +61,12 @@ use eliot_kernel_service::{
 };
 use eliot_ors::{
     AdmissionReservationClaimRef, AdmissionReservationClaims, AdmissionReservationIdentityInput,
-    AdmissionReservationStageRequest, NativeWorkerClaimRecord, NativeWorkerClaimState, OpaqueLabel,
-    OperationIdentity, OrsError, StateFenceSnapshot, admission_reservation_identity,
-    epoch_lineage_for, stage_admission_reservation_inactive, stage_operation_identity,
+    AdmissionReservationLaunchPrerequisite, AdmissionReservationStageRequest,
+    CanonicalAdmissionResolution, CanonicalAdmissionUnknownReason, NativeWorkerClaimRecord,
+    NativeWorkerClaimState, OpaqueLabel, OperationIdentity, OrsError, StateFenceSnapshot,
+    admission_reservation_identity, epoch_lineage_for, reconcile_canonical_admission,
+    reload_staged_admission_reservation, stage_admission_reservation_inactive,
+    stage_operation_identity, verify_admission_reservation_launch_prerequisite,
 };
 use eliot_process::OperationId;
 use eliot_protocol::{Frame, FrameKind, MessageType, ProtocolPayload};
@@ -215,6 +218,30 @@ pub(crate) enum NativeWorkerRouteError {
     Conflict(NativeWorkerRouteConflict),
     /// The absolute claim deadline elapsed before admission.
     ExpiredDeadline,
+    /// The canonical admission operation's outcome is not established
+    /// (#1678 W4, I5.19, I14.21).
+    ///
+    /// This is deliberately NOT `Fence{field}`: an unknown commit is an
+    /// unresolved outcome to be reconciled under the SAME canonical operation
+    /// identity, not a fence failure, and collapsing it into `Fence` would
+    /// misreport a recoverable reconcile as a session-fencing verdict. The
+    /// reservation stays inactive/reconciling and launch stays blocked
+    /// (I14.20: a staged reservation cannot provision or launch).
+    UnknownCommit {
+        /// The reservation whose canonical admission could not be resolved.
+        reservation_id: String,
+        /// The exact canonical operation identity that must be reconciled.
+        operation_id: String,
+        /// Why the outcome could not be established, as the ORS owner's own
+        /// [`CanonicalAdmissionUnknownReason`] discriminant.
+        reason: CanonicalAdmissionUnknownReason,
+        /// The owner-verified launch-prerequisite disposition read back at the
+        /// moment the outcome could not be established. It is the same sealed
+        /// value #1701 consumes, and on this path it is never `Active`: a
+        /// reservation with an unresolved canonical commit stays inactive and
+        /// carries no launch authority (I14.20).
+        disposition: AdmissionReservationLaunchPrerequisite,
+    },
 }
 
 impl std::fmt::Display for NativeWorkerRouteError {
@@ -234,6 +261,15 @@ impl std::fmt::Display for NativeWorkerRouteError {
                 conflict.changed_fields.join(","),
             ),
             Self::ExpiredDeadline => write!(f, "native-worker claim deadline elapsed"),
+            Self::UnknownCommit {
+                reservation_id,
+                operation_id,
+                reason,
+                ..
+            } => write!(
+                f,
+                "native-worker canonical admission unresolved for reservation {reservation_id} under operation {operation_id} ({reason:?})",
+            ),
         }
     }
 }
@@ -245,6 +281,14 @@ impl NativeWorkerRouteError {
             Self::Unknown { .. } => TransportError::UnknownRequest,
             Self::Conflict(_) => TransportError::IdentityConflict,
             Self::ExpiredDeadline => TransportError::Timeout,
+            // An unresolved canonical commit is neither a shape/fence failure nor
+            // an unknown claim identity: the reservation exists and is staged,
+            // but the owner has not established whether the operation
+            // committed. The caller must reconcile the SAME operation identity,
+            // so the transport contour reports it as a request whose referenced
+            // operation state is not yet resolvable rather than fencing a
+            // session that will recover correctly.
+            Self::UnknownCommit { .. } => TransportError::UnknownRequest,
         }
     }
 }
@@ -2196,6 +2240,203 @@ impl KernelComposition {
         Ok(reservation_id)
     }
 
+    /// Drives the residual halves of the normative admission reservation saga
+    /// for one admitted claim: reconcile the canonical admission operation, and
+    /// read the launch prerequisite back through the single owner verifier
+    /// (#1678 W4, W5, W6, A4, A7, A8).
+    ///
+    /// The stage half already ran in `stage_claim_admission_reservation` before
+    /// `admit_native_worker_claim`, so the durable `StagedInactive` row exists
+    /// and the owner has returned its admission verdict. What remains between
+    /// that verdict and a launch is the canonical join, and this method is
+    /// where it lives.
+    ///
+    /// The canonical operation identity is DERIVED, never minted: it is the
+    /// stage operation identity of this exact reservation
+    /// ([`stage_operation_identity`]), so a retry, a replay or a restart after
+    /// a lost response re-resolves the SAME canonical operation and can never
+    /// mint a second admission (I5.27, A3). The ORS reconcile half
+    /// ([`reconcile_canonical_admission`]) is asked for the owner's readback of
+    /// exactly that identity, and it — not this function — decides the I14.21
+    /// disposition. An absent receipt reaches it as `None` and is `Unknown`,
+    /// never `ProvenNonCommit` (I5.19: an unknown commit is never assumed to be
+    /// a non-commit).
+    ///
+    /// Every non-committed disposition keeps the reservation inactive and blocks
+    /// launch; this method never falls through to an activation on an unknown
+    /// (I14.20). A committed resolution proceeds to the launch-prerequisite
+    /// readback, which is the single owner-verifiable artefact #1701 consumes.
+    /// That readback is a pure read: it provisions nothing, launches nothing and
+    /// changes no lifecycle position, and a staged/reconciling/released/expired
+    /// reservation comes back as its own inert variant rather than as active
+    /// authority.
+    ///
+    /// # Why this method does not activate
+    ///
+    /// The activation half ([`eliot_ors::activate_admission_reservation_from_owner_evidence`])
+    /// requires an owner-issued `eliot_store_api::WriteReceipt` for the
+    /// canonical admission operation, and I14.6 forbids fabricating that receipt
+    /// in Kernel or inferring it from a successful transport response. This
+    /// route has no such receipt and cannot obtain one:
+    ///
+    /// - `service.admit_native_worker_claim` returns a
+    ///   `NativeWorkerClaimResponse`, whose `Admitted` arm carries an ORS-level
+    ///   `NativeWorkerClaimReceipt` (crates/kernel/eliot-kernel-service/src/protocol/native_worker_claim.rs:984).
+    ///   That receipt is a `Serialize`/`Deserialize` ORS claim-table receipt
+    ///   with a `receipt_digest`; it carries no canonical `commit_id`, no
+    ///   `idempotency_key` and no `outbox_refs`, so it cannot stand in for a
+    ///   `WriteReceipt`, and turning it into one would be exactly the
+    ///   fabrication the spec forbids.
+    /// - The only owner port that returns a real `WriteReceipt` for an exact
+    ///   operation is `KernelStoreGateway::receipt`
+    ///   (crates/kernel/eliot-kernel-service/src/store_gateway.rs:2182). It is
+    ///   `async` — it performs live `CanonicalStoreClient` IO — and this route
+    ///   is synchronously reachable only through `KernelComposition::dispatch_frame`
+    ///   (bins/eliot-kernel/src/frame_dispatch.rs:744 -> :984), so no receipt for
+    ///   the reservation's canonical operation can be read back from here, and
+    ///   no canonical `ADMITTED` write is ever submitted for it by this claim
+    ///   path.
+    ///
+    /// So the activation leg is left as a truthful typed refusal rather than a
+    /// made-up receipt. The missing owner port is a canonical admission write
+    /// (`admit`/named-write) plus receipt readback reached through an ASYNC
+    /// Kernel surface; the orchestrator for those does not exist yet. #1701
+    /// consumes the `verify_admission_reservation_launch_prerequisite` result
+    /// this method returns, and the activate half is unreachable for it until
+    /// that port lands — which is the correct fail-closed posture while it
+    /// does.
+    fn coordinate_admission_reservation_saga(
+        &self,
+        request: &NativeWorkerClaimRequest,
+        reservation_id: &OperationIdentity,
+        now_unix_ms: i64,
+    ) -> Result<AdmissionReservationLaunchPrerequisite, NativeWorkerRouteError> {
+        // The current epoch and fence are read from the claim as presented and
+        // re-validated by the ORS owner on every leg below; a stale or foreign
+        // epoch/fence fails BEFORE any mutation.
+        let authority_epoch = epoch_lineage_for(&request.authority_epoch, None).map_err(|_| {
+            NativeWorkerRouteError::Fence {
+                field: "authority_epoch",
+            }
+        })?;
+        let state_fence = StateFenceSnapshot::capture(
+            &request.state_fence,
+            request.authority_epoch.sequence.get(),
+        )
+        .and_then(|snapshot| {
+            snapshot
+                .validate_against_epoch(&request.authority_epoch)
+                .map(|()| snapshot)
+        })
+        .map_err(|_| NativeWorkerRouteError::Fence {
+            field: "state_fence",
+        })?;
+        let work_item_id = OperationIdentity::new(&request.claim_id)
+            .map_err(|_| NativeWorkerRouteError::Shape { field: "claim_id" })?;
+        let proposed_attempt_id = OperationIdentity::new(&request.attempt_id).map_err(|_| {
+            NativeWorkerRouteError::Shape {
+                field: "attempt_id",
+            }
+        })?;
+        // One canonical operation identity for the whole saga, derived from the
+        // reservation alone. It is stable across replay and restart, so a lost
+        // response re-resolves this exact operation instead of admitting again.
+        let canonical_operation_id = stage_operation_identity(reservation_id).map_err(|_| {
+            NativeWorkerRouteError::Fence {
+                field: "admission_reservation.canonical_operation",
+            }
+        })?;
+        // Durably read the staged reservation back. This is the A2/A7 recovery
+        // read: a restart lands on the identical row, and a missing reservation
+        // is `Unknown` rather than silently created here.
+        let current = reload_staged_admission_reservation(
+            self.generation_gateway.ors.as_ref(),
+            reservation_id,
+            now_unix_ms,
+        )
+        .map_err(|error| match error {
+            OrsError::ReservationNotFound => NativeWorkerRouteError::Unknown {
+                identity: reservation_id.as_str().to_owned(),
+            },
+            _ => NativeWorkerRouteError::Fence {
+                field: "admission_reservation.reload",
+            },
+        })?;
+        // Ask the ORS owner for the disposition of the ORIGINAL canonical
+        // operation. There is no owner port that can read a `WriteReceipt` for
+        // it from this synchronous route (see this method's docs), so the
+        // readback is absent and the owner classifies it exactly as it must:
+        // `Unknown`, never a presumed non-commit.
+        let readback: Option<&eliot_store_api::WriteReceipt> = None;
+        let resolution = reconcile_canonical_admission(readback, canonical_operation_id.as_str())
+            .map_err(|_| NativeWorkerRouteError::Fence {
+                field: "admission_reservation.reconcile",
+            })?;
+        // Read the launch prerequisite back through the SINGLE owner verifier.
+        // It is a pure read that re-derives the reservation's current
+        // disposition; only an exact `Active` record carrying both owner receipts
+        // yields active authority, and every other state is a distinct inert
+        // variant. It launches nothing (#1701's single issuance point). This runs
+        // on EVERY path, so the refusal below carries the same sealed evidence a
+        // consumer would have read, rather than a route-local guess.
+        let disposition = verify_admission_reservation_launch_prerequisite(
+            Some(&current),
+            &work_item_id,
+            &proposed_attempt_id,
+            &authority_epoch,
+            &state_fence,
+            now_unix_ms,
+        )
+        .map_err(|_| NativeWorkerRouteError::Fence {
+            field: "admission_reservation.launch_prerequisite",
+        })?;
+        match resolution {
+            CanonicalAdmissionResolution::Committed => {
+                // Proven committed `ADMITTED` with its exact launch intent. The
+                // activation still needs an owner-issued `WriteReceipt` for that
+                // operation, which this route cannot produce or read back (see
+                // this method's docs), so the readback above reports the
+                // reservation's true current state instead of asserting an
+                // activation that was never performed.
+                Ok(disposition)
+            }
+            CanonicalAdmissionResolution::ProvenNonCommit => {
+                // A proven terminal non-commit may be retried only under this
+                // same operation identity and only under the existing write
+                // policy. The claim route does not re-admit from here, so the
+                // reservation stays inactive and launch stays blocked; the
+                // readback above is the evidence of that.
+                Ok(disposition)
+            }
+            CanonicalAdmissionResolution::TerminalFailure { .. } => {
+                // Terminal rejection/rollback/dead-letter: the same identity is
+                // dead, the reservation is dispositioned without launch, and the
+                // exact terminal evidence is retained by the ORS owner. Nothing
+                // here retries or re-admits. The refusal is reported as unknown
+                // work state rather than a fence: the claim is not fenced, the
+                // canonical operation is simply not admitted.
+                Err(NativeWorkerRouteError::UnknownCommit {
+                    reservation_id: reservation_id.as_str().to_owned(),
+                    operation_id: canonical_operation_id.as_str().to_owned(),
+                    reason: CanonicalAdmissionUnknownReason::ReceiptAbsent,
+                    disposition,
+                })
+            }
+            CanonicalAdmissionResolution::Unknown { reason } => {
+                // Missing, unavailable, inconclusive or conflicting: keep the
+                // reservation inactive/reconciling and BLOCK LAUNCH. A later
+                // reconcile under the same operation identity resolves it; no
+                // fresh admission is minted (I14.21, I5.19).
+                Err(NativeWorkerRouteError::UnknownCommit {
+                    reservation_id: reservation_id.as_str().to_owned(),
+                    operation_id: canonical_operation_id.as_str().to_owned(),
+                    reason,
+                    disposition,
+                })
+            }
+        }
+    }
+
     /// Projects the complete W2 claim set for one claim from the existing
     /// owner fields (resource, lane, environment, effect, quota).
     ///
@@ -2399,6 +2640,24 @@ impl KernelComposition {
             )?;
             Self::enforce_claim_executable_binding(&request, &expectation, now)?;
         }
+        // #1678 W4/W5/W6/A4/A7: drive the residual saga halves for an ADMITTED
+        // claim only. A `Rejected`/`Conflict` verdict admits no canonical work,
+        // so there is no canonical admission outcome to reconcile and no
+        // activation to read back; the staged reservation simply stays inert
+        // (I14.20). For an `Admitted` claim this reconciles the ONE canonical
+        // operation under its derived identity and then reads the launch
+        // prerequisite back through the single owner verifier. An unresolved
+        // canonical commit is a typed `UnknownCommit` refusal — never a fence,
+        // and never a fall-through to activation.
+        let launch_prerequisite = if matches!(decision, NativeWorkerClaimResponse::Admitted(_)) {
+            Some(self.coordinate_admission_reservation_saga(
+                &request,
+                &reservation_id,
+                stage_now_ms,
+            )?)
+        } else {
+            None
+        };
         // The sealed executable digest lets later reconcile observe the exact
         // binding this admission sealed (kind `native_worker_claim` only).
         let executable_echo = request
@@ -2414,6 +2673,28 @@ impl KernelComposition {
         // reservation instead of minting a new one. It is an identity echo only:
         // a staged reservation carries no launch authority (I14.20).
         extra_echo.push(("admission_reservation_id", reservation_id.as_str()));
+        // #1678 W6/A8: the owner-verified launch-prerequisite disposition rides
+        // the same sealed receipt, so a consumer can tell staged from released,
+        // expired, reconciling, stale-fence, foreign-owner and identity-conflict
+        // without re-deriving it. Only `ACTIVE` is launch authority, and only
+        // the owner verifier can produce it. Serialized through the owner's own
+        // `Serialize` so the discriminant is the owner's spelling, not a local
+        // one.
+        if let Some(prerequisite) = launch_prerequisite.as_ref() {
+            let disposition = serde_json::to_value(prerequisite).map_err(|_| {
+                NativeWorkerRouteError::Shape {
+                    field: "admission_reservation.launch_prerequisite",
+                }
+            })?;
+            let disposition_kind = disposition
+                .as_object()
+                .and_then(|object| object.keys().next())
+                .cloned()
+                .ok_or(NativeWorkerRouteError::Shape {
+                    field: "admission_reservation.launch_prerequisite",
+                })?;
+            extra_echo.push(("admission_reservation_launch_prerequisite", &disposition_kind));
+        }
         Self::seal_decision(
             "native_worker_claim",
             &claim_id,
