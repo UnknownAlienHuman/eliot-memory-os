@@ -4692,7 +4692,7 @@ fn lower_coverage(left: EvidenceCoverage, right: EvidenceCoverage) -> EvidenceCo
             EvidenceCoverage::Unknown => 0,
         }
     };
-    if rank(left) >= rank(right) {
+    if rank(left) <= rank(right) {
         left
     } else {
         right
