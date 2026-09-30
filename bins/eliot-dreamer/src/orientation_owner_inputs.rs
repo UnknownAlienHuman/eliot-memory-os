@@ -2,7 +2,10 @@
 
 use eliot_context_assembly::ActiveUnderstandingViewResult;
 use eliot_context_candidates::ContextCandidateSetResult;
-use eliot_context_contracts::{CanonicalProjectionSet, ContextError, SerializedContextMeasurement};
+use eliot_context_contracts::{
+    AtomAvailability, AtomRepresentation, CanonicalProjectionSet, ContextError, ProviderId,
+    SerializedContextMeasurement,
+};
 use eliot_cue_activation::CueActivationEvaluation;
 use eliot_dreamer_claim_grounding::GroundingRequest;
 use eliot_dreamer_classification::ClassificationResult;
@@ -18,6 +21,7 @@ use eliot_dreamer_orientation::{
 };
 use eliot_dreamer_probe_plan::{ProbePlan, ProbePlanParams, ProbeProposal};
 use eliot_dreamer_rival_model::RivalModelSet;
+use eliot_context_candidates::{EpistemicInput, PROVIDER_EPISTEMIC};
 use eliot_epistemic::{CurrentEpistemicPosition, ObservationRecord, PositionRequest};
 use eliot_epistemic_contracts::EpistemicPositionCandidate;
 use serde::Serialize;
@@ -604,6 +608,20 @@ fn run_initial_stages(
             }))
         },
     )?;
+    let Some(epistemic_projection) = inputs.candidates.epistemic_position else {
+        return Err((
+            PulseStageId::Understanding,
+            PulseError::Boundary("understanding admitted epistemic predecessor missing"),
+        ));
+    };
+    if epistemic_projection.position != *inputs.rivals.current_position {
+        return Err((
+            PulseStageId::Understanding,
+            PulseError::Boundary("understanding epistemic source differs from bound CEP"),
+        ));
+    }
+    check_understanding_epistemic_source(&inputs.understanding, epistemic_projection)
+        .map_err(|error| (PulseStageId::Understanding, error))?;
     run.execute(
         PulseStageId::Understanding,
         check_understanding_binding(&inputs.understanding, bundle, projections),
@@ -617,6 +635,78 @@ fn run_initial_stages(
             }))
         },
     )
+}
+
+/// Joins the AUV's admitted epistemic atom to the exact admitted position
+/// already validated by CEP. The context set remains the original owner
+/// output: this only compares its retained whole atom with the existing
+/// candidate-mapper projection of the same typed position.
+fn check_understanding_epistemic_source(
+    stage: &UnderstandingStage<'_, MeasureFn>,
+    input: &EpistemicInput,
+) -> Result<(), PulseError> {
+    let provider = ProviderId::new(PROVIDER_EPISTEMIC)
+        .map_err(|_| PulseError::Boundary("epistemic provider identity"))?;
+    let expected = eliot_context_candidates::derive::derive_epistemic(
+        input,
+        &provider,
+        AtomAvailability::PresentCurrent,
+    )
+    .map_err(|_| PulseError::Boundary("understanding epistemic source invalid"))?;
+    let [member] = expected.as_slice() else {
+        return Err(PulseError::Boundary(
+            "understanding epistemic source denominator",
+        ));
+    };
+    let rule = eliot_context_candidates::kind_rule(PROVIDER_EPISTEMIC, &member.kind)
+        .ok_or(PulseError::Boundary("understanding epistemic kind"))?;
+    let Some(record) = stage
+        .admitted
+        .records
+        .iter()
+        .find(|record| record.candidate.atom_id == member.member_id)
+    else {
+        return Err(PulseError::Boundary(
+            "understanding admitted epistemic member missing",
+        ));
+    };
+    let candidate = &record.candidate;
+    let content_matches = matches!(
+        &candidate.representation,
+        AtomRepresentation::Whole { content } if content == &member.content
+    );
+    let slot_matches = stage
+        .recipe
+        .denominator
+        .requested
+        .iter()
+        .any(|slot| slot.provider.as_str() == PROVIDER_EPISTEMIC && slot.role == rule.role);
+    if !slot_matches
+        || candidate.binding != stage.admitted.binding
+        || candidate.provider_role.provider.as_str() != PROVIDER_EPISTEMIC
+        || candidate.provider_role.role != rule.role
+        || candidate.atom_id != member.member_id
+        || candidate.source != member.source
+        || candidate.source_range.is_some()
+        || candidate.learning.is_some()
+        || !content_matches
+        || candidate.loss_policy != rule.loss_policy
+        || candidate.availability != member.truthful_state
+        || candidate.protected != member.protected
+        || candidate.privacy != member.privacy
+        || candidate.authority != member.authority
+        || candidate.status != member.status
+        || candidate.assertability != member.assertability
+        || candidate.measurement.digest != member.content_sha
+        || candidate.measurement.serializer != member.measurement.serializer
+        || candidate.dependencies != member.dependencies
+        || candidate.proof != member.proof
+    {
+        return Err(PulseError::Boundary(
+            "understanding admitted epistemic source differs from CEP input",
+        ));
+    }
+    Ok(())
 }
 
 fn run_grounding_rival_conflict(
