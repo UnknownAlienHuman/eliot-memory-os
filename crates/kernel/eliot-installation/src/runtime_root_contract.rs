@@ -263,7 +263,8 @@ impl RuntimeStateRoots {
     /// destination preparation proves already exists — so the published effect
     /// and the admitted contour are one name with one owner, and neither can
     /// drift into an effect that can never execute.
-    const ISOLATED_RESTORE_ROOT_DIR: &'static str = eliot_platform_windows::ISOLATED_RESTORE_ROOT_DIR;
+    const ISOLATED_RESTORE_ROOT_DIR: &'static str =
+        eliot_platform_windows::ISOLATED_RESTORE_ROOT_DIR;
     const ROOT_SUFFIXES: [(&'static str, &'static str); 7] = [
         ("host_state_root", "host"),
         ("kernel_ors_root", "kernel\\state"),
