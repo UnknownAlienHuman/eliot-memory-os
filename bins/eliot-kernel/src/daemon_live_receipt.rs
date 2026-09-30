@@ -740,12 +740,12 @@ impl KernelComposition {
         // rather than a healthy Store.
         let availability_fence =
             StateFence::new(candidate.kernel_epoch.clone(), request.generation);
-        // `observe_canonical_store_availability` fails closed: it returns the
-        // full three-fact record only when all three hold, and otherwise
-        // returns the refusal naming the owner that is missing. The caller
-        // therefore cannot reach the evidence below on stale truth, an
-        // unattached transport, or an owner it could not read.
-        let (_availability, evidence) = self
+        // `observe_canonical_store_availability` fails closed: it yields the
+        // evidence only when all three facts hold, and otherwise returns the
+        // refusal naming the owner that is missing. The caller therefore
+        // cannot reach the evidence below on stale truth, an unattached
+        // transport, or an owner it could not read.
+        let evidence = self
             .observe_canonical_store_availability(&availability_fence)
             .await
             .map_err(|refusal| {

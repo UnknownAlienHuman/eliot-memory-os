@@ -489,9 +489,9 @@ impl KernelComposition {
     ///   bound to a different fence is [`StoreSemanticFreshness::Stale`],
     ///   which is refused; it is never served and never read as an outage.
     ///
-    /// On success it also returns the two owner-issued values the readiness
-    /// receipt cites, taken from those same two round trips. Proving the three
-    /// facts therefore costs no additional Store IO.
+    /// On success it returns the two owner-issued values the readiness receipt
+    /// cites, taken from those same two round trips. Proving the three facts
+    /// therefore costs no additional Store IO.
     ///
     /// The whole observation is bounded and performs no waiting beyond the two
     /// bounded Store round trips the readiness proof already performed, and it
@@ -510,7 +510,7 @@ impl KernelComposition {
     pub async fn observe_canonical_store_availability(
         &self,
         request_fence: &eliot_contracts::StateFence,
-    ) -> Result<(CanonicalStoreAvailability, StoreTruthEvidence), StoreFactRefusal> {
+    ) -> Result<StoreTruthEvidence, StoreFactRefusal> {
         // F-LOG-KERNEL-2 (#899): Store availability phases only; no operation,
         // digest, process, job or owner-error material is emitted.
         //
@@ -647,16 +647,13 @@ impl KernelComposition {
             semantic_freshness,
         };
         availability.refuse_canonical_sensitive_authority()?;
-        Ok((
-            availability,
-            StoreTruthEvidence {
-                // The health object is the Store's own neutral observation and
-                // was already validated by the gateway before it was returned;
-                // its recorded manifest digest is cited verbatim.
-                manifest_digest: health.manifest_digest,
-                validation_revision: snapshot.validation_revision,
-            },
-        ))
+        Ok(StoreTruthEvidence {
+            // The health object is the Store's own neutral observation and was
+            // already validated by the gateway before it was returned; its
+            // recorded manifest digest is cited verbatim.
+            manifest_digest: health.manifest_digest,
+            validation_revision: snapshot.validation_revision,
+        })
     }
 
     /// Fails closed on a connectivity fact alone, recording the two downstream
@@ -678,9 +675,10 @@ impl KernelComposition {
                 StoreOwnerUnreadable::NoTransportToQuery,
             ),
         };
-        // The connectivity arms are all refusals, so this predicate always
-        // decides; `Err` is returned rather than an `expect` so no edit can
-        // turn it into a fabricated success.
+        // Every non-`Attached` connectivity arm is a refusal, so the predicate
+        // decides. The fallback is a defensive arm rather than an expected
+        // path, and it still refuses: no edit to this function can turn an
+        // unestablished record into a success.
         match record.refuse_canonical_sensitive_authority() {
             Err(refusal) => refusal,
             Ok(()) => StoreFactRefusal::NotEstablished {
@@ -691,7 +689,11 @@ impl KernelComposition {
     }
 
     /// Fails closed on a record whose connectivity is established but whose
-    /// later facts are not yet readable.
+    /// later facts are not yet established.
+    ///
+    /// The record is still complete — every field is assigned — and the one
+    /// fail-closed predicate decides which owner is named, so this helper adds
+    /// no decision logic of its own.
     #[cfg(windows)]
     fn refuse_on(
         process_readiness: StoreProcessReadiness,
