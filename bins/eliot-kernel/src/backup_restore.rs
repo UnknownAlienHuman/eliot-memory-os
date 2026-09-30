@@ -2081,7 +2081,10 @@ impl<'a> KernelRestoreTarget<'a> {
         if self.published.is_empty() {
             return match cleanup {
                 StagedCleanupOutcome::TemporariesPreserved(refusal) => {
-                    KernelRestoreError::StagedCleanupIncomplete { primary, cleanup: refusal }
+                    KernelRestoreError::StagedCleanupIncomplete {
+                        primary,
+                        cleanup: refusal,
+                    }
                 }
                 StagedCleanupOutcome::NothingStaged | StagedCleanupOutcome::TemporariesRemoved => {
                     KernelRestoreError::TargetFailed(primary)
@@ -2090,10 +2093,14 @@ impl<'a> KernelRestoreTarget<'a> {
         }
         KernelRestoreError::RetainedForResume {
             primary,
-            retained: RetainedPhaseMaterial {
+            // Boxed on the owner side for the size reason stated on the
+            // variant: this is the error path of a failed restore, so the one
+            // allocation is paid only when there is already a failure to
+            // report, and no ordinary call in the crate grows.
+            retained: Box::new(RetainedPhaseMaterial {
                 members: self.published.len(),
                 bytes: self.staged_bytes,
-            },
+            }),
             cleanup,
         }
     }

@@ -476,7 +476,19 @@ pub enum KernelRestoreError {
         /// The engine's typed failure, unchanged.
         primary: BackupError,
         /// The bounded reference to what was left in place.
-        retained: RetainedPhaseMaterial,
+        ///
+        /// Boxed, and that is a size decision with a stated reason, not a
+        /// convenience. [`BackupError`] is itself the largest payload this enum
+        /// carries, and adding a 16-byte reference beside it pushed the whole
+        /// `Err` variant one byte past the threshold at which every
+        /// `Result<_, KernelRestoreError>` in the crate becomes a stack-
+        /// allocated 129-byte error path. Boxing this one payload keeps the
+        /// variant at 121 bytes and keeps the *other* variants' sizes
+        /// unchanged, so the cost is one allocation on an error path that is
+        /// already reporting a failure, and the benefit is that no ordinary
+        /// call in the crate pays for it. Nothing is dropped: the retained
+        /// members/bytes and the cleanup disposition travel exactly as before.
+        retained: Box<RetainedPhaseMaterial>,
         /// The bounded disposition of the automatic cleanup.
         cleanup: StagedCleanupOutcome,
     },
