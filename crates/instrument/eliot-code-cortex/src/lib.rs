@@ -27,7 +27,6 @@ pub const CONTRACT_NAME: &str = "eliot.code-cortex";
 pub const CONTRACT_VERSION: &str = "1.0.0";
 /// Stable normalized-evidence kind for a historically adopted LSP observation.
 pub const LSP_NORMALIZED_EVIDENCE_KIND: &str = "eliot.lsp.normalized-observation.v1";
-const MAX_RETAINED_LSP_OBSERVATIONS: usize = 32;
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum CodeCortexError {
@@ -288,10 +287,6 @@ impl SemanticIndex {
         process_operation_id: String,
         currentness: LspFreshness,
     ) -> Result<GraphRevision, CodeCortexError> {
-        if self.retained_lsp.len() >= MAX_RETAINED_LSP_OBSERVATIONS {
-            return Err(CodeCortexError::InvalidLimit);
-        }
-
         let source_kind = match &record.operation {
             SemanticOperation::Diagnostics | SemanticOperation::ProbeVersion => {
                 LspRawOutputKind::Stdout
@@ -459,9 +454,6 @@ impl CodeCortexService {
     pub fn with_retained_lsp_observations(
         records: Vec<RetainedLspObservationV1>,
     ) -> Result<Self, CodeCortexError> {
-        if records.len() > MAX_RETAINED_LSP_OBSERVATIONS {
-            return Err(CodeCortexError::InvalidLimit);
-        }
         let mut index = SemanticIndex::new();
         for record in records {
             index.admit_retained_lsp_observation(record)?;
@@ -476,9 +468,6 @@ impl CodeCortexService {
     pub fn with_lsp_adoption_projections(
         observations: Vec<(RetainedLspObservationV1, LspAdoptionProjection)>,
     ) -> Result<Self, CodeCortexError> {
-        if observations.len() > MAX_RETAINED_LSP_OBSERVATIONS {
-            return Err(CodeCortexError::InvalidLimit);
-        }
         let mut index = SemanticIndex::new();
         for (record, projection) in observations {
             index.admit_lsp_adoption_projection(record, &projection)?;
