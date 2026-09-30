@@ -1011,6 +1011,10 @@ pub fn execute_describe_experimental(
         semantic_digest: Sha256Digest::of_bytes(b"typed-semantic-pending"),
     };
     receipt.semantic_digest = semantic_digest(&receipt);
+    // STITCH(#758-P10.1): the describe-only lane is kit-less — no governing
+    // kit binds this call, so no honest `kit_digest` source exists here.
+    // This site stays on the host receipt and must not call the shared
+    // projection until a kit owner binds one.
     Ok((receipt, descriptor))
 }
 
@@ -2012,6 +2016,11 @@ pub fn execute_domain_experimental(
         semantic_digest: Sha256Digest::of_bytes(b"typed-semantic-pending"),
     };
     receipt.semantic_digest = semantic_digest(&receipt);
+    // STITCH(#758-P10.1): the unbound domain lane is kit-less — `provenance`
+    // is `None` at this shared constructor, so no honest `kit_digest` source
+    // exists here. The kit-bound capsule lane projects after return in
+    // `execute_capsule_domain_experimental`; this site stays on the host
+    // receipt and never synthesizes a digest.
     Ok((receipt, result))
 }
 
@@ -2144,8 +2153,23 @@ pub fn execute_capsule_domain_experimental(
             "capsule-output".to_owned(),
         ));
     }
+    // P10.1 (#758) receipt assembly inputs, bound at this kit-owned call
+    // site only: the governing kit digest and the admitted ceiling come
+    // from the validated `kit` above; nothing is synthesized. Bound before
+    // delegation so a kit-digest failure denies before any engine work.
+    let kit_digest = kit.digest().map_err(map_contract_error)?;
     // Delegation re-enters the direct lane: capsule provenance is consumed.
-    execute_domain_experimental(world, artifact, limits, request, admitted, None)
+    let (receipt, result) =
+        execute_domain_experimental(world, artifact, limits, request, admitted, None)?;
+    // Resolve the emitted host receipt through #760's shared contract. The
+    // host receipt stays the source of truth: the projection is additive
+    // fail-closed evidence, never a replacement. A projection denial fails
+    // the call instead of emitting a receipt the shared contract rejects.
+    // STITCH(#758-P10.1): the projected shared receipt is validated but not
+    // yet carried outward; returning or emitting it is follow-up outside
+    // this receipt-assembly slice.
+    crate::receipt_bridge::project_shared_receipt(&receipt, &kit_digest, kit.proof_ceiling)?;
+    Ok((receipt, result))
 }
 
 /// Digest of the admitted operation envelope plus the measured request bound.
