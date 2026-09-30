@@ -568,16 +568,13 @@ impl HostComposition {
             host_terminal.disarm();
             return Ok(false);
         }
-        let drain = match state
+        let Some(drain) = state
             .drain
             .as_ref()
             .filter(|drain| drain.state == DrainState::Cancelled)
-        {
-            Some(drain) => drain,
-            None => {
-                host_terminal.disarm();
-                return Ok(false);
-            }
+        else {
+            host_terminal.disarm();
+            return Ok(false);
         };
         let activation = state.activation.clone().ok_or_else(|| {
             HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
