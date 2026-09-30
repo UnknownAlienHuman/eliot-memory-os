@@ -55,7 +55,7 @@ const ORS_DIMENSIONS: [CapacityBottleneck; 2] = [
 pub fn join_ors_owner_evidence(
     rows: &[BottleneckCapacityProfile],
     config_snapshot_ref: &str,
-    authority_epoch_ref: EpochId,
+    authority_epoch_ref: &EpochId,
 ) -> KernelResult<[BottleneckOwnerEvidence; 2]> {
     if config_snapshot_ref.trim().is_empty() {
         return Err(KernelError::InvalidField {
@@ -75,13 +75,13 @@ pub fn join_ors_owner_evidence(
         CapacityBottleneck::OrsTransactionSlots,
         rows,
         config_snapshot_ref,
-        &authority_epoch_ref,
+        authority_epoch_ref,
     )?;
     let durable = evidence_for(
         CapacityBottleneck::OrsDurableQueueBytes,
         rows,
         config_snapshot_ref,
-        &authority_epoch_ref,
+        authority_epoch_ref,
     )?;
     Ok([transaction, durable])
 }
