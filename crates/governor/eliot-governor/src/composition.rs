@@ -6653,7 +6653,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// construct this claim: the source set must validate against the
     /// admitted privacy profile and the scan receipt must read back through
     /// its installation-bound owner.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the claim validates one complete lease, source set, scanner receipt, and installation contour before constructing its durable key"
+    )]
     pub fn build_cold_start_readiness_claim(
         &self,
         proposed: &OnboardingLease,
@@ -6856,7 +6860,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         &mut self,
         trigger: ColdStartTrigger,
         discovery_lease: &DiscoveryReadLease,
-        proposed: OnboardingLease,
+        proposed: &OnboardingLease,
         candidate: &WorkScopeCandidate,
         sources: &GoverningSourceSet,
         privacy: &PrivacyProfile,
@@ -6874,7 +6878,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 CompositionError::Recovery(format!("cold-start lease join refused: {error:?}"))
             })?;
         let claim = self.build_cold_start_readiness_claim(
-            &proposed,
+            proposed,
             candidate,
             sources,
             privacy,
@@ -6944,13 +6948,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// discovery or onboarding lease). Caller: STITCH.
     #[allow(
         clippy::too_many_arguments,
-        reason = "cold-start compilation joins every frozen receipt field in one owner-checked entry"
+        clippy::too_many_lines,
+        reason = "cold-start compilation joins every frozen receipt field and the durable terminal in one owner-checked entry"
     )]
     pub fn compile_cold_start_at_trigger(
         &mut self,
         trigger: ColdStartTrigger,
         discovery_lease: &DiscoveryReadLease,
-        proposed: OnboardingLease,
+        proposed: &OnboardingLease,
         receipt_ref: &str,
         principal_ref: &str,
         session_ref: &str,
@@ -6990,7 +6995,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 CompositionError::Recovery(format!("cold-start lease join refused: {error:?}"))
             })?;
         let claim = self.build_cold_start_readiness_claim(
-            &proposed,
+            proposed,
             candidate,
             sources,
             privacy,
@@ -7002,7 +7007,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         if !fences_match_exact(&claim.key.state_fence, state_fence) {
             return Err(CompositionError::ActivationStaleFence);
         }
-        let owned = self
+        let retained_claim = self
             .cold_start_readiness_claims
             .get(&claim.binding_digest)
             .cloned()
@@ -7011,9 +7016,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                     "this composition did not win the durable cold-start lease claim".to_owned(),
                 )
             })?;
-        if owned.claim.key != claim.key
-            || owned.claim.binding_digest != claim.binding_digest
-            || owned.claim.lease_ref != claim.lease_ref
+        if retained_claim.claim.key != claim.key
+            || retained_claim.claim.binding_digest != claim.binding_digest
+            || retained_claim.claim.lease_ref != claim.lease_ref
         {
             return Err(CompositionError::ActivationStaleFence);
         }
@@ -7021,7 +7026,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             CompositionError::Recovery("cold-start readiness ORS owner is not bound".to_owned())
         })?;
         let record = owner
-            .load_cold_start_readiness(&owned.record_key)
+            .load_cold_start_readiness(&retained_claim.record_key)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?
             .ok_or_else(|| {
                 CompositionError::Recovery(
@@ -7031,7 +7036,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         record
             .validate()
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        if record.record_key != owned.record_key
+        if record.record_key != retained_claim.record_key
             || record.claim.key != claim.key
             || record.claim.binding_digest != claim.binding_digest
         {
@@ -7162,7 +7167,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
 
     /// Projects the exact durable cold-start terminal named by a full owner
     /// claim. Reads revalidate the stored lease, terminal revision, current
-    /// StateFence, and freshly matched WorkScope before returning a surface.
+    /// `StateFence`, and freshly matched `WorkScope` before returning a surface.
     pub fn cold_start_surface_for_claim(
         &self,
         claim: &ColdStartReadinessClaim,
