@@ -162,14 +162,12 @@ BASELINE_DISPOSITIONS: tuple[str, ...] = (
 # signals (``context_measurement_inventory.py:80-81,1064-1073``), so those two
 # values are the only exact version-identity facts a row can record.
 #
-# The *closed* (expired/retirement-bound) side is carried by the two recorded
-# facts that express "no longer a writable current owner": the row's
-# ``write_scope`` and its producer-derived ``dispatch_blocked``. Both are
-# written on every row (``context_measurement_inventory.py:1445-1475``,
-# ``ROW_KEYS`` closed set at :502-528) and both are validated as mutually
-# consistent by the producer's own read path
-# (``context_measurement_inventory.py:2213-2214``), so reading them is a real
-# recorded-fact comparison and not a presence probe.
+# The *closed* (expired/retirement-bound) side is carried by the row's
+# ``write_scope``: the producer writes it from ``_write_scope_of``
+# (``context_measurement_inventory.py:1395-1400``) on every row (``:1462``,
+# closed set at ``:2219``) as exactly ``writable`` / ``read-only`` / ``none``,
+# so a non-writable row is one that is no longer a writable current owner.
+# Reading it is a real recorded-fact comparison, not a presence probe.
 #
 # An authorised adapter is always ``status == "owned"``: #866's
 # ``_owner_confirmed`` (``context_measurement_inventory.py:1233-1256``) fails
@@ -1547,12 +1545,20 @@ def _derive_baseline_disposition(row: Mapping[str, Any]) -> str:
             consequently classified ``route-identity-bound``. An unbound
             provider/model/tokenizer identity is not an exact adapter.
           * closed -- the row's recorded ``write_scope`` is a closed scope
-            (not ``writable``), or its recorded ``dispatch_blocked`` is true
-            (:data:`BASELINE_LEGACY_ADAPTER_CLOSED_SCOPES`). A row that is
-            still a writable, dispatch-open current owner is not retired.
+            (not ``writable``), i.e. the row is no longer a writable current
+            owner (:data:`BASELINE_LEGACY_ADAPTER_CLOSED_SCOPES`). A row that
+            is still a writable, dispatch-open current owner is not retired.
+            The producer writes ``write_scope`` from ``_write_scope_of``
+            (``context_measurement_inventory.py:1395-1400``), which yields
+            exactly ``writable`` / ``read-only`` / ``none``.
           * authorised -- the ``explicit-unresolved`` arm is ordered first, so
             only a row the producer confirmed against the frozen owner map can
-            reach this disposition.
+            reach this disposition. The producer's ``dispatch_blocked`` field
+            is deliberately NOT used as a second closedness test: it is defined
+            as ``status != "owned"`` (``:1447``) and re-validated against
+            ``status`` on the read path (``:2213-2214``), so for any row
+            reaching this arm it is invariably ``False`` and could only restate
+            the check the first arm already made.
 
     ``canonical-owner-consumer``
         The honest residual: a present, owned, current writable row in the
@@ -1573,10 +1579,7 @@ def _derive_baseline_disposition(row: Mapping[str, Any]) -> str:
     if (
         signal in BASELINE_LEGACY_ADAPTER_IDENTITY_SIGNALS
         and classification == "route-identity-bound"
-        and (
-            str(row["write_scope"]) in BASELINE_LEGACY_ADAPTER_CLOSED_SCOPES
-            or bool(row["dispatch_blocked"])
-        )
+        and str(row["write_scope"]) in BASELINE_LEGACY_ADAPTER_CLOSED_SCOPES
     ):
         return "exact-versioned-legacy-adapter"
     return "canonical-owner-consumer"
