@@ -49,8 +49,13 @@ $dependencyPolicyReceiptPath = Join-Path $repoRoot (
 # shared oracle block (with the standalone verifier in compile-only mode),
 # then metadata, fmt, check, denominator, test-compile (no-run), bounded
 # changed-package clippy with normal warning semantics, standalone compile,
-# and locked Operator restore/build with zero test execution. Quick and Review
-# behavior is unchanged. Each gate runs once per invocation.
+# and locked Operator restore/build with zero test execution. Review's tail
+# additionally carries the manual source/release lane stages that
+# .github/workflows/source-candidate.yml used to run as its own private command
+# list (issue #1914 W4): all-target test execution under the nonzero-execution
+# safeguard, all-target build, and locked Operator restore/build. Quick
+# behavior is unchanged, and MergeCompile keeps zero test execution. Each gate
+# runs once per invocation.
 $allGates = @(
     [pscustomobject]@{ Name = 'documentation-shards-self-test'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $docsShardVerifier self-test } },
     [pscustomobject]@{ Name = 'documentation-shards'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $docsShardVerifier verify --root $repoRoot } },
@@ -69,7 +74,16 @@ $allGates = @(
     [pscustomobject]@{ Name = 'core-daemon-inventory'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $coreDaemonInventoryVerifier --root $repoRoot } },
     [pscustomobject]@{ Name = 'normative-pair'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { pwsh -NoProfile -File (Join-Path $PSScriptRoot 'verify-normative.ps1') } },
     [pscustomobject]@{ Name = 'dependency-policy-self-test'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $dependencyPolicyVerifier --self-test } },
-    [pscustomobject]@{ Name = 'dependency-policy-offline'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $dependencyPolicyVerifier --root $repoRoot --profile offline-source --receipt-out $dependencyPolicyReceiptPath } },
+    # The dependency-policy artifacts are generated here, by the one shared
+    # offline-source owner, into the same `.eliot/dependency-policy-artifacts/`
+    # paths `just dependency-policy-artifacts` and the release builder use. This
+    # is a change in WHERE the artifacts are written, not in WHAT is checked:
+    # every profile that ran this gate before still runs the same verifier with
+    # the same profile and the same receipt path, and the three extra flags only
+    # select the caller-chosen output files the verifier documents. The manual
+    # source/release lane binds those artifacts' bytes by digest, so producing
+    # them here is what lets that workflow stop invoking the verifier itself.
+    [pscustomobject]@{ Name = 'dependency-policy-offline'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $dependencyPolicyVerifier --root $repoRoot --profile offline-source --receipt-out $dependencyPolicyReceiptPath --sbom-out .eliot/dependency-policy-artifacts/sbom.json --license-report-out .eliot/dependency-policy-artifacts/licenses.json --advisory-report-out .eliot/dependency-policy-artifacts/advisories.json } },
     [pscustomobject]@{ Name = 'architecture-boundaries-self-test'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $architectureAudit --self-test } },
     [pscustomobject]@{ Name = 'architecture-boundaries'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $architectureAudit --root $repoRoot } },
     [pscustomobject]@{ Name = 'agent-guardrails-self-test'; Profiles = @('Quick', 'Review', 'MergeCompile'); Command = { python $guardrailVerifier --self-test } },
@@ -379,6 +393,100 @@ $allGates = @(
                 throw 'dotnet build Eliot.Operator.Tests failed'
             }
         }
+    },
+    # Manual source/release lane tail (issue #1914 W4). Before this, the
+    # manual release-candidate workflow (.github/workflows/source-candidate.yml)
+    # carried these stages as its OWN private cargo/dotnet command list, so the
+    # I18.21 line "no CI-only hidden verifier command list" was violated in the
+    # literal sense: a `workflow_dispatch` of that file executed a command set no
+    # versioned profile revision covered and emitted no shared-schema evidence.
+    # The commands below are the SAME commands that workflow executed, moved
+    # here to the one ordered gate-definition owner and reached by that workflow
+    # through a single `-Profile Review` invocation. The workflow no longer names
+    # a verifier command, a stage, or an order; it selects one closed profile
+    # exactly as ci.yml and integration.yml already do, so the run that workflow
+    # reports is a run of the same profile revision a local `verify.ps1 -Profile
+    # Review` reports. Nothing below is a new or weakened check: every command and
+    # every failure condition is the one the workflow already ran on its own
+    # `run:` lines, and it joins the existing Review tail rather than replacing
+    # any Review stage.
+    #
+    # These stages are in `Review` because `Review` IS the repository's
+    # documented manual source/release profile: docs/DEPENDENCY_POLICY.md names
+    # `current-advisories` "a manual source/release workflow profile", and
+    # integration.yml already dispatches `Review` for the other manual source
+    # lane. A separate fourth profile would have been a second name for the same
+    # work, and .github/workflows/repository-policy.yml:399-401 pins the closed
+    # Quick/Review/MergeCompile profile set in this file, so a new name there is
+    # not available without editing a checker this issue does not own.
+    [pscustomobject]@{
+        Name = 'cargo-test-workspace-all-targets'
+        Profiles = @('Review')
+        Command = {
+            # The manual release lane compiles and runs every target, not only
+            # the default lib/bin/test targets `cargo-test-workspace` covers, and
+            # it refuses a run in which no test was listed or none executed. The
+            # all-targets test run and the nonzero-execution safeguard are the
+            # exact commands and the exact refusal the release workflow ran on
+            # its own `run:` lines; `cargo-test-workspace` above is unchanged, so
+            # this adds coverage rather than replacing it.
+            $testListOutput = @(& cargo test --workspace --all-targets --locked -- --list 2>&1)
+            if ($LASTEXITCODE -ne 0) {
+                throw "TEST_LIST_FAILURE: cargo test -- --list exited $LASTEXITCODE"
+            }
+
+            $testOutput = @(& cargo test --workspace --all-targets --locked 2>&1)
+            if ($LASTEXITCODE -ne 0) {
+                throw "TEST_EXECUTION_FAILURE: cargo test exited $LASTEXITCODE"
+            }
+
+            $listedTests = @(
+                $testListOutput |
+                    ForEach-Object { "$_" } |
+                    Where-Object { $_ -match '^\s*.+:\s+test\s*$' }
+            ).Count
+            $executedTests = 0
+            foreach ($line in $testOutput) {
+                $text = "$line"
+                if ($text -match 'test result: .*?(\d+) passed;\s+(\d+) failed;\s+(\d+) ignored;\s+(\d+) measured;') {
+                    $executedTests += [int]$Matches[1] + [int]$Matches[2]
+                }
+            }
+
+            Write-Host "TEST_EVIDENCE: listed=$listedTests executed=$executedTests"
+            if ($listedTests -eq 0 -or $executedTests -eq 0) {
+                throw "TEST_CONTRACT_FAILURE: expected nonzero listed and executed tests"
+            }
+        }
+    },
+    [pscustomobject]@{
+        Name = 'cargo-build-workspace-all-targets'
+        Profiles = @('Review')
+        Command = { cargo build --workspace --all-targets --locked }
+    },
+    [pscustomobject]@{
+        Name = 'dotnet-restore-operator-release'
+        Profiles = @('Review')
+        Command = {
+            dotnet restore apps/Eliot.Operator/Eliot.Operator.csproj --locked-mode
+            if ($LASTEXITCODE -ne 0) {
+                throw 'dotnet restore Eliot.Operator failed'
+            }
+            dotnet restore tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj --locked-mode
+            if ($LASTEXITCODE -ne 0) {
+                throw 'dotnet restore Eliot.Operator.Tests failed'
+            }
+        }
+    },
+    [pscustomobject]@{
+        Name = 'dotnet-build-operator-release'
+        Profiles = @('Review')
+        Command = {
+            dotnet build apps/Eliot.Operator/Eliot.Operator.csproj -c Release --no-restore
+            if ($LASTEXITCODE -ne 0) {
+                throw 'dotnet build Eliot.Operator failed'
+            }
+        }
     }
 )
 
@@ -439,7 +547,7 @@ if ($selectedGates.Count -eq 0) {
 # refused. That is the difference between a governed entrypoint and a gate that
 # only consults a resolver somebody remembered to install.
 #
-# The three PowerShell profiles map onto the admitted verification route:
+# The PowerShell profiles map onto the admitted verification route:
 # Quick and Review are package-scoped source verification, MergeCompile is
 # package-scoped compile-only verification. The mapping is declared here, once,
 # as data — not as a command list — and the resolver refuses any alias outside
@@ -454,6 +562,45 @@ if ([string]::IsNullOrWhiteSpace($verificationRouteAlias)) {
     [Console]::Error.WriteLine("VERIFY_PROFILE_ADMISSION_REFUSED: PowerShell profile '$Profile' names no admitted verification route alias.")
     exit 1
 }
+
+# Declared CI-only environment dependencies (I18.21:10, "CI-specific
+# environment differences are explicit profile dependencies"). Every
+# environment difference this profile's stage set has over the same profile run
+# elsewhere is named here, once, and handed to the shared resolver so the run's
+# `VerificationProfileReceipt` records it as a declared dependency instead of
+# leaving it implicit. The list is deliberately NOT derived from the same table
+# it validates: a dependency a run invents from its own gate list would always
+# agree with itself, and a CI-only difference it forgot to invent would then be
+# invisible. This list is the independent record of what a hosted lane needs
+# that a developer's machine does not.
+#
+# `Review` is the only profile that declares any. It is the repository's manual
+# source/release profile, so it is the profile both manual hosted lanes reach
+# (integration.yml and source-candidate.yml), and its Operator stages need a
+# .NET SDK that no other profile's stage set touches. The other two profiles
+# declare none today because they have no CI-only environment difference left;
+# an empty list is the honest record, and the receipt still reports it as such.
+$declaredProfileEnvironmentDependencies = @{
+    'Quick'        = @()
+    'Review'       = @(
+        # The Operator gates (locked restore and Release build) need a .NET SDK
+        # that this profile's admitted route has no stage for, so the
+        # toolchain's presence is a declared environment dependency of the run
+        # rather than an ambient fact. It is named, not probed: the resolver
+        # records the dependency and its admitted class, and a run whose
+        # attested class differs fails closed in
+        # check_declared_environment_dependencies.
+        'eliot-manual-source-lane-dotnet-sdk'
+        # Both manual hosted lanes run on a shared GitHub-hosted runner, which
+        # establishes no filesystem, network or ACL boundary. That runner class
+        # is a CI-only environment difference and is declared as one, so the
+        # receipt shows the run's proof ceiling was reached on a shared host
+        # rather than leaving the reader to infer it.
+        'eliot-manual-source-lane-github-hosted-runner'
+    )
+    'MergeCompile' = @()
+}
+$profileDeclaredEnvironmentDependencies = @($declaredProfileEnvironmentDependencies[$Profile])
 $profileResolver = 'eliot-profile-resolver'
 $profileResolverSource = 'crates/instrument/eliot-instrument-runner/src/bin/eliot-profile-resolver.rs'
 $profileResolverPackage = 'eliot-instrument-runner'
@@ -520,9 +667,20 @@ try {
         '--source-root', $repoRoot,
         '--target-root', $resolverTargetRoot,
         '--cache-root', $resolverCacheRoot,
-        '--declared-environment', "eliot-verify-profile-$Profile",
-        '--receipt-out', $profileReceiptPath
+        '--declared-environment', "eliot-verify-profile-$Profile"
     )
+    # Every declared CI-only environment dependency this profile has travels into
+    # the same receipt, as its own `--declared-environment` pair. The resolver
+    # validates each one against the admitted environment class in
+    # check_declared_environment_dependencies and refuses the receipt on a
+    # mismatch, so declaring a difference is a claim CI's receipt carries and
+    # not a comment beside it. A dependency this run did not declare is
+    # invisible to the receipt; that is why the list above is the independent
+    # record rather than something derived from the gate table.
+    foreach ($declaredEnvironmentDependency in $profileDeclaredEnvironmentDependencies) {
+        $resolverArgs += @('--declared-environment', $declaredEnvironmentDependency)
+    }
+    $resolverArgs += @('--receipt-out', $profileReceiptPath)
     $resolverOutput = @(& $resolverExecutable @resolverArgs 2>&1)
     $resolverExit = $LASTEXITCODE
     foreach ($resolverLine in $resolverOutput) { Write-Host "VERIFY_PROFILE_RESOLVER: $resolverLine" }
@@ -801,7 +959,7 @@ if ($Profile -eq 'Quick') {
 } elseif ($Profile -eq 'MergeCompile') {
     $proofCeiling = 'MERGE_COMPILE_SOURCE_ONLY: locked compile-only merge check on this candidate only. Zero test execution, no lint-cleanliness claim. Not Review, not release/source-candidate, not installed-runtime/store/Product-Pulse proof.'
 } else {
-    $proofCeiling = 'REVIEW_SOURCE_ONLY: complete locked Review on this candidate only. Not release/source-candidate, not installed-runtime/store/Product-Pulse proof.'
+    $proofCeiling = 'REVIEW_SOURCE_ONLY: complete locked Review on this candidate only, including the manual source/release lane stages. No installed-runtime/store/Product-Pulse proof, and no filesystem, network or ACL isolation is claimed on a shared hosted runner.'
 }
 
 # Bounded, redacted summary: identities, gate states, ceilings. No command
@@ -817,12 +975,13 @@ $summaryLines = @(
     "VERIFY_PROFILE_RESOLVER: $profileResolver built at $resolverExecutable and invoked with alias $verificationRouteAlias (exit $resolverExit); the shared receipt, not a PATH lookup, is the admission evidence",
     "VERIFY_PROFILE_RECEIPT_CLEANUP: $profileReceiptCleanupState",
     "VERIFY_PROFILE_REVISION: $($profileReceipt.profile)@$($profileReceipt.profile_revision) schema=$($profileReceipt.schema.schema)@$($profileReceipt.schema.version) profile_digest=$($profileReceipt.profile_digest) dag_digest=$($profileReceipt.dag_digest) outcome=$($profileReceipt.outcome)",
-    "VERIFY_PROFILE_RECEIPT: shared owner crates/instrument/eliot-instrument-runner/src/bin/eliot-profile-resolver.rs issued this run's VerificationProfileReceipt through resolve_verification_route/build_verification_profile_receipt; this script performs the minimal bootstrap build (I18.21:14) and then invokes it, and ci.yml enters this same script, so the revision resolved here is the revision CI resolves",
+    "VERIFY_PROFILE_RECEIPT: shared owner crates/instrument/eliot-instrument-runner/src/bin/eliot-profile-resolver.rs issued this run's VerificationProfileReceipt through resolve_verification_route/build_verification_profile_receipt; this script performs the minimal bootstrap build (I18.21:14) and then invokes it, and ci.yml, integration.yml and source-candidate.yml all enter this same script, so the revision resolved here is the revision every CI lane resolves",
+    "VERIFY_PROFILE_DECLARED_ENVIRONMENT: $((@($profileDeclaredEnvironmentDependencies) | ForEach-Object { "$_" }) -join ', ') declared by profile $Profile and carried in the receipt above as $(if ($profileDeclaredEnvironmentDependencies.Count -gt 0) { 'declared dependencies' } else { 'no declared dependencies' })",
     "VERIFY_PROFILE_ENVIRONMENT: $((@($profileReceipt.environment_dependencies) | ForEach-Object { "$($_.name)=$($_.expected_class)/$($_.observed_class)" }) -join ', ')",
     "VERIFY_PROFILE_PROOF_CEILING: $($profileReceipt.proof_ceiling)",
     "VERIFY_PROOF_CEILING: $proofCeiling",
     'VERIFY_DINT_CEILING: ignored/stateful/live-provider tests are outside the normal Quick/Review/MergeCompile profiles (D-INT family issues 905/907/909/911/913/915); this result covers none of them',
-    'VERIFY_QUARANTINE: the individual cargo/dotnet gates (cargo-fmt/cargo-check-workspace/cargo-clippy-workspace/cargo-test-workspace/cargo-denominator/cargo-test-compile/cargo-clippy-changed/standalone-crates-compile/dotnet-restore-operator/dotnet-build-operator) still execute the quarantined legacy lane with no PER-GATE receipt (issue #1813 W6); what is now governed is the profile ADMISSION above, not each gate in this table'
+    'VERIFY_QUARANTINE: the individual cargo/dotnet gates (cargo-fmt/cargo-check-workspace/cargo-clippy-workspace/cargo-test-workspace/cargo-denominator/cargo-test-compile/cargo-clippy-changed/standalone-crates-compile/dotnet-restore-operator/dotnet-build-operator/cargo-test-workspace-all-targets/cargo-build-workspace-all-targets/dotnet-restore-operator-release/dotnet-build-operator-release) still execute the quarantined legacy lane with no PER-GATE receipt (issue #1813 W6); what is now governed is the profile ADMISSION above, not each gate in this table'
 )
 if ($harnessState -ne 'pass') {
     $summaryLines += "VERIFY_HARNESS: $harnessState $harnessError"
