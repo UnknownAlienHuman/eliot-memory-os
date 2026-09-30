@@ -1564,7 +1564,7 @@ impl ObservedClosure {
     /// composes: `lineage_ref()` is the record's own accessor for the durable
     /// delta artifact and the canonical digest of exactly those bytes
     /// (`StoredLearningDelta::lineage_ref`,
-    /// `crates/smart/eliot-learning-delta/src/stored.rs:327`). The artifact
+    /// `crates/smart/eliot-learning-delta/src/stored.rs:355`). The artifact
     /// handle is namespaced so it cannot collide with a maintenance ref, and
     /// the digest is prefixed for the same reason and because the bare digest is
     /// not a resolvable handle on its own.

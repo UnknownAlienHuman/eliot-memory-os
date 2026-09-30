@@ -29,14 +29,40 @@ use crate::{LearningDeltaError, RetryReason};
 /// marker is admitted by the same non-empty, duplicate-free check every other
 /// retained reference is.
 ///
-/// The marker is minted by the owner that can compare the two independent
-/// records the claim needs (the durable terminal job row and the canonical
-/// verifier-execution fact); this crate only owns the vocabulary, so no caller
-/// can spell a marker whose content was never compared against the run it
-/// names. [`StoredLearningDelta::repeated_verifier_failure_verifier`] is the only
+/// The marker is minted through [`repeated_verifier_failure_ref`], beside the
+/// reader [`StoredLearningDelta::repeated_verifier_failure_verifier`], so the
+/// reader and the constructor of this vocabulary live in the crate that owns the
+/// record it annotates. A caller that composes the handle itself out of this
+/// prefix is spelling a marker outside the vocabulary's own boundary, which is
+/// why the constructor — not the prefix — is the supported entry point.
+/// [`StoredLearningDelta::repeated_verifier_failure_verifier`] is the only
 /// reader, and it returns the verifier identity as the whole remainder rather
 /// than splitting it, because a contract identity may itself contain the `:`.
 pub const REPEATED_VERIFIER_FAILURE_REF_PREFIX: &str = "repeated-verifier-failure:";
+
+/// Builds the retained handle for one proven repeated verifier failure.
+///
+/// The counterpart to [`StoredLearningDelta::repeated_verifier_failure_verifier`]:
+/// this is how a marker is created, that is how it is read, and both live here
+/// so no external crate has to compose the vocabulary out of the raw prefix.
+///
+/// `verifier` is the verifier identity the compared records agreed on. It must
+/// be non-blank, so a marker can never be reduced to the bare prefix — a bare
+/// prefix would still satisfy a prefix-presence test while naming no verifier at
+/// all, and would therefore be a marker that proves nothing.
+pub fn repeated_verifier_failure_ref(verifier: &str) -> Result<ArtifactId, LearningDeltaError> {
+    if verifier.trim().is_empty() {
+        return Err(LearningDeltaError::InvalidInput {
+            field: "repeated_verifier_failure.verifier",
+        });
+    }
+    ArtifactId::new(format!(
+        "{REPEATED_VERIFIER_FAILURE_REF_PREFIX}{verifier}"
+    ))
+    .map_err(|_| LearningDeltaError::InvalidInput {
+        field: "repeated_verifier_failure.verifier",
+    })
+}
 
 /// Durable disposition vocabulary for a stored learning delta.
 ///
