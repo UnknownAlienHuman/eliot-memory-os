@@ -77,11 +77,11 @@ use eliot_store_api::{StoreError, SwarmOwnerRevision, WriteReceipt, WriteReceipt
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::semantic_revision_store::SemanticRevisionStore;
 use crate::staffing_policy::{
     PolicyAuthorizedDegradation, StaffingPlanReceipt, check_attempt_route_continuity,
     enforce_plan_receipt, plan_coordinator_staffing, verify_receipt_digest,
 };
-use crate::semantic_revision_store::SemanticRevisionStore;
 
 /// Crate that owns the coordinated execution projection.
 pub const COORDINATOR_CRATE: &str = "eliot-agent-coordinator";
@@ -3678,7 +3678,7 @@ impl AgentFabric {
         snapshot: FabricSnapshot,
         config: CoordinatorConfig,
         ports: FabricPorts,
-        semantic_revisions: Option<SemanticRevisionStore>,
+        semantic_revisions: Option<&SemanticRevisionStore>,
     ) -> Result<Self, FabricError> {
         if snapshot.coordinator_snapshot.config != config {
             return Err(FabricError::IdentityConflict(
@@ -3743,7 +3743,7 @@ impl AgentFabric {
             // #1702 W2: a restored fabric re-attaches the same durable
             // carrier, so a revision published after restore is committed
             // before it is reported current exactly as it was before.
-            semantic_revisions: semantic_revisions.clone(),
+            semantic_revisions: semantic_revisions.cloned(),
             initialized: true,
         };
         fabric.record("fabric_restored", "fabric");
@@ -3768,7 +3768,7 @@ impl AgentFabric {
         snapshot: FabricSnapshot,
         config: CoordinatorConfig,
         ports: FabricPorts,
-        semantic_revisions: Option<SemanticRevisionStore>,
+        semantic_revisions: Option<&SemanticRevisionStore>,
         capability: AdmittedProviderCapability,
     ) -> Result<Self, FabricError> {
         if snapshot.coordinator_snapshot.config != config {
@@ -3826,7 +3826,7 @@ impl AgentFabric {
             // #1702 W2: same durable carrier as the plan-only restore, so a
             // revision published after a verified restore is committed before
             // it is reported current.
-            semantic_revisions: semantic_revisions.clone(),
+            semantic_revisions: semantic_revisions.cloned(),
             initialized: true,
         };
         fabric.record("fabric_restored_verified", "fabric");

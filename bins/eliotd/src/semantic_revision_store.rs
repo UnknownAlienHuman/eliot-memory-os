@@ -23,8 +23,8 @@
 //!
 //! The design sentence that decided the work (I10.15,
 //! `docs/architecture/I10-15-agent-execution-fabric-and-durable-swarm.md`:
-//! "The SurrealDB DEFAULT uses separate definition, admission and execution
-//! records with separate owner revisions/Ordering Scopes... A derived
+//! "The `SurrealDB` `DEFAULT` uses separate definition, admission and execution
+//! records with separate owner revisions/`Ordering Scopes`... A derived
 //! `SwarmPlanView` may join them for reads, but is not a mutable owner."):
 //! the three revisions are separate durable records under separate owner
 //! revisions, and the joined view is a read projection only.
@@ -67,24 +67,24 @@ pub const SEMANTIC_REVISION_WIRE_VERSION: u32 = 1;
 /// current" one step rather than two.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SemanticRevisionEnvelope {
+pub struct SemanticRevisionEnvelope {
     /// Definition revisions by definition identity.
-    semantic_definitions: BTreeMap<String, SwarmPlanDefinition>,
+    definitions: BTreeMap<String, SwarmPlanDefinition>,
     /// Governor admission revisions by admission identity.
-    semantic_admissions: BTreeMap<String, SwarmPlanAdmission>,
+    admissions: BTreeMap<String, SwarmPlanAdmission>,
     /// Coordinator execution revisions by execution identity.
-    semantic_executions: BTreeMap<String, SwarmExecutionRevision>,
+    executions: BTreeMap<String, SwarmExecutionRevision>,
     /// Supersession links by replacement definition identity.
-    semantic_supersessions: BTreeMap<String, SupersessionLink>,
+    supersessions: BTreeMap<String, SupersessionLink>,
 }
 
 impl SemanticRevisionEnvelope {
     fn from_snapshot(snapshot: &FabricSnapshot) -> Self {
         Self {
-            semantic_definitions: snapshot.semantic_definitions.clone(),
-            semantic_admissions: snapshot.semantic_admissions.clone(),
-            semantic_executions: snapshot.semantic_executions.clone(),
-            semantic_supersessions: snapshot.semantic_supersessions.clone(),
+            definitions: snapshot.semantic_definitions.clone(),
+            admissions: snapshot.semantic_admissions.clone(),
+            executions: snapshot.semantic_executions.clone(),
+            supersessions: snapshot.semantic_supersessions.clone(),
         }
     }
 }
@@ -120,7 +120,9 @@ impl SemanticRevisionStore {
     #[must_use]
     pub fn new(state_root: &Path) -> Self {
         Self {
-            path: state_root.join(SEMANTIC_REVISION_DIR).join("owner-revisions.json"),
+            path: state_root
+                .join(SEMANTIC_REVISION_DIR)
+                .join("owner-revisions.json"),
         }
     }
 
@@ -170,14 +172,13 @@ impl SemanticRevisionStore {
                 "owner-separated revision envelope exceeds the bounded file size".to_owned(),
             ));
         }
-        let lease = eliot_platform_windows::ProtectedRuntimePathLease::open_or_create_absolute(
-            &self.path,
-        )
-        .map_err(|error| {
-            FabricError::DurabilityUnproven(format!(
-                "owner-separated revision lease: {error}"
-            ))
-        })?;
+        let lease =
+            eliot_platform_windows::ProtectedRuntimePathLease::open_or_create_absolute(&self.path)
+                .map_err(|error| {
+                    FabricError::DurabilityUnproven(format!(
+                        "owner-separated revision lease: {error}"
+                    ))
+                })?;
         // A directory or lease you reuse must be owned by this operation. The
         // lease is the only thing that guarantees the file at `self.path` is
         // the one just written, so a foreign object at that path is refused
@@ -190,19 +191,15 @@ impl SemanticRevisionStore {
         // Content compare on readback: the write is verified before the commit
         // is reported, so a torn write fails closed instead of persisting.
         std::fs::write(&self.path, &bytes).map_err(|error| {
-            FabricError::DurabilityUnproven(format!(
-                "owner-separated revision write: {error}"
-            ))
+            FabricError::DurabilityUnproven(format!("owner-separated revision write: {error}"))
         })?;
         let back = std::fs::read(&self.path).map_err(|error| {
-            FabricError::DurabilityUnproven(format!(
-                "owner-separated revision readback: {error}"
-            ))
+            FabricError::DurabilityUnproven(format!("owner-separated revision readback: {error}"))
         })?;
         if back != bytes {
             return Err(FabricError::DurabilityUnproven(
                 "owner-separated revision readback mismatch after write".to_owned(),
-            ))
+            ));
         }
         Ok(())
     }
@@ -222,14 +219,11 @@ impl SemanticRevisionStore {
     /// the wire version does not match, the recorded digest does not match its
     /// payload, or the bounded read fails.
     pub fn load(&self) -> Result<SemanticRevisionEnvelope, FabricError> {
-        let lease = eliot_platform_windows::ProtectedRuntimePathLease::open_existing_absolute(
-            &self.path,
-        )
-        .map_err(|error| {
-            FabricError::DurabilityUnproven(format!(
-                "owner-separated revision lease: {error}"
-            ))
-        })?;
+        let lease =
+            eliot_platform_windows::ProtectedRuntimePathLease::open_existing_absolute(&self.path)
+                .map_err(|error| {
+                FabricError::DurabilityUnproven(format!("owner-separated revision lease: {error}"))
+            })?;
         if lease.path() != self.path {
             return Err(FabricError::DurabilityUnproven(
                 "owner-separated revision path identity changed under the lease".to_owned(),
@@ -238,14 +232,10 @@ impl SemanticRevisionStore {
         let bytes = lease
             .read_bounded(SEMANTIC_REVISION_MAX_BYTES)
             .map_err(|error| {
-                FabricError::DurabilityUnproven(format!(
-                    "owner-separated revision read: {error}"
-                ))
+                FabricError::DurabilityUnproven(format!("owner-separated revision read: {error}"))
             })?;
         let file: SemanticRevisionFile = serde_json::from_slice(&bytes).map_err(|error| {
-            FabricError::DurabilityUnproven(format!(
-                "owner-separated revision decode: {error}"
-            ))
+            FabricError::DurabilityUnproven(format!("owner-separated revision decode: {error}"))
         })?;
         if file.wire_version != SEMANTIC_REVISION_WIRE_VERSION {
             return Err(FabricError::DurabilityUnproven(
@@ -268,9 +258,7 @@ impl SemanticRevisionFile {
     /// recompute the digest that was recorded at write time; the result is
     /// *compared* against the stored digest and never used to replace it.
     fn payload_bytes_digest(&self) -> String {
-        serde_json::to_vec(&self.payload).map_or_else(
-            |_| String::from("unencodable"),
-            |bytes| sha256_hex(&bytes),
-        )
+        serde_json::to_vec(&self.payload)
+            .map_or_else(|_| String::from("unencodable"), |bytes| sha256_hex(&bytes))
     }
 }
