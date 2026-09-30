@@ -325,9 +325,13 @@ struct PhaseBPreviousProjectionFile {
     bytes: Vec<u8>,
     digest: PlatformHandle,
     is_current: bool,
-    is_template: bool,
-    is_durable: bool,
-    is_prepared: bool,
+}
+
+#[cfg(windows)]
+impl PhaseBPreviousProjectionFile {
+    fn is_template(&self, template_digest: &PlatformHandle) -> bool {
+        &self.digest == template_digest
+    }
 }
 
 #[cfg(windows)]
@@ -354,7 +358,7 @@ pub(super) struct PhaseBPreviousStoreBootstrapInput<'a> {
 
 #[cfg(windows)]
 fn phase_b_previous_projection_file(
-    input: PhaseBPreviousProjectionFileInput<'_>,
+    input: &PhaseBPreviousProjectionFileInput<'_>,
 ) -> Result<Option<PhaseBPreviousProjectionFile>, HostError> {
     if let Err(error) = std::fs::symlink_metadata(input.path) {
         if error.kind() == std::io::ErrorKind::NotFound
@@ -376,20 +380,17 @@ fn phase_b_previous_projection_file(
         .map_err(|error| HostError::Platform(error.to_string()))?;
     let observation = PhaseBPreviousProjectionFile {
         is_current: bytes == input.desired,
-        is_template: &digest == input.template_digest,
-        is_durable: input
-            .durable_digest
-            .is_some_and(|expected| &digest == expected),
-        is_prepared: input
-            .prepared_digest
-            .is_some_and(|expected| &digest == expected),
         bytes,
         digest,
     };
     if !observation.is_current
-        && !observation.is_template
-        && !observation.is_durable
-        && !observation.is_prepared
+        && !observation.is_template(input.template_digest)
+        && !input
+            .durable_digest
+            .is_some_and(|expected| observation.digest == *expected)
+        && !input
+            .prepared_digest
+            .is_some_and(|expected| observation.digest == *expected)
     {
         phase_b_previous_projection_observe("host.phase-b prior-projection mismatch retained");
         return Err(HostError::RecoveryRequired(format!(
@@ -408,7 +409,8 @@ fn phase_b_previous_projection_digest_binding(
     prepared: Option<&HostPhaseBPreparedMaterialization>,
 ) -> Option<PhaseBPreviousProjectionDigestBinding> {
     if let Some(durable) = durable
-        && (config.is_durable || bootstrap.is_durable)
+        && (config.digest == durable.config_file_digest
+            || bootstrap.digest == durable.store_bootstrap_descriptor_digest)
     {
         return Some(PhaseBPreviousProjectionDigestBinding {
             config_file_digest: durable.config_file_digest.clone(),
@@ -417,7 +419,8 @@ fn phase_b_previous_projection_digest_binding(
         });
     }
     if let Some(prepared) = prepared
-        && (config.is_prepared || bootstrap.is_prepared)
+        && (config.digest == prepared.config_file_digest
+            || bootstrap.digest == prepared.store_bootstrap_descriptor_digest)
     {
         return Some(PhaseBPreviousProjectionDigestBinding {
             config_file_digest: prepared.config_file_digest.clone(),
@@ -497,12 +500,23 @@ fn phase_b_previous_peer_identity(
 
 #[cfg(windows)]
 pub(super) fn phase_b_previous_store_bootstrap(
-    input: PhaseBPreviousStoreBootstrapInput<'_>,
+    input: &PhaseBPreviousStoreBootstrapInput<'_>,
 ) -> Result<Option<PhaseBPreviousStoreBootstrap>, HostError> {
     phase_b_previous_projection_observe("host.phase-b prior-projection requested");
+    let config = phase_b_previous_store_config_file(input)?;
+    let Some(bootstrap) = phase_b_previous_store_bootstrap_file(input)? else {
+        return phase_b_previous_store_bootstrap_without_file(input, &config);
+    };
+    phase_b_previous_store_bootstrap_from_files(input, &config, &bootstrap)
+}
+
+#[cfg(windows)]
+fn phase_b_previous_store_config_file(
+    input: &PhaseBPreviousStoreBootstrapInput<'_>,
+) -> Result<PhaseBPreviousProjectionFile, HostError> {
     let durable_config = input.durable.map(|binding| &binding.config_file_digest);
     let prepared_config = input.prepared.map(|binding| &binding.config_file_digest);
-    let config = phase_b_previous_projection_file(PhaseBPreviousProjectionFileInput {
+    phase_b_previous_projection_file(&PhaseBPreviousProjectionFileInput {
         profile: input.profile,
         portable_root: input.portable_root,
         path: input.config_path,
@@ -513,14 +527,20 @@ pub(super) fn phase_b_previous_store_bootstrap(
         allow_missing: false,
         label: "config",
     })?
-    .ok_or_else(|| HostError::RecoveryRequired("prior Store config is missing".to_owned()))?;
+    .ok_or_else(|| HostError::RecoveryRequired("prior Store config is missing".to_owned()))
+}
+
+#[cfg(windows)]
+fn phase_b_previous_store_bootstrap_file(
+    input: &PhaseBPreviousStoreBootstrapInput<'_>,
+) -> Result<Option<PhaseBPreviousProjectionFile>, HostError> {
     let durable_bootstrap = input
         .durable
         .map(|binding| &binding.store_bootstrap_descriptor_digest);
     let prepared_bootstrap = input
         .prepared
         .map(|binding| &binding.store_bootstrap_descriptor_digest);
-    let Some(bootstrap) = phase_b_previous_projection_file(PhaseBPreviousProjectionFileInput {
+    phase_b_previous_projection_file(&PhaseBPreviousProjectionFileInput {
         profile: input.profile,
         portable_root: input.portable_root,
         path: input.bootstrap_path,
@@ -530,38 +550,49 @@ pub(super) fn phase_b_previous_store_bootstrap(
         prepared_digest: prepared_bootstrap,
         allow_missing: true,
         label: "bootstrap",
-    })?
-    else {
-        if let Some(prepared) = input.prepared
-            && !config.is_current
-            && !config.is_template
+    })
+}
+
+#[cfg(windows)]
+fn phase_b_previous_store_bootstrap_without_file(
+    input: &PhaseBPreviousStoreBootstrapInput<'_>,
+    config: &PhaseBPreviousProjectionFile,
+) -> Result<Option<PhaseBPreviousStoreBootstrap>, HostError> {
+    let Some(prepared) = input.prepared.filter(|prepared| {
+        !config.is_current
+            && !config.is_template(input.config_template_digest)
             && config.digest == prepared.config_file_digest
-        {
-            if input.previous.is_none() {
-                return Err(HostError::RecoveryRequired(
-                    "prepared prior Store config has no exact previous Host binding".to_owned(),
-                ));
-            }
-            let binding = PhaseBPreviousProjectionDigestBinding {
-                config_file_digest: prepared.config_file_digest.clone(),
-                store_bootstrap_descriptor_digest: prepared
-                    .store_bootstrap_descriptor_digest
-                    .clone(),
-                semantic_config_hash: prepared.semantic_config_hash.clone(),
-            };
-            let (expected_peer_sid, expected_peer_session_id) =
-                phase_b_previous_peer_identity(&config, &binding, None)?;
-            return Ok(Some(PhaseBPreviousStoreBootstrap {
-                digest: None,
-                requirement: None,
-                expected_peer_sid,
-                expected_peer_session_id,
-                config_file_digest: binding.config_file_digest,
-                semantic_config_hash: binding.semantic_config_hash,
-            }));
-        }
+    }) else {
         return Ok(None);
     };
+    if input.previous.is_none() {
+        return Err(HostError::RecoveryRequired(
+            "prepared prior Store config has no exact previous Host binding".to_owned(),
+        ));
+    }
+    let binding = PhaseBPreviousProjectionDigestBinding {
+        config_file_digest: prepared.config_file_digest.clone(),
+        store_bootstrap_descriptor_digest: prepared.store_bootstrap_descriptor_digest.clone(),
+        semantic_config_hash: prepared.semantic_config_hash.clone(),
+    };
+    let (expected_peer_sid, expected_peer_session_id) =
+        phase_b_previous_peer_identity(config, &binding, None)?;
+    Ok(Some(PhaseBPreviousStoreBootstrap {
+        digest: None,
+        requirement: None,
+        expected_peer_sid,
+        expected_peer_session_id,
+        config_file_digest: binding.config_file_digest,
+        semantic_config_hash: binding.semantic_config_hash,
+    }))
+}
+
+#[cfg(windows)]
+fn phase_b_previous_store_bootstrap_from_files(
+    input: &PhaseBPreviousStoreBootstrapInput<'_>,
+    config: &PhaseBPreviousProjectionFile,
+    bootstrap: &PhaseBPreviousProjectionFile,
+) -> Result<Option<PhaseBPreviousStoreBootstrap>, HostError> {
     if config.is_current && bootstrap.is_current {
         return Ok(None);
     }
@@ -573,9 +604,11 @@ pub(super) fn phase_b_previous_store_bootstrap(
     ) else {
         return Ok(None);
     };
-    if !config.is_current && !config.is_template && config.digest != binding.config_file_digest
+    if !config.is_current
+        && !config.is_template(input.config_template_digest)
+        && config.digest != binding.config_file_digest
         || !bootstrap.is_current
-            && !bootstrap.is_template
+            && !bootstrap.is_template(input.bootstrap_template_digest)
             && bootstrap.digest != binding.store_bootstrap_descriptor_digest
     {
         phase_b_previous_projection_observe("host.phase-b prior-projection mismatch retained");

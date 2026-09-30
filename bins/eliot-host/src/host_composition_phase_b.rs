@@ -870,7 +870,7 @@ impl HostComposition {
             };
         let previous_store_bootstrap =
             super::phase_b_previous_projection::phase_b_previous_store_bootstrap(
-                super::phase_b_previous_projection::PhaseBPreviousStoreBootstrapInput {
+                &super::phase_b_previous_projection::PhaseBPreviousStoreBootstrapInput {
                     profile,
                     portable_root: user_owned_launch_root.as_ref(),
                     config_path: &config_path,
