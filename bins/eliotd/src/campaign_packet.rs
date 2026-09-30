@@ -1276,15 +1276,27 @@ async fn resolve_compile_and_bind_result(
     // revision, State Fence and Decision Safety Floor check the audit names; the
     // decision it would feed is separately absent and is reported as absent
     // rather than fabricated.
-    if check_campaign_view_for_admission(
+    //
+    // #1862: the admission owner's typed refusal crosses this boundary intact.
+    // It used to be discarded by `.is_err()`, which flattened five distinct
+    // admission-cell refusals — a moved State Fence, a cross-compilation task or
+    // scope, a `STALE`/`BLOCKED`/invalidated view, a missing or non-current
+    // Context recipe row, and a recipe content-digest mismatch — into one
+    // undifferentiated "the admission cell said no". The wire gap code below
+    // stays the coarse classification a consumer branches on; the owner's exact
+    // typed variant goes to the log, which is what makes the five
+    // distinguishable again without changing the response shape.
+    if let Err(refusal) = check_campaign_view_for_admission(
         &context_recipe_body.recipe.binding,
         &publication.view,
         &context_recipe_digest,
         &admission_floor,
         &context_recipe_body.recipe,
-    )
-    .is_err()
-    {
+    ) {
+        tracing::warn!(
+            reason = %refusal,
+            "current admission cell refused the campaign learning-state view"
+        );
         return campaign_packet_result_body(
             envelope,
             attempt,
