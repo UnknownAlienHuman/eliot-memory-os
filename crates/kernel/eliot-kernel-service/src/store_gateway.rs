@@ -5825,8 +5825,37 @@ impl KernelStoreGateway {
     }
 
     /// Completes the `RunNow` handoff: exact committed/replayed invocation
-    /// readback, current owner projection, and the owner readback of the wake
-    /// for that exact occurrence over the authenticated runtime channel.
+    /// readback, the current owner projection, the complete preflight
+    /// projection assembled from those owners, and the Durable Job execution
+    /// joined over the authenticated runtime channel.
+    /// Proves the committed `run-now` wake intent against the committed
+    /// occurrence and State Fence.
+    ///
+    /// A `run-now` occurrence is admitted by an explicit manual nonce and is
+    /// deliberately not a member of the revision's published wake horizon, so
+    /// the Host wake journal provably retains no record for it (I11.12 makes the
+    /// Task Scheduler wake Host only from the admitted *scheduled* intent). The
+    /// binding the wake owner would have read back is therefore proved here
+    /// against the committed occurrence itself, from the intent the canonical
+    /// Store minted with this same mutation — the same two facts, no default
+    /// and no second scheme.
+    fn prove_committed_run_now_wake_intent(
+        wake_intent: &eliot_runtime_contracts::WakeIntent,
+        occurrence_id: &str,
+        sealed: &UserAutomationServiceRequest,
+    ) -> Result<(), String> {
+        if wake_intent.wake_id != occurrence_id
+            || wake_intent.state_fence != sealed.context.state_fence
+        {
+            return Err(
+                "the committed run-now wake intent does not bind to this occurrence and State \
+                 Fence"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+
     async fn run_now_handoff<R>(
         &self,
         sealed: &UserAutomationServiceRequest,
@@ -5838,8 +5867,10 @@ impl KernelStoreGateway {
     where
         R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
     {
-        let Some(UserAutomationMutationResult::RunNow { invocation, .. }) =
-            configuration.mutation_result()
+        let Some(UserAutomationMutationResult::RunNow {
+            invocation,
+            wake_intent,
+        }) = configuration.mutation_result()
         else {
             return Err("run-now did not return a run-now projection".to_owned());
         };
@@ -5884,6 +5915,25 @@ impl KernelStoreGateway {
         );
         let wake = match UserAutomationWakePort::read_pending_wake(runtime, wake_request).await {
             Ok(readback) => UserAutomationWakePhase::Published { readback },
+            // The wake owner's COMPLETE negative answer, reported as the
+            // complete negative it is. A `run-now` occurrence is admitted by an
+            // explicit manual nonce and is deliberately not a member of the
+            // revision's published horizon denominator, so the Host journal
+            // provably retains no record for it: this operation owns no wake
+            // publication and no wake cancellation. I11.12 makes the Task
+            // Scheduler wake Host only from the admitted scheduled intent, and
+            // a run-now arrives on a live authenticated session with the Human
+            // present, so there is no scheduled intent here to wake. Any other
+            // error still proves nothing and stays unresolved.
+            Err(UserAutomationRuntimeError::NotRetained(reason)) => {
+                UserAutomationWakePhase::NotApplicable {
+                    reason: format!(
+                        "the Host wake owner definitively retains no wake for manual occurrence \
+                         {occurrence_id}, because a run-now nonce is not a member of any published \
+                         wake horizon: {reason}"
+                    ),
+                }
+            }
             Err(error) => UserAutomationWakePhase::UnknownOutcome {
                 reason: error.to_string(),
             },
@@ -5895,18 +5945,14 @@ impl KernelStoreGateway {
         // path through deterministic preflight: the complete projection is
         // assembled from the live owners, the service runs the model-free
         // preflight, and an admitted occurrence reaches the Durable Job owner
-        // over the composed runtime channel. Without a proven pending wake
-        // there is no occurrence to join, so the execution stays unavailable
-        // beside the unresolved wake instead of inventing an admission.
-        let UserAutomationWakePhase::Published { readback } = &wake else {
-            return Ok((
-                wake,
-                UserAutomationExecutionPhase::Unavailable {
-                    reason: unproven_run_now_wake_reason(&occurrence_id),
-                },
-            ));
-        };
-        let wake_intent = readback.intent.clone();
+        // over the composed runtime channel.
+        //
+        // The wake identity that binds the occurrence to that admission is the
+        // fence-bound pending intent the canonical Store minted for this exact
+        // occurrence with the committed mutation. Nothing is defaulted and no
+        // second scheme is introduced: the intent is the committed mutation's
+        // own member.
+        Self::prove_committed_run_now_wake_intent(wake_intent, &occurrence_id, sealed)?;
         let projection = match self
             .assemble_run_now_preflight_projection(sealed, &owner, &invocation)
             .await
@@ -5937,7 +5983,7 @@ impl KernelStoreGateway {
                     identity: sealed.identity.clone(),
                     invocation: invocation.clone(),
                     projection,
-                    wake_intent,
+                    wake_intent: wake_intent.clone(),
                 },
                 runtime,
             )
@@ -8148,19 +8194,6 @@ fn unproven_execution_channel_reason() -> String {
     "no authenticated UserAutomation runtime channel was composed for this transition, so the \
      committed occurrence was not handed to the Durable Job owner"
         .to_owned()
-}
-
-/// Execution phase reason for a committed occurrence whose wake handoff did
-/// not prove a pending wake.
-///
-/// The preflight execution join needs the retained pending wake as its
-/// occurrence binding. An unreadable or absent wake proves nothing to join, so
-/// no admission is invented and the Durable Job owner is never asked.
-fn unproven_run_now_wake_reason(occurrence_id: &str) -> String {
-    format!(
-        "the wake handoff of committed occurrence {occurrence_id} did not prove a pending wake, \
-         so no occurrence joins the Durable Job owner and the occurrence stays unadmitted"
-    )
 }
 
 /// Execution phase reason for a `RunNow` join whose owner answer does not

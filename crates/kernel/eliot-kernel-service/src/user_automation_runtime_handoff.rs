@@ -1452,13 +1452,38 @@ impl UserAutomationOperatorTransition {
                             return Err("RunNow phases are not bound to the committed occurrence"
                                 .to_owned());
                         }
+                        let occurrence_id = invocation
+                            .occurrence_identity()
+                            .map_err(|error| error.to_string())?;
+                        // The committed wake intent is the occurrence's own wake
+                        // identity, so it is bound to this occurrence here exactly
+                        // as the Durable Job admission binds it: a `run-now`
+                        // occurrence is minted from an explicit manual nonce and
+                        // the committed intent must carry that same occurrence
+                        // under this State Fence. An intent for another occurrence
+                        // or another fence is a contradiction the committed
+                        // mutation cannot contain.
+                        if wake_intent.wake_id != occurrence_id.as_str() {
+                            return Err(
+                                "the committed RunNow wake intent does not name its occurrence"
+                                    .to_owned(),
+                            );
+                        }
                         match &self.wake {
                             UserAutomationWakePhase::Published { readback }
                                 if readback.intent == *wake_intent
                                     && !readback.operation_id.trim().is_empty()
                                     && !readback.idempotency_key.trim().is_empty()
                                     && !readback.record_checksum.trim().is_empty() => {}
-                            UserAutomationWakePhase::UnknownOutcome { .. }
+                            // `NotApplicable` is the Host wake owner's COMPLETE
+                            // negative answer for a manual occurrence: a `run-now`
+                            // nonce is not a member of the revision's published
+                            // horizon denominator, so the journal provably retains
+                            // no wake for it. That is a proven absence, not an
+                            // unknown one, and the committed intent above is the
+                            // occurrence's own wake identity.
+                            UserAutomationWakePhase::NotApplicable { .. }
+                            | UserAutomationWakePhase::UnknownOutcome { .. }
                             | UserAutomationWakePhase::Unavailable { .. } => {}
                             _ => {
                                 return Err(
@@ -1467,35 +1492,35 @@ impl UserAutomationOperatorTransition {
                                 );
                             }
                         }
-                        let occurrence_id = invocation
-                            .occurrence_identity()
-                            .map_err(|error| error.to_string())?;
+                        // A proven manual occurrence is one the canonical Store
+                        // committed under this exact invocation, so the execution
+                        // disposition may join it beside either proven wake answer:
+                        // a retained wake record that equals the committed intent,
+                        // or the wake owner's complete negative. An unresolved wake
+                        // answer still admits only the dispositions that need no
+                        // wake at all.
+                        let wake_proven = matches!(
+                            &self.wake,
+                            UserAutomationWakePhase::Published { .. }
+                                | UserAutomationWakePhase::NotApplicable { .. }
+                        );
                         match &self.execution {
                             UserAutomationExecutionPhase::Admitted { execution }
-                                if execution.occurrence_id == occurrence_id
-                                    && matches!(
-                                        &self.wake,
-                                        UserAutomationWakePhase::Published { .. }
-                                    ) => {}
+                                if execution.occurrence_id == occurrence_id && wake_proven => {}
                             UserAutomationExecutionPhase::Deferred { reason }
-                                if matches!(
-                                    &self.wake,
-                                    UserAutomationWakePhase::Published { .. }
-                                ) || (matches!(
-                                    &self.wake,
-                                    UserAutomationWakePhase::UnknownOutcome { .. }
-                                        | UserAutomationWakePhase::Unavailable { .. }
-                                ) && matches!(
-                                    reason,
-                                    UserAutomationDeferReason::Paused
-                                        | UserAutomationDeferReason::Retired
-                                )) => {}
+                                if wake_proven
+                                    || (matches!(
+                                        &self.wake,
+                                        UserAutomationWakePhase::UnknownOutcome { .. }
+                                            | UserAutomationWakePhase::Unavailable { .. }
+                                    ) && matches!(
+                                        reason,
+                                        UserAutomationDeferReason::Paused
+                                            | UserAutomationDeferReason::Retired
+                                    )) => {}
                             UserAutomationExecutionPhase::BlockedConfig { .. }
                             | UserAutomationExecutionPhase::UnknownOutcome { .. }
-                                if matches!(
-                                    &self.wake,
-                                    UserAutomationWakePhase::Published { .. }
-                                ) => {}
+                                if wake_proven => {}
                             UserAutomationExecutionPhase::Unavailable { .. } => {}
                             _ => {
                                 return Err(
