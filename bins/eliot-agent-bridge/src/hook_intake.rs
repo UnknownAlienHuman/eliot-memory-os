@@ -167,7 +167,7 @@ pub fn run_hook_intake(argv: &[String]) -> Result<(), HookIntakeError> {
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
     serde_json::to_writer_pretty(&mut lock, &result.decision.stdout)
-        .map_err(HookIntakeError::DecisionUnwritable)?;
+        .map_err(|e| HookIntakeError::DecisionUnwritable(std::io::Error::other(e)))?;
     writeln!(lock).map_err(HookIntakeError::DecisionUnwritable)?;
     Ok(())
 }
