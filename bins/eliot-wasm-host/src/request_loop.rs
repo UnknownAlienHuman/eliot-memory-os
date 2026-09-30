@@ -5691,10 +5691,14 @@ pub enum ServedResultReadback {
     /// the stream: the events it never stored are not synthesized here, so
     /// this is never a complete replay.
     Incomplete,
-    /// The record contradicts the staged identity or itself.
+    /// The record contradicts the staged identity or itself, including a
+    /// record file that exists but cannot be a well-formed record at all
+    /// (absent, empty or dual payloads, an unusable `stream_digest`, or a
+    /// `terminal_sequence` naming an event the record never stored).
     Conflict,
-    /// No usable retained result: absent, unreadable, oversize, malformed,
-    /// or wire-mismatched.
+    /// No usable retained result: absent, unreadable, or oversize. Only these
+    /// three states, because a present-but-unusable record is the conflict
+    /// above and never an absence.
     Unavailable,
 }
 
@@ -5710,11 +5714,27 @@ fn read_back_served_result(
     directory: &std::path::Path,
     identity: &crate::dispatch_material::StagedDeliveryIdentity,
 ) -> ServedResultReadback {
-    // An absent record, an unreadable or oversize one, and a malformed one
-    // all answer the same typed state: this identity has no usable retained
-    // result. That mapping is unchanged by reading it as a `let ... else`.
-    let Ok(Some(record)) = crate::dispatch_material::read_served_result(directory) else {
-        return ServedResultReadback::Unavailable;
+    // An absent record, and one that could not be read or is oversize, all
+    // answer the same typed state: this identity has no usable retained
+    // result. `MaterialError::Malformed` is NOT that state and is not folded
+    // into it here. The reader already proved a record file EXISTS at this
+    // path; malformed therefore never means absence, it means the bytes there
+    // contradict a record this host itself defines — a `ServedResultRecord`
+    // that is not valid JSON, that cannot name an identity, that carries
+    // zero or both result payloads, whose `stream_digest` is not a hex
+    // digest, or whose `terminal_sequence` names an event it never stored.
+    // Each is a self-contradicting record and is reported as the conflict it
+    // is, with the distinction made here on this side of the reader rather
+    // than by editing it. Genuinely unreadable and oversize records keep
+    // their own error variants and stay `Unavailable`, so no check is
+    // weakened and no absent record is ever reported as a conflict.
+    let record = match crate::dispatch_material::read_served_result(directory) {
+        Ok(Some(record)) => record,
+        Ok(None) => return ServedResultReadback::Unavailable,
+        Err(crate::dispatch_material::MaterialError::Malformed) => {
+            return ServedResultReadback::Conflict;
+        }
+        Err(_unreadable_or_oversize) => return ServedResultReadback::Unavailable,
     };
     if !record.names(identity) {
         return ServedResultReadback::Conflict;
@@ -5743,6 +5763,18 @@ fn read_back_served_result(
 /// whole stream: the first event, naming no predecessors. A terminal that
 /// names predecessors was never retained together with them, so the record
 /// stays explicitly incomplete and those events are never synthesized.
+///
+/// [`validate_frame`] is deliberately not enough to answer this. It checks
+/// wire identity/version, sequence bound, the ordered predecessor prefix,
+/// phase/command agreement, output and engine bindings and the closed
+/// vocabularies — but it does NOT read `terminal`: the requirement that a
+/// complete stream carries exactly one closing event lives only in
+/// [`validate_result_stream`]. So the decision is taken with the REAL stream
+/// validator, the same one the v2 arm runs and the same one
+/// `publish_retained_sequence` runs before republishing, over the single
+/// recorded event. A record that is genuinely complete still answers
+/// `Complete`; a record whose event set is not a closed stream is typed
+/// honestly here instead of surfacing later as a generic loop error.
 fn read_back_terminal_only_record(
     payload: crate::dispatch_material::ServedResultPayload,
     identity: &crate::dispatch_material::StagedDeliveryIdentity,
@@ -5763,9 +5795,23 @@ fn read_back_terminal_only_record(
     if frame.sequence != 0 || !frame.observation_predecessors.is_empty() {
         return ServedResultReadback::Incomplete;
     }
-    ServedResultReadback::Complete {
-        events: vec![frame],
+    // One real event is the whole stream the record retained, and the real
+    // stream validator decides what that one event MEANS: it is the only rule
+    // that reads `terminal`. The single-event sequence is borrowed exactly as
+    // the v2 arm borrows its recorded sequence, never rebuilt, so the recorded
+    // value is the one that is judged.
+    let events = std::slice::from_ref(&frame);
+    if validate_result_stream(events).is_ok() {
+        return ServedResultReadback::Complete {
+            events: vec![frame],
+        };
     }
+    // A single event that is not a closing event — for example a non-terminal
+    // v1 frame — names this identity and is a real retained observation, but
+    // the events that would have followed it were never stored. That is
+    // exactly the `Incomplete` case: a bounded prefix whose missing events are
+    // not synthesized here, and never a complete replay.
+    ServedResultReadback::Incomplete
 }
 
 /// Classifies the #2787 v2 payload, the exact retained result-event sequence.
