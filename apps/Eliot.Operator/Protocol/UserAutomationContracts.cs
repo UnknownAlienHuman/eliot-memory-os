@@ -593,6 +593,22 @@ public sealed record UserAutomationNormalizedSchedule(
     /// </remarks>
     public void Validate()
     {
+        // `normalization_receipt` is a required reference-typed member and an
+        // absent member decodes to null, so `NormalizationBinding.Validate()`
+        // below is itself the dereference. `UserAutomationRevision.Validate`
+        // refuses a null `schedule`, but the schedule record being present is
+        // not the same claim as its own members being present. A
+        // `NullReferenceException` is not an `InvalidOperationException`, so
+        // the fault would escape every handler written to contain a
+        // closed-shape refusal (`MainViewModel`, the pending journal, the
+        // reconciliation loop) instead of the withheld, still-reconciling
+        // outcome they are written to produce. Refused by name here, one fixed
+        // sentence over the wire member, exactly as `create`, `edit` and
+        // `UserAutomationRevision` refuse their nested records. This adds no
+        // bound, no wire member and no digest input: a previously valid
+        // schedule carried the member, so its retained bytes still validate
+        // and still re-derive the same idempotency key.
+        if (NormalizationBinding is null) throw new InvalidOperationException("schedule.normalization_receipt must be present.");
         UserAutomationContract.RequireOneOf(Kind, "schedule.kind", "ONE_SHOT", "RECURRING");
         UserAutomationContract.RequireText(Expression, "schedule.expression");
         UserAutomationContract.RequireText(Calendar, "schedule.calendar");
@@ -754,6 +770,27 @@ public sealed record UserAutomationTaskBinding(
 {
     public void Validate()
     {
+        // `capability_profile` is a required reference-typed member and an
+        // absent member decodes to null, so the call below is itself the
+        // dereference; `UserAutomationCapabilityProfile` holds no
+        // reference-typed member of its own and an empty body, but that does
+        // not make it safe here, for the same reason
+        // `UserAutomationRevision.Validate` states for `resource_ceiling` and
+        // `recursion_policy`: the call is the dereference. It also fires
+        // FIRST — `UserAutomationRevision.Validate` reaches
+        // `Task.CapabilityProfile.ModelAccess` only after `Task.Validate()`
+        // returns — so the merged revision refusal provably does not close
+        // this path, and a `create`/`edit` envelope missing the member still
+        // faults untyped today. A `NullReferenceException` is not an
+        // `InvalidOperationException`, so it would escape every handler
+        // written to contain a closed-shape refusal (`MainViewModel`, the
+        // pending journal, the reconciliation loop) instead of the withheld,
+        // still-reconciling outcome they are written to produce. Refused by
+        // name here, one fixed sentence over the wire member. This adds no
+        // bound, no wire member and no digest input: a previously valid task
+        // binding carried the member, so its retained bytes still validate
+        // and still re-derive the same idempotency key.
+        if (CapabilityProfile is null) throw new InvalidOperationException("task.capability_profile must be present.");
         UserAutomationContract.RequireText(QualifiedRef, "task.qualified_ref");
         UserAutomationContract.RequireOneOf(Kind, "task.kind", "AGENT_TASK", "QUALIFIED_SCRIPT");
         CapabilityProfile.Validate();
@@ -782,6 +819,23 @@ public sealed record UserAutomationAllowedProviderPolicy(
 {
     public override void Validate()
     {
+        // `fingerprints` is a required reference-typed member and an absent
+        // member decodes to null, so the `.Count` below is a direct
+        // dereference with nothing in front of it. `RequireTextList` cannot
+        // stand in front of it: this member is a list of records, not
+        // `IEnumerable<string>`. `UserAutomationRevision.Validate` refuses a
+        // null `provider_policy`, but the policy record being present is not
+        // the same claim as its own members being present. A
+        // `NullReferenceException` is not an `InvalidOperationException`, so
+        // the fault would escape every handler written to contain a
+        // closed-shape refusal (`MainViewModel`, the pending journal, the
+        // reconciliation loop) instead of the withheld, still-reconciling
+        // outcome they are written to produce. Refused by name here, one fixed
+        // sentence over the wire member. This adds no bound, no wire member
+        // and no digest input: a previously valid policy carried the member,
+        // so its retained bytes still validate and still re-derive the same
+        // idempotency key.
+        if (Fingerprints is null) throw new InvalidOperationException("provider_policy.fingerprints must be present.");
         if (Fingerprints.Count == 0) throw new InvalidOperationException("provider_policy.fingerprints must not be empty.");
         foreach (var fingerprint in Fingerprints) fingerprint.Validate();
         if (Fingerprints.Zip(Fingerprints.Skip(1)).Any(pair => pair.First == pair.Second))
@@ -831,6 +885,23 @@ public sealed record UserAutomationDeliveryTarget(
 {
     public void Validate()
     {
+        // `channels` is a required reference-typed member and an absent member
+        // decodes to null, so the `.Count` below is a direct dereference with
+        // nothing in front of it: the `RequireOneOf` that follows it is
+        // reached too late, and the `RequireTextList` further down covers
+        // `recipient_refs`, not this member. `UserAutomationRevision.Validate`
+        // refuses a null `delivery_target`, but the target record being
+        // present is not the same claim as its own members being present. A
+        // `NullReferenceException` is not an `InvalidOperationException`, so
+        // the fault would escape every handler written to contain a
+        // closed-shape refusal (`MainViewModel`, the pending journal, the
+        // reconciliation loop) instead of the withheld, still-reconciling
+        // outcome they are written to produce. Refused by name here, one fixed
+        // sentence over the wire member. This adds no bound, no wire member
+        // and no digest input: a previously valid target carried the member,
+        // so its retained bytes still validate and still re-derive the same
+        // idempotency key.
+        if (Channels is null) throw new InvalidOperationException("delivery.channels must be present.");
         UserAutomationContract.RequireText(TargetRef, "delivery.target_ref");
         if (Channels.Count == 0) throw new InvalidOperationException("delivery.channels must not be empty.");
         UserAutomationContract.RequireOneOf(Channels, "delivery.channels", "CONTROL_BOARD", "NATIVE_TOAST", "WINDOWS_EVENT_LOG", "RECOVERY_FALLBACK");
