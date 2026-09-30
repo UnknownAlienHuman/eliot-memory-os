@@ -48,6 +48,8 @@ use super::{
 use eliot_contracts::{
     CapabilityCellId, CapabilityCellRegistry, ResourceGeneration, SupportStatus,
 };
+use eliot_kernel_service::CanonicalStoreEvidence;
+use eliot_ors::CanonicalEvidenceProvider;
 use eliot_platform_windows::ProtectedPathLease;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -273,16 +275,23 @@ impl KernelComposition {
             );
             observe_terminal_error(kernel_build_error_code(error));
         })?;
-        let ors = Arc::new(
+        let (ors, canonical_store_evidence) =
             Self::open_ors_for_config(&config, &ors_path).inspect_err(|error| {
                 observe_entrypoint_with_detail(
                     EntrypointStage::Composition,
                     "kernel.composition.build_failed",
                 );
                 observe_terminal_error(kernel_build_error_code(error));
-            })?,
-        );
-        Self::assemble(config, ors, ors_path, None, platform).inspect_err(|error| {
+            })?;
+        Self::assemble(
+            config,
+            Arc::new(ors),
+            ors_path,
+            None,
+            platform,
+            Some(canonical_store_evidence),
+        )
+        .inspect_err(|error| {
             observe_entrypoint_with_detail(
                 EntrypointStage::Composition,
                 "kernel.composition.build_failed",
@@ -298,14 +307,22 @@ impl KernelComposition {
     fn open_ors_for_config(
         config: &KernelConfig,
         ors_path: &Path,
-    ) -> Result<RedbRecoveryStore, KernelBuildError> {
+    ) -> Result<(RedbRecoveryStore, Arc<CanonicalStoreEvidence>), KernelBuildError> {
+        let evidence = Arc::new(CanonicalStoreEvidence::new());
+        let evidence_provider: Arc<dyn CanonicalEvidenceProvider> = evidence.clone();
         let result = if let Some(binding) = config.eliotd_receipt_binding.as_ref() {
-            RedbRecoveryStore::open_for_installation(ors_path, binding.installation_id())
+            RedbRecoveryStore::open_for_installation_with_evidence(
+                ors_path,
+                binding.installation_id(),
+                evidence_provider,
+            )
                 .map(|(store, _identity)| store)
         } else {
-            RedbRecoveryStore::open(ors_path)
+            RedbRecoveryStore::open_with_evidence(ors_path, evidence_provider)
         };
-        result.map_err(|error| KernelBuildError::Ors(error.to_string()))
+        result
+            .map(|store| (store, evidence))
+            .map_err(|error| KernelBuildError::Ors(error.to_string()))
     }
 
     /// Consumes the Host-approved protected authority descriptor before
@@ -338,7 +355,9 @@ impl KernelComposition {
                 .map_err(&terminal)?,
         );
         let ors_path = Self::ors_path_for_config(&config).map_err(&terminal)?;
-        let ors = Arc::new(Self::open_ors_for_config(&config, &ors_path).map_err(&terminal)?);
+        let (ors, canonical_store_evidence) =
+            Self::open_ors_for_config(&config, &ors_path).map_err(&terminal)?;
+        let ors = Arc::new(ors);
         let prepared = Self::prepare_authority_descriptor_material(
             &platform,
             &ors,
@@ -417,6 +436,7 @@ impl KernelComposition {
             ors,
             ors_path,
             platform,
+            canonical_store_evidence,
         )
         .map_err(&terminal)
     }
@@ -448,8 +468,16 @@ impl KernelComposition {
                 .map_err(&terminal)?,
         );
         let ors_path = Self::ors_path_for_config(&config).map_err(&terminal)?;
-        let ors = Arc::new(Self::open_ors_for_config(&config, &ors_path).map_err(&terminal)?);
-        Self::assemble_with_process_authority(config, authority_config, ors, ors_path, platform)
+        let (ors, canonical_store_evidence) =
+            Self::open_ors_for_config(&config, &ors_path).map_err(&terminal)?;
+        Self::assemble_with_process_authority(
+            config,
+            authority_config,
+            Arc::new(ors),
+            ors_path,
+            platform,
+            canonical_store_evidence,
+        )
             .map_err(&terminal)
     }
 
@@ -705,6 +733,7 @@ impl KernelComposition {
         ors: Arc<RedbRecoveryStore>,
         ors_object_path: PathBuf,
         platform: Arc<WindowsPlatform>,
+        canonical_store_evidence: Arc<CanonicalStoreEvidence>,
     ) -> Result<Self, KernelBuildError> {
         let authority_store: Arc<dyn OperationalRecoveryStore> = ors.clone();
         let controller = Arc::new(Mutex::new(
@@ -724,6 +753,7 @@ impl KernelComposition {
             ors,
             ors_object_path,
             platform,
+            canonical_store_evidence,
         )
     }
 
@@ -734,6 +764,7 @@ impl KernelComposition {
         ors: Arc<RedbRecoveryStore>,
         ors_object_path: PathBuf,
         platform: Arc<WindowsPlatform>,
+        canonical_store_evidence: Arc<CanonicalStoreEvidence>,
     ) -> Result<Self, KernelBuildError> {
         let path_admission = Arc::new(KernelPathAdmission::new(Arc::clone(&platform)));
         let gateway = Arc::new(ProcessExecutionGateway::new(
@@ -742,7 +773,14 @@ impl KernelComposition {
             snapshot_binding,
             path_admission,
         ));
-        Self::assemble(config, ors, ors_object_path, Some(gateway), platform)
+        Self::assemble(
+            config,
+            ors,
+            ors_object_path,
+            Some(gateway),
+            platform,
+            Some(canonical_store_evidence),
+        )
     }
 
     /// Reconciles the durable activation intent and replay snapshot before a
@@ -1103,7 +1141,7 @@ impl KernelComposition {
             RedbRecoveryStore::open_with_evidence(&ors_path, evidence)
                 .map_err(|error| KernelBuildError::Ors(error.to_string()))?,
         );
-        Self::assemble(config, ors, ors_path, None, platform)
+        Self::assemble(config, ors, ors_path, None, platform, None)
     }
 
     /// Keeps ordered generation, authority, and handoff construction in one
@@ -1116,6 +1154,7 @@ impl KernelComposition {
         ors_object_path: PathBuf,
         process_gateway: Option<Arc<ProcessExecutionGateway>>,
         platform: Arc<WindowsPlatform>,
+        canonical_store_evidence: Option<Arc<CanonicalStoreEvidence>>,
     ) -> Result<Self, KernelBuildError> {
         // F-LOG-KERNEL-2 (#899): assembly phases only; the public
         // constructors own the single terminal per failed build. Only fixed
@@ -1755,6 +1794,7 @@ impl KernelComposition {
             backup_restore,
             backup_capture,
             backup_owner_clients,
+            canonical_store_evidence,
             #[cfg(windows)]
             canonical_store_gateway: Mutex::new(None),
             #[cfg(windows)]
