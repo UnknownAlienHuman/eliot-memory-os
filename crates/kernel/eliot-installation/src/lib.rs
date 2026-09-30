@@ -10876,9 +10876,14 @@ where
             }
         })?;
         transaction.validate()?;
+        // The sealed store compares the pre-mutation version, so the expected
+        // version is captured before the in-memory reconciliation. Capturing it
+        // after would turn every durable recording of a validated Complete
+        // readback into a spurious conflict and leave the adoption block
+        // permanently unreleasable. An unresolved readback persists nothing.
+        let expected = TransactionVersion::of(&transaction)?;
         let readback = transaction.reconcile_guard_revert_evidence(retained_record)?;
         if matches!(readback, TerminalContainmentReadback::Complete(_)) {
-            let expected = TransactionVersion::of(&transaction)?;
             self.store.compare_and_save(expected, &transaction)?;
         }
         Ok(readback)
