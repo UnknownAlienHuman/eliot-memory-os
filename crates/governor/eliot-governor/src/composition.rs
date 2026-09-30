@@ -119,9 +119,9 @@ use eliot_workscope::{
     ColdStartController, ColdStartTrigger, DiscoveryLeaseKey, DiscoveryReadLease,
     GenerationEvidence, GoverningSourceAdmission, GoverningSourceSet, GuardTrigger, GuardVerdict,
     IdentityEvidence, IdentityLegOutcome, LeaseJoin, LooseScanQuarantine, MaterialAdmission,
-    MaterialReadinessDirective, MaterialReadinessInputs, MemoryState, ObservedScopeResources,
-    OnboardingLease, PrivacyBoundary, PrivacyProfile, QuarantinedScopeRecord, ReadinessLifecycle,
-    ReadinessSurface, RepositoryLineageIdentity, RequestedEffect, ResolutionAuthentication, ResolutionRequest,
+    MaterialReadinessDirective, MaterialReadinessInputs, ObservedScopeResources, OnboardingLease,
+    PrivacyBoundary, PrivacyProfile, QuarantinedScopeRecord, ReadinessLifecycle,
+    RepositoryLineageIdentity, RequestedEffect, ResolutionAuthentication, ResolutionRequest,
     ScanDisclosureOwnerBinding, ScanReceiptHandle, ScannerResolverInputs, ScopeBinding,
     ScopeBindingDisposition, ScopeBindingGuard, ScopeIdentity, ScopeKind,
     ScopeRelocationOrAttachReceipt, ScopeResolution, SourceAdmissionRequest, TaskBindingInput,
@@ -4998,7 +4998,7 @@ pub struct ColdStartHumanBoardView {
     pub readiness: String,
     pub smallest_missing_question: Option<String>,
     pub next_safe_action: String,
-    pub memory_state: MemoryState,
+    pub memory_state: eliot_workscope::MemoryState,
     pub minimum_understanding_seed: Vec<String>,
     pub maintenance_recommendations: Vec<String>,
     pub lease_deadline: u64,
@@ -7970,7 +7970,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     ///
     /// Reads the exact terminal named by the full owner claim through
     /// [`Self::cold_start_owner_readback_for_claim`] and returns its
-    /// [`ReadinessSurface`]: the current readiness state, the single smallest
+    /// [`eliot_workscope::ReadinessSurface`]: the current readiness state, the single smallest
     /// missing question (`None` when nothing is missing), the next safe
     /// action, and the lease deadline after which the readiness expires. The
     /// readiness state travels with the receipt instead of staying buried in
@@ -7984,7 +7984,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         &self,
         claim: &ColdStartReadinessClaim,
         now: u64,
-    ) -> Result<ReadinessSurface, CompositionError> {
+    ) -> Result<eliot_workscope::ReadinessSurface, CompositionError> {
         let (lease, receipt) = self.cold_start_readiness_terminal_for_claim(claim, now)?;
         receipt
             .surface(&lease)
