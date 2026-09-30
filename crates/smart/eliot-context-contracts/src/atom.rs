@@ -198,6 +198,21 @@ impl MeasurementRef {
         validate_digest(&self.digest, "measurement.digest")?;
         validate_text(&self.serializer, "measurement.serializer")
     }
+
+    /// The measured-input identity this reference names, as the exact pair a
+    /// current observation has to match.
+    ///
+    /// [`MeasurementRef::validate`] is shape only: it proves the digest and
+    /// serializer are well formed, and two unrelated payloads can each carry a
+    /// well-formed pair. Reading the pair back is what lets an *owner-recorded*
+    /// current observation be compared with the bytes this reference claims, so
+    /// a reference cannot pass as a measurement of the wrong envelope. The
+    /// comparison itself is made once, by `QualityEvidenceIndex::binds` in
+    /// `quality.rs`; this accessor exposes the values and decides nothing.
+    #[must_use]
+    pub fn observation_identity(&self) -> (&str, &str) {
+        (self.digest.as_str(), self.serializer.as_str())
+    }
 }
 
 /// Immutable policy recipe for one Context compilation.
