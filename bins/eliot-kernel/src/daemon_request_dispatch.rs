@@ -31,7 +31,8 @@ use eliot_kernel_service::{
     UserAutomationHostExecutionOperation, UserAutomationHostExecutionTransport,
     UserAutomationOperatorRuntime, UserAutomationOwnerLookup, UserAutomationRuntimeAdmission,
     UserAutomationRuntimeError, UserAutomationRuntimePort, UserAutomationWakeCancellation,
-    UserAutomationWakeEnumerationRequest, UserAutomationWakeHorizonPublication,
+    UserAutomationWakeEnumerationReceipt, UserAutomationWakeEnumerationRequest,
+    UserAutomationWakeHorizonPublication, UserAutomationWakeOccurrenceDisposition,
     UserAutomationWakePort, UserAutomationWakePublication, UserAutomationWakeReadRequest,
     UserAutomationWakeReadback, advance_wake_horizon, horizon_retry_handle, refuse_consumed_wake,
     resolve_due_wake,
@@ -4741,17 +4742,13 @@ impl KernelComposition {
                 }
             }
             UserAutomationHostExecutionOperation::EnumeratePendingWakes { request } => {
-                match Box::pin(client.enumerate_pending_wakes(request)).await {
-                    Ok(receipt) => Ok(serde_json::json!({
-                        "status": "known",
-                        "value": {
-                            "outcome": "wake_enumeration",
-                            "receipt": receipt,
-                        },
-                        "recovery": null,
-                    })),
-                    Err(error) => Ok(Self::user_automation_runtime_error_response(error)),
-                }
+                let receipt = match Box::pin(client.enumerate_pending_wakes(request)).await {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        return Ok(Self::user_automation_runtime_error_response(error));
+                    }
+                };
+                Ok(Self::user_automation_wake_enumeration_response(&receipt))
             }
             UserAutomationHostExecutionOperation::PublishWakeHorizon { request } => {
                 let answer = match Box::pin(client.publish_wake_horizon(request.clone())).await {
@@ -4836,6 +4833,83 @@ impl KernelComposition {
             "value": {
                 "outcome": outcome,
                 "publication": answer,
+            },
+            "recovery": recovery,
+        })
+    }
+
+    #[cfg(windows)]
+    /// Projects one complete owner wake enumeration against the exact request it
+    /// was asked for (issue #2806 item 9).
+    ///
+    /// An enumeration receipt is not a completeness proof. `Unresolved` is the
+    /// owner's own disposition for a denominator member its one Host snapshot
+    /// could not classify: a duplicated record, a retained record identity that
+    /// conflicts with the denominator member, or a retained pending record under
+    /// a different State Fence. The owner answers with the typed
+    /// `UserAutomationWakeOccurrenceDisposition::Unresolved` per-member
+    /// reference in `evidence` plus a closed `reason`. The same crate already
+    /// refuses to derive a cancellation target set from such a receipt:
+    /// `UserAutomationWakeEnumerationReceipt::cancellation_targets` and
+    /// `KernelStoreGateway`'s retirement path both reject a non-zero
+    /// `coverage.unresolved_count`.
+    ///
+    /// Reporting such a receipt as `status: "known"` with `recovery: null` told
+    /// the caller that nothing was outstanding, which is exactly the claim the
+    /// owner refused to make. No complete owner-issued pending-wake set is
+    /// proven, so a `cancelled_wake_ids` list derived from it would be a short
+    /// page rather than evidence that no wake exists. An unresolved member is
+    /// therefore reported as an incomplete owner query, never as completion.
+    ///
+    /// The outstanding set is read from the receipt's own validated
+    /// `dispositions`, which is the owner's answer rather than a list this
+    /// function built, and the reconciliation handle is the receipt's own
+    /// `parent_operation_identity`: the exact operation identity the Host owner
+    /// must be asked about again under. A receipt whose denominator is fully
+    /// classified, every member either `PendingTarget` or `NotRetained`, is a
+    /// complete enumeration and still settles, because only then is the derived
+    /// target set the complete one the owner proved.
+    fn user_automation_wake_enumeration_response(
+        receipt: &UserAutomationWakeEnumerationReceipt,
+    ) -> serde_json::Value {
+        let unresolved_occurrence_ids = receipt
+            .dispositions
+            .iter()
+            .filter_map(|disposition| match disposition {
+                UserAutomationWakeOccurrenceDisposition::Unresolved { evidence, .. } => {
+                    Some(evidence.occurrence_id.clone())
+                }
+                UserAutomationWakeOccurrenceDisposition::PendingTarget { .. }
+                | UserAutomationWakeOccurrenceDisposition::NotRetained { .. } => None,
+            })
+            .collect::<Vec<String>>();
+        let recovery = if unresolved_occurrence_ids.is_empty() {
+            None
+        } else {
+            Some(serde_json::json!({
+                "kind": "unknown_outcome",
+                "reason": "the schedule owner accounted for every committed occurrence of this \
+                           revision but left the members below unclassified, so no complete \
+                           owner-issued pending-wake set is proven and no cancellation set may be \
+                           derived from this answer; each member carries its own owner evidence \
+                           and closed reason inside the enumeration receipt, and the exact \
+                           unresolved set must be reconciled under its parent operation identity",
+                "automation_id": &receipt.automation_id,
+                "automation_revision": &receipt.automation_revision,
+                "unresolved_occurrence_ids": unresolved_occurrence_ids,
+                "unresolved_occurrence_count": receipt.coverage.unresolved_count,
+                "parent_operation_identity": &receipt.parent_operation_identity,
+                "host_owner_identity": &receipt.host_owner_identity,
+                "host_owner_generation": &receipt.host_owner_generation,
+                "journal_sequence": receipt.journal_sequence,
+                "snapshot_digest": &receipt.snapshot_digest,
+            }))
+        };
+        serde_json::json!({
+            "status": if recovery.is_none() { "known" } else { "unknown" },
+            "value": {
+                "outcome": "wake_enumeration",
+                "receipt": receipt,
             },
             "recovery": recovery,
         })
