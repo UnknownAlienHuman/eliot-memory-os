@@ -264,7 +264,7 @@ impl<'a, P: ?Sized> GovernorTaskLifecycle<'a, P> {
             Some(&sources),
             None,
         )?;
-        prepare_task_exchange(self.canonical, identity, envelope, manifest_digest)
+        prepare_task_exchange(self.canonical, identity, envelope)
     }
 
     /// Prepares a recipe-bearing proposal with the complete authenticated
@@ -304,7 +304,7 @@ impl<'a, P: ?Sized> GovernorTaskLifecycle<'a, P> {
             Some(&sources),
             Some(&publications),
         )?;
-        prepare_task_exchange(self.canonical, identity, envelope, manifest_digest)
+        prepare_task_exchange(self.canonical, identity, envelope)
     }
 
     /// Prepares a recipe-bearing guarded command using source heads read
@@ -334,7 +334,7 @@ impl<'a, P: ?Sized> GovernorTaskLifecycle<'a, P> {
             Some(&sources),
             None,
         )?;
-        prepare_task_exchange(self.canonical, identity, envelope, manifest_digest)
+        prepare_task_exchange(self.canonical, identity, envelope)
     }
 
     /// Prepares a recipe-bearing guarded command with complete authenticated
@@ -366,7 +366,7 @@ impl<'a, P: ?Sized> GovernorTaskLifecycle<'a, P> {
             Some(&sources),
             Some(&publications),
         )?;
-        prepare_task_exchange(self.canonical, identity, envelope, manifest_digest)
+        prepare_task_exchange(self.canonical, identity, envelope)
     }
 
     /// Prepares a Task Controller transition carrying the exact owner-issued
@@ -415,7 +415,7 @@ impl<'a, P: ?Sized> GovernorTaskLifecycle<'a, P> {
         envelope
             .validate()
             .map_err(|_| TaskLifecycleError::Owner(TaskError::InvalidField("task_envelope")))?;
-        prepare_task_exchange(self.canonical, identity, envelope, manifest_digest)
+        prepare_task_exchange(self.canonical, identity, envelope)
     }
 
     fn check_proposal_identity(
@@ -482,7 +482,6 @@ fn prepare_task_exchange(
     canonical: &CanonicalAdmissionOwner,
     identity: &eliot_protocol::RequestIdentity,
     envelope: CanonicalWriteEnvelope,
-    manifest_digest: OperationManifestDigest,
 ) -> Result<PreparedTaskTransition, TaskLifecycleError> {
     identity.validate().map_err(|error| {
         TaskLifecycleError::Composition(CompositionError::Provider(error.to_string()))
