@@ -243,7 +243,9 @@ enum OperatorPipeMessage {
     },
     /// Cancellation receipt for the broker-owned operation the admitted
     /// `Cancel` request named. It carries the same receipt stdin renders.
-    Cancelled { receipt: Value },
+    Cancelled {
+        receipt: Value,
+    },
     Error {
         code: &'static str,
         detail: String,
@@ -673,7 +675,10 @@ fn dispatch_operator_pipe(
                     capabilities: endpoint.capabilities,
                 },
             ),
-        OperatorPipeRequest::Cancel { operation_id, authority } => {
+        OperatorPipeRequest::Cancel {
+            operation_id,
+            authority,
+        } => {
             match composition.admit_human_state_change(authority.as_ref(), operation_id.as_str()) {
                 Err(error) => operator_pipe_rejection(&error),
                 Ok(()) => composition.cancel(&operation_id).map_or_else(
@@ -1027,21 +1032,35 @@ async fn serve_operator_pipe_connection(
         return Ok(());
     }
 
-    // The connection stays authenticated after redemption, so the redeemed
-    // client may present its admitted authority once more on this same
-    // connection. Only the state-changing cancel rides here: a further
-    // challenge or redemption would replay the consumed handoff, and anything
-    // else is a sequence violation. The same OS-observed peer evidence goes
-    // down again, so the state change is admitted against the connected
-    // process, never against a presented tuple.
-    let Some(third_line) = read_operator_pipe_line(&mut reader).await? else {
+    serve_operator_pipe_state_change(sender, &mut reader, &mut writer, &peer).await
+}
+
+/// Serves the one state-changing request a redeemed connection may still make.
+///
+/// The connection stays authenticated after redemption, so the redeemed
+/// client may present its admitted authority once more on this same
+/// connection. Only the state-changing cancel rides here: a further
+/// challenge or redemption would replay the consumed handoff, and anything
+/// else is a sequence violation. The same OS-observed peer evidence goes
+/// down again, so the state change is admitted against the connected
+/// process, never against a presented tuple.
+#[cfg(windows)]
+async fn serve_operator_pipe_state_change(
+    sender: &mpsc::Sender<BrokerInput>,
+    reader: &mut tokio::io::BufReader<
+        tokio::io::ReadHalf<tokio::net::windows::named_pipe::NamedPipeServer>,
+    >,
+    writer: &mut tokio::io::WriteHalf<tokio::net::windows::named_pipe::NamedPipeServer>,
+    peer: &eliot_platform_windows::NamedPipePeerEvidence,
+) -> io::Result<()> {
+    let Some(third_line) = read_operator_pipe_line(reader).await? else {
         return Ok(());
     };
     let third_request = match serde_json::from_str::<OperatorPipeRequest>(&third_line) {
         Ok(request) => request,
         Err(error) => {
             write_operator_pipe_message(
-                &mut writer,
+                writer,
                 &OperatorPipeMessage::Error {
                     code: "REQUEST_INVALID",
                     detail: error.to_string(),
@@ -1053,7 +1072,7 @@ async fn serve_operator_pipe_connection(
     };
     if !matches!(&third_request, OperatorPipeRequest::Cancel { .. }) {
         write_operator_pipe_message(
-            &mut writer,
+            writer,
             &OperatorPipeMessage::Error {
                 code: "BROKER_PROTOCOL_SEQUENCE_REJECTED",
                 detail: "the third Operator pipe request must be cancel".to_owned(),
@@ -1062,8 +1081,8 @@ async fn serve_operator_pipe_connection(
         .await?;
         return Ok(());
     }
-    let third_response = dispatch_operator_pipe_to_owner(sender, third_request, &peer).await;
-    write_operator_pipe_message(&mut writer, &third_response).await
+    let third_response = dispatch_operator_pipe_to_owner(sender, third_request, peer).await;
+    write_operator_pipe_message(writer, &third_response).await
 }
 
 #[cfg(windows)]
