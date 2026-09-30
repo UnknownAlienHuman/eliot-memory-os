@@ -35,10 +35,9 @@ use crate::model::{
     ProviderUnknownOutcomeReconciliation, ProviderWorkerFenceReceipt, ReadyItemSkipReason,
     ReadySelectionOutcome, ReassignmentId, ReassignmentReceipt, ResultSubmission,
     RoleProfileManifest, RouteCandidateEvidence, SchedulingProfile, SelectionScopeCoverage,
-    StaffingLaneCandidate,
-    StaffingPlanCandidate, StaffingPlanRequest, SubmissionId, UnknownOutcomeFinalReceipt,
-    WipPartitionKey, WorkClass, WorkClassProfile, WorkClassSelectionReport, WorkerId,
-    validate_text,
+    StaffingLaneCandidate, StaffingPlanCandidate, StaffingPlanRequest, SubmissionId,
+    UnknownOutcomeFinalReceipt, WipPartitionKey, WorkClass, WorkClassProfile,
+    WorkClassSelectionReport, WorkerId, validate_text,
 };
 use crate::provider_admission::{
     AdmittedProviderCapability, KernelProviderVerifier, ProviderSelectionHealth,
@@ -475,7 +474,10 @@ fn scope_coverage(profile: Option<&SchedulingProfile>) -> SelectionScopeCoverage
     let mut unlimited = Vec::new();
     let mut limited = 0u32;
     for work_class in WorkClass::ALL {
-        if profile.and_then(|set| set.class_profile(work_class)).is_some() {
+        if profile
+            .and_then(|set| set.class_profile(work_class))
+            .is_some()
+        {
             limited = limited.saturating_add(1);
         } else {
             unlimited.push(work_class);
