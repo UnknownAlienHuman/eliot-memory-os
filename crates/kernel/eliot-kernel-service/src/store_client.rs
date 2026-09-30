@@ -19,15 +19,16 @@ use eliot_protocol::{ClientHello, Frame, ProtocolRange, ProtocolVersion, ServerH
 use eliot_runtime_contracts::{ModuleContract, ModuleGeneration, ModuleGenerationState};
 use eliot_store_api::{
     BackupOperationReconciliation, CAPABILITIES, CanonicalRequestView, CanonicalRestoreBatch,
-    CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS, IsolatedDestination,
-    IsolatedDestinationReceipt, NamedReadOperation, NamedReadRequest, NamedReadResponse,
-    OperationId, OperationIdentity, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
-    PreparedTransition, ReadConsistency, RecoveryRecordKey, RequestMeta, ReservedWriteRequest,
-    RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId,
-    ScopeRevisionView, SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle,
-    SnapshotPage, StoreBackupStatus, StoreError, StoreGenesisRequest, StoreHealth,
-    StoreRecoveryRequest, StoreRecoverySnapshot, StoreRequest, StoreResponse, StoreWireError,
-    WriteReceipt, dreamer_job_capability, map_durable_error, validate_genesis_receipt_envelope,
+    CanonicalStoreClient, CanonicalValidationSnapshot, CausalWriteReceipt, EFFECTS,
+    IsolatedDestination, IsolatedDestinationReceipt, NamedReadOperation, NamedReadRequest,
+    NamedReadResponse, OperationId, OperationIdentity, OrderingHead, OrderingHeadExpectation,
+    OrderingScopeId, PreparedTransition, ReadConsistency, RecoveryRecordKey, RequestMeta,
+    ReservedWriteRequest, RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation,
+    RevisionKey, ScopeId, ScopeRevisionView, SnapshotBeginRequest, SnapshotCursor,
+    SnapshotEndReceipt, SnapshotHandle, SnapshotPage, StoreBackupStatus, StoreError,
+    StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, StoreRequest,
+    StoreResponse, StoreWireError, WriteReceipt, dreamer_job_capability, map_durable_error,
+    validate_genesis_receipt_envelope, validate_store_receipt_envelope_with_causal,
     verify_canonical_request_hash, verify_ordering_scope_binding,
 };
 use thiserror::Error;
@@ -579,6 +580,25 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             Err(error) => Err(DreamerCommitEvidence::Refused(error.into_store_error())),
         }
     }
+
+    async fn reconcile_apply_with_causal(
+        &self,
+        context: &RequestMeta,
+        transition: &PreparedTransition,
+        operation_id: OperationId,
+        canonical_request_hash: &str,
+    ) -> Result<CausalWriteReceipt, StoreError> {
+        let pair = self
+            .receipt_exact_with_causal(operation_id, canonical_request_hash)
+            .await?;
+        validate_store_receipt_envelope_with_causal(
+            context,
+            transition,
+            &pair.receipt,
+            &pair.causal,
+        )?;
+        Ok(pair)
+    }
 }
 
 /// Renders durable Dreamer commit evidence onto the transport-boundary
@@ -610,6 +630,23 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
         expected_revision_heads: Vec<RevisionHeadExpectation>,
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     ) -> Result<WriteReceipt, StoreError> {
+        self.apply_prepared_with_causal(
+            ctx,
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+        )
+        .await
+        .map(|pair| pair.receipt)
+    }
+
+    async fn apply_prepared_with_causal(
+        &self,
+        ctx: &RequestMeta,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    ) -> Result<CausalWriteReceipt, StoreError> {
         transition.validate()?;
         ctx.validate().map_err(StoreError::Foundation)?;
         if ctx.state_fence != self.requirement.state_fence
@@ -649,6 +686,7 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
         let operation_id = transition.identity.operation_id.clone();
         let idempotency_key = transition.identity.idempotency_key.clone();
         let canonical_request_hash = transition.identity.canonical_request_hash.clone();
+        let expected_transition = transition.clone();
         let result = self
             .execute_raw(
                 StoreRequest::Apply {
@@ -662,7 +700,9 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
             )
             .await;
         match result {
-            Ok(StoreResponse::Transaction { receipt }) if receipt.operation_id == operation_id => {
+            Ok(StoreResponse::TransactionWithCausal { receipt, causal })
+                if receipt.operation_id == operation_id =>
+            {
                 // Post-commit response loss (issue #2030, 994/12): the
                 // provider durably committed, but the response is dropped
                 // here. Unknown — never success — so the caller reconciles
@@ -671,15 +711,27 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
                 if fault == StoreClientFault::PostCommitResponseLoss {
                     return Err(StoreError::MissingReceiptEnvelope);
                 }
-                Ok(receipt)
+                let pair = CausalWriteReceipt::new(receipt, causal)?;
+                validate_store_receipt_envelope_with_causal(
+                    ctx,
+                    &expected_transition,
+                    &pair.receipt,
+                    &pair.causal,
+                )?;
+                Ok(pair)
             }
             // Once Apply has crossed the transport boundary, a valid response
             // with the wrong operation identity or response kind is itself an
             // uncertain observation. Reconcile only the operation that this
             // Kernel call admitted; never adopt an identity from the peer.
             Ok(_) => {
-                self.receipt_exact(operation_id, &canonical_request_hash)
-                    .await
+                self.reconcile_apply_with_causal(
+                    ctx,
+                    &expected_transition,
+                    operation_id,
+                    &canonical_request_hash,
+                )
+                .await
             }
             Err(RequestFailure::Unknown {
                 operation_id: observed,
@@ -688,14 +740,24 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
                 // The peer's identity is evidence of a mismatch only; the
                 // receipt lookup remains bound to our admitted operation.
                 let _ = observed;
-                self.receipt_exact(operation_id, &canonical_request_hash)
-                    .await
+                self.reconcile_apply_with_causal(
+                    ctx,
+                    &expected_transition,
+                    operation_id,
+                    &canonical_request_hash,
+                )
+                .await
             }
             // A typed unknown-outcome failure was already bound to the
             // admitted operation in `execute_raw`; reconcile exactly it.
             Err(error) if error.is_unknown_outcome_failure() => {
-                self.receipt_exact(operation_id, &canonical_request_hash)
-                    .await
+                self.reconcile_apply_with_causal(
+                    ctx,
+                    &expected_transition,
+                    operation_id,
+                    &canonical_request_hash,
+                )
+                .await
             }
             Err(error) => Err(error.into_store_error()),
         }
@@ -747,7 +809,7 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
             )
             .await;
         match result {
-            Ok(StoreResponse::Transaction { receipt }) => {
+            Ok(StoreResponse::TransactionWithCausal { receipt, causal }) => {
                 // Post-commit response loss (issue #2030, 994/12) is
                 // evaluated immediately after the canonical commit, before
                 // receipt validation: the commit is durable but the
@@ -760,12 +822,19 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
                 if fault == StoreClientFault::PostCommitResponseLoss {
                     return Err(StoreError::MissingReceiptEnvelope);
                 }
+                let pair = CausalWriteReceipt::new(receipt, causal)?;
+                validate_store_receipt_envelope_with_causal(
+                    &request.context,
+                    &request.transition,
+                    &pair.receipt,
+                    &pair.causal,
+                )?;
                 // A misbound or malformed receipt observed after the single
                 // send is a typed receipt-validation failure for the caller
                 // to reconcile — never success, never an adopted peer
                 // identity, and never a second wire operation.
-                self.validate_reserved_write_receipt(&request, &receipt)?;
-                Ok(receipt)
+                self.validate_reserved_write_receipt(&request, &pair.receipt)?;
+                Ok(pair.receipt)
             }
             // Once the reserved write has crossed the transport boundary, a
             // valid response of the wrong kind is itself a typed contract
@@ -859,6 +928,16 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
     }
 
     async fn receipt(&self, operation_id: OperationId) -> Result<Option<WriteReceipt>, StoreError> {
+        Ok(self
+            .receipt_with_causal(operation_id)
+            .await?
+            .map(|pair| pair.receipt))
+    }
+
+    async fn receipt_with_causal(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<Option<CausalWriteReceipt>, StoreError> {
         let response = self
             .execute_raw(
                 StoreRequest::Receipt {
@@ -870,11 +949,17 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
             .await
             .map_err(RequestFailure::into_store_error)?;
         match response {
-            StoreResponse::Receipt {
+            StoreResponse::ReceiptWithCausal {
                 receipt: Some(receipt),
-            } if receipt.operation_id == operation_id => Ok(Some(receipt)),
-            StoreResponse::Receipt { receipt: None } => Ok(None),
-            StoreResponse::Receipt { .. } => Err(StoreError::IdentityConflict),
+                causal: Some(causal),
+            } if receipt.operation_id == operation_id => {
+                Ok(Some(CausalWriteReceipt::new(receipt, causal)?))
+            }
+            StoreResponse::ReceiptWithCausal {
+                receipt: None,
+                causal: None,
+            } => Ok(None),
+            StoreResponse::ReceiptWithCausal { .. } => Err(StoreError::IdentityConflict),
             _ => Err(StoreError::InvalidReceipt),
         }
     }
