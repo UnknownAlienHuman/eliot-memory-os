@@ -2880,7 +2880,11 @@ impl AgentActivationResolutionTicket {
                 reason: "must bind the exact activation request and peer receipt",
             });
         }
-        if self.peer_admission_receipt.as_ref().is_some_and(|retained| retained != receipt) {
+        if self
+            .peer_admission_receipt
+            .as_ref()
+            .is_some_and(|retained| retained != receipt)
+        {
             return Err(ProtocolError::InvalidField {
                 field: "agent_activation_resolution_ticket.peer_admission_receipt",
                 reason: "must preserve the exact original peer receipt",

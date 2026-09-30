@@ -64,14 +64,14 @@ use eliot_runtime_contracts::{
     DaemonSupervisionRenewalReceipt, SupervisionLeasePredecessorProof,
 };
 use eliot_store_api::{
-    CanonicalStoreClient, CampaignLearningStateViewLookup, CampaignLearningStateViewRead,
+    CampaignLearningStateViewLookup, CampaignLearningStateViewRead,
     CampaignLearningStateViewReadStatus, CampaignSourcePublication, CampaignSourceRevisionLookup,
-    CampaignSourceRevisionRef, CanonicalRequestView, MAX_RECOVERY_OWNER_RECORDS,
-    NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationIdentity,
-    OrderingHeadExpectation, PreparedTransition, ReadConsistency, RecoveryRecord,
-    RecoveryRecordKey, RequestMeta, RevisionHeadExpectation, StoreError, StoreGenesisRequest,
-    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, WriteReceiptStatus,
-    verify_canonical_request_hash, verify_ordering_scope_binding,
+    CampaignSourceRevisionRef, CanonicalRequestView, CanonicalStoreClient,
+    MAX_RECOVERY_OWNER_RECORDS, NamedReadOperation, NamedReadRequest, NamedReadResponse,
+    OperationIdentity, OrderingHeadExpectation, PreparedTransition, ReadConsistency,
+    RecoveryRecord, RecoveryRecordKey, RequestMeta, RevisionHeadExpectation, StoreError,
+    StoreGenesisRequest, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
+    WriteReceiptStatus, verify_canonical_request_hash, verify_ordering_scope_binding,
 };
 use serde::Deserialize;
 
@@ -3925,9 +3925,11 @@ impl KernelComposition {
                         Ok(host_request_route::ObserveDeferDisposition::Settled(record)) => Ok(
                             Self::settled_observe_daemon_response(record.operation_id.as_str()),
                         ),
-                        Ok(host_request_route::ObserveDeferDisposition::ReconciliationRequired(
-                            record,
-                        )) => Ok(Self::unknown_observe_daemon_response(
+                        Ok(
+                            host_request_route::ObserveDeferDisposition::ReconciliationRequired(
+                                record,
+                            ),
+                        ) => Ok(Self::unknown_observe_daemon_response(
                             record.operation_id.as_str(),
                         )),
                         Ok(host_request_route::ObserveDeferDisposition::StaleAttempt(
@@ -9382,8 +9384,7 @@ impl KernelComposition {
             || record.capability_ref.as_str() != "eliot.observe"
             || record.state != eliot_ors::HostRequestState::Submitted
             || attempt.phase != eliot_ors::HostRequestAttemptPhase::Claimed
-            || attempt.input_commitment_sha256.as_deref()
-                != Some(input.commitment_sha256.as_str())
+            || attempt.input_commitment_sha256.as_deref() != Some(input.commitment_sha256.as_str())
         {
             return Err(
                 "protected Observe row is not the exact durably claimed submission".to_owned(),
@@ -9416,8 +9417,9 @@ impl KernelComposition {
         }
         let created_at_ms = i64::try_from(current_time_ms)
             .map_err(|_| "Kernel clock is outside the reservation time range".to_owned())?;
-        let expires_at_ms = i64::try_from(record.deadline_unix_ms)
-            .map_err(|_| "host request deadline is outside the reservation time range".to_owned())?;
+        let expires_at_ms = i64::try_from(record.deadline_unix_ms).map_err(|_| {
+            "host request deadline is outside the reservation time range".to_owned()
+        })?;
 
         let store = BorrowedCanonicalStoreClient::new(gateway);
         let actual_revision_heads = store
@@ -9436,7 +9438,12 @@ impl KernelComposition {
         let expected_revisions: BTreeMap<_, _> = operation
             .expected_revision_heads
             .iter()
-            .map(|head| (head.key.as_str(), (head.expected_revision, &head.state_fence)))
+            .map(|head| {
+                (
+                    head.key.as_str(),
+                    (head.expected_revision, &head.state_fence),
+                )
+            })
             .collect();
         let mut seen_revision_keys = BTreeSet::new();
         for head in &actual_revision_heads {
@@ -9454,7 +9461,9 @@ impl KernelComposition {
             }
         }
         if seen_revision_keys.len() != expected_revisions.len() {
-            return Err("canonical revision-head observation does not cover the admitted keys".to_owned());
+            return Err(
+                "canonical revision-head observation does not cover the admitted keys".to_owned(),
+            );
         }
 
         let actual_ordering_heads = store
@@ -9467,7 +9476,12 @@ impl KernelComposition {
         let expected_ordering: BTreeMap<_, _> = operation
             .expected_ordering_heads
             .iter()
-            .map(|head| (head.scope.as_str(), (head.expected_sequence, &head.state_fence)))
+            .map(|head| {
+                (
+                    head.scope.as_str(),
+                    (head.expected_sequence, &head.state_fence),
+                )
+            })
             .collect();
         let mut observed_heads = Vec::with_capacity(actual_ordering_heads.len());
         let mut seen_ordering_scopes = BTreeSet::new();
@@ -9477,8 +9491,7 @@ impl KernelComposition {
             if !seen_ordering_scopes.insert(head.scope.clone()) {
                 return Err("canonical ordering-head observation contains duplicates".to_owned());
             }
-            let canonical_head =
-                canonical_json_bytes(&head).map_err(|error| error.to_string())?;
+            let canonical_head = canonical_json_bytes(&head).map_err(|error| error.to_string())?;
             if canonical_head != readback.canonical_bytes
                 || sha256_hex(&readback.canonical_bytes) != readback.canonical_sha256
                 || head.state_fence != operation.context.state_fence
@@ -9498,7 +9511,9 @@ impl KernelComposition {
             });
         }
         if seen_ordering_scopes.len() != expected_ordering.len() {
-            return Err("canonical ordering-head observation does not cover admitted scopes".to_owned());
+            return Err(
+                "canonical ordering-head observation does not cover admitted scopes".to_owned(),
+            );
         }
 
         let access = input

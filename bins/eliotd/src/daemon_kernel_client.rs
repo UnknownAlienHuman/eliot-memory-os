@@ -1238,7 +1238,10 @@ pub fn parse_observe_claimed_pair(
                 format!("Kernel original request identity cannot encode: {error}")
             })? != executable_input.application_binding.source_request_identity
             {
-                return Err("Kernel original RequestIdentity differs from the retained ORS source".to_owned());
+                return Err(
+                    "Kernel original RequestIdentity differs from the retained ORS source"
+                        .to_owned(),
+                );
             }
             let peer_admission_receipt: eliot_protocol::AgentBridgePeerAdmissionReceipt =
                 serde_json::from_value(
@@ -1258,10 +1261,12 @@ pub fn parse_observe_claimed_pair(
                         .source_activation_ticket
                         .clone(),
                 )
-                .map_err(|error| format!("retained source activation ticket does not decode: {error}"))?;
-            source_activation_ticket
-                .validate()
-                .map_err(|error| format!("retained source activation ticket is invalid: {error}"))?;
+                .map_err(|error| {
+                    format!("retained source activation ticket does not decode: {error}")
+                })?;
+            source_activation_ticket.validate().map_err(|error| {
+                format!("retained source activation ticket is invalid: {error}")
+            })?;
             let source_activation_result: eliot_protocol::AgentActivationResolutionResult =
                 serde_json::from_value(
                     executable_input
@@ -1269,10 +1274,14 @@ pub fn parse_observe_claimed_pair(
                         .source_activation_result
                         .clone(),
                 )
-                .map_err(|error| format!("retained source activation result does not decode: {error}"))?;
+                .map_err(|error| {
+                    format!("retained source activation result does not decode: {error}")
+                })?;
             source_activation_result
                 .validate_against(&source_activation_ticket)
-                .map_err(|error| format!("retained source activation result is invalid: {error}"))?;
+                .map_err(|error| {
+                    format!("retained source activation result is invalid: {error}")
+                })?;
             if record.operation_id.as_str() != attempt.operation_id
                 || record.request_digest != envelope.envelope_sha256
                 || record.payload_digest != envelope.identity.payload_sha256
@@ -1290,8 +1299,7 @@ pub fn parse_observe_claimed_pair(
                 || attempt.facet_method != OBSERVE_CAPABILITY
                 || envelope.state_fence != executable_input.application_binding.state_fence
                 || envelope.connection_id != peer_admission_receipt.connection_id
-                || envelope.peer_admission_receipt_sha256
-                    != peer_admission_receipt.receipt_sha256
+                || envelope.peer_admission_receipt_sha256 != peer_admission_receipt.receipt_sha256
                 || executable_input.peer_admission_receipt_sha256
                     != peer_admission_receipt.receipt_sha256
                 || source_activation_ticket.peer_admission_receipt.as_ref()
@@ -1301,7 +1309,8 @@ pub fn parse_observe_claimed_pair(
                 || source_activation_ticket.connection_id != envelope.connection_id
                 || source_activation_ticket.state_fence != envelope.state_fence
                 || source_activation_result.ticket_id != source_activation_ticket.ticket_id
-                || source_activation_result.ticket_state_fence != source_activation_ticket.state_fence
+                || source_activation_result.ticket_state_fence
+                    != source_activation_ticket.state_fence
                 || !envelope.activation_binding.as_ref().is_some_and(|binding| {
                     binding.ticket_id == source_activation_ticket.ticket_id
                         && binding.ticket_sha256 == source_activation_ticket.ticket_sha256
@@ -1335,7 +1344,11 @@ pub fn parse_observe_claimed_pair(
                     &source_request_identity.request.metadata.state_fence,
                     &executable_input.application_binding.state_fence,
                 )
-                || source_request_identity.request.metadata.session_id.is_some()
+                || source_request_identity
+                    .request
+                    .metadata
+                    .session_id
+                    .is_some()
                 || source_request_identity.request.metadata.task_id.is_some()
             {
                 return Err(
@@ -1380,7 +1393,9 @@ fn neutral_source_fence_matches_owner(
     source: &eliot_contracts::StateFence,
     semantic: &eliot_contracts::StateFence,
 ) -> bool {
-    source.authority_epoch.is_same_authority(&semantic.authority_epoch)
+    source
+        .authority_epoch
+        .is_same_authority(&semantic.authority_epoch)
         && source.resource_generation == semantic.resource_generation
         && source.task_revision.is_none()
         && source.policy_revision.is_none()
