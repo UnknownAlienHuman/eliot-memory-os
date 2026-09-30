@@ -75,6 +75,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use eliot_agent_api::{AttemptId, RouteFingerprint};
+use eliot_agent_bridge_core::ToolResultReceipt;
 use eliot_agent_coordinator::{
     AdmissionId, CandidateId, RUNTIME_PROFILE_FILE_NAME, SchedulingProfile, StaffingPlanRequest,
     load_runtime_scheduling_profile,
@@ -2101,6 +2102,97 @@ pub fn solo_ingest_result(
     };
     fabric.submit_attempt_result(&record)?;
     projection.result_digest = Some(result_digest.to_owned());
+    repersist_after_control(composition, &fabric, &mut projection)?;
+    // Issue #1683 W1 / I14.8: the settled attempt released its slot, so the
+    // coordinator's bounded fair pull runs now instead of on the next agent
+    // command. The candidate result is already durable above.
+    drive_fair_pull_after_release(composition, &mut fabric, &mut projection)?;
+    solo_status(composition, operation_id)
+}
+
+/// Ingests one bridge-projected tool result as attempt evidence for the
+/// recorded dispatch operation (issue #1108, A12).
+///
+/// Production entry for the bridge-receipt leg: `receipt` is the bridge
+/// owner's projected ORIGINAL. It is validated with the existing
+/// [`ToolResultReceipt::check_complete_evidence`] gate inside
+/// [`AgentFabric::observe_tool_result`] — never recomputed here — and bound
+/// to the exact dispatch identity recorded in the durable projection, whose
+/// recorded intent in the restored fabric is the independent expected set.
+/// The recorded dispatch binding (operation/attempt identity) is
+/// content-compared before anything is observed, so a receipt for a foreign
+/// operation refuses instead of attaching; same identity and payload replay
+/// exactly with no second effect, while a changed payload under one identity
+/// is the typed `FabricError` residual, never a substitution. The candidate
+/// digest submitted is the owner-observed [`ToolResultReceipt::result_digest`],
+/// never a caller string, and it stays candidate evidence that can never
+/// satisfy task Finish.
+///
+/// No `DaemonComposition` method drives this yet (STITCH): the transport leg
+/// that delivers the bridge-projected receipt is outside this slice's paths.
+/// The string-digest leg ([`solo_ingest_result`]) is unchanged.
+pub fn solo_ingest_tool_result(
+    composition: &DaemonComposition,
+    kernel: &Arc<DaemonKernelClient>,
+    operation_id: &str,
+    worker_id: &str,
+    receipt: &ToolResultReceipt,
+    observed_via: &str,
+) -> Result<SoloAttemptStatus, DaemonError> {
+    if composition.readiness() != CompositionReadiness::Ready {
+        return Err(DaemonError::Composition(CompositionError::NotReady));
+    }
+    require_text(worker_id, "worker identity").map_err(DaemonError::ProviderAdmission)?;
+    require_text(observed_via, "observation leg").map_err(DaemonError::ProviderAdmission)?;
+    let mut projection = load_projection(composition.state_root(), operation_id)?;
+    let dispatch = projection.dispatch.clone().ok_or_else(|| {
+        DaemonError::ProviderAdmission(FabricError::Quarantined(format!(
+            "solo tool result finds no recorded dispatch for {operation_id}; \
+             a receipt without a recorded intent is never attached"
+        )))
+    })?;
+    if dispatch.operation_id != projection.operation_id
+        || dispatch.attempt_id != projection.attempt_id
+    {
+        return Err(DaemonError::ProviderAdmission(
+            FabricError::IdentityConflict(
+                "solo tool result refuses a dispatch binding that drifted from the recorded \
+                 projection; no substitution"
+                    .to_owned(),
+            ),
+        ));
+    }
+    let mut fabric = restore_solo_fabric(composition, kernel, &projection)?;
+    fabric
+        .observe_tool_result(&dispatch.dispatch_id, receipt)
+        .map_err(DaemonError::ProviderAdmission)?;
+    if let Some(recorded) = projection.result_digest.clone()
+        && recorded.as_str() != receipt.result_digest()
+    {
+        return Err(DaemonError::ProviderAdmission(
+            FabricError::IdentityConflict(
+                "solo tool result reuses the dispatch identity with different bytes; no \
+                 substitution, retry, or route change"
+                    .to_owned(),
+            ),
+        ));
+    }
+    if projection.result_digest.is_some() {
+        return solo_status(composition, operation_id);
+    }
+    let attempt = AttemptId::new(projection.attempt_id.clone())
+        .map_err(|error| DaemonError::ProviderAdmission(contract(error)))?;
+    let worker = crate::agent_fabric::WorkerAck {
+        attempt_id: attempt.clone(),
+        worker_id: worker_id.to_owned(),
+    };
+    fabric.observe_worker_ack(&worker)?;
+    let record = crate::agent_fabric::AttemptResultRecord {
+        attempt_id: attempt,
+        result_digest: receipt.result_digest().to_owned(),
+    };
+    fabric.submit_attempt_result(&record)?;
+    projection.result_digest = Some(receipt.result_digest().to_owned());
     repersist_after_control(composition, &fabric, &mut projection)?;
     // Issue #1683 W1 / I14.8: the settled attempt released its slot, so the
     // coordinator's bounded fair pull runs now instead of on the next agent
