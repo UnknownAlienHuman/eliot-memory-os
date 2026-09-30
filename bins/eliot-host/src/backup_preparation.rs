@@ -818,10 +818,10 @@ pub enum ReconcileDisposition {
     /// preparation run under the same operation id and overwrite the recorded
     /// intent, destroying the only evidence that the first one was admitted.
     ///
-    /// A record that DID reach an outcome, including one whose reclamation is
-    /// authorized or completed, is never this: the recorded disposition already
-    /// says what happened to the root, so it arrives as [`Self::Uncertain`] with
-    /// the disposition named, not as a result that was never written.
+    /// A record that DID reach an outcome is never this. A record that only
+    /// *authorized* a reclamation is [`Self::Uncertain`], and a record whose
+    /// reclamation completed is [`Self::Reclaimed`]; neither is a result that
+    /// was never written.
     AdmittedWithoutResult {
         /// The admission digest the durable intent binds, carried so the recorded
         /// operation identity survives reconciliation instead of being discarded
@@ -830,14 +830,40 @@ pub enum ReconcileDisposition {
         /// a destination from it.
         admission_digest: String,
     },
-    /// State cannot be established, or the recorded disposition has already
-    /// settled the operation: preserved as-is, never deleted, never retried
-    /// blindly.
+    /// The recorded destination was removed and its absence was OBSERVED: the
+    /// reclamation finished and the operation is terminal (case 958/15).
     ///
-    /// A retained reclamation authorization and an already-reclaimed
-    /// disposition both arrive here rather than as a destination: neither names
-    /// a live prepared root, and re-attempting an effect whose absence nobody
-    /// observed is exactly the blind retry I14.21 forbids.
+    /// This is the disposition of a durable, observed fact, and it is
+    /// deliberately distinct from every other arm. It is not
+    /// [`Self::Uncertain`] because nothing here is unestablished: the owner's
+    /// [`BackupPreparationState::Reclaimed`] disposition is retained only AFTER
+    /// the absence was observed, so the record proves the exact root this
+    /// operation created is gone rather than that its fate is unknown. Reporting
+    /// a finished operation as `Uncertain` would tell a caller to preserve and
+    /// wait on work that is already done, and every later sweep would list the
+    /// finished operation as a preserved unknown. It is not
+    /// [`Self::AdmittedWithoutResult`] because an outcome WAS recorded here: the
+    /// whole reclamation protocol completed.
+    ///
+    /// It is not stronger than the record proves either. The pinned identity is
+    /// retained by the owner rather than cleared, so this arm says exactly that
+    /// the directory this operation created was removed; it names no
+    /// destination to reuse, claims no restoration, activation or retirement,
+    /// and authorizes no further effect.
+    ///
+    /// A record that only authorized the reclamation is never this: an
+    /// authorization retained before an irreversible effect whose absence nobody
+    /// observed is genuinely unestablished, and stays [`Self::Uncertain`].
+    Reclaimed,
+    /// State cannot be established, or an owner-authorized cleanup transition is
+    /// retained whose effect nobody observed: preserved as-is, never deleted,
+    /// never retried blindly.
+    ///
+    /// A retained reclamation authorization arrives here rather than as a
+    /// destination: it names no live prepared root, and re-attempting an effect
+    /// whose absence nobody observed is exactly the blind retry I14.21 forbids.
+    /// A *completed* reclamation is not unestablished and is
+    /// [`Self::Reclaimed`], not this.
     Uncertain { reason: String },
 }
 
@@ -855,10 +881,20 @@ pub struct CleanupReport {
     /// durable sink both transitions are the Host journal owner's reclamation
     /// dispositions, so an entry here names a record that says the root is
     /// gone.
+    ///
+    /// The entry states that the root is gone, not that THIS call removed it: an
+    /// operation whose record was already `Reclaimed` before the sweep started
+    /// is reported here from that record's own durable state, and no second
+    /// removal is attempted for it. That is the same fact `removed` already
+    /// names, so a later sweep must not report a finished reclamation as a
+    /// preserved unknown.
     pub removed: Vec<String>,
     /// Operation ids preserved with reasons (unknown/foreign/mismatch/populated/
     /// unauthorized). An operation the sweep stopped before is preserved here
-    /// too, so a partial sweep is always visible in the returned report.
+    /// too, so a partial sweep is always visible in the returned report. An
+    /// operation whose reclamation is only authorized is preserved here, because
+    /// its effect is unestablished; one whose reclamation completed is in
+    /// [`Self::removed`] instead.
     pub preserved: Vec<(String, String)>,
 }
 
@@ -2500,12 +2536,14 @@ pub fn prepare_isolated_destination<J: PreparationJournal>(
 /// destination or a conflict, not another installation"). Reconciliation never
 /// deletes.
 ///
-/// A record whose reclamation is authorized, or whose destination was already
-/// reclaimed, carries no live prepared destination, so it is `Uncertain` with
-/// the recorded disposition named in the reason rather than `Current`. That is
-/// fail-closed in both directions: a `Reclaimed` root is never offered for reuse
-/// or re-reclamation, and a reclamation whose absence nobody observed is never
-/// attempted a second time.
+/// A record whose reclamation is only *authorized* carries no live prepared
+/// destination and no established outcome, so it is `Uncertain`: a reclamation
+/// whose absence nobody observed is never attempted a second time. A record
+/// whose reclamation *completed* is `Reclaimed`, because the absence was
+/// observed and the record proves it: reporting that finished operation as
+/// uncertain would understate the evidence and send the caller into a reconcile
+/// loop for work that is already done. Neither is `Current`, so a reclaimed root
+/// is never offered for reuse or re-reclamation.
 pub fn reconcile_preparation<J: PreparationJournal>(
     journal: &J,
     operation_id: &str,
@@ -2522,26 +2560,29 @@ pub fn reconcile_preparation<J: PreparationJournal>(
     };
     let Some(result) = result else {
         // A reclamation disposition is not an outcome that can be re-derived by
-        // looking at the root, and it is not the "outcome unknown" an unsettled
-        // admission represents, so it is reported as what the durable record
-        // already says. Both variants are preserved and never re-prepared or
-        // reclaimed again: a reclamation whose absence was never observed is an
-        // unknown effect, and I14.21 forbids retrying it blindly.
+        // looking at the root, so each one is reported as what the durable
+        // record itself already says, read from the record's own disposition
+        // rather than inferred from the root.
+        //
+        // The two are deliberately NOT one answer. `Reclaimed` is retained only
+        // after the absence was observed, so it is an established, finished
+        // fact and reports as such; `CleanupPending` is an authorization whose
+        // effect nobody observed, which is genuinely unestablished and reports as
+        // uncertain. Neither is ever re-prepared or reclaimed again: re-attempting
+        // an effect whose absence nobody observed is the blind retry I14.21
+        // forbids, and a terminal disposition is not re-attemptable at all.
         let disposition = projected_disposition(&intent);
-        let reclaiming = matches!(disposition, Some(BackupPreparationState::CleanupPending));
-        let reclaimed = matches!(disposition, Some(BackupPreparationState::Reclaimed));
-        if reclaiming || reclaimed {
+        if matches!(disposition, Some(BackupPreparationState::Reclaimed)) {
+            observe_prepare_progress(OP_RECONCILE, "outcome", "reclaimed", 0, 0);
+            return Ok(ReconcileDisposition::Reclaimed);
+        }
+        if matches!(disposition, Some(BackupPreparationState::CleanupPending)) {
             observe_prepare_progress(OP_RECONCILE, "outcome", "uncertain", 0, 0);
             return Ok(ReconcileDisposition::Uncertain {
-                reason: if reclaimed {
-                    "this operation already reclaimed its destination and the retained identity \
-                     proves which exact root was removed; nothing remains to reuse or reclaim"
-                        .to_owned()
-                } else {
-                    "reclamation of this exact destination is authorized but its absence was \
-                     never observed; the root is preserved and the effect is never retried blindly"
-                        .to_owned()
-                },
+                reason: "reclamation of this exact destination is authorized but its absence \
+                         was never observed; the root is preserved and the effect is never \
+                         retried blindly"
+                    .to_owned(),
             });
         }
         // Intent without result: a crash between intent recording and effect
@@ -2610,7 +2651,9 @@ pub fn reconcile_preparation<J: PreparationJournal>(
 /// embeds the prior receipt so no evidence is destroyed. Absent operations
 /// cannot be cancelled; uncertain ones must reconcile first, and so must
 /// admitted-but-unrecorded ones, which have no receipt to embed and are
-/// preserved rather than released.
+/// preserved rather than released. A `Reclaimed` operation is finished: its
+/// destination is already gone, so there is nothing to cancel and nothing that
+/// reconciling first could change.
 pub fn cancel_preparation<J: PreparationJournal>(
     journal: &mut J,
     operation_id: &str,
@@ -2644,6 +2687,18 @@ pub fn cancel_preparation<J: PreparationJournal>(
                 operation: operation_id.to_owned(),
                 reason: "admitted without a recorded result; there is no receipt to embed, so the \
                           operation is preserved for inspection"
+                    .to_owned(),
+            },
+            0,
+        )),
+        ReconcileDisposition::Reclaimed => Err(note_prepare_error(
+            OP_CANCEL,
+            "outcome",
+            PreparationError::UnknownState {
+                operation: operation_id.to_owned(),
+                reason: "this operation already reclaimed its destination and the absence was \
+                          observed; it is finished, so there is nothing to cancel, nothing to \
+                          preserve and nothing to retry"
                     .to_owned(),
             },
             0,
@@ -2712,7 +2767,11 @@ pub fn cancel_preparation<J: PreparationJournal>(
 /// [`CleanupTransitionState::Reclaimed`] is retained only after the absence has
 /// actually been observed, and an operation whose `Reclaimed` retention is
 /// refused is reported as preserved rather than removed, so [`CleanupReport`]
-/// never claims a durable state this module could not write.
+/// never claims a durable state this module could not write. A record that
+/// already carries `Reclaimed` when the sweep reaches it reports as
+/// [`CleanupReport::removed`] from that record's own state, never as a
+/// preserved unknown: the root is gone, and no proof is re-verified and no
+/// effect re-attempted for a terminal disposition.
 pub fn cleanup_preparations<J: PreparationJournal>(
     journal: &mut J,
     operation_ids: &[String],
@@ -2811,6 +2870,18 @@ pub fn cleanup_preparations<J: PreparationJournal>(
                          (admission digest {admission_digest})"
                     ),
                 ));
+            }
+            Ok(ReconcileDisposition::Reclaimed) => {
+                // The record's own durable state says this operation's root was
+                // removed and its absence observed, so this sweep reports it as
+                // removed rather than as a preserved unknown: listing a correctly
+                // reclaimed root under `preserved` is a false statement about a
+                // directory that is gone. The disposition is read from the
+                // record, never inferred from the root, and nothing is deleted
+                // here - `Reclaimed` is terminal, so there is no proof to
+                // re-verify and no effect left to attempt.
+                observe_prepare_progress(OP_CLEANUP, "sweep", "reclaimed", 0, 0);
+                report.removed.push(operation_id.to_owned());
             }
             Ok(ReconcileDisposition::Uncertain { reason }) => {
                 observe_prepare_progress(OP_CLEANUP, "sweep", "preserved", 0, 0);

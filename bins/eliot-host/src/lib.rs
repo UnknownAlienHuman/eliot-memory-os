@@ -6306,6 +6306,27 @@ impl HostComposition {
                             "this Host retains no isolated-restore preparation for the admitted operation",
                         ))
                     }
+                    // The reclamation finished: the recorded destination was
+                    // removed and its absence was observed, so the operation is
+                    // terminal. It is answered as a refusal in the same shape as
+                    // the `Absent` arm above — this Host will take no effect for
+                    // this operation, and nothing is left to do — rather than as
+                    // `PossibleEffect`.
+                    //
+                    // It must NOT be `PossibleEffect`: that disposition tells the
+                    // requester the effect may or may not have committed and the
+                    // operation must be preserved and waited on, which is exactly
+                    // wrong for an operation whose root is already gone. It is
+                    // not `Admitted` either, which claims the operation is still
+                    // executing, and it is not `Completed`, which this Host must
+                    // not mint without a `#954` `BackupPhaseAttestation` (see the
+                    // `Current` arm above).
+                    Ok(crate::backup_preparation::ReconcileDisposition::Reclaimed) => {
+                        Err(BackupDispatchRefusal::new(
+                            operation,
+                            "this Host already reclaimed the admitted operation's isolated-restore destination and observed its absence: the operation is finished, its root is gone, and there is nothing to preserve and nothing to retry",
+                        ))
+                    }
                     // Two dispositions, one answer, because they are the same
                     // fact about authority.
                     //
@@ -6319,9 +6340,14 @@ impl HostComposition {
                     // invite a second preparation under the same operation id.
                     //
                     // `Uncertain`: a recorded result that cannot be re-proved
-                    // against the live root. The effects are unverified, so the
-                    // retained operation is preserved and reconciled, never
-                    // deleted and never retried blindly.
+                    // against the live root, or a cleanup transition whose
+                    // removal effect nobody observed. Either way the effects are
+                    // unestablished, so the retained operation is preserved and
+                    // reconciled, never deleted and never retried blindly. A
+                    // record whose reclamation COMPLETED is not here: the owner
+                    // observed that absence, and the `Reclaimed` arm above says
+                    // so instead of sending a finished operation into a
+                    // preserve-and-wait loop.
                     //
                     // They are one arm because they carry the same obligation -
                     // reconcile the original operation - and splitting them would
