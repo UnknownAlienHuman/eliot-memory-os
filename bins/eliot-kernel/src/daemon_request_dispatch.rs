@@ -4893,6 +4893,19 @@ impl KernelComposition {
                 );
             }
         }
+        // I12.24:65's "decision owner selects reject / investigate / work item /
+        // experiment" is declined here, on an authenticated request, before any
+        // Store dispatch. See `improvement_brief_decision_refusal` for the
+        // closed disposition this returns and for the exact route that is
+        // missing.
+        if let eliot_kernel_core::UserAutomationOperation::DecideImprovementBrief { brief_id, .. } =
+            &request.intent.operation
+        {
+            return Self::bind_user_automation_operator_response(
+                &request,
+                &Self::improvement_brief_decision_refusal(&request, brief_id),
+            );
+        }
         let transition = match self
             .dispatch_user_automation_operator_transition(session, &request)
             .await
@@ -4947,6 +4960,91 @@ impl KernelComposition {
         serde_json::to_value(envelope).map_err(|_| TransportError::SessionFenced)
     }
 
+    /// Answers an authenticated owner who selected a disposition over an
+    /// improvement brief (I12.24:65).
+    ///
+    /// This is the route's OWN closed, non-reconciling answer, returned through
+    /// the existing response machinery rather than as a transport fault:
+    /// `user_automation_runtime_error_response` projects
+    /// [`UserAutomationRuntimeError::Rejected`] as `accepted: false`,
+    /// `outcome: "rejected"` with `recovery: null`, and
+    /// `bind_user_automation_operator_response` wraps it through
+    /// `UserAutomationOperatorResultEnvelope::bind_internal_response`, whose
+    /// `validate_for_request` requires exactly that `Rejected` disposition —
+    /// status `Known` and no recovery obligation. The envelope is bound to this
+    /// authenticated request's correlation, principal-bound intent and State
+    /// Fence, so the answer is addressed to the owner who made the selection
+    /// and cannot be mistaken for a foreign or unattributed refusal.
+    ///
+    /// # Why a refusal and not a durable record
+    ///
+    /// I12.24:65 places "decision owner selects reject / investigate / work
+    /// item / experiment" as the owner's selection over a brief. The selection
+    /// IS authenticated here — the request is built and validated and its
+    /// principal is bound before this refusal is returned — but no durable
+    /// writer for a brief disposition is reachable from this route, and the
+    /// measured gap is structural, not a missing branch:
+    ///
+    /// - The canonical improvement record is a `Candidate` learning record
+    ///   whose document is `{candidate, brief, owner_decision, enforced_bound,
+    ///   governed_admission_digest}` (I12.24, committed by
+    ///   `improvement_intake_dispatch::commit_improvement_artifact` through the
+    ///   single Governor `commit_learning_record` seam). This Kernel route owns
+    ///   no such writer and must not add one: `bins/AGENTS.md` forbids adding
+    ///   canonical-write or store semantics to a composition binary, and the
+    ///   route holds no `ImprovementCandidate` from which the artifact's
+    ///   candidate, brief, bound or governed admission digest could be READ
+    ///   rather than fabricated.
+    /// - The brief the owner names is owned by the improvement owner and reaches
+    ///   no Kernel surface this route can look it up on: the operation carries
+    ///   only a `brief_id`, this route has no lookup that maps one onto a
+    ///   committed candidate row, and the automation Store below refuses the
+    ///   operation structurally — `CanonicalUserAutomationStore` answers
+    ///   `StoreError::UnknownOperation` both when it executes the operation and
+    ///   when it derives the operation's ordering scope, because every row,
+    ///   scope and mutation projection it owns is keyed by an automation
+    ///   identity this operation does not name.
+    /// - `reject` and `investigate` are both non-mutating by definition
+    ///   (`OwnerDecisionKind::is_non_mutating` admits exactly those two), so
+    ///   this answer records nothing and executes nothing: I12.24:3 "never
+    ///   silently rewrites code, policy or memory authority" and I12.24:82's
+    ///   advisory class "changes nothing until owner acts" both hold. The
+    ///   refusal is the honest ceiling — an owner can select a non-mutating
+    ///   decision here, and the selection is answered as a typed, non-reconciling
+    ///   refusal because the durable record for it does not yet exist, not
+    ///   because the owner lacks authority.
+    ///
+    /// The exact route that would turn this refusal into a durable record — a
+    /// Kernel queue carrying `brief_id`, the closed decision string and the
+    /// authenticated principal, a daemon-side poll, and the improvement owner's
+    /// `record_owner_decision` writing the `Candidate` artifact — is named in
+    /// `improvement_intake_dispatch`'s "The exact missing route, named" section
+    /// and is owned by those three other paths. This route deliberately does not
+    /// stand in for any of them.
+    ///
+    /// The refusal is a genuine decline, so it must not be reported as
+    /// reconcilable. It is the `Rejected` variant precisely because this
+    /// operation never reaches its Store and there is no
+    /// `prior_attempt_may_have_committed` obligation:
+    /// `user_automation_precommit_refusal_response` — the answer that DOES carry
+    /// that recovery — is for shape refusals where a prior attempt may have
+    /// committed, and is deliberately not used here.
+    #[cfg(windows)]
+    fn improvement_brief_decision_refusal(
+        request: &eliot_kernel_service::UserAutomationServiceRequest,
+        brief_id: &str,
+    ) -> serde_json::Value {
+        Self::user_automation_runtime_error_response(UserAutomationRuntimeError::Rejected(
+            format!(
+                "the authenticated principal {} may select a non-mutating disposition (reject or \
+                 investigate) over improvement brief {brief_id}, but this Kernel route owns no \
+                 durable writer for a brief decision, so the selection is declined rather than \
+                 recorded; the decision has not been executed and nothing was changed",
+                request.authenticated_principal,
+            ),
+        ))
+    }
+
     #[cfg(windows)]
     fn build_user_automation_operator_request(
         session: &Session,
@@ -4969,37 +5067,13 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         validate_user_automation_trigger_text(&route.payload.idempotency_key, "idempotency_key")?;
-        // I12.24:65's "decision owner selects reject / investigate / work item /
-        // experiment" is a closed operation on this boundary, and this route is
-        // not the seam that can record one. The operation carries `brief_id`
-        // and no `automation_id`, while every row, ordering scope and mutation
-        // projection the canonical Store below owns is keyed by an automation
-        // identity. Admitting it here would force one of two fabrications:
-        // hang the decision on an invented automation so it could reach a
-        // writer that cannot interpret it, or let it fall through to a Store
-        // refusal after this route had already reported a reconcilable outcome
-        // that no Store call ever backed. The second is the worse one, because
-        // the recoverable answer this route hands back asserts "prior_attempt_
-        // may_have_committed" about a Store that was never entered.
-        //
-        // Refusing here changes nothing about the brief, the candidate or
-        // their authority: I12.24:82 makes the advisory class "default;
-        // changes nothing until owner acts" and I12.24:3 states that ELIOT
-        // "never silently rewrites code, policy or memory authority". What is
-        // refused is only this route's claim to own a decision it cannot
-        // durably record. The improvement owner is the single writer of that
-        // record, and it must take the deciding principal from an
-        // authenticated Session of its own — A12.02:3's "Identity is not a
-        // model's self-declared string" is why the decision cannot be
-        // forwarded over a payload and re-attributed there, and why an ingress
-        // that could not bind the session principal has no honest way to
-        // complete the selection at all.
-        if matches!(
-            route.payload.operation,
-            eliot_kernel_core::UserAutomationOperation::DecideImprovementBrief { .. }
-        ) {
-            return Err(TransportError::SessionFenced);
-        }
+        // The I12.24:65 owner decision is a closed operation on this boundary
+        // and it is NOT declined here, because declining it before the principal
+        // is bound would answer an authenticated peer with a transport fence
+        // instead of a typed disposition. It is answered by
+        // `improvement_brief_decision_refusal` in
+        // `user_automation_operator_operation`, which runs once this request
+        // exists and therefore once the session principal is a real name.
         let principal = authenticated_user_automation_principal(session)?;
         let operation_id = eliot_contracts::OperationId::new(format!(
             "user-automation-operation:{}",
