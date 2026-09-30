@@ -190,6 +190,7 @@ fn valid_request_with(tag: &str) -> ReservedWriteRequest {
             expected_sequence: 6,
             state_fence: fence(),
         }],
+        original_write_submission: None,
     }
 }
 

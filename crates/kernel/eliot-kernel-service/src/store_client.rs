@@ -2454,6 +2454,7 @@ mod tests {
             admission,
             expected_revision_heads,
             expected_ordering_heads,
+            original_write_submission: None,
         };
         request.validate().expect("reserved request validates");
         request

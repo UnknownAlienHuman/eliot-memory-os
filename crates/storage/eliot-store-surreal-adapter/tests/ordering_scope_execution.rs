@@ -201,6 +201,7 @@ fn request_scopes(op: &str, scopes: &[(&str, u64, u64)], order: u64) -> Reserved
             state_fence: fence(),
         }],
         expected_ordering_heads,
+        original_write_submission: None,
     }
 }
 
