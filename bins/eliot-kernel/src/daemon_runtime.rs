@@ -105,7 +105,10 @@ fn record_daemon_recovery_operation_context(
         ),
         ("generation", generation.as_deref()),
         ("state_fence", state_fence.as_deref()),
-        ("authority_epoch", epoch.as_deref()),
+        (
+            "authority_epoch",
+            epoch.as_ref().map(|value| value.as_str()),
+        ),
     ] {
         if let Some(original) = original {
             let value = super::kernel_diagnostics::bound_field(original);

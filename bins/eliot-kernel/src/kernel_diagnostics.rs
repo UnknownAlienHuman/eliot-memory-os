@@ -502,6 +502,7 @@ pub fn operation_context(
         process_start_100ns = "unavailable",
         image_sha256 = "unavailable",
         lease = "unavailable",
+        lease_operation = "unavailable",
         receipt = "unavailable",
     )
 }

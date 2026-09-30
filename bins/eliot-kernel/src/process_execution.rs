@@ -133,7 +133,11 @@ fn record_process_owner_operation_context(
         eliot_contracts::StateFence::canonical_epoch_digest(owner.authority_epoch()).ok();
     record_process_context_field(context, "operation", Some(operation_id.as_str()));
     record_process_context_field(context, "generation", Some(generation.as_str()));
-    record_process_context_field(context, "authority_epoch", authority_epoch.as_deref());
+    record_process_context_field(
+        context,
+        "authority_epoch",
+        authority_epoch.as_ref().map(|epoch| epoch.as_str()),
+    );
 }
 
 fn record_process_start_request_context(
@@ -145,7 +149,11 @@ fn record_process_start_request_context(
     let owner_authority_epoch =
         eliot_contracts::StateFence::canonical_epoch_digest(owner.authority_epoch()).ok();
     record_process_context_field(context, "generation", Some(owner_generation.as_str()));
-    record_process_context_field(context, "authority_epoch", owner_authority_epoch.as_deref());
+    record_process_context_field(
+        context,
+        "authority_epoch",
+        owner_authority_epoch.as_ref().map(|epoch| epoch.as_str()),
+    );
     if admission.validate().is_err() {
         return;
     }

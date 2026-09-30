@@ -217,8 +217,11 @@ fn record_daemon_progress_operation_context(
             observation.map(|value| value.observation_id.as_str()),
         ),
         ("generation", generation.as_deref()),
-        ("state_fence", fence.as_deref()),
-        ("authority_epoch", epoch.as_deref()),
+        ("state_fence", fence.as_ref().map(|value| value.as_str())),
+        (
+            "authority_epoch",
+            epoch.as_ref().map(|value| value.as_str()),
+        ),
     ] {
         if let Some(original) = original {
             let value = kernel_diagnostics::bound_field(original);
