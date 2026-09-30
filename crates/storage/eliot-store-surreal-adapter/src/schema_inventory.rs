@@ -784,6 +784,31 @@ impl fmt::Display for AdjacentClassOmission {
 /// record of who can reach a migration root must close before a migration is
 /// applied, not after.
 pub(crate) fn validate_adjacent_classes() -> Result<(), AdjacentClassOmission> {
+    validate_adjacent_locations()?;
+    validate_adjacent_bodies()?;
+    validate_adjacent_access()?;
+    validate_adjacent_roots()?;
+    validate_adjacent_restore_dependencies()
+}
+
+/// Whether some recorded configuration path or packaging consumer names this
+/// declared non-executable root.
+///
+/// A retained root with no recorded consumer is the orphan shape `A3` names: a
+/// body the owner still classifies but nothing can reach. Both adjacent classes
+/// that can select a root are consulted, so a consumer recorded in either place
+/// discharges the check.
+fn root_has_recorded_consumer(root: &'static str) -> bool {
+    CONFIG_MIGRATION_PATHS
+        .iter()
+        .any(|path| path.selects_root == Some(root))
+        || PACKAGE_RELEASE_CONSUMERS
+            .iter()
+            .any(|consumer| consumer.root == root)
+}
+
+/// Refuses when one source location is claimed by two adjacent-class rows.
+fn validate_adjacent_locations() -> Result<(), AdjacentClassOmission> {
     let mut claimed: Vec<&'static str> = Vec::new();
     for location in MIGRATION_CONSTRUCTORS
         .iter()
@@ -798,12 +823,19 @@ pub(crate) fn validate_adjacent_classes() -> Result<(), AdjacentClassOmission> {
         }
         claimed.push(location);
     }
+    Ok(())
+}
+
+/// Cross-checks the constructor rows against the executable bodies in both
+/// directions, so neither an undeclared body nor an unconstructed admitted body
+/// can sit in the record unnoticed.
+fn validate_adjacent_bodies() -> Result<(), AdjacentClassOmission> {
     for constructor in &MIGRATION_CONSTRUCTORS {
         for const_name in constructor.builds {
-            if embedded_body_by_const_name(*const_name).is_none() {
+            if embedded_body_by_const_name(const_name).is_none() {
                 return Err(AdjacentClassOmission::ConstructorBuildsUndeclaredBody {
                     location: constructor.location,
-                    const_name: *const_name,
+                    const_name,
                 });
             }
         }
@@ -821,14 +853,23 @@ pub(crate) fn validate_adjacent_classes() -> Result<(), AdjacentClassOmission> {
             });
         }
     }
+    Ok(())
+}
+
+/// Refuses when an owner-admitted executor can be handed caller-supplied SQL,
+/// and when a current configuration key or a packaging consumer selects a root
+/// the owner never declared.
+fn validate_adjacent_access() -> Result<(), AdjacentClassOmission> {
     for path in CONFIG_MIGRATION_PATHS {
         if path.state == ConfigKeyState::Current
             && non_executable_root_for(path.default_value).is_none()
         {
-            return Err(AdjacentClassOmission::CurrentConfigPathSelectsUndeclaredRoot {
-                key: path.key,
-                root: path.default_value,
-            });
+            return Err(
+                AdjacentClassOmission::CurrentConfigPathSelectsUndeclaredRoot {
+                    key: path.key,
+                    root: path.default_value,
+                },
+            );
         }
     }
     for executor in &MIGRATION_EXECUTORS {
@@ -840,6 +881,12 @@ pub(crate) fn validate_adjacent_classes() -> Result<(), AdjacentClassOmission> {
             });
         }
     }
+    Ok(())
+}
+
+/// Refuses a declared non-executable root that no recorded configuration path or
+/// packaging consumer names, and a packaging consumer staging an undeclared one.
+fn validate_adjacent_roots() -> Result<(), AdjacentClassOmission> {
     for consumer in &PACKAGE_RELEASE_CONSUMERS {
         if consumer.action == PackagingAction::StagesDirectory
             && non_executable_root_for(consumer.root).is_none()
@@ -851,36 +898,36 @@ pub(crate) fn validate_adjacent_classes() -> Result<(), AdjacentClassOmission> {
         }
     }
     for root in &NON_EXECUTABLE_MIGRATION_ROOTS {
-        let has_recorded_consumer = CONFIG_MIGRATION_PATHS
-            .iter()
-            .any(|path| path.selects_root == Some(root.path))
-            || PACKAGE_RELEASE_CONSUMERS
-                .iter()
-                .any(|consumer| consumer.root == root.path);
-        if !has_recorded_consumer {
-            return Err(AdjacentClassOmission::RootWithoutRecordedConsumer {
-                path: root.path,
-            });
+        if !root_has_recorded_consumer(root.path) {
+            return Err(AdjacentClassOmission::RootWithoutRecordedConsumer { path: root.path });
         }
     }
+    Ok(())
+}
+
+/// Cross-checks the restore-path rows against the owner's own table list and
+/// published generations in both directions.
+fn validate_adjacent_restore_dependencies() -> Result<(), AdjacentClassOmission> {
     for dependency in &RESTORE_SCHEMA_DEPENDENCIES {
         for table in dependency.tables {
             if !schema::table::ALL_TABLES.contains(table) {
-                return Err(AdjacentClassOmission::RestoreDependencyNamesUndeclaredTable {
-                    location: dependency.location,
-                    table: *table,
-                });
+                return Err(
+                    AdjacentClassOmission::RestoreDependencyNamesUndeclaredTable {
+                        location: dependency.location,
+                        table,
+                    },
+                );
             }
         }
         for generation in dependency.pinned_generations {
             if !EMBEDDED_SCHEMA_BODIES
                 .iter()
-                .any(|body| body.generation == Some(*generation))
+                .any(|body| body.generation == Some(generation))
             {
                 return Err(
                     AdjacentClassOmission::RestoreDependencyPinsUndeclaredGeneration {
                         location: dependency.location,
-                        generation: *generation,
+                        generation,
                     },
                 );
             }
@@ -2026,9 +2073,8 @@ pub(crate) fn resolve_executable_body(
     generation: &str,
     checksum_sha256: &str,
 ) -> Result<&'static EmbeddedSchemaBody, ExecutableBodyRefusal> {
-    validate_adjacent_classes().map_err(|omission| {
-        ExecutableBodyRefusal::AdjacentClassRecordIncomplete { omission }
-    })?;
+    validate_adjacent_classes()
+        .map_err(|omission| ExecutableBodyRefusal::AdjacentClassRecordIncomplete { omission })?;
     if let Some(body) = embedded_body_by_migration_id(identity) {
         return admit_published_body(body, statements, generation, checksum_sha256);
     }
