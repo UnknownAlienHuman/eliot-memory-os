@@ -136,15 +136,20 @@
 //! an `AuthenticatedOwnerLease` from a real issuer. Both belong to the lease
 //! owner and the Problem owner respectively, not to this Governor.
 //!
-//! The nine named owner transitions (issue #1759 I2) are now prepared and
-//! committed from this owner through
+//! The nine named owner transitions (issue #1759 I2) are prepared and committed
+//! from this owner through
 //! [`GovernorObservationReconciliation::commit_problem_owner_transition`], which
 //! reuses this same gateway and the same `problem:{problem_id}` revision-head
-//! namespace. The same named prerequisite applies unchanged: that entry takes an
-//! `AuthenticatedOwnerLease`, so it is type-sound and production-unreachable
-//! until the lease owner issues one. It is stated here rather than worked
-//! around — no principal string is accepted on that path, and no Problem or
-//! Incident literal is constructed in this module.
+//! namespace. That entry currently has **no caller anywhere in the tree** — not
+//! a production entry and not a test — so the whole nine-verb path is reached
+//! from nothing. It is type-sound and its preparation is exercised through the
+//! same gateway as every other canonical write here; what is missing is a caller,
+//! and the caller cannot be written until the lease owner exists, because the
+//! entry takes an `AuthenticatedOwnerLease` and nothing outside `eliot-problem`'s
+//! own test module can construct one. Both facts are stated here rather than
+//! worked around: no principal string is accepted on that path, no Problem or
+//! Incident literal is constructed in this module, and no alias or wrapper was
+//! added to make the missing caller appear to exist.
 
 #![forbid(unsafe_code)]
 
@@ -2148,12 +2153,15 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
     ///
     /// The returned [`ProblemOwnerTransitionOutcome`] reports the committed
     /// candidate, the retained closure of a `Waive`/`Supersede` transition, and
-    /// the store's own receipt. No production
-    /// [`OwnerLeaseIssuer`](eliot_problem::OwnerLeaseIssuer) exists in this tree,
-    /// so no caller can currently present an
-    /// [`AuthenticatedOwnerLease`](eliot_problem::AuthenticatedOwnerLease):
-    /// every verb is type-sound here and production-unreachable until the lease
-    /// owner issues one.
+    /// the store's own receipt.
+    ///
+    /// This entry has no caller anywhere in the tree today, and no production
+    /// [`OwnerLeaseIssuer`](eliot_problem::OwnerLeaseIssuer) exists either, so
+    /// no caller could present the
+    /// [`AuthenticatedOwnerLease`](eliot_problem::AuthenticatedOwnerLease) this
+    /// takes: every verb is type-sound here and production-unreachable until the
+    /// lease owner issues one. A caller was deliberately not written, because a
+    /// caller that cannot construct its own argument is not a caller.
     ///
     /// # Errors
     ///
