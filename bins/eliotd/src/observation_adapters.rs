@@ -61,7 +61,7 @@ impl<'a, P: ?Sized> ForwardingObservationReconciliation<'a, P> {
 }
 
 impl<P: KernelTransitionPort + ?Sized> ForwardingObservationReconciliation<'_, P> {
-    /// Prepares one original MCP ObservationContent capture through the
+    /// Prepares one original MCP `ObservationContent` capture through the
     /// Governor owner. This remains a preparation step only; callers exchange
     /// the returned immutable write after releasing their composition lock.
     pub fn prepare_mcp_observation(

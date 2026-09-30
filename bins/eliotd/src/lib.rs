@@ -793,7 +793,7 @@ enum RetainedWorkspaceLocatorOrigin {
         task_ref: String,
     },
     HostPeer {
-        peer_admission_receipt: eliot_protocol::AgentBridgePeerAdmissionReceipt,
+        peer_admission_receipt: Box<eliot_protocol::AgentBridgePeerAdmissionReceipt>,
         activation_request_id: String,
     },
 }
@@ -2625,7 +2625,7 @@ impl DaemonComposition {
             })?;
         self.activation_workspace_locator = Some(RetainedActivationWorkspaceLocator {
             origin: RetainedWorkspaceLocatorOrigin::HostPeer {
-                peer_admission_receipt: receipt.clone(),
+                peer_admission_receipt: Box::new(receipt.clone()),
                 activation_request_id: ticket.activation_request_id.as_str().to_owned(),
             },
             work_scope_ref: owner_binding
@@ -2755,7 +2755,7 @@ impl DaemonComposition {
             RetainedWorkspaceLocatorOrigin::HostPeer {
                 peer_admission_receipt,
                 activation_request_id: retained_request_id,
-            } if peer_admission_receipt == receipt && retained_request_id == activation_request_id
+            } if peer_admission_receipt.as_ref() == receipt && retained_request_id == activation_request_id
         );
         if !origin_matches || locator.work_scope_ref != work_scope.binding.scope.scope_ref {
             return Err(
