@@ -197,7 +197,7 @@ pub struct MemoryInfluenceAckInput {
     pub downstream_outcome_ref: Option<String>,
 }
 
-const MEMORY_INFLUENCE_ACK_FIELDS: &[&str] = &[
+pub(crate) const MEMORY_INFLUENCE_ACK_FIELDS: &[&str] = &[
     "project_id",
     "write_id",
     "memory_handle",

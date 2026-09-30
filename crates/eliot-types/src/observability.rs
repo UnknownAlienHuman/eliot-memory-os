@@ -1,8 +1,8 @@
 //! Durable non-truth observability contracts.
 
 use crate::{
-    MemoryInfluenceAckInput, MemoryInfluenceClass, MemoryInfluenceTrace, MemoryRevision, ProjectId,
-    SessionId, TaskId, WriteId,
+    ul::injection::MEMORY_INFLUENCE_ACK_FIELDS, MemoryInfluenceAckInput, MemoryInfluenceClass,
+    MemoryInfluenceTrace, MemoryRevision, ProjectId, SessionId, TaskId, WriteId,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -195,11 +195,14 @@ impl<'de> Deserialize<'de> for MemoryInfluenceToolInput {
 /// Single-pass decoder for [`MemoryInfluenceToolInput`].
 ///
 /// A repeated key is refused before any value is stored, and a key outside the
-/// selected variant is refused before the typed union is returned. The two
-/// accepted shapes keep their own per-variant key policy: the full shape is
-/// closed (`MemoryInfluenceTraceWriteInput::deny_unknown_fields`), while the
-/// acknowledgement shape keeps the open key set its owner
-/// `crates/eliot-types/src/ul/injection.rs::MemoryInfluenceAckInput` declares.
+/// selected variant is refused before the typed union is returned. Both
+/// accepted shapes are closed, so this composition accepts no argument object
+/// that the stricter owning contract refuses: the full shape is closed by
+/// `MemoryInfluenceTraceWriteInput::deny_unknown_fields`, and the
+/// acknowledgement shape is closed here against the exact declared field set
+/// its owner `crates/eliot-types/src/ul/injection.rs::MemoryInfluenceAckInput`
+/// publishes as `MEMORY_INFLUENCE_ACK_FIELDS` and refuses in
+/// `MemoryInfluenceAckInputVisitor::visit_map`.
 struct MemoryInfluenceToolInputVisitor;
 
 impl<'de> serde::de::Visitor<'de> for MemoryInfluenceToolInputVisitor {
@@ -220,7 +223,9 @@ impl<'de> serde::de::Visitor<'de> for MemoryInfluenceToolInputVisitor {
         let mut influence_class: Option<MemoryInfluenceClass> = None;
         let mut downstream_outcome_ref: Option<String> = None;
         let mut saw_acknowledgement_key = false;
-        let mut saw_foreign_key = false;
+        // The first unrecognised key name, kept so the refusal can name it and
+        // the owning acknowledgement field set rather than a second list.
+        let mut foreign_key: Option<String> = None;
 
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
@@ -245,7 +250,7 @@ impl<'de> serde::de::Visitor<'de> for MemoryInfluenceToolInputVisitor {
                 }
                 _ => {
                     map.next_value::<serde::de::IgnoredAny>()?;
-                    saw_foreign_key = true;
+                    foreign_key = foreign_key.or(key);
                 }
             }
         }
@@ -259,7 +264,7 @@ impl<'de> serde::de::Visitor<'de> for MemoryInfluenceToolInputVisitor {
                 "unrecognised memory influence argument: it carries neither the full trace shape nor the acknowledgement shape",
             )),
             (true, false) => {
-                if saw_foreign_key {
+                if foreign_key.is_some() {
                     return Err(serde::de::Error::custom(
                         "unknown field in the full memory influence trace write argument",
                     ));
@@ -272,13 +277,26 @@ impl<'de> serde::de::Visitor<'de> for MemoryInfluenceToolInputVisitor {
                     },
                 ))
             }
-            (false, true) => Ok(MemoryInfluenceToolInput::Ack(MemoryInfluenceAckInput {
-                project_id,
-                write_id,
-                memory_handle: required(memory_handle, "memory_handle")?,
-                influence_class: required(influence_class, "influence_class")?,
-                downstream_outcome_ref,
-            })),
+            (false, true) => {
+                // The composed union is at least as strict as its strictest
+                // branch: an argument object carrying a key outside the owning
+                // acknowledgement contract is refused here exactly as
+                // `MemoryInfluenceAckInputVisitor` refuses it, rather than
+                // being accepted with the key dropped.
+                if let Some(unknown) = foreign_key {
+                    return Err(serde::de::Error::unknown_field(
+                        unknown.as_str(),
+                        MEMORY_INFLUENCE_ACK_FIELDS,
+                    ));
+                }
+                Ok(MemoryInfluenceToolInput::Ack(MemoryInfluenceAckInput {
+                    project_id,
+                    write_id,
+                    memory_handle: required(memory_handle, "memory_handle")?,
+                    influence_class: required(influence_class, "influence_class")?,
+                    downstream_outcome_ref,
+                }))
+            }
         }
     }
 }
