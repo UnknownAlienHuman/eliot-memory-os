@@ -1,0 +1,96 @@
+    Checking windows-link v0.1.3
+    Checking windows-link v0.2.1
+    Checking pin-project-lite v0.2.17
+    Checking base64 v0.22.1
+    Checking bytes v1.12.1
+   Compiling syn v3.0.5
+    Checking uuid v1.26.1
+   Compiling windows-interface v0.59.3
+   Compiling windows-implement v0.60.2
+    Checking windows-strings v0.4.2
+    Checking windows-result v0.3.4
+    Checking windows-threading v0.1.0
+    Checking windows-sys v0.61.2
+    Checking windows-core v0.61.2
+    Checking windows-collections v0.2.0
+    Checking windows-future v0.2.1
+    Checking windows-numerics v0.2.0
+    Checking windows v0.61.3
+   Compiling serde_derive_internals v0.30.0
+   Compiling serde_derive v1.0.229
+   Compiling thiserror-impl v2.0.20
+   Compiling ref-cast-impl v1.0.27
+   Compiling tokio-macros v2.7.2
+   Compiling schemars_derive v1.2.2
+    Checking ref-cast v1.0.27
+    Checking thiserror v2.0.20
+    Checking serde v1.0.229
+    Checking schemars v1.2.2
+    Checking eliot-conformance-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\foundation\eliot-conformance-contracts)
+    Checking eliot-build-test-graph v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\instrument\eliot-build-test-graph)
+    Checking eliot-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\foundation\eliot-contracts)
+    Checking eliot-source-assurance v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\security\eliot-source-assurance)
+    Checking mio v1.2.3
+    Checking socket2 v0.6.5
+    Checking tokio v1.53.1
+    Checking eliot-windows-ipc v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\eliot-windows-ipc)
+    Checking eliot-receipts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\foundation\eliot-receipts)
+    Checking eliot-evidence v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\foundation\eliot-evidence)
+    Checking eliot-runtime-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\foundation\eliot-runtime-contracts)
+    Checking eliot-instrument-api v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\instrument\eliot-instrument-api)
+    Checking eliot-agent-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\agent\eliot-agent-contracts)
+    Checking eliot-security-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\foundation\eliot-security-contracts)
+    Checking eliot-epistemic-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\smart\eliot-epistemic-contracts)
+    Checking eliot-learning-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\smart\eliot-learning-contracts)
+    Checking eliot-cue-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\smart\eliot-cue-contracts)
+    Checking eliot-influence v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\security\eliot-influence)
+    Checking eliot-observation-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\foundation\eliot-observation-contracts)
+    Checking eliot-protocol v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\foundation\eliot-protocol)
+    Checking eliot-platform v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\kernel\eliot-platform)
+    Checking eliot-rules v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\foundation\eliot-rules)
+    Checking eliot-authority v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\governor\eliot-authority)
+    Checking eliot-config v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\governor\eliot-config)
+    Checking eliot-skills v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\surfaces\eliot-skills)
+    Checking eliot-process v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\kernel\eliot-process)
+    Checking eliot-platform-windows v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\kernel\eliot-platform-windows)
+    Checking eliot-agent-api v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\agent\eliot-agent-api)
+    Checking eliot-wasm-runtime v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\modules\eliot-wasm-runtime)
+    Checking eliot-process-executor v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\instrument\eliot-process-executor)
+    Checking eliot-context-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\smart\eliot-context-contracts)
+    Checking eliot-bootstrap v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\foundation\eliot-bootstrap)
+    Checking eliot-user-broker-core v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\surfaces\eliot-user-broker-core)
+    Checking eliot-ipc v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\kernel\eliot-ipc)
+    Checking eliot-testd-core v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\instrument\eliot-testd-core)
+    Checking eliot-workscope v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\governor\eliot-workscope)
+    Checking eliot-reactive-context-plan v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\smart\eliot-reactive-context-plan)
+    Checking eliot-store-api v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\storage\eliot-store-api)
+    Checking eliot-ors v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\kernel\eliot-ors)
+    Checking eliot-skill v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\governor\eliot-skill)
+    Checking eliot-kernel-core v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\kernel\eliot-kernel-core)
+    Checking eliot-mcp v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\surfaces\eliot-mcp)
+    Checking eliot-cli v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\surfaces\eliot-cli)
+    Checking eliot-testd v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\bins\eliot-testd)
+bins\eliot-testd\src\kernel_client.rs:74:61: error: item in documentation is missing backticks
+bins\eliot-testd\src\kernel_client.rs:77:20: error: item in documentation is missing backticks
+bins\eliot-testd\src\kernel_client.rs:101:12: error: item in documentation is missing backticks
+bins\eliot-testd\src\kernel_client.rs:170:1: error: large size difference between variants: the entire enum is at least 2424 bytes
+bins\eliot-testd\src\kernel_client.rs:656:19: error: item in documentation is missing backticks
+bins\eliot-testd\src\kernel_client.rs:750:17: error: wildcard matches only a single variant and will also match any future added variants: help: try: `TestdTerminalCompletionResponse::Pending { .. }`
+bins\eliot-testd\src\worker.rs:136:65: error: item in documentation is missing backticks
+bins\eliot-testd\src\worker.rs:218:1: error: this function has too many lines (102/100)
+bins\eliot-testd\src\worker.rs:347:5: error: item in documentation is missing backticks
+bins\eliot-testd\src\worker.rs:537:17: error: assigning the result of `ToOwned::to_owned()` may be inefficient: help: use `clone_into()`: `observation_reason(&view).clone_into(&mut reason)`
+bins\eliot-testd\src\worker.rs:556:21: error: assigning the result of `ToOwned::to_owned()` may be inefficient: help: use `clone_into()`: `"bounded terminal supervision expired after cancellation; reconcile by exact identity".clone_into(&mut reason)`
+bins\eliot-testd\src\worker.rs:629:9: error: you seem to be trying to use `match` for destructuring a single pattern. Consider using `if let`
+bins\eliot-testd\src\worker.rs:647:17: error: assigning the result of `ToOwned::to_owned()` may be inefficient: help: use `clone_into()`: `"productive verifier has no persisted pre-dispatch source observation".clone_into(&mut reason)`
+bins\eliot-testd\src\worker.rs:864:15: error: casting `u64` to `i64` may wrap around the value: help: if this is intentional, use `cast_signed()` instead: `now.min(i64::MAX as u64).cast_signed()`
+bins\eliot-testd\src\lib.rs:744:62: error: item in documentation is missing backticks
+bins\eliot-testd\src\lib.rs:1166:25: error: redundant closure: help: replace the closure with the method itself: `std::fs::FileType::is_dir`
+bins\eliot-testd\src\lib.rs:1202:24: error: case-sensitive file extension comparison
+bins\eliot-testd\src\lib.rs:1317:1: error: this function has too many lines (107/100)
+bins\eliot-testd\src\lib.rs:1355:17: error: used `expect()` on an `Option` value
+bins\eliot-testd\src\lib.rs:1356:17: error: used `expect()` on an `Option` value
+bins\eliot-testd\src\lib.rs:1522:15: error: unnecessary closure used to substitute value for `Option::None`
+bins\eliot-testd\src\lib.rs:1723:19: error: item in documentation is missing backticks
+bins\eliot-testd\src\lib.rs:1693:1: error: unused `async` for function with no await statements
+error: could not compile `eliot-testd` (lib) due to 23 previous errors

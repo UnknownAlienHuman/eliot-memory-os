@@ -1,0 +1,12 @@
+    Checking uuid v1.26.1
+    Checking schemars v1.2.2
+    Checking eliot-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\foundation\eliot-contracts)
+    Checking eliot-receipts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\foundation\eliot-receipts)
+    Checking eliot-evidence v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\foundation\eliot-evidence)
+    Checking eliot-runtime-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\foundation\eliot-runtime-contracts)
+    Checking eliot-instrument-api v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\instrument\eliot-instrument-api)
+    Checking eliot-security-contracts v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\foundation\eliot-security-contracts)
+    Checking eliot-platform v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\kernel\eliot-platform)
+    Checking eliot-process v0.1.0 (C:\Development\Rust\projects\eliot-swarm\CB-1140-base\crates\kernel\eliot-process)
+crates\kernel\eliot-process\src\dispatch_permit.rs:66:5: error: missing `#[must_use]` attribute on a method returning `Self`
+error: could not compile `eliot-process` (lib) due to 1 previous error
