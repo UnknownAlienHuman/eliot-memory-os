@@ -1066,11 +1066,12 @@ pub fn fabric_rejection_of(error: &FabricError) -> (RejectionReason, OwningCompo
         | FabricError::StaleOwnerLease(_)
         | FabricError::ForeignOwnerField(_)
         | FabricError::BrokenOwnershipLink(_)
+        | FabricError::RevisionNotDurable(_)
         | FabricError::Quarantined(_) => {
             let reason = match error {
-                FabricError::ReceiptBinding(_) | FabricError::SemanticDrift(_) => {
-                    RejectionReason::ReceiptBinding
-                }
+                FabricError::ReceiptBinding(_)
+                | FabricError::SemanticDrift(_)
+                | FabricError::RevisionNotDurable(_) => RejectionReason::ReceiptBinding,
                 FabricError::DuplicateLaunch(_) => RejectionReason::DuplicateLaunch,
                 FabricError::Quarantined(_) => RejectionReason::Quarantined,
                 _ => RejectionReason::Contract,
