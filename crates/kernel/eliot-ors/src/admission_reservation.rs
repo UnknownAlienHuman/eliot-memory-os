@@ -121,11 +121,15 @@ pub struct AdmissionReservationActivationEvidence {
 impl AdmissionReservationActivationEvidence {
     /// Validates both receipt references as well-shaped owner evidence.
     ///
-    /// The two references are checked with the shape rules the receipts crate
-    /// itself applies to an issued identity — a lowercase SHA-256 canonical
-    /// digest and a `receipt-`-namespaced, non-blank receipt id. Nothing is
-    /// recomputed from the record in order to be trusted: the caller's copy is
-    /// validated, and the caller is the canonical owner that issued it.
+    /// The two references are checked with the shape rules an issued
+    /// `ReceiptIdentity` must satisfy: a non-blank, control-free receipt id and
+    /// a lowercase SHA-256 canonical digest. This is a shape check on the
+    /// caller's copy of the owner-issued receipt, not a re-derivation of it —
+    /// the receipt's digest was fixed by the canonical owner that issued it, and
+    /// recomputing it here would be inventing a second digest scheme rather than
+    /// verifying the existing one. The two halves must also be distinct, so one
+    /// receipt can never serve as both the canonical admission and the ORS
+    /// activation.
     ///
     /// # Errors
     ///
