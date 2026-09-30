@@ -45,9 +45,9 @@ IF ($position_before[0].epistemic_position_revision ?? 0) != $expected_position_
 
 // Issue #1712 admits the named erasure dispatch: `apply.rs` routes an
 // admitted `ApplyErasure` transition through `record_surreal_erasure_intent`
-// and `apply_surreal_erasure` below, so the intent-before-dispatch path is
-// live. The pure template/binding helpers remain exercised by the wired
-// erasure unit tests in `apply.rs`.
+// and the in-transaction bundle below, so the intent-before-dispatch body is
+// live inside the canonical transaction. The pure template/binding helpers
+// remain exercised by the wired erasure unit tests in `apply.rs`.
 /// Upsert of one durable erasure-intent row: creates the row when absent,
 /// refuses with `erasure_intent_conflict` when the same `operation_id`
 /// already names a different intent. First statement of the erasure atomic
@@ -102,22 +102,31 @@ pub(super) enum TxLane {
 
 /// Provider markers proving the shared fence/sequence allocation moved while
 /// the transaction carried no semantic conflict marker.
+///
+/// Closed to the canonical fence CAS alone (S-CONC-TX, issue #989, audit
+/// `5919482812`): only the fence compare-and-set arbitrates the global
+/// commit/outbox cursors. Every owner-row/revision/snapshot marker lives in
+/// [`SEMANTIC_CONFLICT_MARKERS`]: such a marker proves an owner row read
+/// before the transaction changed before the transaction CAS, i.e.
+/// semantic/currentness drift for the named leg, never bare allocation
+/// movement. Matching is exact sentinel-token equality (see
+/// [`has_marker_token`]), never a substring search over provider prose.
 const ALLOCATION_CONFLICT_MARKERS: &[&str] = &[
     "canonical_fence_cas_conflict",
     "canonical_fence_create_conflict",
-    "notification_revision_conflict",
-    "reactive_session_conflict",
-    "reactive_snapshot_conflict",
-    "automation_revision_conflict",
-    "automation_current_conflict",
-    "automation_invocation_conflict",
-    "experience_bank_conflict",
-    "experience_feedback_conflict",
-    "learning_record_conflict",
 ];
 
-/// Provider markers proving a deterministic semantic conflict: stale
-/// epistemic position, revision head, or ordering head.
+/// Provider markers proving a deterministic semantic conflict: a stale
+/// epistemic position, revision head, ordering head, or owner-row
+/// predecessor (notification, reactive, automation, experience, learning,
+/// finish/canonical/module-registry/capability-evidence owners, swarm,
+/// blackboard, task-contract acceptance).
+///
+/// Each of these proves the admitted operation's semantic input moved under
+/// it. The apply loop never retries them as allocation contention and never
+/// recomputes the named leg under the old operation identity: they surface
+/// as the exact typed semantic/currentness conflict (or demand a separately
+/// specified re-admission whose refreshed revisions are bound into identity).
 const SEMANTIC_CONFLICT_MARKERS: &[&str] = &[
     "epistemic_position_cas_conflict",
     "revision_head_cas_conflict",
@@ -129,70 +138,137 @@ const SEMANTIC_CONFLICT_MARKERS: &[&str] = &[
     "canonical_owner_cas_conflict",
     "canonical_owner_create_conflict",
     "module_registry_owner_cas_conflict",
+    "capability_evidence_cas_conflict",
+    "capability_evidence_create_conflict",
     "swarm_owner_revision_conflict",
     "blackboard_item_revision_conflict",
+    "task_contract_acceptance_revision_conflict",
+    "notification_revision_conflict",
+    "reactive_session_conflict",
+    "reactive_snapshot_conflict",
+    "automation_revision_conflict",
+    "automation_current_conflict",
+    "automation_invocation_conflict",
+    "automation_failure_conflict",
+    "automation_continuation_guard_conflict",
+    "automation_continuation_parent_conflict",
+    "experience_bank_conflict",
+    "experience_feedback_conflict",
+    "learning_record_conflict",
 ];
+
+/// Reports whether a provider statement error carries the exact closed
+/// sentinel token (S-CONC-TX, issue #989, audit `5919482812`).
+///
+/// The provider contour on this path offers no numeric statement codes: the
+/// transport decodes only per-statement `status` plus a free-form `result`
+/// string. The closed protocol is therefore exact token equality against the
+/// sentinel vocabulary our own `THROW` templates emit. The error is split on
+/// every character outside `[0-9A-Za-z_]` and one token must equal the marker
+/// exactly, so `THROW 'canonical_fence_cas_conflict'`, `An error occurred:
+/// canonical_fence_cas_conflict`, and a bare echoed marker all match, while a
+/// longer identifier merely containing the marker
+/// (`not_canonical_fence_cas_conflict`, `canonical_fence_cas_confliction`),
+/// a translation without the token, or surrounding narration can never match.
+/// Retry authority comes from this typed token plus the validated
+/// statement-result denominator (see [`write_canonical_transaction`]), never
+/// from prose.
+fn has_marker_token(error: &str, marker: &str) -> bool {
+    error
+        .split(|cell: char| !(cell.is_ascii_alphanumeric() || cell == '_'))
+        .any(|token| token == marker)
+}
 
 /// Reports whether a provider statement error proves shared-allocation
 /// movement (fence/sequence CAS).
 fn is_allocation_conflict(error: &str) -> bool {
     ALLOCATION_CONFLICT_MARKERS
         .iter()
-        .any(|marker| error.contains(marker))
+        .any(|marker| has_marker_token(error, marker))
 }
 
 /// Reports whether a provider statement error proves a deterministic
-/// semantic conflict (epistemic/revision/ordering CAS).
+/// semantic conflict (epistemic/revision/ordering/owner-row CAS).
 fn is_semantic_conflict(error: &str) -> bool {
     SEMANTIC_CONFLICT_MARKERS
         .iter()
-        .any(|marker| error.contains(marker))
+        .any(|marker| has_marker_token(error, marker))
 }
 
-/// Provider prose narrating an aborted transaction's cascade, never an
+/// Provider narration of an aborted transaction's cascade, never an
 /// independent statement outcome.
 ///
 /// Observed on a real fence race (S-CONC-TX, issue #989): the fence `THROW`
 /// aborts the transaction, and the provider reports one allocation marker
-/// plus this deterministic fallout for every unexecuted statement —
-/// `"The query was not executed due to a failed/cancelled transaction"`
-/// and `"Cannot COMMIT: the transaction was aborted due to a prior
-/// error"`. Those lines assert non-execution, so they carry no outcome
-/// evidence of their own: filtering them before classification neither
-/// invents contention nor hides a possible commit. A genuine transport
-/// ambiguity (`"connection reset during COMMIT"`, timeouts, duplicate
-/// creates) never matches these markers and still resolves unknown.
+/// plus this deterministic fallout for every unexecuted statement. Those
+/// lines assert non-execution, so they carry no outcome evidence of their
+/// own. Membership is CLOSED EXACT matching (see [`is_abort_fallout`]): any
+/// rewording, localization, or additional observation fails closed to
+/// [`AdapterError::UnknownOutcome`] for same-operation reconciliation — a
+/// safe direction, never a blind retry. A genuine transport ambiguity
+/// (`"connection reset during COMMIT"`, timeouts, duplicate creates) never
+/// equals these strings and still resolves unknown.
 const TRANSACTION_ABORT_FALLOUT_MARKERS: &[&str] = &[
-    "was not executed due to a failed transaction",
-    "was not executed due to a cancelled transaction",
-    "the transaction was aborted due to a prior error",
+    "The query was not executed due to a failed transaction",
+    "The query was not executed due to a cancelled transaction",
+    "Cannot COMMIT: the transaction was aborted due to a prior error",
 ];
 
 /// Reports whether a provider statement error is aborted-transaction
 /// cascade narration rather than an executed statement's outcome.
+///
+/// Closed exact match only: one layer of JSON string quoting (the transport
+/// pushes `result.to_string()`) and one optional `An error occurred: ` wrap
+/// are stripped, then the remainder must EQUAL a member of
+/// [`TRANSACTION_ABORT_FALLOUT_MARKERS`]. No substring search, no prose
+/// inference: an error carrying any sentinel token is evidence regardless of
+/// narration, and any other deviation is unknown.
 fn is_abort_fallout(error: &str) -> bool {
-    TRANSACTION_ABORT_FALLOUT_MARKERS
-        .iter()
-        .any(|marker| error.contains(marker))
+    let unquoted = strip_json_string_quotes(error.trim());
+    let bare = unquoted
+        .strip_prefix("An error occurred: ")
+        .unwrap_or(unquoted);
+    TRANSACTION_ABORT_FALLOUT_MARKERS.contains(&bare)
+}
+
+/// Strips one layer of JSON string quoting from a transported provider
+/// error: `result.to_string()` renders a `Value::String` with surrounding
+/// double quotes, which carry no outcome meaning.
+fn strip_json_string_quotes(error: &str) -> &str {
+    if error.len() >= 2 && error.starts_with('"') && error.ends_with('"') {
+        &error[1..error.len() - 1]
+    } else {
+        error
+    }
 }
 
 /// Classifies one canonical-transaction statement-error set without wildcard
-/// collapse (S-CONC-TX, issue #989).
+/// collapse (S-CONC-TX, issue #989, audit `5919482812`).
 ///
-/// A deterministic semantic marker anywhere in the set wins: the heads it
-/// names are stale regardless of fence movement. Pure fence/sequence
-/// movement is transient allocation contention on proved-not-committed
-/// ground (the fence CAS precedes the receipt create in statement order, so
-/// its abort commits nothing) — but ONLY when every executed statement
-/// error is a recognized allocation marker: a mixed allocation-plus-unknown
-/// set is an unknown outcome resolved by exact receipt reconciliation,
-/// never retried blindly and never reported as a semantic conflict.
-/// Aborted-transaction cascade narration is filtered first (see
-/// [`TRANSACTION_ABORT_FALLOUT_MARKERS`]): it asserts non-execution, so it
-/// is non-evidence, not ambiguity. A cascade with no executed error behind
-/// it resolves unknown — never contention, which requires positive fence
-/// evidence. Provider diagnostic text is matched only against these exact
-/// closed markers; no trustworthy code is inferred from arbitrary prose.
+/// Closed typed protocol over the transaction's own sentinel vocabulary:
+///
+/// - a deterministic semantic token anywhere in the set wins: the head or
+///   owner row it names is stale regardless of fence movement, so the
+///   outcome is [`AdapterError::ProviderConflict`] and the apply loop never
+///   retries it as contention and never recomputes the named leg under the
+///   old operation identity;
+/// - otherwise, pure fence/sequence movement is transient allocation
+///   contention on proved-not-committed ground (the fence CAS precedes the
+///   receipt create in statement order, so its abort commits nothing) — but
+///   ONLY when the set carries at least one exact fence token and every
+///   other member is either an exact fence token or exact aborted-transaction
+///   cascade narration, which asserts non-execution and is non-evidence;
+/// - anything else (mixed allocation-plus-unknown, bare cascade, transport
+///   ambiguity, duplicate creates, malformed rows) is
+///   [`AdapterError::UnknownOutcome`] resolved by exact same-operation
+///   receipt reconciliation, never retried blindly and never reported as a
+///   semantic conflict.
+///
+/// No trustworthy code is inferred from arbitrary prose: sentinels match by
+/// exact token equality ([`has_marker_token`]), cascade by exact full-string
+/// equality ([`is_abort_fallout`]). [`AdapterError::AllocationContention`] is
+/// the only outcome that re-enters the transaction loop, and it requires
+/// positive fence evidence.
 fn classify_transaction_errors(errors: &[String], operation_id: &str) -> AdapterError {
     debug_assert!(
         !errors.is_empty(),
@@ -201,11 +277,12 @@ fn classify_transaction_errors(errors: &[String], operation_id: &str) -> Adapter
     if errors.iter().any(|error| is_semantic_conflict(error)) {
         return AdapterError::ProviderConflict;
     }
-    let executed: Vec<&String> = errors
-        .iter()
-        .filter(|error| !is_abort_fallout(error))
-        .collect();
-    if !executed.is_empty() && executed.iter().all(|error| is_allocation_conflict(error)) {
+    let has_allocation = errors.iter().any(|error| is_allocation_conflict(error));
+    if has_allocation
+        && errors
+            .iter()
+            .all(|error| is_allocation_conflict(error) || is_abort_fallout(error))
+    {
         return AdapterError::AllocationContention {
             operation_id: operation_id.to_owned(),
         };
@@ -216,11 +293,62 @@ fn classify_transaction_errors(errors: &[String], operation_id: &str) -> Adapter
     }
 }
 
+/// Typed terminal allocation proof returned by the canonical transaction
+/// itself (S-CONC-TX, issue #989, audit `5919482812`).
+///
+/// Decoded from the [`schema::TX_ALLOC_PROOF`] result slot — the
+/// second-to-last statement result, immediately before `COMMIT` — on every
+/// error-free RPC. The writer requires exact operation binding plus exact
+/// allocation equality against the attempted plan; a missing, duplicate,
+/// malformed, or mismatched slot is a possible-commit outcome for
+/// same-operation reconciliation, never a local success. Unknown provider
+/// fields are tolerated on read (no `deny_unknown_fields`); every
+/// load-bearing value is compared exactly after decode.
+#[derive(serde::Deserialize)]
+struct AllocationProof {
+    operation_id: String,
+    commit_sequence: u64,
+    next_commit_sequence: u64,
+    next_outbox_sequence: u64,
+}
+
+/// Counts the top-level statements of one assembled canonical transaction.
+///
+/// The provider returns exactly one result slot per executed statement, so
+/// this count is the closed expected result denominator the writer validates
+/// against (`values_len` equality is proven through indexed `take`s, the only
+/// result accessor this contour owns). Quote- and brace-aware: `;` inside
+/// single/double-quoted literals (every `THROW` sentinel) or inside `{...}`
+/// blocks (every `IF` body) never counts. Covers only the closed templates
+/// this writer assembles — never caller-supplied query text.
+fn count_transaction_statements(sql: &str) -> usize {
+    let mut count = 0_usize;
+    let mut depth = 0_usize;
+    let mut quote: Option<char> = None;
+    for cell in sql.chars() {
+        if let Some(open) = quote {
+            if cell == open {
+                quote = None;
+            }
+            continue;
+        }
+        match cell {
+            '\'' | '"' => quote = Some(cell),
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ';' if depth == 0 => count += 1,
+            _ => {}
+        }
+    }
+    count
+}
+
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "the transaction writer preserves the closed named-operation order and atomic SQL assembly"
 )]
+#[cfg(test)]
 pub(super) async fn write_transaction(
     db: &client::RpcTransport,
     config: &SurrealAdapterConfig,
@@ -239,8 +367,80 @@ pub(super) async fn write_transaction(
     experience: &ExperienceWrites,
     learning: &LearningWrites,
 ) -> Result<(), AdapterError> {
+    write_canonical_transaction(
+        db,
+        config,
+        transition,
+        plan,
+        receipt,
+        initial_state,
+        expected_commit_sequence,
+        expected_outbox_sequence,
+        current_revisions,
+        current_orderings,
+        lane,
+        notifications,
+        reactive,
+        automation,
+        experience,
+        learning,
+        None,
+    )
+    .await
+}
+
+/// Sends one assembled canonical transaction and validates its complete
+/// provider result (S-CONC-TX, issue #989, audit `5919482812`).
+///
+/// Closed success protocol, in order:
+///
+/// 1. the transport sends the single `BEGIN`/`COMMIT` transaction (transport
+///    loss maps to [`AdapterError::UnknownOutcome`], never to a retry);
+/// 2. a non-empty statement-error set classifies through
+///    [`classify_transaction_errors`] (exact sentinel tokens only);
+/// 3. an error-free RPC must still prove its commit: the exact statement
+///    count ([`count_transaction_statements`]) must decode slot-for-slot —
+///    the terminal [`AllocationProof`] at the proof index must carry the
+///    attempted operation identity and allocation, and no trailing slot may
+///    exist past `COMMIT`.
+///
+/// Every failure at step 3 is a possible-commit outcome for same-operation
+/// receipt reconciliation — an error-free RPC is never treated as a
+/// committed exact receipt on its own. The caller additionally compares the
+/// durable receipt/fence/event/outbox readback before returning success (see
+/// `apply.rs::verify_durable_commit_bundle`).
+///
+/// `erasure` carries an admitted erasure intent's in-transaction fragment
+/// (intent upsert, scrub pairs, outcome seal) spliced before the receipt
+/// create when the transition class is `Erasure`; `None` assembles the
+/// receipt-only boundary. Either way the whole bundle commits in this one
+/// transaction — a destructive effect never commits ahead of it.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the transaction writer preserves the closed named-operation order and atomic SQL assembly"
+)]
+pub(super) async fn write_canonical_transaction(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    transition: &eliot_store_api::PreparedTransition,
+    plan: &ApplyPlan,
+    receipt: &WriteReceipt,
+    initial_state: bool,
+    expected_commit_sequence: u64,
+    expected_outbox_sequence: u64,
+    current_revisions: &[RevisionHead],
+    current_orderings: &[OrderingHead],
+    lane: TxLane,
+    notifications: &[super::surreal_notification::SurrealNotificationWrite],
+    reactive: &ReactiveWrites,
+    automation: &AutomationWrites,
+    experience: &ExperienceWrites,
+    learning: &LearningWrites,
+    erasure: Option<ErasureInTx>,
+) -> Result<(), AdapterError> {
     let operation_id = transition.identity.operation_id.to_string();
-    let (sql, bindings) = build_apply_statements(
+    let (mut sql, mut bindings) = build_apply_statements(
         transition,
         plan,
         receipt,
@@ -255,19 +455,55 @@ pub(super) async fn write_transaction(
         experience,
         learning,
     )?;
+    if let Some(erasure) = erasure {
+        // The erasure bundle joins the canonical atomic unit ahead of the
+        // receipt create (intent before destructive scrubs, seal before the
+        // linearization point), inside this same `BEGIN`/`COMMIT`.
+        let receipt_at = sql.rfind(schema::TX_CREATE_RECEIPT).ok_or_else(|| {
+            AdapterError::Serialization(
+                "canonical transaction is missing its receipt create".to_owned(),
+            )
+        })?;
+        sql.insert_str(receipt_at, &erasure.sql_fragment);
+        for (name, value) in erasure.bindings {
+            if bindings.insert(name.clone(), value).is_some() {
+                return Err(AdapterError::Serialization(
+                    "erasure binding collided with a canonical binding".to_owned(),
+                ));
+            }
+        }
+    }
     // 688-B classifies provider replies after the atomic RPC: deterministic
     // fence/head markers are conflicts, while an unavailable or unclassified
     // reply remains an unknown outcome for identity-based reconciliation.
+    let unknown = || AdapterError::UnknownOutcome {
+        operation_id: operation_id.clone(),
+    };
     let mut response = match send_transaction(db, config, &sql, bindings, lane).await {
         Ok(response) => response,
-        Err(AdapterError::ProviderUnavailable) => {
-            return Err(AdapterError::UnknownOutcome { operation_id });
-        }
+        Err(AdapterError::ProviderUnavailable) => return Err(unknown()),
         Err(error) => return Err(error),
     };
     let errors = response.take_errors();
     if !errors.is_empty() {
         return Err(classify_transaction_errors(&errors, &operation_id));
+    }
+    let expected_statements = count_transaction_statements(&sql);
+    if expected_statements < 2 {
+        return Err(unknown());
+    }
+    let proof: AllocationProof = response
+        .take(expected_statements - 2)
+        .map_err(|_| unknown())?;
+    if proof.operation_id != operation_id
+        || proof.commit_sequence != plan.commit_sequence
+        || proof.next_commit_sequence != plan.next_commit_sequence
+        || proof.next_outbox_sequence != plan.next_outbox_sequence
+    {
+        return Err(unknown());
+    }
+    if response.take::<Value>(expected_statements).is_ok() {
+        return Err(unknown());
     }
     Ok(())
 }
@@ -293,10 +529,12 @@ async fn send_transaction(
 ///
 /// Statement order is the commit boundary: epistemic CAS, fence CAS/create,
 /// revision CAS/create, ordering CAS/create(s), event/projection/relation/
-/// outbox creates, receipt create — all inside one `BEGIN`/`COMMIT`. Every
-/// declared expected revision head, ordering head, and the fence allocation
-/// is verified inside this transaction immediately before applying changes;
-/// shared allocation contention never waives those checks.
+/// outbox creates, receipt create, terminal allocation proof — all inside one
+/// `BEGIN`/`COMMIT`. Every declared expected revision head, ordering head,
+/// and the fence allocation is verified inside this transaction immediately
+/// before applying changes; shared allocation contention never waives those
+/// checks. An admitted erasure bundle is spliced ahead of the receipt create
+/// by [`write_canonical_transaction`], never in a side transaction.
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -597,6 +835,21 @@ fn build_apply_statements(
             "epistemic_payload": epistemic.as_ref().map(serde_json::to_string).transpose()
                 .map_err(|error| AdapterError::Serialization(error.to_string()))?,
         }),
+    );
+
+    sql.push_str(schema::TX_ALLOC_PROOF);
+    bindings.insert("alloc_operation_id".to_owned(), json!(operation_id));
+    bindings.insert(
+        "alloc_commit_sequence".to_owned(),
+        json!(plan.commit_sequence),
+    );
+    bindings.insert(
+        "alloc_next_commit_sequence".to_owned(),
+        json!(plan.next_commit_sequence),
+    );
+    bindings.insert(
+        "alloc_next_outbox_sequence".to_owned(),
+        json!(plan.next_outbox_sequence),
     );
 
     sql.push_str(schema::TX_COMMIT);
@@ -1028,9 +1281,12 @@ fn append_capability_evidence_owner_statements(
 /// One compare-and-set per computed write, assembled from the pre-transaction
 /// model computation: creates refuse when a row already exists, updates
 /// refuse on missing rows or revision drift. Drift surfaces the
-/// `notification_revision_conflict` marker so the apply loop retries with
-/// fresh rows. Record rows commit in the same transaction as the receipt and
-/// outbox rows below, so record, receipt, and outbox stay atomic.
+/// `notification_revision_conflict` marker, which the classifier reports as
+/// the exact typed semantic/currentness conflict: the apply loop never
+/// retries it as allocation contention and never recomputes the leg under
+/// the old operation identity. Record rows commit in the same transaction
+/// as the receipt and outbox rows below, so record, receipt, and outbox
+/// stay atomic.
 fn append_notification_statements(
     sql: &mut String,
     bindings: &mut Map<String, Value>,
@@ -1466,16 +1722,33 @@ pub(crate) fn erasure_outcome_record_id(operation_id: &str) -> String {
     format!("erasure-outcome-{operation_id}")
 }
 
+/// Intent-before-dispatch body shared by the standalone template below and
+/// the canonical in-transaction bundle (S-CONC-TX, issue #989): (1) the
+/// intent upsert that creates the durable intent row when absent and refuses
+/// when the same id already names different bytes; (2) one scrub `UPDATE`
+/// pair per store-owned surface admitted under the exact recorded scope; (3)
+/// the outcome seal. No `BEGIN`/`COMMIT` delimiters: the caller supplies the
+/// transaction boundary.
+fn erasure_body_template(store_owned_surface_count: usize) -> String {
+    let mut sql = String::new();
+    sql.push_str(TX_ERASURE_INTENT);
+    for index in 0..store_owned_surface_count {
+        sql.push_str(&schema::indexed(TX_ERASURE_SCRUB_AUTHORITY, index));
+        sql.push_str(&schema::indexed(TX_ERASURE_SCRUB_EVIDENCE, index));
+    }
+    sql.push_str(TX_ERASURE_OUTCOME);
+    sql
+}
+
 /// Intent-before-dispatch transaction template (688-B, pure).
 ///
-/// Statement order inside one `BEGIN`/`COMMIT` pair: (1) the intent upsert
-/// that creates the durable intent row when absent and refuses when the same
-/// id already names different bytes; (2) one scrub `UPDATE` pair per
-/// store-owned surface (authority entries first, then evidence entries), each
-/// pair removing only the selected subject's erasable entries admitted under
-/// the exact recorded scope while the receipt row itself survives for exact
-/// replay and resolution; (3) the outcome seal that
-/// persists the exact per-surface outcomes for idempotent replay.
+/// Statement order inside one `BEGIN`/`COMMIT` pair: the intent upsert, one
+/// scrub `UPDATE` pair per store-owned surface (authority entries first,
+/// then evidence entries), and the outcome seal that persists the exact
+/// per-surface outcomes for idempotent replay. Renders over
+/// [`erasure_body_template`], the same body the canonical in-transaction
+/// bundle splices, so the standalone ordering assertion and the live bundle
+/// cannot drift.
 ///
 /// All `SurrealQL` stays inside the local `TX_ERASURE_*` templates above:
 /// this builder composes closed statement constants owned by this apply
@@ -1489,12 +1762,7 @@ pub(crate) fn erasure_outcome_record_id(operation_id: &str) -> String {
 #[must_use]
 pub(crate) fn erasure_transaction_template(store_owned_surface_count: usize) -> String {
     let mut sql = String::from(schema::TX_BEGIN);
-    sql.push_str(TX_ERASURE_INTENT);
-    for index in 0..store_owned_surface_count {
-        sql.push_str(&schema::indexed(TX_ERASURE_SCRUB_AUTHORITY, index));
-        sql.push_str(&schema::indexed(TX_ERASURE_SCRUB_EVIDENCE, index));
-    }
-    sql.push_str(TX_ERASURE_OUTCOME);
+    sql.push_str(&erasure_body_template(store_owned_surface_count));
     sql.push_str(schema::TX_COMMIT);
     sql
 }
@@ -1619,42 +1887,44 @@ fn erasure_delete_bindings(
     );
 }
 
-/// Executes one recorded erasure intent atomically (688-B, live path).
+/// Executes one recorded erasure intent inside the canonical atomic
+/// transaction (S-CONC-TX, issue #989, audit `5919482812`).
 ///
-/// Order: replay check (sealed outcome rows replay verbatim, no duplicate
-/// destructive work) → intent-before-dispatch transaction (intent row first,
-/// then exact subject/scope scrub `UPDATE`s, then outcome seal) → sealed
-/// outcomes. A
-/// lost commit response surfaces as
-/// [`AdapterError::UnknownOutcome`] for same-operation reconciliation (no
-/// blind retry); a guard conflict surfaces as `IdentityConflict`.
+/// In-transaction bundle for one admitted erasure intent: the intent upsert
+/// opens the fragment before any destructive statement, then the exact
+/// subject/scope scrub `UPDATE` pairs, then the outcome seal. The caller
+/// splices this fragment into the canonical `BEGIN`/`COMMIT` ahead of the
+/// receipt create, so intent, destructive effects, canonical event, heads,
+/// outbox, and receipt commit atomically or not at all: a fence-contention
+/// abort, a semantic head conflict, retry exhaustion, or an unknown outcome
+/// can never leave a separately committed destructive effect behind the
+/// canonical receipt. Same-operation replay converges without duplicate
+/// destructive work: the intent upsert refuses a same-identity intent naming
+/// different bytes (`erasure_intent_conflict`), and the scrub filters are
+/// idempotent over the already-scrubbed rows.
 ///
-/// Callers invoke this only after the apply-path intent gate below has
-/// recorded the durable intent: without that gate this function is never
-/// reached (fail-closed, zero destructive effects without recorded intent).
-pub(super) async fn write_erasure_transaction(
-    db: &client::RpcTransport,
-    config: &SurrealAdapterConfig,
+/// Constructed only after the caller proves the outcome is not already
+/// sealed (see [`read_sealed_erasure_outcomes`]); a sealed row replays
+/// verbatim with no fragment and no duplicate destructive work.
+pub(super) struct ErasureInTx {
+    pub(super) sql_fragment: String,
+    pub(super) bindings: Map<String, Value>,
+}
+
+/// Builds the in-transaction erasure bundle for one recorded intent.
+///
+/// Pure over the frozen intent: bindings and sealed outcomes follow
+/// [`erasure_transaction_bindings`] exactly (store-owned surfaces report
+/// `Purged`, foreign surfaces `Incomplete`, preserved terminal outcomes
+/// replay verbatim with zero scrub statements), and the fragment renders
+/// from the emitted `erasure_subject{i}` bindings so a replayed terminal
+/// outcome contributes no scrub `UPDATE`.
+pub(super) fn erasure_in_tx_parts(
     intent: &SurrealErasureIntent,
-) -> Result<Vec<SurrealSurfaceOutcome>, AdapterError> {
+) -> Result<ErasureInTx, AdapterError> {
     intent.validate().map_err(AdapterError::Store)?;
-    // Single sealed-outcome read: a sealed row replays verbatim with no
-    // duplicate destructive work; the unsealed case (`None`) binds against an
-    // empty prior so the transaction emits the full store-owned scrub set.
-    let sealed = read_erasure_outcome(db, config, &intent.operation_id).await?;
-    if let Some(sealed) = sealed {
-        return Ok(sealed);
-    }
     let prior: Vec<SurrealSurfaceOutcome> = Vec::new();
-    let (bindings, outcomes) = erasure_transaction_bindings(intent, &prior)?;
-    // 688-FIX derives the scrub-pair count from emitted bindings. This keeps the
-    // transaction empty of scrub statements when a terminal surface is
-    // preserved during same-operation replay.
-    // 688-FIX: render the template from the emitted `erasure_subject{i}`
-    // bindings (not from the intent denominator), so a replayed terminal
-    // outcome — preserved verbatim above with no bindings — contributes zero
-    // scrub `UPDATE`s. On the fresh path every store-owned surface emits bindings,
-    // so this equals the intent's store-owned count.
+    let (bindings, _) = erasure_transaction_bindings(intent, &prior)?;
     let store_owned = bindings
         .keys()
         .filter(|key| {
@@ -1664,30 +1934,26 @@ pub(super) async fn write_erasure_transaction(
                     .all(|byte| byte.is_ascii_digit())
         })
         .count();
-    let sql = erasure_transaction_template(store_owned);
-    let mut response = match client::query(db, config, "transaction.erasure", &sql, bindings).await
-    {
-        Ok(response) => response,
-        Err(AdapterError::ProviderUnavailable) => {
-            return Err(AdapterError::UnknownOutcome {
-                operation_id: intent.operation_id.clone(),
-            });
-        }
-        Err(error) => return Err(error),
-    };
-    let errors = response.take_errors();
-    if !errors.is_empty() {
-        if errors
-            .iter()
-            .any(|error| error.contains("erasure_intent_conflict"))
-        {
-            return Err(AdapterError::Store(StoreError::IdentityConflict));
-        }
-        return Err(AdapterError::UnknownOutcome {
-            operation_id: intent.operation_id.clone(),
-        });
-    }
-    Ok(outcomes)
+    Ok(ErasureInTx {
+        sql_fragment: erasure_body_template(store_owned),
+        bindings,
+    })
+}
+
+/// Reads one sealed erasure-outcome row by exact operation id.
+///
+/// `Some` means a prior attempt sealed the exact per-surface outcomes: the
+/// caller replays them verbatim with no duplicate destructive work. `None`
+/// means no sealed row exists, so the caller builds the full in-transaction
+/// bundle. A lost commit response surfaces as
+/// [`AdapterError::UnknownOutcome`] for same-operation reconciliation (no
+/// blind retry); a guard conflict surfaces as `IdentityConflict`.
+pub(super) async fn read_sealed_erasure_outcomes(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    operation_id: &eliot_store_api::OperationId,
+) -> Result<Option<Vec<SurrealSurfaceOutcome>>, AdapterError> {
+    read_erasure_outcome(db, config, &operation_id.to_string()).await
 }
 
 async fn read_erasure_outcome(
