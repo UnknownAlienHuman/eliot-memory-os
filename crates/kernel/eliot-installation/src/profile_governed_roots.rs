@@ -108,8 +108,9 @@ impl ProfileGovernedRoots {
     /// I3.1: "Mutable data is never stored beside immutable versioned binaries,
     /// except inside the explicitly disposable `portable_dev` profile." A target
     /// inside the profile's versioned immutable binaries root is therefore
-    /// refused for `system_service` and `user_mode`, and admitted only for the
-    /// disposable `portable_dev` profile. The comparison is lexical on
+    /// refused for `system_service` and `user_mode`. `portable_dev` admits it
+    /// only within its selected repository, including the disposable binary
+    /// and state contours. The comparison is lexical on
     /// [`WindowsPathIdentity`], the same bounded identity this crate already uses
     /// for root separation, so a traversal or alias cannot slip past it.
     ///
@@ -118,7 +119,7 @@ impl ProfileGovernedRoots {
     /// Returns [`InstallationError::InvalidField`] when the target is not a
     /// usable absolute path, and [`InstallationError::ProfileViolation`] when
     /// the target lies inside the versioned immutable binaries root of a profile
-    /// that does not permit it.
+    /// that does not permit it, or outside the selected `portable_dev` checkout.
     pub fn admits_write_target(&self, target: &str) -> Result<(), InstallationError> {
         let target = WindowsPathIdentity::parse_root(target, "write_target")?;
         let binaries =
@@ -128,6 +129,24 @@ impl ProfileGovernedRoots {
                 "write target lies inside the {} immutable binaries root; mutable data is never stored beside immutable versioned binaries",
                 self.profile_name()
             )));
+        }
+        if self.profile == InstallationProfile::PortableDev {
+            let state = WindowsPathIdentity::parse_root(&self.durable_data, "durable_data")?;
+            if !state.ends_with(&[PORTABLE_STATE_DIR, "state"]) || state.components.len() <= 2 {
+                return Err(InstallationError::ProfileViolation(
+                    "portable_dev durable root does not identify a repository checkout".to_owned(),
+                ));
+            }
+            let repository = WindowsPathIdentity {
+                prefix: state.prefix.clone(),
+                components: state.components[..state.components.len() - 2].to_vec(),
+            };
+            if !repository.contains(&target) {
+                return Err(InstallationError::ProfileViolation(
+                    "portable_dev write target is outside its selected repository checkout"
+                        .to_owned(),
+                ));
+            }
         }
         Ok(())
     }
