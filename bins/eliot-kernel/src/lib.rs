@@ -706,9 +706,11 @@ pub struct KernelComposition {
     /// while no approved blob manifest was injected; `Some` validates the
     /// manifest at startup without starting the generation.
     blob_store: Mutex<Option<BlobStoreController>>,
-    /// Kernel-owned production restore adapter (issue #960). Held without
-    /// effects until the #962 owner-channel turn drives restores through it;
-    /// the durable journal is injected per execution, never constructed here.
+    /// Kernel-owned production restore adapter (issue #960). Reached from the
+    /// production front door by `backup.restore-test`, which obtains the
+    /// owner-issued journal admission and then runs
+    /// [`KernelComposition::backup_restore_with_ors_journal`]; the durable
+    /// journal is injected per execution, never constructed here.
     backup_restore: KernelBackupRestore,
     /// Kernel-owned cross-owner backup capture coordinator (issue #959).
     /// Holds the work root only; every capture consumes already-accepted
@@ -837,8 +839,11 @@ pub struct KernelComposition {
 impl KernelComposition {
     /// Returns the Kernel-owned production restore adapter (issue #960).
     ///
-    /// Invocation arrives with the #962 owner-channel turn; until then the
-    /// adapter is held without effects.
+    /// It is reached on the production front door: `dispatch_backup_frame`'s
+    /// restore-test arm calls `admit_restore_journal` through this accessor
+    /// (`request_dispatch.rs`, `handle_backup_restore_test`) and then
+    /// [`Self::backup_restore_with_ors_journal`], so the durable journal is
+    /// injected per execution from this composition rather than constructed here.
     #[must_use]
     pub fn backup_restore(&self) -> &KernelBackupRestore {
         &self.backup_restore
@@ -888,21 +893,22 @@ impl KernelComposition {
     /// (`crate::dispatch_contour`); there is no other way to construct one, so
     /// a caller cannot name an installation here.
     ///
-    /// ## Chain status: still no production caller
+    /// ## Chain status: reached from the production front door
     ///
-    /// This entry has no caller in this repository, and that is recorded here
-    /// rather than papered over. The Kernel's only front-door backup dispatch
-    /// (`KernelComposition::dispatch_backup_frame`) routes `backup.create`,
-    /// `backup.verify` and `backup.restore-test`; `backup.verify` is read-only,
-    /// and `backup.restore-test` is a rehearsal that answers `plan_gap` naming
-    /// the missing owner evidence, so neither performs a restore. The other two
-    /// workspace consumers of this package are a native worker and an
-    /// instrument harness, not a restore owner. Calling this from any of them
-    /// would be a caller invented for the sake of one, and calling it from the
-    /// rehearsal path would run restore effects off a rehearsal and would still
-    /// refuse for want of owner-issued `DestinationManifestEvidence`, whose
-    /// producer (AUDIT-7) is also open. No placeholder call stands in for the
-    /// missing transport; #963/#2569 own the front-door connection.
+    /// `KernelComposition::dispatch_backup_frame` routes `backup.restore-test`
+    /// to `request_dispatch::handle_backup_restore_test`, which obtains the
+    /// owner-issued admission through
+    /// [`KernelBackupRestore::admit_restore_journal`]
+    /// and calls this entry, so the durable ORS journal a production restore runs
+    /// on is the one this composition opened. `backup.create` still answers
+    /// `plan_gap` naming the absent capture owner, which is the other half of
+    /// this issue and is not reached from here.
+    ///
+    /// What this entry still does not do is reach cutover: it runs in rehearsal
+    /// posture, so nothing here activates, retires or qualifies an installation.
+    /// A caller that reached it from a non-rehearsal posture would need owner
+    /// epoch and destination evidence this front door does not hold, and would
+    /// be refused by the engine's own gates rather than by a rule added here.
     pub fn backup_restore_with_ors_journal(
         &self,
         bundle: &eliot_backup::BackupBundle,

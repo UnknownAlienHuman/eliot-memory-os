@@ -127,6 +127,26 @@ pub const RESTORE_JOURNAL_INSTRUCTION_TAINT: InstructionTaint = InstructionTaint
 /// Kernel-owned operational ORS file; this label names that owner, never a
 /// second database.
 pub const RESTORE_JOURNAL_OWNER_LABEL: &str = "kernel-operational-ors";
+/// Exact writer identity of the Kernel owner that writes restore-journal rows.
+///
+/// This is the `writer_id` an [`OrsRestoreBinding`] carries, so it is the value
+/// the ORS owner commits into `RestoreJournalStreamBinding::writer_id`, the
+/// value [`OrsRestoreJournalOwner::durable_journal_record`] reads back as
+/// `persistent_owner.owner_id`, and the value the coordinator re-compares
+/// against that admitted owner in `check_ors_journal_binding`. It names the same
+/// Kernel restore owner the phase matrix in `super::backup_restore` attributes
+/// the prepare and finalize phases to; that matrix reports which owner is
+/// responsible for a phase in restore evidence, while this constant is the
+/// durable writer identity, so the two are separate vocabularies that happen to
+/// name one owner. It is declared here so the writer identity the journal rows
+/// carry has one owner-declared home.
+///
+/// It is a composition fact and never a request, config or fixture value: no
+/// caller can present a different writer, and a binding that disagrees with the
+/// admitted owner refuses before a row is read or written. It is NOT
+/// [`RESTORE_JOURNAL_OWNER_LABEL`], which names the operational ORS *database*
+/// behind the rows rather than the process that writes them.
+pub const RESTORE_JOURNAL_WRITER_ID: &str = "kernel-restore-owner";
 /// Isolated-restore area below `<work_root>/.eliot`.
 pub const RESTORE_ISOLATED_AREA: &str = "restore-isolated";
 /// Content-addressed sealed journal-payload area below `<work_root>/.eliot`.

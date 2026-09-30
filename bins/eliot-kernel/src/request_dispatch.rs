@@ -143,6 +143,7 @@
 
 use std::num::NonZeroU64;
 
+use eliot_backup::{BackupBundle, BackupClass, RestoreContext};
 use eliot_contracts::{
     EpochId, EpochLineageId, ResourceGeneration, canonical_json_bytes, sha256_hex,
 };
@@ -152,7 +153,7 @@ use eliot_ors::{
     BACKUP_VERIFY_PROFILE_VERSION, BACKUP_VERIFY_RETENTION_WINDOW, BackupVerificationDisposition,
     BackupVerificationResultRecord, BackupVerifyRequestIdentity,
     CONTRACT_VERSION as ORS_CONTRACT_VERSION, LegacyFenceBoundBackupVerificationClass,
-    LegacyUnscopedBackupVerificationClass, OrsError,
+    LegacyUnscopedBackupVerificationClass, OrsError, RestoreJournalArchiveClass,
 };
 use eliot_protocol::backup::BackupClassWire;
 use eliot_protocol::{Frame, FrameKind, MessageType, ProtocolPayload};
@@ -161,6 +162,10 @@ use serde_json::{Map, Value};
 use super::backup_capture::{
     KernelBackupCapture, MEMBER_DOMAIN_BLOB, MEMBER_DOMAIN_CANONICAL, MEMBER_DOMAIN_RECEIPT,
     archived_state_fence_digest, class_name, member_domain_count,
+};
+use super::backup_restore::{KernelBackupRestore, KernelRestoreOutcome};
+use super::backup_restore_ports::{
+    KernelRestoreError, OrsRestoreBinding, RESTORE_JOURNAL_WRITER_ID, RestorePorts,
 };
 use super::backup_verify_provenance::{OwnerProvenanceEvidence, check_provenance_binding};
 use super::composition_bootstrap::DAEMON_FRONT_DOOR_CAPABILITY;
@@ -189,12 +194,11 @@ pub(crate) const BACKUP_VERIFY_OPERATION: &str = "backup.verify";
 /// CLI surface; rehearsal only, never cutover).
 pub(crate) const BACKUP_RESTORE_TEST_OPERATION: &str = "backup.restore-test";
 
-/// The one genuinely absent owner capability the isolated restore-test refusal
-/// names, re-measured on this tree.
+/// The ONE owner capability the isolated restore-test route genuinely cannot
+/// reach, re-measured on this tree.
 ///
-/// This literal replaced a refusal that named THREE owners, and re-measured on
-/// the base this route runs on, all three of those EXIST — so naming them absent
-/// was a false claim in production prose:
+/// This literal replaced a refusal that named THREE owners, and all three of
+/// those EXIST — so naming them absent was a false claim in production prose:
 ///
 /// - the Kernel restore coordinator and its production call — #960 — EXISTS:
 ///   `KernelComposition::backup_restore_with_ors_journal` (`lib.rs`) and
@@ -208,29 +212,30 @@ pub(crate) const BACKUP_RESTORE_TEST_OPERATION: &str = "backup.restore-test";
 ///   (`backup_restore_ports.rs`);
 /// - the front-door connection — #2569 — EXISTS: `ce06e7824` (PR #4368).
 ///
-/// What is actually missing is ONE thing, named exactly: the ORS
-/// restore-journal STREAM ESTABLISHMENT the owner-issued admission is proved
-/// against. `RestoreJournalAdmission::issue_for_operation` calls
-/// `binds_owner_record`, which requires that the live journal ALREADY hold this
-/// plan's transaction and that the admission's `journal_identity_ref` equal the
-/// per-plan stream key `sha256(plan_id, bundle_sha256)`. Neither holds on this
-/// tree: the only writer of the durable `RestoreJournalStreamBinding` row is the
-/// engine's own genesis compare-and-swap, which runs strictly AFTER admission,
-/// and the owner that produces the admission
-/// (`OrsRestoreJournalOwner::durable_journal_record`, `backup_restore_ports.rs`)
-/// reports the fixed channel constant `RESTORE_JOURNAL_IDENTITY` rather than the
-/// per-plan key. So a first run is refused for want of a row, and the
-/// per-plan-identity requirement contradicts the channel requirement
-/// (`check_ors_journal_binding` in `backup_restore.rs` requires the constant) for
-/// every run.
+/// What is actually missing is ONE thing, named exactly: the DESTINATION-SIDE
+/// key and scope admission. The front door holds no owner channel that issues
+/// the admitted wrapped-key manifest (`RestorePorts::keys`) or the destination
+/// blob scope (`RestorePorts::blob_scope`), so a blob-carrying archive cannot be
+/// keyed here: the restore owner refuses it with its own typed
+/// `CapabilityMissing` and this route reports that refusal as the plan gap it
+/// is.
 ///
-/// The owner seam that closes that circle is
-/// `RestoreJournalAdmissionOwner::issue_journal_stream`, which does not exist on
-/// this tree (`git grep issue_journal_stream` — zero matches) and whose
-/// implementation belongs to `crates/storage/eliot-backup/src/restore_journal_admission.rs`,
-/// outside this route's mutable scope. `plan_gap` therefore stays on this arm,
-/// and it stays for that one named reason only.
-pub(crate) const BACKUP_RESTORE_TEST_MISSING_OWNER: &str = "restore-journal-stream-establishment (RestoreJournalAdmissionOwner::issue_journal_stream in crates/storage/eliot-backup/src/restore_journal_admission.rs; the ORS RestoreJournalStreamBinding row has no producer that runs before admission)";
+/// A FOURTH name this same doc used to carry became false when `0a93a0307`
+/// landed, and is corrected here rather than left standing: the ORS
+/// `RestoreJournalStreamBinding` row DOES have a producer that runs before
+/// admission. `RestoreJournalAdmissionOwner::issue_journal_stream`
+/// (`crates/storage/eliot-backup/src/restore_journal_admission.rs`) establishes
+/// that row as the plan's own genesis record through the accepted
+/// `RestoreJournalPort` seam, and `RestoreJournalAdmission::issue_for_operation`
+/// calls it before it reads the owner's durable record — so a first run is
+/// admitted, not only a resume. `handle_backup_restore_test` obtains that
+/// admission through `KernelBackupRestore::admit_restore_journal` and executes
+/// the rehearsal through `backup_restore_with_ors_journal`, so this refusal is
+/// no longer the successful endpoint of the advertised command.
+///
+/// `plan_gap` therefore stays on this arm, and only here — for that one named
+/// reason.
+pub(crate) const BACKUP_RESTORE_TEST_MISSING_OWNER: &str = "destination-key-and-blob-scope-admission (RestorePorts::keys and RestorePorts::blob_scope, #953/#956/#958: no owner channel on this front door issues the admitted wrapped-key manifest or the destination blob scope, so a blob-carrying archive is refused by the restore owner with its own CapabilityMissing)";
 
 /// Maximum inline bundle bytes admitted on one backup frame payload.
 ///
@@ -278,12 +283,23 @@ const BACKUP_VERIFY_REQUEST_ENCODING_VERSION: u16 = 1;
 /// and not a restatement of what the route intended to do. It was one
 /// eight-element list before, whose two owner-held entries were suffixed
 /// `-deferred` and were emitted INSIDE `gates_passed` — a field whose name
-/// asserts every entry passed. A gate that needs owner-held state and therefore
-/// did not run is now named in
-/// [`RESTORE_TEST_GATES_NOT_ADMITTED`] and reported under
-/// `gates_not_admitted` instead, so a reader of `gates_passed` sees only gates
-/// that passed. See [`handle_backup_restore_test`].
-const RESTORE_TEST_GATES_ADMITTED: [&str; 6] = [
+/// asserts every entry passed. A gate that needs owner-held state this front
+/// door does not hold is named in [`RESTORE_TEST_GATES_NOT_ADMITTED`] and
+/// reported under `gates_not_admitted` instead, so a reader of `gates_passed`
+/// sees only gates that passed.
+///
+/// The first six are the shape gates, which run in this order before any
+/// owner-held state is touched. The four owner-held gates that follow are
+/// appended by [`handle_backup_restore_test`] at the moment each one passes, so
+/// the reported route is the route this execution actually took rather than a
+/// fixed list: `archive-decode` (the owner's own `BackupBundle::decode` and
+/// validation), `plan-compile` (`KernelBackupRestore::compile_plan`, the pure
+/// lineage-advance gate), `journal-admission` (the owner-issued
+/// `RestoreJournalAdmission` from the durable ORS owner), and
+/// `isolated-rehearsal` (the journalled engine returning its own validated
+/// receipt). A gate inside the owner's execution body is reported only through
+/// the owner's answer, never inferred here.
+const RESTORE_TEST_SHAPE_GATES_ADMITTED: [&str; 6] = [
     "decode",
     "validate",
     "shape",
@@ -296,11 +312,43 @@ const RESTORE_TEST_GATES_ADMITTED: [&str; 6] = [
 ///
 /// Each needs owner-held state this front door does not hold, so naming one in
 /// `gates_passed` would assert an admission that never happened. They are
-/// reported here, in their own field, and the operator surface refuses a reply
-/// that lists the same gate in both sets — that contradiction is the defect this
+/// reported in their own field, and the operator surface refuses a reply that
+/// lists the same gate in both sets — that contradiction is the defect this
 /// split exists to make impossible.
+///
+/// The first entry is structural: the Host-side destination manifest binding
+/// (#958) reaches no owner channel on this front door, so the rehearsal runs
+/// with `RestorePorts::manifest_evidence == None` — the shape that type's own
+/// doc names as "a bundle with no Host admission", under which isolated import
+/// still runs, prepare pins nothing, and cutover qualification refuses for want
+/// of a pinned owner admission. The second is the no-cutover boundary this
+/// command may never cross (A13.7: "Cutover requires separate authority"): the
+/// route never calls `qualify_cutover`, so that gate is reported as not admitted
+/// on every answer, successful or not. The two gates in
+/// [`RESTORE_TEST_BLOB_GATES_NOT_ADMITTED`] are appended to this list only for an
+/// archive that carries blobs, and they are the owner capability
+/// [`BACKUP_RESTORE_TEST_MISSING_OWNER`] names.
 const RESTORE_TEST_GATES_NOT_ADMITTED: [&str; 2] =
-    ["restore-journal-admission", "owner-fence-currency"];
+    ["destination-manifest-admission", "cutover-qualification"];
+
+/// The owner-held gates that are additionally not admitted for a blob-carrying
+/// archive, appended to [`RESTORE_TEST_GATES_NOT_ADMITTED`] for that archive.
+const RESTORE_TEST_BLOB_GATES_NOT_ADMITTED: [&str; 2] =
+    ["destination-key-admission", "destination-blob-scope"];
+
+/// The restore owner's `CapabilityMissing` capability that means this front door
+/// holds no channel to the admitted wrapped-key manifest, and the one that means
+/// the same for the destination blob scope.
+///
+/// These mirror the restore owner's own capability vocabulary
+/// (`backup_restore.rs`, the `blob_key_material` refusal and
+/// `owners::BLOB_SCOPE_BINDING`) so a refusal for either one is reported as the
+/// `plan_gap` it is instead of a generic failure. The mirror is deliberately
+/// one-directional and fails closed: a capability this route does not recognise
+/// is reported as the owner's own typed `refused`, never as a plan gap, so a new
+/// owner capability can never be reported as an absent one by accident.
+const RESTORE_TEST_ABSENT_OWNER_CAPABILITIES: [&str; 2] =
+    ["blob_key_material", "blob-destination-scope"];
 
 /// Field-bound shape failure, rendered as an `invalid` reply by the handlers.
 struct InvalidShape {
@@ -2969,13 +3017,22 @@ fn answer_failed_stage(
 }
 
 /// Validates the restore target shape and binds the exact authority tuple,
-/// returning the admitted target identity.
+/// returning the admitted [`RestoreContext`] the restore owner compiles against.
 ///
 /// `EpochLineageId::new` proves canonical lineage spelling, `NonZeroU64`
 /// plus `EpochId::new` bind the exact `(lineage_id, sequence)` authority
 /// tuple, and `ResourceGeneration::new` proves a nonzero generation; all
 /// three contract imports compile directly against current main.
-fn restore_target_shape(target: &Map<String, Value>) -> Result<String, InvalidShape> {
+///
+/// The returned context is the SAME value the owner's plan is compiled from, not
+/// a re-derivation of it at the point of use: the `target_id` is what
+/// `KernelIsolatedDestination::open` constructs the isolated root under (so it is
+/// a destination label, bounded and validated by the owner, never an arbitrary
+/// path), and it is what `check_ors_journal_binding` re-compares the ORS
+/// binding's `destination_ref` against. A target that does not advance the
+/// archive's own lineage is refused by the owner in
+/// [`KernelBackupRestore::compile_plan`], not here.
+fn restore_target_shape(target: &Map<String, Value>) -> Result<RestoreContext, InvalidShape> {
     require_exact_keys(
         target,
         &[
@@ -3022,12 +3079,14 @@ fn restore_target_shape(target: &Map<String, Value>) -> Result<String, InvalidSh
             reason: "target sequence must be nonzero".to_owned(),
         })?;
     // Binds the exact authority tuple; the constructor is infallible on main
-    // but the binding itself is the proof the rehearsal carries.
-    let _authority_epoch = EpochId::new(lineage_id, sequence).map_err(|_| InvalidShape {
+    // but the binding itself is the proof the rehearsal carries. Both values
+    // move into the context the owner compiles its plan from, so this route
+    // holds no second copy of the authority tuple it answers with.
+    let authority_epoch = EpochId::new(lineage_id, sequence).map_err(|_| InvalidShape {
         field: "restore.target_sequence",
         reason: "target authority epoch is not admissible".to_owned(),
     })?;
-    let _resource_generation =
+    let resource_generation =
         ResourceGeneration::new(get_u64(target, "target_generation").map_err(|reason| {
             InvalidShape {
                 field: "restore.target_generation",
@@ -3038,7 +3097,11 @@ fn restore_target_shape(target: &Map<String, Value>) -> Result<String, InvalidSh
             field: "restore.target_generation",
             reason: "target resource generation must be nonzero".to_owned(),
         })?;
-    Ok(target_id)
+    Ok(RestoreContext {
+        target_id,
+        target_authority_epoch: authority_epoch,
+        target_resource_generation: resource_generation,
+    })
 }
 
 /// Validates the restore provisioning shape, returning the admitted
@@ -3095,9 +3158,20 @@ fn restore_provisioning_shape(provisioning: &Map<String, Value>) -> Result<Strin
     Ok(dest_store_id)
 }
 
-/// Handles one isolated restore-test frame: rehearses the shape path reachable
-/// without owner-held state, then returns `blocked` naming the exact missing
-/// Governor inputs.
+/// The exact inputs one isolated restore-test frame admitted, after every shape
+/// gate has run for real against the presented bytes.
+struct AdmittedRestoreTest {
+    /// The presented archive bytes, NOT yet decoded. Decoding is the archive
+    /// owner's own gate (`BackupBundle::decode` plus its validation), so it runs
+    /// after this admission and is reported as its own executed gate.
+    bundle_raw: Vec<u8>,
+    /// The typed target context the restore owner compiles its plan against,
+    /// carrying the admitted authority tuple.
+    target: RestoreContext,
+}
+
+/// Admits one isolated restore-test frame's shape, returning the archive bytes
+/// and the typed target the owner is reached with.
 ///
 /// Gates that run here for real, reported in `gates_passed` in pass order:
 /// `decode` (both inline hex bodies admit bounded even-length lowercase hex and
@@ -3110,35 +3184,24 @@ fn restore_provisioning_shape(provisioning: &Map<String, Value>) -> Result<Strin
 /// `isolation` (target identity differs from the destination store identity at
 /// shape level only).
 ///
-/// Gates that need owner-held state and therefore DID NOT RUN are reported
-/// separately in `gates_not_admitted`, never inside `gates_passed`:
-/// `owner-fence-currency` (live fence currency needs the owner-held fence) and
-/// `restore-journal-admission` (journal production admission, introduction
-/// exact-set verification against live owner readback, and the admission mint
-/// need the owner-held journal). The two sets are disjoint by construction and
-/// the operator surface refuses a reply that overlaps them, so a gate can never
-/// be reported as both passed and not admitted. Typed projection decode of
-/// introductions likewise waits for the owner edge; each entry must already be
-/// a JSON object so malformed rows refuse before any owner readback.
+/// The destination authorization is admitted at SHAPE level only and is
+/// deliberately not carried past this point: no owner channel on this front door
+/// verifies it, so it is never turned into destination evidence, a key manifest
+/// or a scope. A caller cannot promote it into authority by presenting it, and it
+/// is not echoed back as a verified admission. Typed projection decode of
+/// introductions likewise waits for the owner edge; each entry must already be a
+/// JSON object so malformed rows refuse before any owner readback.
 ///
-/// Execution refuses with `plan_gap` naming the ONE capability that is
-/// genuinely absent — see [`BACKUP_RESTORE_TEST_MISSING_OWNER`], which carries
-/// the re-measurement that retired the three owner names this reply used to
-/// claim were open. Rehearsal never activates, retires, or cuts over, and that
-/// boundary is unchanged by this repair: no path here reaches cutover
-/// qualification, activation or retirement.
-#[allow(
-    clippy::too_many_lines,
-    reason = "one linear shape-validation sequence per rehearsal gate; splitting it would hide the exact admission order the blocked reply reports"
-)]
-fn handle_backup_restore_test(payload: &Value, idempotency_key: &str) -> Value {
+/// Every failure is the same field-bound shape refusal the target and
+/// provisioning gates already return, so one `InvalidShape` carries the field and
+/// the reason and the caller renders the single `invalid` reply: this function
+/// never decides a status and never speaks the wire.
+fn admit_restore_test_shape(payload: &Value) -> Result<AdmittedRestoreTest, InvalidShape> {
     let Some(object) = payload.as_object() else {
-        return invalid_reply(
-            BACKUP_RESTORE_TEST_OPERATION,
-            idempotency_key,
-            "backup.restore-test",
-            "payload must be a JSON object",
-        );
+        return Err(InvalidShape {
+            field: "backup.restore-test",
+            reason: "payload must be a JSON object".to_owned(),
+        });
     };
     if let Err(reason) = require_exact_keys(
         object,
@@ -3150,202 +3213,518 @@ fn handle_backup_restore_test(payload: &Value, idempotency_key: &str) -> Value {
             "introductions",
         ],
     ) {
-        return invalid_reply(
-            BACKUP_RESTORE_TEST_OPERATION,
-            idempotency_key,
-            "backup.restore-test",
-            &reason,
-        );
+        return Err(InvalidShape {
+            field: "backup.restore-test",
+            reason,
+        });
     }
-    let bundle_hex = match get_str(object, "bundle_hex") {
-        Ok(bundle_hex) => bundle_hex,
-        Err(reason) => {
-            return invalid_reply(
-                BACKUP_RESTORE_TEST_OPERATION,
-                idempotency_key,
-                "backup.bundle_hex",
-                &reason,
-            );
-        }
-    };
-    let bundle_raw = match hex_bytes(bundle_hex, "backup.bundle_hex", BACKUP_WIRE_BYTES_MAX) {
-        Ok(bundle_raw) => bundle_raw,
-        Err(reason) => {
-            return invalid_reply(
-                BACKUP_RESTORE_TEST_OPERATION,
-                idempotency_key,
-                "backup.bundle_hex",
-                &reason,
-            );
-        }
-    };
-    if bundle_raw.is_empty() {
-        return invalid_reply(
-            BACKUP_RESTORE_TEST_OPERATION,
-            idempotency_key,
-            "backup.bundle_hex",
-            "bundle bytes must be non-empty",
-        );
-    }
-    let authorization_hex = match get_str(object, "destination_authorization_hex") {
-        Ok(authorization_hex) => authorization_hex,
-        Err(reason) => {
-            return invalid_reply(
-                BACKUP_RESTORE_TEST_OPERATION,
-                idempotency_key,
-                "backup.destination_authorization_hex",
-                &reason,
-            );
-        }
-    };
-    let authorization_raw = match hex_bytes(
-        authorization_hex,
+    let bundle_raw = hex_field(
+        object,
+        "bundle_hex",
+        "backup.bundle_hex",
+        BACKUP_WIRE_BYTES_MAX,
+    )?;
+    // Admitted for its shape and length only. See this function's doc: it is
+    // never carried into an owner call.
+    hex_field(
+        object,
+        "destination_authorization_hex",
         "backup.destination_authorization_hex",
         BACKUP_AUTH_BYTES_MAX,
-    ) {
-        Ok(authorization_raw) => authorization_raw,
-        Err(reason) => {
-            return invalid_reply(
-                BACKUP_RESTORE_TEST_OPERATION,
-                idempotency_key,
-                "backup.destination_authorization_hex",
-                &reason,
-            );
-        }
-    };
-    if authorization_raw.is_empty() {
-        return invalid_reply(
-            BACKUP_RESTORE_TEST_OPERATION,
-            idempotency_key,
-            "backup.destination_authorization_hex",
-            "destination authorization bytes must be non-empty",
-        );
-    }
-    let target = match get_object(object, "target") {
-        Ok(target) => target,
-        Err(reason) => {
-            return invalid_reply(
-                BACKUP_RESTORE_TEST_OPERATION,
-                idempotency_key,
-                "backup.target",
-                &reason,
-            );
-        }
-    };
-    let target_id = match restore_target_shape(target) {
-        Ok(target_id) => target_id,
-        Err(fault) => {
-            return invalid_reply(
-                BACKUP_RESTORE_TEST_OPERATION,
-                idempotency_key,
-                fault.field,
-                &fault.reason,
-            );
-        }
-    };
-    let provisioning = match get_object(object, "provisioning") {
-        Ok(provisioning) => provisioning,
-        Err(reason) => {
-            return invalid_reply(
-                BACKUP_RESTORE_TEST_OPERATION,
-                idempotency_key,
-                "backup.provisioning",
-                &reason,
-            );
-        }
-    };
-    let dest_store_id = match restore_provisioning_shape(provisioning) {
-        Ok(dest_store_id) => dest_store_id,
-        Err(fault) => {
-            return invalid_reply(
-                BACKUP_RESTORE_TEST_OPERATION,
-                idempotency_key,
-                fault.field,
-                &fault.reason,
-            );
-        }
-    };
+    )?;
+    let target = restore_target_shape(require_object(object, "backup.target", "target")?)?;
+    let provisioning = require_object(object, "backup.provisioning", "provisioning")?;
+    let dest_store_id = restore_provisioning_shape(provisioning)?;
     // Console-presented introductions must be an explicit JSON array of
     // objects, never defaulted. An explicitly empty array is admitted (a
     // restore with no capability introductions has nothing to compare);
     // full source-installation isolation and exact-set verification stay
     // owner-held.
     let Some(introductions) = object.get("introductions").and_then(Value::as_array) else {
-        return invalid_reply(
-            BACKUP_RESTORE_TEST_OPERATION,
-            idempotency_key,
-            "backup.introductions",
-            "console-presented introductions must be an explicit JSON array",
-        );
+        return Err(InvalidShape {
+            field: "backup.introductions",
+            reason: "console-presented introductions must be an explicit JSON array".to_owned(),
+        });
     };
     if introductions.len() > BACKUP_INTRODUCTIONS_MAX {
-        return invalid_reply(
-            BACKUP_RESTORE_TEST_OPERATION,
-            idempotency_key,
-            "backup.introductions",
-            "exceeds the bounded console-presented introduction count",
-        );
+        return Err(InvalidShape {
+            field: "backup.introductions",
+            reason: "exceeds the bounded console-presented introduction count".to_owned(),
+        });
     }
     for (index, entry) in introductions.iter().enumerate() {
         if !entry.is_object() {
-            return invalid_reply(
-                BACKUP_RESTORE_TEST_OPERATION,
-                idempotency_key,
-                "backup.introductions",
-                &format!("introduction {index} must be a JSON object"),
-            );
+            return Err(InvalidShape {
+                field: "backup.introductions",
+                reason: format!("introduction {index} must be a JSON object"),
+            });
         }
     }
-    if target_id == dest_store_id {
-        return invalid_reply(
-            BACKUP_RESTORE_TEST_OPERATION,
-            idempotency_key,
-            "restore.isolation",
-            "restore destination is not isolated from the source store at shape level",
-        );
+    if target.target_id == dest_store_id {
+        return Err(InvalidShape {
+            field: "restore.isolation",
+            reason: "restore destination is not isolated from the source store at shape level"
+                .to_owned(),
+        });
     }
+    Ok(AdmittedRestoreTest { bundle_raw, target })
+}
+
+/// Reads one required bounded hex member, binding the refusal to the field the
+/// handlers report rather than to the raw key.
+fn hex_field(
+    object: &Map<String, Value>,
+    key: &str,
+    field: &'static str,
+    max_bytes: usize,
+) -> Result<Vec<u8>, InvalidShape> {
+    let value = get_str(object, key).map_err(|reason| InvalidShape { field, reason })?;
+    let raw =
+        hex_bytes(value, field, max_bytes).map_err(|reason| InvalidShape { field, reason })?;
+    if raw.is_empty() {
+        return Err(InvalidShape {
+            field,
+            reason: "bytes must be non-empty".to_owned(),
+        });
+    }
+    Ok(raw)
+}
+
+/// Reads one required object member, binding the refusal to the field the
+/// handlers report rather than to the raw key.
+fn require_object<'a>(
+    object: &'a Map<String, Value>,
+    field: &'static str,
+    key: &str,
+) -> Result<&'a Map<String, Value>, InvalidShape> {
+    get_object(object, key).map_err(|reason| InvalidShape { field, reason })
+}
+
+/// Handles one isolated restore-test frame through the production restore owner.
+///
+/// This is the front door the audit found missing: the route now obtains the
+/// owner-issued `RestoreJournalAdmission` from the durable ORS owner
+/// (#962/#958, `KernelBackupRestore::admit_restore_journal`), binds the operation
+/// identity the owner itself derives
+/// ([`OrsRestoreBinding::from_composition`]), and runs the full isolated
+/// rehearsal through
+/// [`KernelComposition::backup_restore_with_ors_journal`]
+/// (#960) on the composition-owned durable ORS journal. It answers with the
+/// owner's own receipt and evidence level, so the reply carries the persisted
+/// rehearsal result rather than a refusal.
+///
+/// ## The execution identity is the owner's, never the caller's
+///
+/// The frame's `idempotency_key` is correlation only and is echoed back
+/// unchanged; it selects nothing here. The execution identity is
+/// [`OrsRestoreBinding`], which has exactly one constructor, and whose
+/// `installation_ref` is read from the live `crate::dispatch_contour` cell
+/// rather than settable by any caller — so no frame, payload or spelling of the
+/// key can name the installation, the archive, the destination or the writer of
+/// this restore. Three of its four arguments are facts this route reads from
+/// state the owners hold rather than from the request: the archive identity and
+/// class are the archive's OWN manifest fields, and the destination is the same
+/// validated `RestoreContext` the owner constructs the isolated root under. The
+/// fourth is the Kernel's own writer identity,
+/// [`RESTORE_JOURNAL_WRITER_ID`].
+///
+/// ## What the ports carry, and what they deliberately do not
+///
+/// `journal_admission` is the owner-issued admission obtained below;
+/// `restore_with_ors_journal` re-issues it from the same durable owner for the
+/// same plan and replaces the bundle's copy with that value, exactly as
+/// `RestorePorts::with_owner_destination_evidence` documents, so nothing here
+/// can select this restore's journal, installation, generation or receipt.
+/// `kernel_fence` is the live session fence, the same one the effect gate
+/// compares against the archive's own export fence.
+///
+/// `keys` and `blob_scope` are `None`, and that is this archive's own answer
+/// rather than a value chosen to satisfy a signature: the restore owner refuses
+/// with its typed `CapabilityMissing` (`blob_key_material`,
+/// `blob-destination-scope`) the moment an archive carries blobs without them,
+/// so the difference between "this archive is keyed" and "this front door holds
+/// no key owner" is decided by the owner's own gate and reported, never guessed.
+/// `manifest_evidence` is `None` for the reason
+/// [`RESTORE_TEST_GATES_NOT_ADMITTED`] states: the Host-side manifest binding
+/// reaches no owner channel here, and `None` is the shape that type's own doc
+/// names as a bundle with no Host admission — under which isolated import still
+/// runs and cutover qualification refuses.
+///
+/// `rehearsal` is `true`, because this is a rehearsal: the engine then validates
+/// the admission instead of demanding production durable recovery, activates
+/// nothing, retires nothing and cannot qualify cutover (A13.7: "Cutover requires
+/// separate authority"). The admission it runs on is the production-grade,
+/// owner-issued one either way.
+///
+/// ## The reply
+///
+/// Success answers `ok` with the owner's own `RestoreReceipt` (its
+/// `evidence_level` is the exact proof level this restore established, and its
+/// `operational_recovery_ready`/`cutover_performed` are the owner's own `false`),
+/// the finalized evidence document when this execution wrote one, the exact
+/// applied phase log, and the admitted journal owner behind the run. A typed
+/// owner refusal is answered with the owner's own causal class, bounded, and
+/// keeps the executed route so a reader can see how far it got. `plan_gap`
+/// survives for exactly one case — the owner's own
+/// [`KernelRestoreError::CapabilityMissing`] for a destination owner admission
+/// this front door holds no channel to, named by
+/// [`BACKUP_RESTORE_TEST_MISSING_OWNER`] — and never as the endpoint of a
+/// command that reached its owner.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one linear admission sequence per rehearsal gate; splitting it would hide the exact order the executed route reports"
+)]
+fn handle_backup_restore_test(
+    composition: &KernelComposition,
+    session: &Session,
+    payload: &Value,
+    idempotency_key: &str,
+) -> Result<Value, TransportError> {
+    let admitted = match admit_restore_test_shape(payload) {
+        Ok(admitted) => admitted,
+        Err(fault) => {
+            return Ok(invalid_reply(
+                BACKUP_RESTORE_TEST_OPERATION,
+                idempotency_key,
+                fault.field,
+                &fault.reason,
+            ));
+        }
+    };
+    // The same single peer-and-capability admission the owner-reaching capture
+    // arms run: a rehearsal that imports into an isolated root is an
+    // owner-reaching operation, so it is gated by that one gate rather than by a
+    // second, looser one. `CaptureCallerAuth` is the capture owner's admission
+    // value and the restore owner takes no such parameter, so the composite
+    // principal is not fabricated into one here — what this call contributes is
+    // the fence.
+    admit_backup_caller(session)?;
+    // The executed route, in pass order. Only a gate that actually ran is ever
+    // appended, and the two sets are reported in disjoint fields the operator
+    // surface refuses to let overlap.
+    let mut gates_passed: Vec<&str> = RESTORE_TEST_SHAPE_GATES_ADMITTED.to_vec();
+    let mut gates_not_admitted: Vec<&str> = RESTORE_TEST_GATES_NOT_ADMITTED.to_vec();
+    let fence = &session.module_generation.state_fence;
+    let refuse = |error: &KernelRestoreError,
+                  passed: &[&str],
+                  absent: &[&str]|
+     -> Result<Value, TransportError> {
+        Ok(restore_test_refusal(idempotency_key, passed, absent, error))
+    };
+    // The archive is decoded and validated by the archive format's own gate, not
+    // by this route, so an archive that is not one refuses with the owner's
+    // reason rather than a shape guess.
+    let bundle = match BackupBundle::decode(&admitted.bundle_raw) {
+        Ok(bundle) => bundle,
+        Err(error) => {
+            return Ok(invalid_reply(
+                BACKUP_RESTORE_TEST_OPERATION,
+                idempotency_key,
+                "backup.bundle_hex",
+                &bounded_reason(&error.to_string()),
+            ));
+        }
+    };
+    gates_passed.push("archive-decode");
+    if !bundle.blobs.is_empty() {
+        gates_not_admitted.extend(RESTORE_TEST_BLOB_GATES_NOT_ADMITTED);
+    }
+    // The plan is compiled by the owner's own pure gate: the archive's declared
+    // class denominator, its checksums and the lineage-advance rule all run
+    // there, so a target that does not advance the archive's lineage refuses
+    // before any journal row or destination byte exists.
+    let plan = match KernelBackupRestore::compile_plan(&bundle, admitted.target.clone()) {
+        Ok(plan) => plan,
+        Err(error) => return refuse(&error, &gates_passed, &gates_not_admitted),
+    };
+    gates_passed.push("plan-compile");
+    let identity = match OrsRestoreBinding::from_composition(
+        bundle.manifest.backup_id.clone(),
+        restore_journal_archive_class(bundle.manifest.class),
+        admitted.target.target_id.clone(),
+        RESTORE_JOURNAL_WRITER_ID.to_owned(),
+    ) {
+        Ok(identity) => identity,
+        Err(error) => return refuse(&error, &gates_passed, &gates_not_admitted),
+    };
+    // The owner-issued admission, from the durable ORS owner this composition
+    // owns: `issue_journal_stream` establishes this plan's stream before the
+    // admission is proved against it, so a first run is admitted and the
+    // admission's references are the ones the owner read out of its own durable
+    // row. Nothing here can present an admission for another operation,
+    // installation, generation or channel.
+    let journal_admission = match composition.backup_restore().admit_restore_journal(
+        &composition.p07_ors,
+        &plan,
+        fence,
+        &identity,
+    ) {
+        Ok(admission) => admission,
+        Err(error) => return refuse(&error, &gates_passed, &gates_not_admitted),
+    };
+    gates_passed.push("journal-admission");
+    let ports = RestorePorts {
+        journal_admission: &journal_admission,
+        kernel_fence: fence,
+        keys: None,
+        blob_scope: None,
+        manifest_evidence: None,
+        rehearsal: true,
+    };
+    match composition.backup_restore_with_ors_journal(&bundle, admitted.target, &ports, &identity) {
+        Ok(outcome) => {
+            gates_passed.push("isolated-rehearsal");
+            Ok(rehearsed_reply(
+                idempotency_key,
+                &outcome,
+                &gates_passed,
+                &gates_not_admitted,
+            ))
+        }
+        Err(error) => refuse(&error, &gates_passed, &gates_not_admitted),
+    }
+}
+
+/// Maps one accepted archive class onto the ORS restore-journal class the owner
+/// binds the stream to.
+///
+/// This is a spelling bridge between two closed vocabularies that already agree
+/// one-for-one, not a second class set: the coordinator re-derives the same
+/// mapping from the same `BackupClass` in `check_ors_journal_binding` and refuses
+/// any binding that disagrees with it, so a value this route cannot map is a
+/// compile error rather than a silent mismatch. The match is deliberately
+/// exhaustive over the archive's own class, so a new class cannot be admitted
+/// here as some existing one.
+const fn restore_journal_archive_class(class: BackupClass) -> RestoreJournalArchiveClass {
+    match class {
+        BackupClass::FullRecovery => RestoreJournalArchiveClass::FullRecovery,
+        BackupClass::CanonicalOnlyDegraded => RestoreJournalArchiveClass::CanonicalOnlyDegraded,
+        BackupClass::ScopeExport => RestoreJournalArchiveClass::ScopeExport,
+    }
+}
+
+/// Answers one executed rehearsal with the owner's own receipt and proof level.
+///
+/// Every field here is read out of [`KernelRestoreOutcome`], which is the
+/// journalled engine's own validated answer: the receipt is projected whole
+/// rather than field by field, so its `evidence_level` is the exact proof level
+/// the restore established and its readiness and cutover flags are the owner's
+/// own values, never this route's reading of them. The evidence document is the
+/// owner's finalize proof and is reported as present or absent, never
+/// synthesised; a resumed run's evidence file is re-validated by the owner before
+/// it is reported. The isolated root's absolute path is deliberately NOT
+/// projected: the receipt and the target identity already name the destination,
+/// and a filesystem layout is not an operator proof.
+///
+/// A receipt this route cannot project is not reported as a success with an empty
+/// receipt: the owner's answer is refused instead, so `ok` always carries the
+/// owner's own receipt.
+fn rehearsed_reply(
+    idempotency_key: &str,
+    outcome: &KernelRestoreOutcome,
+    gates_passed: &[&str],
+    gates_not_admitted: &[&str],
+) -> Value {
+    // A receipt that cannot be projected is a projection failure, not a
+    // transport one: it answers with the same bounded `refused` envelope the
+    // other refusals on this operation use, carrying the gates that really ran
+    // so the caller can still see what was executed. It is returned as the
+    // reply value, matching how the other projections in this module report an
+    // unserialisable field.
+    let unprojectable = |error: &serde_json::Error| {
+        backup_reply(
+            BACKUP_RESTORE_TEST_OPERATION,
+            "refused",
+            idempotency_key,
+            vec![
+                (
+                    "code",
+                    Value::String("restore-receipt-projection-failed".to_owned()),
+                ),
+                ("reason", Value::String(bounded_reason(&error.to_string()))),
+                ("gates_passed", gate_values(gates_passed)),
+                ("gates_not_admitted", gate_values(gates_not_admitted)),
+            ],
+        )
+    };
+    let receipt = match serde_json::to_value(&outcome.receipt) {
+        Ok(value) => value,
+        Err(error) => return unprojectable(&error),
+    };
+    // Absent means the owner observed none: a run that did not execute finalize
+    // reports no evidence, and a resumed run's file is re-validated by the owner
+    // before it is reported here. It is never synthesised and never carried over
+    // from an earlier execution.
+    let evidence = match outcome.evidence.as_ref() {
+        Some(evidence) => match serde_json::to_value(evidence) {
+            Ok(value) => value,
+            Err(error) => return unprojectable(&error),
+        },
+        None => Value::Null,
+    };
     backup_reply(
         BACKUP_RESTORE_TEST_OPERATION,
-        "blocked",
+        "ok",
         idempotency_key,
         vec![
-            ("code", Value::String("plan_gap".to_owned())),
+            ("code", Value::String("rehearsed".to_owned())),
+            ("receipt", receipt),
+            ("evidence", evidence),
             (
-                "missing_owner",
-                Value::String(BACKUP_RESTORE_TEST_MISSING_OWNER.to_owned()),
+                "phase_log",
+                Value::Array(
+                    outcome
+                        .phase_log
+                        .iter()
+                        .map(|phase| Value::String(phase.clone()))
+                        .collect(),
+                ),
             ),
+            (
+                "journal_owner",
+                Value::String(outcome.journal_owner.clone()),
+            ),
+            ("rehearsal", Value::Bool(outcome.rehearsal)),
             (
                 "reason",
                 Value::String(
-                    "the six rehearsal shape gates ran for real and are reported in gates_passed; the two owner-held gates in gates_not_admitted did not run, because admitting the durable ORS restore journal needs a RestoreJournalStreamBinding row whose only producer is the engine's own genesis compare-and-swap, which runs after admission"
+                    "the isolated rehearsal ran on the composition-owned durable ORS restore journal under the owner-issued admission and returned the owner's own receipt; the receipt's evidence_level is the exact proof level established, no cutover was qualified and nothing was activated or retired"
                         .to_owned(),
                 ),
             ),
-            // The route this handler ACTUALLY executed, and nothing else. A gate
-            // that did not run can never appear in this array, so its name is a
-            // claim this route can keep.
-            (
-                "gates_passed",
-                Value::Array(
-                    RESTORE_TEST_GATES_ADMITTED
-                        .iter()
-                        .map(|gate| Value::String((*gate).to_owned()))
-                        .collect(),
-                ),
-            ),
-            // The gates that did NOT run, in their own field. The operator
-            // surface refuses a reply that lists one gate in both arrays, so a
-            // gate can never be reported as passed and not-admitted at once.
-            (
-                "gates_not_admitted",
-                Value::Array(
-                    RESTORE_TEST_GATES_NOT_ADMITTED
-                        .iter()
-                        .map(|gate| Value::String((*gate).to_owned()))
-                        .collect(),
-                ),
-            ),
+            ("gates_passed", gate_values(gates_passed)),
+            ("gates_not_admitted", gate_values(gates_not_admitted)),
         ],
+    )
+}
+
+/// Answers one typed restore-owner refusal, keeping the executed route.
+///
+/// The vocabulary is the owner's own, not a second one: the causal class is
+/// named in the closed spelling below and the reason is the owner's own
+/// `Display` text, bounded, so no Rust variant name and no caller-shaped string
+/// reaches the operator wire. A refusal that names no missing owner carries no
+/// `missing_owner` field at all — inventing one would be exactly the fabricated
+/// owner answer this route exists to stop reporting — so `blocked` is the only
+/// status that carries one, and only for the owner's own `CapabilityMissing`.
+///
+/// The two sets are reported in their own fields and the operator surface refuses
+/// a reply that names one gate in both, so how far the route got stays readable
+/// next to why it stopped.
+fn restore_test_refusal(
+    idempotency_key: &str,
+    gates_passed: &[&str],
+    gates_not_admitted: &[&str],
+    error: &KernelRestoreError,
+) -> Value {
+    let route = vec![
+        ("gates_passed", gate_values(gates_passed)),
+        ("gates_not_admitted", gate_values(gates_not_admitted)),
+    ];
+    match error {
+        // The ONE genuinely absent owner capability on this front door: no owner
+        // channel issues the destination key manifest or blob scope. The owner
+        // named it, so this route reports it as the plan gap it is — and as
+        // nothing else, because a capability outside
+        // `RESTORE_TEST_ABSENT_OWNER_CAPABILITIES` falls through to the typed
+        // refusal below rather than being reported as an absent owner.
+        KernelRestoreError::CapabilityMissing { capability }
+            if RESTORE_TEST_ABSENT_OWNER_CAPABILITIES.contains(capability) =>
+        {
+            let mut fields = vec![
+                ("code", Value::String("plan_gap".to_owned())),
+                (
+                    "missing_owner",
+                    Value::String(BACKUP_RESTORE_TEST_MISSING_OWNER.to_owned()),
+                ),
+                ("reason", Value::String(bounded_reason(&error.to_string()))),
+            ];
+            fields.extend(route);
+            backup_reply(
+                BACKUP_RESTORE_TEST_OPERATION,
+                "blocked",
+                idempotency_key,
+                fields,
+            )
+        }
+        // A malformed archive or a target that does not advance the archive's own
+        // lineage is a field-shaped failure of what the caller presented, so it
+        // answers `invalid` with the owner's reason and names the archive.
+        KernelRestoreError::ArchiveInvalid(reason) => {
+            let mut fields = vec![
+                ("code", Value::String("invalid".to_owned())),
+                ("field", Value::String("restore.archive".to_owned())),
+                ("reason", Value::String(bounded_reason(reason))),
+            ];
+            fields.extend(route);
+            backup_reply(
+                BACKUP_RESTORE_TEST_OPERATION,
+                "invalid",
+                idempotency_key,
+                fields,
+            )
+        }
+        KernelRestoreError::InvalidInput { field, reason } => {
+            let mut fields = vec![
+                ("code", Value::String("invalid".to_owned())),
+                ("field", Value::String((*field).to_owned())),
+                ("reason", Value::String(bounded_reason(reason))),
+            ];
+            fields.extend(route);
+            backup_reply(
+                BACKUP_RESTORE_TEST_OPERATION,
+                "invalid",
+                idempotency_key,
+                fields,
+            )
+        }
+        other => {
+            let mut fields = vec![
+                ("code", Value::String(restore_error_code(other).to_owned())),
+                ("reason", Value::String(bounded_reason(&other.to_string()))),
+            ];
+            fields.extend(route);
+            backup_reply(
+                BACKUP_RESTORE_TEST_OPERATION,
+                "refused",
+                idempotency_key,
+                fields,
+            )
+        }
+    }
+}
+
+/// The closed wire spelling of one restore-owner causal class.
+///
+/// One arm per `KernelRestoreError` variant, so a new variant cannot be reported
+/// through an existing class by accident: the match is exhaustive and a new arm
+/// is a compile error rather than a silently mislabelled refusal. The spellings
+/// name the owner's own class, not a Rust variant name.
+const fn restore_error_code(error: &KernelRestoreError) -> &'static str {
+    match error {
+        KernelRestoreError::InvalidInput { .. } => "restore-invalid-input",
+        KernelRestoreError::JournalIo(_) => "restore-journal-io",
+        KernelRestoreError::JournalNotAdmitted => "restore-journal-not-admitted",
+        KernelRestoreError::JournalCorrupt => "restore-journal-corrupt",
+        KernelRestoreError::JournalBindingConflict => "restore-journal-binding-conflict",
+        KernelRestoreError::DestinationInvalid(_) => "restore-destination-invalid",
+        KernelRestoreError::FenceMismatch(_) => "restore-fence-mismatch",
+        KernelRestoreError::ArchiveInvalid(_) => "restore-archive-invalid",
+        KernelRestoreError::CapabilityMissing { .. } => "restore-capability-missing",
+        KernelRestoreError::OwnerEvidenceInvalid(_) => "restore-owner-evidence-invalid",
+        KernelRestoreError::CutoverNotAuthorized => "cutover-not-authorized",
+        KernelRestoreError::TargetFailed(_)
+        | KernelRestoreError::StagedCleanupIncomplete { .. } => "restore-engine-failed",
+    }
+}
+
+/// Projects one executed/not-admitted gate list onto the wire.
+fn gate_values(gates: &[&str]) -> Value {
+    Value::Array(
+        gates
+            .iter()
+            .map(|gate| Value::String((*gate).to_owned()))
+            .collect(),
     )
 }
 
@@ -3362,12 +3741,15 @@ impl KernelComposition {
     ///
     /// The receiver is the composition, exactly like the sibling `TestD` and
     /// Dreamer route entries: `backup.verify` reaches the real capture owner held at
-    /// [`KernelComposition::backup_capture`], and no second dispatch entry is
-    /// introduced. `backup.create` admits its caller through the same
-    /// [`admit_backup_caller`] gate and then returns a typed refusal naming the
-    /// exact absent capture-owner behaviour, and `backup.restore-test` still
-    /// refuses naming its missing owners, so binding the receiver changes no
-    /// other behaviour.
+    /// [`KernelComposition::backup_capture`], `backup.restore-test` reaches the real
+    /// restore owner held at [`KernelComposition::backup_restore`] through
+    /// [`KernelComposition::backup_restore_with_ors_journal`], and no second
+    /// dispatch entry is introduced. `backup.create` admits its caller through the
+    /// same [`admit_backup_caller`] gate and then returns a typed refusal naming the
+    /// exact absent capture-owner behaviour, and `backup.restore-test` reports the
+    /// owner's own receipt — or, for the one destination owner capability this front
+    /// door holds no channel to, the plan gap naming it. Binding the receiver
+    /// changes no other behaviour.
     ///
     /// Service-readiness and peer-authentication gates stay with the
     /// `frame_dispatch` backup arm, which owns the exact pre-dispatch binding
@@ -3435,7 +3817,9 @@ impl KernelComposition {
             BACKUP_VERIFY_OPERATION => {
                 self.handle_backup_verify(session, &params, idempotency_key)?
             }
-            BACKUP_RESTORE_TEST_OPERATION => handle_backup_restore_test(&params, idempotency_key),
+            BACKUP_RESTORE_TEST_OPERATION => {
+                handle_backup_restore_test(self, session, &params, idempotency_key)?
+            }
             _ => return Err(TransportError::SessionFenced),
         };
         let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, reply)?;
