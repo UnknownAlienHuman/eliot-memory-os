@@ -54,20 +54,38 @@ pub const HOST_TERMINAL_CODE_DISPATCHER_FAILED: &str = "dispatcher_failed";
 /// failure; later leaves (#891) own the remaining sites.
 pub const HOST_TERMINAL_CODE_CONSOLE_FAILED: &str = "console_failed";
 
-/// Observed outcome of the facade's one process-global subscriber install.
+/// Observed state of the facade's one process-global subscriber install.
 ///
-/// A claim, a successful Host-owned install, and a failed or foreign install
-/// are three distinct states, so `OnceLock<()>` — which cannot tell a
-/// completed install from the mere right to attempt one — is replaced by this
-/// value under a private lock. The state records one observed attempt only:
-/// it never authorizes a second install, a retry, or a replacement of an
-/// existing global subscriber.
+/// A claim, a running attempt, a successful Host-owned install, and a failed or
+/// foreign install are four distinct states, so `OnceLock<()>` — which cannot
+/// tell a completed install from the mere right to attempt one — is replaced by
+/// this value under a private lock. It moves one way:
+///
+/// ```text
+/// InProgress -> Claimed -> Installed | Unavailable
+/// ```
+///
+/// `InProgress` is the fresh cell: the cell exists but nobody holds the claim
+/// yet, which is the only moment a caller may take it. `Claimed` is reachable
+/// exactly once per process, so the single attempt is a property of this value
+/// rather than of call order; the terminal pair is written only by the
+/// claimant, under the same lock, after `try_init` returned. Nothing here
+/// authorizes a second install, a retry, or a replacement of an existing global
+/// subscriber.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SubscriberSetup {
-    /// A caller holds the claim and the single install attempt is still in
-    /// progress: no outcome is observed yet, and a caller arriving now is
-    /// not the owner of an installed subscriber.
+    /// No caller has claimed the process's single install attempt yet, so no
+    /// outcome is observed and no subscriber is owned. This is the fresh-cell
+    /// state; it is not a licence to attempt, because a concurrent caller
+    /// reaching the cell may already have advanced it to `Claimed`.
+    ///
+    /// The claim itself is the explicit `InProgress` -> `Claimed` transition
+    /// under the cell lock in `claim_subscriber_setup`.
     InProgress,
+    /// The claim is taken and the single `try_init` is running (or about to
+    /// run) with this process lock released. No outcome is observed: a
+    /// concurrent reader is answered "not yet known" and never `Ok`.
+    Claimed,
     /// This facade's stderr subscriber is the installed global subscriber.
     Installed,
     /// The one attempt failed, so an unknown pre-existing global subscriber
@@ -78,39 +96,65 @@ enum SubscriberSetup {
 
 impl SubscriberSetup {
     /// The caller-facing answer for this observed state: a Host-owned
-    /// subscriber, the claim of a still-running attempt, a failed/foreign
-    /// subscriber, or the honest "no attempt observed yet".
+    /// subscriber, an attempt whose outcome is not yet known, a failed/foreign
+    /// subscriber, or the honest "no attempt claimed yet".
     const fn as_result(self) -> Result<(), HostDiagnosticsError> {
         match self {
             Self::Installed => Ok(()),
-            Self::InProgress => Err(HostDiagnosticsError::SetupInProgress),
+            Self::InProgress | Self::Claimed => Err(HostDiagnosticsError::SetupInProgress),
             Self::Unavailable => Err(HostDiagnosticsError::SetupUnavailable),
+        }
+    }
+
+    /// The same observed state as answered to a caller that did *not* perform
+    /// the install, where a completed Host-owned install is additionally the
+    /// typed [`HostDiagnosticsError::AlreadyOwned`] evidence for a repeat call.
+    ///
+    /// The two answers differ in exactly one case: `Installed` is `Ok` for the
+    /// attempter and `AlreadyOwned` for everyone after. Both are truthful — "this
+    /// facade's subscriber owns the global slot" — and neither is reachable
+    /// before the attempt has settled, so no repeat call can read success out of
+    /// an unclaimed or in-flight state.
+    const fn as_install_result(self) -> Result<(), HostDiagnosticsError> {
+        match self {
+            Self::Installed => Err(HostDiagnosticsError::AlreadyOwned),
+            other => other.as_result(),
         }
     }
 }
 
 /// Process state for the facade's one global subscriber install.
 ///
-/// The `OnceLock` still names this one attempt: a caller that loses the
-/// `get_or_init` race learns the first observed outcome instead of winning a
-/// second claim, and only the initializing caller ever runs `try_init`. The
-/// mutex then serializes the transition from claimed to settled, so a
-/// concurrent claimant is never answered `Ok` before the install finished.
+/// The `OnceLock` only publishes the one shared cell; it no longer doubles as
+/// the install claim, because `get_or_init` hands the *same* `&Mutex` to every
+/// caller, so "who called `get_or_init` first" proves nothing about who may
+/// attempt. The claim is therefore the explicit state machine in
+/// [`install_host_diagnostics`], and this cell exists from the first
+/// observation so no reader has to invent a state for an uninitialised `None`.
 static SUBSCRIBER_SETUP: OnceLock<Mutex<SubscriberSetup>> = OnceLock::new();
 
 /// One-process state for the facade's single subscriber install attempt.
 ///
-/// Bounded by construction: one process-global cell, a claim, one
+/// Bounded by construction: one process-global cell, one claim, one
 /// `try_init`, and one settled outcome. No queue, thread, worker, or retry.
 fn subscriber_setup_cell() -> &'static Mutex<SubscriberSetup> {
     SUBSCRIBER_SETUP.get_or_init(|| Mutex::new(SubscriberSetup::InProgress))
 }
 
-/// Reads the first observed outcome without touching the install claim.
+/// Reads the first observed state without touching the install claim.
 ///
-/// A poisoned lock is not a startup gate: the value it still holds is the
-/// one observed attempt, so it is read rather than fabricated, and this
-/// function never panics.
+/// This never takes the claim and never creates the cell, so a pure reader can
+/// never become the attempter. The uninitialised branch is not a guess about a
+/// missing value: the cell is created only by a claiming caller, so `None`
+/// *means* "no caller has claimed yet" and the fresh-cell
+/// [`SubscriberSetup::InProgress`] is the exact state, not a fallback chosen
+/// for the answer it produces. That answer is `SetupInProgress`, i.e. this
+/// facade's stderr sink is not certified, which is why [`sink_status`] cannot
+/// report it as available before an install has actually succeeded.
+///
+/// A poisoned lock is not a startup gate: the value it still holds is the one
+/// observed attempt, so it is read rather than fabricated, and this function
+/// never panics.
 fn subscriber_setup_observed() -> SubscriberSetup {
     let Some(cell) = SUBSCRIBER_SETUP.get() else {
         return SubscriberSetup::InProgress;
@@ -137,9 +181,10 @@ pub enum HostDiagnosticsError {
     /// not fake one (real delivery lives in the `windows_event_log`
     /// wrapper over #984's landed safe port).
     EventLogUnavailable,
-    /// The single install attempt is still running in another caller. Its
-    /// outcome is not observed yet, so this answer asserts no ownership and
-    /// makes no second attempt.
+    /// The outcome of the single install attempt is not observed yet: either
+    /// no caller has claimed the attempt, or the claiming caller is still
+    /// running it. Either way this answer asserts no ownership and makes no
+    /// attempt, so a caller in this state is never told the install succeeded.
     SetupInProgress,
     /// The facade's stderr subscriber is not the installed global
     /// subscriber: the one attempt failed, typically because another
@@ -183,11 +228,15 @@ pub enum DiagnosticSink {
 /// Reports whether a sink can carry Host diagnostics.
 ///
 /// The `tracing` arm answers from this facade's *observed* installation
-/// state, not from compiled-in support: before any install attempt, while
-/// the one attempt is still running, or after it failed, this sink cannot be
-/// certified and the answer is a typed error. Even a successful install
-/// certifies only that the Host stderr subscriber owns the global slot: the
-/// `EnvFilter` may still suppress a given event, and the `tracing` library
+/// state, not from compiled-in support. `Ok(())` is produced by exactly one
+/// state, [`SubscriberSetup::Installed`], which only the settling attempt can
+/// write; every other state answers a typed error. So "before installation or
+/// after failure it cannot certify the Host stderr sink" is a property of that
+/// mapping, not of which value a missing cell happens to fall back to: the
+/// unclaimed state answers `SetupInProgress` and the failed state answers
+/// `SetupUnavailable`, and neither is a certification. Even a successful
+/// install certifies only that the Host stderr subscriber owns the global slot:
+/// the `EnvFilter` may still suppress a given event, and the `tracing` library
 /// proves neither emission nor delivery, so no arm of this function claims
 /// that a record was written or received.
 ///
@@ -207,49 +256,95 @@ pub fn sink_status(sink: DiagnosticSink) -> Result<(), HostDiagnosticsError> {
 /// preserved. The reported answer is the real setup outcome, never an
 /// unconditional success:
 ///
-/// * `Ok(())` only when `try_init` installed *this* facade's stderr
-///   subscriber as the global subscriber;
+/// * `Ok(())` only for the caller that held the claim *and* observed `try_init`
+///   install *this* facade's stderr subscriber as the global subscriber;
+/// * [`HostDiagnosticsError::AlreadyOwned`] for every later call after an
+///   install this facade performed, bounded and non-panicking, with no second
+///   subscriber created;
 /// * [`HostDiagnosticsError::SetupUnavailable`] when the one attempt failed,
 ///   typically because a foreign subscriber already holds the global slot —
 ///   that subscriber is never replaced and never claimed, and the degraded
-///   outcome is retained;
-/// * [`HostDiagnosticsError::SetupInProgress`] for a caller that arrives
-///   while the claimed attempt is still running: no ownership is asserted
-///   and no second attempt is started;
-/// * [`HostDiagnosticsError::AlreadyOwned`] for every later call after an
-///   install this facade performed, bounded and non-panicking, with no
-///   second subscriber created.
+///   outcome is retained for every later call;
+/// * [`HostDiagnosticsError::SetupInProgress`] for a caller that arrives while
+///   the single attempt is running (or before the claim is taken): no ownership
+///   is asserted and no attempt is started.
 ///
-/// Repeated calls report the *first observed* outcome; they are one
-/// observation, not a re-attempt. Setup stays best-effort and never becomes
-/// fatal: no result here gates startup, retries, recurses into the
-/// unavailable sink, or changes a Host result, because diagnostics must
-/// never gate startup.
+/// The claim is taken first, in [`claim_subscriber_setup`], and the attempt runs
+/// only after it, with this process lock released; a caller arriving mid-attempt
+/// therefore observes `SetupInProgress` and can never read success out of an
+/// unfinished install. Repeated calls report the *first observed* outcome; they
+/// are one observation, not a re-attempt. Setup stays best-effort and never
+/// becomes fatal: no result here gates startup, retries, recurses into the
+/// unavailable sink, or changes a Host result, because diagnostics must never
+/// gate startup.
 pub fn install_host_diagnostics() -> Result<(), HostDiagnosticsError> {
-    let Some(cell) = SUBSCRIBER_SETUP.get() else {
-        // This caller wins the one install claim: the cell starts claimed
-        // and in progress, so a concurrent caller sees `SetupInProgress`
-        // until the outcome below is recorded.
-        return install_claimed_subscriber();
-    };
-    // The single attempt is already claimed. Report the first observed
-    // outcome and make no second attempt.
-    let observed = *subscriber_setup_lock(cell);
-    if observed == SubscriberSetup::Installed {
-        return Err(HostDiagnosticsError::AlreadyOwned);
+    // Claiming and attempting are separate steps, because the attempt runs
+    // library code that must never execute under this process lock.
+    let claim = claim_subscriber_setup();
+    match claim {
+        // This caller took the process's single claim, so it is the one
+        // caller permitted to run the single `try_init`.
+        SubscriberClaim::Claimed => install_claimed_subscriber(),
+        // The claim is already taken. Report the first observed outcome and
+        // make no attempt: bounded, non-panicking, never a replacement.
+        SubscriberClaim::Observed(observed) => observed.as_install_result(),
     }
-    observed.as_result()
+}
+
+/// What a caller learned about the one install claim it asked for.
+///
+/// A claim is a one-way, process-global fact, not a value a second caller can
+/// take: [`SubscriberClaim::Claimed`] is reachable exactly once in the process
+/// because only the `InProgress` -> `Claimed` transition produces it.
+enum SubscriberClaim {
+    /// This caller took the claim and is the only caller that may attempt.
+    Claimed,
+    /// The claim was already taken; the payload is the state observed under
+    /// the same lock, so the answer is decided with the claim in one step.
+    Observed(SubscriberSetup),
+}
+
+/// Takes the process's single install claim, or observes it already taken.
+///
+/// This is the whole anti-race: the claim is a state transition, not a
+/// side effect ordered after a check. `subscriber_setup_cell()` publishes the
+/// one cell and returns a `&'static Mutex`, so a cell this call did not create
+/// can already carry a claim another caller took first; every caller therefore
+/// re-reads the state under the lock and only the one that still finds
+/// `InProgress` (and therefore still sees no other attempt) advances it to
+/// `Claimed` and may attempt. Two concurrent callers serialize on this lock,
+/// and the loser observes `Claimed` and returns, so at most one `try_init`
+/// call is ever reachable in the process — the claim is established strictly
+/// before the attempt, never after it.
+fn claim_subscriber_setup() -> SubscriberClaim {
+    let cell = subscriber_setup_cell();
+    let mut state = subscriber_setup_lock(cell);
+    if *state == SubscriberSetup::InProgress {
+        *state = SubscriberSetup::Claimed;
+        return SubscriberClaim::Claimed;
+    }
+    SubscriberClaim::Observed(*state)
 }
 
 /// Runs the one install attempt for the caller that holds the claim, then
 /// records whether this facade's stderr subscriber actually owns the global
 /// slot.
 ///
+/// Reached only by the caller that took the claim in
+/// `claim_subscriber_setup`. The process lock is *not* held here: the
+/// `EnvFilter` read, the `fmt()` builder and `try_init` are library code, and
+/// running them under the lock would make a re-entrant path a deadlock, while
+/// a lock held across the attempt would hide the claim from a concurrent
+/// reader instead of letting it answer "not yet known". So the claim is already
+/// published as `Claimed` when this runs, a concurrent reader keeps observing
+/// that state until the real outcome exists, and the outcome is written and
+/// read back in one short critical section in [`settle_subscriber_setup`].
+///
 /// `try_init` is observed, never discarded: a failure (a pre-existing global
 /// subscriber, or any other initialization failure) settles the state as
-/// [`SubscriberSetup::Unavailable`] and returns the typed degraded answer.
-/// The library's own error text is neither returned, logged, nor stringified
-/// into a `Host` result (I07.20).
+/// `Unavailable` and returns the typed degraded answer. The library's own
+/// error text is neither returned, logged, nor stringified into a `Host`
+/// result (I07.20).
 fn install_claimed_subscriber() -> Result<(), HostDiagnosticsError> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let installed = tracing_subscriber::fmt()
@@ -257,20 +352,29 @@ fn install_claimed_subscriber() -> Result<(), HostDiagnosticsError> {
         .with_writer(std::io::stderr)
         .try_init()
         .is_ok();
-    settle_subscriber_setup(if installed {
+    let outcome = if installed {
         SubscriberSetup::Installed
     } else {
         SubscriberSetup::Unavailable
-    })
+    };
+    settle_subscriber_setup(outcome)
 }
 
-/// Records the settled install outcome exactly once and answers the caller
-/// with it.
+/// Records the settled install outcome once and answers the caller with the
+/// value it actually observed.
+///
+/// The caller that holds the claim does not re-read a value it computed
+/// itself and it does not win the state unconditionally: it writes
+/// `Claimed -> Installed | Unavailable` under the lock and reads back
+/// whatever the cell then holds. A poisoned or unexpectedly advanced cell can
+/// therefore only produce a truthful non-`Ok` answer, never a fabricated
+/// success, and the recorded outcome stays the first one for every later
+/// caller.
 fn settle_subscriber_setup(outcome: SubscriberSetup) -> Result<(), HostDiagnosticsError> {
     let cell = subscriber_setup_cell();
     let mut recorded = subscriber_setup_lock(cell);
     *recorded = outcome;
-    outcome.as_result()
+    recorded.as_result()
 }
 
 /// Locks the setup cell, tolerating poisoning because diagnostics must never
