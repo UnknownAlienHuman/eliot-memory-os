@@ -1376,6 +1376,50 @@ impl ToolExposureHistoryEntry {
         }
         Ok(())
     }
+
+    /// Opens a fresh entry with every owner-populated stage explicitly unresolved.
+    ///
+    /// Binds the tool identity, the definition version, the joining route when
+    /// the opening seam owns one, and the owner-joined turn/run/attempt/surface
+    /// identities; all ten stages (registered, advertised, eligible, selected,
+    /// called, transport, delivery, retry, use, outcome) stay unresolved
+    /// unknown coverage. Each stage is then populated only by its respective
+    /// owner with its source reference through the matching `record_*` stager
+    /// (or owner joins such as the semantic-registry `apply_registered_fact`); nothing is inferred from another stage here,
+    /// `None` never coerces to `false`, and the populated entry persists as a
+    /// replay-safe revision through [`persist_exposure_history_revision`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an identity, version, or route text is blank or
+    /// carries control characters, or when the surface identity is missing.
+    pub fn unpopulated(
+        tool_definition: String,
+        definition_version: String,
+        route_fingerprint: Option<String>,
+        identities: ExposureIdentities,
+    ) -> Result<Self, ToolExposureError> {
+        let entry = Self {
+            schema_version: EXPOSURE_HISTORY_VERSION,
+            tool_definition,
+            definition_version,
+            route_fingerprint,
+            identities,
+            registered: OwnerStageFact::unresolved(),
+            advertised_to_route: OwnerStageFact::unresolved(),
+            eligible_under_scope_policy_and_grant: OwnerStageFact::unresolved(),
+            selected_by_planner_or_model: OwnerStageFact::unresolved(),
+            called: OwnerStageFact::unresolved(),
+            transport_completed: OwnerStageFact::unresolved(),
+            result_delivery: None,
+            delivery_source_ref: None,
+            expanded_or_retried: OwnerStageFact::unresolved(),
+            observably_used_in_decision_action_or_verifier: OwnerStageFact::unresolved(),
+            terminal_task_or_product_outcome_ref: None,
+        };
+        entry.validate()?;
+        Ok(entry)
+    }
 }
 
 /// Refuses a second supply for one recorded history stage.
