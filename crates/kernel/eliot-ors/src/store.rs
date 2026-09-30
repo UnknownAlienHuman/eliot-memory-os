@@ -17301,7 +17301,7 @@ impl RedbRecoveryStore {
                 owner.incarnation,
                 BridgeStreamRight::Append,
             )?;
-            match Self::check_bridge_retained_replay_in(
+            let mut outcome = match Self::check_bridge_retained_replay_in(
                 &write,
                 &access,
                 &stage,
@@ -17317,7 +17317,29 @@ impl RedbRecoveryStore {
                     &provenance,
                     now_ms,
                 )?,
+            };
+            // Bind receipt (issue #2729, AUD2): the retained creating
+            // occurrence is returned so the admitted creator keeps
+            // owner-issued continuity evidence for read/ack after a
+            // reconnect. The bind gate above admits only the creating
+            // session, so no other presenter ever sees this receipt;
+            // conflict and lookup replies never pass that gate and carry
+            // no receipt.
+            if let Some(object) = outcome.as_object_mut() {
+                object.insert(
+                    "owner_continuity_connection".to_owned(),
+                    serde_json::Value::String(owner.creating_connection.clone()),
+                );
+                object.insert(
+                    "owner_continuity_launch_nonce".to_owned(),
+                    serde_json::Value::String(owner.creating_launch_nonce.clone()),
+                );
+                object.insert(
+                    "owner_continuity_session_epoch".to_owned(),
+                    serde_json::Value::from(owner.creating_session_epoch),
+                );
             }
+            outcome
         };
         write.commit().map_err(storage)?;
         Ok(outcome)
