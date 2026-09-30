@@ -4893,6 +4893,7 @@ fn create_generation_root(_path: &Path) -> Result<std::fs::File, PackageStagingE
 }
 
 #[cfg(windows)]
+#[cfg(test)]
 fn is_create_new_collision(code: u32) -> bool {
     use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
 
@@ -4900,6 +4901,7 @@ fn is_create_new_collision(code: u32) -> bool {
 }
 
 #[cfg(windows)]
+#[cfg(test)]
 fn create_destination_file_for_profile(
     path: &Path,
     profile: super::InstallerRootProfile,
@@ -4914,12 +4916,10 @@ fn create_destination_file_for_profile(
 
     let descriptor =
         staging_security_descriptor(profile, false, PackageStagingStage::SetSecurityInfo)?;
-    // Absolute-path create-only entry point for callers with no retained
-    // parent in scope (the preparation marker) and for fixtures. Staged file
-    // bytes below a retained generation tree never use this path: production
-    // file bytes go through `create_destination_file_at`, which creates
-    // relative to the exact retained parent handle instead of resolving any
-    // pathname while that parent is live.
+    // Test-only absolute-path create entry point for fixtures. Production
+    // staged file bytes go through `create_destination_file_at`, which
+    // creates relative to the exact retained parent handle instead of
+    // resolving any pathname while that parent is live.
     let attributes = SECURITY_ATTRIBUTES {
         nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>())
             .map_err(|_| PackageStagingError::Io)?,
@@ -5032,8 +5032,8 @@ fn staging_apply_file_security(
 /// carries DELETE access without delete sharing, so reopening it by path
 /// would fail with a sharing violation while it is live; the relative create
 /// traverses the live handle instead. No delete sharing is added: the child
-/// keeps `FILE_SHARE_READ` only, matching [`create_destination_file_for_profile`], so the
-/// substitution fence is unchanged. A colliding name reports
+/// keeps `FILE_SHARE_READ` only, matching the test-only absolute-path helper,
+/// so the substitution fence is unchanged. A colliding name reports
 /// `GenerationExists` and is never adopted.
 #[cfg(windows)]
 fn nt_create_file_relative(
@@ -5151,7 +5151,7 @@ fn nt_create_file_relative(
 /// Create one destination file below an already-retained destination parent
 /// handle. The retained parent is pinned through its live handle and never
 /// reopened by path; the byte create then runs the same create-only proof as
-/// [`create_destination_file_for_profile`].
+/// the test-only absolute-path helper.
 #[cfg(windows)]
 fn create_destination_file_at(
     parent: &std::fs::File,
@@ -5178,6 +5178,7 @@ fn create_destination_file_at(
 }
 
 #[cfg(not(windows))]
+#[cfg(test)]
 fn create_destination_file_for_profile(
     _path: &Path,
     _profile: super::InstallerRootProfile,
