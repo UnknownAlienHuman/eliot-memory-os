@@ -694,7 +694,6 @@ fn solo_dispatch_identity(attempt_id: &str, admission_id: &str) -> String {
 }
 
 /// Derives the deterministic solo cancellation identity.
-#[cfg(test)]
 fn solo_cancellation_identity(operation_id: &str) -> String {
     format!("{operation_id}-cancel")
 }
@@ -1328,7 +1327,7 @@ fn emit_verified_solo_dispatch(
     fabric: &mut AgentFabric,
     dispatch_id: &str,
     projection: SoloPersistedAttempt,
-) -> Result<(SoloPersistedAttempt, bool), DaemonError> {
+) -> Result<bool, DaemonError> {
     persist_projection(composition.state_root(), &projection)?;
     let ack = fabric.emit(dispatch_id)?;
     if !ack.retained || ack.dispatch_id != dispatch_id {
@@ -1340,7 +1339,7 @@ fn emit_verified_solo_dispatch(
     projection.emitted = true;
     projection.snapshot = fabric.snapshot()?;
     persist_projection(composition.state_root(), &projection)?;
-    Ok((projection, ack.retained))
+    Ok(ack.retained)
 }
 
 /// Dispatches one verified solo fabric through intent and projection.
@@ -1405,8 +1404,7 @@ fn dispatch_verified_solo_fabric(
         result_digest: None,
         cancellation_evidence: None,
     };
-    let (projection, retained) =
-        emit_verified_solo_dispatch(composition, fabric, &dispatch_id, projection)?;
+    let retained = emit_verified_solo_dispatch(composition, fabric, &dispatch_id, projection)?;
     {
         let mut state = composition.solo_state.lock().map_err(|_| {
             DaemonError::Composition(CompositionError::Recovery(
