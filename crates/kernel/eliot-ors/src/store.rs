@@ -4307,6 +4307,14 @@ pub trait OperationalRecoveryStore: Send + Sync {
         operation_id: &crate::OperationIdentity,
         request_digest: &str,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError>;
+    /// Reads the unique durable row for an exact operation. Implementations
+    /// without this source refuse rather than report authoritative absence.
+    fn load_host_request_by_operation(
+        &self,
+        _operation_id: &crate::OperationIdentity,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        Err(OrsError::InvalidTransition)
+    }
     /// Atomically claims one logical host-request key or returns its winner
     /// (issue #2571: cross-restart replay without double execution).
     ///
@@ -7677,6 +7685,48 @@ impl RedbRecoveryStore {
                 Ok(record)
             })
             .transpose()
+    }
+
+    /// Reads the original request identity from the existing durable table.
+    /// The operation is compared as an opaque identity; no request digest is
+    /// derived from it, and multiple matching identities are a conflict.
+    pub fn load_host_request_by_operation(
+        &self,
+        operation_id: &crate::OperationIdentity,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(HOST_REQUESTS).map_err(storage)?;
+        let prefix = format!("{}::", operation_id.as_str());
+        let end = format!("{prefix}~");
+        let mut found: Option<crate::HostRequestRecord> = None;
+        for item in table
+            .range(prefix.as_str()..=end.as_str())
+            .map_err(storage)?
+        {
+            let (key, value) = item.map_err(storage)?;
+            let record: crate::HostRequestRecord = decode(value.value())?;
+            record.validate()?;
+            if key.value()
+                != format!("{}::{}", record.operation_id.as_str(), record.request_digest)
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "host_request",
+                    reason: "durable key differs from its original operation/request identity"
+                        .to_owned(),
+                });
+            }
+            if record.operation_id != *operation_id {
+                continue;
+            }
+            if found.is_some() {
+                return Err(OrsError::HostRequestIdentityConflict {
+                    operation_id: operation_id.as_str().to_owned(),
+                    request_digest: record.request_digest,
+                });
+            }
+            found = Some(record);
+        }
+        Ok(found)
     }
 
     /// Derives the canonical logical key for one host-request record
@@ -35137,6 +35187,13 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         RedbRecoveryStore::load_host_request(self, operation_id, request_digest)
     }
 
+    fn load_host_request_by_operation(
+        &self,
+        operation_id: &crate::OperationIdentity,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        RedbRecoveryStore::load_host_request_by_operation(self, operation_id)
+    }
+
     fn resolve_or_stage_host_request(
         &self,
         record: &crate::HostRequestRecord,
@@ -35812,6 +35869,15 @@ impl<S: OperationalRecoveryStore> OrsCoordinator<S> {
         request_digest: &str,
     ) -> Result<Option<HostRequestRecord>, OrsError> {
         self.store.load_host_request(operation_id, request_digest)
+    }
+
+    /// Resolves the unique original host-request row for a canonical caller
+    /// that carries its operation identity but no transport request digest.
+    pub fn load_host_request_by_operation(
+        &self,
+        operation_id: &OperationIdentity,
+    ) -> Result<Option<HostRequestRecord>, OrsError> {
+        self.store.load_host_request_by_operation(operation_id)
     }
 
     /// Atomically claims one logical host-request key or returns its winner.
