@@ -1701,10 +1701,9 @@ fn write_create_new(path: &Path, bytes: &[u8]) -> Result<FileIdentity, Materiali
     })?;
     file.sync_all()
         .map_err(|error| MaterializeError::Platform(format!("sync {}: {error}", path.display())))?;
-    eliot_platform_windows::file_identity_for_open_handle(&file)
-        .map_err(|error| {
-            MaterializeError::Platform(format!("identify {}: {error}", path.display()))
-        })
+    eliot_platform_windows::file_identity_for_open_handle(&file).map_err(|error| {
+        MaterializeError::Platform(format!("identify {}: {error}", path.display()))
+    })
 }
 
 fn retain_created_role_lease(
@@ -2020,11 +2019,7 @@ fn typed_bundle_from_journal(
             "publication journal evidence digest does not match its role inventory".to_owned(),
         ));
     }
-    Ok((
-        manifest,
-        expected,
-        precommit_files,
-    ))
+    Ok((manifest, expected, precommit_files))
 }
 
 fn reconcile_journal_destination(
@@ -2619,7 +2614,10 @@ fn materialize_with_resolved_selection(
             )));
         }
         let lease = retain_created_role_lease(&publication, role, identity)?;
-        if retained_role_leases.insert(role.to_owned(), lease).is_some() {
+        if retained_role_leases
+            .insert(role.to_owned(), lease)
+            .is_some()
+        {
             return Err(MaterializeError::Invalid(format!(
                 "source role was created more than once: {role}"
             )));
