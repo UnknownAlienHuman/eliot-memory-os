@@ -253,6 +253,27 @@ impl std::fmt::Debug for WasmtimeComponentEngine {
     }
 }
 
+/// Actual import/export identities the compiled component bytes declare,
+/// observed from Wasmtime component-type metadata before instantiation
+/// (P10.1 engine evidence).
+///
+/// No instance is created and no guest function is invoked to discover the
+/// type. Both engine legs compile the same digest-bound artifact bytes under
+/// the same component-model configuration, so the observation holds for
+/// either leg; the epoch leg is the canonical observation point. Names are
+/// exact (no truncation or `Value` repair): total size is transitively
+/// bounded by the already-bounded artifact, and receipt-line bounding stays
+/// with the receipt-map assembly that consumes this evidence. Carries no
+/// digest, path, secret, timing, or backtrace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComponentIoEvidence {
+    /// Import names the component bytes actually declare. The closed-world
+    /// expectation is empty; the empty linker enforces it at instantiation.
+    pub imports: Vec<String>,
+    /// Export names the component bytes actually declare.
+    pub exports: Vec<String>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum WasmtimeBuildError {
     #[error("wasmtime configuration failed: {0}")]
@@ -357,6 +378,28 @@ impl WasmtimeComponentEngine {
             component_configuration_digest: key.component_configuration,
             artifact_bytes: artifact.len() as u64,
         })
+    }
+
+    /// Observes the actual import/export identities the compiled component
+    /// declares, for the bounded engine/run receipt (P10.1).
+    ///
+    /// Reads Wasmtime component-type metadata only: no instantiation, no
+    /// descriptor or domain invocation, no ambient import granted. The
+    /// receipt-map assembly binds these observed identities (instead of
+    /// manifest claims) to the receipt's actual-imports/exports fields.
+    #[must_use]
+    pub fn observed_component_io(&self) -> ComponentIoEvidence {
+        let component_type = self.epoch_component.component_type();
+        ComponentIoEvidence {
+            imports: component_type
+                .imports(&self.epoch_engine)
+                .map(|(name, _)| name.to_owned())
+                .collect(),
+            exports: component_type
+                .exports(&self.epoch_engine)
+                .map(|(name, _)| name.to_owned())
+                .collect(),
+        }
     }
 
     /// Executes raw input through the admitted component without the port
