@@ -359,7 +359,10 @@ impl KernelGovernedProcessEffectPort {
         // and stays fail-closed at the finish-acceptance gate, which
         // rehydrates (and refuses) before consulting it.
         if change_monitor::hydrate_ledger_sidecar_if_empty().is_err() {
-            observe_process("kernel.process.effect_baseline_unavailable", "hydrate_failed");
+            observe_process(
+                "kernel.process.effect_baseline_unavailable",
+                "hydrate_failed",
+            );
         }
         port
     }
@@ -667,13 +670,12 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
                         );
                     }
                     Err(error) => {
-                        let outcome = if error
-                            == change_monitor::ChangeMonitorError::UnstableReadback
-                        {
-                            "unstable"
-                        } else {
-                            "unobserved"
-                        };
+                        let outcome =
+                            if error == change_monitor::ChangeMonitorError::UnstableReadback {
+                                "unstable"
+                            } else {
+                                "unobserved"
+                            };
                         // I10.21 AUD4: the retained previous digest proves
                         // a real transition, but the ledger could not
                         // record it. The target leaves the baseline with a
@@ -794,8 +796,7 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
                         .ok()
                         .and_then(|last| last.get(&base.resource).cloned())
                         .or_else(|| {
-                            change_monitor::resource_tip(&base.resource)
-                                .and_then(|tip| tip.digest)
+                            change_monitor::resource_tip(&base.resource).and_then(|tip| tip.digest)
                         });
                     let outcome = match previous {
                         Some(digest) => match change_monitor::note_unresolved_transition(
