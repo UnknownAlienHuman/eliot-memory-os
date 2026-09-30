@@ -2,18 +2,20 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use eliot_platform::{KernelActivationNonce, PlatformHandle};
+use eliot_runtime_contracts::WakeIntentState;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::backend::{BackendReconcileState, CommittedAppend, DurableImage, PreparedAppend};
 use crate::model::{
-    AppliedOperation, BackupPreparationState, CutoverIntentState, DrainState, EpochEvidence,
-    EpochRetirementRecord, HostInstallationEpoch, HostState, HostStateRecord, IdempotencyIdentity,
-    PredecessorRetirementRelation, RecordFence, RecoveryLineageReason,
-    WakeCancellationBatchProjection, activation_transition, backup_preparation_transition,
-    dependency_transition, drain_transition, epoch_transition_is_direct_child_of,
-    kernel_transition, store_rebind_transition, wake_transition,
+    AppliedOperation, BackupPreparationState, CutoverIntentState, DrainState,
+    EliotActivationRecord, EpochEvidence, EpochRetirementRecord, HostInstallationEpoch, HostState,
+    HostStateRecord, IdempotencyIdentity, PredecessorRetirementRelation, RecordFence,
+    RecoveryLineageReason, WakeCancellationBatchProjection, activation_transition,
+    backup_preparation_transition, dependency_transition, drain_transition,
+    epoch_transition_is_direct_child_of, kernel_transition, store_rebind_transition,
+    wake_transition,
 };
 use crate::reactive_context::{
     ReactiveContextEnqueueReceipt, ReactiveContextJournalAction, ReactiveContextOperationQuery,
@@ -459,6 +461,55 @@ pub(crate) fn frame_bindings(
 
 // Keeping the record union in one exhaustive match makes the one-writer state
 // mutation boundary auditable; individual transition laws live in `model`.
+//
+// I1.5 demand-start survival: a post-commit trigger is queued as the next
+// activation generation, so the resulting `Pending` `WakeIntent` is fenced to
+// the generation being drained. Clearing every wake on the succeeding
+// `Activation` append would delete the demand the restart was queued for, so
+// the cutover owner retains — and explicitly re-anchors — it instead:
+//
+// * retained: unserved demand (`Pending`, plus `Claimed`/`Started` claims of
+//   the superseded generation, which died with that generation and return to
+//   `Pending` as ambiguous rather than being silently dropped) fenced to the
+//   generation being succeeded. The record fence moves to the new generation
+//   and the intent authority moves to the new generation's Kernel epoch, so
+//   the claiming generation's revalidation (same generation, same authority,
+//   covered capabilities) can admit it. Reason, evidence, timing, capability,
+//   maintenance, safety and budget fields are untouched: a wake still never
+//   grants authority and is still revalidated on claim — stale or mismatched
+//   demand is cancelled there, never executed;
+// * dropped: terminal history (`Satisfied`, `Cancelled`, `Expired`, `Failed`)
+//   and any wake fenced to a generation other than the one being succeeded
+//   (foreign or stale demand is never carried forward).
+//
+// The rule is a pure function of the pre-append projection and the admitted
+// successor, so journal replay rebuilds the identical projection.
+fn retain_next_generation_wakes(state: &mut HostState, next: &EliotActivationRecord) {
+    let Some(succeeded) = state.activation.as_ref() else {
+        state.wakes.clear();
+        return;
+    };
+    let succeeded_generation = succeeded.fence.activation_generation.clone();
+    let mut carried = Vec::with_capacity(state.wakes.len());
+    for wake in state.wakes.drain(..) {
+        let unserved = matches!(
+            wake.intent.state,
+            WakeIntentState::Pending | WakeIntentState::Claimed | WakeIntentState::Started
+        );
+        if !unserved || wake.fence.activation_generation != succeeded_generation {
+            continue;
+        }
+        let mut reanchored = wake;
+        reanchored.fence = next.fence.clone();
+        // Ambiguous in-flight claims of the dead generation stay pending:
+        // only the claiming generation may advance a wake past `Pending`.
+        reanchored.intent.state = WakeIntentState::Pending;
+        reanchored.intent.state_fence.authority_epoch = next.lineage.kernel_epoch.clone();
+        carried.push(reanchored);
+    }
+    state.wakes = carried;
+}
+
 #[allow(clippy::too_many_lines)]
 fn apply(
     state: &mut HostState,
@@ -524,7 +575,7 @@ fn apply(
                 state.dependencies.clear();
                 state.drain = None;
                 state.drain_commit = None;
-                state.wakes.clear();
+                retain_next_generation_wakes(state, next);
                 state.module_build_provenance.clear();
                 if let Some(queue) = state.reactive_context.as_mut() {
                     queue.advance_generation()?;
