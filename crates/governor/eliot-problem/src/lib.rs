@@ -114,6 +114,38 @@ pub enum ProblemError {
     /// A challenge/deviation has expired or is no longer mutable.
     #[error("record is no longer mutable")]
     ImmutableState,
+    /// A record revision or counter cannot advance without reusing an identity.
+    #[error("{field} overflow: refusing to reuse revision {current}")]
+    CounterOverflow {
+        field: &'static str,
+        current: u64,
+    },
+    /// The record is unassigned and therefore carries a visible obligation
+    /// instead of an owner. It is not resolved, accepted risk, or discardable.
+    #[error("record is unassigned: a reassignment or escalation obligation is outstanding")]
+    OwnerUnassigned,
+    /// The presented ownership lease is no longer inside its validity window.
+    #[error("ownership lease is outside its validity window")]
+    OwnerLeaseNotCurrent,
+    /// The presented owner claim does not match the retained lease identity.
+    #[error("owner claim does not match the retained ownership lease")]
+    OwnerLeaseMismatch,
+    /// An owner-loss event names a lease or ownership epoch this record no
+    /// longer holds, so it is a delayed event for an already-superseded lease
+    /// and must not unassign the current successor.
+    #[error("owner-loss event is stale for the lease and ownership epoch this record holds")]
+    StaleOwnerLoss,
+    /// Closure evidence must come from a verifier independent of the owner.
+    #[error("resolution evidence must come from a verifier independent of the owner")]
+    IndependentVerifierRequired,
+    /// The submitted evidence does not cover every independently expected
+    /// observable, so the resolution condition is not satisfied yet.
+    #[error("resolution evidence does not cover expected observable {value}")]
+    UnresolvedExpectation { value: String },
+    /// A waiver was attempted by a principal that is not the recorded waiver
+    /// authority, or by the current owner, who cannot waive its own obligation.
+    #[error("waiver is not the recorded waiver authority")]
+    WaiverAuthorityRequired,
 }
 
 fn text(value: &str, field: &'static str) -> Result<(), ProblemError> {
@@ -173,19 +205,38 @@ fn owner_name(value: &str) -> Result<(), ProblemError> {
 ///
 /// A saturating bump pins a live record to the revision that already names its
 /// current committed state, so the transition is refused and the caller must
-/// re-read the record rather than write a reused identity.
+/// re-read the record rather than write a reused identity. Refusal is the only
+/// correct outcome: two distinct states sharing one revision is a
+/// compare-and-set that has stopped comparing, so the caller sees a conflict
+/// and re-reads instead of committing under an identity it already used.
 fn next_revision(current: u64) -> Result<u64, ProblemError> {
-    current.checked_add(1).ok_or(ProblemError::InvalidField {
-        field: "revision",
-        reason: "revision overflow",
-    })
+    current
+        .checked_add(1)
+        .ok_or(ProblemError::CounterOverflow {
+            field: "revision",
+            current,
+        })
 }
 
 /// Advances the reopen counter under the same no-reuse rule as the revision.
 fn next_reopen_count(current: u32) -> Result<u32, ProblemError> {
-    current.checked_add(1).ok_or(ProblemError::InvalidField {
-        field: "reopen_count",
-        reason: "reopen_count overflow",
+    current
+        .checked_add(1)
+        .ok_or(ProblemError::CounterOverflow {
+            field: "reopen_count",
+            current: u64::from(current),
+        })
+}
+
+/// Advances the ownership epoch under the same no-reuse rule.
+///
+/// I13.8 requires a lost owner to be replaced "with new Authority Epoch". A
+/// reused epoch would let the fenced owner present the same epoch it lost, so
+/// overflow is a refusal rather than a clamp.
+fn next_ownership_epoch(current: u64) -> Result<u64, ProblemError> {
+    current.checked_add(1).ok_or(ProblemError::CounterOverflow {
+        field: "ownership_epoch",
+        current,
     })
 }
 
@@ -1033,11 +1084,16 @@ impl Incident {
         nonempty(&evidence, "new_evidence")?;
         let revision = next_revision(self.revision)?;
         let reopen_count = next_reopen_count(self.reopen_count)?;
-        self.evidence_refs.extend(evidence);
-        self.state = IncidentState::Open;
-        self.acknowledged_by = None;
-        self.reopen_count = reopen_count;
-        self.revision = revision;
+        // The reopened record is built and validated as a candidate, so a
+        // refused reopen leaves the terminal Incident exactly as it was.
+        let mut candidate = self.clone();
+        candidate.evidence_refs.extend(evidence);
+        candidate.state = IncidentState::Open;
+        candidate.acknowledged_by = None;
+        candidate.reopen_count = reopen_count;
+        candidate.revision = revision;
+        candidate.validate()?;
+        *self = candidate;
         Ok(())
     }
 }
@@ -1138,8 +1194,9 @@ impl Conflict {
                 value: rival.claim_ref,
             });
         }
+        let revision = next_revision(self.revision)?;
         self.rival_claims.push(rival);
-        self.revision = self.revision.saturating_add(1);
+        self.revision = revision;
         Ok(())
     }
 
@@ -1157,9 +1214,10 @@ impl Conflict {
                 to: "RESOLVED".to_owned(),
             });
         }
+        let revision = next_revision(self.revision)?;
         self.decision_ref = Some(decision_ref.to_owned());
         self.state = ConflictState::Resolved;
-        self.revision = self.revision.saturating_add(1);
+        self.revision = revision;
         Ok(())
     }
 
@@ -1180,10 +1238,11 @@ impl Conflict {
             });
         }
         rival.validate()?;
+        let revision = next_revision(self.revision)?;
         self.rival_claims.push(rival);
         self.state = ConflictState::Open;
         self.decision_ref = None;
-        self.revision = self.revision.saturating_add(1);
+        self.revision = revision;
         self.validate()
     }
 }
@@ -1276,8 +1335,9 @@ impl ConciliumRun {
                 to: format!("{next:?}"),
             });
         }
+        let revision = next_revision(self.revision)?;
         self.stage = next;
-        self.revision = self.revision.saturating_add(1);
+        self.revision = revision;
         Ok(())
     }
 }
@@ -1608,8 +1668,9 @@ impl RecoveryAcceptanceProfile {
                 reason: "all gaps require evidence-backed closure",
             });
         }
+        let revision = next_revision(self.revision)?;
         self.state = RecoveryProfileState::Satisfied;
-        self.revision = self.revision.saturating_add(1);
+        self.revision = revision;
         Ok(())
     }
 }
@@ -1690,8 +1751,9 @@ impl GovernedChallenge {
                 to: "UNDER_REVIEW".to_owned(),
             });
         }
+        let revision = next_revision(self.revision)?;
         self.state = ChallengeState::UnderReview;
-        self.revision = self.revision.saturating_add(1);
+        self.revision = revision;
         Ok(())
     }
 
@@ -1704,8 +1766,9 @@ impl GovernedChallenge {
                 to: "ACCEPTED".to_owned(),
             });
         }
+        let revision = next_revision(self.revision)?;
         self.state = ChallengeState::Accepted;
-        self.revision = self.revision.saturating_add(1);
+        self.revision = revision;
         Ok(())
     }
 
@@ -1718,8 +1781,9 @@ impl GovernedChallenge {
         ) {
             return Err(ProblemError::ImmutableState);
         }
+        let revision = next_revision(self.revision)?;
         self.state = ChallengeState::Rejected;
-        self.revision = self.revision.saturating_add(1);
+        self.revision = revision;
         Ok(())
     }
 }
@@ -1795,9 +1859,10 @@ impl ImplementationDeviation {
         if self.state != DeviationState::Active {
             return Err(ProblemError::ImmutableState);
         }
+        let revision = next_revision(self.revision)?;
         self.outcome_ref = Some(outcome_ref.to_owned());
         self.state = DeviationState::Promoted;
-        self.revision = self.revision.saturating_add(1);
+        self.revision = revision;
         Ok(())
     }
 
@@ -1807,8 +1872,9 @@ impl ImplementationDeviation {
         if self.state != DeviationState::Active {
             return Err(ProblemError::ImmutableState);
         }
+        let revision = next_revision(self.revision)?;
         self.state = DeviationState::Rejected;
-        self.revision = self.revision.saturating_add(1);
+        self.revision = revision;
         Ok(())
     }
 
@@ -1827,9 +1893,10 @@ impl ImplementationDeviation {
         if self.state != DeviationState::Active {
             return Err(ProblemError::ImmutableState);
         }
+        let revision = next_revision(self.revision)?;
         self.outcome_ref = Some(outcome_ref.to_owned());
         self.state = DeviationState::Expired;
-        self.revision = self.revision.saturating_add(1);
+        self.revision = revision;
         Ok(())
     }
 }
