@@ -847,13 +847,22 @@ impl fmt::Display for CapabilityCellProofError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidRegistry => {
-                write!(formatter, "capability cell registry failed typed validation")
+                write!(
+                    formatter,
+                    "capability cell registry failed typed validation"
+                )
             }
             Self::UndeclaredCell { cell } => {
-                write!(formatter, "capability cell registry declares no cell '{cell}'")
+                write!(
+                    formatter,
+                    "capability cell registry declares no cell '{cell}'"
+                )
             }
             Self::AmbiguousCell { cell } => {
-                write!(formatter, "capability cell '{cell}' is claimed by more than one record")
+                write!(
+                    formatter,
+                    "capability cell '{cell}' is claimed by more than one record"
+                )
             }
             Self::SourceCrateMismatch {
                 cell,
