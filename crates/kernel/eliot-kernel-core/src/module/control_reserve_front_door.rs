@@ -1128,6 +1128,13 @@ impl FrontDoor {
     /// [`Self::acquire_emergency`]) or, while migrating, [`Self::acquire_control`]
     /// explicitly.
     ///
+    /// Partition discipline (issue #1679, W8/I14.3): the idempotency resolve
+    /// and the authority verification run before any partition is touched, so
+    /// the protected call-scoped hold below is drawn only after the normal
+    /// authority checks pass. A forged, fenced, misrouted or expired receipt
+    /// is denied without consuming protected control capacity, and
+    /// conflicting replays never reach a partition.
+    ///
     /// # Errors
     ///
     /// Returns [`KernelError::ControlReserveExhausted`] or
@@ -1141,10 +1148,6 @@ impl FrontDoor {
         idempotency_key: &str,
         request_digest: &str,
     ) -> Result<AuthorityDecision, KernelError> {
-        let _permit = self
-            .reserve
-            .acquire_legacy_protected(self.authority.current_epoch())
-            .ok_or(KernelError::ControlReserveExhausted)?;
         let mut ledger = self.lock_ledger();
         match ledger.resolve(idempotency_key, request_digest) {
             IdempotencyDisposition::Replay(decision) => return Ok(decision),
@@ -1168,6 +1171,10 @@ impl FrontDoor {
             Err(error) => return Err(error),
         };
         ledger.record(idempotency_key, request_digest, decision.clone())?;
+        let _permit = self
+            .reserve
+            .acquire_legacy_protected(self.authority.current_epoch())
+            .ok_or(KernelError::ControlReserveExhausted)?;
         Ok(decision)
     }
 
