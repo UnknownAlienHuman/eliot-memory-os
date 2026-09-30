@@ -1667,11 +1667,15 @@ pub struct MaterialBootstrap {
 /// `DaemonComposition::read_cold_start_surface_for_attach` supplies the exact
 /// retained surface for the lease, and
 /// [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition)
-/// carries the admitted bootstrap toward the #1742 Material gate. This entry
+/// carries the admitted bootstrap toward the #1742 Material gate. `now` is the
+/// caller's unix-millisecond observation clock (the same clock
+/// [`observe_cold_start_discovery`] takes): the join honors #8's bounded
+/// freshness instead of re-deriving it, so an expired receipt or lease fails
+/// closed here before any owner field is compared. This entry
 /// mints no profile, receipt, or lease of its own.
 #[allow(
     clippy::too_many_arguments,
-    reason = "bootstrap joins the receipt, surface, both profiles, and the live fence in one edge"
+    reason = "bootstrap joins the receipt, surface, both profiles, the live fence, and the freshness clock in one edge"
 )]
 #[expect(
     clippy::too_many_lines,
@@ -1683,6 +1687,7 @@ pub fn admit_bootstrap_context(
     coverage: Option<&IntegrationCoverageProfile>,
     governance: Option<&GovernanceProfile>,
     live_fence: &StateFence,
+    now: u64,
 ) -> Result<BootstrapAdmission, TaskBindingError> {
     receipt.validate().map_err(|error| {
         TaskBindingError::scope_incompatible(format!(
@@ -1692,6 +1697,24 @@ pub fn admit_bootstrap_context(
     if !eliot_contracts::fences_match_exact(&receipt.state_fence, live_fence) {
         return Err(TaskBindingError::scope_incompatible(
             "compiled readiness receipt was compiled at another fence",
+        ));
+    }
+    // #8 bounds every bootstrap by receipt expiry and lease deadline. The join
+    // reuses that bound as stated: an expired receipt or lease re-resolves
+    // through the owner route instead of admitting a stale bootstrap.
+    if now == 0 {
+        return Err(TaskBindingError::selection_required(
+            "bootstrap freshness clock is not available",
+        ));
+    }
+    if receipt.expiry_tick < now {
+        return Err(TaskBindingError::scope_incompatible(
+            "compiled readiness receipt expired before bootstrap; re-resolve through the owner route",
+        ));
+    }
+    if surface.lease_deadline < now {
+        return Err(TaskBindingError::scope_incompatible(
+            "bootstrap lease expired before dispatch; re-resolve through the owner route",
         ));
     }
     // Same session/scope/selection-state and source revisions on both sides.
@@ -2178,6 +2201,42 @@ pub fn seal_dispatched_binding(
     })
 }
 
+/// Renders one non-matched `MaterialEffect` guard report as a stable typed
+/// detail (issue #1746, W3).
+///
+/// Preserves the exact owner disposition — stale, different-instance,
+/// ambiguous, provisional, or conflicted — instead of reducing every refusal
+/// to one prose reason, so the effect gate answers conflict/rebind with the
+/// discriminating identity instead of a guess. Called only by
+/// [`revalidate_dispatched_binding`].
+fn material_effect_guard_detail(report: &eliot_workscope::TriggerReport) -> String {
+    let identity = match report.identity {
+        eliot_workscope::IdentityLegOutcome::DifferentInstance => "DIFFERENT_INSTANCE",
+        eliot_workscope::IdentityLegOutcome::Ambiguous => "AMBIGUOUS",
+        eliot_workscope::IdentityLegOutcome::StaleBinding => "STALE_BINDING",
+        eliot_workscope::IdentityLegOutcome::IdentityClear => "IDENTITY_CLEAR",
+    };
+    let verdict = match report.verdict {
+        eliot_workscope::GuardVerdict::Allow => "ALLOW",
+        eliot_workscope::GuardVerdict::Withhold => "WITHHOLD",
+        eliot_workscope::GuardVerdict::Quarantine => "QUARANTINE",
+    };
+    let receipt = report
+        .receipt
+        .as_ref()
+        .map_or("", |receipt| match receipt.disposition {
+            ScopeBindingDisposition::Matched => ", receipt MATCHED",
+            ScopeBindingDisposition::DifferentInstance => ", receipt DIFFERENT_INSTANCE",
+            ScopeBindingDisposition::Ambiguous => ", receipt AMBIGUOUS",
+            ScopeBindingDisposition::StaleBinding => ", receipt STALE_BINDING",
+            ScopeBindingDisposition::ProvisionalRebind => ", receipt PROVISIONAL_REBIND",
+            ScopeBindingDisposition::Conflicted => ", receipt CONFLICTED",
+        });
+    format!(
+        "scope guard at material effect is not MATCHED: identity {identity}, verdict {verdict}{receipt}; rebind under a new operation, no rewrite"
+    )
+}
+
 /// Revalidates one sealed dispatch identity at the effect gate against the
 /// live owners (issue #1746, W6/A5).
 ///
@@ -2193,13 +2252,30 @@ pub fn seal_dispatched_binding(
 /// Shared safe status/recovery remains available under its own authority and
 /// never passes through this entry.
 ///
+/// The scope-identity legs run here as well (issue #1746, W3; I4.2.1): the
+/// retained binding the gate read at the live fence, the live observation,
+/// and the governing-source closure run through the existing owner
+/// (`eliot_workscope::check_at_trigger`) at the `MaterialEffect` trigger.
+/// `Allow` requires identity-clear `MATCHED`; stale, different-instance,
+/// ambiguous, provisional, or conflicted observations conflict for rebind with
+/// the exact disposition (see [`material_effect_guard_detail`]). Scope
+/// uncertainty never admits a task-bound effect here — only the quarantined
+/// capture route ([`admit_capture`] `ColdUnbound`) may retain bytes. This entry
+/// runs only the pure owner legs over gate-supplied bindings; the Governor's
+/// retained-data legs (`require_scope_guard_for_observed`,
+/// `check_canonical_write_work_scope`) remain the authority for the
+/// retained binding itself. This entry mints no receipt and installs no
+/// binding.
+///
 /// Designated caller (STITCH, daemon composition lane): the pre-commit effect
 /// gate in `DaemonComposition::commit_canonical_and_refresh`
 /// (`bins/eliotd/src/lib.rs`), between the `ColdUnbound` admission projection
-/// and the scope-sensitive trigger, passing the live Governor task/scope,
-/// principal/session, task revision, acceptance digest, receipt revision,
-/// governance profile reference, projection generation (the live receipt's own
-/// `projection_generation`, alongside its revision), and kernel-snapshot fence.
+/// and the scope-sensitive trigger, passing the live Governor task/scope, the
+/// retained binding read at the live fence, the live observed binding, the
+/// governing-source closure, principal/session, task revision, acceptance digest,
+/// receipt revision, governance profile reference, projection generation (the
+/// live receipt's own `projection_generation`, alongside its revision), and
+/// kernel-snapshot fence.
 #[allow(
     clippy::too_many_arguments,
     reason = "revalidation joins the sealed identity against every live owner value that can invalidate it in one fail-closed edge"
@@ -2208,6 +2284,9 @@ pub fn revalidate_dispatched_binding(
     binding: &DispatchedBinding,
     live_task_ref: Option<&str>,
     live_scope_ref: &str,
+    retained: &ScopeBinding,
+    observed: &ScopeBinding,
+    source_closure: Option<(&GoverningSourceSet, &PrivacyProfile)>,
     live_principal_ref: &str,
     live_session_ref: &str,
     live_task_revision: u64,
@@ -2230,6 +2309,29 @@ pub fn revalidate_dispatched_binding(
     if live_scope_ref != binding.scope_ref {
         return Err(TaskBindingError::scope_incompatible(
             "dispatched WorkScope is not the admitted WorkScope; rebind, no rewrite",
+        ));
+    }
+    // Issue #1746, W3: the MaterialEffect scope-identity legs run at this
+    // effect gate, not only at the canonical-write trigger. The gate passes
+    // the retained binding it read at the live fence, the live observation,
+    // and the governing-source closure; the existing owner legs decide.
+    // `Allow` requires identity-clear `MATCHED`. Anything else conflicts for
+    // rebind with the exact disposition — never a silent move, never a task
+    // or memory transfer.
+    if retained.scope.scope_ref != binding.scope_ref {
+        return Err(TaskBindingError::scope_incompatible(
+            "effect gate retained binding is not the admitted WorkScope; rebind, no rewrite",
+        ));
+    }
+    let guard = eliot_workscope::check_at_trigger(
+        retained,
+        observed,
+        source_closure,
+        eliot_workscope::GuardTrigger::MaterialEffect,
+    );
+    if !guard.is_matched() {
+        return Err(TaskBindingError::scope_incompatible(
+            material_effect_guard_detail(&guard),
         ));
     }
     // An intervening logout or rebind moved the live principal/session. The
@@ -2365,7 +2467,8 @@ pub fn revalidate_task_bound_for_effect(
 /// cannot admit:
 ///
 /// - a `CaptureObservation` naming no task on either the admitted context or
-///   the transition has no unique task selection, so it is admitted through
+///   the transition, and with no task-relative/effectful operation in the
+///   typed catalogue, has no unique task selection, so it is admitted through
 ///   [`admit_capture`] as [`TaskBindingAdmission::ColdUnbound`] with no task
 ///   activation, support/influence promotion, or finish relevance;
 /// - a `CaptureObservation` that names a task is task-relative, and this edge
@@ -2375,12 +2478,14 @@ pub fn revalidate_task_bound_for_effect(
 ///   proof handles the transition actually carries. A typed selection is never
 ///   manufactured here, and an absent one is never treated as compatible;
 /// - a transition with no capture that still names a task on either the
-///   admitted context or the transition is equally task-relative work passing
-///   a capture-only edge (issue #1746, A6): it is reported as
-///   [`TaskBindingAdmission::TaskRelative`] — never admitted here and never
-///   labelled [`TaskBindingAdmission::NotTaskRelative`], which would claim no
-///   binding is required. Its binding belongs to the same selection-owning
-///   ingress and store gate as the capture-naming-task arm;
+///   admitted context or the transition — or whose typed operation is
+///   task-relative/effectful under the frozen requirement table
+///   ([`requirement_for_named_mutation`]) even when no task handle is named —
+///   is equally task-relative work passing a capture-only edge (issue #1746,
+///   A6): it is reported as [`TaskBindingAdmission::TaskRelative`] — never
+///   admitted here and never labelled [`TaskBindingAdmission::NotTaskRelative`],
+///   which would claim no binding is required. Its binding belongs to the same
+///   selection-owning ingress and store gate as the capture-naming-task arm;
 /// - a transition with no capture and no task on either side is
 ///   [`TaskBindingAdmission::NotTaskRelative`].
 ///
@@ -2407,12 +2512,19 @@ pub fn admit_named_mutation_capture(
     context: &RequestMetadata,
     transition: &PreparedTransition,
 ) -> Result<TaskBindingAdmission, TaskBindingError> {
-    let captures = transition
-        .named_operations
-        .iter()
-        .any(|named| named.operation == NamedMutationOperation::CaptureObservation);
+    // Issue #1746, W1: the capture/task-relative split is derived from the
+    // frozen requirement table, never from an operation-name comparison on
+    // this edge, so a renamed or newly catalogued effectful operation cannot
+    // slip through as needing no binding. This is the same table
+    // [`admit_canonical_write`] derives its split from.
+    let carries_requirement = |requirement: CanonicalOperationRequirement| {
+        transition
+            .named_operations
+            .iter()
+            .any(|named| requirement_for_named_mutation(named.operation) == requirement)
+    };
     let names_a_task = transition.task_id.is_some() || context.task_id.is_some();
-    if names_a_task {
+    if names_a_task || carries_requirement(CanonicalOperationRequirement::TaskRelativeEffectful) {
         // Issue #1746, A6: the bridge transport edge enforces the same binding
         // rule as the direct internal intake — task-relative work needs owner
         // evidence, so its binding decision belongs to the ingress that owns
@@ -2431,7 +2543,7 @@ pub fn admit_named_mutation_capture(
             "bridge transport edge cannot admit a task-relative effect without owner evidence",
         ));
     }
-    if !captures {
+    if !carries_requirement(CanonicalOperationRequirement::SafeRawCapture) {
         return Ok(TaskBindingAdmission::NotTaskRelative);
     }
     match admit_capture(
