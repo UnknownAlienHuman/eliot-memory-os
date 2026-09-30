@@ -5886,31 +5886,7 @@ impl KernelStoreGateway {
                 },
             ));
         };
-        let wake_request = run_now_wake_read_request(
-            sealed.context.clone(),
-            sealed.authenticated_principal.clone(),
-            sealed.identity.clone(),
-            invocation.clone(),
-        );
-        let wake = match UserAutomationWakePort::read_pending_wake(runtime, wake_request).await {
-            Ok(readback) => UserAutomationWakePhase::Published { readback },
-            // A complete negative from the sole writer of that journal. The Host
-            // journal publishes only the calendar occurrences the immutable
-            // revision compiles, and an explicit manual `run-now` nonce is
-            // deliberately outside that set (I11.12:33), so "the owner retains
-            // no such wake" is the expected and correct answer here rather than
-            // a lost one. Reporting it as an unknown would leave every committed
-            // run-now permanently reconciling over a proven absence. Every other
-            // answer — an owner that could not be reached, an answer that was
-            // lost, a record about another occurrence — proves nothing and stays
-            // unresolved.
-            Err(UserAutomationRuntimeError::NotRetained(reason)) => {
-                UserAutomationWakePhase::NotApplicable { reason }
-            }
-            Err(error) => UserAutomationWakePhase::UnknownOutcome {
-                reason: error.to_string(),
-            },
-        };
+        let wake = Self::resolve_run_now_wake_phase(sealed, &invocation, runtime).await;
         if let Some(reason) = defer_reason {
             return Ok((wake, UserAutomationExecutionPhase::Deferred { reason }));
         }
@@ -6017,6 +5993,47 @@ impl KernelStoreGateway {
     /// without one: the join's own owner boundary is where that typed refusal is
     /// already produced, so the reported disposition stays the join's own answer
     /// rather than the same refusal restated under another error type.
+    /// Resolves the wake phase of one committed `RunNow` occurrence over the
+    /// authenticated runtime channel.
+    ///
+    /// The request reuses the admitted parent identity and the committed
+    /// invocation, so a replayed Store mutation asks about the same original
+    /// occurrence instead of minting another manual nonce.
+    async fn resolve_run_now_wake_phase<R>(
+        sealed: &UserAutomationServiceRequest,
+        invocation: &UserAutomationInvocation,
+        runtime: &R,
+    ) -> UserAutomationWakePhase
+    where
+        R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
+    {
+        let wake_request = run_now_wake_read_request(
+            sealed.context.clone(),
+            sealed.authenticated_principal.clone(),
+            sealed.identity.clone(),
+            invocation.clone(),
+        );
+        match UserAutomationWakePort::read_pending_wake(runtime, wake_request).await {
+            Ok(readback) => UserAutomationWakePhase::Published { readback },
+            // A complete negative from the sole writer of that journal. The Host
+            // journal publishes only the calendar occurrences the immutable
+            // revision compiles, and an explicit manual `run-now` nonce is
+            // deliberately outside that set (I11.12:33), so "the owner retains
+            // no such wake" is the expected and correct answer here rather than
+            // a lost one. Reporting it as an unknown would leave every committed
+            // run-now permanently reconciling over a proven absence. Every other
+            // answer - an owner that could not be reached, an answer that was
+            // lost, a record about another occurrence - proves nothing and stays
+            // unresolved.
+            Err(UserAutomationRuntimeError::NotRetained(reason)) => {
+                UserAutomationWakePhase::NotApplicable { reason }
+            }
+            Err(error) => UserAutomationWakePhase::UnknownOutcome {
+                reason: error.to_string(),
+            },
+        }
+    }
+
     fn run_now_durable_job_material(
         sealed: &UserAutomationServiceRequest,
         invocation: &UserAutomationInvocation,
