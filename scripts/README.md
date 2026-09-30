@@ -43,6 +43,7 @@ committed as repository authority.
 | `verify-release-claim-boundary.py` | Verify the build-success claim boundary stays bound to source and build identity (issue #1855) | Static release-claim policy evidence only |
 | `migration_inventory_1860.py` | Publish required migration inventory, dispositions, impact graph, and Product Proof plan (issue #1860) | Static migration inventory evidence only |
 | `verify-dependency-policy.py` | Verify multi-ecosystem dependency admission, scanner tool pinning, inventory completeness, lockfiles, and advisory evidence | Static and advisory admission evidence only |
+| `prepare-dependency-policy-inputs.py` | Prepare declared reproducible scanner and input readiness before dependency policy checks | Prepared dependency-policy input readiness evidence only |
 | `verify-branch-protection.py` | Read back live branch protection/rulesets and compare against the retained merge-enforcement rule (#3004) | Live enforcement readback evidence only; never configures protection |
 | `crate_reachability_inventory.py` | Generate deterministic support-neutral Cargo package reachability and source-shape inventory | Reachability and source-shape evidence only |
 | `audit-work-unit-assignments.py` | Deterministic fail-closed assignment-integrity oracle over a frozen complete repository/GitHub snapshot (#818) | Assignment integrity oracle evidence only |
@@ -57,6 +58,7 @@ committed as repository authority.
 | `verify-lint-policy.ps1` | Verify the Rust lint-policy configuration and declared exceptions | Static source-policy evidence only |
 | `audit_host_diagnostic_coverage.py` | Bounded Host diagnostic coverage and identity validator (#985) | Static host diagnostic coverage evidence only |
 | `documentation_evidence_check.py` | Frozen outer documentation evidence package verifier (I18.31 W4) | Documentation evidence package re-extraction evidence only |
+| `gen_capability_cell_registry.py` | Generate daemon projection and native-worker capability-cell registry | Generated capability-cell registry projection only |
 | `gen_operator_schedule_contract.py` | Generate C# mirror of Kernel UserAutomation schedule contract (#2865) | Generated C# schedule contract mirror only |
 | `gen_user_automation_zone_table.py` | Generate pinned IANA zone table for Kernel UserAutomation occurrence validator (#2805) | Pinned IANA zone table generation only |
 | `read_freeze_digest.py` | Reproducible-digest readback for static field contract freeze (#223) | Static contract freeze digest readback only |

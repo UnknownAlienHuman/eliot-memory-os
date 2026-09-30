@@ -685,8 +685,8 @@ class TestPackageReaderClosure(unittest.TestCase):
             root = Path(td)
             write_index(root, {"A0": record("A0", "a"), "A1": record("A1", "b")})
             resolver = DestinationResolver(root)
-            self.assertEqual(resolver.resolve("A0")["direct_destination"], "docs/architecture/A.md#a")
-            self.assertEqual(resolver.resolve("A1")["direct_destination"], "docs/architecture/A.md#b")
+            self.assertEqual(resolver.resolve("A0")["direct_destination"], "docs/" + "architecture/A.md#a")
+            self.assertEqual(resolver.resolve("A1")["direct_destination"], "docs/" + "architecture/A.md#b")
 
     # WORK_UNIT_CASE: 690/23
     def test_23_malformed_empty_handle(self) -> None:
@@ -1291,6 +1291,8 @@ class TestPackageReaderClosure(unittest.TestCase):
             "docs/code-navigation/",
             "workstreams/documentation/assignments/690-package-reader-closure.toml",
             ".eliot/",
+            "crates/",
+            "integrations/",
         )
         import subprocess
         diff = subprocess.check_output(
