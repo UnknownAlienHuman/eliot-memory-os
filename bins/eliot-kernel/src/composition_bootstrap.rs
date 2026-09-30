@@ -1640,6 +1640,8 @@ impl KernelComposition {
             wasm_host_artifact_sha256,
             user_broker_executable_path,
             user_broker_artifact_sha256,
+            user_broker_registration_authority:
+                super::user_broker_registration_authority::UserBrokerRegistrationAuthority::default(),
             wasm_join_table: Mutex::new(eliot_kernel_service::WasmJoinTable::default()),
             pre_stage_identity_cache: Mutex::new(
                 eliot_kernel_service::PreStageIdentityCache::default(),

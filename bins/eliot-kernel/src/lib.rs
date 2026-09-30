@@ -284,6 +284,8 @@ pub mod kernel_unavailability;
 mod native_worker_lifecycle_route;
 mod native_worker_reconcile_route;
 mod native_worker_replay_route;
+mod user_broker_registration_authority;
+mod user_broker_registration_route;
 pub mod notify_operation_identity;
 mod provider_capability_route;
 pub mod reactive_restore_serve;
@@ -654,6 +656,11 @@ pub struct KernelComposition {
     user_broker_executable_path: Option<PathBuf>,
     /// Digest bound to `user_broker_executable_path`.
     user_broker_artifact_sha256: Option<String>,
+    /// Process-local typed authority for broker registrations admitted on the
+    /// exact authenticated User Broker connection. ORS payload bytes remain
+    /// opaque and can never be used to reconstruct this live state.
+    user_broker_registration_authority:
+        user_broker_registration_authority::UserBrokerRegistrationAuthority,
     /// Retained owner-side WASM join table (#2786 step 3): the single
     /// cross-call registry of published delivery-bound joins. The
     /// dispatch operation merges each published bundle here and admits

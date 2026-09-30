@@ -25,6 +25,7 @@ use super::generation_control::{
     ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION, GENERATION_CUTOVER_OPERATION,
 };
 use super::native_worker_lifecycle_route::is_native_worker_operation;
+use super::user_broker_registration_route::USER_BROKER_MODULE_ID;
 use super::request_dispatch::is_backup_operation;
 use super::wasm_runtime_port_grant::{
     HandlerSession, HostBinaryFacts, KernelObservedGrantFacts, WASM_GRANT_REQUEST_WIRE_ID,
@@ -849,6 +850,13 @@ impl KernelComposition {
                 .is_compatible_with(&identity.request.state_fence)
         {
             return Err(TransportError::SessionFenced);
+        }
+
+        // User Broker Sessions have a dedicated, operation-scoped matrix.
+        // They cannot fall through to health, daemon, process, or generic
+        // control routes even when a peer presents a valid frame envelope.
+        if session.module_generation.module_id.as_str() == USER_BROKER_MODULE_ID {
+            return self.dispatch_user_broker_frame(session, frame);
         }
 
         if frame.kind == FrameKind::Heartbeat && frame.message_type == MessageType::Health {
