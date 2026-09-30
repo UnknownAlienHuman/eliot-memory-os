@@ -3605,10 +3605,8 @@ impl KernelHostRequestPort for KernelHostRequestClient {
             // unknown-outcome error is returned unchanged and MUST NOT be
             // rewritten into DeadlineExceeded. Only the Kernel-owned Expired
             // record state maps to an owner timeout.
-            return self.record_settled(
-                correlation.as_str(),
-                self.probe_settles_invocation(&facts, &session, &envelope, now_ms),
-            );
+            let outcome = self.probe_settles_invocation(&facts, &session, &envelope, now_ms);
+            return self.record_settled(correlation.as_str(), outcome);
         }
         let frame = match canonical_dispatch_entry(&request.tool) {
             CanonicalDispatchEntry::InvokeRead => {
@@ -3655,10 +3653,9 @@ impl KernelHostRequestPort for KernelHostRequestClient {
             Ok(reply) => reply,
             Err(error @ PortFailure::AgentResponse { .. }) => return Err(error),
             Err(_) => {
-                return self.record_settled(
-                    correlation.as_str(),
-                    self.probe_settles_invocation(&facts, &session, &envelope, now_ms),
-                );
+                let outcome =
+                    self.probe_settles_invocation(&facts, &session, &envelope, now_ms);
+                return self.record_settled(correlation.as_str(), outcome);
             }
         };
         if is_legacy_correlation_unresolved_reply(&reply, &envelope) {
@@ -3691,10 +3688,11 @@ impl KernelHostRequestPort for KernelHostRequestClient {
                     submit_outcome(&receipt, &record, request, &envelope),
                 )
             }
-            None => self.record_settled(
-                correlation.as_str(),
-                self.probe_settles_invocation(&facts, &session, &envelope, now_ms),
-            ),
+            None => {
+                let outcome =
+                    self.probe_settles_invocation(&facts, &session, &envelope, now_ms);
+                self.record_settled(correlation.as_str(), outcome)
+            },
         }
     }
 
@@ -3736,17 +3734,15 @@ impl KernelHostRequestPort for KernelHostRequestClient {
             // Unknown delivery: resolve the retained cancellation identity
             // before any probe, without generating another cancellation.
             Err(_) => {
-                return self.record_settled(
-                    parent.request_base.as_str(),
-                    self.resolve_retained_cancellation(
-                        &parent,
-                        cancel_correlation.as_str(),
-                        &envelope,
-                        &facts,
-                        &session,
-                        now_ms,
-                    ),
+                let outcome = self.resolve_retained_cancellation(
+                    &parent,
+                    cancel_correlation.as_str(),
+                    &envelope,
+                    &facts,
+                    &session,
+                    now_ms,
                 );
+                return self.record_settled(parent.request_base.as_str(), outcome);
             }
         };
         if is_legacy_correlation_unresolved_reply(&reply, &envelope) {
@@ -3756,21 +3752,22 @@ impl KernelHostRequestPort for KernelHostRequestClient {
             return Err(PortFailure::IdempotencyConflict);
         }
         match decode_admitted_reply(&reply, &envelope) {
-            Some((_, _intent_record)) => self.record_settled(
-                parent.request_base.as_str(),
-                self.resolve_cancellation_parent_disposition(&parent, &facts, &session),
-            ),
-            None => self.record_settled(
-                parent.request_base.as_str(),
-                self.resolve_retained_cancellation(
+            Some((_, _intent_record)) => {
+                let outcome =
+                    self.resolve_cancellation_parent_disposition(&parent, &facts, &session);
+                self.record_settled(parent.request_base.as_str(), outcome)
+            }
+            None => {
+                let outcome = self.resolve_retained_cancellation(
                     &parent,
                     cancel_correlation.as_str(),
                     &envelope,
                     &facts,
                     &session,
                     now_ms,
-                ),
-            ),
+                );
+                self.record_settled(parent.request_base.as_str(), outcome)
+            },
         }
     }
 
