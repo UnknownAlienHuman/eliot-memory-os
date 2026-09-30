@@ -47,7 +47,7 @@ use eliot_protocol::{
 };
 use eliot_runtime_contracts::{
     AffectedOperationClass, BackpressureDisposition, BottleneckAvailability,
-    BottleneckCoverageState, BottleneckObservationV1, CapacityBottleneck,
+    BottleneckCoverageState, BottleneckObservationV1, CapacityBottleneck, ControlOperationClass,
     EarliestRecoveryCondition, EvidenceCoverageState, HumanActionRequirement,
     I14_BACKPRESSURE_RESPONSE_VERSION, I14AlternativeRoute, I14BackpressureCause,
     I14BackpressureResponseV1, I14CurrentnessState, I14EscalationCondition, I14ForbiddenAction,
@@ -76,9 +76,10 @@ use crate::commit_recovery::{
 use crate::store_client::DreamerCommitEvidence;
 use crate::store_write_reservation::{
     CompositionReservation, ReservationSeed, ReservedSubmission, ResolvedSendOutcome,
-    StagedWriteRecovery, begin_execute_after_send, cancel_before_send, ensure_eligible,
-    finalize_reservation, mark_unknown_outcome, reconcile_receipt, reserve_for_transition,
-    retain_unsupported_prepared_plan, writer_epoch_for_fence_from_epoch,
+    ScopeStoreReserve, StagedWriteRecovery, begin_execute_after_send, cancel_before_send,
+    ensure_eligible, finalize_reservation, mark_unknown_outcome, reconcile_receipt,
+    reserve_for_control_transition, reserve_for_transition, retain_unsupported_prepared_plan,
+    writer_epoch_for_fence_from_epoch,
 };
 use crate::user_automation_execution::{
     UserAutomationExecutionError, UserAutomationExecutionOutcome, UserAutomationExecutionRequest,
@@ -817,6 +818,18 @@ pub struct KernelStoreGateway {
     /// receipt binds (decision), and startup restores through
     /// [`Self::restore_maintenance_trigger_ledger`].
     maintenance_triggers: Mutex<MaintenanceTriggerDeliveryLedger>,
+    /// Composition-bound Store control-reserve scope binding (issue #1679,
+    /// item A6).
+    ///
+    /// The shared [`ScopeStoreReserve`] wraps the Store bridge generation's
+    /// own partition owner; this gateway manufactures no capacity and sizes
+    /// no partition. `None` until composition attaches the binding, so owners
+    /// bound here reserve exactly as before. When attached, reservation
+    /// owners are bound through
+    /// [`CompositionReservation::bind_with_store_reserve`] and admitted
+    /// control staging routes to `reserve_for_control_transition` under its
+    /// explicit [`ControlOperationClass`].
+    store_scopes: Option<Arc<ScopeStoreReserve>>,
 }
 
 impl std::fmt::Debug for KernelStoreGateway {
@@ -999,7 +1012,25 @@ impl KernelStoreGateway {
             // maintenance trigger row. It starts empty; the startup path
             // restores it before any claim is served.
             maintenance_triggers: Mutex::new(MaintenanceTriggerDeliveryLedger::new()),
+            // No Store reserve until composition attaches the shared binding:
+            // owners bound here reserve exactly as before.
+            store_scopes: None,
         }
+    }
+
+    /// Attaches the composition-bound Store control-reserve scope binding
+    /// (issue #1679, item A6).
+    ///
+    /// The binding is the Store bridge generation's own partition owner
+    /// wrapped once in [`ScopeStoreReserve`]; it is shared, never constructed
+    /// per reservation, so the one-protected-holding-per-scope ledger stays
+    /// exact across concurrent control reservations. This constructor
+    /// manufactures no capacity: every slot and byte still comes from the
+    /// owner's partitions.
+    #[must_use]
+    pub fn with_store_scopes(mut self, store_scopes: Arc<ScopeStoreReserve>) -> Self {
+        self.store_scopes = Some(store_scopes);
+        self
     }
 
     #[doc(hidden)]
@@ -1301,7 +1332,110 @@ impl KernelStoreGateway {
             &expected_ordering_heads,
         )
         .map_err(|error| error.to_string())?;
-        ensure_eligible(&owner, &sealed.token).map_err(|error| error.to_string())?;
+        self.execute_reserved(
+            &owner,
+            sealed,
+            context,
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+        )
+        .await
+    }
+
+    /// Applies one already prepared admitted control transition through a
+    /// durable ORS reservation drawn from the Store protected partitions
+    /// (issue #1679, item A6).
+    ///
+    /// Same gates and lifecycle as [`Self::apply_reserved`], except staging
+    /// runs through [`reserve_for_control_transition`] under the exact
+    /// [`ControlOperationClass`] the caller names: the reservation acquires
+    /// its Store footprint (one connection slot, one transaction slot, the
+    /// staged-payload bytes) from the owner's protected partitions and
+    /// registers its scopes in the per-scope protected ledger, so saturating
+    /// one scope never consumes another scope's protected control path.
+    /// Ordinary work cannot reach this path: the operation class is an
+    /// explicit typed parameter, never inferred from the transition.
+    ///
+    /// The owner must carry the composition-bound Store reserve (see
+    /// [`Self::with_store_scopes`]): without it there is no protected
+    /// partition to draw from, and staging refuses with the explicit
+    /// unsupported error instead of falling back to the normal partitions.
+    pub async fn apply_reserved_control(
+        &self,
+        operation: ControlOperationClass,
+        context: &RequestMetadata,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+        seed: ReservationSeed,
+    ) -> Result<WriteReceipt, String> {
+        let _flight = self.flight.enter()?;
+        if self.is_fenced() {
+            return Err("canonical-store gateway is fenced for rebind".to_owned());
+        }
+        // I14.16 step 4, same as `apply_reserved`: the shadow refusal precedes
+        // the ORS `stage_and_reserve` write below.
+        self.refuse_shadow_mutation()?;
+        apply_reserved_admission(context, &transition)?;
+        {
+            let view = CanonicalRequestView::from_apply(
+                context,
+                &transition,
+                &expected_revision_heads,
+                &expected_ordering_heads,
+            );
+            verify_canonical_request_hash(&view, &transition.identity.canonical_request_hash)
+                .map_err(|error| error.to_string())?;
+        }
+        let commit_ors = self.commit_ors.clone().ok_or_else(|| {
+            "reserved writes require the composition-bound ORS; refusing without unreserved Apply fallback"
+                .to_owned()
+        })?;
+        let owner = self.bind_reservation_owner(&commit_ors, context, &transition)?;
+        // Control staging only: an explicit `ControlOperationClass` against
+        // the owner's protected partitions. An unbound owner refuses here with
+        // the typed unsupported error; the normal partitions are never
+        // consulted.
+        let sealed = reserve_for_control_transition(
+            &owner,
+            operation,
+            &seed,
+            context,
+            &transition,
+            &expected_revision_heads,
+            &expected_ordering_heads,
+        )
+        .map_err(|error| error.to_string())?;
+        self.execute_reserved(
+            &owner,
+            sealed,
+            context,
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+        )
+        .await
+    }
+
+    /// Executes one already staged reservation through eligibility, the bounded
+    /// send window, and receipt reconciliation (issue #992).
+    ///
+    /// Shared tail behind [`Self::apply_reserved`] and
+    /// [`Self::apply_reserved_control`]: staging already chose the Store
+    /// capacity class, so both run this identical deterministic order. The
+    /// sealed Store permits ride along and release exactly on drop on every
+    /// path below.
+    async fn execute_reserved(
+        &self,
+        owner: &CompositionReservation,
+        sealed: crate::SealedReservation,
+        context: &RequestMetadata,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    ) -> Result<WriteReceipt, String> {
+        ensure_eligible(owner, &sealed.token).map_err(|error| error.to_string())?;
         // Bounded send window: one normal admission lease, mirroring `apply`
         // (Slices A+B, #65). Cancellation and reconciliation stay on the
         // protected reserve and never consume this lease.
@@ -1334,14 +1468,14 @@ impl KernelStoreGateway {
                 // exact-receipt recovery under the current epoch instead of
                 // finalizing under the wrong one.
                 let post_send = ResolvedSendOutcome::after_resolved_send(&sealed.token);
-                begin_execute_after_send(&owner, &sealed.token, &post_send).map_err(|error| {
+                begin_execute_after_send(owner, &sealed.token, &post_send).map_err(|error| {
                     format!(
                         "reserved write committed for operation {operation_id} but the reservation cannot execute ({error}); reconcile by exact receipt once the writer epoch is current"
                     )
                 })?;
                 let reconciliation = reconcile_receipt(&sealed.token, &receipt)
                     .map_err(|error| error.to_string())?;
-                finalize_reservation(&owner, &reconciliation).map_err(|error| error.to_string())?;
+                finalize_reservation(owner, &reconciliation).map_err(|error| error.to_string())?;
                 drop(lease);
                 Ok(receipt)
             }
@@ -1350,9 +1484,9 @@ impl KernelStoreGateway {
                 // `Executing`/`Reconciling` identity until exact Store receipt
                 // reconciliation. Never a blind retry, never a release.
                 let post_send = ResolvedSendOutcome::after_resolved_send(&sealed.token);
-                begin_execute_after_send(&owner, &sealed.token, &post_send)
+                begin_execute_after_send(owner, &sealed.token, &post_send)
                     .map_err(|error| error.to_string())?;
-                mark_unknown_outcome(&owner, &sealed.token).map_err(|error| error.to_string())?;
+                mark_unknown_outcome(owner, &sealed.token).map_err(|error| error.to_string())?;
                 drop(lease);
                 Err(format!(
                     "reserved write outcome unknown for operation {operation_id}: reconciling; reconcile by exact Store receipt"
@@ -1363,7 +1497,7 @@ impl KernelStoreGateway {
                 // the still-`Eligible` token releases cleanly and nothing
                 // orphans.
                 let refusal =
-                    refuse_determinate_reserved_write(&owner, &sealed.token, &error, &operation_id);
+                    refuse_determinate_reserved_write(owner, &sealed.token, &error, &operation_id);
                 drop(lease);
                 Err(refusal)
             }
@@ -1399,6 +1533,12 @@ impl KernelStoreGateway {
     /// the live service epoch both name. A stale or foreign fence never reaches
     /// ORS, so a recovery pass can never read or close another generation's
     /// reservation.
+    ///
+    /// When composition attached the shared Store control-reserve binding (see
+    /// [`Self::with_store_scopes`]), the owner is bound through
+    /// [`CompositionReservation::bind_with_store_reserve`] so reservations
+    /// acquire their Store footprint before any ORS mutation; otherwise the
+    /// owner binds exactly as before with no Store partition contact.
     fn bind_reservation_owner_for_fence(
         &self,
         commit_ors: &Arc<RedbRecoveryStore>,
@@ -1429,8 +1569,18 @@ impl KernelStoreGateway {
         let writer_epoch =
             writer_epoch_for_fence_from_epoch(&fence.authority_epoch).map_err(|e| e.to_string())?;
         drop(service);
-        CompositionReservation::bind(Arc::clone(commit_ors), writer_epoch)
-            .map_err(|error| error.to_string())
+        match self.store_scopes.clone() {
+            Some(store_scopes) => {
+                CompositionReservation::bind_with_store_reserve(
+                    Arc::clone(commit_ors),
+                    writer_epoch,
+                    store_scopes,
+                )
+                .map_err(|error| error.to_string())
+            }
+            None => CompositionReservation::bind(Arc::clone(commit_ors), writer_epoch)
+                .map_err(|error| error.to_string()),
+        }
     }
 
     /// Acquires the one normal admission lease for the bounded send window.
