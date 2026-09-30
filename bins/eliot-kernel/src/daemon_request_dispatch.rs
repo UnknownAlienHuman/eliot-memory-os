@@ -23,6 +23,8 @@ use eliot_kernel_service::AuthenticatedHostSession;
 // import is the closed wire vocabulary the ingress projects out of it, never a
 // second stage machine or a second cutover gate.
 #[cfg(windows)]
+use eliot_kernel_service::MaintenanceTriggerDeliveryError;
+#[cfg(windows)]
 use eliot_kernel_service::{
     AuthenticatedUserAutomationHostExecutionTransport, NamedReadGatewayError, PreStageRejection,
     StoreApplyRefusal, UserAutomationDueWakeRejection, UserAutomationDueWakeResolution,
@@ -41,10 +43,6 @@ use eliot_kernel_service::{
     IrreversibleStorageEffect, StorageReplacement, StorageReplacementCutoverReceipt,
     StorageReplacementStage, StorageReplacementTransfer, StorageRollbackDisposition,
 };
-#[cfg(windows)]
-use eliot_kernel_service::MaintenanceTriggerDeliveryError;
-#[cfg(windows)]
-use eliot_protocol::{MaintenanceTriggerIntakeReceipt, MaintenanceTriggerRecord, ProtocolError};
 use eliot_process::{
     OperationId, OriginChallengeRequest, OriginControlGrant, OriginControlOperation,
     OriginControlPresentation, ProcessExecutionView, ProcessLifecycle,
@@ -55,6 +53,8 @@ use eliot_protocol::{
     LocalReadExecutionEvidence, RequestIdentity, TaskControllerResultBody,
     host_request_operation_id,
 };
+#[cfg(windows)]
+use eliot_protocol::{MaintenanceTriggerIntakeReceipt, MaintenanceTriggerRecord, ProtocolError};
 use eliot_runtime_contracts::GenerationCutoverState;
 #[cfg(windows)]
 use eliot_runtime_contracts::{
@@ -2751,10 +2751,9 @@ impl KernelComposition {
             &request.state_fence,
         )?;
         let gateway = self.retained_store_gateway()?;
-        match gateway.admit_maintenance_trigger(
-            session.module_generation.module_id.as_str(),
-            request.record,
-        ) {
+        match gateway
+            .admit_maintenance_trigger(session.module_generation.module_id.as_str(), request.record)
+        {
             Ok((receipt, _)) => Ok(maintenance_trigger_intake_response(
                 &MaintenanceTriggerIntakeAnswer {
                     version: 1,
