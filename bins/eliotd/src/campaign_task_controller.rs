@@ -11,8 +11,9 @@ use eliot_context::campaign_publication::ContextCampaignRecipeBody;
 use eliot_context_contracts::SessionDeliverySnapshot;
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_governor::{
-    CampaignOwnerSourceInput, GuardedTaskCommand, KernelTransitionPort, PreparedTaskTransition,
-    TaskCommand, TaskCommandContext, TaskProposal,
+    CampaignOwnerSourceInput, GuardedTaskCommand, KernelPortError, KernelTransitionPort,
+    PreparedTaskTransition, TaskCommand, TaskCommandContext, TaskProposal,
+    TaskSelectionAdmissionBinding,
 };
 use eliot_learning_contracts::{
     CampaignSourceBinding, CampaignSourceRevisionRef, CampaignSourceRole, LearningStateViewRecipe,
@@ -27,10 +28,12 @@ use eliot_store_api::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     DaemonComposition, KernelContextReadClient,
-    daemon_kernel_client::TaskControllerClaimedInvocation,
+    daemon_kernel_client::{DaemonKernelClient, TaskControllerClaimedInvocation},
+    task_binding_admission::ObservedScopeResources,
 };
 
 /// Task Controller input fully decoded and all required campaign reads
@@ -40,7 +43,17 @@ pub struct PreparedTaskControllerClaim {
     recipe: LearningStateViewRecipe,
     source_heads: eliot_governor::TaskControllerCampaignSourceHeads,
     owner_publications: Option<Vec<CampaignSourcePublication>>,
+    selection: Option<TaskControllerSelectionAdmission>,
     action: PreparedTaskControllerAction,
+}
+
+/// Exact owner selection and Host observation retained from claim intake
+/// through immutable transition preparation and pre-transport admission.
+#[derive(Clone)]
+pub struct TaskControllerSelectionAdmission {
+    pub owner: TaskSelectionAdmissionBinding,
+    pub observed_scope: ObservedScopeResources,
+    pub live_fence: StateFence,
 }
 
 enum PreparedTaskControllerAction {
@@ -59,6 +72,7 @@ pub enum TaskControllerClaimPreparation {
 pub struct PreparedTaskControllerExecution {
     claimed: TaskControllerClaimedInvocation,
     transition: PreparedTaskTransition,
+    selection: Option<TaskControllerSelectionAdmission>,
 }
 
 pub enum TaskControllerTransitionPreparation {
@@ -413,6 +427,7 @@ fn task_controller_rejection(
 pub async fn prepare_task_controller_claim(
     reads: &KernelContextReadClient,
     kernel: &dyn KernelTransitionPort,
+    composition: &tokio::sync::Mutex<DaemonComposition>,
     claimed: TaskControllerClaimedInvocation,
 ) -> Result<TaskControllerClaimPreparation, String> {
     let invocation = &claimed.invocation;
@@ -486,6 +501,20 @@ pub async fn prepare_task_controller_claim(
             task_controller_rejection(&claimed, "invalid_task_input")?,
         )));
     };
+    let selection = match &action {
+        PreparedTaskControllerAction::Propose(_) => None,
+        PreparedTaskControllerAction::Apply(_) => {
+            match task_controller_selection_admission(kernel, composition, &claimed).await {
+                Ok(selection) => Some(selection),
+                Err(reason) => {
+                    let code = task_binding_reason_code(&reason).unwrap_or("transition_rejected");
+                    return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
+                        task_controller_rejection(&claimed, code)?,
+                    )));
+                }
+            }
+        }
+    };
     let Ok(source_heads) = kernel
         .campaign_source_heads(
             &invocation.task_id,
@@ -504,9 +533,110 @@ pub async fn prepare_task_controller_claim(
             recipe,
             source_heads,
             owner_publications: complete_owner_publications,
+            selection,
             action,
         },
     )))
+}
+
+async fn task_controller_selection_admission(
+    kernel: &dyn KernelTransitionPort,
+    composition: &tokio::sync::Mutex<DaemonComposition>,
+    claimed: &TaskControllerClaimedInvocation,
+) -> Result<TaskControllerSelectionAdmission, String> {
+    let identity = &claimed.envelope.identity;
+    let session_ref = identity
+        .session_id
+        .as_deref()
+        .ok_or_else(|| "TASK_SELECTION_REQUIRED: Task Controller request has no session".to_owned())?;
+    let scope_ref = identity
+        .work_scope_id
+        .as_deref()
+        .ok_or_else(|| "TASK_SCOPE_INCOMPATIBLE: Task Controller request has no WorkScope".to_owned())?;
+    let task_ref = identity
+        .task_id
+        .as_deref()
+        .ok_or_else(|| "TASK_SELECTION_REQUIRED: Task Controller request has no task".to_owned())?;
+    let fence = &claimed.envelope.state_fence;
+    let now = u64::try_from(
+        SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("TASK_SELECTION_REQUIRED: daemon clock is invalid: {error}"))?
+        .as_millis(),
+    )
+    .map_err(|_| "TASK_SELECTION_REQUIRED: daemon clock exceeds owner range".to_owned())?;
+    let pending = {
+        let guard = composition.lock().await;
+        if !eliot_contracts::fences_match_exact(&guard.governor_kernel_fence(), fence) {
+            return Err("TASK_SCOPE_INCOMPATIBLE: Task Controller request fence is stale".to_owned());
+        }
+        guard
+            .prepare_task_selection_for_request(
+                now,
+                &claimed.authenticated_principal,
+                session_ref,
+                task_ref,
+                scope_ref,
+                fence,
+            )
+            .map_err(task_selection_composition_error)?
+    };
+    let acceptance_set = kernel
+        .task_contract_acceptance_set(
+            pending.task_id(),
+            pending.task_revision(),
+            pending.state_fence(),
+        )
+        .await
+        .map_err(|error| {
+            format!("TASK_SELECTION_REQUIRED: exact TaskContract acceptance read failed: {error}")
+        })?;
+    let now_after_kernel_read = u64::try_from(
+        SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("TASK_SELECTION_REQUIRED: daemon clock is invalid: {error}"))?
+        .as_millis(),
+    )
+    .map_err(|_| "TASK_SELECTION_REQUIRED: daemon clock exceeds owner range".to_owned())?;
+    let (owner, explicit_root, live_fence) = {
+        let guard = composition.lock().await;
+        let owner = guard
+            .finish_task_selection_for_request(pending, now_after_kernel_read, acceptance_set)
+            .map_err(task_selection_composition_error)?;
+        let live_fence = guard.governor_kernel_fence();
+        if !eliot_contracts::fences_match_exact(owner.state_fence(), &live_fence) {
+            return Err("TASK_SCOPE_INCOMPATIBLE: Task Controller selection fence moved".to_owned());
+        }
+        let explicit_root = guard
+            .activation_workspace_locator_for_selection(&owner)
+            .map_err(|error| error.to_string())?;
+        (owner, explicit_root, live_fence)
+    };
+    let observed_scope = crate::task_binding_admission::observe_explicit_workspace(
+        &explicit_root,
+        &live_fence,
+    )
+    .map_err(|error| format!("TASK_SCOPE_INCOMPATIBLE: Host workspace observation failed: {error}"))?;
+    Ok(TaskControllerSelectionAdmission {
+        owner,
+        observed_scope,
+        live_fence,
+    })
+}
+
+fn task_selection_composition_error(error: eliot_governor::CompositionError) -> String {
+    let code = match &error {
+        eliot_governor::CompositionError::ActivationTaskSelectionRequired
+        | eliot_governor::CompositionError::ActivationScopeAmbiguous { .. } => {
+            "TASK_SELECTION_REQUIRED"
+        }
+        eliot_governor::CompositionError::ActivationScopeSelectionRequired
+        | eliot_governor::CompositionError::ActivationStaleFence => {
+            "TASK_SCOPE_INCOMPATIBLE"
+        }
+        _ => "TASK_SELECTION_REQUIRED",
+    };
+    format!("{code}: {error}")
 }
 
 fn decode_task_controller_action(
@@ -545,6 +675,7 @@ pub fn prepare_task_controller_transition(
         recipe,
         source_heads,
         owner_publications,
+        selection,
         action,
     } = prepared;
     let Ok(lifecycle) = composition.task_lifecycle() else {
@@ -571,29 +702,32 @@ pub fn prepare_task_controller_transition(
                 recipe,
                 source_heads,
             ),
-        (PreparedTaskControllerAction::Apply(guarded), Some(publications)) => lifecycle
-            .prepare_apply_task_with_complete_campaign_sources(
+        (PreparedTaskControllerAction::Apply(guarded), owner_publications) => {
+            let Some(selection) = selection.as_ref() else {
+                return match task_controller_rejection(&claimed, "transition_rejected") {
+                    Ok(body) => TaskControllerTransitionPreparation::Rejected(Box::new(body)),
+                    Err(error) => TaskControllerTransitionPreparation::Failed(error),
+                };
+            };
+            lifecycle.prepare_apply_task_with_selection(
                 &claimed.request_identity,
                 claimed.operation_id.clone(),
                 guarded,
                 recipe,
                 source_heads,
-                publications,
-            ),
-        (PreparedTaskControllerAction::Apply(guarded), None) => lifecycle
-            .prepare_apply_task_with_learning_state_recipe(
-                &claimed.request_identity,
-                claimed.operation_id.clone(),
-                guarded,
-                recipe,
-                source_heads,
-            ),
+                eliot_governor::TaskSelectionTransitionInput {
+                    selection: &selection.owner,
+                    owner_publications,
+                },
+            )
+        }
     };
     match transition {
         Ok(transition) => {
             TaskControllerTransitionPreparation::Ready(Box::new(PreparedTaskControllerExecution {
                 claimed,
                 transition,
+                selection,
             }))
         }
         Err(_) => match task_controller_rejection(&claimed, "transition_rejected") {
@@ -606,14 +740,49 @@ pub fn prepare_task_controller_transition(
 /// Exchanges the exact owned task transition after the composition guard has
 /// been released, preserving the canonical receipt reconciliation contract.
 pub async fn exchange_task_controller_transition(
-    kernel: &dyn KernelTransitionPort,
+    kernel: &DaemonKernelClient,
     execution: PreparedTaskControllerExecution,
 ) -> Result<TaskControllerResultBody, String> {
-    let Ok(receipt) = execution.transition.exchange(kernel).await else {
-        return task_controller_rejection(&execution.claimed, "transition_rejected");
+    let receipt = if let Some(selection) = execution.selection.as_ref() {
+        let caller = &execution.claimed.envelope.identity;
+        let selection_port = crate::kernel_transition_client::OwnerSelectionKernelPort::new(
+            kernel,
+            (
+                &execution.claimed.authenticated_principal,
+                caller.session_id.as_deref().unwrap_or_default(),
+                caller.task_id.as_deref().unwrap_or_default(),
+                caller.work_scope_id.as_deref().unwrap_or_default(),
+            ),
+            &selection.owner,
+            &selection.observed_scope,
+            &selection.live_fence,
+        );
+        execution.transition.exchange(&selection_port).await
+    } else {
+        execution.transition.exchange(kernel).await
+    };
+    let receipt = match receipt {
+        Ok(receipt) => receipt,
+        Err(eliot_governor::TaskLifecycleError::Kernel(KernelPortError::Contract(reason))) => {
+            if let Some(code) = task_binding_reason_code(&reason) {
+                return task_controller_rejection(&execution.claimed, code);
+            }
+            return task_controller_rejection(&execution.claimed, "transition_rejected");
+        }
+        Err(_) => return task_controller_rejection(&execution.claimed, "transition_rejected"),
     };
     task_controller_result_body(
         &execution.claimed,
         json!({ "status": "committed", "receipt": receipt }),
     )
+}
+
+fn task_binding_reason_code(reason: &str) -> Option<&'static str> {
+    if reason.starts_with("TASK_SELECTION_REQUIRED") {
+        Some("TASK_SELECTION_REQUIRED")
+    } else if reason.starts_with("TASK_SCOPE_INCOMPATIBLE") {
+        Some("TASK_SCOPE_INCOMPATIBLE")
+    } else {
+        None
+    }
 }
