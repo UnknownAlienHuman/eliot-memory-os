@@ -22,9 +22,10 @@ use eliot_governor::{
 use eliot_kernel_core::Notification;
 use eliot_platform_windows::{ProtectedPathError, ProtectedRuntimePathLease};
 use eliot_protocol::{
-    AgentActivationOwnerEvidence, AgentActivationOwnerReadback,
-    AgentActivationResolutionDisposition, AgentActivationResolutionResult,
-    AgentActivationResolutionTicket, AgentActivationResolvedBinding, RequestIdentity,
+    AgentActivationObservationAccessBinding, AgentActivationObservationPolicyReadback,
+    AgentActivationOwnerEvidence, AgentActivationOwnerReadback, AgentActivationResolutionResult,
+    AgentActivationResolutionDisposition, AgentActivationResolutionTicket,
+    AgentActivationResolvedBinding, RequestIdentity,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -2097,11 +2098,86 @@ impl DaemonComposition {
         let evidence = AgentActivationOwnerEvidence::for_binding(
             &binding,
             snapshot.owner_revision,
-            snapshot.state_fence,
+            snapshot.state_fence.clone(),
         )
         .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        let observation = self
+            .governor
+            .observation_capture_owner_binding_for_activation(&snapshot)
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        let observation = Self::activation_observation_policy_readback(&observation)?;
         AgentActivationOwnerReadback::from_evidence(evidence, now.max(1))
+            .and_then(|readback| readback.with_observation_policy_readback(observation))
             .map_err(|error| DaemonError::Lifecycle(error.to_string()))
+    }
+
+    /// Re-reads the current activation's exact Session, WorkScope, and
+    /// Observation Policy owners. The activation task remains context only;
+    /// this projection always has no task-selection applicability.
+    pub fn current_activation_observation_owner_binding(
+        &self,
+        now: u64,
+    ) -> Result<eliot_governor::ObservationCaptureOwnerBinding, DaemonError> {
+        let snapshot = self
+            .governor
+            .read_unique_agent_activation(now)
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        self.governor
+            .observation_capture_owner_binding_for_activation(&snapshot)
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))
+    }
+
+    fn activation_observation_policy_readback(
+        binding: &eliot_governor::ObservationCaptureOwnerBinding,
+    ) -> Result<AgentActivationObservationPolicyReadback, DaemonError> {
+        let value = binding
+            .canonical_value()
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        let config_policy_snapshot = serde_json::to_value(&binding.config_policy_snapshot)
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        let work_scope_binding = serde_json::to_value(&binding.work_scope_binding)
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        let visibility = match binding.access.visibility {
+            eliot_governor::ObservationCaptureVisibility::LocalOnly => "LOCAL_ONLY",
+        };
+        let readback = AgentActivationObservationPolicyReadback {
+            wire_version: binding.wire_version,
+            authenticated_principal_ref: binding.authenticated_principal_ref.clone(),
+            authenticated_session_ref: binding.authenticated_session_ref.clone(),
+            authenticated_task_ref: binding.authenticated_task_ref.clone(),
+            authenticated_scope_ref: binding.authenticated_scope_ref.clone(),
+            state_fence: binding.state_fence.clone(),
+            policy_owner_revision: binding.policy_owner_revision,
+            policy_read_revision: binding.policy_read_revision,
+            policy_read_fence: binding.policy_read_fence.clone(),
+            policy_named_read_digest: binding.policy_named_read_digest.clone(),
+            config_policy_snapshot,
+            config_policy_snapshot_sha256: binding.config_policy_snapshot_sha256.clone(),
+            ingress_setting_key: binding.ingress_setting_key.clone(),
+            ingress_setting_value_ref: binding.ingress_setting_value_ref.clone(),
+            ingress_setting_owner_ref: binding.ingress_setting_owner_ref.clone(),
+            policy: binding.policy.clone(),
+            access: AgentActivationObservationAccessBinding {
+                privacy: binding.access.privacy,
+                visibility: visibility.to_owned(),
+                instruction_taint: binding.access.instruction_taint,
+            },
+            work_scope_owner_revision: binding.work_scope_owner_revision,
+            work_scope_read_revision: binding.work_scope_read_revision,
+            work_scope_read_fence: binding.work_scope_read_fence.clone(),
+            work_scope_canonical_read_digest: binding.work_scope_canonical_read_digest.clone(),
+            work_scope_binding,
+            work_scope_binding_sha256: binding.work_scope_binding_sha256.clone(),
+        };
+        let serialized = serde_json::to_value(&readback)
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        if serialized != value {
+            return Err(DaemonError::Lifecycle(
+                "Observation policy protocol readback differs from the canonical Governor binding"
+                    .to_owned(),
+            ));
+        }
+        Ok(readback)
     }
 
     /// Single production resolver spine: resolves one Kernel-issued semantic
