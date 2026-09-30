@@ -3297,17 +3297,15 @@ impl FilesystemPort for WindowsPlatform {
                 missing: vec![handle("content_digest")],
             },
             #[cfg(windows)]
-            FilesystemOperation::Read => {
-                match read_filesystem_content_digest(&self.root, &path) {
-                    Ok((size, digest)) => PortOutcome::Known(FilesystemObservation {
-                        path: request.path.clone(),
-                        kind: FileKind::File,
-                        size: Some(size),
-                        content_digest: Some(handle(&format!("sha256:{digest}"))),
-                    }),
-                    Err(error) => inspect_failure(&error),
-                }
-            }
+            FilesystemOperation::Read => match read_filesystem_content_digest(&self.root, &path) {
+                Ok((size, digest)) => PortOutcome::Known(FilesystemObservation {
+                    path: request.path.clone(),
+                    kind: FileKind::File,
+                    size: Some(size),
+                    content_digest: Some(handle(&format!("sha256:{digest}"))),
+                }),
+                Err(error) => inspect_failure(&error),
+            },
             #[cfg(not(windows))]
             FilesystemOperation::Read => PortOutcome::Unknown(UnknownReason::Unsupported),
             FilesystemOperation::Write { .. } | FilesystemOperation::Remove => {
@@ -3322,9 +3320,7 @@ fn read_filesystem_content_digest(
     root: &Path,
     path: &Path,
 ) -> Result<(u64, String), std::io::Error> {
-    let parent = path
-        .parent()
-        .ok_or_else(indeterminate_filesystem_read)?;
+    let parent = path.parent().ok_or_else(indeterminate_filesystem_read)?;
     let parent_pins = pin_ancestors(root, parent).map_err(|_| indeterminate_filesystem_read())?;
     let parent_identities = parent_pins
         .iter()

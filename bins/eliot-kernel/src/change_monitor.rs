@@ -1718,8 +1718,8 @@ pub(crate) struct ObservationTransferDocument {
 /// (I10.21 W4/W5/W6). Iteration follows the ledger's key order, so the
 /// same ledger always exports the same document. A poisoned ledger fails
 /// closed instead of exporting a half-read projection.
-pub(crate) fn export_observation_transfer(
-) -> Result<ObservationTransferDocument, ChangeMonitorError> {
+pub(crate) fn export_observation_transfer()
+-> Result<ObservationTransferDocument, ChangeMonitorError> {
     let ledger = ledger()?;
     let pending_hints = ledger
         .hints
@@ -1846,7 +1846,6 @@ pub(crate) fn persist_observation_transfer() -> Result<(), ChangeMonitorError> {
         return Err(ChangeMonitorError::SidecarUnavailable);
     };
     let document = export_observation_transfer()?;
-    let bytes =
-        serde_json::to_vec(&document).map_err(|_| ChangeMonitorError::TransferEncode)?;
+    let bytes = serde_json::to_vec(&document).map_err(|_| ChangeMonitorError::TransferEncode)?;
     write_durable_json(&path, &bytes)
 }
