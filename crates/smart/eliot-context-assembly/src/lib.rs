@@ -34,6 +34,8 @@ mod error;
 #[cfg(not(target_arch = "wasm32"))]
 mod handoff_rebuild;
 #[cfg(not(target_arch = "wasm32"))]
+mod handoff_resume;
+#[cfg(not(target_arch = "wasm32"))]
 mod learning_gate;
 mod measurement;
 mod readback;
@@ -57,6 +59,8 @@ pub use handoff_rebuild::{
     HandoffRebuildCurrent, HandoffRebuildDiagnostic, HandoffRebuildError, HandoffRebuildOutcome,
     HandoffRebuiltView, rebuild_handoff_view,
 };
+#[cfg(not(target_arch = "wasm32"))]
+pub use handoff_resume::{HandoffResumeOutcome, resume_handoff};
 #[cfg(not(target_arch = "wasm32"))]
 pub use learning_gate::assemble_active_view_with_learning;
 pub use measurement::assemble_active_view_with_measurement;
