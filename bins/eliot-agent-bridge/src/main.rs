@@ -377,10 +377,20 @@ enum Response {
     /// Typed refusal to allocate a bridge-event slot. The exact exhausted
     /// resource, permitted reconciliation path, and ORS-local acceptance
     /// phase remain structured through the host response.
+    ///
+    /// Issue #1679: bridge-local pressure only — no I14 disposition and no
+    /// versioned recovery directive. This arm never claims I14.4/5
+    /// conformance as-is; the versioned directive is whole-or-null and null
+    /// at this projection (see `bridge_error`), with STITCH placement for a
+    /// later slice to thread the reserve owner's live measurement.
     Backpressure {
         pressure: BridgeEventCapacityPressure,
     },
     /// Typed transport refusal from the kernel; local durable phase is unknown.
+    ///
+    /// Issue #1679: same whole-or-null seam as [`Response::Backpressure`] —
+    /// bridge-local pressure only, no I14 disposition, no versioned
+    /// directive, never an I14.4/5 conformance claim as-is.
     TransportBackpressure {
         pressure: BridgeTransportBackpressure,
     },
@@ -2448,10 +2458,32 @@ fn bridge_error(error: &BridgeError) -> Response {
             code: "KERNEL_ACTIVATION_PORT_REJECTED",
             detail: "Kernel-owned HostActivationPort rejected or fenced the request".to_owned(),
         }
+    // Issue #1679 bridge backpressure (caller STITCH): the versioned I14
+    // backpressure directive for these arms is whole-or-null, and at this
+    // projection it is honestly null. This path holds only the bridge-local
+    // pressure the owner typed on the wire — a dimension, a recovery route,
+    // and a local phase — with no I14 disposition, no operation identity, no
+    // profile revision, no state fence, and no authority epoch, so naming a
+    // bottleneck observation or a revision here would fabricate capacity
+    // evidence this projection never observed (cf. the owner-side
+    // `control_reserve_rejection` builders, which refuse to emit unless the
+    // live partition actually reads saturated). The typed bridge pressure
+    // below is unchanged. A later slice threads the reserve owner's live
+    // `I14BackpressureResponseV1` measurement into this response; until that
+    // owner call site exists the answer keeps this pressure with a null
+    // versioned directive rather than a partial one.
     } else if let BridgeError::Backpressure(pressure) = error {
         Response::Backpressure {
             pressure: *pressure,
         }
+    // Issue #1679 bridge backpressure (caller STITCH): same whole-or-null
+    // seam as the event-capacity arm above. The transport refusal carries no
+    // owner-measured observation at this projection — no disposition, no
+    // operation identity, no profile revision, no state fence — so the
+    // versioned directive is honestly null here rather than a fabricated
+    // transport record. Placement is this same response, fed later by the
+    // reserve owner's live measurement; the typed bridge pressure below is
+    // unchanged.
     } else if let BridgeError::TransportBackpressure(pressure) = error {
         Response::TransportBackpressure {
             pressure: *pressure,
