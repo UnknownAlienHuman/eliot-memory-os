@@ -22,9 +22,9 @@ use eliot_governor::{
 use eliot_kernel_core::Notification;
 use eliot_platform_windows::{ProtectedPathError, ProtectedRuntimePathLease};
 use eliot_protocol::{
-    AgentActivationOwnerEvidence, AgentActivationOwnerReadback, AgentActivationResolutionResult,
-    AgentActivationResolutionDisposition, AgentActivationResolutionTicket,
-    AgentActivationResolvedBinding, RequestIdentity,
+    AgentActivationOwnerEvidence, AgentActivationOwnerReadback,
+    AgentActivationResolutionDisposition, AgentActivationResolutionResult,
+    AgentActivationResolutionTicket, AgentActivationResolvedBinding, RequestIdentity,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -2488,9 +2488,11 @@ impl DaemonComposition {
         })?;
         let live_fence = self.governor.kernel_snapshot().state_fence();
         if !eliot_contracts::fences_match_exact(&work_scope.state_fence, live_fence) {
-            return Err(crate::task_binding_admission::TaskBindingError::scope_incompatible(
-                "current WorkScope snapshot fence is no longer live",
-            ));
+            return Err(
+                crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                    "current WorkScope snapshot fence is no longer live",
+                ),
+            );
         }
         let locator = self.activation_workspace_locator.as_ref().ok_or_else(|| {
             crate::task_binding_admission::TaskBindingError::scope_incompatible(
@@ -2501,9 +2503,11 @@ impl DaemonComposition {
             || locator.session_ref != session_ref
             || locator.work_scope_ref != work_scope.binding.scope.scope_ref
         {
-            return Err(crate::task_binding_admission::TaskBindingError::scope_incompatible(
-                "retained activation locator does not match the authenticated request and current WorkScope",
-            ));
+            return Err(
+                crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                    "retained activation locator does not match the authenticated request and current WorkScope",
+                ),
+            );
         }
         Ok(locator.root.clone())
     }
