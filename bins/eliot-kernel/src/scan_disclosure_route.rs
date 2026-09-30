@@ -303,7 +303,7 @@ impl KernelComposition {
         binding: &ScanDisclosureOwnerBinding,
         record: &ScanDisclosureOrsRecord,
     ) -> Result<ScanDisclosureOwnerValue, TransportError> {
-        self.validate_scan_disclosure_binding(current, binding)?;
+        Self::validate_scan_disclosure_binding(current, binding)?;
         Self::validate_record_binding(current, binding, record)?;
         match self.p07_ors.stage_scan_disclosure(record) {
             Ok(ScanDisclosureStageOutcome::Stored) => Ok(ScanDisclosureOwnerValue::Staged {
@@ -329,7 +329,7 @@ impl KernelComposition {
         request_hash: &str,
         writer_receipt: &str,
     ) -> Result<ScanDisclosureOwnerValue, TransportError> {
-        self.validate_scan_disclosure_binding(current, binding)?;
+        Self::validate_scan_disclosure_binding(current, binding)?;
         if operation_key != binding.operation_key().as_str()
             || request_hash.trim().is_empty()
             || writer_receipt.trim().is_empty()
@@ -353,7 +353,7 @@ impl KernelComposition {
         binding: &ScanDisclosureOwnerBinding,
         operation_key: &str,
     ) -> Result<ScanDisclosureOwnerValue, TransportError> {
-        self.validate_scan_disclosure_binding(current, binding)?;
+        Self::validate_scan_disclosure_binding(current, binding)?;
         if operation_key != binding.operation_key().as_str() {
             return Err(TransportError::IdentityConflict);
         }
@@ -377,7 +377,7 @@ impl KernelComposition {
         policy_revision: u64,
         successor_ref: Option<&str>,
     ) -> Result<ScanDisclosureOwnerValue, TransportError> {
-        self.validate_scan_disclosure_binding(current, binding)?;
+        Self::validate_scan_disclosure_binding(current, binding)?;
         if operation_key != binding.operation_key().as_str()
             || policy_revision != binding.policy_revision
             || request_hash.trim().is_empty()
@@ -401,7 +401,7 @@ impl KernelComposition {
         binding: &ScanDisclosureOwnerBinding,
         limit: u16,
     ) -> Result<ScanDisclosureOwnerValue, TransportError> {
-        self.validate_scan_disclosure_binding(current, binding)?;
+        Self::validate_scan_disclosure_binding(current, binding)?;
         if limit == 0 || limit > eliot_ors::MAX_SCAN_DISCLOSURE_PAGE {
             return Err(TransportError::SessionFenced);
         }
@@ -814,7 +814,6 @@ impl KernelComposition {
 
     #[cfg(windows)]
     fn validate_scan_disclosure_binding(
-        &self,
         current: &CurrentScanDisclosureActivation,
         binding: &ScanDisclosureOwnerBinding,
     ) -> Result<(), TransportError> {

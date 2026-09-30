@@ -5273,15 +5273,15 @@ fn trigger_cold_start_controller(
     ) else {
         // The privacy-bounded scanner's question path validates this exact
         // retained lease/key/evidence and performs no charge or persistence.
-        let question = eliot_workscope::run_bootstrap_discovery(
+        let question = match eliot_workscope::run_bootstrap_discovery(
             None,
             None,
             &mut discovery.lease,
             &discovery.key,
             &discovery.discovery,
         )
-        .map_err(|error| format!("privacy-bounded attach scanner refused: {error}"))?;
-        let question = match question {
+        .map_err(|error| format!("privacy-bounded attach scanner refused: {error}"))?
+        {
             eliot_workscope::BootstrapScanOutcome::PrivacyBoundaryRequired { code, .. } => code,
             eliot_workscope::BootstrapScanOutcome::Completed { .. } => {
                 "scanner returned completion without an installation owner".to_owned()
