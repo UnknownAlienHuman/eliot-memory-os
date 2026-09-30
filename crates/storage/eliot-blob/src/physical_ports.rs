@@ -180,12 +180,13 @@ impl WindowsBlobPlatform {
             .map_err(|_| BlobError::Provider("system clock is before Unix epoch".to_owned()))?
             .as_nanos();
         let now = u64::try_from(now).map_err(|_| {
-            BlobError::Provider("physical Blob provider generation could not be established".to_owned())
+            BlobError::Provider(
+                "physical Blob provider generation could not be established".to_owned(),
+            )
         })?;
-        let sequence = PHYSICAL_PROVIDER_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let backend_generation = now
-            ^ (u64::from(owner.process_id()) << 32)
-            ^ sequence;
+        let sequence =
+            PHYSICAL_PROVIDER_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let backend_generation = now ^ (u64::from(owner.process_id()) << 32) ^ sequence;
         if backend_generation == 0 {
             return Err(BlobError::Provider(
                 "physical Blob provider generation could not be established".to_owned(),
