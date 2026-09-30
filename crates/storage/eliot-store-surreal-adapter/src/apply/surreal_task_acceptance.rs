@@ -49,12 +49,9 @@ const REVISION_CONFLICT: &str = "task_contract_acceptance_revision_conflict";
 pub(crate) fn task_contract_acceptance_statements(
     transition: &PreparedTransition,
 ) -> Result<(String, Map<String, Value>), AdapterError> {
-    let mut matching = transition
-        .named_operations
-        .iter()
-        .filter(|command| {
-            command.operation == NamedMutationOperation::RecordTaskContractAcceptanceSet
-        });
+    let mut matching = transition.named_operations.iter().filter(|command| {
+        command.operation == NamedMutationOperation::RecordTaskContractAcceptanceSet
+    });
     let Some(command) = matching.next() else {
         return Ok((String::new(), Map::new()));
     };
@@ -88,7 +85,9 @@ fn record_write(
 ) -> Result<(String, Map<String, Value>), AdapterError> {
     let key = record.record_key();
     let record_id = super::surreal_blackboard::recovery_owner_id(&key)?;
-    let record_json = record.canonical_record_json().map_err(AdapterError::Store)?;
+    let record_json = record
+        .canonical_record_json()
+        .map_err(AdapterError::Store)?;
     let row = RecoveryRecord {
         namespace: TASK_CONTRACT_ACCEPTANCE_RECORD_NAMESPACE.to_owned(),
         key: key.key.clone(),

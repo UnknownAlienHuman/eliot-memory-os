@@ -1871,9 +1871,8 @@ fn check_declared_shape(
             // whole contract, so the existing closed acceptance-set validator
             // is the complete check. There is no sibling parameter to compare
             // it against, and inventing one would be a second scheme.
-            let record: crate::TaskContractAcceptanceRecord =
-                serde_json::from_value(value.clone())
-                    .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            let record: crate::TaskContractAcceptanceRecord = serde_json::from_value(value.clone())
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
             record.validate()
         }
     }

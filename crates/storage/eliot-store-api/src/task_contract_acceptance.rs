@@ -52,8 +52,8 @@ use serde_json::Value;
 
 use crate::{
     NamedMutationOperation, NamedMutationRequest, RecoveryRecordKey, StateFence, StoreError,
-    TASK_CONTRACT_ACCEPTANCE_SET_SCHEMA_V1, TaskContractAcceptanceItem,
-    TaskContractAcceptanceSet, canonical_json_bytes, sha256_hex, validate_text,
+    TASK_CONTRACT_ACCEPTANCE_SET_SCHEMA_V1, TaskContractAcceptanceItem, TaskContractAcceptanceSet,
+    canonical_json_bytes, sha256_hex, validate_text,
 };
 
 /// Schema identifier of the persisted owner acceptance-set record.
