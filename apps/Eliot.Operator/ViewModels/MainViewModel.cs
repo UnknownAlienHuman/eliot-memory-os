@@ -449,7 +449,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
         }
         catch (Exception error) when (error is JsonException or InvalidOperationException)
         {
-            WithholdUserAutomation(pending, $"the retained typed request is not a closed UserAutomation envelope ({error.Message});");
+            WithholdUserAutomation(pending, $"the retained typed request is not a closed UserAutomation envelope ({BoundedRefusalReason(error)});");
             return;
         }
 
@@ -582,7 +582,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
         {
             SetBanner(
                 "UserAutomation command not sent",
-                AppendLocalProjectionInspection(error.Message, scheduleProjection),
+                AppendLocalProjectionInspection(BoundedRefusalReason(error), scheduleProjection),
                 OperatorBannerSeverity.Warning);
             return;
         }
@@ -616,7 +616,11 @@ public sealed class MainViewModel : INotifyPropertyChanged
             }
             catch (Exception error)
             {
-                SetBanner("UserAutomation read failed", error.Message, OperatorBannerSeverity.Error);
+                SetBanner(
+                    "UserAutomation read failed",
+                    $"The UserAutomation read did not complete ({OperatorFaultReason.ForException(error)}); "
+                    + "a read has no owner effect, so it can be retried once the session is restored.",
+                    OperatorBannerSeverity.Error);
             }
             finally
             {
@@ -761,7 +765,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
             RefreshPendingState();
             SetBanner(
                 "Command outcome unproven — recovery retained",
-                $"{action}: {error.Message}; use Reconcile before any retry.",
+                $"{action}: the transport did not prove an owner outcome ({OperatorFaultReason.ForException(error)}); use Reconcile before any retry.",
                 OperatorBannerSeverity.Warning);
         }
         finally
@@ -1090,7 +1094,11 @@ public sealed class MainViewModel : INotifyPropertyChanged
         {
             if (!cancellationToken.IsCancellationRequested || !IsUserAutomationPage)
             {
-                SetBanner("Degraded / reconnect required", error.Message, OperatorBannerSeverity.Error);
+                SetBanner(
+                    "Degraded / reconnect required",
+                    $"The projection read did not complete ({OperatorFaultReason.ForException(error)}); "
+                    + "reconnect through a fresh broker handoff before retrying.",
+                    OperatorBannerSeverity.Error);
             }
         }
         finally
@@ -1333,7 +1341,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
             RefreshPendingState();
             SetBanner(
                 "Command outcome unproven — recovery retained",
-                $"{action}: {error.Message}; use Reconcile before any retry.",
+                $"{action}: the transport did not prove an owner outcome ({OperatorFaultReason.ForException(error)}); use Reconcile before any retry.",
                 OperatorBannerSeverity.Warning);
         }
         finally
@@ -1719,6 +1727,22 @@ public sealed class MainViewModel : INotifyPropertyChanged
     /// evidence and recovery fields expandable.
     private static string ClipSignalSummary(string value) =>
         value.Length <= 200 ? value : $"{value[..200]}…";
+
+    /// One bounded reason for a banner that reports a locally refused typed
+    /// request.
+    ///
+    /// A refusal raised by this application's own closed UserAutomation
+    /// contract keeps its message: every such message is a fixed sentence over
+    /// locally authored field names, so it names the rule that refused the
+    /// request and carries no value. A framework exception message is never
+    /// shown — a serializer message can carry a JSON path, a line/byte offset
+    /// and a character lifted from the refused bytes — so only its closed
+    /// [`OperatorFaultReason`] code is displayed, exactly as the transport
+    /// paths do.
+    private static string BoundedRefusalReason(Exception error) =>
+        error is JsonException
+            ? OperatorFaultReason.ForException(error)
+            : error.Message;
 
     private void SetBanner(string title, string message, OperatorBannerSeverity severity)
     {
