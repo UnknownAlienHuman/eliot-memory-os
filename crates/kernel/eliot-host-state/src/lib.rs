@@ -37,6 +37,8 @@ pub use journal::{
     readonly_project_host_state, record_checksum,
 };
 pub use legacy::{LegacyHostStateImporter, LegacyHostStateSnapshot};
+#[cfg(any(test, feature = "test-support"))]
+pub use model::HostStateReadVerificationParts;
 pub use model::{
     ActivationState, AppliedOperation, BackupPreparationRecord, BackupPreparationState,
     CanonicalStoreWriteRefusal, CleanMarker, CutoverIntentRecord, CutoverIntentState,
