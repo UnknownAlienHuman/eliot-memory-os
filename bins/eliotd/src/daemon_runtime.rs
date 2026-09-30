@@ -5080,21 +5080,26 @@ struct FairPullRecoveryFlightState {
 /// Sole owner of the always-armed bounded fair-pull recovery poll in
 /// `run_loop` (issue #1683 W5, I14.8).
 ///
-/// This is the thirteenth single-owner polled flight, and it is the one that
-/// makes the I14.8 progress loop correct rather than merely fast. The event arm
-/// (`solo_ingest_result`) advances released capacity in the same operation that
-/// released it; that arm is an optimisation. This one exists because an
-/// event-only loop is a lost-wakeup deadlock: a dropped, coalesced or
-/// pre-registered notification would leave the loop waiting forever for work
-/// that is already eligible.
+/// This is the thirteenth single-owner polled flight. I14.8 closes with two
+/// sentences, and this flight is the one that discharges the second: "Mechanical
+/// queue progress never depends on an LLM remembering to start another agent."
+/// The first sentence is an ordering requirement — "terminal/deferred/blocked
+/// attempt releases its slot, then the next currently admissible Ready Work
+/// Item is selected" — and the event arm (`solo_ingest_result`) is the
+/// *synchronous* implementation of it. That arm has no caller in this tree, so
+/// this poll is what preserves the ordering today, at up to one tick of latency
+/// rather than synchronously. It exists in its own right because an event-only
+/// loop is a lost-wakeup deadlock: a dropped, coalesced or pre-registered
+/// notification would leave the loop waiting forever for work that is already
+/// eligible.
 ///
 /// So `maybe_start_fair_pull_recovery` starts the poll on **every** tick of the
 /// shared `ACTIVATION_POLL_INTERVAL` cadence. It is not gated on a pending
 /// wake, on a prior failure, on a "did anything change" flag, or on any
-/// degraded state: the bounded poll is the authoritative arm and the event is
-/// the optimisation, so a fallback that only ran after a failure would invert
-/// that and reintroduce the deadlock. `Idle` means no poll is outstanding;
-/// `InFlight` holds the one pending bounded poll, so ticks never overlap it.
+/// degraded state: no external prompt may be what makes the queue progress, so
+/// a fallback that only ran after a failure would reintroduce the deadlock.
+/// `Idle` means no poll is outstanding; `InFlight` holds the one pending bounded
+/// poll, so ticks never overlap it.
 /// The future remains a select branch, so a pending restore keeps the cadence
 /// and shutdown pollable.
 enum FairPullRecoveryFlight {

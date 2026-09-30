@@ -967,11 +967,17 @@ pub async fn solo_poll_queue_async(
 /// The always-armed bounded recovery poll of the I14.8 progress loop (issue
 /// #1683 W5).
 ///
-/// This is the arm that makes progress correct under a lost notification, and
-/// the event-driven release path is only the optimisation. The daemon runtime
-/// calls it on its existing bounded activation cadence without consulting any
-/// wake state, so a dropped, coalesced or pre-registered wake costs one cadence
-/// of latency instead of stranding work that is already eligible.
+/// This is the arm that discharges I14.8's guarantee that mechanical queue
+/// progress never depends on an LLM remembering to start another agent, and it
+/// preserves that fragment's release-then-select *ordering* rather than
+/// replacing it: the release it follows has already happened by the time it
+/// selects. The daemon runtime calls it on its existing bounded activation
+/// cadence without consulting any wake state, so a dropped, coalesced or
+/// pre-registered wake costs one cadence of latency instead of stranding work
+/// that is already eligible. It is not the whole of I14.8 — the event-driven
+/// release path is the synchronous form of the ordering, and it currently has
+/// no caller in this tree, so the ordering is met only with this poll's
+/// bounded latency.
 ///
 /// Thin wrapper over
 /// [`solo_agent_driver::solo_fair_pull_recovery`](crate::solo_agent_driver::solo_fair_pull_recovery):
@@ -3595,6 +3601,11 @@ impl DaemonComposition {
     /// [`solo_agent_driver::solo_ingest_result`](crate::solo_agent_driver::solo_ingest_result):
     /// acknowledgement first (never success), then the candidate result
     /// (never Finish).
+    ///
+    /// This wrapper currently has no caller in this tree, which is why the
+    /// synchronous I14.8 release-event join it fronts does not run in
+    /// production. That join is private, so it is described at its own
+    /// definition rather than linked from here.
     ///
     /// # Errors
     ///

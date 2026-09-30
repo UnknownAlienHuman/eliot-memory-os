@@ -1370,36 +1370,60 @@ fn load_scheduling_profile(
 /// Drives the coordinator's fair pull over the capacity a settled attempt just
 /// released (issue #1683 W1, I14.8 "Scheduler is pull-based").
 ///
-/// This is the **event arm** of the I14.8 progress loop: the daemon's
-/// production call of `AgentFabric::drive_fair_pull`, on the I14.8 release
-/// path. `submit_attempt_result` has just settled an attempt, so the
-/// coordinator is asked for the next currently admissible item instead of
-/// waiting for another agent command. It runs after
+/// I14.8's closing paragraph is two sentences, and this join exists to satisfy
+/// the first one: "Scheduler is pull-based: terminal/deferred/blocked attempt
+/// releases its slot, then the next currently admissible Ready Work Item is
+/// selected." That is an **ordering requirement**, not only the second
+/// sentence's guarantee that progress needs no external prompt — and this join
+/// is the *synchronous* form of it.
+///
+/// This is the **event arm** of the I14.8 progress loop: the daemon's call of
+/// `AgentFabric::drive_fair_pull`, on the I14.8 release path.
+/// `submit_attempt_result` has just settled an attempt, so the coordinator is
+/// asked for the next currently admissible item immediately, in the same
+/// operation that released the slot, rather than waiting for another agent
+/// command or for a later tick. It runs after
 /// [`repersist_after_control`], so the candidate result and settlement state are
 /// already durable and a refused queue profile cannot lose an observation.
 ///
-/// A release that arrives while nobody is listening to a wake still cannot
-/// strand work, because the same drive is also reached by the always-armed
-/// bounded recovery poll in [`solo_fair_pull_recovery`]. This arm is the
-/// low-latency path; it is not the correctness mechanism.
+/// The always-armed bounded recovery poll in [`solo_fair_pull_recovery`] reaches
+/// the same drive over the same projection one cadence later. It still preserves
+/// the ordering, because the release it follows has already happened; it is the
+/// *no external prompt* half of I14.8 that only that poll can discharge, because
+/// an event-only loop is a lost-wakeup deadlock. But the two are not
+/// interchangeable answers to one requirement, and this arm is not a mere
+/// optimisation of it: while it is unwired, the ordering is met only with
+/// bounded latency.
 ///
-/// Reachable in a non-test build: [`solo_ingest_result`] and
+/// **Not currently wired.** This join is not `cfg(test)`-gated, so it is
+/// compiled and callable in production, but its only caller is
+/// [`solo_ingest_result`], which has no caller in this tree: the sole remaining
+/// reference to it is the public
 /// [`DaemonComposition::solo_ingest_result`](crate::DaemonComposition::solo_ingest_result)
 /// are not `cfg(test)`-gated, so this join is compiled and callable in
-/// production. The fabric it drives is restored through the verified seam
-/// (issue #1108): [`restore_solo_fabric`] binds the frozen plan digest,
-/// re-resolves live owner evidence over the closed production ports, and
-/// reconciles an emitted-but-unresulted dispatch to unknown instead of
-/// relaunching; missing, stale, or revoked evidence refuses typed before any
-/// effect. New production work stays one documented fail-closed hop short of
-/// live admission, and that hop is not this issue's:
-/// `drive_solo_delegate_async` refuses before any fabric effect until the
-/// native-worker owner persists the executable-binding digest, so no
-/// production build yet creates an admitted coordinator projection to pull
-/// over. That residual is the Kernel native-worker owner (issue #1678). The
-/// join is placed on the release path because that is where I14.8 says the
-/// wake happens, not on a site that would be reachable only by pulling over
-/// an empty plan-only coordinator.
+/// production, but its only caller is [`solo_ingest_result`], which has no
+/// caller in this tree: the sole remaining reference to it is the public
+/// [`DaemonComposition::solo_ingest_result`](crate::DaemonComposition::solo_ingest_result)
+/// wrapper, which nothing calls either. So no released capacity is advanced by
+/// the operation that released it today. Wiring it is a caller decision, not a
+/// defect in the mechanism, and no caller is invented here.
+///
+/// The arm is blocked one hop further down as well. Issue #1108 added a real
+/// provider-admission verifier and a verified restore seam — the
+/// `#[cfg(test)]` arm of [`restore_solo_fabric`] binds the frozen plan
+/// digest, re-resolves live owner evidence and reconciles an
+/// emitted-but-unresulted dispatch to unknown instead of relaunching — but the
+/// `#[cfg(not(test))]` arm of that same function still returns `Err`
+/// unconditionally ("solo restore is blocked until Kernel retains an
+/// independently owner-verified executable-binding digest"). So the verified
+/// seam is `cfg(test)`-only and **no production build reaches it**.
+/// `drive_solo_delegate_async` refuses before any fabric effect for the same
+/// reason. Consequently no production run *sets* a live operation and every
+/// recovery tick reports `FairPullRecovery::NoLiveProjection`. Both residuals
+/// are the Kernel native-worker owner and the G-11 admission owner (issue
+/// #1678), not this issue's. The join is placed on the release path because
+/// that is where I14.8 says the wake happens, not on a site that would be
+/// reachable only by pulling over an empty plan-only coordinator.
 fn drive_fair_pull_after_release(
     composition: &DaemonComposition,
     fabric: &mut AgentFabric,
@@ -1446,8 +1470,8 @@ pub enum FairPullRecovery {
 /// The always-armed bounded recovery poll of the I14.8 progress loop (issue
 /// #1683 W5).
 ///
-/// **This is the arm that makes the loop correct under a lost notification, and
-/// the event arm in [`drive_fair_pull_after_release`] is only the optimisation.**
+/// **This is the arm that discharges I14.8's *no external prompt* guarantee,
+/// and it preserves the release-then-select ordering rather than replacing it.**
 /// An event-only loop deadlocks: if a wake is dropped, coalesced away, or
 /// delivered before anything is waiting, the loop waits forever for work that
 /// is already eligible. So this poll is *armed unconditionally* — the caller
@@ -1456,6 +1480,17 @@ pub enum FairPullRecovery {
 /// performs runs its bounded selector loop whether or not a wake was pending.
 /// That is why a lost wake costs one cadence of latency rather than stranding
 /// work.
+///
+/// I14.8 requires two things, and this poll is load-bearing for both. The
+/// release it follows has already happened by the time it selects, so the
+/// ordering "release its slot, then the next currently admissible Ready Work
+/// Item is selected" still holds — with up to one tick of latency, rather than
+/// synchronously. And the guarantee "Mechanical queue progress never depends
+/// on an LLM remembering to start another agent" is the half this poll alone
+/// can satisfy, because the event arm in [`drive_fair_pull_after_release`] has
+/// no caller in this tree. Describing the event arm as "only the optimisation"
+/// would under-read the fragment: the ordering is specified, so while the event
+/// arm is unwired the ordering is met only with this poll's bounded latency.
 ///
 /// It is the same drive over the same projection as the release path, with the
 /// same `SchedulingProfile` resolved from the same Kernel-owned `runtime.toml`
@@ -1472,13 +1507,15 @@ pub enum FairPullRecovery {
 /// Reachable in a non-test build: this is not `cfg(test)`-gated, and its
 /// production caller is `daemon_runtime::maybe_start_fair_pull_recovery`, which
 /// runs it on the daemon's existing `ACTIVATION_POLL_INTERVAL` cadence. The
-/// poll restores through the verified seam (issue #1108): missing, stale, or
-/// revoked evidence reports its typed refusal and stays blocked, and an
-/// emitted-but-unresulted dispatch reconciles to unknown instead of
-/// relaunching. No new production projection is created here — that residual
-/// (the Kernel native-worker executable-binding owner, #1678) still refuses
-/// at `drive_solo_delegate_async` — so the poll only ever drives a previously
-/// admitted projection.
+/// same fail-closed residual as the release arm applies and is not worked
+/// around here: the `#[cfg(not(test))]` arm of [`restore_solo_fabric`] returns
+/// `Err` unconditionally and `drive_solo_delegate_async` refuses before any
+/// fabric effect, so no production run *sets* a live operation and every tick
+/// reports `FairPullRecovery::NoLiveProjection` without performing a drive,
+/// until the Kernel native-worker owner and the G-11 admission owner (#1678)
+/// land. So this arm is *scheduled* in production today but does not yet select
+/// work; it is the only arm that is scheduled, which is why the unwired event
+/// arm leaves the ordering met only with latency rather than met outright.
 ///
 /// The Kernel handle is used only for the restore's live owner-evidence
 /// re-resolution that [`restore_solo_fabric`] already performs; this poll
@@ -1657,7 +1694,9 @@ pub fn solo_ingest_result(
     repersist_after_control(composition, &fabric, &mut projection)?;
     // Issue #1683 W1 / I14.8: the settled attempt released its slot, so the
     // coordinator's bounded fair pull runs now instead of on the next agent
-    // command. The candidate result is already durable above.
+    // command. The candidate result is already durable above. This whole
+    // function currently has no caller in the tree, so this synchronous join
+    // does not run in production yet; see `drive_fair_pull_after_release`.
     drive_fair_pull_after_release(composition, &mut fabric, &mut projection)?;
     solo_status(composition, operation_id)
 }
