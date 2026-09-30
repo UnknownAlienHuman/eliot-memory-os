@@ -173,6 +173,7 @@ pub enum GovernorAuthorityDriveOutcome {
 /// mismatch arm compares only the recorded baseline against the
 /// caller-presented live route. Constructed once per daemon run loop and
 /// travels with its drive flight, exactly like the owner-feed trigger.
+#[derive(Default)]
 pub struct GovernorAuthorityDriver {
     last_published: Option<(String, u64)>,
 }
@@ -182,9 +183,7 @@ impl GovernorAuthorityDriver {
     /// feed publish records, and no route comparison runs until then.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            last_published: None,
-        }
+        Self::default()
     }
 
     /// Drives one feed pass through the designated
