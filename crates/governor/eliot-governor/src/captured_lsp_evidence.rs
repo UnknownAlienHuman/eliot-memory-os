@@ -20,7 +20,7 @@ pub enum CapturedLspEvidenceError {
 /// chunk and projects only its bounded historical evidence.
 pub(crate) fn consume_captured_lsp_observations(
     current_read_task_binding: TaskBinding,
-    current_read_causal_binding: CausalBinding,
+    current_read_causal_binding: &CausalBinding,
     observations: Vec<CapturedLspObservation>,
 ) -> Result<Vec<NormalizedEvidence>, CapturedLspEvidenceError> {
     let service = CodeCortexService::with_captured_lsp_observations(
