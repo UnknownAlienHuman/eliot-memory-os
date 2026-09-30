@@ -60,7 +60,7 @@ use eliot_change_monitor::ChangeMonitor;
 use eliot_config::ConfigPolicySnapshot;
 use eliot_context_contracts::{CanonicalProjectionSet, ContextBinding};
 use eliot_contracts::{
-    ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, OperationId,
+    ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, OperationId, TaskRevision,
     ResourceGeneration, SessionId, StateFence, TaskId, canonical_json_bytes, fences_match_exact,
     sha256_hex,
 };
@@ -6968,12 +6968,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let evidence = self
             .issue_task_selection_evidence_for_binding(
                 now,
-                &receipt.principal_ref,
-                &receipt.session_ref,
+                (&receipt.principal_ref, &receipt.session_ref),
                 &receipt.scope.scope_ref,
                 &receipt.state_fence,
-                activation.task_id.as_str(),
-                activation.task_revision,
+                (
+                    activation.task_id.as_str(),
+                    activation.task_revision,
+                    &retained.acceptance_digest,
+                ),
             )
             .await?;
         if &evidence != retained {
@@ -6993,13 +6995,13 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     async fn issue_task_selection_evidence_for_binding(
         &self,
         now: u64,
-        principal_ref: &str,
-        session_ref: &str,
+        authenticated_identity: (&str, &str),
         work_scope_ref: &str,
         state_fence: &StateFence,
-        task_ref: &str,
-        task_revision: u64,
+        task_binding: (&str, u64, &str),
     ) -> Result<TaskSelectionEvidence, CompositionError> {
+        let (principal_ref, session_ref) = authenticated_identity;
+        let (task_ref, task_revision, expected_acceptance_digest) = task_binding;
         let (activation, selected) = self.read_unique_agent_activation_with_selection(now)?;
         if !fences_match_exact(&activation.state_fence, state_fence)
             || !fences_match_exact(&self.snapshot.state_fence(), state_fence)
@@ -7009,8 +7011,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             || activation.task_revision != task_revision
             || state_fence
                 .task_revision
-                .as_ref()
-                .map(|revision| revision.value())
+                .map(TaskRevision::value)
                 != Some(task_revision)
             || activation.work_scope_id != work_scope_ref
             || selected.work_item.work_item_id != activation.work_unit_id
@@ -7036,6 +7037,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         acceptance.validate()?;
         if acceptance.task_id != activation.task_id
             || acceptance.task_revision != activation.task_revision
+            || acceptance.acceptance_digest != expected_acceptance_digest
             || !fences_match_exact(&acceptance.read_state_fence, &activation.state_fence)
         {
             return Err(CompositionError::ActivationStaleFence);
@@ -7793,34 +7795,31 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             TaskBindingInput::Current {
                 task_ref,
                 task_revision,
-                ..
+                acceptance_digest,
             } => {
                 let evidence = self
                     .issue_task_selection_evidence_for_binding(
                         now,
-                        principal_ref,
-                        session_ref,
+                        (principal_ref, session_ref),
                         &scope.scope_ref,
                         state_fence,
-                        &task_ref,
-                        task_revision,
+                        (&task_ref, task_revision, &acceptance_digest),
                     )
                     .await?;
-                if evidence.task_ref != task_ref || evidence.task_revision != task_revision {
-                    return Err(CompositionError::ActivationStaleFence);
-                }
                 TaskBindingInput::Selected(evidence)
             }
             TaskBindingInput::Selected(supplied) => {
                 let evidence = self
                     .issue_task_selection_evidence_for_binding(
                         now,
-                        principal_ref,
-                        session_ref,
+                        (principal_ref, session_ref),
                         &scope.scope_ref,
                         state_fence,
-                        &supplied.task_ref,
-                        supplied.task_revision,
+                        (
+                            &supplied.task_ref,
+                            supplied.task_revision,
+                            &supplied.acceptance_digest,
+                        ),
                     )
                     .await?;
                 if evidence != supplied {
@@ -10078,10 +10077,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let activation = GovernorActivationSnapshot {
             state_fence,
             owner_revision: self.owners.canonical.owner_revision(),
-            principal_id: work.session.principal_id,
-            session_id: work.session.session_id,
+            principal_id: work.session.principal_id.clone(),
+            session_id: work.session.session_id.clone(),
             task_id,
-            work_unit_id: work.work_item.work_item_id,
+            work_unit_id: work.work_item.work_item_id.clone(),
             work_scope_id,
             task_revision: task.revision,
             plan_id: plan.plan_id,
