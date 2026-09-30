@@ -405,7 +405,6 @@ impl CanonicalStoreWriterAdmission {
     /// The `Ok` payload is the committed cutover's owner generation when the
     /// window is open, and `None` when it is not, so a caller can never read the
     /// absence of an owner as a permission it did not get from durable state.
-    #[must_use]
     pub const fn admitted(self) -> Result<Option<ResourceGeneration>, CanonicalStoreWriterRefusal> {
         match self {
             Self::Admitted { owner } => Ok(Some(owner)),
