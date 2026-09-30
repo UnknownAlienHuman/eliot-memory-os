@@ -10822,12 +10822,21 @@ impl HostComposition {
             return disposition;
         }
         // A late Store recovery result is not proof that Host supervision
-        // recovered.  Require the exact current Active activation generation
-        // before any fresh positive readiness observation is appended; a
-        // Starting, DegradedRecovery, missing, or unreadable activation remains
-        // a visible recovery boundary.
-        let activation = match self.journal.snapshot() {
-            Ok(state) => state.activation,
+        // recovered.  Require the exact current activation generation before
+        // any fresh positive readiness observation is appended. The generation
+        // may attempt the proof while `Active`, or while `Draining` with a
+        // pre-commit `Cancelled` drain awaiting revalidation: I1.5 requires a
+        // pre-linearization observable-use trigger to return the same
+        // generation to `ACTIVE` after readiness revalidation, and that
+        // revalidation is this exact authenticated proof — never the
+        // cancellation itself. Every other state (Starting,
+        // DegradedRecovery, missing, unreadable, committed, or still
+        // `Draining` behind a live drain) remains a visible recovery
+        // boundary, and the proof below is unchanged: a complete contour
+        // under the exact generation fence, a fresh Watchdog observation,
+        // and the gate grant.
+        let snapshot = match self.journal.snapshot() {
+            Ok(state) => state,
             Err(error) => {
                 self.readiness_gate.fail(
                     None,
@@ -10837,7 +10846,7 @@ impl HostComposition {
                 return HostBranchDisposition::ReadinessDegraded;
             }
         };
-        let Some(activation) = activation else {
+        let Some(activation) = snapshot.activation.as_ref() else {
             self.readiness_gate.fail(
                 None,
                 readiness_failure_kind(&HostError::OwnerLeaseRecovery(
@@ -10847,13 +10856,29 @@ impl HostComposition {
             );
             return HostBranchDisposition::ReadinessDegraded;
         };
-        if activation.state != ActivationState::Active
-            || activation.fence.activation_generation != self.activation_generation
+        // I1.5 drain-cancel resume: `note_observable_use` appends
+        // `Drain(Cancelled)` while leaving the activation `Draining`, and
+        // only `resume_cancelled_drain` — fed by the `Healthy` this proof
+        // produces on the live SCM tick — moves it back to `Active`. The
+        // `Cancelled` record plus the absent `DrainCommitRecord` prove the
+        // linearization point has not passed, so this attempt is the
+        // norm-mandated revalidation, not a second admission.
+        let cancelled_drain_awaits_revalidation =
+            activation.state == ActivationState::Draining
+                && snapshot.drain_commit.is_none()
+                && snapshot
+                    .drain
+                    .as_ref()
+                    .is_some_and(|drain| drain.state == DrainState::Cancelled);
+        if activation.fence.activation_generation != self.activation_generation
+            || !(activation.state == ActivationState::Active
+                || cancelled_drain_awaits_revalidation)
         {
             self.readiness_gate.fail(
                 None,
                 readiness_failure_kind(&HostError::RecoveryRequired(
-                    "fresh readiness requires the exact current Active Host activation".to_owned(),
+                    "fresh readiness requires the exact current Active Host activation or its pre-commit cancelled drain"
+                        .to_owned(),
                 )),
                 now,
             );
