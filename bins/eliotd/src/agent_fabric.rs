@@ -65,12 +65,11 @@ use eliot_agent_contracts::{
 };
 use eliot_agent_coordinator::{
     AdmissionId, AdmittedProviderCapability, AgentCoordinator, CandidateId, CoordinatorConfig,
-    CoordinatorError, CoordinatorSnapshot, FairPullOutcome, PlanGap, ProviderBindingSnapshot,
-    ProviderIdentity, ProviderSelectionHealth, SchedulingProfile, StaffingPlanCandidate,
-    StaffingPlanRequest, SwarmDefinitionAdmissionPrep, WorkClass,
+    CoordinatorError, CoordinatorSnapshot, FairPullOutcome, OwnerCurrentness, PlanGap,
+    PresentedClaimMaterial, ProviderBindingSnapshot, ProviderIdentity, ProviderSelectionHealth,
+    SchedulingProfile, StaffingPlanCandidate, StaffingPlanRequest, SwarmDefinitionAdmissionPrep,
+    WorkClass,
 };
-#[cfg(test)]
-use eliot_agent_coordinator::{OwnerCurrentness, PresentedClaimMaterial};
 use eliot_contracts::{EpochId, StateFence, fences_match_exact};
 use eliot_kernel_service::ProviderCapabilityExpectation;
 use eliot_store_api::{StoreError, SwarmOwnerRevision, WriteReceipt, WriteReceiptStatus};
@@ -585,7 +584,6 @@ fn digest_json<T: Serialize>(value: &T) -> Result<String, FabricError> {
 ///
 /// Returns [`FabricError::Contract`] when the request cannot be canonically
 /// encoded.
-#[cfg(test)]
 pub(crate) fn frozen_definition_digest(
     request: &StaffingPlanRequest,
 ) -> Result<String, FabricError> {
@@ -704,7 +702,6 @@ pub struct VerifiedProviderMaterial {
 ///
 /// Returns the coordinator owner rejection unchanged (shape, coherence, or
 /// stale/revoked binding).
-#[cfg(test)]
 pub(crate) fn build_admitted_provider_capability(
     material: VerifiedProviderMaterial,
 ) -> Result<AdmittedProviderCapability, FabricError> {
@@ -3860,7 +3857,6 @@ impl AgentFabric {
     ///
     /// Returns the capability construction rejection, the coordinator owner
     /// restore rejection, or a stale-config conflict unchanged.
-    #[cfg(test)]
     pub(crate) fn restore_verified(
         snapshot: FabricSnapshot,
         config: CoordinatorConfig,

@@ -1574,9 +1574,12 @@ impl DaemonKernelClient {
     /// Route and capacity currentness in `material` came from serialized intake
     /// data, not a live Governor read; the Kernel response echoes those
     /// presented values and this method does not promote them to owner evidence.
-    /// This is only a provider-binding probe. The current Kernel/ORS claim row
-    /// does not retain an independently verified executable-binding digest,
-    /// so this response must never be treated as admitted execution capability.
+    /// This is only a provider-binding probe. The Kernel route compares the
+    /// presented executable digest against the independently owner-retained
+    /// digest on the durable claim row (issue #2567), so success carries
+    /// owner evidence for the presented binding — but the response itself is
+    /// still not an admitted execution capability. Capability construction
+    /// happens at adopt time over freshly re-resolved owner halves.
     pub(super) async fn verify_provider_binding_async(
         &self,
         material: &super::agent_fabric::VerifiedProviderMaterial,

@@ -58,13 +58,15 @@
 //!
 //! # Pollability and durability
 //!
-//! The production queue poll snapshots its head under a short composition
-//! lock, then performs authenticated Kernel verification with owned inputs
-//! and no composition guard across the await. Until the Kernel owner retains
-//! the executable-binding digest, that check fails closed before admission,
-//! activation, or dispatch. The test-only historical dispatch projection is
-//! persisted under the daemon state root before `emit`; uncertain ownership
-//! is never released without an observed terminal disposition.
+//! The production queue poll prepares under a short composition lock, then
+//! performs authenticated Kernel verification with owned inputs and no
+//! composition guard across the await, then adopts with fresh revision
+//! checks: prepare/IO/adopt. The owner probe compares the presented
+//! executable digest against the owner-retained claim row, so a failed probe
+//! fails closed before admission, activation, or dispatch and the intake
+//! stays queued. The dispatch projection is persisted under the daemon state
+//! root before `emit`; uncertain ownership is never released without an
+//! observed terminal disposition.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -74,7 +76,7 @@ use eliot_agent_coordinator::{
     AdmittedProviderCapability, AdmissionId, CandidateId, RUNTIME_PROFILE_FILE_NAME,
     SchedulingProfile, StaffingPlanRequest, load_runtime_scheduling_profile,
 };
-use eliot_contracts::{fences_match_exact, sha256_hex};
+use eliot_contracts::{StateFence, fences_match_exact, sha256_hex};
 use serde::{Deserialize, Serialize};
 
 use crate::agent_fabric::{
@@ -268,6 +270,11 @@ pub struct SoloDelegateIntake {
     pub requirements: RouteRequirements,
     /// Caller-observed route scope threaded into the evidence gate.
     pub observed_scope: RouteScopeFingerprint,
+    /// Authenticated principal the admitted operation binds (issue #2567,
+    /// AUD7). The daemon never mints it: the admitted envelope supplies it
+    /// and the drive carries it unchanged, so inspect/cancel/readback can
+    /// prove whose admitted request an attempt serves.
+    pub principal: String,
     /// Claim deadline in Unix milliseconds; must be in the future at drive.
     pub deadline_unix_ms: u64,
 }
@@ -285,6 +292,7 @@ impl SoloDelegateIntake {
         for item in &self.requirements.competence {
             require_text(item, "route competence")?;
         }
+        require_text(&self.principal, "admitted principal")?;
         if self.deadline_unix_ms == 0 || self.deadline_unix_ms <= now_unix_ms {
             return Err(FabricError::Contract(
                 "solo delegate deadline is not in the future".to_owned(),
@@ -292,6 +300,123 @@ impl SoloDelegateIntake {
         }
         Ok(())
     }
+}
+
+/// Exact delegate field mirror of the public MCP contract, used only to
+/// decode admitted delegate bytes at the intake edge.
+///
+/// Same three fields and same validation as the canonical `DelegateRequest`
+/// (`goal`, `owned_resources`, `expected_result`); the bridge direction
+/// never inverts because this mirror depends on no surface crate. Unknown
+/// fields refuse: the admitted bytes must be exactly the delegate shape.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdmittedDelegateShape {
+    goal: String,
+    owned_resources: Vec<String>,
+    expected_result: String,
+}
+
+/// One admitted delegate operation supplying the exact solo intake
+/// (issue #2567, I2/I4/A1/AUD7).
+///
+/// Every field arrives from an already-admitted owner: the delegate bytes
+/// are the exact canonical request bytes, the plan is Task
+/// Controller-authored, the claimed halves are the operation presentation
+/// the drive re-verifies Kernel-side, and the operation/task/principal
+/// identities plus the deadline come from the admitted envelope. The
+/// assembler binds them by content and refuses substitution; it invents no
+/// route, no principal, and no digest.
+pub struct AdmittedDelegateOperation {
+    /// Exact canonical delegate JSON bytes (`goal`, `owned_resources`,
+    /// `expected_result`).
+    pub delegate_bytes: Vec<u8>,
+    /// Frozen Task Controller-authored staffing plan request.
+    pub plan: StaffingPlanRequest,
+    /// Operation-presented provider halves.
+    pub claimed: SoloClaimedHalves,
+    /// Route requirements for the admitted-route gate.
+    pub requirements: RouteRequirements,
+    /// Caller-observed route scope threaded into the evidence gate.
+    pub observed_scope: RouteScopeFingerprint,
+    /// Authenticated principal from the admitted envelope.
+    pub principal: String,
+    /// Operation identity from the admitted envelope.
+    pub operation_id: String,
+    /// Task identity from the admitted envelope.
+    pub task_id: String,
+    /// Claim deadline from the admitted envelope, Unix milliseconds.
+    pub deadline_unix_ms: u64,
+}
+
+/// Assembles the exact solo intake from one admitted delegate operation.
+///
+/// Decodes the delegate bytes against the canonical shape, binds the digest
+/// over the original bytes, and checks the operation/task identities across
+/// the delegate presentation, the Task Controller plan, and the admitted
+/// envelope before constructing the intake. The validated intake still
+/// proves nothing by itself: the drive re-verifies every digest Kernel-side
+/// before adoption.
+///
+/// # Errors
+///
+/// Returns the malformed-bytes, digest-mismatch, identity-conflict, or
+/// intake-validation rejection unchanged.
+pub fn assemble_solo_intake(
+    operation: AdmittedDelegateOperation,
+    now_unix_ms: u64,
+) -> Result<SoloDelegateIntake, DaemonError> {
+    let shape: AdmittedDelegateShape = serde_json::from_slice(&operation.delegate_bytes)
+        .map_err(|error| {
+            DaemonError::ProviderAdmission(FabricError::Contract(format!(
+                "admitted delegate bytes are not the canonical delegate shape: {error}"
+            )))
+        })?;
+    require_text(&operation.principal, "admitted principal")
+        .map_err(DaemonError::ProviderAdmission)?;
+    require_text(&operation.operation_id, "admitted operation identity")
+        .map_err(DaemonError::ProviderAdmission)?;
+    require_text(&operation.task_id, "admitted task identity")
+        .map_err(DaemonError::ProviderAdmission)?;
+    if operation.claimed.operation_id != operation.operation_id {
+        return Err(DaemonError::ProviderAdmission(FabricError::IdentityConflict(
+            "admitted delegate operation identity does not match the presented claim halves"
+                .to_owned(),
+        )));
+    }
+    if operation.plan.launch.task_id.as_str() != operation.task_id {
+        return Err(DaemonError::ProviderAdmission(FabricError::IdentityConflict(
+            "admitted delegate task identity does not match the Task Controller plan".to_owned(),
+        )));
+    }
+    let mut seen: Vec<&str> = Vec::with_capacity(shape.owned_resources.len());
+    for resource in &shape.owned_resources {
+        if seen.contains(&resource.as_str()) {
+            return Err(DaemonError::ProviderAdmission(FabricError::Contract(
+                "admitted delegate owned resources must be unique".to_owned(),
+            )));
+        }
+        seen.push(resource.as_str());
+    }
+    let intake = SoloDelegateIntake {
+        delegate: SoloDelegateBody {
+            goal: shape.goal,
+            owned_resources: shape.owned_resources,
+            expected_result: shape.expected_result,
+            source_digest: sha256_hex(&operation.delegate_bytes),
+            source_bytes: operation.delegate_bytes,
+        },
+        plan: operation.plan,
+        claimed: operation.claimed,
+        requirements: operation.requirements,
+        observed_scope: operation.observed_scope,
+        principal: operation.principal,
+        deadline_unix_ms: operation.deadline_unix_ms,
+    };
+    intake
+        .validate(now_unix_ms)
+        .map_err(DaemonError::ProviderAdmission)?;
+    Ok(intake)
 }
 
 /// Verified solo context threaded into every adapter.
@@ -704,6 +829,13 @@ pub struct SoloPersistedAttempt {
     pub requirements: RouteRequirements,
     /// Caller-observed route scope threaded into the evidence gate.
     pub observed_scope: RouteScopeFingerprint,
+    /// Authenticated principal bound at intake (issue #2567, AUD7), carried
+    /// so status/cancel/readback serve the same admitted requester.
+    /// Defaulted only so projections persisted before principal binding
+    /// still load; every newly persisted row carries the validated intake
+    /// principal.
+    #[serde(default)]
+    pub principal: String,
     /// Claimed provider halves for restore-time material rebuild.
     pub claimed: SoloClaimedHalves,
     /// Staffing receipt lanes bound at drive time (route source of truth).
@@ -759,6 +891,9 @@ pub struct SoloAttemptStatus {
     pub operation_id: String,
     /// Registered attempt identity.
     pub attempt_id: String,
+    /// Authenticated principal bound at intake; empty only for projections
+    /// persisted before principal binding existed.
+    pub principal: String,
     /// Fabric attempt lifecycle (retention/observation states only).
     pub lifecycle: crate::agent_fabric::AttemptLifecycle,
     /// Cancellation lifecycle, if a cancellation was requested.
@@ -1144,6 +1279,7 @@ pub fn drive_solo_delegate(
     let projection = SoloPersistedAttempt {
         operation_id: operation_id.clone(),
         attempt_id: attempt_id.as_str().to_owned(),
+        principal: intake.principal.clone(),
         delegate_digest: intake.delegate.source_digest.clone(),
         plan_digest: definition.definition_digest.clone(),
         requirements: intake.requirements.clone(),
@@ -1186,30 +1322,65 @@ pub fn drive_solo_delegate(
     })
 }
 
-/// Performs the authenticated Kernel provider-binding check for one solo
-/// intake without crossing into local admission, activation, or dispatch
-/// substitutes.
+/// Owned prepare output for one solo drive (issue #2567, AUD9).
 ///
-/// Kernel currently has no independently owner-backed executable-binding
-/// digest on its durable provider claim row. Its accepted verifier therefore
-/// cannot yet authorize construction of an `AdmittedProviderCapability` for
-/// this operation. The call below verifies the remaining exact owner tuple,
-/// then returns a typed fail-closed residual before any capability or fabric
-/// effect is created. The native-worker owner must persist and verify the
-/// executable join itself before this path can proceed.
-pub async fn drive_solo_delegate_async(
+/// Everything the async owner probe needs, computed under short composition
+/// borrows with no effects: the validated intake, its provider material, the
+/// operation/attempt identities, the expected live fence, and the pure
+/// staffing receipt. The borrow is released before the IO below runs, and
+/// [`adopt_solo_drive`] revalidates every revision before touching the
+/// fabric, so a moved fence, epoch, or live slot refuses instead of driving
+/// stale material.
+pub struct SoloDrivePrepared {
+    intake: SoloDelegateIntake,
+    material: VerifiedProviderMaterial,
+    operation_id: String,
+    attempt_id: String,
+    expected_fence: StateFence,
+    receipt: StaffingPlanReceipt,
+}
+
+/// Prepares one solo drive without owner IO and without effects.
+///
+/// Readiness, intake shape, and solo-slice shape are validated first, the
+/// single live slot is consulted (a foreign unsettled attempt refuses; a
+/// settled one clears), then the pure staffing plan and receipt are computed
+/// and the expected live fence is snapshotted. No lock is held on return.
+pub fn prepare_solo_drive(
+    composition: &DaemonComposition,
     kernel: &Arc<DaemonKernelClient>,
     intake: SoloDelegateIntake,
     now_unix_ms: u64,
-) -> Result<SoloDriveOutcome, DaemonError> {
+) -> Result<SoloDrivePrepared, DaemonError> {
+    if composition.readiness() != CompositionReadiness::Ready {
+        return Err(DaemonError::Composition(CompositionError::NotReady));
+    }
     intake
         .validate(now_unix_ms)
         .map_err(DaemonError::ProviderAdmission)?;
     guard_solo_plan(&intake.plan).map_err(DaemonError::ProviderAdmission)?;
-
-    // Preserve the useful plan-only staffing validation while the authenticated
-    // owner check runs; it does not construct a coordinator capability or
-    // reserve, activate, or dispatch work.
+    let material = intake.claimed.material();
+    let operation_id = material.operation_id.clone();
+    let attempt_id = material.attempt_id.clone();
+    {
+        let mut state = composition.solo_state.lock().map_err(|_| {
+            DaemonError::Composition(CompositionError::Recovery(
+                "solo driver state lock poisoned".to_owned(),
+            ))
+        })?;
+        if let Some(live) = state.live_operation.clone()
+            && live != operation_id
+        {
+            let settled = load_projection(composition.state_root(), &live)
+                .is_ok_and(|projection| projection_settled(&projection));
+            if !settled {
+                return Err(DaemonError::ProviderAdmission(FabricError::Contract(
+                    format!("solo slice holds live attempt {live}; settle or cancel it first"),
+                )));
+            }
+            state.live_operation = None;
+        }
+    }
     let config = daemon_coordinator_config()?;
     let receipt = plan_coordinator_staffing(&config, &intake.plan).map_err(|error| {
         DaemonError::ProviderAdmission(FabricError::Contract(error.to_string()))
@@ -1217,16 +1388,227 @@ pub async fn drive_solo_delegate_async(
     verify_receipt_digest(&receipt).map_err(|error| {
         DaemonError::ProviderAdmission(FabricError::Contract(error.to_string()))
     })?;
+    Ok(SoloDrivePrepared {
+        intake,
+        material,
+        operation_id,
+        attempt_id,
+        expected_fence: kernel.kernel_fence(),
+        receipt,
+    })
+}
 
+/// Adopts one owner-verified solo drive: revalidates, then runs the exact
+/// fabric sequence to a retained dispatch (issue #2567, AUD8/AUD12/AUD13).
+///
+/// The caller runs the authenticated Kernel provider-binding probe between
+/// prepare and adopt with no composition borrow held. Adopt re-checks
+/// readiness, re-reads the live fence against the prepared expectation, and
+/// re-checks the live slot; any move returns stale/conflict typed and
+/// applies nothing to another plan. The admitted capability is then resolved
+/// fresh over the live session and the drive runs define/reserve/admit/
+/// activate/dispatch against it, persisting the operation/attempt identity
+/// before `emit` and revalidating the launch gate inside the fabric chain.
+/// A digest alone never dispatches: the executable digest adopted here is the
+/// one the owner probe just compared against the retained claim row.
+///
+/// # Errors
+///
+/// Returns the readiness, staleness, capability, route-gate, staffing,
+/// fabric-chain, persistence, or live-slot rejection unchanged. A missing
+/// downstream owner port blocks typed with its prerequisite residual; the
+/// intake stays queued and nothing is dispatched.
+pub fn adopt_solo_drive(
+    composition: &DaemonComposition,
+    kernel: &Arc<DaemonKernelClient>,
+    prepared: SoloDrivePrepared,
+) -> Result<SoloDriveOutcome, DaemonError> {
+    let SoloDrivePrepared {
+        intake,
+        material,
+        operation_id,
+        attempt_id,
+        expected_fence,
+        receipt,
+    } = prepared;
+    if composition.readiness() != CompositionReadiness::Ready {
+        return Err(DaemonError::Composition(CompositionError::NotReady));
+    }
+    intake
+        .validate(crate::unix_ms())
+        .map_err(DaemonError::ProviderAdmission)?;
+    let live_fence = kernel.kernel_fence();
+    if !fences_match_exact(&live_fence, &expected_fence) {
+        return Err(DaemonError::ProviderAdmission(FabricError::StaleFence(
+            "solo drive refuses a fence moved during owner verification".to_owned(),
+        )));
+    }
+    {
+        let state = composition.solo_state.lock().map_err(|_| {
+            DaemonError::Composition(CompositionError::Recovery(
+                "solo driver state lock poisoned".to_owned(),
+            ))
+        })?;
+        if let Some(live) = state.live_operation.as_ref()
+            && live != &operation_id
+        {
+            return Err(DaemonError::ProviderAdmission(FabricError::Contract(
+                format!("solo slice holds live attempt {live}; settle or cancel it first"),
+            )));
+        }
+    }
+    let capability =
+        composition.agent_fabric_verified_capability(kernel, material)?;
+    let attempt_id = AttemptId::new(attempt_id)
+        .map_err(|error| DaemonError::ProviderAdmission(contract(error)))?;
+    let staffed = receipt.lanes.first().ok_or_else(|| {
+        DaemonError::ProviderAdmission(FabricError::NoRoute(
+            "solo staffing receipt staffed no lane".to_owned(),
+        ))
+    })?;
+    // Production binds the closed production ports: a prerequisite owner
+    // without an accepted interface revision blocks typed instead of
+    // inventing authority. Unit tests bind the preloaded solo fakes.
+    #[cfg(test)]
+    let ports = {
+        let registry = SoloModelRegistryPort::new();
+        registry
+            .preload(PreloadedRoute {
+                role: intake.requirements.role.clone(),
+                competence: intake.requirements.competence.clone(),
+                route: staffed.route.clone(),
+            })
+            .map_err(DaemonError::ProviderAdmission)?;
+        let definition_digest =
+            crate::agent_fabric::frozen_definition_digest(&intake.plan)
+                .map_err(DaemonError::ProviderAdmission)?;
+        solo_fabric_ports(
+            SoloVerifiedContext {
+                definition_id: intake.plan.candidate_id.clone(),
+                definition_digest,
+                work_class: intake.plan.work_class,
+                fence: live_fence.clone(),
+                epoch: live_fence.authority_epoch.clone(),
+                attempt_id: attempt_id.clone(),
+            },
+            kernel,
+            registry,
+        )
+    };
+    #[cfg(not(test))]
+    let ports = composition.production_fabric_ports()?;
+    let config = daemon_coordinator_config()?;
+    let mut fabric = AgentFabric::new_with_admitted_provider(config, ports, capability)
+        .map_err(DaemonError::ProviderAdmission)?;
+    fabric.attach_semantic_revision_store(composition.state_root());
+    let evidence = composition.capability_admission()?;
+    let route = fabric.require_model_route(
+        &intake.requirements,
+        evidence,
+        &intake.observed_scope,
+        crate::unix_ms(),
+    )?;
+    let (definition, _) = fabric.define_and_plan(intake.plan.clone())?;
+    let reservation = fabric.stage_reservation(&definition.definition_id)?;
+    let admission = fabric.commit_admission(&reservation.reservation_id)?;
+    let _evidence = fabric.activate(&admission.admission_id, &attempt_id)?;
+    let dispatch_id = solo_dispatch_identity(attempt_id.as_str(), admission.admission_id.as_str());
+    let intent = fabric.dispatch(&admission.admission_id, &attempt_id, &dispatch_id)?;
+    let dispatch = SoloDispatchRecord {
+        dispatch_id: dispatch_id.clone(),
+        claim_id: intake.claimed.claim_id.clone(),
+        attempt_id: attempt_id.as_str().to_owned(),
+        operation_id: operation_id.clone(),
+        task_id: intake.plan.launch.task_id.as_str().to_owned(),
+        route: route.clone(),
+        route_class: staffed.route_class.clone(),
+        worker_generation: intake.claimed.worker_generation,
+        binding_digest: intake.claimed.binding_digest.clone(),
+        executable_digest: intake.claimed.executable_digest.clone(),
+        expected_result_schema: intake.delegate.expected_result.clone(),
+        deadline_unix_ms: intake.deadline_unix_ms,
+        cancellation_id: solo_cancellation_identity(&operation_id),
+        fence: intent.fence.clone(),
+        epoch: intent.epoch.clone(),
+        worker_completed_fields: vec![
+            "registration_id".to_owned(),
+            "executable_binding".to_owned(),
+            "decision_id".to_owned(),
+            "parent_job_id".to_owned(),
+            "work_scope_id".to_owned(),
+            "expected_result_schema_version".to_owned(),
+        ],
+    };
+    let snapshot = fabric.snapshot()?;
+    let projection = SoloPersistedAttempt {
+        operation_id: operation_id.clone(),
+        attempt_id: attempt_id.as_str().to_owned(),
+        principal: intake.principal.clone(),
+        delegate_digest: intake.delegate.source_digest.clone(),
+        plan_digest: definition.definition_digest.clone(),
+        requirements: intake.requirements.clone(),
+        observed_scope: intake.observed_scope.clone(),
+        claimed: intake.claimed.clone(),
+        receipt: receipt.clone(),
+        snapshot,
+        dispatch: Some(dispatch.clone()),
+        emitted: false,
+        result_digest: None,
+        cancellation_evidence: None,
+    };
+    persist_projection(composition.state_root(), &projection)?;
+    let ack = fabric.emit(&dispatch_id)?;
+    if !ack.retained || ack.dispatch_id != dispatch_id {
+        return Err(DaemonError::ProviderAdmission(FabricError::Contract(
+            "solo egress acknowledgement does not retain the intent".to_owned(),
+        )));
+    }
+    let mut projection = projection;
+    projection.emitted = true;
+    projection.snapshot = fabric.snapshot()?;
+    persist_projection(composition.state_root(), &projection)?;
+    {
+        let mut state = composition.solo_state.lock().map_err(|_| {
+            DaemonError::Composition(CompositionError::Recovery(
+                "solo driver state lock poisoned".to_owned(),
+            ))
+        })?;
+        state.live_operation = Some(operation_id.clone());
+    }
+    Ok(SoloDriveOutcome {
+        operation_id,
+        attempt_id: attempt_id.as_str().to_owned(),
+        dispatch_id,
+        admission_id: admission.admission_id.as_str().to_owned(),
+        route,
+        retained: ack.retained,
+        dispatch,
+    })
+}
+
+/// Drives one admitted solo delegate intake through the bounded
+/// prepare/IO/adopt sequence (issue #2567).
+///
+/// Prepare computes the exact owner request and expected revisions under a
+/// short composition borrow; the borrow is released before the authenticated
+/// Kernel provider-binding probe runs (the probe compares the presented
+/// executable digest against the owner-retained claim row, so a success
+/// carries owner evidence, never caller claims); adopt reacquires,
+/// revalidates, and runs the fabric chain. No composition lock is held
+/// across the await, so health, shutdown, and cancellation pollers stay
+/// runnable during owner IO.
+pub async fn drive_solo_delegate_async(
+    composition: &DaemonComposition,
+    kernel: &Arc<DaemonKernelClient>,
+    intake: SoloDelegateIntake,
+    now_unix_ms: u64,
+) -> Result<SoloDriveOutcome, DaemonError> {
+    let prepared = prepare_solo_drive(composition, kernel, intake, now_unix_ms)?;
     kernel
-        .verify_provider_binding_async(&intake.claimed.material())
+        .verify_provider_binding_async(&prepared.material)
         .await
         .map_err(|error| DaemonError::Kernel(error.to_string()))?;
-
-    Err(DaemonError::ProviderAdmission(FabricError::Contract(
-        "Kernel verified the claim binding, but the native-worker owner has no durable executable-binding digest for this claim; admitted provider capability and execution remain blocked"
-            .to_owned(),
-    )))
+    adopt_solo_drive(composition, kernel, prepared)
 }
 
 /// The synchronous solo path is retained only for unit tests. Production must
@@ -1246,7 +1628,9 @@ pub fn drive_solo_delegate(
 }
 
 /// Returns true when the persisted projection needs no further drive.
-#[cfg(test)]
+///
+/// Shared by the test-only synchronous drive and the production prepare leg:
+/// pure readback over the persisted projection, no owner calls.
 fn projection_settled(projection: &SoloPersistedAttempt) -> bool {
     if projection.result_digest.is_some() || projection.cancellation_evidence.is_some() {
         return true;
@@ -1353,16 +1737,64 @@ fn restore_solo_fabric(
     Ok(fabric)
 }
 
+/// Production restore from the durable projection without relaunching
+/// (issue #2567, AUD16/AUD17).
+///
+/// The native-worker claim owner now retains the independently verified
+/// executable-binding digest on its durable row, so this seam restores
+/// instead of refusing: the definition binding is re-found by frozen digest,
+/// the live fence must equal the stored binding exactly, the provider
+/// material is re-resolved fresh over the live authenticated session (never
+/// replayed from storage), and the fabric restores through the closed
+/// production ports with the daemon state root attached before the first
+/// semantic write. An emitted dispatch with no ingested result reconciles to
+/// unknown instead of relaunching or releasing uncertain ownership.
 #[cfg(not(test))]
 fn restore_solo_fabric(
-    _composition: &DaemonComposition,
-    _kernel: &Arc<DaemonKernelClient>,
-    _projection: &SoloPersistedAttempt,
+    composition: &DaemonComposition,
+    kernel: &Arc<DaemonKernelClient>,
+    projection: &SoloPersistedAttempt,
 ) -> Result<AgentFabric, DaemonError> {
-    Err(DaemonError::Kernel(
-        "solo restore is blocked until Kernel retains an independently owner-verified executable-binding digest"
-            .to_owned(),
-    ))
+    let definition = projection
+        .snapshot
+        .definitions
+        .values()
+        .find(|definition| definition.definition_digest == projection.plan_digest)
+        .ok_or_else(|| {
+            DaemonError::ProviderAdmission(FabricError::BrokenOwnershipLink(
+                "solo restore finds no definition binding the frozen plan digest".to_owned(),
+            ))
+        })?
+        .clone();
+    let live_fence = kernel.kernel_fence();
+    if !fences_match_exact(&live_fence, &definition.fence) {
+        return Err(DaemonError::ProviderAdmission(FabricError::StaleFence(
+            "solo restore refuses a fence-moved definition".to_owned(),
+        )));
+    }
+    let ports = composition.production_fabric_ports()?;
+    let material =
+        composition.resolve_verified_material(kernel, projection.claimed.material())?;
+    let config = daemon_coordinator_config()?;
+    let mut fabric = AgentFabric::restore_verified(
+        projection.snapshot.clone(),
+        config,
+        ports,
+        Some(crate::semantic_revision_store::SemanticRevisionStore::new(
+            composition.state_root(),
+        )),
+        material,
+    )
+    .map_err(DaemonError::ProviderAdmission)?;
+    fabric.attach_semantic_revision_store(composition.state_root());
+    if projection.emitted && projection.result_digest.is_none() {
+        let attempt = AttemptId::new(projection.attempt_id.clone())
+            .map_err(|error| DaemonError::ProviderAdmission(contract(error)))?;
+        if fabric.attempt_of(&attempt) == Some(crate::agent_fabric::AttemptLifecycle::Dispatched) {
+            fabric.mark_unknown_outcome(&attempt)?;
+        }
+    }
+    Ok(fabric)
 }
 
 /// Re-persists the projection after a control operation.
@@ -1427,13 +1859,12 @@ fn load_scheduling_profile(
 /// [`DaemonComposition::solo_ingest_result`](crate::DaemonComposition::solo_ingest_result)
 /// are not `cfg(test)`-gated, so this join is compiled and callable in
 /// production. It is one documented fail-closed hop short of live work today,
-/// and that hop is not this issue's: in a non-test build
-/// `restore_solo_fabric` refuses with "solo restore is blocked until Kernel
-/// retains an independently owner-verified executable-binding digest", and
-/// `drive_solo_delegate_async` refuses before any fabric effect, so no
-/// production build yet holds an admitted coordinator projection to pull over.
-/// The two residuals above are the Kernel native-worker owner and the G-11
-/// admission owner (issue #1678). The join is placed on the release path
+/// and that hop is not this issue's: in a non-test build the drive restores
+/// through the closed production ports, and the model-registry prerequisite
+/// owner (B-MOD #694) has no accepted interface revision yet, so the route
+/// gate blocks typed before any admitted coordinator projection exists to
+/// pull over. The residual is the registry owner, plus the G-11 admission
+/// owner (issue #1678). The join is placed on the release path
 /// because that is where I14.8 says the wake happens, not on a site that would
 /// be reachable only by pulling over an empty plan-only coordinator.
 fn drive_fair_pull_after_release(
@@ -1599,6 +2030,7 @@ pub fn solo_status(
     Ok(SoloAttemptStatus {
         operation_id: projection.operation_id.clone(),
         attempt_id: attempt_key.clone(),
+        principal: projection.principal.clone(),
         lifecycle,
         cancellation: projection.snapshot.cancellations.get(&attempt_key).copied(),
         result_digest: projection.result_digest.clone(),
@@ -1853,9 +2285,24 @@ pub async fn solo_poll_queue_async(
         }
         head
     };
-    // The async owner call operates only on owned intake and Kernel handles.
-    // The Tokio composition guard above is out of scope across this await.
-    let outcome = drive_solo_delegate_async(kernel, intake, crate::unix_ms()).await?;
+    // Bounded prepare/IO/adopt: prepare under a short borrow, release it,
+    // run the authenticated owner probe with no composition guard held,
+    // then reacquire and adopt with fresh revision checks. A failed owner
+    // lookup propagates without dequeuing and grants nothing.
+    let prepared = {
+        let Ok(composition) = composition.try_lock() else {
+            return Ok(SoloPollOutcome::SlotBusy);
+        };
+        prepare_solo_drive(&composition, kernel, intake, crate::unix_ms())?
+    };
+    kernel
+        .verify_provider_binding_async(&prepared.material)
+        .await
+        .map_err(|error| DaemonError::Kernel(error.to_string()))?;
+    let outcome = {
+        let composition = composition.lock().await;
+        adopt_solo_drive(&composition, kernel, prepared)?
+    };
     {
         let composition = composition.lock().await;
         let mut state = composition.solo_state.lock().map_err(|_| {

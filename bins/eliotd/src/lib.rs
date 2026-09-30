@@ -3151,9 +3151,11 @@ impl DaemonComposition {
     /// W4/A1/A2).
     ///
     /// Per-operation resolution, mirroring [`Self::agent_fabric_plan`]:
-    /// Test-only pure composition helper; it does not call the Kernel
-    /// provider-capability route. Production remains blocked until that owner
-    /// receipt is validated for every claim leg. Readiness is checked first,
+    /// Pure composition helper; it does not call the Kernel
+    /// provider-capability route itself — the caller runs the authenticated
+    /// owner probe first (issue #2567: the async solo adapter verifies the
+    /// binding, including the retained executable digest, through the Kernel
+    /// route before adopting here). Readiness is checked first,
     /// then the owner half is resolved
     /// exclusively from the live authenticated session — the freshly
     /// observed live fence from the caller-held [`DaemonKernelClient`] plus
@@ -3179,7 +3181,6 @@ impl DaemonComposition {
     /// [`DaemonError::ProviderAdmission`] carrying the fabric/coordinator
     /// owner rejection unchanged (stale, revoked, foreign, or conflicting
     /// evidence).
-    #[cfg(test)]
     pub fn agent_fabric_verified_capability(
         &self,
         kernel: &Arc<DaemonKernelClient>,
@@ -3359,6 +3360,31 @@ impl DaemonComposition {
         solo_agent_driver::solo_enqueue(self, intake, unix_ms())
     }
 
+    /// Enqueues the exact solo intake for one admitted delegate operation
+    /// (issue #2567, I2/I4/A1/AUD7).
+    ///
+    /// The producer wiring for the solo slice: binds the exact admitted
+    /// delegate bytes, the Task Controller-authored plan, the presented
+    /// claim halves, and the admitted envelope identities into one
+    /// content-checked intake through
+    /// [`solo_agent_driver::assemble_solo_intake`](crate::solo_agent_driver::assemble_solo_intake),
+    /// then queues it bounded for the runtime poll hook. The intake proves
+    /// nothing by itself; the drive re-verifies every digest Kernel-side
+    /// before adoption. The admitted-operation serve leg that will call this
+    /// is the execution-fabric owner join (#1740).
+    ///
+    /// # Errors
+    ///
+    /// Returns the assembly (malformed bytes, digest mismatch, identity
+    /// conflict, intake validation) or queue-bound rejection unchanged.
+    pub fn solo_enqueue_admitted_delegate(
+        &self,
+        operation: solo_agent_driver::AdmittedDelegateOperation,
+    ) -> Result<(), DaemonError> {
+        let intake = solo_agent_driver::assemble_solo_intake(operation, unix_ms())?;
+        solo_agent_driver::solo_enqueue(self, intake, unix_ms())
+    }
+
     /// Synchronous compatibility entry for one solo delegate intake
     /// (issue #2567). Production returns a fail-closed async-required error;
     /// use [`Self::solo_drive_once_async`] for Kernel-backed verification.
@@ -3380,10 +3406,19 @@ impl DaemonComposition {
         Ok(outcome)
     }
 
-    /// Drives one solo delegate through the nonblocking authenticated Kernel
-    /// provider-binding check (issue #1108). Until native-worker claim records
-    /// retain an independently owner-verified executable-binding digest, this
-    /// entry fails closed before admitted capability construction or dispatch.
+    /// Drives one solo delegate through the bounded prepare/IO/adopt sequence
+    /// (issue #2567). The native-worker claim owner retains the independently
+    /// verified executable-binding digest, so the async drive consumes the
+    /// owner probe result: prepare under a short borrow, verify through the
+    /// authenticated Kernel route with the borrow released, then adopt with
+    /// fresh revision checks before any fabric effect. On success the
+    /// solo-slice live pointer is retained so later status/cancel/result
+    /// calls address the same durable attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns the readiness, prepare, owner-probe, or adopt rejection
+    /// unchanged; a failed probe or a moved revision drives nothing.
     pub async fn solo_drive_once_async(
         &self,
         kernel: &Arc<DaemonKernelClient>,
@@ -3392,7 +3427,10 @@ impl DaemonComposition {
         if self.readiness() != CompositionReadiness::Ready {
             return Err(DaemonError::Composition(CompositionError::NotReady));
         }
-        solo_agent_driver::drive_solo_delegate_async(kernel, intake, unix_ms()).await
+        let outcome =
+            solo_agent_driver::drive_solo_delegate_async(self, kernel, intake, unix_ms()).await?;
+        self.store_solo_slice_live(agent_fabric_solo_adapters::retain_solo_slice_live(&outcome))?;
+        Ok(outcome)
     }
 
     /// Drives at most one queued solo intake; the runtime poll hook
@@ -3646,8 +3684,7 @@ impl DaemonComposition {
     /// `session_binding` values are replaced with the session-observed
     /// ones. Presented halves and the Governor expectation travel through
     /// untouched for the coherence gates downstream to judge.
-    #[cfg(test)]
-    fn resolve_verified_material(
+    pub(crate) fn resolve_verified_material(
         &self,
         kernel: &Arc<DaemonKernelClient>,
         mut material: VerifiedProviderMaterial,

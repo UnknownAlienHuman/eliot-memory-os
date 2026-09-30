@@ -9505,11 +9505,13 @@ pub(crate) const fn is_replay_terminal_phase(phase: WorkerReplayPhase) -> bool {
 // stays the single durable binding, and this projection only names the row a
 // reverse scan must agree with byte-for-byte.
 //
-// Residual: there is deliberately no `executable_binding_digest` column here
-// (no write migration in this slice). The executable digest is presented per
-// call by daemon composition and compared for equality against the durable
-// claim binding material, exactly like the T9-02 presented-expectation
-// pattern — never trusted by value.
+// The lookup carries identity only: there is deliberately no
+// `executable_binding_digest` column on this projection. The durable claim
+// row retains the owner-verified digest (issue #2567, populated at stage
+// from the Kernel-gated v2 join), the executable digest is presented per
+// call, and [`NativeWorkerClaimRecord::verified_executable_binding_digest`]
+// compares the presentation against the retained row — never trusted by
+// value — exactly like the T9-02 presented-expectation pattern.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderCapabilityLookup {
