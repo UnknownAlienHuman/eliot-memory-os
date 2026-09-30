@@ -1179,6 +1179,19 @@ struct RetainedDestinationParent {
     contour: Vec<std::fs::File>,
 }
 
+impl RetainedDestinationParent {
+    #[cfg(windows)]
+    fn leaf_handle(&self) -> Result<&std::fs::File, PackageStagingError> {
+        self.contour.last().ok_or(PackageStagingError::Io)
+    }
+
+    #[cfg(not(windows))]
+    fn leaf_handle(&self) -> Result<&std::fs::File, PackageStagingError> {
+        let _ = self;
+        Err(PackageStagingError::UnsupportedPlatform)
+    }
+}
+
 fn agent_bridge_path_is_at_or_below(root: &Path, candidate: &Path) -> bool {
     let mut root_components = root.components();
     let mut candidate_components = candidate.components();
@@ -2152,6 +2165,20 @@ fn write_or_validate_prepared_marker(
     ownership_key: &[u8],
     profile: super::InstallerRootProfile,
 ) -> Result<(), PackageStagingError> {
+    // Retain every path component through the marker root before probing or
+    // creating by path. This keeps the existing-marker replay path bound too:
+    // no ancestor can be replaced while the probe/read or relative create is
+    // in flight. The acquired leaf must be the same object admitted by the
+    // stager, not merely a path that currently resolves to an acceptable ACL.
+    let marker_parent = retain_destination_parent_for_profile(
+        &authorization.staging_root,
+        &authorization.staging_root,
+        profile,
+    )?;
+    if Some(marker_parent.identity) != authorization.installation_root_identity {
+        return Err(PackageStagingError::IdentityMismatch);
+    }
+    let marker_parent_handle = marker_parent.leaf_handle()?;
     let marker_path = authorization.marker_path();
     if path_exists(&marker_path).map_err(|error| error.with_site(STAGING_SITE_MARKER_PROBE))? {
         let marker = read_prepared_marker(&marker_path, ownership_key, profile)?;
@@ -2174,8 +2201,13 @@ fn write_or_validate_prepared_marker(
         mac,
     };
     let bytes = serde_json::to_vec(&marker).map_err(|_| PackageStagingError::Io)?;
-    let (mut file, _) = match create_destination_file_for_profile(&marker_path, profile)
-        .map_err(|error| error.with_site(STAGING_SITE_MARKER_CREATE))
+    let (mut file, _) = match create_destination_file_at(
+        marker_parent_handle,
+        &marker_path,
+        profile,
+        STAGING_SITE_MARKER_CREATE,
+    )
+    .map_err(|error| error.with_site(STAGING_SITE_MARKER_CREATE))
     {
         Ok(file) => file,
         Err(PackageStagingError::GenerationExists) => {
@@ -3297,8 +3329,13 @@ fn copy_destination_bytes(
     // live. A missing owner is a fail-closed identity error, never a reason
     // to fall back to an absolute create.
     let (mut destination_file, destination_identity) = match parent {
-        Some(handle) => create_destination_file_at(handle, destination, profile)
-            .map_err(|error| error.with_site(STAGING_SITE_DESTINATION_FILE_CREATE))?,
+        Some(handle) => create_destination_file_at(
+            handle,
+            destination,
+            profile,
+            STAGING_SITE_DESTINATION_FILE_CREATE,
+        )
+        .map_err(|error| error.with_site(STAGING_SITE_DESTINATION_FILE_CREATE))?,
         None => return Err(PackageStagingError::IdentityMismatch),
     };
     let copy_hash =
@@ -5004,6 +5041,7 @@ fn nt_create_file_relative(
     name: &str,
     expected: &Path,
     profile: super::InstallerRootProfile,
+    site: &'static str,
 ) -> Result<(std::fs::File, FileIdentity), PackageStagingError> {
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
     use windows_sys::Win32::Storage::FileSystem::{
@@ -5077,7 +5115,7 @@ fn nt_create_file_relative(
         // create failure to a bare I/O error.
         return Err(PackageStagingError::Win32At {
             stage: PackageStagingStage::CreateFileW,
-            site: STAGING_SITE_DESTINATION_FILE_CREATE.to_owned(),
+            site: site.to_owned(),
             code: u32::from_ne_bytes(status.to_ne_bytes()),
         });
     }
@@ -5119,13 +5157,14 @@ fn create_destination_file_at(
     parent: &std::fs::File,
     path: &Path,
     profile: super::InstallerRootProfile,
+    site: &'static str,
 ) -> Result<(std::fs::File, FileIdentity), PackageStagingError> {
     pin_retained_parent(parent, path)?;
     let name = path
         .file_name()
         .and_then(|value| value.to_str())
         .ok_or(PackageStagingError::InvalidRelativePath)?;
-    nt_create_file_relative(parent, name, path, profile)
+    nt_create_file_relative(parent, name, path, profile, site)
 }
 
 #[cfg(not(windows))]
@@ -5133,6 +5172,7 @@ fn create_destination_file_at(
     _parent: &std::fs::File,
     _path: &Path,
     _profile: super::InstallerRootProfile,
+    _site: &'static str,
 ) -> Result<(std::fs::File, FileIdentity), PackageStagingError> {
     Err(PackageStagingError::UnsupportedPlatform)
 }
