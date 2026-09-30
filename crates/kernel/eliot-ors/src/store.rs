@@ -3617,6 +3617,12 @@ fn current_unix_ms_u64() -> Result<u64, OrsError> {
 /// Composition-injected canonical/readback authenticator. `Ok(())` is trusted only because
 /// composition owns this provider; caller-created receipts never bypass it.
 pub trait CanonicalEvidenceProvider: Send + Sync {
+    /// Verifies Store owner observations against the complete original
+    /// reservation request before sequence allocation.
+    fn verify_reservation(&self, request: &crate::ReservationRequest) -> Result<(), OrsError> {
+        self.verify_ordering_heads(&request.scopes)
+    }
+
     fn verify_ordering_heads(
         &self,
         scopes: &[crate::ScopeReservationRequest],
@@ -34706,7 +34712,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         if let Some(token) = Self::existing_token(&write, &request)? {
             return Ok(token);
         }
-        self.evidence.verify_ordering_heads(&request.scopes)?;
+        self.evidence.verify_reservation(&request)?;
         let reservation_order = Self::next_reservation_order(&write)?;
         let reserved_scopes = Self::reserve_scope_sequences(&write, &request)?;
 
