@@ -293,9 +293,9 @@ fn invocation_terminal_fact(
                 tool_name: observation.tool_name.as_str(),
             })
         }
-        NormalizedHostEventPayload::ToolInvocation(_) => Err(HostObservationReject::NonTerminalKind(
-            "tool_invocation".to_owned(),
-        )),
+        NormalizedHostEventPayload::ToolInvocation(_) => Err(
+            HostObservationReject::NonTerminalKind("tool_invocation".to_owned()),
+        ),
         _ => Err(HostObservationReject::InvocationScopeUnattributable),
     }
 }

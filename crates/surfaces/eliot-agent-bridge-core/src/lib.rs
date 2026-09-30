@@ -106,8 +106,8 @@ pub use mcp_correlation::{
 // into this list would make the two distinct types collide at the root and would
 // silently misname the transport one.
 pub use mcp_host_observation::{
-    HostEventJoinKeys, HostEventReplay, HostObservationReject, HostOwnerBinding, RecordedInvocation,
-    ReplayConflict, check_event_replay, normalize_terminal_observation,
+    HostEventJoinKeys, HostEventReplay, HostObservationReject, HostOwnerBinding,
+    RecordedInvocation, ReplayConflict, check_event_replay, normalize_terminal_observation,
 };
 
 /// Stable A-16 source contract identity.
