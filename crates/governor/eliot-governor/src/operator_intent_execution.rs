@@ -101,6 +101,48 @@ pub struct OperatorIntentExecutionLink {
 }
 
 impl OperatorIntentExecutionLink {
+    /// Binds one authorized plan revision to the retained durable execution
+    /// that answers it, refusing an inconsistent join instead of publishing it.
+    ///
+    /// Every part must arrive from its retained owner: the plan is the current
+    /// admitted plan re-read at execute time while `plan_revision` is the
+    /// exact revision the confirmation authorized, so a delayed confirmation
+    /// of a predecessor revision cannot execute its replacement; the request,
+    /// job and attempt identities come from the admitted submission; `record`
+    /// is the durable-job owner's own record, never a locally rebuilt
+    /// facsimile; `receipt_id` is the owner receipt the observed operation
+    /// issued, when it issued one; and `epistemic` and `effects` come from the
+    /// answer assessor. This constructor mints nothing, defaults nothing and
+    /// substitutes no placeholder: it assembles the parts and proves the join
+    /// through [`validate_against_plan`](Self::validate_against_plan), so a
+    /// superseded revision, a request bound to another public message, or a
+    /// job identity taken from a foreign record is returned as a typed refusal
+    /// and never as a published link.
+    pub fn join(
+        plan: &OperatorIntentPlan,
+        plan_revision: OperatorIntentPlanRevisionRef,
+        request_id: RequestId,
+        job_id: TaskId,
+        attempt_id: ArtifactId,
+        record: DurableJobRecord,
+        receipt_id: Option<ReceiptId>,
+        epistemic: OperatorIntentEpistemic,
+        effects: Vec<OperatorIntentEffectDisposition>,
+    ) -> Result<Self, OperatorIntentExecutionError> {
+        let link = Self {
+            plan_revision,
+            request_id,
+            job_id,
+            attempt_id,
+            record,
+            receipt_id,
+            epistemic,
+            effects,
+        };
+        link.validate_against_plan(plan)?;
+        Ok(link)
+    }
+
     /// Validates the join against the plan revision it claims to execute.
     ///
     /// The plan must be valid, its scope must already be resolved, and the
