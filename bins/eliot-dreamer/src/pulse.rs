@@ -437,7 +437,7 @@ pub(crate) enum StageOwnerOutput {
     Classification(Box<ClassificationResult>),
     CueActivation(CueActivationEvaluation),
     EpistemicPosition(CurrentEpistemicPosition),
-    Understanding(ActiveUnderstandingViewResult),
+    Understanding(Box<ActiveUnderstandingViewResult>),
     Grounding(Box<StructuredGroundedDreamDraft>),
     Rivals(RivalModelSet),
     Conflict(ConflictAnalysisCandidate),
@@ -527,58 +527,6 @@ pub(crate) enum PulseError {
     /// Orientation projector refused; maps through the existing denial table.
     #[error("pulse packet refused")]
     Packet(#[from] OrientationError),
-}
-
-impl PulseError {
-    /// Converts a pulse error back to the projector error.
-    ///
-    /// Every variant keeps a distinct refusal: boundary failures name their
-    /// static field, each stage refusal names its stage, cancellation and
-    /// deadline name their gate, and only the packet owner itself can report
-    /// an internal projector failure. Nothing collapses to a generic
-    /// `Internal`, so malformed, partial, timeout, cancellation, privacy
-    /// refusal, budget exhaustion, stale source, missing owner, and owner
-    /// rejection stay independently visible through dispatch.
-    pub(crate) fn into_orientation_error(self) -> OrientationError {
-        match self {
-            Self::Packet(error) => error,
-            Self::Boundary(field) => OrientationError::Binding(field),
-            Self::Classification => OrientationError::Invalid("pulse classification owner refused"),
-            Self::CueActivation => OrientationError::Invalid("pulse cue activation owner refused"),
-            Self::Epistemic => OrientationError::Invalid("pulse epistemic position owner refused"),
-            Self::EpistemicBinding(AdmittedBindingError::Mismatch { field }) => {
-                OrientationError::Binding(field)
-            }
-            Self::EpistemicBinding(AdmittedBindingError::Unsupported { field }) => {
-                OrientationError::Invalid(field)
-            }
-            Self::EpistemicBinding(AdmittedBindingError::CandidateContract) => {
-                OrientationError::Invalid("admitted candidate contract")
-            }
-            Self::EpistemicBinding(AdmittedBindingError::PositionContract) => {
-                OrientationError::Invalid("admitted position contract")
-            }
-            Self::EpistemicBinding(AdmittedBindingError::ResolverRequest) => {
-                OrientationError::Invalid("native resolver request contract")
-            }
-            Self::EpistemicBinding(AdmittedBindingError::Observation) => {
-                OrientationError::Invalid("original source observation contract")
-            }
-            Self::EpistemicBinding(AdmittedBindingError::Canonicalization) => {
-                OrientationError::Invalid("source binding canonicalization")
-            }
-            Self::Understanding => {
-                OrientationError::Invalid("pulse understanding view owner refused")
-            }
-            Self::Grounding => OrientationError::Invalid("pulse claim grounding owner refused"),
-            Self::Rivals => OrientationError::Invalid("pulse rival models owner refused"),
-            Self::Conflict => OrientationError::Invalid("pulse conflict analysis owner refused"),
-            Self::Probes => OrientationError::Invalid("pulse probe plan owner refused"),
-            Self::Candidates => OrientationError::Invalid("pulse context candidates owner refused"),
-            Self::Cancelled => OrientationError::Cancelled,
-            Self::DeadlineExceeded => OrientationError::RevalidationRequired,
-        }
-    }
 }
 
 pub(crate) fn fences_compatible(left: &StateFence, right: &StateFence) -> bool {
@@ -819,7 +767,7 @@ where
                 PulseStageId::Understanding,
                 input_commitment,
                 commitment,
-                StageOwnerOutput::Understanding(output),
+                StageOwnerOutput::Understanding(Box::new(output)),
                 canonical,
             ))
         },

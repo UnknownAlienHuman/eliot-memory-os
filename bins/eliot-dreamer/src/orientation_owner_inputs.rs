@@ -198,7 +198,7 @@ impl StageOutputSet {
                 }
                 self.epistemic_position = Some(output);
             }
-            StageOwnerOutput::Understanding(output) => self.understanding = Some(output),
+            StageOwnerOutput::Understanding(output) => self.understanding = Some(*output),
             StageOwnerOutput::Grounding(output) => {
                 if !retain_grounding_semantics(self, &output) {
                     return false;
