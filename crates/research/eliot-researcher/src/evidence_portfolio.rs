@@ -4959,6 +4959,22 @@ pub struct AuditedClaim {
     /// fall back to the weaker same-domain test that produced the original
     /// defect.
     pub opposition_relations: Vec<ClaimOppositionRelation>,
+    /// Exact excerpts this claim offers as its evidence, verified against the
+    /// admitted bytes by [`audit_claim_with_excerpts`].
+    ///
+    /// This is the field the prior state of this crate did not have, and its
+    /// absence is why cropped negation and snippet-as-quote were *unrepresentable*
+    /// rather than merely unchecked: nothing on this side of the boundary
+    /// carried the quoted text, so there was no value to compare with the
+    /// original. `EvidenceSpan` does not fill the gap — it holds an anchor and a
+    /// digest of bytes nobody holds.
+    ///
+    /// Empty is an honest state with a consequence, not a neutral one: a material
+    /// claim whose citations are admitted but which offers no exact excerpt has
+    /// satisfied `source_satisfies_requirement` and has *not* satisfied
+    /// `excerpt_supports_requirement`, and I21.8 says the two are separate
+    /// obligations precisely so that case cannot be laundered into support.
+    pub excerpts: Vec<crate::admitted_excerpt::AdmittedExcerpt>,
 }
 
 impl AuditedClaim {
@@ -5850,6 +5866,23 @@ pub struct ClaimVerdict {
     pub run_reference_manifest_digest: String,
     /// State Fence the audit job ran under.
     pub state_fence: StateFence,
+    /// The measured occurrence-and-context result for every exact excerpt this
+    /// claim offered, in claim order.
+    ///
+    /// This is the recorded *measurement*, not just the requirement's rendering:
+    /// each entry carries the excerpt's own digest, how many times its bytes
+    /// occur in the admitted revision, whether the quoted window was stitched
+    /// across a section boundary or cropped away a governing negation, the
+    /// context window each I21.8 axis was read over, and the typed failures found.
+    /// A release consumer asking "was this crop detected" reads this field
+    /// rather than a substring of the requirement's reason prose.
+    ///
+    /// A verdict reached through the four-argument [`audit_claim`] carries one
+    /// entry per offered excerpt with `NoRetainedRevision`, because that is
+    /// what happened there: the original was never in hand. It is not an empty
+    /// list, so "no excerpt was checked" and "an excerpt was checked and failed"
+    /// remain distinguishable.
+    pub excerpt_checks: Vec<crate::admitted_excerpt::OccurrenceCheck>,
 }
 
 /// Outcome of one named requirement obligation, kept distinct from support.
@@ -7141,6 +7174,50 @@ pub fn audit_claim(
     binding: &AuditReferenceBinding,
     now_ms: i64,
 ) -> ClaimVerdict {
+    // The retained originals are absent on this entry point, so every excerpt
+    // the claim offers is `NoRetainedRevision` — an honest, reported state, not
+    // a silent skip. The four-argument form is kept as the surface that does
+    // *not* have a governed source-admission/persistence owner in hand, and
+    // `audit_claim_with_excerpts` is the entry point that takes one.
+    audit_claim_with_retained(claim, portfolio, binding, now_ms, &BTreeMap::new())
+}
+
+/// Audits one claim and additionally verifies its exact excerpts against the
+/// retained original bytes of the admitted revisions.
+///
+/// This is the entry point that makes I21.8's `excerpt_supports_requirement`
+/// decidable for its occurrence half. `retained` maps a source handle to the
+/// [`crate::admitted_excerpt::RetainedSourceRevision`] the governed
+/// source-admission/persistence owner committed; it is supplied by the caller
+/// because that owner is not this crate, and a revision's own integrity and
+/// content digest are re-proved by the verifier on every use.
+///
+/// A handle absent from `retained` is a real finding, not a skip: the excerpt
+/// was never compared with the original, so it did not verify.
+#[allow(clippy::too_many_lines)]
+pub fn audit_claim_with_excerpts(
+    claim: &AuditedClaim,
+    portfolio: &EvidencePortfolio,
+    binding: &AuditReferenceBinding,
+    now_ms: i64,
+    retained: &BTreeMap<String, crate::admitted_excerpt::RetainedSourceRevision>,
+) -> ClaimVerdict {
+    audit_claim_with_retained(claim, portfolio, binding, now_ms, retained)
+}
+
+/// The one implementation both entry points share.
+///
+/// `retained` is threaded through to the requirement recorder rather than being
+/// consumed here, so the excerpt obligation and the dimension evaluations that
+/// read it are both derived from the same measured state in one place.
+#[allow(clippy::too_many_lines)]
+fn audit_claim_with_retained(
+    claim: &AuditedClaim,
+    portfolio: &EvidencePortfolio,
+    binding: &AuditReferenceBinding,
+    now_ms: i64,
+    retained: &BTreeMap<String, crate::admitted_excerpt::RetainedSourceRevision>,
+) -> ClaimVerdict {
     let manifest = binding.authorized();
     let mut residue: Vec<String> = Vec::new();
     let mut supporting: Vec<&SourceRecord> = Vec::new();
@@ -7380,6 +7457,43 @@ pub fn audit_claim(
     // release, and both still project onto `NOT_VERIFIABLE_IN_SCOPE`.
     let unfrozen_material_claim =
         claim.material && !claim_identity_verified && !outside_citation && !revoked_citation;
+    // The measured occurrence-and-context result for every exact excerpt the
+    // claim offers, computed **before** the terminal outcome so the outcome can
+    // read it. `admitted_handles` is this audit's own `evidence_map`, not a
+    // caller-supplied roster: a completeness rule that compared two copies of
+    // the same caller list would prove nothing, and the map here is the set of
+    // handles that survived the citation loop above.
+    let admitted_handles: BTreeSet<String> = evidence_map.iter().cloned().collect();
+    let excerpt_checks: Vec<crate::admitted_excerpt::OccurrenceCheck> = claim
+        .excerpts
+        .iter()
+        .map(|excerpt| {
+            crate::admitted_excerpt::verify_excerpt_occurrence(
+                excerpt,
+                &admitted_handles,
+                retained.get(&excerpt.source_handle),
+            )
+        })
+        .collect();
+    // The excerpt obligation is computed here rather than after the outcome so
+    // that the outcome chain can read it. This is the whole point of I21.8's
+    // separate-obligation rule: a material claim whose cited source genuinely
+    // contains the required evidence has satisfied `source_satisfies_requirement`
+    // and can still be refused here, because the exact words it quotes are
+    // absent from the admitted revision, were cropped out of a negated clause,
+    // were stitched across sections, or were never compared with the original at
+    // all.
+    let excerpt_obligation = crate::admitted_excerpt::excerpt_requirement_from_checks(&excerpt_checks);
+    // Any excerpt that did not verify is a support gap, and the fail-closed
+    // arm is what turns it into a terminal class. `Unknown` (every excerpt
+    // verified for occurrence and context, semantic sufficiency still
+    // unexamined) is deliberately NOT a gap here: it is already carried by
+    // `requirements`, and it blocks a `Supported` promotion through
+    // `requirements_complete` and `releasable_as_supported` rather than by
+    // flattening the terminal class. Making it a gap as well would turn the
+    // honest "occurrence verified, semantics unknown" state into a claim about
+    // the evidence that the audit did not measure.
+    let excerpt_gap = excerpt_obligation.outcome == RequirementOutcome::Unsatisfied;
     // The dimensions this audit examines. The name list is the *set* examined;
     // the per-dimension evaluations carrying the actual evaluator identity, the
     // evidence each dimension covered and its recorded outcome are built from
@@ -7413,6 +7527,19 @@ pub fn audit_claim(
         ClaimOutcome::Contradicted
     } else if !unverifiable.is_empty() {
         ClaimOutcome::NotVerifiableInScope
+    } else if excerpt_gap {
+        // The cited source satisfies the requirement, but the exact words the
+        // claim quotes do not verify against the admitted revision — they are
+        // absent, cropped of a governing negation, stitched across sections, or
+        // were never compared with the original because no retained revision was
+        // supplied. I21.8's `excerpt_supports_requirement` is the separate
+        // obligation that catches exactly this, and an admitted source containing
+        // relevant material with an insufficient or wrong excerpt must not yield
+        // a supported claim. This sits after the support-gap arms so a claim that
+        // is *also* missing a whole source still reports the missing source as
+        // the more specific finding; it sits before the `stale_hit` arm so a
+        // stale source is not reported when the quote is additionally wrong.
+        ClaimOutcome::PartiallySupported
     } else if lineage_gap || precision_gap || support_gap {
         if stale_hit && supporting.is_empty() {
             ClaimOutcome::StaleLimited
@@ -7484,8 +7611,9 @@ pub fn audit_claim(
         root_context_revision: binding.root_context_revision().to_owned(),
         run_reference_manifest_digest: binding.run_reference_manifest_digest().to_owned(),
         state_fence: binding.state_fence().clone(),
+        excerpt_checks,
     };
-    let requirements = record_claim_requirements(&verdict, claim, portfolio);
+    let requirements = record_claim_requirements(&verdict, claim, portfolio, &excerpt_obligation);
     let mut evaluations = record_dimension_evaluations(&verdict, &requirements);
     // `sort_by_key` on `dimension`, which is `AuditDimension`'s own derived
     // `Ord`. That is the very comparison the closure performed — derived
@@ -7509,10 +7637,18 @@ pub fn audit_claim(
 /// it needs was never examined — the fail-closed answer I21.8 requires,
 /// because the absence of an admitted evaluation route is *unknown*, not a pass
 /// and not a new truth oracle.
+///
+/// `excerpt_obligation` is the excerpt half, already decided by
+/// [`crate::admitted_excerpt::excerpt_requirement_from_checks`] from the
+/// measured occurrence-and-context results in `verdict.excerpt_checks`. It is
+/// threaded in rather than recomputed here so the obligation a consumer reads
+/// and the checks a consumer inspects cannot disagree: there is exactly one
+/// place the excerpt verdict is produced.
 fn record_claim_requirements(
     verdict: &ClaimVerdict,
     claim: &AuditedClaim,
     portfolio: &EvidencePortfolio,
+    excerpt_obligation: &ClaimRequirement,
 ) -> Vec<ClaimRequirement> {
     let supporting: Vec<String> = claim
         .citations
@@ -7550,65 +7686,7 @@ fn record_claim_requirements(
             reason: String::new(),
         }
     };
-    // `excerpt_supports_requirement`: the admitted revision must contain an exact
-    // excerpt, with sufficient surrounding context, and that excerpt must
-    // support the statement. It is a SEPARATE obligation and it is decided
-    // separately: a source being admissible says nothing about whether any
-    // excerpt of it entails the statement.
-    //
-    // The only evidence available for it is a cited record's own declared
-    // `evidence_spans`. A claim whose cited records declare no span has no
-    // excerpt to verify, so the obligation is `Unsatisfied` with that reason
-    // rather than satisfied by the mere presence of a source. This is measured,
-    // not assumed: the live `eliot-mod-research` path records
-    // `evidence_spans: Vec::new()`, so on that path the obligation is honestly
-    // unsatisfied and a claim there can never be released as supported.
-    let spanned: Vec<String> = claim
-        .citations
-        .iter()
-        .filter(|handle| {
-            portfolio
-                .records
-                .get(*handle)
-                .is_some_and(|record| !record.evidence_spans.is_empty())
-        })
-        .cloned()
-        .collect();
-    let excerpt = if claim.citations.is_empty() {
-        ClaimRequirement {
-            name: CLAIM_REQUIREMENTS[1],
-            outcome: RequirementOutcome::Unsatisfied,
-            examined_over: Vec::new(),
-            reason: "claim records no citation to excerpt".to_owned(),
-        }
-    } else if spanned.is_empty() {
-        ClaimRequirement {
-            name: CLAIM_REQUIREMENTS[1],
-            outcome: RequirementOutcome::Unsatisfied,
-            examined_over: claim.citations.clone(),
-            reason: format!(
-                "no cited record declares an evidence span in its admitted revision, so no excerpt \
-                 occurrence, context, unit, population or version could be verified: {}",
-                claim.citations.join(",")
-            ),
-        }
-    } else {
-        // A span exists on at least one cited record. Occurrence against the
-        // admitted bytes and sufficient context still require the admitted
-        // evaluation route, which no production caller supplies; that absence is
-        // unknown and is recorded as such rather than resolved by this module.
-        ClaimRequirement {
-            name: CLAIM_REQUIREMENTS[1],
-            outcome: RequirementOutcome::Unknown,
-            examined_over: spanned,
-            reason: format!(
-                "excerpt spans are declared but no admitted evaluation route \
-                 ({ADMITTED_EVALUATION_ROUTE} {ADMITTED_EVALUATION_ROUTE_VERSION}) verified \
-                 occurrence in the admitted bytes or the surrounding context"
-            ),
-        }
-    };
-    vec![source, excerpt]
+    vec![source, excerpt_obligation.clone()]
 }
 
 /// Records one evaluation per examined dimension, each with the evaluator that
