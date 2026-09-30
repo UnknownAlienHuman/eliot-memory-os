@@ -290,22 +290,7 @@ impl OrientationPacketCandidate {
         {
             return Err(OrientationError::Invalid("packet identity"));
         }
-        if let Some(closure) = &self.owner_closure {
-            if closure.denominator != ORIENTATION_PRODUCT_DENOMINATOR {
-                return Err(OrientationError::Binding("product denominator"));
-            }
-            validate_runtime_owner_input(
-                &closure.runtime_owner_input,
-                &self.task_id,
-                &self.scope_id,
-                &self.provenance.state_fence,
-            )?;
-            validate_native_outputs(
-                &closure.stage_outputs,
-                &closure.model_outcome,
-                &closure.projections,
-            )?;
-        }
+        self.validate_owner_closure()?;
         if self
             .sections
             .iter()
@@ -386,6 +371,26 @@ impl OrientationPacketCandidate {
         );
         if self.output_digest != expected_output {
             return Err(OrientationError::Binding("output_digest"));
+        }
+        Ok(())
+    }
+
+    fn validate_owner_closure(&self) -> Result<(), OrientationError> {
+        if let Some(closure) = &self.owner_closure {
+            if closure.denominator != ORIENTATION_PRODUCT_DENOMINATOR {
+                return Err(OrientationError::Binding("product denominator"));
+            }
+            validate_runtime_owner_input(
+                &closure.runtime_owner_input,
+                &self.task_id,
+                &self.scope_id,
+                &self.provenance.state_fence,
+            )?;
+            validate_native_outputs(
+                &closure.stage_outputs,
+                &closure.model_outcome,
+                &closure.projections,
+            )?;
         }
         Ok(())
     }
