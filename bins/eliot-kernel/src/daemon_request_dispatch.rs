@@ -600,6 +600,7 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "agent_activation_reconcile" => "agent_activation_reconcile",
         "local_read_claim" => "local_read_claim",
         "local_read_result" => "local_read_result",
+        "improvement_decision_claim" => "improvement_decision_claim",
         "semantic_observe_claim" => "semantic_observe_claim",
         "semantic_observe_result" => "semantic_observe_result",
         "semantic_observe_deferred" => "semantic_observe_deferred",
@@ -3148,6 +3149,49 @@ impl KernelComposition {
                     Err(TransportError::SessionFenced)
                 }
             }
+            "improvement_decision_claim" => {
+                // Outbound-only eliotd poller for queued I12.24:65 owner
+                // decisions (issue #1867): mirrors `local_read_claim` — same
+                // session/auth/ready/fence gates via the dispatcher head and the
+                // `frame_dispatch` allowlist, same single-`operation`-key
+                // payload shape, same null poll (not error) when the queue holds
+                // nothing this Session may claim.
+                //
+                // The claim reads the Kernel's own bounded owner-decision queue
+                // and returns the exact admitted entry: the request identity
+                // that produced it, the principal the front-door Session
+                // authenticated, the brief, the closed disposition and the
+                // owner's note. `claim_owner_decision` skips and leaves queued
+                // any entry whose State Fence or authority epoch this Session
+                // may not serve, so a stale decision is never handed over.
+                //
+                // A returned decision is a record, not an effect. Reading it
+                // starts nothing: the entry names a brief and a disposition
+                // only, and this arm executes, schedules and commits nothing.
+                #[cfg(windows)]
+                {
+                    if payload.as_object().is_none_or(|object| object.len() != 1) {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    self.claim_owner_decision(session).map(|decision| match decision {
+                        Some(decision) => serde_json::json!({
+                            "status": "known",
+                            "value": { "decision": decision },
+                            "recovery": null,
+                        }),
+                        None => serde_json::json!({
+                            "status": "known",
+                            "value": { "decision": null },
+                            "recovery": null,
+                        }),
+                    })
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
             "local_read_result" => {
                 // Daemon submit leg for the claimed pair (Implements #18):
                 // validates plus fence-checks the submitted
@@ -4855,10 +4899,11 @@ impl KernelComposition {
     /// principal, and no second canonical writer.
     ///
     /// The closed vocabulary is not the same set as `UserAutomationOperation`:
-    /// the I12.24:65 owner decision appears in the latter and is refused at this
-    /// boundary, because the automation Store has no automation identity to
-    /// commit it under and this route will not report a durable outcome for a
-    /// decision it cannot record.
+    /// the I12.24:65 owner decision appears in the latter and has no automation
+    /// identity to commit under here, so it is admitted into the Kernel's own
+    /// bounded owner-decision queue and answered from that queue instead of
+    /// from a Store transition. Every other operation on this route answers
+    /// from the Store commit below.
     ///
     /// The answer is one post-commit orchestration transition. The canonical
     /// Store commit, the wake publication/cancellation handoff over the
@@ -4873,7 +4918,7 @@ impl KernelComposition {
         request_id: RequestId,
         payload: &serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
-        let request = Self::build_user_automation_operator_request(session, &request_id, payload)?;
+        let request = self.build_user_automation_operator_request(session, &request_id, payload)?;
         match eliot_kernel_service::KernelStoreGateway::validate_user_automation_request(&request) {
             Ok(()) => {}
             Err(eliot_kernel_service::UserAutomationExecutionError::Contract(error)) => {
@@ -4892,6 +4937,24 @@ impl KernelComposition {
                     ),
                 );
             }
+        }
+        if matches!(
+            request.intent.operation,
+            eliot_kernel_core::UserAutomationOperation::DecideImprovementBrief { .. }
+        ) {
+            // The builder above already admitted this selection into the
+            // bounded owner-decision queue, and that admission is the whole
+            // terminal effect of the operation here. The automation Store is not
+            // entered: this operation names a brief, not an automation, and
+            // committing it against the automation rows would be a fabricated
+            // record. The disposition is retained and its readback is owed to
+            // the daemon through `improvement_decision_claim`, so the reply is
+            // bound through the same closed envelope every other answer on this
+            // route uses.
+            return Self::bind_user_automation_operator_response(
+                &request,
+                &Self::user_automation_owner_decision_queued_response(),
+            );
         }
         let transition = match self
             .dispatch_user_automation_operator_transition(session, &request)
@@ -4947,8 +5010,40 @@ impl KernelComposition {
         serde_json::to_value(envelope).map_err(|_| TransportError::SessionFenced)
     }
 
+    /// Projects the outcome of one admitted non-mutating owner decision.
+    ///
+    /// The value is the internal three-key response shape, exactly as the
+    /// sibling projections above produce it, and
+    /// `bind_user_automation_operator_response` converts it through
+    /// `UserAutomationOperatorResultEnvelope::bind_internal_response` and the
+    /// envelope's own `validate_for_request`. No response shape is hand-built
+    /// past that gate.
+    ///
+    /// `outcome_settled` is the honest closed value here, and `rejected` /
+    /// `not_retained` would be false: the selection was accepted and the entry
+    /// is retained, so `accepted` stays true. What remains is the readback of
+    /// the retained entry, which is reported as the structured
+    /// `ledger_read_owed` obligation it is rather than as prose. No canonical
+    /// Store commit is claimed here, and none was made.
+    #[cfg(windows)]
+    fn user_automation_owner_decision_queued_response() -> serde_json::Value {
+        let reason = "the authenticated owner's non-mutating disposition is retained in the \
+                      bounded owner-decision queue and is not committed to the automation Store; \
+                      the daemon reads it back through improvement_decision_claim";
+        serde_json::json!({
+            "status": "known",
+            "value": {
+                "accepted": true,
+                "outcome": "outcome_settled",
+                "reason": reason,
+            },
+            "recovery": { "kind": "ledger_read_owed", "reason": reason },
+        })
+    }
+
     #[cfg(windows)]
     fn build_user_automation_operator_request(
+        &self,
         session: &Session,
         request_id: &RequestId,
         payload: &serde_json::Value,
@@ -4969,37 +5064,6 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         validate_user_automation_trigger_text(&route.payload.idempotency_key, "idempotency_key")?;
-        // I12.24:65's "decision owner selects reject / investigate / work item /
-        // experiment" is a closed operation on this boundary, and this route is
-        // not the seam that can record one. The operation carries `brief_id`
-        // and no `automation_id`, while every row, ordering scope and mutation
-        // projection the canonical Store below owns is keyed by an automation
-        // identity. Admitting it here would force one of two fabrications:
-        // hang the decision on an invented automation so it could reach a
-        // writer that cannot interpret it, or let it fall through to a Store
-        // refusal after this route had already reported a reconcilable outcome
-        // that no Store call ever backed. The second is the worse one, because
-        // the recoverable answer this route hands back asserts "prior_attempt_
-        // may_have_committed" about a Store that was never entered.
-        //
-        // Refusing here changes nothing about the brief, the candidate or
-        // their authority: I12.24:82 makes the advisory class "default;
-        // changes nothing until owner acts" and I12.24:3 states that ELIOT
-        // "never silently rewrites code, policy or memory authority". What is
-        // refused is only this route's claim to own a decision it cannot
-        // durably record. The improvement owner is the single writer of that
-        // record, and it must take the deciding principal from an
-        // authenticated Session of its own — A12.02:3's "Identity is not a
-        // model's self-declared string" is why the decision cannot be
-        // forwarded over a payload and re-attributed there, and why an ingress
-        // that could not bind the session principal has no honest way to
-        // complete the selection at all.
-        if matches!(
-            route.payload.operation,
-            eliot_kernel_core::UserAutomationOperation::DecideImprovementBrief { .. }
-        ) {
-            return Err(TransportError::SessionFenced);
-        }
         let principal = authenticated_user_automation_principal(session)?;
         let operation_id = eliot_contracts::OperationId::new(format!(
             "user-automation-operation:{}",
@@ -5012,6 +5076,45 @@ impl KernelComposition {
             state_fence: session.module_generation.state_fence.clone(),
             operation: route.payload.operation,
         };
+        // I12.24:65's "decision owner selects reject / investigate / work item /
+        // experiment" reaches this route as one closed `UserAutomationOperation`.
+        // This operation carries `brief_id` and no `automation_id`, so it has
+        // nothing the automation Store below could key a canonical row on: the
+        // decision is retained instead by this Kernel's own bounded
+        // owner-decision queue, and the daemon that owns the durable record
+        // reads it back over `improvement_decision_claim`.
+        //
+        // The principal is the one this front-door Session authenticated, not a
+        // payload string: A12.02:3's "Identity is not a model's self-declared
+        // string" is why the selection cannot be forwarded over a wire value and
+        // re-attributed there. `admit_owner_decision` re-proves that binding
+        // against the peer on this same Session, admits only `reject` and
+        // `investigate` — the two `OwnerDecisionKind::is_non_mutating`
+        // dispositions — and charges the entry against its own capacity ledger.
+        // `work_item` and `experiment` are refused there rather than queued,
+        // because they reach effect only through the work-item/canary/rollback
+        // flow of I12.24:90-91 and admitting them here would make this queue an
+        // effect path it is not. The caller answers an admitted decision from
+        // the queue and returns before the automation Store is entered, so this
+        // queue is never on the way to a commit.
+        if matches!(
+            intent.operation,
+            eliot_kernel_core::UserAutomationOperation::DecideImprovementBrief { .. }
+        ) {
+            // The closed operation contract is proved before the entry is
+            // retained, so a decision that contract refuses — a blank brief
+            // identity, a blank note (I12.24:74 makes "what remains unknown"
+            // part of what the owner decides on), or a disposition outside the
+            // closed set — is never queued as though it had been selected. This
+            // is the same pure check the route runs again over the returned
+            // request; running it here is what makes the queue admission
+            // strictly no earlier than that refusal point, so the queue can
+            // never retain an operation the route then reports as refused.
+            intent
+                .validate()
+                .map_err(|_| TransportError::SessionFenced)?;
+            self.admit_owner_decision(session, &identity, &principal, &intent.operation)?;
+        }
         Ok(eliot_kernel_service::UserAutomationServiceRequest {
             context: identity.request.metadata.clone(),
             authenticated_principal: principal,
