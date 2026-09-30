@@ -1414,7 +1414,10 @@ async fn pre_send_refusal_is_distinct_from_post_send_possible_effect() {
         .await
         .expect_err("fence-diverged context is refused before send");
     assert!(
-        matches!(refused, StoreBackupClientError::Store(StoreError::FenceMismatch)),
+        matches!(
+            refused,
+            StoreBackupClientError::Store(StoreError::FenceMismatch)
+        ),
         "fence-diverged context is refused as a fence mismatch, got {refused:?}"
     );
     assert_eq!(
@@ -1437,7 +1440,10 @@ async fn pre_send_refusal_is_distinct_from_post_send_possible_effect() {
         .await
         .expect_err("unknown delivery is possible effect, never success");
     assert!(
-        matches!(unknown, StoreBackupClientError::Store(StoreError::MissingReceiptEnvelope)),
+        matches!(
+            unknown,
+            StoreBackupClientError::Store(StoreError::MissingReceiptEnvelope)
+        ),
         "unknown delivery is a missing receipt envelope, got {unknown:?}"
     );
     assert_eq!(
@@ -1459,7 +1465,10 @@ async fn pre_send_refusal_is_distinct_from_post_send_possible_effect() {
         .await
         .expect_err("disconnect after send is unknown, never success");
     assert!(
-        matches!(dropped, StoreBackupClientError::Store(StoreError::MissingReceiptEnvelope)),
+        matches!(
+            dropped,
+            StoreBackupClientError::Store(StoreError::MissingReceiptEnvelope)
+        ),
         "disconnect after send is a missing receipt envelope, got {dropped:?}"
     );
     assert_eq!(
@@ -1488,7 +1497,10 @@ async fn unknown_effect_triggers_no_new_operation_or_retry() {
         .await
         .expect_err("unknown stays unknown");
     assert!(
-        matches!(outcome, StoreBackupClientError::Store(StoreError::MissingReceiptEnvelope)),
+        matches!(
+            outcome,
+            StoreBackupClientError::Store(StoreError::MissingReceiptEnvelope)
+        ),
         "the projected outcome is a missing receipt envelope, got {outcome:?}"
     );
     let mutating = sent_backup_requests(&log)
