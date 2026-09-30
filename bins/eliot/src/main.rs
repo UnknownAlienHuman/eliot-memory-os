@@ -18,9 +18,9 @@ use eliot_installation::{
     InstallationProfile, InstallationStage, InstallationStepOutcome, InstallationTransaction,
     InstallationTransactionStore, PlatformHandle, PostBootstrapRejectionClass, ProfileRootAnchors,
     ProfileSelectionInput, RedbInstallationRegistry, RedbInstallationTransactionStore,
-    WindowsInstallationCoordinator, parse_installation_transaction_id,
-    post_bootstrap_rejection_pending_ref, require_published_source_bundle_journal,
-    validate_installation_transaction_json,
+    WindowsInstallationCoordinator, compose_profile_launch,
+    parse_installation_transaction_id, post_bootstrap_rejection_pending_ref,
+    require_published_source_bundle_journal, validate_installation_transaction_json,
 };
 use eliot_kernel_core::KernelRuntimeHealthEvidence;
 use eliot_live_canary::{
@@ -4256,6 +4256,12 @@ fn run_installation_resolve_profile(request: ResolveProfileRequest) -> Result<i3
             return Ok(INVALID_REQUEST_EXIT);
         }
     };
+    // Implementation item 4: report the launch adapter this profile actually
+    // composes. Composing it is read-only — it resolves the adapter and, for
+    // `UserMode`, retains the current-user roots through the existing adapter
+    // without touching Task Scheduler — so this command still creates nothing,
+    // reserves no service, and mutates nothing.
+    let launch_composition = compose_profile_launch(&resolution);
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
@@ -4264,6 +4270,18 @@ fn run_installation_resolve_profile(request: ResolveProfileRequest) -> Result<i3
             "status": "PROFILE_RESOLVED",
             "profile": resolution.governance.profile,
             "supervision": resolution.governance.supervision,
+            "launch_adapter": eliot_installation::launch_adapter_name(
+                resolution.governance.profile
+            ),
+            "launch_composition": match &launch_composition {
+                Ok(composition) => {
+                    serde_json::to_value(composition).unwrap_or_else(|_| json!(null))
+                }
+                Err(error) => json!({
+                    "state": "REFUSED",
+                    "reason": error.to_string(),
+                }),
+            },
             "root_roles": resolution.governance.roots,
             "enforced_guarantees": resolution.governance.enforced_guarantees,
             "unsupported_guarantees": resolution.governance.unsupported_guarantees,

@@ -131,6 +131,7 @@ mod package;
 mod package_planner;
 mod plan;
 mod profile_governed_roots;
+mod profile_launch_composition;
 mod profile_roots;
 mod profile_supervision;
 mod redb_state;
@@ -256,6 +257,8 @@ use plan::{
     validate_user_mode_authority_effect_bindings,
 };
 pub use profile_governed_roots::{ProfileGovernedRoots, ProfileRootAnchors, select_profile_roots};
+pub use profile_launch_composition::{ProfileLaunchComposition, compose_profile_launch};
+pub use profile_supervision::launch_adapter_name;
 pub use profile_roots::{INSTALLATION_ROOT_BINDING_VERSION, InstallationRoots};
 pub use profile_supervision::{
     NoServiceProfileAuthorityProof, ProfileGovernanceReport, ProfileRootRoles, ProfileSupervision,
@@ -1603,6 +1606,46 @@ impl RuntimeLaunchDescriptor {
                 vec!["--config".to_owned(), config_path.as_str().to_owned()]
             }
         }
+    }
+
+    /// Returns the exact nonce-free Host bootstrap argv for this descriptor.
+    ///
+    /// `SystemService` Host is launched by SCM with a registration nonce; the
+    /// `UserMode` current-user launcher task must carry no nonce at all,
+    /// because a nonce is the service-creation admission and a current-user
+    /// task never creates a service. This is the single derivation both
+    /// descriptor validation and the `UserMode` launcher composition consume,
+    /// so the two can never drift.
+    pub fn current_user_host_bootstrap_arguments(
+        &self,
+    ) -> Result<Vec<PlatformHandle>, InstallationError> {
+        let authority_generation =
+            PlatformHandle::new(self.authority_generation.value().to_string()).map_err(|error| {
+                InstallationError::InvalidField {
+                    field: "runtime_launch.authority_generation".to_owned(),
+                    reason: error.to_string(),
+                }
+            })?;
+        [
+            "--config-descriptor",
+            self.authority_descriptor_path.as_str(),
+            "--config-descriptor-sha256",
+            self.authority_descriptor_digest.as_str(),
+            "--installation-id",
+            self.installation_epoch.installation.as_str(),
+            "--tx-plan-generation",
+            authority_generation.as_str(),
+            "--host-state-root",
+            self.runtime_state_roots.host_state_root.as_str(),
+        ]
+        .into_iter()
+        .map(|value| {
+            PlatformHandle::new(value.to_owned()).map_err(|error| InstallationError::InvalidField {
+                field: "runtime_launch.current_user_host_bootstrap_arguments".to_owned(),
+                reason: error.to_string(),
+            })
+        })
+        .collect()
     }
 
     fn validate_canonical_store_arguments(&self) -> Result<(), InstallationError> {
