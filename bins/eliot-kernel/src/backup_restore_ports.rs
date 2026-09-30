@@ -1196,7 +1196,20 @@ impl RestoreJournalAdmissionOwner for OrsRestoreJournalOwner {
             database_ref: RESTORE_JOURNAL_OWNER_LABEL.to_owned(),
             installation_ref: self.binding.installation_ref().to_owned(),
             generation: self.kernel_fence.resource_generation,
-            journal_identity_ref: journal_key.to_owned(),
+            // The journal IDENTITY this owner writes under is the ORS restore
+            // journal namespace itself, which is what the coordinator's
+            // `check_ors_journal_binding` compares the admission against: the
+            // constant is what proves the presented admission and the journal
+            // actually executing are the same owner channel. The per-plan
+            // `journal_key` is the STREAM this record was loaded from — it is
+            // the lookup key used above, and it is proved exactly, not by this
+            // field but by `matches_stream`, which compares the persisted
+            // binding's source archive, class, destination, writer identity and
+            // writer fence digest against this owner's own binding. Reporting
+            // the stream key here instead named a different identity for every
+            // admission this owner issued, so `check_ors_journal_binding`
+            // refused all of them before a single effect: fail-closed and dead.
+            journal_identity_ref: RESTORE_JOURNAL_IDENTITY.to_owned(),
             admission_receipt_ref: bound.transaction_id,
         })
     }
