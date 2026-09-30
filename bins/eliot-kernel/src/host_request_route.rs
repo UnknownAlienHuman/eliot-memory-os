@@ -7439,10 +7439,44 @@ fn host_request_failure_response(
         .validate()
         .map_err(|_| TransportError::SessionFenced)?;
     let failure = serde_json::to_value(failure).map_err(|_| TransportError::SessionFenced)?;
-    Ok(Some(serde_json::json!({
+    let mut response = serde_json::json!({
         "status": "failure",
         "failure": failure,
-    })))
+    });
+    if matches!(error, TransportError::Backpressure) {
+        // Migration seam (issue #1679): the versioned BUSY directive rides
+        // alongside the legacy failure, never duplicating it. The legacy
+        // `RecoveryDirective` above is untouched until W6 retires the shape;
+        // the versioned observation is whole-or-null — `null` while the shed
+        // carries no owner-measured dimension to report.
+        response["recovery"] = serde_json::json!({
+            "backpressure_directive": host_request_busy_backpressure_directive()
+                .unwrap_or(serde_json::Value::Null),
+        });
+    }
+    Ok(Some(response))
+}
+
+/// Builds the versioned I14 BUSY directive for one shed host request, or
+/// `None` when the shedding owner produced no complete one (issue #1679).
+///
+/// Whole-or-null seam mirroring `store_read_unavailable_directive` in
+/// `daemon_request_dispatch.rs`: the BUSY arm attaches the returned value
+/// alongside the legacy failure and reports its absence as `null` instead of
+/// shipping a partial directive.
+///
+/// A `BUSY` response validates only with a claimed, observed exhausted
+/// bottleneck dimension plus the owner-produced compiled profile revision.
+/// The plain `TransportError::Backpressure` shed carries no owner-measured
+/// dimension — its shed sites span heterogeneous owners (local-read queue
+/// fullness, reservation-counter overflow, ORS projection limits) — and this
+/// edge owns no capacity-profile revision or state fence. Naming one
+/// denominator dimension or a revision here would fabricate capacity evidence
+/// the shed path never observed, so the arm reports the absence honestly. A
+/// later slice threads the shedding owner's measurement; until then this
+/// returns `None`.
+fn host_request_busy_backpressure_directive() -> Option<serde_json::Value> {
+    None
 }
 
 /// Stored phase persisted by the bridge-event stage entry. The route answers
