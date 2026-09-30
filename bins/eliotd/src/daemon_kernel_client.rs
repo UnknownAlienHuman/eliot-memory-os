@@ -1237,7 +1237,7 @@ fn required_observe_pair_field(
 }
 
 fn decode_observe_retained_sources(
-    executable_input: &eliot_ors::RetainedExecutableInput,
+    executable_input: &eliot_ors::HostRequestExecutableInput,
 ) -> Result<ObserveRetainedSources, String> {
     let binding = &executable_input.application_binding;
     let source_request_identity: RequestIdentity =
@@ -1285,7 +1285,7 @@ fn decode_observe_retained_sources(
 
 fn validate_observe_claim_lineage(
     parts: &ObserveClaimParts,
-    executable_input: &eliot_ors::RetainedExecutableInput,
+    executable_input: &eliot_ors::HostRequestExecutableInput,
     sources: &ObserveRetainedSources,
 ) -> Result<(), String> {
     let envelope = &parts.envelope;
@@ -1336,22 +1336,30 @@ fn validate_observe_claim_lineage(
             "Kernel semantic_observe_claim ORS row is not the exact admitted pair".to_owned(),
         );
     }
-    validate_observe_activation_lineage(envelope, binding, sources).and_then(|()| {
+    validate_observe_activation_lineage(envelope, executable_input, sources).and_then(|()| {
         validate_observe_source_identity(envelope, binding, &sources.source_request_identity)
     })
 }
 
 fn validate_observe_activation_lineage(
     envelope: &HostRequestEnvelope,
-    binding: &eliot_ors::HostRequestApplicationBinding,
+    executable_input: &eliot_ors::HostRequestExecutableInput,
     sources: &ObserveRetainedSources,
 ) -> Result<(), String> {
+    let binding = &executable_input.application_binding;
     let peer = &sources.peer_admission_receipt;
     let ticket = &sources.source_activation_ticket;
     let result = &sources.source_activation_result;
+    let retained_peer_receipt = serde_json::to_value(peer)
+        .map_err(|error| format!("retained Host peer receipt cannot encode: {error}"))?;
+    let computed_peer_receipt_sha256 = peer
+        .compute_digest()
+        .map_err(|error| format!("retained Host peer receipt digest cannot compute: {error}"))?;
     if envelope.connection_id != peer.connection_id
         || envelope.peer_admission_receipt_sha256 != peer.receipt_sha256
-        || binding.peer_admission_receipt_sha256 != peer.receipt_sha256
+        || executable_input.peer_admission_receipt_sha256 != peer.receipt_sha256
+        || computed_peer_receipt_sha256 != peer.receipt_sha256
+        || binding.host_peer_admission_receipt != retained_peer_receipt
         || ticket.peer_admission_receipt.as_ref() != Some(peer)
         || ticket.peer_admission_receipt_sha256 != peer.receipt_sha256
         || ticket.connection_id != envelope.connection_id
@@ -1404,7 +1412,7 @@ fn validate_observe_source_identity(
 
 fn validate_observe_tool_commitment(
     tool: &serde_json::Value,
-    executable_input: &eliot_ors::RetainedExecutableInput,
+    executable_input: &eliot_ors::HostRequestExecutableInput,
 ) -> Result<(), String> {
     let tool_bytes = canonical_json_bytes(tool)
         .map_err(|error| format!("original observe tool cannot canonicalize: {error}"))?;

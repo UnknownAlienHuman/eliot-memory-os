@@ -5225,6 +5225,12 @@ async fn run_observe_poll(
             Ok(
                 eliotd::ObserveSubmitOutcome::Expired | eliotd::ObserveSubmitOutcome::StaleAttempt,
             ) => ObservePollOutcome::ReconciliationRequired,
+            // A staged result is durable but has no committed receipt yet.
+            // The capture effect already occurred, so preserve the operation
+            // for receipt reconciliation instead of reporting completion.
+            Ok(eliotd::ObserveSubmitOutcome::Staged(_)) => {
+                ObservePollOutcome::ReconciliationRequired
+            }
             Err(error) => {
                 kernel
                     .defer_observe_claim_async(&operation_id, &request_digest, attempt)
