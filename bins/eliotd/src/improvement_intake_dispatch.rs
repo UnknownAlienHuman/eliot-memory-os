@@ -878,6 +878,145 @@ pub struct ImprovementArtifact {
     pub observed_closure: ObservedClosure,
 }
 
+/// Builds the brief's eight decision fields from ONE observed closure record.
+///
+/// The whole brief-field assembly lives here, intact, because the property those
+/// fields carry is only auditable in one place: every one of I12.24:74's eight
+/// is either an OBSERVED value read out of the owner-committed closure record, a
+/// DERIVED value the owning crate's own predicate produced, or an explicitly
+/// stated MEASURED ABSENCE — never a plausible-sounding literal about a
+/// quantity nothing measured. Scattering these fields over two functions is what
+/// made that claim unreadable, so they are not scattered here.
+///
+/// `boundary` is the gate the brief is built AT, and the two values it carries
+/// are its OWN observed strings, so the boundary this brief describes and the
+/// boundary it is gated on are literally the same value. The application class
+/// the brief states is derived from `candidate`'s own recorded target surface
+/// through the owning crate's own classifier, not spelled:
+/// `enforce_improvement_class_gate` re-derives the same class at the admission
+/// seam where the live registry is in hand, and this copy is the value the brief
+/// quotes so the owner reads the class the gate will check.
+///
+/// Why the brief names the OBSERVED principal, and which brief fields the
+/// closure record cannot supply, is stated in the module documentation above
+/// under "One principal, two roles".
+fn brief_fields_from_observed_closure(
+    candidate: &ImprovementCandidate,
+    observed: &ObservedClosure,
+    boundary: &SafeBoundary,
+    decision: &eliot_maintenance::AutomationTriggerDecision,
+    trigger: &str,
+    repeated_failure: Option<&RepeatedVerifierFailure>,
+) -> Result<ImprovementBrief, ImprovementDispatchError> {
+    // The brief's decision information is a PROJECTION OF THAT SAME OBSERVED
+    // RECORD, not the raw maintenance trigger text. I12.24:74 requires the
+    // named decision owner to read the problem, evidence, likely benefit, risk,
+    // cost, next reversible step and unknowns without searching raw metrics;
+    // repeating the trigger text satisfied the letter of that and none of its
+    // purpose, because it said nothing about what the closure actually
+    // recorded.
+    //
+    // `observed` was read at the TOP of the assembly from the caller's one
+    // exhaustive DURABLE read, and this assembly commits nothing, so it is the
+    // record whose `actor_id` and `consequential_boundary` the `boundary`
+    // argument names. It is read there and not here for two reasons that are now both
+    // load-bearing: the evidence lineage is bound to it (issue #1867 W2, see the
+    // top of this function), and the two-string `SafeBoundary` cannot carry the
+    // record itself — `eliot-improvement` has no `eliot-learning-delta` edge, so
+    // widening `SafeBoundary` to hold one would be a new dependency for a value
+    // the brief only needs to quote. The record TYPE is not named in this file
+    // either — `eliotd` has no `eliot-learning-delta` dependency — so it arrives as the
+    // Governor's own owned projection. An empty durable scope is the same typed
+    // `UnsafeBoundary` refusal the boundary constructor returns for the same
+    // condition, never a substituted value — and because the read was hoisted, it
+    // now surfaces EARLIER than it used to: before `admitted_fence_ref`'s
+    // refusal and before any candidate is assembled, where previously the fence
+    // refusal was reported first. Same typed error, same condition, different
+    // precedence; stated because the precedence is observable to the caller as
+    // which error string a pass reports.
+    // The durable lineage handle and canonical digest the record itself
+    // committed, so the owner can read exactly this closure without searching.
+    let (observed_artifact, observed_digest) = (
+        observed.lineage_artifact.clone(),
+        observed.lineage_digest.clone(),
+    );
+    // What the observed closure actually concluded about behaviour, read
+    // through the record's own predicates rather than re-spelled here.
+    let observed_effect = observed_behaviour_effect(observed);
+    // The two values below are the boundary's OWN observed strings, so the
+    // boundary this brief describes and the boundary it is gated on are
+    // literally the same value.
+    let principal = boundary.observed_principal_ref();
+    let boundary_ref = boundary.observed_boundary_ref();
+    let unknowns = observed_unknowns(observed, decision.family);
+    // The application class the brief states is DERIVED from the candidate's own
+    // recorded target surface through the crate's own classifier, not spelled.
+    // The previous wording asserted the word "advisory" as a literal while the
+    // only thing that makes it true is this derivation, so the brief now names
+    // what was derived. `enforce_improvement_class_gate` re-derives the same
+    // class at the admission seam, where the live registry is in hand; this copy
+    // is the value the brief quotes so the owner reads the class the gate will
+    // check rather than a constant.
+    let brief_class = classify(&ChangeDescriptor::from_recorded_surface(
+        candidate.target_surface,
+    ));
+    // A recorded repeat is a fact the brief states in its own right, not a
+    // clause the owner has to infer from the trigger text: it is the reason this
+    // candidate exists on this pass, and I12.24:74 requires the evidence to be
+    // readable without searching raw metrics. The prose lives on the record
+    // itself (see `RepeatedVerifierFailure::brief_evidence_clause`); `None`
+    // leaves every brief field exactly as it was, so a pass with no recorded
+    // repeat is unchanged.
+    let repeat_clause = repeated_failure
+        .map_or_else(String::new, RepeatedVerifierFailure::brief_evidence_clause);
+    let next_step_clause =
+        repeated_failure.map_or_else(String::new, RepeatedVerifierFailure::brief_next_step_clause);
+
+    // Why the brief names the OBSERVED principal, and which brief fields the
+    // closure record cannot supply, is stated in the module documentation
+    // above under "One principal, two roles".
+    let brief = brief_at_safe_boundary(
+        candidate,
+        &format!(
+            "{trigger}; the learning closure this brief is gated on committed durable delta \
+             {observed_artifact} (digest {observed_digest}) for attempt {} of campaign {} on \
+             route {}, at consequential boundary {boundary_ref} by principal {principal}, over {} \
+             observed evidence ref(s){repeat_clause}",
+            observed.attempt_id,
+            observed.campaign_id,
+            observed.route_id,
+            observed.evidence_ref_count,
+        ),
+        &format!(
+            "OBSERVED: the maintenance owner recorded family {} blocked at this scope, and the \
+             closure this brief is gated on {observed_effect}. NOT MEASURED: this candidate has \
+             run no experiment and carries no baseline/after metric, so there is NO measured \
+             benefit figure for it; the expectation that giving that family a start route removes \
+             a blocked evaluation per cadence is an UNMEASURED PROJECTION put to the owner's \
+             judgement, not a result",
+            decision.family
+        ),
+        &format!(
+            "OBSERVED: this pass executed nothing, so no authority, privacy, finish, durability \
+             or reserve effect was taken on any owner record, and the consequential boundary \
+             {boundary_ref} is unchanged. DERIVED, NOT ASSUMED: the candidate's own recorded \
+             target surface classifies as {brief_class:?}, which an advisory class makes a \
+             no-op until the owner acts (I12.24:82). NOT MEASURED: there is no risk metric, no \
+             counter-metric and no exposure window on this path, so no risk magnitude is claimed"
+        ),
+        principal,
+        &observed_cost_account(observed),
+        &format!(
+            "triage maintenance trigger {} against the observed boundary \
+             {boundary_ref}{next_step_clause}",
+            decision.trigger_id
+        ),
+        unknowns,
+        boundary,
+    )?;
+    Ok(brief)
+}
+
 /// Assembles the deduplicated improvement candidate, the owner-actionable
 /// brief, and the recorded owner decision from one real maintenance-trigger
 /// observation.
@@ -1032,113 +1171,16 @@ pub fn assemble_improvement_artifact(
         observed.boundary_ref.as_str(),
     )?;
 
-    // The brief's decision information is a PROJECTION OF THAT SAME OBSERVED
-    // RECORD, not the raw maintenance trigger text. I12.24:74 requires the
-    // named decision owner to read the problem, evidence, likely benefit, risk,
-    // cost, next reversible step and unknowns without searching raw metrics;
-    // repeating the trigger text satisfied the letter of that and none of its
-    // purpose, because it said nothing about what the closure actually
-    // recorded.
-    //
-    // `observed` was read at the TOP of this function from the caller's one
-    // exhaustive DURABLE read, and this guarded phase commits nothing, so it is
-    // the record whose `actor_id` and `consequential_boundary` the boundary above
-    // names. It is read there and not here for two reasons that are now both
-    // load-bearing: the evidence lineage is bound to it (issue #1867 W2, see the
-    // top of this function), and the two-string `SafeBoundary` cannot carry the
-    // record itself — `eliot-improvement` has no `eliot-learning-delta` edge, so
-    // widening `SafeBoundary` to hold one would be a new dependency for a value
-    // the brief only needs to quote. The record TYPE is not named here either —
-    // `eliotd` has no `eliot-learning-delta` dependency — so it arrives as the
-    // Governor's own owned projection. An empty durable scope is the same typed
-    // `UnsafeBoundary` refusal the boundary constructor returns for the same
-    // condition, never a substituted value — and because the read was hoisted, it
-    // now surfaces EARLIER than it used to: before `admitted_fence_ref`'s
-    // refusal and before any candidate is assembled, where previously the fence
-    // refusal was reported first. Same typed error, same condition, different
-    // precedence; stated because the precedence is observable to the caller as
-    // which error string a pass reports.
-    // The durable lineage handle and canonical digest the record itself
-    // committed, so the owner can read exactly this closure without searching.
-    let (observed_artifact, observed_digest) = (
-        observed.lineage_artifact.clone(),
-        observed.lineage_digest.clone(),
-    );
-    // What the observed closure actually concluded about behaviour, read
-    // through the record's own predicates rather than re-spelled here.
-    let observed_effect = observed_behaviour_effect(&observed);
-    // The two values below are the boundary's OWN observed strings, so the
-    // boundary this brief describes and the boundary it is gated on are
-    // literally the same value.
-    let principal = boundary.observed_principal_ref();
-    let boundary_ref = boundary.observed_boundary_ref();
-    let unknowns = observed_unknowns(&observed, decision.family);
-    // The application class the brief states is DERIVED from the candidate's own
-    // recorded target surface through the crate's own classifier, not spelled.
-    // The previous wording asserted the word "advisory" as a literal while the
-    // only thing that makes it true is this derivation, so the brief now names
-    // what was derived. `enforce_improvement_class_gate` re-derives the same
-    // class at the admission seam, where the live registry is in hand; this copy
-    // is the value the brief quotes so the owner reads the class the gate will
-    // check rather than a constant.
-    let brief_class = classify(&ChangeDescriptor::from_recorded_surface(
-        candidate.target_surface,
-    ));
-    // A recorded repeat is a fact the brief states in its own right, not a
-    // clause the owner has to infer from the trigger text: it is the reason this
-    // candidate exists on this pass, and I12.24:74 requires the evidence to be
-    // readable without searching raw metrics. The prose lives on the record
-    // itself (see `RepeatedVerifierFailure::brief_evidence_clause`); `None`
-    // leaves every brief field exactly as it was, so a pass with no recorded
-    // repeat is unchanged.
-    let repeat_clause = repeated_failure
-        .as_ref()
-        .map_or_else(String::new, RepeatedVerifierFailure::brief_evidence_clause);
-    let next_step_clause = repeated_failure
-        .as_ref()
-        .map_or_else(String::new, RepeatedVerifierFailure::brief_next_step_clause);
-
-    // Why the brief names the OBSERVED principal, and which brief fields the
-    // closure record cannot supply, is stated in the module documentation
-    // above under "One principal, two roles".
-    let brief = brief_at_safe_boundary(
+    // The eight brief fields, with their own checks, are assembled by
+    // `brief_fields_from_observed_closure` so that each field's honesty claim is
+    // auditable in one place.
+    let brief = brief_fields_from_observed_closure(
         &candidate,
-        &format!(
-            "{trigger}; the learning closure this brief is gated on committed durable delta \
-             {observed_artifact} (digest {observed_digest}) for attempt {} of campaign {} on \
-             route {}, at consequential boundary {boundary_ref} by principal {principal}, over {} \
-             observed evidence ref(s){repeat_clause}",
-            observed.attempt_id,
-            observed.campaign_id,
-            observed.route_id,
-            observed.evidence_ref_count,
-        ),
-        &format!(
-            "OBSERVED: the maintenance owner recorded family {} blocked at this scope, and the \
-             closure this brief is gated on {observed_effect}. NOT MEASURED: this candidate has \
-             run no experiment and carries no baseline/after metric, so there is NO measured \
-             benefit figure for it; the expectation that giving that family a start route removes \
-             a blocked evaluation per cadence is an UNMEASURED PROJECTION put to the owner's \
-             judgement, not a result",
-            decision.family
-        ),
-        &format!(
-            "OBSERVED: this pass executed nothing, so no authority, privacy, finish, durability \
-             or reserve effect was taken on any owner record, and the consequential boundary \
-             {boundary_ref} is unchanged. DERIVED, NOT ASSUMED: the candidate's own recorded \
-             target surface classifies as {brief_class:?}, which an advisory class makes a \
-             no-op until the owner acts (I12.24:82). NOT MEASURED: there is no risk metric, no \
-             counter-metric and no exposure window on this path, so no risk magnitude is claimed"
-        ),
-        principal,
-        &observed_cost_account(&observed),
-        &format!(
-            "triage maintenance trigger {} against the observed boundary \
-             {boundary_ref}{next_step_clause}",
-            decision.trigger_id
-        ),
-        unknowns,
+        &observed,
         &boundary,
+        decision,
+        &trigger,
+        repeated_failure.as_ref(),
     )?;
 
     // The single place the disposition is chosen between the two arms: an
@@ -3461,6 +3503,97 @@ pub async fn publish_learning_delta_record(
     Ok(write_receipt)
 }
 
+/// Re-proves ONE served learning-delta page against the request that asked for
+/// it, and returns that page's rows and its truncation flag.
+///
+/// This is the block [`read_durable_learning_delta_scope`] runs on every page of
+/// its enumeration, extracted because it is a concern of its own: it answers
+/// "is this page the evidence I asked for, and what does it carry?" and nothing
+/// about enumeration. Every check it makes is made BEFORE any row is returned to
+/// the caller, so a page that does not answer the planned read can never
+/// contribute a row.
+///
+/// It is deliberately NOT the re-proof that matters most. Having a page is not
+/// having evidence: the decode and the per-row `validate()` belong to
+/// [`eliot_governor::observed_closure_from_durable_rows`] and
+/// [`eliot_governor::repeated_verifier_failure_from_durable_rows`], which run in
+/// the caller over the whole returned set. "We read everything" and "every row
+/// re-proves" are different guarantees and this function is only the first of
+/// them.
+///
+/// The checks, in order, each with its own typed
+/// [`ImprovementDispatchError::ClosureRead`]: the served operation is
+/// `GetLearningRecordRange` AND is the operation the planned request named; the
+/// served fence is the planned request's fence; the response validates against
+/// its own closed shape; the payload's fence echo decodes and equals the
+/// response's fence; and the payload carries both a truncation flag and a record
+/// set. A missing truncation flag is a refusal rather than a default, because
+/// defaulting it to "not truncated" would end an enumeration the store says is
+/// unfinished.
+fn served_learning_delta_page(
+    request: &eliot_store_api::NamedReadRequest,
+    response: &eliot_store_api::NamedReadResponse,
+) -> Result<(Vec<Value>, bool), ImprovementDispatchError> {
+    // The response must answer EXACTLY the planned read, or it is not this
+    // read's evidence: operation identity, request fence, response shape and
+    // the payload's own fence echo are all re-proved before any row is read.
+    if response.operation != NamedReadOperation::GetLearningRecordRange
+        || response.operation != request.operation
+    {
+        return Err(ImprovementDispatchError::ClosureRead(
+            "the served page answers a different named read".to_owned(),
+        ));
+    }
+    if response.state_fence != request.state_fence {
+        return Err(ImprovementDispatchError::ClosureRead(
+            "the served page answers a different fence than the planned read".to_owned(),
+        ));
+    }
+    response.validate().map_err(|error| {
+        ImprovementDispatchError::ClosureRead(format!(
+            "the served page is not well formed: {error}"
+        ))
+    })?;
+    let payload_fence: StateFence =
+        serde_json::from_value(response.payload.get(EXPERIENCE_PAGE_STATE_FENCE).cloned().ok_or_else(
+            || {
+                ImprovementDispatchError::ClosureRead(
+                    "the served page carries no state fence".to_owned(),
+                )
+            },
+        )?)
+        .map_err(|_| {
+            ImprovementDispatchError::ClosureRead(
+                "the served page fence does not decode".to_owned(),
+            )
+        })?;
+    if payload_fence != response.state_fence {
+        return Err(ImprovementDispatchError::ClosureRead(
+            "the served page fence contradicts the response fence".to_owned(),
+        ));
+    }
+    let truncated = response
+        .payload
+        .get(EXPERIENCE_PAGE_TRUNCATED)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            ImprovementDispatchError::ClosureRead(
+                "the served page reports no truncation flag".to_owned(),
+            )
+        })?;
+    let page_rows = response
+        .payload
+        .get(EXPERIENCE_PAGE_RECORDS)
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            ImprovementDispatchError::ClosureRead(
+                "the served page carries no record set".to_owned(),
+            )
+        })?
+        .clone();
+    Ok((page_rows, truncated))
+}
+
 /// Reads the whole DURABLE learning-delta scope for this pass, at one fence.
 ///
 /// # This is the read side of [`publish_learning_delta_record`]
@@ -3483,11 +3616,26 @@ pub async fn publish_learning_delta_record(
 /// scope. The store's own `next_cursor` is therefore followed until it reports
 /// `truncated == false`, which is the providers' authoritative
 /// end-of-enumeration signal, and the only way to stop without one — a
-/// non-advancing cursor — is a typed refusal. Every other refusal (transport,
-/// operation or fence mismatch, payload shape, missing continuation) propagates
-/// as [`ImprovementDispatchError::ClosureRead`] and the caller does NOT assemble
-/// a brief. It is never downgraded to "no closure was ever recorded", because
-/// that is precisely the state in which a committed repeat would be dropped.
+/// non-advancing cursor, or a truncated page carrying no usable continuation — is
+/// a typed refusal. Every other refusal (transport, operation or fence mismatch,
+/// payload shape, missing continuation) propagates as
+/// [`ImprovementDispatchError::ClosureRead`] and the caller does NOT assemble a
+/// brief. It is never downgraded to "no closure was ever recorded", because that
+/// is precisely the state in which a committed repeat would be dropped.
+///
+/// # What this function guarantees, and what it deliberately does not
+///
+/// The enumeration loop is this function's own, and the two cursor refusals stay
+/// in it with it. What leaves is the per-page re-proof, which
+/// [`served_learning_delta_page`] runs on every page and which is a separate
+/// concern: that helper answers "is this page the evidence I asked for", and this
+/// function answers "did I read everything". Neither answers "does every row
+/// re-prove" — that is
+/// [`eliot_governor::observed_closure_from_durable_rows`] and
+/// [`eliot_governor::repeated_verifier_failure_from_durable_rows`], which the
+/// caller runs over the whole returned set. Keeping the three separable is the
+/// point: an exhausted read is not a proven one, and merging the guarantees
+/// would let the second claim ride on the first.
 ///
 /// Executed WITHOUT the composition lock, exactly like the candidate-scope read:
 /// the caller captures the fence under a short borrow, awaits this with no mutex
@@ -3524,63 +3672,9 @@ pub async fn read_durable_learning_delta_scope(
             .map_err(|error| {
                 ImprovementDispatchError::ClosureRead(format!("transport failed: {error}"))
             })?;
-        // The response must answer EXACTLY the planned read, or it is not this
-        // read's evidence: operation identity, request fence, response shape and
-        // the payload's own fence echo are all re-proved before any row is read.
-        if response.operation != NamedReadOperation::GetLearningRecordRange
-            || response.operation != request.operation
-        {
-            return Err(ImprovementDispatchError::ClosureRead(
-                "the served page answers a different named read".to_owned(),
-            ));
-        }
-        if response.state_fence != request.state_fence {
-            return Err(ImprovementDispatchError::ClosureRead(
-                "the served page answers a different fence than the planned read".to_owned(),
-            ));
-        }
-        response.validate().map_err(|error| {
-            ImprovementDispatchError::ClosureRead(format!(
-                "the served page is not well formed: {error}"
-            ))
-        })?;
-        let payload_fence: StateFence =
-            serde_json::from_value(response.payload.get(EXPERIENCE_PAGE_STATE_FENCE).cloned().ok_or_else(
-                || {
-                    ImprovementDispatchError::ClosureRead(
-                        "the served page carries no state fence".to_owned(),
-                    )
-                },
-            )?)
-            .map_err(|_| {
-                ImprovementDispatchError::ClosureRead(
-                    "the served page fence does not decode".to_owned(),
-                )
-            })?;
-        if payload_fence != response.state_fence {
-            return Err(ImprovementDispatchError::ClosureRead(
-                "the served page fence contradicts the response fence".to_owned(),
-            ));
-        }
-        let truncated = response
-            .payload
-            .get(EXPERIENCE_PAGE_TRUNCATED)
-            .and_then(Value::as_bool)
-            .ok_or_else(|| {
-                ImprovementDispatchError::ClosureRead(
-                    "the served page reports no truncation flag".to_owned(),
-                )
-            })?;
-        let page_rows = response
-            .payload
-            .get(EXPERIENCE_PAGE_RECORDS)
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                ImprovementDispatchError::ClosureRead(
-                    "the served page carries no record set".to_owned(),
-                )
-            })?
-            .clone();
+        // Every page is re-proved against the request that asked for it before
+        // any of its rows is read; the per-row re-proof is the caller's.
+        let (page_rows, truncated) = served_learning_delta_page(&request, &response)?;
         rows.extend(page_rows);
         if !truncated {
             return Ok(rows);
