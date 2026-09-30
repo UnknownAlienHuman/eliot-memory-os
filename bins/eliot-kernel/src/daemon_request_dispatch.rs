@@ -8416,10 +8416,7 @@ impl KernelComposition {
                         return Ok(Self::store_error_response_text("store_recovery", &error));
                     }
                     staged = match gateway
-                        .reconcile_staged_writes(
-                            &recovery_fence,
-                            eliot_ors::MAX_RECOVERY_PAGE,
-                        )
+                        .reconcile_staged_writes(&recovery_fence, eliot_ors::MAX_RECOVERY_PAGE)
                         .await
                     {
                         Ok(staged) => staged,
@@ -8931,7 +8928,12 @@ impl KernelComposition {
 
         let (staged_sender, staged_receiver) = tokio::sync::oneshot::channel();
         let (receipt_sender, receipt_receiver) = tokio::sync::oneshot::channel();
-        let expected_operation_id = operation.transition.identity.operation_id.as_str().to_owned();
+        let expected_operation_id = operation
+            .transition
+            .identity
+            .operation_id
+            .as_str()
+            .to_owned();
         let expected_request_hash = operation.transition.identity.canonical_request_hash.clone();
         let response_mode = original_submission.response_mode.clone();
         let staged = self.runtime.spawn(
@@ -9010,9 +9012,7 @@ impl KernelComposition {
         .await
         {
             Ok(Ok(Ok(receipt))) => store_apply_response(&receipt, None, None),
-            Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_) => {
-                store_apply_staged_response(&write_submission)
-            }
+            Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_) => store_apply_staged_response(&write_submission),
         }
     }
 
@@ -12396,9 +12396,7 @@ fn store_apply_response(
 }
 
 #[cfg(windows)]
-fn store_apply_staged_response(
-    submission: &eliot_store_api::WriteSubmission,
-) -> serde_json::Value {
+fn store_apply_staged_response(submission: &eliot_store_api::WriteSubmission) -> serde_json::Value {
     serde_json::json!({
         "status": "accepted_pending",
         "value": { "kind": "write_submission", "value": submission },

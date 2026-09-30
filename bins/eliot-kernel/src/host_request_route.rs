@@ -6260,7 +6260,9 @@ impl KernelComposition {
                     presented.attempt_id == durable.attempt_id.as_str()
                         && presented.fencing_generation == durable.generation
                         && presented.expires_at_unix_ms == stored.deadline_unix_ms
-                        && presented.authority_epoch.is_same_authority(&stored.authority_epoch)
+                        && presented
+                            .authority_epoch
+                            .is_same_authority(&stored.authority_epoch)
                 })
         });
         let staged_continuation = if (live.is_none()
@@ -6544,8 +6546,8 @@ impl KernelComposition {
             Self::validate_staged_observe_lineage(&stored, body, lineage)?;
             let operation = match staged_continuation {
                 Some(operation) => operation,
-                None => self
-                    .validate_original_staged_observe_plan(
+                None => {
+                    self.validate_original_staged_observe_plan(
                         &stored,
                         stored
                             .executable_input
@@ -6553,7 +6555,8 @@ impl KernelComposition {
                             .ok_or(TransportError::SessionFenced)?,
                         &operation_id,
                     )?
-                    .0,
+                    .0
+                }
             };
             self.validate_staged_observe_submission(
                 &stored,
@@ -6565,10 +6568,7 @@ impl KernelComposition {
             // nonterminal in the Host lifecycle. Retiring only the consumed
             // claim prevents this same admitted operation from being executed
             // or admitted a second time while its canonical receipt is polled.
-            self.retire_observe_pair_under_transition(
-                &body.operation_id,
-                &body.request_sha256,
-            );
+            self.retire_observe_pair_under_transition(&body.operation_id, &body.request_sha256);
             return Ok(LocalReadSubmitDisposition::StagedWrite(Box::new(
                 submission,
             )));
@@ -6688,8 +6688,7 @@ impl KernelComposition {
             || !object.contains_key("status")
             || !object.contains_key("response_mode")
             || !object.contains_key("submission")
-            || object.get("status").and_then(serde_json::Value::as_str)
-                != Some("accepted_pending")
+            || object.get("status").and_then(serde_json::Value::as_str) != Some("accepted_pending")
         {
             return Err(TransportError::IdentityConflict);
         }
@@ -6752,7 +6751,10 @@ impl KernelComposition {
             .executable_input
             .as_ref()
             .ok_or(TransportError::SessionFenced)?;
-        let durable = record.attempt.as_ref().ok_or(TransportError::SessionFenced)?;
+        let durable = record
+            .attempt
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
         let presented = body.attempt.as_ref().ok_or(TransportError::SessionFenced)?;
         let host_peer_origin = input
             .application_binding
@@ -6770,8 +6772,7 @@ impl KernelComposition {
             || durable.owner_connection_ref.as_str() != session.connection_id
             || durable.owner_launch_nonce.as_str() != session.launch_nonce
             || durable.owner_session_epoch != session.session_epoch
-            || durable.input_commitment_sha256.as_deref()
-                != Some(input.commitment_sha256.as_str())
+            || durable.input_commitment_sha256.as_deref() != Some(input.commitment_sha256.as_str())
             || presented.operation_id != record.operation_id.as_str()
             || presented.attempt_id != durable.attempt_id.as_str()
             || presented.fencing_generation != durable.generation
@@ -6816,7 +6817,12 @@ impl KernelComposition {
             .ok_or(TransportError::SessionFenced)?;
         let (envelope, tool) = self.read_observe_executable_input(record)?;
         let operation_identity = OperationIdentity::new(
-            operation.transition.identity.operation_id.as_str().to_owned(),
+            operation
+                .transition
+                .identity
+                .operation_id
+                .as_str()
+                .to_owned(),
         )
         .map_err(|_| TransportError::SessionFenced)?;
         let reservation = self
@@ -6830,10 +6836,9 @@ impl KernelComposition {
             .write_binding
             .as_ref()
             .ok_or(TransportError::SessionFenced)?;
-        let original_source: RequestIdentity = serde_json::from_value(
-            input.application_binding.source_request_identity.clone(),
-        )
-        .map_err(|_| TransportError::SessionFenced)?;
+        let original_source: RequestIdentity =
+            serde_json::from_value(input.application_binding.source_request_identity.clone())
+                .map_err(|_| TransportError::SessionFenced)?;
         let original_submission = Self::original_write_submission_from_tool_request(&tool)?;
         let response_mode = response
             .get("response_mode")
@@ -6924,11 +6929,14 @@ impl KernelComposition {
         record: &HostRequestRecord,
         input: &HostRequestExecutableInput,
         operation_identity: &OperationIdentity,
-    ) -> Result<(
-        super::daemon_request_dispatch::StoreApplyOperation,
-        String,
-        String,
-    ), TransportError> {
+    ) -> Result<
+        (
+            super::daemon_request_dispatch::StoreApplyOperation,
+            String,
+            String,
+        ),
+        TransportError,
+    > {
         let gateway = self.retained_store_gateway()?;
         let staged = gateway
             .verify_staged_envelope(&input.application_binding.state_fence, &operation_identity)
@@ -7010,10 +7018,9 @@ impl KernelComposition {
         transition
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
-        let original_source: RequestIdentity = serde_json::from_value(
-            input.application_binding.source_request_identity.clone(),
-        )
-        .map_err(|_| TransportError::SessionFenced)?;
+        let original_source: RequestIdentity =
+            serde_json::from_value(input.application_binding.source_request_identity.clone())
+                .map_err(|_| TransportError::SessionFenced)?;
         let (_, original_tool_request) = self.read_observe_executable_input(record)?;
         let original_submission =
             Self::original_write_submission_from_tool_request(&original_tool_request)?;
