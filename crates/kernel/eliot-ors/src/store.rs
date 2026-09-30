@@ -35499,7 +35499,9 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             drop(reservations);
             Self::bump_recovery_inventory_revision(&write, RecoveryInventorySource::Reservations)?;
         }
-        write.commit().map_err(storage)
+        write.commit().map_err(storage)?;
+        self.reservation_lifecycle_changed.notify_waiters();
+        Ok(())
     }
 
     fn stage_host_request(
