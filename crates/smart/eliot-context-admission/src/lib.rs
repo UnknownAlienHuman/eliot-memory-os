@@ -250,22 +250,24 @@ fn check_headroom(
     })
 }
 
-/// Require the declared fixed overhead and the required floor to fit the
-/// occupancy the referenced reserves leave.
+/// Require the required floor cost to fit the occupancy the referenced reserves
+/// leave.
 ///
 /// This is the reservation-aware form of the pre-existing floor-plus-overhead
 /// fit: it reserves the recipe's own `output_reserve` and `review_reserve`
 /// before optional filling rather than only the nominal route capacity.
+///
+/// Only `required_cost` is compared, because
+/// [`HeadroomAllocationLedger::occupancy_available`] already has the declared
+/// `fixed_overhead`, `output_reserve` and `review_reserve` subtracted once from
+/// the route capacity. Adding `fixed_cost(input)` — which re-adds exactly those
+/// same three terms — would charge every reserve and the fixed overhead twice
+/// and refuse packets that fit inside the envelope they were compiled under.
 fn check_reserved_occupancy(
-    input: &AdmissionInput,
     headroom: &HeadroomContext<'_>,
     required_cost: u64,
 ) -> Result<(), ContextError> {
-    let available = headroom.ledger.occupancy_available()?;
-    let occupied = fixed_cost(input)?
-        .checked_add(required_cost)
-        .ok_or(ContextError::Overflow)?;
-    if occupied > available {
+    if required_cost > headroom.ledger.occupancy_available()? {
         return Err(ContextError::CapacityExceeded);
     }
     Ok(())
@@ -323,7 +325,14 @@ pub fn admit_context_traced_with_headroom(
             attempted_binding: input.binding.clone(),
         })
     };
-    let check = check_headroom(input, headroom).map_err(refusal)?;
+    // A headroom failure is a TYPED REFUSAL, not a transport error, so it is
+    // returned as `Ok(Refused(..))` on the same footing as the floor-path
+    // refusal below - never as `Err(..)`, which would erase the limiting
+    // dimensions the caller needs in order to narrow or decompose.
+    let check = match check_headroom(input, headroom) {
+        Ok(check) => check,
+        Err(error) => return Ok(refusal(error)),
+    };
     // A refused dimension means no optional filling happened at all, so the
     // typed refusal carries the same exact error the floor path reports for an
     // unsatisfiable required floor, plus the limiting dimensions.
@@ -344,7 +353,7 @@ pub fn admit_context_traced_with_headroom(
                 check,
             })
         }
-        Err(error) => Err(refusal(error)),
+        Err(error) => Ok(refusal(error)),
     }
 }
 
@@ -402,12 +411,12 @@ fn admit_context_inner_with_headroom(
             }
         };
 
-    // Before optional filling: the required floor plus the declared fixed
-    // overhead must fit the occupancy the referenced output and review reserves
-    // leave. Without a granted reservation the pre-existing nominal-capacity
-    // fit above already applies; with one, the reserves are actually held back.
+    // Before optional filling: the required floor must fit the occupancy the
+    // referenced output and review reserves leave. Without a granted reservation
+    // the pre-existing nominal-capacity fit above already applies; with one, the
+    // reserves are actually held back.
     if let Some(headroom) = headroom {
-        check_reserved_occupancy(input, headroom, required_cost)?;
+        check_reserved_occupancy(headroom, required_cost)?;
     }
 
     let (optional_cost, failure_causes) = select_optional(OptionalSelectionInput {

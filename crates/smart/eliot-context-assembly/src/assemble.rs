@@ -67,7 +67,7 @@ impl AssemblyPolicy {
 
 /// The typed refusal this assembly owner returns instead of an assembled packet.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
-#[error("downstream headroom handoff refused for recipe {attempt}")]
+#[error("downstream headroom handoff refused for recipe {attempt.attempted_recipe_digest}")]
 pub struct HeadroomHandoffRefusal {
     /// The attempted recipe and omissions preserved across the refusal.
     pub attempt: HeadroomAttempt,
@@ -173,18 +173,35 @@ pub fn recheck_headroom_handoff(
     // Post-render overflow against the reserved envelope: the exact rendered
     // payload plus the referenced output and review reserves must still fit the
     // route capacity the reservation was compiled under.
-    let capacity = &assembled.admitted.floor.capacity;
-    let reserved = capacity
+    //
+    // The envelope compared against is the *recipe's* declared capacity, and the
+    // economy receipt's recorded allocations must equal it. The floor's own
+    // `capacity` is a caller-supplied Safety Floor envelope that nothing proves
+    // equal this recipe's, so measuring the rendered payload against it would
+    // check the overflow against an envelope the reservation was never issued
+    // for.
+    let declared = &recipe.capacity;
+    let allocations = &assembled.admitted.economy.allocations;
+    if allocations.route_capacity != declared.route_capacity
+        || allocations.fixed_overhead != declared.fixed_overhead
+        || allocations.output_reserve != declared.output_reserve
+        || allocations.review_reserve != declared.review_reserve
+    {
+        return Err(withhold(HeadroomRefusal::IdentityChanged {
+            reason: reason_ref.clone(),
+        }));
+    }
+    let reserved = declared
         .fixed_overhead
-        .checked_add(capacity.output_reserve)
-        .and_then(|value| value.checked_add(capacity.review_reserve))
+        .checked_add(declared.output_reserve)
+        .and_then(|value| value.checked_add(declared.review_reserve))
         .and_then(|value| value.checked_add(assembled.view.measurement.rendered_utf8_bytes))
         .ok_or_else(|| {
             withhold(HeadroomRefusal::PostRenderOverflow {
                 reason: reason_ref.clone(),
             })
         })?;
-    if reserved > capacity.route_capacity {
+    if reserved > declared.route_capacity {
         return Err(withhold(HeadroomRefusal::PostRenderOverflow {
             reason: reason_ref.clone(),
         }));
