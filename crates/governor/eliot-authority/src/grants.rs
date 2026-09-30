@@ -15,6 +15,7 @@ use eliot_security_contracts::{EffectCeiling, RevocationReason};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::leases::{ActionLease, LeaseId};
 use crate::quarantine_evidence::{QuarantineDisposition, VerifiedQuarantineBinding};
 use crate::revocation_history::{
     AdmittedRevocationClosure, AuthorityRootRef, ClosureIdentityConflict, OriginTargetMismatch,
@@ -829,6 +830,12 @@ fn migrate_to_quarantine(
 pub struct EffectiveCapabilityPath {
     pub grant_path: Vec<GrantId>,
     pub authority: AuthoritySet,
+    /// Authority binding read from the validated leaf grant on this path.
+    /// This is kept path-local so issuance cannot combine authority from one
+    /// delegation line with the binding from another.
+    pub authority_binding: AuthorityBinding,
+    /// Earliest expiry of any grant in this independently validated path.
+    pub expires_at: LogicalTime,
 }
 
 /// Derived holder view. Authorization checks exact paths to avoid unsafe
@@ -862,6 +869,58 @@ impl EffectiveCapabilitySnapshot {
     /// Number of independently supporting effective paths in this snapshot.
     pub fn path_count(&self) -> usize {
         self.paths.len()
+    }
+
+    /// Graph revision whose current active paths produced this snapshot.
+    pub const fn grant_graph_revision(&self) -> u64 {
+        self.grant_graph_revision
+    }
+
+    /// Returns one exact supporting path for this operation/resource/effect
+    /// tuple. A caller never combines fields from independent paths.
+    pub fn supporting_path(
+        &self,
+        operation: &str,
+        resource: &str,
+        effect: EffectClass,
+    ) -> Result<&EffectiveCapabilityPath, AuthorityError> {
+        self.paths
+            .iter()
+            .find(|path| path.authority.allows(operation, resource, effect))
+            .ok_or(AuthorityError::NoEffectivePath)
+    }
+
+    /// Issues one exact-use lease from an original validated capability path.
+    ///
+    /// The caller supplies only the use identity and obligation. The binding,
+    /// holder, `WorkScope`, `Session`, and expiry are copied from the same
+    /// effective path and the snapshot that `GrantGraph` admitted; caller-made
+    /// bindings or path cross-products are not accepted.
+    pub fn issue_action_lease(
+        &self,
+        lease_id: LeaseId,
+        exact_idempotency_key: impl Into<String>,
+        operation: impl Into<String>,
+        resource: impl Into<String>,
+        effect: EffectClass,
+        receipt_obligations: Vec<ReceiptObligation>,
+    ) -> Result<ActionLease, AuthorityError> {
+        let operation = operation.into();
+        let resource = resource.into();
+        let path = self.supporting_path(&operation, &resource, effect)?;
+        let authority_set = AuthoritySet::new([operation], [resource], effect)?;
+        ActionLease::new(
+            lease_id,
+            self.holder.clone(),
+            exact_idempotency_key,
+            authority_set,
+            path.authority_binding.clone(),
+            self.work_scope.clone(),
+            self.session.clone(),
+            path.expires_at,
+            1,
+            receipt_obligations,
+        )
     }
 
     pub fn validate_context(
@@ -3567,8 +3626,10 @@ impl GrantGraph {
         let mut cursor = leaf;
         let mut path = Vec::new();
         let mut effective = leaf.authority.clone();
+        let mut expires_at = leaf.expires_at;
         loop {
             self.validate_active(cursor, work_scope, session, now)?;
+            expires_at = expires_at.min(cursor.expires_at);
             path.push(cursor.grant_id.clone());
             let Some(parent_id) = &cursor.parent_grant_id else {
                 break;
@@ -3591,6 +3652,8 @@ impl GrantGraph {
         Ok(EffectiveCapabilityPath {
             grant_path: path,
             authority: effective,
+            authority_binding: leaf.binding.clone(),
+            expires_at,
         })
     }
 
