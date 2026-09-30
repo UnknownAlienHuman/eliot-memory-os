@@ -20,7 +20,8 @@ use crate::{
     RuntimeLaunchDescriptor, RuntimeStateRoots, StateFence, StoreCredentialProvider,
     StoreCredentialProvisionPlan, StoreCredentialScope, SupervisionAuthorityProvisionPlan,
     candidate_manifest_digest as candidate_digest_fn, handle,
-    phase_b_static_template_for_candidate, select_profile_roots, supervision_key_slot_for_scope_id,
+    phase_b_static_template_for_candidate, provider_bootstrap_credential_target_for_store_target,
+    select_profile_roots, supervision_key_slot_for_scope_id,
 };
 use eliot_contracts::{EpochId, EpochLineageId};
 
@@ -47,7 +48,7 @@ fn planner_epoch(sequence: u64) -> EpochId {
 /// are live Host-owned handoff material and cannot be represented by an
 /// installer candidate. Destination file identities are observed after
 /// Phase B materialization and are not part of this immutable inventory.
-pub(crate) const REQUIRED_PACKAGE_ROLES: [(&str, bool); 14] = [
+pub(crate) const REQUIRED_PACKAGE_ROLES: [(&str, bool); 15] = [
     ("eliot-host.exe", true),
     ("eliot-watchdog.exe", true),
     ("eliot-kernel.exe", true),
@@ -58,19 +59,22 @@ pub(crate) const REQUIRED_PACKAGE_ROLES: [(&str, bool); 14] = [
     ("eliot-testd.exe", true),
     ("eliot-native-worker.exe", true),
     ("eliot-wasm-host.exe", true),
+    ("eliot-user-broker.exe", true),
     ("eliot-notify.exe", true),
     ("generation.json", false),
     ("eliotd-governor.json", false),
     ("eliotd.json", false),
 ];
 
-/// Per-user adapter staged in Phase A but never Kernel-dispatched.
-/// `eliot-notify.exe` (I1.3/I1.4: interactive user-session branch) is
-/// evidence-bound by the fourteen-file inventory while
-/// [`strict_role_bindings`] and the launch descriptor keep exactly the
-/// thirteen dispatched daemon roles.
+/// Per-user notification adapter staged in Phase A but never Kernel-dispatched.
+/// `eliot-notify.exe` has no launch descriptor binding. The User Broker is
+/// also staged in the per-user branch, but its exact path and digest are
+/// pinned in the manifest and launch descriptor while remaining outside
+/// Host-managed daemon roles.
 pub(crate) const NOTIFY_STAGED_ROLE: &str = "eliot-notify.exe";
 pub(crate) const NOTIFY_STAGED_EXECUTABLE: bool = true;
+pub(crate) const USER_BROKER_STAGED_ROLE: &str = "eliot-user-broker.exe";
+pub(crate) const USER_BROKER_STAGED_EXECUTABLE: bool = true;
 
 fn package_plan_error(error: &PackageStagingError) -> InstallationError {
     InstallationError::InvalidField {
@@ -159,13 +163,13 @@ const CANARY_ARTIFACT_SET_EVIDENCE_DOMAIN: &[u8] =
 /// `generation.json` contains the resulting `RuntimeLaunchDescriptor`, while
 /// `eliotd.json` contains the same launch nonce.  Including either file in the
 /// derivation input would create a cryptographic self-reference.  The complete
-/// fourteen-role artifact evidence remains separate and continues to bind both
+/// fifteen-role artifact evidence remains separate and continues to bind both
 /// files byte-for-byte.
 // This is a package-planner derivation domain, not a registry wire revision:
 // RegistryWireV10 decoding and its explicit active-Phase-B migration rules
 // remain unchanged by this non-recursive template split.
 const PHASE_A_TEMPLATE_CONTENT_DOMAIN: &[u8] = b"eliot.runtime-live.phase-a-template-content.v1";
-const PHASE_A_TEMPLATE_ROLES: [(&str, bool); 11] = [
+const PHASE_A_TEMPLATE_ROLES: [(&str, bool); 12] = [
     ("eliot-host.exe", true),
     ("eliot-watchdog.exe", true),
     ("eliot-kernel.exe", true),
@@ -176,6 +180,7 @@ const PHASE_A_TEMPLATE_ROLES: [(&str, bool); 11] = [
     ("eliot-testd.exe", true),
     ("eliot-native-worker.exe", true),
     ("eliot-wasm-host.exe", true),
+    ("eliot-user-broker.exe", true),
     ("eliotd-governor.json", false),
 ];
 
@@ -210,6 +215,16 @@ struct PlannerStoreLaunchConfig {
     blob_root: String,
     instance_id: String,
     credential_ref: String,
+    /// Exact typed mirror of the bridge `StoreLaunchConfig` provider bootstrap
+    /// credential reference field. I15.4 requires the server bootstrap/admin and
+    /// the normal application credential to be distinct, independently
+    /// rotatable references, so this field is part of the launch declaration and
+    /// therefore part of the approved-digest projection. `deny_unknown_fields`
+    /// above makes omitting it here a hard parse failure, not a silent default.
+    provider_bootstrap_credential_ref: String,
+    /// Exact typed mirror of the bridge `StoreLaunchConfig` provider bootstrap
+    /// identity field, for the same reason.
+    provider_bootstrap_username: String,
     runtime_launch: RuntimeLaunchDescriptor,
 }
 
@@ -236,6 +251,8 @@ struct PlannerOperationalConfig<'a> {
     blob_root: &'a str,
     instance_id: &'a str,
     credential_ref: &'a str,
+    provider_bootstrap_credential_ref: &'a str,
+    provider_bootstrap_username: &'a str,
     runtime_launch: &'a RuntimeLaunchDescriptor,
 }
 
@@ -299,6 +316,8 @@ fn validate_source_store_config(
         blob_root: &config.blob_root,
         instance_id: &config.instance_id,
         credential_ref: &config.credential_ref,
+        provider_bootstrap_credential_ref: &config.provider_bootstrap_credential_ref,
+        provider_bootstrap_username: &config.provider_bootstrap_username,
         runtime_launch: &config.runtime_launch,
     };
     let digest = hex_digest(&serde_json::to_vec(&operational).map_err(|error| {
@@ -321,7 +340,7 @@ fn append_evidence_text(bytes: &mut Vec<u8>, value: &str) {
 /// Derive the Runtime Live canary artifact-set evidence reference.
 ///
 /// The reference is a domain-separated SHA-256 over the canonical generation
-/// and the complete, fixed-order fourteen-file Phase-A inventory.  Each fact contains
+/// and the complete, fixed-order fifteen-file Phase-A inventory. Each fact contains
 /// the validated relative path, executable bit, exact byte size, and lowercase
 /// SHA-256.  Source identities and other volatile filesystem observations are
 /// deliberately excluded; the retained-source and destination receipt gates
@@ -334,7 +353,7 @@ pub(crate) fn artifact_set_evidence_digest(
         || expected.len() != REQUIRED_PACKAGE_ROLES.len()
     {
         return Err(InstallationError::IncompleteObservation(
-            "canary artifact evidence requires the complete fourteen-file Phase-A runtime inventory"
+            "canary artifact evidence requires the complete fifteen-file Phase-A runtime inventory"
                 .to_owned(),
         ));
     }
@@ -414,7 +433,7 @@ pub(crate) fn artifact_set_evidence_digest(
 /// Derive the non-recursive Phase-A content digest used only for launch
 /// template derivation.
 ///
-/// The input is the typed ten-role expected fact set.  The helper validates
+/// The input is the typed twelve-role expected fact set. The helper validates
 /// that exact set and hashes it in the fixed order above.  `generation.json`
 /// and `eliotd.json` remain fully bound by [`artifact_set_evidence_digest`],
 /// the candidate manifest and the staging receipt; they are excluded here
@@ -424,7 +443,7 @@ pub fn phase_a_template_content_digest(
 ) -> Result<PlatformHandle, InstallationError> {
     if expected.len() != PHASE_A_TEMPLATE_ROLES.len() {
         return Err(InstallationError::IncompleteObservation(
-            "Phase-A template facts require exactly ten immutable roles".to_owned(),
+            "Phase-A template facts require exactly twelve immutable roles".to_owned(),
         ));
     }
     let mut names = BTreeSet::new();
@@ -535,6 +554,11 @@ fn expected_role_map(candidate: &CandidateManifest) -> Vec<(String, bool, String
             candidate.wasm_host_artifact_digest.as_str().to_owned(),
         ),
         (
+            file_name(&candidate.user_broker_executable_path),
+            true,
+            candidate.user_broker_artifact_digest.as_str().to_owned(),
+        ),
+        (
             file_name(&candidate.config_path),
             false,
             candidate.config_digest.as_str().to_owned(),
@@ -599,7 +623,7 @@ fn validate_candidate_package_binding(
     }
     // `eliot-notify.exe` is staged in Phase A but never Kernel-dispatched
     // (NOTIFY_STAGED_ROLE, I1.3/I1.4): accept exactly one such entry, then
-    // validate the remaining thirteen-role bijection below.
+    // validate the remaining pinned-role bijection below.
     let mut notify_staged = false;
     for spec in &manifest.files {
         if spec.relative_path == NOTIFY_STAGED_ROLE {
@@ -764,13 +788,11 @@ pub(crate) fn strict_role_bindings(
 /// Validate the complete production package bijection.
 ///
 /// This boundary is intentionally independent of the caller's manifest and
-/// expected-digest vectors. It binds all thirteen canonical Phase-A dispatch
-/// roles and requires every `CandidateManifest` path/digest to participate
-/// exactly once. The fourteenth staged role, `eliot-notify.exe`, is a
-/// per-user one-shot adapter (I1.3/I1.4: user-session branch, never a
-/// Kernel-dispatched child): it is evidence-bound by the fourteen-file
-/// inventory but deliberately has no launch-descriptor fields and no dispatch
-/// binding, so it is accepted here without participating in the bijection.
+/// expected-digest vectors. It binds all thirteen canonical Phase-A
+/// launch-bound roles and the immutable per-user User Broker executable. The Broker is
+/// pinned by exact installed path and digest in the candidate and launch
+/// descriptor, but remains outside Host-managed daemon roles. The notification
+/// adapter remains evidence-bound only and has no launch-descriptor binding.
 pub(crate) fn validate_exact_candidate_package_binding(
     candidate: &CandidateManifest,
     manifest: &PackageManifest,
@@ -780,7 +802,7 @@ pub(crate) fn validate_exact_candidate_package_binding(
     }
     if manifest.files.len() != REQUIRED_PACKAGE_ROLES.len() {
         return Err(InstallationError::IncompleteObservation(
-            "package manifest must contain the complete fourteen-file Phase-A runtime inventory"
+            "package manifest must contain the complete fifteen-file Phase-A runtime inventory"
                 .to_owned(),
         ));
     }
@@ -819,6 +841,32 @@ pub(crate) fn validate_exact_candidate_package_binding(
             return Err(InstallationError::IdentityConflict);
         }
     }
+    let broker_path = &candidate.user_broker_executable_path;
+    let broker_digest = &candidate.user_broker_artifact_digest;
+    if Path::new(broker_path.as_str())
+        .file_name()
+        .and_then(|value| value.to_str())
+        != Some(USER_BROKER_STAGED_ROLE)
+    {
+        return Err(InstallationError::IdentityConflict);
+    }
+    crate::sha256_handle(broker_digest, "candidate user broker artifact digest")?;
+    if !expected_names.insert(USER_BROKER_STAGED_ROLE.to_ascii_lowercase())
+        || !candidate_paths.insert(broker_path.as_str().to_ascii_lowercase())
+    {
+        return Err(InstallationError::Duplicate {
+            kind: "candidate package path".to_owned(),
+            identity: broker_path.as_str().to_owned(),
+        });
+    }
+    let broker_spec = manifest
+        .files
+        .iter()
+        .find(|spec| spec.relative_path == USER_BROKER_STAGED_ROLE)
+        .ok_or(InstallationError::IdentityConflict)?;
+    if !USER_BROKER_STAGED_EXECUTABLE || !broker_spec.executable || broker_spec.expected_size == 0 {
+        return Err(InstallationError::IdentityConflict);
+    }
     let mut manifest_names = BTreeSet::new();
     for spec in &manifest.files {
         if spec.relative_path == NOTIFY_STAGED_ROLE {
@@ -850,6 +898,12 @@ pub(crate) fn validate_exact_candidate_package_binding(
 pub(crate) fn candidate_has_nonplaceholder_package_digests(candidate: &CandidateManifest) -> bool {
     strict_role_bindings(candidate)
         .into_iter()
+        .chain(std::iter::once((
+            USER_BROKER_STAGED_ROLE,
+            USER_BROKER_STAGED_EXECUTABLE,
+            &candidate.user_broker_executable_path,
+            &candidate.user_broker_artifact_digest,
+        )))
         .any(|(_, _, _, digest)| {
             let value = digest.as_str();
             value.len() != 64
@@ -869,8 +923,7 @@ pub(crate) fn validate_exact_expected_file_digests(
     validate_exact_candidate_package_binding(candidate, manifest)?;
     if expected.len() != REQUIRED_PACKAGE_ROLES.len() {
         return Err(InstallationError::IncompleteObservation(
-            "expected package digest set must contain all fourteen Phase-A runtime files"
-                .to_owned(),
+            "expected package digest set must contain all fifteen Phase-A runtime files".to_owned(),
         ));
     }
     let bindings = strict_role_bindings(candidate);
@@ -895,6 +948,24 @@ pub(crate) fn validate_exact_expected_file_digests(
                 return Err(InstallationError::IdentityConflict);
             }
             crate::sha256_handle(&item.sha256, "expected package digest")?;
+            continue;
+        }
+        if item.relative_path == USER_BROKER_STAGED_ROLE {
+            let spec = manifest
+                .files
+                .iter()
+                .find(|spec| spec.relative_path == item.relative_path)
+                .ok_or(InstallationError::IdentityConflict)?;
+            if !spec.executable
+                || item.expected_size == 0
+                || item.expected_size != spec.expected_size
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            crate::sha256_handle(&item.sha256, "expected package digest")?;
+            if item.sha256 != candidate.user_broker_artifact_digest {
+                return Err(InstallationError::IdentityConflict);
+            }
             continue;
         }
         let Some((name, _, _, digest)) = bindings
@@ -1068,7 +1139,7 @@ pub struct ProfileRootSelectionInput {
 pub struct GenerationPackagePlanner;
 
 impl GenerationPackagePlanner {
-    /// Computes the canonical full fourteen-role artifact evidence reference.
+    /// Computes the canonical full fifteen-role artifact evidence reference.
     ///
     /// This associated wrapper is the single public entry point for producers
     /// that materialize the retained source bundle before invoking
@@ -1206,7 +1277,7 @@ impl GenerationPackagePlanner {
     /// immutable `PLANNED` transaction.
     ///
     /// The source is opened and observed independently of every manifest claim.
-    /// The exact fourteen-file Phase-A inventory is then used to construct all
+    /// The exact fifteen-file Phase-A inventory is then used to construct all
     /// canonical destination paths, descriptor/config bindings and artifact
     /// digests before the single transaction constructor is called.
     #[allow(
@@ -1337,6 +1408,7 @@ impl GenerationPackagePlanner {
         let testd_path = destination("eliot-testd.exe")?;
         let native_worker_path = destination("eliot-native-worker.exe")?;
         let wasm_host_path = destination("eliot-wasm-host.exe")?;
+        let user_broker_path = destination(USER_BROKER_STAGED_ROLE)?;
         let config_path = destination("generation.json")?;
         let eliotd_config_path = destination("eliotd-governor.json")?;
         let eliotd_descriptor_path = destination("eliotd.json")?;
@@ -1353,6 +1425,7 @@ impl GenerationPackagePlanner {
             (&testd_path, "generation.testd_path"),
             (&native_worker_path, "generation.native_worker_path"),
             (&wasm_host_path, "generation.wasm_host_path"),
+            (&user_broker_path, "generation.user_broker_path"),
             (&config_path, "generation.config_path"),
             (&eliotd_config_path, "generation.eliotd_config_path"),
             (&eliotd_descriptor_path, "generation.eliotd_descriptor_path"),
@@ -1400,6 +1473,7 @@ impl GenerationPackagePlanner {
         let testd_digest = digest_for("eliot-testd.exe")?;
         let native_worker_digest = digest_for("eliot-native-worker.exe")?;
         let wasm_host_digest = digest_for("eliot-wasm-host.exe")?;
+        let user_broker_digest = digest_for(USER_BROKER_STAGED_ROLE)?;
         let config_digest = digest_for("generation.json")?;
         let eliotd_config_digest = digest_for("eliotd-governor.json")?;
         let eliotd_descriptor_digest = digest_for("eliotd.json")?;
@@ -1539,6 +1613,10 @@ impl GenerationPackagePlanner {
             testd_digest.as_str().to_owned(),
             "--native-worker-artifact-sha256".to_owned(),
             native_worker_digest.as_str().to_owned(),
+            "--user-broker-executable".to_owned(),
+            user_broker_path.as_str().to_owned(),
+            "--user-broker-artifact-sha256".to_owned(),
+            user_broker_digest.as_str().to_owned(),
             "--eliotd-descriptor".to_owned(),
             eliotd_descriptor_path.as_str().to_owned(),
             "--eliotd-descriptor-sha256".to_owned(),
@@ -1623,10 +1701,12 @@ impl GenerationPackagePlanner {
             testd_artifact_digest: testd_digest.clone(),
             native_worker_artifact_digest: native_worker_digest.clone(),
             wasm_host_artifact_digest: wasm_host_digest.clone(),
+            user_broker_artifact_digest: user_broker_digest.clone(),
             doctor_executable_path: doctor_path.clone(),
             testd_executable_path: testd_path.clone(),
             native_worker_executable_path: native_worker_path.clone(),
             wasm_host_executable_path: wasm_host_path.clone(),
+            user_broker_executable_path: user_broker_path.clone(),
             descriptor_digest: PlatformHandle::new("0".repeat(64)).map_err(|error| {
                 InstallationError::InvalidField {
                     field: "generation.descriptor_digest".to_owned(),
@@ -1658,6 +1738,7 @@ impl GenerationPackagePlanner {
             testd_artifact_digest: testd_digest,
             native_worker_artifact_digest: native_worker_digest,
             wasm_host_artifact_digest: wasm_host_digest,
+            user_broker_artifact_digest: user_broker_digest,
             kernel_executable_path: kernel_path,
             store_bridge_executable_path: store_bridge_path,
             canonical_store_executable_path: canonical_store_path,
@@ -1666,6 +1747,7 @@ impl GenerationPackagePlanner {
             testd_executable_path: testd_path,
             native_worker_executable_path: native_worker_path,
             wasm_host_executable_path: wasm_host_path,
+            user_broker_executable_path: user_broker_path,
             config_path,
             dependency_closure_refs: vec![
                 PlatformHandle::new(format!("evidence:phase-a-content:{phase_a_content_digest}"))
@@ -1704,9 +1786,15 @@ impl GenerationPackagePlanner {
         validate_exact_candidate_package_binding(&candidate, &package_manifest)?;
         for digest in &expected_file_digests {
             if digest.relative_path == NOTIFY_STAGED_ROLE {
-                // Per-user adapter digest is bound by the fourteen-file
+                // Per-user adapter digest is bound by the fifteen-file
                 // evidence digest and the manifest size match above; it has
                 // no launch-descriptor digest slot by design.
+                continue;
+            }
+            if digest.relative_path == USER_BROKER_STAGED_ROLE {
+                if digest.sha256 != candidate.user_broker_artifact_digest {
+                    return Err(InstallationError::IdentityConflict);
+                }
                 continue;
             }
             let (_, _, _, expected) = strict_role_bindings(&candidate)
@@ -1855,6 +1943,25 @@ impl GenerationPackagePlanner {
                     host_state_root: roots.host_state_root.clone(),
                     expected_host_executable: candidate.host_executable_path.clone(),
                     target: candidate.store_credential_target.clone(),
+                    // The provider child's own bootstrap/admin reference, derived
+                    // by the single installation owner in its own reserved
+                    // namespace. Provisioning it here is what makes the pair
+                    // INDEPENDENTLY rotatable (#1810 step 3): before this, the
+                    // Store bridge required a second reference that nothing in
+                    // installation ever provisioned, so it could not be rotated,
+                    // revoked, or proved absent. This calls the owner's single
+                    // derivation rule rather than repeating it.
+                    provider_bootstrap_target: Some(
+                        provider_bootstrap_credential_target_for_store_target(
+                            &candidate.store_credential_target,
+                        )
+                        .map_err(|error| {
+                            InstallationError::InvalidField {
+                                field: "generation.provider_bootstrap_target".to_owned(),
+                                reason: error.to_string(),
+                            }
+                        })?,
+                    ),
                     provider: StoreCredentialProvider::WindowsCredentialManager,
                     scope: StoreCredentialScope::LocalService,
                     expected_principal_sid: PlatformHandle::new(LOCAL_SERVICE_SID).map_err(
@@ -1928,6 +2035,20 @@ impl GenerationPackagePlanner {
                     host_state_root: roots.host_state_root.clone(),
                     expected_host_executable: candidate.host_executable_path.clone(),
                     target: candidate.store_credential_target.clone(),
+                    // Same owner, same single derivation rule as the other
+                    // provisioning site; a second copy of the domain string
+                    // would let the two contours drift apart.
+                    provider_bootstrap_target: Some(
+                        provider_bootstrap_credential_target_for_store_target(
+                            &candidate.store_credential_target,
+                        )
+                        .map_err(|error| {
+                            InstallationError::InvalidField {
+                                field: "generation.provider_bootstrap_target".to_owned(),
+                                reason: error.to_string(),
+                            }
+                        })?,
+                    ),
                     provider: StoreCredentialProvider::WindowsCredentialManager,
                     scope: StoreCredentialScope::LocalService,
                     expected_principal_sid: PlatformHandle::new(LOCAL_SERVICE_SID).map_err(
@@ -2051,7 +2172,7 @@ fn validate_exact_source_inventory(
 ) -> Result<(), InstallationError> {
     if observed.files.len() != REQUIRED_PACKAGE_ROLES.len() {
         return Err(InstallationError::IncompleteObservation(
-            "trusted source must contain exactly fourteen Phase-A runtime files".to_owned(),
+            "trusted source must contain exactly fifteen Phase-A runtime files".to_owned(),
         ));
     }
     let expected = REQUIRED_PACKAGE_ROLES
@@ -2150,7 +2271,7 @@ fn validate_source_bundle_publication_binding(
         || manifest.files.len() != REQUIRED_PACKAGE_ROLES.len()
     {
         return Err(InstallationError::IncompleteObservation(
-            "source publication binding must contain the complete fourteen-role inventory"
+            "source publication binding must contain the complete fifteen-role inventory"
                 .to_owned(),
         ));
     }
@@ -2582,10 +2703,10 @@ mod tests {
     fn exact_size(root: &std::path::Path, name: &str) -> u64 {
         std::fs::metadata(root.join(name)).unwrap().len()
     }
-    /// Manifest specs for the struct-bound dispatch roles plus the staged
-    /// per-user adapter. `expected_role_map` is struct-driven (thirteen
-    /// dispatched roles); the fourteen-file inventory additionally carries
-    /// `eliot-notify.exe`, which the population helper stages on disk.
+    /// Manifest specs for launch-bound and per-user staged roles.
+    /// `expected_role_map` binds the thirteen existing
+    /// launch-bound roles plus the User Broker pin; the fifteen-file inventory
+    /// also carries the unpinned `eliot-notify.exe` adapter.
     fn manifest_specs_with_staged_notify(
         roles: &[(String, bool, String)],
         source_dir: &std::path::Path,
@@ -2709,6 +2830,7 @@ mod tests {
             testd_artifact_digest: h("c".repeat(64)),
             native_worker_artifact_digest: h("d".repeat(64)),
             wasm_host_artifact_digest: h("f".repeat(64)),
+            user_broker_artifact_digest: h("e".repeat(64)),
             doctor_executable_path: test_path(portable_root.as_str(), "eliot-doctor.exe"),
             testd_executable_path: test_path(portable_root.as_str(), "eliot-testd.exe"),
             native_worker_executable_path: test_path(
@@ -2716,6 +2838,7 @@ mod tests {
                 "eliot-native-worker.exe",
             ),
             wasm_host_executable_path: test_path(portable_root.as_str(), "eliot-wasm-host.exe"),
+            user_broker_executable_path: test_path(portable_root.as_str(), USER_BROKER_STAGED_ROLE),
             descriptor_digest: h("0".repeat(64)),
         };
         desc.store_bridge_arguments = desc
@@ -2740,6 +2863,7 @@ mod tests {
             testd_artifact_digest: h("c".repeat(64)),
             native_worker_artifact_digest: h("d".repeat(64)),
             wasm_host_artifact_digest: h("f".repeat(64)),
+            user_broker_artifact_digest: h("e".repeat(64)),
             kernel_executable_path: test_path(portable_root.as_str(), "eliot-kernel.exe"),
             store_bridge_executable_path: desc.store_bridge_executable_path.clone(),
             canonical_store_executable_path: desc.canonical_store_executable_path.clone(),
@@ -2751,6 +2875,7 @@ mod tests {
                 "eliot-native-worker.exe",
             ),
             wasm_host_executable_path: test_path(portable_root.as_str(), "eliot-wasm-host.exe"),
+            user_broker_executable_path: test_path(portable_root.as_str(), USER_BROKER_STAGED_ROLE),
             config_path: desc.store_config_path.clone(),
             dependency_closure_refs: vec![h("evidence:dep")],
             license_refs: vec![h("evidence:license")],
@@ -3166,6 +3291,7 @@ mod tests {
         base.testd_artifact_digest = h(get("eliot-testd.exe"));
         base.native_worker_artifact_digest = h(get("eliot-native-worker.exe"));
         base.wasm_host_artifact_digest = h(get("eliot-wasm-host.exe"));
+        base.user_broker_artifact_digest = h(get(USER_BROKER_STAGED_ROLE));
         base.config_digest = h(get("generation.json"));
         base.supervision_key_slot = h("c".repeat(64));
         base.runtime_launch.kernel_artifact_digest = h(get("eliot-kernel.exe"));
@@ -3180,6 +3306,7 @@ mod tests {
         base.runtime_launch.testd_artifact_digest = h(get("eliot-testd.exe"));
         base.runtime_launch.native_worker_artifact_digest = h(get("eliot-native-worker.exe"));
         base.runtime_launch.wasm_host_artifact_digest = h(get("eliot-wasm-host.exe"));
+        base.runtime_launch.user_broker_artifact_digest = h(get(USER_BROKER_STAGED_ROLE));
         base.runtime_launch.kernel_arguments = base
             .runtime_launch
             .expected_kernel_arguments(&base.runtime_launch.store_config_path.clone())
@@ -3211,6 +3338,7 @@ mod tests {
             ("eliot-testd.exe", true),
             ("eliot-native-worker.exe", true),
             ("eliot-wasm-host.exe", true),
+            ("eliot-user-broker.exe", true),
             ("eliot-notify.exe", true),
             ("generation.json", false),
             ("eliotd-governor.json", false),
@@ -3385,9 +3513,8 @@ mod tests {
         let kernel_args = candidate
             .runtime_launch
             .expected_kernel_arguments(&candidate.runtime_launch.store_config_path.clone());
-        // 11 pairs = 22 values: work-root, store-bootstrap(+sha), authority(+sha),
-        // kernel, doctor, testd, native-worker, eliotd(+sha).
-        assert_eq!(kernel_args.len(), 22, "kernel contour must be 22 values");
+        // 13 pairs = 26 values, including the exact User Broker path and digest.
+        assert_eq!(kernel_args.len(), 26, "kernel contour must be 26 values");
         assert!(kernel_args.contains(&"--doctor-artifact-sha256".to_owned()));
         assert!(kernel_args.contains(&"--testd-artifact-sha256".to_owned()));
         assert!(kernel_args.contains(&"--native-worker-artifact-sha256".to_owned()));
@@ -3584,6 +3711,8 @@ mod tests {
             blob_root: &config.blob_root,
             instance_id: &config.instance_id,
             credential_ref: &config.credential_ref,
+            provider_bootstrap_credential_ref: &config.provider_bootstrap_credential_ref,
+            provider_bootstrap_username: &config.provider_bootstrap_username,
             runtime_launch: &config.runtime_launch,
         };
         hex_digest(&serde_json::to_vec(&operational).unwrap())
@@ -3610,6 +3739,8 @@ mod tests {
             "blob_root": &config.blob_root,
             "instance_id": &config.instance_id,
             "credential_ref": &config.credential_ref,
+            "provider_bootstrap_credential_ref": &config.provider_bootstrap_credential_ref,
+            "provider_bootstrap_username": &config.provider_bootstrap_username,
             "runtime_launch": &config.runtime_launch,
         });
         if let Some(limit) = config.store_transaction_limit {
@@ -3653,6 +3784,14 @@ mod tests {
                 .into_owned(),
             instance_id: "store-candidate".to_owned(),
             credential_ref: launch.store_credential_target.as_str().to_owned(),
+            provider_bootstrap_credential_ref:
+                provider_bootstrap_credential_target_for_store_target(
+                    &launch.store_credential_target,
+                )
+                .unwrap()
+                .as_str()
+                .to_owned(),
+            provider_bootstrap_username: "provider-bootstrap".to_owned(),
             runtime_launch: launch,
         };
         config.approved_config_hash = planner_store_config_digest(&config);
@@ -3663,7 +3802,7 @@ mod tests {
         )
         .unwrap();
 
-        // Recompute the exact fourteen-role SHA/size vector and publication
+        // Recompute the exact fifteen-role SHA/size vector and publication
         // evidence after writing the valid generation document.
         let binding = test_source_publication_binding(&input).unwrap();
         GenerationPackagePlanner::plan_with_source_publication_binding(
@@ -3726,6 +3865,14 @@ mod tests {
                 .into_owned(),
             instance_id: "store-candidate".to_owned(),
             credential_ref: launch.store_credential_target.as_str().to_owned(),
+            provider_bootstrap_credential_ref:
+                provider_bootstrap_credential_target_for_store_target(
+                    &launch.store_credential_target,
+                )
+                .unwrap()
+                .as_str()
+                .to_owned(),
+            provider_bootstrap_username: "provider-bootstrap".to_owned(),
             runtime_launch: launch,
         };
         // Legacy: an unset knob is omitted on the wire, parses to default,
@@ -4199,7 +4346,7 @@ mod tests {
         );
         assert_ne!(
             first.candidate_manifest.signature_ref, second.candidate_manifest.signature_ref,
-            "full fourteen-role artifact evidence must still include both nonce-bearing JSON roles"
+            "full fifteen-role artifact evidence must still include both nonce-bearing JSON roles"
         );
     }
 

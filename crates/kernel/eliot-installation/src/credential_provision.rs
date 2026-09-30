@@ -550,6 +550,74 @@ pub fn validate_store_credential_target(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Validates the one canonical Credential Manager target admitted for the
+/// provider child's own bootstrap/admin credential.
+///
+/// I15.4 (`docs/architecture/I15-04-secrets.md`#i154-secrets) requires the
+/// server bootstrap/admin credential and the normal application credential to
+/// be "distinct, independently rotatable references". A separate reserved
+/// namespace is what makes that comparison and that rotation possible: two
+/// references in one namespace could only be distinguished by an accidental
+/// token difference, and rotating one would silently rewrite the other.
+///
+/// The target is an opaque [`PlatformHandle`] at the wire boundary. No target
+/// may be derived, defaulted or substituted at runtime, and no value is ever
+/// carried here.
+pub fn validate_provider_bootstrap_credential_target(value: &str) -> Result<(), String> {
+    let target_token = value.strip_prefix("eliot/provider/v1/");
+    if target_token.is_none_or(|token| {
+        token.len() != 32
+            || !token
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) {
+        return Err(
+            "must be an unpredictable reserved provider bootstrap credential target".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+/// Derives the one reserved provider bootstrap/admin credential locator from the
+/// exact Store locator.
+///
+/// I15.4 requires the two references to be independently rotatable, so the
+/// derivation is a distinct digest domain in a distinct namespace. A caller
+/// cannot pass an arbitrary provider target: the only admitted value is the one
+/// this owner derives from the Store target it already admitted.
+///
+/// # Errors
+/// Returns [`InstallationError::InvalidField`] when the Store locator is not
+/// itself an admitted reserved Store credential target.
+pub fn provider_bootstrap_credential_target_for_store_target(
+    store_target: &PlatformHandle,
+) -> Result<PlatformHandle, InstallationError> {
+    validate_store_credential_target(store_target.as_str()).map_err(|reason| {
+        InstallationError::InvalidField {
+            field: "credential.provider_bootstrap_target".to_owned(),
+            reason,
+        }
+    })?;
+    let digest = sha256_hex(
+        format!(
+            "eliot.provider-bootstrap-credential-target.v1\0{}",
+            store_target.as_str()
+        )
+        .as_bytes(),
+    );
+    let target = format!("eliot/provider/v1/{}", &digest[..32]);
+    validate_provider_bootstrap_credential_target(&target).map_err(|reason| {
+        InstallationError::InvalidField {
+            field: "credential.provider_bootstrap_target".to_owned(),
+            reason,
+        }
+    })?;
+    PlatformHandle::new(target).map_err(|error| InstallationError::InvalidField {
+        field: "credential.provider_bootstrap_target".to_owned(),
+        reason: error.to_string(),
+    })
+}
+
 /// Derives the one transaction-owned dispatch-secret locator from the exact
 /// Store locator.  It is a distinct digest domain, so a Store config digest,
 /// watchdog selector, or destination path cannot be substituted as the
@@ -651,6 +719,19 @@ pub struct StoreCredentialProvisionPlan {
     /// this non-public target plus the create-new marker is the final race
     /// trust boundary; any observed target is rejected and never overwritten.
     pub target: PlatformHandle,
+    /// The provider child's own bootstrap/admin reference, provisioned by this
+    /// same owner in its own reserved namespace.
+    ///
+    /// #1810 step 3 requires the bootstrap/admin reference and the ordinary
+    /// client reference to be INDEPENDENTLY rotatable, and I15.4 requires that
+    /// they are distinct references a sibling process inherits neither of. A
+    /// single `target` cannot express that: rotating it would rewrite the
+    /// ordinary client credential too, and one absent value would silently
+    /// leave the provider child unauthenticated. It is `Option` only because a
+    /// pre-existing single-reference installation is still parseable; when it
+    /// is `None` no bootstrap credential is provisioned at all, which the Store
+    /// bridge then fails closed on rather than substituting a default.
+    pub provider_bootstrap_target: Option<PlatformHandle>,
     /// Exact provider implementation.
     pub provider: StoreCredentialProvider,
     /// Exact token scope.
@@ -682,6 +763,37 @@ impl StoreCredentialProvisionPlan {
                 field: "credential.target".to_owned(),
                 reason,
             });
+        }
+        if let Some(provider_bootstrap_target) = &self.provider_bootstrap_target {
+            handle(
+                provider_bootstrap_target,
+                "credential.provider_bootstrap_target",
+            )?;
+            if let Err(reason) =
+                validate_provider_bootstrap_credential_target(provider_bootstrap_target.as_str())
+            {
+                return Err(InstallationError::InvalidField {
+                    field: "credential.provider_bootstrap_target".to_owned(),
+                    reason,
+                });
+            }
+            // Sibling noninheritance, proved on the pair rather than asserted
+            // in prose: the two references must land in DIFFERENT reserved
+            // namespaces, so no single rotation rewrites both and neither
+            // contour's read can resolve the other's value.
+            //
+            // The two namespaces are the owner-admitted constants, not a
+            // caller-supplied list, so a missing member cannot make this pass
+            // by agreeing with itself: a caller that sets
+            // `provider_bootstrap_target` to the client reference itself is
+            // refused here, because `eliot/store/v1/` is not a provider target.
+            if provider_bootstrap_target.as_str() == self.target.as_str() {
+                return Err(InstallationError::ProfileViolation(
+                    "provider bootstrap credential must not alias the ordinary client \
+                     credential reference; a sibling inheriting one inherits both"
+                        .to_owned(),
+                ));
+            }
         }
         handle(
             &self.expected_principal_sid,
