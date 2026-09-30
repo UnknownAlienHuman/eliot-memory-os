@@ -2842,68 +2842,199 @@ impl DaemonComposition {
         Ok(build_admitted_provider_capability(material)?)
     }
 
-    /// Test-only local construction helper (issue #1108). It does not
-    /// establish the missing executable owner leg.
+    /// Constructs the one verified coordinator fabric on freshly resolved
+    /// owner material (issue #1108, W5 production composition).
     ///
-    /// Builds the capability through
-    /// [`Self::agent_fabric_verified_capability`], then constructs the
-    /// fabric through
+    /// Production constructor requiring the admitted provider capability:
+    /// the capability is admitted through the coordinator owner boundary
+    /// (`AdmittedProviderCapability::new`) over the presented half from the
+    /// operation at hand plus the owner half resolved exclusively from the
+    /// live authenticated session — the freshly observed live fence from the
+    /// caller-held [`DaemonKernelClient`] plus the validated Kernel-issued
+    /// session binding threaded once via [`Self::note_owner_session_binding`].
+    /// Caller-supplied session halves in `material` are unconditionally
+    /// overwritten, never trusted; the threaded Governor expectation must be
+    /// current under the live session epoch (`is_same_authority`, the same
+    /// rule the coordinator enforces), so a stale or foreign expectation
+    /// fails closed here, never at first effect. The fabric is then
+    /// constructed through
     /// [`AgentFabric::new_with_admitted_provider`](crate::agent_fabric::AgentFabric::new_with_admitted_provider)
     /// under the deterministic [`daemon_coordinator_config`]. The injected
     /// `ports` stay driver-supplied (prerequisite owner ports #694/#696/
     /// #698/#839/#837 remain OPEN): this composition invents no port
-    /// implementation and reimplements no owner. The per-operation driver
-    /// (executor) binds this seam per admitted operation without changing
-    /// executor semantics here.
+    /// implementation and reimplements no owner. Without a validated
+    /// handshake the composition has no live session and construction fails
+    /// closed — the daemon stays plan-only.
+    ///
+    /// No second verification scheme: the presented/owner halves are judged
+    /// by the same T9-04 owner constructors the coordinator re-runs on every
+    /// `verify` call, so currency is re-checked per operation, never cached.
     ///
     /// # Errors
     ///
-    /// Returns the [`Self::agent_fabric_verified_capability`] rejection, a
-    /// coordinator config rejection, or the verified-construction owner
-    /// rejection unchanged.
-    #[cfg(test)]
+    /// Returns [`DaemonError::Composition`] when the Governor is not ready,
+    /// [`DaemonError::Kernel`] when no validated session binding exists, or
+    /// [`DaemonError::ProviderAdmission`] carrying the fabric/coordinator
+    /// owner rejection unchanged (malformed presentation, stale expectation
+    /// epoch, stale/revoked/foreign/conflicting evidence, or the
+    /// verified-construction rejection).
     pub fn agent_fabric_new_verified(
         &self,
         kernel: &Arc<DaemonKernelClient>,
         ports: FabricPorts,
-        material: VerifiedProviderMaterial,
+        mut material: VerifiedProviderMaterial,
     ) -> Result<AgentFabric, DaemonError> {
+        // #1108: verified-admission span over the admitted construction. The
+        // presented halves travel by identity only; digests and revisions
+        // never enter the sink.
         let _span = tracing::info_span!("eliotd.fabric_new_verified").entered();
-        let capability = self.agent_fabric_verified_capability(kernel, material)?;
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        let live_fence = kernel.kernel_fence();
+        let session_binding = self
+            .owner_session
+            .as_ref()
+            .map(|facts| facts.session_binding().to_owned())
+            .ok_or_else(|| {
+                DaemonError::Kernel(
+                    "daemon has no validated Kernel session binding; verified provider admission stays plan-only"
+                        .to_owned(),
+                )
+            })?;
+        if !material
+            .expectation
+            .live_authority_epoch
+            .is_same_authority(&live_fence.authority_epoch)
+        {
+            return Err(FabricError::StaleEpoch(
+                "provider expectation epoch is not current under the live Kernel session"
+                    .to_owned(),
+            )
+            .into());
+        }
+        material.live_fence = live_fence;
+        material.session_binding = session_binding;
+        let presented = eliot_agent_coordinator::PresentedClaimMaterial::new(
+            material.claim_id,
+            material.attempt_id,
+            material.operation_id,
+            material.binding_digest,
+            material.executable_digest,
+            material.route_revision,
+            material.capacity_revision,
+            material.worker_generation,
+            material.presented_fence,
+        )
+        .map_err(FabricError::Coordinator)?;
+        let currentness = eliot_agent_coordinator::OwnerCurrentness::new(
+            material.expectation,
+            material.live_fence,
+            material.session_binding,
+        )
+        .map_err(FabricError::Coordinator)?;
+        let capability = eliot_agent_coordinator::AdmittedProviderCapability::new(
+            material.identity,
+            presented,
+            currentness,
+            material.health,
+            material.minimum_event_sequence,
+        )
+        .map_err(FabricError::Coordinator)?;
         let config = daemon_coordinator_config()?;
         Ok(AgentFabric::new_with_admitted_provider(
             config, ports, capability,
         )?)
     }
 
-    /// Test-only restore helper from locally resolved material (issue #1108).
+    /// Restores the fabric on freshly resolved owner material in one call
+    /// (issue #1108, A6 production verified restore).
     ///
-    /// Resolves owner halves through the private session-bound resolution,
-    /// then restores through
-    /// [`AgentFabric::restore_verified`](crate::agent_fabric::AgentFabric::restore_verified).
-    /// Missing, stale, or revoked evidence propagates typed and stays
-    /// blocked: the restore never downgrades silently to plan-only, and a
-    /// stored `Verified` label alone restores nothing.
+    /// Production restore requiring a freshly admitted provider capability:
+    /// the owner halves are re-resolved over the live authenticated session
+    /// exactly like construction (readiness, freshly re-queried live fence,
+    /// validated session binding, current expectation epoch; caller-supplied
+    /// session halves overwritten, never trusted), the capability is admitted
+    /// through the coordinator owner boundary
+    /// (`AdmittedProviderCapability::new`), and the fabric is restored through
+    /// [`AgentFabric::restore_with_admitted_provider`](crate::agent_fabric::AgentFabric::restore_with_admitted_provider).
+    /// Callers pass freshly resolved material on every restore: a stored
+    /// capability is never reused across restarts, and a stored `Verified`
+    /// label alone restores nothing. Missing, stale, or revoked evidence
+    /// propagates typed and stays blocked: the restore never downgrades
+    /// silently to plan-only and never resumes effecting operations without
+    /// current owner evidence.
     ///
     /// # Errors
     ///
-    /// Returns the session-resolution rejection (not ready, no live
-    /// session, stale expectation epoch), the capability construction
-    /// rejection, the coordinator owner restore rejection, or a
-    /// stale-config conflict unchanged.
-    #[cfg(test)]
+    /// Returns the session-resolution rejection (not ready, no live session,
+    /// stale expectation epoch), the capability construction rejection, the
+    /// coordinator owner restore rejection, or a stale-config conflict
+    /// unchanged.
     pub fn agent_fabric_restore_verified(
         &self,
         kernel: &Arc<DaemonKernelClient>,
         snapshot: FabricSnapshot,
         ports: FabricPorts,
-        material: VerifiedProviderMaterial,
+        mut material: VerifiedProviderMaterial,
     ) -> Result<AgentFabric, DaemonError> {
         let _span = tracing::info_span!("eliotd.fabric_restore_verified").entered();
-        let material = self.resolve_verified_material(kernel, material)?;
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        let live_fence = kernel.kernel_fence();
+        let session_binding = self
+            .owner_session
+            .as_ref()
+            .map(|facts| facts.session_binding().to_owned())
+            .ok_or_else(|| {
+                DaemonError::Kernel(
+                    "daemon has no validated Kernel session binding; verified provider restore stays blocked"
+                        .to_owned(),
+                )
+            })?;
+        if !material
+            .expectation
+            .live_authority_epoch
+            .is_same_authority(&live_fence.authority_epoch)
+        {
+            return Err(FabricError::StaleEpoch(
+                "provider expectation epoch is not current under the live Kernel session"
+                    .to_owned(),
+            )
+            .into());
+        }
+        material.live_fence = live_fence;
+        material.session_binding = session_binding;
+        let presented = eliot_agent_coordinator::PresentedClaimMaterial::new(
+            material.claim_id,
+            material.attempt_id,
+            material.operation_id,
+            material.binding_digest,
+            material.executable_digest,
+            material.route_revision,
+            material.capacity_revision,
+            material.worker_generation,
+            material.presented_fence,
+        )
+        .map_err(FabricError::Coordinator)?;
+        let currentness = eliot_agent_coordinator::OwnerCurrentness::new(
+            material.expectation,
+            material.live_fence,
+            material.session_binding,
+        )
+        .map_err(FabricError::Coordinator)?;
+        let capability = eliot_agent_coordinator::AdmittedProviderCapability::new(
+            material.identity,
+            presented,
+            currentness,
+            material.health,
+            material.minimum_event_sequence,
+        )
+        .map_err(FabricError::Coordinator)?;
         let config = daemon_coordinator_config()?;
-        Ok(AgentFabric::restore_verified(
-            snapshot, config, ports, material,
+        Ok(AgentFabric::restore_with_admitted_provider(
+            snapshot, config, ports, capability,
         )?)
     }
 
