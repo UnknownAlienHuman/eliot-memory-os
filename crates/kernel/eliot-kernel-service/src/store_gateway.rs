@@ -6662,9 +6662,20 @@ impl KernelStoreGateway {
             .await
         {
             Ok(projection) => projection,
-            Err(RunNowPreflightAssembly::Unknown(reason)) => return Err(reason),
-            Err(RunNowPreflightAssembly::Unavailable(reason)) => {
-                return Ok((wake, UserAutomationExecutionPhase::Unavailable { reason }));
+            // A preflight that could not be assembled is reported as the phase it
+            // is, beside the committed configuration, rather than as a route error
+            // that discards the committed `WriteReceipt` — the only carrier of that
+            // commit. Nothing is claimed about an admission here: the assembly
+            // stopped before the Durable Job owner was asked on this attempt, so the
+            // disposition stays unresolved under this exact occurrence identity and
+            // the caller reconciles it instead of being handed prose that names only
+            // the occurrence.
+            Err(assembly) => {
+                return Ok(Self::project_run_now_preflight_assembly(
+                    wake,
+                    &occurrence_id,
+                    assembly,
+                ));
             }
         };
         // The blocked fingerprint is retained before the execution join moves
@@ -6702,6 +6713,71 @@ impl KernelStoreGateway {
             blocked_fingerprint,
             &occurrence_id,
         )
+    }
+
+    /// Projects one preflight assembly this leg could not complete into the
+    /// execution phase it is, beside the already-resolved wake phase.
+    ///
+    /// The committed configuration is deliberately NOT dropped here. The
+    /// `WriteReceipt` it carries is the sole carrier of the committed run-now
+    /// invocation, so returning a route error instead would leave the caller
+    /// naming an occurrence it has no committed receipt for — which is the
+    /// `recovery=null`-shaped loss item 9 of issue #2806 refuses. Both arms
+    /// therefore return a phase the caller can act on, and `recovery()` still
+    /// reports the unresolved disposition because neither phase is `resolved()`.
+    ///
+    /// The two arms are NOT merged, because they are not the same claim.
+    /// [`RunNowPreflightAssembly::Unknown`] is an owner that could not be read:
+    /// the Durable Job owner may already hold an answer this leg cannot see, so
+    /// the honest phase is `UnknownOutcome` and the occurrence must be reconciled
+    /// under its own identity. [`RunNowPreflightAssembly::Unavailable`] is named
+    /// evidence with no issuer at this boundary, which proves nothing was sent,
+    /// so it stays `Unavailable`. Collapsing them would either fabricate a
+    /// possible effect that provably did not issue, or hide a possibly-issued
+    /// effect behind "unreachable" — and this vocabulary deliberately keeps the
+    /// two apart (see the `RunNowPreflightAssembly` contract).
+    ///
+    /// An unresolved wake changes what the execution phase may honestly say, and
+    /// the change is a strict narrowing rather than a substitution. When the wake
+    /// handoff is itself unresolved, the wake owner has already reported the
+    /// answer this leg cannot see, and
+    /// [`UserAutomationOperatorTransition::recovery`] returns that wake answer
+    /// ahead of the execution phase, so the unresolved owner fact is still the
+    /// caller's recovery directive. The execution phase then says only what is
+    /// true of itself: the handoff to the Durable Job owner was never attempted,
+    /// because the preflight stopped before the join. It claims no admission and
+    /// no refusal, and `is_known()` is still false, so nothing here converts an
+    /// unresolved answer into a decided one. This is also the only phase
+    /// `validate_phase_joins` will join beside an unresolved wake, which is why
+    /// the distinction is load-bearing rather than cosmetic.
+    fn project_run_now_preflight_assembly(
+        wake: UserAutomationWakePhase,
+        occurrence_id: &str,
+        assembly: RunNowPreflightAssembly,
+    ) -> (UserAutomationWakePhase, UserAutomationExecutionPhase) {
+        // A wake that names this occurrence — the owner's retained record or its
+        // complete negative — is what an unresolved execution may sit beside. An
+        // unresolved wake proves neither, so it is excluded here exactly as
+        // `validate_phase_joins` excludes it there.
+        let wake_proven = matches!(
+            &wake,
+            UserAutomationWakePhase::Published { .. }
+                | UserAutomationWakePhase::NotApplicable { .. }
+        );
+        let execution = match assembly {
+            RunNowPreflightAssembly::Unknown(reason) if wake_proven => {
+                UserAutomationExecutionPhase::UnknownOutcome {
+                    reason: unestablished_run_now_preflight_reason(occurrence_id, &reason),
+                }
+            }
+            RunNowPreflightAssembly::Unknown(reason) => UserAutomationExecutionPhase::Unavailable {
+                reason: unattempted_run_now_preflight_reason(occurrence_id, &reason),
+            },
+            RunNowPreflightAssembly::Unavailable(reason) => {
+                UserAutomationExecutionPhase::Unavailable { reason }
+            }
+        };
+        (wake, execution)
     }
 
     /// Resolves the wake phase of one committed `RunNow` occurrence over the
@@ -9150,6 +9226,41 @@ fn unestablished_run_now_execution_reason(
         "the Durable Job owner did not establish an admission for committed occurrence \
          {occurrence_id}, so the occurrence stays unadmitted until that same occurrence is \
          reconciled: {detail}"
+    )
+}
+
+/// Execution phase reason for one committed occurrence whose owner preflight
+/// could not be assembled because an owner could not be read.
+///
+/// This is deliberately NOT a refusal and NOT an admission. The preflight never
+/// completed, so the leg has no decision to report in either direction: naming it
+/// `UnknownOutcome` alongside the committed `WriteReceipt` is what lets the caller
+/// reconcile this exact occurrence under its own Durable Job identity, instead of
+/// receiving a route error that discards the commit and names the occurrence in
+/// prose alone. Reporting it as a decided `Rejected` would claim the occurrence
+/// provably admitted nothing, which an unread owner does not prove — the reason
+/// text is therefore the owner's own failure and never a re-derived outcome.
+fn unestablished_run_now_preflight_reason(occurrence_id: &str, detail: &str) -> String {
+    format!(
+        "the owner preflight for committed occurrence {occurrence_id} could not be assembled, so \
+         this occurrence's execution disposition is unresolved and no admission or refusal is \
+         claimed for it until that same occurrence is reconciled: {detail}"
+    )
+}
+
+/// Execution phase reason for one committed occurrence whose preflight could not
+/// be assembled while the WAKE handoff was itself unresolved.
+///
+/// The unresolved owner fact is the wake phase's, and
+/// `UserAutomationOperatorTransition::recovery` reports it first, so this reason
+/// states only what is true of the execution handoff itself: the preflight never
+/// completed, so the Durable Job owner was never asked on this attempt. It claims
+/// no admission and no refusal, and the transition is still not `known`.
+fn unattempted_run_now_preflight_reason(occurrence_id: &str, detail: &str) -> String {
+    format!(
+        "the wake handoff of committed occurrence {occurrence_id} is itself unresolved, and its \
+         owner preflight could not be assembled either, so this occurrence was never handed to the \
+         Durable Job owner and no admission or refusal is claimed for it: {detail}"
     )
 }
 
