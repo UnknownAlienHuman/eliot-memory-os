@@ -23,8 +23,9 @@
 //! so the A/store physical-durability binding drives reconnect unchanged.
 
 use crate::{
-    BestEffortDropGap, DurableHostEventJournal, EventKey, HostEventPersistenceOwner, IngestError,
-    ReplayItem,
+    BestEffortDropGap, CoverageManifestRun, DurableHostEventJournal, EventKey,
+    FingerprintIngestRunOutcome, HostEventPersistenceOwner, IngestError, ReplayItem,
+    run_ingest_for_fingerprint,
 };
 use eliot_agent_api::CommittedHostEventIntake;
 
@@ -135,4 +136,26 @@ pub fn drive_reconnect_observed(
         intakes,
         gaps,
     })
+}
+
+/// Production reconnect run for one product/session/attempt/route fingerprint
+/// (issue #1936 W1, I7.23): the in-crate production caller of the
+/// per-fingerprint coverage-manifest flow.
+///
+/// The bridge reconnect sweep invokes this once per fingerprint with the run
+/// roster, the pinned allowed-manifest revision, and the caller-declared
+/// denominator plan ([`CoverageManifestRun`]) plus the transport replay
+/// callback. Observed ingest runs per fingerprint before anything is
+/// persisted, so staged-but-uncommitted facts abort with
+/// [`IngestError::NotCommitted`] before any manifest is retained; every other
+/// failure is likewise typed ([`IngestError`]) and retains nothing partial.
+/// On success the retained denominator returns with the run outcome
+/// ([`FingerprintIngestRunOutcome`]) for the downstream evidence-assembly
+/// owner.
+pub fn drive_fingerprint_ingest_run(
+    owner: &mut DurableHostEventJournal,
+    run: &CoverageManifestRun<'_>,
+    deliver: impl FnMut(&ReplayItem) -> bool,
+) -> Result<FingerprintIngestRunOutcome, IngestError> {
+    run_ingest_for_fingerprint(owner, run, deliver)
 }
