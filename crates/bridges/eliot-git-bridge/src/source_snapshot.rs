@@ -453,9 +453,7 @@ fn verify_archive(
                     detail: "tar extended header is malformed".to_owned(),
                 }
             })?;
-            if payload.is_some() {
-                extended_path = payload;
-            }
+            extended_path = payload;
         } else if kind == b'g' {
             return Err(GitSnapshotError::InvalidGitOutput {
                 operation: "tree archive",
@@ -482,7 +480,19 @@ fn verify_archive(
                     detail: "tar repeated a source path".to_owned(),
                 });
             }
-        } else if kind != b'5' {
+        } else if kind == b'5' {
+            let directory = extended_path.take().unwrap_or_else(|| tar_path(header));
+            let directory = directory.strip_suffix(b"/").unwrap_or(&directory);
+            let prefix = [directory, &b"/"[..]].concat();
+            if directory.is_empty()
+                || !expected.keys().any(|path| path.starts_with(&prefix))
+            {
+                return Err(GitSnapshotError::InvalidGitOutput {
+                    operation: "tree archive",
+                    detail: "archive contains a directory outside the source tree".to_owned(),
+                });
+            }
+        } else {
             return Err(GitSnapshotError::InvalidGitOutput {
                 operation: "tree archive",
                 detail: format!("unsupported tar entry type {}", kind as char),
@@ -497,7 +507,7 @@ fn verify_archive(
             detail: "tar offset overflow".to_owned(),
         })?;
     }
-    if !ended || actual.len() != expected.len() {
+    if !ended || extended_path.is_some() || actual.len() != expected.len() {
         return Err(GitSnapshotError::InvalidGitOutput {
             operation: "tree archive",
             detail: "archive did not terminate or omit/duplicate source entries".to_owned(),
