@@ -119,10 +119,11 @@ pub use recipe::{
     ProtectedReservePolicy, RECIPE_ACTIVATION_DIGEST_DOMAIN, RECIPE_REVOCATION_DIGEST_DOMAIN,
     RecipeActivationRecord, RecipeAdmissionPolicy, RecipeApplicability,
     RecipeApplicabilityDimension, RecipeCandidateRejection, RecipeCounterMetric,
-    RecipeExecutionContour, RecipeExecutionSupport, RecipeLayoutPolicy, RecipeOmissionPolicy,
-    RecipePolicyIdentity, RecipeQualification, RecipeQualificationState, RecipeRejectionReason,
-    RecipeResolutionRefusal, RecipeRevocationRecord, RecipeRolePosition, RecipeStage,
-    RecipeSupersession, ResolvedContextRecipe,
+    RecipeExecutionContour, RecipeExecutionSupport, RecipeImprovementCandidate, RecipeLayoutPolicy,
+    RecipeOmissionPolicy, RecipePolicyIdentity, RecipePromotionBasis, RecipeQualification,
+    RecipeQualificationState, RecipeRejectionReason, RecipeResolutionRefusal,
+    RecipeRevocationRecord, RecipeRolePosition, RecipeStage, RecipeSupersession,
+    ResolvedContextRecipe,
 };
 pub use view::{ActiveUnderstandingView, RenderedAtom, SelectionIntegrityProof};
 
