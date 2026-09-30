@@ -64,6 +64,7 @@ fn store_build_error_code(error: &KernelBuildError) -> &'static str {
         KernelBuildError::Service(_) => "SERVICE",
         KernelBuildError::StoreBootstrapRequired => "STORE_BOOTSTRAP_REQUIRED",
         KernelBuildError::StoreAlreadyConnected => "STORE_ALREADY_CONNECTED",
+        KernelBuildError::StoreRouteOwnerRefused { .. } => "STORE_ROUTE_OWNER_REFUSED",
         KernelBuildError::Principal(_) => "PRINCIPAL",
     }
 }
@@ -317,6 +318,50 @@ impl KernelComposition {
             EntrypointStage::StoreBootstrap,
             "kernel.store.requirement_validated",
         );
+        // #1872 / I5.11 stages 8 and 10: the composition may not build a
+        // canonical-Store writer for a generation the durable `canonical_store`
+        // route does not name, and it must learn that BEFORE any Store pipe,
+        // peer or process is touched. Every *generation* check in this function
+        // compares the descriptor against itself - the route resolved below is
+        // registered from the same Host descriptor, so that tuple test is
+        // tautological on this path - so without this one a self-consistent
+        // descriptor naming a cut-over incumbent or an uncommitted candidate
+        // would build a writer and a Store client, and only a per-operation gate
+        // would later refuse to use them. A12.3: a second writer is a security
+        // and integrity problem "regardless of how plausible the content
+        // appears".
+        //
+        // The decision reads owner-issued durable state only
+        // (`eliot_kernel_service::canonical_store_writer_admission`, which is the
+        // committed `GenerationCutoverOwnership` row for this route scope read
+        // through the Kernel's own `CutoverRouteSnapshot::rebuild`) and compares
+        // the generation itself, not the existence of a route, a route name or
+        // a descriptor shape.
+        if let Err(refusal) = eliot_kernel_service::canonical_store_writer_admission(
+            &self.generation_gateway.ors,
+            requirement.store_generation,
+        )
+        .map_err(|error| {
+            observe_entrypoint_with_detail(
+                EntrypointStage::StoreBootstrap,
+                "kernel.store.connect_rejected:route_owner_unreadable",
+            );
+            KernelBuildError::Service(error.to_string())
+        })?
+        .admitted()
+        {
+            observe_entrypoint_with_detail(
+                EntrypointStage::StoreBootstrap,
+                "kernel.store.connect_rejected:route_owner_refused",
+            );
+            // The single terminal for a failed connect stays with the outer
+            // `connect_canonical_store`, which classifies this error through
+            // `store_build_error_code`; this phase only records which one it was.
+            return Err(KernelBuildError::StoreRouteOwnerRefused {
+                presented: requirement.store_generation,
+                refusal,
+            });
+        }
         let process = &handoff.process_binding.process;
         let observed = observe_named_pipe_peer_process_in_job(
             handoff.process_binding.job.as_str(),
