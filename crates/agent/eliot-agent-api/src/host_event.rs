@@ -1284,6 +1284,55 @@ pub fn validate_legacy_carry(
     Ok(normalized)
 }
 
+/// Versioned route-binding contract bound into every retained route-evidence
+/// relation (issue #2645).
+///
+/// The version names the owner-qualification rule, not a hash recipe:
+/// requested binds the accepted admission's original requested route, actual
+/// binds the validated physical observation's observed route (absent exactly
+/// when unobserved), and the observation digest resolves the exact receipt.
+/// A row that predates this stamp carries no verifiable binding: it is
+/// retained with its evidence but fails closed at intake instead of being
+/// reinterpreted as verified (I15.19: a digest proves byte identity, never
+/// origin or authority by itself).
+pub const ROUTE_BINDING_CONTRACT_VERSION: &str = "eliot-agent-api/route-binding-v1";
+
+/// Validated route-evidence relation retained for one staged host event
+/// (issue #2645, I7.23).
+///
+/// Every digest here is owner-qualified: `requested_route_digest` is the
+/// fingerprint digest recomputed from the accepted admission's original
+/// requested route (never the admission self-digest, which is
+/// logical-decision identity, not route identity); `actual_route_digest` is
+/// the fingerprint digest recomputed from the validated physical
+/// observation's observed route, or `None` exactly when no observation
+/// applies; `physical_observation_digest` is that observation's own receipt
+/// `self_digest`, resolving the exact receipt — requested/observed routes,
+/// route state, usage, and recovery reference — through the receipt owner.
+/// Unknown observation stays explicit: absence never copies requested bytes
+/// into an actual claim, and a valid divergent observation is retained with
+/// its differences, never rejected as malformed.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommittedRouteEvidence {
+    /// Fingerprint digest of the accepted admission's original requested
+    /// route. `Some` exactly for execution-unit lineage.
+    pub requested_route_digest: Option<LowercaseSha256>,
+    /// Fingerprint digest of the validated observation's observed route.
+    /// `Some` exactly when a validated observation reports an observed
+    /// route; an `Unobserved` observation leaves this absent while still
+    /// naming its receipt below.
+    pub actual_route_digest: Option<LowercaseSha256>,
+    /// Receipt identity of the validated physical observation. `Some`
+    /// exactly when an observation applies; resolves the exact receipt,
+    /// never a fingerprint or admission digest in disguise.
+    pub physical_observation_digest: Option<LowercaseSha256>,
+    /// Route-binding contract version bound at staging. Must equal
+    /// [`ROUTE_BINDING_CONTRACT_VERSION`]; any other value marks a row whose
+    /// binding predates owner qualification and fails closed at intake.
+    pub route_binding_version: String,
+}
+
 /// Durable-to-intake conversion view for one committed journal record (issues
 /// #371 W7/A27).
 ///
@@ -1297,6 +1346,12 @@ pub fn validate_legacy_carry(
 /// state travel as explicit fields — never re-derived, never dropped — plus
 /// the stable event identity derived from the normalized input and the full
 /// envelope/receipt pair for the intake equality and digest checks.
+///
+/// The retained route relation (issue #2645) travels the same way: the
+/// owner-qualified requested/actual digests, the exact validated observation
+/// receipt identity, and the binding contract version are preserved verbatim
+/// from the committed record, so a consumer that uses route claims receives
+/// the validated relation, not an envelope-only projection.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommittedHostEventIntake {
@@ -1327,16 +1382,40 @@ pub struct CommittedHostEventIntake {
     pub envelope: NormalizedHostEventEnvelope,
     /// Sealed normalization receipt; must equal `envelope.normalization`.
     pub receipt: HostEventNormalizationReceipt,
+    /// Owner-bound requested route digest, preserved verbatim from the
+    /// committed record (see [`CommittedRouteEvidence`]). `Some` exactly for
+    /// execution-unit lineage. Defaults for wire readers that predate the
+    /// route relation; such views fail [`Self::verify`] instead of passing
+    /// as verified.
+    #[serde(default)]
+    pub requested_route_digest: Option<LowercaseSha256>,
+    /// Owner-bound actual route digest, preserved verbatim. `Some` exactly
+    /// when a validated observation reports an observed route.
+    #[serde(default)]
+    pub actual_route_digest: Option<LowercaseSha256>,
+    /// Receipt identity of the validated physical observation, preserved
+    /// verbatim. Resolves the exact receipt through the receipt owner.
+    #[serde(default)]
+    pub physical_observation_digest: Option<LowercaseSha256>,
+    /// Route-binding contract version, preserved verbatim. Must equal
+    /// [`ROUTE_BINDING_CONTRACT_VERSION`].
+    #[serde(default)]
+    pub route_binding_version: String,
 }
 
 impl CommittedHostEventIntake {
     /// Builds the intake view for one envelope known committed by the durable
     /// journal. Rejects a receipt that is not the envelope's sealed receipt
     /// and an output digest that does not recompute; extracts every preserved
-    /// fact from the envelope instead of re-deriving it.
+    /// fact from the envelope instead of re-deriving it. The retained route
+    /// relation travels verbatim from the committed record via `routes` and
+    /// the minted view is fully re-verified (including lineage/route
+    /// agreement and binding-version currency) before it is returned, so a
+    /// stale or drifted relation fails closed here with a typed error.
     pub fn from_envelope(
         envelope: &NormalizedHostEventEnvelope,
         acked: bool,
+        routes: CommittedRouteEvidence,
     ) -> Result<Self, ContractError> {
         let receipt = envelope.normalization.clone();
         let computed = envelope
@@ -1360,7 +1439,7 @@ impl CommittedHostEventIntake {
             &envelope.payload,
             &envelope.raw_source.digest,
         )?;
-        Ok(Self {
+        let intake = Self {
             event_id: envelope.event_id.clone(),
             cursor: envelope.cursor.clone(),
             sequence: envelope.sequence,
@@ -1373,15 +1452,33 @@ impl CommittedHostEventIntake {
             stable_event_identity,
             envelope: envelope.clone(),
             receipt,
-        })
+            requested_route_digest: routes.requested_route_digest,
+            actual_route_digest: routes.actual_route_digest,
+            physical_observation_digest: routes.physical_observation_digest,
+            route_binding_version: routes.route_binding_version,
+        };
+        intake.verify()?;
+        Ok(intake)
     }
 
     /// Re-verifies the preserved facts against the carried envelope: receipt
     /// equality, recomputed output digest, identity/sequence/cursor agreement,
     /// predecessor/delivery/payload-kind agreement, generation/fence presence
-    /// agreement with the lineage, and stable-identity recomputation. The
-    /// coordinator intake calls this before observing; a view that drifted
-    /// from its envelope fails closed here.
+    /// agreement with the lineage, route-relation agreement with the lineage
+    /// (issue #2645), binding-version currency, and stable-identity
+    /// recomputation. The coordinator intake calls this before observing; a
+    /// view that drifted from its envelope fails closed here.
+    ///
+    /// Route agreement is shape-qualified, never a column-equality shortcut:
+    /// session lineage carries no route authority, so every route field must
+    /// be absent; execution-unit lineage must carry the owner-bound requested
+    /// column; an actual column without a validating observation rejects,
+    /// while a validating observation without an observed route is the
+    /// explicit `Unobserved` shape and passes. A binding version other than
+    /// [`ROUTE_BINDING_CONTRACT_VERSION`] marks a pre-qualification row and
+    /// fails closed as [`ContractError::UnknownContractVersion`]: old shapes
+    /// decode (see the field defaults) but are never reinterpreted as
+    /// verified bindings.
     pub fn verify(&self) -> Result<(), ContractError> {
         if self.receipt != self.envelope.normalization {
             return Err(ContractError::DigestMismatch);
@@ -1411,6 +1508,29 @@ impl CommittedHostEventIntake {
         };
         if self.runtime_generation.as_ref() != generation || self.state_fence.as_ref() != fence {
             return Err(ContractError::BindingMismatch);
+        }
+        if self.route_binding_version != ROUTE_BINDING_CONTRACT_VERSION {
+            return Err(ContractError::UnknownContractVersion);
+        }
+        match &self.envelope.lineage {
+            ProviderObservationLineage::SessionObservation(_) => {
+                if self.requested_route_digest.is_some()
+                    || self.actual_route_digest.is_some()
+                    || self.physical_observation_digest.is_some()
+                {
+                    return Err(ContractError::BindingMismatch);
+                }
+            }
+            ProviderObservationLineage::ExecutionUnitObservation(_) => {
+                if self.requested_route_digest.is_none() {
+                    return Err(ContractError::BindingMismatch);
+                }
+                if self.actual_route_digest.is_some()
+                    && self.physical_observation_digest.is_none()
+                {
+                    return Err(ContractError::InvalidRouteDisposition);
+                }
+            }
         }
         let stable = stable_event_id_for(
             &self.envelope.producer_adapter_identity,

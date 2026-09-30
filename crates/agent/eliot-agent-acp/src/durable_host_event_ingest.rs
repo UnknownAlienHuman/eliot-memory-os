@@ -43,12 +43,13 @@
 use std::collections::BTreeMap;
 
 use eliot_agent_api::{
-    AdmittedRouteReceipt, CommittedHostEventIntake, ContractError, EventCursor, EventId,
-    HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM, HostEventDeliveryDisposition,
-    HostEventPrivacyClass, LowercaseSha256, NormalizedHostEventEnvelope,
-    NormalizedHostEventPayload, PhysicalRouteObservationReceipt, ProviderExecutionBinding,
-    ProviderObservationLineage, QualifiedSourceDigest,
-    host_event::HOST_EVENT_RAW_BYTES_DIGEST_ALGORITHM, route_fingerprint_digest_for,
+    AdmittedRouteReceipt, CommittedHostEventIntake, CommittedRouteEvidence, ContractError,
+    EventCursor, EventId, HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM,
+    ROUTE_BINDING_CONTRACT_VERSION, HostEventDeliveryDisposition, HostEventPrivacyClass,
+    LowercaseSha256, NormalizedHostEventEnvelope, NormalizedHostEventPayload,
+    PhysicalRouteObservationReceipt, ProviderExecutionBinding, ProviderObservationLineage,
+    QualifiedSourceDigest, host_event::HOST_EVENT_RAW_BYTES_DIGEST_ALGORITHM,
+    route_fingerprint_digest_for,
 };
 use eliot_contracts::sha256_hex;
 use eliot_evaluation_contracts::{
@@ -349,6 +350,13 @@ pub struct DurableHostEventRecord {
     pub requested_route_digest: Option<LowercaseSha256>,
     /// Observed actual route reference digest, when one was observed.
     pub actual_route_digest: Option<LowercaseSha256>,
+    /// Versioned validated route-evidence relation (issue #2645): the
+    /// owner-qualified requested/actual digests above plus the exact
+    /// validated physical-observation receipt identity and the binding
+    /// contract version. Exact replay compares this relation, coordinator
+    /// intake carries it verbatim, and readback resolves the observation
+    /// receipt through its owner — never caller strings alone.
+    pub route_evidence: CommittedRouteEvidence,
     /// Causal predecessor event identities carried at ingest.
     pub predecessors: Vec<EventId>,
     /// Normalization warnings. Bounded; never raw provider content.
@@ -849,11 +857,16 @@ impl DurableHostEventJournal {
     /// Route-relation note (issue #2645): commit implies the record's
     /// requested/actual route columns already passed owner-qualified staging
     /// validation (admission fingerprint for requested, validated physical
-    /// observation for actual, explicit absence otherwise). The envelope's
-    /// `admitted_route_digest` travels in this view as the exact
-    /// owner-resolvable admission reference; the fingerprint-level columns
-    /// remain readable on the committed record itself. No unused column is
-    /// declared proof of coordinator validation here.
+    /// observation for actual, explicit absence otherwise). The minted view
+    /// carries that retained relation verbatim — the owner-qualified
+    /// digests, the exact validated observation receipt identity, and the
+    /// binding contract version — and `from_envelope` re-verifies
+    /// lineage/route agreement plus version currency before returning. A
+    /// row whose relation predates owner qualification (stale version) or
+    /// drifted from its envelope fails closed here with a typed error and
+    /// stays retained with restricted use; it is never silently upgraded
+    /// into a route-claiming view. No unused column is declared proof of
+    /// coordinator validation here.
     pub fn to_coordinator_intake(
         &self,
         key: &EventKey,
@@ -865,8 +878,12 @@ impl DurableHostEventJournal {
         if !record.disposition.committed {
             return Err(IngestError::NotCommitted);
         }
-        CommittedHostEventIntake::from_envelope(&record.envelope, record.disposition.acked)
-            .map_err(IngestError::Contract)
+        CommittedHostEventIntake::from_envelope(
+            &record.envelope,
+            record.disposition.acked,
+            record.route_evidence.clone(),
+        )
+        .map_err(IngestError::Contract)
     }
 
     /// Returns every recorded best-effort drop gap for a stream, in record
@@ -1553,6 +1570,19 @@ impl DurableHostEventJournal {
             requested_route_digest.as_ref(),
             actual_route_digest.as_ref(),
         )?;
+        // Retained route relation (issue #2645 W1/W5): the owner-qualified
+        // columns plus a resolved immutable owner reference — the validated
+        // physical observation's own receipt identity — and the binding
+        // contract version. Exact replay, coordinator intake, and readback
+        // all bind this relation; the redundant caller values were already
+        // verified independently against their owners above.
+        let route_evidence = CommittedRouteEvidence {
+            requested_route_digest: requested_route_digest.clone(),
+            actual_route_digest: actual_route_digest.clone(),
+            physical_observation_digest: physical_observation
+                .map(|observation| observation.self_digest.clone()),
+            route_binding_version: ROUTE_BINDING_CONTRACT_VERSION.to_owned(),
+        };
         Self::check_envelope_linkage(&envelope, sequence, &stored)?;
         let envelope_digest = envelope
             .compute_digest()
@@ -1570,6 +1600,7 @@ impl DurableHostEventJournal {
                 && existing.envelope_digest == envelope_digest
                 && existing.requested_route_digest.as_ref() == requested_route_digest.as_ref()
                 && existing.actual_route_digest.as_ref() == actual_route_digest.as_ref()
+                && existing.route_evidence == route_evidence
             {
                 return Ok(StageOutcome { key, fresh: false });
             }
@@ -1627,6 +1658,7 @@ impl DurableHostEventJournal {
                 transformation_version: transformation_version.to_owned(),
                 requested_route_digest,
                 actual_route_digest,
+                route_evidence,
                 predecessors,
                 warnings,
                 disposition: RecordDisposition {

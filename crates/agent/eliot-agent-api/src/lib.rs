@@ -28,19 +28,19 @@ pub use execution_binding::{
 };
 pub use host_event::{
     AssistantDeltaObservation, CancellationObservation, CandidateResultReference,
-    CheckpointObservation, CommittedHostEventIntake, ErrorObservation, ExecutionStartedObservation,
-    HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM,
+    CheckpointObservation, CommittedHostEventIntake, CommittedRouteEvidence, ErrorObservation,
+    ExecutionStartedObservation, HOST_EVENT_CONTRACT_VERSION, HOST_EVENT_DIGEST_ALGORITHM,
     HOST_EVENT_RAW_BYTES_DIGEST_ALGORITHM, HostEventDeliveryDisposition,
     HostEventNormalizationReceipt, HostEventPrivacyClass, HostEventQuarantineReason,
     HostEventReplayDisposition, MAX_HOST_EVENT_OMITTED_FIELDS, MAX_HOST_EVENT_PREDECESSORS,
     MAX_HOST_EVENT_SAFE_TEXT_CHARS, MAX_HOST_EVENT_TEXT_CHARS, MAX_HOST_EVENT_WARNINGS,
     NormalizationCoverage, NormalizedHostEventEnvelope, NormalizedHostEventPayload,
-    ProviderTerminalObservation, ProviderTerminalStatus, QualifiedSourceDigest, RawSourceRecord,
-    ReasoningSummaryObservation, RestrictedRawSourceHandle, SessionLifecycleObservation,
-    SessionLifecycleTransition, ToolInvocationObservation, ToolOutcomeClass,
-    ToolOutcomeObservation, UnsupportedDisposition, UnsupportedEventObservation,
-    UnsupportedEventReason, WarningObservation, candidate_result_digest_for,
-    contains_restricted_source_token, stable_event_id_for,
+    ProviderTerminalObservation, ProviderTerminalStatus, QualifiedSourceDigest,
+    ROUTE_BINDING_CONTRACT_VERSION, RawSourceRecord, ReasoningSummaryObservation,
+    RestrictedRawSourceHandle, SessionLifecycleObservation, SessionLifecycleTransition,
+    ToolInvocationObservation, ToolOutcomeClass, ToolOutcomeObservation, UnsupportedDisposition,
+    UnsupportedEventObservation, UnsupportedEventReason, WarningObservation,
+    candidate_result_digest_for, contains_restricted_source_token, stable_event_id_for,
 };
 pub use provider_translation::{
     CodecRevision, EventOrderChange, EventReorderRequest, IdentifierPolicy, LossyConversionPolicy,
