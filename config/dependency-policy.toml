@@ -179,6 +179,24 @@ features = []
 public_exposure = "digest strings only; no blake3 vendor types"
 removal_plan = "version and migrate existing digest contracts and readers before removal"
 
+[direct_dependencies.cap-fs-ext]
+ecosystem = "rust"
+consumer = "crates/foundation/eliot-bootstrap"
+owner = "crates/foundation/eliot-bootstrap"
+reason = "refuse symlink traversal while opening selected workspace source content after privacy admission (#1790)"
+features = []
+public_exposure = "none; source observations use ELIOT-owned types"
+removal_plan = "refuse content observation until an equivalent nofollow opener is installed"
+
+[direct_dependencies.cap-std]
+ecosystem = "rust"
+consumer = "crates/foundation/eliot-bootstrap"
+owner = "crates/foundation/eliot-bootstrap"
+reason = "confine selected source content reads to an opened workspace directory (#1790)"
+features = []
+public_exposure = "none; source observations use ELIOT-owned types"
+removal_plan = "refuse content observation until an equivalent confined opener is installed"
+
 [direct_dependencies.clap]
 ecosystem = "rust"
 consumer = "bins/eliot-cli"
