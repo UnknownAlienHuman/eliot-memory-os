@@ -209,6 +209,30 @@ public sealed record UserAutomationOperatorRequest(
 
     public void Validate()
     {
+        // `operation` is a required reference-typed member and an absent member
+        // decodes to null, so the `Operation.Validate()` call below is itself
+        // the dereference. The `[JsonPolymorphic]` base refuses an unmapped or
+        // unknown `kind`, but that is a different claim: a decoded request
+        // whose `operation` member is `null` reaches this method with nothing
+        // in front of it, and `DeriveIdempotencyKey` does not stand in front
+        // either — its `ArgumentNullException.ThrowIfNull` at :195 refuses a
+        // caller-supplied argument, never a decoded request record. A
+        // `NullReferenceException` is not an `InvalidOperationException`, so
+        // the fault would escape `MainViewModel.cs:473` and
+        // `OperatorPendingOperationJournal.cs:495`, which both filter on
+        // `JsonException or InvalidOperationException`, instead of the
+        // withheld, still-reconciling outcome they are written to produce.
+        // Refused by name here, one fixed sentence over the wire member,
+        // exactly as `create`, `edit` and `UserAutomationRevision` refuse
+        // theirs. This fires before the journal's own
+        // `Request.Operation.IsEffect()` at :486, so that second dereference
+        // is covered by the same refusal. This adds no bound, no wire member
+        // and no digest input: `DeriveIdempotencyKey` digests
+        // `JsonSerializer.Serialize(operation, OperatorJson.Writer)`, which
+        // this method does not touch, so a previously valid request carried
+        // the member, its retained bytes still validate and still re-derive
+        // the same idempotency key.
+        if (Operation is null) throw new InvalidOperationException("operation must be present.");
         Operation.Validate();
         OperatorIntentContract.RequireOperationId(IdempotencyKey);
     }
@@ -837,6 +861,25 @@ public sealed record UserAutomationAllowedProviderPolicy(
         // idempotency key.
         if (Fingerprints is null) throw new InvalidOperationException("provider_policy.fingerprints must be present.");
         if (Fingerprints.Count == 0) throw new InvalidOperationException("provider_policy.fingerprints must not be empty.");
+        // The element type is a reference record, so `"fingerprints": [null]`
+        // decodes to a list holding `null` and the `Validate()` call below is
+        // a dereference on that element, not on the list. This is still a
+        // refusal of the FIELD, not of a slot: the wire member is not valid
+        // unless every slot in it holds a present record, and the file names
+        // the field for every refusal inside a list, never a slot —
+        // `RequireTextList` passes its own `field` to `RequireText` per element
+        // rather than any index, and `RequireOneOf(IEnumerable<string>, ...)`
+        // does the same. So it needs no new reason string, no new type and no
+        // new fault code: the sentence is the one already emitted for this
+        // exact wire member by the guard above. Same typed
+        // `InvalidOperationException`, so the contained handlers
+        // (`MainViewModel.cs:473`, `OperatorPendingOperationJournal.cs:495`)
+        // hold this fault exactly as they hold the twelve above instead of
+        // letting a `NullReferenceException` past them. No bound, no wire
+        // member and no digest input change: a previously valid policy held a
+        // non-null fingerprint in every slot, so its retained bytes still
+        // validate and still re-derive the same idempotency key.
+        if (Fingerprints.Any(fingerprint => fingerprint is null)) throw new InvalidOperationException("provider_policy.fingerprints must be present.");
         foreach (var fingerprint in Fingerprints) fingerprint.Validate();
         if (Fingerprints.Zip(Fingerprints.Skip(1)).Any(pair => pair.First == pair.Second))
         {
