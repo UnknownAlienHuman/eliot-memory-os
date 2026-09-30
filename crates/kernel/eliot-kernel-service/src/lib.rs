@@ -147,9 +147,8 @@ pub use notify_grant::{
 pub use owner_history::{
     GRANT_CLOSURE_CANONICAL_LINKS_VERSION, GrantClosureCanonicalLink,
     GrantClosureCanonicalLinkRequest, GrantClosureCanonicalLinks, GrantClosureCanonicalLinksQuery,
-    GrantClosureReceiptQuery, commit_grant_closure_canonical_link,
-    grant_closure_canonical_links, serve_authority_revocation_history,
-    serve_grant_closure_receipt,
+    GrantClosureReceiptQuery, commit_grant_closure_canonical_link, grant_closure_canonical_links,
+    serve_authority_revocation_history, serve_grant_closure_receipt,
 };
 pub use process_execution_client::{
     KernelProcessExecutionClient, ProcessOperationFuture, ProcessOperationPort, ProcessStarter,

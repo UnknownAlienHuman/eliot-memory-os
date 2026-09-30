@@ -690,10 +690,12 @@ pub fn commit_grant_closure_canonical_link(
     if request.state_fence != *session_fence {
         return Err(StoreError::FenceMismatch);
     }
-    let operation_id = eliot_ors::OperationIdentity::new(&request.closure_operation_id)
-        .map_err(|_| StoreError::InvalidField {
-            field: "operation.parameter",
-            reason: "closure_operation_id must be a bounded non-blank string",
+    let operation_id =
+        eliot_ors::OperationIdentity::new(&request.closure_operation_id).map_err(|_| {
+            StoreError::InvalidField {
+                field: "operation.parameter",
+                reason: "closure_operation_id must be a bounded non-blank string",
+            }
         })?;
     if !canonical_receipt_identity_is_usable(&request.canonical_receipt) {
         return Err(StoreError::InvalidField {
@@ -734,8 +736,9 @@ fn closure_link_store_error(error: eliot_ors::OrsError) -> StoreError {
         | eliot_ors::OrsError::InboxIntegrityMismatch
         | eliot_ors::OrsError::Contract(_) => StoreError::InvalidProjection,
         eliot_ors::OrsError::ReservationNotFound => StoreError::ReceiptNotFound,
-        eliot_ors::OrsError::ProjectionLimitExceeded
-        | eliot_ors::OrsError::PayloadTooLarge => StoreError::PayloadTooLarge,
+        eliot_ors::OrsError::ProjectionLimitExceeded | eliot_ors::OrsError::PayloadTooLarge => {
+            StoreError::PayloadTooLarge
+        }
         _ => StoreError::Unavailable,
     }
 }
