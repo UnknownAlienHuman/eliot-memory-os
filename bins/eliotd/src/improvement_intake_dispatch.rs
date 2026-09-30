@@ -1420,13 +1420,17 @@ fn maintenance_sourced_evidence(
             // appended, so the bundle holds no repeat of one reference. The
             // bundle is revalidated afterwards, so this composition cannot
             // produce a bundle the constructor would have refused.
-            let already: BTreeSet<String> = evidence.evidence_refs.iter().cloned().collect();
-            evidence.evidence_refs.extend(
-                evidence_refs
-                    .iter()
-                    .filter(|r| !already.contains(r))
-                    .cloned(),
-            );
+            //
+            // The probe set borrows the bundle's own refs rather than cloning
+            // them, which is the lookup idiom `improvement_dedup_read.rs:745`
+            // uses for the same "is this ref already retained" question: a
+            // `BTreeSet<&str>` probed with the plain `&str`. Both sides are
+            // compared as content, so a ref is skipped only on an exact byte
+            // match against a ref the constructor already retained.
+            let already: BTreeSet<&str> = evidence.evidence_refs.iter().map(String::as_str).collect();
+            evidence
+                .evidence_refs
+                .extend(evidence_refs.iter().filter(|r| !already.contains(r.as_str())).cloned());
             evidence.validate()?;
             Ok(evidence)
         }
