@@ -809,8 +809,7 @@ impl KernelComposition {
         let mut evidence_refs = KernelReadyReceipt::probe_binding_evidence(request)?;
         evidence_refs.extend([
             eliot_platform::PlatformHandle::new(format!(
-                "kernel-store-validation:{}",
-                validation_revision
+                "kernel-store-validation:{validation_revision}"
             ))
             .map_err(|error| KernelServiceError::Platform(error.to_string()))?,
             eliot_platform::PlatformHandle::new(format!(
