@@ -74,7 +74,7 @@
     {
       "manifest": "Cargo.lock",
       "base_blob_sha256": "8694704b293ac155f6a073c19734c72de81564719570abf5bc1bdfe4719118d3",
-      "current_blob_sha256": "9e429d412940f6fc2c46321b8e5fd120787189b93f11447a646ba3023b8c6363",
+      "current_blob_sha256": "939b0bd95ed397a7c76fb0b480e2e406d287969cd9dc491841fc39103722425b",
       "byte_identical_since_base": false
     }
   ],
