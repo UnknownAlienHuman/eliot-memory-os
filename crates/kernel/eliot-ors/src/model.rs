@@ -41,7 +41,7 @@ pub const HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION: u16 = 1;
 /// Current version of the encrypted executable-input carrier on a host request.
 pub const HOST_REQUEST_EXECUTABLE_INPUT_CONTRACT_VERSION: u16 = 1;
 
-/// Shared schema identity for the canonical ToolRequest byte stream.
+/// Shared schema identity for the canonical `ToolRequest` byte stream.
 pub const HOST_REQUEST_TOOL_REQUEST_SCHEMA_ID: &str = "eliot.mcp.tool-request.v1";
 
 /// This issue allows one original send attempt plus one proven-not-sent retry.
@@ -6774,7 +6774,7 @@ pub struct HostRequestAttempt {
     pub owner_launch_nonce: OpaqueLabel,
     pub owner_session_epoch: u64,
     pub phase: HostRequestAttemptPhase,
-    /// Commitment to the exact retained executable ToolRequest and its
+    /// Commitment to the exact retained executable `ToolRequest` and its
     /// protected recovery envelope. Absent only on legacy attempts.
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -7740,22 +7740,28 @@ fn validate_unique_texts(values: &[String], field: &'static str) -> Result<(), O
 pub struct HostRequestApplicationBinding {
     /// Application-binding wire version.
     pub wire_version: u16,
-    /// Exact original HostRequestIdentity serialized by the Kernel owner.
+    /// Exact original `HostRequestIdentity` serialized by the Kernel owner.
     pub request_identity: Value,
     /// Canonical digest of `request_identity`.
     pub request_identity_sha256: String,
+    /// Exact original EBP `RequestIdentity` from the Bridge `Frame`, retained
+    /// separately from the `HostRequestIdentity` claim.
+    pub source_request_identity: Value,
+    /// Canonical digest of `source_request_identity`.
+    pub source_request_identity_sha256: String,
     /// Authenticated principal resolved from retained application binding.
     pub principal_ref: OpaqueLabel,
-    /// Resolved durable Session.
+    /// Resolved durable `Session`.
     pub session_ref: OpaqueLabel,
     /// Resolved task, if one is selected.
     pub task_ref: Option<OpaqueLabel>,
-    /// Resolved WorkScope, if one is selected.
+    /// Exact owner-resolved `WorkScope` used for this capture, including when
+    /// the original request omitted a scope selector.
     pub scope_ref: Option<OpaqueLabel>,
     /// Task revision to which this capture applies, absent when task selection
     /// is not part of the capture even if the retained live fence has one.
     pub task_revision: Option<u64>,
-    /// Exact activation State Fence retained by the application owner.
+    /// Exact activation `StateFence` retained by the application owner.
     pub state_fence: StateFence,
     /// Full resolved activation binding as an opaque typed-owner projection.
     pub resolved_application_binding: Option<Value>,
@@ -7766,7 +7772,7 @@ pub struct HostRequestApplicationBinding {
     /// Canonical digest of `activation_owner_evidence`.
     pub activation_owner_evidence_sha256: Option<String>,
     /// Exact Governor-owned observation-policy binding, including its
-    /// persisted Setting and PolicyOwner revision/fence evidence.
+    /// persisted `Setting` and `PolicyOwner` revision/fence evidence.
     pub observation_policy_binding: Value,
     /// Canonical digest of the exact Governor policy-owner projection.
     pub observation_policy_binding_sha256: String,
@@ -7776,7 +7782,7 @@ pub struct HostRequestApplicationBinding {
     pub p07_revision: Option<u64>,
     /// Exact P07 bundle digest captured by the admission owner.
     pub p07_bundle_sha256: Option<String>,
-    /// Clock reading captured at admission and passed unchanged to the daemon.
+    /// `ClockReading` captured at admission and passed unchanged to the daemon.
     pub clock_reading: eliot_contracts::ClockReading,
     /// Kernel-observed admission time in Unix milliseconds.
     pub admitted_at_unix_ms: u64,
@@ -7799,6 +7805,7 @@ impl HostRequestApplicationBinding {
         self.validate_resolved_binding_fields()?;
         self.validate_clock_and_revisions()?;
         self.validate_fence_binding(record)?;
+        self.validate_source_request_identity(record)?;
         self.validate_observation_policy_binding(record)?;
         self.validate_request_identity(record)
     }
@@ -7808,6 +7815,11 @@ impl HostRequestApplicationBinding {
             Some(&self.request_identity),
             Some(&self.request_identity_sha256),
             "host_request_owner_identity",
+        )?;
+        Self::validate_projection(
+            Some(&self.source_request_identity),
+            Some(&self.source_request_identity_sha256),
+            "host_request_source_identity",
         )?;
         Self::validate_projection(
             self.resolved_application_binding.as_ref(),
@@ -7952,7 +7964,7 @@ impl HostRequestApplicationBinding {
                 })
             };
         };
-        for (field, value, expected) in [
+        for (_field, value, expected) in [
             (
                 "host_request_application_principal",
                 binding.get("principal_id").and_then(Value::as_str),
@@ -8029,12 +8041,155 @@ impl HostRequestApplicationBinding {
         Ok(())
     }
 
+    fn validate_source_request_identity(
+        &self,
+        record: &HostRequestRecord,
+    ) -> Result<(), OrsError> {
+        self.validate_source_request_identity_ids(record)?;
+        self.validate_source_request_identity_fence()?;
+        self.validate_source_request_identity_metadata()
+    }
+
+    fn source_request_parts(&self) -> Result<(&Value, &Value), OrsError> {
+        let request = self
+            .source_request_identity
+            .get("request")
+            .ok_or(OrsError::InvalidField {
+                field: "host_request_source_identity_request",
+                reason: "the original EBP request binding is required",
+            })?;
+        let metadata = request.get("metadata").ok_or(OrsError::InvalidField {
+            field: "host_request_source_identity_metadata",
+            reason: "the original EBP request metadata is required",
+        })?;
+        Ok((request, metadata))
+    }
+
+    fn validate_source_request_identity_ids(
+        &self,
+        record: &HostRequestRecord,
+    ) -> Result<(), OrsError> {
+        let (_, metadata) = self.source_request_parts()?;
+        let transport_request_id = metadata
+            .get("request_id")
+            .and_then(Value::as_str)
+            .ok_or(OrsError::InvalidField {
+                field: "host_request_source_identity_request_id",
+                reason: "the original EBP request id must be text",
+            })?;
+        let flat_request_id = self
+            .request_identity
+            .get("request_id")
+            .and_then(Value::as_str);
+        if transport_request_id != record.request_id.as_str()
+            || Some(transport_request_id) != flat_request_id
+            || self
+                .source_request_identity
+                .get("idempotency_key")
+                .and_then(Value::as_str)
+                != Some(record.idempotency_key.as_str())
+            || self
+                .source_request_identity
+                .get("cancellation_id")
+                .and_then(Value::as_str)
+                != Some(record.cancellation_id.as_str())
+            || self
+                .source_request_identity
+                .get("deadline_unix_ms")
+                .and_then(Value::as_u64)
+                != Some(record.deadline_unix_ms)
+        {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: record.operation_id.as_str().to_owned(),
+                request_digest: record.request_digest.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_source_request_identity_fence(&self) -> Result<(), OrsError> {
+        let (request, metadata) = self.source_request_parts()?;
+        let metadata_fence = serde_json::from_value::<StateFence>(
+            metadata
+                .get("state_fence")
+                .cloned()
+                .unwrap_or(Value::Null),
+        )
+        .map_err(|_| OrsError::FenceMismatch)?;
+        let request_fence = serde_json::from_value::<StateFence>(
+            request.get("state_fence").cloned().unwrap_or(Value::Null),
+        )
+        .map_err(|_| OrsError::FenceMismatch)?;
+        metadata_fence
+            .validate()
+            .map_err(|_| OrsError::FenceMismatch)?;
+        if request_fence != metadata_fence
+            || metadata_fence.authority_epoch != self.state_fence.authority_epoch
+            || metadata_fence.resource_generation != self.state_fence.resource_generation
+            || metadata_fence.task_revision.is_some()
+            || metadata_fence.policy_revision.is_some()
+            || metadata_fence.integration_revision.is_some()
+        {
+            return Err(OrsError::FenceMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_source_request_identity_metadata(&self) -> Result<(), OrsError> {
+        let (_, metadata) = self.source_request_parts()?;
+        for field in ["session_id", "task_id"] {
+            if metadata.get(field) != Some(&Value::Null) {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_source_identity_selectors",
+                    reason: "the original Bridge transport identity must retain neutral session and task selectors",
+                });
+            }
+        }
+        let product_id = metadata
+            .get("product_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        validate_text(product_id, "host_request_source_identity_product")?;
+        let source_id = metadata
+            .get("source_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        validate_text(source_id, "host_request_source_identity_source")?;
+
+        let transport_clock = serde_json::from_value::<eliot_contracts::ClockReading>(
+            metadata.get("clock").cloned().unwrap_or(Value::Null),
+        )
+        .map_err(|_| OrsError::InvalidField {
+            field: "host_request_source_identity_clock",
+            reason: "the original EBP transport clock must be retained intact",
+        })?;
+        if transport_clock.valid_time_ms.is_some()
+            || transport_clock.known_time_ms.is_some()
+            || transport_clock.transaction_sequence.is_some()
+            || transport_clock.monotonic_ns.is_some()
+        {
+            return Err(OrsError::InvalidField {
+                field: "host_request_source_identity_clock",
+                reason: "the original Bridge request carries no clock reading",
+            });
+        }
+        Ok(())
+    }
+
     fn validate_observation_policy_binding(
         &self,
         record: &HostRequestRecord,
     ) -> Result<(), OrsError> {
+        self.validate_observation_policy_identity(record)?;
+        self.validate_observation_policy_reads()
+    }
+
+    fn validate_observation_policy_identity(
+        &self,
+        record: &HostRequestRecord,
+    ) -> Result<(), OrsError> {
         let policy = &self.observation_policy_binding;
-        for (field, value, expected) in [
+        for (_field, value, expected) in [
             (
                 "host_request_observation_policy_principal",
                 policy
@@ -8072,6 +8227,16 @@ impl HostRequestApplicationBinding {
         if policy_fence != expected_fence {
             return Err(OrsError::FenceMismatch);
         }
+        if record.scope_ref.as_ref().map(OpaqueLabel::as_str)
+            != self.scope_ref.as_ref().map(OpaqueLabel::as_str)
+        {
+            return Err(OrsError::FenceMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_observation_policy_reads(&self) -> Result<(), OrsError> {
+        let policy = &self.observation_policy_binding;
         for field in [
             "policy_named_read_digest",
             "config_policy_snapshot_sha256",
@@ -8140,11 +8305,6 @@ impl HostRequestApplicationBinding {
                 });
             }
         }
-        if record.scope_ref.as_ref().map(OpaqueLabel::as_str)
-            != self.scope_ref.as_ref().map(OpaqueLabel::as_str)
-        {
-            return Err(OrsError::FenceMismatch);
-        }
         Ok(())
     }
 
@@ -8183,13 +8343,6 @@ impl HostRequestApplicationBinding {
                 self.request_identity.get("task_id").and_then(Value::as_str),
                 record.task_ref.as_ref().map(OpaqueLabel::as_str),
             ),
-            (
-                "host_request_owner_scope",
-                self.request_identity
-                    .get("work_scope_id")
-                    .and_then(Value::as_str),
-                record.scope_ref.as_ref().map(OpaqueLabel::as_str),
-            ),
         ] {
             if value != expected {
                 return Err(OrsError::InvalidField {
@@ -8197,6 +8350,18 @@ impl HostRequestApplicationBinding {
                     reason: "original request selectors diverge from the retained row",
                 });
             }
+        }
+        if let Some(claimed_scope) = self
+            .request_identity
+            .get("work_scope_id")
+            .and_then(Value::as_str)
+            && Some(claimed_scope)
+                != record.scope_ref.as_ref().map(OpaqueLabel::as_str)
+        {
+            return Err(OrsError::InvalidField {
+                field: "host_request_owner_scope",
+                reason: "an explicit request scope claim must equal the owner-resolved scope",
+            });
         }
         let request_correlation = self
             .request_identity
@@ -8242,28 +8407,28 @@ impl HostRequestApplicationBinding {
     }
 }
 
-/// Encoding required for an executable ToolRequest byte stream.
+/// Encoding required for an executable `ToolRequest` byte stream.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum HostRequestExecutableInputEncoding {
-    /// Shared canonical JSON representation of the typed ToolRequest.
+    /// Shared canonical JSON representation of the typed `ToolRequest`.
     CanonicalJsonV1,
 }
 
-/// Exact executable ToolRequest input retained under the existing protected
+/// Exact executable `ToolRequest` input retained under the existing protected
 /// recovery payload contract. The plaintext is never stored in this type.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostRequestExecutableInput {
     /// Executable-input wire version.
     pub contract_version: u16,
-    /// Exact shared ToolRequest schema identity.
+    /// Exact shared `ToolRequest` schema identity.
     pub schema_id: OpaqueLabel,
-    /// Encoding used for the original typed ToolRequest.
+    /// Encoding used for the original typed `ToolRequest`.
     pub encoding: HostRequestExecutableInputEncoding,
-    /// Digest of the original canonical ToolRequest bytes.
+    /// Digest of the original canonical `ToolRequest` bytes.
     pub payload_sha256: String,
-    /// Byte length of the original canonical ToolRequest bytes.
+    /// Byte length of the original canonical `ToolRequest` bytes.
     pub payload_length: u64,
     /// SID observed by Kernel for the admitted bridge peer.
     pub authenticated_principal_ref: OpaqueLabel,
@@ -8552,7 +8717,7 @@ pub struct HostRequestRecord {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload_body: Option<Value>,
-    /// Protected original ToolRequest bytes and their schema/digest binding.
+    /// Protected original `ToolRequest` bytes and their schema/digest binding.
     /// Optional only for historical or non-executable rows.
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
