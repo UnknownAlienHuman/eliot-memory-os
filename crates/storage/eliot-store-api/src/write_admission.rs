@@ -225,6 +225,8 @@
 //! | `ApplyUserAutomationState` | F8 | `UserAutomation` | `ReversibleMutation` | 4 |
 //! | `RecordFinishDecision` | F5 | `RecoverySchema` | `ReversibleMutation` | 4 |
 //! | `RecordFinishEvidence` | F5 | `RecoverySchema` | `ReversibleMutation` | 4 |
+//! | `RecordModuleCatalogSnapshot` | F8 | `RecoverySchema` | `ReversibleMutation` | 4 |
+//! | `RecordCoordinationOwner` | F7 | `RecoverySchema` | `ReversibleMutation` | 4 |
 //! | `ApplyNotificationState` | F6 | `NotificationState` | `ReversibleMutation` | 4 |
 //! | `ApplyReactiveInjectionState` | F7 | `ReactiveState` | `ReversibleMutation` | 4 |
 //! | `ApplyResourceSnapshot` | F7 | `ReactiveState` | `ReversibleMutation` | 4 |

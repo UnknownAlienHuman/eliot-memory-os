@@ -4114,6 +4114,18 @@ pub enum NamedMutationOperation {
     /// Governor registry re-evaluates through its own exact-fingerprint,
     /// freshness, invalidation, and requalification predicates.
     RecordCapabilityEvidenceRecord,
+    /// Persists the Governor-produced coordination owner image through the
+    /// same fenced `RecoverySchema` transition. The store treats the snapshot
+    /// as opaque bytes and only arbitrates the fixed `owner/coordination`
+    /// revision.
+    ///
+    /// This is the coordination owner's post-genesis write route: before it,
+    /// `owner/coordination` was written exactly once by genesis and every later
+    /// coordination mutation was erased by the next owner rehydration. The
+    /// Governor remains the sole author of coordination meaning; the store only
+    /// arbitrates the address, the fence, and the outer revision, exactly as it
+    /// does for `owner/canonical`, `owner/finish` and `owner/module_registry`.
+    RecordCoordinationOwner,
     /// Canonical problem owner-state transaction (issue #1759 I2, I13.9/I13.7).
     ///
     /// Durable Problem-registry ownership and lifecycle only: the prepared
@@ -4147,6 +4159,7 @@ impl NamedMutationOperation {
             | Self::RecordFinishDecision
             | Self::RecordFinishEvidence
             | Self::RecordModuleCatalogSnapshot
+            | Self::RecordCoordinationOwner
             | Self::RecordAuthorityRevocation
             | Self::ApplyProblemOwnerState => TransitionClass::RecoverySchema,
             Self::ApplyErasure => TransitionClass::Erasure,
