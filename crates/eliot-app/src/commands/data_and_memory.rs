@@ -815,7 +815,7 @@ pub async fn run_skill_influence(config_path: &Path, project: &str, task: &str) 
         included: vec![skill.skill_id],
         executed: Vec::new(),
         execution_proofs: Vec::new(),
-        estimated_context_cost: 128,
+        measured_skills: Some(vec![skill]),
     });
     write_skill_influence_to_memory(config_path, &mut report).await?;
     write_skill_influence_report(&root, &report)?;
@@ -837,7 +837,7 @@ pub fn run_skill_report(config_path: &Path) -> Result<()> {
         included: filter.skills_included.clone(),
         executed: Vec::new(),
         execution_proofs: Vec::new(),
-        estimated_context_cost: 128,
+        measured_skills: Some(skills.clone()),
     });
     let report = serde_json::json!({
         "component": "skill_report",

@@ -65,6 +65,9 @@ pub(super) fn dispatch_skill_filter(arguments: Value) -> Result<Value> {
 pub(super) fn dispatch_skill_influence(arguments: Value) -> Result<Value> {
     let input: SkillTaskToolInput = serde_json::from_value(arguments)?;
     let skill = mcp_active_skill(SkillId::new_v7(), SkillLifecycleState::Active);
+    // The measured Skill bytes travel with the request, so the report carries a
+    // canonical #704 serialized-byte measurement instead of a caller-declared
+    // constant. (Issue #880, inventory rows 783/21 and 783/22.)
     let report = SkillInfluenceService::report(SkillInfluenceReportInput {
         project_id: project_id_from_label(&input.project),
         task_id: task_id_from_label(&input.task),
@@ -73,7 +76,7 @@ pub(super) fn dispatch_skill_influence(arguments: Value) -> Result<Value> {
         included: vec![skill.skill_id],
         executed: Vec::new(),
         execution_proofs: Vec::new(),
-        estimated_context_cost: 128,
+        measured_skills: Some(vec![skill]),
     });
     serde_json::to_value(report).map_err(Into::into)
 }
