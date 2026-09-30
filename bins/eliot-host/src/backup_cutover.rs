@@ -2986,7 +2986,8 @@ fn activate_cutover_contour(
 /// is the exact state the owners established for this operation rather than a
 /// local assumption, and the returned `residual` names whatever uncertainty the
 /// owners left behind. This function cannot return `Validated` or `Committed`
-/// (see [`reconcile_cutover_outcome`]); an unqualified read answers `Requested`.
+/// (see [`reconcile_cutover_outcome`]); a COHERENT unqualified read answers
+/// `Requested`, while a torn pair is reported as movement instead.
 ///
 /// `retirement_receipt` is a LOOKUP HINT, never the proof — the retirement is
 /// resolved through the journal owner, and the presented receipt only has to
@@ -4487,14 +4488,26 @@ pub fn reconcile_cutover_outcome(
                 CutoverResidual::UnattributedActivation,
             )
         }
+    } else if coherence != OwnerObservationCoherence::Coherent {
+        // This arm is only reached when no intent of this operation is retained
+        // and the registry is not showing this operation's target, so the same
+        // torn-pair hazard the `UnattributedActivation` arm above guards applies
+        // here: when the pair was torn the missing intent may simply have landed
+        // after the sampled journal read, so the movement is named rather than an
+        // absence the read did not actually observe. The `owner_moved` signal the
+        // reader itself emitted is not discarded for a settled pre-effect word.
+        (
+            CutoverDisposition::Unknown,
+            CutoverResidual::ConcurrentOwnerMovement,
+        )
     } else {
-        // No owner observation establishes anything for this operation. The old
-        // code returned `Validated` here whenever the caller passed a bare
-        // `true`, which let an unconstrained caller assertion certify
-        // qualification. The honest answer for an unqualified read is
-        // `Requested`: not validated, not refused, not an effect — and the
-        // `Validated` disposition is now unreachable from this mapper, so it
-        // cannot be minted from a caller's word.
+        // No owner observation establishes anything for this operation, and the
+        // pair was read as one moment. The old code returned `Validated` here
+        // whenever the caller passed a bare `true`, which let an unconstrained
+        // caller assertion certify qualification. The honest answer for an
+        // unqualified read is `Requested`: not validated, not refused, not an
+        // effect — and the `Validated` disposition is now unreachable from this
+        // mapper, so it cannot be minted from a caller's word.
         (CutoverDisposition::Requested, CutoverResidual::None)
     };
     let outcome = CutoverOutcome {
