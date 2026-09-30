@@ -122,6 +122,7 @@ mod credential_provision;
 mod guard_containment;
 mod installation_registry;
 mod integration_discovery;
+mod managed_change_admission;
 mod managed_change_plan;
 mod package;
 mod package_planner;
@@ -177,6 +178,12 @@ pub use integration_discovery::{
     ManagedChangeAdmissionError, NON_SECRET_PROBE_ENVIRONMENT_NAMES, ProbeBehaviour,
     admit_installation_survey_and_compile_change, integration_seed_family_ids,
     load_accepted_catalogue, resolve_bounded_probe, survey_accepted_installation,
+};
+
+pub use managed_change_admission::{
+    ManagedCapabilityAdvertisement, ManagedCapabilityState, ManagedCapabilityStatus,
+    MissingQualification, RequalificationBinding, requalify_managed_capability,
+    validate_advertisement,
 };
 
 pub use managed_change_plan::{

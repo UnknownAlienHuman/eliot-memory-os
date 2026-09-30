@@ -970,10 +970,19 @@ pub struct AcceptedCatalogueContext<'a> {
 /// produced, so revalidating the plan against a later survey of the same
 /// catalogue revision fails when any observation changed.
 ///
+/// The third element is the requalified capability advertisement: the only value
+/// here a consumer may present as "what is true about this candidate now". It is
+/// derived from a second, independent re-derivation of the accepted catalogue
+/// and the ordered survey, never from the plan's own fields, so a consumer that
+/// displays a capability from this function's product is displaying a re-proof
+/// and not a stored record. A plan whose bindings no longer hold is refused
+/// here rather than returned.
+///
 /// # Errors
 /// Returns [`ManagedChangeAdmissionError`] when no accepted revision loads for
-/// the observed platform, when the survey or catalogue refuses, or when the
-/// request cannot be compiled against that exact survey and approval.
+/// the observed platform, when the survey or catalogue refuses, when the
+/// request cannot be compiled against that exact survey and approval, or when
+/// the compiled plan does not survive live requalification.
 pub fn admit_installation_survey_and_compile_change(
     context: &AcceptedCatalogueContext<'_>,
     source: &dyn SurveyObservationSource,
@@ -982,6 +991,7 @@ pub fn admit_installation_survey_and_compile_change(
     (
         AcceptedInstallationSurvey,
         super::ManagedEnvironmentChangePlan,
+        super::ManagedCapabilityAdvertisement,
     ),
     ManagedChangeAdmissionError,
 > {
@@ -992,7 +1002,16 @@ pub fn admit_installation_survey_and_compile_change(
         &admitted.survey,
         context.authority,
     )?;
-    Ok((admitted, plan))
+    // Requalify before this plan is handed out, and hand the advertisement out
+    // with it. A compiled plan is a record of a check performed at plan time,
+    // so returning it as the only product would let a consumer read its bindings
+    // and advertise on their strength — a remembered qualification. The
+    // requalifier re-derives the accepted catalogue and re-runs the ordered
+    // survey from the retained signed publication and the pinned anchor, so the
+    // advertisement is a live re-proof. The plan still narrows to one family and
+    // one exact identity and still supplies no fact about them.
+    let advertisement = super::requalify_managed_capability(&plan, context, source)?;
+    Ok((admitted, plan, advertisement))
 }
 
 /// One ordered, metadata-only survey of the accepted catalogue together with
