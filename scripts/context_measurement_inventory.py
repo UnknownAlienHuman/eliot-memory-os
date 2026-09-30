@@ -66,7 +66,23 @@ workset exceeds the I2.16 upper review band, as a new closed top-level
 classification set, the 72-case denominator and the owner allocations are
 unchanged, so every existing row keeps its identity and digest inputs.
 
-Classification rules (RULE_REVISION 866.3, first match wins, evidence kept):
+Revision 866.4 changes no classification rule and no discovered row, and the
+72-case denominator is unchanged. It allocates the four candidates that 866.2
+had to carry as ``unresolved`` -- ``crates/eliot-engine/src/control_plane.rs``
+(cost/token budget ledger) and ``crates/eliot-engine/src/cognition.rs``
+(planning-record ``estimated_tokens`` comparison) -- to the existing engine
+consumer #878, because #878's own contract is the engine measurement migration
+that owns exactly these obligations. Their case identities, spans, span
+digests, classes and evidence are carried over byte for byte, so every row
+keeps its measured meaning; only ``owner``/``seam``/``write_scope``/``status``
+move. The 15-class cascade, ``MEASURED_FIELD`` and ``EXCLUSION_CASES`` are
+untouched, and ``UNRESOLVED_OWNER`` stays a live tier, so a candidate with no
+exact-scope owner is still never defaulted and still blocks dispatch.
+
+Classification rules (RULE_REVISION 866.4, first match wins, evidence kept).
+866.4 changes no rule: 866.1's ten classes and 866.2's five are frozen and
+reproduced here verbatim, in the same first-match order, so every existing row
+keeps its class:
   1. signal is "#[test]" or "cfg(test)", or the enclosing item scope is a
      real test scope -> test-only
   2. signal contains "stu_for_bytes" or signal is "StuEstimate"
@@ -185,7 +201,7 @@ import tomllib
 from pathlib import Path
 
 SCHEMA = "eliot.context-measurement-inventory.v2"
-RULE_REVISION = "866.3"
+RULE_REVISION = "866.4"
 TOOL_VERSION = "0.2.0"
 OWNED_TOML = Path(".github/work-units/context-measurement-inventory.toml")
 OWNER_MAP_PATH = Path(".github/work-units/context-measurement-owner-map.toml")
@@ -301,6 +317,30 @@ CONSUMER_SEAM_CASES: tuple[tuple[str, str, str, str], ...] = (
     ("878/18", "#878", "crates/eliot-engine/src/host.rs", "if description.chars().count().div_ceil(4) > 25"),
     ("878/19", "#878", "crates/eliot-engine/src/host.rs", "pub listing_characters: usize,"),
     ("878/20", "#878", "crates/eliot-engine/src/host.rs", "if descriptions.div_ceil(4) > 100"),
+    # #878 engine autonomy cost/token budget ledger and planning-record
+    # comparison. These four were carried as unallocated candidates by
+    # revision 866.2 because no declared seam named their files. Each case
+    # keeps its identity byte for byte -- same exact path, same exact signal,
+    # same located span -- so its span digest, its class and its reason are
+    # unchanged; only the owner moves from "unresolved" to the existing
+    # engine consumer. #878 is that owner and not a new one: its own lane
+    # (CS2) already holds the #866 E1 finite allocation and is migrating
+    # crates/eliot-engine measurement to canonical owner #704, and #878's
+    # contract states "This E1 slice alone adds the engine measurement
+    # dependency" and that "Current estimated_tokens fields must reference
+    # honest evidence or remain only behind a closed explicit legacy
+    # adapter". control_plane.rs holds the engine's autonomy cost/token
+    # budget ledger and cognition.rs compares the estimated_tokens of two
+    # planning decisions -- both are exactly that obligation. Neither file is
+    # #880's (Skill/memory) and neither is #704's (the algorithm crates hold
+    # no engine row). The frozen owner map supplies the matching exact file
+    # paths, so a row stays unresolved unless the allocation AND the map
+    # agree; the UNRESOLVED_OWNER tier below stays load bearing, so a
+    # candidate with no exact-scope owner is still never defaulted.
+    ("878/21", "#878", "crates/eliot-engine/src/control_plane.rs", "pub cost_or_token_units: u64,"),
+    ("878/22", "#878", "crates/eliot-engine/src/control_plane.rs", ".cost_or_token_budget"),
+    ("878/23", "#878", "crates/eliot-engine/src/control_plane.rs", ".saturating_add(intent.cost_or_token_units)"),
+    ("878/24", "#878", "crates/eliot-engine/src/cognition.rs", "|| treatment.estimated_tokens < control.estimated_tokens"),
     # #880 engine Skill / memory seam
     ("880/10", "#880", "crates/eliot-engine/src/skill.rs", "fn estimated_skill_context_cost(skill: &SkillCardV2) -> u64"),
     ("880/11", "#880", "crates/eliot-engine/src/skill.rs", "pub estimated_context_cost: u64,"),
@@ -317,27 +357,15 @@ CONSUMER_SEAM_CASES: tuple[tuple[str, str, str, str], ...] = (
     ("880/22", "#880", "crates/eliot-engine/src/memory_lifecycle.rs", "context_cost_tokens: 64"),
 )
 
-# ---------------------------------------------------------------------------
-# Unallocated candidates: real measurement sites outside every declared seam.
-# They stay rows with owner "unresolved"; no owner is invented for them.
-# ---------------------------------------------------------------------------
-UNRESOLVED_CASES: tuple[tuple[str, str, str, str], ...] = (
-    ("unres/1", UNRESOLVED_OWNER, "crates/eliot-engine/src/control_plane.rs", "pub cost_or_token_units: u64,"),
-    ("unres/2", UNRESOLVED_OWNER, "crates/eliot-engine/src/control_plane.rs", ".cost_or_token_budget"),
-    ("unres/3", UNRESOLVED_OWNER, "crates/eliot-engine/src/control_plane.rs", ".saturating_add(intent.cost_or_token_units)"),
-    ("unres/4", UNRESOLVED_OWNER, "crates/eliot-engine/src/cognition.rs", "|| treatment.estimated_tokens < control.estimated_tokens"),
-)
-
 DENOMINATOR_CASES: tuple[tuple[str, str, str, str], ...] = (
-    BASELINE_CASES + CONSUMER_SEAM_CASES + UNRESOLVED_CASES
+    BASELINE_CASES + CONSUMER_SEAM_CASES
 )
 EXPECTED_DENOMINATOR_COUNT = 72
 EXPECTED_OWNER_ALLOCATIONS = (
     ("#704", 9),
     ("#783", 21),
-    ("#878", 17),
+    ("#878", 21),
     ("#880", 21),
-    (UNRESOLVED_OWNER, 4),
 )
 
 # ---------------------------------------------------------------------------
@@ -452,7 +480,9 @@ CONSUMER_WRITE_EDGES: dict[str, tuple[str, ...]] = {
         "serialized-after: #704 algorithm merge, then " + INTEGRATION_OWNER + " regeneration",
     ),
     "#878": (
-        "single-writer: crates/eliot-engine/src/{context.rs,context_contracts.rs,host.rs} and crates/eliot-engine/src/context/packet_quality.rs are the #878 Context/packet-quality/Host seam",
+        "single-writer: crates/eliot-engine/src/{context.rs,context_contracts.rs,host.rs,"
+        "control_plane.rs,cognition.rs} and crates/eliot-engine/src/context/packet_quality.rs "
+        "are the #878 Context/packet-quality/Host/ledger seam",
         "parallel-with: #783 and #880, on disjoint paths; no shared mutable source path between the three",
         "blocked-for-others: " + _OWNED_TOML_EDGE,
         "serialized-after: #704 algorithm merge, then " + INTEGRATION_OWNER + " regeneration",
