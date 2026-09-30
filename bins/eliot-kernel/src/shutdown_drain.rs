@@ -255,21 +255,21 @@ impl ShutdownTerminal {
 /// `drain_generation` ("a trigger received after `DrainCommitRecord` creates a
 /// new activation generation"), so it is persisted in the same
 /// lineage-plus-sequence domain [`SupervisionJournalEpoch`] defines for the
-/// activation generation the request carries, and it is the value
+/// activation generation the request carries, and the linearization point
+/// promotes it into the installation-scoped fence
 /// [`ShutdownDrainCoordinator::classify_wake`] compares against.
 ///
 /// That value is `Option` and `#[serde(default)]` so the durable format stayed
 /// backward compatible and `DRAIN_STATE_VERSION` did not have to move: a
 /// committed state written by a build that predates the field decodes here as
 /// `None`, meaning "this commit recorded no fenced activation generation"
-/// rather than "any generation is fenced". `classify_wake` reads that `None`
-/// fail-closed — it can never satisfy the equality that yields
-/// `RejectStale`, so such a commit resolves to `QueueNextGeneration` and the
-/// old authority is still fenced through `fences_old_authority`. Refusing the
-/// whole file as an unsupported version instead would be the one genuinely
-/// unsafe option: the file survives the upgrade, `coordinator_for` does not
-/// cache its load failure, and the Kernel would be unusable for that work root
-/// until someone hand-deleted it.
+/// rather than "any generation is fenced". `ShutdownDrainCoordinator::load`
+/// re-derives the installation fence from a recovered decision, so a pre-field
+/// state is fenced on read rather than revived. Refusing the whole file as an
+/// unsupported version instead would be the one genuinely unsafe option: the
+/// file survives the upgrade, `coordinator_for` does not cache its load
+/// failure, and the Kernel would be unusable for that work root until someone
+/// hand-deleted it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DrainCommitDecision {
     pub(crate) generation: String,
@@ -400,6 +400,17 @@ struct DurableDrainState {
     committed: Option<DrainCommitDecision>,
     terminal: Option<ShutdownTerminal>,
     pending: Vec<String>,
+    /// Installation-scoped activation fence, keyed by journal lineage.
+    ///
+    /// `#[serde(default)]` for the same compatibility reason
+    /// [`DrainCommitDecision::activation_generation_fenced`] is: the field is
+    /// additive, so a state file written before it existed still decodes, and
+    /// `DRAIN_STATE_VERSION` did not have to move. The absent-map case is
+    /// repaired on load by re-deriving the fence from a recovered
+    /// [`Self::committed`] decision, which only ever *adds* a fence, so the
+    /// repair is one-directional and a pre-field file is fenced, not revived.
+    #[serde(default)]
+    fenced_activation_generations: BTreeMap<String, u64>,
 }
 
 #[derive(Clone)]
@@ -412,9 +423,22 @@ struct CoordinatorState {
     committed: Option<DrainCommitDecision>,
     terminal: Option<ShutdownTerminal>,
     pending: BTreeSet<String>,
+    /// Highest activation-generation sequence a linearized drain fenced per
+    /// journal lineage. This is deliberately *not* drain-generation state: see
+    /// [`Self::fresh`] and [`ShutdownDrainCoordinator::request_shutdown`].
+    fenced_activation_generations: BTreeMap<String, u64>,
 }
 
 impl CoordinatorState {
+    /// A fresh drain generation. The installation-scoped activation fence is
+    /// deliberately NOT reset here, which is why this constructor takes only
+    /// the new correlation id: a generation a committed drain already fenced
+    /// stays fenced for the life of the installation, because I1.5 serializes
+    /// activation and drain on one *installation-scoped*
+    /// `activation_generation` ("Activation and drain are serialized by one
+    /// installation-scoped `activation_generation`"). Tying the fence to the
+    /// drain correlation id would let a fresh generation forget a revocation
+    /// the durable `DrainCommitRecord` still states.
     fn fresh(generation: String) -> Self {
         Self {
             generation,
@@ -425,8 +449,28 @@ impl CoordinatorState {
             committed: None,
             terminal: None,
             pending: BTreeSet::new(),
+            fenced_activation_generations: BTreeMap::new(),
         }
     }
+}
+
+/// Whether the presented activation generation was already fenced by a
+/// linearized drain in this installation.
+///
+/// The comparison is `sequence <= fenced_sequence` *within one lineage*, not
+/// equality. I1.5 sequences a lineage's activation generations monotonically
+/// ("A trigger received after `DrainCommitRecord` creates a new activation
+/// generation"), so every generation at or below the fence is one the commit
+/// already revoked, and only a strictly greater sequence is a fresh one. A
+/// presented generation from a *different* lineage is not comparable at all
+/// and is left to the per-generation rule rather than being guessed at.
+fn fenced_activation_generation(
+    fences: &BTreeMap<String, u64>,
+    presented: &SupervisionJournalEpoch,
+) -> bool {
+    fences
+        .get(&presented.lineage_id)
+        .is_some_and(|fenced_sequence| presented.sequence <= *fenced_sequence)
 }
 
 /// Owner family of a drain-gate obligation. One family is read only by its own
@@ -668,6 +712,41 @@ fn validate_durable_state(durable: &DurableDrainState) -> Result<(), String> {
         }
     }
 
+    // The installation-scoped fence must never name a lineage at sequence
+    // zero: that is a blank identity, not a revocation. Every recorded fence
+    // is also a complete journal identity, held to the same rule the decision
+    // field itself is.
+    if durable.fenced_activation_generations.iter().any(|(lineage, sequence)| {
+        lineage.trim().is_empty()
+            || *sequence == 0
+            || SupervisionJournalEpoch {
+                lineage_id: lineage.clone(),
+                sequence: *sequence,
+            }
+            .validate("shutdown.fenced_activation_generations")
+            .is_err()
+    }) {
+        return Err("shutdown state contains an invalid activation fence".to_owned());
+    }
+    // A persisted linearization whose activation generation is not covered by
+    // the installation fence would be a commit that forgot its own
+    // revocation. Repaired on load rather than refused: the repair only adds a
+    // fence, so it can never un-fence an authority.
+    if let Some(fenced) = durable
+        .committed
+        .as_ref()
+        .and_then(|committed| committed.activation_generation_fenced.as_ref())
+    {
+        let recorded = durable
+            .fenced_activation_generations
+            .get(&fenced.lineage_id)
+            .copied()
+            .unwrap_or(0);
+        if fenced.sequence > recorded {
+            return Err("shutdown state activation fence is behind its own commit".to_owned());
+        }
+    }
+
     // Pending identities are written only through the registration and
     // terminal paths, which refuse blank identities; a blank entry on disk
     // is corruption, never an obligation.
@@ -744,6 +823,24 @@ impl ShutdownDrainCoordinator {
                 state.committed = durable.committed;
                 state.terminal = durable.terminal;
                 state.pending = durable.pending.into_iter().collect();
+                state.fenced_activation_generations = durable.fenced_activation_generations;
+                // One-directional repair of a pre-field state: a recovered
+                // linearization re-derives its own activation fence, because
+                // the durable `DrainCommitRecord` it hands back still states
+                // that revocation. Adding a fence can only refuse more, never
+                // admit more, so a file written before the field existed is
+                // fenced on read rather than revived.
+                if let Some(fenced) = state
+                    .committed
+                    .as_ref()
+                    .and_then(|committed| committed.activation_generation_fenced.clone())
+                {
+                    let recorded = state
+                        .fenced_activation_generations
+                        .entry(fenced.lineage_id)
+                        .or_insert(0);
+                    *recorded = (*recorded).max(fenced.sequence);
+                }
                 state
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -780,6 +877,7 @@ impl ShutdownDrainCoordinator {
             committed: state.committed.clone(),
             terminal: state.terminal.clone(),
             pending: state.pending.iter().cloned().collect(),
+            fenced_activation_generations: state.fenced_activation_generations.clone(),
         };
         let payload = match serde_json::to_vec(&durable) {
             Ok(payload) => payload,
@@ -847,9 +945,18 @@ impl ShutdownDrainCoordinator {
         if let Some(terminal) = &state.terminal {
             carried.extend(terminal.pending());
         }
+        // The installation-scoped activation fence is carried forward across
+        // the rollover, never reset. This is the point where a drain-generation
+        // scoped fence would silently un-revoke: the previous generation's
+        // `DrainCommitRecord` already fenced that activation generation, and
+        // dropping the fence on rollover would let the very next wake/attach
+        // present it and be answered `Proceed`. I1.5 scopes the fence to the
+        // installation, not to a drain correlation id.
+        let carried_fences = state.fenced_activation_generations.clone();
         let mut candidate = CoordinatorState::fresh(fresh_generation());
         candidate.requested = true;
         candidate.pending = carried;
+        candidate.fenced_activation_generations = carried_fences;
         self.persist_state(&candidate)?;
         *state = candidate;
         observe_shutdown("kernel.shutdown.requested", "admitted");
@@ -1212,6 +1319,20 @@ impl ShutdownDrainCoordinator {
         // durable record can never be written in a shape it would refuse.
         decision.validate()?;
         let mut candidate = state.clone();
+        // The linearization point and the activation-generation fence are
+        // established together, under this one lock, and reach the durable
+        // owner in this one write. A wake that acquires the lock first sets
+        // `cancelled` and this commit refuses; a wake that acquires it after
+        // reads the fence this write installed. There is no window in which a
+        // commit is durable but its revocation is not, and none in which a
+        // revocation is durable but the commit is not.
+        if let Some(fenced) = decision.activation_generation_fenced.as_ref() {
+            let recorded = candidate
+                .fenced_activation_generations
+                .entry(fenced.lineage_id.clone())
+                .or_insert(0);
+            *recorded = (*recorded).max(fenced.sequence);
+        }
         candidate.committed = Some(decision);
         self.persist_state(&candidate)?;
         *state = candidate;
@@ -1222,52 +1343,61 @@ impl ShutdownDrainCoordinator {
     /// Classifies one wake/attach request against the linearization point:
     /// pre-linearization cancels the drain (`CancelDrain`); post-linearization
     /// the caller must await a fresh generation (`QueueNextGeneration`);
-    /// a wake presenting the activation generation the commit fenced is
-    /// reviving that fenced generation and is stale (`RejectStale`). Without
-    /// an active drain the request proceeds.
+    /// a wake presenting an activation generation a linearized drain already
+    /// fenced is stale (`RejectStale`). Without an active drain the request
+    /// proceeds.
+    ///
+    /// The first thing this reads is the *installation-scoped* activation
+    /// fence, before any per-generation drain state. That ordering is the
+    /// linearizability property rather than a check on it: I1.5 pairs the
+    /// drain correlation with an installation-scoped
+    /// `activation_generation`, and "No caller may 'rescue' shutdown by
+    /// reviving an old lease or process handle" holds across a drain
+    /// generation rollover and across a process restart. Reading it after the
+    /// `state.committed` check would scope the revocation to one drain
+    /// correlation id, so a rollover into a fresh generation
+    /// ([`Self::request_shutdown`]) or a process that starts with no drain in
+    /// progress would answer `Proceed` to the exact activation generation a
+    /// durable `DrainCommitRecord` states it fenced.
     ///
     /// The discriminator is the *activation generation*, not the drain
     /// correlation id. `DrainCommitDecision::generation` is minted by
     /// [`fresh_generation`] in this process and never crosses a wire boundary,
-    /// so a waking `Activate` can never present it; the fenced
-    /// [`DrainCommitDecision::activation_generation_fenced`] is the same
-    /// identity `HostKernelCandidateBinding::supervision_incarnation`
-    /// carries, which is what makes the two comparable. Presenting a different
-    /// activation generation means the caller is establishing a *new*
-    /// authority, so it is queued rather than rejected and no legitimate
-    /// new-generation activation is refused.
+    /// so a waking `Activate` can never present it. Presenting an activation
+    /// generation at or below a fenced sequence within the same lineage is
+    /// reviving fenced authority (`RejectStale`); presenting one strictly
+    /// beyond it is a caller establishing a *new* generation, so it is queued
+    /// rather than rejected and no legitimate new-generation activation is
+    /// refused.
     ///
-    /// A committed state whose `activation_generation_fenced` is `None` — a
-    /// state persisted by a build that predates the field — is a commit that
-    /// named no fenced generation, not one that fenced every generation. It
-    /// therefore cannot reach `RejectStale`: the equality below requires a
-    /// recorded value to compare against, so the arms match only on
-    /// `Some(..) == Some(..)`, and this case falls to `QueueNextGeneration`.
-    /// That is fail-closed — both post-linearization dispositions refuse the
-    /// old authority through
-    /// [`DrainWakeDisposition::fences_old_authority`] — so a pre-field commit
-    /// still never admits the authority it linearized against, and it never
-    /// has to be migrated, quarantined, or repaired to be safe.
+    /// A wake presenting no activation generation at all is answered from the
+    /// per-generation drain state alone: there is no identity to compare
+    /// against a fence, and inventing one would let a caller that presents
+    /// nothing pass a check that exists precisely to compare something.
     pub(crate) fn classify_wake(
         &self,
         presented_activation_generation: Option<&SupervisionJournalEpoch>,
     ) -> Result<DrainWakeDisposition, String> {
         let mut state = self.lock();
+        if let Some(presented) = presented_activation_generation
+            && fenced_activation_generation(&state.fenced_activation_generations, presented)
+        {
+            return Ok(DrainWakeDisposition::RejectStale);
+        }
         if !state.requested {
             return Ok(DrainWakeDisposition::Proceed);
         }
-        if let Some(committed) = state.committed.as_ref() {
-            return Ok(
-                match (
-                    presented_activation_generation,
-                    committed.activation_generation_fenced.as_ref(),
-                ) {
-                    (Some(presented), Some(fenced)) if presented == fenced => {
-                        DrainWakeDisposition::RejectStale
-                    }
-                    _ => DrainWakeDisposition::QueueNextGeneration,
-                },
-            );
+        if let Some(_committed) = state.committed.as_ref() {
+            // The installation fence above already rejected the fenced
+            // generation, so everything reaching here is post-linearization
+            // with an activation generation beyond the fence, and must wait
+            // for a fresh generation. A committed state whose
+            // `activation_generation_fenced` is `None` — a state persisted by a
+            // build that predates the field — never reached `RejectStale`
+            // through that field; it is still fenced through
+            // [`DrainWakeDisposition::fences_old_authority`] here, and it never
+            // has to be migrated, quarantined, or repaired to be safe.
+            return Ok(DrainWakeDisposition::QueueNextGeneration);
         }
         if state.terminal.is_some() {
             return Ok(DrainWakeDisposition::QueueNextGeneration);
