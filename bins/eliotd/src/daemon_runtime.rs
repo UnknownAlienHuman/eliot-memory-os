@@ -5568,12 +5568,29 @@ async fn trigger_accepted_cold_start(
                     "accepted activation's I4.4.1 scanner trigger worker failed closed"
                 );
             },
-            |trigger_result| {
-                if let Err(refusal) = trigger_result {
+            |trigger_result| match trigger_result {
+                Err(refusal) => {
                     tracing::warn!(
                         ticket = %eliotd::diagnostics::sanitize_identity(&ticket_id),
                         refusal = %refusal,
                         "accepted activation's I4.4.1 scanner trigger refused"
+                    );
+                }
+                Ok(eliot_workscope::BootstrapScanOutcome::PrivacyBoundaryRequired {
+                    code,
+                    ..
+                }) => {
+                    tracing::info!(
+                        ticket = %eliotd::diagnostics::sanitize_identity(&ticket_id),
+                        question_code = %code,
+                        "accepted activation's I4.4.1 scanner retained its privacy question"
+                    );
+                }
+                Ok(eliot_workscope::BootstrapScanOutcome::Completed { persisted, .. }) => {
+                    tracing::info!(
+                        ticket = %eliotd::diagnostics::sanitize_identity(&ticket_id),
+                        scan_receipt = %persisted.receipt_ref,
+                        "accepted activation's I4.4.1 scanner retained its owner receipt"
                     );
                 }
             },
@@ -5592,7 +5609,7 @@ fn trigger_cold_start_controller(
     kernel: &Arc<DaemonKernelClient>,
     ticket: &AgentActivationResolutionTicket,
     mut discovery: eliotd::task_binding_admission::ColdStartDiscoveryInput,
-) -> Result<(), String> {
+) -> Result<eliot_workscope::BootstrapScanOutcome, String> {
     let now = unix_ms(SystemTime::now())?;
     let trigger = eliot_workscope::ColdStartTrigger::AttachOrLaunch;
     let controller_result = eliot_workscope::ColdStartController::check_discovery_with_scan(
@@ -5645,23 +5662,14 @@ fn trigger_cold_start_controller(
     ) else {
         // The privacy-bounded scanner's question path validates this exact
         // retained lease/key/evidence and performs no charge or persistence.
-        let question = match eliot_workscope::run_bootstrap_discovery(
+        return eliot_workscope::run_bootstrap_discovery(
             None,
             None,
             &mut discovery.lease,
             &discovery.key,
             &discovery.discovery,
         )
-        .map_err(|error| format!("privacy-bounded attach scanner refused: {error}"))?
-        {
-            eliot_workscope::BootstrapScanOutcome::PrivacyBoundaryRequired { code, .. } => code,
-            eliot_workscope::BootstrapScanOutcome::Completed { .. } => {
-                "scanner returned completion without an installation owner".to_owned()
-            }
-        };
-        return Err(format!(
-            "I4.4.1 AttachOrLaunch reached privacy-bounded scanner question path: {question}; Kernel contour owner: {contour_status}; Kernel binding owner: {binding_status}; privacy class, admitted boundary and policy remain absent",
-        ));
+        .map_err(|error| format!("privacy-bounded attach scanner refused: {error}"));
     };
 
     let contour = contour_result?;
@@ -5696,7 +5704,6 @@ fn trigger_cold_start_controller(
         discovery.discovery.governing_source_refs.clone(),
         now,
     )
-    .map(|_| ())
     .map_err(|error| format!("I4.4.1 AttachOrLaunch scanner failed closed: {error}"))
 }
 
