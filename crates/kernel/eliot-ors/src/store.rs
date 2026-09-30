@@ -19423,9 +19423,7 @@ impl RedbRecoveryStore {
         {
             let records = write.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
             let handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
-            let mut positions = write
-                .open_table(BRIDGE_EVENT_POSITIONS)
-                .map_err(storage)?;
+            let mut positions = write.open_table(BRIDGE_EVENT_POSITIONS).map_err(storage)?;
             for (sequence, event_id) in &page {
                 // Contiguity first: a hole inside the certified prefix is
                 // unexplained coverage — stop, never skip it.
@@ -19444,9 +19442,7 @@ impl RedbRecoveryStore {
                     break;
                 }
                 positions
-                    .remove(
-                        Self::bridge_position_key(&access.namespace, *sequence).as_str(),
-                    )
+                    .remove(Self::bridge_position_key(&access.namespace, *sequence).as_str())
                     .map_err(storage)?;
                 resume = *sequence;
                 drained += 1;
