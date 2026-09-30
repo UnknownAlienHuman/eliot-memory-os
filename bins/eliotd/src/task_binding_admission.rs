@@ -1971,7 +1971,9 @@ pub struct MaterialBootstrap {
 ///
 /// Unknown/unavailable/partial profile evidence is preserved, never defaulted:
 /// absent coverage/governance profiles, or present-but-unverified ones, yield
-/// `Diagnostic`, never `Material`. Empty sensor lists or a caller READY flag
+/// `Diagnostic`, never `Material`. A governance profile at revision zero fails
+/// closed instead: the owner derivation never issues it (see below), so zero
+/// was defaulted, never derived. Empty sensor lists or a caller READY flag
 /// cannot imply full readiness — and the surface's string readiness token is
 /// never even read here (issue #1746, A7): only the receipt's typed
 /// [`ReadinessLifecycle`] and the surface's typed [`ScopeResolutionState`]
@@ -2142,6 +2144,16 @@ pub fn admit_bootstrap_context(
             if coverage.fingerprint != governance.fingerprint {
                 return Err(TaskBindingError::scope_incompatible(
                     "coverage and governance profiles name different fingerprints",
+                ));
+            }
+            // Issue #1746, W5: the owner derivation never issues revision zero
+            // (`GovernorCoverageDerivation` floors issued revisions at one and
+            // reports zero only when nothing was derived). A zero revision was
+            // defaulted, never derived, so it fails closed here instead of
+            // sealing into a Material bootstrap.
+            if governance.revision == 0 {
+                return Err(TaskBindingError::scope_incompatible(
+                    "governance profile revision is not owner-issued",
                 ));
             }
             coverage.verified && governance.verified
