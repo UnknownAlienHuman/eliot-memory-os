@@ -30755,9 +30755,7 @@ impl RedbRecoveryStore {
         }
         let order = Self::next_operational_order(&write)?;
         let committed = IrreversibleStorageEffectRecord {
-            linearization_record_id: Some(format!(
-                "ors:irreversible-storage-effect:{key}#{order}"
-            )),
+            linearization_record_id: Some(format!("ors:irreversible-storage-effect:{key}#{order}")),
             ..declaration.clone()
         };
         committed.validate()?;
@@ -30834,8 +30832,9 @@ impl RedbRecoveryStore {
             {
                 return Err(OrsError::IntegrityProblem {
                     record_type: "irreversible_storage_effect",
-                    reason: "the declaration is not bound to a committed cutover of its own route scope"
-                        .to_owned(),
+                    reason:
+                        "the declaration is not bound to a committed cutover of its own route scope"
+                            .to_owned(),
                 });
             }
             if bound.len() == usize::from(limit) {

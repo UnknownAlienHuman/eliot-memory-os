@@ -120,10 +120,7 @@ impl IrreversibleStorageEffectRecord {
             "irreversible_storage_effect_cutover_linearization",
         )?;
         if let Some(linearization) = &self.linearization_record_id {
-            validate_text(
-                linearization,
-                "irreversible_storage_effect_linearization",
-            )?;
+            validate_text(linearization, "irreversible_storage_effect_linearization")?;
         }
         Ok(())
     }
