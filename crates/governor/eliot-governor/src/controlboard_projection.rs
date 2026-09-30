@@ -554,7 +554,7 @@ pub struct ControlBoardAttentionBoard {
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum ControlBoardAttentionBoardRow {
     /// Full row: the viewer covers the record scope or is its evaluator.
-    Full(ControlBoardAttentionEvaluationRow),
+    Full(Box<ControlBoardAttentionEvaluationRow>),
     /// Observations and evidence handles withheld for lack of scope cover.
     ScopeWithheld {
         /// Evaluation identity of the withheld revision.
@@ -912,11 +912,9 @@ pub fn project_attention_board(
             .get(&(record.evaluation_id.to_string(), record.revision))
             .copied();
         if attention_evidence_expansion_permitted(record, viewer) {
-            rows.push(ControlBoardAttentionBoardRow::Full(project_attention_row(
-                record,
-                successor,
-                now_unix_ms,
-            )?));
+            rows.push(ControlBoardAttentionBoardRow::Full(Box::new(
+                project_attention_row(record, successor, now_unix_ms)?,
+            )));
         } else {
             rows.push(ControlBoardAttentionBoardRow::ScopeWithheld {
                 evaluation_id: record.evaluation_id.to_string(),

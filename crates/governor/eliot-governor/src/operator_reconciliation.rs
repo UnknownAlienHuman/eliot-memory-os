@@ -453,6 +453,200 @@ fn validates_as_lower_attention_digest(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
+/// Attention-specific command bindings carried into
+/// [`attention_evaluation_command_envelope`].
+///
+/// Bundles the ten attention bindings (access digest, action literal,
+/// evaluator, evaluation, revision link, record and evidence digests, and the
+/// evidence manifest identity) so the envelope adapter takes four arguments.
+/// Identity (`identity`), operation identity (`operation_id`), and the
+/// operator session (`session_id`) stay separate arguments because admission
+/// checks them against the admitted request before any attention binding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AttentionEvaluationCommandParams<'a> {
+    /// Operator access digest bound by the envelope.
+    pub access_digest: &'a str,
+    /// Closed action literal: `create`, `correct`, or `invalidate`.
+    pub action: &'a str,
+    /// Principal that assembled the record, exactly as the record names it.
+    pub evaluator_principal_id: &'a str,
+    /// Evaluation identity the revision belongs to.
+    pub evaluation_id: &'a str,
+    /// Monotonic revision within the evaluation identity.
+    pub revision: u64,
+    /// Immediately preceding revision, absent only on revision one.
+    pub predecessor_revision: Option<u64>,
+    /// Digest over the canonical bytes of the exact record revision.
+    pub record_digest: &'a str,
+    /// Commitment over the bound evidence manifest.
+    pub evidence_commitment: &'a str,
+    /// Evidence manifest identity bound by the record.
+    pub manifest_id: &'a str,
+    /// Evidence manifest revision bound by the record.
+    pub manifest_revision: &'a str,
+}
+
+/// Fail-closed identity, fence, and session checks for the attention adapter.
+///
+/// Behavior-identical extract of the head of
+/// [`attention_evaluation_command_envelope`]: admitted identity shape, exact
+/// fence agreement, admitted session equality, and non-blank session shape.
+fn check_attention_identity(
+    identity: &RequestIdentity,
+    session_id: &str,
+) -> Result<(), CompositionError> {
+    identity
+        .validate()
+        .map_err(|error| identity_refused(error.to_string()))?;
+    let fence = &identity.request.metadata.state_fence;
+    if identity.request.state_fence != *fence {
+        return Err(identity_refused(
+            "admitted request fence does not match the request binding fence".to_owned(),
+        ));
+    }
+    let identity_session = identity
+        .request
+        .metadata
+        .session_id
+        .as_ref()
+        .map(SessionId::as_str)
+        .unwrap_or_default();
+    if identity_session != session_id {
+        return Err(identity_refused(
+            "operator session does not match the admitted request session".to_owned(),
+        ));
+    }
+    if session_id.trim().is_empty() || session_id.chars().any(char::is_control) {
+        return Err(owner_refused(
+            "operator session binding is blank or contains control characters".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Fail-closed attention binding checks: access digest, action literal,
+/// non-blank evaluator/evaluation/manifest bindings, non-zero revision, exact
+/// predecessor linkage, and well-formed digests.
+///
+/// Behavior-identical extract of the middle of
+/// [`attention_evaluation_command_envelope`]; refusal strings are unchanged.
+fn check_attention_command(
+    params: &AttentionEvaluationCommandParams<'_>,
+) -> Result<(), CompositionError> {
+    if params.access_digest.trim().is_empty() {
+        return Err(owner_refused(
+            "operator binding digests must not be blank".to_owned(),
+        ));
+    }
+    if params.action != ATTENTION_EVALUATION_ACTION_CREATE
+        && params.action != ATTENTION_EVALUATION_ACTION_CORRECT
+        && params.action != ATTENTION_EVALUATION_ACTION_INVALIDATE
+    {
+        return Err(owner_refused(
+            "attention evaluation action must be create, correct, or invalidate".to_owned(),
+        ));
+    }
+    for (field, value) in [
+        ("evaluator principal", params.evaluator_principal_id),
+        ("evaluation identity", params.evaluation_id),
+        ("evidence manifest identity", params.manifest_id),
+        ("evidence manifest revision", params.manifest_revision),
+    ] {
+        if value.trim().is_empty() || value.chars().any(char::is_control) {
+            return Err(owner_refused(format!(
+                "attention evaluation {field} binding is blank or contains control characters"
+            )));
+        }
+    }
+    if params.revision == 0 {
+        return Err(owner_refused(
+            "attention evaluation revision must be non-zero".to_owned(),
+        ));
+    }
+    let revision_linked = match params.predecessor_revision {
+        None => params.action == ATTENTION_EVALUATION_ACTION_CREATE && params.revision == 1,
+        Some(predecessor) => {
+            (params.action == ATTENTION_EVALUATION_ACTION_CORRECT
+                || params.action == ATTENTION_EVALUATION_ACTION_INVALIDATE)
+                && predecessor.checked_add(1) == Some(params.revision)
+        }
+    };
+    if !revision_linked {
+        return Err(owner_refused(
+            "attention evaluation revision link does not match the action".to_owned(),
+        ));
+    }
+    for (field, value) in [
+        ("record digest", params.record_digest),
+        ("evidence commitment", params.evidence_commitment),
+    ] {
+        if !validates_as_lower_attention_digest(value) {
+            return Err(owner_refused(format!(
+                "attention evaluation {field} is not a lowercase SHA-256 value"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Attention-namespaced `AppendAuditEvent` parameters bound into the envelope.
+///
+/// Behavior-identical extract of the parameter assembly in
+/// [`attention_evaluation_command_envelope`].
+fn attention_command_parameters(
+    operation_id: &OperationId,
+    identity: &RequestIdentity,
+    session_id: &str,
+    params: &AttentionEvaluationCommandParams<'_>,
+) -> BTreeMap<String, serde_json::Value> {
+    let mut parameters = BTreeMap::new();
+    for (name, value) in [
+        ("operation_id", operation_id.as_str().to_owned()),
+        ("idempotency_key", identity.idempotency_key.clone()),
+        ("session_id", session_id.to_owned()),
+        ("access_digest", params.access_digest.to_owned()),
+        ("expected_revision", params.revision.to_string()),
+        ("attention_evaluation.action", params.action.to_owned()),
+        (
+            "attention_evaluation.evaluator_principal_id",
+            params.evaluator_principal_id.to_owned(),
+        ),
+        (
+            "attention_evaluation.evaluation_id",
+            params.evaluation_id.to_owned(),
+        ),
+        (
+            "attention_evaluation.revision",
+            params.revision.to_string(),
+        ),
+        (
+            "attention_evaluation.record_digest",
+            params.record_digest.to_owned(),
+        ),
+        (
+            "attention_evaluation.evidence_commitment",
+            params.evidence_commitment.to_owned(),
+        ),
+        (
+            "attention_evaluation.manifest_id",
+            params.manifest_id.to_owned(),
+        ),
+        (
+            "attention_evaluation.manifest_revision",
+            params.manifest_revision.to_owned(),
+        ),
+    ] {
+        parameters.insert(name.to_owned(), serde_json::Value::String(value));
+    }
+    if let Some(predecessor) = params.predecessor_revision {
+        parameters.insert(
+            "attention_evaluation.predecessor_revision".to_owned(),
+            serde_json::Value::String(predecessor.to_string()),
+        );
+    }
+    parameters
+}
+
 /// Builds the canonical envelope binding one authorized attention-evaluation command.
 ///
 /// This is the A1 operator path: an authorized evaluator creates (revision one
@@ -491,149 +685,26 @@ pub fn attention_evaluation_command_envelope(
     identity: &RequestIdentity,
     operation_id: &OperationId,
     session_id: &str,
-    access_digest: &str,
-    action: &str,
-    evaluator_principal_id: &str,
-    evaluation_id: &str,
-    revision: u64,
-    predecessor_revision: Option<u64>,
-    record_digest: &str,
-    evidence_commitment: &str,
-    manifest_id: &str,
-    manifest_revision: &str,
+    params: AttentionEvaluationCommandParams<'_>,
 ) -> Result<CanonicalWriteEnvelope, CompositionError> {
-    identity
-        .validate()
-        .map_err(|error| identity_refused(error.to_string()))?;
+    check_attention_identity(identity, session_id)?;
+    check_attention_command(&params)?;
     let fence = &identity.request.metadata.state_fence;
-    if identity.request.state_fence != *fence {
-        return Err(identity_refused(
-            "admitted request fence does not match the request binding fence".to_owned(),
-        ));
-    }
-    let identity_session = identity
-        .request
-        .metadata
-        .session_id
-        .as_ref()
-        .map(SessionId::as_str)
-        .unwrap_or_default();
-    if identity_session != session_id {
-        return Err(identity_refused(
-            "operator session does not match the admitted request session".to_owned(),
-        ));
-    }
-    if session_id.trim().is_empty() || session_id.chars().any(char::is_control) {
-        return Err(owner_refused(
-            "operator session binding is blank or contains control characters".to_owned(),
-        ));
-    }
-    if access_digest.trim().is_empty() {
-        return Err(owner_refused(
-            "operator binding digests must not be blank".to_owned(),
-        ));
-    }
-    if action != ATTENTION_EVALUATION_ACTION_CREATE
-        && action != ATTENTION_EVALUATION_ACTION_CORRECT
-        && action != ATTENTION_EVALUATION_ACTION_INVALIDATE
-    {
-        return Err(owner_refused(
-            "attention evaluation action must be create, correct, or invalidate".to_owned(),
-        ));
-    }
-    for (field, value) in [
-        ("evaluator principal", evaluator_principal_id),
-        ("evaluation identity", evaluation_id),
-        ("evidence manifest identity", manifest_id),
-        ("evidence manifest revision", manifest_revision),
-    ] {
-        if value.trim().is_empty() || value.chars().any(char::is_control) {
-            return Err(owner_refused(format!(
-                "attention evaluation {field} binding is blank or contains control characters"
-            )));
-        }
-    }
-    if revision == 0 {
-        return Err(owner_refused(
-            "attention evaluation revision must be non-zero".to_owned(),
-        ));
-    }
-    let revision_linked = match predecessor_revision {
-        None => action == ATTENTION_EVALUATION_ACTION_CREATE && revision == 1,
-        Some(predecessor) => {
-            (action == ATTENTION_EVALUATION_ACTION_CORRECT
-                || action == ATTENTION_EVALUATION_ACTION_INVALIDATE)
-                && predecessor.checked_add(1) == Some(revision)
-        }
-    };
-    if !revision_linked {
-        return Err(owner_refused(
-            "attention evaluation revision link does not match the action".to_owned(),
-        ));
-    }
-    for (field, value) in [
-        ("record digest", record_digest),
-        ("evidence commitment", evidence_commitment),
-    ] {
-        if !validates_as_lower_attention_digest(value) {
-            return Err(owner_refused(format!(
-                "attention evaluation {field} is not a lowercase SHA-256 value"
-            )));
-        }
-    }
     let manifest_digest = production_manifest_digest()?;
     let attention_action_digest = canonical_digest(&(
-        action,
-        evaluator_principal_id,
-        evaluation_id,
-        revision,
-        predecessor_revision,
-        record_digest,
-        evidence_commitment,
-        manifest_id,
-        manifest_revision,
+        params.action,
+        params.evaluator_principal_id,
+        params.evaluation_id,
+        params.revision,
+        params.predecessor_revision,
+        params.record_digest,
+        params.evidence_commitment,
+        params.manifest_id,
+        params.manifest_revision,
         operation_id.as_str(),
         identity.idempotency_key.clone(),
     ))?;
-    let mut parameters = BTreeMap::new();
-    for (name, value) in [
-        ("operation_id", operation_id.as_str().to_owned()),
-        ("idempotency_key", identity.idempotency_key.clone()),
-        ("session_id", session_id.to_owned()),
-        ("access_digest", access_digest.to_owned()),
-        ("expected_revision", revision.to_string()),
-        ("attention_evaluation.action", action.to_owned()),
-        (
-            "attention_evaluation.evaluator_principal_id",
-            evaluator_principal_id.to_owned(),
-        ),
-        (
-            "attention_evaluation.evaluation_id",
-            evaluation_id.to_owned(),
-        ),
-        ("attention_evaluation.revision", revision.to_string()),
-        (
-            "attention_evaluation.record_digest",
-            record_digest.to_owned(),
-        ),
-        (
-            "attention_evaluation.evidence_commitment",
-            evidence_commitment.to_owned(),
-        ),
-        ("attention_evaluation.manifest_id", manifest_id.to_owned()),
-        (
-            "attention_evaluation.manifest_revision",
-            manifest_revision.to_owned(),
-        ),
-    ] {
-        parameters.insert(name.to_owned(), serde_json::Value::String(value));
-    }
-    if let Some(predecessor) = predecessor_revision {
-        parameters.insert(
-            "attention_evaluation.predecessor_revision".to_owned(),
-            serde_json::Value::String(predecessor.to_string()),
-        );
-    }
+    let parameters = attention_command_parameters(operation_id, identity, session_id, &params);
     let envelope = CanonicalWriteEnvelope {
         operation_id: operation_id.clone(),
         request: identity.request.metadata.clone(),
@@ -651,9 +722,9 @@ pub fn attention_evaluation_command_envelope(
         requested_effect_ceiling: EffectClass::Candidate,
         admission_contract_set_digest: canonical_digest(&(
             session_id,
-            access_digest,
+            params.access_digest,
             attention_action_digest,
-            revision,
+            params.revision,
             operation_id.as_str(),
             identity.idempotency_key.clone(),
         ))?,
