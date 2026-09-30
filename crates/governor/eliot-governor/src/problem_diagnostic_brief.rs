@@ -46,7 +46,7 @@ use eliot_context_candidates::ProjectionState;
 use eliot_contracts::{ArtifactId, StateFence};
 use eliot_problem::{
     OwnerRoute, Ownership, Problem, ProblemClass, ProblemHypothesis, ProblemId, ProblemState,
-    RepairRecord, ReopenRecord, SignalSeverity,
+    ReopenRecord, RepairRecord, SignalSeverity,
 };
 use eliot_store_api::{
     PROBLEM_OWNER_STATE_MUTATION_NAME, PROBLEM_PARAM_PROBLEM_ID, ProblemOwnerTransition,
@@ -327,7 +327,9 @@ pub enum ProblemBriefError {
     PageShape(String),
     /// One committed transition on the page is not a decodable owner-state
     /// mutation for this Problem.
-    #[error("committed transition at page position {page_position} is not a decodable problem owner transition: {reason}")]
+    #[error(
+        "committed transition at page position {page_position} is not a decodable problem owner transition: {reason}"
+    )]
     TransitionUndecodable {
         /// The page position the decoder stopped at.
         page_position: u64,
@@ -337,7 +339,9 @@ pub enum ProblemBriefError {
     /// A committed revision does not replace the revision the page presented
     /// before it, so the page does not describe one Problem's history in commit
     /// order. Reordered, repeated and interleaved pages all land here.
-    #[error("committed revision {revision} does not replace the preceding committed revision {replaced}")]
+    #[error(
+        "committed revision {revision} does not replace the preceding committed revision {replaced}"
+    )]
     HistoryBroken {
         /// The revision the page claims to have produced.
         revision: u64,
@@ -378,12 +382,14 @@ pub fn compile_problem_diagnostic_brief(
         return Ok(None);
     };
     let Some(records) = payload.get("records").and_then(Value::as_array) else {
-        return Err(ProblemBriefError::PageShape(
-            "no records array".to_owned(),
-        ));
+        return Err(ProblemBriefError::PageShape("no records array".to_owned()));
     };
     let Some(CommittedProblemHistory {
-        head: CommittedTransition { problem, revision: head_revision },
+        head:
+            CommittedTransition {
+                problem,
+                revision: head_revision,
+            },
         timeline,
     }) = committed_history(records, problem_id)?
     else {
@@ -412,7 +418,9 @@ pub fn compile_problem_diagnostic_brief(
         coverage: coverage(history_complete),
         privacy: ProblemBriefPrivacy {
             classification: ProblemEvidenceVisibility::Unestablished,
-            read_limit: ProblemEvidenceVisibility::Unestablished.read_limit().to_owned(),
+            read_limit: ProblemEvidenceVisibility::Unestablished
+                .read_limit()
+                .to_owned(),
         },
         next_step: ProblemBriefNextStep {
             probe: problem.next_probe.clone(),
@@ -490,13 +498,11 @@ fn decode_history_entry(
     };
     let decoded = decode_problem_owner_state_mutation(parameters)
         .map_err(|error| undecodable(error.to_string()))?;
-    let problem: Problem =
-        serde_json::from_value(decoded.record_json).map_err(|error| {
-            undecodable(format!("candidate record is not a Problem: {error}"))
-        })?;
-    problem
-        .validate()
-        .map_err(|error| undecodable(format!("candidate record is not a valid Problem: {error}")))?;
+    let problem: Problem = serde_json::from_value(decoded.record_json)
+        .map_err(|error| undecodable(format!("candidate record is not a Problem: {error}")))?;
+    problem.validate().map_err(|error| {
+        undecodable(format!("candidate record is not a valid Problem: {error}"))
+    })?;
     let replaced_revision = match decoded.transition {
         ProblemOwnerTransition::Create => None,
         _ => Some(decoded.expected_revision),
@@ -540,7 +546,11 @@ fn owner_transition_parameters(
         return None;
     }
     let parameters = record.get("parameters")?;
-    if parameters.get(PROBLEM_PARAM_PROBLEM_ID).and_then(Value::as_str) != Some(problem_id) {
+    if parameters
+        .get(PROBLEM_PARAM_PROBLEM_ID)
+        .and_then(Value::as_str)
+        != Some(problem_id)
+    {
         return None;
     }
     serde_json::from_value(parameters.clone()).ok()
@@ -558,8 +568,18 @@ fn observed_evidence(problem: &Problem) -> Vec<ArtifactId> {
         .observed_evidence
         .iter()
         .chain(problem.containment.iter())
-        .chain(problem.repair_history.iter().flat_map(|repair| repair.evidence.iter()))
-        .chain(problem.reopen_history.iter().flat_map(|reopen| reopen.evidence.iter()))
+        .chain(
+            problem
+                .repair_history
+                .iter()
+                .flat_map(|repair| repair.evidence.iter()),
+        )
+        .chain(
+            problem
+                .reopen_history
+                .iter()
+                .flat_map(|reopen| reopen.evidence.iter()),
+        )
     {
         if !merged.contains(handle) {
             merged.push(handle.clone());
