@@ -526,17 +526,12 @@ impl<'a> VerifierHarness<'a> {
                 // refused here, before any process exists. The verifier run
                 // records the exact typed refusal and is never `Passed`, so a
                 // refused build cannot admit the patch either.
-                return Ok(verifier_run(
+                return Ok(recorded_lane_refusal(
                     project_id,
                     task_id,
                     agent_id,
                     requirement,
-                    VerifierStatus::NotAllowed,
-                    None,
-                    0,
-                    None,
-                    None,
-                    format!("{QUARANTINED_LEGACY_LANE} {refusal}"),
+                    &refusal,
                     started_at,
                 ));
             }
@@ -560,17 +555,12 @@ impl<'a> VerifierHarness<'a> {
         {
             Ok(output) => output,
             Err(refusal) => {
-                return Ok(verifier_run(
+                return Ok(recorded_lane_refusal(
                     project_id,
                     task_id,
                     agent_id,
                     requirement,
-                    VerifierStatus::NotAllowed,
-                    None,
-                    0,
-                    None,
-                    None,
-                    format!("{QUARANTINED_LEGACY_LANE} {refusal}"),
+                    &refusal,
                     started_at,
                 ));
             }
@@ -1264,6 +1254,38 @@ fn git_apply_args(repo_root: &Path, check: bool, reverse: bool, diff_path: &Path
 
 /// The governed-build-lane service name this lane refuses under.
 const GOVERNED_BUILD_LANE_SERVICE: &str = "governed-build-lane";
+
+/// Record a lane refusal as a `NotAllowed` verifier run rather than propagating it.
+///
+/// Both refusal seams — the agent Cargo admission check and the governed-lane
+/// launch backstop — record the exact typed refusal and can never be `Passed`,
+/// so a refused build cannot admit the patch. Recording rather than propagating
+/// is deliberate: propagating would abort `PatchRunner::apply` after `git apply`
+/// had already mutated the checkout, skipping the rollback that containment
+/// depends on. `required_verifiers_passed` stays unsatisfiable, so the patch
+/// still rolls back through the ordinary path.
+fn recorded_lane_refusal(
+    project_id: eliot_types::ProjectId,
+    task_id: eliot_types::TaskId,
+    agent_id: eliot_types::AgentId,
+    requirement: &VerifierRequirement,
+    refusal: &EngineError,
+    started_at: OffsetDateTime,
+) -> VerifierRun {
+    verifier_run(
+        project_id,
+        task_id,
+        agent_id,
+        requirement,
+        VerifierStatus::NotAllowed,
+        None,
+        0,
+        None,
+        None,
+        format!("{QUARANTINED_LEGACY_LANE} {refusal}"),
+        started_at,
+    )
+}
 
 /// The single owner of this lane's governed-lane admission, which today is a
 /// typed refusal instead of a chosen Cargo target root.
