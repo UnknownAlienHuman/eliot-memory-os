@@ -772,25 +772,41 @@ foreach ($dependency in @($profileReceipt.environment_dependencies)) {
 # (run()/require_receipt_parity) and an ordinary non-PASS aggregate
 # (run(), `receipt.outcome.is_pass()`), so keying on the exit would report a
 # normal non-PASS run as a parity divergence that never happened. The resolver
-# prints exactly one `PARITY_PASS`/`PARITY_NON_PASS` line when — and only when —
-# a comparison ran, so that line states which of the two nonzero refusals this
+# emits a `PARITY_PASS`/`PARITY_NON_PASS` line when — and only when — a
+# comparison ran, so those lines state which of the two nonzero refusals this
 # is. An unreadable or malformed counterpart artifact produces no verdict line
 # and is refused above as a run that could not be admitted, which is what it is.
-$profileParityVerdict = if ($resolverOutput) {
-    @($resolverOutput | Where-Object { "$_" -match '^\s*PARITY_(PASS|NON_PASS)\b' })
-} else {
-    @()
-}
+#
+# The refusal is keyed on the ABSENCE OF ANY NON-PASS, not on the presence of a
+# PASS. `$array -match <pattern>` is a per-element filter that returns the
+# SURVIVING matches, so `-not ($verdicts -match '^PARITY_PASS')` is false as
+# soon as ONE line matches — a `PARITY_NON_PASS` sitting beside a `PARITY_PASS`
+# would be silently ignored and the run would proceed under a divergence that
+# was reported. The divergence is the fail-closed direction, so it must win over
+# any PASS, and the single extraction pattern below is used for both the refusal
+# and the report so the two can never disagree about which lines are verdicts.
+$profileParityVerdict = @(
+    if ($resolverOutput) {
+        $resolverOutput | Where-Object { "$_" -match '^\s*PARITY_(PASS|NON_PASS)\b' }
+    }
+)
+$profileParityNonPass = @($profileParityVerdict | Where-Object { "$_" -match '^\s*PARITY_NON_PASS\b' })
 $profileParitySummary = if ([string]::IsNullOrWhiteSpace($CompareProfileReceipt)) {
     'not compared; no -CompareProfileReceipt was supplied, so this run reports its own profile revision without a counterpart verdict'
+} elseif ($profileParityNonPass.Count -gt 0) {
+    "compared against $CompareProfileReceipt through the shared verify_profile_parity owner: $($profileParityNonPass -join '; ')"
 } elseif ($profileParityVerdict.Count -eq 0) {
     "compared against $CompareProfileReceipt; the shared verify_profile_parity owner produced no verdict line, so this run was refused as a comparison it could not decide"
 } else {
-    "compared against $CompareProfileReceipt through the shared verify_profile_parity owner: $($profileParityVerdict[0])"
+    "compared against $CompareProfileReceipt through the shared verify_profile_parity owner: $($profileParityVerdict -join '; ')"
 }
 Write-Host "VERIFY_PROFILE_PARITY: $profileParitySummary"
-if (-not [string]::IsNullOrWhiteSpace($CompareProfileReceipt) -and -not ($profileParityVerdict -match '^PARITY_PASS\b')) {
+if (-not [string]::IsNullOrWhiteSpace($CompareProfileReceipt) -and $profileParityNonPass.Count -gt 0) {
     [Console]::Error.WriteLine("VERIFY_PROFILE_PARITY_REFUSED: the local/CI parity comparison against '$CompareProfileReceipt' reported non-PASS (resolver exit $resolverExit); the VERIFY_PROFILE_PARITY line above names the comparison and the resolver's own line names the divergence, and no gate ran under a refused parity verdict.")
+    exit 1
+}
+if (-not [string]::IsNullOrWhiteSpace($CompareProfileReceipt) -and $profileParityVerdict.Count -eq 0) {
+    [Console]::Error.WriteLine("VERIFY_PROFILE_PARITY_REFUSED: the local/CI parity comparison against '$CompareProfileReceipt' produced no PARITY_PASS/PARITY_NON_PASS verdict line (resolver exit $resolverExit); a comparison that could not decide is not a pass, and no gate ran under an undecided parity verdict.")
     exit 1
 }
 
