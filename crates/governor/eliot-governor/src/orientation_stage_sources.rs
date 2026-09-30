@@ -6,17 +6,18 @@
 //! substitute profile.
 
 use eliot_contracts::{
-    ArtifactId, ContractId, OperationId, RequestMetadata, StateFence, TaskId, TaskRevision,
-    TransactionSequence,
+    ArtifactId, ClockReading, ContractId, ContractError, OperationId, RequestMetadata, StateFence,
+    TaskId, TaskRevision, TransactionSequence,
 };
 use eliot_cue_contracts::{
     AdmittedCueBindingProjection, CueBindingAdmissionRef, CueProjectionDenominator,
     OrientationCueBindingsSource, RelationEdge, SnapshotEdgeWeight, SnapshotId, WorkScopeId,
 };
 use eliot_cue_binding::{
-    BindingProfile, CueBindingResult, ExpectedReuseHint, TouchedResourceProjection,
+    BindingProfile, CueBindingError, CueBindingResult, ExpectedReuseHint, TouchedResourceProjection,
     derive_cue_binding_candidates,
 };
+use eliot_cue_contracts::CueContractError;
 use eliot_dreamer_contracts::OrientationClassificationProfile;
 use eliot_learning_contracts::CampaignSourceRole;
 use eliot_receipts::{
@@ -69,6 +70,8 @@ pub struct OrientationCueAdmissionValuesV1<'a> {
 pub struct OrientationCueAdmissionInput<'a> {
     /// Original request identity, caller session, task, source, clock, and fence.
     pub request: &'a RequestMetadata,
+    /// Original authenticated request clock supplied by the live owner boundary.
+    pub owner_clock: &'a ClockReading,
     /// Kernel-issued operation identity for this owner operation.
     pub operation_id: &'a OperationId,
     /// Original accepted Observation owner receipt used as A-12 admission input.
@@ -119,13 +122,25 @@ pub enum OrientationCueAdmissionError {
     },
     /// Native A-12 derivation rejected the original inputs.
     #[error("native A-12 cue derivation failed: {0}")]
-    A12(String),
+    A12(CueBindingError),
+    /// Native A-12 output failed an exact predecessor join.
+    #[error("native A-12 result binding failed at {0}")]
+    A12Binding(&'static str),
     /// Exact A-10 closure construction rejected the original inputs.
     #[error("native A-10 cue closure failed: {0}")]
-    A10(String),
+    A10(CueContractError),
+    /// Native A-10 output failed an exact predecessor join.
+    #[error("native A-10 result binding failed at {0}")]
+    A10Binding(&'static str),
+    /// The authenticated owner clock is invalid or differs from request metadata.
+    #[error("Orientation cue owner clock is invalid at {0}")]
+    OwnerClock(&'static str),
+    /// The original request clock failed its native contract.
+    #[error("Orientation cue request clock is invalid")]
+    RequestClock(ContractError),
     /// Standard C0-02 receipt issuance rejected the complete owner decision.
     #[error("Governor cue admission receipt is invalid: {0}")]
-    Receipt(String),
+    Receipt(eliot_receipts::ReceiptError),
 }
 
 /// Typed failure while admitting the original Orientation profile readback.
@@ -210,6 +225,15 @@ pub fn admit_orientation_cue_bindings<P: crate::composition::KernelGenerationPor
         .request
         .validate()
         .map_err(|_| OrientationCueAdmissionError::RequestBinding("request_metadata"))?;
+    input
+        .owner_clock
+        .validate()
+        .map_err(OrientationCueAdmissionError::RequestClock)?;
+    if input.owner_clock != &input.request.clock {
+        return Err(OrientationCueAdmissionError::OwnerClock(
+            "request metadata clock mismatch",
+        ));
+    }
     let task_id = input
         .request
         .task_id
@@ -294,8 +318,7 @@ pub fn admit_orientation_cue_bindings<P: crate::composition::KernelGenerationPor
     }
 
     let now = input
-        .request
-        .clock
+        .owner_clock
         .valid_time_ms
         .and_then(|value| u64::try_from(value).ok())
         .ok_or(OrientationCueAdmissionError::RequestBinding("valid_time"))?;
@@ -393,19 +416,19 @@ pub fn admit_orientation_cue_bindings<P: crate::composition::KernelGenerationPor
         input.hint,
         input.profile,
     )
-    .map_err(|error| OrientationCueAdmissionError::A12(error.to_string()))?;
+    .map_err(OrientationCueAdmissionError::A12)?;
     if a12_result.admission != *input.observation
         || a12_result.profile != *input.profile
         || a12_result.state_fence != *fence
     {
-        return Err(OrientationCueAdmissionError::A12(
-            "native result differs from the exact original input".to_owned(),
+        return Err(OrientationCueAdmissionError::A12Binding(
+            "original_inputs",
         ));
     }
     input
         .denominator
         .validate()
-        .map_err(|error| OrientationCueAdmissionError::A10(error.to_string()))?;
+        .map_err(OrientationCueAdmissionError::A10)?;
 
     let policy_snapshot_id = policy.snapshot().snapshot_id.clone();
     let policy_snapshot_digest = eliot_cue_contracts::Digest::new(
@@ -413,12 +436,12 @@ pub fn admit_orientation_cue_bindings<P: crate::composition::KernelGenerationPor
     )
     .map_err(|error| OrientationCueAdmissionError::Authorization("policy_digest_shape"))?;
     let a12_result_canonical_bytes = eliot_contracts::canonical_json_bytes(&a12_result)
-        .map_err(|error| OrientationCueAdmissionError::A12(error.to_string()))?;
+        .map_err(|_| OrientationCueAdmissionError::A12Binding("canonical_result"))?;
 
     let mut artifacts = Vec::with_capacity(a12_result.candidates.len() + 2);
     artifacts.push(ArtifactBinding {
         artifact_id: ArtifactId::new("orientation-a12-result")
-            .map_err(|_| OrientationCueAdmissionError::A12("result artifact id".to_owned()))?,
+            .map_err(|_| OrientationCueAdmissionError::A12Binding("result_artifact_id"))?,
         sha256: a12_result.result_digest.as_str().to_owned(),
         role: ReceiptKind::Artifact,
         source_revision: None,
@@ -437,15 +460,15 @@ pub fn admit_orientation_cue_bindings<P: crate::composition::KernelGenerationPor
     for candidate in &a12_result.candidates {
         candidate
             .validate()
-            .map_err(|error| OrientationCueAdmissionError::A12(error.to_string()))?;
+            .map_err(OrientationCueAdmissionError::A12)?;
         if !artifact_ids.insert(candidate.binding_candidate_id.as_str().to_owned()) {
-            return Err(OrientationCueAdmissionError::A12(
-                "duplicate or reserved candidate artifact identity".to_owned(),
+            return Err(OrientationCueAdmissionError::A12Binding(
+                "candidate_artifact_identity",
             ));
         }
         artifacts.push(ArtifactBinding {
             artifact_id: ArtifactId::new(candidate.binding_candidate_id.as_str().to_owned())
-                .map_err(|_| OrientationCueAdmissionError::A12("candidate artifact id".to_owned()))?,
+                .map_err(|_| OrientationCueAdmissionError::A12Binding("candidate_artifact_id"))?,
             sha256: candidate.digest.as_str().to_owned(),
             role: ReceiptKind::Artifact,
             source_revision: None,
@@ -471,7 +494,7 @@ pub fn admit_orientation_cue_bindings<P: crate::composition::KernelGenerationPor
     };
     let receipt = ReceiptEnvelope::issue(ReceiptCore {
         contract: eliot_receipts::contract_identity()
-            .map_err(|error| OrientationCueAdmissionError::Receipt(error.to_string()))?,
+            .map_err(OrientationCueAdmissionError::Receipt)?,
         kind: ReceiptKind::Operation,
         work_scope: WorkScopeBinding {
             scope_id: scope_id.clone(),
@@ -511,7 +534,7 @@ pub fn admit_orientation_cue_bindings<P: crate::composition::KernelGenerationPor
             proof: ProofCeiling::CandidateArtifact,
         },
     })
-    .map_err(|error| OrientationCueAdmissionError::Receipt(error.to_string()))?;
+    .map_err(OrientationCueAdmissionError::Receipt)?;
 
     let mut projections = Vec::with_capacity(a12_result.candidates.len());
     let mut used_touched_rows = std::collections::BTreeSet::new();
@@ -521,13 +544,13 @@ pub fn admit_orientation_cue_bindings<P: crate::composition::KernelGenerationPor
                 && row.normalization.normalized.canonical.as_ref() == Some(&candidate.canonical)
         });
         let Some((index, row)) = matches.next() else {
-            return Err(OrientationCueAdmissionError::A12(
-                "candidate has no exact normalized source row".to_owned(),
+        return Err(OrientationCueAdmissionError::A12Binding(
+                "candidate_source_row_missing",
             ));
         };
         if matches.next().is_some() || !used_touched_rows.insert(index) {
-            return Err(OrientationCueAdmissionError::A12(
-                "candidate source-row join is ambiguous".to_owned(),
+            return Err(OrientationCueAdmissionError::A12Binding(
+                "candidate_source_row_ambiguous",
             ));
         }
         if row.normalization.policy.profile != a12_result.profile.expected_normalization_profile
@@ -535,8 +558,8 @@ pub fn admit_orientation_cue_bindings<P: crate::composition::KernelGenerationPor
             || row.normalization.normalized.observed.context.scope_id != scope_id
             || row.normalization.normalized.observed.context.state_fence != *fence
         {
-            return Err(OrientationCueAdmissionError::A12(
-                "candidate source row is outside the exact task context".to_owned(),
+            return Err(OrientationCueAdmissionError::A12Binding(
+                "candidate_source_row_context",
             ));
         }
         let admission = CueBindingAdmissionRef::new(
@@ -554,7 +577,7 @@ pub fn admit_orientation_cue_bindings<P: crate::composition::KernelGenerationPor
         );
         projection
             .validate()
-            .map_err(|error| OrientationCueAdmissionError::A10(error.to_string()))?;
+            .map_err(OrientationCueAdmissionError::A10)?;
         projections.push(projection);
     }
 
@@ -569,7 +592,7 @@ pub fn admit_orientation_cue_bindings<P: crate::composition::KernelGenerationPor
         input.denominator,
         input.weights,
     )
-    .map_err(|error| OrientationCueAdmissionError::A10(error.to_string()))?;
+    .map_err(OrientationCueAdmissionError::A10)?;
     let source = OrientationCueBindingsSource {
         schema_version: OrientationCueBindingsSource::SCHEMA_VERSION,
         task_id: task_id.clone(),
@@ -587,7 +610,7 @@ pub fn admit_orientation_cue_bindings<P: crate::composition::KernelGenerationPor
     };
     source
         .validate()
-        .map_err(|error| OrientationCueAdmissionError::A10(error.to_string()))?;
+        .map_err(OrientationCueAdmissionError::A10)?;
     Ok(source)
 }
 
@@ -602,6 +625,7 @@ pub fn admit_orientation_cue_bindings_from_values<
 >(
     composition: &crate::composition::GovernorComposition<P>,
     request: &RequestMetadata,
+    owner_clock: &ClockReading,
     operation_id: &OperationId,
     values: OrientationCueAdmissionValuesV1<'_>,
 ) -> Result<OrientationCueBindingsSource, OrientationCueAdmissionError> {
@@ -633,6 +657,7 @@ pub fn admit_orientation_cue_bindings_from_values<
         composition,
         OrientationCueAdmissionInput {
             request,
+            owner_clock,
             operation_id,
             observation: &observation,
             touched: &touched,
