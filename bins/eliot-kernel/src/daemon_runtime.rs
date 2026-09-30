@@ -515,15 +515,13 @@ impl KernelComposition {
         // binding that does not prove them is the same defect the class rule
         // already names for this identity, so it is refused with that same
         // reason instead of being reported as a budget of its own.
-        let declared_threshold =
-            match admitted.declared_attempt_threshold(admitted_generation, &admitted_state_fence) {
-                Ok(declared) => declared,
-                Err(_) => {
-                    return Ok(Some(
-                        DaemonRestartRefusal::PolicyNotBoundToAdmittedGeneration,
-                    ));
-                }
-            };
+        let Ok(declared_threshold) =
+            admitted.declared_attempt_threshold(admitted_generation, &admitted_state_fence)
+        else {
+            return Ok(Some(
+                DaemonRestartRefusal::PolicyNotBoundToAdmittedGeneration,
+            ));
+        };
         let store = self.generation_gateway.ors.as_ref();
         let recorded = store
             .load_kernel_restart_reconciliation(ACTIVE_DAEMON_CALLER, admitted_generation.value())
