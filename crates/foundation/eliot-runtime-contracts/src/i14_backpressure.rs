@@ -326,6 +326,8 @@ pub struct I14RecoveryDirectiveV1 {
     /// Explicit evidence-reference coverage state.
     pub evidence_coverage: EvidenceCoverageState,
     /// Escalation condition when automated recovery cannot proceed.
+    /// Unknown commit outcomes must declare a problem, incident, or
+    /// manual/platform-recovery boundary (I14.21).
     pub escalation_condition: I14EscalationCondition,
     /// Current recovery resolution state.
     pub resolution_state: I14ResolutionState,
@@ -698,6 +700,20 @@ impl I14RecoveryDirectiveV1 {
             return Err(invalid(
                 "earliest_permitted_condition",
                 "unknown outcomes require reconciliation evidence or completed manual recovery",
+            ));
+        }
+        // I14.21 sends an unknown outcome to a Problem State: the scope pauses,
+        // the operation is preserved, and a problem is opened. An unknown
+        // commit with no declared escalation boundary would report a possible
+        // effect as a warning-only observation, so the directive must name the
+        // problem, incident, or manual/platform-recovery boundary that owns
+        // the reconciliation.
+        if self.commit_status == RecoveryCommitStatus::Unknown
+            && self.escalation_condition == I14EscalationCondition::None
+        {
+            return Err(invalid(
+                "escalation_condition",
+                "unknown outcomes require a declared problem, incident, or manual-recovery boundary",
             ));
         }
         Ok(())
