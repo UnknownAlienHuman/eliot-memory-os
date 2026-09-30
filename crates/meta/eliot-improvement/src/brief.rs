@@ -22,7 +22,7 @@
 //! - `boundary_ref` is the `consequential_boundary` value
 //!   `eliot_learning_delta::derive_boundaries` DERIVED from the lifecycle
 //!   activities the same owner recorded
-//!   (`crates/governor/eliot-governor/src/learning_closure.rs:483`), which
+//!   (`crates/governor/eliot-governor/src/learning_closure.rs:498`), which
 //!   refuses an ordinary read (`read_file`/`read`/`grep`) and an empty activity
 //!   set outright (`crates/smart/eliot-learning-delta/src/boundary.rs:214-228`)
 //!   before anything is committed. A record in that image IS therefore an
@@ -31,7 +31,7 @@
 //!   reading of the record's own public field is the whole observation.
 //! - `active_main_agent_or_human_ref` is the `actor_id` the closure owner
 //!   recorded for that attempt
-//!   (`crates/governor/eliot-governor/src/learning_closure.rs:844`) — the
+//!   (`crates/governor/eliot-governor/src/learning_closure.rs:925`) — the
 //!   identity that EXECUTED the consequential work, a principal rather than a
 //!   label. `ASSUMPTION:` that actor is the "active Main Agent or Human" of
 //!   I12.24:64, because it is the only principal the closure owner records and
@@ -211,7 +211,7 @@ impl SafeBoundary {
     /// The MOST RECENT committed record is the observed boundary:
     /// [`eliot_governor::LearningClosureService::close_attempt`] appends one
     /// record per consequential closure
-    /// (`crates/governor/eliot-governor/src/learning_closure.rs:293-303`), so
+    /// (`crates/governor/eliot-governor/src/learning_closure.rs:308-317`), so
     /// the last element is the newest owner-observed consequential boundary
     /// this process holds. Both boundary values on the result are that record's
     /// own fields; neither is formatted, defaulted or synthesized here. The

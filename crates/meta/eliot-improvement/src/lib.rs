@@ -178,7 +178,12 @@
 //! - `route_rejected_surface`, `ImprovementCandidateDraft`,
 //!   `route_overlay_task_policy_change` — the whole
 //!   `overlay_policy_routing` module has no production consumer.
-//! - `sourced_evidence_from_repeated_verifier_failure` — zero external hits.
+//! - `sourced_evidence_from_repeated_verifier_failure` — called from the daemon
+//!   intake (`bins/eliotd/src/improvement_intake_dispatch.rs`,
+//!   `repeated_verifier_failure_evidence`, issue #1867 W2/A1) over a repeated
+//!   verifier failure the TestD terminal-owner lane committed to the durable
+//!   attempt records. Its `verifier_ref`, `failure_refs` and `trace_refs` are
+//!   read from that committed record, never composed by the caller.
 //! - `brief::is_non_mutating`, `budget_proof::{ComplexityEconomicsDelta,
 //!   is_conclusive, supports_promotion}` — zero external hits.
 //! - The entire `promotion_input` module (45 top-level items, including
