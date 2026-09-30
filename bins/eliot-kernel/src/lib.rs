@@ -4670,8 +4670,8 @@ impl KernelComposition {
             }
             Err(_) => return Err(DrainHalt::new("daemon-contour-unavailable")),
         }
-        let quiescence =
-            reverse_quiescence_order(&live_branches).map_err(|_| DrainHalt::new("module-contour-unprovable"))?;
+        let quiescence = reverse_quiescence_order(&live_branches)
+            .map_err(|_| DrainHalt::new("module-contour-unprovable"))?;
         record(
             ShutdownPhase::ModulesQuiescedReverse,
             format!("quiesce-requested:{}", quiescence.join(">")),

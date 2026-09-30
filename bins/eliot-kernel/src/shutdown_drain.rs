@@ -29,6 +29,24 @@
 //! vocabulary here is Kernel-owned; `DrainState`
 //! (`Requested`/`Draining`/`Cancelled`/`Failed`) stays Host-journal owned.
 //!
+//! # The activation fence is installation-scoped, not generation-scoped
+//!
+//! I1.5 pairs [`DrainCommitDecision::activation_generation_fenced`] with an
+//! installation-scoped `activation_generation`, and I14.23 says "No caller may
+//! 'rescue' shutdown by reviving an old lease or process handle". Those two
+//! sentences together mean the revocation outlives the drain that made it. A
+//! fence recorded only inside the current drain generation's [`Self::
+//! DrainCommitDecision`] would be dropped by [`ShutdownDrainCoordinator::
+//! request_shutdown`]'s rollover into a fresh generation, and by a process that
+//! reloads the durable file with no drain in progress — and a wake presenting
+//! exactly the generation a committed `DrainCommitRecord` states it fenced
+//! would then be answered `Proceed`. The fence is therefore durable in its own
+//! right ([`DurableDrainState::fenced_activation_generations`]), carried across
+//! rollover, and consulted by [`ShutdownDrainCoordinator::classify_wake`]
+//! *before* any per-generation drain state, so the property does not depend on
+//! a drain being in progress. That ordering is the linearizability property,
+//! not a check that reports on it.
+//!
 //! Handoffs (recorded, not implemented here): audit/outbox flush is
 //! Governor/`eliotd`-owned — Kernel flushes ORS staged rows and records the
 //! Governor flush as awaited via daemon quiescence; canonical-store internals
@@ -1380,16 +1398,16 @@ impl ShutdownDrainCoordinator {
         if !state.requested {
             return Ok(DrainWakeDisposition::Proceed);
         }
-        if let Some(_committed) = state.committed.as_ref() {
+        if state.committed.is_some() {
             // The installation fence above already rejected the fenced
             // generation, so everything reaching here is post-linearization
             // with an activation generation beyond the fence, and must wait
-            // for a fresh generation. A committed state whose
-            // `activation_generation_fenced` is `None` — a state persisted by a
-            // build that predates the field — never reached `RejectStale`
-            // through that field; it is still fenced through
-            // [`DrainWakeDisposition::fences_old_authority`] here, and it never
-            // has to be migrated, quarantined, or repaired to be safe.
+            // for a fresh one. A committed state whose
+            // `activation_generation_fenced` is `None` — persisted by a build
+            // that predates the field, and therefore carrying no fence to
+            // reject against — is still refused here through
+            // [`DrainWakeDisposition::fences_old_authority`], and it never has
+            // to be migrated, quarantined, or repaired to be safe.
             return Ok(DrainWakeDisposition::QueueNextGeneration);
         }
         if state.terminal.is_some() {
@@ -1412,9 +1430,10 @@ impl ShutdownDrainCoordinator {
     /// the race disposition for evidence.
     ///
     /// The presented activation generation is the one the request's own
-    /// candidate contour carries, so the post-linearization comparison is
-    /// decided against a value that genuinely reached this call from the
-    /// production `Activate` path.
+    /// candidate contour carries, so the post-linearization verdict is decided
+    /// against a value that genuinely reached this call from the production
+    /// `Activate` path and against the installation-scoped fence, not against
+    /// this process's local drain correlation id.
     pub(crate) fn on_activate_request(
         &self,
         presented_activation_generation: &SupervisionJournalEpoch,
@@ -1490,17 +1509,19 @@ impl ShutdownDrainCoordinator {
     /// terminal in particular. I14.23 requires that deadline expiry "produces
     /// visible incomplete-shutdown recovery state; it does not silently discard
     /// pending work", and this projection is the production reader
-    /// ([`crate::health_view::KernelComposition::activation_operational_view`])
-    /// that survives into the next process: collapsing both terminals into one
-    /// `"terminated"` code made an interrupted-then-incomplete drain
-    /// indistinguishable from a clean intentional stop to anyone reading the
-    /// live view, which is the absence the requirement forbids.
+    /// ([`crate::KernelComposition::activation_operational_view`], re-exported
+    /// through `crate::health_view`) that survives into the next process:
+    /// collapsing both terminals into one `"terminated"` code made an
+    /// interrupted-then-incomplete drain indistinguishable from a clean
+    /// intentional stop to anyone reading the live view, which is the absence
+    /// the requirement forbids.
     pub(crate) fn drain_disposition(&self) -> &'static str {
         let state = self.lock();
-        match &state.terminal {
-            Some(ShutdownTerminal::Intentional) => return "terminated-intentional",
-            Some(ShutdownTerminal::Incomplete { .. }) => return "terminated-incomplete",
-            None => {}
+        if let Some(terminal) = &state.terminal {
+            return match terminal {
+                ShutdownTerminal::Intentional => "terminated-intentional",
+                ShutdownTerminal::Incomplete { .. } => "terminated-incomplete",
+            };
         }
         if state.committed.is_some() {
             return "queue-next-generation";
