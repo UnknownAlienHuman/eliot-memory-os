@@ -1593,6 +1593,22 @@ pub struct UsageTelemetry {
     pub extra: UnknownFields,
 }
 
+/// Exact malformed assistant payload retained by the admitted route owner.
+/// Its payload is boxed by `OpenCodeRunError` so a large provider response
+/// does not inflate every error value.
+#[derive(Debug, thiserror::Error)]
+#[error("OpenCode assistant returned malformed structured output: {reason}")]
+pub struct MalformedProviderOutput {
+    /// Provider/model identity observed in the assistant message.
+    pub observed_model: ModelSelection,
+    /// Exact UTF-8 assistant output text returned by the provider.
+    pub raw_output: String,
+    /// Provider-reported usage telemetry, including partial fields.
+    pub usage: Option<UsageTelemetry>,
+    /// Bounded parser or output-schema reason.
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct UsageAvailability {
     pub state: AvailabilityState,
@@ -1698,6 +1714,12 @@ pub struct NoAuthorityRunResult {
     #[serde(flatten)]
     pub extra: UnknownFields,
 }
+
+/// Key in [`NoAuthorityRunResult::extra`] containing the exact UTF-8
+/// assistant text from a successfully reconciled provider response. The
+/// structured `output` remains a convenience projection and never replaces
+/// this retained provider payload.
+pub const OPENCODE_PROVIDER_RAW_OUTPUT_UTF8_KEY: &str = "provider_raw_output_utf8";
 
 pub type ActualRouteResult = NoAuthorityRunResult;
 pub type OpenCodeRunResult = NoAuthorityRunResult;
