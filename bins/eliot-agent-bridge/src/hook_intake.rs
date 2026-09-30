@@ -129,11 +129,13 @@ fn hook_runtime_root() -> Result<PathBuf, HookIntakeError> {
             .unwrap_or_else(|| Path::new(".eliot-governor"))
             .to_path_buf());
     }
-    let local_app_data = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).ok_or_else(|| {
-        HookIntakeError::RuntimeHomeUnresolved(
-            "LOCALAPPDATA is required for a standalone Eliot instance".to_owned(),
-        )
-    })?;
+    let local_app_data = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            HookIntakeError::RuntimeHomeUnresolved(
+                "LOCALAPPDATA is required for a standalone Eliot instance".to_owned(),
+            )
+        })?;
     Ok(local_app_data.join("Eliot"))
 }
 
@@ -146,8 +148,8 @@ pub fn run_hook_intake(argv: &[String]) -> Result<(), HookIntakeError> {
     if argv.len() != 1 {
         return Err(HookIntakeError::MissingEvent(argv.len()));
     }
-    let kind = parse_hook_event(&argv[0])
-        .ok_or_else(|| HookIntakeError::UnknownEvent(argv[0].clone()))?;
+    let kind =
+        parse_hook_event(&argv[0]).ok_or_else(|| HookIntakeError::UnknownEvent(argv[0].clone()))?;
     let mut input = String::new();
     std::io::stdin()
         .read_to_string(&mut input)
