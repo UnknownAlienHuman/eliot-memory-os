@@ -531,7 +531,9 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
         }
         let verification = change_monitor::HintVerification {
             before_digest: Some(before_digest),
-            first_read: change_monitor::ContentRead::Present { sha256: after_first },
+            first_read: change_monitor::ContentRead::Present {
+                sha256: after_first,
+            },
             reread: change_monitor::ContentRead::Present {
                 sha256: after_reread,
             },
@@ -1802,9 +1804,7 @@ impl ProcessExecutionGateway {
         // pre-effect point that still carries the admission the binding is
         // formed from, and the retained path proof whose lease owns the
         // image the port opens.
-        if let Err(error) =
-            self.capture_governed_effect_baseline(owner, &admission, &path_proof)
-        {
+        if let Err(error) = self.capture_governed_effect_baseline(owner, &admission, &path_proof) {
             observe_process("kernel.process.start_failed", "rejected");
             super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
             return Err(error);
