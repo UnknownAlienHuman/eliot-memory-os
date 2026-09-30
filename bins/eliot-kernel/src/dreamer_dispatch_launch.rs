@@ -26,9 +26,9 @@
 //!
 //! Single-flight and reconcile state lives in the process-local lineage table
 //! below, keyed by the exact job identity: an exact replay returns the
-//! retained original lineage (same nonce, same operation, same grant digest)
-//! instead of minting a second worker, while changed terms under one job
-//! identity refuse with [`DreamerMaterialError::ChangedTerms`]. The durable
+//! retained original lineage (same semantic-input reference, nonce, operation,
+//! and grant digest) instead of minting a second worker, while changed terms
+//! under one job identity refuse with [`DreamerMaterialError::ChangedTerms`]. The durable
 //! job ledger (Store S0/S1 over the K1 gateway) stays the terminal authority;
 //! this table only enforces launch-once per identity and carries the values
 //! the claim and reconcile paths compare. A persisted launch nonce is never
@@ -53,6 +53,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use eliot_contracts::{EpochId, StateFence};
+use eliot_protocol::dreamer_job::OpaqueContentRef;
 use serde::{Deserialize, Serialize};
 
 use super::DispatchGrant;
@@ -125,6 +126,10 @@ pub enum DreamerMaterialError {
     /// Changed terms under one retained job identity; the retained original
     /// is never overwritten.
     ChangedTerms(String),
+    /// The retained Store owner response has no original semantic input.
+    SemanticInputUnavailable,
+    /// The retained Store owner response carries a malformed semantic input.
+    SemanticInputStale,
     /// A mechanical gate failed (lock poison, serialization, live authority
     /// unavailable).
     Gate(String),
@@ -140,6 +145,12 @@ impl std::fmt::Display for DreamerMaterialError {
             }
             Self::ChangedTerms(detail) => {
                 write!(f, "changed dreamer terms under one job identity: {detail}")
+            }
+            Self::SemanticInputUnavailable => {
+                f.write_str("the durable Dreamer owner has no retained semantic input reference")
+            }
+            Self::SemanticInputStale => {
+                f.write_str("the durable Dreamer semantic input reference is stale or malformed")
             }
             Self::Gate(detail) => write!(f, "dreamer launch gate failed: {detail}"),
             Self::Io(detail) => write!(f, "dreamer material file failed: {detail}"),
@@ -170,6 +181,11 @@ pub struct DreamerDispatchedEnvelope {
     pub attempt_id: String,
     /// Exact ledger revision the worker must claim.
     pub revision: u64,
+    /// Original semantic input reference projected by the durable Store owner.
+    /// `None` is admitted only for legacy material and can never drive a
+    /// semantic claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_input: Option<OpaqueContentRef>,
     /// Scope the ledger bound to this job (never caller bytes).
     pub scope_id: String,
     /// Fence the ledger bound to this job (never caller bytes).
@@ -203,6 +219,10 @@ pub struct ValidatedDreamerMaterial {
     pub attempt_id: String,
     /// Exact ledger revision the worker must claim.
     pub revision: u64,
+    /// Original semantic input reference projected by the durable Store owner.
+    /// Absence is explicit for legacy material; the child must not synthesize
+    /// a ready input from it.
+    pub semantic_input: Option<OpaqueContentRef>,
     /// Scope the ledger bound to this job.
     pub scope_id: String,
     /// Fence the ledger bound to this job.
@@ -279,6 +299,10 @@ pub struct DreamerLaunchRecord {
     pub attempt_id: String,
     /// Exact ledger revision the worker must claim.
     pub revision: u64,
+    /// Original semantic-input reference retained by the durable job owner.
+    /// It participates in single-flight equality so a retry cannot replace
+    /// the source under the same job/attempt/fence lineage.
+    pub semantic_input: OpaqueContentRef,
     /// Scope the ledger bound to this job.
     pub scope_id: String,
     /// Fence the ledger bound to this job.
@@ -635,6 +659,11 @@ pub(crate) fn validate_dreamer_material(
             "dreamer lineage revision must be non-zero".to_owned(),
         ));
     }
+    if let Some(semantic_input) = &envelope.semantic_input {
+        semantic_input
+            .validate("semantic_input.sha256")
+            .map_err(|_| DreamerMaterialError::SemanticInputStale)?;
+    }
     envelope
         .fence
         .validate()
@@ -676,6 +705,7 @@ pub(crate) fn validate_dreamer_material(
         job_id: envelope.job_id.clone(),
         attempt_id: envelope.attempt_id.clone(),
         revision: envelope.revision,
+        semantic_input: envelope.semantic_input.clone(),
         scope_id: envelope.scope_id.clone(),
         fence: envelope.fence.clone(),
         epoch: envelope.epoch.clone(),
@@ -688,7 +718,8 @@ pub(crate) fn validate_dreamer_material(
 /// Reserves one Dreamer launch lineage under its job identity.
 ///
 /// Insert-or-replay: a fresh identity reserves; an exact resubmit (same
-/// attempt, revision, scope, fence, and executable binding) returns the
+/// attempt, revision, original semantic input, scope, fence, and executable
+/// binding) returns the
 /// RETAINED original record so the caller rewrites byte-identical material
 /// and never spawns a second worker; changed terms under one identity
 /// refuse instead of overwriting the original.
@@ -705,6 +736,7 @@ pub(crate) fn reserve_dreamer_launch(
     if let Some(existing) = launches.get(&record.job_id) {
         if existing.attempt_id == record.attempt_id
             && existing.revision == record.revision
+            && existing.semantic_input == record.semantic_input
             && existing.scope_id == record.scope_id
             && existing.fence == record.fence
             && existing.executable_sha256 == record.executable_sha256
@@ -924,7 +956,10 @@ mod dreamer_dispatch_launch_tests {
     #![allow(clippy::expect_used, clippy::unwrap_used, clippy::too_many_lines)]
 
     use super::*;
-    use eliot_contracts::{EpochLineageId, ResourceGeneration};
+    use eliot_contracts::{
+        ArtifactId, ContractId, ContractIdentity, ContractVersion, EpochLineageId,
+        ResourceGeneration,
+    };
     use std::num::NonZeroU64;
 
     const LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -939,6 +974,20 @@ mod dreamer_dispatch_launch_tests {
 
     fn test_fence() -> StateFence {
         StateFence::new(test_epoch(1), ResourceGeneration::genesis())
+    }
+
+    fn test_semantic_input() -> OpaqueContentRef {
+        OpaqueContentRef {
+            contract: ContractIdentity {
+                name: ContractId::new("eliot.dreamer.test-input").expect("contract"),
+                version: ContractVersion::new(1, 0, 0),
+                shape_sha256: "11".repeat(32),
+            },
+            source_revision: "source-revision-1".to_owned(),
+            byte_length: 1,
+            sha256: "22".repeat(32),
+            artifact_id: Some(ArtifactId::new("dreamer-semantic-input-1").expect("artifact")),
+        }
     }
 
     fn test_grant(epoch: &EpochId, generation: u64, identity_digest: &str) -> DispatchGrant {
@@ -977,6 +1026,7 @@ mod dreamer_dispatch_launch_tests {
             job_id: job_tag.to_owned(),
             attempt_id: "attempt-t12-09-01".to_owned(),
             revision: 1,
+            semantic_input: None,
             scope_id: "scope-t12-09".to_owned(),
             fence: test_fence(),
             epoch: epoch.clone(),
@@ -1071,6 +1121,7 @@ mod dreamer_dispatch_launch_tests {
             job_id: job_id.clone(),
             attempt_id: "attempt-lineage-01".to_owned(),
             revision: 1,
+            semantic_input: test_semantic_input(),
             scope_id: "scope-lineage".to_owned(),
             fence: fence.clone(),
             executable_sha256: "ef".repeat(32),

@@ -174,6 +174,10 @@ fn base_response(request: &DurableJobRequest, bound_scope: WorkScopeBinding) -> 
         job_id: TaskId::new("job").expect("job"),
         attempt_id: ArtifactId::new("attempt").expect("attempt"),
         scope: bound_scope,
+        semantic_input: match &request.operation {
+            JobOperation::Submit { submission } => Some(submission.semantic_input.clone()),
+            _ => None,
+        },
         revision: 1,
         state: JobState::Queued,
         disposition: None,
