@@ -103,6 +103,10 @@ fn work_scope() -> ObservationScope {
     })))
 }
 
+// `expires_at_ms` is a `u64`; an unsuffixed integer literal inside `json!` has
+// no other constraint and falls back to `i32`, which cannot hold a far-future
+// millisecond instant. The suffix names the real field type; the value is the
+// same far-future expiry the census compares against.
 fn lease() -> RuntimeLease {
     must(serde_json::from_value(json!({
         "lease_id": "lease-1", "scope_ref": "scope-1", "authority_epoch": {"lineage_id": "550e8400-e29b-41d4-a716-446655440000", "sequence": 1},
@@ -111,7 +115,7 @@ fn lease() -> RuntimeLease {
             "task_revision": 1, "policy_revision": 1,
             "integration_revision": null
         },
-        "state": "ACTIVE", "expires_at_ms": 4000000000000
+        "state": "ACTIVE", "expires_at_ms": 4_000_000_000_000u64
     })))
 }
 

@@ -1215,6 +1215,10 @@ mod lifecycle_proof_tests {
         })))
     }
 
+    // `expires_at_ms` is a `u64`; the `json!` macro has no other constraint on
+    // a bare integer literal, so an unsuffixed one falls back to `i32` and a
+    // far-future millisecond instant does not fit. The suffix names the real
+    // field type and keeps the same value the census compares against.
     fn lease_fixture() -> RuntimeLease {
         must(serde_json::from_value(json!({
             "lease_id": "lease-1956", "scope_ref": "scope-1956",
@@ -1225,7 +1229,7 @@ mod lifecycle_proof_tests {
                 "task_revision": 1, "policy_revision": 1,
                 "integration_revision": null
             },
-            "state": "ACTIVE", "expires_at_ms": 4000000000000
+            "state": "ACTIVE", "expires_at_ms": 4_000_000_000_000u64
         })))
     }
 

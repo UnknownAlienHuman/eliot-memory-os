@@ -1732,6 +1732,7 @@ mod tests {
 
     #[test]
     fn non_finalize_request_rejects_a_final_receipt_payload() {
+        let target = handle("eliot/store/v1/".to_owned() + &"b".repeat(32));
         let intent = HostCredentialControlIntent::new(
             HostCredentialControlOperation::Inspect,
             handle("tx:test"),
@@ -1739,7 +1740,21 @@ mod tests {
             StoreCredentialProvisionPlan {
                 generation: ResourceGeneration::genesis(),
                 config_digest: handle("a".repeat(64)),
-                target: handle("eliot/store/v1/".to_owned() + &"b".repeat(32)),
+                target: target.clone(),
+                // The owner's single derivation rule, called exactly as the two
+                // production provisioning sites call it, rather than a second
+                // copy of the reserved-namespace domain string. This plan is
+                // shaped like a live provisioning plan, so it carries the
+                // derived provider reference: the `Option` exists only so a
+                // pre-existing single-reference installation stays parseable,
+                // and a `None` here would model that instead of what this test
+                // exercises. The derivation also guarantees the two invariants
+                // `validate()` enforces — a reserved `eliot/provider/v1/`
+                // namespace, and never an alias of the client reference.
+                provider_bootstrap_target: Some(
+                    provider_bootstrap_credential_target_for_store_target(&target)
+                        .unwrap_or_else(|_| unreachable!()),
+                ),
                 provider: StoreCredentialProvider::WindowsCredentialManager,
                 scope: StoreCredentialScope::LocalService,
                 expected_principal_sid: handle(LOCAL_SERVICE_SID),

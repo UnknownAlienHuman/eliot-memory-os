@@ -1099,7 +1099,7 @@ mod tests {
 
     use eliot_installation::{
         HostCredentialControlIntent, StoreCredentialProvider, StoreCredentialProvisionPlan,
-        StoreCredentialScope,
+        StoreCredentialScope, provider_bootstrap_credential_target_for_store_target,
     };
 
     use super::*;
@@ -1109,10 +1109,20 @@ mod tests {
     }
 
     fn provision() -> StoreCredentialProvisionPlan {
+        let target = handle("eliot/store/v1/0123456789abcdef0123456789abcdef");
         StoreCredentialProvisionPlan {
             host_state_root: handle(r"C:\ProgramData\Eliot\host"),
             expected_host_executable: handle(r"C:\ProgramData\Eliot\eliot-host.exe"),
-            target: handle("eliot/store/v1/0123456789abcdef0123456789abcdef"),
+            target: target.clone(),
+            // The owner's single derivation rule, as the two production
+            // provisioning sites call it. This plan is built for the Store
+            // credential bridge itself, which fails closed on an absent
+            // provider reference, so the derived value is the modelled state
+            // rather than a parse-compatibility `None`.
+            provider_bootstrap_target: Some(
+                provider_bootstrap_credential_target_for_store_target(&target)
+                    .unwrap_or_else(|error| panic!("test provider bootstrap target: {error}")),
+            ),
             provider: StoreCredentialProvider::WindowsCredentialManager,
             scope: StoreCredentialScope::LocalService,
             expected_principal_sid: handle(LOCAL_SERVICE_SID),
