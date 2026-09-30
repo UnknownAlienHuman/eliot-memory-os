@@ -49,6 +49,23 @@
 //!   `EVIDENCE_PACK_MAX_RECORDS` cap, which every one of the six T11.3
 //!   handlers parses as its declared upper bound.
 //!
+//! # Degraded reads settle; they do not fail the daemon
+//!
+//! The reconstruction is served over a rebuildable closure aggregate
+//! ([`eliot_store_api::ScopeRevisionView`], I5.20:34). The owner reads it
+//! before acquisition and rebuilds it after
+//! ([`eliot_governor::GovernorContextInputs::reconstruct`]), and a rebuilt
+//! aggregate that no longer equals the one it replaced is the conflicting-read
+//! condition I5.20:31 names ("else retry once or return stale/churn
+//! directive"). This route DEGRADES that condition:
+//! [`context_reconstruction_degraded_result_body`] settles the claimed pair
+//! with the read owner's own closed [`ReadOutcome::Conflicted`], under
+//! [`HostRequestResultClass::RetainedDeliveryRecord`] and with no semantic
+//! receipt, so a moved closure is a typed, submitted, distinguishable outcome
+//! rather than a failed poll step. Every other reconstruction refusal stays a
+//! step failure, because those name a caller or transport fault rather than a
+//! read the owner observed and declined to publish.
+//!
 //! # Ceiling
 //!
 //! The result is a reconstructed INPUT closure, never an admitted
@@ -56,6 +73,7 @@
 //! qualification and never action authority. The result body therefore
 //! declares the candidate result class with no semantic receipt, exactly as the
 //! campaign-packet body does for content this daemon compiled from owner reads.
+//! The degraded body is weaker still: it declares no result content at all.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -64,15 +82,16 @@ use eliot_contracts::{
     ClockReading, ProductId, RequestId, RequestMetadata, SessionId, SourceId, StateFence, TaskId,
     canonical_json_bytes, sha256_hex,
 };
-use eliot_governor::{ContextReconstructionRequest, SevenRoleInputs};
+use eliot_governor::{ContextInputsError, ContextReconstructionRequest, SevenRoleInputs};
 use eliot_learning_contracts::{
     CampaignOwnerRecordId, CampaignOwnerRevision, CampaignSourceBinding, CampaignSourceRole,
     LearningStateViewRecipe, OwnerId, SlotRequirement, TASK_CONTROLLER_CAMPAIGN_OWNER_ID,
 };
 use eliot_protocol::{
     HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestEnvelope, HostRequestResultBody,
-    HostRequestResultLineage, LocalReadAttempt, host_request_operation_id,
+    HostRequestResultClass, HostRequestResultLineage, LocalReadAttempt, host_request_operation_id,
 };
+use eliot_read::ReadOutcome;
 use eliot_store_api::{
     CampaignSourceDocumentSchema, CampaignSourceReadStatus, CampaignSourceRevisionLookup,
     CampaignSourceRevisionRead, CanonicalReadClient, EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation,
@@ -285,11 +304,109 @@ pub async fn serve_context_reconstruction(
     )?;
 
     let ctx = reconstruction_context(envelope, &owner_session, &retained_fence)?;
-    let seven = reads
-        .reconstruct_context_inputs(&ctx, &request)
-        .await
-        .map_err(|error| ReconstructionPrerequisite::ReconstructionRefused(error.to_string()))?;
+    let seven = match reads.reconstruct_context_inputs(&ctx, &request).await {
+        Ok(seven) => seven,
+        // The rebuildable closure aggregate (`ScopeRevisionView`, I5.20) was
+        // rebuilt after acquisition and no longer equals the one it replaced.
+        // That is the read cell's own conflicting-read verdict, and it travels
+        // as the read owner's `Conflicted` outcome rather than as a daemon
+        // fault: the claimed pair is settled with a typed degraded body below,
+        // exactly as the ControlBoard leg settles a moved-fence read
+        // (`daemon_runtime.rs:4408`) instead of failing the poller.
+        //
+        // A mixed before/after snapshot must never be served, so the closure is
+        // refused whole rather than degraded per role — the role-level
+        // `ProjectionState::Stale` dispositions already carry the per-read
+        // staleness that IS observable inside a coherent closure.
+        Err(ContextInputsError::SourceHeadsChanged) => {
+            return context_reconstruction_degraded_result_body(
+                envelope,
+                attempt,
+                &scope,
+                task_id,
+                ReadOutcome::Conflicted,
+                "read closure moved during acquisition; no coherent reconstruction was served",
+            );
+        }
+        // Every other reconstruction refusal (unavailable closure, invalid
+        // request, rejected role request) stays a daemon step failure: those
+        // name a caller or transport fault, not a read the owner observed and
+        // declined to publish.
+        Err(error) => {
+            return Err(ReconstructionPrerequisite::ReconstructionRefused(
+                error.to_string(),
+            ));
+        }
+    };
     context_reconstruction_result_body(envelope, attempt, &scope, task_id, &seven)
+}
+
+/// Settles one claimed reconstruction pair whose read closure was DEGRADED.
+///
+/// The body is a refusal, not a read: it carries the read owner's own closed
+/// [`ReadOutcome`] so a stale or conflicting read is distinguishable by variant
+/// and can never be read back as a served reconstruction, and it declares
+/// [`HostRequestResultClass::RetainedDeliveryRecord`] because nothing was read
+/// into a coherent closure and nothing was committed — the same class the
+/// `ControlBoard` owner uses for a refused read
+/// (`controlboard_adapters.rs:486`). It carries no semantic receipt, so it
+/// cannot be mistaken for admitted content.
+fn context_reconstruction_degraded_result_body(
+    envelope: &HostRequestEnvelope,
+    attempt: &LocalReadAttempt,
+    scope: &ScopeId,
+    task_id: &str,
+    outcome: ReadOutcome,
+    reason: &str,
+) -> Result<HostRequestResultBody, ReconstructionPrerequisite> {
+    let response = json!({
+        "operation": CONTEXT_RECONSTRUCTION_MODE,
+        "task_id": task_id,
+        "scope_id": scope.as_str(),
+        "degraded": {
+            "read_outcome": outcome,
+            "reason": reason,
+        },
+    });
+    let bytes = canonical_json_bytes(&response)
+        .map_err(|error| ReconstructionPrerequisite::ReconstructionRefused(error.to_string()))?;
+    let result_digest = sha256_hex(&bytes);
+    let body = HostRequestResultBody {
+        wire_id: HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
+        wire_version: HostRequestResultBody::CONTRACT_VERSION,
+        operation_id: attempt.operation_id.clone(),
+        request_sha256: envelope.envelope_sha256.clone(),
+        result_digest: result_digest.clone(),
+        response,
+        attempt: Some(attempt.clone()),
+        lineage: Some(HostRequestResultLineage {
+            output_artifact_ref: None,
+            output_digest: result_digest,
+            producer_ref: None,
+            // Source revisions stay unknown on this arm exactly as on the served
+            // arm: this leg published no coherent closure, so naming a revision
+            // would claim a head it did not observe.
+            source_revisions: None,
+            source_state_fence: None,
+            input_refs: None,
+            transformation_lineage: None,
+            closure_refs: None,
+            policy_fence: None,
+            origin_evidence_refs: None,
+            semantic_receipt_ref: None,
+            result_class: HostRequestResultClass::RetainedDeliveryRecord,
+            proof_ceiling: None,
+            influence_state: eliot_security_contracts::InfluenceState::Unknown,
+            instruction_taint: None,
+        }),
+        evidence: None,
+    };
+    body.validate().map_err(|error| {
+        ReconstructionPrerequisite::ReconstructionRefused(format!(
+            "degraded result body is not valid: {error}"
+        ))
+    })?;
+    Ok(body)
 }
 
 /// The authenticated task recipe, read under the admitted fence.
