@@ -217,6 +217,11 @@ pub enum SourceArtifactAdmissionError {
     Binding(&'static str),
     #[error("source effect admission could not encode the current State Fence")]
     FenceEncoding,
+    /// A typed Governor composition guard refused an owner binding during
+    /// source-effect admission. Boxing keeps the refusal typed and inspectable
+    /// instead of flattening it into an owner-error string.
+    #[error("source effect admission owner guard failed: {0}")]
+    OwnerComposition(#[source] Box<crate::composition::CompositionError>),
     #[error("source effect admission could not read an original Governor owner: {0}")]
     Owner(String),
     #[error("source mutation admission lacks an exact active ORS reservation")]

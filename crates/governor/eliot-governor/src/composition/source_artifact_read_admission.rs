@@ -190,7 +190,7 @@ fn read_current_owner_bindings<P: KernelGenerationPort + ?Sized>(
         &current_scope,
         "source-artifact read WorkScope is not fresh",
     )
-    .map_err(|error| SourceArtifactAdmissionError::Owner(error.to_string()))?;
+    .map_err(|error| SourceArtifactAdmissionError::OwnerComposition(Box::new(error)))?;
     let current_scope_identity = &current_scope.binding.scope;
     if current_scope.state_fence != *fence
         || current_scope_identity.scope_ref != original.work_scope_ref
