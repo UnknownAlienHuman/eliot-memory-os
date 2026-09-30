@@ -4494,6 +4494,16 @@ pub enum CompositionReadiness {
 /// restart recovery still belongs to the `WorkScope` owner path.
 const MAX_RETAINED_SCOPE_QUARANTINE_RECORDS: usize = 8;
 
+struct ObservationCaptureSessionOwnerRequest<'a> {
+    authenticated_principal_ref: &'a str,
+    session_id: &'a SessionId,
+    request_fence: &'a StateFence,
+    session_task_ref: Option<&'a str>,
+    task_selection: Option<&'a TaskSelectionAdmissionBinding>,
+    expected_task_ref: Option<&'a str>,
+    expected_scope_ref: Option<&'a str>,
+}
+
 /// One daemon-owned Governor composition. There is no second provider or
 /// process executor hidden behind this value.
 ///
@@ -6376,12 +6386,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     #[must_use]
     pub fn observation_reconciliation(&self) -> GovernorObservationReconciliation<'_, P> {
         GovernorObservationReconciliation::new(
-            &self.owners.observation,
-            &self.owners.problem.revisions,
-            &self.owners.canonical,
-            self.owners.policy.as_ref(),
-            self.owners.work_scope.as_ref(),
-            Some(&self.owners.session),
+            crate::observation_reconciliation::ObservationOwnerContext {
+                observation: &self.owners.observation,
+                problem_revisions: &self.owners.problem.revisions,
+                canonical: &self.owners.canonical,
+                policy: self.owners.policy.as_ref(),
+                work_scope: self.owners.work_scope.as_ref(),
+                session: Some(&self.owners.session),
+            },
             self.kernel.as_ref(),
             self.readiness,
         )
@@ -6413,7 +6425,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         self.observation_reconciliation().current_ingress_policy()
     }
 
-    /// Reads the exact Policy and WorkScope named-read projections needed by
+    /// Reads the exact `Policy` and `WorkScope` named-read projections needed by
     /// an Observe request before protected bytes are staged. The authenticated
     /// session and both owner projections must match the request fence.
     pub fn observation_capture_owner_binding(
@@ -6462,13 +6474,15 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             ));
         }
         self.observation_capture_owner_binding_for_refs(
-            authenticated_principal_ref,
-            session_id,
-            request_fence,
-            session_task_ref.as_deref(),
-            None,
-            None,
-            None,
+            ObservationCaptureSessionOwnerRequest {
+                authenticated_principal_ref,
+                session_id,
+                request_fence,
+                session_task_ref: session_task_ref.as_deref(),
+                task_selection: None,
+                expected_task_ref: None,
+                expected_scope_ref: None,
+            },
         )
     }
 
@@ -6522,20 +6536,22 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .as_ref()
             .map(TaskId::as_str);
         self.observation_capture_owner_binding_for_refs(
-            authenticated_principal_ref,
-            session_id,
-            request_fence,
-            session_task_ref.as_deref(),
-            Some(selection),
-            request_task_ref,
-            None,
+            ObservationCaptureSessionOwnerRequest {
+                authenticated_principal_ref,
+                session_id,
+                request_fence,
+                session_task_ref: session_task_ref.as_deref(),
+                task_selection: Some(selection),
+                expected_task_ref: request_task_ref,
+                expected_scope_ref: None,
+            },
         )
     }
 
-    /// Reads observation policy and WorkScope from the exact current activated
+    /// Reads observation policy and `WorkScope` from the exact current activated
     /// binding. The outer activation evidence remains the source for its task,
     /// work unit, and plan; task applicability for capture is explicitly None
-    /// until an original TaskSelectionEvidence is supplied.
+    /// until an original `TaskSelectionEvidence` is supplied.
     pub fn observation_capture_owner_binding_for_activation(
         &self,
         activation: &GovernorActivationSnapshot,
@@ -6543,9 +6559,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         self.observation_capture_owner_binding_for_activation_inner(activation, None)
     }
 
-    /// Reads the current Observation policy and WorkScope for an authenticated
+    /// Reads the current Observation policy and `WorkScope` for an authenticated
     /// cold capture identified by its original principal, semantic Session,
-    /// and StateFence. No RequestIdentity or task identity is synthesized;
+    /// and `StateFence`. No `RequestIdentity` or task identity is synthesized;
     /// task applicability remains None unless a separate validated task
     /// selection is supplied through the task-bound API.
     pub fn observation_capture_owner_binding_for_principal_session(
@@ -6576,17 +6592,19 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .task_scope
             .clone();
         self.observation_capture_owner_binding_for_refs(
-            authenticated_principal_ref,
-            session_id,
-            state_fence,
-            session_task_ref.as_deref(),
-            None,
-            None,
-            None,
+            ObservationCaptureSessionOwnerRequest {
+                authenticated_principal_ref,
+                session_id,
+                request_fence: state_fence,
+                session_task_ref: session_task_ref.as_deref(),
+                task_selection: None,
+                expected_task_ref: None,
+                expected_scope_ref: None,
+            },
         )
     }
 
-    /// Reads current Policy and WorkScope owners for a cold Host capture from
+    /// Reads current `Policy` and `WorkScope` owners for a cold Host capture from
     /// the exact original Kernel peer-admission receipt. The receipt is the
     /// host-origin authority; this path creates no semantic principal,
     /// Session, or task identity.
@@ -6611,7 +6629,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         self.observation_capture_owner_binding_for_origin_at_fence(
             crate::ObservationCaptureOwnerOrigin::HostPeer {
                 domain: crate::ObservationCaptureHostOriginDomain::AgentBridge,
-                peer_admission_receipt: peer_admission_receipt.clone(),
+                peer_admission_receipt: Box::new(peer_admission_receipt.clone()),
             },
             request_fence,
             None,
@@ -6644,13 +6662,15 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             CompositionError::Provider(format!("activated Observe session is invalid: {error}"))
         })?;
         self.observation_capture_owner_binding_for_refs(
-            &activation.principal_id,
-            &session_id,
-            fence,
-            Some(activation.task_id.as_str()),
-            task_selection,
-            task_selection.map(|_| activation.task_id.as_str()),
-            Some(&activation.work_scope_id),
+            ObservationCaptureSessionOwnerRequest {
+                authenticated_principal_ref: &activation.principal_id,
+                session_id: &session_id,
+                request_fence: fence,
+                session_task_ref: Some(activation.task_id.as_str()),
+                task_selection,
+                expected_task_ref: task_selection.map(|_| activation.task_id.as_str()),
+                expected_scope_ref: Some(&activation.work_scope_id),
+            },
         )
     }
 
@@ -6666,14 +6686,17 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
 
     fn observation_capture_owner_binding_for_refs(
         &self,
-        authenticated_principal_ref: &str,
-        session_id: &SessionId,
-        request_fence: &StateFence,
-        session_task_ref: Option<&str>,
-        task_selection: Option<&TaskSelectionAdmissionBinding>,
-        expected_task_ref: Option<&str>,
-        expected_scope_ref: Option<&str>,
+        input: ObservationCaptureSessionOwnerRequest<'_>,
     ) -> Result<crate::ObservationCaptureOwnerBinding, CompositionError> {
+        let ObservationCaptureSessionOwnerRequest {
+            authenticated_principal_ref,
+            session_id,
+            request_fence,
+            session_task_ref,
+            task_selection,
+            expected_task_ref,
+            expected_scope_ref,
+        } = input;
         if authenticated_principal_ref.trim().is_empty()
             || authenticated_principal_ref.chars().any(char::is_control)
         {
@@ -6719,7 +6742,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             let evidence = selection.evidence();
             evidence
                 .validate()
-                .map_err(|error| CompositionError::from(error))?;
+                .map_err(CompositionError::from)?;
             let work_scope = self.current_work_scope_binding_at_retained_fence()?;
             if expected_task_ref != Some(selection.task_ref())
                 || selection.task_ref() != evidence.task_ref
