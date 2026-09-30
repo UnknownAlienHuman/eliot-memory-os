@@ -20919,8 +20919,7 @@ impl RedbRecoveryStore {
                         Self::bridge_cursor_stable_and_scan_bytes(value.value())?;
                     let cursor: BridgeEventCursorRow = decode(value.value())?;
                     cursor.validate()?;
-                    if !cursor.owner_namespace.is_empty() && cursor.owner_namespace != namespace
-                    {
+                    if !cursor.owner_namespace.is_empty() && cursor.owner_namespace != namespace {
                         return Err(OrsError::IntegrityProblem {
                             record_type: "bridge_event_cursor",
                             reason: "checked cursor row carries a foreign owner namespace"
