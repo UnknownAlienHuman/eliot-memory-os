@@ -610,6 +610,64 @@ impl IndicatorObservation {
     }
 }
 
+/// One classified I8.8 indicator observation, as a source assessment retains it.
+///
+/// This is the shape a producer writes and the use boundary reads. It names the
+/// class the producer classified, the exact evidence supporting that
+/// classification, the provenance of whoever produced it, and the discriminating
+/// evidence that would release a restriction this record may support. It is
+/// retained evidence, not authority: nothing here is resolved until
+/// [`IndicatorSourceMap`] decides what the combination may propose, and that
+/// decision is a narrowing of use, never a grant.
+///
+/// A model-proposed observation may be retained here exactly as an independent
+/// one may. Retaining it says nothing about it, and the map resolves a model
+/// proposal to [`IndicatorResolution::CandidateOnly`] whatever it claims.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RecordedIndicatorObservation {
+    /// The indicator class the producer classified.
+    pub indicator: IndicatorClass,
+    /// The exact evidence that supports the classification. The map refuses a
+    /// record whose evidence belongs to a different class.
+    pub evidence: IndicatorEvidence,
+    /// The provenance of the observation. A model proposal has no rule identity
+    /// to supply here, so it cannot arrive with one.
+    pub observation: IndicatorObservation,
+    /// The discriminating evidence that would release a restriction this record
+    /// may support. Required by the map for a class that may propose one;
+    /// ignored for a class that may not, which has no release to describe.
+    pub release_condition: Option<String>,
+}
+
+impl RecordedIndicatorObservation {
+    /// Validates this record's own shape, independently of any resolution.
+    ///
+    /// A record that is retained malformed is refused at the use boundary
+    /// rather than skipped, so a producer cannot store a record the map would
+    /// refuse and have the source treated as if no indicator existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the class does not accept the evidence, when the
+    /// evidence or the observation provenance is malformed, or when a release
+    /// condition is present but blank.
+    pub fn validate(&self) -> Result<(), SecurityContractError> {
+        if !self.indicator.accepts(&self.evidence) {
+            return Err(SecurityContractError::SecurityIndicatorMismatch {
+                indicator: self.indicator.name(),
+                evidence: self.evidence.class().name(),
+            });
+        }
+        self.evidence.validate()?;
+        self.observation.validate()?;
+        if let Some(condition) = &self.release_condition {
+            assessment_text(condition, "indicator.release_condition")?;
+        }
+        Ok(())
+    }
+}
+
 /// A bounded, source-revision scoped restriction an indicator may propose.
 ///
 /// Every permitted set here is later intersected with the assurance in force
