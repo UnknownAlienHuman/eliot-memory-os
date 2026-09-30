@@ -270,18 +270,6 @@ fn next_reopen_count(current: u32) -> Result<u32, ProblemError> {
         })
 }
 
-/// Advances the ownership epoch under the same no-reuse rule.
-///
-/// I13.8 requires a lost owner to be replaced "with new Authority Epoch". A
-/// reused epoch would let the fenced owner present the same epoch it lost, so
-/// overflow is a refusal rather than a clamp.
-fn next_ownership_epoch(current: u64) -> Result<u64, ProblemError> {
-    current.checked_add(1).ok_or(ProblemError::CounterOverflow {
-        field: "ownership_epoch",
-        current,
-    })
-}
-
 /// Signal severity from deterministic supervision.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1519,31 +1507,30 @@ impl Incident {
                 reason: "must be non-zero",
             });
         }
-        if let Ok(identity) = &self.promotion {
+        if let Some(promotion) = &self.promotion {
             if self.expected_resolution.is_empty() {
                 return Err(ProblemError::InvalidField {
                     field: "expected_resolution",
                     reason: "a promoted incident must retain its expected closure set",
                 });
             }
-            if identity.reason == IncidentReason::StructuralCorruption
-                && !self.review_requests.is_empty()
+            // I13.9 separates semantic contamination from structural corruption.
+            // A review request that observed a wrong interpretation is not a
+            // corruption finding, so an `UnknownMaterialOrCriticalExternalEffect`
+            // or `CriticalTelemetryOrControlPathLost` request can never be the
+            // retained request a structural-corruption promotion decides on:
+            // wrong interpretations do not automatically justify restore or a
+            // global shutdown.
+            if promotion.reason == IncidentReason::StructuralCorruption
+                && self
+                    .review_requests
+                    .iter()
+                    .all(|request| request.reason != IncidentReason::StructuralCorruption)
             {
-                // I13.9 separates semantic contamination from structural
-                // corruption. A review request that observed a wrong
-                // interpretation is not a corruption finding, so a
-                // corruption promotion may not be carried on one.
-                let contamination = self.review_requests.iter().all(|request| {
-                    request.reason != IncidentReason::StructuralCorruption
+                return Err(ProblemError::InvalidField {
+                    field: "promotion.reason",
+                    reason: "structural corruption requires a retained review request that found it",
                 });
-                if contamination && self.review_requests.iter().any(|request| {
-                    request.reason == IncidentReason::UnknownMaterialOrCriticalExternalEffect
-                }) {
-                    return Err(ProblemError::InvalidField {
-                        field: "promotion.reason",
-                        reason: "an unknown-effect finding does not by itself establish structural corruption",
-                    });
-                }
             }
         }
         let expected = self
