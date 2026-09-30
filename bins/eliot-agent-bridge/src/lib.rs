@@ -354,6 +354,16 @@ impl OwnerStreamIdentity {
             owner_revision: cut.owner_revision(),
         })
     }
+
+    /// Issue #2885 W1: true only for a genuine successor of `prior` — same
+    /// owner namespace and producer, strictly greater incarnation. The
+    /// single predicate behind both closure recording and ledger entry
+    /// creation, so a cross-owner replacement never mints ledger state.
+    fn is_successor_of(&self, prior: &Self) -> bool {
+        self.owner_namespace == prior.owner_namespace
+            && self.producer_id == prior.producer_id
+            && self.incarnation > prior.incarnation
+    }
 }
 
 /// Issue #2885 W1: the local closure record of one stream incarnation.
@@ -391,26 +401,34 @@ struct StreamIncarnationLedger {
     /// retire or when the stream entry is evicted.
     closure: Option<IncarnationClosure>,
     /// Highest incarnation retired through authenticated successor
-    /// evidence. Terminal within this stream entry: never lowered, never
-    /// re-adopted.
-    retired_incarnation: u64,
+    /// evidence, with its owner lineage. Terminal within this stream
+    /// entry: never lowered within its lineage, never re-adopted.
+    /// Lineage-scoped so a retired incarnation of one owner never
+    /// refuses a verified page from another owner lineage.
+    retired: Option<OwnerStreamIdentity>,
 }
 
 impl StreamIncarnationLedger {
     /// Issue #2885 W8: reconnect adoption guard. Refuses a retired
     /// incarnation replay — a candidate at or below the retired
-    /// high-water mark that is not the currently adopted identity — and a
-    /// stale predecessor page — same namespace and producer below the
-    /// adopted incarnation. Anything refused leaves bases, receipts, and
-    /// the adopted identity untouched, so a retired incarnation never
-    /// reopens and its ranges can never be adopted into another
-    /// generation (I07-23 duplicates stay idempotent under exact identity).
+    /// high-water mark of the same owner lineage that is not the
+    /// currently adopted identity — and a stale predecessor page — same
+    /// namespace and producer below the adopted incarnation. Anything
+    /// refused leaves bases, receipts, and the adopted identity
+    /// untouched, so a retired incarnation never reopens and its ranges
+    /// can never be adopted into another generation (I07-23 duplicates
+    /// stay idempotent under exact identity). A page from another owner
+    /// lineage is never refused here: cross-owner legitimacy is #2729
+    /// evidence, never asserted by the bridge.
     fn reconnect_may_adopt(
         &self,
         candidate: &OwnerStreamIdentity,
         adopted: Option<&OwnerStreamIdentity>,
     ) -> bool {
-        if candidate.incarnation <= self.retired_incarnation
+        if let Some(retired) = self.retired.as_ref()
+            && retired.owner_namespace == candidate.owner_namespace
+            && retired.producer_id == candidate.producer_id
+            && candidate.incarnation <= retired.incarnation
             && adopted.is_none_or(|current| current != candidate)
         {
             return false;
@@ -430,10 +448,7 @@ impl StreamIncarnationLedger {
     /// greater incarnation — closes; cross-owner replacement keeps the
     /// existing reset behavior without recording a closure.
     fn close_on_successor(&mut self, prior: OwnerStreamIdentity, successor: OwnerStreamIdentity) {
-        if prior.owner_namespace != successor.owner_namespace
-            || prior.producer_id != successor.producer_id
-            || successor.incarnation <= prior.incarnation
-        {
+        if !successor.is_successor_of(&prior) {
             return;
         }
         self.closure = Some(IncarnationClosure {
@@ -446,8 +461,9 @@ impl StreamIncarnationLedger {
     /// proves the recorded successor. Callers pass only authenticated
     /// owner evidence: an owner-confirmed consumed offer (Kernel
     /// acknowledgement receipt) or a jointly imported owner-confirmed
-    /// frontier. Retirement advances the terminal high-water mark and
-    /// drops the pending closure.
+    /// frontier. Retirement advances the terminal high-water mark —
+    /// never lowered within its owner lineage — and drops the pending
+    /// closure.
     fn retire_if_successor_confirmed(&mut self, confirmed: &OwnerStreamIdentity) {
         let Some(closure) = self.closure.as_ref() else {
             return;
@@ -455,8 +471,13 @@ impl StreamIncarnationLedger {
         if closure.successor != *confirmed {
             return;
         }
-        if closure.closed.incarnation > self.retired_incarnation {
-            self.retired_incarnation = closure.closed.incarnation;
+        let dominated = self.retired.as_ref().is_some_and(|retired| {
+            retired.owner_namespace == closure.closed.owner_namespace
+                && retired.producer_id == closure.closed.producer_id
+                && retired.incarnation >= closure.closed.incarnation
+        });
+        if !dominated {
+            self.retired = Some(closure.closed.clone());
         }
         self.closure = None;
     }
@@ -512,12 +533,16 @@ fn project_reconciled_owner_ack_state(
             // page — same namespace and producer, strictly greater
             // incarnation — so closure is derived from #2729 owner
             // evidence, never asserted. Cross-owner replacement keeps the
-            // existing reset without recording a closure.
-            if let Some(prior) = prior_identity {
+            // existing reset without recording a closure and without
+            // minting a ledger entry, keeping the one-entry-per-live-stream
+            // budget exact.
+            if let Some(prior) = prior_identity
+                && identity.is_successor_of(prior)
+            {
                 incarnation_ledgers
                     .entry(stream_id.to_owned())
                     .or_default()
-                    .close_on_successor(prior.clone(), identity.clone());
+                    .close_on_successor(OwnerStreamIdentity::clone(prior), identity.clone());
             }
             owner_acked.insert(stream_id.to_owned(), stream.acked_cursor());
             delivered_sequences.remove(stream_id);
