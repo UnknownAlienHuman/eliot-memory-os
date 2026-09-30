@@ -1,8 +1,6 @@
 //! Original-owner READ admission for one retained source-artifact Blob pointer.
 
-use eliot_authority::{
-    ActionContract, ImpactClass, LeaseId, ReceiptObligation, SnapshotId,
-};
+use eliot_authority::{ActionContract, ImpactClass, LeaseId, ReceiptObligation, SnapshotId};
 use eliot_contracts::{
     ClockReading, OperationId, RequestId, ResourceGeneration, StateFence, TaskRevision,
     canonical_json_bytes,
@@ -15,7 +13,9 @@ use eliot_receipts::{
 use eliot_store_api::NamedReadOperation;
 
 use super::{CompositionReadiness, GovernorComposition, KernelGenerationPort};
-use crate::{SourceArtifactAdmission, SourceArtifactAdmissionError, SourceArtifactAdmissionRequest};
+use crate::{
+    SourceArtifactAdmission, SourceArtifactAdmissionError, SourceArtifactAdmissionRequest,
+};
 
 const LSP_OBSERVATION_RECEIPT_KIND: &str = "instrument.lsp_observation.v1";
 const CONTEXT_RECONSTRUCTION_REQUEST_PREFIX: &str = "eliotd:context-reconstruction:";
@@ -74,8 +74,9 @@ fn validate_original_read_request<'a>(
     input.payload_ref.validate()?;
 
     let host_operation_id = host_request_operation_id(&input.envelope);
-    let expected_request_id =
-        RequestId::new(format!("{CONTEXT_RECONSTRUCTION_REQUEST_PREFIX}{host_operation_id}"))?;
+    let expected_request_id = RequestId::new(format!(
+        "{CONTEXT_RECONSTRUCTION_REQUEST_PREFIX}{host_operation_id}"
+    ))?;
     let identity = &input.envelope.identity;
     let metadata = &input.request_metadata;
     let work_scope_ref = identity
@@ -85,16 +86,19 @@ fn validate_original_read_request<'a>(
         .ok_or(SourceArtifactAdmissionError::Binding(
             "context reconstruction request lacks its original WorkScope identity",
         ))?;
-    let metadata_task = metadata.task_id.as_ref().ok_or(
-        SourceArtifactAdmissionError::Binding(
+    let metadata_task = metadata
+        .task_id
+        .as_ref()
+        .ok_or(SourceArtifactAdmissionError::Binding(
             "context reconstruction metadata lacks its task identity",
-        ),
-    )?;
-    let metadata_session = metadata.session_id.as_ref().ok_or(
-        SourceArtifactAdmissionError::Binding(
-            "context reconstruction metadata lacks its session identity",
-        ),
-    )?;
+        ))?;
+    let metadata_session =
+        metadata
+            .session_id
+            .as_ref()
+            .ok_or(SourceArtifactAdmissionError::Binding(
+                "context reconstruction metadata lacks its session identity",
+            ))?;
 
     if input.envelope.kind != HostRequestKind::Invocation
         || identity.capability != "eliot.query"
@@ -173,9 +177,14 @@ fn read_current_owner_bindings<P: KernelGenerationPort + ?Sized>(
     original: &OriginalReadRequestContext<'_>,
     fence: &StateFence,
 ) -> Result<CurrentOwnerBindings, SourceArtifactAdmissionError> {
-    let work_scope_owner = composition.owners.work_scope.as_ref().ok_or(
-        SourceArtifactAdmissionError::Binding("current WorkScope owner is unbound"),
-    )?;
+    let work_scope_owner =
+        composition
+            .owners
+            .work_scope
+            .as_ref()
+            .ok_or(SourceArtifactAdmissionError::Binding(
+                "current WorkScope owner is unbound",
+            ))?;
     let current_scope = work_scope_owner.read_current(fence)?;
     let current_scope_identity = &current_scope.binding.scope;
     if current_scope.state_fence != *fence
@@ -193,27 +202,25 @@ fn read_current_owner_bindings<P: KernelGenerationPort + ?Sized>(
         state_fence: fence.clone(),
     };
 
-    let metadata_task = input
-        .request_metadata
-        .task_id
-        .as_ref()
-        .ok_or(SourceArtifactAdmissionError::Binding(
-            "context reconstruction metadata lacks its task identity",
-        ))?;
-    let metadata_session = input
-        .request_metadata
-        .session_id
-        .as_ref()
-        .ok_or(SourceArtifactAdmissionError::Binding(
-            "context reconstruction metadata lacks its session identity",
-        ))?;
-    let current_task = composition
-        .owners
-        .task
-        .task(metadata_task)
-        .ok_or(SourceArtifactAdmissionError::Binding(
-            "current Task owner lacks the requested task",
-        ))?;
+    let metadata_task =
+        input
+            .request_metadata
+            .task_id
+            .as_ref()
+            .ok_or(SourceArtifactAdmissionError::Binding(
+                "context reconstruction metadata lacks its task identity",
+            ))?;
+    let metadata_session =
+        input
+            .request_metadata
+            .session_id
+            .as_ref()
+            .ok_or(SourceArtifactAdmissionError::Binding(
+                "context reconstruction metadata lacks its session identity",
+            ))?;
+    let current_task = composition.owners.task.task(metadata_task).ok_or(
+        SourceArtifactAdmissionError::Binding("current Task owner lacks the requested task"),
+    )?;
     if !current_task.state.is_active() || current_task.state_fence != *fence {
         return Err(SourceArtifactAdmissionError::Binding(
             "current Task owner is not active under the admitted request fence",
@@ -225,13 +232,9 @@ fn read_current_owner_bindings<P: KernelGenerationPort + ?Sized>(
         state_fence: current_task.state_fence.clone(),
     };
 
-    let current_session = composition
-        .owners
-        .session
-        .session(metadata_session)
-        .ok_or(SourceArtifactAdmissionError::Binding(
-            "current Session owner lacks the requested session",
-        ))?;
+    let current_session = composition.owners.session.session(metadata_session).ok_or(
+        SourceArtifactAdmissionError::Binding("current Session owner lacks the requested session"),
+    )?;
     if current_session.status != eliot_session::SessionState::Active
         || current_session.state_fence != *fence
         || current_session.authority_epoch != fence.authority_epoch
