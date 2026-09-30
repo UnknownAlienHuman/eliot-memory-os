@@ -506,7 +506,7 @@ impl KernelGovernedProcessEffectPort {
                     Some(previous.to_owned()),
                 ) {
                     Ok(_) => {
-                        observe_process("kernel.process.effect_external_transition", "unresolved")
+                        observe_process("kernel.process.effect_external_transition", "unresolved");
                     }
                     Err(change_monitor::ChangeMonitorError::LedgerPoisoned) => {
                         return Err(GovernedProcessEffectPortError::LedgerPoisoned);
