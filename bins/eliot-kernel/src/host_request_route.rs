@@ -7492,7 +7492,7 @@ impl KernelComposition {
         let receipt = Self::validate_observe_result_receipt(response, lineage)?;
         let operation_identity = OperationIdentity::new(record.operation_id.as_str())
             .map_err(|_| TransportError::SessionFenced)?;
-        let (transition, prepared_transition_sha256, canonical_request_sha256) =
+        let (transition, prepared_transition_sha256, canonical_request_sha256, _) =
             self.validate_original_staged_observe_plan(record, input, &operation_identity)?;
         Self::validate_observe_receipt_against_plan(
             record,
