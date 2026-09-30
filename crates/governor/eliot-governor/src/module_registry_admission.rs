@@ -8,8 +8,7 @@
 
 use eliot_contracts::StateFence;
 use eliot_module_registry::{
-    DesiredModuleState, GenerationAdmission, ModuleCatalogEntry, ModuleCatalogSnapshot,
-    ModuleError,
+    DesiredModuleState, GenerationAdmission, ModuleCatalogEntry, ModuleCatalogSnapshot, ModuleError,
 };
 use thiserror::Error;
 
@@ -134,9 +133,7 @@ pub enum ModuleRegistryAdmissionError {
     #[error("Module Catalog owner revision mismatch: expected {expected}, observed {observed}")]
     OwnerRevisionMismatch { expected: u64, observed: u64 },
     /// Store owner revision and Governor catalog revision disagree.
-    #[error(
-        "Module Catalog revision mismatch: expected {expected}, observed {catalog_revision}"
-    )]
+    #[error("Module Catalog revision mismatch: expected {expected}, observed {catalog_revision}")]
     CatalogRevisionMismatch {
         expected: u64,
         catalog_revision: u64,

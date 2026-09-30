@@ -1609,24 +1609,22 @@ type Duration = std::time::Duration;
 #[cfg(windows)]
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use eliot_contracts::{AuthorityEpoch, EpochContractError, EpochId, ResourceGeneration};
 #[cfg(windows)]
 use eliot_contracts::{
     ArtifactId, ClockReading, ContractId, ProductId, RequestId, RequestMetadata, SourceId,
     StateFence,
 };
-#[cfg(windows)]
-use eliot_runtime_contracts::{admit_module_manifest, admitted_manifest_path};
+use eliot_contracts::{AuthorityEpoch, EpochContractError, EpochId, ResourceGeneration};
 #[cfg(windows)]
 use eliot_host_service::{HostDurableJobAdapter, HostWakeIntentAdapter};
 use eliot_host_state::{
     ActivationState, AppendReceipt, DrainRecord, DrainState, EpochIdentity, EpochLineageId,
     EpochTransition, HostInstallationEpoch, HostObservationRecord, HostState,
     HostStateJournalService, HostStateRecord, IdempotencyIdentity, JournalBackend, JournalError,
-    KernelJobBinding, KernelRecord, ModuleBuildProvenanceRecord, NonceState,
-    OneTimeNonceState, PriorKernelDisposition, ProductionHostStateJournal, ReconcileOutcome,
-    RecordFence, RecoveryLineageEvidence, RedbJournalBackend, StoreRebindRecord,
-    StoreRebindState, host_owner_epoch_digest, record_checksum,
+    KernelJobBinding, KernelRecord, ModuleBuildProvenanceRecord, NonceState, OneTimeNonceState,
+    PriorKernelDisposition, ProductionHostStateJournal, ReconcileOutcome, RecordFence,
+    RecoveryLineageEvidence, RedbJournalBackend, StoreRebindRecord, StoreRebindState,
+    host_owner_epoch_digest, record_checksum,
 };
 use eliot_installation::{
     ActivationCommitFence, ActivePhaseBRebindIntent, ActivePhaseBRebindReceipt,
@@ -1693,6 +1691,8 @@ use eliot_runtime_contracts::{
     WATCHDOG_PUBLICATION_FILE_NAME, WATCHDOG_PUBLICATION_RETAINED_LIMIT, WatchdogAdmissionTemplate,
     WatchdogPublicationBundle, WatchdogPublicationRetentionPlan,
 };
+#[cfg(windows)]
+use eliot_runtime_contracts::{admit_module_manifest, admitted_manifest_path};
 use sha2::{Digest as _, Sha256};
 
 #[cfg(windows)]
@@ -9400,18 +9400,18 @@ impl HostComposition {
         let error = |reason: String| HostError::RecoveryRequired(reason);
         let hash_bytes = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
         let is_lower_digest = |value: &str| {
-            valid_sha256_text(value)
-                && value
-                    .bytes()
-                    .all(|byte| !byte.is_ascii_uppercase())
+            valid_sha256_text(value) && value.bytes().all(|byte| !byte.is_ascii_uppercase())
         };
         let make_handle = |value: &str, field: &str| {
-            PlatformHandle::new(value.to_owned())
-                .map_err(|handle_error| HostError::ProcessContour(format!("{field}: {handle_error}")))
+            PlatformHandle::new(value.to_owned()).map_err(|handle_error| {
+                HostError::ProcessContour(format!("{field}: {handle_error}"))
+            })
         };
         let artifact_path = Path::new(launch.eliotd_executable_path.as_str());
         if !artifact_path.is_absolute() {
-            return Err(error("approved eliotd artifact path is not absolute".to_owned()));
+            return Err(error(
+                "approved eliotd artifact path is not absolute".to_owned(),
+            ));
         }
         let artifact_lease = open_launch_lease(
             launch.profile,
@@ -9476,9 +9476,13 @@ impl HostComposition {
         let provenance_bytes = provenance_lease
             .read_bounded(MAX_PROVENANCE_BYTES)
             .map_err(HostError::ProcessContour)?;
-        provenance_lease.verify().map_err(HostError::ProcessContour)?;
-        let source: ModuleBuildSourceProof = serde_json::from_slice(&provenance_bytes)
-            .map_err(|parse_error| error(format!("module source proof is malformed: {parse_error}")))?;
+        provenance_lease
+            .verify()
+            .map_err(HostError::ProcessContour)?;
+        let source: ModuleBuildSourceProof =
+            serde_json::from_slice(&provenance_bytes).map_err(|parse_error| {
+                error(format!("module source proof is malformed: {parse_error}"))
+            })?;
         let provenance_sha256 = hash_bytes(&provenance_bytes);
         let provenance_bytes_len = u64::try_from(provenance_bytes.len())
             .map_err(|_| error("module provenance size exceeds its bound".to_owned()))?;
@@ -9493,14 +9497,17 @@ impl HostComposition {
             "--bin",
             "eliotd",
         ];
-        let source_identity_valid = [source.source_commit.as_str(), source.source_tree_id.as_str()]
-            .into_iter()
-            .all(|value| {
-                (40..=64).contains(&value.len())
-                    && value
-                        .bytes()
-                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-            });
+        let source_identity_valid = [
+            source.source_commit.as_str(),
+            source.source_tree_id.as_str(),
+        ]
+        .into_iter()
+        .all(|value| {
+            (40..=64).contains(&value.len())
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        });
         let source_hashes_valid = [
             source.builder_script_sha256.as_str(),
             source.cargo_manifest_sha256.as_str(),
@@ -9525,7 +9532,11 @@ impl HostComposition {
             || !source_hashes_valid
             || source.cargo_profile != "release"
             || source.build_target != "x86_64-pc-windows-msvc"
-            || source.build_argv.iter().map(String::as_str).ne(expected_build_arguments)
+            || source
+                .build_argv
+                .iter()
+                .map(String::as_str)
+                .ne(expected_build_arguments)
             || !is_lower_digest(&source.artifact_sha256)
             || !is_lower_digest(&source.manifest_sha256)
             || provenance_bytes.is_empty()
@@ -9534,9 +9545,10 @@ impl HostComposition {
                 "module-specific source/build proof does not bind the exact active eliotd artifact and manifest".to_owned(),
             ));
         }
-        let config_lease = self.jobs.eliotd_config_lease.as_ref().ok_or_else(|| {
-            error("active eliotd Governor config lease is missing".to_owned())
-        })?;
+        let config_lease =
+            self.jobs.eliotd_config_lease.as_ref().ok_or_else(|| {
+                error("active eliotd Governor config lease is missing".to_owned())
+            })?;
         if config_lease.path() != Path::new(launch.eliotd_config_path.as_str()) {
             return Err(error(
                 "eliotd config lease differs from the active launch descriptor".to_owned(),
@@ -9738,10 +9750,7 @@ impl HostComposition {
                 "Host activation readback is not in the Starting state".to_owned(),
             ));
         }
-        self.admit_and_record_module_build_provenance(
-            &phase_b.launch,
-            &starting_activation.fence,
-        )?;
+        self.admit_and_record_module_build_provenance(&phase_b.launch, &starting_activation.fence)?;
         // I1.5 "start only the remaining capabilities required by the admitted
         // request". The set that may gate this contour is the one the
         // activation generation itself durably carries, read back from the

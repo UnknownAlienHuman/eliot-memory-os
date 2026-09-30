@@ -37,12 +37,12 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
+#[cfg(windows)]
+use eliot_contracts::{ArtifactId, ContractId};
 use eliot_contracts::{
     ClockReading, OperationId, ProductId, RequestId, RequestMetadata, SessionId, SourceId,
     StateFence,
 };
-#[cfg(windows)]
-use eliot_contracts::{ArtifactId, ContractId};
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError};
 use eliot_kernel_service::PROVIDER_CAPABILITY_WIRE_VERSION;
@@ -57,13 +57,13 @@ use eliot_protocol::{
     TaskControllerInvocation, TaskControllerResultBody, host_request_operation_id,
 };
 use eliot_receipts::RequestBinding;
+#[cfg(windows)]
+use eliot_runtime_contracts::{MODULE_MANIFEST_SCHEMA_VERSION, ModuleManifest};
 use eliot_store_api::{NamedReadRequest, NamedReadResponse, WriteReceipt};
 use eliot_testd_core::{
     TestdPendingVerifierDispatch, TestdTerminalCompletionEvidence, TestdVerifierDispatchBinding,
 };
 use serde::{Deserialize, Serialize};
-#[cfg(windows)]
-use eliot_runtime_contracts::{ModuleManifest, MODULE_MANIFEST_SCHEMA_VERSION};
 
 #[cfg(windows)]
 use eliot_ipc::{DeliveryOutcome, NamedPipeTransport, TransportLimits};

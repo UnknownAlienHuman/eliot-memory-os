@@ -2659,26 +2659,62 @@ impl ModuleBuildProvenanceRecord {
         for (value, field) in [
             (&self.module_id, "module_build_provenance.module_id"),
             (&self.artifact_path, "module_build_provenance.artifact_path"),
-            (&self.installation_profile, "module_build_provenance.installation_profile"),
+            (
+                &self.installation_profile,
+                "module_build_provenance.installation_profile",
+            ),
             (&self.manifest_path, "module_build_provenance.manifest_path"),
-            (&self.provenance_path, "module_build_provenance.provenance_path"),
+            (
+                &self.provenance_path,
+                "module_build_provenance.provenance_path",
+            ),
             (&self.cargo_profile, "module_build_provenance.cargo_profile"),
             (&self.build_target, "module_build_provenance.build_target"),
         ] {
             handle(value, field)?;
         }
         for (value, field) in [
-            (&self.artifact_digest, "module_build_provenance.artifact_digest"),
+            (
+                &self.artifact_digest,
+                "module_build_provenance.artifact_digest",
+            ),
             (&self.config_digest, "module_build_provenance.config_digest"),
-            (&self.state_fence_digest, "module_build_provenance.state_fence_digest"),
-            (&self.manifest_digest, "module_build_provenance.manifest_digest"),
-            (&self.contract_digest, "module_build_provenance.contract_digest"),
-            (&self.protocol_set_digest, "module_build_provenance.protocol_set_digest"),
-            (&self.provenance_digest, "module_build_provenance.provenance_digest"),
-            (&self.builder_script_digest, "module_build_provenance.builder_script_digest"),
-            (&self.cargo_manifest_digest, "module_build_provenance.cargo_manifest_digest"),
-            (&self.cargo_lock_digest, "module_build_provenance.cargo_lock_digest"),
-            (&self.rust_toolchain_digest, "module_build_provenance.rust_toolchain_digest"),
+            (
+                &self.state_fence_digest,
+                "module_build_provenance.state_fence_digest",
+            ),
+            (
+                &self.manifest_digest,
+                "module_build_provenance.manifest_digest",
+            ),
+            (
+                &self.contract_digest,
+                "module_build_provenance.contract_digest",
+            ),
+            (
+                &self.protocol_set_digest,
+                "module_build_provenance.protocol_set_digest",
+            ),
+            (
+                &self.provenance_digest,
+                "module_build_provenance.provenance_digest",
+            ),
+            (
+                &self.builder_script_digest,
+                "module_build_provenance.builder_script_digest",
+            ),
+            (
+                &self.cargo_manifest_digest,
+                "module_build_provenance.cargo_manifest_digest",
+            ),
+            (
+                &self.cargo_lock_digest,
+                "module_build_provenance.cargo_lock_digest",
+            ),
+            (
+                &self.rust_toolchain_digest,
+                "module_build_provenance.rust_toolchain_digest",
+            ),
             (
                 &self.daemon_contract_source_digest,
                 "module_build_provenance.daemon_contract_source_digest",
@@ -2689,11 +2725,7 @@ impl ModuleBuildProvenanceRecord {
             ),
         ] {
             digest(value, field)?;
-            if value
-                .as_str()
-                .bytes()
-                .any(|byte| byte.is_ascii_uppercase())
-            {
+            if value.as_str().bytes().any(|byte| byte.is_ascii_uppercase()) {
                 return Err(JournalError::Invalid(format!(
                     "{field} must use lowercase hexadecimal"
                 )));
@@ -2701,11 +2733,16 @@ impl ModuleBuildProvenanceRecord {
         }
         for (value, field) in [
             (&self.source_commit, "module_build_provenance.source_commit"),
-            (&self.source_tree_id, "module_build_provenance.source_tree_id"),
+            (
+                &self.source_tree_id,
+                "module_build_provenance.source_tree_id",
+            ),
         ] {
             let text = value.as_str();
             if !(40..=64).contains(&text.len())
-                || !text.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                || !text
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
             {
                 return Err(JournalError::Invalid(format!(
                     "{field} must be a lowercase source identity"

@@ -39,7 +39,7 @@ fn emit_build_module_manifest() -> Option<Result<(), String>> {
             .is_some_and(|value| value.eq_ignore_ascii_case("eliotd.exe"))
         {
             return Some(Err(
-                "builder executable is not the staged eliotd.exe".to_owned(),
+                "builder executable is not the staged eliotd.exe".to_owned()
             ));
         }
         let executable_bytes = match std::fs::read(&executable) {
@@ -49,7 +49,8 @@ fn emit_build_module_manifest() -> Option<Result<(), String>> {
         let observed_artifact_sha256 = eliot_contracts::sha256_hex(&executable_bytes);
         if !artifact_sha256.eq_ignore_ascii_case(&observed_artifact_sha256) {
             return Some(Err(
-                "supplied artifact digest does not match the executing staged eliotd.exe".to_owned(),
+                "supplied artifact digest does not match the executing staged eliotd.exe"
+                    .to_owned(),
             ));
         }
         let manifest = match eliotd::render_build_module_manifest(&observed_artifact_sha256) {
@@ -58,14 +59,16 @@ fn emit_build_module_manifest() -> Option<Result<(), String>> {
         };
         let Some(parent) = executable.parent() else {
             return Some(Err(
-                "builder executable has no staged runtime directory".to_owned(),
+                "builder executable has no staged runtime directory".to_owned()
             ));
         };
         let module_id = match eliot_contracts::ContractId::new(SERVICE_NAME) {
             Ok(value) => value,
             Err(error) => return Some(Err(error.to_string())),
         };
-        let path = parent.join(eliot_runtime_contracts::module_manifest_file_name(&module_id));
+        let path = parent.join(eliot_runtime_contracts::module_manifest_file_name(
+            &module_id,
+        ));
         let result = (|| {
             use std::io::Write as _;
 

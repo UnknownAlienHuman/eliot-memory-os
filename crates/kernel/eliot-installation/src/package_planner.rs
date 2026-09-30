@@ -74,7 +74,9 @@ pub(crate) const MODULE_BUILD_PROVENANCE_ROLES: [(&str, bool); 2] = [
     ("module.eliotd.provenance.json", false),
 ];
 
-pub(crate) fn package_inventory_roles(include_module_provenance: bool) -> Vec<(&'static str, bool)> {
+pub(crate) fn package_inventory_roles(
+    include_module_provenance: bool,
+) -> Vec<(&'static str, bool)> {
     let mut roles = REQUIRED_PACKAGE_ROLES.to_vec();
     if include_module_provenance {
         roles.extend(MODULE_BUILD_PROVENANCE_ROLES);
@@ -82,7 +84,9 @@ pub(crate) fn package_inventory_roles(include_module_provenance: bool) -> Vec<(&
     roles
 }
 
-fn module_provenance_present(names: impl IntoIterator<Item = String>) -> Result<bool, InstallationError> {
+fn module_provenance_present(
+    names: impl IntoIterator<Item = String>,
+) -> Result<bool, InstallationError> {
     let names = names.collect::<BTreeSet<_>>();
     let has_manifest = names.contains("module.eliotd.toml");
     let has_proof = names.contains("module.eliotd.provenance.json");
@@ -95,9 +99,8 @@ fn module_provenance_present(names: impl IntoIterator<Item = String>) -> Result<
 fn package_roles_for_manifest(
     manifest: &PackageManifest,
 ) -> Result<Vec<(&'static str, bool)>, InstallationError> {
-    let include_module_provenance = module_provenance_present(
-        manifest.files.iter().map(|file| file.relative_path.clone()),
-    )?;
+    let include_module_provenance =
+        module_provenance_present(manifest.files.iter().map(|file| file.relative_path.clone()))?;
     let roles = package_inventory_roles(include_module_provenance);
     if manifest.files.len() != roles.len() {
         return Err(InstallationError::IncompleteObservation(
@@ -931,9 +934,7 @@ pub(crate) fn validate_exact_candidate_package_binding(
             }
             continue;
         }
-        let Some((name, executable)) = roles
-            .iter()
-            .find(|(name, _)| *name == spec.relative_path)
+        let Some((name, executable)) = roles.iter().find(|(name, _)| *name == spec.relative_path)
         else {
             return Err(InstallationError::IdentityConflict);
         };
@@ -2256,19 +2257,15 @@ impl GenerationPackagePlanner {
 fn validate_exact_source_inventory(
     observed: &eliot_platform_windows::PackageSourceObservation,
 ) -> Result<(), InstallationError> {
-    let include_module_provenance = module_provenance_present(
-        observed.files.iter().map(|file| file.relative_path.clone()),
-    )?;
+    let include_module_provenance =
+        module_provenance_present(observed.files.iter().map(|file| file.relative_path.clone()))?;
     let roles = package_inventory_roles(include_module_provenance);
     if observed.files.len() != roles.len() {
         return Err(InstallationError::IncompleteObservation(
             "trusted source must contain the complete approved runtime inventory".to_owned(),
         ));
     }
-    let expected = roles
-        .iter()
-        .map(|(name, _)| *name)
-        .collect::<BTreeSet<_>>();
+    let expected = roles.iter().map(|(name, _)| *name).collect::<BTreeSet<_>>();
     let mut actual = BTreeSet::new();
     for file in &observed.files {
         validate_package_relative_path(Path::new(&file.relative_path))

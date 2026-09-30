@@ -2694,10 +2694,8 @@ fn validate_publication_journal(
             reason: "publication journal must retain a complete approved role inventory".to_owned(),
         });
     }
-    for (role, (expected_path, expected_executable)) in journal
-        .precommit_files
-        .iter()
-        .zip(expected_roles)
+    for (role, (expected_path, expected_executable)) in
+        journal.precommit_files.iter().zip(expected_roles)
     {
         validate_package_relative_path(Path::new(&role.relative_path)).map_err(|error| {
             InstallationError::InvalidField {
