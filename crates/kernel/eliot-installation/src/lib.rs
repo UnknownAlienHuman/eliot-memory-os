@@ -139,13 +139,16 @@ mod registry_wire;
 mod runtime_root_contract;
 mod scm_approval;
 mod setup_binding;
+mod isolated_destination;
 mod signed_activation;
 mod survey;
 mod transaction;
 mod user_broker_profile;
 
 pub use guard_containment::RetainedGuardRevert;
-pub use installation_registry::RedbInstallationRegistry;
+pub use installation_registry::{
+    InstallationHostRootClass, RedbInstallationRegistry, classify_installation_host_root,
+};
 #[cfg(test)]
 use installation_registry::classify_registry_table;
 #[cfg(test)]
@@ -177,6 +180,12 @@ use approved_generation_registry::{
 };
 
 pub(crate) use integration_discovery::WindowsPathIdentity;
+pub use isolated_destination::{
+    IsolatedDestinationAdmissionInput, IsolatedDestinationAllocation, IsolatedDestinationError,
+    IsolatedDestinationRefusal, IsolationEvidence, PREPARED_DESTINATION_ADMISSION_WIRE,
+    PreparedDestinationAdmission, PreparedDestinationFacts, ProposedRestorationRequirements,
+    admit_prepared_isolated_destination,
+};
 pub use integration_discovery::{
     AcceptedCatalogueContext, AcceptedInstallationSurvey, AcceptedIntegrationCatalogue,
     BoundedProbeInvocation, BoundedSafeProbe, CatalogueAdmissionError, DISCOVERY_CATALOGUE_SCHEMA,
