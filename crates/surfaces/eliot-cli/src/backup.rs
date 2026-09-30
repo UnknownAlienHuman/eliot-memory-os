@@ -2930,7 +2930,8 @@ fn apply_restore_test_status(
             // owner did NOT admit each become a bounded missing obligation,
             // because a gate no owner admitted is an outstanding obligation and
             // never a passed one.
-            let route = executed_route.ok_or(BackupClientError::Client(CliError::ResultMismatch))?;
+            let route =
+                executed_route.ok_or(BackupClientError::Client(CliError::ResultMismatch))?;
             outcome.gates_passed = route.passed.to_vec();
             // The Kernel's own owner name comes first, unresolved, exactly as
             // the reply wrote it. The declaration obligation is this surface's
@@ -3090,7 +3091,9 @@ pub fn backup_restore_test(
         state,
         &operation_id,
         (effect, proof_ceiling),
-        claim.as_ref().map_or(BackupStage::Requested, |claim| claim.stage),
+        claim
+            .as_ref()
+            .map_or(BackupStage::Requested, |claim| claim.stage),
         Some(params.capture_operation_id.clone()),
         Some(params.dest_store_id.clone()),
         next_action(state, BACKUP_RESTORE_TEST_OPERATION, &operation_id),
