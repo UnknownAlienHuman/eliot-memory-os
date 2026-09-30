@@ -24642,10 +24642,14 @@ impl RedbRecoveryStore {
     ///
     /// Returned outcomes are aligned with
     /// [`Self::load_process_stream_recovery`], so stdout and stderr stay
-    /// independently observable. This path never writes transport, persistence
-    /// or gaps: a failed revalidation records a typed availability fault and
-    /// preserves the prior typed state exactly, and no outcome can promote
-    /// `PARTIAL_SOURCE` or `SOURCE_UNAVAILABLE` to `COMPLETE_SOURCE`.
+    /// independently observable. One fence carries one locator identity, so it
+    /// covers at most one of the two streams: a stream whose durable locator
+    /// differs fails closed as a locator mismatch. Restart callers that must
+    /// cover every row use [`Self::revalidate_all_process_stream_recovery`],
+    /// which builds the fence per row. This path never writes transport,
+    /// persistence or gaps: a failed revalidation records a typed availability
+    /// fault and preserves the prior typed state exactly, and no outcome can
+    /// promote `PARTIAL_SOURCE` or `SOURCE_UNAVAILABLE` to `COMPLETE_SOURCE`.
     pub fn revalidate_process_stream_recovery(
         &self,
         operation_id: &crate::OperationIdentity,
