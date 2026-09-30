@@ -110,87 +110,39 @@ fn selection_proof(
     Ok(selection)
 }
 
-/// The exact output identity one assembly of this admitted set will produce.
-///
-/// I12.13 grades a rendered packet, so `QualityScorecard::output` must name the
-/// final representation through `rendered_digest` — the ordered rendered
-/// payload, not the pre-pruning candidate set. That digest is produced here and
-/// nowhere else, and `assemble_active_view` consumes the scorecard as an input
-/// to its quality gate. A caller therefore has to know the rendered digest
-/// before it can grade, while the rendered digest only exists once the admitted
-/// set has been rendered. This is the one value that closes that order, and it
-/// is returned by the same two functions `assemble_active_view` itself uses, so
-/// the digest a card is built against and the digest assembly later compares are
-/// one derivation rather than two that must agree.
-///
-/// It is a read of the admitted set and the recipe. It grants nothing, admits
-/// nothing and changes no state: the values it returns are recomputed and
-/// re-compared by `require_graded_output` when the real assembly runs, so a
-/// caller cannot launder a mismatched card through this function.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RenderedOutputIdentity {
-    /// `ActiveUnderstandingView::canonical_output_digest` of the ordered
-    /// rendered payload this stage will produce for this admitted set.
-    pub output_digest: String,
-    /// The canonical digest of the state fence that render is bound to.
-    pub fence_digest: String,
-}
-
-/// The one render-and-match derivation, shared by the pre-render identity and
-/// by the assembly itself.
-///
-/// `fence_digest` is passed in rather than recomputed so the caller's already
-/// validated fence value is the one that binds the render, and so this function
-/// adds no second computation of it.
-fn render_and_match(
-    admitted: &AdmittedContextSet,
-    recipe: &ContextRecipe,
-    fence_digest: &str,
-) -> Result<(Vec<eliot_context_contracts::RenderedAtom>, String, Vec<u8>), AssemblyError> {
-    let rendered = render::render(admitted);
-    let (output_digest, bytes) = measurement::canonical_matches(
-        &admitted.binding,
-        &recipe.recipe_sha256,
-        fence_digest,
-        &rendered,
-    )?;
-    Ok((rendered, output_digest, bytes))
-}
-
-/// The output identity [`assemble_active_view`] will produce for this admitted
-/// set, obtained without grading it.
-///
-/// The caller needs this to build the `QualityScorecard` that
-/// `assemble_active_view` requires, and it needs it before that call because the
-/// card names the rendered output. The admission and recipe are validated with
-/// their own owners' validators first, and the render is the same
-/// `render::render` + `measurement::canonical_matches` pair the assembly runs, so
-/// the value returned here is the value the assembly later recomputes and
-/// compares rather than an independent prediction of it.
-///
-/// # Errors
-///
-/// Returns [`AssemblyError`] when the admitted set or the recipe fails its own
-/// closed contract, when they are not bound to one another, or when the render
-/// cannot be canonicalised. Nothing is defaulted and no empty identity is
-/// returned: a caller that cannot learn the real rendered digest must not grade.
-pub fn rendered_output_identity(
-    admitted: &AdmittedContextSet,
-    recipe: &ContextRecipe,
-) -> Result<RenderedOutputIdentity, AssemblyError> {
-    recipe.validate()?;
-    if recipe.binding != admitted.binding {
-        return Err(AssemblyError::Contract(ContextError::IdentityConflict));
-    }
-    admitted.validate()?;
-    let fence_digest =
-        eliot_context_contracts::canonical_fence_digest(&admitted.binding.state_fence)?;
-    let (_, output_digest, _) = render_and_match(admitted, recipe, &fence_digest)?;
-    Ok(RenderedOutputIdentity {
-        output_digest,
-        fence_digest,
-    })
-}
+// #1862 RESIDUAL, named rather than papered over: a caller cannot obtain the
+// rendered output identity this stage will produce.
+//
+// I12.13 grades a rendered packet, so `QualityScorecard::output` must name the
+// final representation through `rendered_digest` — the ordered rendered payload,
+// not the pre-pruning candidate set. That digest is produced below, by
+// `render::render` + `measurement::canonical_matches`, and `assemble_active_view`
+// consumes the scorecard as an INPUT to its quality gate. A caller must therefore
+// know the rendered digest before it can grade, while the rendered digest only
+// exists once the admitted set has been rendered. `render` and `measurement` are
+// private to this crate and `assemble_active_view` takes the card by value, so
+// there is no two-pass escape and no caller outside this crate can derive the
+// value independently without duplicating the assembly render projection — which
+// would be a second derivation that has to agree with this one by luck rather
+// than by construction.
+//
+// An earlier revision of this issue's #1862 work exported a `rendered_output_identity`
+// for exactly this purpose. It was removed again, unused: nothing on any production
+// route can call it, because the route that would need it
+// (`KernelContextReadClient::compile_context_packet`) still has no production
+// caller, and the owner records its scorecard would need — the twelve
+// `QualityDimensionResult` observations, and the `PriorityPolicyIdentity`,
+// `AdmissionRuleIdentity` and `MeasurementCompositionProfile` of the admission
+// closure — have no producer. Exporting an entry point that nothing can reach is a
+// helper without a caller, and shipping it would have made this issue look closed
+// while closing nothing.
+//
+// The unblocking change belongs here and is a real architecture decision, not a
+// patch: either this crate publishes the output identity as part of a two-phase
+// assemble (render, then grade against the identity the render produced), or the
+// scorecard stops naming the rendered digest and grades the admitted set instead.
+// Either way it is this crate's owner call, because this is the only place the
+// rendered payload exists.
 
 /// Assemble one exact admitted set using one injected measurement call.
 ///
@@ -260,8 +212,13 @@ where
     // one envelope per rendered unit plus the exact input-to-output member relation,
     // keyed to the admitted source order rather than the role/provider sort below.
     let boundaries = boundary::project_assembly_boundaries(admitted, recipe)?;
-    let (rendered, output_digest, bytes) =
-        render_and_match(admitted, recipe, &expected_fence_digest)?;
+    let rendered = render::render(admitted);
+    let (output_digest, bytes) = measurement::canonical_matches(
+        &admitted.binding,
+        &recipe.recipe_sha256,
+        &expected_fence_digest,
+        &rendered,
+    )?;
     require_graded_output(
         &quality,
         admitted,

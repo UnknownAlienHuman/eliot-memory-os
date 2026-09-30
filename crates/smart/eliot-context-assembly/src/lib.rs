@@ -38,8 +38,7 @@ mod readback;
 mod render;
 
 pub use assemble::{
-    ASSEMBLY_ORDERING_REVISION, ActiveUnderstandingViewResult, AssemblyPolicy,
-    RenderedOutputIdentity, assemble_active_view, rendered_output_identity,
+    ASSEMBLY_ORDERING_REVISION, ActiveUnderstandingViewResult, AssemblyPolicy, assemble_active_view,
 };
 pub use boundary::{
     BOUNDARY_ASSEMBLY_TRANSFORMER_ID, BOUNDARY_ASSEMBLY_TRANSFORMER_REVISION,
