@@ -86,6 +86,9 @@ mod tool_exposure;
 /// #1838; I16.12): the Kernel-owned record sealed through the single audit
 /// chain, never a second store.
 pub mod trace_manifest;
+/// Bounded asynchronous producer for the fixed Kernel Event Log profile.
+/// The platform FFI is reached only from this module's single worker.
+pub mod windows_event_log;
 
 /// Public wire-operation name for the authenticated `TestD` completion route.
 pub use testd_terminal_completion_route::OPERATION as TESTD_TERMINAL_COMPLETION_OPERATION;

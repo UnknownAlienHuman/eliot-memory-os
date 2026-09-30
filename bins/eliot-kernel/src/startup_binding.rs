@@ -231,6 +231,12 @@ impl KernelStartupBinding {
             && self.host_process_image == image_path
     }
 
+    /// Projects the already parsed Host profile for best-effort telemetry.
+    /// This is not descriptor ownership or supervision admission evidence.
+    pub(crate) fn is_system_service(&self) -> bool {
+        self.installation_profile == "system_service"
+    }
+
     pub(crate) fn supervision_profile_binding(
         &self,
         retained_roots: Option<&ProfileRootLeaseSet>,
