@@ -59,11 +59,11 @@ use eliot_store_api::{
     OrderingHeadReadback, OrderingScopeId, PreparedTransition, RequestMeta,
     ReservedWriteRequest, RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId,
     ScopeRevisionView, SnapshotBeginRequest,
-    SnapshotCursor, SnapshotEndReceipt, SnapshotHandle, SnapshotPage, StateFence, StoreError,
-    StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
+    SnapshotCursor, SnapshotEndReceipt, SnapshotHandle, SnapshotPage, ResourceGeneration,
+    StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreRecoveryRequest,
+    StoreRecoverySnapshot, WriteReceipt,
     generated_operation_manifests, operation_manifest_set_digest,
 };
-use eliot_contracts::ResourceGeneration;
 pub use error::AdapterError;
 pub use health::{AdapterAvailability, AdapterHealth, ProviderHealth};
 
