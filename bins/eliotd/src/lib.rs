@@ -231,6 +231,14 @@ pub use daemon_kernel_client::{parse_local_read_claimed_pair, parse_local_read_s
 pub use daemon_kernel_client::{
     parse_observe_claimed_pair, parse_observe_defer_outcome, parse_observe_submit_outcome,
 };
+// Issue #1867 A2, I12.24:65: the daemon half of the improvement owner-decision
+// ingress. Re-exported on the same footing as the other claim-leg parsers
+// because `daemon_runtime` drains this lane and `improvement_intake_dispatch`
+// records what it returns, and neither may reach past this crate root.
+pub use daemon_kernel_client::{
+    ClaimedOwnerDecision, IMPROVEMENT_DECISION_CLAIM_OPERATION, IMPROVEMENT_DECISION_DRAIN_BOUND,
+    NON_MUTATING_OWNER_DECISIONS, parse_claimed_owner_decision,
+};
 pub(crate) use daemon_kernel_port_adapters::kind_value;
 pub use dreamer_admission::{
     DREAMER_JOB_WIRE_ID, DreamerJobQueue, GovernorDreamerAdapter, KernelDreamerJobQueue,

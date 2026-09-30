@@ -331,18 +331,29 @@
 //! existing G-19 admission policy record, read through the existing
 //! maintenance owner.
 //!
-//! # The recorded disposition is OWNER-ISSUED, and what the ingress still lacks
+//! # What the recorded disposition IS, on the two arms this module now has
 //!
 //! I12.24:65 places "decision owner selects reject / investigate / work item /
 //! experiment" AFTER the brief reaches one, and this module records a
-//! disposition on every pass. Since #1867 A2 the disposition is not this
-//! module's: it is ISSUED by the maintenance (`G-19`) improvement admission
-//! owner, out of that owner's own recorded state, by
-//! [`eliot_maintenance::select_non_mutating_disposition`] inside the owner
-//! crate. The issuer reads two records the owner itself produced — the
-//! [`ImprovementAdmissionPolicy`] it issued for this exact operation, whose
-//! `external_owner_id` is the candidate's own `owner_and_decision_authority`
-//! (I12.24:31), and the
+//! disposition on every pass. It records one of exactly two things, and
+//! [`record_brief_disposition`] is the single place that choice is made.
+//!
+//! **With a claim naming this brief revision, it is an OWNER's own recorded
+//! selection.** It is claimed from the Kernel's bounded owner-decision queue and
+//! its `owner` is the principal that owner's front-door Session authenticated
+//! and the Kernel re-proved against `Session.peer` at admission
+//! ([`record_claimed_owner_disposition`]). The `kind` is mapped from the owner's
+//! own recorded decision string by [`owner_decision_kind_from_recorded`], and the
+//! owner's note is carried verbatim.
+//!
+//! **With no claim naming it, the disposition is the maintenance (`G-19`)
+//! improvement admission owner's own, ISSUED by the owner crate** out of that
+//! owner's recorded state by
+//! [`eliot_maintenance::select_non_mutating_disposition`]
+//! ([`record_owner_disposition`]). The issuer reads two records the owner itself
+//! produced — the [`ImprovementAdmissionPolicy`] it issued for this exact
+//! operation, whose `external_owner_id` is the candidate's own
+//! `owner_and_decision_authority` (I12.24:31), and the
 //! [`AutomationDecision`](eliot_maintenance::AutomationDecision) it recorded for
 //! this exact observation — and copies the selecting principal out of the first
 //! one. The selection has private fields, no public constructor and no
@@ -350,29 +361,35 @@
 //! [`eliot_maintenance::OwnerDispositionSelection::bind`] re-checks the exact
 //! `brief_id` and `candidate_id` by CONTENT before the record is written.
 //!
-//! Before this, the disposition was derived in this file and recorded under
-//! [`SERVICE_NAME`] with the note "the daemon triaged this … no owner has ruled
-//! on this brief". That sentence was true and the record was still wrong in the
-//! direction A12.02:3 names: the maintenance owner HAD ruled — it recorded a
-//! verdict on this family at this scope and it issued the admission policy this
-//! candidate is admitted under — and the daemon was re-labelling that ruling as
-//! its own. The note stays as narrow as the evidence: the owner ruled from its
-//! recorded verdict, and it did not read the brief's prose.
+//! The two arms are distinguishable by the recorded `owner` field alone: one is
+//! a principal that PRESENTED a selection over this brief revision, the other is
+//! a principal that issued one from its own recorded verdict on the family. A
+//! third value does not exist and cannot be spelled here — no constant, and
+//! never the daemon's own service identity. Before this the disposition was
+//! derived in this file and recorded under [`SERVICE_NAME`] with the note "the
+//! daemon triaged this … no owner has ruled on this brief", which is the arm
+//! that no longer survives: A12.02:3 forbids attaching a principal's name to a
+//! selection it did not make, and the daemon's own identity is not a principal
+//! that selected anything.
 //!
-//! Both kinds are non-mutating, so recording one authorizes nothing
-//! (I12.24:82: "advisory … default; changes nothing until owner acts"), and that
-//! is now structural rather than asserted: the issuer's vocabulary
+//! Both arms record non-mutating kinds, so recording one authorizes nothing
+//! (I12.24:82: "advisory … default; changes nothing until owner acts"). On the
+//! issued arm that is structural rather than asserted: the issuer's vocabulary
 //! ([`eliot_maintenance::ImprovementBriefDisposition`]) has exactly two members,
 //! so a mutating kind is unrepresentable, and the RECORDED value is re-checked
-//! against [`OwnerDecision::is_non_mutating`] before this module returns it.
-//! `WorkItem` and `Experiment` remain unproduced anywhere in `bins/`, because
-//! reaching them would require a work item or an experiment this intake does not
-//! hold, and both are mutating kinds.
+//! against [`OwnerDecision::is_non_mutating`] before this module returns it. On
+//! the claim arm the Kernel's ingress admits only `reject` and `investigate`
+//! and [`owner_decision_kind_from_recorded`] refuses anything else, so a
+//! `work_item` or `experiment` spelling is refused rather than recorded.
+//! `WorkItem` and `Experiment` therefore remain unproduced anywhere in `bins/`,
+//! because reaching them would require a work item or an experiment this intake
+//! does not hold, and both are mutating kinds.
 //!
-//! # What is still missing: an owner cannot PRESENT a selection
+//! # What is still missing: no Human presents a selection, and the BRIEF reaches
+//! no owner by itself
 //!
-//! Issuing the disposition closes WHO selects, not HOW a Human reaches this
-//! process. Measured on this tree rather than assumed:
+//! Claiming closes HOW a decision reaches this module, not how a Human learns
+//! the brief exists. Measured on this tree rather than assumed:
 //!
 //! | candidate ingress surface | measured result |
 //! |---|---|
@@ -380,7 +397,7 @@
 //! | the daemon's only transport | OUTBOUND. `daemon_kernel_client.rs:2038 connect_authenticated_kernel_front_door` is the authenticated named-pipe CLIENT. `eliotd` dials the Kernel; nothing dials `eliotd` |
 //! | the daemon's pull queues | REAL, but wrong-typed. `local_read_claim` (`frame_dispatch.rs:1493`), `semantic_observe_claim` (`:1495`), `task_controller_claim` (`:1552`), `campaign_packet_claim` (`:1554`) and `finish_claim` (`:1560`) are genuine Kernel→daemon routes, and each carries one fixed attempt type. None carries a brief decision, and adding one is a Kernel operation plus a store record kind |
 //! | `eliot_user_automation` / `UserAutomationOperation` | never reaches `eliotd`: `git grep -c user_automation -- bins/eliotd` is 0. Served inside the Kernel, which dispatches a wake to the Host |
-//! | the `DecideImprovementBrief` operation itself | the vocabulary entry is closed, authenticated and live - `daemon_request_dispatch.rs:5393` binds `principal` from `authenticated_user_automation_principal(session)` and `:5399-5403` puts it in `intent.principal_ref` - and it is REFUSED at both ends: the automation Store answers `StoreError::UnknownOperation` at both of its own refusals (`user_automation_store.rs:1027-1029` and `:2527`) and the operator route answers `TransportError::SessionFenced` (`daemon_request_dispatch.rs:5387-5392`, before the principal is bound) |
+//! | the `DecideImprovementBrief` operation itself | **CHANGED — now the owner ingress.** The vocabulary entry is closed and authenticated: `build_user_automation_operator_request` binds `principal` from `authenticated_user_automation_principal(session)` and puts it in `intent.principal_ref`. It used to be REFUSED at both ends; it is now answered by `queue_owner_decision_response`, which admits the selection into the Kernel's bounded owner-decision queue through `admit_owner_decision` and reports the `ledger_read_owed` obligation. The automation Store still answers `StoreError::UnknownOperation` at both of its own refusals (`user_automation_store.rs:1027-1029` and `:2527`), which remains correct: the automation Store has no ordering scope a brief can join |
 //! | a durable decision an owner could write for the daemon to read | none. The daemon's read client admits a closed set of named reads (`kernel_context_read_client.rs:186-253`) and `GetUserAutomationState` is not among them; and the only row the daemon re-reads is its OWN `Candidate` artifact, written by this same pass under the same record key, so an owner cannot pre-empt it |
 //! | a production `CapabilityGrant` issuer | NONE, measured two ways. `eliot_authority::CapabilityGrant` is constructed only by `grants.rs::grant_from_recovery_record` (a stored-row projection) and at sites that are all `#[cfg(test)]`; `activate_root_transition` activates a caller-PRESENTED record rather than issuing one. And the live graph cannot delegate at all: every production construction is `GrantGraph::from_grants(std::iter::empty(), 1)` (`eliot-governor/src/composition.rs:10954`, `genesis_owner_packet.rs:308`), so there is no parent grant to narrow. `check_narrowing` is a real check against a real parent, and inventing one would be exactly the self-declared authority I11.3 forbids |
 //!
@@ -390,36 +407,167 @@
 //! idempotency key all come from the admission policy record the same owner
 //! issued and the bound is already read from.
 //!
-//! # The exact missing route, named
+//! # The owner ingress, and what it is worth (issue #1867 A2, I12.24:65)
 //!
-//! Reaching I12.24:65 needs three artifacts in three other owners' files:
+//! An owner's selection now reaches [`record_brief_disposition`] on a production
+//! path, in three pieces that are each in the owner that owns them:
 //!
-//! 1. a Kernel dispatch arm that COMMITS the authenticated decision as a durable
-//!    row, beside `dispatch_user_automation_operator_transition`
-//!    (`bins/eliot-kernel/src/daemon_request_dispatch.rs:5421`), replacing the
-//!    `SessionFenced` refusal at `:5387-5392` for this one operation. It is
-//!    refused today because the automation Store owns no ordering scope a brief
-//!    can join, which is correct; the commit belongs to the improvement owner's
-//!    own canonical record, not to the automation Store.
-//! 2. a Kernel queue the daemon can claim, beside the existing pull legs in
-//!    `DaemonKernelClient` (`daemon_kernel_client.rs:2308` is the first,
-//!    `claim_local_read_pair_async`; `claim_finish_pair_async` at `:2573` is the
-//!    last), carrying the committed decision's `brief_id`, its closed decision
-//!    string, and the principal the Session authenticated.
-//! 3. the daemon-side poll, in `daemon_runtime::run_improvement_intake`
-//!    (`bins/eliotd/src/daemon_runtime.rs:5604` is `run_improvement_intake`
-//!    itself, the guarded phase it would
-//!    have to precede) — outside this change's two files — which maps the closed
-//!    decision string onto [`OwnerDecisionKind`] FAILING CLOSED on an unmapped
-//!    value, and presents the claimed principal to
-//!    [`eliot_maintenance::select_non_mutating_disposition`] as a state-owner
-//!    capability it verified, so the issuer binds the selection to THAT principal
-//!    rather than to the daemon.
+//! 1. the Kernel's bounded owner-decision queue,
+//!    `bins/eliot-kernel/src/hot_path_runtime.rs::admit_owner_decision`, which
+//!    admits only `reject` and `investigate`, re-validates the request identity,
+//!    binds its State Fence and authority epoch to the presenting Session, and
+//!    re-proves that the presented principal IS that Session's authenticated
+//!    peer. Its write half is
+//!    `bins/eliot-kernel/src/daemon_request_dispatch.rs::queue_owner_decision_response`,
+//!    the arm that replaced the `SessionFenced` refusal on
+//!    `UserAutomationOperation::DecideImprovementBrief`.
+//! 2. the daemon-side claim,
+//!    `bins/eliotd/src/daemon_kernel_client.rs::DaemonKernelClient::claim_owner_decision_async`
+//!    over the `improvement_decision_claim` route
+//!    (`daemon_request_dispatch.rs`, the `claim_owner_decision` read half), and
+//!    the drain in `daemon_runtime::run_improvement_intake`.
+//! 3. the record, [`record_claimed_owner_disposition`], which takes the `kind`
+//!    from [`owner_decision_kind_from_recorded`] and the `owner` from the
+//!    principal the Kernel's Session authenticated, and appends the owner's own
+//!    note verbatim.
 //!
-//! Until (1) and (2) exist, no code in this repository can make a HUMAN's
-//! selection reach `record_owner_decision`, and this module will not pretend
-//! otherwise. What (3) would replace is the one half that is already real: the
-//! owner-issued disposition recorded on every pass.
+//! ## What it does NOT buy, stated so no later reader over-claims it
+//!
+//! - **It is not durable at the ingress, and this daemon cannot observe that it
+//!   was not.** The Kernel queue is bounded process memory of the same class as
+//!   the bounded local-read pairs (`bins/AGENTS.md` forbids a composition binary
+//!   from acquiring a canonical store), so a Kernel restart before this daemon
+//!   claims an entry loses it. That is why the operator's answer is the
+//!   `outcome_settled` / `ledger_read_owed` disposition and not a settled one.
+//!   See "Undecided is not representable" below for what the daemon can and
+//!   cannot say about it.
+//! - **It reaches only the two non-mutating kinds.** `WorkItem` and
+//!   `Experiment` are refused at admission, so I12.24:65's other two spellings
+//!   still have no route, by design.
+//! - **It does widen the reachable outcomes, in exactly one direction.** Before
+//!   the ingress every live pass recorded [`OwnerDecisionKind::Reject`], so
+//!   `Investigate` had no producer at all. An owner selecting `investigate` over
+//!   a named brief is now recorded as `Investigate`. Nothing else changes: the
+//!   two kinds are the same two the owner's own issuer derives between, the
+//!   issued `Investigate` is still unreachable (see "The policy-mode question,
+//!   still open" below), and no mutating kind is reachable by either arm.
+//! - **The BRIEF still reaches no owner by itself.** The half below is
+//!   unchanged: the ingress lets an owner who already knows a `brief_id` rule on
+//!   it, and it is the content-derived `brief_id` that makes such a handle
+//!   stable. Getting a brief INTO an owner's hands in the first place is the
+//!   separate, still-missing publication half.
+//!
+//! # Undecided is not representable, and the gap is named rather than faked
+//!
+//! The loss the ingress can suffer is a decision that an owner made and no pass
+//! ever records. Nothing in this tree can express that state, and the two shapes
+//! that would be needed do not exist:
+//!
+//! - there is no owner-decision record a pass could find absent BY LOOKING. The
+//!   claim lane
+//!   ([`DaemonKernelClient::claim_owner_decision_async`], over
+//!   `improvement_decision_claim`) answers `null` for an empty queue, and an
+//!   empty queue is the same answer a lost entry produces. There is no depth, no
+//!   epoch, and no admission counter on that answer, so this daemon cannot tell
+//!   "no owner has ruled" from "an owner ruled and the entry was lost", and
+//!   `eliot-kernel`'s
+//!   `KernelComposition::claim_owner_decision` is the only reader of the queue
+//!   that could carry such a counter and does not.
+//! - there is no kind, disposition or artifact member meaning "no decision was
+//!   reached". [`OwnerDecision`] is a required field of [`ImprovementArtifact`]
+//!   and it is a decision, not an absence; `ImprovementBriefDisposition` has
+//!   exactly two members and both are selections; and
+//!   `ImprovementDispatchError` has no variant for an undecided brief. Naming
+//!   the exact absent symbols is the whole of the fix available here: adding an
+//!   `Undecided` member to `OwnerDecisionKind`, making
+//!   `ImprovementArtifact::decision` an `Option`, or carrying a queue epoch on
+//!   the claim answer are all changes to contracts this file does not own.
+//!
+//! So the honest reading of an empty claim is the narrow one this module
+//! actually holds: NO CLAIM NAMED THIS BRIEF REVISION WAS OBSERVED ON THIS
+//! PASS. That is what the recorded note says, and the alternative — recording
+//! the loss as though an owner had selected nothing — is a claim about a queue
+//! this daemon cannot see and does not make.
+//!
+//! # The policy-mode question, still open — reported, not decided
+//!
+//! [`OwnerDecisionKind::Investigate`] and [`OwnerDecisionKind::Reject`] are both
+//! reachable now, but NOT from the issued arm, and the reason is a policy
+//! decision this module must not make. `UNRESOLVED_POLICY_MODE` is
+//! `MaintenanceAutomationMode::Off`
+//! (`bins/eliotd/src/maintenance_family_catalog.rs:93`, and the module
+//! documentation at `:30` records it for all fifteen families), `Off` is the
+//! FIRST match arm of `evaluate_trigger`
+//! (`crates/governor/eliot-maintenance/src/lib.rs:798`, the arm at `:832`), and
+//! `Block` is the verdict the issuer maps to
+//! [`OwnerDecisionKind::Reject`]
+//! ([`eliot_maintenance::select_non_mutating_disposition`]). So every live pass
+//! that reaches this module with no claim over its brief issues `Reject`, and
+//! the issued `Investigate` is unreachable.
+//!
+//! That is the correct outcome for an unresolved family, and minting a policy
+//! mode for one would be this lane deciding an owner decision that the catalog
+//! records as not made. So it is reported with its exact handles rather than
+//! repaired: `UNRESOLVED_POLICY_MODE`
+//! (`bins/eliotd/src/maintenance_family_catalog.rs:93`), the policy gap
+//! `MaintenanceDecisionGap::missing_owner`
+//! (`bins/eliotd/src/maintenance_dispatch.rs:98`, which names "the Human
+//! maintenance-policy owner that publishes MaintenanceAutomationMode to eliotd
+//! (issue #1692)" and records that eliotd holds no such publisher),
+//! `evaluate_trigger`'s match order
+//! (`crates/governor/eliot-maintenance/src/lib.rs:798` and `:832`), and the
+//! `Block` → `Reject` mapping above. An owner's own `investigate` IS now
+//! recordable through the ingress, which is the strongest statement this tree
+//! admits without inventing a policy mode.
+//!
+//! # The exact route, and the loss it still admits
+//!
+//! The three artifacts I12.24:65 needs are now in place, in three owners'
+//! files, and the residual loss around them is named rather than closed:
+//!
+//! 1. ~~a Kernel dispatch arm that COMMITS the authenticated decision as a
+//!    durable row~~ — DONE as a bounded queue admission rather than a durable
+//!    commit, because the commit belongs to the improvement owner's own
+//!    canonical record and `bins/AGENTS.md` forbids this composition from
+//!    writing it. See `queue_owner_decision_response`. The automation Store
+//!    still owns no ordering scope a brief can join, which remains correct.
+//! 2. ~~a Kernel queue the daemon can claim~~ — DONE:
+//!    `hot_path_runtime.rs::claim_owner_decision` over the
+//!    `improvement_decision_claim` route, read by
+//!    `DaemonKernelClient::claim_owner_decision_async`.
+//! 3. ~~the daemon-side poll~~ — DONE: the drain in
+//!    `daemon_runtime::run_improvement_intake`, which maps the closed decision
+//!    string onto [`OwnerDecisionKind`] FAILING CLOSED through
+//!    [`owner_decision_kind_from_recorded`] and records the claimed principal as
+//!    the owner.
+//!
+//! # The residual loss, measured
+//!
+//! The claim is a destructive pop: the Kernel removes the entry it serves, and
+//! `KernelComposition::claim_owner_decision` offers no peek and no requeue, so
+//! three losses are possible and none of them is repairable from this side.
+//! Each is reported rather than absorbed:
+//!
+//! 1. **an entry this pass cannot place.** [`record_brief_disposition`] records
+//!    an entry only when its `brief_id` names the brief this pass assembled, and
+//!    a selection over a brief revision that is not currently being assembled has
+//!    no `Candidate` artifact for this pass to record it on — inventing one would
+//!    mean fabricating a candidate this daemon never observed. The drain in
+//!    `daemon_runtime::claim_owner_decisions` names every entry it could not
+//!    place, with the `brief_id` the selection was made over, in the daemon's own
+//!    diagnostic surface;
+//! 2. **an entry stranded by a refusal after the claim.** The claim is the last
+//!    pre-assembly step precisely so that fewest possible claims are stranded, and
+//!    the phase it precedes reports a refusal as its own diagnostic, but the
+//!    entries claimed into that pass are gone when it refuses;
+//! 3. **an entry the Kernel never held.** A restart between the owner's admitted
+//!    selection and this claim drops it, and the `null` the claim lane answers for
+//!    an empty queue is byte-for-byte the answer a dropped entry produces. That is
+//!    the case "Undecided is not representable" above names: this daemon can say
+//!    only that no claim naming this brief revision was observed on this pass.
+//!
+//! All three are properties of the claim API, not of the loop that calls it, and
+//! the repair for the first two is a peek on the Kernel side.
 //!
 //! # The brief reaches no owner, and the contour that would carry it is absent
 //!
@@ -760,15 +908,26 @@ pub struct ImprovementArtifact {
 ///
 /// `policy` is the maintenance (`G-19`) owner's own admission policy record,
 /// read from the live owner in the same guarded phase. It is what the recorded
-/// disposition is ISSUED FROM: [`record_owner_disposition`] presents it to the
-/// owner crate's own issuer, so the principal that selected the disposition is
-/// the one the owner's record names rather than this daemon. See "The recorded
-/// disposition is OWNER-ISSUED, and what the ingress still lacks" above.
+/// disposition is ISSUED FROM on the no-claim arm: [`record_owner_disposition`]
+/// presents it to the owner crate's own issuer, so the principal that selected
+/// the disposition is the one the owner's record names rather than this daemon.
+/// See "What the recorded disposition IS, on the two arms this module now has"
+/// above.
+///
+/// `claimed_owner_decisions` is the set the caller drained from the Kernel's
+/// bounded owner-decision claim queue, and it is the ONLY route by which a real
+/// owner's PRESENTED selection reaches the disposition this function records. It
+/// is passed in rather than read here because claiming is an authenticated Kernel
+/// exchange and this function is a pure guarded phase that must not perform one;
+/// the caller drains before the guard is taken. An empty slice is the normal
+/// case and records the maintenance owner's own issued disposition, exactly as
+/// it did before the ingress existed.
 pub fn assemble_improvement_artifact(
     decision: &eliot_maintenance::AutomationTriggerDecision,
     state_fence: &StateFence,
     durable_delta_rows: &[Value],
     policy: &ImprovementAdmissionPolicy,
+    claimed_owner_decisions: &[crate::ClaimedOwnerDecision],
 ) -> Result<ImprovementArtifact, ImprovementDispatchError> {
     // The observed campaign-closure record is read FIRST, because the
     // candidate's evidence lineage is now BOUND to it (issue #1867 W2,
@@ -980,7 +1139,12 @@ pub fn assemble_improvement_artifact(
         &boundary,
     )?;
 
-    let decision_record = record_owner_disposition(&brief, decision, policy)?;
+    // The single place the disposition is chosen between the two arms: an
+    // owner's PRESENTED selection when a claim names this brief revision, the
+    // maintenance owner's own ISSUED selection when none does. See
+    // `record_brief_disposition`.
+    let decision_record =
+        record_brief_disposition(&brief, decision, policy, claimed_owner_decisions)?;
 
     // Deduplication and bounded admission are NOT done here. They need the
     // live Governor owner (a real permit whose authority the bound is checked
@@ -998,8 +1162,162 @@ pub fn assemble_improvement_artifact(
     })
 }
 
-/// Records the non-mutating disposition the maintenance (`G-19`) owner issued
-/// over the brief this pass assembled (issue #1867 A2, I11.3, I12.24:65).
+/// Records the disposition on the brief this pass assembled: an OWNER's own
+/// PRESENTED selection when the claim queue carries one for THIS brief revision,
+/// and the maintenance (`G-19`) owner's own ISSUED selection when it does not
+/// (issue #1867 A2, I11.3, I12.24:65).
+///
+/// This is the only place that choice is made, and the two arms cannot overwrite
+/// one another because exactly one of them runs per pass. A later reader of
+/// `improvement_dedup_read` can always tell which by the recorded `owner` field
+/// alone: a principal that PRESENTED a selection over this exact brief revision,
+/// or a principal that ISSUED one out of its own recorded verdict on the family.
+/// Neither is a constant and neither is this daemon's own service identity.
+///
+/// # The owner's selection wins, and it wins as recorded
+///
+/// `claimed` is drained from the Kernel's bounded owner-decision queue by
+/// `daemon_runtime::claim_owner_decisions` before this assembly, and each entry
+/// is matched here against the brief's own `brief_id`. That match is exact
+/// string equality on a name that is itself derived from the candidate revision
+/// the brief describes (`eliot-improvement`'s `brief_identity`), which is what
+/// makes it meaningful at all: before that derivation a brief carried a fresh
+/// identity per pass, so no owner could name it and no claim could ever match
+/// one. An entry naming a different brief revision is NOT this brief's decision,
+/// and is reported by the drain rather than recorded here.
+///
+/// # What an empty claim means, stated no wider than it is
+///
+/// An empty slice means NO CLAIM NAMING THIS BRIEF REVISION WAS OBSERVED ON THIS
+/// PASS, and that is the whole of what it means. It does not mean no owner
+/// ruled: the Kernel's queue is bounded process memory, a restart drops what it
+/// holds, and its claim answer carries no depth, epoch or admission counter that
+/// would let this daemon tell a lost entry from an empty queue. The issued arm
+/// therefore says the maintenance owner issued the disposition from its own
+/// recorded verdict, and says nothing at all about any other owner. The absent
+/// symbols that would let it say more are named in the module documentation
+/// above under "Undecided is not representable, and the gap is named rather
+/// than faked".
+///
+/// # The arm that does not survive, and why
+///
+/// The daemon's OWN triage — the disposition this file used to derive here from
+/// the maintenance owner's `AutomationDecision` and record under
+/// [`SERVICE_NAME`] — is not one of the two arms and is no longer reachable from
+/// anywhere in `bins/`. [`SERVICE_NAME`] is this daemon's harness-established
+/// service identity, not a principal that selected anything over a brief it
+/// never read, and A12.02:3 ("Identity is not a model's self-declared string") is
+/// violated by attaching it to a disposition it did not choose just as surely as
+/// by attaching a real owner's name to a selection that owner did not make. It is
+/// deliberately not the brief's `proposed_owner` either: that field names the
+/// principal PROPOSED to decide (the observed boundary's `actor_id`), and this
+/// one names the principal that DID record a disposition.
+fn record_brief_disposition(
+    brief: &eliot_improvement::ImprovementBrief,
+    decision: &eliot_maintenance::AutomationTriggerDecision,
+    policy: &ImprovementAdmissionPolicy,
+    claimed: &[crate::ClaimedOwnerDecision],
+) -> Result<OwnerDecision, ImprovementDispatchError> {
+    if let Some(entry) = claimed
+        .iter()
+        .find(|entry| entry.brief_id == brief.brief_id)
+    {
+        return record_claimed_owner_disposition(brief, entry);
+    }
+    record_owner_disposition(brief, decision, policy)
+}
+
+/// Records ONE owner's own PRESENTED selection, as that owner's record states it.
+///
+/// `record_owner_decision` COPIES `brief_id` and `candidate_id` out of the brief
+/// it is handed, so the recorded decision always names the brief it is recorded
+/// against. That is why the match in [`record_brief_disposition`] is the whole
+/// of the binding: an entry whose `brief_id` did not equal this brief's own name
+/// would otherwise be recorded as though it had been selected over this
+/// revision. This function is reached only through that match, and the mapping
+/// in [`owner_decision_kind_from_recorded`] and the authenticated principal are
+/// the only two things it contributes; both are read rather than chosen.
+///
+/// The principal is the identity the Kernel's front-door Session authenticated
+/// for the request that produced the entry, re-proved there against
+/// `Session.peer` before the entry was admitted
+/// (`bins/eliot-kernel/src/hot_path_runtime.rs::admit_owner_decision`). It is
+/// owner state this daemon copies verbatim, which is what discharges A12.02:3
+/// for the call to [`crate::improvement_intake::record_brief_decision`]. The
+/// owner's note is carried verbatim and only the claim leg that served it is
+/// appended, because a re-worded note would be a different record. The recorded
+/// value is re-checked against [`OwnerDecision::is_non_mutating`] here as well as
+/// on the issued arm, so a mutating record is refused before it can be committed
+/// rather than trusted because the ingress was supposed to be safe.
+fn record_claimed_owner_disposition(
+    brief: &eliot_improvement::ImprovementBrief,
+    entry: &crate::ClaimedOwnerDecision,
+) -> Result<OwnerDecision, ImprovementDispatchError> {
+    let kind = owner_decision_kind_from_recorded(&entry.decision)?;
+    let recorded = crate::improvement_intake::record_brief_decision(
+        brief,
+        entry.principal.trim(),
+        kind,
+        &format!(
+            "the authenticated principal {} selected {kind:?} over this brief revision through the \
+             Kernel's bounded {claim} queue and this daemon claimed it from there; the owner's own \
+             note follows verbatim: {:?}",
+            entry.principal,
+            entry.note,
+            claim = crate::IMPROVEMENT_DECISION_CLAIM_OPERATION,
+        ),
+    )
+    .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))?;
+    if !recorded.is_non_mutating() {
+        return Err(ImprovementDispatchError::Contract(format!(
+            "the owner-claimed disposition for brief {} recorded as a MUTATING kind, which this \
+             advisory intake may not commit",
+            brief.brief_id
+        )));
+    }
+    Ok(recorded)
+}
+
+/// Maps one owner's RECORDED closed decision string onto the kind this daemon
+/// records, refusing anything it does not admit (issue #1867 A2, I12.24:65).
+///
+/// This is the whole translation layer between the Kernel's bounded
+/// owner-decision queue and `eliot-improvement`'s own closed
+/// [`OwnerDecisionKind`], and it FAILS CLOSED. The two vocabularies are the same
+/// two words by design — `reject` and `investigate` are exactly the kinds
+/// `OwnerDecisionKind::is_non_mutating` admits — but they are declared in three
+/// owners (`UserAutomationOperation::DecideImprovementBrief` in
+/// `eliot-kernel-core`, the queue's own literal list in
+/// `bins/eliot-kernel/src/hot_path_runtime.rs`, and `OwnerDecisionKind` in
+/// `eliot-improvement`) and there is no edge between those owners that could
+/// make a rename propagate. So a string with no mapping is refused as a typed
+/// [`ImprovementDispatchError::Contract`] rather than defaulted:
+///
+/// - a `work_item` or `experiment` spelling is MUTATING, reaches effect only
+///   through the normal work-item/canary/rollback flow of I12.24:90-91, and is
+///   refused by the Kernel's ingress before it can ever be claimed. If one is
+///   ever claimed anyway, this refusal is the second, independent gate.
+/// - any other spelling is an unmapped value, and unmapped is not `Investigate`.
+///   A silent default here would record an owner's `reject` as an
+///   `investigate` the moment a third disposition was added, which is the exact
+///   reclassification this whole route exists to prevent.
+pub fn owner_decision_kind_from_recorded(
+    decision: &str,
+) -> Result<OwnerDecisionKind, ImprovementDispatchError> {
+    match decision {
+        "reject" => Ok(OwnerDecisionKind::Reject),
+        "investigate" => Ok(OwnerDecisionKind::Investigate),
+        other => Err(ImprovementDispatchError::Contract(format!(
+            "owner decision {other:?} has no mapping onto a recordable OwnerDecisionKind; a \
+             mutating disposition reaches effect only through the work-item/canary/rollback flow, \
+             and an unmapped value is not Investigate"
+        ))),
+    }
+}
+
+/// Records the non-mutating disposition the maintenance (`G-19`) owner ISSUED
+/// over the brief this pass assembled, on the no-claim arm of
+/// [`record_brief_disposition`] (issue #1867 A2, I11.3, I12.24:65).
 ///
 /// A2 reads "An owner can select a non-mutating decision such as reject or
 /// investigate." What makes the SELECTION an owner's rather than this daemon's
@@ -1023,8 +1341,9 @@ pub fn assemble_improvement_artifact(
 /// selection that owner did not make; the same rule is violated by demoting a
 /// selection an owner DID make to the daemon's own. Both are fixed by naming the
 /// principal the ISSUER read, and by keeping the note exactly as narrow as the
-/// evidence: the owner ruled from its recorded verdict, and it did not read the
-/// brief's prose.
+/// evidence: the owner ruled from its recorded verdict, it did not read the
+/// brief's prose, and no owner PRESENTED a selection over this brief revision
+/// on this pass.
 ///
 /// # The kind is the owner's, and it is structurally non-mutating
 ///
@@ -1042,12 +1361,13 @@ pub fn assemble_improvement_artifact(
 ///
 /// # What is still absent, and is not claimed here
 ///
-/// A Human or operator still cannot PRESENT a selection: the closed
-/// `UserAutomationOperation::DecideImprovementBrief` operation is refused at both
-/// of its ends and no transport carries one to this process. That measurement,
-/// with every candidate ingress surface, is in the module documentation above
-/// under "The recorded disposition is OWNER-ISSUED, and what the ingress still
-/// lacks". This function closes WHO selects; it does not claim a UI route, and it
+/// A Human cannot be handed a brief by this process: the brief is a field of
+/// this daemon's own committed `Candidate` row, and the measurement of every
+/// candidate owner-facing surface is in the module documentation above. What an
+/// owner CAN do is present a selection over a `brief_id` it already holds, through
+/// the bounded ingress ([`record_claimed_owner_disposition`]); what it still
+/// cannot do is be handed the brief. This function closes WHO selects on a pass
+/// with no presented selection; it claims no publication route, and it
 /// substitutes no fabricated caller for one.
 fn record_owner_disposition(
     brief: &eliot_improvement::ImprovementBrief,
@@ -1078,7 +1398,9 @@ fn record_owner_disposition(
             "the maintenance improvement admission owner selected this from its own recorded \
              verdict {verdict:?} on family {family}, under its own admission operation {operation} \
              (idempotency key {key}, bound-set revision {revision}); the owner did not read this \
-             brief's prose, and this disposition is non-mutating so it changes no surface",
+             brief's prose, and this disposition is non-mutating so it changes no surface. NO \
+             OWNER PRESENTED A SELECTION over this brief revision on this pass: the Kernel's \
+             bounded owner-decision queue carried no entry naming it",
             verdict = decision.decision,
             family = decision.family,
             operation = selection.operation_ref(),

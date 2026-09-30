@@ -30,45 +30,48 @@ pub enum IntakeBridgeError {
 ///
 /// [`record_owner_decision`] is a pure record constructor: it checks that
 /// `owner` is non-empty and copies it verbatim. It cannot tell a real principal
-/// from a fabricated one, so the value's integrity is entirely the caller's,
-/// and A12.02:3 — "Identity is not a model's self-declared string" — is
-/// discharged by the call site, not here.
+/// from a fabricated one, so the value's integrity is entirely the caller's, and
+/// A12.02:3 — "Identity is not a model's self-declared string" — is discharged by
+/// the call site, not here. There are exactly two production call sites and they
+/// discharge it differently, which is why both are named:
 ///
-/// # What the production caller supplies as `owner` TODAY, stated precisely
+/// - [`crate::improvement_intake_dispatch::record_claimed_owner_disposition`]
+///   records a real OWNER's PRESENTED selection, claimed from the Kernel's
+///   bounded owner-decision queue, and its `owner` is the identity the Kernel's
+///   front-door Session authenticated and re-proved against `Session.peer` at
+///   admission (`bins/eliot-kernel/src/hot_path_runtime.rs::admit_owner_decision`).
+///   The integrity of that value is the Kernel's, not this daemon's, and this
+///   daemon copies it rather than choosing it.
+/// - [`crate::improvement_intake_dispatch::record_owner_disposition`] records
+///   the disposition the maintenance (`G-19`) improvement admission owner
+///   ISSUED, out of its own recorded state, by
+///   [`eliot_maintenance::select_non_mutating_disposition`] having COPIED the
+///   selecting principal out of the
+///   [`eliot_maintenance::ImprovementAdmissionPolicy`] it issued for this exact
+///   operation, beside the owner's own recorded
+///   [`eliot_maintenance::AutomationDecision`] for this observation. That
+///   constructor's principal is owner state too, and
+///   [`crate::DaemonComposition`]'s service identity is named nowhere in it.
 ///
-/// This doc previously said the single production caller,
-/// [`crate::improvement_intake_dispatch::record_owner_disposition`] (reached
-/// from `assemble_improvement_artifact`), "records the DAEMON's own triage under
-/// its own service identity". **That is no longer true and the sentence was left
-/// behind by the change that made it false.**
+/// # What the call sites do NOT claim
 ///
-/// The caller is still this function's only production caller, but the `owner`
-/// it presents is no longer the daemon's: it presents
-/// `selection.decision_authority()`, which is
-/// [`eliot_maintenance::select_non_mutating_disposition`] having COPIED the
-/// selecting principal out of the maintenance (`G-19`) owner's own
-/// [`eliot_maintenance::ImprovementAdmissionPolicy`] for this exact operation,
-/// beside the owner's own recorded
-/// [`eliot_maintenance::AutomationDecision`](eliot_maintenance::AutomationDecision)
-/// for this observation. This constructor therefore records the OWNER's
-/// principal, and [`crate::DaemonComposition`]'s service identity is named
-/// nowhere in it.
+/// Neither call site presents a selection this daemon chose on the owner's
+/// behalf, and neither attaches this daemon's own service identity to a
+/// disposition. Two things that is not, stated so no later reader over-claims
+/// it:
 ///
-/// Two things that is NOT, and neither is claimed here:
-///
-/// - it is not a selection over this brief's prose. The owner ruled from its
-///   recorded verdict on the family and scope; it never read the brief, and the
-///   note says so verbatim;
-/// - it is not an operator-PRESENTED disposition. The closed
-///   `UserAutomationOperation::DecideImprovementBrief` operation is still
-///   refused at both of its ends, so a Human cannot hand a disposition to this
-///   process. What exists is an owner-ISSUED decision read from owner state,
-///   which is why no owner ingress is claimed here.
+/// - neither is a selection over this brief's prose. The issued arm's owner ruled
+///   from its recorded verdict on the family and scope; it never read the brief,
+///   and the note says so verbatim;
+/// - the PRESENTED arm is not a publication half. An owner can rule on a
+///   `brief_id` it already holds, but nothing hands it one: the brief is a field
+///   of this daemon's own committed `Candidate` row. That measurement is in the
+///   module documentation of `improvement_intake_dispatch`.
 ///
 /// What stays true of this function is only the weaker half: `owner` is still the
 /// CALLER's claim, and the integrity of whatever string arrives here is still the
-/// caller's to discharge. What changed is that the one production caller now
-/// supplies an owner it did not compose.
+/// caller's to discharge. What the call sites do is supply an owner neither of
+/// them composed.
 pub fn record_brief_decision(
     brief: &ImprovementBrief,
     owner: &str,

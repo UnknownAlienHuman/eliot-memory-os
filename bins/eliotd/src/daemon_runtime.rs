@@ -79,12 +79,13 @@ use eliotd::testd_terminal_completion::{
     query_testd_owner_terminal_evidence,
 };
 use eliotd::{
-    ActivationClaim, ActivationSubmitError, AgentActivationResolver, DaemonComposition,
-    DaemonConfig, DaemonKernelClient, DaemonStatus, FinishSubmitOutcome,
-    GovernorAuthorityDriveOutcome, GovernorAuthorityDriver, KernelContextReadClient,
-    LocalReadSubmitOutcome, MaintenanceObservation, MaintenanceTriggerOrigin, ObserveDeferOutcome,
-    PROTOCOL_VERSION, SELF_OBSERVED_FAMILY, SERVICE_NAME, TaskControllerSubmitOutcome,
-    forward_admitted_local_read, serve_admitted_observe, terminal_for_invalid_ticket,
+    ActivationClaim, ActivationSubmitError, AgentActivationResolver, ClaimedOwnerDecision,
+    DaemonComposition, DaemonConfig, DaemonKernelClient, DaemonStatus, FinishSubmitOutcome,
+    GovernorAuthorityDriveOutcome, GovernorAuthorityDriver, IMPROVEMENT_DECISION_DRAIN_BOUND,
+    KernelContextReadClient, LocalReadSubmitOutcome, MaintenanceObservation,
+    MaintenanceTriggerOrigin, ObserveDeferOutcome, PROTOCOL_VERSION, SELF_OBSERVED_FAMILY,
+    SERVICE_NAME, TaskControllerSubmitOutcome, forward_admitted_local_read, serve_admitted_observe,
+    terminal_for_invalid_ticket,
 };
 use serde::Serialize;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
@@ -5678,6 +5679,15 @@ enum ImprovementIntakeFlight {
 /// that read ran at is re-checked here against the fence re-read under this
 /// guard, so a pass can never assemble over rows read at a superseded fence.
 ///
+/// `claimed_owner_decisions` is what the caller drained from the Kernel's
+/// bounded owner-decision queue in its own UNGUARDED phase
+/// ([`claim_owner_decisions`]); it is passed in for the same reason the durable
+/// rows are, because the claim is an authenticated exchange and this function
+/// performs none. An entry whose `brief_id` names the brief this pass assembles
+/// is recorded as that owner's own selection; an empty slice records the
+/// maintenance owner's own issued disposition instead. The two are told apart by
+/// the recorded `owner` field alone.
+///
 /// The admission is deliberately NOT performed here. It needs the restored
 /// deduplication registry first, and that registry is read over the
 /// authenticated Kernel named-read route, which is an exchange and must not
@@ -5694,6 +5704,7 @@ fn improvement_intake_artifact(
     decision: &eliot_maintenance::AutomationTriggerDecision,
     durable_delta_rows: &[serde_json::Value],
     delta_fence: &eliot_contracts::StateFence,
+    claimed_owner_decisions: &[ClaimedOwnerDecision],
 ) -> Result<
     (
         eliotd::improvement_intake_dispatch::ImprovementArtifact,
@@ -5745,9 +5756,69 @@ fn improvement_intake_artifact(
         &fence,
         durable_delta_rows,
         &policy,
+        claimed_owner_decisions,
     )
     .map_err(|error| error.to_string())?;
     Ok((artifact, policy, fence))
+}
+
+/// Drains the Kernel's bounded owner-decision queue into this pass's claimed set
+/// (issue #1867 A2, I12.24:65).
+///
+/// This is the daemon half of the improvement decision ingress, and the only
+/// production caller of
+/// [`DaemonKernelClient::claim_owner_decision_async`]. It exists as its own
+/// function because the claim is an authenticated Kernel exchange and every
+/// phase of `run_improvement_intake` that holds the composition guard is a pure
+/// read: the drain therefore runs before the guard is taken, and its result is
+/// passed into the assembly rather than fetched inside it.
+///
+/// # The claim removes the entry, so the drain is bounded and reports
+///
+/// The Kernel's claim is a pop: serving an entry removes it and releases its
+/// capacity permit, and the API exposes no peek and no requeue. So the drain is
+/// bounded by [`IMPROVEMENT_DECISION_DRAIN_BOUND`] — the Kernel's own declared
+/// retained ceiling for that queue, and the maximum number of answers a queue of
+/// that size can return before an empty one — and stops at the first empty
+/// answer. An entry this pass then cannot place is REPORTED here by name rather
+/// than dropped: `improvement_intake_dispatch::record_brief_disposition` records
+/// an entry only when its `brief_id` names the brief this pass assembled, and an
+/// entry naming any other brief revision has no `Candidate` artifact on this
+/// pass to be recorded against. The owner's selection is therefore visible in the
+/// daemon's own operational surface as an unplaced claim instead of vanishing,
+/// and the note names exactly which `brief_id` it was made over.
+///
+/// The bound is not a substitute for a requeue and does not pretend to be: the
+/// loss is a property of the claim API, it is named in the module documentation
+/// of `improvement_intake_dispatch` under "The residual loss, measured", and
+/// repairing it needs a peek on the Kernel side, not a different loop here.
+async fn claim_owner_decisions(
+    kernel: &Arc<DaemonKernelClient>,
+) -> Result<Vec<ClaimedOwnerDecision>, eliotd::DaemonError> {
+    let mut claimed = Vec::new();
+    while claimed.len() < IMPROVEMENT_DECISION_DRAIN_BOUND {
+        let Some(entry) = kernel.claim_owner_decision_async().await? else {
+            return Ok(claimed);
+        };
+        tracing::info!(
+            target: "eliotd::diagnostics",
+            event = "eliotd.improvement_owner_decision_claimed",
+            brief_id = %entry.brief_id,
+            decision = %entry.decision,
+            principal = %entry.principal,
+        );
+        claimed.push(entry);
+    }
+    tracing::warn!(
+        target: "eliotd::diagnostics",
+        event = "eliotd.improvement_owner_decision_drain_bounded",
+        claimed = claimed.len(),
+        bound = IMPROVEMENT_DECISION_DRAIN_BOUND,
+        note = "the drain stopped at the Kernel's declared retained ceiling for the owner-decision \
+                queue; any further queued decision stays queued rather than being claimed and \
+                reported without being placed",
+    );
+    Ok(claimed)
 }
 
 /// Admits the assembled artifact into the deduplication registry restored from
@@ -5812,18 +5883,25 @@ fn admit_over_restored_registry(
 /// artifact through the Governor improvement pipeline.
 ///
 /// Six phases, and the lock is taken more than once because phase 1 is split
-/// around the publication and around the durable closure read:
+/// around the publication, around the durable closure read and around the
+/// owner-decision claim:
 ///
-/// 1. guarded, in three steps: evaluate the observation into the maintenance
+/// 1. guarded, in five steps: evaluate the observation into the maintenance
 ///    owner's own decision; then, UNGUARDED, publish that decision's source
 ///    result through [`publish_maintenance_source_results`]; then, UNGUARDED,
 ///    read the DURABLE learning-delta scope back at a fence captured under its
-///    own short borrow; then guarded again to re-check that fence, assemble the
-///    artifact and read the `G-19` admission policy. Both splits exist because
-///    the decision is a maintenance source result in its own right and owes its
-///    observation whether or not the phases below it ever run, and because the
-///    closure evidence it assembles over must survive a restart — the in-process
-///    closure image it replaced was emptied by every one of them;
+///    own short borrow; then, UNGUARDED, drain the Kernel's bounded
+///    owner-decision queue through [`claim_owner_decisions`]; then guarded again
+///    to re-check that fence, assemble the artifact — over BOTH the durable
+///    closure rows and the claimed owner decisions — and read the `G-19`
+///    admission policy. Each split exists for its own reason: the decision is a
+///    maintenance source result in its own right and owes its observation
+///    whether or not the phases below it ever run; the closure evidence it
+///    assembles over must survive a restart, the in-process closure image it
+///    replaced was emptied by every one of them; and the claim is an
+///    authenticated exchange that must not run under the guard, and it is LAST
+///    among the pre-assembly steps because the claim is destructive and the
+///    later it runs the fewer entries a following refusal can strand;
 /// 2. UNGUARDED: read the whole candidate scope back through the existing
 ///    authenticated `GetLearningRecordRange` route at the fence captured in
 ///    phase 1. No mutex is held across this await, exactly as the Skill
@@ -5885,36 +5963,37 @@ fn admit_over_restored_registry(
 /// publication here is bounded by the same 30s transport deadline the other two
 /// sites use, and the composition lock is not held across it.
 ///
-/// # An owner's decision reaches no row, and this poll is not where that is fixed
+/// # An owner's decision, and where it is claimed
 ///
 /// I12.24:65's "decision owner selects reject / investigate / work item /
-/// experiment" is not observable in this pass, and that is stated here rather
-/// than left to be discovered. This poll is already complete for the shape a
-/// decision WOULD take: phase 2 reads the whole committed `candidate` scope
-/// exhaustively and `improvement_dedup_read::classify_row` re-proves each
-/// row's `owner_decision` — its `brief_id`, its `candidate_id`, and its owner
-/// against the authority owner's own `PrincipalRef` constructor. So a decision
-/// recorded in the SAME committed artifact shape would be seen by this pass
-/// with no additional read, and it needs no new record kind or document shape.
+/// experiment" IS observable in this pass, and where it is claimed is named here
+/// rather than left to be discovered: phase 1d above drains the Kernel's bounded
+/// owner-decision queue through `claim_owner_decisions`, and the entries it
+/// returns are handed to
+/// `improvement_intake_dispatch::assemble_improvement_artifact`. This poll was
+/// already complete for the SHAPE a decision takes: phase 2 reads the whole
+/// committed `candidate` scope exhaustively and
+/// `improvement_dedup_read::classify_row` re-proves each row's `owner_decision` —
+/// its `brief_id`, its `candidate_id`, and its owner — so a decision recorded in
+/// the SAME committed artifact shape is seen by this pass with no additional
+/// read and needs no new record kind or document shape.
 ///
-/// What is absent is the ROW, not the observation. No route writes one: the
-/// Kernel operator route answers an authenticated
-/// `UserAutomationOperation::DecideImprovementBrief` with the typed,
-/// non-reconciling refusal `KernelComposition::improvement_brief_decision_refusal`
-/// rather than a transport fence, and this daemon owns no ingress that could
-/// carry the selection here. So the `owner_decision` in every row this pass
-/// reads is the one the intake assembly recorded for ITSELF
-/// (`assemble_improvement_artifact` calls `record_brief_decision` with
-/// `OwnerDecisionKind::Investigate` and this daemon's own service name as the
-/// owner), and never a selection by an owner.
+/// What phase 1c adds is the WRITE half of that pair, and it is now present:
+/// the Kernel's operator route answers an authenticated
+/// `UserAutomationOperation::DecideImprovementBrief` through
+/// `KernelComposition::queue_owner_decision_response`, which admits the
+/// selection into that bounded queue, and the Kernel serves the claim leg to
+/// this poll. So the `owner_decision` in a row this pass commits is an owner's
+/// own selection — carrying the principal that owner's Session authenticated —
+/// whenever one named the brief; and it is this daemon's own triage, under
+/// `SERVICE_NAME`, only when none did. `assemble_improvement_artifact` chooses
+/// between the two and the recorded `owner` field is what tells a later reader
+/// which happened.
 ///
-/// The three artifacts that would carry one — a Kernel queue the daemon can
-/// claim, the poll leg that claims it, and the improvement owner's commit of a
-/// caller-supplied `OwnerDecision` through `commit_improvement_artifact` — are
-/// named with their exact locations in `improvement_intake_dispatch`'s "The
-/// exact missing route, named" section. They are not in this function and are
-/// not simulated here: this poll admits and commits only what its own
-/// observation produced.
+/// The phase 1d claim is a destructive pop with no requeue, so an entry this
+/// pass cannot place, and an entry stranded by an assembly refusal immediately
+/// after, are the residual this API shape allows. Both are named at the claim
+/// site and in `improvement_intake_dispatch`'s "The residual loss, measured".
 async fn run_improvement_intake(
     kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
@@ -5993,9 +6072,46 @@ async fn run_improvement_intake(
                 return retained.cloned();
             }
         };
+    // Phase 1d: claim whatever authenticated owners have already recorded over
+    // improvement briefs (issue #1867 A2, I12.24:65). Unguarded, and LAST of the
+    // pre-assembly phases, because claiming is an authenticated Kernel exchange
+    // while every phase that holds the composition guard is a pure read — and
+    // because the claim is destructive, so the later it runs the fewer claims
+    // this pass can strand. See `claim_owner_decisions`.
+    //
+    // An exchange failure is this phase's own diagnostic and STOPS the pass: a
+    // pass that cannot read the owner queue must not record a daemon triage as
+    // though no owner had ruled, because it does not know that. Retaining
+    // nothing new and reporting is the honest outcome; the prior admitted record
+    // stays.
+    //
+    // RESIDUAL, stated rather than hidden: the claim above is destructive, so an
+    // assembly refusal in the very next block strands the entries claimed into
+    // it. This is the same property of the claim API as the unplaced-entry loss
+    // named in `claim_owner_decisions` — the Kernel offers no peek and no
+    // requeue — and it is the reason the claim is the last thing before the
+    // assembly rather than the first thing in the pass.
+    let claimed_owner_decisions = match claim_owner_decisions(kernel).await {
+        Ok(claimed) => claimed,
+        Err(error) => {
+            let _ = eliotd::diagnostics::ErrorRecord::of(
+                eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                "improvement-owner-decision-claim",
+                &error.to_string(),
+            )
+            .emit();
+            return retained.cloned();
+        }
+    };
     let prepared = {
         let guard = composition.lock().await;
-        improvement_intake_artifact(&guard, &decision, &delta_rows, &delta_fence)
+        improvement_intake_artifact(
+            &guard,
+            &decision,
+            &delta_rows,
+            &delta_fence,
+            &claimed_owner_decisions,
+        )
     };
     let (artifact, policy, fence) = match prepared {
         Ok(prepared) => prepared,
