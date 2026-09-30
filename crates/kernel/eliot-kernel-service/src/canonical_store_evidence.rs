@@ -45,7 +45,7 @@ enum ScopedCanonicalEvidence {
     Receipt {
         token: WriterReservationToken,
         reconciliation: CanonicalReconciliation,
-        store_receipt: WriteReceipt,
+        store_receipt: Box<WriteReceipt>,
         envelope: ReceiptEnvelope,
     },
 }
@@ -190,7 +190,7 @@ impl CanonicalStoreEvidence {
             ScopedCanonicalEvidence::Receipt {
                 token: token.clone(),
                 reconciliation: reconciliation.clone(),
-                store_receipt: store_receipt.clone(),
+                store_receipt: Box::new(store_receipt.clone()),
                 envelope,
             },
             action,
