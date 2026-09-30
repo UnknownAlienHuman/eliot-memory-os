@@ -9923,14 +9923,13 @@ impl ColdStartReadinessClaim {
                 reason: "cold-start lease bytes do not match their digest".to_owned(),
             });
         }
-        let value: Value = serde_json::from_str(&self.lease_bytes).map_err(|_| {
-            OrsError::InvalidField {
+        let value: Value =
+            serde_json::from_str(&self.lease_bytes).map_err(|_| OrsError::InvalidField {
                 field: "cold_start_lease_bytes",
                 reason: "lease bytes must be JSON",
-            }
-        })?;
-        let canonical = canonical_json_bytes(&value)
-            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+            })?;
+        let canonical =
+            canonical_json_bytes(&value).map_err(|error| OrsError::Encoding(error.to_string()))?;
         if canonical.as_slice() != self.lease_bytes.as_bytes() {
             return Err(OrsError::InvalidField {
                 field: "cold_start_lease_bytes",
@@ -10069,37 +10068,33 @@ impl ColdStartReadinessOrsRecord {
             }
             let expected_fence = serde_json::to_value(&self.claim.key.state_fence)
                 .map_err(|error| OrsError::Encoding(error.to_string()))?;
-            let expected_lineage =
-                Value::String(self.claim.key.lineage_candidate_ref.clone());
+            let expected_lineage = Value::String(self.claim.key.lineage_candidate_ref.clone());
             let expected_vcs = serde_json::to_value(&self.claim.key.vcs_identity_ref)
                 .map_err(|error| OrsError::Encoding(error.to_string()))?;
             if value.get("receipt_ref").and_then(Value::as_str)
                 != Some(terminal.receipt_ref.as_str())
                 || value.get("lease_ref").and_then(Value::as_str)
                     != Some(self.claim.lease_ref.as_str())
-                || value
-                    .get("receipt_revision")
-                    .and_then(Value::as_u64)
+                || value.get("receipt_revision").and_then(Value::as_u64)
                     != Some(self.record_revision)
                 || value
                     .get("governing_source_generation")
                     .and_then(Value::as_u64)
                     != Some(self.claim.key.governing_source_generation)
-                || value.get("governing_source_set_ref").and_then(Value::as_str)
+                || value
+                    .get("governing_source_set_ref")
+                    .and_then(Value::as_str)
                     != Some(self.claim.key.governing_source_set_ref.as_str())
                 || value.get("state_fence") != Some(&expected_fence)
-                || value.get("scope").and_then(|scope| scope.get("lineage_ref"))
+                || value
+                    .get("scope")
+                    .and_then(|scope| scope.get("lineage_ref"))
                     != Some(&expected_lineage)
                 || value
                     .get("scope")
                     .and_then(|scope| scope.get("instance_ref"))
                     .and_then(Value::as_str)
-                    != Some(
-                        self.claim
-                            .key
-                            .workspace_instance_candidate_ref
-                            .as_str(),
-                    )
+                    != Some(self.claim.key.workspace_instance_candidate_ref.as_str())
                 || value
                     .get("scope")
                     .and_then(|scope| scope.get("root_identity"))
@@ -10109,12 +10104,7 @@ impl ColdStartReadinessOrsRecord {
                     .get("instance")
                     .and_then(|instance| instance.get("instance_ref"))
                     .and_then(Value::as_str)
-                    != Some(
-                        self.claim
-                            .key
-                            .workspace_instance_candidate_ref
-                            .as_str(),
-                    )
+                    != Some(self.claim.key.workspace_instance_candidate_ref.as_str())
                 || value
                     .get("instance")
                     .and_then(|instance| instance.get("root_identity"))
@@ -10154,8 +10144,7 @@ impl ColdStartReadinessOrsRecord {
             if !disposition_matches {
                 return Err(OrsError::IntegrityProblem {
                     record_type: COLD_START_READINESS_RECORD_TYPE,
-                    reason: "terminal disposition disagrees with the readiness receipt"
-                        .to_owned(),
+                    reason: "terminal disposition disagrees with the readiness receipt".to_owned(),
                 });
             }
         }
@@ -10168,9 +10157,13 @@ impl ColdStartReadinessOrsRecord {
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ColdStartReadinessStageOutcome {
     /// This caller atomically created the active lease revision.
-    Stored { record: Box<ColdStartReadinessOrsRecord> },
+    Stored {
+        record: Box<ColdStartReadinessOrsRecord>,
+    },
     /// An earlier durable lease or terminal receipt owns the same exact key.
-    AlreadyBound { record: Box<ColdStartReadinessOrsRecord> },
+    AlreadyBound {
+        record: Box<ColdStartReadinessOrsRecord>,
+    },
 }
 
 fn cold_start_readiness_record_key(base_identity_digest: &str, revision: u64) -> String {

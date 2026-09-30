@@ -6109,7 +6109,9 @@ impl RedbRecoveryStore {
         validate_cold_start_installation(claim, &store_identity)?;
 
         let existing_index = {
-            let indexes = write.open_table(COLD_START_READINESS_BINDINGS).map_err(storage)?;
+            let indexes = write
+                .open_table(COLD_START_READINESS_BINDINGS)
+                .map_err(storage)?;
             indexes
                 .get(claim.binding_digest.as_str())
                 .map_err(storage)?
@@ -6127,7 +6129,9 @@ impl RedbRecoveryStore {
                 });
             }
             let existing = {
-                let records = write.open_table(COLD_START_READINESS_RECORDS).map_err(storage)?;
+                let records = write
+                    .open_table(COLD_START_READINESS_RECORDS)
+                    .map_err(storage)?;
                 let raw = records
                     .get(index.record_key.as_str())
                     .map_err(storage)?
@@ -6159,7 +6163,9 @@ impl RedbRecoveryStore {
         }
 
         let head = {
-            let heads = write.open_table(COLD_START_READINESS_HEADS).map_err(storage)?;
+            let heads = write
+                .open_table(COLD_START_READINESS_HEADS)
+                .map_err(storage)?;
             heads
                 .get(claim.base_identity_digest.as_str())
                 .map_err(storage)?
@@ -6176,7 +6182,9 @@ impl RedbRecoveryStore {
                     });
                 }
                 let head_record = {
-                    let records = write.open_table(COLD_START_READINESS_RECORDS).map_err(storage)?;
+                    let records = write
+                        .open_table(COLD_START_READINESS_RECORDS)
+                        .map_err(storage)?;
                     let raw = records
                         .get(head.record_key.as_str())
                         .map_err(storage)?
@@ -6192,7 +6200,8 @@ impl RedbRecoveryStore {
                 {
                     return Err(OrsError::IntegrityProblem {
                         record_type: crate::COLD_START_READINESS_RECORD_TYPE,
-                        reason: "cold-start revision head does not match its durable row".to_owned(),
+                        reason: "cold-start revision head does not match its durable row"
+                            .to_owned(),
                     });
                 }
                 head.record_revision
@@ -6222,7 +6231,9 @@ impl RedbRecoveryStore {
         let head_bytes = encode(&head)?;
         let index_bytes = encode(&index)?;
         {
-            let mut records = write.open_table(COLD_START_READINESS_RECORDS).map_err(storage)?;
+            let mut records = write
+                .open_table(COLD_START_READINESS_RECORDS)
+                .map_err(storage)?;
             if records
                 .get(record.record_key.as_str())
                 .map_err(storage)?
@@ -6239,13 +6250,17 @@ impl RedbRecoveryStore {
                 .map_err(storage)?;
         }
         {
-            let mut heads = write.open_table(COLD_START_READINESS_HEADS).map_err(storage)?;
+            let mut heads = write
+                .open_table(COLD_START_READINESS_HEADS)
+                .map_err(storage)?;
             heads
                 .insert(claim.base_identity_digest.as_str(), head_bytes.as_str())
                 .map_err(storage)?;
         }
         {
-            let mut indexes = write.open_table(COLD_START_READINESS_BINDINGS).map_err(storage)?;
+            let mut indexes = write
+                .open_table(COLD_START_READINESS_BINDINGS)
+                .map_err(storage)?;
             indexes
                 .insert(claim.binding_digest.as_str(), index_bytes.as_str())
                 .map_err(storage)?;
@@ -6276,7 +6291,9 @@ impl RedbRecoveryStore {
             read_store_object_identity(&meta)?.installed_identity()?
         };
         let mut record = {
-            let records = write.open_table(COLD_START_READINESS_RECORDS).map_err(storage)?;
+            let records = write
+                .open_table(COLD_START_READINESS_RECORDS)
+                .map_err(storage)?;
             let Some(raw) = records.get(record_key).map_err(storage)? else {
                 drop(records);
                 write.commit().map_err(storage)?;
@@ -6313,8 +6330,9 @@ impl RedbRecoveryStore {
                 record.validate()?;
                 let bytes = encode(&record)?;
                 {
-                    let mut records =
-                        write.open_table(COLD_START_READINESS_RECORDS).map_err(storage)?;
+                    let mut records = write
+                        .open_table(COLD_START_READINESS_RECORDS)
+                        .map_err(storage)?;
                     records
                         .insert(record_key, bytes.as_str())
                         .map_err(storage)?;
@@ -6336,7 +6354,9 @@ impl RedbRecoveryStore {
             let meta = read.open_table(META).map_err(storage)?;
             read_store_object_identity(&meta)?.installed_identity()?
         };
-        let records = read.open_table(COLD_START_READINESS_RECORDS).map_err(storage)?;
+        let records = read
+            .open_table(COLD_START_READINESS_RECORDS)
+            .map_err(storage)?;
         records
             .get(record_key)
             .map_err(storage)?
@@ -6367,7 +6387,9 @@ impl RedbRecoveryStore {
             read_store_object_identity(&meta)?.installed_identity()?
         };
         let index = {
-            let indexes = read.open_table(COLD_START_READINESS_BINDINGS).map_err(storage)?;
+            let indexes = read
+                .open_table(COLD_START_READINESS_BINDINGS)
+                .map_err(storage)?;
             indexes
                 .get(binding_digest)
                 .map_err(storage)?
@@ -6384,7 +6406,9 @@ impl RedbRecoveryStore {
                 reason: "cold-start binding index key does not match its record".to_owned(),
             });
         }
-        let records = read.open_table(COLD_START_READINESS_RECORDS).map_err(storage)?;
+        let records = read
+            .open_table(COLD_START_READINESS_RECORDS)
+            .map_err(storage)?;
         let raw = records
             .get(index.record_key.as_str())
             .map_err(storage)?
