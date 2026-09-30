@@ -21,7 +21,7 @@ use eliot_dreamer_contracts::rival::{
     CurrentPositionBinding, DeclarationAvailability, DiscriminatorPeerAddress as ProbePeerAddress,
     RequirementFacet as ProbeRequirementFacet, RequirementReason as ProbeRequirementReason,
     RetainedDiscriminator, RivalCoverageDeclaration, RivalCoverageStatus, RivalCoverageSummary,
-    RivalDeclarationSet, RivalDeclarationSetRef, RivalModelDeclaration,
+    RivalCoverageReceipt, RivalDeclarationSet, RivalDeclarationSetRef, RivalModelDeclaration,
     RivalModelRef, RivalModelSet as ProbeRivalModelSet, RivalModelSetParams as ProbeRivalModelSetParams,
     RivalModelSlot, UnresolvedDiscriminatorRequirement,
 };
@@ -75,10 +75,12 @@ impl RivalModelSet {
     ///
     /// The native value remains the authority and must validate before any
     /// projection occurs. This adapter preserves each retained discriminator,
-    /// unresolved comparison, coverage status/denominator, and every frontier
-    /// identity the probe contract can represent. Unknown-facet rows and
-    /// non-identity frontier metadata remain in the native value, so this
-    /// narrower contract refuses when it cannot represent them losslessly.
+    /// unresolved comparison, and coverage status/denominator. Omitted model
+    /// references carry revision and declaration-digest identity that the
+    /// probe contract cannot represent, so a nonempty native frontier is
+    /// retained only in this owner value and makes this narrower projection
+    /// refuse. Unknown-facet rows and other frontier metadata likewise remain
+    /// in the native value.
     pub fn to_probe_projection(&self) -> Result<ProbeRivalModelSet, RivalModelError> {
         self.validate()?;
 
@@ -86,6 +88,7 @@ impl RivalModelSet {
             || self.unknown_omitted_count != 0
             || !self.unknown_slots.is_empty()
             || !self.omission_frontier.sections.is_empty()
+            || !self.omission_frontier.model_ids.is_empty()
             || self.omission_frontier.exhausted_stage.is_some()
             || self.omission_frontier.exhausted_model_id.is_some()
             || self.omission_frontier.exhausted_prediction_id.is_some()

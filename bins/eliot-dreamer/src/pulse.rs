@@ -727,7 +727,7 @@ where
             let output = assemble_active_view(
                 inputs.admitted,
                 inputs.recipe,
-                inputs.quality,
+                inputs.quality.clone(),
                 inputs.policy,
                 inputs.measure,
             )
@@ -741,16 +741,25 @@ where
             {
                 return Err(PulseError::Understanding);
             }
-            // The owner result carries no Serialize form; commit the exact
-            // owner-produced serialized bytes instead.
-            let canonical = output.serialized_bytes.clone();
+            // The callback has no portable function identity. Retain both its
+            // exact measured bytes and its typed returned result in the
+            // canonical stage output, without asserting a commitment to the
+            // callback implementation itself.
+            let canonical = canonical_bytes(&(
+                &output.view,
+                &output.admitted,
+                &output.serialized_bytes,
+                &output.boundaries,
+                &output.boundary_binding,
+            ))
+            .ok();
             let commitment = output.view.output_digest.clone();
             Ok(PulseStage::executed(
                 PulseStageId::Understanding,
                 input_commitment,
                 commitment,
                 StageOwnerOutput::Understanding(output),
-                Some(canonical),
+                canonical,
             ))
         },
     )
@@ -800,7 +809,7 @@ pub(crate) fn run_grounding_stage(
             let output =
                 ground_draft_with_controls(inputs.clone()).map_err(|_| PulseError::Grounding)?;
             output.validate().map_err(|_| PulseError::Grounding)?;
-            if output.job_id != inputs.job.job_id
+            if output.job_id != inputs.job.canonical_id()
                 || output.input.job != inputs.job
                 || output.input.bundle != inputs.bundle
                 || output.input != inputs.draft
@@ -816,7 +825,7 @@ pub(crate) fn run_grounding_stage(
                 input_commitment,
                 commitment,
                 StageOwnerOutput::Grounding(output),
-                Some(canonical),
+                canonical,
             ))
         },
     )
@@ -865,7 +874,7 @@ pub(crate) fn run_rival_stage(stage: Option<&RivalStage>) -> Result<PulseStage, 
                 input_commitment,
                 commitment,
                 StageOwnerOutput::Rivals(output),
-                Some(canonical),
+                canonical,
             ))
         },
     )
@@ -955,7 +964,7 @@ pub(crate) fn run_probe_stage(
                 input_commitment,
                 commitment,
                 StageOwnerOutput::Probes(output),
-                Some(canonical),
+                canonical,
             ))
         },
     )
@@ -1033,7 +1042,7 @@ pub(crate) fn run_candidate_stage(
                 input_commitment,
                 commitment,
                 StageOwnerOutput::Candidates(output),
-                Some(canonical),
+                canonical,
             ))
         }
         (None, Some(_)) => Ok(PulseStage::pending_reason(
