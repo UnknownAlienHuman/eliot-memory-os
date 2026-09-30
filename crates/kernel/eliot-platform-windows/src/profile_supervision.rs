@@ -1226,7 +1226,7 @@ fn validate_user_mode_layout(
     let expected_data = local_app_data.join("Eliot").join("data");
     let expected_config = local_app_data.join("Eliot").join("config");
     let expected_cache = local_app_data.join("Eliot").join("cache");
-    let expected_installation = local_app_data.join("Eliot").join("installations").join(
+    let expected_installation = expected_data.join("installations").join(
         request
             .installation_key
             .as_deref()
@@ -1293,13 +1293,6 @@ fn validate_portable_layout(
     let expected_state = repository.join(".eliot-dev").join("state");
     let expected_config = repository.join(".eliot-dev").join("config");
     let expected_cache = repository.join(".eliot-dev").join("cache");
-    let installation_root = request
-        .roots
-        .runtime_state_roots
-        .iter()
-        .find(|(role, _)| role == "runtime_state_roots.installation_root")
-        .map(|(_, path)| path)
-        .ok_or(WindowsAdapterError::InvalidInput)?;
     let expected_runtime_roots = [
         (
             "runtime_state_roots.profile_anchor_root",
@@ -1307,42 +1300,41 @@ fn validate_portable_layout(
         ),
         (
             "runtime_state_roots.installation_root",
-            repository.to_path_buf(),
+            expected_state.clone(),
         ),
         (
             "runtime_state_roots.host_state_root",
-            repository.join("host"),
+            expected_state.join("host"),
         ),
         (
             "runtime_state_roots.kernel_ors_root",
-            repository.join("kernel").join("state"),
+            expected_state.join("kernel").join("state"),
         ),
         (
             "runtime_state_roots.kernel_work_root",
-            repository.join("kernel").join("work"),
+            expected_state.join("kernel").join("work"),
         ),
         (
             "runtime_state_roots.store_data_root",
-            repository.join("store").join("data"),
+            expected_state.join("store").join("data"),
         ),
         (
             "runtime_state_roots.store_work_root",
-            repository.join("store").join("work"),
+            expected_state.join("store").join("work"),
         ),
         (
             "runtime_state_roots.store_temp_root",
-            repository.join("store").join("tmp"),
+            expected_state.join("store").join("tmp"),
         ),
         (
             "runtime_state_roots.watchdog_state_root",
-            repository.join("watchdog"),
+            expected_state.join("watchdog"),
         ),
     ];
     if !crate::windows_paths_equal(&request.roots.immutable_binaries, &expected_binaries)
         || !crate::windows_paths_equal(&request.roots.durable_data, &expected_state)
         || !crate::windows_paths_equal(&request.roots.user_config, &expected_config)
         || !crate::windows_paths_equal(&request.roots.user_cache, &expected_cache)
-        || !crate::windows_paths_equal(installation_root, repository)
         || expected_runtime_roots
             .iter()
             .any(|(role, expected)| !runtime_root_matches(request, role, expected))
