@@ -1129,11 +1129,15 @@ impl FrontDoor {
     /// explicitly.
     ///
     /// Partition discipline (issue #1679, W8/I14.3): the idempotency resolve
-    /// and the authority verification run before any partition is touched, so
-    /// the protected call-scoped hold below is drawn only after the normal
-    /// authority checks pass. A forged, fenced, misrouted or expired receipt
-    /// is denied without consuming protected control capacity, and
-    /// conflicting replays never reach a partition.
+    /// and the authority verification run before any partition is touched. A
+    /// forged, fenced, misrouted or expired receipt is recorded and denied
+    /// without touching the protected partition, and conflicting replays
+    /// never reach a partition. The protected call-scoped hold below is
+    /// drawn only for a granted decision after the normal authority checks
+    /// pass, and before the grant is recorded: a saturated reserve fails
+    /// with [`KernelError::ControlReserveExhausted`] leaving no ledger
+    /// entry, so an exact retry re-verifies instead of replaying past the
+    /// saturation gate.
     ///
     /// # Errors
     ///
@@ -1170,11 +1174,15 @@ impl FrontDoor {
             },
             Err(error) => return Err(error),
         };
-        ledger.record(idempotency_key, request_digest, decision.clone())?;
+        if !decision.is_granted() {
+            ledger.record(idempotency_key, request_digest, decision.clone())?;
+            return Ok(decision);
+        }
         let _permit = self
             .reserve
             .acquire_legacy_protected(self.authority.current_epoch())
             .ok_or(KernelError::ControlReserveExhausted)?;
+        ledger.record(idempotency_key, request_digest, decision.clone())?;
         Ok(decision)
     }
 
