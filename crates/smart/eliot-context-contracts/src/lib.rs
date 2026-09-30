@@ -91,8 +91,8 @@ pub use measurement::{
 };
 pub use omission::{ExpansionHandle, NonRecoverableReason, OmissionReason, OmissionRecord};
 pub use quality::{
-    QUALITY_APPLICABILITY_INPUTS, QUALITY_DIMENSIONS, QUALITY_RESULT_SCHEMA_VERSION,
-    QUALITY_SCORECARD_SCHEMA_VERSION, ObservationOwnerRecheck, QualityApplicability,
+    ObservationOwnerRecheck, QUALITY_APPLICABILITY_INPUTS, QUALITY_DIMENSIONS,
+    QUALITY_RESULT_SCHEMA_VERSION, QUALITY_SCORECARD_SCHEMA_VERSION, QualityApplicability,
     QualityApplicabilityEvidence, QualityApplicabilityInput, QualityApplicabilityResolution,
     QualityApplicabilityResolutionSet, QualityDimension, QualityDimensionResult,
     QualityDimensionState, QualityEvidenceExpectation, QualityEvidenceIndex, QualityOperation,

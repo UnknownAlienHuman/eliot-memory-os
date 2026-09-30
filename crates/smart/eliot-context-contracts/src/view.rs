@@ -501,7 +501,7 @@ impl ActiveUnderstandingView {
         {
             return Err(ContextError::QualityIncomplete);
         }
-// #1726: the grade is bound to this exact representation's own source
+        // #1726: the grade is bound to this exact representation's own source
         // and omission handles, not only to a pre-pruning candidate set.
         //
         // This is the self-contained half of that binding, so a deserialized
@@ -590,7 +590,8 @@ impl ActiveUnderstandingView {
             {
                 return Err(ContextError::QualityIncomplete);
             }
-// #1726: the omission half of the same binding, which the checks above
+        }
+        // #1726: the omission half of the same binding, which the checks above
         // do not cover. The card's recorded `omission_handles` are compared
         // against this representation's own selection-proof omission evidence —
         // a second record the view carries, written by the selection proof and

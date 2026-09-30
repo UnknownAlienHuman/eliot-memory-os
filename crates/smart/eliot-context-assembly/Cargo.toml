@@ -34,6 +34,12 @@ eliot-learning-contracts = { path = "../eliot-learning-contracts", version = "0.
 eliot-context-measurement = { path = "../eliot-context-measurement", version = "0.1.0" }
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
+# Issue #1726: the scorecard grades a packet's proof ceiling, and `ProofCeiling`
+# is owned by the receipts crate. This was a dev-dependency only, which is why the
+# ported `scorecard` module could not resolve it: the scorecard is PRODUCTION
+# code, so its evidence vocabulary is a real dependency, not a test fixture one.
+# The dev-dependency entry below is left in place for the existing test surface.
+eliot-receipts = { path = "../../foundation/eliot-receipts", version = "0.1.0" }
 
 # Host-only owner evidence (same rule as eliot-context-admission): the
 # permit-based delivery screen never enters a guest closure.

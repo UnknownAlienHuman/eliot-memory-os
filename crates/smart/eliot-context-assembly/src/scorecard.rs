@@ -58,7 +58,7 @@
 use std::collections::BTreeSet;
 
 use eliot_context_contracts::{
-    AdmittedAtom, AdmittedContextSet, AdmissionDisposition, AtomAvailability, AtomRepresentation,
+    AdmissionDisposition, AdmittedAtom, AdmittedContextSet, AtomAvailability, AtomRepresentation,
     ContextBinding, ContextError, ContextRecipe, LossPolicy, MeasurementRef, QUALITY_DIMENSIONS,
     QUALITY_RESULT_SCHEMA_VERSION, QUALITY_SCORECARD_SCHEMA_VERSION, QualityApplicability,
     QualityApplicabilityInput, QualityDimension, QualityDimensionResult, QualityDimensionState,
@@ -151,9 +151,7 @@ pub const fn quality_obligation_of(dimension: QualityDimension) -> QualityObliga
 pub fn mandatory_quality_dimensions() -> Vec<QualityDimension> {
     QUALITY_DIMENSIONS
         .into_iter()
-        .filter(|dimension| {
-            quality_obligation_of(*dimension) == QualityObligation::Mandatory
-        })
+        .filter(|dimension| quality_obligation_of(*dimension) == QualityObligation::Mandatory)
         .collect()
 }
 
@@ -426,10 +424,7 @@ fn carried_records(admitted: &AdmittedContextSet) -> Vec<&AdmittedAtom> {
 
 /// Rendered atom identities, as an independent membership set.
 fn rendered_ids(rendered: &[RenderedAtom]) -> BTreeSet<ArtifactId> {
-    rendered
-        .iter()
-        .map(|atom| atom.atom_id.clone())
-        .collect()
+    rendered.iter().map(|atom| atom.atom_id.clone()).collect()
 }
 
 /// The measured cost of each carried unit, as graded evidence references.
@@ -632,14 +627,20 @@ fn grade_causal_sufficiency(
     binding: &ContextBinding,
     evidence: &GoverningEvidence,
 ) -> Result<QualityDimensionResult, ContextError> {
-    let required = vec![evidence
+    let required = vec![
+        evidence
+            .causal_sufficiency_fact
+            .clone()
+            .unwrap_or(missing_handle(
+                QualityDimension::CausalOperationalSufficiency,
+                "causal-owner-fact",
+            )?),
+    ];
+    let observed: BTreeSet<ArtifactId> = evidence
         .causal_sufficiency_fact
         .clone()
-        .unwrap_or(missing_handle(
-            QualityDimension::CausalOperationalSufficiency,
-            "causal-owner-fact",
-        )?)];
-    let observed: BTreeSet<ArtifactId> = evidence.causal_sufficiency_fact.clone().into_iter().collect();
+        .into_iter()
+        .collect();
     coverage_axis(
         QualityDimension::CausalOperationalSufficiency,
         required,
@@ -1078,10 +1079,7 @@ fn grade_payload_cost(
         QualityDimension::PayloadHandleReconstructionCost,
         required,
         observed,
-        measurements
-            .iter()
-            .map(measurement_reference)
-            .collect(),
+        measurements.iter().map(measurement_reference).collect(),
         binding,
     )
 }
@@ -1198,12 +1196,13 @@ fn grade_telemetry_cost(
     binding: &ContextBinding,
 ) -> Result<QualityDimensionResult, ContextError> {
     let fence_digest = eliot_context_contracts::canonical_fence_digest(&binding.state_fence)?;
-    let rendered_digest = eliot_context_contracts::ActiveUnderstandingView::canonical_output_digest(
-        binding,
-        &admitted.economy.recipe_digest,
-        &fence_digest,
-        rendered,
-    )?;
+    let rendered_digest =
+        eliot_context_contracts::ActiveUnderstandingView::canonical_output_digest(
+            binding,
+            &admitted.economy.recipe_digest,
+            &fence_digest,
+            rendered,
+        )?;
     let matching: Vec<&SerializedContextMeasurement> = measurements
         .iter()
         .filter(|measurement| {
@@ -1229,7 +1228,11 @@ fn grade_telemetry_cost(
     let observed: BTreeSet<ArtifactId> = matching
         .iter()
         .filter_map(|measurement| {
-            ArtifactId::new(format!("telemetry:{measurement_id}", measurement_id = measurement.measurement_id.as_str())).ok()
+            ArtifactId::new(format!(
+                "telemetry:{measurement_id}",
+                measurement_id = measurement.measurement_id.as_str()
+            ))
+            .ok()
         })
         .collect();
     let mut axis = coverage_axis(

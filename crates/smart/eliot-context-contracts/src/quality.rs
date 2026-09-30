@@ -619,10 +619,8 @@ impl QualityApplicabilityEvidence {
                 {
                     return Err("declared route contradicts the graded output route".to_owned());
                 }
-                match crate::validate_text(
-                    output.route_id.as_str(),
-                    "quality.applicability.route",
-                ) {
+                match crate::validate_text(output.route_id.as_str(), "quality.applicability.route")
+                {
                     Ok(()) => Ok(()),
                     Err(error) => Err(std::format!("{error:?}")),
                 }
@@ -824,7 +822,9 @@ impl QualityOutputBinding {
     ) -> Result<(), ContextError> {
         self.validate()?;
         if expected_revisions.is_empty() {
-            return Err(ContextError::MissingField("quality.output.expected_revisions"));
+            return Err(ContextError::MissingField(
+                "quality.output.expected_revisions",
+            ));
         }
         let recorded: BTreeSet<&ArtifactId> = self.evidence_revisions.iter().collect();
         let expected: BTreeSet<&ArtifactId> = expected_revisions.iter().collect();
@@ -871,10 +871,7 @@ pub struct QualityEvidenceExpectation {
 impl QualityEvidenceExpectation {
     /// Validate the expectation's own identities.
     pub fn validate(&self) -> Result<(), ContextError> {
-        crate::validate_digest(
-            &self.rendered_digest,
-            "quality.evidence.rendered_digest",
-        )?;
+        crate::validate_digest(&self.rendered_digest, "quality.evidence.rendered_digest")?;
         crate::validate_text(&self.serializer_id, "quality.evidence.serializer_id")
     }
 
@@ -1000,7 +997,8 @@ impl<'a> QualityEvidenceIndex<'a> {
                 gaps.insert(
                     ArtifactId::new(std::format!(
                         "quality-measurement-unobserved:{}:{}",
-                        reference.serializer, reference.digest
+                        reference.serializer,
+                        reference.digest
                     ))
                     .map_err(|_| ContextError::InvalidField("quality.measurement.handle"))?,
                 );
@@ -1296,13 +1294,15 @@ impl QualityScorecard {
                 // result whose evidence no longer resolves to a current
                 // observation blocks exactly as a failure does, and the refusal
                 // names the handles that could not be joined.
-                let unbacked = index.unbacked_evidence(result).map_err(|_| QualityRefusal {
-                    kind: QualityRefusalKind::InvalidScorecard,
-                    operation,
-                    blocking: Vec::new(),
-                    unresolved_applicability: Vec::new(),
-                    missing_evidence: BTreeMap::new(),
-                })?;
+                let unbacked = index
+                    .unbacked_evidence(result)
+                    .map_err(|_| QualityRefusal {
+                        kind: QualityRefusalKind::InvalidScorecard,
+                        operation,
+                        blocking: Vec::new(),
+                        unresolved_applicability: Vec::new(),
+                        missing_evidence: BTreeMap::new(),
+                    })?;
                 if !unbacked.is_empty() {
                     blocks = true;
                     unobserved_evidence |= result.state.is_pass();
