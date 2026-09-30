@@ -7,8 +7,8 @@ use eliot_agent_bridge::{
     CurrentAssessment, DeliveryStatus, FiringEvidence, HotResourceView, InjectionReceipt,
     ItemDisposition, KernelHostRequestClient, LoopbackHttpProfile, NormalizedCue,
     OwnerDryRunPreview, Profile, TransportAdmissionError, TransportProfile, UnderstandingBootstrap,
-    UseOutcome, kernel_ports_with_declaration, loopback_http_route, parse_args,
-    reactive_runtime_composition, validate_credential, validate_host, validate_origin,
+    UseOutcome, kernel_ports_with_declaration, loopback_http_route, opencode_host_events,
+    parse_args, reactive_runtime_composition, validate_credential, validate_host, validate_origin,
 };
 use eliot_agent_bridge_core::{
     ACTIVATION_DISPOSITION_INVALID_REQUEST, ACTIVATION_DISPOSITION_STALE_OR_CONFLICT,
@@ -34,6 +34,7 @@ use eliot_mcp::{
 };
 #[cfg(test)]
 use eliot_mcp::{HostCancellationPortOutcome, HostInvocationPortOutcome};
+use eliot_process::SecretRef;
 use eliot_protocol::{
     AckPhase, AgentActivationResolutionDisposition, EventDisposition, EventEnvelope,
     HARD_STRUCTURED_RESPONSE_BYTES,
@@ -43,6 +44,7 @@ use request_input::{
     check_profile_id, check_request_envelope, classify_serde_error, prevalidate_record,
     read_bounded_record, scratch_budget,
 };
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{self, Read, Write};
@@ -60,6 +62,24 @@ const PROVIDER_PORT_EXIT: i32 = 69;
 /// materialization of that argv; the tokenless argv keeps serving the
 /// existing private `op` clients byte-for-byte.
 const MCP_MODE_TOKEN: &str = "mcp";
+
+/// Explicit checked `/v1/host-events` entrypoint token (issue #2898): a
+/// leading `host-events` argv token selects the supervised host-event service
+/// front door. It is stripped before the checked CLI parse exactly like
+/// [`MCP_MODE_TOKEN`], so the remaining argv keeps the documented
+/// `--profile/--transport/--client-declaration` contract, and it is named by
+/// argv alone — never inferred from payload bytes or a listening port.
+///
+/// The service borrows `&mut BridgeRunner` for its whole serving life and the
+/// admission port over that runner is deliberately not `Send`
+/// (`crates/agent/eliot-agent-opencode/src/ingress.rs:777`), so it cannot
+/// share the runner with a stdio front door. It is therefore a distinct front
+/// door under the same explicit argv discipline as `mcp` and the loopback HTTP
+/// transport: one process, one lifecycle owner, no second scheduler and no
+/// supervisor thread. Serving the route concurrently with a stdio front door
+/// stays the named gap `OPENCODE_BRIDGE_THREAD_INTEGRATION` and is not claimed
+/// closed here.
+const HOST_EVENTS_MODE_TOKEN: &str = "host-events";
 
 /// Media type of retained hot-resource snapshots: `record_tool_result_delivery`
 /// publishes the JSON-serialized response content (`serde_json::to_vec`), so
@@ -740,6 +760,16 @@ fn main() {
     if mcp_mode {
         argv.remove(0);
     }
+    // Same checked discipline for the supervised `/v1/host-events` service:
+    // the front door is named by an explicit leading argv token, stripped before
+    // the CLI parse, never inferred from payload bytes, a listening port or the
+    // presence of an environment entry.
+    let host_events_mode = argv
+        .first()
+        .is_some_and(|first| first == HOST_EVENTS_MODE_TOKEN);
+    if host_events_mode {
+        argv.remove(0);
+    }
     let config = match parse_args(argv) {
         Ok(config) => config,
         Err(error) => {
@@ -817,6 +847,14 @@ fn main() {
         // decodes an MCP frame. The exit code mirrors the provider discipline
         // of the private path.
         let code = run_mcp_front_door(host_gateway, &mut host_request_client, &mut runner);
+        std::process::exit(code);
+    }
+    if host_events_mode {
+        // This front door owns the live runner for its whole serving life and
+        // never falls through to the stdio loops below: the exclusive
+        // `&mut BridgeRunner` borrow the admission port needs cannot coexist
+        // with them, so exactly one front door is composed per process.
+        let code = run_host_events_front_door(&mut runner);
         std::process::exit(code);
     }
     let mut stdin_lock = io::stdin().lock();
@@ -2949,6 +2987,84 @@ impl McpFrontDoor {
 struct McpFrameOutcome {
     response: Option<Value>,
     dispatched: bool,
+}
+
+/// Serves `POST /v1/host-events` for the whole life of this bridge process
+/// (issue #2898, composition root).
+///
+/// The composition root owns the service lifecycle and nothing else: the
+/// exclusive runner borrow, the introduction store, the Governor policy
+/// profile, the credential resolver and both supervisor channels are built
+/// here and held for the whole serving life. No port, generation or route
+/// decision is taken here — [`opencode_host_events::serve_host_events`] reads
+/// the port and the bound generation from the installed User Broker
+/// introduction alone and binds no socket at all when none is installed, so a
+/// composition that cannot obtain an introduction refuses with the typed
+/// [`opencode_host_events::HostEventsServiceError::Unintroduced`] instead of
+/// serving a route nobody introduced. The refusal surfaces as the provider
+/// exit code and a secret-free stderr diagnostic.
+///
+/// The two watch senders are kept alive for the entire call, so `serve_until`
+/// can never read a dropped supervisor channel as a supervised stop. This
+/// process never signals either one — a stop is this process exiting — and the
+/// typed shutdown cause the listener returns is projected rather than
+/// collapsed, so rotation and a deliberate stop stay distinguishable.
+fn run_host_events_front_door(runner: &mut BridgeRunner) -> i32 {
+    // The live attach generation is the only generation this route may serve
+    // under. With no live attach there is none, and the channel carries the
+    // absent value rather than a fabricated generation, so the listener's own
+    // generation join refuses rather than admitting under a guessed one.
+    let active_generation = runner
+        .attach_view()
+        .map_or(0, |view| view.binding().activation_generation().get());
+    let (_stop, stop_receiver) = tokio::sync::watch::channel(false);
+    let (_generation, active_generation_receiver) =
+        tokio::sync::watch::channel(active_generation);
+    match opencode_host_events::serve_host_events(
+        runner,
+        opencode_host_events::BridgeIntroductionStore::new(),
+        // No Governor policy profile is derived in this composition, so the
+        // gate evaluates to its typed `no current policy` refusal: a mutating
+        // tool can never be authorized here.
+        None,
+        refuse_unowned_bridge_credential,
+        stop_receiver,
+        active_generation_receiver,
+    ) {
+        // The typed shutdown cause is the listener's own and is projected, not
+        // collapsed: rotation ended this incarnation's route, and a stop ended
+        // it deliberately. Neither is a failure, so neither changes the exit
+        // code.
+        Ok(shutdown) => {
+            emit_error(
+                match shutdown {
+                    eliot_agent_opencode::HostEventsShutdown::Stopped => "HOST_EVENTS_STOPPED",
+                    eliot_agent_opencode::HostEventsShutdown::Rotated => "HOST_EVENTS_ROTATED",
+                },
+                "host-events front door ended on its typed shutdown cause",
+            );
+            0
+        }
+        Err(error) => {
+            emit_error("HOST_EVENTS_SERVICE_REFUSED", &error.to_string());
+            PROVIDER_PORT_EXIT
+        }
+    }
+}
+
+/// Composition-level credential resolution for `/v1/host-events`.
+///
+/// The introduction's opaque [`SecretRef`] resolves only through the physical
+/// User Broker secret boundary, and this bridge process is not that boundary:
+/// it holds no broker registration, no broker epoch and no launch nonce, and
+/// it must not acquire any. The composition therefore resolves no handle at
+/// all and refuses every one of them, so a request that reached the credential
+/// join would receive the typed capability-unavailable refusal rather than a
+/// bearer comparison against material this process cannot own. The join is
+/// reached only behind the introduction gate, which refuses first whenever no
+/// current introduction is installed.
+fn refuse_unowned_bridge_credential(_handle: &SecretRef) -> Option<SecretString> {
+    None
 }
 
 /// Serves the MCP front door on stdio until EOF or a fail-closed break.

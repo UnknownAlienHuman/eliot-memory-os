@@ -27,6 +27,16 @@
 //! listener serves on a single-threaded runtime there. Moving admission
 //! onto a main-loop channel is the named gap
 //! `OPENCODE_BRIDGE_THREAD_INTEGRATION`.
+//!
+//! [`serve_host_events`] is composed into the bridge binary's
+//! `/v1/host-events` front door
+//! (`bins/eliot-agent-bridge/src/main.rs::run_host_events_front_door`), which
+//! owns the runner for the whole serving life and therefore cannot share it
+//! with a stdio front door. That composition is real: the service is reached
+//! on an explicitly admitted argv contour and binds the broker-pinned port
+//! when — and only when — an introduction is installed. No introduction
+//! producer exists yet, so today it resolves
+//! [`HostEventsServiceError::Unintroduced`] and opens no socket.
 
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, HashSet};
@@ -147,6 +157,19 @@ where
 /// with [`BridgeIntroductionStore::observe_session`]. Rotation, listener
 /// death, bridge restart, logout, and revocation invalidate the old
 /// introduction here before another request is admitted.
+///
+/// The composed front door
+/// (`bins/eliot-agent-bridge/src/main.rs::run_host_events_front_door`)
+/// constructs this holder and starts the service over it, but it installs
+/// nothing: no broker-to-bridge introduction delivery exists yet, so
+/// `current_introduction` is `None` and the startup resolution yields
+/// [`HostEventsStartup::Unintroduced`]. That
+/// is the honest outcome of a missing producer, not a defect of this holder:
+/// minting an introduction here would require broker-observed owner state
+/// (installation, Windows SID, interactive session, both generations, the
+/// `OpenCode` executable digest and a broker launch nonce) that this process
+/// cannot observe, and fabricating it would defeat the very join it is checked
+/// against.
 #[derive(Clone, Debug, Default)]
 pub struct BridgeIntroductionStore {
     current: Option<OpenCodeBridgeIntroduction>,
