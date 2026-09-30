@@ -577,7 +577,9 @@ fn validate_snapshot_governed_record(
     else {
         return Err(ChangeMonitorError::InvalidSnapshot);
     };
-    if !is_sha256_hex(before_digest) || !is_sha256_hex(after_digest) || before_digest == after_digest
+    if !is_sha256_hex(before_digest)
+        || !is_sha256_hex(after_digest)
+        || before_digest == after_digest
     {
         return Err(ChangeMonitorError::InvalidSnapshot);
     }
