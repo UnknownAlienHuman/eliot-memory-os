@@ -18,15 +18,15 @@ use eliot_receipts::surface::{
     BudgetReplaySignal, MaterialGrantStanding, authorize_material_grant, detect_budget_replay,
     resolve_material_grant,
 };
+use eliot_receipts::tool_exposure::{
+    DeliveredToolRepresentation, EXPOSURE_HISTORY_VERSION, ExposureIdentities,
+    ExposureReplaySignal, OwnerStageFact, ProducedToolResultIdentity, ResultDelivery,
+    ToolExposureHistoryEntry, ToolExposureReceiptV2, detect_exposure_replay,
+};
 use eliot_receipts::{
     BudgetCoverage, BudgetOverflow, GrantClosureReceipt, OverflowDisposition, RenderedToolCost,
     SurfaceBudgetInput, TOOL_SURFACE_CONTRACT_VERSION, TokenCountObservation,
     TokenCountUnavailableReason, ToolExposureError, ToolSurfaceBudget, compile_surface_budget,
-};
-use eliot_receipts::tool_exposure::{
-    DeliveredToolRepresentation, EXPOSURE_HISTORY_VERSION, ExposureIdentities, ExposureReplaySignal,
-    OwnerStageFact, ProducedToolResultIdentity, ResultDelivery, ToolExposureHistoryEntry,
-    ToolExposureReceiptV2, detect_exposure_replay,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -1309,11 +1309,12 @@ pub fn advertise_exposure_history(
         .ok_or_else(|| SurfaceDecisionError::UnknownMethod {
             method: method.to_owned(),
         })?;
-    let disposition = decision
-        .disposition_of(method)
-        .ok_or_else(|| SurfaceDecisionError::UnknownMethod {
-            method: method.to_owned(),
-        })?;
+    let disposition =
+        decision
+            .disposition_of(method)
+            .ok_or_else(|| SurfaceDecisionError::UnknownMethod {
+                method: method.to_owned(),
+            })?;
     let permitted = surface
         .permitted
         .iter()
@@ -1326,8 +1327,7 @@ pub fn advertise_exposure_history(
         "{}@{}",
         considered.method.canonical_name, considered.profile_version
     );
-    let registered =
-        OwnerStageFact::supplied(true, profile_source).map_err(map_exposure_error)?;
+    let registered = OwnerStageFact::supplied(true, profile_source).map_err(map_exposure_error)?;
     let advertised =
         OwnerStageFact::supplied(permitted, decision_source.clone()).map_err(map_exposure_error)?;
     let eligible = match (permitted, disposition) {
