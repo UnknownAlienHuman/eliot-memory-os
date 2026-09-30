@@ -82,7 +82,16 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
                 {
                     return null;
                 }
-                return new OperatorRoleBinding(endpoint.Role, endpoint.Capabilities);
+                // The grant is reported as the handoff's OWN copy of the
+                // capability set, never the live list: `OperatorEndpoint.
+                // Capabilities` is the client's authority material, re-sent as
+                // `requested_capabilities` and re-validated against the broker
+                // challenge and redemption, so handing out the aliased
+                // instance would let a reader that casts this `IReadOnlyList`
+                // to its mutable materialised type and clears it rewrite what
+                // the client asks for and accepts. The copy changes no value,
+                // order or check; it only breaks the alias (ARCH-AUTH-01).
+                return new OperatorRoleBinding(endpoint.Role, [.. endpoint.Capabilities]);
             }
             catch (Exception error) when (error is ObjectDisposedException or IOException or InvalidOperationException)
             {
