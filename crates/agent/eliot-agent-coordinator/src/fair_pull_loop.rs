@@ -10,16 +10,48 @@
 //! allowed to do, and what the caller is told. The drive itself is
 //! [`AgentCoordinator::drive_fair_pull`], next to the selector it drives.
 //!
+//! # Event-driven *with* bounded recovery polling, and which of the two is
+//! # authoritative
+//!
+//! "Event-driven with bounded recovery polling" is a conjunction of two
+//! different things, and only the conjunction is correct:
+//!
+//! - **Event-driven** is the low-latency arm. A state change that makes more
+//!   work eligible should drive the pull at the moment of the change, not on
+//!   some later tick. The seam for that is [`FairPullLoop`]: the four
+//!   transitions that release a slot — `reconcile_cancellation`,
+//!   `mark_worker_lost`, `submit_result` and `reconcile_unknown_outcome` — and
+//!   the three that change what is queued — `admit`, `reassign` and
+//!   `start_attempt` — each arm the loop through
+//!   `AgentCoordinator::note_selection_inputs_changed`, and
+//!   `AgentCoordinator::drive_fair_pull` reports the wake it consumed in
+//!   [`FairPullOutcome::consumed_wake`].
+//! - **Bounded recovery polling** is the safety net. An event-only loop is a
+//!   lost-wakeup deadlock: a dropped, coalesced or pre-registered notification
+//!   leaves the loop waiting forever for work that is already eligible. So the
+//!   poll must be *always armed* — a fallback that runs on every bounded
+//!   cadence tick whether or not a wake is pending, never a degraded mode
+//!   entered after a failure.
+//!
+//! **The bounded poll is authoritative; the event is an optimisation.** The
+//! deciding property is in [`FairPullOutcome::consumed_wake`]: it is
+//! "evidence, not a gate: the drive runs its bounded loop either way", so
+//! `drive_fair_pull` performs at least one pull even when
+//! `take_wake` returned `None`. Correctness therefore rests on the poll; the
+//! event only decides *when* the same work is noticed, and a missed event
+//! costs one cadence of latency rather than stranding work. I8.3's
+//! deterministic loop is the same shape — `observe` is a step of the loop, not
+//! the thing that makes the loop run — and I14.8's "Mechanical queue progress
+//! never depends on an LLM remembering to start another agent" is the
+//! normative consequence: a reminder that can be forgotten is not a scheduler.
+//!
 //! Three facts make that a real join rather than a restatement:
 //!
-//! 1. **The wake is a coordinator transition, not a notification.** The four
-//!    transitions that release a slot — `reconcile_cancellation`,
-//!    `mark_worker_lost`, `submit_result` and `reconcile_unknown_outcome` —
-//!    and the three that change what is queued — `admit`, `reassign` and
-//!    `start_attempt` — each arm the loop through
-//!    `AgentCoordinator::note_selection_inputs_changed`. There is no
-//!    notification bus to miss because there is no separate wake: the event
-//!    that releases the slot is the same event that arms the drive.
+//! 1. **The wake is a coordinator transition, not a separate notification.**
+//!    The event that releases the slot is the same event that arms the drive,
+//!    so there is no second wake channel that could disagree with the
+//!    projection. The arm is a latch and an evidence counter, never an
+//!    authority: `take_wake` returning `None` does not stop the drive.
 //! 2. **The cursor is the durable event log.** The published cursor is
 //!    `events.len()` at the newest observed selection-input change, so
 //!    `AgentCoordinator::replay_snapshot_events` re-derives it by running the
@@ -29,7 +61,8 @@
 //!    attempt per currently non-terminal admitted attempt, and `admit` /
 //!    `reassign` refuse to push the coordinator past the validated
 //!    `CoordinatorConfig::max_admitted_attempts`, so the loop is finite with no
-//!    constant chosen by this module.
+//!    constant chosen by this module. The recovery poll's own cadence belongs
+//!    to the caller's existing bounded tick; this crate names no interval.
 //!
 //! Selection is not execution. A drive turns a selection into a `Running`
 //! attempt through the existing [`AgentCoordinator::start_attempt`] transition,
@@ -39,11 +72,28 @@
 //!
 //! # Production reachability
 //!
-//! Reachable in a non-test build: `AgentFabric::drive_fair_pull` in
-//! `bins/eliotd/src/agent_fabric.rs` calls
-//! [`AgentCoordinator::drive_fair_pull`] on the daemon's live coordinator, and
-//! `solo_agent_driver::solo_ingest_result` calls that on the production worker
-//! settle path. Neither is `cfg(test)`-gated.
+//! Reachable in a non-test build, and the two arms are separate callers:
+//!
+//! - **Event arm.** `AgentFabric::drive_fair_pull` in
+//!   `bins/eliotd/src/agent_fabric.rs` calls
+//!   [`AgentCoordinator::drive_fair_pull`] on the daemon's live coordinator, and
+//!   `solo_agent_driver::solo_ingest_result` calls that on the production
+//!   worker settle path, so released capacity advances work in the same
+//!   operation that released it. Neither is `cfg(test)`-gated.
+//! - **Recovery-poll arm.** `solo_agent_driver::solo_fair_pull_recovery` in
+//!   `bins/eliotd/src/solo_agent_driver.rs` calls the same
+//!   [`AgentCoordinator::drive_fair_pull`] on the daemon's existing bounded
+//!   activation cadence, and `daemon_runtime::maybe_start_fair_pull_recovery`
+//!   starts it on **every** tick of that cadence. It is not gated on a pending
+//!   wake, on a prior failure, or on anything else: that is what makes it a
+//!   fallback rather than a degraded mode, and it is the arm that survives a
+//!   lost notification.
+//!
+//! The recovery poll reuses the same `ACTIVATION_POLL_INTERVAL` tick every
+//! other bounded step in `run_loop` already rides. No new timer, no new
+//! interval constant, and no second scheme: the recovery arm is the *same*
+//! drive over the *same* projection, differing only in that it does not wait
+//! to be told there is work.
 //!
 //! Still blocked, and stated here rather than hidden: this coordinator's
 //! `attempts` map is empty in production because nothing in the tree
@@ -155,6 +205,17 @@ pub struct FairPullOutcome {
     /// This is evidence, not a gate: the drive runs its bounded loop either
     /// way, which is what makes a missed wake unable to strand eligible work.
     pub consumed_wake: Option<(u64, u64)>,
+    /// Whether this drive ran as the always-armed bounded recovery poll
+    /// (issue #1683 W5) rather than as the response to an observed event.
+    ///
+    /// `Some(true)` is the arm that survives a lost notification: the caller
+    /// invoked the drive because its bounded cadence fired, not because a wake
+    /// was pending, so `consumed_wake` is legitimately `None` on a drive that
+    /// still performed a real pull. `Some(false)` is the event arm.
+    /// `None` when the caller did not classify the drive, which keeps the
+    /// field additive for an existing caller rather than forcing every caller
+    /// to take a position it has no evidence for.
+    pub recovery_poll: Option<bool>,
     /// Upper bound this drive enforced: the number of non-terminal admitted
     /// attempts it could have started. Derived from the projection, never a
     /// constant chosen here.
