@@ -1062,7 +1062,7 @@ impl ShutdownDrainCoordinator {
         // from work that was already in scope. Like `pending` it is
         // drain-generation state, so a fresh generation snapshots its own
         // carried set rather than inheriting the previous closure.
-        candidate.admission_snapshot = carried.clone();
+        candidate.admission_snapshot.clone_from(&carried);
         candidate.pending = carried;
         candidate.fenced_activation_generations = carried_fences;
         self.persist_state(&candidate)?;
@@ -1145,7 +1145,7 @@ impl ShutdownDrainCoordinator {
                 .pending
                 .iter()
                 .any(|identity| !candidate.admission_snapshot.contains(identity));
-            candidate.admission_snapshot = candidate.pending.clone();
+            candidate.admission_snapshot.clone_from(&candidate.pending);
             raced
         } else {
             false
