@@ -106,7 +106,7 @@
 //! engine, no archive/phase algorithm, no invented target methods, no
 //! Value-based escapes.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 
 use eliot_backup::{
@@ -116,14 +116,18 @@ use eliot_backup::{
     RestoreEffectReceipt, RestoreEvidence, RestoreHistoricalAuthority, RestoreIntent,
     RestoreJournalAdmission, RestoreJournalPort, RestoreObligationState, RestoreObligations,
     RestoreOwnerObligation, RestorePhase, RestorePlan, RestoreReceipt, RestoreReconciliation,
-    RestoreStep, RestoreTarget, RestoredFence, RestoredSealedBlob, WrappedKeyManifest,
-    issue_restoration_receipts, suspended_recovery_entries, verify_portable_key_material,
+    RestoreStep, RestoreTarget, RestoredFence, RestoredSealedBlob, WRITE_RECEIPT_RECORD_TYPE,
+    WrappedKeyManifest, issue_restoration_receipts, suspended_recovery_entries,
+    verify_portable_key_material,
 };
 use eliot_backup::{ObservedLineageLimit, OwnerTrustBinding, RestoreProvenance};
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_ors::{MAX_JOURNAL_PAGE_ENTRIES, RedbRecoveryStore};
 use eliot_security_contracts::PurgeLedgerEntry;
-use eliot_store_api::{RevocationHistoryPayload, WriteReceipt, parse_revocation_history_payload};
+use eliot_store_api::{
+    CanonicalRestoreBatch, RetainedArchiveMember, RevocationHistoryPayload, SnapshotMemberType,
+    WriteReceipt, parse_revocation_history_payload,
+};
 use serde::Serialize;
 
 use super::backup_restore_ports::{
@@ -418,6 +422,122 @@ fn staged_member_bytes(bundle: &BackupBundle) -> Result<usize, BackupError> {
         checked_total(&mut total, bytes.len())?;
     }
     Ok(total)
+}
+
+/// Canonical JSON text of one value the admitted archive holds, in the exact
+/// byte sequence every digest over it is taken from.
+///
+/// One function, so the text a retained member publishes and the text a digest
+/// is computed over can never be two different encodings of one record.
+fn canonical_archive_text<T: Serialize>(value: &T) -> Result<String, BackupError> {
+    let bytes = canonical_json_bytes(value)
+        .map_err(|error| BackupError::Serialization(error.to_string()))?;
+    String::from_utf8(bytes).map_err(|_| {
+        BackupError::Serialization("canonical archive bytes are not valid text".to_owned())
+    })
+}
+
+/// One restore-class member's canonical bytes, as the admitted archive holds
+/// them.
+///
+/// Private to this module and to the single publication that consumes it: the
+/// resolved bytes and the owner's attestation over them are read out of the
+/// admitted archive, handed to the admitted batch once, and never recomputed on
+/// the far side. The digest here describes the ORIGINAL RECORDED bytes — it is
+/// a value the archive itself recorded — and the receiving port validates that
+/// recorded value against the bytes it actually holds rather than substituting
+/// a fresh checksum of its own.
+struct RetainedCanonicalPayload {
+    /// Closed class label the archive itself carries for this record.
+    ///
+    /// Taken verbatim from the archive: `CanonicalRecord::record_type` for a
+    /// canonical event or a projection, and the backup owner's own
+    /// `WRITE_RECEIPT_RECORD_TYPE` for a write receipt. No class table is
+    /// invented here and no record type is mapped onto another: a label the
+    /// destination port does not own is refused there, typed, against the
+    /// class it does not recognise.
+    class: String,
+    /// Digest of exactly `payload`, recorded by the archive owner.
+    payload_digest: String,
+    /// The canonical JSON encoding of the record, exactly as the archive holds
+    /// it. This text IS the retained content: the byte count published beside
+    /// it is this string's length and the digest above is this string's digest.
+    payload: String,
+}
+
+/// The admitted archive's own restore-class member denominator.
+///
+/// Keyed by the archive's OWN recorded commitment to each member's canonical
+/// content, never by anything a restore request supplied. For a canonical event
+/// or projection that commitment is `CanonicalRecord::sha256`, which
+/// `CanonicalRecord::validate` proves against the record's own payload here, so
+/// the value published is a proven claim rather than an unverified one. A write
+/// receipt carries no per-record checksum of its own — the archive records only
+/// the section digest over the whole receipt list — so for a receipt the owner
+/// attests once, here, over exactly the canonical bytes it holds, and the
+/// destination validates that attestation against the bytes it received.
+///
+/// Members are held in a queue per commitment so byte-identical archive
+/// records stay two members instead of collapsing into one: the admitted
+/// member list decides how many of them this batch takes, and each admitted
+/// member consumes exactly one.
+struct RetainedArchiveIndex {
+    entries: BTreeMap<String, VecDeque<RetainedCanonicalPayload>>,
+}
+
+impl RetainedArchiveIndex {
+    /// Reads the admitted archive's restore-class members.
+    ///
+    /// Sealed blobs are deliberately absent. They are the blob owner's route —
+    /// `DestinationRestoreAdapter::restore_blob_sealed`, already bound on this
+    /// adapter through `apply_blob` — and no canonical-store class names them,
+    /// so an admitted `Blob` member has nothing this index can honestly
+    /// publish. It retains no payload here, and the destination port refuses
+    /// that member typed rather than receiving bytes under a class this owner
+    /// made up.
+    fn read(bundle: &BackupBundle) -> Result<Self, BackupError> {
+        let mut entries: BTreeMap<String, VecDeque<RetainedCanonicalPayload>> = BTreeMap::new();
+        for record in bundle.canonical_events.iter().chain(&bundle.projections) {
+            // The archive's own recorded checksum is proved against the
+            // archive's own payload BEFORE the value is used as a lookup key or
+            // published, so a record whose payload was replaced while its
+            // checksum was retained can never become a retained payload here.
+            record.validate()?;
+            entries
+                .entry(record.sha256.clone())
+                .or_default()
+                .push_back(RetainedCanonicalPayload {
+                    class: record.record_type.clone(),
+                    payload_digest: record.sha256.clone(),
+                    payload: canonical_archive_text(&record.payload)?,
+                });
+        }
+        for receipt in &bundle.receipts {
+            receipt.validate().map_err(BackupError::Store)?;
+            let payload = canonical_archive_text(receipt)?;
+            // Attested once, over exactly the bytes published below: the
+            // digest is taken from `payload` itself, so it describes the
+            // retained content and not a re-encoding of it.
+            let payload_digest = sha256_hex(payload.as_bytes());
+            entries
+                .entry(payload_digest.clone())
+                .or_default()
+                .push_back(RetainedCanonicalPayload {
+                    class: WRITE_RECEIPT_RECORD_TYPE.to_owned(),
+                    payload_digest,
+                    payload,
+                });
+        }
+        Ok(Self { entries })
+    }
+
+    /// Consumes the archive member one admitted member names, or `None` when
+    /// the archive holds no member under that commitment.
+    fn take(&mut self, content_digest: &str) -> Option<RetainedCanonicalPayload> {
+        self.entries
+            .get_mut(content_digest)
+            .and_then(VecDeque::pop_front)
+    }
 }
 
 /// The bounded staged-output budget one restore execution works inside.
@@ -914,6 +1034,154 @@ impl KernelBackupRestore {
             .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
         RestorePlan::compile(bundle, target)
             .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))
+    }
+
+    /// Publishes the admitted archive's retained canonical payloads into one
+    /// admitted restore batch (issue #952, audit `5869992012`).
+    ///
+    /// The #950 restore carrier names identities, digests and residency
+    /// metadata in [`CanonicalRestoreBatch::members`] and that is all it can
+    /// carry: a member's `content_digest` names content, it does not hold it.
+    /// So a batch assembled without this step reaches the destination port
+    /// unable to say WHAT it restores, and the port refuses every one of its
+    /// members typed rather than importing anything. This is the join the audit
+    /// asked for — resolve the admitted archive/member-set reference through
+    /// the archive owner and publish the canonical logical payloads — done
+    /// where the bytes actually are, in the owner that holds them.
+    ///
+    /// Everything published is read out of `bundle`, never derived from the
+    /// batch and never re-encoded from a re-encoding:
+    ///
+    /// - `class` is the archive's own label for the record
+    ///   (`CanonicalRecord::record_type`, or the backup owner's own
+    ///   `WRITE_RECEIPT_RECORD_TYPE` for a receipt). No class is mapped onto
+    ///   another and none is invented; a class the destination does not own is
+    ///   refused there against the class it does not recognise.
+    /// - `payload` is the record's canonical JSON encoding as the archive holds
+    ///   it, and `byte_count` is that text's own length. The admitted member's
+    ///   own `residency.byte_count` must therefore already be the length of that
+    ///   canonical text: the destination port compares the two independently,
+    ///   and a member that declares a different length is refused here first
+    ///   rather than reaching the port as a payload whose size disagrees with
+    ///   the member it answers for.
+    /// - `payload_digest` is the archive's OWN recorded commitment for those
+    ///   bytes (`CanonicalRecord::sha256`, proved against the record's payload
+    ///   by the existing [`CanonicalRecord::validate`]; for a receipt, which
+    ///   carries no per-record checksum, the single attestation this owner
+    ///   makes over exactly the bytes it publishes). The destination port
+    ///   validates that recorded value against the bytes it actually received
+    ///   and never substitutes a checksum of its own for it.
+    /// - `record_id` is the member's own domain-qualified logical identity
+    ///   (`SnapshotMember::logical_identity`), so the same admitted member
+    ///   always lands at the same destination address and equal bytes under a
+    ///   different residency domain never coalesce into one record.
+    ///
+    /// Completeness is measured against the ARCHIVE, which is the independent
+    /// expected set: the admitted member list is counted first, each admitted
+    /// canonical member must then consume exactly one archive member under the
+    /// archive's own recorded commitment, and the published count must equal
+    /// that first count. The comparison is never made against the vector this
+    /// call is building, so a member with no archive backing and a published
+    /// entry with no admitted member are two distinct refusals instead of one
+    /// self-consistent partial result.
+    ///
+    /// Structural admission is deliberately not repeated here.
+    /// [`CanonicalRestoreBatch::validate`] is the destination's own shape and
+    /// admission check and it cannot construct content, so source resolution
+    /// and destination execution admission stay separate steps; what is
+    /// re-proved here is only the archive (whole-bundle integrity, section
+    /// checksums and class denominator) and the three member facts the
+    /// publication depends on — member type, the member's own declared byte
+    /// count, and the archive's commitment to the member's content.
+    ///
+    /// Only a canonical `Record` member is a canonical-store payload. A
+    /// `Reference` edge names a canonical object and is not one, and a sealed
+    /// blob travels the blob owner's route; both retain nothing here, and the
+    /// destination port refuses them typed rather than receiving a payload
+    /// under a class this owner does not own.
+    ///
+    /// Create-only: a batch that already carries retained payloads is refused
+    /// rather than merged, so a second publication can never quietly widen or
+    /// replace the content a batch was admitted with. Idempotent replay is the
+    /// destination's own readback of the row this content produced, not a
+    /// second write here.
+    ///
+    /// # Errors
+    ///
+    /// Refuses typed, before any destination effect, when the archive does not
+    /// validate ([`KernelRestoreError::ArchiveInvalid`]), when the batch
+    /// already carries retained payloads, when an admitted canonical member is
+    /// not attested by the archive, when an admitted member declares a byte
+    /// count the archive does not hold, or when the published set does not
+    /// cover the admitted member set
+    /// ([`KernelRestoreError::InvalidInput`]).
+    pub fn publish_retained_archive_members(
+        &self,
+        bundle: &BackupBundle,
+        batch: &mut CanonicalRestoreBatch,
+    ) -> Result<(), KernelRestoreError> {
+        // The whole archive is re-proven first, so no member of a partially
+        // valid archive can become a retained payload.
+        bundle
+            .validate()
+            .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
+        if !batch.retained_members.is_empty() {
+            return Err(KernelRestoreError::InvalidInput {
+                field: "restore.retained_members",
+                reason: "batch already carries published retained archive payloads",
+            });
+        }
+        // Independent expected set: the ARCHIVE's restore-class member
+        // denominator, counted from the admitted member list BEFORE a single
+        // payload is resolved, so completeness can never be measured against
+        // the list this call is about to build.
+        let admitted = batch
+            .members
+            .iter()
+            .filter(|member| member.member_type == SnapshotMemberType::Record)
+            .count();
+        let mut index = RetainedArchiveIndex::read(bundle)
+            .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
+        let mut published: Vec<RetainedArchiveMember> = Vec::with_capacity(admitted);
+        for member in &batch.members {
+            if member.member_type != SnapshotMemberType::Record {
+                continue;
+            }
+            let Some(payload) = index.take(&member.content_digest) else {
+                return Err(KernelRestoreError::InvalidInput {
+                    field: "restore.members",
+                    reason: "admitted member is not attested by the admitted archive",
+                });
+            };
+            // The member's own declared residency length is an independent
+            // expected value for the archive's bytes, so a member that declares
+            // a length the archive does not hold is refused here rather than
+            // handed to the destination as a payload whose size disagrees with
+            // the member it answers for.
+            let byte_count = member.residency.byte_count;
+            if byte_count == 0 || usize::try_from(byte_count).ok() != Some(payload.payload.len()) {
+                return Err(KernelRestoreError::InvalidInput {
+                    field: "restore.members",
+                    reason: "admitted member declares a byte count the archive does not hold",
+                });
+            }
+            published.push(RetainedArchiveMember {
+                member_id: member.member_id.clone(),
+                class: payload.class,
+                record_id: member.logical_identity(),
+                payload_digest: payload.payload_digest,
+                byte_count,
+                payload: payload.payload,
+            });
+        }
+        if published.len() != admitted {
+            return Err(KernelRestoreError::InvalidInput {
+                field: "restore.retained_members",
+                reason: "published retained payloads do not cover the admitted member set",
+            });
+        }
+        batch.retained_members = published;
+        Ok(())
     }
 
     /// Executes (or resumes) one isolated restore under the Kernel effect fence.
