@@ -2538,11 +2538,13 @@ fn apply_accepted_exit(
     receipt: Option<&RestoreTestReceipt<'_>>,
     evidence: &RestoreTestEvidence<'_>,
 ) -> Result<(), BackupClientError> {
-    outcome.missing_obligations.push(outstanding_restore_obligation(
-        operation_id,
-        receipt,
-        evidence,
-    ));
+    outcome
+        .missing_obligations
+        .push(outstanding_restore_obligation(
+            operation_id,
+            receipt,
+            evidence,
+        ));
     match envelope_optional_text(response, "reason")? {
         Some(reason) => reason.clone_into(&mut outcome.reason),
         None if receipt.is_some() => {
@@ -2815,26 +2817,10 @@ pub fn backup_restore_test(
     }
     match wire_status {
         BACKUP_STATE_BLOCKED => {
-            if envelope_text(&response, "code")? != "plan_gap" {
-                return Err(BackupClientError::Client(CliError::ResultMismatch));
-            }
-            // The route read above, which `restore_test_claim` already required
-            // to be non-empty on the passed side and disjoint across both sides.
-            // The Kernel's own owner name comes first, unresolved, exactly as
-            // the reply wrote it. The declaration obligation is this surface's
-            // own: the `source:`/`destination:` lines above are what the request
-            // declared, and no owner provisioned, admitted or issued either
-            // identity, so the projection must not read as a provisioned
-            // destination or an admitted source.
             let route = executed_route
                 .as_ref()
                 .ok_or(BackupClientError::Client(CliError::ResultMismatch))?;
-            outcome.missing_obligations = vec![
-                envelope_text(&response, "missing_owner")?.to_owned(),
-                RESTORE_TEST_DECLARED_IDENTITY_OBLIGATION.to_owned(),
-            ];
-            apply_executed_route(&mut outcome, route.passed, route.not_admitted);
-            envelope_text(&response, "reason")?.clone_into(&mut outcome.reason);
+            apply_plan_gap(&mut outcome, &response, route)?;
         }
         BACKUP_STATE_INVALID | BACKUP_STATE_REFUSED => {
             envelope_text(&response, "reason")?.clone_into(&mut outcome.reason);
@@ -2942,6 +2928,36 @@ struct ExecutedRouteOwned {
     passed: Vec<String>,
     /// Gates the owner names it did not admit.
     not_admitted: Vec<String>,
+}
+
+/// Projects one `plan_gap` answer onto its outcome.
+///
+/// A plan gap is the ABSENCE of a named owner, so it projects absence: the
+/// owner's own unresolved name first, then this surface's own declaration
+/// obligation, then one bounded obligation per gate the owner did not admit —
+/// a gate no owner admitted is an outstanding obligation and never a passed one.
+/// The route handed in is the one `restore_test_claim` already required to be
+/// non-empty on the passed side and disjoint across both sides.
+fn apply_plan_gap(
+    outcome: &mut BackupOperationOutcome,
+    response: &Value,
+    route: &ExecutedRoute<'_>,
+) -> Result<(), BackupClientError> {
+    if envelope_text(response, "code")? != "plan_gap" {
+        return Err(BackupClientError::Client(CliError::ResultMismatch));
+    }
+    // The Kernel's own owner name comes first, unresolved, exactly as the reply
+    // wrote it. The declaration obligation is this surface's own: the
+    // `source:`/`destination:` lines are what the request declared, and no owner
+    // provisioned, admitted or issued either identity, so the projection must not
+    // read as a provisioned destination or an admitted source.
+    outcome.missing_obligations = vec![
+        envelope_text(response, "missing_owner")?.to_owned(),
+        RESTORE_TEST_DECLARED_IDENTITY_OBLIGATION.to_owned(),
+    ];
+    apply_executed_route(outcome, route.passed, route.not_admitted);
+    envelope_text(response, "reason")?.clone_into(&mut outcome.reason);
+    Ok(())
 }
 
 /// The owner's own restore receipt, decoded into the vocabularies that own it.
@@ -3056,9 +3072,7 @@ struct RestoreTestEvidence<'a> {
 /// stream. Both are closed-checked (bounded name list, bounded non-blank text),
 /// because a rehearsal that answered neither in a shape this surface can name is
 /// an answer this surface may not reason about.
-fn restore_test_evidence(
-    response: &Value,
-) -> Result<RestoreTestEvidence<'_>, BackupClientError> {
+fn restore_test_evidence(response: &Value) -> Result<RestoreTestEvidence<'_>, BackupClientError> {
     let (finalize_evidence, operational_validation) = match response.get("evidence") {
         None | Some(Value::Null) => (false, false),
         Some(evidence) => {
