@@ -30,9 +30,8 @@
 //! snapshot preview instead. Callers: STITCH (agent-bridge intake for the
 //! agent surface, Human board for the board view).
 
-use crate::composition::{
-    ColdStartReadinessClaim, CompositionError, GovernorComposition, KernelGenerationPort,
-};
+use crate::composition::{CompositionError, GovernorComposition, KernelGenerationPort};
+use eliot_ors::ColdStartReadinessClaim;
 use eliot_workscope::{MemoryState, ReadinessLifecycle, ReadinessSurface};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
