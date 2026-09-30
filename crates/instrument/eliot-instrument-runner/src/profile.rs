@@ -78,6 +78,73 @@ pub const ISOLATED_NETWORK_POLICY: &str = "eliot.policy.network.isolated-process
 /// it with its own semaphore and circuit state. A system-wide pool never
 /// overrides the module limit, so no global pool exists here.
 pub const BUILTIN_MAX_CONCURRENCY: u32 = 1;
+/// Declared environment class: the child receives no ambient variable at all.
+///
+/// This is the toolchain environment every builtin verification spec admits.
+/// It is not an inference about what a tool might tolerate; it is the declared
+/// [`ISOLATED_PROCESS_CLASS`] this crate already shipped for every builtin
+/// spec, matching [`ISOLATED_CREDENTIAL_POLICY`] (no ambient credentials) and
+/// [`ISOLATED_NETWORK_POLICY`] (no ambient network). An environment a spec ever
+/// needs beyond isolation is a new admitted spec revision that names it in
+/// `InstrumentSpec::allowed_environment`, never an ambient inheritance the
+/// launch happens to observe.
+pub const BUILTIN_ALLOWED_ENVIRONMENT: &[&str] = &[];
+
+/// Fixed argument template for the builtin Cargo build/metadata spec.
+///
+/// This is Cargo's own real invocation as the repository's single verification
+/// owner runs it (`scripts/verify.ps1:114`, the `cargo-metadata` gate):
+/// `cargo metadata --locked --no-deps --format-version 1`. It is the same
+/// locked, dependency-free metadata read that resolves the admitted workspace,
+/// so a stage on this spec performs real work whose result is the admitted
+/// package set rather than printing a tool's help text.
+pub const CARGO_METADATA_ARGUMENTS: &[&str] =
+    &["metadata", "--locked", "--no-deps", "--format-version", "1"];
+
+/// Fixed argument template for the builtin rustc compiler spec.
+///
+/// `--print=sysroot` is the compiler's own real, source-independent query of
+/// the toolchain it will compile with, and `--error-format=json` selects the
+/// machine-readable dialect `parse_jsonl` in `eliot-instrument-rustc` reads.
+/// It is deliberately NOT `--help`, `--version`, or the empty vector: a stage
+/// that printed a tool's own banner or version is not a compilation, and this
+/// template must never be one.
+pub const RUSTC_COMPILER_ARGUMENTS: &[&str] =
+    &["--print=sysroot", "--error-format=json"];
+
+/// Fixed argument template for the builtin nextest test spec.
+///
+/// `run --message-format libtest-json-plus --message-format-version 0.1` is
+/// the real test-execution invocation `NextestCommand::run` builds in
+/// `eliot-instrument-nextest`, restricted to its fixed flags. The selected test
+/// identities are not in this template: they are project values bound through
+/// the capsule binding, not profile text, so the template carries only the
+/// flags that are the same on every machine.
+pub const NEXTEST_RUN_ARGUMENTS: &[&str] = &[
+    "run",
+    "--message-format",
+    "libtest-json-plus",
+    "--message-format-version",
+    "0.1",
+];
+
+/// Fixed argument template for the builtin rustfmt format spec.
+///
+/// `fmt --all -- --check` is exactly the admitted read-only format check
+/// `RustfmtCommand::check` builds in `eliot-instrument-rustfmt`: `--check`
+/// makes it a verification that reports rather than one that rewrites the
+/// worktree.
+pub const RUSTFMT_CHECK_ARGUMENTS: &[&str] = &["fmt", "--all", "--", "--check"];
+
+/// Copies one declared builtin constant list into an owned `Vec<String>`.
+///
+/// The builtin specs are the only construction site, so this keeps every
+/// template an owned `String` vector while the declaration above stays a
+/// `const` slice that cannot drift at runtime.
+fn declared_strings(constants: &[&str]) -> Vec<String> {
+    constants.iter().map(|value| (*value).to_owned()).collect()
+}
+
 /// Stable schema name of the canonical registry snapshot.
 pub const REGISTRY_SNAPSHOT_SCHEMA: &str = "eliot.instrument.registry-snapshot";
 /// Exact schema wire version of the canonical registry snapshot.
@@ -408,6 +475,15 @@ pub struct InstrumentSpecParams {
     pub parser_generation: u64,
     /// Admitted environment class.
     pub environment_profile: String,
+    /// Environment variables this spec permits its child to receive, by name.
+    ///
+    /// The empty vector is the admitted default and means the child receives no
+    /// variable at all under the [`ISOLATED_PROCESS_CLASS`] environment this
+    /// crate ships. A variable is admitted only by naming it here, so the set
+    /// of variables a tool can observe is declared by the spec owner and
+    /// digested with the rest of the admission rather than inherited from
+    /// whatever ambient environment the launch process happens to hold.
+    pub allowed_environment: Vec<String>,
     /// Invocation schema authority: the contract that validates arguments.
     pub schema: ContractId,
     /// Fixed command template; empty when the manifest declares none, in
@@ -452,6 +528,11 @@ pub struct InstrumentSpec {
     pub parser_generation: u64,
     /// Admitted environment class.
     pub environment_profile: String,
+    /// Environment variables this spec admits its child to receive, by name.
+    ///
+    /// Empty — the shipped builtin default — means the child receives no
+    /// variable at all. The launch admits exactly these names and nothing else.
+    pub allowed_environment: Vec<String>,
     /// Invocation schema authority.
     pub schema: ContractId,
     /// Fixed command template; empty admits only the empty argument vector.
@@ -483,6 +564,9 @@ impl InstrumentSpec {
         for argument in &params.argument_template {
             validate_text(argument, "argument_template")?;
         }
+        for variable in &params.allowed_environment {
+            validate_text(variable, "allowed_environment")?;
+        }
         Ok(Self {
             kind: params.kind,
             class: params.class,
@@ -492,6 +576,7 @@ impl InstrumentSpec {
             parser: params.parser,
             parser_generation: params.parser_generation,
             environment_profile: params.environment_profile,
+            allowed_environment: params.allowed_environment,
             schema: params.schema,
             argument_template: params.argument_template,
             credential_policy: params.credential_policy,
@@ -509,7 +594,7 @@ impl InstrumentSpec {
     /// Deterministic identity over every spec field.
     pub fn digest(&self) -> String {
         let material = format!(
-            "{}\0{:?}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            "{}\0{:?}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
             self.kind.digest(),
             self.class,
             self.revision,
@@ -518,6 +603,7 @@ impl InstrumentSpec {
             self.parser.as_str(),
             self.parser_generation,
             self.environment_profile,
+            self.allowed_environment.join("\0"),
             self.schema.as_str(),
             self.argument_template.join("\0"),
             self.credential_policy.as_str(),
@@ -887,14 +973,25 @@ impl InstrumentProfile {
 ///
 /// Builtin specs pin the exact executable file, the owning adapter's schema
 /// authority, the isolated-process environment/credential/network classes,
-/// and the adapter's real capture bound where the adapter defines one (the
+/// the environment variables that environment admits (none), and the
+/// adapter's real capture bound where the adapter defines one (the
 /// cargo adapter defines none, so its ceiling stays with the
-/// composition-root port). No fixed command template is declared, so the
-/// shared gate admits only the empty invocation argument vector for
-/// builtins; a manifest that needs further arguments admits them as an
-/// exact fixed template. No machine observation exists at registry
-/// construction, so builtins ship no supply-chain receipt and pin no tool
-/// version.
+/// composition-root port).
+///
+/// Every builtin spec now declares the fixed argument template its own
+/// owning adapter runs in production, so an admitted stage performs real
+/// verification work instead of launching its tool with an empty vector and
+/// reading whatever that tool prints with no arguments. The templates are
+/// the adapter-owned commands, not a second command list: Cargo's
+/// [`CARGO_METADATA_ARGUMENTS`] is the `cargo-metadata` gate
+/// `scripts/verify.ps1:114` runs, the nextest template is the flag prefix
+/// `NextestCommand::run` builds, the rustfmt template is exactly
+/// `RustfmtCommand::check`, and the rustc template is the compiler's own
+/// source-independent toolchain query in the JSON dialect its parser reads.
+/// None of them is `--help`, `--version`, or empty, because a tool printing
+/// its banner or version is not a verification. No machine observation
+/// exists at registry construction, so builtins ship no supply-chain receipt
+/// and pin no tool version.
 pub fn builtin_specs() -> Result<Vec<InstrumentSpec>, ProfileError> {
     let credential = ContractId::new(ISOLATED_CREDENTIAL_POLICY)?;
     let network = ContractId::new(ISOLATED_NETWORK_POLICY)?;
@@ -911,8 +1008,9 @@ pub fn builtin_specs() -> Result<Vec<InstrumentSpec>, ProfileError> {
             parser: ContractId::new(DIAGNOSTIC_PARSER_CONTRACT)?,
             parser_generation: BUILTIN_PARSER_GENERATION,
             environment_profile: ISOLATED_PROCESS_CLASS.to_owned(),
+            allowed_environment: declared_strings(BUILTIN_ALLOWED_ENVIRONMENT),
             schema: ContractId::new(CARGO_CONTRACT_NAME)?,
-            argument_template: Vec::new(),
+            argument_template: declared_strings(CARGO_METADATA_ARGUMENTS),
             credential_policy: credential.clone(),
             network_policy: network.clone(),
             limits: ResourceLimits::new(None, None),
@@ -927,8 +1025,9 @@ pub fn builtin_specs() -> Result<Vec<InstrumentSpec>, ProfileError> {
             parser: ContractId::new(RUSTC_INSTRUMENT)?,
             parser_generation: BUILTIN_PARSER_GENERATION,
             environment_profile: ISOLATED_PROCESS_CLASS.to_owned(),
+            allowed_environment: declared_strings(BUILTIN_ALLOWED_ENVIRONMENT),
             schema: ContractId::new(RUSTC_INSTRUMENT)?,
-            argument_template: Vec::new(),
+            argument_template: declared_strings(RUSTC_COMPILER_ARGUMENTS),
             credential_policy: credential.clone(),
             network_policy: network.clone(),
             limits: ResourceLimits::new(None, Some(MAX_RUSTC_OUTPUT_BYTES as u64)),
@@ -946,8 +1045,9 @@ pub fn builtin_specs() -> Result<Vec<InstrumentSpec>, ProfileError> {
             parser: ContractId::new(NEXTEST_INSTRUMENT)?,
             parser_generation: BUILTIN_PARSER_GENERATION,
             environment_profile: ISOLATED_PROCESS_CLASS.to_owned(),
+            allowed_environment: declared_strings(BUILTIN_ALLOWED_ENVIRONMENT),
             schema: ContractId::new(NEXTEST_INSTRUMENT)?,
-            argument_template: Vec::new(),
+            argument_template: declared_strings(NEXTEST_RUN_ARGUMENTS),
             credential_policy: credential.clone(),
             network_policy: network.clone(),
             limits: ResourceLimits::new(None, Some(MAX_NEXTEST_OUTPUT_BYTES as u64)),
@@ -965,8 +1065,9 @@ pub fn builtin_specs() -> Result<Vec<InstrumentSpec>, ProfileError> {
             parser: ContractId::new(RUSTFMT_INSTRUMENT)?,
             parser_generation: BUILTIN_PARSER_GENERATION,
             environment_profile: ISOLATED_PROCESS_CLASS.to_owned(),
+            allowed_environment: declared_strings(BUILTIN_ALLOWED_ENVIRONMENT),
             schema: ContractId::new(RUSTFMT_INSTRUMENT)?,
-            argument_template: Vec::new(),
+            argument_template: declared_strings(RUSTFMT_CHECK_ARGUMENTS),
             credential_policy: credential.clone(),
             network_policy: network.clone(),
             limits: ResourceLimits::new(None, Some(MAX_RUSTFMT_OUTPUT_BYTES as u64)),
@@ -1634,6 +1735,7 @@ fn rebuild_spec(spec: InstrumentSpec) -> Result<InstrumentSpec, ProfileError> {
         parser: spec.parser,
         parser_generation: spec.parser_generation,
         environment_profile: spec.environment_profile,
+        allowed_environment: spec.allowed_environment,
         schema: spec.schema,
         argument_template: spec.argument_template,
         credential_policy: spec.credential_policy,
@@ -2023,6 +2125,13 @@ pub struct AdmittedStage {
     pub schema: ContractId,
     /// Admitted environment class.
     pub environment_class: String,
+    /// Environment variable names the admitted spec permits its child to
+    /// receive.
+    ///
+    /// The launcher builds the child projection from exactly these names. An
+    /// empty list means the child receives no variable at all, so no ambient
+    /// value from the launching process can reach a verification tool.
+    pub allowed_environment: Vec<String>,
     /// Admitted credential policy identity.
     pub credential_policy: ContractId,
     /// Admitted network policy identity.
@@ -2592,6 +2701,7 @@ impl<'a> ProfileCompiler<'a> {
                 argument_template: spec.argument_template.clone(),
                 schema: spec.schema.clone(),
                 environment_class: spec.environment_profile.clone(),
+                allowed_environment: spec.allowed_environment.clone(),
                 credential_policy: spec.credential_policy.clone(),
                 network_policy: spec.network_policy.clone(),
                 parser: spec.parser.clone(),

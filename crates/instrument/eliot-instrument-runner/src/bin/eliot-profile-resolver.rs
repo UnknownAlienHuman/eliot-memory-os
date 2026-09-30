@@ -891,7 +891,7 @@ fn seal_version_request(
     epoch: &EpochId,
     executable: &Path,
 ) -> Result<ProcessRequest, CliError> {
-    let projection = isolated_projection()?;
+    let projection = isolated_projection(&[])?;
     let argv = vec!["--version".to_owned()];
     // The operation identity is derived from the same real tool bytes the stage
     // launch pins, so the read and the stage it precedes are bound to one
@@ -1389,6 +1389,7 @@ impl StagePort {
                 stage_id,
                 &planned.stage.executable,
                 &argv,
+                &planned.stage.allowed_environment,
             )?;
             sealed.insert(operation, request);
         }
@@ -1401,12 +1402,22 @@ impl StagePort {
 
 /// The exact process argv one admitted stage runs.
 ///
-/// It is built from the admitted spec's own argument template and nothing else.
-/// An admitted template is empty for every builtin verification spec, so a stage
-/// runs its executable with no arguments at all rather than with a command this
-/// entry invented; a spec that declares a template contributes exactly those
-/// arguments. Either way the argv is profile text read from the admitted
-/// registry, not a command list restated here.
+/// It is built from the admitted spec's own argument template and nothing else,
+/// so the argv is profile text read from the admitted registry, not a command
+/// list restated here. Every builtin verification spec declares the real
+/// argument template its owning adapter runs in production, so a stage runs
+/// `cargo metadata --locked --no-deps --format-version 1`,
+/// `rustc --print=sysroot --error-format=json`, the nextest
+/// `run --message-format libtest-json-plus …` invocation, or
+/// `cargo fmt --all -- --check`, rather than its executable with no arguments
+/// at all.
+///
+/// No template is empty, `--help`, or `--version`, and none ever may be: a tool
+/// that prints its banner or version has performed no verification, and its
+/// own output would then be the only thing in the receipt standing in for the
+/// work the stage was declared to do. The builtin templates this route runs are
+/// non-empty by construction, so no stage of either admitted route reaches
+/// `require_launched_stage` with nothing to execute.
 fn stage_argv(stage: &PlannedStage) -> Vec<String> {
     stage.stage.argument_template.clone()
 }
@@ -1435,9 +1446,10 @@ fn seal_stage_request(
     stage_id: &str,
     executable_name: &str,
     argv: &[String],
+    allowed_environment: &[String],
 ) -> Result<ProcessRequest, CliError> {
     let executable = resolve_tool(executable_name)?;
-    let projection = isolated_projection()?;
+    let projection = isolated_projection(allowed_environment)?;
     let observed = ExecutableObservation::observe_at_path(
         &executable,
         argv.to_vec(),
@@ -1494,15 +1506,36 @@ fn seal_stage_request(
     )
 }
 
-/// The isolated environment projection every admitted stage child runs under.
+/// The isolated environment projection one admitted stage child runs under.
 ///
-/// An empty projection with `EnvironmentInheritance::None` is the same isolated
-/// class the admitted specs declare: the child receives no ambient variable and
-/// no inherited secret, and the digest of that projection is what the executor
-/// binds as the stage's environment identity.
-fn isolated_projection() -> Result<EnvironmentProjection, CliError> {
+/// The projection carries exactly the variables the admitted spec permits,
+/// resolved from this process's own environment and never inherited wholesale,
+/// under `EnvironmentInheritance::None`. The admitted builtin environment is
+/// the empty set (`BUILTIN_ALLOWED_ENVIRONMENT`), which is the same isolated
+/// class every builtin spec declares together with its isolated credential and
+/// network policies: the child receives no ambient variable and no inherited
+/// secret, and the digest of that projection is what the executor binds as the
+/// stage's environment identity.
+///
+/// "Allowed" is therefore the spec owner's [`InstrumentSpec::allowed_environment`]
+/// list, not a judgement about what a tool might tolerate and not the ambient
+/// environment. A verification tool that needs a variable is admitted by a spec
+/// revision that names it, and only then does this function copy that one value
+/// across; a variable nobody admitted can never reach the child.
+fn isolated_projection(
+    allowed: &[String],
+) -> Result<EnvironmentProjection, CliError> {
+    let mut variables = BTreeMap::new();
+    for name in allowed {
+        let value = std::env::var(name).map_err(|_| {
+            CliError::Contract(format!(
+                "stage environment admits '{name}' but this process does not define it"
+            ))
+        })?;
+        variables.insert(name.clone(), value);
+    }
     Ok(EnvironmentProjection::new(
-        BTreeMap::new(),
+        variables,
         Vec::new(),
         EnvironmentInheritance::None,
     )?)
