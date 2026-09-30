@@ -4511,6 +4511,7 @@ struct HostRequestResultPersistence<'a> {
     operation_id: &'a crate::OperationIdentity,
     request_digest: &'a str,
     observe_attempt: Option<&'a crate::HostRequestAttempt>,
+    prepared_transition_sha256: Option<&'a str>,
     result_digest: &'a str,
     result_response: &'a serde_json::Value,
     result_evidence: Option<&'a crate::HostRequestEffectEvidence>,
@@ -4526,6 +4527,10 @@ pub struct HostRequestObserveResult<'a> {
     pub request_digest: &'a str,
     /// Whole current durable attempt returned with the claimed pair.
     pub attempt: &'a crate::HostRequestAttempt,
+    /// Digest of the exact original staged `PreparedTransition`, validated
+    /// by Kernel after recovery decryption and supplied as a proof for the
+    /// retained write binding. ORS never interprets the transition payload.
+    pub prepared_transition_sha256: &'a str,
     /// Canonical digest of the exact result response.
     pub result_digest: &'a str,
     /// Exact bounded owner response body containing the canonical receipt.
@@ -4539,6 +4544,8 @@ pub struct HostRequestObserveResult<'a> {
 fn validate_host_request_result_scope(
     record: &crate::HostRequestRecord,
     observe_attempt: Option<&crate::HostRequestAttempt>,
+    prepared_transition_sha256: Option<&str>,
+    original_write_binding: Option<&crate::RecoveryWriteBinding>,
     response: &serde_json::Value,
     lineage: Option<&crate::HostRequestRetainedLineage>,
 ) -> Result<(), OrsError> {
@@ -4547,12 +4554,50 @@ fn validate_host_request_result_scope(
         reason: "protected Observe results require the exact durable attempt and canonical receipt",
     };
     let Some(attempt) = observe_attempt else {
-        if record.executable_input.is_some() {
+        if record.executable_input.is_some()
+            || prepared_transition_sha256.is_some()
+            || original_write_binding.is_some()
+        {
             return Err(invalid());
         }
         return Ok(());
     };
     let input = record.executable_input.as_ref().ok_or_else(invalid)?;
+    let prepared_transition_sha256 = prepared_transition_sha256.ok_or_else(invalid)?;
+    crate::model::validate_digest(
+        prepared_transition_sha256,
+        "host_request_prepared_transition_sha256",
+    )?;
+    let original_write_binding = original_write_binding.ok_or_else(invalid)?;
+    original_write_binding.validate()?;
+    validate_observe_attempt_binding(record, attempt, input)?;
+    let lineage = lineage.ok_or_else(invalid)?;
+    if lineage.result_class != crate::HostRequestRetainedResultClass::CanonicalWriteReceipt {
+        return Err(invalid());
+    }
+    let receipt_value = response.get("receipt").cloned().ok_or_else(invalid)?;
+    let receipt: eliot_store_api::WriteReceipt =
+        serde_json::from_value(receipt_value).map_err(|_| invalid())?;
+    receipt.validate().map_err(|_| invalid())?;
+    let envelope = receipt
+        .require_reconciliation_envelope()
+        .map_err(|_| invalid())?;
+    validate_observe_receipt_binding(
+        record,
+        input,
+        prepared_transition_sha256,
+        original_write_binding,
+        &receipt,
+        envelope,
+        lineage,
+    )
+}
+
+fn validate_observe_attempt_binding(
+    record: &crate::HostRequestRecord,
+    attempt: &crate::HostRequestAttempt,
+    input: &crate::HostRequestExecutableInput,
+) -> Result<(), OrsError> {
     if record.send_claim_protocol_version != 0
         || record.kind != crate::HostRequestKind::Invocation
         || record.capability_ref.as_str() != "eliot.observe"
@@ -4570,40 +4615,82 @@ fn validate_host_request_result_scope(
         || attempt.owner_readback.is_some()
         || attempt.input_commitment_sha256.as_deref() != Some(input.commitment_sha256.as_str())
     {
-        return Err(invalid());
+        return Err(OrsError::InvalidField {
+            field: "host_request_result_observe_binding",
+            reason: "protected Observe results require the exact durable attempt and input commitment",
+        });
     }
-    let lineage = lineage.ok_or_else(invalid)?;
-    if lineage.result_class != crate::HostRequestRetainedResultClass::CanonicalWriteReceipt {
-        return Err(invalid());
-    }
-    let receipt_value = response.get("receipt").cloned().ok_or_else(invalid)?;
-    let receipt: eliot_store_api::WriteReceipt =
-        serde_json::from_value(receipt_value).map_err(|_| invalid())?;
-    receipt.validate().map_err(|_| invalid())?;
-    let envelope = receipt
-        .require_reconciliation_envelope()
-        .map_err(|_| invalid())?;
+    Ok(())
+}
+
+fn validate_observe_receipt_binding(
+    record: &crate::HostRequestRecord,
+    input: &crate::HostRequestExecutableInput,
+    prepared_transition_sha256: &str,
+    original_write_binding: &crate::RecoveryWriteBinding,
+    receipt: &eliot_store_api::WriteReceipt,
+    envelope: &eliot_receipts::ReceiptEnvelope,
+    lineage: &crate::HostRequestRetainedLineage,
+) -> Result<(), OrsError> {
+    let invalid = || OrsError::InvalidField {
+        field: "host_request_result_observe_binding",
+        reason: "canonical receipt must join the original staged write and source request",
+    };
+    let source_request = input
+        .application_binding
+        .source_request_identity
+        .get("request")
+        .ok_or_else(invalid)?;
+    let source_metadata = source_request.get("metadata").ok_or_else(invalid)?;
+    let source_request_id = source_metadata
+        .get("request_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(invalid)?;
+    let source_product_id = source_metadata
+        .get("product_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(invalid)?;
+    let source_id = source_metadata
+        .get("source_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(invalid)?;
     let scope_ref = input.application_binding.scope_ref.as_ref().ok_or_else(invalid)?;
     let Some(work_scope) = record.scope_ref.as_ref() else {
         return Err(invalid());
     };
     if receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+        || receipt.operation_id.as_str() != record.operation_id.as_str()
         || receipt.idempotency_key != record.idempotency_key.as_str()
+        || receipt.canonical_request_hash != original_write_binding.canonical_request_sha256
+        || original_write_binding.operation_id != record.operation_id
+        || original_write_binding.idempotency_key.as_str() != record.idempotency_key.as_str()
+        || original_write_binding.prepared_transition_sha256 != prepared_transition_sha256
+        || original_write_binding.admission_contract_set_digest != receipt.admission_digest
+        || original_write_binding.operation_manifest_digest.as_str()
+            != receipt.operation_manifest_digest.as_str()
+        || original_write_binding
+            .state_fence
+            .validate()
+            .is_err()
+        || serde_json::from_str::<eliot_contracts::StateFence>(
+            &original_write_binding.state_fence.canonical_json,
+        )
+        .map(|fence| fence != input.application_binding.state_fence || fence != receipt.state_fence)
+        .unwrap_or(true)
+        || envelope.core.request.metadata.request_id.as_str() != source_request_id
+        || envelope.core.request.metadata.product_id.as_str() != source_product_id
+        || envelope.core.request.metadata.source_id.as_str() != source_id
+        || envelope.core.request.state_fence != input.application_binding.state_fence
         || envelope.core.work_scope.scope_id.as_str() != work_scope.as_str()
         || envelope.core.work_scope.state_fence != input.application_binding.state_fence
+        || envelope.core.operation.operation_id.as_str() != record.operation_id.as_str()
+        || envelope.core.operation.idempotency_key != record.idempotency_key.as_str()
         || envelope.core.operation.state_fence != input.application_binding.state_fence
         || scope_ref != work_scope
         || lineage.semantic_receipt_ref.as_deref()
             != Some(envelope.identity.receipt_id.as_str())
     {
         return Err(invalid());
-    }
-    match (&record.task_ref, input.application_binding.task_revision, &envelope.core.task) {
-        (Some(task_ref), Some(task_revision), Some(receipt_task))
-            if receipt_task.task_id.as_str() == task_ref.as_str()
-                && receipt_task.task_revision.value() == task_revision => {}
-        (None, None, None) => {}
-        _ => return Err(invalid()),
     }
     Ok(())
 }
@@ -11424,6 +11511,7 @@ impl RedbRecoveryStore {
             operation_id,
             request_digest,
             observe_attempt: None,
+            prepared_transition_sha256: None,
             result_digest,
             result_response,
             result_evidence,
@@ -11442,6 +11530,7 @@ impl RedbRecoveryStore {
             operation_id: result.operation_id,
             request_digest: result.request_digest,
             observe_attempt: Some(result.attempt),
+            prepared_transition_sha256: Some(result.prepared_transition_sha256),
             result_digest: result.result_digest,
             result_response: result.result_response,
             result_evidence: result.result_evidence,
@@ -11461,6 +11550,7 @@ impl RedbRecoveryStore {
             operation_id,
             request_digest,
             observe_attempt,
+            prepared_transition_sha256,
             result_digest,
             result_response,
             result_evidence,
@@ -11482,9 +11572,42 @@ impl RedbRecoveryStore {
             return Ok(None);
         };
         existing.validate()?;
+        let original_write_binding = if observe_attempt.is_some() {
+            let envelope = {
+                let table = write.open_table(ENVELOPES).map_err(storage)?;
+                table
+                    .get(operation_id.as_str())
+                    .map_err(storage)?
+                    .map(|value| decode::<RecoveryPayloadEnvelope>(value.value()))
+                    .transpose()?
+            }
+            .ok_or(OrsError::InvalidField {
+                field: "host_request_result_observe_binding",
+                reason: "protected Observe requires the exact staged write envelope",
+            })?;
+            envelope.validate()?;
+            if envelope.operation_or_checkpoint_id != existing.operation_id {
+                return Err(OrsError::HostRequestIdentityConflict {
+                    operation_id: operation_id.as_str().to_owned(),
+                    request_digest: request_digest.to_owned(),
+                });
+            }
+            Some(
+                envelope
+                    .write_binding
+                    .ok_or(OrsError::InvalidField {
+                        field: "host_request_result_observe_binding",
+                        reason: "protected Observe requires the exact staged write binding",
+                    })?,
+            )
+        } else {
+            None
+        };
         validate_host_request_result_scope(
             &existing,
             observe_attempt,
+            prepared_transition_sha256,
+            original_write_binding.as_ref(),
             result_response,
             result_lineage,
         )?;
