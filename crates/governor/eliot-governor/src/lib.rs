@@ -39,6 +39,8 @@ mod campaign_task_sources;
 mod canonical_projections;
 mod capability_evidence;
 mod capability_evidence_commit;
+mod cold_start_surface;
+mod cold_start_trigger;
 mod composition;
 mod context_inputs;
 mod cue_composition;
@@ -172,6 +174,7 @@ pub use capability_evidence_commit::{
     capability_evidence_idempotency_key, capability_evidence_mutation_request_for_record,
     commit_capability_evidence_record,
 };
+pub use cold_start_surface::ColdStartHumanBoardView;
 pub use composition::*;
 pub use controlboard_projection::{
     ControlBoardAttentionEvaluationRow, ControlBoardGovernorSnapshot, ControlBoardOwnerBinding,
