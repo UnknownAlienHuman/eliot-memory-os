@@ -226,6 +226,100 @@ pub fn acknowledgement_for_batch(
     }
 }
 
+/// Admits one claimed Watchdog spool export window through the Governor's
+/// canonical observation path and returns the exact sink-owned acknowledgement.
+///
+/// This is the production caller of
+/// [`ForwardingObservationReconciliation::admit_watchdog_batch`], and therefore
+/// of the Governor's own `admit_watchdog_batch`. The chain it closes is the live
+/// drain path: the Watchdog's own tick exports a bounded window over the
+/// authenticated Kernel front door, Kernel stages the durable pending export
+/// projections, this drain claims them back, and the Governor commits the
+/// canonical observation for every entry.
+///
+/// The publication identity is derived from the batch's own recorded identity, so
+/// an exact retry of the same window reconciles the same per-entry receipts
+/// instead of committing a second observation for one spool sequence. The live
+/// admitted fence is read from the retained Governor snapshot, never taken from
+/// the claimed window or the caller.
+///
+/// No semantic rule lives here: per-entry canonical outcomes map to sink
+/// dispositions through the existing mapping, and the cursor-advance decision
+/// stays with the Watchdog owner, which applies it only against a disposition
+/// the Governor itself recorded.
+///
+/// # Errors
+///
+/// Returns the composition's readiness refusal, the Governor's typed
+/// [`CompositionError`], or a protocol refusal when the publication identity is
+/// not a valid contract value. Every one of those is a refusal, not a
+/// publication: the window stays pending and is replayed by the next tick.
+pub async fn admit_claimed_watchdog_export(
+    composition: &super::DaemonComposition,
+    batch: &eliot_watchdog_core::WatchdogSpoolExportBatch,
+) -> Result<eliot_watchdog_core::WatchdogSpoolAcknowledgement, String> {
+    let live_fence = composition
+        .governor
+        .kernel_snapshot()
+        .state_fence()
+        .clone();
+    let now_ms = crate::unix_ms();
+    let operation_text = format!(
+        "watchdog-spool-drain:{}:{}",
+        batch.installation_id, batch.batch_id
+    );
+    let base_operation = eliot_contracts::OperationId::new(operation_text.clone())
+        .map_err(|error| format!("Watchdog drain base operation: {error}"))?;
+    let request_id = eliot_contracts::RequestId::new(format!("{operation_text}:admit"))
+        .map_err(|error| format!("Watchdog drain request identity: {error}"))?;
+    let metadata = eliot_protocol::RequestMetadata {
+        request_id: request_id.clone(),
+        session_id: None,
+        task_id: None,
+        product_id: eliot_contracts::ProductId::new("eliot-watchdog")
+            .map_err(|error| format!("Watchdog drain product id: {error}"))?,
+        source_id: eliot_contracts::SourceId::new("watchdog-spool")
+            .map_err(|error| format!("Watchdog drain source id: {error}"))?,
+        // The live admitted fence, read from the retained Governor snapshot and
+        // never from the claimed window.
+        state_fence: live_fence.clone(),
+        clock: eliot_contracts::ClockReading {
+            valid_time_ms: i64::try_from(now_ms).ok(),
+            known_time_ms: i64::try_from(now_ms).ok(),
+            transaction_sequence: None,
+            monotonic_ns: None,
+        },
+    };
+    metadata
+        .validate()
+        .map_err(|error| format!("Watchdog drain request metadata: {error}"))?;
+    let identity = eliot_protocol::RequestIdentity {
+        request: eliot_receipts::RequestBinding {
+            metadata,
+            state_fence: live_fence,
+        },
+        // Derived from the batch identity, so the same window always presents
+        // the same caller idempotency and the Governor's per-entry keys stay
+        // stable across retries.
+        idempotency_key: operation_text.clone(),
+        deadline_unix_ms: now_ms.saturating_add(WATCHDOG_DRAIN_ADMIT_DEADLINE_MS),
+        cancellation_id: format!("{operation_text}:cancel"),
+    };
+    composition
+        .observation_reconciliation()
+        .map_err(|error| format!("Watchdog drain composition: {error}"))?
+        .admit_watchdog_batch(&identity, &base_operation, batch)
+        .await
+        .map_err(|error| format!("Watchdog drain admission: {error}"))
+}
+
+/// Bounded absolute deadline of one Watchdog drain admission request.
+///
+/// The window is already freshness-bounded by the Watchdog owner's own export
+/// window, so this is a transport deadline, not a semantic one: it exists so a
+/// stuck canonical commit cannot hold the single in-flight drain step open.
+const WATCHDOG_DRAIN_ADMIT_DEADLINE_MS: u64 = 30_000;
+
 /// Forwards one Watchdog export batch through the live disposition mapping.
 ///
 /// Takes the immutable export batch plus the per-entry canonical outcomes in

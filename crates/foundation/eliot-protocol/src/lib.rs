@@ -5972,6 +5972,224 @@ impl WatchdogSpoolExportBatchPayload {
     }
 }
 
+/// Closed terminal sink disposition the Governor recorded for one export entry.
+///
+/// Only the three dispositions that actually advance the Watchdog's cursor can
+/// be expressed. There is deliberately no wire value for `Received`,
+/// `Durable`, `AdmittedCandidate`, or `Unknown`: those are non-terminal
+/// states the spool owner must keep replaying, and a producer that cannot name
+/// them cannot substitute one for a decision. A producer with no canonical
+/// outcome therefore submits nothing and the entry stays pending.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", tag = "disposition")]
+pub enum WatchdogSpoolEntryOutcome {
+    /// The entry was canonically applied; advances the cursor for every kind.
+    Applied,
+    /// The entry was decided against. `reason` is required and non-empty.
+    Rejected {
+        /// Bounded closed refusal reason recorded with the decision.
+        reason: String,
+    },
+    /// Terminal gap-resolution phase; advances `Gap`/`Recovery` entries only.
+    GapRequiresRecovery,
+}
+
+impl WatchdogSpoolEntryOutcome {
+    /// Returns the stable wire code for the non-rejected variants.
+    ///
+    /// `Rejected` carries its reason in the body, so it has no flat code.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Applied => "APPLIED",
+            Self::Rejected { .. } => "REJECTED",
+            Self::GapRequiresRecovery => "GAP_REQUIRES_RECOVERY",
+        }
+    }
+}
+
+/// One terminal outcome the Governor recorded for one exported spool entry.
+///
+/// It carries the retained sequence and record digest the decision answers, so
+/// a result can never be bound to a different record than the one the drain
+/// projected.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WatchdogSpoolExportOutcomeSubmission {
+    /// Retained spool sequence this outcome answers.
+    pub sequence: u64,
+    /// Owner-computed record digest this outcome answers.
+    pub record_digest: String,
+    /// Exactly-once reconciliation key the drain projected for this entry; the
+    /// Kernel re-derives it and fences on any presented value it cannot
+    /// reproduce.
+    pub idempotency_key: String,
+    /// Exactly the terminal disposition the Governor recorded.
+    pub outcome: WatchdogSpoolEntryOutcome,
+}
+
+impl WatchdogSpoolExportOutcomeSubmission {
+    /// Validates the closed submission shape and its digest bindings.
+    ///
+    /// `installation_id` is the owning installation of the answered drain
+    /// window; the derivation it feeds is re-checked here so an outcome can never
+    /// be bound to an entry the drain never projected.
+    pub fn validate(&self, installation_id: &str) -> Result<(), ProtocolError> {
+        if self.sequence == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "watchdog_spool_export_outcome.sequence",
+                reason: "retained spool sequence must be positive",
+            });
+        }
+        lowercase_sha256(
+            &self.record_digest,
+            "watchdog_spool_export_outcome.record_digest",
+        )?;
+        lowercase_sha256(
+            &self.idempotency_key,
+            "watchdog_spool_export_outcome.idempotency_key",
+        )?;
+        if self.idempotency_key
+            != watchdog_export_reconciliation_idempotency_key(
+                installation_id,
+                self.sequence,
+                &self.record_digest,
+            )
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "watchdog_spool_export_outcome.idempotency_key",
+                reason: "must be the derived reconciliation key for this installation, sequence, and record digest",
+            });
+        }
+        if let WatchdogSpoolEntryOutcome::Rejected { reason } = &self.outcome {
+            if reason.trim().is_empty() {
+                return Err(ProtocolError::InvalidField {
+                    field: "watchdog_spool_export_outcome.outcome.reason",
+                    reason: "a terminal rejection must carry a non-empty reason",
+                });
+            }
+            bounded_text(
+                reason,
+                "watchdog_spool_export_outcome.outcome.reason",
+                MAX_HOST_REQUEST_TEXT_BYTES,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Versioned Watchdog spool export result carried back through the Kernel.
+///
+/// This payload exists only so the Governor's *own* terminal per-entry
+/// disposition can be recorded against the durable drain projection. It cannot
+/// mint a cursor advance by itself: the Watchdog still applies the cursor
+/// decision through its owner-side acknowledgement validation, and it only
+/// advances on a disposition this payload was derived from. It carries no
+/// semantic field beyond the closed disposition, the retained sequence, and the
+/// owner-computed digest.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WatchdogSpoolExportResultPayload {
+    /// Payload wire identity.
+    pub wire_id: String,
+    /// Payload wire version.
+    pub wire_version: u16,
+    /// Closed route identity; must equal [`WATCHDOG_SPOOL_EXPORT_ROUTE`].
+    pub route: String,
+    /// Owning installation of the answered drain window.
+    pub installation_id: String,
+    /// Batch identity of the answered drain window.
+    pub batch_id: String,
+    /// Batch digest of the answered drain window.
+    pub batch_digest: String,
+    /// Terminal outcomes, one per answered entry, in ascending sequence order.
+    pub outcomes: Vec<WatchdogSpoolExportOutcomeSubmission>,
+    /// Lowercase SHA-256 over every payload field except this field.
+    pub payload_sha256: String,
+}
+
+impl WatchdogSpoolExportResultPayload {
+    /// Current result payload contract version.
+    pub const CONTRACT_VERSION: u16 = WATCHDOG_SPOOL_EXPORT_BATCH_WIRE_VERSION;
+
+    /// Returns canonical bytes covered by `payload_sha256`.
+    pub fn canonical_unsigned_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
+        let mut unsigned = self.clone();
+        unsigned.payload_sha256.clear();
+        canonical_json_bytes(&unsigned).map_err(|error| ProtocolError::Json(error.to_string()))
+    }
+
+    /// Computes the canonical payload digest.
+    pub fn compute_digest(&self) -> Result<String, ProtocolError> {
+        Ok(eliot_contracts::sha256_hex(
+            &self.canonical_unsigned_bytes()?,
+        ))
+    }
+
+    /// Populates the canonical payload digest.
+    pub fn with_computed_digest(mut self) -> Result<Self, ProtocolError> {
+        self.payload_sha256 = self.compute_digest()?;
+        Ok(self)
+    }
+
+    /// Validates the closed result shape, the window identity it answers, and
+    /// every terminal outcome.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.wire_id != WATCHDOG_SPOOL_EXPORT_BATCH_WIRE_ID
+            || self.wire_version != Self::CONTRACT_VERSION
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "watchdog_spool_export_result.wire",
+                reason: "unsupported watchdog spool export result payload",
+            });
+        }
+        if self.route != WATCHDOG_SPOOL_EXPORT_ROUTE {
+            return Err(ProtocolError::InvalidField {
+                field: "watchdog_spool_export_result.route",
+                reason: "must be the admitted watchdog spool export route",
+            });
+        }
+        bounded_text(
+            &self.installation_id,
+            "watchdog_spool_export_result.installation_id",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        bounded_text(
+            &self.batch_id,
+            "watchdog_spool_export_result.batch_id",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        lowercase_sha256(
+            &self.batch_digest,
+            "watchdog_spool_export_result.batch_digest",
+        )?;
+        if self.outcomes.is_empty() || self.outcomes.len() > MAX_WATCHDOG_SPOOL_EXPORT_ENTRIES {
+            return Err(ProtocolError::InvalidField {
+                field: "watchdog_spool_export_result.outcomes",
+                reason: "must carry a bounded non-empty terminal outcome list",
+            });
+        }
+        let mut previous: Option<u64> = None;
+        for outcome in &self.outcomes {
+            outcome.validate(&self.installation_id)?;
+            if previous.is_some_and(|sequence| outcome.sequence <= sequence) {
+                return Err(ProtocolError::InvalidField {
+                    field: "watchdog_spool_export_result.outcomes",
+                    reason: "terminal outcomes must be strictly ascending by sequence",
+                });
+            }
+            previous = Some(outcome.sequence);
+        }
+        if self.payload_sha256 != self.compute_digest()? {
+            return Err(ProtocolError::InvalidField {
+                field: "watchdog_spool_export_result.payload_sha256",
+                reason: "payload digest mismatch",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Stable typed denial codes for host-request admission control.
 ///
 /// Codes are control values, never human prose: no error text drives routing.

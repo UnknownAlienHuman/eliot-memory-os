@@ -25,8 +25,8 @@ use eliot_protocol::{
     ClientHello, EliotPipeName, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload,
     ProtocolRange, ProtocolVersion, WATCHDOG_SPOOL_BATCH_ROUTE, WATCHDOG_SPOOL_EXPORT_BATCH_WIRE_ID,
     WATCHDOG_SPOOL_EXPORT_ROUTE, WATCHDOG_SPOOL_INTENT_BATCH_WIRE_ID, WatchdogIntentKind,
-    WatchdogSpoolEntryKind, WatchdogSpoolExportBatchPayload, WatchdogSpoolExportSubmission,
-    WatchdogSpoolIntentBatchPayload, WatchdogSpoolIntentSubmission,
+    WatchdogSpoolEntryKind, WatchdogSpoolEntryOutcome, WatchdogSpoolExportBatchPayload,
+    WatchdogSpoolExportSubmission, WatchdogSpoolIntentBatchPayload, WatchdogSpoolIntentSubmission,
     watchdog_export_reconciliation_idempotency_key, watchdog_intent_reconciliation_idempotency_key,
 };
 use eliot_runtime_contracts::{
@@ -908,7 +908,6 @@ fn acknowledgement_from_kernel_outcome(
                     .get("payload_digest")
                     .and_then(serde_json::Value::as_str)
                     != Some(submitted.payload_digest.as_str())
-                || projection.get("state").and_then(serde_json::Value::as_str) != Some("ADMITTED")
                 || projection
                     .get("operation_id")
                     .and_then(serde_json::Value::as_str)
@@ -922,9 +921,38 @@ fn acknowledgement_from_kernel_outcome(
                     "Kernel export projection did not bind the exact retained record".to_owned(),
                 ));
             }
+            // Only the Governor's own recorded terminal disposition may answer an
+            // entry. While the durable record is a pending projection with no
+            // recorded outcome, the honest sink disposition is the non-terminal
+            // `AdmittedCandidate`, which this owner refuses to advance on: the
+            // window replays and the cursor stays exactly where it is.
+            let disposition = match projection.get("outcome") {
+                None | Some(serde_json::Value::Null) => {
+                    if projection.get("state").and_then(serde_json::Value::as_str)
+                        != Some("ADMITTED")
+                    {
+                        return Err(SpoolError::LeaseFenced(
+                            "Kernel export projection reported no outcome for an undecided record"
+                                .to_owned(),
+                        ));
+                    }
+                    WatchdogSpoolSinkDisposition::AdmittedCandidate
+                }
+                Some(outcome) => {
+                    if projection.get("state").and_then(serde_json::Value::as_str)
+                        != Some("RESULT_RECEIVED")
+                    {
+                        return Err(SpoolError::LeaseFenced(
+                            "Kernel export projection reported an outcome for an undecided record"
+                                .to_owned(),
+                        ));
+                    }
+                    terminal_disposition_from_kernel_outcome(outcome)?
+                }
+            };
             Ok(WatchdogSpoolEntryDisposition {
                 sequence: submitted.sequence,
-                disposition: WatchdogSpoolSinkDisposition::AdmittedCandidate,
+                disposition,
                 record_digest: submitted.record_digest.clone(),
             })
         })
@@ -942,6 +970,33 @@ fn acknowledgement_from_kernel_outcome(
             installation_id: payload.installation_id.clone(),
             dispositions,
         })
+}
+
+/// Decodes the one closed terminal disposition the Governor recorded.
+///
+/// The wire value is the typed `WatchdogSpoolEntryOutcome`, decoded here through
+/// its own contract rather than by string matching, so this sink cannot invent
+/// a disposition and cannot map a non-terminal state onto a terminal one. A value
+/// outside the closed vocabulary fences rather than falling back to a
+/// non-terminal disposition, because silently downgrading a recorded decision
+/// would strand the entry forever.
+fn terminal_disposition_from_kernel_outcome(
+    value: &serde_json::Value,
+) -> Result<eliot_watchdog_core::WatchdogSpoolSinkDisposition, SpoolError> {
+    use eliot_watchdog_core::WatchdogSpoolSinkDisposition as Disposition;
+
+    let outcome: WatchdogSpoolEntryOutcome =
+        serde_json::from_value(value.clone()).map_err(|_| {
+            SpoolError::LeaseFenced(
+                "Kernel recorded export outcome is not the closed disposition vocabulary"
+                    .to_owned(),
+            )
+        })?;
+    Ok(match outcome {
+        WatchdogSpoolEntryOutcome::Applied => Disposition::Applied,
+        WatchdogSpoolEntryOutcome::Rejected { reason } => Disposition::Rejected { reason },
+        WatchdogSpoolEntryOutcome::GapRequiresRecovery => Disposition::GapRequiresRecovery,
+    })
 }
 
 /// Authenticated Kernel front-door sink for one bounded Watchdog spool export.

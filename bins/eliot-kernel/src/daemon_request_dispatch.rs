@@ -662,6 +662,7 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "semantic_observe_result" => "semantic_observe_result",
         "semantic_observe_deferred" => "semantic_observe_deferred",
         "watchdog_export_claim" => "watchdog_export_claim",
+        "watchdog_export_result" => "watchdog_export_result",
         "campaign_packet_claim" => "campaign_packet_claim",
         "campaign_packet_result" => "campaign_packet_result",
         "task_controller_claim" => "task_controller_claim",
@@ -3771,6 +3772,34 @@ impl KernelComposition {
                             "recovery": null,
                         }),
                     }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "watchdog_export_result" => {
+                // Daemon outcome leg for the claimed Watchdog spool drain
+                // window (#2899): records the Governor's OWN terminal
+                // per-entry dispositions against the durable drain projections
+                // this Kernel already staged. It mirrors `semantic_observe_result`:
+                // same dispatcher-head session/auth/ready/fence gates, same
+                // single-`operation`-key payload shape. The Kernel writes no
+                // disposition of its own; it only persists the submitted ones
+                // through the owner's ORS result path, after proving each one
+                // answers the exact retained record the drain projected.
+                #[cfg(windows)]
+                {
+                    if payload.as_object().is_none_or(|object| object.len() != 1) {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    let result =
+                        host_request_route::watchdog_export_result_from_payload(&payload)?;
+                    let projections = self.record_watchdog_export_outcomes(session, &result)?;
+                    Ok(host_request_route::watchdog_export_result_response(
+                        &projections,
+                    ))
                 }
                 #[cfg(not(windows))]
                 {
