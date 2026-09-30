@@ -2427,16 +2427,15 @@ impl KernelStoreGateway {
         // Only the edges this row has not already taken are walked. A record
         // that already reached `Routed` proves the possible effect durably, and
         // this contour never moves a row backward out of it.
-        let mut target = existing.state;
-        for next in [
-            HostRequestState::Admitted,
-            HostRequestState::Routed,
-            HostRequestState::Routed,
-        ] {
-            if target == HostRequestState::Routed {
-                break;
-            }
-            target = next;
+        let missing = match existing.state {
+            HostRequestState::Requested => vec![
+                HostRequestState::Admitted,
+                HostRequestState::Routed,
+            ],
+            HostRequestState::Admitted => vec![HostRequestState::Routed],
+            _ => Vec::new(),
+        };
+        for target in missing {
             match ors.advance_host_request(&operation_id, &obligation.request_digest, target, None) {
                 Ok(Some(_)) => {}
                 Ok(None) => {
@@ -2457,14 +2456,6 @@ impl KernelStoreGateway {
                     ));
                 }
             }
-        }
-        if target != HostRequestState::Routed {
-            return Err(unretained_obligation_reason(
-                obligation,
-                "the retained wake horizon obligation could not reach a durable possible-effect \
-                 state before the schedule owner handoff"
-                    .to_owned(),
-            ));
         }
         Ok(())
     }
