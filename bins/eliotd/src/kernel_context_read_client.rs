@@ -88,13 +88,13 @@ use eliot_context_contracts::{
     AdmissionDisposition, AdmissionInput, AdmissionMeasurement, AdmissionRuleIdentity,
     AdmittedContextSet, CONTEXT_CONTRACT_VERSION, ContextBinding, ContextError, ContextOutcome,
     ContextRecipe, DecisionContextIncomplete, DownstreamHeadroomRequest, DownstreamHeadroomResult,
-HeadroomAllocationLedger, HeadroomDimension, MeasurementCompositionProfile,
+    HeadroomAllocationLedger, HeadroomDimension, MeasurementCompositionProfile,
     PriorityPolicyIdentity, ProviderId, QualityRefusal, QualityScorecard, SafetyFloorIdentity,
     SerializedContextMeasurement, SuppliedOmissionBinding, canonical_render_serializer,
 };
 use eliot_contracts::{
-    ArtifactId, ClockReading, ProductId, RequestId, RequestMetadata, ResourceGeneration,
-    SourceId, StateFence, sha256_hex,
+    ArtifactId, ClockReading, ProductId, RequestId, RequestMetadata, ResourceGeneration, SourceId,
+    StateFence, sha256_hex,
 };
 use eliot_governor::{
     ContextInputsError, ContextReconstructionRequest, GovernorContextInputs,
@@ -103,13 +103,15 @@ use eliot_governor::{
     ROLE_TASK_FRAME, SevenRoleInputs,
 };
 use eliot_kernel_core::module::control_reserve_front_door::ControlReleaseEvidence;
-use eliot_kernel_core::{ControlPermit, FRONT_DOOR_OWNER, FrontDoor};
+use eliot_kernel_core::{ControlPermit, FrontDoor};
 use eliot_learning_contracts::CampaignLearningStateView;
 use eliot_protocol::{
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope, HostRequestInvokeReadPayload,
 };
 use eliot_read::{LocalReadPort, QueryResult, ReadError, ReadService};
-use eliot_runtime_contracts::{CapacityBottleneck, CapacityPermitBinding, frozen_bottleneck_owner_map};
+use eliot_runtime_contracts::{
+    CapacityBottleneck, CapacityPermitBinding, frozen_bottleneck_owner_map,
+};
 use eliot_store_api::{
     CampaignLearningStateViewLookup, CampaignSourceRevisionLookup, CanonicalReadClient,
     EVIDENCE_PACK_MAX_RECORDS, MAX_EXPERIENCE_PAGE_RECORDS, NamedReadOperation, NamedReadRequest,
@@ -1483,6 +1485,13 @@ pub enum PacketHeadroomJoinRefusal {
     /// row but no live owner behind it: the permit that was issued names a
     /// different bottleneck, so it is not a reservation for this dimension. The
     /// issued permit is returned to its owner before this refusal is raised.
+    ///
+    /// Both owner names here are derived, never restated: `required_owner` is
+    /// read out of [`frozen_bottleneck_owner_map`] for `required_bottleneck`,
+    /// and `consulted_owner_ref` is the reference the consulted owner stamped on
+    /// the permit it actually issued. No owner identity is written as a literal
+    /// at any use site, so this variant cannot become a second naming scheme
+    /// alongside the frozen map.
     NotIssuableByOwner {
         /// The demanded dimension.
         dimension: HeadroomDimension,
@@ -1490,8 +1499,9 @@ pub enum PacketHeadroomJoinRefusal {
         required_bottleneck: CapacityBottleneck,
         /// The runtime owner the frozen map names for `required_bottleneck`.
         required_owner: &'static str,
-        /// The runtime owner that was actually consulted.
-        consulted_owner: &'static str,
+        /// The owner reference the consulted owner minted onto the permit it
+        /// actually issued, read from that binding rather than named here.
+        consulted_owner_ref: String,
         /// The bottleneck that owner actually issued, which is never the
         /// required one on this route.
         issued_bottleneck: CapacityBottleneck,
@@ -1539,11 +1549,11 @@ impl std::fmt::Display for PacketHeadroomJoinRefusal {
                 dimension,
                 required_bottleneck,
                 required_owner,
-                consulted_owner,
+                consulted_owner_ref,
                 issued_bottleneck,
             } => write!(
                 formatter,
-                "no live owner for {}: requires {} ({required_owner}), consulted {consulted_owner} issued {}",
+                "no live owner for {}: requires {} ({required_owner}), consulted {consulted_owner_ref} issued {}",
                 dimension.as_contract_str(),
                 required_bottleneck.as_contract_str(),
                 issued_bottleneck.as_contract_str()
@@ -1647,13 +1657,12 @@ impl<'a> PacketHeadroomJoin<'a> {
             // The owner's issuance port takes its clock as a signed reading; a
             // clock this compilation cannot represent is refused against this
             // exact demand rather than wrapped into a negative one.
-            let issued_at = i64::try_from(now_ms).map_err(|_| {
-                PacketHeadroomJoinRefusal::OwnerRefused {
+            let issued_at =
+                i64::try_from(now_ms).map_err(|_| PacketHeadroomJoinRefusal::OwnerRefused {
                     dimension: demand.dimension,
                     bottleneck: required_bottleneck,
                     reason: String::from("observed clock does not fit the owner issuance clock"),
-                }
-            })?;
+                })?;
             let (permit, binding) = owner
                 .issue_permit(&demand.request, owner_generation, issued_at)
                 .map_err(|error| PacketHeadroomJoinRefusal::OwnerRefused {
@@ -1666,12 +1675,20 @@ impl<'a> PacketHeadroomJoin<'a> {
                 // bottleneck, so it is not a reservation for this dimension.
                 // The slot goes back to the owner that issued it; the owner
                 // stays the only party that can release it.
+                //
+                // Both owner names are read, not written: `required_owner` came
+                // out of the frozen owner map above, and the consulted owner is
+                // the reference that owner stamped on the binding it actually
+                // minted. Naming either one from a constant here would create a
+                // second owner-naming scheme and would make the `NoFrozenOwner`
+                // refusal unreachable on this path.
+                let consulted_owner_ref = binding.capacity_owner_ref.clone();
                 drop(permit);
                 return Err(PacketHeadroomJoinRefusal::NotIssuableByOwner {
                     dimension: demand.dimension,
                     required_bottleneck,
                     required_owner,
-                    consulted_owner: FRONT_DOOR_OWNER,
+                    consulted_owner_ref,
                     issued_bottleneck: binding.bottleneck,
                 });
             }
@@ -1781,7 +1798,13 @@ impl<'a> PacketHeadroomJoin<'a> {
 ///
 /// The map is read, never restated: a dimension whose bottleneck has no frozen
 /// row has no owner this join could reach, and is refused as such rather than
-/// resolved to a default owner.
+/// resolved to a default owner. This is the ONLY way this file names the owner
+/// a dimension requires — including the front-door control channel, which is
+/// row zero of the same frozen map — so there is one owner-naming scheme and
+/// [`PacketHeadroomJoinRefusal::NoFrozenOwner`] remains the single, always
+/// reachable refusal that reports "this dimension has no owner name at all".
+/// The owner that was actually consulted is never named here either: it is
+/// identified by the reference it stamped on the permit it minted.
 fn frozen_owner_for(dimension: HeadroomDimension) -> Option<&'static str> {
     let bottleneck = dimension.owner_bottleneck()?;
     frozen_bottleneck_owner_map()
