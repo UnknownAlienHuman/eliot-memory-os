@@ -30,6 +30,30 @@
 //!   [`MaintenanceError`] through [`DaemonError::Maintenance`]; it is never
 //!   stringified into a lifecycle or transport message.
 
+//! # The observed-origin vocabulary and what is still missing from it
+//!
+//! [`MaintenanceTriggerOrigin`] names the five durable occurrences this daemon
+//! can genuinely observe, and each one's `maintenance_trigger` mapping names
+//! the I14.22 origin the Governor evaluator decides with. The map is exhaustive
+//! over the origin enum, so extending either enum is a compile-time event
+//! rather than a silent mislabel.
+//!
+//! Five origins exist; four have a production site that constructs them, and the
+//! fifth — [`MaintenanceTriggerOrigin::DreamerSuggestion`] — does not yet. That
+//! is stated here rather than left for a reader to discover from a match arm:
+//! the origin exists because [`MaintenanceTrigger::Dreamer`] is a real I14.22
+//! member that the improvement funnel already reads, and until this arm no
+//! origin could produce it. The map is now exhaustive over the origins the
+//! documents place there; what is absent is the PRODUCER — the durable record
+//! the Dreamer would publish and a trigger site to read it — and that gap is
+//! measured and named on that method.
+//!
+//! No origin here is a substitute for another. In particular the store-health
+//! poll is [`MaintenanceTriggerOrigin::AdmittedObservation`], a problem/signal
+//! recipe, and it is NOT a Dreamer suggestion and NOT a Watchdog suggestion;
+//! wiring it into the improvement intake would produce a mislabelled candidate,
+//! so it stays out of that path.
+
 #![forbid(unsafe_code)]
 
 use std::sync::Arc;
@@ -95,6 +119,20 @@ pub enum MaintenanceTriggerOrigin {
     /// The activation poll observed no in-flight admitted activation, so no
     /// conflicting interactive work owns the scope.
     IdleTransition,
+    /// The Dreamer published one of its own maintenance suggestions and this
+    /// daemon read that published record through the owner that publishes it
+    /// (issue #1867 W2, I12.24:54, I9.2:11).
+    ///
+    /// This is a separate origin rather than a reuse of
+    /// [`Self::AdmittedObservation`] because the two occurrences are
+    /// different kinds of fact and must never share a label. An admitted
+    /// observation is a problem/signal occurrence this daemon recorded about
+    /// ITSELF; a Dreamer suggestion is a proposal some other owner authored.
+    /// Routing the Dreamer suggestion through the admitted-observation origin
+    /// would name it a Watchdog/Doctor problem RECIPE — the exact
+    /// name-only conflation this enum exists to keep apart — so it gets its
+    /// own member and its own [`MaintenanceTrigger::Dreamer`] arm below.
+    DreamerSuggestion,
 }
 
 impl MaintenanceTriggerOrigin {
@@ -107,6 +145,7 @@ impl MaintenanceTriggerOrigin {
             Self::ColdStartCompletion => "COLD_START_COMPLETION",
             Self::AdmittedObservation => "ADMITTED_OBSERVATION",
             Self::IdleTransition => "IDLE_TRANSITION",
+            Self::DreamerSuggestion => "DREAMER_SUGGESTION",
         }
     }
 
@@ -114,16 +153,131 @@ impl MaintenanceTriggerOrigin {
     ///
     /// `StartupReconciliation` and `IdleTransition` are approved
     /// policy-driven occurrences ("Human-approved idle/scheduled policy"),
-    /// `ColdStartCompletion` is a first-run/onboarding occurrence, and
+    /// `ColdStartCompletion` is a first-run/onboarding occurrence,
     /// `AdmittedObservation` is an admitted problem/signal occurrence
-    /// (Watchdog/Doctor problem recipe). The I14.22 origin enum has no
-    /// finer-grained member than these four, so the mapping is exhaustive.
+    /// (Watchdog/Doctor problem recipe), and `DreamerSuggestion` is an
+    /// occurrence the Dreamer itself proposed. The I14.22 origin enum has no
+    /// finer-grained member than these five, so the mapping is exhaustive
+    /// over this daemon's observed-origin vocabulary.
+    ///
+    /// # `DreamerSuggestion` makes [`MaintenanceTrigger::Dreamer`] producible
+    ///
+    /// [`MaintenanceTrigger::Dreamer`] is documented "Accepted Dreamer
+    /// maintenance plan candidate"
+    /// (`crates/governor/eliot-maintenance/src/lib.rs:194-195`) and the
+    /// improvement funnel already reads it
+    /// (`bins/eliotd/src/improvement_intake_dispatch.rs:1888`,
+    /// `maintenance_trigger_evidence_source`), but before this arm NO origin
+    /// mapped to it: this match named only `Policy`, `Onboarding` and
+    /// `WatchdogProblem`, so `git grep MaintenanceTrigger::Dreamer` returned
+    /// exactly two non-declaration hits — the classifier and
+    /// `maintenance_family_catalog.rs:924`'s origin-name listing — and the
+    /// member was UNPRODUCIBLE from any observation. This arm is the contract
+    /// half of the fix: a trigger site that genuinely reads a published
+    /// Dreamer suggestion now produces a decision whose own `trigger` field
+    /// says so, and the funnel labels it `EvidenceSource::Dreamer` rather
+    /// than mislabelling it a Watchdog occurrence.
+    ///
+    /// # The PRODUCER is still absent, and it is named, not assumed
+    ///
+    /// This arm makes the origin constructible; it does not make anything
+    /// construct it, and nothing constructs it on this base. Measured, so the
+    /// next owner does not re-derive it:
+    ///
+    /// * the owner that produces the record this origin names is
+    ///   `eliot_dreamer_maintenance_plan::propose_maintenance_plan`
+    ///   (`crates/smart/eliot-dreamer-maintenance-plan/src/lib.rs:3256`), whose
+    ///   `MaintenancePlanCandidate` (`:1004`) is the typed candidate
+    ///   [`MaintenanceTrigger::Dreamer`] documents. It is a pure
+    ///   candidate-only zero-effect cell — its own header states it contains
+    ///   "no persistence, identifier allocation, ... authority, effect, or
+    ///   terminal-completion calls by construction" — and it has ZERO
+    ///   production call sites anywhere in the workspace.
+    /// * its Governor-owned plan inputs (`MaintenanceObjective`,
+    ///   `TriggerEvidence`, `BudgetSlice`, `MaintenancePolicy`, `PriorHistory`)
+    ///   are published by no owner to this daemon and are not constructible
+    ///   from admitted binary material. That absence is ALREADY recorded, by
+    ///   this daemon's own catalog, as
+    ///   `crate::maintenance_family_catalog::MaintenanceAdmissionBlocker::MaintenanceJobWire`
+    ///   (`maintenance_family_catalog.rs:462`, stated at `:476-478`), so this
+    ///   arm does not restate a guess: it names the same publication gap from
+    ///   the origin side.
+    /// * no Dreamer instance is staffed on this base:
+    ///   `staffing_policy.rs:511-521` gives every `dreamer_route_classes` entry
+    ///   an explicit defer disposition reading "dreamer route class is
+    ///   non-executing on this base", so there is no Dreamer producing
+    ///   suggestions to read in the first place.
+    /// * the three daemon-side Dreamer lanes that would consume such a record
+    ///   each have zero production call sites:
+    ///   `dreamer_admission.rs:176::GovernorDreamerAdapter::submit_orientation`
+    ///   (the `eliot.kernel.dreamer-job` K2 route),
+    ///   `experience_runtime.rs:775::run_experience_quality_event_with_revision`
+    ///   (the Dreamer memory-revision `propose`), and
+    ///   `negative_memory_action_gate.rs:677::commit_gated_action` (the
+    ///   Dreamer negative-memory rule gate). Nothing in
+    ///   `experience_runtime.rs`/`negative_memory_action_gate.rs`/`dreamer_*`
+    ///   is reached from `daemon_runtime`'s live loop.
+    /// * the Dreamer binary's own publication is one stdout line:
+    ///   `result_stage.rs:72::emit_jsonl_stdout` renders the `DreamResult`
+    ///   (including the `CurationProductPulse`) as JSONL, and no durable owner
+    ///   reads it back.
+    ///
+    /// So the exact remaining step is a daemon trigger site that reads a
+    /// PUBLISHED `MaintenancePlanCandidate` and names
+    /// [`MaintenanceFamily::DreamerCuration`] — the one registered family whose
+    /// own obligation is not an I12.24 source in its own right and whose
+    /// catalog entry already lists `Dreamer` among its registered origins
+    /// (`maintenance_family_catalog.rs:1388`) — together with the Dreamer's own
+    /// suggestion refs in `MaintenanceObservation::evidence_refs`. Until that
+    /// record exists, this arm changes nothing this daemon records, which is
+    /// the fail-closed direction: an absent Dreamer suggestion produces no
+    /// candidate rather than a fabricated one.
+    ///
+    /// # A second gap the producer must ALSO close, measured here
+    ///
+    /// Passing the Dreamer's own suggestion refs into
+    /// [`MaintenanceObservation::evidence_refs`] is necessary but NOT
+    /// sufficient, because the decision this arm produces does not carry them
+    /// forward. [`AutomationTriggerDecision`] has no `evidence_refs` field
+    /// (`crates/governor/eliot-maintenance/src/lib.rs:317-346`) — the evaluator
+    /// validates `input.evidence_refs` for non-emptiness and uniqueness
+    /// (`:300-301`) and then drops it. The trigger identity is not a substitute
+    /// either: `maintenance_family_catalog::MaintenanceDedupScope::dedup_key`
+    /// renders `"{scope}:{origin}:{family}:{scope_ref}@{generation}"`
+    /// (`:212-219`), so the Dreamer record's own identity is absent from it. Those
+    /// refs therefore reach exactly one place — the catalog's per-family record,
+    /// as `MaintenanceObservedEvidence::observed_refs`
+    /// (`maintenance_family_catalog.rs:254-258`, bound at `:1120`).
+    ///
+    /// The improvement funnel does not read that record. Its candidate lineage is
+    /// built from the DECISION's own fields only:
+    /// `improvement_intake_dispatch::maintenance_evidence_refs` returns exactly
+    /// `[maintenance-trigger:{trigger_id}, maintenance-scope:{scope_ref}]`
+    /// (`:1037-1044`). So a Dreamer suggestion that DID reach the intake would be
+    /// labelled `EvidenceSource::Dreamer` correctly and would still cite none of
+    /// its own evidence — the same "a candidate labelled a source it cannot cite"
+    /// failure this origin exists to avoid. Closing that is a change in
+    /// `improvement_intake_dispatch.rs` and, if the decision itself must carry
+    /// the refs, in `eliot-maintenance`'s `AutomationTriggerDecision`. Neither is
+    /// this file's, and neither is silently assumed here.
+    ///
+    /// `ASSUMPTION:` I9.2 is a list of Dreamer RESPONSIBILITIES and names no
+    /// store, no record kind and no publication point ("system-maintenance and
+    /// configuration-plan candidates", `I09-02-dreamer-service-responsibilities.md:11`),
+    /// and `crates/governor/eliot-maintenance/module.toml` does not exist on
+    /// this tree (no `module.toml` exists under `crates/governor/` at all). So
+    /// "where a Dreamer suggestion is published" is answered by the OWNER THAT
+    /// WRITES THE RECORD — `propose_maintenance_plan` and its
+    /// `MaintenancePlanCandidate` — and by `MaintenanceTrigger::Dreamer`'s own
+    /// "Accepted Dreamer maintenance plan candidate" doc, not by a document
+    /// sentence that states a publication site.
     #[must_use]
     const fn maintenance_trigger(self) -> MaintenanceTrigger {
         match self {
             Self::StartupReconciliation | Self::IdleTransition => MaintenanceTrigger::Policy,
             Self::ColdStartCompletion => MaintenanceTrigger::Onboarding,
             Self::AdmittedObservation => MaintenanceTrigger::WatchdogProblem,
+            Self::DreamerSuggestion => MaintenanceTrigger::Dreamer,
         }
     }
 }
@@ -151,6 +305,15 @@ pub struct MaintenanceObservation {
     /// Must be non-empty and duplicate-free: the evaluator rejects an empty
     /// evidence set, so a trigger with no observed evidence fails closed
     /// instead of being treated as maintenance-relevant.
+    ///
+    /// For [`MaintenanceTriggerOrigin::DreamerSuggestion`] these ARE the
+    /// Dreamer's own suggestion refs — the published record's identity and
+    /// digest — and nothing else may stand in for them. Note the measured limit
+    /// on what they can prove: the decision does not carry them past the
+    /// evaluator, so they reach the per-family catalog record and not the
+    /// improvement candidate's lineage;
+    /// see `MaintenanceTriggerOrigin::maintenance_trigger` for the exact
+    /// boundary and the two files that have to change to widen it.
     pub evidence_refs: Vec<String>,
     /// Whether an admitted activation is in flight right now.
     pub activation_in_flight: bool,
