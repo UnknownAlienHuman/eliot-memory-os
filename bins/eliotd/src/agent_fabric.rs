@@ -1198,6 +1198,13 @@ pub enum AdmittedOpenCodeAttemptProjectionError {
     /// The selected route is not the route stored by the coordinator.
     #[error("selected route differs from the original coordinator attempt")]
     RouteMismatch,
+    /// The coordination owner's issued lease differs from the lease stored
+    /// by the original coordinator admission.
+    #[error("owner-issued work lease differs from the original coordinator attempt")]
+    LeaseMismatch,
+    /// The original coordinator attempt is not bound to the current fence.
+    #[error("original coordinator attempt differs from the current state fence")]
+    FenceMismatch,
     /// The original coordinator attempt has no owner-recorded execution binding.
     #[error("original coordinator attempt has no owner-recorded provider binding")]
     MissingProviderBinding,
@@ -1968,6 +1975,7 @@ impl AgentFabric {
     pub fn admitted_open_code_attempt(
         &self,
         attempt_id: &AttemptId,
+        coordinator_lease: &eliot_agent_api::WorkLeaseId,
         selected_route: &RouteFingerprint,
         model: ModelSelection,
         current_fence: &StateFence,
@@ -1978,6 +1986,12 @@ impl AgentFabric {
             .ok_or(AdmittedOpenCodeAttemptProjectionError::UnknownAttempt)?;
         if record.route != *selected_route {
             return Err(AdmittedOpenCodeAttemptProjectionError::RouteMismatch);
+        }
+        if record.lease_id != *coordinator_lease {
+            return Err(AdmittedOpenCodeAttemptProjectionError::LeaseMismatch);
+        }
+        if record.state_fence != *current_fence {
+            return Err(AdmittedOpenCodeAttemptProjectionError::FenceMismatch);
         }
         let route_receipt = record.admitted_route.clone();
         let binding = record
@@ -1994,6 +2008,18 @@ impl AgentFabric {
             current_fence,
             runtime_generation,
         )?)
+    }
+
+    /// Submits an original Governor-issued provider admission to the sealed
+    /// coordinator verifier. This is an admission consumer: it does not mint
+    /// the receipt or any of its route, lease, attempt, or provider evidence.
+    pub fn admit_provider_admission(
+        &mut self,
+        receipt: eliot_agent_coordinator::ProviderAdmissionReceipt,
+    ) -> Result<eliot_agent_coordinator::ProviderAdmissionReceipt, FabricError> {
+        let accepted = self.coordinator.admit(receipt)?;
+        self.record("provider_admission_accepted", accepted.admission_id.as_str());
+        Ok(accepted)
     }
 
     /// Returns the ordered call ledger.
