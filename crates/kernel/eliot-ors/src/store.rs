@@ -1463,6 +1463,12 @@ impl BridgeEventHandoffReconcileComplete {
     }
 }
 
+/// One bounded retirement page: the contiguous terminal-eligible prefix
+/// (issue #2885, item 6) examined in sequence order. `continuation` means
+/// more indexed positions remain behind the page end or behind the
+/// blocker that stopped the prefix; `after_sequence` is the last
+/// examined position, so the next bounded entry re-meets the same
+/// blocker instead of skipping past it.
 struct BridgeRetirementPage {
     eligible: Vec<(u64, String, BridgeEventHandoffRow)>,
     continuation: bool,
@@ -1604,6 +1610,15 @@ struct BridgeEventCursorRow {
     /// terminal or retired.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     handoff_reconcile_complete: Option<BridgeEventHandoffReconcileComplete>,
+    /// Bounded restart-safe position-prefix drain progress (issue #2885,
+    /// items 6-7). Covers only positions at or below the compacted
+    /// boundary whose event record and handoff are both gone; the
+    /// deletions are the durable progress and this cursor is the exact
+    /// resume point with the expected owner revision/incarnation and
+    /// recovery view. Volatile scan metadata like the handoff scans
+    /// above: it never changes event identity or any frontier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    position_drain_scan: Option<BridgeEventHandoffScanCursor>,
 }
 
 impl BridgeEventCursorRow {
@@ -1631,6 +1646,7 @@ impl BridgeEventCursorRow {
             self.handoff_repair_scan.as_ref(),
             self.handoff_retirement_scan.as_ref(),
             self.handoff_reconcile_scan.as_ref(),
+            self.position_drain_scan.as_ref(),
         ]
         .into_iter()
         .flatten()
@@ -12501,6 +12517,9 @@ impl RedbRecoveryStore {
             handoff_retirement_scan: None,
             handoff_reconcile_scan: None,
             handoff_reconcile_complete: None,
+            // Legacy rows stay ownerless, so the owner-bound drain
+            // continuation is never present here.
+            position_drain_scan: None,
         };
         cursor.validate()?;
         {
@@ -12549,6 +12568,9 @@ impl RedbRecoveryStore {
             handoff_retirement_scan: None,
             handoff_reconcile_scan: None,
             handoff_reconcile_complete: None,
+            // Legacy rows stay ownerless, so the owner-bound drain
+            // continuation is never present here.
+            position_drain_scan: None,
         };
         cursor.validate()?;
         let mut cursors = write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
@@ -14571,6 +14593,7 @@ impl RedbRecoveryStore {
         fields.remove("handoff_retirement_scan");
         fields.remove("handoff_reconcile_scan");
         fields.remove("handoff_reconcile_complete");
+        fields.remove("position_drain_scan");
         let stable = serde_json::to_string(&stable)
             .map_err(|error| OrsError::Encoding(error.to_string()))?;
         let full_bytes = u64::try_from(encoded.len()).map_err(|_| OrsError::PayloadTooLarge)?;
@@ -15630,6 +15653,9 @@ impl RedbRecoveryStore {
             handoff_reconcile_complete: prior
                 .as_ref()
                 .and_then(|row| row.handoff_reconcile_complete.clone()),
+            position_drain_scan: prior
+                .as_ref()
+                .and_then(|row| row.position_drain_scan.clone()),
         };
         cursor.validate()?;
         {
@@ -15695,6 +15721,9 @@ impl RedbRecoveryStore {
             handoff_reconcile_complete: prior
                 .as_ref()
                 .and_then(|row| row.handoff_reconcile_complete.clone()),
+            position_drain_scan: prior
+                .as_ref()
+                .and_then(|row| row.position_drain_scan.clone()),
         };
         cursor.validate()?;
         let mut cursors = write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
@@ -15760,6 +15789,9 @@ impl RedbRecoveryStore {
             handoff_reconcile_complete: prior
                 .as_ref()
                 .and_then(|row| row.handoff_reconcile_complete.clone()),
+            position_drain_scan: prior
+                .as_ref()
+                .and_then(|row| row.position_drain_scan.clone()),
         };
         cursor.validate()?;
         let mut cursors = write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
@@ -16271,6 +16303,7 @@ impl RedbRecoveryStore {
             handoff_retirement_scan: row.handoff_retirement_scan.clone(),
             handoff_reconcile_scan: row.handoff_reconcile_scan.clone(),
             handoff_reconcile_complete: row.handoff_reconcile_complete.clone(),
+            position_drain_scan: row.position_drain_scan.clone(),
         };
         next.validate()?;
         let mut cursors = write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
@@ -19162,24 +19195,41 @@ impl RedbRecoveryStore {
         }))
     }
 
-    /// Collects terminal-eligible handoffs from one bounded position page.
-    /// The current producer reconcile tuple is not receiver evidence, so no
-    /// present row is eligible. Source/projection joins still run before a
-    /// row could enter a future terminalization path.
+    /// Collects terminal-eligible handoffs as one contiguous prefix over a
+    /// bounded position page (issues #2731 item 5 and #2885 item 6).
+    /// Positions are examined in sequence order from just above the
+    /// compacted boundary; the first gap-covered, unknown-handoff,
+    /// nonterminal, or missing position stops the range instead of being
+    /// skipped to free space, and torn bindings fail closed. The current
+    /// producer reconcile tuple is not receiver evidence, so no present
+    /// row is eligible. Source/projection joins still run before a row
+    /// could enter a future terminalization path. `gaps` carries this
+    /// namespace's scoped coverage intervals loaded once by the caller,
+    /// so the page never scans the gap table per candidate.
     fn bridge_retire_eligible_in(
         write: &redb::WriteTransaction,
         access: &BridgeStreamAccess,
         owner: &BridgeStreamOwnerRow,
         cursor: &BridgeEventCursorRow,
         scan: &BridgeEventHandoffScanCursor,
+        gaps: &[(u64, u64)],
         budget: usize,
     ) -> Result<BridgeRetirementPage, OrsError> {
-        let (positions, continuation) =
+        let (positions, page_continuation) =
             Self::bridge_handoff_position_page_in(write, access, scan, budget)?;
-        let after_sequence = positions.last().map(|(sequence, _)| *sequence);
         let mut eligible: Vec<(u64, String, BridgeEventHandoffRow)> = Vec::new();
+        // The next expected position in the contiguous run: a hole with no
+        // index row is unexplained coverage and stops the prefix. The
+        // scan starts above the compacted boundary, so certified drained
+        // history never presents as a hole here.
+        let mut expected = scan.after_sequence.saturating_add(1);
+        let mut stopped = false;
         let handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
         for (sequence, event_id) in positions {
+            if sequence != expected || Self::bridge_sequence_gap_covered(gaps, sequence) {
+                stopped = true;
+                break;
+            }
             let Some(record) = Self::bridge_event_record_for_maintenance_position_in(
                 write,
                 owner,
@@ -19188,35 +19238,19 @@ impl RedbRecoveryStore {
                 cursor.last_compacted_sequence,
             )?
             else {
-                let key = format!("{}::{event_id}", access.namespace);
-                let handoff = handoffs
-                    .get(key.as_str())
-                    .map_err(storage)?
-                    .map(|value| decode::<BridgeEventHandoffRow>(value.value()))
-                    .transpose()?;
-                if let Some(handoff) = handoff {
-                    handoff.validate()?;
-                    if handoff.owner_namespace != access.namespace
-                        || handoff.stream_id != owner.local_stream
-                        || handoff.event_id != event_id
-                        || handoff.sequence != sequence
-                    {
-                        return Err(OrsError::IntegrityProblem {
-                            record_type: "bridge_event_handoff",
-                            reason: "handoff does not bind its retained owner position".to_owned(),
-                        });
-                    }
-                    return Err(OrsError::IntegrityProblem {
-                        record_type: "bridge_event_handoff",
-                        reason: "retained handoff has no retained source or terminal disposition"
-                            .to_owned(),
-                    });
-                }
-                continue;
+                // Certified history whose source is gone belongs to the
+                // position drain, not to this prefix: stop without
+                // skipping it.
+                stopped = true;
+                break;
             };
             let key = format!("{}::{}", access.namespace, event_id);
             let Some(value) = handoffs.get(key.as_str()).map_err(storage)? else {
-                continue;
+                // An unknown handoff stops the range: the delivery
+                // obligation may still exist and repair owns rebuilding
+                // it on a later entry.
+                stopped = true;
+                break;
             };
             let row: BridgeEventHandoffRow = decode(value.value())?;
             row.validate()?;
@@ -19233,29 +19267,224 @@ impl RedbRecoveryStore {
                         .to_owned(),
                 });
             }
-            if row.retirement_eligible() {
-                eligible.push((row.sequence, key, row));
+            if !row.retirement_eligible() {
+                // A nonterminal event stops the range: later positions
+                // are never terminalized past it.
+                stopped = true;
+                break;
             }
+            expected = sequence.saturating_add(1);
+            eligible.push((row.sequence, key, row));
         }
+        // Resume at the last eligible position so the next bounded entry
+        // re-meets the same blocker; when nothing was eligible the scan
+        // start is kept unchanged.
+        let after_sequence = eligible
+            .last()
+            .map(|(sequence, _, _)| *sequence)
+            .or(Some(scan.after_sequence));
         Ok(BridgeRetirementPage {
             eligible,
-            continuation,
+            continuation: stopped || page_continuation,
             after_sequence,
         })
     }
 
+    /// Loads this namespace's scoped gap intervals in key order (issue
+    /// #2885, item 6): at most [`MAX_BRIDGE_EVENT_GAPS_PER_STREAM`] rows,
+    /// each validated and key-bound exactly like the recovery-cut gap
+    /// enumeration, so one maintenance entry performs one bounded gap
+    /// pass instead of scanning the gap table per position candidate.
+    fn bridge_scoped_gap_intervals_in(
+        write: &redb::WriteTransaction,
+        access: &BridgeStreamAccess,
+    ) -> Result<Vec<(u64, u64)>, OrsError> {
+        let prefix = format!("{}::", access.namespace);
+        let end = format!("{prefix}\u{10ffff}");
+        let gaps = write.open_table(BRIDGE_EVENT_GAPS).map_err(storage)?;
+        let mut intervals = Vec::new();
+        for entry in gaps
+            .range(prefix.as_str()..=end.as_str())
+            .map_err(storage)?
+        {
+            let (key, value) = entry.map_err(storage)?;
+            let gap: BridgeEventGapRow = decode(value.value())?;
+            gap.validate()?;
+            if gap.owner_namespace != access.namespace
+                || key.value() != format!("{}::{}", access.namespace, gap.gap_id)
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_event_gap",
+                    reason: "gap key or owner does not match its indexed scope".to_owned(),
+                });
+            }
+            if gap.stream_id.is_empty() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_event_gap",
+                    reason: "stream gap scope carries no stream identity".to_owned(),
+                });
+            }
+            if intervals.len() >= MAX_BRIDGE_EVENT_GAPS_PER_STREAM {
+                return Err(OrsError::ProjectionLimitExceeded);
+            }
+            intervals.push((gap.start_sequence, gap.end_sequence));
+        }
+        Ok(intervals)
+    }
+
+    /// Reports whether one sequence falls inside any scoped gap interval.
+    /// Pure interval membership over the caller's loaded intervals: no
+    /// table access, no allocation.
+    fn bridge_sequence_gap_covered(intervals: &[(u64, u64)], sequence: u64) -> bool {
+        intervals
+            .iter()
+            .any(|(start, end)| *start <= sequence && sequence <= *end)
+    }
+
+    /// Drains one bounded slice of the certified position prefix (issue
+    /// #2885, items 6-7): positions at or below the compacted boundary
+    /// whose event record and handoff are both gone. Only the contiguous
+    /// certified prefix drains: the first position that still binds a
+    /// record, a handoff, or a hole in the expected run stops the slice
+    /// instead of being skipped, so no payload, pending delivery
+    /// obligation, or forensic conflict is silently erased. Work per entry
+    /// is one key-ordered range seek plus at most `budget` direct probes
+    /// and deletes — never a lifetime-table scan. The persisted
+    /// `position_drain_scan` carries the exact resume point with the
+    /// expected owner revision/incarnation and recovery view; a view
+    /// change from another writer restarts the slice at the certified
+    /// prefix start, which only ever moves forward because the deletions
+    /// are the durable progress. The drain removes only history every
+    /// other scan already treats as skippable, so it never bumps the
+    /// recovery revision itself: repair, retirement, and reconcile
+    /// progress stay valid while a long drain converges (issue #2885,
+    /// acceptance: maintenance remains available under normal load).
+    /// Returns the drained count and whether certified positions remain.
+    fn drain_bridge_positions_in(
+        write: &redb::WriteTransaction,
+        access: &BridgeStreamAccess,
+        owner: &BridgeStreamOwnerRow,
+        cursor: &mut BridgeEventCursorRow,
+        recovery_revision: u64,
+        budget: usize,
+    ) -> Result<(u64, bool), OrsError> {
+        access.require(BridgeStreamRight::Acknowledge)?;
+        let compacted = cursor.last_compacted_sequence;
+        let after = cursor
+            .position_drain_scan
+            .as_ref()
+            .filter(|scan| {
+                scan.owner_revision == owner.revision
+                    && scan.owner_incarnation == owner.incarnation
+                    && scan.recovery_revision == recovery_revision
+            })
+            .map_or(0, |scan| scan.after_sequence);
+        if compacted == 0 || after >= compacted {
+            cursor.position_drain_scan = None;
+            return Ok((0, false));
+        }
+        let start = Self::bridge_position_key(&access.namespace, after);
+        let end = Self::bridge_position_key(&access.namespace, compacted);
+        let positions = write.open_table(BRIDGE_EVENT_POSITIONS).map_err(storage)?;
+        let mut page: Vec<(u64, String)> = Vec::new();
+        let mut lookahead = false;
+        for entry in positions
+            .range::<&str>((
+                Bound::Excluded(start.as_str()),
+                Bound::Included(end.as_str()),
+            ))
+            .map_err(storage)?
+            .take(budget.saturating_add(1))
+        {
+            let (key, value) = entry.map_err(storage)?;
+            if page.len() == budget {
+                lookahead = true;
+                break;
+            }
+            let (namespace, sequence) = Self::parse_bridge_position_key(key.value())?;
+            if namespace != access.namespace
+                || key.value() != Self::bridge_position_key(&namespace, sequence)
+                || sequence <= after
+                || sequence > compacted
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_event_position",
+                    reason: "position drain escaped its certified owner range".to_owned(),
+                });
+            }
+            let position: BridgeEventPosition = decode(value.value())?;
+            position.validate()?;
+            page.push((sequence, position.event_id));
+        }
+        drop(positions);
+        let mut drained = 0_u64;
+        let mut resume = after;
+        let mut stopped = false;
+        {
+            let records = write.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
+            let handoffs = write.open_table(BRIDGE_EVENT_HANDOFFS).map_err(storage)?;
+            let mut positions = write
+                .open_table(BRIDGE_EVENT_POSITIONS)
+                .map_err(storage)?;
+            for (sequence, event_id) in &page {
+                // Contiguity first: a hole inside the certified prefix is
+                // unexplained coverage — stop, never skip it.
+                if *sequence != resume.saturating_add(1) {
+                    stopped = true;
+                    break;
+                }
+                let key = format!("{}::{event_id}", access.namespace);
+                // Completeness is proved against the independent record
+                // and handoff tables: any remaining evidence stops the
+                // slice, so a live row is never orphaned from its index.
+                if records.get(key.as_str()).map_err(storage)?.is_some()
+                    || handoffs.get(key.as_str()).map_err(storage)?.is_some()
+                {
+                    stopped = true;
+                    break;
+                }
+                positions
+                    .remove(
+                        Self::bridge_position_key(&access.namespace, *sequence).as_str(),
+                    )
+                    .map_err(storage)?;
+                resume = *sequence;
+                drained += 1;
+            }
+        }
+        let continuation = stopped || lookahead;
+        cursor.position_drain_scan = if continuation {
+            Some(BridgeEventHandoffScanCursor {
+                owner_revision: owner.revision,
+                owner_incarnation: owner.incarnation,
+                recovery_revision,
+                after_sequence: resume,
+                upper_sequence: compacted,
+            })
+        } else {
+            None
+        };
+        Ok((drained, continuation))
+    }
+
     /// Retires one namespace's handoffs inside the recovery transaction
-    /// (issue #2731, items 4 and 5). Eligibility is evaluated per row by
-    /// [`BridgeEventHandoffRow::retirement_eligible`]. The stored reconcile
-    /// tuple is producer-presented frontier/owner data, not a receiving-owner
-    /// receipt or admitted terminal disposition; therefore no current row is
-    /// eligible. Pending payloads and handoffs, replay commitments, and
-    /// cursors remain untouched. In the result,
-    /// `retirement_continuation` means additional indexed positions remain to
-    /// scan for this owner; it does not assert that any row is eligible or
-    /// that there are no unresolved handoffs. Admission at the existing
-    /// handoff capacity continues to return typed pending-handoff
-    /// backpressure instead of evicting them.
+    /// (issue #2731, items 4 and 5) over a contiguous eligible prefix
+    /// (issue #2885, item 6). Eligibility is evaluated per row by
+    /// [`BridgeEventHandoffRow::retirement_eligible`], and the first
+    /// gap-covered, unknown-handoff, nonterminal, or missing position
+    /// stops the prefix instead of being skipped to free space. The
+    /// stored reconcile tuple is producer-presented frontier/owner data,
+    /// not a receiving-owner receipt or admitted terminal disposition;
+    /// therefore no current row is eligible. Pending payloads and
+    /// handoffs, replay commitments, and cursors remain untouched. In
+    /// the result, `retirement_continuation` means additional indexed
+    /// positions remain to scan for this owner — behind the page end or
+    /// behind the blocker that stopped the prefix; it does not assert
+    /// that any row is eligible or that there are no unresolved
+    /// handoffs. `position_drained`/`position_drain_continuation` report
+    /// the bounded certified-prefix drain in the same entry. Admission
+    /// at the existing handoff capacity continues to return typed
+    /// pending-handoff backpressure instead of evicting them.
     #[allow(
         clippy::too_many_lines,
         reason = "The owner-bound retirement proof, payload/projection mutation, and cursor update must remain one atomic write-transaction flow."
@@ -19294,33 +19523,37 @@ impl RedbRecoveryStore {
         let acked = cursor.last_acked_sequence;
         let compacted = cursor.last_compacted_sequence;
         let recovery_revision = Self::bridge_recovery_revision_for_in(write, namespace)?;
-        let Some(scan) = Self::bridge_handoff_scan_for(
+        // Floor the retirement scan at the certified compacted boundary
+        // (issue #2885, item 7): compacted history belongs to the
+        // position drain, so one entry never re-walks the lifetime
+        // prefix to reach the unretired window.
+        let scan = Self::bridge_handoff_scan_for(
             cursor.handoff_retirement_scan.as_ref(),
             &owner,
             recovery_revision,
             cursor.last_observed_sequence,
-        ) else {
-            cursor.handoff_retirement_scan = None;
-            cursor.validate()?;
-            let mut cursors = write.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
-            cursors
-                .insert(namespace, encode(&cursor)?.as_str())
-                .map_err(storage)?;
-            drop(cursors);
-            let scan_bytes = Self::bridge_handoff_scan_bytes_in(write, namespace)?;
-            return Ok(json!({
-                "namespace": access.namespace,
-                "retired": 0_u64,
-                "terminalized": 0_u64,
-                "retirement_continuation": false,
-                "handoff_scan_bytes": scan_bytes,
-            }));
+        )
+        .map(|mut scan| {
+            if scan.after_sequence < compacted {
+                scan.after_sequence = compacted;
+            }
+            scan
+        })
+        .filter(|scan| scan.after_sequence < scan.upper_sequence);
+        let (eligible, retirement_continuation, eligible_after) = match &scan {
+            Some(scan) => {
+                let gaps = Self::bridge_scoped_gap_intervals_in(write, &access)?;
+                let BridgeRetirementPage {
+                    eligible,
+                    continuation,
+                    after_sequence,
+                } = Self::bridge_retire_eligible_in(
+                    write, &access, &owner, &cursor, scan, &gaps, budget,
+                )?;
+                (eligible, continuation, after_sequence)
+            }
+            None => (Vec::new(), false, None),
         };
-        let BridgeRetirementPage {
-            eligible,
-            continuation,
-            after_sequence,
-        } = Self::bridge_retire_eligible_in(write, &access, &owner, &cursor, &scan, budget)?;
         let now_ms = current_unix_ms_u64()?;
         let retired = 0_u64;
         let mut terminalized = 0_u64;
@@ -19393,21 +19626,44 @@ impl RedbRecoveryStore {
             )?;
             cursor.last_compacted_sequence = terminalized_boundary;
         }
-        let mut next_scan = if continuation {
+        let mut next_scan = if retirement_continuation {
+            let scan = scan.as_ref().ok_or(OrsError::IntegrityProblem {
+                record_type: "bridge_event_position",
+                reason: "bounded retirement continuation has no active scan".to_owned(),
+            })?;
             Some(BridgeEventHandoffScanCursor {
-                after_sequence: after_sequence.ok_or(OrsError::IntegrityProblem {
+                owner_revision: scan.owner_revision,
+                owner_incarnation: scan.owner_incarnation,
+                recovery_revision: scan.recovery_revision,
+                after_sequence: eligible_after.ok_or(OrsError::IntegrityProblem {
                     record_type: "bridge_event_position",
                     reason: "bounded retirement continuation has no processed position".to_owned(),
                 })?,
-                ..scan
+                upper_sequence: scan.upper_sequence,
             })
         } else {
             None
         };
+        // Drain the certified position prefix in the same entry (issue
+        // #2885, items 6-7): one bounded slice under the same owner
+        // revision/incarnation check, so the live position window keeps
+        // draining while the prefix stays blocked on its first gap,
+        // unknown handoff, or nonterminal event.
+        let (position_drained, position_drain_continuation) = Self::drain_bridge_positions_in(
+            write,
+            &access,
+            &owner,
+            &mut cursor,
+            recovery_revision,
+            budget,
+        )?;
         if terminalized > 0 {
             let updated_revision =
                 Self::bump_bridge_recovery_revision_in(write, &access.namespace)?;
             if let Some(scan) = &mut next_scan {
+                scan.recovery_revision = updated_revision;
+            }
+            if let Some(scan) = &mut cursor.position_drain_scan {
                 scan.recovery_revision = updated_revision;
             }
             cursor.handoff_repair_scan = None;
@@ -19437,7 +19693,9 @@ impl RedbRecoveryStore {
             "namespace": access.namespace,
             "retired": retired,
             "terminalized": terminalized,
-            "retirement_continuation": continuation,
+            "retirement_continuation": retirement_continuation,
+            "position_drained": position_drained,
+            "position_drain_continuation": position_drain_continuation,
             "handoff_scan_bytes": scan_bytes,
         }))
     }
