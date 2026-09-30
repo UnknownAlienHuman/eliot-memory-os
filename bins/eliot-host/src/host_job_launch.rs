@@ -312,6 +312,12 @@ pub(super) struct StoreEndpointOwnershipBinding<'a> {
 /// Observes the planned Store endpoint and refuses launch when it is occupied
 /// by anything this installation has not proven it owns.
 ///
+/// This is the fresh-start posture: the caller carries no retained child, so
+/// a collision records [`AdmittedCollisionOperation::FreshDependencyStart`].
+/// Owned-reconnect callers that proved a retained owned child must use
+/// [`ensure_store_endpoint_available_or_owned`] instead, so the directive
+/// records [`AdmittedCollisionOperation::OwnedReconnect`].
+///
 /// The listener owner PID is observation data only; it does not prove that the
 /// process is part of this installation. The returned directive preserves that
 /// boundary and authorizes no termination, adoption, reuse, or credential
@@ -346,6 +352,19 @@ pub(super) fn ensure_store_endpoint_available_or_owned(
         host_launch_observe("host.launch store endpoint configuration rejected");
     })?;
 
+    // Issue #1775: the directive records the operation this caller actually
+    // attempted. A caller that proved a retained owned child is attempting an
+    // owned reconnect on that proof; a caller with no retained child is
+    // attempting a fresh start. Recording the wrong operation would let a
+    // proof obtained for one class be read as permission for another (I3.4),
+    // so the posture is bound here from the caller's own proof, never
+    // defaulted inside the directive.
+    let admitted_operation = if retained_old_child_pid.is_some() {
+        AdmittedCollisionOperation::OwnedReconnect
+    } else {
+        AdmittedCollisionOperation::FreshDependencyStart
+    };
+
     match store_endpoint_foreign_occupant(endpoint) {
         StoreEndpointObservation::Occupied { owner_process_id }
             if Some(owner_process_id) == retained_old_child_pid =>
@@ -366,6 +385,8 @@ pub(super) fn ensure_store_endpoint_available_or_owned(
             // port or endpoint response can never establish control. I3.3
             // admits only inspection/import or a separately admitted alternate
             // endpoint, so the next-action set is read-only by construction.
+            // The directive is bound to the operation this caller attempted
+            // (`admitted_operation` above), never a defaulted one.
             //
             // The occupant is left RUNNING. Nothing here terminates, kills,
             // authenticates against, adopts, reuses or migrates from it.
@@ -374,6 +395,7 @@ pub(super) fn ensure_store_endpoint_available_or_owned(
                     endpoint,
                     Some(owner_process_id),
                     retained_old_child_pid,
+                    admitted_operation,
                     binding,
                 )?,
             )))
@@ -403,8 +425,9 @@ pub(super) fn ensure_store_endpoint_available_or_owned(
 /// back from the approved launch descriptor, the observed owner process ID
 /// (or `None` when the owner could not be read), the retained owned child PID
 /// the caller proved through Job membership and committed predecessor binding,
-/// the managed generation from the approved descriptor, and the installation's
-/// own authority state fence.
+/// the operation that caller attempted on that proof, the managed generation
+/// from the approved descriptor, and the installation's own authority state
+/// fence.
 ///
 /// The result is a directive, never an effect: it names the blocked control
 /// operations, the exact missing ownership evidence and the one safe next
@@ -414,6 +437,7 @@ fn store_endpoint_collision_directive(
     endpoint: std::net::SocketAddr,
     observed_owner_process_id: Option<u32>,
     retained_owned_process_id: Option<u32>,
+    admitted_operation: AdmittedCollisionOperation,
     binding: &StoreEndpointOwnershipBinding<'_>,
 ) -> Result<ForeignOccupantRecoveryDirective, HostError> {
     let observed_at_unix_ms = std::time::SystemTime::now()
@@ -464,12 +488,15 @@ fn store_endpoint_collision_directive(
     // never silently become exclusive ownership. I3.3 admits only
     // read-only inspection or a separately admitted alternate endpoint, so the
     // permitted set is read-only by construction and `admit` is the only
-    // conversion point from a requested operation to a disposition.
+    // conversion point from a requested operation to a disposition. The
+    // admitted operation is the caller's own attempted operation, passed in
+    // rather than defaulted, so the record never re-labels an owned reconnect
+    // as a fresh start.
     //
     // The occupant is left RUNNING. Nothing here terminates, kills,
     // authenticates against, adopts, reuses or migrates from it.
     ForeignOccupantRecoveryDirective::for_observed_endpoint_occupant(
-        AdmittedCollisionOperation::FreshDependencyStart,
+        admitted_operation,
         occupant,
         ManagedTreeObservation::Unavailable,
     )
@@ -696,6 +723,21 @@ impl HostJobBranches {
         let expected = executable;
         let validated = child
             .validate(|evidence| {
+                // Issue #1775: bind the observed containment to the approved
+                // branch Job before resume. The platform re-observed this
+                // evidence from the retained handles (exact PID/start/image
+                // plus Job membership), but only the host knows which branch
+                // Job it approved: a suspended child outside that Job is never
+                // resumed, never credentialed, and never controlled by
+                // name/PID. This establishes the ownership relation before the
+                // dependent resume below.
+                if evidence.job_identity() != identity {
+                    // WORK_UNIT_CASE: 978/2 — typed rejection, never admitted.
+                    host_launch_observe("host.launch typed rejection");
+                    return Err(
+                        "suspended child is not contained in the approved branch Job".to_owned(),
+                    );
+                }
                 // Issue #1685: bind the observed enforced limits to the
                 // requested approved limits while still suspended. A divergence
                 // rejects the candidate before resume; it never executes.
