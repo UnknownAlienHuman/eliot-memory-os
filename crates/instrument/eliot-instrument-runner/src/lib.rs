@@ -68,7 +68,8 @@ pub use package_disposition::{
 };
 pub use process_owner::{
     KernelAdmissionError, KernelAdmittedProcess, KernelInstrumentAdmission,
-    KernelInstrumentRequestPort, UnprovisionedKernelAdmission,
+    KernelInstrumentAdmissionRequest, KernelInstrumentRequestPort,
+    UnprovisionedKernelAdmission,
 };
 pub use profile::{
     ADMITTED_SCOPE_CLASS, ADMITTED_WORKTREE_CLASS, AdmissionError, AdmittedProfile, AdmittedStage,

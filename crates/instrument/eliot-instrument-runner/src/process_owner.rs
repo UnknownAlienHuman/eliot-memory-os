@@ -6,11 +6,191 @@
 //! root one concrete adapter for handing that already-admitted request to the
 //! runner while retaining the Kernel-derived owner/session binding.
 
-use eliot_instrument_api::InstrumentInvocation;
-use eliot_process::{ProcessCallerSession, ProcessRequest};
+use eliot_instrument_api::{InstrumentAdmissionGrant, InstrumentAdmissionRequest, InstrumentInvocation};
+use eliot_process::{ProcessCallerSession, ProcessIntent, ProcessRequest};
 use thiserror::Error;
 
-use crate::{InstrumentRequestPort, RunnerError};
+use crate::{
+    AdmittedStage, InstrumentRequestPort, ResolvedExecutableIdentity, RunnerError, StageIdentity,
+    TestExecutionPlaneRoute,
+};
+
+/// Complete resolved terms required by the Kernel-owned stage admission.
+///
+/// All profile and candidate identities come from the immutable stage plan;
+/// the instrument grant comes from #1814's shared admission gate; and the
+/// process intent is a non-authoritative description that the TestD owner
+/// must rederive from its durable job before issuing one sealed request.
+pub struct KernelInstrumentAdmissionRequest<'a> {
+    /// Typed invocation presented for this stage.
+    pub invocation: &'a InstrumentInvocation,
+    /// Exact #1814 admitted stage, including spec, parser, policies and caps.
+    pub stage: &'a AdmittedStage,
+    /// Durable profile/revision/stage/operation identity.
+    pub identity: &'a StageIdentity,
+    /// Owning external execution-plane route for this stage.
+    pub route: &'a TestExecutionPlaneRoute,
+    /// Profile definition digest from the resolved plan.
+    pub profile_digest: &'a str,
+    /// Stage DAG digest from the resolved plan.
+    pub dag_digest: &'a str,
+    /// Registry generation from the resolved plan.
+    pub registry_generation: u64,
+    /// Registry digest from the resolved plan.
+    pub registry_digest: &'a str,
+    /// Optional bound candidate identity digest from the stage plan.
+    pub candidate_identity: Option<&'a str>,
+    /// Exact typed request accepted by #1814 stage admission.
+    pub instrument_request: &'a InstrumentAdmissionRequest,
+    /// Machine-observed executable identity checked by that admission.
+    pub executable: &'a ResolvedExecutableIdentity,
+    /// Exact #1814 instrument grant, including its admitted spec/profile and
+    /// observed executable commitments.
+    pub instrument_grant: &'a InstrumentAdmissionGrant,
+    /// Exact prospective process terms. It carries no permit or authority.
+    pub process_intent: &'a ProcessIntent,
+}
+
+impl KernelInstrumentAdmissionRequest<'_> {
+    /// Rechecks every stage, candidate, instrument-grant and process binding
+    /// before the request can cross the Kernel owner boundary.
+    pub fn validate(&self) -> Result<(), KernelAdmissionError> {
+        self.invocation
+            .validate()
+            .map_err(|error| KernelAdmissionError::InvalidRequest(error.to_string()))?;
+        self.instrument_request
+            .validate()
+            .map_err(|error| KernelAdmissionError::InvalidRequest(error.to_string()))?;
+        self.process_intent
+            .validate()
+            .map_err(|error| KernelAdmissionError::InvalidRequest(error.to_string()))?;
+        let invalid = |detail: &'static str| KernelAdmissionError::StageBinding(detail);
+        let route_identity = self.route.stage();
+        if !self.stage.external
+            || !self.route.external()
+            || self.identity.profile != self.stage.profile
+            || self.identity.profile_revision != self.stage.profile_revision
+            || self.identity.stage_id != self.stage.stage_id
+            || route_identity.profile != self.identity.profile
+            || route_identity.profile_revision != self.identity.profile_revision
+            || route_identity.stage_id != self.identity.stage_id
+            || route_identity
+                .operation_id
+                .as_ref()
+                .is_some_and(|operation| self.identity.operation_id.as_ref() != Some(operation))
+            || self.invocation.profile != self.stage.profile
+            || self.invocation.instrument != self.stage.spec
+            || self.invocation.kind != self.stage.kind
+            || self.invocation.arguments != self.stage.argument_template
+            || self.route.kind() != self.stage.kind
+        {
+            return Err(invalid("resolved stage, route, and invocation disagree"));
+        }
+        if self.registry_generation == 0
+            || !is_lower_sha256(self.profile_digest)
+            || !is_lower_sha256(self.dag_digest)
+            || !is_lower_sha256(self.registry_digest)
+            || self
+                .candidate_identity
+                .is_some_and(|identity| !is_lower_sha256(identity))
+        {
+            return Err(invalid("resolved profile or candidate identity is malformed"));
+        }
+        let grant = self.instrument_grant;
+        if grant.grant_digest != grant.digest()
+            || grant.profile != self.stage.profile
+            || grant.profile_revision != self.stage.profile_revision
+            || grant.kind_id != self.stage.spec.as_str()
+            || grant.kind != self.stage.kind
+            || grant.kind_version != self.stage.kind_version
+            || grant.spec_digest != self.stage.spec_digest
+            || grant.executable != self.stage.executable
+            || grant.executable_version != self.stage.executable_version
+            || grant.supply_digest
+                != self
+                    .stage
+                    .supply_receipt
+                    .as_ref()
+                    .map(crate::SupplyChainReceipt::digest)
+                    .unwrap_or_default()
+            || grant.arguments != self.stage.argument_template
+            || grant.environment_class != self.stage.environment_class
+            || grant.credential_policy != self.stage.credential_policy
+            || grant.network_policy != self.stage.network_policy
+            || grant.timeout_ms != self.stage.timeout_ms
+            || grant.max_output_bytes != self.stage.max_output_bytes
+            || grant.parser != self.stage.parser
+            || grant.parser_generation != self.stage.parser_generation
+        {
+            return Err(invalid("instrument grant differs from the admitted stage"));
+        }
+        if self.instrument_request.instrument != self.stage.spec
+            || self.instrument_request.kind != self.stage.kind
+            || self.instrument_request.profile != self.stage.profile
+            || self.instrument_request.arguments != self.stage.argument_template
+            || self.executable.canonical_path != grant.executable_path
+            || self.executable.content_digest != grant.content_digest
+            || self.executable.tool_version != grant.executable_version
+            || self.executable.executable_file_name() != grant.executable
+        {
+            return Err(invalid("instrument admission facts differ from the grant"));
+        }
+        if self.process_intent.operation_id().as_str()
+            != self.invocation.request.request_id.as_str()
+            || self.process_intent.operation_id().as_str()
+                != self.identity.operation_id.as_deref().unwrap_or_default()
+            || self.process_intent.generation().get()
+                != self
+                    .invocation
+                    .request
+                    .state_fence
+                    .resource_generation
+                    .value()
+            || self.process_intent.executable() != self.executable.canonical_path
+            || self.process_intent.executable_sha256() != self.executable.content_digest
+            || self.process_intent.argv() != self.executable.arguments
+            || !is_lower_sha256(self.process_intent.effect_digest())
+        {
+            return Err(invalid("prospective process intent differs from the stage identity"));
+        }
+        let environment_digest = eliot_contracts::canonical_json_bytes(
+            self.process_intent.environment(),
+        )
+        .map(|bytes| eliot_contracts::sha256_hex(&bytes))
+        .map_err(|error| KernelAdmissionError::InvalidRequest(error.to_string()))?;
+        if environment_digest != self.executable.environment_digest {
+            return Err(invalid(
+                "prospective process environment differs from the observed executable identity",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Digest of the immutable stage/candidate/grant/process association.
+    pub fn binding_digest(&self) -> String {
+        let candidate = self.candidate_identity.unwrap_or_default();
+        let material = format!(
+            "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            self.identity.digest(),
+            candidate,
+            self.profile_digest,
+            self.dag_digest,
+            self.registry_generation,
+            self.registry_digest,
+            self.instrument_grant.grant_digest,
+            self.process_intent.effect_digest(),
+            self.executable.identity_digest(),
+        );
+        eliot_contracts::sha256_hex(material.as_bytes())
+    }
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
 
 /// A Kernel-issued process request plus the durable owner/session that admitted
 /// it.
@@ -23,6 +203,7 @@ use crate::{InstrumentRequestPort, RunnerError};
 pub struct KernelAdmittedProcess {
     request: ProcessRequest,
     caller: ProcessCallerSession,
+    stage_binding_digest: Option<String>,
 }
 
 impl KernelAdmittedProcess {
@@ -59,7 +240,30 @@ impl KernelAdmittedProcess {
                 "process request authority epoch differs from admitted owner epoch",
             ));
         }
-        Ok(Self { request, caller })
+        Ok(Self {
+            request,
+            caller,
+            stage_binding_digest: None,
+        })
+    }
+
+    /// Validates the exact process request against the complete stage terms
+    /// returned by the Kernel/TestD owner.
+    pub fn new_for_stage(
+        request: ProcessRequest,
+        caller: ProcessCallerSession,
+        terms: &KernelInstrumentAdmissionRequest<'_>,
+    ) -> Result<Self, KernelAdmissionError> {
+        terms.validate()?;
+        if request.intent() != terms.process_intent {
+            return Err(KernelAdmissionError::StageBinding(
+                "owner process request differs from the exact admitted process intent",
+            ));
+        }
+        let binding_digest = terms.binding_digest();
+        let mut admitted = Self::new(request, caller)?;
+        admitted.stage_binding_digest = Some(binding_digest);
+        Ok(admitted)
     }
 
     /// Returns the exact Kernel-admitted caller binding for diagnostics and
@@ -80,6 +284,13 @@ impl KernelAdmittedProcess {
     pub fn into_request(self) -> ProcessRequest {
         self.request
     }
+
+    /// Returns the stage/candidate/process digest bound when the owner issued
+    /// this request.
+    #[must_use]
+    pub fn stage_binding_digest(&self) -> Option<&str> {
+        self.stage_binding_digest.as_deref()
+    }
 }
 
 /// Failure returned by the Kernel-owned process admission implementation.
@@ -98,6 +309,9 @@ pub enum KernelAdmissionError {
     /// The owner/session projection itself is malformed.
     #[error("Kernel process owner is invalid: {0}")]
     InvalidOwner(String),
+    /// Stage, candidate, instrument-grant, or process terms differ.
+    #[error("Kernel stage process binding failed: {0}")]
+    StageBinding(&'static str),
 }
 
 /// Sole composition hook for the active Kernel process-authority owner.
@@ -107,11 +321,14 @@ pub enum KernelAdmissionError {
 /// `ProcessExecutor`.  It returns a fresh one-shot request for each invocation
 /// and never exposes a key, replay journal, or caller-created permit.
 pub trait KernelInstrumentAdmission: Send + Sync {
-    /// Admits one provider-neutral BUILD invocation and returns its sealed
-    /// process request plus the exact Kernel-derived owner/session binding.
+    /// Admits one complete resolved stage/candidate/process tuple and returns
+    /// its sealed request plus the exact Kernel-derived owner/session
+    /// binding. Implementations must recheck the #1814 stage grant against
+    /// the live TestD admission and dispatch authority before constructing the
+    /// request.
     fn admit(
         &self,
-        invocation: &InstrumentInvocation,
+        request: &KernelInstrumentAdmissionRequest<'_>,
     ) -> Result<KernelAdmittedProcess, KernelAdmissionError>;
 }
 
@@ -132,7 +349,7 @@ pub struct UnprovisionedKernelAdmission;
 impl KernelInstrumentAdmission for UnprovisionedKernelAdmission {
     fn admit(
         &self,
-        _invocation: &InstrumentInvocation,
+        _request: &KernelInstrumentAdmissionRequest<'_>,
     ) -> Result<KernelAdmittedProcess, KernelAdmissionError> {
         Err(KernelAdmissionError::Rejected(
             "no Kernel/testd process-admission provider is bound in this composition root; stage execution awaits the admitted provider (issue #1813 W4)"
@@ -160,15 +377,40 @@ impl<'a> KernelInstrumentRequestPort<'a> {
 }
 
 impl InstrumentRequestPort for KernelInstrumentRequestPort<'_> {
-    fn bind(&self, invocation: &InstrumentInvocation) -> Result<ProcessRequest, RunnerError> {
-        invocation
+    fn bind(&self, _invocation: &InstrumentInvocation) -> Result<ProcessRequest, RunnerError> {
+        Err(RunnerError::Binding(
+            "Kernel stage admission requires a resolved stage, candidate identity, instrument grant, and complete process terms"
+                .to_owned(),
+        ))
+    }
+}
+
+impl KernelInstrumentRequestPort<'_> {
+    /// Binds one stage only after every plan, candidate, grant, executable,
+    /// and process-intent term is present and revalidated.
+    pub fn bind_stage(
+        &self,
+        terms: &KernelInstrumentAdmissionRequest<'_>,
+    ) -> Result<ProcessRequest, RunnerError> {
+        terms
             .validate()
-            .map_err(|error| RunnerError::InvalidInvocation(error.to_string()))?;
+            .map_err(|error| RunnerError::Binding(error.to_string()))?;
         let admitted = self
             .admission
-            .admit(invocation)
+            .admit(terms)
             .map_err(|error| RunnerError::Binding(error.to_string()))?;
-        if let Some(session_id) = invocation.request.session_id.as_ref()
+        if admitted.stage_binding_digest() != Some(terms.binding_digest().as_str()) {
+            return Err(RunnerError::Binding(
+                "Kernel stage binding differs from the resolved stage/candidate/process terms"
+                    .to_owned(),
+            ));
+        }
+        if admitted.request().intent() != terms.process_intent {
+            return Err(RunnerError::Binding(
+                "Kernel process request differs from the admitted process intent".to_owned(),
+            ));
+        }
+        if let Some(session_id) = terms.invocation.request.session_id.as_ref()
             && session_id.as_str() != admitted.caller().session_id().as_str()
         {
             return Err(RunnerError::Binding(
@@ -176,16 +418,24 @@ impl InstrumentRequestPort for KernelInstrumentRequestPort<'_> {
             ));
         }
         let request = admitted.request();
-        if request.operation_id().as_str() != invocation.request.request_id.as_str() {
+        if request.operation_id().as_str() != terms.invocation.request.request_id.as_str() {
             return Err(RunnerError::IdentityMismatch);
         }
-        if request.generation().get() != invocation.request.state_fence.resource_generation.value()
+        if request.generation().get()
+            != terms
+                .invocation
+                .request
+                .state_fence
+                .resource_generation
+                .value()
         {
             return Err(RunnerError::Binding(
                 "Kernel request generation differs from invocation fence".to_owned(),
             ));
         }
-        if request.fence().authority_epoch() != &invocation.request.state_fence.authority_epoch {
+        if request.fence().authority_epoch()
+            != &terms.invocation.request.state_fence.authority_epoch
+        {
             return Err(RunnerError::Binding(
                 "Kernel request authority epoch differs from invocation fence".to_owned(),
             ));

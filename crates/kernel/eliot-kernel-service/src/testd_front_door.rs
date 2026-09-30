@@ -65,7 +65,7 @@
 //! validation stays with the testd owner. The path
 //! `eliot_testd_core::KernelProcessAdmissionRequest` names that owner type.
 
-use eliot_contracts::{EpochId, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{ContractId, ContractVersion, EpochId, canonical_json_bytes, sha256_hex};
 use eliot_process::FencingToken;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -104,6 +104,22 @@ pub const TESTD_LIST_PROFILE: &str = "cargo-nextest-list";
 pub const TESTD_SCOPED_PROFILE: &str = "cargo-nextest-scoped";
 /// Relative program for the admitted probe, mirrored from `eliot-testd-core`.
 pub const TESTD_PROFILE_PROGRAM: &str = "cargo";
+/// Closed contract identity for the probe instrument, mirrored from #1814's
+/// `eliot-instrument-runner::TESTD_PROBE_INSTRUMENT`.
+pub const TESTD_PROBE_INSTRUMENT: &str = "eliot.instrument.test";
+/// Closed contract identity for productive TestD profiles, mirrored from
+/// `eliot-instrument-nextest::NEXTEST_INSTRUMENT`.
+pub const TESTD_NEXTEST_INSTRUMENT: &str = "eliot.instrument.nextest";
+/// Exact #1814 profile revision currently admitted for TestD.
+pub const TESTD_PROFILE_REVISION: u64 = 1;
+/// Exact #1814 built-in spec and kind versions for the closed TestD stage.
+pub const TESTD_STAGE_CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
+/// Environment class attached by #1814's `AdmittedStage::for_testd_launch`.
+pub const TESTD_STAGE_ENVIRONMENT_CLASS: &str = "isolated-process";
+/// Credential policy attached by #1814's `AdmittedStage::for_testd_launch`.
+pub const TESTD_STAGE_CREDENTIAL_POLICY: &str = "eliot.policy.credential.isolated-process";
+/// Network policy attached by #1814's `AdmittedStage::for_testd_launch`.
+pub const TESTD_STAGE_NETWORK_POLICY: &str = "eliot.policy.network.isolated-process";
 /// Relative executable for the productive nextest profile.
 pub const TESTD_PRODUCTIVE_PROFILE_PROGRAM: &str = "cargo-nextest";
 /// Fixed argv for the admitted probe, mirrored from `eliot-testd-core`.
@@ -1003,6 +1019,491 @@ impl TestdAdmissionResponse {
             Self::Conflict(conflict) => conflict.validate(),
         }
     }
+}
+
+/// Stable identity for the Kernel-owned per-stage process admission.
+///
+/// This owner-issued binding joins the durable TestD attempt to the exact
+/// #1814 admitted stage, candidate, observed executable, and complete
+/// `ProcessIntent` digest. It is admission evidence only: it contains no
+/// process permit and cannot be deserialized as a `ProcessRequest`.
+pub const TESTD_STAGE_PROCESS_WIRE_ID: &str = "eliot.kernel.testd-stage-process";
+/// Version of the Kernel-owned per-stage process admission.
+pub const TESTD_STAGE_PROCESS_WIRE_VERSION: u16 = 1;
+/// Durable stage name used by #1814's closed TestD launch admission.
+pub const TESTD_DRIVE_STAGE_ID: &str = "testd-drive";
+
+/// Complete owner request for one durable TestD stage process.
+///
+/// The fields mirror #1814's `AdmittedStage` and `InstrumentAdmissionGrant`
+/// without introducing a dependency from this Kernel service crate onto the
+/// instrument runner. `process_effect_digest` commits the exact prospective
+/// process intent (including executable, argv, roots, environment, limits,
+/// operation, job, session, and generation); the TestD dispatch owner checks
+/// it against the intent it derives from the claimed durable job before it
+/// reconstructs a `ProcessRequest`.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdStageProcessAdmissionRequest {
+    /// Stage-process wire identity.
+    pub wire_id: String,
+    /// Stage-process wire revision.
+    pub wire_version: u16,
+    /// Durable TestD job identity.
+    pub job_id: String,
+    /// Durable attempt sequence for this job.
+    pub attempt_seq: u32,
+    /// Digest of the outer Kernel TestD admission request.
+    pub request_digest: String,
+    /// Digest of the target resource envelope bound by that durable request.
+    pub target_resource_digest: String,
+    /// Digest of the existing Kernel TestD admission receipt.
+    pub admission_digest: String,
+    /// One consuming operation shared with the admitted TestD job.
+    pub operation_id: String,
+    /// Exact resolved profile name.
+    pub profile: String,
+    /// Exact resolve-once profile revision.
+    pub profile_revision: u64,
+    /// Resolved profile definition digest.
+    pub profile_digest: String,
+    /// Resolved stage DAG digest.
+    pub dag_digest: String,
+    /// Registry generation that admitted the profile and stage.
+    pub registry_generation: u64,
+    /// Registry digest that admitted the profile and stage.
+    pub registry_digest: String,
+    /// Full resolution digest when the profile was resolved with bindings.
+    pub resolution_digest: String,
+    /// Candidate identity digest inherited from the durable plan, when bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_identity: Option<String>,
+    /// Stable stage identity within the resolved profile revision.
+    pub stage_id: String,
+    /// Whether the resolved stage is required for the profile outcome.
+    pub required: bool,
+    /// Whether the stage belongs to the external TestExecutionPlane.
+    pub external: bool,
+    /// Resolved stage prerequisites in their admitted order.
+    pub depends_on: Vec<String>,
+    /// Admitted instrument/spec identity.
+    pub spec: ContractId,
+    /// Exact admitted spec revision.
+    pub spec_revision: ContractVersion,
+    /// Digest of the exact admitted spec/profile binding.
+    pub spec_digest: String,
+    /// Admitted stage class in the instrument API's wire spelling.
+    pub kind: String,
+    /// Exact admitted kind version.
+    pub kind_version: ContractVersion,
+    /// Admitted executable file name, without an `.exe` suffix.
+    pub executable: String,
+    /// Admitted executable version requirement, when one exists.
+    pub executable_version: Option<String>,
+    /// Admitted supply-chain receipt digest, empty only when no receipt was
+    /// admitted for this TestD profile.
+    pub supply_receipt_digest: String,
+    /// Exact invocation arguments admitted by the stage.
+    pub argument_template: Vec<String>,
+    /// Exact process argv produced from the admitted profile and slots.
+    pub process_argv: Vec<String>,
+    /// Admitted invocation schema identity.
+    pub schema: ContractId,
+    /// Admitted process environment class.
+    pub environment_class: String,
+    /// Admitted credential policy identity.
+    pub credential_policy: ContractId,
+    /// Admitted network policy identity.
+    pub network_policy: ContractId,
+    /// Admitted parser identity.
+    pub parser: ContractId,
+    /// Admitted parser generation.
+    pub parser_generation: u64,
+    /// Admitted raw-output capture ceiling in bytes.
+    pub max_output_bytes: Option<u64>,
+    /// Admitted wall-clock ceiling in milliseconds.
+    pub timeout_ms: Option<u64>,
+    /// Admitted per-adapter maximum concurrency.
+    pub max_concurrency: u32,
+    /// Canonical observed executable path used by the instrument grant.
+    pub observed_executable_path: String,
+    /// Machine-observed lowercase SHA-256 over executable bytes.
+    pub observed_executable_digest: String,
+    /// Machine-observed executable version, when available.
+    pub observed_executable_version: Option<String>,
+    /// Digest of the observed environment projection.
+    pub observed_environment_digest: String,
+    /// Digest of the exact #1814 instrument admission grant.
+    pub instrument_grant_digest: String,
+    /// Digest of the complete prospective process intent.
+    pub process_effect_digest: String,
+    /// Canonical digest over this complete stage-process request.
+    pub stage_request_digest: String,
+}
+
+impl TestdStageProcessAdmissionRequest {
+    /// Computes the canonical digest over every stage/process term except its
+    /// digest field.
+    pub fn canonical_stage_request_digest(&self) -> Result<String, KernelServiceError> {
+        let mut value = serde_json::to_value(self).map_err(|_| KernelServiceError::InvalidField {
+            field: "testd_stage_process.request",
+            reason: "cannot canonicalize stage process request",
+        })?;
+        let Some(object) = value.as_object_mut() else {
+            return Err(KernelServiceError::InvalidField {
+                field: "testd_stage_process.request",
+                reason: "stage process request is not an object",
+            });
+        };
+        object.remove("stage_request_digest");
+        canonical_json_bytes(&value)
+            .map(|bytes| sha256_hex(&bytes))
+            .map_err(|_| KernelServiceError::InvalidField {
+                field: "testd_stage_process.request",
+                reason: "cannot canonicalize stage process request",
+            })
+    }
+
+    /// Returns this request with its canonical digest populated.
+    pub fn with_computed_digest(mut self) -> Result<Self, KernelServiceError> {
+        self.stage_request_digest = self.canonical_stage_request_digest()?;
+        Ok(self)
+    }
+
+    /// Validates the closed TestD stage shape and complete request digest.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        let invalid = |field, reason| KernelServiceError::InvalidField { field, reason };
+        if self.wire_id != TESTD_STAGE_PROCESS_WIRE_ID
+            || self.wire_version != TESTD_STAGE_PROCESS_WIRE_VERSION
+        {
+            return Err(invalid(
+                "testd_stage_process.wire",
+                "unsupported stage-process wire",
+            ));
+        }
+        for (value, field) in [
+            (&self.job_id, "testd_stage_process.job_id"),
+            (&self.operation_id, "testd_stage_process.operation_id"),
+            (&self.profile, "testd_stage_process.profile"),
+            (&self.stage_id, "testd_stage_process.stage_id"),
+            (&self.kind, "testd_stage_process.kind"),
+            (&self.executable, "testd_stage_process.executable"),
+            (
+                &self.environment_class,
+                "testd_stage_process.environment_class",
+            ),
+        ] {
+            validate_wire_text(value, field)?;
+        }
+        for (digest, field) in [
+            (&self.request_digest, "testd_stage_process.request_digest"),
+            (
+                &self.target_resource_digest,
+                "testd_stage_process.target_resource_digest",
+            ),
+            (&self.admission_digest, "testd_stage_process.admission_digest"),
+            (&self.profile_digest, "testd_stage_process.profile_digest"),
+            (&self.dag_digest, "testd_stage_process.dag_digest"),
+            (&self.registry_digest, "testd_stage_process.registry_digest"),
+            (
+                &self.resolution_digest,
+                "testd_stage_process.resolution_digest",
+            ),
+            (&self.spec_digest, "testd_stage_process.spec_digest"),
+            (
+                &self.observed_executable_digest,
+                "testd_stage_process.executable_digest",
+            ),
+            (
+                &self.observed_environment_digest,
+                "testd_stage_process.environment_digest",
+            ),
+            (
+                &self.instrument_grant_digest,
+                "testd_stage_process.instrument_grant_digest",
+            ),
+            (
+                &self.process_effect_digest,
+                "testd_stage_process.process_effect_digest",
+            ),
+            (
+                &self.stage_request_digest,
+                "testd_stage_process.stage_request_digest",
+            ),
+        ] {
+            validate_wire_digest(digest, field)?;
+        }
+        if let Some(candidate) = &self.candidate_identity {
+            validate_wire_digest(candidate, "testd_stage_process.candidate_identity")?;
+        }
+        if self.attempt_seq == 0
+            || self.profile_revision != TESTD_PROFILE_REVISION
+            || self.registry_generation == 0
+            || self.parser_generation == 0
+            || self.max_concurrency == 0
+        {
+            return Err(invalid(
+                "testd_stage_process.identity",
+                "attempt, profile revision, registry generation, parser generation, and concurrency must be non-zero",
+            ));
+        }
+        if self.stage_id != TESTD_DRIVE_STAGE_ID
+            || !self.required
+            || !self.external
+            || !self.depends_on.is_empty()
+            || self.kind != "TEST"
+            || self.spec_revision != TESTD_STAGE_CONTRACT_VERSION
+            || self.kind_version != TESTD_STAGE_CONTRACT_VERSION
+            || self.parser_generation != 1
+            || self.max_concurrency != 1
+            || self.executable_version.is_some()
+            || self.observed_executable_version.is_some()
+            || !self.supply_receipt_digest.is_empty()
+        {
+            return Err(invalid(
+                "testd_stage_process.stage",
+                "stage terms differ from #1814's single external TestD drive stage",
+            ));
+        }
+        if !is_admitted_testd_profile(&self.profile) {
+            return Err(invalid(
+                "testd_stage_process.profile",
+                "profile is outside the closed TestD registry",
+            ));
+        }
+        let expected_spec = if self.profile == TESTD_ADMITTED_PROFILE {
+            TESTD_PROBE_INSTRUMENT
+        } else {
+            TESTD_NEXTEST_INSTRUMENT
+        };
+        let expected_program = if self.profile == TESTD_ADMITTED_PROFILE {
+            TESTD_PROFILE_PROGRAM
+        } else {
+            TESTD_PRODUCTIVE_PROFILE_PROGRAM
+        };
+        let expected_environment = if matches!(
+            self.profile.as_str(),
+            TESTD_PRODUCTIVE_PROFILE | TESTD_LIST_PROFILE | TESTD_SCOPED_PROFILE
+        ) {
+            TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let (expected_argv, limits) =
+            testd_mirrored_argv_and_limits(&self.profile, &self.argument_template)?;
+        if self.spec.as_str() != expected_spec
+            || self.schema.as_str() != expected_spec
+            || self.parser.as_str() != expected_spec
+            || self.executable != expected_program
+            || self.environment_class != TESTD_STAGE_ENVIRONMENT_CLASS
+            || self.credential_policy.as_str() != TESTD_STAGE_CREDENTIAL_POLICY
+            || self.network_policy.as_str() != TESTD_STAGE_NETWORK_POLICY
+            || self.spec_digest
+                != testd_profile_definition_digest_for_slots(
+                    &self.profile,
+                    &self.argument_template,
+                )?
+            || self.process_argv != expected_argv
+            || self.timeout_ms != Some(limits.0)
+            || self.max_output_bytes != Some(limits.3)
+            || self.argument_template.len() > 32
+        {
+            return Err(invalid(
+                "testd_stage_process.profile_binding",
+                "spec, parser, executable, argv, policy, or limit fields differ from the exact admitted profile",
+            ));
+        }
+        validate_wire_text(
+            &self.observed_executable_path,
+            "testd_stage_process.observed_executable_path",
+        )?;
+        if self.canonical_stage_request_digest()? != self.stage_request_digest {
+            return Err(invalid(
+                "testd_stage_process.stage_request_digest",
+                "stage process request digest mismatch",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Rechecks this stage request against the retained Kernel TestD
+    /// admission and the exact request/envelope that produced it.
+    pub fn validate_admission_binding(
+        &self,
+        admission: &TestdAdmission,
+        admission_request: &TestdAdmissionAttemptRequest,
+        envelope: &TestdAdmissionEnvelope,
+    ) -> Result<(), KernelServiceError> {
+        self.validate()?;
+        admission.validate()?;
+        admission_request.validate()?;
+        admission_request.validate_canonical_digest()?;
+        if self.job_id != admission.job_id
+            || self.job_id != admission_request.job_id
+            || self.attempt_seq != admission_request.attempt_seq
+            || self.request_digest != admission.request_digest
+            || self.request_digest != admission_request.request_digest
+            || self.target_resource_digest != admission_request.target_resource_digest
+            || self.admission_digest != admission.admission_digest
+            || self.operation_id != admission.operation_id
+            || self.operation_id != envelope.operation_id.as_deref().unwrap_or_default()
+            || self.profile != admission.profile
+            || self.profile != envelope.profile
+            || self.argument_template != admission.sealed_slot_suffix
+            || self.profile_binding_digest() != admission.profile_binding_digest
+            || admission.cancelled
+            || envelope.cancellation
+        {
+            return Err(KernelServiceError::InvalidField {
+                field: "testd_stage_process.admission_binding",
+                reason: "stage process request differs from the retained TestD admission",
+            });
+        }
+        Ok(())
+    }
+
+    fn profile_binding_digest(&self) -> String {
+        self.spec_digest.clone()
+    }
+}
+
+/// Kernel-issued admission for exactly one durable TestD stage process.
+///
+/// The grant binds the complete stage request to the existing TestD
+/// admission, current Kernel epoch, and activation generation. It carries no
+/// process permit; the authenticated TestD dispatch authority must recheck
+/// this grant against the resolved #1814 stage and its locally derived
+/// `ProcessIntent`, then reconstruct the one consuming `ProcessRequest`.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdStageProcessGrant {
+    /// Exact complete stage/process request that was admitted.
+    pub request: TestdStageProcessAdmissionRequest,
+    /// Existing TestD admission receipt digest joined by this grant.
+    pub admission_digest: String,
+    /// Live Kernel authority epoch at grant time.
+    pub authority_epoch: EpochId,
+    /// Live Kernel activation generation at grant time.
+    pub generation: u64,
+    /// Grant creation time in Unix nanoseconds.
+    pub issued_at_unix_nanos: u64,
+    /// Canonical digest over the request and live owner binding.
+    pub grant_digest: String,
+}
+
+impl TestdStageProcessGrant {
+    fn canonical_digest(&self) -> Result<String, KernelServiceError> {
+        #[derive(Serialize)]
+        struct Canonical<'a> {
+            request: &'a TestdStageProcessAdmissionRequest,
+            admission_digest: &'a str,
+            authority_epoch: &'a EpochId,
+            generation: u64,
+            issued_at_unix_nanos: u64,
+        }
+        canonical_json_bytes(&Canonical {
+            request: &self.request,
+            admission_digest: &self.admission_digest,
+            authority_epoch: &self.authority_epoch,
+            generation: self.generation,
+            issued_at_unix_nanos: self.issued_at_unix_nanos,
+        })
+        .map(|bytes| sha256_hex(&bytes))
+        .map_err(|_| KernelServiceError::InvalidField {
+            field: "testd_stage_process.grant_digest",
+            reason: "cannot canonicalize stage process grant",
+        })
+    }
+
+    /// Validates the complete owner grant against the retained admission and
+    /// the current authenticated Kernel authority.
+    pub fn validate_live(
+        &self,
+        service: &KernelService,
+        session: &AuthenticatedTestdSession,
+        admission: &TestdAdmission,
+        admission_request: &TestdAdmissionAttemptRequest,
+        envelope: &TestdAdmissionEnvelope,
+    ) -> Result<(), KernelServiceError> {
+        let (epoch, generation) = session.live_authority(service)?;
+        self.request
+            .validate_admission_binding(admission, admission_request, envelope)?;
+        validate_wire_digest(&self.admission_digest, "testd_stage_process.admission_digest")?;
+        validate_wire_digest(&self.grant_digest, "testd_stage_process.grant_digest")?;
+        if self.admission_digest != admission.admission_digest
+            || self.authority_epoch != epoch
+            || self.generation != generation
+            || self.generation != self.request_generation(admission_request)
+            || self.issued_at_unix_nanos == 0
+            || self.canonical_digest()? != self.grant_digest
+        {
+            return Err(KernelServiceError::InvalidField {
+                field: "testd_stage_process.grant",
+                reason: "stage process grant is stale or differs from its owner binding",
+            });
+        }
+        Ok(())
+    }
+
+    fn request_generation(&self, admission_request: &TestdAdmissionAttemptRequest) -> u64 {
+        serde_json::from_str::<TestdAdmissionEnvelope>(&admission_request.closed_request_json)
+            .map(|envelope| envelope.fence.generation().get())
+            .unwrap_or_default()
+    }
+}
+
+/// Issues one stage grant after rechecking the existing Kernel TestD
+/// admission, durable attempt identity, closed profile, and live owner
+/// authority. No process request is constructed here.
+pub fn issue_testd_stage_process_grant(
+    service: &KernelService,
+    session: &AuthenticatedTestdSession,
+    admission: &TestdAdmission,
+    admission_request: &TestdAdmissionAttemptRequest,
+    request: &TestdStageProcessAdmissionRequest,
+    now_unix_nanos: u64,
+) -> Result<TestdStageProcessGrant, KernelServiceError> {
+    if now_unix_nanos == 0 {
+        return Err(KernelServiceError::InvalidField {
+            field: "testd_stage_process.issued_at",
+            reason: "grant time must be non-zero",
+        });
+    }
+    let (authority_epoch, generation) = session.live_authority(service)?;
+    admission.validate()?;
+    admission_request.validate()?;
+    admission_request.validate_canonical_digest()?;
+    let envelope: TestdAdmissionEnvelope = serde_json::from_str(&admission_request.closed_request_json)
+        .map_err(|_| KernelServiceError::InvalidField {
+            field: "testd_stage_process.envelope",
+            reason: "admitted TestD envelope is malformed",
+        })?;
+    if !reconcile_testd_admission(admission, admission_request, &envelope, &authority_epoch)? {
+        return Err(KernelServiceError::InvalidField {
+            field: "testd_stage_process.admission",
+            reason: "retained TestD admission does not bind the exact live request",
+        });
+    }
+    request.validate_admission_binding(admission, admission_request, &envelope)?;
+    if request.registry_generation == 0 || generation == 0 {
+        return Err(KernelServiceError::InvalidField {
+            field: "testd_stage_process.generation",
+            reason: "registry and Kernel generations must be non-zero",
+        });
+    }
+    let mut grant = TestdStageProcessGrant {
+        request: request.clone(),
+        admission_digest: admission.admission_digest.clone(),
+        authority_epoch,
+        generation,
+        issued_at_unix_nanos: now_unix_nanos,
+        grant_digest: String::new(),
+    };
+    grant.grant_digest = grant.canonical_digest()?;
+    Ok(grant)
 }
 
 /// Authenticated testd session bound from live Kernel authority.
