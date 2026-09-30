@@ -23,6 +23,8 @@ use eliot_kernel_service::AuthenticatedHostSession;
 // import is the closed wire vocabulary the ingress projects out of it, never a
 // second stage machine or a second cutover gate.
 #[cfg(windows)]
+use eliot_kernel_service::MaintenanceTriggerDeliveryError;
+#[cfg(windows)]
 use eliot_kernel_service::{
     AuthenticatedUserAutomationHostExecutionTransport, NamedReadGatewayError, PreStageRejection,
     StoreApplyRefusal, UserAutomationDueWakeRejection, UserAutomationDueWakeResolution,
@@ -31,7 +33,8 @@ use eliot_kernel_service::{
     UserAutomationHostExecutionOperation, UserAutomationHostExecutionTransport,
     UserAutomationOperatorRuntime, UserAutomationOwnerLookup, UserAutomationRuntimeAdmission,
     UserAutomationRuntimeError, UserAutomationRuntimePort, UserAutomationWakeCancellation,
-    UserAutomationWakeEnumerationRequest, UserAutomationWakeHorizonPublication,
+    UserAutomationWakeEnumerationReceipt, UserAutomationWakeEnumerationRequest,
+    UserAutomationWakeHorizonPublication, UserAutomationWakeOccurrenceDisposition,
     UserAutomationWakePort, UserAutomationWakePublication, UserAutomationWakeReadRequest,
     UserAutomationWakeReadback, advance_wake_horizon, horizon_retry_handle, refuse_consumed_wake,
     resolve_due_wake,
@@ -42,7 +45,7 @@ use eliot_kernel_service::{
 };
 use eliot_process::{
     OperationId, OriginChallengeRequest, OriginControlGrant, OriginControlOperation,
-    OriginControlPresentation, ProcessExecutionView, ProcessLifecycle,
+    OriginControlPresentation, ProcessExecutionError, ProcessExecutionView, ProcessLifecycle,
 };
 use eliot_protocol::{
     AgentActivationClaimRequest, HostRequestEnvelope, HostRequestResultBody,
@@ -50,6 +53,8 @@ use eliot_protocol::{
     LocalReadExecutionEvidence, RequestIdentity, TaskControllerResultBody,
     host_request_operation_id,
 };
+#[cfg(windows)]
+use eliot_protocol::{MaintenanceTriggerIntakeReceipt, MaintenanceTriggerRecord, ProtocolError};
 use eliot_runtime_contracts::GenerationCutoverState;
 #[cfg(windows)]
 use eliot_runtime_contracts::{
@@ -276,6 +281,26 @@ pub(crate) const STORAGE_REPLACEMENT_RESUME_OPERATION: &str = "daemon_storage_re
 /// [`STORAGE_REPLACEMENT_OPERATION`].
 pub(crate) const STORAGE_REPLACEMENT_ROLLBACK_OPERATION: &str =
     "daemon_storage_replacement_rollback";
+
+/// Authenticated daemon operation that admits one ORS-staged maintenance
+/// trigger before acknowledging intake (issue #1694 W2).
+///
+/// Persist before ack: the arm admits the ORS-staged input through the
+/// existing gateway owner entry
+/// (`KernelStoreGateway::admit_maintenance_trigger`) BEFORE issuing any
+/// intake acknowledgement. The complete opaque input must already be staged
+/// through the ORS owner; exact identity/hash replay returns the same
+/// staging obligation, changed content conflicts, and any capacity, key,
+/// integrity, or durable-write failure is answered with the exact bounded
+/// failure — never an acknowledgement — so the producer keeps its retry
+/// identity and its cursor must not advance. No new owner, database, or
+/// poller; no Governor types in ORS.
+///
+/// It carries the same front-door caveat as
+/// [`STORAGE_REPLACEMENT_RESUME_OPERATION`]: it is recognized here and
+/// unreachable from the front door until
+/// `frame_dispatch::is_daemon_operation` lists it.
+pub(crate) const MAINTENANCE_TRIGGER_INTAKE_OPERATION: &str = "maintenance_trigger_intake";
 
 const STARTUP_EVIDENCE_FIELDS: [&str; 8] = [
     "transport_binding",
@@ -576,11 +601,13 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "daemon_ready" => "daemon_ready",
         "origin_challenge_issue" => "origin_challenge_issue",
         "origin_control_decide" => "origin_control_decide",
+        "origin_grant_reconcile" => "origin_grant_reconcile",
         ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION => ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION,
         GENERATION_CUTOVER_OPERATION => GENERATION_CUTOVER_OPERATION,
         STORAGE_REPLACEMENT_OPERATION => STORAGE_REPLACEMENT_OPERATION,
         STORAGE_REPLACEMENT_RESUME_OPERATION => STORAGE_REPLACEMENT_RESUME_OPERATION,
         STORAGE_REPLACEMENT_ROLLBACK_OPERATION => STORAGE_REPLACEMENT_ROLLBACK_OPERATION,
+        MAINTENANCE_TRIGGER_INTAKE_OPERATION => MAINTENANCE_TRIGGER_INTAKE_OPERATION,
         DAEMON_STARTUP_EVIDENCE_OPERATION => DAEMON_STARTUP_EVIDENCE_OPERATION,
         USER_AUTOMATION_RUNTIME_OPERATION => USER_AUTOMATION_RUNTIME_OPERATION,
         "health" => "health",
@@ -625,6 +652,7 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         LINK_GRANT_CLOSURE_RECEIPT_OPERATION => LINK_GRANT_CLOSURE_RECEIPT_OPERATION,
         "publish_wasm_dispatch_bundle" => "publish_wasm_dispatch_bundle",
         "bind_notify_launch_grant" => "bind_notify_launch_grant",
+        "bind_operator_session_token" => "bind_operator_session_token",
         "agent_host_request_reconcile" => "agent_host_request_reconcile",
         "agent_host_request_rehydrate" => "agent_host_request_rehydrate",
         _ => "untrusted_operation",
@@ -902,6 +930,27 @@ struct NotifyLaunchGrantOperation {
     notification_digest: String,
     executable_path: String,
     artifact_digest: String,
+}
+
+/// Closed Operator session-token request (`#1777` I11.8).
+///
+/// Carries the exact binding evidence the requesting User Broker observed for
+/// one connecting UI process: its live Kernel registration identity, the
+/// one-shot handoff nonce it issued for this binding, the OS-observed Windows
+/// SID/session/process tuple, and the exact requested role and capability set.
+/// Session evidence is threaded from the live authenticated session, never from
+/// the payload. Unknown fields fail closed.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperatorSessionTokenOperation {
+    registration_digest: String,
+    handoff_nonce: String,
+    windows_sid: String,
+    interactive_session_id: String,
+    client_process_id: String,
+    client_image_path: String,
+    role: String,
+    capabilities: Vec<String>,
 }
 
 /// Checks every admitted binding in the bundle against the authenticated
@@ -1903,6 +1952,19 @@ struct OriginControlDecideOperation {
     presentation: serde_json::Value,
 }
 
+/// Crash/lost-response reconciliation for one grant-funded kill effect.
+///
+/// Both fields are front-door envelope values, never proof content: the
+/// gateway authorizes the caller against the retained operation record,
+/// then cross-checks the envelope operation against the operation the
+/// journaled one-shot was decided for before any effect or live read.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OriginGrantReconcileOperation {
+    operation_id: OperationId,
+    request_nonce: String,
+}
+
 #[cfg(windows)]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2527,6 +2589,246 @@ impl KernelComposition {
     }
 }
 
+/// Exact request payload for [`MAINTENANCE_TRIGGER_INTAKE_OPERATION`].
+///
+/// The caller presents the complete retained trigger record plus the exact
+/// admitted session fence. The record carries the ORS envelope reference and
+/// payload hash; the intake operation proves staging through the ORS owner
+/// before any intake acknowledgement is issued. The caller never supplies
+/// authority, a receipt, or a delivery identity: those are owner-issued on
+/// admission, never asserted.
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceTriggerIntakeRequest {
+    /// Version of the authenticated intake request.
+    version: u8,
+    /// Exact State Fence carried by the admitted daemon session.
+    state_fence: StateFence,
+    /// Complete retained trigger record to stage-admit.
+    record: MaintenanceTriggerRecord,
+}
+
+/// Closed intake failure for one maintenance-trigger intake (issue #1694 W2).
+///
+/// Variants name the failure kind only: exact source errors stay with their
+/// owners (retry under the same identity re-observes them) and never enter
+/// logs or responses, so a refusal carries its stable code and nothing
+/// privacy-sensitive. An ORS/staging fault, a protocol or changed-content
+/// conflict, a fenced generation, and a live-authority refusal stay
+/// distinguishable and never collapse into an acknowledgement. Any failure
+/// admits nothing and acknowledges nothing: the producer keeps its retry
+/// identity and its cursor must not advance.
+#[cfg(windows)]
+enum MaintenanceTriggerIntakeFailure {
+    /// The ORS owner could not prove the staged opaque input: capacity, key,
+    /// integrity, or durable-write failure.
+    OrsStaging,
+    /// The presented record failed protocol validation, or changed content
+    /// under the same identity conflicted with staged bytes (`ReplayConflict`).
+    Protocol(ProtocolError),
+    /// The live generation is fenced for this intake.
+    FencedGeneration,
+    /// Live Kernel authority refused session or admission; fails closed.
+    LiveAuthority,
+    /// The Kernel owner could not reach its service or ledger state.
+    OwnerUnavailable,
+    /// The canonical Store refused the backing read.
+    Store,
+    /// A ledger-level refusal owned by another transition (claim/ack paths).
+    /// Intake admission never produces one; it is preserved exactly and
+    /// fails closed here rather than becoming an acknowledgement.
+    UnexpectedLedgerRefusal,
+}
+
+#[cfg(windows)]
+impl From<MaintenanceTriggerDeliveryError> for MaintenanceTriggerIntakeFailure {
+    /// Classifies one owner-side admission outcome into the closed intake
+    /// failure.
+    ///
+    /// Exact source errors are preserved in their variant; only the stable
+    /// code reads the classification. The five ledger-level refusals owned
+    /// by the claim/ack transitions can never be produced by intake
+    /// admission and fail closed as ledger refusals, never as
+    /// acknowledgements. STITCH (issue #1694): when the gateway half lands
+    /// `MaintenanceTriggerDeliveryError::LedgerAuthority` plus its
+    /// `from_ledger_admission_error` mapper in
+    /// `crates/kernel/eliot-kernel-service/src/store_gateway.rs`, this match
+    /// intentionally breaks until that variant is classified here — no
+    /// wildcard arm may absorb it.
+    fn from(error: MaintenanceTriggerDeliveryError) -> Self {
+        match error {
+            MaintenanceTriggerDeliveryError::StagingProof(_) => Self::OrsStaging,
+            MaintenanceTriggerDeliveryError::Protocol(error) => Self::Protocol(error),
+            MaintenanceTriggerDeliveryError::Service(KernelServiceError::GenerationFenced) => {
+                Self::FencedGeneration
+            }
+            MaintenanceTriggerDeliveryError::Service(_) => Self::LiveAuthority,
+            MaintenanceTriggerDeliveryError::OwnerUnavailable(_) => Self::OwnerUnavailable,
+            MaintenanceTriggerDeliveryError::Store(_) => Self::Store,
+            MaintenanceTriggerDeliveryError::UnknownTrigger
+            | MaintenanceTriggerDeliveryError::ClaimConflict
+            | MaintenanceTriggerDeliveryError::RevokedConsumer
+            | MaintenanceTriggerDeliveryError::ExpiredEligibility
+            | MaintenanceTriggerDeliveryError::MirrorRecoveryRequired => {
+                Self::UnexpectedLedgerRefusal
+            }
+        }
+    }
+}
+
+/// Maps one intake failure to its stable diagnostic code.
+///
+/// Only the variant is emitted; the `String` payloads and the source errors'
+/// own fields are never logged. Changed-content conflicts stay
+/// distinguishable from other protocol rejections, and a fenced generation
+/// stays distinguishable from a live-authority refusal, so none of them
+/// collapses into an effect-free success. The match stays exhaustive with no
+/// wildcard: a new failure variant breaks here loudly.
+#[cfg(windows)]
+fn maintenance_trigger_intake_terminal_code(
+    failure: &MaintenanceTriggerIntakeFailure,
+) -> &'static str {
+    match failure {
+        MaintenanceTriggerIntakeFailure::OrsStaging => "INTAKE_STAGING_UNAVAILABLE",
+        MaintenanceTriggerIntakeFailure::Protocol(error) => {
+            if *error == ProtocolError::ReplayConflict {
+                "INTAKE_REPLAY_CONFLICT"
+            } else {
+                "INTAKE_PROTOCOL_REJECTED"
+            }
+        }
+        MaintenanceTriggerIntakeFailure::FencedGeneration => "INTAKE_GENERATION_FENCED",
+        MaintenanceTriggerIntakeFailure::LiveAuthority => "INTAKE_LIVE_AUTHORITY_REFUSED",
+        MaintenanceTriggerIntakeFailure::OwnerUnavailable => "INTAKE_OWNER_UNAVAILABLE",
+        MaintenanceTriggerIntakeFailure::Store => "INTAKE_STORE_REFUSED",
+        MaintenanceTriggerIntakeFailure::UnexpectedLedgerRefusal => "INTAKE_LEDGER_REFUSED",
+    }
+}
+
+/// Closed outcome of one admitted maintenance-trigger intake.
+///
+/// `terminal_code` is the ONE stable diagnostic code for a refused intake
+/// and is `None` only when the gateway owner actually admitted the staged
+/// input and issued its receipt. A receipt is present only when the owner
+/// constructed one after proving ORS staging, so "requested", "refused",
+/// and "admitted" never collapse into one answer.
+#[cfg(windows)]
+#[derive(Serialize)]
+struct MaintenanceTriggerIntakeAnswer {
+    /// Version of the authenticated intake answer.
+    version: u8,
+    /// Terminal diagnostic code of the refused intake, `None` when admitted.
+    terminal_code: Option<&'static str>,
+    /// The owner's intake receipt, present only when admitted.
+    receipt: Option<MaintenanceTriggerIntakeReceipt>,
+}
+
+/// The admitted-reply envelope, identical to every other arm on this channel.
+#[cfg(windows)]
+fn maintenance_trigger_intake_response(
+    answer: &MaintenanceTriggerIntakeAnswer,
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": "known",
+        "value": answer,
+        "recovery": null,
+    })
+}
+
+/// The outcome of an intake the owner refused before it could admit.
+///
+/// Every position field is empty on purpose: an intake that never reached
+/// admission staged nothing new, holds no obligation, and owns no receipt.
+/// Reporting the refusal code alone is the honest shape — a refused intake
+/// is not an admitted trigger that made no progress, and the producer keeps
+/// its retry identity.
+#[cfg(windows)]
+fn maintenance_trigger_intake_refusal_answer(
+    terminal_code: &'static str,
+) -> MaintenanceTriggerIntakeAnswer {
+    MaintenanceTriggerIntakeAnswer {
+        version: 1,
+        terminal_code: Some(terminal_code),
+        receipt: None,
+    }
+}
+
+#[cfg(windows)]
+impl KernelComposition {
+    /// Admits one ORS-staged maintenance trigger before acknowledging intake.
+    ///
+    /// The operation selector only picks this entry. The closed request
+    /// carries the complete retained trigger record and the exact admitted
+    /// session fence; the principal comes from the authenticated session
+    /// module binding, never from the request DTO. A malformed request or a
+    /// fence that is not the exact admitted session fence is fenced at the
+    /// transport, before the gateway is touched.
+    ///
+    /// Admission itself is the existing gateway owner entry
+    /// (`KernelStoreGateway::admit_maintenance_trigger`), which proves
+    /// ORS staging first and validates the record with the existing wire
+    /// validators: the complete opaque input must already be staged, exact
+    /// identity/hash replay returns the same staging receipt, and changed
+    /// content conflicts. Any failure is answered with the intake's own
+    /// stable refusal code and never with an acknowledgement, so the
+    /// producer keeps its retry identity and its cursor must not advance.
+    fn maintenance_trigger_intake_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let request: MaintenanceTriggerIntakeRequest =
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
+        Self::validate_maintenance_trigger_intake_fence(
+            session,
+            request.version,
+            &request.state_fence,
+        )?;
+        let gateway = self.retained_store_gateway()?;
+        match gateway
+            .admit_maintenance_trigger(session.module_generation.module_id.as_str(), request.record)
+        {
+            Ok((receipt, _)) => Ok(maintenance_trigger_intake_response(
+                &MaintenanceTriggerIntakeAnswer {
+                    version: 1,
+                    terminal_code: None,
+                    receipt: Some(receipt),
+                },
+            )),
+            Err(error) => Ok(maintenance_trigger_intake_response(
+                &maintenance_trigger_intake_refusal_answer(
+                    maintenance_trigger_intake_terminal_code(
+                        &MaintenanceTriggerIntakeFailure::from(error),
+                    ),
+                ),
+            )),
+        }
+    }
+
+    /// The one admission gate every maintenance-trigger intake request passes.
+    ///
+    /// The same three checks the storage-replacement ingress applies: the
+    /// request's own State Fence must be well formed, the version must be
+    /// the one this arm speaks, and the presented fence must be the
+    /// **exact** admitted session fence. A request failing any of them is
+    /// fenced at the transport, before the gateway is touched.
+    fn validate_maintenance_trigger_intake_fence(
+        session: &Session,
+        version: u8,
+        state_fence: &StateFence,
+    ) -> Result<(), TransportError> {
+        state_fence
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if version != 1 || state_fence != &session.module_generation.state_fence {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(())
+    }
+}
+
 impl KernelComposition {
     /// Executes one authenticated daemon lifecycle request.  Only the
     /// narrow handshake/health dispositions are handled here; semantic
@@ -2820,6 +3122,9 @@ impl KernelComposition {
                 self.origin_control_decide_operation(session, payload.clone())
                     .await
             }
+            "origin_grant_reconcile" => {
+                self.origin_grant_reconcile_operation(session, payload.clone())
+            }
             ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION => {
                 self.generation_registry_active_query_operation(session, payload.clone())
             }
@@ -2843,6 +3148,15 @@ impl KernelComposition {
             }
             STORAGE_REPLACEMENT_ROLLBACK_OPERATION => {
                 self.storage_replacement_rollback_operation(session, payload.clone())
+            }
+            // Issue #1694 W2: the persist-before-ack maintenance-trigger
+            // intake. The arm admits the ORS-staged record through the
+            // existing gateway owner entry before issuing any intake
+            // acknowledgement; every route scope, receipt, and delivery
+            // identity on the reply is owner-issued, never from the payload.
+            #[cfg(windows)]
+            MAINTENANCE_TRIGGER_INTAKE_OPERATION => {
+                self.maintenance_trigger_intake_operation(session, payload.clone())
             }
             DAEMON_STARTUP_EVIDENCE_OPERATION => {
                 self.daemon_startup_evidence_operation(session, &request_id, payload)
@@ -4104,6 +4418,9 @@ impl KernelComposition {
                 self.notify_launch_grant_operation(session, payload.clone())
                     .await
             }
+            "bind_operator_session_token" => {
+                self.operator_session_token_operation(session, payload.clone())
+            }
             _ => return Err(TransportError::SessionFenced),
         };
         // Typed refusal propagation (`#1110`): the arm already decided the
@@ -4741,17 +5058,13 @@ impl KernelComposition {
                 }
             }
             UserAutomationHostExecutionOperation::EnumeratePendingWakes { request } => {
-                match Box::pin(client.enumerate_pending_wakes(request)).await {
-                    Ok(receipt) => Ok(serde_json::json!({
-                        "status": "known",
-                        "value": {
-                            "outcome": "wake_enumeration",
-                            "receipt": receipt,
-                        },
-                        "recovery": null,
-                    })),
-                    Err(error) => Ok(Self::user_automation_runtime_error_response(error)),
-                }
+                let receipt = match Box::pin(client.enumerate_pending_wakes(request)).await {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        return Ok(Self::user_automation_runtime_error_response(error));
+                    }
+                };
+                Ok(Self::user_automation_wake_enumeration_response(&receipt))
             }
             UserAutomationHostExecutionOperation::PublishWakeHorizon { request } => {
                 let answer = match Box::pin(client.publish_wake_horizon(request.clone())).await {
@@ -4836,6 +5149,83 @@ impl KernelComposition {
             "value": {
                 "outcome": outcome,
                 "publication": answer,
+            },
+            "recovery": recovery,
+        })
+    }
+
+    #[cfg(windows)]
+    /// Projects one complete owner wake enumeration against the exact request it
+    /// was asked for (issue #2806 item 9).
+    ///
+    /// An enumeration receipt is not a completeness proof. `Unresolved` is the
+    /// owner's own disposition for a denominator member its one Host snapshot
+    /// could not classify: a duplicated record, a retained record identity that
+    /// conflicts with the denominator member, or a retained pending record under
+    /// a different State Fence. The owner answers with the typed
+    /// `UserAutomationWakeOccurrenceDisposition::Unresolved` per-member
+    /// reference in `evidence` plus a closed `reason`. The same crate already
+    /// refuses to derive a cancellation target set from such a receipt:
+    /// `UserAutomationWakeEnumerationReceipt::cancellation_targets` and
+    /// `KernelStoreGateway`'s retirement path both reject a non-zero
+    /// `coverage.unresolved_count`.
+    ///
+    /// Reporting such a receipt as `status: "known"` with `recovery: null` told
+    /// the caller that nothing was outstanding, which is exactly the claim the
+    /// owner refused to make. No complete owner-issued pending-wake set is
+    /// proven, so a `cancelled_wake_ids` list derived from it would be a short
+    /// page rather than evidence that no wake exists. An unresolved member is
+    /// therefore reported as an incomplete owner query, never as completion.
+    ///
+    /// The outstanding set is read from the receipt's own validated
+    /// `dispositions`, which is the owner's answer rather than a list this
+    /// function built, and the reconciliation handle is the receipt's own
+    /// `parent_operation_identity`: the exact operation identity the Host owner
+    /// must be asked about again under. A receipt whose denominator is fully
+    /// classified, every member either `PendingTarget` or `NotRetained`, is a
+    /// complete enumeration and still settles, because only then is the derived
+    /// target set the complete one the owner proved.
+    fn user_automation_wake_enumeration_response(
+        receipt: &UserAutomationWakeEnumerationReceipt,
+    ) -> serde_json::Value {
+        let unresolved_occurrence_ids = receipt
+            .dispositions
+            .iter()
+            .filter_map(|disposition| match disposition {
+                UserAutomationWakeOccurrenceDisposition::Unresolved { evidence, .. } => {
+                    Some(evidence.occurrence_id.clone())
+                }
+                UserAutomationWakeOccurrenceDisposition::PendingTarget { .. }
+                | UserAutomationWakeOccurrenceDisposition::NotRetained { .. } => None,
+            })
+            .collect::<Vec<String>>();
+        let recovery = if unresolved_occurrence_ids.is_empty() {
+            None
+        } else {
+            Some(serde_json::json!({
+                "kind": "unknown_outcome",
+                "reason": "the schedule owner accounted for every committed occurrence of this \
+                           revision but left the members below unclassified, so no complete \
+                           owner-issued pending-wake set is proven and no cancellation set may be \
+                           derived from this answer; each member carries its own owner evidence \
+                           and closed reason inside the enumeration receipt, and the exact \
+                           unresolved set must be reconciled under its parent operation identity",
+                "automation_id": &receipt.automation_id,
+                "automation_revision": &receipt.automation_revision,
+                "unresolved_occurrence_ids": unresolved_occurrence_ids,
+                "unresolved_occurrence_count": receipt.coverage.unresolved_count,
+                "parent_operation_identity": &receipt.parent_operation_identity,
+                "host_owner_identity": &receipt.host_owner_identity,
+                "host_owner_generation": &receipt.host_owner_generation,
+                "journal_sequence": receipt.journal_sequence,
+                "snapshot_digest": &receipt.snapshot_digest,
+            }))
+        };
+        serde_json::json!({
+            "status": if recovery.is_none() { "known" } else { "unknown" },
+            "value": {
+                "outcome": "wake_enumeration",
+                "receipt": receipt,
             },
             "recovery": recovery,
         })
@@ -7042,6 +7432,64 @@ impl KernelComposition {
             "value": value,
             "recovery": null,
         }))
+    }
+
+    /// Reconciles one grant-funded kill effect after crash or lost response
+    /// (issue #1775 A-crash).
+    ///
+    /// The reachable front-door caller for the durable authority journal's
+    /// reconciliation query path: the envelope carries only the operation
+    /// and the consumed one-shot nonce, and the gateway authorizes the
+    /// caller against the retained operation record, cross-checks the
+    /// envelope operation and the live installation against the journaled
+    /// original, and then either replays the preserved original kill
+    /// receipt or answers reconciliation-required — never re-executing and
+    /// never minting a fresh nonce. A proven (`Effected`) effect projects
+    /// the preserved receipt; an unproven (`Unknown`) effect projects a
+    /// structured `reconciliation_required` recovery obligation, not prose;
+    /// every authorization or binding failure fences the session before any
+    /// effect or live read.
+    fn origin_grant_reconcile_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let operation: OriginGrantReconcileOperation =
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
+        let (owner, _) =
+            super::caller_binding(session).map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        let gateway = self
+            .process_gateway
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        match gateway.reconcile_origin_grant_effect(
+            &owner,
+            &operation.operation_id,
+            &operation.request_nonce,
+        ) {
+            Ok(receipt) => Ok(serde_json::json!({
+                "status": "known",
+                "value": {
+                    "kind": "origin_grant_reconcile",
+                    "effect": "effected",
+                    "receipt": receipt,
+                },
+                "recovery": null,
+            })),
+            Err(ProcessExecutionError::UnknownOutcome) => Ok(serde_json::json!({
+                "status": "known",
+                "value": {
+                    "kind": "origin_grant_reconcile",
+                    "effect": "unknown",
+                },
+                "recovery": {
+                    "kind": "reconciliation_required",
+                    "operation_id": operation.operation_id.as_str(),
+                },
+            })),
+            Err(_) => Err(TransportError::SessionFenced),
+        }
     }
 
     fn generation_registry_active_query_operation(
@@ -9491,6 +9939,89 @@ impl KernelComposition {
         }))
     }
 
+    /// Binds one fresh, short-lived Operator session token on the admitted path
+    /// (`#1777` I11.8): the production caller of
+    /// `eliot_kernel_service::bind_operator_session_token`, the minter of the
+    /// Kernel challenge/session token the `WinUI` client then presents at
+    /// redemption.
+    ///
+    /// The binding evidence arrives as closed payload evidence from the
+    /// requesting User Broker; session evidence is threaded from the live
+    /// authenticated session - connection, exact epoch, exact fence - never
+    /// from the payload, and the binder re-proves it against live Kernel
+    /// admission together with Ready state, unfenced generation, and the exact
+    /// epoch/fence currency. The token and its bounded lease are derived here
+    /// from the observed authority triple, so this composition root never mints
+    /// one itself.
+    ///
+    /// The grant binds and echoes the presented peer tuple; it does not claim
+    /// that a presented process id owns a channel. The connected-peer proof
+    /// belongs to the pipe owner in the broker
+    /// (`bins/eliot-user-broker/src/main.rs::serve_operator_pipe_connection`),
+    /// which compares this echoed evidence with the OS-observed peer before it
+    /// accepts any redemption.
+    pub(crate) fn operator_session_token_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let operation: OperatorSessionTokenOperation =
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
+        validate_store_session_fence(session, &session.module_generation.state_fence)?;
+        self.admit_material_authority_for_governor_issued_fence(
+            &session.module_generation.state_fence,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        // Session evidence threaded from the live authenticated session, the
+        // same `SessionBinding` projection the notify grant binds with.
+        let session_evidence = serde_json::json!({
+            "session_id": &session.connection_id,
+            "authority_epoch": &session.authority_epoch,
+            "state_fence": &session.module_generation.state_fence,
+        });
+        let session_binding =
+            serde_json::from_value(session_evidence).map_err(|_| TransportError::SessionFenced)?;
+        let inputs = eliot_kernel_service::OperatorSessionTokenInputs {
+            registration_digest: operation.registration_digest,
+            handoff_nonce: operation.handoff_nonce,
+            windows_sid: operation.windows_sid,
+            interactive_session_id: operation.interactive_session_id,
+            client_process_id: operation.client_process_id,
+            client_image_path: operation.client_image_path,
+            role: operation.role,
+            capabilities: operation.capabilities,
+            session: session_binding,
+        };
+        let service = self
+            .service
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let authorization = eliot_kernel_service::bind_operator_session_token(&service, &inputs)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let bound = authorization.inputs();
+        Ok(serde_json::json!({
+            "kind": "operator_session_token",
+            "value": {
+                "operation_id": authorization.operation_id(),
+                "token": authorization.token(),
+                "issued_at_unix_ms": authorization.issued_at_unix_ms(),
+                "expires_at_unix_ms": authorization.expires_at_unix_ms(),
+                "generation": authorization.generation().value(),
+                "authority_epoch": authorization.authority_epoch(),
+                "state_fence": authorization.state_fence(),
+                "registration_digest": &bound.registration_digest,
+                "handoff_nonce": &bound.handoff_nonce,
+                "windows_sid": &bound.windows_sid,
+                "interactive_session_id": &bound.interactive_session_id,
+                "client_process_id": &bound.client_process_id,
+                "client_image_path": &bound.client_image_path,
+                "role": &bound.role,
+                "capabilities": &bound.capabilities,
+            },
+        }))
+    }
+
     /// Proves the presented notification reference against durable canonical
     /// state before a Notify launch grant binds (`#1780` W2).
     ///
@@ -10314,6 +10845,23 @@ fn validate_origin_inspection(
     }
     let identity = view.identity().ok_or(TransportError::SessionFenced)?;
     if identity.generation() != request.generation() || identity.physical() != request.physical() {
+        return Err(TransportError::SessionFenced);
+    }
+    // The packaged operation must equal the envelope operation the live
+    // view was just read under: a request packaged for one operation can
+    // never be issued or decided under another.
+    if request.operation_id() != operation_id {
+        return Err(TransportError::SessionFenced);
+    }
+    // The packaged installation is caller text until it is proven against
+    // the Kernel-retained composition identity: a foreign installation
+    // fails here, before any challenge is minted or decided. An uncomposed
+    // Kernel has no installation identity at all and refuses.
+    let live = super::dispatch_contour().map_or(
+        "",
+        super::dispatch_launch::ComposedDispatchContour::installation_id,
+    );
+    if live.trim().is_empty() || request.installation_id() != live {
         return Err(TransportError::SessionFenced);
     }
     Ok(())

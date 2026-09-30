@@ -301,6 +301,25 @@ pub fn map_governor_outcome_to_protocol_for_successor(
     )
 }
 
+/// Revalidates the frozen owner map against the built result: the mapped
+/// disposition admits owner authority exactly when the Governor resolved,
+/// and owner evidence is present exactly then.
+fn revalidate_owner_map_against_outcome(
+    was_resolved: bool,
+    result: &AgentActivationResolutionResult,
+) -> Result<(), DaemonError> {
+    let admits_owner = matches!(
+        result.disposition,
+        AgentActivationResolutionDisposition::Resolved { .. }
+    );
+    if admits_owner != was_resolved || result.owner_evidence.is_some() != was_resolved {
+        return Err(DaemonError::Lifecycle(
+            "activation result owner map drifted from the mapped Governor outcome".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn map_governor_outcome_to_protocol_inner(
     ticket: &AgentActivationResolutionTicket,
     outcome: GovernorActivationOutcome,
@@ -335,6 +354,12 @@ fn map_governor_outcome_to_protocol_inner(
             .as_ref()
             .map_or(1, |(owner_revision, _)| *owner_revision),
     };
+    // Issue #1775 (W1-map): the operation-to-owner map for the activation
+    // route is frozen here, on the real Governor→protocol caller path. Only
+    // a `Resolved` operation admits owner authority; every other operation
+    // maps to a terminal carrying proof of no owner. Captured before the
+    // move into the disposition match below.
+    let was_resolved = matches!(&outcome, GovernorActivationOutcome::Resolved(_));
     let disposition = match outcome {
         GovernorActivationOutcome::Resolved(snapshot) => {
             // #740: resolved scope/task/fence triple, preserved exactly as the
@@ -408,6 +433,12 @@ fn map_governor_outcome_to_protocol_inner(
         owner_revision,
         successor_observation,
     )?;
+    // Independent owner-map revalidation against the original outcome: the
+    // mapped disposition admits owner authority exactly when the Governor
+    // resolved, and owner evidence is present exactly then. A drift between
+    // the map and the built result fails closed instead of projecting owner
+    // authority — or hiding it — for the wrong operation.
+    revalidate_owner_map_against_outcome(was_resolved, &result)?;
     // #740: result span carries disposition + digest identities only.
     let _ = crate::diagnostics::AdmissionRecord::of(
         crate::diagnostics::disposition_of_resolution(&result.disposition),

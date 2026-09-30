@@ -173,8 +173,12 @@ fn build_context_tool_policy_record(
 pub(crate) fn derive_context_recipe_record(
     recipe_body: &ContextCampaignRecipeBody,
 ) -> Result<CampaignSourceRecord, String> {
-    let recipe_owner = context_recipe_publication(&recipe_body.recipe, &recipe_body.compiler_input)
-        .map_err(|error| error.to_string())?;
+    let recipe_owner = context_recipe_publication(
+        &recipe_body.recipe,
+        &recipe_body.catalogue,
+        &recipe_body.compiler_input,
+    )
+    .map_err(|error| error.to_string())?;
     build_context_recipe_record(&recipe_owner, context_required_references(recipe_body))
         .map_err(|error| error.to_string())
 }
@@ -209,8 +213,11 @@ pub fn build_context_owner_publications(
     expected_delivery_head: Option<CampaignSourceHead>,
     read_state_fence: &StateFence,
 ) -> Result<Vec<CampaignSourcePublication>, ContextPublicationError> {
-    let recipe_owner =
-        context_recipe_publication(&recipe_body.recipe, &recipe_body.compiler_input)?;
+    let recipe_owner = context_recipe_publication(
+        &recipe_body.recipe,
+        &recipe_body.catalogue,
+        &recipe_body.compiler_input,
+    )?;
     let delivery_owner = context_delivery_publication(&recipe_body.recipe, prior_delivery)?;
     let required_references = context_required_references(recipe_body);
     let recipe_record = build_context_recipe_record(&recipe_owner, required_references.clone())?;
@@ -262,8 +269,12 @@ pub(crate) fn validate_context_owner_bodies(
     if recipe_body.recipe.binding.state_fence != *state_fence {
         return Err("Context recipe does not share the packet State Fence".to_owned());
     }
-    let recipe_owner = context_recipe_publication(&recipe_body.recipe, &recipe_body.compiler_input)
-        .map_err(|error| error.to_string())?;
+    let recipe_owner = context_recipe_publication(
+        &recipe_body.recipe,
+        &recipe_body.catalogue,
+        &recipe_body.compiler_input,
+    )
+    .map_err(|error| error.to_string())?;
     let required_references = context_required_references(recipe_body);
     let recipe_record = build_context_recipe_record(&recipe_owner, required_references.clone())
         .map_err(|error| error.to_string())?;

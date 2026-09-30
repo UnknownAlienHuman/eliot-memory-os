@@ -27,7 +27,8 @@ use eliot_kernel_core::UserAutomationOperatorIntent;
 use eliot_kernel_core::user_automation::{
     ConfigPolicySnapshot, DeliveryChannel, UserAutomationConfigurationState,
     UserAutomationDeferReason, UserAutomationExecutionMode, UserAutomationInvocation,
-    UserAutomationPreflightAssembly, UserAutomationPreflightEvidence,
+    UserAutomationPreflightAssembly, UserAutomationPreflightContext,
+    UserAutomationPreflightDecision, UserAutomationPreflightEvidence,
     UserAutomationPreflightProjection, UserAutomationRevision,
 };
 use eliot_ors::{
@@ -52,7 +53,7 @@ use eliot_runtime_contracts::{
     I14_BACKPRESSURE_RESPONSE_VERSION, I14AlternativeRoute, I14BackpressureCause,
     I14BackpressureResponseV1, I14CurrentnessState, I14EscalationCondition, I14ForbiddenAction,
     I14RecoveryAction, I14RecoveryDirectiveV1, I14RequiredAuthority, I14ResolutionState,
-    I14WorkOutcome, NormalWorkClass, RecoveryCommitStatus, StatePreservationStatus,
+    I14WorkOutcome, NormalWorkClass, RecoveryCommitStatus, StatePreservationStatus, WakeIntent,
 };
 use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, NamedReadRequest,
@@ -81,8 +82,8 @@ use crate::store_write_reservation::{
     retain_unsupported_prepared_plan, writer_epoch_for_fence_from_epoch,
 };
 use crate::user_automation_execution::{
-    UserAutomationExecutionError, UserAutomationExecutionOutcome, UserAutomationExecutionRequest,
-    UserAutomationRemovalResult, UserAutomationWakeCancellation,
+    UserAutomationDurableJobMaterial, UserAutomationExecutionError, UserAutomationExecutionOutcome,
+    UserAutomationRemovalResult, UserAutomationRuntimeAdmission, UserAutomationWakeCancellation,
     UserAutomationWakeCancellationTarget, UserAutomationWakeEnumerationReceipt,
     UserAutomationWakePublication, UserAutomationWakeTargetEnumeration,
     read_retirement_wake_targets, retirement_wake_enumeration_request,
@@ -5838,11 +5839,20 @@ impl KernelStoreGateway {
     where
         R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
     {
-        let Some(UserAutomationMutationResult::RunNow { invocation, .. }) =
-            configuration.mutation_result()
+        let Some(UserAutomationMutationResult::RunNow {
+            invocation,
+            wake_intent,
+        }) = configuration.mutation_result()
         else {
             return Err("run-now did not return a run-now projection".to_owned());
         };
+        // The committed `WakeIntent` the canonical Store minted for this manual
+        // occurrence beside the invocation is the owner record this join binds
+        // through. It is kept rather than discarded in favour of a journal
+        // readback, because a manual nonce is deliberately not a published
+        // calendar occurrence (I11.12:33) and therefore never appears in the
+        // Host wake journal at all.
+        let committed_wake_intent = wake_intent.clone();
         let occurrence_id = invocation
             .occurrence_identity()
             .map_err(|error| error.to_string())?;
@@ -5876,37 +5886,41 @@ impl KernelStoreGateway {
                 },
             ));
         };
-        let wake_request = run_now_wake_read_request(
-            sealed.context.clone(),
-            sealed.authenticated_principal.clone(),
-            sealed.identity.clone(),
-            invocation.clone(),
-        );
-        let wake = match UserAutomationWakePort::read_pending_wake(runtime, wake_request).await {
-            Ok(readback) => UserAutomationWakePhase::Published { readback },
-            Err(error) => UserAutomationWakePhase::UnknownOutcome {
-                reason: error.to_string(),
-            },
-        };
+        let wake = Self::resolve_run_now_wake_phase(sealed, &invocation, runtime).await;
         if let Some(reason) = defer_reason {
             return Ok((wake, UserAutomationExecutionPhase::Deferred { reason }));
         }
-        // The committed occurrence joins the existing Durable Job execution
-        // path through deterministic preflight: the complete projection is
-        // assembled from the live owners, the service runs the model-free
-        // preflight, and an admitted occurrence reaches the Durable Job owner
-        // over the composed runtime channel. Without a proven pending wake
-        // there is no occurrence to join, so the execution stays unavailable
-        // beside the unresolved wake instead of inventing an admission.
-        let UserAutomationWakePhase::Published { readback } = &wake else {
+        // The committed occurrence joins the existing Durable Job execution path
+        // through deterministic preflight: the complete projection is assembled
+        // from the live owners, the service runs the model-free preflight, and
+        // an admitted occurrence reaches the Durable Job owner over the composed
+        // runtime channel.
+        //
+        // The occurrence binding this join needs is proved from the committed
+        // owner record itself, not from a journal record that cannot exist for a
+        // manual occurrence: the committed `WakeIntent` must name this exact
+        // occurrence under this exact State Fence, which is the same pair
+        // `UserAutomationExecutionRequest::validate` and the Durable Job
+        // admission both re-check. A gate that no committed manual occurrence
+        // could ever open is therefore replaced by a proof that one can, and
+        // nothing is defaulted or substituted: a committed intent that does not
+        // bind leaves the occurrence unadmitted beside its named reason.
+        //
+        // A retained readback, when the owner does answer with one, is still
+        // held to full equality with that committed intent by
+        // `UserAutomationOperatorTransition::validate_phase_joins`, so the
+        // owner's own proof is never traded away for the committed one.
+        if committed_wake_intent.wake_id != occurrence_id
+            || committed_wake_intent.state_fence != sealed.context.state_fence
+        {
             return Ok((
                 wake,
                 UserAutomationExecutionPhase::Unavailable {
                     reason: unproven_run_now_wake_reason(&occurrence_id),
                 },
             ));
-        };
-        let wake_intent = readback.intent.clone();
+        }
+        let wake_intent = committed_wake_intent;
         let projection = match self
             .assemble_run_now_preflight_projection(sealed, &owner, &invocation)
             .await
@@ -5928,19 +5942,22 @@ impl KernelStoreGateway {
                 .map(|failure| failure.failure_fingerprint.clone()),
             _ => None,
         };
-        let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(self));
-        let outcome = UserAutomationService::new(&store)
-            .execute_occurrence(
-                UserAutomationExecutionRequest {
-                    context: sealed.context.clone(),
-                    authenticated_principal: sealed.authenticated_principal.clone(),
-                    identity: sealed.identity.clone(),
-                    invocation: invocation.clone(),
-                    projection,
-                    wake_intent,
-                },
-                runtime,
-            )
+        // The committed occurrence crosses into the existing `RunNow` execution
+        // join with the complete owner-issued Durable Job material, rather than
+        // through a hand-assembled execution request beside it. The join reads
+        // the canonical run-now answer under the very identity this phase
+        // already committed, so it replays that one operation and can neither
+        // commit the invocation again nor mint a second manual nonce, and it
+        // then runs the same deterministic preflight and Durable Job admission
+        // every other occurrence uses.
+        let durable_job = Self::run_now_durable_job_material(
+            sealed,
+            &invocation,
+            &projection,
+            wake_intent.clone(),
+        );
+        let outcome = self
+            .join_run_now_occurrence(sealed, projection, durable_job, runtime)
             .await;
         Self::project_run_now_execution_outcome(
             wake,
@@ -5949,6 +5966,142 @@ impl KernelStoreGateway {
             blocked_fingerprint,
             &occurrence_id,
         )
+    }
+
+    /// Completes the owner-issued Durable Job submission for one committed
+    /// `RunNow` occurrence, or reports that no such submission exists to hand
+    /// over.
+    ///
+    /// The submission is compiled by the existing
+    /// [`UserAutomationDurableJobMaterial::from_admitted_occurrence`] out of the
+    /// members this occurrence already carries: the accepted revision the
+    /// preflight projection was assembled from, the deterministic preflight
+    /// receipt that authorises the admission, the committed wake intent bound to
+    /// this occurrence under this State Fence, and the authenticated parent
+    /// identity. Nothing is defaulted and no value is asserted on an owner's
+    /// behalf, so the occurrence identity, the certified capability closure and
+    /// the declared cost and runtime ceilings the Durable Job owner is asked to
+    /// admit are the ones the committed revision itself declares.
+    ///
+    /// The deterministic preflight is the owner's own pure decision function, so
+    /// asking it here answers exactly one question: does an admitted occurrence
+    /// exist for which owner-issued material can be completed at all. The
+    /// execution join runs the same function on the same projection immediately
+    /// before it builds the admission it sends, so this read cannot disagree
+    /// with the decision the join makes. A preflight that does not admit, and a
+    /// submission the compiler itself refuses, are both handed to the join
+    /// without one: the join's own owner boundary is where that typed refusal is
+    /// already produced, so the reported disposition stays the join's own answer
+    /// rather than the same refusal restated under another error type.
+    /// Resolves the wake phase of one committed `RunNow` occurrence over the
+    /// authenticated runtime channel.
+    ///
+    /// The request reuses the admitted parent identity and the committed
+    /// invocation, so a replayed Store mutation asks about the same original
+    /// occurrence instead of minting another manual nonce.
+    async fn resolve_run_now_wake_phase<R>(
+        sealed: &UserAutomationServiceRequest,
+        invocation: &UserAutomationInvocation,
+        runtime: &R,
+    ) -> UserAutomationWakePhase
+    where
+        R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
+    {
+        let wake_request = run_now_wake_read_request(
+            sealed.context.clone(),
+            sealed.authenticated_principal.clone(),
+            sealed.identity.clone(),
+            invocation.clone(),
+        );
+        match UserAutomationWakePort::read_pending_wake(runtime, wake_request).await {
+            Ok(readback) => UserAutomationWakePhase::Published { readback },
+            // A complete negative from the sole writer of that journal. The Host
+            // journal publishes only the calendar occurrences the immutable
+            // revision compiles, and an explicit manual `run-now` nonce is
+            // deliberately outside that set (I11.12:33), so "the owner retains
+            // no such wake" is the expected and correct answer here rather than
+            // a lost one. Reporting it as an unknown would leave every committed
+            // run-now permanently reconciling over a proven absence. Every other
+            // answer - an owner that could not be reached, an answer that was
+            // lost, a record about another occurrence - proves nothing and stays
+            // unresolved.
+            Err(UserAutomationRuntimeError::NotRetained(reason)) => {
+                UserAutomationWakePhase::NotApplicable { reason }
+            }
+            Err(error) => UserAutomationWakePhase::UnknownOutcome {
+                reason: error.to_string(),
+            },
+        }
+    }
+
+    fn run_now_durable_job_material(
+        sealed: &UserAutomationServiceRequest,
+        invocation: &UserAutomationInvocation,
+        projection: &UserAutomationPreflightProjection,
+        wake_intent: WakeIntent,
+    ) -> Option<UserAutomationDurableJobMaterial> {
+        let context = UserAutomationPreflightContext {
+            request_metadata: sealed.context.clone(),
+        };
+        let UserAutomationPreflightDecision::Admitted { receipt } =
+            projection.preflight(invocation, &context).ok()?
+        else {
+            return None;
+        };
+        let admission = UserAutomationRuntimeAdmission {
+            context: sealed.context.clone(),
+            authenticated_principal: sealed.authenticated_principal.clone(),
+            identity: sealed.identity.clone(),
+            revision: projection.revision.clone(),
+            invocation: invocation.clone(),
+            preflight: receipt,
+            wake_intent,
+            durable_job: None,
+        };
+        UserAutomationDurableJobMaterial::from_admitted_occurrence(&admission).ok()
+    }
+
+    /// Hands one committed `RunNow` occurrence to the existing `RunNow` execution
+    /// join over the composed runtime channel.
+    ///
+    /// The join is the same `UserAutomationService` contour every other
+    /// occurrence uses: it dispatches the canonical run-now Store operation
+    /// under the admitted parent identity, reads back the committed invocation
+    /// and its wake intent, runs the deterministic preflight, and reaches the
+    /// Durable Job owner. It adds no channel, no retry and no second admission.
+    ///
+    /// The two joins are different future types, so each arm owns its own
+    /// awaited value. The material arm is polled through one box because
+    /// `from_admitted_occurrence` holds a whole canonical-JSON K0
+    /// `JobSubmission` and its digest inputs on the stack; the transient
+    /// allocation is released as soon as the owner's answer is back, so this
+    /// contour's own future stays bounded.
+    async fn join_run_now_occurrence<R>(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        projection: UserAutomationPreflightProjection,
+        durable_job: Option<UserAutomationDurableJobMaterial>,
+        runtime: &R,
+    ) -> Result<UserAutomationExecutionOutcome, UserAutomationExecutionError>
+    where
+        R: UserAutomationRuntimePort + ?Sized,
+    {
+        let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(self));
+        let service = UserAutomationService::new(&store);
+        match durable_job {
+            Some(material) => {
+                Box::pin(service.run_now_and_execute_with_durable_job(
+                    sealed.clone(),
+                    projection,
+                    material,
+                    runtime,
+                ))
+                .await
+            }
+            None => {
+                Box::pin(service.run_now_and_execute(sealed.clone(), projection, runtime)).await
+            }
+        }
     }
 
     /// Re-proves one committed `RunNow` occurrence against the live owner.
@@ -6007,8 +6160,19 @@ impl KernelStoreGateway {
     /// unadmitted beside its named reason, except for a blocked decision the
     /// notification owner cannot be reached for, which stays unknown under its
     /// failure fingerprint instead of collapsing into an unattributed error.
-    /// Any other join failure is an unknown disposition: an owner may already
-    /// have effected it.
+    ///
+    /// Every answer the Durable Job owner could give about an effect it may
+    /// already have issued is the occurrence's `UnknownOutcome` disposition, not
+    /// a route error and never an admission. This leg's wake phase names the
+    /// occurrence at this point — the owner's retained record or its complete
+    /// negative beside the committed owner intent that binds it — so the
+    /// occurrence exists, its Durable Job identity is the occurrence identity,
+    /// and the disposition names exactly that occurrence: the caller is told
+    /// what must be reconciled instead of being handed a route error that
+    /// discards the committed configuration and every phase beside it. A
+    /// refusal the owner answered before any effect, and every precondition
+    /// this leg could not establish locally, stay route errors: those provably
+    /// admitted nothing, and no phase member may claim otherwise.
     fn project_run_now_execution_outcome(
         wake: UserAutomationWakePhase,
         outcome: Result<UserAutomationExecutionOutcome, UserAutomationExecutionError>,
@@ -6047,6 +6211,35 @@ impl KernelStoreGateway {
                 }
                 Ok((wake, UserAutomationExecutionPhase::Unavailable { reason }))
             }
+            // The join crossed the Durable Job admission boundary and the owner
+            // did not establish what it did there: the answer was lost, it was
+            // settled without a readable ledger result, it was bound to another
+            // identity, or it returned a reference that does not bind to this
+            // occurrence. The occurrence is therefore unadmitted exactly as far
+            // as this caller can prove, and the only honest member of the
+            // canonical disposition vocabulary is `UnknownOutcome`. It is never
+            // reported as `Admitted`, and it is not discarded into a route error
+            // that would hide the committed Store receipt and the occurrence the
+            // caller must reconcile.
+            Err(
+                error @ (UserAutomationExecutionError::Runtime(
+                    UserAutomationRuntimeError::UnknownOutcome(_)
+                    | UserAutomationRuntimeError::IdentityConflict
+                    | UserAutomationRuntimeError::OutcomeSettled(_),
+                )
+                | UserAutomationExecutionError::RuntimeResponseMismatch(_)),
+            ) => Ok((
+                wake,
+                UserAutomationExecutionPhase::UnknownOutcome {
+                    reason: unestablished_run_now_execution_reason(occurrence_id, &error),
+                },
+            )),
+            // A refusal the Durable Job owner answered before any owner effect,
+            // and a precondition this leg could not prove locally, provably
+            // admitted nothing. They are not an unknown outcome, and the closed
+            // execution vocabulary has no member for a decided refusal that is
+            // not an owner policy deferral, so the operation is refused instead
+            // of being dressed up as one.
             Err(error) => Err(error.to_string()),
         }
     }
@@ -8111,16 +8304,40 @@ fn unproven_execution_channel_reason() -> String {
         .to_owned()
 }
 
-/// Execution phase reason for a committed occurrence whose wake handoff did
-/// not prove a pending wake.
+/// Execution phase reason for a committed occurrence whose committed
+/// `WakeIntent` does not bind it.
 ///
-/// The preflight execution join needs the retained pending wake as its
-/// occurrence binding. An unreadable or absent wake proves nothing to join, so
-/// no admission is invented and the Durable Job owner is never asked.
+/// The preflight execution join needs the committed pending wake as its
+/// occurrence binding, and the Durable Job admission re-checks the same pair. A
+/// committed intent that names another occurrence or another State Fence proves
+/// nothing to join, so no admission is invented and the Durable Job owner is
+/// never asked.
 fn unproven_run_now_wake_reason(occurrence_id: &str) -> String {
     format!(
         "the wake handoff of committed occurrence {occurrence_id} did not prove a pending wake, \
          so no occurrence joins the Durable Job owner and the occurrence stays unadmitted"
+    )
+}
+
+/// Execution phase reason for a `RunNow` join whose owner answer does not
+/// establish whether the occurrence was admitted.
+///
+/// The Durable Job owner's answer for this exact occurrence was lost, bound to
+/// another identity, settled without a readable ledger result, or returned a
+/// reference that does not bind to this occurrence. The wake handoff is proven,
+/// so the occurrence exists, and its Durable Job identity is the occurrence
+/// identity: naming it is what lets a later attempt reconcile that same
+/// occurrence under its original job identity instead of submitting a second
+/// job. An unknown external effect is reported as unresolved and is never
+/// turned into a fabricated admission (I5.19).
+fn unestablished_run_now_execution_reason(
+    occurrence_id: &str,
+    detail: impl std::fmt::Display,
+) -> String {
+    format!(
+        "the Durable Job owner did not establish an admission for committed occurrence \
+         {occurrence_id}, so the occurrence stays unadmitted until that same occurrence is \
+         reconciled: {detail}"
     )
 }
 

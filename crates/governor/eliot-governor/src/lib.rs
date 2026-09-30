@@ -115,6 +115,8 @@ mod operator_reconciliation;
 mod owner_closure_feed;
 mod owner_closure_provider;
 mod owner_projection_refresh;
+mod problem_owner_transitions;
+mod quality_applicability;
 mod reactive_admission;
 mod route_registry;
 mod scan_disclosure_owner;
@@ -141,7 +143,7 @@ pub use canonical_projections::{
     GOVERNOR_PROJECTIONS_SCHEMA_VERSION, GovernorAffordanceProjection,
     GovernorContinuityProjection, GovernorProjectionError, GovernorProjectionSet,
     GovernorSafetyProjection, GovernorTaskProjection, ProjectionOmission,
-    compose_canonical_projections,
+    compose_canonical_projections, emit_canonical_projection_set,
 };
 pub use capability_evidence::{
     CapabilityEvidenceRecord, CapabilityRegistry, CapabilitySource, CapabilityStatus,
@@ -245,6 +247,16 @@ pub use owner_closure_provider::{
     AdmittedHydrationsSnapshot, GrantAdmissionParams, IntroductionAdmissionParams,
     OWNER_HYDRATION_SNAPSHOT_SCHEMA, OWNER_HYDRATION_SNAPSHOT_VERSION, OwnerClosureProvider,
     PreservedAdmission,
+};
+pub use problem_owner_transitions::{
+    PreparedProblemOwnerTransition, ProblemOwnerClosure, ProblemOwnerTransitionBody,
+    ProblemOwnerTransitionOutcome, ProblemOwnerTransitionRequest, prepare_problem_owner_transition,
+};
+pub use quality_applicability::{
+    ACTIVE_DIRECTIVE_OWNER, GOVERNANCE_PROFILE_OWNER, GovernedDecision, IMPACT_OWNER,
+    PROTECTED_FLOOR_OWNER, QualityApplicabilityError, QualityApplicabilityOwnerInputs, ROUTE_OWNER,
+    TASK_ACCEPTANCE_OWNER, governed_decision, quality_applicability_of,
+    resolve_quality_applicability,
 };
 pub use reactive_admission::{
     AtomRiskBinding, ReactiveAdmissionError, ReactiveRiskAssessment, ReactiveRiskTier,

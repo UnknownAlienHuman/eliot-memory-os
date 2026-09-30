@@ -174,6 +174,11 @@ pub enum ParameterShape {
     BlackboardItemRevision,
     /// Opaque, versioned `InstrumentRegistry` snapshot emitted by `persist`.
     InstrumentRegistrySnapshot,
+    /// Closed canonical Problem candidate record for issue #1759 I2: the
+    /// complete candidate `Problem` document the `ApplyProblemOwnerState` leg
+    /// commits. The value must be a JSON object; the problem owner-state
+    /// contract owns its identity, revision and source-Signal bindings.
+    ProblemOwnerState,
 }
 
 impl ParameterShape {
@@ -192,6 +197,7 @@ impl ParameterShape {
             Self::BlackboardItemLookup => "eliot.blackboard.item-lookup.v1",
             Self::BlackboardItemRevision => "eliot.blackboard.item-revision.v1",
             Self::InstrumentRegistrySnapshot => "eliot.instrument.registry-snapshot@1.0.0",
+            Self::ProblemOwnerState => crate::PROBLEM_OWNER_STATE_SCHEMA_V1,
         }
     }
 }
@@ -345,6 +351,58 @@ static RECONCILE_RECOVERY_PARAMETERS: [ParameterDeclaration; 10] = [
         name: "observation_request_digest",
         shape: ParameterShape::Subject,
         required: true,
+    },
+];
+/// Owner-approved Problem owner-transition fields (issue #1759 I2, I13.9).
+///
+/// The six scalar fields are the four bindings every named owner transition
+/// carries — the source Signal, the re-proved current authorization digest,
+/// the expected record revision and the candidate record digest — plus the
+/// Problem identity and the named-transition discriminator. Membership is
+/// exact and every one of them is required, so a transition cannot be admitted
+/// with a binding missing; `validate_problem_owner_state_params` then closes the
+/// verb set, compares the candidate record against them, and gates the optional
+/// retained closure record to exactly the two verbs that produce one.
+static APPLY_PROBLEM_OWNER_STATE_PARAMETERS: [ParameterDeclaration; 8] = [
+    ParameterDeclaration {
+        name: "transition",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "problem_id",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "expected_problem_revision",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "source_signal_id",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "authorization_digest",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "record_digest",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "record_json",
+        shape: ParameterShape::ProblemOwnerState,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "closure_json",
+        shape: ParameterShape::ProblemOwnerState,
+        required: false,
     },
 ];
 /// Owner-approved Governor finish persistence fields. The receipt remains an
@@ -1261,6 +1319,7 @@ pub const fn named_mutation_operation_name(operation: NamedMutationOperation) ->
         NamedMutationOperation::ApplySwarmOwnerRevisions => "ApplySwarmOwnerRevisions",
         NamedMutationOperation::ApplyLifecyclePolicy => "ApplyLifecyclePolicy",
         NamedMutationOperation::ReconcileRecovery => "ReconcileRecovery",
+        NamedMutationOperation::ApplyProblemOwnerState => "ApplyProblemOwnerState",
         NamedMutationOperation::RecordFinishDecision => "RecordFinishDecision",
         NamedMutationOperation::RecordFinishEvidence => "RecordFinishEvidence",
         NamedMutationOperation::RecordModuleCatalogSnapshot => "RecordModuleCatalogSnapshot",
@@ -1290,6 +1349,7 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
         b"ApplySwarmOwnerRevisions" => Some(NamedMutationOperation::ApplySwarmOwnerRevisions),
         b"ApplyLifecyclePolicy" => Some(NamedMutationOperation::ApplyLifecyclePolicy),
         b"ReconcileRecovery" => Some(NamedMutationOperation::ReconcileRecovery),
+        b"ApplyProblemOwnerState" => Some(NamedMutationOperation::ApplyProblemOwnerState),
         b"RecordFinishDecision" => Some(NamedMutationOperation::RecordFinishDecision),
         b"RecordFinishEvidence" => Some(NamedMutationOperation::RecordFinishEvidence),
         b"RecordModuleCatalogSnapshot" => Some(NamedMutationOperation::RecordModuleCatalogSnapshot),
@@ -1458,6 +1518,7 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::AppendAuditEvent => &APPEND_AUDIT_EVENT_PARAMETERS,
         NamedMutationOperation::ApplyLifecyclePolicy => &APPLY_LIFECYCLE_POLICY_PARAMETERS,
         NamedMutationOperation::ReconcileRecovery => &RECONCILE_RECOVERY_PARAMETERS,
+        NamedMutationOperation::ApplyProblemOwnerState => &APPLY_PROBLEM_OWNER_STATE_PARAMETERS,
         NamedMutationOperation::RecordFinishDecision => &RECORD_FINISH_DECISION_PARAMETERS,
         NamedMutationOperation::RecordFinishEvidence => &RECORD_FINISH_EVIDENCE_PARAMETERS,
         NamedMutationOperation::RecordModuleCatalogSnapshot => {
@@ -1569,7 +1630,8 @@ pub fn verify_declaration_holds_no_payload_encoding(
         | ParameterShape::CampaignViewLookup
         | ParameterShape::SwarmOwnerRevision
         | ParameterShape::BlackboardItemRevision
-        | ParameterShape::InstrumentRegistrySnapshot => true,
+        | ParameterShape::InstrumentRegistrySnapshot
+        | ParameterShape::ProblemOwnerState => true,
     };
     if structured && CONTROL_FIELD_DENYLIST.contains(&declaration.name) {
         return Err(StoreError::InvalidField {
@@ -1711,33 +1773,7 @@ fn check_declared_shape(
                 .map_err(|error| StoreError::Serialization(error.to_string()))?;
             lookup.validate()
         }
-        ParameterShape::CampaignSourcePublications => {
-            let publications: Vec<crate::CampaignSourcePublication> =
-                serde_json::from_value(value.clone())
-                    .map_err(|error| StoreError::Serialization(error.to_string()))?;
-            if publications.is_empty() || publications.len() > 64 {
-                return Err(StoreError::InvalidField {
-                    field: "campaign_source_publications",
-                    reason: "must contain between one and 64 publications",
-                });
-            }
-            let mut keys = std::collections::BTreeSet::new();
-            for publication in &publications {
-                publication.validate()?;
-                let key = serde_json::to_string(&(
-                    publication.record.role,
-                    &publication.record.owner_id,
-                    &publication.record.record_id,
-                ))
-                .map_err(|error| StoreError::Serialization(error.to_string()))?;
-                if !keys.insert(key) {
-                    return Err(StoreError::Duplicate {
-                        field: "campaign_source_publications.key",
-                    });
-                }
-            }
-            Ok(())
-        }
+        ParameterShape::CampaignSourcePublications => validate_campaign_source_publications(value),
         ParameterShape::CampaignViewLookup => {
             let lookup: crate::CampaignLearningStateViewLookup =
                 serde_json::from_value(value.clone())
@@ -1757,7 +1793,55 @@ fn check_declared_shape(
                 .map_err(|error| StoreError::Serialization(error.to_string()))?;
             revision.validate()
         }
+        ParameterShape::ProblemOwnerState => {
+            // The candidate record's own bindings are compared by the
+            // problem owner-state contract, which needs the whole parameter map
+            // (the record alone cannot see the presented identity, expected
+            // revision or source Signal it must agree with). Shape only here.
+            if value.is_object() {
+                Ok(())
+            } else {
+                Err(StoreError::InvalidField {
+                    field: "operation.parameter",
+                    reason: "problem owner transition candidate record must be a JSON object",
+                })
+            }
+        }
     }
+}
+
+/// Validates the `campaign_source_publications` parameter.
+///
+/// Split out of [`check_declared_shape`] because it is the only declared shape
+/// whose validation is real work rather than shape dispatch: it decodes the
+/// publication list, bounds it, validates every publication, and refuses a
+/// repeated `(role, owner, record)` identity. Keeping it named says what it
+/// decides; inlining it in the dispatch match buried that under six other arms.
+fn validate_campaign_source_publications(value: &Value) -> Result<(), StoreError> {
+    let publications: Vec<crate::CampaignSourcePublication> = serde_json::from_value(value.clone())
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    if publications.is_empty() || publications.len() > 64 {
+        return Err(StoreError::InvalidField {
+            field: "campaign_source_publications",
+            reason: "must contain between one and 64 publications",
+        });
+    }
+    let mut keys = std::collections::BTreeSet::new();
+    for publication in &publications {
+        publication.validate()?;
+        let key = serde_json::to_string(&(
+            publication.record.role,
+            &publication.record.owner_id,
+            &publication.record.record_id,
+        ))
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        if !keys.insert(key) {
+            return Err(StoreError::Duplicate {
+                field: "campaign_source_publications.key",
+            });
+        }
+    }
+    Ok(())
 }
 
 fn validate_instrument_registry_snapshot(value: &Value) -> Result<(), StoreError> {

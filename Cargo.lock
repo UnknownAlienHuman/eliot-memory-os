@@ -939,6 +939,7 @@ name = "eliot-blob"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "eliot-backup",
  "eliot-blob-api",
  "eliot-platform",
  "eliot-platform-windows",
@@ -1144,6 +1145,7 @@ dependencies = [
  "eliot-evidence",
  "eliot-governor",
  "eliot-improvement",
+ "eliot-learning-contracts",
  "eliot-reactive-context-plan",
  "eliot-receipts",
  "eliot-security-contracts",
@@ -1161,6 +1163,7 @@ dependencies = [
  "eliot-evidence",
  "eliot-governor",
  "eliot-improvement",
+ "eliot-learning-contracts",
  "eliot-observation-contracts",
  "eliot-receipts",
  "serde",
@@ -1177,6 +1180,7 @@ dependencies = [
  "eliot-cue-contracts",
  "eliot-epistemic-contracts",
  "eliot-evidence",
+ "eliot-learning-contracts",
  "eliot-memory-projection-contracts",
  "eliot-protocol",
  "eliot-receipts",
@@ -1810,6 +1814,8 @@ dependencies = [
  "blake3",
  "eliot-bootstrap",
  "eliot-build-test-graph",
+ "eliot-context-contracts",
+ "eliot-context-measurement",
  "eliot-contracts",
  "eliot-instrument-api",
  "eliot-instrument-nextest",
@@ -2385,6 +2391,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror",
+ "time",
  "tokio",
 ]
 

@@ -114,20 +114,30 @@ public static class OperatorProjectionNames
 }
 
 /// One closed serializer profile for every Operator surface. `Web` defaults
-/// alone leave three surfaces open, so they are closed explicitly here:
-/// unmapped members are refused instead of silently ignored, duplicate names
-/// are refused by the framing guard, and the depth is bounded by
+/// alone leave four surfaces open, so they are closed explicitly here:
+/// unmapped members are refused instead of silently ignored, member names
+/// match exactly instead of case-insensitively, duplicate names are refused
+/// by the framing guard, and the depth is bounded by
 /// [`OperatorProtocol.MaxResponseDepth`].
 public static class OperatorJson
 {
     /// Serializer options for wire and local payloads. `NumberHandling`
     /// stays at the framework default so a typed numeric field is never
     /// accepted as a string by accident.
+    ///
+    /// `PropertyNameCaseInsensitive` is stated, not inherited. `Web` turns it
+    /// on, and an on profile makes two spellings of one member collide here
+    /// while the framing guard's ordinal duplicate set calls them two distinct
+    /// names — so `{"schema_version":a,"SCHEMA_VERSION":b}` would pass the
+    /// guard as duplicate-free and then let the second member silently win.
+    /// Every protected member here is an exact `[JsonPropertyName]`, so exact
+    /// matching is the whole contract and nothing needs the tolerance.
     public static JsonSerializerOptions Reader { get; } = new(JsonSerializerDefaults.Web)
     {
         MaxDepth = OperatorProtocol.MaxResponseDepth,
         UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
-        NumberHandling = JsonNumberHandling.Strict
+        NumberHandling = JsonNumberHandling.Strict,
+        PropertyNameCaseInsensitive = false
     };
 
     /// Redacts nothing and rewrites nothing: it is the same closed profile.

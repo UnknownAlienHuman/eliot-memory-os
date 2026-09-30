@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use eliot_backup::{
     BackupArtifact, BackupBlob, BackupBundle, BackupClass, BackupError, BackupInput,
     CanonicalRecord, EventRange, ExportFence, HostStateAuditFence, OrsSnapshotFence,
-    WatchdogSpoolFence,
+    PublicationError, WatchdogSpoolFence,
 };
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex};
 use eliot_kernel::{
@@ -516,7 +516,7 @@ impl PublicationPort for MemPublisher {
         operation_id: &str,
         idempotency_key: &str,
         bytes: &[u8],
-    ) -> Result<PublicationReceipt, KernelCaptureError> {
+    ) -> Result<PublicationReceipt, PublicationError> {
         self.publishes.push((
             operation_id.to_owned(),
             idempotency_key.to_owned(),
@@ -524,9 +524,7 @@ impl PublicationPort for MemPublisher {
         ));
         if self.drop_first && !self.dropped {
             self.dropped = true;
-            return Err(KernelCaptureError::PublicationUnknown(
-                operation_id.to_owned(),
-            ));
+            return Err(PublicationError::Unknown(operation_id.to_owned()));
         }
         Ok(PublicationReceipt {
             operation_id: operation_id.to_owned(),
@@ -535,7 +533,7 @@ impl PublicationPort for MemPublisher {
         })
     }
 
-    fn reconcile(&mut self, operation_id: &str) -> Result<PublicationReceipt, KernelCaptureError> {
+    fn reconcile(&mut self, operation_id: &str) -> Result<PublicationReceipt, PublicationError> {
         self.reconciles.push(operation_id.to_owned());
         self.publishes
             .iter()
@@ -546,7 +544,7 @@ impl PublicationPort for MemPublisher {
                 archive_sha256: sha256_hex(bytes),
                 durable: true,
             })
-            .ok_or_else(|| KernelCaptureError::PublicationUnknown(operation_id.to_owned()))
+            .ok_or_else(|| PublicationError::Unknown(operation_id.to_owned()))
     }
 }
 

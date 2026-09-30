@@ -41,8 +41,9 @@ use eliot_types::{
     MetaPolicyExecutionReceipt, MinorityPressureRecord, ObservabilityKind,
     ObservabilityWriteEnvelope, ObservabilityWriteReceipt, ObservabilityWriteStatus, ProjectId,
     ProjectSequence, RecallL0Request, RecallL0Response, SessionId, SleepCandidateArtifact,
-    SleepConsolidationBundle, SleepConsolidationRun, SurrealServerConfig, TaskContract, TaskId,
-    ToolObservation, VerificationId, VerificationRun, WriteId, WriteReceipt, WriteStatus,
+    SleepConsolidationBundle, SleepConsolidationRun, SurrealServerConfig,
+    TaskAcceptanceEvidenceKind, TaskContract, TaskId, ToolObservation, VerificationId,
+    VerificationRun, WriteId, WriteReceipt, WriteStatus,
 };
 use recall_ranking::{is_default_visible_lifecycle, rank_recall_candidates};
 use serde::de::DeserializeOwned;
@@ -1381,6 +1382,56 @@ fn surreal_datetime_binding(value: OffsetDateTime, label: &str) -> Result<String
     value.format(&Rfc3339).map_err(|error| {
         StoreError::ConfigMessage(format!("could not encode {label} as RFC3339: {error}"))
     })
+}
+
+/// One enumerated acceptance obligation of a `TaskContract`, as read at an
+/// exact task revision, together with the handles that make the submitter's own
+/// satisfaction claim checkable.
+///
+/// `submitter_satisfied_claim` is a submitter-shaped claim carried forward
+/// verbatim from the durable `TaskAcceptanceItem.satisfied` value. It is not
+/// coverage truth and this type does not promote it to one. The three binding
+/// handles beside it — `observation_id`, `verification_id` and
+/// `verification_scope_hash` — are the only material a consumer may use to
+/// re-derive coverage against owner-bound evidence, and
+/// `submitter_claim_is_bound` records only whether the handles `required_evidence`
+/// names are present at all, never that they support the claim.
+/// `crates/eliot-app/src/mcp_stdio/task.rs` (`task_completion_proof_gaps`) is
+/// the existing precedent for the same discipline: it walks the bindings and
+/// reports `missing_observation` / `missing_verification` / `not_exact` rather
+/// than reading the flag.
+#[derive(Clone, Debug)]
+pub struct TaskAcceptanceItemRead {
+    pub item_id: String,
+    pub description: String,
+    pub required_evidence: TaskAcceptanceEvidenceKind,
+    /// A submitter-shaped claim, not coverage truth.
+    pub submitter_satisfied_claim: bool,
+    pub observation_id: Option<String>,
+    pub verification_id: Option<VerificationId>,
+    pub verification_scope_hash: Option<String>,
+    /// Whether the bindings `required_evidence` names are present, so the claim
+    /// above is checkable at all. Absent means the obligation is uncovered
+    /// until a consumer joins owner-bound evidence to it.
+    pub submitter_claim_is_bound: bool,
+}
+
+/// The current `TaskContract` acceptance item set of one task, read at an exact
+/// task id and an exact memory revision, with the owner identity of the write
+/// that last set it.
+///
+/// The obligation list is enumerated item by item. No digest, count or other
+/// summary stands in for it, because a summary cannot make an omitted obligation
+/// visible. The identity fields bind the read to the owner's own write, so a
+/// consumer can tell which write the denominator came from.
+#[derive(Clone, Debug)]
+pub struct TaskAcceptanceItemSet {
+    pub task_id: TaskId,
+    pub project_id: ProjectId,
+    pub memory_revision: MemoryRevision,
+    pub project_sequence: ProjectSequence,
+    pub write_id: WriteId,
+    pub items: Vec<TaskAcceptanceItemRead>,
 }
 
 #[derive(Clone, Debug)]
@@ -3130,6 +3181,117 @@ impl CanonicalStore {
             return Ok(None);
         }
         decode_value(NamedSurqlOp::TaskContractById, value).map(Some)
+    }
+
+    /// Reads the current acceptance item set of one `TaskContract` at the exact
+    /// `task_id` and the exact `expected_revision`, refusing rather than
+    /// returning a denominator the caller was not admitted against.
+    ///
+    /// This is the owner-bound denominator the finish path needs. I7.9 requires
+    /// the Finish service to rehydrate the current `TaskContract`, its
+    /// acceptance items, exact artifacts, current `State Fence`, executed
+    /// verifier runs and effect outcomes; I5.5 makes the exact `TaskContract`
+    /// revision and the acceptance digest the task-bound write precondition;
+    /// I5.6 step 5 verifies the `State Fence` and the expected current
+    /// revisions. The revision check here is what makes the rehydration
+    /// non-stale.
+    ///
+    /// Fail-closed in every direction: an absent record, a revision mismatch, an
+    /// empty obligation list, or an obligation without a unique non-empty
+    /// `item_id` is an error, never a smaller or empty success. A denominator
+    /// that shrinks without refusing is exactly the #325 P1 defect, where an
+    /// omitted obligation never reaches the completion gate.
+    ///
+    /// The `State Fence` is deliberately not a parameter. The `task_contract`
+    /// record carries `memory_revision` and no fence, and I5.5 lists the exact
+    /// `TaskContract` revision and the `State Fence` as separate admission
+    /// inputs, so a fence passed in here would be a caller assertion that this
+    /// record cannot check and that the store must not treat as proven.
+    ///
+    /// Reuses the existing owner, record and query: this delegates to
+    /// [`Self::task_contract_by_id`], whose meaning for its other callers is
+    /// unchanged, and adds no second read path, table or identity scheme.
+    pub async fn task_acceptance_items_at_revision(
+        &self,
+        task_id: TaskId,
+        expected_revision: MemoryRevision,
+    ) -> Result<TaskAcceptanceItemSet, StoreError> {
+        let contract = self.task_contract_by_id(task_id).await?.ok_or_else(|| {
+            StoreError::PolicyViolation(format!(
+                "acceptance item set refused for task {task_id}: no task contract exists at \
+                 memory revision {expected}",
+                expected = expected_revision.value(),
+            ))
+        })?;
+
+        if contract.memory_revision != expected_revision {
+            return Err(StoreError::PolicyViolation(format!(
+                "acceptance item set refused for task {task_id}: expected memory revision \
+                 {expected} but the contract is at {observed}",
+                expected = expected_revision.value(),
+                observed = contract.memory_revision.value(),
+            )));
+        }
+
+        if contract.task_id != task_id {
+            return Err(StoreError::PolicyViolation(format!(
+                "acceptance item set refused: the record selected for task {task_id} reports \
+                 task {}",
+                contract.task_id
+            )));
+        }
+
+        if contract.acceptance_items.is_empty() {
+            return Err(StoreError::PolicyViolation(format!(
+                "acceptance item set refused for task {task_id}: the contract at memory revision \
+                 {observed} records no obligation",
+                observed = contract.memory_revision.value(),
+            )));
+        }
+
+        let mut item_ids = BTreeSet::new();
+        let mut items = Vec::with_capacity(contract.acceptance_items.len());
+        for item in &contract.acceptance_items {
+            if item.item_id.trim().is_empty() || item.description.trim().is_empty() {
+                return Err(StoreError::PolicyViolation(format!(
+                    "acceptance item set refused for task {task_id}: an item has an empty id or \
+                     description at memory revision {observed}",
+                    observed = contract.memory_revision.value(),
+                )));
+            }
+            if !item_ids.insert(item.item_id.clone()) {
+                return Err(StoreError::PolicyViolation(format!(
+                    "acceptance item set refused for task {task_id}: item id {:?} is not unique at \
+                     memory revision {observed}; an unidentifiable obligation cannot be joined",
+                    item.item_id,
+                    observed = contract.memory_revision.value(),
+                )));
+            }
+            items.push(TaskAcceptanceItemRead {
+                item_id: item.item_id.clone(),
+                description: item.description.clone(),
+                required_evidence: item.required_evidence,
+                submitter_satisfied_claim: item.satisfied,
+                observation_id: item.observation_id.clone(),
+                verification_id: item.verification_id,
+                verification_scope_hash: item.verification_scope_hash.clone(),
+                submitter_claim_is_bound: match item.required_evidence {
+                    TaskAcceptanceEvidenceKind::Observation => item.observation_id.is_some(),
+                    TaskAcceptanceEvidenceKind::Verification => {
+                        item.verification_id.is_some() && item.verification_scope_hash.is_some()
+                    }
+                },
+            });
+        }
+
+        Ok(TaskAcceptanceItemSet {
+            task_id: contract.task_id,
+            project_id: contract.project_id,
+            memory_revision: contract.memory_revision,
+            project_sequence: contract.project_sequence,
+            write_id: contract.write_id,
+            items,
+        })
     }
 
     pub async fn tool_observations_by_kind(

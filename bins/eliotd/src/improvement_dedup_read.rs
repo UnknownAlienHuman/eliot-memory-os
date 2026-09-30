@@ -157,7 +157,9 @@
 //! Whether that effect may be attempted again is the Governor owner's own
 //! question, answered by the obligation's own retry gate — not by this read
 //! deciding to withhold a candidate. It is recognised, re-proved as a
-//! self-binding record, and dropped; see the `Reconciliation` row of `Row`.
+//! self-binding record whose commitment identity is checked by the OWNER's own
+//! `ImprovementUnknownEffectIdentity::validate`, and dropped; see the
+//! `Reconciliation` row of `Row`.
 //!
 //! # What is NOT claimed
 //!
@@ -193,6 +195,7 @@ use eliot_improvement::candidate_bounds::{
 use eliot_improvement::{
     ImprovementBrief, ImprovementCandidate, ImprovementLifecycle, OwnerDecision,
 };
+use eliot_maintenance::ImprovementUnknownEffectIdentity;
 use eliot_store_api::{
     EXPERIENCE_PAGE_NEXT_CURSOR, EXPERIENCE_PAGE_RECORDS, EXPERIENCE_PAGE_STATE_FENCE,
     EXPERIENCE_PAGE_TRUNCATED, LEARNING_PARAM_CURSOR, LearningRecordKind,
@@ -328,28 +331,27 @@ struct LineageMergeReceiptDocument {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReconciliationObligationDocument {
-    unknown_effect_obligation: ReconciliationObligation,
+    unknown_effect_obligation: ImprovementUnknownEffectIdentity,
     retry_permitted: bool,
     completion_retained: bool,
 }
 
-/// The owner-facing identity inside a committed reconciliation record.
-///
-/// Re-proves itself here exactly as the other three shapes do: an obligation
-/// that names no candidate, no owner, no experiment or no committed operation is
-/// a spliced document, and a debt nobody owns is not a debt this registry can
-/// treat as recorded.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReconciliationObligation {
-    owner_id: String,
-    candidate_id: String,
-    experiment_id: String,
-    operation_ref: String,
-    idempotency_key: String,
-    forward_repair_ref: String,
-    invalidation_set: Vec<String>,
-}
+// The owner-facing identity inside a committed reconciliation record.
+//
+// This is the Governor owner's OWN record,
+// `eliot_maintenance::ImprovementUnknownEffectIdentity`, decoded with the
+// owner's own `deny_unknown_fields` decoder rather than as a second
+// daemon-local shape. That is the point: the durable debt is re-proved against
+// the contract that produced it, and a record carrying an identity the pipeline
+// never committed cannot decode as one.
+// `ImprovementUnknownEffectIdentity::validate` then re-checks the ORIGINAL
+// recorded domain, encoding revision and algorithm of the retained commitment
+// against the owner's own constants, which is a content check of the committed
+// proposal bytes rather than a presence check on an operation reference.
+//
+// It is re-proved here as the other three shapes are: an obligation naming no
+// candidate, no owner or no experiment is a spliced document, and a debt nobody
+// owns is not a debt this registry can treat as recorded.
 
 /// One served page of the bounded candidate read.
 pub struct CandidatePage {
@@ -663,16 +665,25 @@ fn classify_merge_receipt(
 /// Split out of [`classify_row`] so this row shape's re-proof reads on its own,
 /// exactly as the merge receipt's does.
 ///
-/// Two checks, both content. The first is self-binding: every identity the
+/// Four checks, all content. The first is the OWNER's own content check:
+/// `ImprovementUnknownEffectIdentity::validate` re-checks the ORIGINAL recorded
+/// domain, encoding revision and algorithm of the retained commitment against
+/// the Governor owner's own constants, so a debt whose commitment was written
+/// under an identity this build does not read is refused here rather than
+/// treated as a recorded debt. The second is self-binding: every identity the
 /// Governor pipeline copied into the obligation must be present and non-empty,
 /// because a record naming an effect nobody owns, over no experiment, under no
-/// committed operation, is not a recorded debt. The second is a cross-check on
+/// committed operation, is not a recorded debt. The third is a cross-check on
 /// the two answers the Governor gate gave. They are mutually exclusive BY
-/// CONSTRUCTION there — a settled `Rejected` outcome opens the retry gate and
-/// retains no completion, while a `Committed`/`Compensated` outcome retains its
-/// result and closes the gate — so a record claiming both is a spliced document
-/// and is refused rather than read. A third check re-proves the quarantine
-/// scope the obligation carries.
+/// CONSTRUCTION there, so a record claiming both a permitted retry and a
+/// retained completion is a spliced document and is refused rather than read.
+/// The fourth re-proves the quarantine scope the obligation carries.
+///
+/// The operation and idempotency identities are read out of the retained
+/// commitment rather than from loose sibling fields, because a second spelling
+/// of them in the document is a second claim about the same operation: the
+/// commitment is what the pipeline committed and what the owner re-checks a
+/// receipt against.
 ///
 /// This read restores a candidate registry; it decides nothing about whether an
 /// effect may be retried, and the cross-check exists only so the recorded
@@ -688,12 +699,29 @@ fn classify_reconciliation_obligation(
             ))
         })?;
     let obligation = &receipt.unknown_effect_obligation;
+    // The OWNER's own content check over the ORIGINAL recorded commitment
+    // identity. It reads the values the producer recorded and compares them
+    // with the Governor owner's constants; nothing is recomputed over what
+    // this process happens to hold, and no digest stands in for a record this
+    // build cannot read.
+    obligation.validate().map_err(|error| {
+        refused(format!(
+            "reconciliation obligation is not the checked commitment identity: {}",
+            error.component
+        ))
+    })?;
     for (name, value) in [
         ("candidate_id", obligation.candidate_id.as_str()),
         ("owner_id", obligation.owner_id.as_str()),
         ("experiment_id", obligation.experiment_id.as_str()),
-        ("operation_ref", obligation.operation_ref.as_str()),
-        ("idempotency_key", obligation.idempotency_key.as_str()),
+        (
+            "operation_ref",
+            obligation.commitment.operation_ref.as_str(),
+        ),
+        (
+            "idempotency_key",
+            obligation.commitment.idempotency_key.as_str(),
+        ),
     ] {
         if value.trim().is_empty() {
             return Err(refused(format!(

@@ -48,11 +48,6 @@ public sealed class MainViewModel : INotifyPropertyChanged
     /// from an unknown outcome.
     public const string StaleFenceReasonCode = "STALE_STATE_FENCE";
 
-    private static readonly JsonSerializerOptions UserAutomationRevisionReader = new(OperatorJson.Reader)
-    {
-        PropertyNameCaseInsensitive = false
-    };
-
     private readonly IGovernorClient _client;
     private readonly OperatorPendingOperationJournal? _pendingJournal;
     private OperatorTaskContext? _taskContext;
@@ -63,6 +58,14 @@ public sealed class MainViewModel : INotifyPropertyChanged
     private SavedFilterViewModel? _selectedSavedFilter;
     private readonly List<OperatorPendingOperation> _pendingOperations = [];
     private OperatorProjectionBinding? _projectionBinding;
+    /// The owner-issued session binding the currently displayed projection was
+    /// built under, read off the live transport at the moment the page was
+    /// applied. Rows, selection, cursor, graph focus, task context and the
+    /// retained result payload are views of ONE grant; a grant that rotates or
+    /// goes away is a runtime-identity change that invalidates all of them
+    /// before any of them is read again. A null value is a real observation
+    /// (no established binding), never a "matches anything" wildcard.
+    private OperatorRoleBinding? _projectionGrant;
     private bool _isBusy;
     private string _projectId = string.Empty;
     private string _taskId = string.Empty;
@@ -355,6 +358,22 @@ public sealed class MainViewModel : INotifyPropertyChanged
             SetBanner("Projection is changing", "Wait for the current request to finish before using a selected action.", OperatorBannerSeverity.Informational);
             return;
         }
+        // The selected action, the selected record and the task context are
+        // rebuildable views of ONE owner-issued session binding, and the task
+        // context carries the owner task revision that becomes
+        // `expected_revision`. If that binding rotated, none of them may be
+        // read to build a mutation: the revision would be sent against a
+        // binding this process no longer holds. Invalidate first, then refuse.
+        var selectedGrant = _projectionGrant;
+        if (!RequireLiveBindingForRetainedState())
+        {
+            SetBanner(
+                "Command not sent — session binding changed",
+                $"The operator session binding this selection was built under ({DescribeGrant(selectedGrant)}) is no longer the live one ({DescribeGrant(_roleBinding)}), "
+                + "so the selected record, action and owner task revision were invalidated before use. Nothing was journaled and nothing was sent.",
+                OperatorBannerSeverity.Warning);
+            return;
+        }
         if (SelectedAction is null || SelectedRecord is null)
         {
             SetBanner("No action selected", "Select a record and one typed action.", OperatorBannerSeverity.Warning);
@@ -371,21 +390,63 @@ public sealed class MainViewModel : INotifyPropertyChanged
             return;
         }
 
+        OperatorIntentEnvelope envelope;
+        try
+        {
+            envelope = BuildCommandRegion(SelectedAction.Command, SelectedRecord, task);
+        }
+        catch (Exception error) when (error is InvalidOperationException or JsonException)
+        {
+            // A typed parameter the operator entered is still a locally
+            // refusable request, not a fault. `ParseJsonObject` caps length and
+            // depth and refuses a non-object root, but well-bounded malformed
+            // JSON only fails here, at the parse -- so without this the
+            // `JsonException` left through the `async void` click handler and
+            // killed the process with no banner shown at all.
+            //
+            // The refusal is displayed under the same closed code the
+            // transport paths use, and the framework message is never shown: a
+            // serializer message can carry a JSON path, an offset and a
+            // character lifted from the bytes the operator typed.
+            //
+            // The containment point is BEFORE `SubmitIntentAsync`, which is
+            // where the first send and the first journal write happen. So this
+            // refusal sends nothing, journals nothing and leaves no pending
+            // operation to reconcile -- the same terminal disposition as the
+            // refusals above, and no partially sent write to recover from.
+            SetBanner(
+                "Command not sent",
+                $"{SelectedAction.Command}: the typed command was refused before submission "
+                    + $"({BoundedRefusalReason(error)}); nothing was journaled and nothing was sent.",
+                OperatorBannerSeverity.Warning);
+            return;
+        }
+        await SubmitIntentAsync(envelope, SelectedAction.Command, isReconcile: false);
+    }
+
+    /// Mints the exact typed envelope one user action sends. Split out of the
+    /// caller so the whole build-and-mint region sits inside a single guard:
+    /// the operator's typed buffer reaches JSON parsing here, and this is the
+    /// only place it does before a send.
+    private OperatorIntentEnvelope BuildCommandRegion(
+        string commandName,
+        OperatorRecordView record,
+        OperatorTaskContext task)
+    {
         var command = BuildCommand(
-            SelectedAction.Command,
-            SelectedRecord,
+            commandName,
+            record,
             task,
             ActionInput.Trim(),
             CandidateDisposition);
         // One identity per user action: the typed envelope mints the
         // operation id once and the exact bytes are retained until a terminal
         // receipt. A retry of this action reconciles the same identity.
-        var envelope = OperatorIntentEnvelope.Create(
+        return OperatorIntentEnvelope.Create(
             task.ProjectId,
             task.TaskId,
             task.Revision,
             JsonSerializer.SerializeToElement(command));
-        await SubmitIntentAsync(envelope, SelectedAction.Command, isReconcile: false);
     }
 
     /// Reconciles every pending unknown-outcome operation under its retained
@@ -449,7 +510,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
         }
         catch (Exception error) when (error is JsonException or InvalidOperationException)
         {
-            WithholdUserAutomation(pending, $"the retained typed request is not a closed UserAutomation envelope ({error.Message});");
+            WithholdUserAutomation(pending, $"the retained typed request is not a closed UserAutomation envelope ({BoundedRefusalReason(error)});");
             return;
         }
 
@@ -500,6 +561,21 @@ public sealed class MainViewModel : INotifyPropertyChanged
 
     public async Task RunCommandAsync(string command)
     {
+        // Same runtime identity axis as every other use of the retained
+        // projection: the autonomy run row and the owner task revision that
+        // becomes `expected_revision` are views of the session binding the
+        // projection was built under. A rotated or gone binding drops both
+        // before they are read, so no mutation is built from a stale revision.
+        var runGrant = _projectionGrant;
+        if (!RequireLiveBindingForRetainedState())
+        {
+            SetBanner(
+                "Command not sent — session binding changed",
+                $"The operator session binding this projection was built under ({DescribeGrant(runGrant)}) is no longer the live one ({DescribeGrant(_roleBinding)}), "
+                + $"so the retained run row and owner task revision were invalidated before use. {command} was not journaled and not sent.",
+                OperatorBannerSeverity.Warning);
+            return;
+        }
         var run = Records.FirstOrDefault(record => record.RecordKind == "autonomy_run");
         var runId = run?.Fields.FirstOrDefault(field => field.Label == "run_id")?.Value;
         if (_taskContext is not { } task || string.IsNullOrWhiteSpace(runId))
@@ -526,12 +602,8 @@ public sealed class MainViewModel : INotifyPropertyChanged
     /// Sends one closed UserAutomation operator operation through the existing
     /// authenticated Governor client. The UI never supplies identity, fence,
     /// schedule authority, provider credentials, or Store receipt fields.
-    ///
-    /// Create/edit revisions are parsed and validated for local inspection, then
-    /// refused at the fresh submission boundary because the owner contract exposes
-    /// no normalization result or migration action bound to the immutable
-    /// revision. The local projection is shown with the refusal and is never
-    /// treated as owner evidence. Read/inspect operations remain usable.
+    /// Create/edit inputs may omit the normalization receipt; the Store owner
+    /// compiles the schedule and issues that evidence before persistence.
     public async Task RunUserAutomationAsync()
     {
         // A create or edit needs a caller-supplied schedule revision. The
@@ -555,19 +627,11 @@ public sealed class MainViewModel : INotifyPropertyChanged
             operation = BuildUserAutomationOperation();
             scheduleProjection = operation switch
             {
-                UserAutomationCreateOperation create => create.Revision.Schedule.ReadLocalProjection(),
-                UserAutomationEditOperation edit => edit.Revision.Schedule.ReadLocalProjection(),
+                UserAutomationCreateOperation create => create.Revision.Schedule.ReadLocalProjection(allowReceiptFreeDraft: true),
+                UserAutomationEditOperation edit => edit.Revision.Schedule.ReadLocalProjection(allowReceiptFreeDraft: true),
                 _ => null
             };
             operation.Validate();
-            if (operation is UserAutomationCreateOperation)
-            {
-                UserAutomationScheduleMirror.RequireOwnerIssuedNormalizationForFreshSubmission("create");
-            }
-            else if (operation is UserAutomationEditOperation)
-            {
-                UserAutomationScheduleMirror.RequireOwnerIssuedNormalizationForFreshSubmission("edit");
-            }
         }
         catch (UserAutomationScheduleContractException refusal)
         {
@@ -582,7 +646,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
         {
             SetBanner(
                 "UserAutomation command not sent",
-                AppendLocalProjectionInspection(error.Message, scheduleProjection),
+                AppendLocalProjectionInspection(BoundedRefusalReason(error), scheduleProjection),
                 OperatorBannerSeverity.Warning);
             return;
         }
@@ -616,7 +680,11 @@ public sealed class MainViewModel : INotifyPropertyChanged
             }
             catch (Exception error)
             {
-                SetBanner("UserAutomation read failed", error.Message, OperatorBannerSeverity.Error);
+                SetBanner(
+                    "UserAutomation read failed",
+                    $"The UserAutomation read did not complete ({OperatorFaultReason.ForException(error)}); "
+                    + "a read has no owner effect, so it can be retried once the session is restored.",
+                    OperatorBannerSeverity.Error);
             }
             finally
             {
@@ -731,6 +799,12 @@ public sealed class MainViewModel : INotifyPropertyChanged
         {
             ReplacePending(pending.OperationId, OperatorOperationPhase.PossiblyExecuted);
             RefreshPendingState();
+            // Same rule as the operator-command path: a proven session-binding
+            // loss drops the rebuildable views at the moment it is observed, so
+            // no retained result payload or task context outlives the binding it
+            // was read under. The retained operation keeps its own identity.
+            ClearRetainedProjectionState(
+                "The operator session binding is gone; retained projection state was invalidated.");
             SetBanner(
                 "Restart required",
                 $"{action}: {restart.Message} Obtain a fresh broker handoff; the pending operation is retained.",
@@ -761,7 +835,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
             RefreshPendingState();
             SetBanner(
                 "Command outcome unproven — recovery retained",
-                $"{action}: {error.Message}; use Reconcile before any retry.",
+                $"{action}: the transport did not prove an owner outcome ({OperatorFaultReason.ForException(error)}); use Reconcile before any retry.",
                 OperatorBannerSeverity.Warning);
         }
         finally
@@ -913,9 +987,11 @@ public sealed class MainViewModel : INotifyPropertyChanged
     {
         // This is operator-typed JSON, so apply its independent structural caps
         // and duplicate-key rejection before allocating the typed revision. The
-        // shared closed reader then rejects unknown fields at every schema level.
+        // shared closed reader then rejects unknown fields at every schema level
+        // and matches member names exactly; that is stated once, on
+        // `OperatorJson.Reader`, and is not restated as a local copy here.
         OperatorResponseGuard.ValidateLocalParameter(value, "user_automation_revision");
-        var revision = JsonSerializer.Deserialize<UserAutomationRevision>(value, UserAutomationRevisionReader)
+        var revision = JsonSerializer.Deserialize<UserAutomationRevision>(value, OperatorJson.Reader)
             ?? throw new InvalidOperationException("UserAutomation schedule revision JSON is required.");
         revision.Validate();
         return revision;
@@ -923,6 +999,16 @@ public sealed class MainViewModel : INotifyPropertyChanged
 
     private async Task LoadPageAsync(bool append)
     {
+        // The runtime identity axis, checked BEFORE the request is started and
+        // before anything retained is read for a scope, a cursor, an append or
+        // a task revision. A projection built under one live owner-issued
+        // session binding must not be consumed once that binding rotated or is
+        // gone. This is a read, not a mutation: the retained state is dropped
+        // and the fresh page is read immediately, so the result of the check
+        // is not a refusal here. `append` is now meaningless because
+        // `InvalidateForScopeChange` cleared the cursor; the load below reads
+        // a first page and `InvalidateOnRotation` reports the rotation.
+        RequireLiveBindingForRetainedState();
         _requestCancellation?.Cancel();
         _requestCancellation?.Dispose();
         _requestCancellation = new CancellationTokenSource();
@@ -934,24 +1020,18 @@ public sealed class MainViewModel : INotifyPropertyChanged
             if (IsUserAutomationPage)
             {
                 // UserAutomation has a typed command route, but no canonical
-                // listing projection. Clear any prior page first. A known
-                // binding that withholds the command capability gets the
+                // listing projection. Clear any prior page first, including the
+                // owner grant stamp it was built under, so the before-use grant
+                // comparison can never find a stamp for a page that is gone. A
+                // known binding that withholds the command capability gets the
                 // withheld explanation (role-filtered rendering); the command
                 // panel itself stays hidden until the grant allows it.
-                Records.Clear();
-                SelectedRecord = null;
-                SelectedAction = null;
-                _nextCursor = null;
-                _graphSelectedRef = null;
-                _projectionBinding = null;
-                _taskContext = null;
-                ResultPayloadText = string.Empty;
+                ClearRetainedProjectionState("UserAutomation listing unavailable; no total is available.");
                 if (!RequireCommandCapability("user_automation"))
                 {
                     ResultSummary = "UserAutomation commands withheld for this role; no total is available.";
                     return;
                 }
-                ResultSummary = "UserAutomation listing unavailable; no total is available.";
                 SetBanner(
                     "UserAutomation listing unavailable",
                     "The listing is unavailable until its owner issues a canonical listing projection. The UserAutomation command panel remains available.",
@@ -1029,20 +1109,30 @@ public sealed class MainViewModel : INotifyPropertyChanged
             {
                 ResultSummary += " The owner truncated this page: the rendering is incomplete.";
             }
+            // The rotation notice is a statement about the binding, not about
+            // completeness, so it is reported on EVERY banner. A rotation that
+            // happened to arrive on a truncated or degraded page is still a
+            // rotation, and withholding the word there would leave the operator
+            // reading a stale page as if nothing had been dropped. The
+            // invalidation itself happened above, before this page was used;
+            // this only names it.
+            var rotationNotice = rotated
+                ? " Runtime rotated: dependent state was invalidated before use."
+                : string.Empty;
             if (degraded.Count == 0 && !page.Truncated)
             {
                 SetBanner(
                     "Connected",
-                    rotated
-                        ? $"Runtime {page.RuntimeId}; auth generation {page.AuthGeneration}; typed {page.Projection} projection. Runtime rotated: dependent state was invalidated before use."
-                        : $"Runtime {page.RuntimeId}; auth generation {page.AuthGeneration}; typed {page.Projection} projection.",
+                    $"Runtime {page.RuntimeId}; auth generation {page.AuthGeneration}; typed {page.Projection} projection."
+                        + rotationNotice,
                     OperatorBannerSeverity.Success);
             }
             else if (page.Truncated && degraded.Count == 0)
             {
                 SetBanner(
                     "Projection truncated",
-                    $"Runtime {page.RuntimeId} truncated the {page.Projection} page: {Records.Count} record(s) shown, completeness not claimed. Narrow the scope or filters for a whole page.",
+                    $"Runtime {page.RuntimeId} truncated the {page.Projection} page: {Records.Count} record(s) shown, completeness not claimed. Narrow the scope or filters for a whole page."
+                        + rotationNotice,
                     OperatorBannerSeverity.Warning);
             }
             else
@@ -1060,7 +1150,8 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 SetBanner(
                     severe ? "Degraded backend capability" : "Operational notices need attention",
                     $"Runtime {page.RuntimeId} reports {incidentCount} open incident(s) and {backupCount} backup concern(s): {detail}. " +
-                    "Full evidence and recovery references stay expandable on each record.",
+                    "Full evidence and recovery references stay expandable on each record."
+                        + rotationNotice,
                     OperatorBannerSeverity.Warning);
             }
         }
@@ -1078,6 +1169,15 @@ public sealed class MainViewModel : INotifyPropertyChanged
             // not a backend degradation, so it never shares the degraded
             // banner. Retained unknown-outcome operations keep their phase for
             // reconciliation after restart; nothing is compacted here.
+            //
+            // The retained projection is dropped HERE, at the moment the loss
+            // is proven, and not at the next use: I11.8 requires that a new
+            // operational binding never revives anything from cached
+            // application state, and a restart creates a new binding. Rows,
+            // selection, cursor, graph focus, task context and result payload
+            // therefore stop describing a live owner state immediately.
+            ClearRetainedProjectionState(
+                "The operator session binding is gone; retained projection state was invalidated.");
             if (!cancellationToken.IsCancellationRequested || !IsUserAutomationPage)
             {
                 SetBanner(
@@ -1090,7 +1190,11 @@ public sealed class MainViewModel : INotifyPropertyChanged
         {
             if (!cancellationToken.IsCancellationRequested || !IsUserAutomationPage)
             {
-                SetBanner("Degraded / reconnect required", error.Message, OperatorBannerSeverity.Error);
+                SetBanner(
+                    "Degraded / reconnect required",
+                    $"The projection read did not complete ({OperatorFaultReason.ForException(error)}); "
+                    + "reconnect through a fresh broker handoff before retrying.",
+                    OperatorBannerSeverity.Error);
             }
         }
         finally
@@ -1221,6 +1325,25 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 // stale-fence answer, which proves the mutation was not
                 // admitted at the current State Fence.
                 var terminal = staleFence ? OperatorOperationPhase.StaleFence : OperatorOperationPhase.Rejected;
+                if (staleFence)
+                {
+                    // The owner PROVED the State Fence moved: the mutation was
+                    // not admitted at the submitted revision. That is a fence
+                    // change this client observed directly, and the retained
+                    // task context carries exactly the revision the owner just
+                    // refused. Rows, selection, cursor, graph focus, task
+                    // context and result payload are dropped HERE, before
+                    // anything can read that revision again. The retained
+                    // operation record is not dependent UI state and is
+                    // compacted by the branch below as usual.
+                    //
+                    // The request that observed the refusal has already
+                    // completed, so no in-flight response can apply state from
+                    // before it; the retained state is dropped without
+                    // cancelling the request token a later command still uses.
+                    ClearRetainedProjectionState(
+                        "The owner refused at the current State Fence; dependent UI state was invalidated before use.");
+                }
                 if (!RemovePending(pending.OperationId, terminal))
                 {
                     RefreshPendingState();
@@ -1290,6 +1413,12 @@ public sealed class MainViewModel : INotifyPropertyChanged
         {
             ReplacePending(pending.OperationId, OperatorOperationPhase.PossiblyExecuted);
             RefreshPendingState();
+            // The binding that carried this mutation is proven gone, so the
+            // projection it was built from stops describing a live owner state
+            // now rather than at the next use. The retained operation record
+            // keeps its own identity and is unaffected.
+            ClearRetainedProjectionState(
+                "The operator session binding is gone; retained projection state was invalidated.");
             SetBanner(
                 "Restart required",
                 $"{action}: {restart.Message} Obtain a fresh broker handoff; the pending operation is retained.",
@@ -1333,7 +1462,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
             RefreshPendingState();
             SetBanner(
                 "Command outcome unproven — recovery retained",
-                $"{action}: {error.Message}; use Reconcile before any retry.",
+                $"{action}: the transport did not prove an owner outcome ({OperatorFaultReason.ForException(error)}); use Reconcile before any retry.",
                 OperatorBannerSeverity.Warning);
         }
         finally
@@ -1343,12 +1472,15 @@ public sealed class MainViewModel : INotifyPropertyChanged
         }
     }
 
-    /// Reads one owner-bound command receipt. The receipt is accepted only when
-    /// it is bound to this exact operation identity, this exact expected
-    /// revision, carries a typed terminal disposition, and — when it claims a
-    /// durable mutation — carries a canonical receipt. A refusal whose outcome
-    /// is the owner's `STALE_STATE_FENCE` reason code is terminal and distinct
-    /// from a plain rejection and from an unknown outcome.
+    /// Reads one owner-bound command receipt. The receipt is read only when it is
+    /// bound to this exact operation identity, this exact expected revision, and
+    /// carries a typed terminal disposition. A claim of an executed durable
+    /// mutation must be consistent with the canonical receipt it carries, except
+    /// for the one accepted-but-unproven shape — executed, accepted, and no
+    /// canonical receipt — which is returned so the caller can explain it
+    /// actionably; it is never treated as a success. A refusal whose outcome is
+    /// the owner's `STALE_STATE_FENCE` reason code is terminal and distinct from
+    /// a plain rejection and from an unknown outcome.
     private static (bool Accepted, bool Executed, bool StaleFence, string Outcome, string? ReceiptId) ReadCommandReceipt(
         JsonElement receipt,
         OperatorPendingOperation pending)
@@ -1431,7 +1563,17 @@ public sealed class MainViewModel : INotifyPropertyChanged
             if (string.IsNullOrWhiteSpace(receiptId)) receiptId = null;
         }
 
-        if (executed != (receiptId is not null) || (executed && !accepted))
+        // A claimed durable mutation that carries no canonical receipt is not a
+        // refused disposition: it is the owner's accepted-but-unproven answer,
+        // and the caller turns it into an actionable reconciliation instruction
+        // rather than a bare "inconsistent" refusal. Only that one shape is
+        // exempted. An unexecuted operation that still carries a receipt, and an
+        // executed one the owner did not accept, remain refusals — the second
+        // disjunct is never exempted, so that arm refuses every executed receipt
+        // the owner did not accept, with or without a receipt id.
+        var executedWithoutCanonicalReceipt = executed && receiptId is null;
+        if ((!executedWithoutCanonicalReceipt && executed != (receiptId is not null))
+            || (executed && !accepted))
         {
             throw new InvalidOperationException("operator command receipt has an inconsistent canonical disposition");
         }
@@ -1567,7 +1709,6 @@ public sealed class MainViewModel : INotifyPropertyChanged
     {
         var previous = _projectionBinding;
         var rotated = binding.DiffersFrom(previous);
-        _projectionBinding = binding;
         if (rotated)
         {
             // Every rebuildable view of the previous owner state is cleared
@@ -1576,8 +1717,67 @@ public sealed class MainViewModel : INotifyPropertyChanged
             // keeping it would send a mutation against a rotated revision.
             ClearDependentProjectionState("No projection loaded.");
         }
+        // The page now applied is a view of the session binding that is live
+        // NOW, so the retained state is stamped with it. Recording the grant
+        // here is what makes the before-use comparison in
+        // `RequireLiveBindingForRetainedState` an observation of the live
+        // transport rather than a hard-wired pass, and it is recorded only
+        // when a page is actually retained.
+        _projectionBinding = binding;
+        _projectionGrant = _roleBinding;
         return rotated;
     }
+
+    /// The runtime identity axis of the retained UI state, checked before a
+    /// rebuildable projection is used.
+    ///
+    /// The projection binding already carries the owner's runtime id, auth
+    /// generation, owner task revision, projection and scope, and
+    /// `InvalidateOnRotation` compares those when a NEW page arrives. That
+    /// check cannot run before a USE, because it needs the new page — so between
+    /// the moment the owner-issued session binding rotates (or the transport
+    /// that carried it goes away) and the moment the next page lands, the
+    /// retained rows, selection, cursor, graph focus, task context and result
+    /// payload are still readable. The task context in particular carries the
+    /// owner task revision used as `expected_revision`, and the cursor is a
+    /// paging token for a binding that may no longer exist.
+    ///
+    /// The granted binding is read LIVE from the transport and compared against
+    /// the one the retained projection was actually built under. When they
+    /// differ, every dependent piece of rebuildable state is dropped HERE —
+    /// before the caller reads a scope, a cursor, an append flag, a task
+    /// revision or a result payload — and the caller is told to re-read.
+    /// Pending unknown-outcome operations are not dependent UI state: they
+    /// carry their own operation identity and stay reconcilable.
+    ///
+    /// Returns true when the retained state is still bound to the live grant
+    /// and may be used. Returns false when it was just invalidated, so the
+    /// caller must not use anything it held.
+    private bool RequireLiveBindingForRetainedState()
+    {
+        // No page is retained, so nothing here depends on a grant. There is
+        // nothing to invalidate and nothing that could be read stale. This is
+        // the honest floor, not a wildcard: `_projectionBinding` is non-null
+        // exactly when a page is applied and is cleared by every invalidation.
+        if (_projectionBinding is null) return true;
+        RefreshRoleBinding();
+        if (RoleBindingEquals(_projectionGrant, _roleBinding)) return true;
+        // The grant the retained projection was built under is gone or has
+        // rotated. `_projectionBinding` and `_projectionGrant` go with it:
+        // keeping them would let the next page's `DiffersFrom` compare against
+        // a grant that no longer describes this process and report "no
+        // rotation".
+        InvalidateForScopeChange();
+        return false;
+    }
+
+    /// Bounded, redacted description of one granted binding. It names the
+    /// presence, the role and the capability count — never a credential, an
+    /// endpoint, a nonce or a record body (A11).
+    private static string DescribeGrant(OperatorRoleBinding? grant) =>
+        grant is null
+            ? "no established binding"
+            : $"role {grant.Role} with {grant.Capabilities.Count} capability/capabilities";
 
     /// A locally changed scope or page no longer describes the currently
     /// displayed projection. Drop that rebuildable context immediately, before
@@ -1588,8 +1788,23 @@ public sealed class MainViewModel : INotifyPropertyChanged
         // after this local binding changes. LoadPageAsync checks this token
         // immediately after the owner call returns, before using the page.
         _requestCancellation?.Cancel();
+        ClearRetainedProjectionState("No projection loaded for the current scope.");
+    }
+
+    /// Drops the retained projection and the owner grant it was stamped with,
+    /// then every rebuildable view built from them. The binding and its grant
+    /// stamp always go together: a stamp without a binding, or a binding
+    /// without its stamp, would let the before-use grant comparison answer a
+    /// question about state that is no longer retained.
+    ///
+    /// This does NOT cancel the in-flight request; `InvalidateForScopeChange`
+    /// does that for a local change. Use this when the state is dropped from
+    /// inside the request that is replacing it.
+    private void ClearRetainedProjectionState(string summary)
+    {
         _projectionBinding = null;
-        ClearDependentProjectionState("No projection loaded for the current scope.");
+        _projectionGrant = null;
+        ClearDependentProjectionState(summary);
     }
 
     private void ClearDependentProjectionState(string summary)
@@ -1684,14 +1899,12 @@ public sealed class MainViewModel : INotifyPropertyChanged
     {
         RefreshRoleBinding();
         if (CanReadProjection) return true;
-        Records.Clear();
-        SelectedRecord = null;
-        SelectedAction = null;
-        _nextCursor = null;
-        _graphSelectedRef = null;
-        _taskContext = null;
-        ResultPayloadText = string.Empty;
-        ResultSummary = "Projection unavailable for this role; no total is available.";
+        // A withheld read capability is an owner-grant change, so the grant
+        // stamp and the binding it describes go with the rows. The existing
+        // clearing primitive is used so that "cleared" always means "nothing
+        // retained", and the before-use grant comparison can never compare a
+        // stamp for a page that no longer exists.
+        ClearRetainedProjectionState("Projection unavailable for this role; no total is available.");
         SetBanner(
             "Projection unavailable for this role",
             $"Role '{_roleBinding?.Role}' was not granted '{OperatorCapabilityNames.ControlboardRead}'; no query was sent.",
@@ -1719,6 +1932,26 @@ public sealed class MainViewModel : INotifyPropertyChanged
     /// evidence and recovery fields expandable.
     private static string ClipSignalSummary(string value) =>
         value.Length <= 200 ? value : $"{value[..200]}…";
+
+    /// One bounded reason for a banner that reports a locally refused typed
+    /// request.
+    ///
+    /// A refusal raised by this application's own closed UserAutomation
+    /// contract keeps its message. Every such message is assembled only from
+    /// locally authored field names, the generated owner refusal table and
+    /// pinned contract constants — the
+    /// <see cref="UserAutomationScheduleContractException"/> shape is the
+    /// generated owner Display sentence joined to a locally authored action —
+    /// so it names the rule that refused the request and carries no value from
+    /// the refused bytes. A framework exception message is never shown — a
+    /// serializer message can carry a JSON path, a line/byte offset and a
+    /// character lifted from the refused bytes — so only its closed
+    /// [`OperatorFaultReason`] code is displayed, exactly as the transport
+    /// paths do.
+    private static string BoundedRefusalReason(Exception error) =>
+        error is JsonException
+            ? OperatorFaultReason.ForException(error)
+            : error.Message;
 
     private void SetBanner(string title, string message, OperatorBannerSeverity severity)
     {

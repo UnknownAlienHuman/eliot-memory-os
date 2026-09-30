@@ -27,13 +27,24 @@
 //! one specific MCP request. Route, session, and generation are shared by every
 //! correlation on that route, so they can narrow a candidate set but never
 //! identify a request; only the candidate's own invocation-scoped observation
-//! can, and a terminal payload does not carry one. An event that names no
-//! invocation is therefore refused outright rather than being allowed to close
-//! whichever correlation happens to be pending.
+//! can. That is the closed `ToolOutcome` payload: the host's own per-invocation
+//! terminal fact, carrying the invocation reference the host integration minted
+//! for the invocation it made and the classified outcome it observed. The
+//! terminal-but-turn-scoped payloads (`ProviderTerminalObserved`, `Error`)
+//! name something coarser than one invocation and are refused outright rather
+//! than being allowed to close whichever correlation happens to be pending.
+//!
+//! Attribution is then an exact value comparison against the correlation's own
+//! recorded request identity ([`RecordedInvocation`]): the candidate's minted
+//! invocation reference must equal the MCP request identity the serving
+//! boundary itself recorded, and a recorded tool name must match the candidate's
+//! own tool name. This is what binds "MCP request/correlation identity" (issue
+//! #2899 item 4) to the event. A host integration that mints its scope from
+//! anything else closes nothing, which is the intended fail-closed direction:
+//! the correlation stays pending rather than borrowing a foreign observation.
 
-use crate::{
-    HostEventEnvelope, HostEventKind, NormalizedHostEventPayload, ProviderObservationLineage,
-};
+use crate::host_event::ToolOutcomeClass;
+use crate::{HostEventEnvelope, NormalizedHostEventPayload, ProviderObservationLineage};
 
 use crate::mcp_correlation::{
     HostObservationEvidence, HostTerminalObservation, HostTerminalState, sha256_hex,
@@ -52,16 +63,39 @@ use crate::mcp_correlation::{
 /// candidate's own owner-validated lineage.
 ///
 /// There is deliberately no correlation identity here either. The digest that
-/// names a correlation is the one the correlation itself recorded, so it is
-/// passed to [`normalize_terminal_observation`] as that recorded value rather
-/// than as a key the joining caller restates: a key would only let the caller
-/// nominate a correlation, never prove the event belongs to it.
+/// names a correlation, the exact request identity that names its invocation,
+/// and the generation it was emitted under are all recorded by the correlation
+/// itself, so they reach [`normalize_terminal_observation`] as that recorded
+/// [`RecordedInvocation`] rather than as keys the joining caller restates: a key
+/// would only let the caller nominate a correlation, never prove the event
+/// belongs to it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostEventJoinKeys {
     /// Host integration identity that produced the observation.
     pub integration_id: String,
     /// Applicable observation deadline admitted by the owner, when one exists.
     pub deadline_unix_ms: Option<u64>,
+}
+
+/// The exact invocation one correlation recorded for itself.
+///
+/// Read back from the correlation's own immutable
+/// [`EliotEmissionObservation`](crate::mcp_correlation::EliotEmissionObservation)
+/// identity, never from the joining caller, so no caller can nominate the
+/// invocation an event is attributed to. Every field is a fact the serving
+/// stdio boundary measured about the request it received: the digest names the
+/// correlation, and the request identity and tool name are what the host must
+/// have named when it minted the invocation scope it observes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordedInvocation {
+    /// Digest the correlation itself recorded.
+    pub correlation_digest: String,
+    /// Exact MCP request identity the serving boundary recorded.
+    pub request_id: String,
+    /// Exact tool name the serving boundary recorded, when the call named one.
+    pub tool_name: Option<String>,
+    /// Session generation the serving boundary recorded, when it recorded one.
+    pub session_id: Option<String>,
 }
 
 /// Live generation the event owner itself states for the joined route.
@@ -92,6 +126,10 @@ pub enum HostObservationReject {
     InvalidEnvelope(String),
     /// The event kind attests no terminal invocation state.
     NonTerminalKind(String),
+    /// The host classified the per-invocation outcome as unknown, so it attests
+    /// no terminal state. Never read as success (I7.23: missing coverage is
+    /// `TAINTED/UNKNOWN`, never a self-reported PASS).
+    UnclassifiedInvocationOutcome,
     /// The event arrived on a different route than the correlation expects.
     RouteMismatch {
         /// Expected route digest from the join keys.
@@ -110,6 +148,31 @@ pub enum HostObservationReject {
     /// attributing it to whichever correlation happens to be pending would
     /// invent a host completion that was never observed for that request.
     InvocationScopeUnattributable,
+    /// The event's own invocation reference names a different MCP request than
+    /// the one this correlation recorded. A foreign or duplicated host
+    /// invocation closes nothing.
+    InvocationMismatch {
+        /// Exact MCP request identity the correlation recorded.
+        expected: String,
+        /// Invocation reference the host's own observation minted.
+        observed: String,
+    },
+    /// The event's own tool name is not the tool this correlation recorded.
+    ToolMismatch {
+        /// Exact tool name the correlation recorded.
+        expected: String,
+        /// Tool name the host's own observation names.
+        observed: String,
+    },
+    /// The event's own session is not the session this correlation recorded,
+    /// so a rotated or restarted generation must not relabel an old invocation
+    /// as current.
+    RecordedGenerationMismatch {
+        /// Session the event's own lineage names.
+        observed: String,
+        /// Session the correlation recorded for the invocation it emitted.
+        recorded: String,
+    },
     /// The event's own session is not the owner's current session; a rotated or
     /// restarted session must not relabel an old observation as current.
     StaleGeneration {
@@ -132,6 +195,9 @@ impl std::fmt::Display for HostObservationReject {
                     "host event kind {kind} attests no terminal invocation state"
                 )
             }
+            Self::UnclassifiedInvocationOutcome => formatter.write_str(
+                "host classified the invocation outcome as unknown; it attests no terminal state",
+            ),
             Self::RouteMismatch { expected, observed } => write!(
                 formatter,
                 "host event route mismatch: expected {expected}, observed {observed}"
@@ -141,6 +207,21 @@ impl std::fmt::Display for HostObservationReject {
             ),
             Self::InvocationScopeUnattributable => formatter.write_str(
                 "host event names no single invocation; it closes no current correlation",
+            ),
+            Self::InvocationMismatch { expected, observed } => write!(
+                formatter,
+                "host event names invocation {observed}, not the correlated request \
+                 {expected}; it closes nothing current"
+            ),
+            Self::ToolMismatch { expected, observed } => write!(
+                formatter,
+                "host event names tool {observed}, not the correlated tool {expected}; \
+                 it closes nothing current"
+            ),
+            Self::RecordedGenerationMismatch { observed, recorded } => write!(
+                formatter,
+                "host event session {observed} is not the session {recorded} this \
+                 invocation was recorded under; it closes nothing current"
             ),
             Self::StaleGeneration { observed, current } => write!(
                 formatter,
@@ -153,13 +234,28 @@ impl std::fmt::Display for HostObservationReject {
 
 impl std::error::Error for HostObservationReject {}
 
-/// Reads the invocation scope the candidate's own observation carries.
+/// One terminal fact read out of the candidate's own invocation-scoped
+/// observation: the host's classified outcome for exactly one invocation, plus
+/// the invocation scope and tool name the host's own integration minted.
+struct InvocationTerminalFact<'a> {
+    /// Terminal state the host's classified outcome attests.
+    state: HostTerminalState,
+    /// Invocation reference the host's integration minted for the invocation.
+    invocation_ref: &'a str,
+    /// Tool name the host's own observation names.
+    tool_name: &'a str,
+}
+
+/// Reads the invocation-scoped terminal fact the candidate's own payload
+/// carries, and refuses everything else.
 ///
-/// Only the two tool-scoped payloads name one exact invocation, through the
-/// adapter-minted `invocation_ref`. Every other payload — including
-/// `ProviderTerminalObserved`, which is what a terminal kind actually carries —
-/// names something coarser than one invocation, and is deliberately reported as
-/// carrying no invocation scope at all.
+/// Only the closed tool-scoped payloads name one exact invocation, through the
+/// adapter-minted `invocation_ref`. Of those two only `ToolOutcome` is terminal:
+/// `ToolInvocation` observes the host *starting* an invocation and says nothing
+/// about how it ended. Every other payload — including
+/// `ProviderTerminalObserved`, which is what a turn- or step-scoped terminal
+/// kind carries — names something coarser than one invocation, and is
+/// deliberately reported as carrying no invocation scope at all.
 ///
 /// In particular `ProviderTerminalObservation::terminal_ref` is NOT an
 /// invocation scope and is never read as one: the `OpenCode` producer emits the
@@ -169,65 +265,96 @@ impl std::error::Error for HostObservationReject {}
 /// every correlation, which is the same self-agreement defect as comparing a
 /// record's digest to itself — only with a false positive instead of a vacuous
 /// pass.
-fn invocation_scope(event: &HostEventEnvelope) -> Option<&str> {
-    let normalized = event.normalized().ok()?;
+///
+/// `ToolOutcomeClass::Unknown` is refused as well: the host classified the
+/// outcome as unknown, and this adapter never infers success from an
+/// unclassified outcome (I7.23: a missing or unclassified observation is
+/// `UNKNOWN`, never a self-reported pass).
+fn invocation_terminal_fact(
+    event: &HostEventEnvelope,
+) -> Result<InvocationTerminalFact<'_>, HostObservationReject> {
+    let normalized = event
+        .normalized()
+        .map_err(|error| HostObservationReject::InvalidEnvelope(error.to_string()))?;
     match &normalized.payload {
-        NormalizedHostEventPayload::ToolInvocation(observation) => {
-            Some(observation.invocation_ref.as_str())
-        }
         NormalizedHostEventPayload::ToolOutcome(observation) => {
-            Some(observation.invocation_ref.as_str())
+            let state = match observation.outcome {
+                ToolOutcomeClass::Succeeded => HostTerminalState::InvocationCompleted,
+                ToolOutcomeClass::Failed | ToolOutcomeClass::Cancelled => {
+                    HostTerminalState::InvocationError
+                }
+                ToolOutcomeClass::Unknown => {
+                    return Err(HostObservationReject::UnclassifiedInvocationOutcome);
+                }
+            };
+            Ok(InvocationTerminalFact {
+                state,
+                invocation_ref: observation.invocation_ref.as_str(),
+                tool_name: observation.tool_name.as_str(),
+            })
         }
-        _ => None,
+        NormalizedHostEventPayload::ToolInvocation(_) => Err(
+            HostObservationReject::NonTerminalKind("tool_invocation".to_owned()),
+        ),
+        _ => Err(HostObservationReject::InvocationScopeUnattributable),
     }
 }
 
 /// Normalizes one owner-nominated host event into a terminal observation.
 ///
-/// Verifies envelope validity, terminal kind, the exact route digest, and that
-/// the event's own owner-validated observation names one exact invocation, then
-/// joins the event's *own* observed generation against the owner's live current
-/// session: the observed side is read from the closed, versioned normalized
-/// observation the envelope carries (never from caller input and never from the
-/// wire's generic JSON), the expected side is the owner's own live attach binding
-/// and its own observed route fingerprint ([`HostOwnerBinding`]). The evidence
-/// records that owner-sourced generation verbatim, so a correlation never
-/// carries a generation the join caller asserted, and it records the recorded
-/// correlation digest passed in by the join rather than a key the caller
-/// restated. Non-terminal kinds, events that name no invocation, foreign routes,
-/// unattributable lineage, and stale generations are rejected: missing or
-/// mismatched telemetry is never relabeled as a host fault.
+/// Verifies envelope validity, reads the terminal state and invocation scope out
+/// of the event's own closed observation, matches that scope against the exact
+/// request identity the correlation itself recorded, checks the exact route
+/// digest, and joins the event's *own* observed generation against BOTH the
+/// generation the correlation recorded and the owner's live current session.
 ///
-/// `correlation_digest` is the digest the correlation itself recorded. It
-/// reaches the evidence because the join already established that this event
-/// belongs to that correlation; it is never an input that could establish it.
+/// The observed side is read from the closed, versioned normalized observation
+/// the envelope carries (never from caller input and never from the wire's
+/// generic JSON). The expected side is the correlation's own recorded
+/// [`RecordedInvocation`] — read back out of the correlation's immutable
+/// identity, never restated by the joining caller — plus the owner's own live
+/// attach binding and its own observed route fingerprint ([`HostOwnerBinding`]).
+/// The evidence records the owner-sourced generation verbatim, so a correlation
+/// never carries a generation the join caller asserted, and it records the
+/// recorded correlation digest rather than a key the caller restated.
+///
+/// Non-terminal outcomes, unclassified outcomes, events that name no invocation,
+/// foreign invocations or tools, foreign routes, unattributable lineage, and
+/// stale or mismatched generations are rejected: missing or mismatched telemetry
+/// is never relabeled as a host fault, and the correlation stays pending.
 pub fn normalize_terminal_observation(
     event: &HostEventEnvelope,
     keys: &HostEventJoinKeys,
     owner: &HostOwnerBinding,
-    correlation_digest: &str,
+    recorded: &RecordedInvocation,
 ) -> Result<HostTerminalObservation, HostObservationReject> {
     event
         .validate()
         .map_err(|error| HostObservationReject::InvalidEnvelope(error.to_string()))?;
-    let state = match event.kind {
-        HostEventKind::Completed => HostTerminalState::InvocationCompleted,
-        HostEventKind::Error | HostEventKind::Failed => HostTerminalState::InvocationError,
-        other => {
-            return Err(HostObservationReject::NonTerminalKind(format!("{other:?}")));
-        }
-    };
-    // A terminal host fact must name the invocation it closes. The candidate's
-    // own normalized payload is the only place that identity can come from, and
-    // a terminal payload carries none: the invocation-scoped payloads are
-    // `ToolInvocation`/`ToolOutcome`, whose kinds are `ToolCall`/`ToolResult`,
-    // not `Completed`/`Error`/`Failed`. Route and session are not a substitute
-    // — every correlation on the route shares both, so accepting on them is
-    // exactly the false attribution this gate exists to prevent. So a terminal
-    // event that names no invocation closes no correlation, and the correlation
-    // stays pending.
-    if invocation_scope(event).is_none() {
-        return Err(HostObservationReject::InvocationScopeUnattributable);
+    // A terminal host fact must name the exact invocation it closes, and the
+    // terminal state itself comes from the host's own classified outcome — never
+    // from the envelope's `kind`, which is the wire's coarse host choice and is
+    // not validated against the closed payload.
+    let fact = invocation_terminal_fact(event)?;
+    // The invocation scope the host's integration minted must be the exact MCP
+    // request identity the serving boundary recorded. Route and session are not
+    // a substitute — every correlation on the route shares both, so accepting on
+    // them is exactly the false attribution this gate exists to prevent. An
+    // event naming another invocation, another tool, or nothing at all closes no
+    // correlation, and the correlation stays pending.
+    if fact.invocation_ref != recorded.request_id {
+        return Err(HostObservationReject::InvocationMismatch {
+            expected: recorded.request_id.clone(),
+            observed: fact.invocation_ref.to_owned(),
+        });
+    }
+    if let Some(tool_name) = recorded.tool_name.as_deref()
+        && tool_name != fact.tool_name
+    {
+        return Err(HostObservationReject::ToolMismatch {
+            expected: tool_name.to_owned(),
+            observed: fact.tool_name.to_owned(),
+        });
     }
     let route_json = event
         .route
@@ -260,6 +387,20 @@ pub fn normalize_terminal_observation(
     let Some(observed_session) = observed_session else {
         return Err(HostObservationReject::SessionLineageUnattributable);
     };
+    // Two exact generation joins, both against a recorded value rather than
+    // against anything the caller supplied: the event must be from the same
+    // generation the invocation was emitted under, AND that generation must
+    // still be the owner's live one. The first stops a rotated host from
+    // relabelling an old invocation as current; the second stops a retained
+    // correlation from being closed by a later session's events.
+    if let Some(recorded_session) = recorded.session_id.as_deref()
+        && recorded_session != observed_session.as_str()
+    {
+        return Err(HostObservationReject::RecordedGenerationMismatch {
+            observed: observed_session.as_str().to_owned(),
+            recorded: recorded_session.to_owned(),
+        });
+    }
     if observed_session.as_str() != owner.session_id {
         return Err(HostObservationReject::StaleGeneration {
             observed: observed_session.as_str().to_owned(),
@@ -269,13 +410,13 @@ pub fn normalize_terminal_observation(
     let event_json = serde_json::to_string(event)
         .map_err(|error| HostObservationReject::InvalidEnvelope(error.to_string()))?;
     Ok(HostTerminalObservation::Observed {
-        state,
+        state: fact.state,
         evidence: Box::new(HostObservationEvidence {
             integration_id: keys.integration_id.clone(),
             installation_id: owner.installation_id.clone(),
             session_generation: owner.session_id.clone(),
             process_generation: owner.activation_generation.clone(),
-            correlation_digest: correlation_digest.to_owned(),
+            correlation_digest: recorded.correlation_digest.clone(),
             route_digest,
             event_id: event.event_id.as_str().to_owned(),
             sequence: event.sequence,

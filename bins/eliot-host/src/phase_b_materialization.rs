@@ -7,7 +7,7 @@ use eliot_contracts::{ResourceGeneration, canonical_json_bytes};
 use eliot_installation::{
     AGENT_BRIDGE_MODULE_ID, AgentBridgeInstallationProfile, AgentBridgePhaseBBinding,
     AgentBridgePreparedBinding, AgentBridgeSourceMaterializationPlan, AgentBridgeStagePrepared,
-    HostPhaseBMaterializationIntent, InstallationProfile,
+    HostPhaseBMaterializationIntent, InstallationProfile, UserBrokerInstallationProfile,
 };
 use eliot_kernel_service::{
     AGENT_BRIDGE_ADMISSION_DESCRIPTOR_WIRE_ID, AGENT_BRIDGE_ADMISSION_DESCRIPTOR_WIRE_VERSION,
@@ -202,6 +202,28 @@ impl<'a> MaterializationObservation<'a> {
             dest: Some(windows_path_identity_digest(dest)),
         }
     }
+
+    /// Binds the approved launch identity and the materialised User Broker
+    /// client-declaration digest of one front-door record.
+    fn for_user_broker(
+        label: &'static str,
+        install: &'a str,
+        generation: &'a str,
+        file: &'a str,
+    ) -> Self {
+        Self {
+            label,
+            transaction: None,
+            effect: None,
+            request: None,
+            install: Some(install),
+            manifest: None,
+            source: None,
+            generation: Some(generation),
+            file: Some(file),
+            dest: None,
+        }
+    }
 }
 
 /// Emits one identity-bound materialization observation through the #889
@@ -243,6 +265,87 @@ pub(super) struct AgentBridgePreparedMaterialization {
     pub binding: AgentBridgePreparedBinding,
     pub profile_bytes: Vec<u8>,
     pub declaration_bytes: Vec<u8>,
+}
+
+/// Materialised User Broker front-door record for one exact Phase-B launch.
+///
+/// The broker's front door presents a `ClientHello` whose capability set the
+/// serving Kernel admits exactly. That declaration is installation-owned: this
+/// record carries the canonical profile bytes, the canonical declaration bytes,
+/// and the SHA-256 of each, recomputed here from those bytes rather than copied
+/// from the profile's own field.
+#[cfg(windows)]
+pub(super) struct UserBrokerClientMaterialization {
+    /// Installation-owned static profile that carries the declaration.
+    pub profile: UserBrokerInstallationProfile,
+    /// Canonical profile bytes covered by `profile_digest`.
+    pub profile_bytes: Vec<u8>,
+    /// Lowercase SHA-256 over the canonical profile bytes.
+    pub profile_digest: PlatformHandle,
+    /// Canonical client declaration bytes covered by `declaration_digest`.
+    pub declaration_bytes: Vec<u8>,
+    /// Lowercase SHA-256 over the canonical client declaration bytes.
+    pub declaration_digest: PlatformHandle,
+}
+
+/// Materialises the User Broker client declaration for one approved Phase-B
+/// launch contour and recomputes its digest from the materialised bytes.
+///
+/// This is the production producer for the broker front door. Before it, the
+/// only place a client declaration was ever produced was the agent-bridge
+/// path, whose declaration is bound to the `eliot-agent-bridge` module
+/// identity; the broker therefore had no installed, hashed front-door
+/// declaration at all and could not state the capability set the Kernel demands.
+///
+/// The digest recomputed here is compared with the value the profile *recorded*
+/// for the same canonical bytes, and the declaration is re-validated in place:
+/// a freshly recomputed digest never substitutes for the recorded one.
+#[cfg(windows)]
+pub(super) fn materialize_user_broker_client_declaration(
+    launch: &eliot_installation::RuntimeLaunchDescriptor,
+) -> Result<UserBrokerClientMaterialization, HostError> {
+    // WORK_UNIT_CASE: 1777/W1 — User Broker client declaration materialisation
+    // requested; observation only, the semantic owner below decides.
+    phase_b_materialization_observe_bound(&MaterializationObservation::for_user_broker(
+        "host.phase-b-broker declaration materialise requested",
+        launch.installation_epoch.installation.as_str(),
+        launch.generation.as_str(),
+        launch.user_broker_artifact_digest.as_str(),
+    ));
+    let profile = UserBrokerInstallationProfile::from_approved_launch(launch)
+        .map_err(HostError::Installation)?;
+    profile.validate().map_err(HostError::Installation)?;
+    let profile_bytes = canonical_json_bytes(&profile)
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let declaration_bytes = canonical_json_bytes(&profile.client_declaration)
+        .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+    let profile_digest = phase_b_bytes_digest(&profile_bytes)?;
+    let declaration_digest = phase_b_bytes_digest(&declaration_bytes)?;
+    if profile.profile_sha256 != profile_digest
+        || profile.client_declaration.declaration_sha256 != declaration_digest.as_str()
+        || profile.broker_artifact_sha256 != launch.user_broker_artifact_digest
+        || profile.broker_executable_path != launch.user_broker_executable_path
+    {
+        return Err(HostError::RecoveryRequired(
+            "User Broker client declaration is not the materialised record of this launch"
+                .to_owned(),
+        ));
+    }
+    // WORK_UNIT_CASE: 1777/W1 — declaration materialised and its digest
+    // recomputed from the canonical bytes; classification only.
+    phase_b_materialization_observe_bound(&MaterializationObservation::for_user_broker(
+        "host.phase-b-broker declaration materialised exact",
+        launch.installation_epoch.installation.as_str(),
+        launch.generation.as_str(),
+        declaration_digest.as_str(),
+    ));
+    Ok(UserBrokerClientMaterialization {
+        profile,
+        profile_bytes,
+        profile_digest,
+        declaration_bytes,
+        declaration_digest,
+    })
 }
 
 #[cfg(windows)]

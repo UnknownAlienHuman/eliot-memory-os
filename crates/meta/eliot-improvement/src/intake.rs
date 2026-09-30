@@ -40,10 +40,80 @@
 //! owning lane can make the evidence durable. I12.24:293 requires raw evidence
 //! to be durable and backlog/archive history not to stay process-local, so no
 //! receipt is dropped inside this crate.
+//!
+//! # The application class is never an input
+//!
+//! [`IntakeRequest`] carries no class flag, so the class gate
+//! ([`check_class_gate`], I12.24:78-95) cannot be talked into a class by the
+//! party presenting the evidence:
+//!
+//! - `touches_protected` is DERIVED, through the crate's closed
+//!   [`is_prohibited_tuning_surface`](crate::application_class::is_prohibited_tuning_surface),
+//!   from `candidate.target_surface`. The surface ITSELF is caller-supplied —
+//!   `candidate_from_evidence` copies `IntakeRequest.target_surface` verbatim —
+//!   so what this entry derives is the class, not the surface;
+//! - `bounded_tuning` and `has_work_item_ref` have no parameter to be set
+//!   through, because [`ChangeDescriptor::from_recorded_surface`] exposes none;
+//! - `work_item_ref` is `None`, `owner_approved` is `false` and
+//!   `migration_proof_ref` is `None` because no owner-issued work-item,
+//!   owner-decision or migration/proof record exists to read.
+//!
+//! The resulting class is
+//! [`ApplicationClass::Advisory`](crate::ApplicationClass::Advisory) or
+//! [`ApplicationClass::Protected`](crate::ApplicationClass::Protected), and a
+//! `Protected` one is REFUSED with
+//! [`ImprovementError::ApplicationClassViolation`]. That is a typed refusal,
+//! not a downgrade: an owner claim is never read as `false` to let a gate pass,
+//! and the two evidence-bound classes stay unreachable rather than reachable
+//! through an unverifiable flag.
+//!
+//! ## This entry has NO caller at all (issue #1867 W5)
+//!
+//! [`intake_from_evidence`] and [`intake_from_evidence_governed`] have no call
+//! site anywhere in this repository — not in production, not in this crate's
+//! tests, not in any fixture or decoder. Every occurrence of either name is
+//! prose, a definition, or the crate root's `pub use`. So `prepare_intake`
+//! does not execute today, and EVERY clause of the class gate is unreachable
+//! END-TO-END through this module, not merely the two below.
+//!
+//! That is a wider statement than the two-clause ceiling, and it is recorded
+//! here so this module is not read as a running gate. The crate root discloses
+//! the same absence in its "No consumer outside this crate, at all" section.
+//! The ONE site that does build a descriptor and run [`check_class_gate`] is
+//! `bins/eliotd/src/improvement_intake_dispatch.rs`, and it carries the
+//! identical class ceiling (see `enforce_advisory_class_gate` there), so no
+//! path anywhere in this repository runs the tuning or code/module/config
+//! arms.
+//!
+//! ## What this entry therefore does NOT enforce (issue #1867 W5)
+//!
+//! Setting the absent caller aside, two clauses of I12.24:78-95 have no
+//! reachable class at all, and this module does not claim otherwise:
+//!
+//! - I12.24:86 "one experiment per control surface, automatic rollback". The
+//!   ONE gate arm that reads `live_experiments_on_surface` is the
+//!   pre-authorized-tuning arm of [`check_class_gate`]; no descriptor any
+//!   constructor in this repository can build selects it, because
+//!   [`ChangeDescriptor::from_recorded_surface`] takes no parameter for
+//!   `bounded_tuning` or `has_work_item_ref` and those two flags are the ONLY
+//!   things that select it. `prepare_intake` therefore passes `0`, and that
+//!   value is provably not read. The code/module/config arm never references
+//!   the count at all. The surface-concurrency bound that IS enforced here is a
+//!   different rule with a different owner:
+//!   [`CandidateBoundPolicy::max_active`](crate::candidate_bounds::CandidateBoundPolicy),
+//!   applied by [`BoundedBacklog::admit`].
+//! - I12.24:90-91, the normal work item with impact tests, immutable candidate,
+//!   canary and rollback. No such record exists on `ImprovementCandidate`
+//!   (I12.24:20-38) or anywhere else in this repository, so the arm has
+//!   nothing to read.
+//!
+//! The reason is a missing owner record, not a missing check: I12.24:85 admits
+//! pre-authorized tuning only "inside a declared safe range", and no declared
+//! safe range record exists here to source the flag from. The ceiling is
+//! therefore stated rather than papered over — see the
+//! `application_class` module header for the measured absence.
 
-use crate::application_class::{
-    ChangeDescriptor, check_class_gate, classify, is_prohibited_tuning_surface,
-};
+use crate::application_class::{ChangeDescriptor, check_class_gate, classify};
 use crate::brief::{ImprovementBrief, SafeBoundary, brief_at_safe_boundary};
 use crate::budget_proof::{BudgetProof, require_matched_budget_for_promotion};
 use crate::candidate_bounds::{
@@ -109,18 +179,45 @@ pub struct RetainedReusableClosure {
 
 /// Everything an intake request source supplies, and nothing it may not.
 ///
-/// This type carries NO `touches_protected` field on purpose. Whether a change
-/// touches a protected surface (I12.24:93-94) is a fact about
-/// `target_surface`, which the candidate records, and `prepare_intake`
-/// derives the flag through the crate's own
-/// [`is_prohibited_tuning_surface`] rather than reading a caller's claim. A
-/// request therefore cannot disagree with the surface it names: there is no
-/// field in which to state the disagreement.
+/// This type carries NO application-class field at all, and that is the point.
+/// Every input the class gate of I12.24:78-95 reads is derived by
+/// `prepare_intake` from a record the requester does not author, so no
+/// application class can be ASSERTED by the party presenting the evidence:
 ///
-/// `bounded_tuning` and `has_work_item_ref` ARE caller-issued, because the
-/// evidence they stand for — a declared safe range (I12.24:85) and a real work
-/// item (I12.24:90-91) — exists on no candidate and can only be supplied by
-/// whoever holds it.
+/// - `touches_protected` is a fact about `target_surface`, which the candidate
+///   records, and `prepare_intake` derives it through the crate's own
+///   [`crate::application_class::is_prohibited_tuning_surface`] rather than
+///   reading a caller's claim. A request cannot disagree with the surface it
+///   names: there is no field in which to state the disagreement.
+/// - `bounded_tuning` — the DECLARED SAFE RANGE of I12.24:85 — and
+///   `has_work_item_ref` / `work_item_ref` — the REAL WORK ITEM of
+///   I12.24:90-91 — are ALSO gone. Neither exists on `ImprovementCandidate`
+///   (I12.24:20-38) or on any other record this crate holds, so a field for
+///   either would be a second caller-assertable scheme with no owner-issued
+///   record behind it. The descriptor is built by
+///   [`ChangeDescriptor::from_recorded_surface`], which exposes no parameter
+///   for them precisely because the evidence does not exist, and states the
+///   unreachability instead of minting a `true`. The measured absence of both
+///   owner records is recorded in the `application_class` module header.
+/// - `owner_approved` and `migration_proof_ref` — the EXPLICIT OWNER DECISION
+///   and MIGRATION/PROOF of I12.24:93-94 — are gone for the same reason: no
+///   owner-issued owner-decision or migration/proof record exists on main that
+///   this entry could read. The consequence is a refusal, not a weaker class: a
+///   change whose recorded surface is prohibited classifies `Protected` and
+///   `check_class_gate` refuses it with
+///   [`ImprovementError::ApplicationClassViolation`].
+/// - `live_experiments_on_surface` is gone, and `prepare_intake` no longer
+///   counts it either: the count is read only by the two class arms that no
+///   descriptor here can reach, so counting it would have been an unread
+///   computation behind a comment claiming enforcement (issue #1867 W5). The
+///   surface-concurrency rule that IS enforced on this path is
+///   `CandidateBoundPolicy::max_active`, applied inside
+///   [`BoundedBacklog::admit`] and reported by
+///   [`BoundedBacklog::admit_reporting_pressure`].
+///
+/// What remains here is content: the evidence, the brief text, the recorded
+/// delivery/canary/rollback/stop condition, the owner-assessed value and owner,
+/// and the budget proof. None of it selects an application class.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IntakeRequest {
     pub project_id: String,
@@ -143,12 +240,6 @@ pub struct IntakeRequest {
     pub next_reversible_step: String,
     pub unknowns: Vec<String>,
     pub boundary: SafeBoundary,
-    pub bounded_tuning: bool,
-    pub has_work_item_ref: bool,
-    pub live_experiments_on_surface: usize,
-    pub work_item_ref: Option<String>,
-    pub owner_approved: bool,
-    pub migration_proof_ref: Option<String>,
     pub budget_proof: BudgetProof,
 }
 
@@ -220,8 +311,7 @@ struct PreparedIntake {
 /// Run the pre-admission intake gates shared by both entries: build the
 /// evidence-bound candidate, move it to `Triaged`, produce the
 /// owner-actionable brief at the safe boundary, enforce the application-class
-/// gate, and require matched budget evidence. Nothing here mutates the
-/// backlog.
+/// gate, and require matched budget evidence. Nothing here touches the backlog.
 fn prepare_intake(request: IntakeRequest) -> Result<PreparedIntake, ImprovementError> {
     let IntakeRequest {
         project_id,
@@ -244,12 +334,6 @@ fn prepare_intake(request: IntakeRequest) -> Result<PreparedIntake, ImprovementE
         next_reversible_step,
         unknowns,
         boundary,
-        bounded_tuning,
-        has_work_item_ref,
-        live_experiments_on_surface,
-        work_item_ref,
-        owner_approved,
-        migration_proof_ref,
         budget_proof,
     } = request;
     let mut candidate = candidate_from_evidence(
@@ -279,38 +363,54 @@ fn prepare_intake(request: IntakeRequest) -> Result<PreparedIntake, ImprovementE
         unknowns,
         &boundary,
     )?;
-    // The protected flag is DERIVED from the candidate's OWN recorded surface
-    // through the crate's closed rule, exactly as
-    // `ChangeDescriptor::from_recorded_surface` does, so this entry cannot
-    // present a descriptor that disagrees with the surface it recorded. I12.24:93-94
-    // routes a schema/authority/verifier/privacy/Architecture change onto the
-    // explicit owner decision and migration/proof path, and I12.24:87-88 keeps
-    // a verifier-definition or reserve surface off pre-authorized tuning; a
-    // caller-supplied boolean could under-claim either and route a prohibited
-    // surface into the advisory or tuning class. `check_class_gate` refuses
-    // such a descriptor, but a request source that can only build a consistent
-    // one needs no refusal to catch it.
+    // `touches_protected` is DERIVED from the recorded surface rather than
+    // read from a caller flag, so a request cannot disagree with the surface it
+    // names — there is no field in which to state the disagreement:
     //
-    // `bounded_tuning` and `has_work_item_ref` stay owner-issued parameters:
-    // they stand for a declared safe range (I12.24:85) and a real work item
-    // (I12.24:90-91) that exist on no candidate, so they cannot be derived —
-    // only asserted, and `validate` refuses them on a prohibited surface.
-    let change = ChangeDescriptor {
-        target_surface: candidate.target_surface,
-        bounded_tuning,
-        touches_protected: is_prohibited_tuning_surface(candidate.target_surface),
-        has_work_item_ref,
-    };
+    // - it is `is_prohibited_tuning_surface` over `candidate.target_surface`,
+    //   the crate's closed rule rather than a spelled constant. I12.24:93-94
+    //   routes a schema/authority/verifier/privacy/Architecture change onto the
+    //   explicit owner decision and migration/proof path, and I12.24:87-88 keeps
+    //   a verifier-definition or reserve surface off pre-authorized tuning; a
+    //   caller-supplied boolean could under-claim either and route a prohibited
+    //   surface into the advisory or tuning class.
+    // - `bounded_tuning` and `has_work_item_ref` are not parameters of
+    //   `from_recorded_surface` at all, and cannot be: I12.24:85 admits
+    //   pre-authorized tuning only inside a declared safe range and the
+    //   I12.24:20-38 candidate schema lists none, and I12.24:90 admits
+    //   code/module/config delivery as a real work item that I12.24:65 places
+    //   after the decision owner's selection. A request that could set either
+    //   would be a fabricated `true` with no owner-issued record behind it, so
+    //   [`IntakeRequest`] has no field for either and the class they select is
+    //   unreachable here rather than assertable.
+    //
+    // What is derived here is the CLASS, not the surface: `candidate.target_surface`
+    // is itself the requester's, copied verbatim from `IntakeRequest` by
+    // `candidate_from_evidence`.
+    let change = ChangeDescriptor::from_recorded_surface(candidate.target_surface);
     let class = classify(&change);
-    check_class_gate(
-        class,
-        &change,
-        live_experiments_on_surface,
-        &rollback,
-        work_item_ref.as_deref(),
-        owner_approved,
-        migration_proof_ref.as_deref(),
-    )?;
+    // Both non-derived arguments below are honest absences, not enforcement:
+    //
+    // - `0` is the live-experiment count I12.24:86 asks for. It is NOT read on
+    //   this path: the ONE arm that reads it is the pre-authorized-tuning arm,
+    //   `classify` cannot return that class from a `from_recorded_surface`
+    //   descriptor, and the code/module/config arm never references the count
+    //   at all. This is a literal rather than a derived count precisely so no
+    //   comment here can claim an enforcement that arm does not perform. The
+    //   per-surface concurrency bound that IS enforced is
+    //   `CandidateBoundPolicy::max_active`, inside the backlog admission below,
+    //   which is a different rule with a different owner and not a substitute
+    //   for I12.24:86.
+    // - `rollback` is the candidate's own recorded value, i.e. the same string
+    //   `candidate_from_evidence` wrote onto it from this request. It is a
+    //   caller-AUTHORED reference that `ImprovementCandidate::validate`
+    //   requires non-empty and that nothing in this crate resolves (see the
+    //   crate root: `canary_plan`, `rollback` and `stop_condition` are
+    //   "String REFERENCES ... never resolves them"). It is therefore NOT
+    //   evidence that a rollback path exists, and it is not the "automatic
+    //   rollback" of I12.24:86 — no rollback is performed, scheduled or proven
+    //   here. It is not read on this path either, for the same reason as `0`.
+    check_class_gate(class, &change, 0, &rollback, None, false, None)?;
     require_matched_budget_for_promotion(Some(&budget_proof))?;
     Ok(PreparedIntake {
         candidate,

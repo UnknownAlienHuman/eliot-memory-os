@@ -85,13 +85,16 @@ pub enum EngineError {
     StaleRead { required: u64, actual: u64 },
 
     #[error(
-        "context packet floor exceeds budget: estimated {estimated_tokens} tokens > max {max_tokens}"
+        "context packet floor exceeds budget: unvalidated STU planning estimate {estimated_tokens} > max {max_tokens} STU; actual token count and measured fit are unknown"
     )]
     PacketFloorExceedsBudget {
         max_tokens: usize,
         estimated_tokens: usize,
         section_tokens: std::collections::BTreeMap<String, usize>,
     },
+
+    #[error(transparent)]
+    ContextMeasurement(#[from] eliot_context_contracts::ContextError),
 
     #[error(transparent)]
     Store(#[from] eliot_store::StoreError),

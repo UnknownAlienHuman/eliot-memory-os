@@ -106,7 +106,7 @@
 //! engine, no archive/phase algorithm, no invented target methods, no
 //! Value-based escapes.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 
 use eliot_backup::{
@@ -116,14 +116,18 @@ use eliot_backup::{
     RestoreEffectReceipt, RestoreEvidence, RestoreHistoricalAuthority, RestoreIntent,
     RestoreJournalAdmission, RestoreJournalPort, RestoreObligationState, RestoreObligations,
     RestoreOwnerObligation, RestorePhase, RestorePlan, RestoreReceipt, RestoreReconciliation,
-    RestoreStep, RestoreTarget, RestoredFence, RestoredSealedBlob, WrappedKeyManifest,
-    issue_restoration_receipts, suspended_recovery_entries, verify_portable_key_material,
+    RestoreStep, RestoreTarget, RestoredFence, RestoredSealedBlob, WRITE_RECEIPT_RECORD_TYPE,
+    WrappedKeyManifest, issue_restoration_receipts, suspended_recovery_entries,
+    verify_portable_key_material,
 };
 use eliot_backup::{ObservedLineageLimit, OwnerTrustBinding, RestoreProvenance};
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_ors::{MAX_JOURNAL_PAGE_ENTRIES, RedbRecoveryStore};
 use eliot_security_contracts::PurgeLedgerEntry;
-use eliot_store_api::{RevocationHistoryPayload, WriteReceipt, parse_revocation_history_payload};
+use eliot_store_api::{
+    CanonicalRestoreBatch, RetainedArchiveMember, RevocationHistoryPayload, SnapshotMemberType,
+    WriteReceipt, parse_revocation_history_payload,
+};
 use serde::Serialize;
 
 use super::backup_restore_ports::{
@@ -418,6 +422,122 @@ fn staged_member_bytes(bundle: &BackupBundle) -> Result<usize, BackupError> {
         checked_total(&mut total, bytes.len())?;
     }
     Ok(total)
+}
+
+/// Canonical JSON text of one value the admitted archive holds, in the exact
+/// byte sequence every digest over it is taken from.
+///
+/// One function, so the text a retained member publishes and the text a digest
+/// is computed over can never be two different encodings of one record.
+fn canonical_archive_text<T: Serialize>(value: &T) -> Result<String, BackupError> {
+    let bytes = canonical_json_bytes(value)
+        .map_err(|error| BackupError::Serialization(error.to_string()))?;
+    String::from_utf8(bytes).map_err(|_| {
+        BackupError::Serialization("canonical archive bytes are not valid text".to_owned())
+    })
+}
+
+/// One restore-class member's canonical bytes, as the admitted archive holds
+/// them.
+///
+/// Private to this module and to the single publication that consumes it: the
+/// resolved bytes and the owner's attestation over them are read out of the
+/// admitted archive, handed to the admitted batch once, and never recomputed on
+/// the far side. The digest here describes the ORIGINAL RECORDED bytes — it is
+/// a value the archive itself recorded — and the receiving port validates that
+/// recorded value against the bytes it actually holds rather than substituting
+/// a fresh checksum of its own.
+struct RetainedCanonicalPayload {
+    /// Closed class label the archive itself carries for this record.
+    ///
+    /// Taken verbatim from the archive: `CanonicalRecord::record_type` for a
+    /// canonical event or a projection, and the backup owner's own
+    /// `WRITE_RECEIPT_RECORD_TYPE` for a write receipt. No class table is
+    /// invented here and no record type is mapped onto another: a label the
+    /// destination port does not own is refused there, typed, against the
+    /// class it does not recognise.
+    class: String,
+    /// Digest of exactly `payload`, recorded by the archive owner.
+    payload_digest: String,
+    /// The canonical JSON encoding of the record, exactly as the archive holds
+    /// it. This text IS the retained content: the byte count published beside
+    /// it is this string's length and the digest above is this string's digest.
+    payload: String,
+}
+
+/// The admitted archive's own restore-class member denominator.
+///
+/// Keyed by the archive's OWN recorded commitment to each member's canonical
+/// content, never by anything a restore request supplied. For a canonical event
+/// or projection that commitment is `CanonicalRecord::sha256`, which
+/// `CanonicalRecord::validate` proves against the record's own payload here, so
+/// the value published is a proven claim rather than an unverified one. A write
+/// receipt carries no per-record checksum of its own — the archive records only
+/// the section digest over the whole receipt list — so for a receipt the owner
+/// attests once, here, over exactly the canonical bytes it holds, and the
+/// destination validates that attestation against the bytes it received.
+///
+/// Members are held in a queue per commitment so byte-identical archive
+/// records stay two members instead of collapsing into one: the admitted
+/// member list decides how many of them this batch takes, and each admitted
+/// member consumes exactly one.
+struct RetainedArchiveIndex {
+    entries: BTreeMap<String, VecDeque<RetainedCanonicalPayload>>,
+}
+
+impl RetainedArchiveIndex {
+    /// Reads the admitted archive's restore-class members.
+    ///
+    /// Sealed blobs are deliberately absent. They are the blob owner's route —
+    /// `DestinationRestoreAdapter::restore_blob_sealed`, already bound on this
+    /// adapter through `apply_blob` — and no canonical-store class names them,
+    /// so an admitted `Blob` member has nothing this index can honestly
+    /// publish. It retains no payload here, and the destination port refuses
+    /// that member typed rather than receiving bytes under a class this owner
+    /// made up.
+    fn read(bundle: &BackupBundle) -> Result<Self, BackupError> {
+        let mut entries: BTreeMap<String, VecDeque<RetainedCanonicalPayload>> = BTreeMap::new();
+        for record in bundle.canonical_events.iter().chain(&bundle.projections) {
+            // The archive's own recorded checksum is proved against the
+            // archive's own payload BEFORE the value is used as a lookup key or
+            // published, so a record whose payload was replaced while its
+            // checksum was retained can never become a retained payload here.
+            record.validate()?;
+            entries
+                .entry(record.sha256.clone())
+                .or_default()
+                .push_back(RetainedCanonicalPayload {
+                    class: record.record_type.clone(),
+                    payload_digest: record.sha256.clone(),
+                    payload: canonical_archive_text(&record.payload)?,
+                });
+        }
+        for receipt in &bundle.receipts {
+            receipt.validate().map_err(BackupError::Store)?;
+            let payload = canonical_archive_text(receipt)?;
+            // Attested once, over exactly the bytes published below: the
+            // digest is taken from `payload` itself, so it describes the
+            // retained content and not a re-encoding of it.
+            let payload_digest = sha256_hex(payload.as_bytes());
+            entries
+                .entry(payload_digest.clone())
+                .or_default()
+                .push_back(RetainedCanonicalPayload {
+                    class: WRITE_RECEIPT_RECORD_TYPE.to_owned(),
+                    payload_digest,
+                    payload,
+                });
+        }
+        Ok(Self { entries })
+    }
+
+    /// Consumes the archive member one admitted member names, or `None` when
+    /// the archive holds no member under that commitment.
+    fn take(&mut self, content_digest: &str) -> Option<RetainedCanonicalPayload> {
+        self.entries
+            .get_mut(content_digest)
+            .and_then(VecDeque::pop_front)
+    }
 }
 
 /// The bounded staged-output budget one restore execution works inside.
@@ -761,26 +881,47 @@ impl KernelBackupRestore {
     /// the two composition facts the record's own doc names, and
     /// `fixture_proof_only` is never set.
     ///
-    /// The admission is issued against a journal that ALREADY holds `plan`'s
+    /// The admission is issued against a durable journal that holds `plan`'s
     /// transaction, because an admission admits an existing durable journal and
-    /// existence and shape prove nothing. A stream the engine has not started
-    /// yet therefore refuses with [`BackupError::RestoreJournalRequired`]
-    /// surfaced as a typed [`KernelRestoreError::TargetFailed`] with its cause
-    /// intact; nothing is minted to make a fresh stream look admitted. Starting
-    /// the stream needs the plan's stream identity, and
-    /// `RestorePlan::journal_key` is private to `eliot-backup`, so that half is
-    /// not reachable from this file. Until it is, a production restore is
-    /// admitted on resume and refused on a first run — the resume path is
-    /// genuinely provable, the first run is not, and this method says so rather
-    /// than admitting an operation the owner cannot name.
+    /// existence and shape prove nothing. That journal row has to EXIST before
+    /// admission, and the only producer of it was the engine's own genesis
+    /// compare-and-swap — which runs after admission. The circle is broken by
+    /// the owner, not by this file:
+    /// [`eliot_backup::RestoreJournalAdmissionOwner::issue_journal_stream`]
+    /// establishes the stream and publishes the identity it filed it under, so
+    /// a FIRST run is admitted and not only a resume.
+    ///
+    /// This file derives nothing and cannot: the stream key is
+    /// `sha256(plan_id, bundle_sha256)`, computed inside `eliot-backup` where
+    /// the plan lives, and the Kernel asks the owner for the key rather than
+    /// reconstructing it — a key the owner did not issue is not the owner's key.
+    /// What the owner establishes is exactly the row the engine would have
+    /// written as its own first act (same transaction, revision 0, phase
+    /// `Pending`, state `Ready`, no intent, no receipt, no effect), committed
+    /// through the same accepted `RestoreJournalPort` seam over the same ORS
+    /// store, the same [`OrsRestoreBinding`] and the same live fence this
+    /// execution uses. The engine reads that row on its way in and continues
+    /// from it. No target effect occurs here, and the durable row the admission
+    /// is proved against is still the row the owner wrote and still has to
+    /// survive a fresh read. A stream already holding this transaction is left
+    /// exactly as it stands, so a second run binds once and not twice; a stream
+    /// already holding another one is refused rather than adopted.
+    ///
+    /// The two journal facts the admission carries keep one meaning each:
+    /// `journal_identity_ref` is the durable CHANNEL
+    /// ([`RESTORE_JOURNAL_IDENTITY`], checked by
+    /// [`check_ors_journal_binding`]), and this plan's own STREAM is proved by
+    /// the issuer reading the live journal under it.
     ///
     /// The returned value grants no cutover, no readiness and no activation
     /// (A13.7: cutover requires separate authority).
     ///
     /// # Errors
     ///
-    /// Refuses typed when the owner holds no durable record for this stream
-    /// ([`KernelRestoreError::TargetFailed`] carrying
+    /// Refuses typed when the stream cannot be established or already exists for
+    /// another transaction ([`KernelRestoreError::TargetFailed`] carrying the
+    /// journal error), when the owner holds no durable record for the stream it
+    /// issued ([`KernelRestoreError::TargetFailed`] carrying
     /// [`BackupError::RestoreJournalRequired`]), when the durable record
     /// disagrees with live composition
     /// ([`KernelRestoreError::JournalBindingConflict`]), or when the binding's
@@ -862,15 +1003,18 @@ impl KernelBackupRestore {
     /// the owner's answer must agree before any import, and neither value is
     /// computed here.
     ///
-    /// What the cross-check does NOT cover, stated rather than implied: an
-    /// archive that carries no purge entry has no owner-issued revision, so no
-    /// comparison is performed for it and none is claimed — the empty-ledger
-    /// path applies nothing and reports no revision, and the published field
-    /// remains the archive's own declared value. A resumed transaction that
+    /// What the cross-check does NOT cover, stated rather than implied: only the
+    /// per-entry completeness of a carried ledger. An archive that carries no
+    /// purge entry has no owner-issued per-entry revision to compare, but its
+    /// DECLARED revision is still reconciled against the owner's own counter —
+    /// including the case where the owner answered nothing, which refuses — so
+    /// the empty ledger cannot pass as a closure this phase never established.
+    /// For that archive the finalize evidence reports the purge obligation as
+    /// not established rather than `Satisfied`. A resumed transaction that
     /// reconciles the purge phase from its journaled receipt does not re-apply
     /// the ledger either, so the check is a property of the phase execution
-    /// that applied the entries, and that phase's receipt is what the purge
-    /// obligation evidence binds.
+    /// that applied the entries, and that phase's receipt is what a non-empty
+    /// purge obligation binds.
     pub fn restore_with_ors_journal(
         &self,
         ors: &std::sync::Arc<RedbRecoveryStore>,
@@ -914,6 +1058,154 @@ impl KernelBackupRestore {
             .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
         RestorePlan::compile(bundle, target)
             .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))
+    }
+
+    /// Publishes the admitted archive's retained canonical payloads into one
+    /// admitted restore batch (issue #952, audit `5869992012`).
+    ///
+    /// The #950 restore carrier names identities, digests and residency
+    /// metadata in [`CanonicalRestoreBatch::members`] and that is all it can
+    /// carry: a member's `content_digest` names content, it does not hold it.
+    /// So a batch assembled without this step reaches the destination port
+    /// unable to say WHAT it restores, and the port refuses every one of its
+    /// members typed rather than importing anything. This is the join the audit
+    /// asked for — resolve the admitted archive/member-set reference through
+    /// the archive owner and publish the canonical logical payloads — done
+    /// where the bytes actually are, in the owner that holds them.
+    ///
+    /// Everything published is read out of `bundle`, never derived from the
+    /// batch and never re-encoded from a re-encoding:
+    ///
+    /// - `class` is the archive's own label for the record
+    ///   (`CanonicalRecord::record_type`, or the backup owner's own
+    ///   `WRITE_RECEIPT_RECORD_TYPE` for a receipt). No class is mapped onto
+    ///   another and none is invented; a class the destination does not own is
+    ///   refused there against the class it does not recognise.
+    /// - `payload` is the record's canonical JSON encoding as the archive holds
+    ///   it, and `byte_count` is that text's own length. The admitted member's
+    ///   own `residency.byte_count` must therefore already be the length of that
+    ///   canonical text: the destination port compares the two independently,
+    ///   and a member that declares a different length is refused here first
+    ///   rather than reaching the port as a payload whose size disagrees with
+    ///   the member it answers for.
+    /// - `payload_digest` is the archive's OWN recorded commitment for those
+    ///   bytes (`CanonicalRecord::sha256`, proved against the record's payload
+    ///   by the existing [`CanonicalRecord::validate`]; for a receipt, which
+    ///   carries no per-record checksum, the single attestation this owner
+    ///   makes over exactly the bytes it publishes). The destination port
+    ///   validates that recorded value against the bytes it actually received
+    ///   and never substitutes a checksum of its own for it.
+    /// - `record_id` is the member's own domain-qualified logical identity
+    ///   (`SnapshotMember::logical_identity`), so the same admitted member
+    ///   always lands at the same destination address and equal bytes under a
+    ///   different residency domain never coalesce into one record.
+    ///
+    /// Completeness is measured against the ARCHIVE, which is the independent
+    /// expected set: the admitted member list is counted first, each admitted
+    /// canonical member must then consume exactly one archive member under the
+    /// archive's own recorded commitment, and the published count must equal
+    /// that first count. The comparison is never made against the vector this
+    /// call is building, so a member with no archive backing and a published
+    /// entry with no admitted member are two distinct refusals instead of one
+    /// self-consistent partial result.
+    ///
+    /// Structural admission is deliberately not repeated here.
+    /// [`CanonicalRestoreBatch::validate`] is the destination's own shape and
+    /// admission check and it cannot construct content, so source resolution
+    /// and destination execution admission stay separate steps; what is
+    /// re-proved here is only the archive (whole-bundle integrity, section
+    /// checksums and class denominator) and the three member facts the
+    /// publication depends on — member type, the member's own declared byte
+    /// count, and the archive's commitment to the member's content.
+    ///
+    /// Only a canonical `Record` member is a canonical-store payload. A
+    /// `Reference` edge names a canonical object and is not one, and a sealed
+    /// blob travels the blob owner's route; both retain nothing here, and the
+    /// destination port refuses them typed rather than receiving a payload
+    /// under a class this owner does not own.
+    ///
+    /// Create-only: a batch that already carries retained payloads is refused
+    /// rather than merged, so a second publication can never quietly widen or
+    /// replace the content a batch was admitted with. Idempotent replay is the
+    /// destination's own readback of the row this content produced, not a
+    /// second write here.
+    ///
+    /// # Errors
+    ///
+    /// Refuses typed, before any destination effect, when the archive does not
+    /// validate ([`KernelRestoreError::ArchiveInvalid`]), when the batch
+    /// already carries retained payloads, when an admitted canonical member is
+    /// not attested by the archive, when an admitted member declares a byte
+    /// count the archive does not hold, or when the published set does not
+    /// cover the admitted member set
+    /// ([`KernelRestoreError::InvalidInput`]).
+    pub fn publish_retained_archive_members(
+        &self,
+        bundle: &BackupBundle,
+        batch: &mut CanonicalRestoreBatch,
+    ) -> Result<(), KernelRestoreError> {
+        // The whole archive is re-proven first, so no member of a partially
+        // valid archive can become a retained payload.
+        bundle
+            .validate()
+            .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
+        if !batch.retained_members.is_empty() {
+            return Err(KernelRestoreError::InvalidInput {
+                field: "restore.retained_members",
+                reason: "batch already carries published retained archive payloads",
+            });
+        }
+        // Independent expected set: the ARCHIVE's restore-class member
+        // denominator, counted from the admitted member list BEFORE a single
+        // payload is resolved, so completeness can never be measured against
+        // the list this call is about to build.
+        let admitted = batch
+            .members
+            .iter()
+            .filter(|member| member.member_type == SnapshotMemberType::Record)
+            .count();
+        let mut index = RetainedArchiveIndex::read(bundle)
+            .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
+        let mut published: Vec<RetainedArchiveMember> = Vec::with_capacity(admitted);
+        for member in &batch.members {
+            if member.member_type != SnapshotMemberType::Record {
+                continue;
+            }
+            let Some(payload) = index.take(&member.content_digest) else {
+                return Err(KernelRestoreError::InvalidInput {
+                    field: "restore.members",
+                    reason: "admitted member is not attested by the admitted archive",
+                });
+            };
+            // The member's own declared residency length is an independent
+            // expected value for the archive's bytes, so a member that declares
+            // a length the archive does not hold is refused here rather than
+            // handed to the destination as a payload whose size disagrees with
+            // the member it answers for.
+            let byte_count = member.residency.byte_count;
+            if byte_count == 0 || usize::try_from(byte_count).ok() != Some(payload.payload.len()) {
+                return Err(KernelRestoreError::InvalidInput {
+                    field: "restore.members",
+                    reason: "admitted member declares a byte count the archive does not hold",
+                });
+            }
+            published.push(RetainedArchiveMember {
+                member_id: member.member_id.clone(),
+                class: payload.class,
+                record_id: member.logical_identity(),
+                payload_digest: payload.payload_digest,
+                byte_count,
+                payload: payload.payload,
+            });
+        }
+        if published.len() != admitted {
+            return Err(KernelRestoreError::InvalidInput {
+                field: "restore.retained_members",
+                reason: "published retained payloads do not cover the admitted member set",
+            });
+        }
+        batch.retained_members = published;
+        Ok(())
     }
 
     /// Executes (or resumes) one isolated restore under the Kernel effect fence.
@@ -1616,7 +1908,11 @@ struct KernelRestoreTarget<'a> {
     /// `None` is a real, declared posture — the injected-journal seam
     /// [`KernelBackupRestore::restore`] has no composition owner to name — and
     /// the purge phase refuses on it rather than degrading (see
-    /// [`KernelRestoreTarget::apply_purge_ledger`]). It is never a silent
+    /// [`KernelRestoreTarget::apply_purge_ledger`]): for a carried ledger
+    /// because nothing can be applied, and for an empty one because the
+    /// revision that archive declares still has to be reconciled against the
+    /// owner that alone can answer for it
+    /// ([`check_purge_revision_closure`]). It is never a silent
     /// skip and never a locally allocated revision.
     ors: Option<std::sync::Arc<RedbRecoveryStore>>,
     /// Revisions the purge phase actually consumed from the ORS purge-ledger
@@ -1717,9 +2013,14 @@ impl<'a> KernelRestoreTarget<'a> {
     /// (A13.7, A0.3: recovery cannot resurrect invalid state). The absence is
     /// the injected-journal seam's declared posture, not a fallback.
     ///
-    /// An archive whose purge ledger is empty has nothing to apply, so the
-    /// absence changes nothing that could have been applied: that case applies
-    /// no entry, reports no revision, and is not a skip of an application.
+    /// An archive whose purge ledger is empty still reaches the revision
+    /// cross-check, because it still DECLARES a purge-ledger revision: there is
+    /// no entry to apply, so this returns the owner's own counter with no
+    /// per-entry revision, and [`check_purge_revision_closure`] reconciles the
+    /// declaration against that answer. An empty ledger is therefore not a
+    /// licence to pass the owner by — with no ORS handle the answer is `None`
+    /// and the phase refuses at that cross-check, the same typed refusal the
+    /// non-empty case meets.
     ///
     /// ## Rehearsal refusal rule
     ///
@@ -1753,10 +2054,12 @@ impl<'a> KernelRestoreTarget<'a> {
     /// today's one — a guard that is unreachable only by accident is not a
     /// guard.
     ///
-    /// An archive whose purge ledger is EMPTY still succeeds under a
-    /// rehearsal, unchanged and byte-for-byte: there is nothing that could
-    /// have been written, so the empty-ledger path applies no entry, reports
-    /// no revision, and is not a skip of an application.
+    /// An archive whose purge ledger is EMPTY is not a rehearsal-shaped
+    /// exception: this guard keys off the entries actually carried, so an empty
+    /// ledger still reads the owner and still has its declared revision
+    /// reconciled against the owner below. A rehearsal that carries no purge
+    /// entry is not a way to obtain purge evidence, and it does not make the
+    /// phase's obligation `Satisfied` for an archive that purged nothing.
     ///
     /// ## Ordering against the revision cross-check
     ///
@@ -2952,8 +3255,28 @@ impl<'a> KernelRestoreTarget<'a> {
                 RestoreObligationState::MissingCapability,
             )
         };
+        // An archive that carried no purge entry established no privacy-purge
+        // closure for this restore: the purge phase applied nothing, so there is
+        // no purge effect of this restore for `owners::PURGE` to attest, and a
+        // phase receipt over an empty ledger is a receipt that says "nothing was
+        // purged", not a closure. Publishing `Satisfied` here on the strength
+        // of the caller's own emptiness is the substitution this restore must
+        // not make — do not fill a missing obligation with `Satisfied` to make
+        // the slice return success — and it is the shape the two neighbouring
+        // slots above already refuse. The obligation is therefore reported as
+        // not established in the existing unbound-owner vocabulary, and
+        // `require_cutover_obligations` refuses this slot on that state rather
+        // than accepting a closure no owner issued. The revision itself was
+        // still reconciled against the purge owner before any evidence was
+        // staged (see [`check_purge_revision_closure`]); that reconciliation
+        // is not a substitute for a purge effect that never happened.
+        let purge_obligation = if bundle.purge_ledger.is_empty() {
+            missing(owners::PURGE)
+        } else {
+            Self::obligation(owners::PURGE, purge_ref, RestoreObligationState::Satisfied)
+        };
         let obligations = RestoreObligations {
-            purge: Self::obligation(owners::PURGE, purge_ref, RestoreObligationState::Satisfied),
+            purge: purge_obligation,
             canonical_validation: Self::obligation(
                 owners::CANONICAL,
                 canonical_ref.clone(),
@@ -3290,28 +3613,44 @@ fn admitted_restore_ports<'a>(
 /// [`require_production_admitted`](super::backup_restore_ports::require_production_admitted)
 /// alone only proves an admission VALUE is well-formed and not fixture-flagged;
 /// it says nothing about which journal the execution then ran on, because
-/// `restore` takes its `J` as a parameter. Binding the admission's
-/// `journal_identity_ref` to [`RESTORE_JOURNAL_IDENTITY`] — the exact
-/// namespace this adapter's ORS rows are filed under, and the identity
-/// composition is required to place in the admission it issues — is what
-/// makes the presented admission and the journal actually executing the same
-/// owner channel. An admission for any other journal identity, including one
-/// describing an in-process store, refuses before a single effect runs.
+/// `restore` takes its `J` as a parameter. Requiring the admission's
+/// `journal_identity_ref` to be [`RESTORE_JOURNAL_IDENTITY`] is what makes the
+/// presented admission and the journal actually executing the same owner
+/// channel: that constant is the exact namespace this adapter's ORS rows are
+/// filed under and the identity composition is required to place in the
+/// admission it issues. An admission for any other journal identity, including
+/// one describing an in-process store, refuses before a single effect runs.
+///
+/// This field carries the CHANNEL and only the channel. It cannot also carry
+/// the per-execution stream key: that key is
+/// `sha256(plan_id, bundle_sha256)` and differs for every plan/bundle pair, so
+/// requiring the two to be equal refused every owner-issued admission — the
+/// constant here and the derived key in the issuer's re-proof were mutually
+/// exclusive requirements on one field, and the route was dead in both
+/// directions. The per-execution guarantee is not dropped and is not weaker: it
+/// is proved where the derivation lives, in
+/// [`RestoreJournalAdmission::binds_owner_record`](eliot_backup::RestoreJournalAdmission::binds_owner_record),
+/// which reads the live journal UNDER this plan's own stream key and requires
+/// that row to hold this plan's own transaction before it compares any owner
+/// field, and which compares the owner record read under that same key.
+/// `admit_restore_journal` runs that check for every admission this coordinator
+/// issues, so both facts are proved on every production restore.
 fn check_ors_journal_binding(
     bundle: &BackupBundle,
     target: &RestoreContext,
     ports: &RestorePorts<'_>,
     identity: &OrsRestoreBinding,
 ) -> Result<(), KernelRestoreError> {
-    // Conflict resolution (wind-down, 2026-09-29): main added the
-    // `RESTORE_JOURNAL_IDENTITY` equality check and documents it as
-    // "load-bearing, not decorative" (backup_restore_ports.rs:51). This branch's
-    // `admit_restore_journal` derives `journal_identity_ref` from the plan's own
-    // stream key instead. The two guarantees are incompatible; main's is kept
-    // because it is the stricter and the merged one. The consequence is recorded
-    // in the issue REPORT.md: until the issuer is reconciled to name the constant
-    // journal identity, this check refuses every owner-issued admission. That is
-    // fail-closed, never a wrong import.
+    // The durable CHANNEL identity. `OrsRestoreJournalOwner::durable_journal_record`
+    // reports this exact constant, so an owner-issued admission passes it; any
+    // other journal identity — including one describing an in-process store or
+    // a second database — refuses before a single effect runs.
+    //
+    // This is a live comparison against a value the owner actually issues, and
+    // it is the only field check here: the composition ALSO proves the
+    // per-execution stream, in the issuer's own re-proof, and it does not do so
+    // by making this channel field equal a per-plan digest. See the function
+    // doc for why one field cannot carry both.
     if ports.journal_admission.journal_identity_ref != RESTORE_JOURNAL_IDENTITY {
         return Err(KernelRestoreError::OwnerEvidenceInvalid(
             "restore journal admission does not name the durable ORS restore journal".to_owned(),
@@ -3469,29 +3808,41 @@ fn check_ors_journal_budget(bundle: &BackupBundle) -> Result<(), KernelRestoreEr
 ///
 /// ## An archive with no purge entry
 ///
-/// When the archive carries no purge entry there is no owner-issued revision
-/// to compare and none is invented, so this function returns without
-/// comparing. That is NOT a cross-checked agreement and is not reported as
-/// one: the empty ledger applied nothing, so there is no purge closure this
-/// phase established, and the published revision remains the archive's own
-/// declared value with nothing of the owner's behind it (see
-/// [`KernelRestoreTarget::apply_purge_ledger`], whose empty-ledger posture is
-/// "applies no entry, reports no revision, and is not a skip of an
-/// application"). A closure this phase never established cannot be claimed as
-/// owner-corroborated, and the obligation the finalize evidence publishes
-/// binds the phase receipt of the phase that actually ran.
+/// An archive that carries no purge entry has no owner-issued per-entry
+/// revision, so the per-entry completeness arm above has nothing to check. That
+/// is a property of the emptiness itself and is NOT a cross-checked agreement.
+///
+/// What still has to hold is the DECLARED revision. It names the purge-ledger
+/// position this archive was taken at; the destination holds that position only
+/// if the purge owner reports it, and a ledger with nothing in it cannot put the
+/// destination there. So the owner comparison above is not skipped for an empty
+/// ledger: an owner that answered no revision at all — the absent-owner seam —
+/// and a destination whose ledger position is not the declared one both refuse
+/// with the same typed `FenceMismatch` naming `purge ledger revision`. `I5.13:44`
+/// binds the purge-ledger revision into the receipt precisely so an unexplained
+/// revision gap fails rather than reading as coherent.
+///
+/// An empty ledger therefore establishes no privacy-purge closure, and the
+/// restore does not claim one: [`KernelRestoreTarget::apply_finalize`] reports
+/// the purge obligation as NOT established for an archive that carried no purge
+/// entry — the same posture its blob and ORS slots already take — instead of
+/// publishing `Satisfied` on the strength of the caller's own emptiness.
 fn check_purge_revision_closure(
     declared: u64,
     owner_revision: Option<u64>,
     entries: &[PurgeLedgerEntry],
     applied: &[AppliedPurgeRevision],
 ) -> Result<(), BackupError> {
-    if entries.is_empty() {
-        return Ok(());
-    }
     // One owner-issued revision per carried entry, and no owner-issued
-    // revision may be the owner's own "nothing was applied" zero.
-    if applied.len() != entries.len() || applied.iter().any(|record| record.revision == 0) {
+    // revision may be the owner's own "nothing was applied" zero. This arm is
+    // about the entries the archive actually carries: an archive carrying none
+    // has no per-entry revision to expect, and `applied` is then empty by
+    // construction because it is built only by iterating `entries`. A
+    // completeness check is never performed against a copy of the caller's own
+    // list, in this arm or the other.
+    if !entries.is_empty()
+        && (applied.len() != entries.len() || applied.iter().any(|record| record.revision == 0))
+    {
         return Err(BackupError::FenceMismatch {
             subject: PURGE_LEDGER_REVISION_SUBJECT.to_owned(),
         });
@@ -3500,6 +3851,15 @@ fn check_purge_revision_closure(
     // moved it, against the archive's declaration. `None` — the owner answered
     // with no revision at all — is compared as itself, so it refuses rather
     // than standing in for agreement.
+    //
+    // This comparison is NOT conditional on the ledger being non-empty. An
+    // archive that carries no purge entry still DECLARES a purge-ledger
+    // revision: that number names the ledger position the source was taken at,
+    // and the destination holds that position only if the purge owner says so —
+    // nothing this phase applied puts it there. So the declaration is
+    // reconciled against the owner here in the empty arm exactly as it is for a
+    // carried ledger, and an uncorroborated declaration — including one no owner
+    // was ever asked about — refuses instead of being passed over.
     if owner_revision != Some(declared) {
         return Err(BackupError::FenceMismatch {
             subject: PURGE_LEDGER_REVISION_SUBJECT.to_owned(),

@@ -674,6 +674,7 @@ def collect_result_struct(lines: list[str], name: str) -> RustResultStruct:
 
     fields: list[RustResultField] = []
     pending_serde = ""
+    in_serde_attribute = False
     field_re = re.compile(r"^\s*pub\s+([a-zA-Z0-9_]+)\s*:\s*(.+),\s*$")
     for line in lines[start:]:
         stripped = line.strip()
@@ -681,6 +682,11 @@ def collect_result_struct(lines: list[str], name: str) -> RustResultStruct:
             break
         if stripped.startswith("#[serde("):
             pending_serde += stripped
+            in_serde_attribute = not stripped.endswith(")]")
+            continue
+        if in_serde_attribute:
+            pending_serde += stripped
+            in_serde_attribute = not stripped.endswith(")]")
             continue
         match = field_re.match(line)
         if match is None:

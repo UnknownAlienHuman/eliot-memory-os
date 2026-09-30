@@ -362,6 +362,8 @@ async fn submit(
         job_id: submission.job_id.clone(),
         attempt_id: submission.attempt_id.clone(),
         scope: submission.work_scope.clone(),
+        semantic_input: Some(submission.semantic_input.clone()),
+        semantic_input_bytes: submission.semantic_input_bytes.clone(),
         revision: FIRST_OUTER_REVISION,
         state: JobState::Queued,
         disposition: Some(MutationDisposition::Committed),
@@ -611,6 +613,8 @@ async fn lease_exact(
         job_id: ledger.record.submission.job_id.clone(),
         attempt_id: attempt_id.clone(),
         scope: ledger.record.submission.work_scope.clone(),
+        semantic_input: Some(ledger.record.submission.semantic_input.clone()),
+        semantic_input_bytes: ledger.record.submission.semantic_input_bytes.clone(),
         revision: selector.expected_revision,
         state: JobState::Leased,
         disposition: Some(MutationDisposition::Committed),
@@ -882,6 +886,8 @@ fn prepare_applicability_mutation(
         job_id: ledger.record.submission.job_id.clone(),
         attempt_id: ledger.record.submission.attempt_id.clone(),
         scope: ledger.record.submission.work_scope.clone(),
+        semantic_input: Some(ledger.record.submission.semantic_input.clone()),
+        semantic_input_bytes: ledger.record.submission.semantic_input_bytes.clone(),
         revision: ledger.record.revision,
         state: ledger.record.state,
         disposition: Some(MutationDisposition::Committed),
@@ -934,6 +940,8 @@ async fn status(
         job_id: ledger.record.submission.job_id.clone(),
         attempt_id: ledger.record.submission.attempt_id.clone(),
         scope: ledger.record.submission.work_scope.clone(),
+        semantic_input: Some(ledger.record.submission.semantic_input.clone()),
+        semantic_input_bytes: ledger.record.submission.semantic_input_bytes.clone(),
         revision: ledger.record.revision,
         state: ledger.record.state,
         disposition: None,
@@ -1276,6 +1284,8 @@ async fn op_lease_next(
         job_id: ledger.record.submission.job_id.clone(),
         attempt_id: ledger.record.submission.attempt_id.clone(),
         scope: ledger.record.submission.work_scope.clone(),
+        semantic_input: Some(ledger.record.submission.semantic_input.clone()),
+        semantic_input_bytes: ledger.record.submission.semantic_input_bytes.clone(),
         revision: selector.expected_revision,
         state: JobState::Leased,
         disposition: Some(MutationDisposition::Committed),
@@ -1385,6 +1395,8 @@ async fn op_renew(
         job_id: ledger.record.submission.job_id.clone(),
         attempt_id: ledger.record.submission.attempt_id.clone(),
         scope: ledger.record.submission.work_scope.clone(),
+        semantic_input: Some(ledger.record.submission.semantic_input.clone()),
+        semantic_input_bytes: ledger.record.submission.semantic_input_bytes.clone(),
         revision: ledger.record.revision,
         state: ledger.record.state,
         disposition: Some(MutationDisposition::Committed),
@@ -1494,6 +1506,8 @@ async fn op_start(
         job_id: ledger.record.submission.job_id.clone(),
         attempt_id: ledger.record.submission.attempt_id.clone(),
         scope: ledger.record.submission.work_scope.clone(),
+        semantic_input: Some(ledger.record.submission.semantic_input.clone()),
+        semantic_input_bytes: ledger.record.submission.semantic_input_bytes.clone(),
         revision: ledger.record.revision,
         state: JobState::Running,
         disposition: Some(MutationDisposition::Committed),
@@ -1654,6 +1668,8 @@ async fn op_checkpoint(
         job_id: ledger.record.submission.job_id.clone(),
         attempt_id: ledger.record.submission.attempt_id.clone(),
         scope: ledger.record.submission.work_scope.clone(),
+        semantic_input: Some(ledger.record.submission.semantic_input.clone()),
+        semantic_input_bytes: ledger.record.submission.semantic_input_bytes.clone(),
         revision: ledger.record.revision,
         state: JobState::Checkpointed,
         disposition: Some(MutationDisposition::Committed),
@@ -1767,6 +1783,8 @@ async fn op_resume(
         job_id: ledger.record.submission.job_id.clone(),
         attempt_id: ledger.record.submission.attempt_id.clone(),
         scope: ledger.record.submission.work_scope.clone(),
+        semantic_input: Some(ledger.record.submission.semantic_input.clone()),
+        semantic_input_bytes: ledger.record.submission.semantic_input_bytes.clone(),
         revision: ledger.record.revision,
         state: JobState::Running,
         disposition: Some(MutationDisposition::Committed),
@@ -1876,6 +1894,8 @@ async fn op_begin_verification(
         job_id: ledger.record.submission.job_id.clone(),
         attempt_id: ledger.record.submission.attempt_id.clone(),
         scope: ledger.record.submission.work_scope.clone(),
+        semantic_input: Some(ledger.record.submission.semantic_input.clone()),
+        semantic_input_bytes: ledger.record.submission.semantic_input_bytes.clone(),
         revision: ledger.record.revision,
         state: JobState::Verifying,
         disposition: Some(MutationDisposition::Committed),
@@ -1994,6 +2014,8 @@ async fn op_publish(
         job_id: ledger.record.submission.job_id.clone(),
         attempt_id: ledger.record.submission.attempt_id.clone(),
         scope: ledger.record.submission.work_scope.clone(),
+        semantic_input: Some(ledger.record.submission.semantic_input.clone()),
+        semantic_input_bytes: ledger.record.submission.semantic_input_bytes.clone(),
         revision: ledger.record.revision,
         state: outcome.state,
         disposition: Some(MutationDisposition::Committed),
@@ -2117,6 +2139,8 @@ async fn op_request_cancel(
         job_id: ledger.record.submission.job_id.clone(),
         attempt_id: ledger.record.submission.attempt_id.clone(),
         scope: ledger.record.submission.work_scope.clone(),
+        semantic_input: Some(ledger.record.submission.semantic_input.clone()),
+        semantic_input_bytes: ledger.record.submission.semantic_input_bytes.clone(),
         revision: ledger.record.revision,
         state: prior_state,
         disposition: Some(MutationDisposition::Committed),
@@ -2227,28 +2251,7 @@ async fn op_reconcile(
         {
             return Err(AdapterError::Store(StoreError::InvalidReceipt));
         }
-        let response = DurableJobResponse {
-            request_identity: request.request_identity.clone(),
-            job_id: ledger.record.submission.job_id.clone(),
-            attempt_id: ledger.record.submission.attempt_id.clone(),
-            scope: ledger.record.submission.work_scope.clone(),
-            revision: ledger.record.revision,
-            state: ledger.record.state,
-            disposition: Some(MutationDisposition::Committed),
-            receipt_id: ledger.last_receipt_id.clone(),
-            lease: ledger.active_lease.clone(),
-            checkpoint: ledger.record.checkpoint.clone(),
-            result_under_verification: ledger.result_under_verification.clone(),
-            outcome: ledger.record.outcome.clone(),
-            applicability_history: ledger.applicability_history.clone(),
-            selection_coverage: Vec::new(),
-            selection_frontier: None,
-        };
-        response
-            .validate_for(&request)
-            .map_err(map_durable_error)
-            .map_err(AdapterError::Store)?;
-        Ok(response)
+        reconcile_response(&request, &ledger, MutationDisposition::Committed)
     } else {
         if mutation.disposition == MutationDisposition::Committed {
             // No operation row, no receipt: not committed success.
@@ -2272,29 +2275,44 @@ async fn op_reconcile(
         // Proven absence: the atomic commit always writes the operation
         // row, so its absence proves this mutation never applied. The
         // current record binds scope and revision without changing it.
-        let response = DurableJobResponse {
-            request_identity: request.request_identity.clone(),
-            job_id: ledger.record.submission.job_id.clone(),
-            attempt_id: ledger.record.submission.attempt_id.clone(),
-            scope: ledger.record.submission.work_scope.clone(),
-            revision: ledger.record.revision,
-            state: ledger.record.state,
-            disposition: Some(mutation.disposition),
-            receipt_id: None,
-            lease: ledger.active_lease.clone(),
-            checkpoint: ledger.record.checkpoint.clone(),
-            result_under_verification: ledger.result_under_verification.clone(),
-            outcome: ledger.record.outcome.clone(),
-            applicability_history: ledger.applicability_history.clone(),
-            selection_coverage: Vec::new(),
-            selection_frontier: None,
-        };
-        response
-            .validate_for(&request)
-            .map_err(map_durable_error)
-            .map_err(AdapterError::Store)?;
-        Ok(response)
+        reconcile_response(&request, &ledger, mutation.disposition)
     }
+}
+
+/// Returns the exact retained owner material for an already-proved reconciliation.
+fn reconcile_response(
+    request: &DurableJobRequest,
+    ledger: &DreamerJobLedgerRecord,
+    disposition: MutationDisposition,
+) -> Result<DurableJobResponse, AdapterError> {
+    let response = DurableJobResponse {
+        request_identity: request.request_identity.clone(),
+        job_id: ledger.record.submission.job_id.clone(),
+        attempt_id: ledger.record.submission.attempt_id.clone(),
+        scope: ledger.record.submission.work_scope.clone(),
+        semantic_input: Some(ledger.record.submission.semantic_input.clone()),
+        semantic_input_bytes: ledger.record.submission.semantic_input_bytes.clone(),
+        revision: ledger.record.revision,
+        state: ledger.record.state,
+        disposition: Some(disposition),
+        receipt_id: if disposition == MutationDisposition::Committed {
+            ledger.last_receipt_id.clone()
+        } else {
+            None
+        },
+        lease: ledger.active_lease.clone(),
+        checkpoint: ledger.record.checkpoint.clone(),
+        result_under_verification: ledger.result_under_verification.clone(),
+        outcome: ledger.record.outcome.clone(),
+        applicability_history: ledger.applicability_history.clone(),
+        selection_coverage: Vec::new(),
+        selection_frontier: None,
+    };
+    response
+        .validate_for(request)
+        .map_err(map_durable_error)
+        .map_err(AdapterError::Store)?;
+    Ok(response)
 }
 
 /// Commits four Dreamer rows (job, event, operation, receipt) in one provider

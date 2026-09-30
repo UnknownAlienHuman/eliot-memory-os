@@ -68,6 +68,25 @@ pub(crate) const HEARTBEAT_OPERATION: &str = "eliot.user-broker.heartbeat";
 pub(crate) const AUTHORIZE_LAUNCH_OPERATION: &str = "eliot.user-broker.authorize-launch";
 /// Canonical Kernel operation selectors issued through this broker.
 pub(crate) const FENCE_OPERATION: &str = "eliot.user-broker.fence";
+/// Canonical Kernel selector for the fresh, short-lived Operator session token
+/// I11.8 requires on every `WinUI` binding. It is the same selector the Kernel
+/// serves at `bins/eliot-kernel/src/daemon_request_dispatch.rs`
+/// (`bind_operator_session_token`); the broker never mints the token itself.
+pub(crate) const OPERATOR_SESSION_TOKEN_OPERATION: &str =
+    "eliot.user-broker.operator-session-token";
+/// Canonical prefix of the Kernel-minted Operator session grant's operation id.
+///
+/// This is the Kernel's own wire prefix, not a broker transport selector: the
+/// Kernel composes `operatorsession:<handoff-nonce>` at
+/// `crates/kernel/eliot-kernel-service/src/operator_session_token.rs`
+/// (`OPERATOR_SESSION_TOKEN_OPERATION_PREFIX`), and this broker re-declares the
+/// identical string at the authenticated boundary - the same paired-declaration
+/// contract its request/grant carriers use - so the grant this broker receives
+/// is compared against the exact id its own request should have produced
+/// instead of merely against a non-empty one. The broker cannot depend on the
+/// Kernel service crate (dependency direction), so the two declarations are
+/// cross-referenced rather than shared.
+pub(crate) const OPERATOR_SESSION_TOKEN_OPERATION_PREFIX: &str = "operatorsession:";
 /// Canonical read-only Kernel selector for receipt-bound native resource currentness.
 pub(crate) const VALIDATE_NATIVE_RESOURCE_SELECTION_CURRENT_OPERATION: &str =
     "eliot.user-broker.validate-native-resource-selection-current";
@@ -94,6 +113,7 @@ pub(crate) enum BrokerOperation {
     HeartbeatRenewal,
     AuthorizeLaunch,
     FenceLogoff,
+    OperatorSessionToken,
     ValidateNativeResourceSelectionCurrent,
 }
 
@@ -106,6 +126,7 @@ impl BrokerOperation {
             Self::HeartbeatRenewal => HEARTBEAT_OPERATION,
             Self::AuthorizeLaunch => AUTHORIZE_LAUNCH_OPERATION,
             Self::FenceLogoff => FENCE_OPERATION,
+            Self::OperatorSessionToken => OPERATOR_SESSION_TOKEN_OPERATION,
             Self::ValidateNativeResourceSelectionCurrent => {
                 VALIDATE_NATIVE_RESOURCE_SELECTION_CURRENT_OPERATION
             }
@@ -119,6 +140,7 @@ impl BrokerOperation {
             Self::HeartbeatRenewal => "heartbeat",
             Self::AuthorizeLaunch => "authorize-launch",
             Self::FenceLogoff => "fence",
+            Self::OperatorSessionToken => "operator-session-token",
             Self::ValidateNativeResourceSelectionCurrent => "resource-currentness",
         }
     }
@@ -841,6 +863,24 @@ impl OperationIdentityIssuer {
         )
     }
 
+    /// Issues (or exactly retries) one Operator session-token identity. The
+    /// canonical payload carries the one-shot handoff nonce, the live
+    /// registration identity and the OS-observed client tuple, so an exact
+    /// retry of one challenge reuses its identity while any changed binding
+    /// mints a new one and can never inherit a spent identity.
+    pub(crate) fn issue_operator_session_token(
+        &mut self,
+        payload: &Value,
+        now_unix_ms: u64,
+    ) -> Result<IssuedIdentity, OperationIdentityError> {
+        self.issue(
+            BrokerOperation::OperatorSessionToken,
+            payload,
+            now_unix_ms,
+            &CallerLink::none(),
+        )
+    }
+
     /// Issues with an explicit transport idempotency key. A key already bound
     /// to different canonical bytes fails with identity conflict; the same
     /// key with identical bytes returns the exact prior identity. This is
@@ -1516,6 +1556,7 @@ fn validate_retained_identity(
             | AUTHORIZE_LAUNCH_OPERATION
             | FENCE_OPERATION
             | VALIDATE_NATIVE_RESOURCE_SELECTION_CURRENT_OPERATION
+            | OPERATOR_SESSION_TOKEN_OPERATION
     );
     let is_control_operation = matches!(
         retained.operation.as_str(),

@@ -22,6 +22,7 @@ use super::{
 };
 use crate::kernel_diagnostics::{EntrypointStage, observe_entrypoint_with_detail};
 use eliot_observability_runtime::RuntimeProfile;
+use eliot_runtime_contracts::RestartPolicyV1;
 
 /// Explicit construction input for the Kernel process.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40,6 +41,24 @@ pub struct KernelConfig {
     /// Host/installer-approved `eliotd` child launch contour.  Integrated
     /// startup must inject this explicitly; there is no path or argv default.
     pub daemon_launch: Option<EliotdLaunchDescriptor>,
+    /// Host/installer-admitted restart policy for the Kernel-supervised
+    /// `eliotd` child (I14.10 child restart class, I08.12 restart budgets).
+    ///
+    /// The whole declaration is the shared versioned contract value
+    /// (`eliot_runtime_contracts::RestartPolicyV1`), so the declared class and
+    /// every one of the eight `RestartIntensityPolicy` numbers arrive from the
+    /// approved config/fault profile the operator admitted.  This type declares
+    /// no restart intensity of its own: there is no default window, backoff,
+    /// jitter, cooldown, healthy-reset or quarantine threshold here, and a
+    /// missing declaration is never read as an unlimited budget.
+    ///
+    /// `None` is the honest fail-closed default.  An absent or unsupported
+    /// declaration means the child performs no automatic restart at all and
+    /// keeps exactly the authority it was already admitted with, which is the
+    /// disposition `eliot_runtime_contracts::restart_policy::dispose_restart_policy`
+    /// already defines; composition validates an admitted value and refuses a
+    /// declaration this contract does not admit.
+    pub daemon_restart_policy: Option<RestartPolicyV1>,
     /// Independent digest of the Kernel executable advertised in the
     /// daemon's generation snapshot. This is a different artifact domain
     /// from the `eliotd` child executable digest.
@@ -130,6 +149,7 @@ impl KernelConfig {
             store_bootstrap: None,
             blob_manifest: None,
             daemon_launch: None,
+            daemon_restart_policy: None,
             kernel_artifact_sha256: None,
             eliotd_descriptor_artifact_sha256: None,
             doctor_artifact_sha256: None,
@@ -198,6 +218,21 @@ impl KernelConfig {
             "kernel.config.daemon_launch_injected",
         );
         self.daemon_launch = Some(launch);
+        self
+    }
+
+    /// Injects the admitted restart policy for the Kernel-supervised `eliotd`
+    /// child (I14.10, I08.12).
+    ///
+    /// The declaration is retained verbatim and validated during composition
+    /// assembly with the shared contract's own validator, so an inconsistent
+    /// intensity window, an unusable group declaration or a policy naming a
+    /// different child is refused at startup rather than at the first failed
+    /// restart.  Calling this is the only way a restart class reaches the
+    /// Kernel: leaving it unset admits no automatic restart for the child.
+    #[must_use]
+    pub fn with_daemon_restart_policy(mut self, policy: RestartPolicyV1) -> Self {
+        self.daemon_restart_policy = Some(policy);
         self
     }
 

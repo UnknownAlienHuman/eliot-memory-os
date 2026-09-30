@@ -15,6 +15,11 @@
 //!
 //! Public construction semantics remain on `KernelComposition`; this ordinary
 //! module only houses their implementation.
+#[cfg(windows)]
+use super::{
+    AdmittedDaemonRestartPolicy, DaemonSupervisionProgressState, SupervisionLeaseAuthorityConfig,
+    dispatch_key, load_agent_bridge_declaration, observed_session_principal_binding,
+};
 use super::{
     ArtifactId, AuditEventDraft, AuthorityDescriptorContour, AuthorityHandoffBegin,
     AuthorityHandoffRecord, AuthorityHandoffState, AuthorityPreparationError,
@@ -35,11 +40,6 @@ use super::{
 };
 #[cfg(test)]
 use super::{CanonicalEvidenceProvider, DispatchValidationPort};
-#[cfg(windows)]
-use super::{
-    DaemonSupervisionProgressState, SupervisionLeaseAuthorityConfig, dispatch_key,
-    load_agent_bridge_declaration, observed_session_principal_binding,
-};
 #[cfg(not(windows))]
 use super::{
     SupervisionLeaseAuthorityConfig, dispatch_key, load_agent_bridge_declaration,
@@ -1128,6 +1128,8 @@ impl KernelComposition {
         let work_root = config.work_root.clone();
         let store_bootstrap = config.store_bootstrap.clone();
         let daemon_launch = config.daemon_launch.clone();
+        #[cfg(windows)]
+        let daemon_restart_policy = config.daemon_restart_policy.clone();
         let kernel_artifact_sha256 = config.kernel_artifact_sha256.clone();
         let eliotd_descriptor_artifact_sha256 = config.eliotd_descriptor_artifact_sha256.clone();
         let wasm_host_executable_path = config.wasm_host_executable_path.clone();
@@ -1333,6 +1335,19 @@ impl KernelComposition {
             .map_err(|error| KernelBuildError::Service(error.to_string()))?;
         let module_id =
             ContractId::new("eliotd").map_err(|error| KernelBuildError::Core(error.to_string()))?;
+        // I14.10 / I8.12: an admitted restart policy must name the child it governs.
+        // A declaration admitted for a different supervised child is refused at
+        // startup rather than discovered at the first failed restart. An absent
+        // declaration stays absent and withholds automatic restart; it is never
+        // widened into an unlimited budget.
+        #[cfg(windows)]
+        if let Some(policy) = &daemon_restart_policy
+            && policy.subject_id != module_id.as_str()
+        {
+            return Err(KernelBuildError::Service(
+                "admitted eliotd restart policy names a different supervised child".to_owned(),
+            ));
+        }
         let artifact_id = daemon_launch
             .as_ref()
             .map_or_else(
@@ -1347,6 +1362,26 @@ impl KernelComposition {
             state: ModuleGenerationState::Starting,
             health: HealthVector::healthy(),
             state_fence: StateFence::new(canonical_epoch.clone(), generation),
+        };
+        // I14.10 / I8.12 / #1682 W1: the admitted declaration is bound to the
+        // admitted generation and the exact admitted state fence, and that
+        // binding is what the composition retains. The shared contract's own
+        // `bind` proves the fence and requires the generation to be the fence's
+        // generation, and `admit` re-proves the retained binding against the
+        // original declaration. Validating the declaration and dropping it, as
+        // this site used to, left nothing that could later say which policy the
+        // admitted generation was admitted under.
+        #[cfg(windows)]
+        let daemon_restart_policy = match daemon_restart_policy {
+            Some(policy) => Some(
+                AdmittedDaemonRestartPolicy::admit(
+                    policy,
+                    module_generation.generation,
+                    &module_generation.state_fence,
+                )
+                .map_err(|error| KernelBuildError::Service(error.to_string()))?,
+            ),
+            None => None,
         };
         #[cfg(windows)]
         let session_principal_binding = observed_session_principal_binding()?;
@@ -1633,6 +1668,8 @@ impl KernelComposition {
             store_bootstrap,
             daemon_active_launch: Mutex::new(daemon_launch.clone()),
             daemon_launch,
+            #[cfg(windows)]
+            daemon_restart_policy,
             eliotd_receipt_binding,
             kernel_artifact_sha256,
             eliotd_descriptor_artifact_sha256,

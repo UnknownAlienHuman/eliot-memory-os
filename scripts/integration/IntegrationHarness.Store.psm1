@@ -37,7 +37,11 @@
 # - Allocate creates unique owned data/log/secret roots under the admitted run
 #   root, writes the owner marker eliot-harness-owned-root-v1, derives
 #   namespace/database from the run identity, and reserves a loopback endpoint
-#   through an ownership-safe reservation->launch protocol. The reservation
+#   through an ownership-safe reservation->launch protocol. A root is reused
+#   only when the marker CONTENT re-states the complete claim (marker value,
+#   run, owner, generation) through the one predicate Test-StoreOwnedRootClaim
+#   that the removal path also uses, so re-allocation cannot adopt a root left
+#   under the same run name by another owner or generation. The reservation
 #   records which ownership proof it actually carries: 'held-socket' when a live
 #   TcpListener is positively proven to still own the loopback endpoint (so no
 #   other process can take that port), and 'seam-asserted' when the seam owns
@@ -47,10 +51,13 @@
 #   (expired), a replaced binding (foreign), and an endpoint that left the
 #   reservation (port race) are distinct typed refusals raised before any
 #   process exists, while an endpoint that cannot be reserved at all is a typed
-#   port conflict rather than an ownership failure. Creation runs through the
-#   FileSystem seam (default real); re-allocation for the same run reuses the
-#   marker-verified roots and re-verifies the existing run-principal-only ACL
-#   instead of re-writing it, while a foreign or missing marker fails closed.
+#   port conflict rather than an ownership failure. The default reservation
+#   binds with ExclusiveAddressUse, so the hold is an exclusive bind that makes
+#   a competing bind fail outright instead of resting on a platform default.
+#   Creation runs through the FileSystem seam (default real); re-allocation for
+#   the same run reuses the marker-verified roots and re-verifies the existing
+#   run-principal-only ACL instead of re-writing it, while a foreign or missing
+#   marker fails closed.
 # - Start verifies the approved executable version/platform/arch/digest plus
 #   acquisition provenance before execution, including cached binaries which
 #   are fully re-verified (digest recomputed; a mismatched cache record fails
@@ -65,7 +72,19 @@
 #   expected schema identity is stale and cannot authorize Stop or readiness.
 # - ObserveReadiness binds exact process/start/endpoint identity plus an
 #   authenticated protocol handshake plus namespace/database selection plus
-#   the required schema identity carried on the start receipt. Process-alive,
+#   the required schema identity carried on the start receipt. The handshake
+#   first CREATES the allocated namespace/database with the bare
+#   `DEFINE NAMESPACE` / `DEFINE DATABASE` forms on this run's own reserved
+#   endpoint under its own ephemeral root credential. Those forms are the atomic
+#   exclusive create: the server refuses the statement when the name already
+#   exists, so exactly one run wins the name. A plain `USE NS x DB y` is not a
+#   claim -- in SurrealDB 3.x regular mode it CREATES a missing namespace or
+#   database and silently adopts an existing one, which would let a run proceed
+#   on another run's namespace. The exclusive create this run won is recorded
+#   per run, so a later handshake or fixture step of the SAME run is a
+#   recognized re-entry, and any namespace or database already present without
+#   that record is refused as foreign (STORE-NAMESPACE-FOREIGN) rather than
+#   adopted. Process-alive,
 #   TCP-open, authenticated, schema-ready, and fixture-ready are separate
 #   receipts; schema-ready is true only when the observed client schemaDigest
 #   equals the expected receipt identity, and liveness without auth is not
@@ -996,6 +1015,42 @@ function Resolve-StoreOwnedPath {
         $cursor = $next
     }
     return $candidate
+}
+
+# The one ownership predicate for an owned root, shared by the reuse path
+# (New-StoreDefaultFileSystem ensure-owned-root) and the removal path
+# (Remove-StoreOwnedRoot) so a root is never reused or deleted on a weaker
+# claim than the one that created it. Ownership is read back from marker
+# CONTENT: the marker value, the run, the owner and the generation must all be
+# stated by the recorded marker. A predictable root path proves nothing, and a
+# marker that names only the run proves nothing about who owns it now.
+function Test-StoreOwnedRootClaim {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowNull()]
+        $Recorded,
+        [Parameter(Mandatory)]
+        [string]$RunId,
+        [Parameter(Mandatory)]
+        [string]$Owner,
+        [Parameter(Mandatory)]
+        [int]$Generation
+    )
+    if ($null -eq $Recorded) { return $false }
+    $markerProp = $Recorded.PSObject.Properties['marker']
+    if ($null -eq $markerProp -or [string]$markerProp.Value -cne $Script:StoreOwnedRootMarker) { return $false }
+    $runProp = $Recorded.PSObject.Properties['run_id']
+    if ($null -eq $runProp -or [string]$runProp.Value -cne $RunId) { return $false }
+    $ownerProp = $Recorded.PSObject.Properties['owner']
+    if ($null -eq $ownerProp -or [string]$ownerProp.Value -cne $Owner) { return $false }
+    $generationProp = $Recorded.PSObject.Properties['generation']
+    if ($null -eq $generationProp) { return $false }
+    $recordedGeneration = -1
+    try { $recordedGeneration = [int]$generationProp.Value } catch { $recordedGeneration = -1 }
+    if ($recordedGeneration -ne $Generation) { return $false }
+    return $true
 }
 
 function Get-StoreChildEnv {
@@ -2410,20 +2465,16 @@ function Remove-StoreOwnedRoot {
         return @{ removed = $false; alreadyAbsent = $false; ownedRoot = $runRoot; failures = @('owner-marker-missing') }
     }
     # Ownership is proven by marker CONTENT, never by the path name: the
-    # recorded claim must name this run, owner, generation, and marker value.
-    # A marker that does not match belongs to another run and is never removed.
+    # recorded claim must state this run, owner, generation and marker value,
+    # read back through the same predicate the reuse path applies. A marker
+    # that does not match belongs to another run and is never removed.
     $recorded = $null
     try {
         $recorded = Get-Content -LiteralPath $markerPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
     } catch {
         return @{ removed = $false; alreadyAbsent = $false; ownedRoot = $runRoot; failures = @('owner-marker-unreadable') }
     }
-    $recordedGeneration = -1
-    try { $recordedGeneration = [int]$recorded.generation } catch { $recordedGeneration = -1 }
-    if ([string]$recorded.marker -cne $Script:StoreOwnedRootMarker -or
-        [string]$recorded.run_id -cne $runId -or
-        [string]$recorded.owner -cne $owner -or
-        $recordedGeneration -ne $generation) {
+    if (-not (Test-StoreOwnedRootClaim -Recorded $recorded -RunId $runId -Owner $owner -Generation $generation)) {
         return @{ removed = $false; alreadyAbsent = $false; ownedRoot = $runRoot; failures = @('ownership-verification-failed') }
     }
     $topLevel = @()
@@ -3489,8 +3540,8 @@ function New-StoreDefaultFileSystem {
                 } catch {
                     throw [System.InvalidOperationException]::new("STORE-FOREIGN-ROOT: owner marker unreadable at: $runRoot")
                 }
-                if ([string]$existing.marker -cne $markerValue -or [string]$existing.run_id -cne $runId) {
-                    throw [System.InvalidOperationException]::new("STORE-FOREIGN-ROOT: owner marker belongs to another run: $runRoot")
+                if (-not (Test-StoreOwnedRootClaim -Recorded $existing -RunId $runId -Owner $owner -Generation $gen)) {
+                    throw [System.InvalidOperationException]::new("STORE-FOREIGN-ROOT: owner marker does not state this run's ownership claim: $runRoot")
                 }
                 foreach ($field in @('dataRoot', 'logRoot', 'secretRoot')) {
                     [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::GetFullPath([string]$Request[$field]))
@@ -3524,8 +3575,8 @@ function New-StoreDefaultFileSystem {
                 } catch {
                     throw [System.InvalidOperationException]::new("STORE-FOREIGN-ROOT: owner marker unreadable at: $runRoot")
                 }
-                if ([string]$raced.marker -cne $markerValue -or [string]$raced.run_id -cne $runId) {
-                    throw [System.InvalidOperationException]::new("STORE-FOREIGN-ROOT: owner marker belongs to another run: $runRoot")
+                if (-not (Test-StoreOwnedRootClaim -Recorded $raced -RunId $runId -Owner $owner -Generation $gen)) {
+                    throw [System.InvalidOperationException]::new("STORE-FOREIGN-ROOT: owner marker does not state this run's ownership claim: $runRoot")
                 }
                 return @{ created = $false; existed = $true; markerPath = $markerPath }
             }
@@ -3653,6 +3704,13 @@ function New-StoreDefaultPortReservation {
         $listener = $null
         try {
             $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Parse($loopback), 0)
+            # The hold is the ownership token, so it is taken as an exclusive
+            # bind: SO_EXCLUSIVEADDRUSE makes a competing bind of this endpoint
+            # fail outright instead of succeeding while this reservation is
+            # waiting for the launch handoff. Without it the exclusivity would
+            # rest on the platform's default bind behaviour rather than on
+            # anything this reservation states about itself.
+            $listener.ExclusiveAddressUse = $true
             $listener.Start()
             $port = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
             if ($port -lt 1024 -or $port -gt 65535) {
@@ -4074,7 +4132,8 @@ function New-StoreDefaultPortObserver {
     return $observe.GetNewClosure()
 }
 
-# Real Store client: version, then authenticated USE NS/DB, then the accepted
+# Real Store client: version, then the exclusive create of this run's
+# namespace/database, then authenticated USE NS/DB, then the accepted
 # schema observation (or the exact declared fixture plus baseline
 # re-observation on reset). Loopback only, bounded, Basic auth with the
 # vaulted ephemeral credential; secrets never enter receipts or errors.
@@ -4099,6 +4158,12 @@ function New-StoreDefaultStoreClient {
     $timeout = $TimeoutMs
     $schemaQuery = $Script:StoreReadSchemaMeta
     $expectedMajor = ([string]$Script:StoreVersion).Split('.')[0]
+    # The namespace/database this run won its exclusive create with, keyed by
+    # the run identity that won it. This is the ownership record that separates
+    # "this run created it" from "it was already here", and it is the only
+    # thing that makes a second interaction of the SAME run (handshake, then
+    # fixture bootstrap) a recognized re-entry instead of a foreign adoption.
+    $namespaceOwners = @{}
     $interact = {
         param($Context)
         if ($null -eq $Context -or $Context -isnot [hashtable] -or -not $Context.ContainsKey('runId')) {
@@ -4142,6 +4207,8 @@ function New-StoreDefaultStoreClient {
                 throw [System.InvalidOperationException]::new("STORE-VERSION-MISMATCH: live server major '$major' is not '$expectedMajor'.")
             }
             $usePrefix = ('USE NS {0} DB {1};' -f $namespace, $database)
+            $defineNamespace = ('DEFINE NAMESPACE {0};' -f $namespace)
+            $defineDatabase = ('DEFINE DATABASE {0};' -f $database)
             $sendSql = {
                 param($Body)
                 $content = [System.Net.Http.StringContent]::new($Body, [System.Text.Encoding]::UTF8, 'text/plain')
@@ -4172,6 +4239,43 @@ function New-StoreDefaultStoreClient {
                 } finally {
                     $message.Dispose()
                     $content.Dispose()
+                }
+            }
+            # Create the allocated namespace/database on this run's own reserved endpoint
+            # under this run's own ephemeral root credential. The bare DEFINE
+            # forms are the atomic exclusive create: the server REFUSES the
+            # statement when the name already exists, so exactly one run can win
+            # it. `USE NS x DB y` cannot do this job -- in SurrealDB 3.x regular
+            # mode it creates a missing namespace or database and silently
+            # adopts an existing one, so a run would proceed on whatever was
+            # already there under that name. Whether a refusal is this run's own
+            # create seen again on a later step, or a name this run never won, is
+            # decided by the ownership record alone and never by the wording of
+            # the server's error: unproven ownership is refused, not adopted.
+            $holdsNames = $false
+            if ($namespaceOwners.ContainsKey($runId)) {
+                $held = $namespaceOwners[$runId]
+                $holdsNames = ([string]$held['namespace'] -ceq $namespace -and [string]$held['database'] -ceq $database)
+                if (-not $holdsNames) {
+                    throw [System.InvalidOperationException]::new('STORE-NAMESPACE-FOREIGN: this run already owns a different namespace/database than the one presented.')
+                }
+            }
+            $defineNamespaceBody = (& $sendSql $defineNamespace)
+            if ($defineNamespaceBody -match '"status"\s*:\s*"ERR"') {
+                if (-not $holdsNames) {
+                    throw [System.InvalidOperationException]::new('STORE-NAMESPACE-FOREIGN: the namespace was not created by this run''s exclusive create.')
+                }
+            } else {
+                $namespaceOwners[$runId] = @{ namespace = $namespace; database = $database }
+            }
+            $selectNamespaceBody = (& $sendSql ('USE NS {0};' -f $namespace))
+            if ($selectNamespaceBody -match '"status"\s*:\s*"ERR"') {
+                throw [System.InvalidOperationException]::new('STORE-NAMESPACE-FAILED: the namespace could not be selected after its exclusive create.')
+            }
+            $defineDatabaseBody = (& $sendSql $defineDatabase)
+            if ($defineDatabaseBody -match '"status"\s*:\s*"ERR"') {
+                if (-not $holdsNames) {
+                    throw [System.InvalidOperationException]::new('STORE-NAMESPACE-FOREIGN: the database was not created by this run''s exclusive create.')
                 }
             }
             $useBody = (& $sendSql $usePrefix)
@@ -4642,6 +4746,7 @@ Export-ModuleMember -Function @(
     'Invoke-StoreValidateRequirement',
     'Invoke-StorePlan',
     'Resolve-StoreOwnedPath',
+    'Test-StoreOwnedRootClaim',
     'Get-StoreChildEnv',
     'New-StoreEphemeralCredential',
     'Test-StoreProviderReceipt',

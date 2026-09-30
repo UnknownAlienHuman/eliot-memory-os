@@ -36,13 +36,15 @@
 //! live owner the rest of the bridge uses. It adds no new owner, no parallel
 //! journal, and no authority.
 
+use eliot_agent_bridge_core::host_event::ToolOutcomeClass;
 use eliot_agent_bridge_core::{
     AgentBridgeCore, Assessment, AssessmentLog, BridgeError, CanonicalDisposition, CommitEvidence,
     CorrelationAssessmentState, CorrelationIdentity, CorrelationIdentityParts, CorrelationStage,
     DeadlineSweepRequest, EliotEmissionObservation, EmissionCause, FaultEdgeSubmission,
-    HandlerOutcome, HostEventEnvelope, HostEventJoinKeys, HostEventKind, OperationIdentity,
-    OwnerValidatedOperationBinding, StdioEmissionReceipt, TerminalReconcileRequest,
-    reconcile_deadline_sweep, reconcile_terminal_event, submit_derived_fault,
+    HandlerOutcome, HostEventEnvelope, HostEventJoinKeys, NormalizedHostEventPayload,
+    OperationIdentity, OwnerValidatedOperationBinding, StdioEmissionReceipt,
+    TerminalReconcileRequest, reconcile_deadline_sweep, reconcile_terminal_event,
+    submit_derived_fault,
 };
 use eliot_contracts::{ResourceGeneration, StateFence};
 use eliot_protocol::{DeliveryClass, EventEnvelope, EventPayload, ProtocolPayload};
@@ -223,6 +225,26 @@ pub fn is_healthy_completion(state: CorrelationAssessmentState) -> bool {
         CorrelationAssessmentState::HostCompleted
             | CorrelationAssessmentState::HostReportedInvocationError
     )
+}
+
+/// Whether one admitted host event is a competent per-invocation terminal
+/// observation candidate.
+///
+/// The answer comes from the event's own closed, versioned normalized payload,
+/// never from the wire's coarse `kind`: the host's terminal fact about one
+/// invocation is its classified tool outcome, while a turn- or step-scoped
+/// terminal kind (`Completed`, `Failed`, `Error`) names something coarser than a
+/// single MCP request and can never close one. An unclassified outcome is not a
+/// terminal fact either — the join derives the typed state from the same closed
+/// payload, and refuses an unclassified one.
+fn attests_invocation_terminal(event: &HostEventEnvelope) -> bool {
+    event.normalized().is_ok_and(|normalized| {
+        matches!(
+            &normalized.payload,
+            NormalizedHostEventPayload::ToolOutcome(observation)
+                if !matches!(observation.outcome, ToolOutcomeClass::Unknown)
+        )
+    })
 }
 
 /// What the stdio boundary measured about one response emission.
@@ -486,20 +508,20 @@ impl BridgeRunner {
     /// false degradation stays current beside a healthy completion.
     ///
     /// Nothing here nominates a correlation on the caller's behalf. The join
-    /// keys carry no correlation digest, because a digest the correlation
-    /// recorded says nothing about which event belongs to it; comparing it back
-    /// would pass for every retained record and let a turn-level terminal fact
-    /// close whichever request was still pending.
+    /// keys carry no correlation digest and no invocation scope, because a
+    /// value the correlation recorded says nothing about which event belongs to
+    /// it; comparing it back would pass for every retained record and let a
+    /// turn-level terminal fact close whichever request was still pending. The
+    /// exact invocation is instead read back out of each retained emission's own
+    /// immutable identity and matched against the host event's own minted
+    /// invocation scope.
     pub fn reconcile_terminal_host_event(
         &mut self,
         event: &HostEventEnvelope,
         integration_id: &str,
         now_unix_ms: u64,
     ) -> Result<HostEventReconciliation, ReconcileFailure> {
-        if !matches!(
-            event.kind,
-            HostEventKind::Completed | HostEventKind::Error | HostEventKind::Failed
-        ) {
+        if !attests_invocation_terminal(event) {
             return Ok(HostEventReconciliation::NotTerminal);
         }
         if self.core.attach_view().is_none() {

@@ -39,6 +39,20 @@ pub const USER_AUTOMATION_PREFLIGHT_EFFECT_CEILING: &str = "READ";
 pub const USER_AUTOMATION_SCOPE: &str = "user-automation";
 /// Revision required by the deterministic preflight contract.
 pub const USER_AUTOMATION_PREFLIGHT_CONTRACT_REVISION: &str = "eliot.user-automation.preflight.v1";
+/// Canonical operation kind for schedule normalization receipts.
+pub const USER_AUTOMATION_NORMALIZATION_OPERATION_KIND: &str = "user-automation.schedule.normalize";
+/// Stable service authority that owns schedule normalization.
+pub const USER_AUTOMATION_NORMALIZATION_AUTHORITY_ID: &str =
+    "eliot-user-automation:schedule-normalizer";
+/// Stable service principal that issues schedule normalization receipts.
+pub const USER_AUTOMATION_NORMALIZATION_AUTHORITY_OWNER: &str =
+    "eliot-user-automation:schedule-normalizer";
+/// Verifier contract used for Gregorian UTC schedule compilation.
+pub const USER_AUTOMATION_NORMALIZATION_VERIFIER_ID: &str =
+    "eliot.user-automation.schedule-compiler.gregorian-utc.v1";
+/// Revision of the schedule compiler verifier contract.
+pub const USER_AUTOMATION_NORMALIZATION_VERIFIER_REVISION: ContractVersion =
+    ContractVersion::new(1, 0, 0);
 /// Canonical encoding of one owner-normalized calendar occurrence.
 ///
 /// One occurrence key is the `|`-separated, fixed-arity record
@@ -66,16 +80,14 @@ const LEGACY_NORMALIZED_OCCURRENCE_ENCODING_V3: &str = "ELIOT/I11.12/OCCURRENCE/
 const LEGACY_NORMALIZED_OCCURRENCE_ENCODING_V2: &str = "ELIOT/I11.12/OCCURRENCE/V2";
 const SCHEDULED_OCCURRENCE_IDENTITY_DOMAIN: &str = "ELIOT/I11.12/USER-AUTOMATION-OCCURRENCE/V3";
 const MANUAL_OCCURRENCE_IDENTITY_DOMAIN: &str = "ELIOT/I11.12/USER-AUTOMATION-OCCURRENCE/V1";
-const SCHEDULE_SOURCE_DIGEST_DOMAIN: &str = "ELIOT/I11.12/USER-AUTOMATION-SCHEDULE-SOURCE/V2";
-/// Domain separator of the owner-issued schedule normalization receipt.
+const SCHEDULE_SOURCE_DIGEST_DOMAIN: &str = "ELIOT/I11.12/USER-AUTOMATION-SCHEDULE-SOURCE/V3";
+/// Domain separator for the canonical schedule normalization result digest.
 ///
-/// The receipt binds one ordered occurrence set to the compiled result of the
-/// declared expression and calendar. It is a separate domain from
-/// [`SCHEDULE_SOURCE_DIGEST_DOMAIN`] because it covers a different fact: the
-/// source digest is over the caller's own expression text, while this one is
-/// over the ordered occurrence set the admitted calendar owner produced from it.
-/// Reusing either domain for the other would make the two claims
-/// indistinguishable, which is exactly what I5.27 forbids.
+/// This digest binds one ordered occurrence set to the complete trigger
+/// contract and pinned zone-table revision. It does not prove that a compiler
+/// produced the set; preflight also requires the matching owner verifier result.
+/// It is separate from [`SCHEDULE_SOURCE_DIGEST_DOMAIN`] because the two
+/// encodings bind different values, as required by I5.27.
 const SCHEDULE_NORMALIZATION_RECEIPT_DOMAIN: &str =
     "ELIOT/I11.12/USER-AUTOMATION-SCHEDULE-NORMALIZATION/V1";
 /// The only pinned zone database revision a stored occurrence may name.
@@ -268,47 +280,40 @@ pub struct NormalizedSchedule {
     /// Bounded, chronologically ordered owner-normalized occurrences in the
     /// [`NORMALIZED_OCCURRENCE_ENCODING`] encoding.
     pub next_occurrences: Vec<String>,
-    /// Owner-issued evidence that `next_occurrences` is the compiled result of
-    /// this schedule's declared expression and calendar.
-    ///
-    /// This field is REQUIRED and it has no default, so every revision stored
-    /// before contract 1.2.0 fails to decode rather than being silently
-    /// certified under the stronger contract. That is the whole fail-closed
-    /// re-normalization behavior issue #2805 step 7 asks for, and it needs no
-    /// separate migration path: a stored revision without an owner-issued
-    /// binding is not a normalized schedule under this contract, and the owning
-    /// calendar adapter must re-normalize it into a new immutable revision.
+    /// Store-issued receipt projection linking `next_occurrences` to a compiled
+    /// result for this schedule's declared trigger contract. Create/Edit wire
+    /// drafts may omit it: serde materializes the all-empty draft sentinel below
+    /// and omits that sentinel again when serializing. Strict revision validation
+    /// rejects the sentinel, so the Store must replace it after compilation and
+    /// before persistence; preflight also validates the retained envelope.
     ///
     /// It is boxed because `NormalizedSchedule` is reachable by value from
     /// `UserAutomationOperation`, and inlining it would grow that enum past the
     /// existing `large_enum_variant` threshold. The box is a layout detail only:
-    /// serde encodes a boxed value exactly as the unboxed one, so the wire format
-    /// and the required-field decode behavior are unchanged.
+    /// serde encodes a boxed value exactly as the unboxed one, so issued receipt
+    /// wire values are unchanged.
+    #[serde(
+        default,
+        skip_serializing_if = "ScheduleNormalizationReceipt::is_unissued_draft_projection"
+    )]
     pub normalization_receipt: Box<ScheduleNormalizationReceipt>,
 }
 
-/// Owner-issued evidence binding one ordered occurrence set to the compiled
-/// result of a schedule's declared expression and calendar.
+/// Receipt identity and declared bindings for a schedule normalization result.
 ///
-/// Every member is EVIDENCE Kernel verifies, never a value Kernel derives. The
-/// expression language is owned elsewhere, so Kernel never reparses
-/// `expression` and never decides which occurrences it selects: it recomputes
-/// [`NormalizedSchedule::compiled_occurrences_digest`] over the stored ordered
-/// set and requires the owner to have signed exactly that digest. An occurrence
-/// set unrelated to the compiled expression therefore cannot pass, and cannot be
-/// made to pass by a caller minting its own digest, because the receipt id is
-/// the identity of a real [`ReceiptEnvelope`] whose canonical bytes the
-/// preflight assembly must supply.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+/// Kernel recomputes [`NormalizedSchedule::compiled_occurrences_digest`] over
+/// the ordered set and checks it against the retained envelope. That content
+/// binding is not a signature or proof that compilation occurred: the Store
+/// producer must issue the envelope only after an authenticated compiler result.
+#[derive(Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScheduleNormalizationReceipt {
-    /// Identity of the [`ReceiptEnvelope`] the owning calendar adapter issued
-    /// for this normalization.
+    /// Content identity of the [`ReceiptEnvelope`] retained for this result.
     ///
-    /// This is the receipt envelope's own content-derived identity, not a
-    /// caller-chosen token. `UserAutomationPreflightProjection` requires an
-    /// envelope with exactly this id to be supplied in the authenticated
-    /// assembly, which is what makes the receipt non-self-asserted.
+    /// This identifies the exact envelope core but is not a signature or issuer
+    /// authentication. Preflight requires the matching envelope and validates
+    /// its operation, authority, verifier, revision, scope and artifact fields;
+    /// the Store must still issue it only after the authenticated compiler call.
     pub receipt_id: String,
     /// Bounded token naming the normalization authority that compiled the
     /// expression and produced this occurrence set.
@@ -321,7 +326,8 @@ pub struct ScheduleNormalizationReceipt {
     /// [`NormalizedSchedule::source_digest`] of the exact schedule the owner
     /// compiled.
     ///
-    /// This binds the evidence to the declared expression and calendar text.
+    /// This binds the evidence to the versioned trigger contract, including the
+    /// expression, calendar, timezone, DST policies and inclusive interval.
     /// Kernel recomputes it from the schedule and refuses a receipt that names a
     /// different one.
     pub source_digest: String,
@@ -338,6 +344,16 @@ pub struct ScheduleNormalizationReceipt {
     /// release and table digest, and the occurrences IN ORDER. Reordering or
     /// substituting a member changes it.
     pub occurrences_digest: String,
+}
+
+impl ScheduleNormalizationReceipt {
+    fn is_unissued_draft_projection(&self) -> bool {
+        self.receipt_id.is_empty()
+            && self.normalizer_authority.is_empty()
+            && self.source_digest.is_empty()
+            && self.zone_database_revision.is_empty()
+            && self.occurrences_digest.is_empty()
+    }
 }
 
 impl NormalizedSchedule {
@@ -386,19 +402,26 @@ impl NormalizedSchedule {
         Ok(())
     }
 
-    /// Returns the immutable digest binding this occurrence projection to its
-    /// declared expression, calendar, and exact pinned zone table semantics.
+    /// Returns the immutable digest binding the full trigger contract to its
+    /// exact pinned zone table semantics.
     ///
     /// The expression language is owned elsewhere, so Kernel never reparses it.
     /// The owner compiles the expression once and every occurrence of the
-    /// projection carries this digest, so an occurrence that is not the next
-    /// result of the declared expression and calendar fails closed instead of
-    /// being presented as their projection.
+    /// projection carries this digest. The versioned identity includes schedule
+    /// kind, timezone, DST policies, and the inclusive interval as well as
+    /// expression and calendar, so those effect-relevant fields cannot change
+    /// while retaining the same occurrence identities.
     pub fn source_digest(&self) -> Result<String, UserAutomationError> {
         let bytes = canonical_json_bytes(&(
             SCHEDULE_SOURCE_DIGEST_DOMAIN,
+            self.kind,
             &self.expression,
             &self.calendar,
+            &self.timezone,
+            self.dst_fold,
+            self.dst_gap,
+            &self.start_at,
+            &self.end_at,
             user_automation_zones::ZONE_TABLE_FORMAT,
             user_automation_zones::ZONE_TABLE_OFFSET_UNIT,
             user_automation_zones::PINNED_ZONE_DATABASE_RELEASE,
@@ -408,26 +431,18 @@ impl NormalizedSchedule {
         Ok(sha256_hex(&bytes))
     }
 
-    /// Returns the digest over this schedule's compiled ordered occurrence set.
+    /// Returns the canonical digest over this schedule's ordered occurrence set.
     ///
-    /// This is the claim the owning calendar adapter signs: that the occurrences
-    /// in `next_occurrences`, IN THIS ORDER, are the result of compiling
-    /// `expression` under `calendar` against the pinned zone table. It binds
-    /// four things at once: the schedule's own source digest, the pinned zone
-    /// table's format, offset unit, release and table digest, and the ordered
-    /// occurrence set itself.
+    /// The digest binds the schedule's source digest, pinned zone-table format,
+    /// offset unit, release and table digest, and the occurrence set in order.
+    /// An authenticated compiler result must bind this exact value; the digest
+    /// alone does not prove that the expression was compiled.
     ///
     /// Order is inside the hashed bytes, so reordering two occurrences changes
     /// the digest, and substituting one member changes it. Kernel computes the
-    /// same value from the stored set and requires
-    /// [`ScheduleNormalizationReceipt::occurrences_digest`] to equal it, so an
-    /// occurrence set that is not the compiled result of the declared
-    /// expression is refused by name instead of being presented as its
-    /// projection.
-    ///
-    /// Kernel derives the digest and never the calendar answer: it does not
-    /// parse the expression language, and it does not choose which occurrences
-    /// the expression selects.
+    /// same value from the stored set and compares it with both the declared
+    /// receipt and its verifier-bound artifact. Kernel does not parse the
+    /// expression language or choose which occurrences it selects.
     pub fn compiled_occurrences_digest(&self) -> Result<String, UserAutomationError> {
         let bytes = canonical_json_bytes(&(
             SCHEDULE_NORMALIZATION_RECEIPT_DOMAIN,
@@ -442,69 +457,163 @@ impl NormalizedSchedule {
         Ok(sha256_hex(&bytes))
     }
 
-    /// Mints the owner-issued normalization receipt for this schedule through
-    /// the existing receipt owner.
+    /// Projects the schedule normalization fields from a canonical envelope.
     ///
-    /// This is the platform-owner receipt exposed through an existing adapter
-    /// that issue #2805 step 1 names, and it is the only constructor of
-    /// [`ScheduleNormalizationReceipt`] in this crate. The owning calendar
-    /// adapter builds the [`eliot_receipts::ReceiptCore`] for its compiled
-    /// result; this mints the immutable [`ReceiptEnvelope`] through
-    /// [`ReceiptEnvelope::issue`], which derives the receipt id from canonical
-    /// core bytes, and projects the schedule's own evidence fields out of it.
+    /// The Store producer must call this only after its authenticated calendar
+    /// compiler has verified the exact result. The generic envelope identity is
+    /// content-derived, not a signature; the normalization-specific validator
+    /// below checks the operation, authority, verifier and artifact bindings.
     ///
-    /// `core` must already carry the compiled result as one of its artifacts,
-    /// with `ArtifactBinding::sha256` equal to [`Self::compiled_occurrences_digest`].
-    /// That is the owner's own declaration of WHAT it compiled, and it is what
-    /// the preflight assembly later re-checks against the envelope this call
-    /// mints. Requiring it here means the constructor cannot mint an envelope
-    /// that covers some other occurrence set, so a receipt and the set it names
-    /// can never be produced apart from one another.
+    /// `core` must carry exactly one compiled-occurrence artifact whose digest,
+    /// source revision and verifier binding match this schedule. The validator
+    /// cannot authenticate the producer by inspecting these serialized fields;
+    /// that guarantee remains with the Store's authenticated compiler call.
     ///
     /// It grants no admission and reads no clock, locale or expression text
-    /// beyond hashing it. A revision constructed any other way carries no
-    /// authority, because `UserAutomationPreflightProjection` requires the
-    /// envelope this id names to be supplied in the authenticated assembly.
+    /// beyond hashing it. The envelope's content-derived identity is not proof
+    /// of who issued it; the Store owns the authenticated compiler boundary and
+    /// preflight checks the complete normalization-specific envelope contract.
     pub fn issue_normalization_receipt(
         &self,
         core: eliot_receipts::ReceiptCore,
-        normalizer_authority: &str,
+        revision: &UserAutomationRevision,
     ) -> Result<Box<ScheduleNormalizationReceipt>, UserAutomationError> {
         let occurrences_digest = self.compiled_occurrences_digest()?;
-        if !core
-            .artifacts
-            .iter()
-            .any(|artifact| artifact.sha256 == occurrences_digest)
-        {
-            return Err(UserAutomationError::Receipt(
-                "normalization receipt core does not carry the compiled occurrence set as an \
-                 artifact"
-                    .to_owned(),
-            ));
-        }
+        let normalizer_authority = core.authority.authority_owner.clone();
         let envelope = ReceiptEnvelope::issue(core)
             .map_err(|error| UserAutomationError::Receipt(error.to_string()))?;
-        Ok(Box::new(ScheduleNormalizationReceipt {
+        let declared = Box::new(ScheduleNormalizationReceipt {
             receipt_id: envelope.identity.receipt_id.as_str().to_owned(),
-            normalizer_authority: normalizer_authority.to_owned(),
+            normalizer_authority,
             source_digest: self.source_digest()?,
             zone_database_revision: user_automation_zones::PINNED_ZONE_DATABASE_RELEASE.to_owned(),
             occurrences_digest,
-        }))
+        });
+        self.validate_normalization_receipt_envelope(&declared, &envelope, revision)?;
+        Ok(declared)
     }
 
-    /// Requires the owner-issued binding between this schedule's expression and
-    /// its occurrence set.
+    /// Validates the semantic bindings carried by one schedule receipt envelope.
     ///
-    /// Four claims are checked, and the last is the one that closes A3: the
-    /// receipt's `occurrences_digest` must equal
-    /// [`Self::compiled_occurrences_digest`] over the stored ordered set. An
-    /// occurrence set unrelated to the compiled expression is refused by name
-    /// here, and no caller can satisfy the check by minting its own digest,
-    /// because a digest alone is not the receipt: the receipt id is the identity
-    /// of a real receipt envelope that the preflight assembly must supply.
+    /// `ReceiptEnvelope`'s content identity only proves that the serialized core
+    /// is unchanged. The Store must bind these fields from its authenticated
+    /// compiler result; this check rejects stale, unrelated or incomplete
+    /// envelopes without treating text or a digest as issuer authentication.
+    /// The artifact and `WorkScope` must name the exact immutable revision. The
+    /// normalization fence remains historical and is checked only for internal
+    /// consistency, never against a later wake.
+    fn validate_normalization_receipt_envelope(
+        &self,
+        declared: &ScheduleNormalizationReceipt,
+        envelope: &ReceiptEnvelope,
+        revision: &UserAutomationRevision,
+    ) -> Result<(), UserAutomationError> {
+        envelope
+            .validate()
+            .map_err(|error| UserAutomationError::Receipt(error.to_string()))?;
+        self.validated_occurrences_without_receipt()?;
+
+        let core = &envelope.core;
+        let source_digest = self.source_digest()?;
+        let occurrences_digest = self.compiled_occurrences_digest()?;
+        if revision.schedule.source_digest()? != source_digest
+            || revision.schedule.compiled_occurrences_digest()? != occurrences_digest
+        {
+            return Err(UserAutomationError::ReceiptBinding);
+        }
+        if declared.receipt_id != envelope.identity.receipt_id.as_str()
+            || declared.source_digest != source_digest
+            || declared.zone_database_revision != PINNED_ZONE_DATABASE_REVISION
+            || declared.occurrences_digest != occurrences_digest
+            || declared.normalizer_authority != USER_AUTOMATION_NORMALIZATION_AUTHORITY_OWNER
+            || declared.normalizer_authority != core.authority.authority_id.as_str()
+            || declared.normalizer_authority != core.authority.authority_owner
+            || core.authority.authority_id.as_str() != USER_AUTOMATION_NORMALIZATION_AUTHORITY_ID
+            || core.authority.authority_owner != USER_AUTOMATION_NORMALIZATION_AUTHORITY_OWNER
+            || core.kind != eliot_receipts::ReceiptKind::Verification
+            || core.operation.operation_kind != USER_AUTOMATION_NORMALIZATION_OPERATION_KIND
+            || core.operation.request_id != core.request.metadata.request_id
+            || core.operation.effect != eliot_receipts::EffectClass::Read
+            || core.request.metadata.product_id != core.work_scope.product_id
+            || core.authority.allowed_effect != eliot_receipts::EffectClass::Read
+            || core.authority.proof_ceiling != eliot_receipts::ProofCeiling::ScopedVerification
+            || !matches!(
+                &core.disposition,
+                eliot_receipts::ReceiptDisposition::Success { proof }
+                    if *proof == eliot_receipts::ProofCeiling::ScopedVerification
+            )
+            || core.artifacts.len() != 1
+        {
+            return Err(UserAutomationError::ReceiptBinding);
+        }
+
+        let artifact = &core.artifacts[0];
+        let verifier = core
+            .verifier
+            .as_ref()
+            .ok_or(UserAutomationError::ReceiptBinding)?;
+        if artifact.sha256 != occurrences_digest
+            || artifact.role != eliot_receipts::ReceiptKind::Artifact
+            || artifact.source_revision.as_deref() != Some(PINNED_ZONE_DATABASE_REVISION)
+            || verifier.verifier_id.as_str() != USER_AUTOMATION_NORMALIZATION_VERIFIER_ID
+            || verifier.verifier_revision != USER_AUTOMATION_NORMALIZATION_VERIFIER_REVISION
+            || verifier.artifact_ids.len() != 1
+            || verifier.artifact_ids[0].as_str() != artifact.artifact_id.as_str()
+            || verifier.proof_ceiling != eliot_receipts::ProofCeiling::ScopedVerification
+        {
+            return Err(UserAutomationError::ReceiptBinding);
+        }
+
+        let original_fence = &core.request.state_fence;
+        if core.request.metadata.state_fence != *original_fence
+            || core.operation.state_fence != *original_fence
+            || core.authority.state_fence != *original_fence
+            || core.causal.state_fence != *original_fence
+            || core.work_scope.state_fence != *original_fence
+            || core.work_scope.resource_generation != original_fence.resource_generation
+            || core.authority.authority_epoch != original_fence.authority_epoch
+            || verifier.state_fence != *original_fence
+            || core.task.as_ref().map(|task| &task.task_id)
+                != core.request.metadata.task_id.as_ref()
+            || core.session.as_ref().map(|session| &session.session_id)
+                != core.request.metadata.session_id.as_ref()
+            || core.task.as_ref().is_some_and(|task| {
+                task.state_fence != *original_fence
+                    || original_fence.task_revision.as_ref() != Some(&task.task_revision)
+            })
+            || core.session.as_ref().is_some_and(|session| {
+                session.state_fence != *original_fence
+                    || session.authority_epoch != original_fence.authority_epoch
+            })
+        {
+            return Err(UserAutomationError::ReceiptBinding);
+        }
+
+        let expected_artifact_id = format!(
+            "compiled-occurrences:{}:{}",
+            revision.automation_id, revision.revision
+        );
+        if artifact.artifact_id.as_str() != expected_artifact_id.as_str()
+            || core.work_scope.scope_id.as_str() != revision.work_scope.scope_id
+            || core.work_scope.product_id.as_str() != revision.work_scope.product_id
+        {
+            return Err(UserAutomationError::ReceiptBinding);
+        }
+
+        Ok(())
+    }
+
+    /// Requires the schedule receipt projection to match its occurrence set.
+    ///
+    /// This checks internal agreement between the stored schedule and declared
+    /// receipt projection. It does not authenticate an issuer; preflight also
+    /// requires the envelope and checks the owner, operation, verifier, exact
+    /// revision/scope, zone release and occurrence artifact together.
     fn require_normalization_receipt(&self) -> Result<(), UserAutomationError> {
         let receipt = &self.normalization_receipt;
+        if receipt.is_unissued_draft_projection() {
+            return Err(UserAutomationError::ReceiptBinding);
+        }
         if receipt.source_digest != self.source_digest()? {
             return Err(UserAutomationError::Invalid(
                 "schedule.normalization_receipt.source_digest",
@@ -536,8 +645,8 @@ impl NormalizedSchedule {
         Ok(())
     }
 
-    /// Returns the decoded owner-issued occurrence set in validated
-    /// chronological order.
+    /// Returns the decoded occurrence set in validated chronological order
+    /// after checking the schedule-declared receipt projection.
     ///
     /// The set is the single normalized occurrence contract. Each member
     /// carries the canonical zone identity, the pinned zone database revision,
@@ -547,12 +656,35 @@ impl NormalizedSchedule {
     /// disposition and applied offset select, lie inside the declared start and
     /// end interval, and be strictly later than its predecessor: a duplicate
     /// instant cannot occupy two positions, and the two distinct instants of a
-    /// fold remain two distinct occurrences instead of colliding.
+    /// fold remain two distinct occurrences instead of colliding. Envelope
+    /// authority and compiler bindings are validated during preflight.
     pub fn normalized_occurrences(&self) -> Result<Vec<NormalizedOccurrence>, UserAutomationError> {
+        self.decode_normalized_occurrences(true)
+    }
+
+    /// Validates and decodes occurrences before the compiler issues a receipt.
+    ///
+    /// This path performs the same schedule, timezone, per-occurrence, interval,
+    /// zone-release, and ordering checks as [`Self::normalized_occurrences`]. It
+    /// skips only the receipt binding so the independent compiler can inspect
+    /// the exact validated output before an owner receipt exists. Callers must
+    /// still issue and validate the normalization receipt before admission.
+    pub fn validated_occurrences_without_receipt(
+        &self,
+    ) -> Result<Vec<NormalizedOccurrence>, UserAutomationError> {
+        self.decode_normalized_occurrences(false)
+    }
+
+    fn decode_normalized_occurrences(
+        &self,
+        require_receipt: bool,
+    ) -> Result<Vec<NormalizedOccurrence>, UserAutomationError> {
         self.validate()?;
         self.validate_timezone()?;
         let source_digest = self.source_digest()?;
-        self.require_normalization_receipt()?;
+        if require_receipt {
+            self.require_normalization_receipt()?;
+        }
         let start = parse_civil_instant(&self.start_at, "schedule.start_at")?;
         let end = self
             .end_at
@@ -609,7 +741,7 @@ impl NormalizedSchedule {
     /// requested and resolved civil local datetimes, the UTC offsets, the resolved instants, the applied
     /// fold and gap dispositions, the compiled source digest, the start and end
     /// interval, and the chronological order. It admits no occurrence it cannot
-    /// derive from the owner-issued evidence and it never resolves a zone, reads
+    /// derive from the stored occurrence evidence and it never resolves a zone, reads
     /// a time zone database, or consults an ambient clock or locale.
     ///
     /// This is a schedule check only. Principal, `WorkScope`, State Fence,
@@ -620,16 +752,28 @@ impl NormalizedSchedule {
         Ok(())
     }
 
+    /// Validates occurrences for a Create/Edit draft before Store compilation.
+    ///
+    /// A missing receipt sentinel skips only the receipt-to-occurrence digest
+    /// check; a supplied projection and every schedule occurrence are still
+    /// validated. Persisted revisions must use `validate_normalized_occurrences`.
+    fn validate_for_normalization_submission(&self) -> Result<(), UserAutomationError> {
+        if self.normalization_receipt.is_unissued_draft_projection() {
+            self.validated_occurrences_without_receipt()?;
+            Ok(())
+        } else {
+            self.validate_normalized_occurrences()
+        }
+    }
+
     /// Returns whether one calendar occurrence belongs to this revision's
     /// owner-normalized occurrence set.
     ///
-    /// The whole stored set is validated first, so the owner-issued binding
-    /// between the declared expression and that set is enforced on this direct
-    /// path exactly as it is on the projection path: a set unrelated to the
-    /// compiled expression is refused before any membership answer exists. The
-    /// supplied key is then validated under the same versioned contract as the
-    /// stored set, so an occurrence outside it is neither resolved, shifted, nor
-    /// folded into a neighbour: the caller fails closed.
+    /// The whole stored set and its schedule-declared digest are validated
+    /// first. This schedule-level check does not authenticate the receipt issuer;
+    /// preflight performs that envelope check. The supplied key is validated
+    /// under the same versioned contract as the stored set, so an occurrence
+    /// outside it is neither resolved, shifted, nor folded into a neighbour.
     pub fn contains_occurrence(&self, occurrence_key: &str) -> Result<bool, UserAutomationError> {
         self.validate_normalized_occurrences()?;
         self.parse_occurrence(occurrence_key, &self.source_digest()?)?;
@@ -1796,6 +1940,22 @@ pub struct UserAutomationRevision {
 impl UserAutomationRevision {
     /// Validates the immutable revision and all nested owner projections.
     pub fn validate(&self) -> Result<(), UserAutomationError> {
+        self.validate_with_schedule_receipt(true)
+    }
+
+    /// Validates an unpersisted Create/Edit revision before Store compilation.
+    ///
+    /// This applies the same revision, scope, task and capability checks as
+    /// `validate`, while allowing only the schedule receipt sentinel to defer
+    /// its binding until the Store issues the compiled receipt.
+    pub fn validate_for_normalization_submission(&self) -> Result<(), UserAutomationError> {
+        self.validate_with_schedule_receipt(false)
+    }
+
+    fn validate_with_schedule_receipt(
+        &self,
+        require_schedule_receipt: bool,
+    ) -> Result<(), UserAutomationError> {
         text(&self.automation_id, "automation_id")?;
         text(&self.revision, "revision")?;
         if self.supersedes.as_deref() == Some(self.revision.as_str()) {
@@ -1804,7 +1964,11 @@ impl UserAutomationRevision {
         text(&self.owner_principal, "owner_principal")?;
         self.work_scope.validate()?;
         text(&self.natural_language_intent, "natural_language_intent")?;
-        self.schedule.validate_normalized_occurrences()?;
+        if require_schedule_receipt {
+            self.schedule.validate_normalized_occurrences()?;
+        } else {
+            self.schedule.validate_for_normalization_submission()?;
+        }
         self.task.validate()?;
         list_text(
             &self.portable_skill_package_revision_refs,
@@ -1884,6 +2048,22 @@ impl UserAutomationRevision {
         old: &UserAutomationRevision,
     ) -> Result<(), UserAutomationError> {
         self.validate()?;
+        old.validate()?;
+        if self.automation_id != old.automation_id
+            || self.revision == old.revision
+            || self.supersedes.as_deref() != Some(old.revision.as_str())
+        {
+            return Err(UserAutomationError::InvalidSupersession);
+        }
+        Ok(())
+    }
+
+    /// Validates Edit input whose replacement schedule awaits Store issuance.
+    pub fn validate_supersedes_for_normalization_submission(
+        &self,
+        old: &UserAutomationRevision,
+    ) -> Result<(), UserAutomationError> {
+        self.validate_for_normalization_submission()?;
         old.validate()?;
         if self.automation_id != old.automation_id
             || self.revision == old.revision
@@ -2753,8 +2933,9 @@ pub struct UserAutomationPreflightAssembly<'a> {
     /// authenticated request.
     ///
     /// The immutable revision names the envelope that compiled its occurrence
-    /// set; assembly requires that exact envelope to be present here, so a
-    /// schedule cannot arrive with a self-asserted normalization digest.
+    /// set; assembly requires that exact envelope to be present here and runs
+    /// the normalization-specific semantic validator. Content identity alone
+    /// is not issuer authentication.
     pub normalization_receipts: &'a [ReceiptEnvelope],
     /// Existing Durable Job/history projection over the complete denominator.
     pub execution: &'a UserAutomationExecutionProjection,
@@ -2933,19 +3114,10 @@ impl UserAutomationPreflightProjection {
         Ok(occurrence_id)
     }
 
-    /// Requires the schedule's normalization receipt to be an envelope actually
-    /// supplied with this authenticated request, and to be the envelope that
-    /// covers the stored occurrence set.
-    ///
-    /// `NormalizedSchedule::require_normalization_receipt` proves the stored
-    /// set matches the digest the receipt claims. It cannot by itself prove the
-    /// claim came from an owner, because a caller can compute a digest. This
-    /// check closes that gap the same way `source_receipt` is bound: the receipt
-    /// id must be the content-derived identity of a real
-    /// [`ReceiptEnvelope`] present in the authenticated assembly, and that
-    /// envelope's canonical bytes must name the occurrence-set digest. Because
-    /// the envelope identity is derived from its own core, re-pointing it at a
-    /// different occurrence set changes the id, so the pair cannot be swapped.
+    /// Requires the exact declared envelope to be supplied and checks its
+    /// normalization-specific success, operation, authority, verifier, fence,
+    /// revision, scope and artifact bindings. The normalization fence remains
+    /// historical; this preflight never compares it to a later wake's fence.
     fn check_normalization_receipt_binding(
         assembly: &UserAutomationPreflightAssembly<'_>,
     ) -> Result<(), UserAutomationError> {
@@ -2955,18 +3127,10 @@ impl UserAutomationPreflightProjection {
             .iter()
             .find(|candidate| candidate.identity.receipt_id.as_str() == declared.receipt_id)
             .ok_or(UserAutomationError::ReceiptBinding)?;
-        envelope
-            .validate()
-            .map_err(|error| UserAutomationError::Receipt(error.to_string()))?;
-        if !envelope
-            .core
-            .artifacts
-            .iter()
-            .any(|artifact| artifact.sha256 == declared.occurrences_digest)
-        {
-            return Err(UserAutomationError::ReceiptBinding);
-        }
-        Ok(())
+        assembly
+            .revision
+            .schedule
+            .validate_normalization_receipt_envelope(declared, envelope, assembly.revision)
     }
 
     /// Requires the evidence completeness the reported configuration state
@@ -3520,6 +3684,19 @@ impl UserAutomationOperation {
             }
         }
     }
+
+    /// Validates operator input before the Store compiles a Create/Edit schedule.
+    /// All other operation variants retain their ordinary strict validation.
+    pub fn validate_for_normalization_submission(&self) -> Result<(), UserAutomationError> {
+        match self {
+            Self::Create { revision } => revision.validate_for_normalization_submission(),
+            Self::Edit {
+                previous_revision,
+                revision,
+            } => revision.validate_supersedes_for_normalization_submission(previous_revision),
+            _ => self.validate(),
+        }
+    }
 }
 
 /// Authenticated Human operator intent; the owner service persists it through
@@ -3546,6 +3723,17 @@ impl UserAutomationOperatorIntent {
             .validate()
             .map_err(|_| UserAutomationError::Invalid("intent.state_fence"))?;
         self.operation.validate()
+    }
+
+    /// Validates an operator submission while deferring only an unissued
+    /// Create/Edit schedule receipt to the Store compiler.
+    pub fn validate_for_normalization_submission(&self) -> Result<(), UserAutomationError> {
+        text(&self.intent_id, "intent_id")?;
+        text(&self.principal_ref, "principal_ref")?;
+        self.state_fence
+            .validate()
+            .map_err(|_| UserAutomationError::Invalid("intent.state_fence"))?;
+        self.operation.validate_for_normalization_submission()
     }
 }
 
@@ -3634,7 +3822,7 @@ mod tests {
         use eliot_receipts::{
             ArtifactBinding, AuthorityBinding, CausalBinding, EffectClass, OperationBinding,
             ProofCeiling, ReceiptCore, ReceiptDisposition, ReceiptKind, RequestBinding,
-            WorkScopeBinding,
+            VerifierBinding, WorkScopeBinding,
         };
 
         let state_fence = fence();
@@ -3672,15 +3860,17 @@ mod tests {
             operation: OperationBinding {
                 operation_id: OperationId::new("normalize-schedule").expect("operation"),
                 request_id,
-                idempotency_key: "normalize-schedule".to_owned(),
-                operation_kind: "user-automation.schedule.normalize".to_owned(),
+                idempotency_key: "normalize-request".to_owned(),
+                operation_kind: USER_AUTOMATION_NORMALIZATION_OPERATION_KIND.to_owned(),
                 effect: EffectClass::Read,
                 state_fence: state_fence.clone(),
             },
             authority: AuthorityBinding {
-                authority_id: eliot_contracts::ContractId::new("calendar-normalizer")
-                    .expect("authority id"),
-                authority_owner: "kernel-test-calendar-owner".to_owned(),
+                authority_id: eliot_contracts::ContractId::new(
+                    USER_AUTOMATION_NORMALIZATION_AUTHORITY_ID,
+                )
+                .expect("authority id"),
+                authority_owner: USER_AUTOMATION_NORMALIZATION_AUTHORITY_OWNER.to_owned(),
                 authority_epoch: state_fence.authority_epoch.clone(),
                 state_fence: state_fence.clone(),
                 allowed_effect: EffectClass::Read,
@@ -3727,23 +3917,10 @@ mod tests {
              |2026-09-21T12:00:00|2026-09-21T12:00:00|-04:00|2026-09-21T16:00:00Z|-|UNIQUE|{source_digest}",
             user_automation_zones::PINNED_ZONE_DATABASE_RELEASE
         )];
-        // The owner-issued binding is minted through the real receipt owner, so
-        // the fixture carries a genuine envelope identity rather than a
-        // self-asserted digest. The digest itself is still derived from product
-        // code, so this fixture proves the wiring is reachable, NOT that an
-        // unrelated occurrence set is refused.
-        let mut normalization_core = normalization_receipt_core();
-        normalization_core.artifacts = vec![eliot_receipts::ArtifactBinding {
-            artifact_id: eliot_contracts::ArtifactId::new("compiled-occurrences")
-                .expect("artifact id"),
-            sha256: schedule.compiled_occurrences_digest().expect("set digest"),
-            role: eliot_receipts::ReceiptKind::Artifact,
-            source_revision: Some(PINNED_ZONE_DATABASE_REVISION.to_owned()),
-        }];
-        schedule.normalization_receipt = schedule
-            .issue_normalization_receipt(normalization_core, "kernel-test-calendar-owner")
-            .expect("normalization receipt");
-        UserAutomationRevision {
+        // This fixture carries the structural verifier contract required by
+        // Kernel. Its content-derived receipt identity does not authenticate an
+        // issuer; production issuance must follow the Store compiler call.
+        let mut revision = UserAutomationRevision {
             automation_id: "automation-1".to_owned(),
             revision: "revision-7".to_owned(),
             supersedes: None,
@@ -3795,7 +3972,38 @@ mod tests {
             work_class: AutomationWorkClass::Maintenance,
             current_execution_refs: Vec::new(),
             execution_history_query_ref: "history:automation-1".to_owned(),
-        }
+        };
+        let artifact_id = format!(
+            "compiled-occurrences:{}:{}",
+            revision.automation_id, revision.revision
+        );
+        let artifact_id = eliot_contracts::ArtifactId::new(artifact_id).expect("artifact id");
+        let mut normalization_core = normalization_receipt_core();
+        normalization_core.artifacts = vec![eliot_receipts::ArtifactBinding {
+            artifact_id: artifact_id.clone(),
+            sha256: revision
+                .schedule
+                .compiled_occurrences_digest()
+                .expect("set digest"),
+            role: eliot_receipts::ReceiptKind::Artifact,
+            source_revision: Some(PINNED_ZONE_DATABASE_REVISION.to_owned()),
+        }];
+        normalization_core.verifier = Some(VerifierBinding {
+            verifier_id: eliot_contracts::ContractId::new(
+                USER_AUTOMATION_NORMALIZATION_VERIFIER_ID,
+            )
+            .expect("verifier id"),
+            verifier_revision: USER_AUTOMATION_NORMALIZATION_VERIFIER_REVISION,
+            artifact_ids: vec![artifact_id],
+            proof_ceiling: eliot_receipts::ProofCeiling::ScopedVerification,
+            state_fence: fence(),
+        });
+        let normalization_receipt = revision
+            .schedule
+            .issue_normalization_receipt(normalization_core, &revision)
+            .expect("normalization receipt");
+        revision.schedule.normalization_receipt = normalization_receipt;
+        revision
     }
 
     fn request_metadata() -> RequestMetadata {

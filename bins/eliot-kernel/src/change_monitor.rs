@@ -707,3 +707,37 @@ pub(crate) fn governed_acceptance_blocked() -> bool {
         .any(|entry| entry.confirmation.is_none())
         || ledger.unknown.values().any(|unknown| !unknown.reconciled)
 }
+
+/// Returns whether governed acceptance for one tracked resource is
+/// currently blocked: a hint naming that resource is still unverified, or
+/// an unknown-origin Material change naming that resource is still
+/// unreconciled (I10.21 A2, per-resource scope).
+///
+/// Scoping is by the tracked source identity carried on the admitted hint
+/// (`KernelChangeHint::resource`) and preserved on the unknown-origin
+/// record derived from it. Both blocking sets of the global gate above are
+/// covered with the same predicates, so completeness matches the global
+/// gate restricted to one resource: a candidate touching a blocked
+/// resource still waits for explicit reconciliation of that resource, while
+/// an out-of-lane re-pin (or any external mutation) of another resource
+/// cannot wedge its acceptance. A poisoned ledger fails closed. The
+/// unknown-origin event itself is still emitted by [`confirm_hint`]; this
+/// query only scopes the block, never clears it.
+///
+/// Caller (I10.21 A2):
+/// `host_request_route::daemon_claim_queue::submit_finish_result`, which
+/// carries the candidate resource from the admitted finish draft and keeps
+/// the global gate above as fallback while the leg carries no resource.
+pub(crate) fn governed_acceptance_blocked_for(resource: &str) -> bool {
+    let Ok(ledger) = ledger() else {
+        return true;
+    };
+    ledger
+        .hints
+        .values()
+        .any(|entry| entry.confirmation.is_none() && entry.hint.resource.as_str() == resource)
+        || ledger
+            .unknown
+            .values()
+            .any(|unknown| !unknown.reconciled && unknown.resource.as_str() == resource)
+}

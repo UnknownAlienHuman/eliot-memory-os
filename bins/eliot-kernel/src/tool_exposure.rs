@@ -14,10 +14,14 @@
 use eliot_contracts::sha256_hex;
 use eliot_receipts::{
     LoopSignal, ToolCallClass, ToolCallIntent, ToolCallRequest,
-    tool_exposure::{AttemptEvidence, detect_repeat_without_progress_with_evidence},
+    tool_exposure::{
+        AttemptEvidence, EXPOSURE_HISTORY_VERSION, OwnerStageFact,
+        detect_repeat_without_progress_with_evidence,
+    },
 };
 
 use super::host_request_route::LocalReadAdmission;
+use super::kernel_audit::AuditEventDraft;
 
 /// Route fingerprint for tool calls admitted through the local-read boundary.
 ///
@@ -276,4 +280,119 @@ pub(crate) fn staged_repeat_without_progress<'a>(
         let previous = build_tool_call_request(envelope, tool, &admission)?;
         detect_repeat_without_progress_with_evidence(&previous, &unobserved, current, &unobserved)
     })
+}
+
+/// Names the admission-owner evidence behind one dispatch-seam eligibility fact.
+///
+/// The reference names the accepted admission kind (and the admitted campaign
+/// task identity for packet methods), never caller tool text. It is the owner
+/// source reference the supplied eligible/selected facts bind, so unknown
+/// coverage stays `None` elsewhere instead of being inferred from this seam.
+fn admission_source(admission: &LocalReadAdmission) -> String {
+    match admission {
+        LocalReadAdmission::Query(_) => "local-read-admission:query".to_owned(),
+        LocalReadAdmission::Skill => "local-read-admission:skill".to_owned(),
+        LocalReadAdmission::CampaignPacket {
+            task_id,
+            task_revision,
+            ..
+        } => format!("local-read-admission:campaign-packet:{task_id}:{task_revision}"),
+    }
+}
+
+/// Populates the dispatch-seam-owned exposure evidence for one freshly
+/// staged pair and seals it as the durable observation draft.
+///
+/// Only the stages this boundary observes are supplied: eligibility and
+/// selection hold because the authorized request was presented for dispatch
+/// and admitted through the existing admission owner
+/// ([`super::host_request_route::check_local_read_admission`]), bound to the
+/// admission source reference from [`admission_source`].
+/// Every other stage — registration, advertisement, call, transport,
+/// delivery, retry, use, terminal outcome — and the turn/run/attempt
+/// identities stay explicitly `null`: unresolved unknown owned elsewhere,
+/// never `false`, never inferred from a neighbouring stage. The Tool
+/// Definition version is unobservable at this seam (the definition owner
+/// lives on the publish side), so it stays explicitly `null` rather than
+/// minted or guessed; the populated stages conform to
+/// [`EXPOSURE_HISTORY_VERSION`].
+///
+/// The `idempotency_key` joins the existing operation identity with the
+/// admitted request digest — the same identity the staging replay join
+/// dedupes on — so a repeated staging reconciles the recorded original
+/// instead of persisting a second revision. The caller emits this draft
+/// only for fresh staging (replays return early at their classifier);
+/// persistence itself runs through the existing observation path
+/// (`audit_observe`: hash-chained append, spool reconcile on lost
+/// acknowledgement, stable terminal on unavailable writeback).
+///
+/// Reads only, never stages, never executes. Observation never changes the
+/// staged admission.
+///
+/// # Errors
+///
+/// Returns [`eliot_receipts::ToolExposureError`] when the tool value carries
+/// no admitted name or when an owner-supplied reference fails its existing
+/// validation.
+pub(crate) fn dispatch_exposure_draft(
+    envelope: &eliot_protocol::HostRequestEnvelope,
+    tool: &serde_json::Value,
+    admission: &LocalReadAdmission,
+) -> Result<AuditEventDraft, eliot_receipts::ToolExposureError> {
+    let name = tool
+        .as_object()
+        .and_then(|object| object.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or(eliot_receipts::ToolExposureError::InvalidField {
+            field: "history.tool_definition",
+            reason: "admitted tool carries no definition identity",
+        })?;
+    let route = route_fingerprint(envelope, admission);
+    let owner_source = admission_source(admission);
+    let eligible = OwnerStageFact::supplied(true, owner_source.clone())?;
+    let selected = OwnerStageFact::supplied(true, owner_source)?;
+    let operation_id = eliot_protocol::host_request_operation_id(envelope);
+    let body = serde_json::json!({
+        "tool_definition": name,
+        "definition_version": null,
+        "route_fingerprint": route.clone(),
+        "surface_ref": route,
+        "turn_ref": null,
+        "run_ref": null,
+        "attempt_ref": null,
+        "registered": null,
+        "advertised_to_route": null,
+        "eligible_under_scope_policy_and_grant": eligible,
+        "selected_by_planner_or_model": selected,
+        "called": null,
+        "transport_completed": null,
+        "result_delivery": null,
+        "delivery_source_ref": null,
+        "expanded_or_retried": null,
+        "observably_used_in_decision_action_or_verifier": null,
+        "terminal_task_or_product_outcome_ref": null,
+        "exposure_history_version": EXPOSURE_HISTORY_VERSION,
+        "idempotency_key": format!("{operation_id}:{}", envelope.envelope_sha256),
+    });
+    Ok(AuditEventDraft::receipt_exposure_recorded(envelope, body))
+}
+
+/// Emits one dispatch-owned exposure draft through the existing observation
+/// path (issue #1745, R7 persistence tail).
+///
+/// Best-effort like every observation: a populate failure is terminal-visible
+/// but never changes the staged admission. Callers invoke this only for fresh
+/// staging; replays reconcile the recorded original upstream.
+pub(crate) fn observe_dispatch_exposure(
+    envelope: &eliot_protocol::HostRequestEnvelope,
+    tool: &serde_json::Value,
+    admission: &LocalReadAdmission,
+    emit: impl FnOnce(AuditEventDraft),
+) {
+    match dispatch_exposure_draft(envelope, tool, admission) {
+        Ok(draft) => emit(draft),
+        Err(_) => crate::kernel_diagnostics::observe_terminal_error(
+            crate::kernel_audit::KERNEL_AUDIT_APPEND_TERMINAL_CODE,
+        ),
+    }
 }

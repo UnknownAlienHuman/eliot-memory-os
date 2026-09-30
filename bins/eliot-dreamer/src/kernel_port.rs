@@ -72,7 +72,7 @@ use eliot_protocol::RequestIdentity;
 use eliot_protocol::dreamer_job::JobState as ProtocolJobState;
 use eliot_protocol::dreamer_job::{
     DurableJobError, DurableJobRequest, DurableJobResponse, DurableRequestIdentity, JobOperation,
-    JobRole,
+    JobRole, OpaqueContentRef,
 };
 
 /// Stable session module identity of the one-shot Dreamer worker.
@@ -172,6 +172,16 @@ pub(crate) struct DreamerDispatchedEnvelope {
     pub(crate) attempt_id: String,
     /// Exact ledger revision the worker must claim.
     pub(crate) revision: u64,
+    /// Original semantic input reference projected by the durable Store
+    /// owner. Legacy envelopes may omit it; the claim path preserves that as
+    /// a typed missing-input refusal rather than making a local replacement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) semantic_input: Option<OpaqueContentRef>,
+    /// Exact inline bytes retained beside the opaque owner reference, when
+    /// present. The child transports and verifies them without interpreting
+    /// `UserAutomation` content as a Dreamer orientation payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) semantic_input_bytes: Option<Vec<u8>>,
     /// Scope the ledger bound to this job (never caller bytes).
     pub(crate) scope_id: String,
     /// Fence the ledger bound to this job (never caller bytes).
@@ -199,6 +209,10 @@ pub(crate) struct ValidatedDreamerMaterial {
     pub(crate) attempt_id: String,
     /// Exact ledger revision the worker must claim.
     pub(crate) revision: u64,
+    /// Exact original semantic input reference retained by the Store owner.
+    pub(crate) semantic_input: Option<OpaqueContentRef>,
+    /// Exact original inline bytes, when supplied by the Store owner.
+    pub(crate) semantic_input_bytes: Option<Vec<u8>>,
     /// Scope the ledger bound to this job.
     pub(crate) scope_id: String,
     /// Fence the ledger bound to this job.
@@ -264,6 +278,16 @@ pub(crate) enum KernelPortError {
     /// An invalid grant is a refusal, never a fallback.
     #[error("dreamer dispatch material launch grant is invalid or foreign: {0}")]
     BadGrant(String),
+    /// A legacy material or owner reply carries no original semantic input.
+    #[error("dreamer durable owner semantic input reference is unavailable")]
+    SemanticInputUnavailable,
+    /// A claim/status reply changed the original semantic input reference or
+    /// its exact inline bytes.
+    #[error("dreamer Kernel reply semantic input reference or bytes are stale: {0}")]
+    SemanticInputStale(String),
+    /// A claim/status reply changed the claimed job identity or fence.
+    #[error("dreamer Kernel reply job, attempt, scope, or fence changed")]
+    StaleClaimBinding,
     /// The authenticated Kernel transport refused the claim.
     #[error("dreamer Kernel claim transport failed: {0}")]
     Transport(String),
@@ -415,6 +439,20 @@ fn validate_envelope(
             "dreamer lineage revision must be non-zero".to_owned(),
         ));
     }
+    if let Some(semantic_input) = &envelope.semantic_input {
+        semantic_input
+            .validate("semantic_input.sha256")
+            .map_err(|error| KernelPortError::SemanticInputStale(error.to_string()))?;
+    }
+    if let Some(bytes) = &envelope.semantic_input_bytes {
+        let semantic_input = envelope
+            .semantic_input
+            .as_ref()
+            .ok_or(KernelPortError::SemanticInputUnavailable)?;
+        semantic_input
+            .validate_semantic_input_bytes(bytes)
+            .map_err(|error| KernelPortError::SemanticInputStale(error.to_string()))?;
+    }
     envelope
         .fence
         .validate()
@@ -442,6 +480,8 @@ fn validate_envelope(
         job_id: envelope.job_id.clone(),
         attempt_id: envelope.attempt_id.clone(),
         revision: envelope.revision,
+        semantic_input: envelope.semantic_input.clone(),
+        semantic_input_bytes: envelope.semantic_input_bytes.clone(),
         scope_id: envelope.scope_id.clone(),
         fence: envelope.fence.clone(),
         epoch: envelope.epoch.clone(),
@@ -1219,6 +1259,45 @@ fn checked_response(
     Ok(response)
 }
 
+/// Requires every Kernel observation to retain the original Store-owned
+/// semantic input and the exact claimed job/attempt/scope/fence. Lifecycle
+/// revisions may advance after `Start`, so operation-specific revision
+/// binding remains the responsibility of `validate_for` above.
+fn validate_owner_response_binding(
+    material: &ValidatedDreamerMaterial,
+    response: &DurableJobResponse,
+) -> Result<(), KernelPortError> {
+    let original = material
+        .semantic_input
+        .as_ref()
+        .ok_or(KernelPortError::SemanticInputUnavailable)?;
+    let echoed = response
+        .semantic_input
+        .as_ref()
+        .ok_or(KernelPortError::SemanticInputUnavailable)?;
+    echoed
+        .validate("semantic_input.sha256")
+        .map_err(|error| KernelPortError::SemanticInputStale(error.to_string()))?;
+    if echoed != original {
+        return Err(KernelPortError::SemanticInputStale(
+            "Kernel owner reply changed the original semantic input reference".to_owned(),
+        ));
+    }
+    if response.semantic_input_bytes != material.semantic_input_bytes {
+        return Err(KernelPortError::SemanticInputStale(
+            "Kernel owner reply changed the original semantic input bytes".to_owned(),
+        ));
+    }
+    if response.job_id.as_str() != material.job_id
+        || response.attempt_id.as_str() != material.attempt_id
+        || response.scope.scope_id.as_str() != material.scope_id
+        || response.scope.state_fence != material.fence
+    {
+        return Err(KernelPortError::StaleClaimBinding);
+    }
+    Ok(())
+}
+
 /// Performs the validated one-shot claim: `LeaseExact` for the exact queued
 /// job through the authenticated worker session, then `Start` on the lease
 /// the claim reply carried.
@@ -1232,6 +1311,11 @@ pub(crate) fn claim_once<T: ClaimTransport>(
     material: &ValidatedDreamerMaterial,
     transport: &mut T,
 ) -> Result<DurableJobResponse, KernelPortError> {
+    // Preserve a legacy or stale owner projection as a typed refusal before
+    // any authenticated claim transaction can produce effects.
+    if material.semantic_input.is_none() {
+        return Err(KernelPortError::SemanticInputUnavailable);
+    }
     let short = short_digest(&material.grant.grant_digest);
     let lease_operation_id = format!("dreamer-lease-{short}");
     let now_unix_ms = unix_ms()?;
@@ -1244,6 +1328,7 @@ pub(crate) fn claim_once<T: ClaimTransport>(
     )?;
     let lease_reply = transport.transact(DREAMER_JOB_WIRE_ID, lease_payload)?;
     let lease_response = checked_response(lease_reply, &lease_request)?;
+    validate_owner_response_binding(material, &lease_response)?;
     let Some(lease) = lease_response.lease.clone() else {
         return Err(KernelPortError::Contract(
             "dreamer Kernel lease claim carried no lease".to_owned(),
@@ -1260,6 +1345,7 @@ pub(crate) fn claim_once<T: ClaimTransport>(
     )?;
     let start_reply = transport.transact(DREAMER_JOB_WIRE_ID, start_payload)?;
     let started = checked_response(start_reply, &start_operation)?;
+    validate_owner_response_binding(material, &started)?;
     if started.state != ProtocolJobState::Running {
         return Err(KernelPortError::Contract(format!(
             "dreamer Kernel start did not report a running job (state {:?})",
@@ -1279,6 +1365,9 @@ pub(crate) fn status_once<T: ClaimTransport>(
     material: &ValidatedDreamerMaterial,
     transport: &mut T,
 ) -> Result<DurableJobResponse, KernelPortError> {
+    if material.semantic_input.is_none() {
+        return Err(KernelPortError::SemanticInputUnavailable);
+    }
     let short = short_digest(&material.grant.grant_digest);
     let operation_id = format!("dreamer-status-{short}");
     let now_unix_ms = unix_ms()?;
@@ -1286,13 +1375,18 @@ pub(crate) fn status_once<T: ClaimTransport>(
     transport.bind_identity(&material.fence, &operation_id)?;
     let payload = dreamer_payload(&request, &format!("{operation_id}-ctx"), now_unix_ms)?;
     let reply = transport.transact(DREAMER_JOB_WIRE_ID, payload)?;
-    checked_response(reply, &request)
+    let response = checked_response(reply, &request)?;
+    validate_owner_response_binding(material, &response)?;
+    Ok(response)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eliot_contracts::{EpochLineageId, ResourceGeneration};
+    use eliot_contracts::{
+        ArtifactId, ContractId, ContractIdentity, ContractVersion, EpochLineageId,
+        ResourceGeneration,
+    };
     use std::num::NonZeroU64;
 
     const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -1315,6 +1409,20 @@ mod tests {
         format!("{byte:02x}").repeat(32)
     }
 
+    fn test_semantic_input() -> OpaqueContentRef {
+        OpaqueContentRef {
+            contract: ContractIdentity {
+                name: ContractId::new("eliot.dreamer.test-input").expect("contract"),
+                version: ContractVersion::new(1, 0, 0),
+                shape_sha256: test_digest(0x11),
+            },
+            source_revision: "source-revision-1".to_owned(),
+            byte_length: 1,
+            sha256: test_digest(0x22),
+            artifact_id: Some(ArtifactId::new("dreamer-semantic-input-1").expect("artifact")),
+        }
+    }
+
     fn valid_envelope_value() -> Result<serde_json::Value, String> {
         let fence = test_fence(7, 3)?;
         let fence_json = serde_json::to_value(&fence).map_err(|error| error.to_string())?;
@@ -1324,6 +1432,8 @@ mod tests {
             "job_id": "dreamer-job-1",
             "attempt_id": "dreamer-attempt-1",
             "revision": 1,
+            "semantic_input": serde_json::to_value(test_semantic_input())
+                .map_err(|error| error.to_string())?,
             "scope_id": "dreamer-scope-1",
             "fence": fence_json,
             "epoch": epoch_json,
@@ -1407,6 +1517,8 @@ mod tests {
                     .map_err(|error| error.to_string())?,
                 "job_id": "dreamer-job-1",
                 "attempt_id": "dreamer-attempt-1",
+                "semantic_input": serde_json::to_value(test_semantic_input())
+                    .map_err(|error| error.to_string())?,
                 "scope": {
                     "scope_id": "dreamer-scope-1",
                     "product_id": CLAIM_PRODUCT_ID,
@@ -1769,6 +1881,9 @@ mod tests {
             KernelPortError::InvalidMaterial(_) => "InvalidMaterial",
             KernelPortError::StaleEpoch { .. } => "StaleEpoch",
             KernelPortError::StaleGeneration { .. } => "StaleGeneration",
+            KernelPortError::SemanticInputUnavailable => "SemanticInputUnavailable",
+            KernelPortError::SemanticInputStale(_) => "SemanticInputStale",
+            KernelPortError::StaleClaimBinding => "StaleClaimBinding",
             KernelPortError::BadNonce => "BadNonce",
             KernelPortError::BadGrant(_) => "BadGrant",
             KernelPortError::Transport(_) => "Transport",

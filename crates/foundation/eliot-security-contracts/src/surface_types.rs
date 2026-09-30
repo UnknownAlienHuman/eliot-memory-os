@@ -76,6 +76,20 @@ pub struct SourceSecurityAssessment {
     pub observed_features: Vec<ObservedSourceFeature>,
     /// Interpretations proposed by a model, kept distinct from observations.
     pub model_interpretations: Vec<ModelProposedInterpretation>,
+    /// I8.8 indicator observations classified for this exact source revision.
+    ///
+    /// These are the classified form of the same retained evidence the rows
+    /// above carry: each one names the class its producer assigned, the exact
+    /// evidence for it, and that producer's provenance. The use boundary
+    /// resolves every one of them through the finite indicator-to-source map
+    /// and keeps only the narrowing that survives, so a retained record is
+    /// evidence and never authority.
+    ///
+    /// Empty means no indicator was classified for this source, which is not a
+    /// finding in either direction; it is the ordinary state for a source that
+    /// raised no signal.
+    #[serde(default)]
+    pub indicator_observations: Vec<crate::RecordedIndicatorObservation>,
 }
 
 /// Closed inventory of dimensions that a source assessment may describe.
@@ -238,7 +252,10 @@ pub struct ModelProposedInterpretation {
     pub coverage: AssessmentCoverage,
 }
 
-fn assessment_text(value: &str, field: &'static str) -> Result<(), crate::SecurityContractError> {
+pub(crate) fn assessment_text(
+    value: &str,
+    field: &'static str,
+) -> Result<(), crate::SecurityContractError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
         return Err(crate::SecurityContractError::InvalidText { field });
     }
@@ -258,7 +275,7 @@ fn assessment_digest(value: &str) -> Result<(), crate::SecurityContractError> {
     Ok(())
 }
 
-fn assessment_refs(
+pub(crate) fn assessment_refs(
     values: &[String],
     field: &'static str,
 ) -> Result<(), crate::SecurityContractError> {
@@ -321,6 +338,28 @@ pub struct SourceUseAuthority {
     pub instruction_taint: InstructionTaint,
     /// Fence this narrowing is bound to for the current operation.
     pub state_fence: StateFence,
+}
+
+impl SourceUseAuthority {
+    /// Intersects this narrowing with a second one over the same source.
+    ///
+    /// Both records describe the same assessed source revision, so the
+    /// intersection is the only use that both admit. Instruction taint takes
+    /// the stronger of the two, so intersecting can never clear taint, and the
+    /// fence of the receiver is kept.
+    #[must_use]
+    pub fn narrowed_with(&self, other: &SourceUseAuthority) -> SourceUseAuthority {
+        SourceUseAuthority {
+            assessed_source: self.assessed_source.clone(),
+            permitted_uses: assessment_intersection(&self.permitted_uses, &other.permitted_uses),
+            permitted_effects: assessment_intersection(
+                &self.permitted_effects,
+                &other.permitted_effects,
+            ),
+            instruction_taint: self.instruction_taint.max(other.instruction_taint),
+            state_fence: self.state_fence.clone(),
+        }
+    }
 }
 
 fn assessment_intersection<T: Copy + PartialEq>(left: &[T], right: &[T]) -> Vec<T> {
@@ -451,6 +490,12 @@ impl SourceSecurityAssessment {
             interpretation.validate()?;
             dimensions.insert(assessment_value_dimension(&interpretation.value));
         }
+        // A retained indicator record is validated here, once, so a malformed
+        // one is refused at the use boundary instead of being skipped by the
+        // resolution that consumes it.
+        for record in &self.indicator_observations {
+            record.validate()?;
+        }
         if REQUIRED_ASSESSMENT_DIMENSIONS
             .iter()
             .any(|dimension| !dimensions.contains(dimension))
@@ -460,6 +505,95 @@ impl SourceSecurityAssessment {
             });
         }
         Ok(())
+    }
+
+    /// Resolves one I8.8 indicator for this assessment's exact source revision
+    /// and returns the use authority that survives it.
+    ///
+    /// The finite indicator-to-source map is consulted with this assessment's
+    /// own [`AssessedSourceRevision`], so an indicator is always scoped to the
+    /// revision it was assessed against. A candidate-only resolution changes
+    /// nothing: it returns exactly what [`Self::resolve_source_use`] returns.
+    /// A bounded restriction is intersected on top of that, so it can only
+    /// remove permitted uses and effects and can never widen them. Instruction
+    /// taint always comes from the assurance in force, so a summary, a second
+    /// model or a re-diagnosis cannot clear it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the assessment shape is malformed, when the
+    /// indicator map refuses the class/evidence/observation combination, or
+    /// when the fence or source in force is no longer the assessed one.
+    pub fn resolve_indicator_use(
+        &self,
+        indicator: crate::IndicatorClass,
+        evidence: &crate::IndicatorEvidence,
+        observation: &crate::IndicatorObservation,
+        current_assurance: &SourceAssurance,
+        state_fence: &StateFence,
+        release_condition: Option<&str>,
+    ) -> Result<SourceUseAuthority, crate::SecurityContractError> {
+        let base = self.resolve_source_use(current_assurance, state_fence)?;
+        let resolution = crate::IndicatorSourceMap::resolve(
+            indicator,
+            evidence,
+            observation,
+            &self.source,
+            state_fence,
+            release_condition,
+        )?;
+        match resolution.restriction() {
+            Some(restriction) => Ok(restriction
+                .resolve_use(current_assurance, state_fence)?
+                .narrowed_with(&base)),
+            None => Ok(base),
+        }
+    }
+
+    /// Resolves every I8.8 indicator observation this assessment retains, and
+    /// returns the use authority that survives all of them.
+    ///
+    /// This is the entry point a use boundary calls: it takes the retained
+    /// indicator records, sends each through the finite indicator-to-source map
+    /// with this assessment's own [`AssessedSourceRevision`], and intersects the
+    /// surviving authorities. Intersection only removes permitted uses and
+    /// effects, so no record can widen them, and instruction taint always comes
+    /// from the assurance in force, so no record can clear it.
+    ///
+    /// Nothing here mutates quarantine, Incident state or authority. A
+    /// model-proposed record, a record whose comparison inputs were missing, and
+    /// every content-shaped class each resolve to
+    /// [`crate::IndicatorResolution::CandidateOnly`], which resolves to exactly
+    /// the base narrowing; those records are therefore retained inert evidence
+    /// here and nowhere else. Any record the map refuses fails the whole
+    /// resolution rather than being skipped, so a malformed record cannot make
+    /// the source look as though no indicator existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the assessment shape or any retained indicator
+    /// record is malformed, when the indicator map refuses a class/evidence/
+    /// observation combination, or when the fence or source in force is no
+    /// longer the assessed one.
+    pub fn resolve_recorded_indicator_uses(
+        &self,
+        current_assurance: &SourceAssurance,
+        state_fence: &StateFence,
+    ) -> Result<SourceUseAuthority, crate::SecurityContractError> {
+        let mut surviving = self.resolve_source_use(current_assurance, state_fence)?;
+        for record in &self.indicator_observations {
+            surviving = self
+                .resolve_indicator_use(
+                    record.indicator,
+                    &record.evidence,
+                    &record.observation,
+                    current_assurance,
+                    state_fence,
+                    record.release_condition.as_deref(),
+                )?
+                .narrowed_with(&surviving);
+        }
+        Ok(surviving)
     }
 
     /// Resolves what one action may take from this assessed source right now.

@@ -15,7 +15,7 @@ use eliot_governor::{
     KernelDurableJobPort, KernelGenerationSnapshot, KernelGenerationSnapshotProvider,
     KernelPortError, KernelServiceObservationPort, KernelServiceRecovery,
 };
-use eliot_maintenance::MaintenanceJob;
+use eliot_maintenance::{MaintenanceJob, prove_job_intent_durable};
 
 use super::DaemonKernelClient;
 
@@ -34,6 +34,23 @@ pub(crate) fn kind_value(
     object.get("value").cloned().ok_or_else(|| {
         KernelPortError::Contract("Kernel typed value is missing payload".to_owned())
     })
+}
+
+/// Decodes one Kernel-owned durable job revision through the single closed
+/// `durable_job` kind and validates it.
+///
+/// Both the save reply and the owning load path serve the owner's own
+/// committed bytes under this kind, so both decode here instead of each
+/// carrying a second decoder. A wrong kind, undecodable bytes, or a revision
+/// the maintenance owner refuses is a contract refusal, never a substituted
+/// or defaulted job.
+fn decode_committed_job(value: &serde_json::Value) -> Result<MaintenanceJob, KernelPortError> {
+    let value = kind_value(value, "durable_job")?;
+    let job: MaintenanceJob = serde_json::from_value(value)
+        .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+    job.validate()
+        .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+    Ok(job)
 }
 
 impl KernelGenerationSnapshotProvider for DaemonKernelClient {
@@ -78,14 +95,39 @@ impl KernelDurableJobPort for DaemonKernelClient {
             "load_durable_job",
             serde_json::json!({ "job_id": job_id, "state_fence": state_fence }),
         )?;
-        let value = kind_value(&value, "durable_job")?;
-        serde_json::from_value(value).map_err(|error| KernelPortError::Contract(error.to_string()))
+        Ok(Some(decode_committed_job(&value)?))
     }
 
     fn save_durable_job(&self, job: &MaintenanceJob) -> Result<(), KernelPortError> {
         // #740: request/result span over the durable-job save boundary.
         let _span = tracing::info_span!("eliotd.kernel_durable_save").entered();
-        let _ = self.request_blocking("save_durable_job", serde_json::json!({ "job": job }))?;
+        // The intent is validated before it travels: a malformed revision is
+        // the caller's defect, not a commit the owner could have recorded.
+        job.validate()
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        let value = self.request_blocking("save_durable_job", serde_json::json!({ "job": job }))?;
+        // Transport acknowledgement is not commit proof (issue #1694 W4): the
+        // reply must carry the owner's own committed bytes binding this exact
+        // job and trigger identity, or the save is refused and the trigger
+        // stays retained and unacknowledged.
+        let committed = decode_committed_job(&value)?;
+        prove_job_intent_durable(job, &committed)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        // The save acknowledgement alone still proves nothing durable: close
+        // the commit through the owning load path and require the retained
+        // revision to bind the same intent. An absent or substituted read-back
+        // leaves the outcome explicitly incomplete for receipt reconciliation,
+        // never a success.
+        let retained = self
+            .load_durable_job(&job.job_id, &job.state_fence)?
+            .ok_or_else(|| {
+                KernelPortError::Contract(
+                    "Kernel durable-job save has no retained revision for the saved job identity"
+                        .to_owned(),
+                )
+            })?;
+        prove_job_intent_durable(job, &retained)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
         Ok(())
     }
 }

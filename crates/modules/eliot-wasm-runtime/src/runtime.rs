@@ -988,14 +988,22 @@ fn validate_resolutions(
     }
     // Instruction/data separation is decided here, at the use boundary, and
     // before any optional diagnosis could matter. A recorded assessment is
-    // resolved against the assurance in force for this exact invocation: it
-    // can only narrow the permitted uses and effects, never widen them, and a
-    // source, profile or fence that moved after diagnosis fails closed here.
+    // resolved against the assurance in force for this exact invocation: every
+    // I8.8 indicator observation the source verifier retained on it goes
+    // through the finite indicator-to-source map first, and only the narrowing
+    // that survives every one of them is admitted. The resolution can only
+    // remove permitted uses and effects, never widen them, and a source,
+    // profile or fence that moved after diagnosis fails closed here. A
+    // model-proposed or otherwise candidate-only indicator resolves to exactly
+    // the assurance, so it stays retained inert evidence and changes nothing.
     // Independent work with no recorded assessment keeps its own assurance.
     let (permitted_uses, permitted_effects, instruction_taint) = match &source.security_assessment {
         Some(assessment) => {
             let use_authority = assessment
-                .resolve_source_use(&source.assurance, &governor.generation.state_fence)
+                .resolve_recorded_indicator_uses(
+                    &source.assurance,
+                    &governor.generation.state_fence,
+                )
                 .map_err(|_| RuntimeError::SourceNotAdmitted)?;
             (
                 use_authority.permitted_uses,

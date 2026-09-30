@@ -219,8 +219,11 @@ impl SpoolFenceEntryKind {
     /// Classifies one spool payload without copying any payload bytes.
     ///
     /// The match is exhaustive with no wildcard: a future payload variant
-    /// fails the build here instead of silently misclassifying.
-    fn classify(payload: &WatchdogSpoolPayload) -> Self {
+    /// fails the build here instead of silently misclassifying. Public so the
+    /// owner's own import path classifies destination-retained records through
+    /// this one owner rather than re-matching payload variants beside it.
+    #[must_use]
+    pub fn classify(payload: &WatchdogSpoolPayload) -> Self {
         match payload {
             WatchdogSpoolPayload::Heartbeat { .. } => Self::Heartbeat,
             WatchdogSpoolPayload::Gap { .. } => Self::Gap,

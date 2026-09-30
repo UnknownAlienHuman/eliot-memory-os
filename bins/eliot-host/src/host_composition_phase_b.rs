@@ -5,9 +5,10 @@ use super::launch_descriptor_validation::verify_user_broker_artifact;
 
 #[cfg(windows)]
 use super::phase_b_materialization::{
-    prepare_agent_bridge_materialization, publish_agent_bridge_pair,
-    rehydrate_agent_bridge_binding, rehydrate_agent_bridge_binding_from_pending,
-    retain_agent_bridge_profile, rollback_agent_bridge_pair, rollback_agent_bridge_stage,
+    materialize_user_broker_client_declaration, prepare_agent_bridge_materialization,
+    publish_agent_bridge_pair, rehydrate_agent_bridge_binding,
+    rehydrate_agent_bridge_binding_from_pending, retain_agent_bridge_profile,
+    rollback_agent_bridge_pair, rollback_agent_bridge_stage,
 };
 #[cfg(windows)]
 use eliot_platform_windows::reconcile_agent_bridge_stage;
@@ -715,6 +716,32 @@ impl HostComposition {
                 eliotd_descriptor_digest.clone(),
             )
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        // WORK_UNIT_CASE: 1777/W1 — the broker's front door presents a
+        // `ClientHello`, so the exact capability set the serving Kernel admits
+        // must exist as an installed, digest-bound record bound to the broker
+        // image just re-proved by `verify_user_broker_artifact`. Phase B
+        // materialises it from this exact live launch contour and recomputes
+        // its digest from the canonical bytes. The launch nonce stays out: it
+        // is correlation-only connection data owned by the broker's protected
+        // launch binding, so Phase B must not mint or restate one here.
+        #[cfg(windows)]
+        let user_broker_client = materialize_user_broker_client_declaration(&launch)?;
+        #[cfg(windows)]
+        if phase_b_bytes_digest(&user_broker_client.profile_bytes)?
+            != user_broker_client.profile_digest
+            || phase_b_bytes_digest(&user_broker_client.declaration_bytes)?
+                != user_broker_client.declaration_digest
+            || user_broker_client.profile.installation_id != launch.installation_epoch.installation
+            || user_broker_client.profile.broker_artifact_sha256
+                != launch.user_broker_artifact_digest
+            || user_broker_client.profile.broker_executable_path
+                != launch.user_broker_executable_path
+        {
+            return Err(HostError::RecoveryRequired(
+                "User Broker client declaration is not the materialised record of this Phase-B launch"
+                    .to_owned(),
+            ));
+        }
         let pending = self.registry.pending_activation().cloned();
         let active_rebind = self.registry.active_phase_b_rebind().cloned();
         #[cfg(windows)]

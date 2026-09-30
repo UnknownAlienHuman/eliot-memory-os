@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 mod admission_reservation;
+mod admission_reservation_stage;
 mod backup_snapshot;
 mod control_reserve;
 mod cutover_ownership;
@@ -31,11 +32,20 @@ mod versioned_artifact;
 pub mod test_support;
 
 pub use admission_reservation::{
-    ActiveAdmissionReservation, AdmissionReservationClaimRef, AdmissionReservationClaims,
-    AdmissionReservationDisposition, AdmissionReservationLaunchPrerequisite,
-    AdmissionReservationRecord, AdmissionReservationSnapshot, AdmissionReservationStage,
-    AdmissionReservationState, AdmissionReservationTransitionRequest,
-    verify_admission_reservation_launch_prerequisite,
+    ActiveAdmissionReservation, AdmissionReservationActivatedOutcome,
+    AdmissionReservationActivationEvidence, AdmissionReservationActivationRequest,
+    AdmissionReservationClaimRef, AdmissionReservationClaims, AdmissionReservationDisposition,
+    AdmissionReservationLaunchPrerequisite, AdmissionReservationRecord,
+    AdmissionReservationSnapshot, AdmissionReservationStage, AdmissionReservationState,
+    AdmissionReservationTransitionRequest, verify_admission_reservation_launch_prerequisite,
+};
+pub use admission_reservation_stage::{
+    ADMISSION_RESERVATION_STAGE_VERSION, AdmissionReservationIdentityInput,
+    AdmissionReservationStageRequest, AdmissionReservationStagedOutcome, StagedClaimRole,
+    activate_admission_reservation_from_owner_evidence, activation_operation_identity,
+    admission_reservation_identity, epoch_lineage_for, proposed_attempt_identity,
+    reload_staged_admission_reservation, stage_admission_reservation_inactive,
+    stage_operation_identity, verify_staged_claim_completeness,
 };
 pub use backup_snapshot::{
     BACKUP_SNAPSHOT_SCHEMA_VERSION, BackupCompleteness, BackupPartialReason, MAX_BACKUP_BYTES,

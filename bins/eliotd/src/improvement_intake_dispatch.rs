@@ -7,9 +7,10 @@
 //! observation. This intake remains distinct from the full
 //! `ImprovementRouteRequest` pipeline, which has no production request source.
 //!
-//! # The evidence is a real observation this daemon already made
+//! # The evidence is real observations this daemon already made
 //!
-//! The single evidence source is the daemon's OWN live
+//! There are TWO, and both were already in hand before this change. The first
+//! is the daemon's OWN live
 //! [`eliot_maintenance::AutomationTriggerDecision`] produced by
 //! [`crate::DaemonComposition::evaluate_maintenance_trigger`]
 //! (`maintenance_trigger_evaluator.rs::DaemonComposition::evaluate_maintenance_trigger`),
@@ -18,6 +19,15 @@
 //! `decision` and `admits_job`, and is bound to the observed evidence
 //! references the trigger site passed in. Nothing here invents an observation:
 //! every ref below is derived from that decision's own fields.
+//!
+//! The second is the daemon's Governor-owned learning-closure image
+//! ([`eliot_governor::CanonicalLearningDeltaStore`], reached as
+//! `DaemonComposition::learning_closure().store()`), whose newest committed
+//! record is a real campaign/attempt closure. It was already mandatory — the
+//! brief's safe boundary refuses the pass without it — but its own committed
+//! lineage reached only the brief's prose, so the candidate's evidence and
+//! deduplication lineage did not include it. It is now bound; see
+//! [`ObservedClosure::lineage_evidence_refs`].
 //!
 //! The evidence source is DERIVED from that decision's own closed fields by
 //! [`maintenance_evidence_source`], not asserted. It previously claimed
@@ -36,30 +46,56 @@
 //! [`conformance_diagnosis_evidence`] below and enters the funnel through the
 //! Self-Quality conformance-diagnosis contract.
 //!
-//! # What is still NOT connected, measured rather than asserted
+//! # The task/campaign closure source is BOUND, and what is still not
 //!
-//! W2 also names attempts/evaluators, campaign closure, security incidents,
-//! accepted implementation deviations, complaints, Watchdog, Dreamer and
-//! Concilium suggestions. On this tree only the first and the conformance
-//! diagnosis are reachable, and the reasons are recorded per-arm on
-//! [`maintenance_evidence_source`]: a family census shows the only families any
-//! production trigger site can name are [`crate::SELF_OBSERVED_FAMILY`] and
-//! `MaintenanceFamily::DonorConformance`, so every other source needs a
-//! producer that does not exist yet rather than a match arm that is missing
-//! here. The security-incident arm is annotated at the arm itself with the
-//! receipt and trigger site that would make it live; Watchdog, Dreamer and
-//! Concilium have no arm and are annotated as such. None is filled from a
-//! substitute value.
+//! The count of ten is the [`EvidenceSource`] variant count
+//! (`evidence_sources.rs:21-32`), and the issue's prose lists them as nine
+//! phrases because it writes "actual attempts/evaluators" as one. Enumerated by
+//! VARIANT, which is the only count that adds up: three are bound to real
+//! evidence this intake already held, and seven are recorded per-arm on
+//! [`maintenance_evidence_source`] with the measured reason each is still dead.
 //!
-//! The decision now also carries its origin —
-//! [`eliot_maintenance::AutomationTriggerDecision::trigger`] is copied verbatim
-//! from the evaluated trigger — so the three suggestion sources are no longer
-//! blocked by a missing field. They remain unselected because the ONE
-//! observation this intake is handed is built from
-//! `MaintenanceTriggerOrigin::IdleTransition`, which maps to
-//! `MaintenanceTrigger::Policy` and can never read `WatchdogProblem`,
-//! `Dreamer` or `Concilium`. The per-source remaining step, which now differs
-//! sharply between them, is recorded on [`maintenance_evidence_source`].
+//! - **Attempt** — the maintenance owner's evaluation of one real trigger plus
+//!   the outcome it produced; the residual [`EvidenceSource::Attempt`] arm.
+//! - **CampaignClosure** — the Governor's committed learning-closure record.
+//!   This is the one this change adds, and it was already a mandatory input of
+//!   this function ([`SafeBoundary::from_observed_closure`] refuses the whole
+//!   pass without it) whose committed lineage reached only the brief's prose.
+//!   [`ObservedClosure::lineage_evidence_refs`] puts the record's own artifact
+//!   handle and canonical digest into the candidate's evidence lineage, on BOTH
+//!   arms, so the deduplication comparison is made over the evidence the
+//!   candidate actually rests on. I12.24:60-61 places the durable evidence set
+//!   at the funnel's second step and this record is one.
+//! - **ConformanceDiagnosis** — the routed #971 finding, projected by
+//!   [`conformance_diagnosis_evidence`].
+//! - **Watchdog** and **Dreamer** — the two of I12.24:54's "Dreamer/Watchdog/
+//!   Concilium suggestion" that the closed [`MaintenanceTrigger`] vocabulary can
+//!   carry, selected by [`maintenance_trigger_evidence_source`] from
+//!   [`eliot_maintenance::AutomationTriggerDecision::trigger`]. That field is the
+//!   evaluator's VERBATIM copy of the caller-observed origin, so the label is a
+//!   derivation from the observation, the same standard the family match is held
+//!   to — and neither is filled from a substitute value.
+//!
+//! That is five of the ten connected. The other five are **EvaluatorVerdict**,
+//! **SecurityIncident**, **ImplementationDeviation**, **Complaint** and
+//! **Concilium**, and none of them is filled from a substitute value either. A
+//! family census shows the only families any production trigger site can name are
+//! [`crate::SELF_OBSERVED_FAMILY`] and `MaintenanceFamily::DonorConformance`, so
+//! security incidents need a pinned-scanner receipt producer that does not exist
+//! (annotated at the arm); evaluator verdicts, accepted implementation
+//! deviations and complaints have no producer anywhere in this workspace to read
+//! (`eliot_problem::ImplementationDeviation` and `CoverageComplaint` each have no
+//! call site); and `Concilium` has no `MaintenanceTrigger` member to be carried
+//! on at all. The three no-producer cases are set out in full below, under "The
+//! three sources with no producer AT ALL".
+//!
+//! The per-source remaining step for Watchdog and Dreamer differs sharply —
+//! Watchdog needs an existing origin ROUTED to this intake, Dreamer needs a new
+//! `MaintenanceTriggerOrigin` member that is not this file's to add — and is
+//! recorded on [`maintenance_evidence_source`]. The live intake observation is
+//! still built from `MaintenanceTriggerOrigin::IdleTransition`, which maps to
+//! `MaintenanceTrigger::Policy`, so the two new arms do not fire on the path
+//! that exists today; they fire on the origin the decision actually carries.
 //!
 //! # The durable port is the existing Governor/Kernel named mutation
 //!
@@ -80,10 +116,51 @@
 //! The candidate identity IS content-derived
 //! ([`eliot_improvement::ImprovementCandidate::new`]), so a repeat of the same
 //! observation produces the same `candidate_id` and therefore the same
-//! `improvement-candidate:<id>` HANDLE. The IN-MEMORY registry converges on one
-//! entry per candidate for that reason, and
-//! [`crate::improvement_dedup_read::restored_registry`] re-establishes it on
-//! every pass from the committed rows.
+//! `improvement-candidate:<id>` HANDLE. "The same observation" now covers both
+//! bound sources, so it means the same maintenance decision AND the same
+//! observed campaign closure.
+//!
+//! A newly committed closure therefore yields a new durable handle for what the
+//! funnel itself calls a duplicate, and that is a TRADE-OFF, not a correctness
+//! claim. I12.24:63 and :297 implement deduplication as an OVERLAP merge —
+//! [`eliot_improvement::BoundedBacklog::merge_target`] returns the first entry
+//! whose canonical lineage shares any element with the incoming one — so by the
+//! code's own definition two candidates differing only in closure lineage ARE
+//! duplicates. They nonetheless get distinct durable identities, because
+//! `derive_candidate_id` digests the evidence lineage and the closure lineage is
+//! in it. What is bought: the closure is bound to the identity, so a candidate
+//! cannot be re-identified over a different observed closure. What is paid: two
+//! durable handles for one merged candidate per new closure, which the merge
+//! receipt has to reconcile. The alternative — deriving identity from the
+//! decision alone and carrying the closure only in the lineage the merge unions
+//! — was rejected because it restores the partial-commit orphan documented at
+//! [`commit_improvement_artifact`]: with a shared identity that orphan was
+//! self-healing, and with a distinct one it is not, which is why the receipt is
+//! committed first.
+//!
+//! The IN-MEMORY registry converges on one entry per decision ONLY while the
+//! evidence lineages still OVERLAP, and the premise is narrower than "the
+//! decision's own refs are on both sides". Both are functions of the admitted
+//! state fence: [`maintenance_evidence_refs`] builds
+//! `maintenance-scope:{scope_ref}` from `scope_ref_for`, which formats
+//! `{service}:{authority_epoch.lineage_id}@{authority_epoch.sequence}:{resource_generation}`
+//! — its `"{}:{}@{}:{}"` is at `maintenance_trigger_evaluator.rs:625-633`, note
+//! the COLON before the resource generation — and `trigger_id` embeds that
+//! same `scope_ref` through the catalog's `FamilyAndScope` dedup key
+//! (`maintenance_family_catalog.rs:191-197`). So BOTH decision refs change
+//! together on an `authority_epoch.sequence` or `resource_generation` move. While
+//! the fence holds, they overlap on every candidate on both arms and the newer
+//! closure's lineage is unioned into the surviving entry (I12.24:297), and
+//! [`crate::improvement_dedup_read::restored_registry`] re-establishes that on
+//! every pass from the committed rows. When the fence moves AND a new closure
+//! lands in the same interval, nothing is shared, `merge_target` returns `None`,
+//! and the candidate is admitted as a brand-new entry that can never merge with
+//! the old one — the daemon's own code treats fence movement as live and
+//! REFUSES mid-flight rather than proceeding on it: "daemon reconstruction
+//! fence moved before serve" (`daemon_runtime.rs:4395-4397`) and "the admitted
+//! state fence moved between the dedup registry read and the admission"
+//! (`daemon_runtime.rs:5465-5470`). Convergence across a fence move is
+//! therefore NOT claimed, and is not achievable by anything in this file.
 //!
 //! It did NOT previously converge to one STORE row, and this claim used to say
 //! it did. It does not, and the reason is the brief: the committed document
@@ -121,6 +198,26 @@
 //! [`commit_lineage_merge_receipt`], which the next pass reads back as the
 //! surviving entry rather than rebuilding from the pre-merge candidate row.
 //!
+//! The union that merge produces is MONOTONE and has no ceiling, and that is a
+//! cost of binding the closure lineage rather than a benefit stated on its own.
+//! `merge_into` unions into a `BTreeSet` and never removes; `require_refs` has
+//! no maximum (unlike the Self-Quality side's `MAX_SELF_QUALITY_REFS = 64`,
+//! which bounds one handoff and not the accumulated union) and
+//! `archive_cause_for` has no lineage-size cause, so nothing prunes it. Growth
+//! per merge is the two closure refs PLUS two more whenever the admitted fence's
+//! `authority_epoch.sequence` or `resource_generation` moved, because both
+//! decision refs embed it. `candidate.evidence_refs` held three elements on both
+//! arms before this change and holds five after. The durable FOOTPRINT grows
+//! faster still and quadratically: every merge appends a new
+//! `improvement-merge:{id}@{revision}` receipt row that embeds the whole
+//! surviving entry, so row `k` is O(k). No cap is added here because retention is
+//! a policy decision this repository assigns to a retention owner; what such an
+//! owner would have to decide is set out in full on
+//! [`ObservedClosure::lineage_evidence_refs`], together with the one length
+//! ceiling these refs introduce on the conformance arm. This is separate from,
+//! and compounds, the pre-existing per-tick row accumulation described
+//! immediately above.
+//!
 //! What is deliberately NOT claimed:
 //! `DurableCandidateRecord::into_entry`
 //! (`crates/meta/eliot-improvement/src/candidate_bounds.rs`) rebuilds
@@ -154,6 +251,19 @@
 //! requirement — a real production caller consuming real evidence and
 //! emitting a durably committed owner-actionable artifact — is met without
 //! weakening that gate, which stays closed.
+//!
+//! The refusal is now ENFORCED rather than merely unreached, which is what A3
+//! asks for. The gate used to hold on this path only because nothing called the
+//! promoting seam: `ImprovementCandidate::promote_lifecycle` had no production
+//! caller anywhere, so a replay-only candidate could not promote by omission and
+//! not by decision — a guarantee that a later change could remove by adding one
+//! call. [`refuse_replay_only_promotion`] now runs in
+//! [`commit_improvement_artifact`] and CHECKS the candidate's own recorded
+//! lifecycle against the crate's own promoting predicate, refusing through the
+//! crate's own gate. So a candidate whose recorded lifecycle reached `Supported`
+//! or `Narrowed` cannot become durable through this seam even if a future change
+//! routed one in without a budget record — the guarantee is a decision this
+//! module makes on every pass, not a property of a seam nobody calls.
 
 //! # The bounded backlog is a GOVERNED admission, not a daemon literal
 //!
@@ -229,18 +339,26 @@
 //!    (I12.24:82: "advisory … default; changes nothing until owner acts"), and
 //!    the artifact is truthful about WHO chose it. What is not true of it is that
 //!    an owner chose it.
-//! 2. **`OwnerDecisionKind::Reject` remains unreachable from a real,
-//!    non-constant source**, and so do `WorkItem` and `Experiment`. That is not
-//!    repaired here, because every available substitute is a fabrication: the
-//!    maintenance owner's own `AutomationDecision` (`eliot-maintenance/src/lib.rs:184`)
-//!    decides whether to run a maintenance JOB and never saw this brief; the
+//! 2. **The SELECTION is now content-derived, and the four dispositions are
+//!    still not an owner's.** [`daemon_disposition_kind`] derives the kind from
+//!    the Governor maintenance owner's own recorded
+//!    [`AutomationDecision`](eliot_maintenance::AutomationDecision) over the same
+//!    family and scope this artifact is assembled from, so
+//!    [`OwnerDecisionKind::Reject`] — which was previously unreachable from any
+//!    non-constant source, because the kind was spelled `Investigate` at the
+//!    call site — is now reached on a real recorded verdict, and the blocked
+//!    intake this module exists to serve is that verdict. What remains
+//!    unrepaired is the PRINCIPAL, not the selection: the maintenance owner
+//!    decided whether to run a maintenance JOB and never saw this brief, the
 //!    observed closure's `actor_id` is the principal that EXECUTED the
-//!    consequential attempt and selected nothing; and the `G-19` admission
+//!    consequential attempt and selected nothing, and the `G-19` admission
 //!    authority issues learning-admission PERMITS, which is a different act from
-//!    selecting a disposition over a brief. Mapping any of them onto this
-//!    vocabulary would record an owner's decision that owner never made — the
-//!    misattribution [`maintenance_evidence_source`] exists to remove, reached
-//!    from the other direction.
+//!    selecting a disposition over a brief. So the daemon is still the recorded
+//!    selector, its verdict is still only EVIDENCE, and the note names both.
+//!    `WorkItem` and `Experiment` remain unproduced anywhere in `bins/`, because
+//!    reaching them would require a work item or an experiment this intake does
+//!    not hold — and both are mutating kinds, which I12.24:82 forbids without
+//!    an owner action that has no route here.
 //!
 //! # The exact missing route, named
 //!
@@ -369,12 +487,12 @@ use eliot_improvement::{
     ChangeDescriptor, EvidenceSource, ImprovementBrief, ImprovementCandidate, ImprovementError,
     ImprovementLifecycle, ImprovementSurface, OwnerDecision, OwnerDecisionKind, ReplayPlan,
     SafeBoundary, SourcedEvidence, brief_at_safe_boundary, candidate_from_evidence,
-    check_class_gate, classify, sourced_evidence,
+    check_class_gate, classify, require_matched_budget_for_promotion, sourced_evidence,
 };
 use eliot_maintenance::{
     IMPROVEMENT_ADMISSION_AUTHORITY, IMPROVEMENT_CANDIDATE_BOUNDS_REVISION,
     ImprovementAdmissionPolicy, ImprovementBoundError, ImprovementSurfaceBound,
-    ImprovementTargetSurface, resolve_candidate_surface_bound,
+    ImprovementTargetSurface, MaintenanceTrigger, resolve_candidate_surface_bound,
 };
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::RequestBinding;
@@ -566,51 +684,37 @@ pub fn assemble_improvement_artifact(
     state_fence: &StateFence,
     observed_closures: &eliot_governor::CanonicalLearningDeltaStore,
 ) -> Result<ImprovementArtifact, ImprovementDispatchError> {
-    // Evidence lineage: the decision's own stable identity, never a fresh
-    // per-observation value, so a repeat deduplicates.
-    let evidence_refs = maintenance_evidence_refs(decision);
+    // The observed campaign-closure record is read FIRST, because the
+    // candidate's evidence lineage is now BOUND to it (issue #1867 W2,
+    // I12.24:53 "successful transfer or evidence that an existing procedure is
+    // unnecessary"). It was already a mandatory input of this function — see
+    // the boundary below — but its own committed lineage reached only the
+    // brief's prose, so the deduplication comparison was made over strictly
+    // less evidence than the candidate actually rests on. Reading it here costs
+    // no extra exchange: it is the same mutex-guarded read of the same
+    // in-process image the boundary performs, under the composition guard the
+    // caller already holds, with no `await` between them.
+    let observed = newest_observed_closure(observed_closures)?;
+    let decision_refs = maintenance_evidence_refs(decision);
     let trace_refs = vec![format!("maintenance-family:{}", decision.family)];
     // `MaintenanceFamily` carries a `Display` impl (its canonical SCREAMING
     // spelling); `AutomationDecision` and `DecisionReason` are `Debug`-only
     // closed owner enums and gain no `Display` here, so they are named by
     // their derived variant spelling instead.
     let trigger = maintenance_trigger_text(decision);
-    // The replay plan is diagnostic-only (I12.24:76-77): the fixed replay,
-    // holdout and transfer legs are the decision's own canonical refs, and the
-    // counter metrics name what must not regress. Promotion is separately
-    // refused by the intake's budget gate, which this advisory path does not
-    // attempt to satisfy.
-    let replay_plan = maintenance_replay_plan(decision, &evidence_refs);
+    // The replay plan is built over the DECISION's refs alone, not the combined
+    // lineage; the reason is recorded on `maintenance_replay_plan`.
+    let replay_plan = maintenance_replay_plan(decision, &decision_refs);
+    let evidence_refs = closure_bound_evidence_refs(decision_refs, &observed);
     let admitted_scope = admitted_fence_ref(state_fence)?;
-    // The evidence bundle is selected by the DERIVED source, not asserted
-    // (issue #1867 W2). Every source but one is the maintenance occurrence
-    // itself, and is assembled by the funnel's own validated constructor. The
-    // conformance-audit source is different in kind: I12.24:50 names the
-    // trigger "Architecture/Implementation/runtime conformance gap", so that
-    // evidence enters the funnel through the Self-Quality conformance
-    // diagnosis contract, which owns the finding's inert owner handoff
-    // (`eliot_self_quality::conformance_evidence`), rather than being labelled
-    // as a maintenance occurrence and losing the conformance owner, the
-    // priority axis and the invalidation set the finding recorded. Both arms
-    // terminate in the same `eliot_improvement::sourced_evidence` validation,
-    // so neither can bypass it.
-    let evidence = match maintenance_evidence_source(decision) {
-        EvidenceSource::ConformanceDiagnosis => {
-            conformance_diagnosis_evidence(decision, &trigger, &admitted_scope)?
-        }
-        source => sourced_evidence(
-            source,
-            &evidence_refs,
-            &trace_refs,
-            &trigger,
-            &[format!(
-                "unproven-blocked-automation:{}",
-                decision.trigger_id
-            )],
-            &admitted_scope,
-            IMPROVEMENT_OWNER,
-        )?,
-    };
+    let evidence = maintenance_sourced_evidence(
+        decision,
+        &observed,
+        &evidence_refs,
+        &trace_refs,
+        &trigger,
+        &admitted_scope,
+    )?;
 
     let mut candidate = candidate_from_evidence(
         SERVICE_NAME,
@@ -631,25 +735,22 @@ pub fn assemble_improvement_artifact(
     // path does, so the durable record carries the owner-decision lifecycle.
     candidate.transition_lifecycle(ImprovementLifecycle::Triaged)?;
 
-    // The application-class boundary is enforced HERE, in the production
-    // assembly, not only inside `prepare_intake` (issue #1867 W5). Before this
-    // the gate had no production caller at all: `classify` and
-    // `check_class_gate` were reachable only from `intake_from_evidence`, which
-    // this daemon deliberately does not call because its budget gate would
-    // demand fabricated canary refs. The class is therefore decided here from
-    // the candidate's OWN recorded surface, and a candidate whose recorded
-    // surface the owner forbids to the advisory class is refused rather than
-    // assembled.
+    // The application-class boundary is enforced in the production path, not
+    // only inside `prepare_intake` (issue #1867 W5). Before this the gate had no
+    // production caller at all: `classify` and `check_class_gate` were reachable
+    // only from `intake_from_evidence`, which this daemon deliberately does not
+    // call because its budget gate would demand fabricated canary refs. The
+    // class is therefore decided from the candidate's OWN recorded surface, and
+    // a candidate whose recorded surface the owner forbids to the advisory
+    // class is refused rather than admitted.
     //
-    // Stated plainly so this call is not read as broader than it is: the
-    // candidate assembled above records [`IMPROVEMENT_SURFACE`] (`Memory`),
-    // which is not a protected surface, so on the live maintenance path the
-    // class taken is `Advisory` and the gate passes. What the gate buys here is
-    // that the class is a FUNCTION of the candidate's recorded surface rather
-    // than of literals — a candidate carrying `Verifier` or `Scheduler` is
-    // refused. See `enforce_advisory_class_gate` for the exact ceiling,
-    // including the two classes this path cannot represent at all.
-    enforce_advisory_class_gate(&candidate)?;
+    // The call is made at the ADMISSION seam
+    // ([`admit_improvement_artifact`]) rather than here, because that is where
+    // the live registry is in hand and I12.24:86's "one experiment per control
+    // surface" is a count over it. This function runs before the authenticated
+    // read that restores that registry, so a count taken here would be a claim
+    // rather than a measurement. See `enforce_improvement_class_gate` for the
+    // full argument and for the two classes this path cannot represent at all.
 
     // The safe boundary is READ, not spelled. It used to be two formatted
     // strings (a constant owner and a constant `boundary:{scope_ref}`), which
@@ -680,20 +781,26 @@ pub fn assemble_improvement_artifact(
     // purpose, because it said nothing about what the closure actually
     // recorded.
     //
-    // `load` is the same mutex-guarded read `from_observed_closure` just
-    // performed on the same image, under the composition guard the caller
-    // already holds (`daemon_runtime::improvement_intake_artifact`), and this
-    // guarded phase commits nothing, so the newest record here is the record
-    // whose `actor_id` and `consequential_boundary` the boundary above names.
-    // It is read a second time because the two-string `SafeBoundary` cannot
-    // carry the record itself: `eliot-improvement` has no `eliot-learning-delta`
-    // edge, so widening `SafeBoundary` to hold one would be a new dependency
-    // for a value the brief only needs to quote. The record TYPE is not named
-    // here either — `eliotd` has no `eliot-learning-delta` dependency — so it is
-    // read by inference and through the record's own accessors. An unreadable
-    // or empty image is the same typed `UnsafeBoundary` refusal the boundary
-    // constructor returns for the same condition, never a substituted value.
-    let observed = newest_observed_closure(observed_closures)?;
+    // `observed` was read at the TOP of this function, from the same
+    // mutex-guarded image, under the composition guard the caller already holds
+    // (`daemon_runtime::improvement_intake_artifact`), and this guarded phase
+    // commits nothing, so it is the record whose `actor_id` and
+    // `consequential_boundary` the boundary above names. It is read there and
+    // not here for two reasons that are now both load-bearing: the evidence
+    // lineage is bound to it (issue #1867 W2, see the top of this function), and
+    // the two-string `SafeBoundary` cannot carry the record itself —
+    // `eliot-improvement` has no `eliot-learning-delta` edge, so widening
+    // `SafeBoundary` to hold one would be a new dependency for a value the
+    // brief only needs to quote. The record TYPE is not named here either —
+    // `eliotd` has no `eliot-learning-delta` dependency — so it is read by
+    // inference and through the record's own accessors. An unreadable or empty
+    // image is the same typed `UnsafeBoundary` refusal the boundary constructor
+    // returns for the same condition, never a substituted value — and because
+    // the read was hoisted, it now surfaces EARLIER than it used to: before
+    // `admitted_fence_ref`'s refusal and before any candidate is assembled,
+    // where previously the fence refusal was reported first. Same typed error,
+    // same condition, different precedence; stated because the precedence is
+    // observable to the caller as which error string a pass reports.
     // The durable lineage handle and canonical digest the record itself
     // committed, so the owner can read exactly this closure without searching.
     let (observed_artifact, observed_digest) = (
@@ -747,71 +854,7 @@ pub fn assemble_improvement_artifact(
         &boundary,
     )?;
 
-    // The disposition recorded here is the DAEMON'S OWN, and is named that way.
-    //
-    // It is still the production caller of the bridge's `record_brief_decision`,
-    // which previously had none, and it is still non-mutating: `Investigate` is
-    // one of the two kinds `is_non_mutating` admits, and recording it changes
-    // no surface, which is I12.24:82's "advisory … default; changes nothing
-    // until owner acts" observed rather than asserted.
-    //
-    // What changed is the `owner`. It used to be [`IMPROVEMENT_OWNER`], the
-    // maintenance (`G-19`) admission authority, on the reasoning that this field
-    // names the principal that RECORDED the disposition and the maintenance owner
-    // is that principal because it issued the permit this candidate was assembled
-    // under. That reasoning was wrong, and it is the same error this issue
-    // exists to remove, read from the other side. Issuing a learning-admission
-    // permit is a different act from selecting a disposition over a brief: the
-    // `G-19` owner admitted the CANDIDATE to the bounded backlog, and it never
-    // saw this brief, never read it, and chose nothing about it. Recording its
-    // name against a disposition it did not select is precisely the false
-    // attribution A12.02:3 forbids — "Identity is not a model's self-declared
-    // string" — with the failure running the other way: not a model inventing an
-    // identity, but a real principal's name attached to a decision that principal
-    // never made. A later reader of `improvement_dedup_read` takes that field at
-    // its word, so the false attribution is not harmless; it is a durable claim
-    // about a real owner.
-    //
-    // The owner recorded now is the only principal that genuinely selected this
-    // disposition: the daemon itself, under its own service identity
-    // ([`SERVICE_NAME`]). That identity is not self-declared — A12.02:3 is
-    // "Identity is not a model's self-declared string" — it is the installed
-    // service's own, named by the composition and carried on every request
-    // identity this daemon commits (`improvement_commit_identity` below binds it
-    // as both `product_id` and `source_id`), and the exchange it makes over is
-    // authenticated in the other direction too: the Kernel front door proves
-    // this daemon's peer SID, session identity and artifact digest before the
-    // connection is used (`daemon_kernel_client.rs:1878-1908`). It grants nothing
-    // either way — `is_non_mutating` is what makes the record advisory. A note
-    // that says "the daemon triaged this and no owner has ruled on it" is a
-    // smaller claim than the one it replaces, and it is a TRUE one.
-    //
-    // It is deliberately NOT the brief's `proposed_owner` either. That field
-    // names the principal proposed to DECIDE (the observed boundary's
-    // `actor_id`, read from a committed closure record); this field names the
-    // principal that DID record a disposition. The daemon is not proposed to
-    // decide its own brief, so conflating the two would overwrite the one route
-    // an owner's decision has a named place to arrive through.
-    //
-    // The four dispositions remain unreachable from an owner's selection, and
-    // `OwnerDecisionKind::Reject` in particular is not produced anywhere in
-    // `bins/`. The measurement of every candidate ingress surface, and the exact
-    // route that is missing and where it would attach, are recorded in the
-    // module documentation above under "The recorded disposition is the DAEMON's
-    // own, and no owner ingress exists". Nothing here substitutes a fabricated
-    // caller for it.
-    let decision_record = crate::improvement_intake::record_brief_decision(
-        &brief,
-        SERVICE_NAME,
-        OwnerDecisionKind::Investigate,
-        &format!(
-            "the daemon triaged blocked maintenance family {} at its own initiative; this \
-             disposition selects nothing and no owner has ruled on this brief, because no \
-             owner-issued ingress reaches this process",
-            decision.family
-        ),
-    )
-    .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))?;
+    let decision_record = record_daemon_disposition(&brief, decision)?;
 
     // Deduplication and bounded admission are NOT done here. They need the
     // live Governor owner (a real permit whose authority the bound is checked
@@ -823,6 +866,145 @@ pub fn assemble_improvement_artifact(
         brief,
         decision: decision_record,
     })
+}
+
+/// The non-mutating disposition the daemon selects over the brief it just
+/// assembled, DERIVED from the Governor maintenance owner's own recorded verdict
+/// on the same family and scope (issue #1867 A2, I12.24:65).
+///
+/// A2 reads "An owner can select a non-mutating decision such as reject or
+/// investigate." This function is what makes the SELECTION real rather than a
+/// constant, and it keeps it inside the two kinds
+/// [`OwnerDecision::is_non_mutating`] admits, so recording it authorizes nothing
+/// — I12.24:82's "advisory … default; changes nothing until owner acts"
+/// observed rather than asserted.
+///
+/// # Why this derivation and not a hardcoded `Investigate`
+///
+/// The disposition used to be spelled `OwnerDecisionKind::Investigate` at the
+/// call site, which made `Reject` unreachable from any content: a later reader
+/// could not tell a considered triage from a default. The input here is the
+/// Governor owner's OWN closed [`AutomationDecision`] on the decision this intake
+/// was handed — the same verdict, over the same `family` and `scope_ref`, that
+/// this artifact is assembled from — so the kind is a function of recorded
+/// evidence rather than of this file's choice:
+///
+/// - [`AutomationDecision::Block`] is "Policy, route, budget or session
+///   requirements deny execution" (`eliot-maintenance/src/lib.rs:194`). The
+///   daemon's own triage of a brief proposing to "evaluate and resolve the
+///   blocked maintenance family" is therefore [`OwnerDecisionKind::Reject`]:
+///   the owner denied the work, so the daemon stops pursuing the proposal. This
+///   is the live case, which is exactly why the constant made the gap
+///   invisible — the arm that mattered was the one never written.
+/// - every other value maps to [`OwnerDecisionKind::Investigate`], including
+///   [`AutomationDecision::Escalate`], which hands the occurrence to a Human or
+///   recovery owner: that owner was GIVEN the problem and has not yet ruled, so
+///   "investigate" is the truthful record and "reject" would claim a resolution
+///   nobody reached.
+///
+/// # What this is NOT
+///
+/// The principal recorded against the decision is still the DAEMON
+/// ([`SERVICE_NAME`], see below), never the maintenance owner. The maintenance
+/// owner's `AutomationDecision` is the EVIDENCE this triage is derived from; it
+/// is not a selection over this brief, because that owner never saw the brief.
+/// Naming it as the selector is the false attribution this module exists to
+/// remove, and the note text says which principal chose and on whose recorded
+/// verdict. The route by which an OWNER's own selection reaches this process is
+/// still absent, and the full measurement of every candidate ingress surface is
+/// in the module documentation above under "The recorded disposition is the
+/// DAEMON's own, and no owner ingress exists".
+fn daemon_disposition_kind(
+    decision: &eliot_maintenance::AutomationTriggerDecision,
+) -> OwnerDecisionKind {
+    use eliot_maintenance::AutomationDecision;
+    match decision.decision {
+        AutomationDecision::Block => OwnerDecisionKind::Reject,
+        _ => OwnerDecisionKind::Investigate,
+    }
+}
+
+/// Records the DAEMON'S OWN non-authoritative disposition over the brief it just
+/// assembled, and names it as such.
+///
+/// This is the production caller of the bridge's `record_brief_decision`, which
+/// previously had none, and it is still non-mutating: `Investigate` is one of the
+/// two kinds `is_non_mutating` admits, and recording it changes no surface, which
+/// is I12.24:82's "advisory … default; changes nothing until owner acts"
+/// observed rather than asserted.
+///
+/// # The owner is the daemon, and deliberately NOT `IMPROVEMENT_OWNER`
+///
+/// The `owner` used to be [`IMPROVEMENT_OWNER`], the maintenance (`G-19`)
+/// admission authority, on the reasoning that this field names the principal
+/// that RECORDED the disposition and the maintenance owner is that principal
+/// because it issued the permit this candidate was assembled under. That
+/// reasoning was wrong, and it is the same error this issue exists to remove,
+/// read from the other side. Issuing a learning-admission permit is a different
+/// act from selecting a disposition over a brief: the `G-19` owner admitted the
+/// CANDIDATE to the bounded backlog, and it never saw this brief, never read it,
+/// and chose nothing about it. Recording its name against a disposition it did
+/// not select is precisely the false attribution A12.02:3 forbids — "Identity is
+/// not a model's self-declared string" — with the failure running the other way:
+/// not a model inventing an identity, but a real principal's name attached to a
+/// decision that principal never made. A later reader of
+/// `improvement_dedup_read` takes that field at its word, so the false
+/// attribution is not harmless; it is a durable claim about a real owner.
+///
+/// The owner recorded now is the only principal that genuinely selected this
+/// disposition: the daemon itself, under its own service identity
+/// ([`SERVICE_NAME`]). That identity is not self-declared — A12.02:3 is "Identity
+/// is not a model's self-declared string" — it is the installed service's own,
+/// named by the composition and carried on every request identity this daemon
+/// commits (`improvement_commit_identity` below binds it as both `product_id` and
+/// `source_id`), and the exchange it makes over is authenticated in the other
+/// direction too: the Kernel front door proves this daemon's peer SID, session
+/// identity and artifact digest before the connection is used
+/// (`daemon_kernel_client.rs:1878-1908`). It grants nothing either way —
+/// `is_non_mutating` is what makes the record advisory. A note that says "the
+/// daemon triaged this and no owner has ruled on it" is a smaller claim than the
+/// one it replaces, and it is a TRUE one.
+///
+/// It is deliberately NOT the brief's `proposed_owner` either. That field names
+/// the principal proposed to DECIDE (the observed boundary's `actor_id`, read
+/// from a committed closure record); this field names the principal that DID
+/// record a disposition. The daemon is not proposed to decide its own brief, so
+/// conflating the two would overwrite the one route an owner's decision has a
+/// named place to arrive through.
+///
+/// The four dispositions remain unreachable from an owner's selection, and
+/// `OwnerDecisionKind::WorkItem` and `OwnerDecisionKind::Experiment` in
+/// particular are not produced anywhere in `bins/`, and the two non-mutating
+/// kinds are reached only from the DAEMON's own triage of its own observation.
+/// The measurement of every candidate ingress surface, and the exact route by
+/// which an owner's own selection is missing and where it would attach, are
+/// recorded in the module documentation above under "The recorded disposition is
+/// the DAEMON's own, and no owner ingress exists". Nothing here substitutes a
+/// fabricated caller for it.
+///
+/// `decision` is the Governor owner's own verdict this artifact is assembled
+/// from; the disposition is DERIVED from it by [`daemon_disposition_kind`] and
+/// the note names both the principal that chose and whose recorded verdict it
+/// chose on.
+fn record_daemon_disposition(
+    brief: &eliot_improvement::ImprovementBrief,
+    decision: &eliot_maintenance::AutomationTriggerDecision,
+) -> Result<OwnerDecision, ImprovementDispatchError> {
+    let kind = daemon_disposition_kind(decision);
+    crate::improvement_intake::record_brief_decision(
+        brief,
+        SERVICE_NAME,
+        kind,
+        &format!(
+            "the daemon triaged maintenance family {family} at its own initiative, on the \
+             maintenance owner's recorded verdict {verdict:?}; this disposition selects \
+             nothing and no owner has ruled on this brief, because no owner-issued ingress \
+             reaches this process",
+            family = decision.family,
+            verdict = decision.decision,
+        ),
+    )
+    .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))
 }
 
 /// The evidence lineage this observation raises, over the decision's own
@@ -853,12 +1035,205 @@ fn maintenance_trigger_text(decision: &eliot_maintenance::AutomationTriggerDecis
     )
 }
 
+/// The candidate's canonical evidence lineage: the decision's own refs, bound to
+/// the observed campaign closure's committed lineage (issue #1867 W2).
+///
+/// The decision's own refs are its stable identity, never a fresh
+/// per-observation value, so a repeat of the same decision deduplicates. What
+/// this adds is the observed closure: the two references come from the
+/// Governor-owned learning-closure record's own committed identity
+/// ([`ObservedClosure::lineage_evidence_refs`]), so two evaluations of the same
+/// family at the same scope over DIFFERENT committed closures are
+/// distinguishable evidence rather than one indistinguishable observation.
+///
+/// `decision_refs` is taken by value because it is consumed here and must NOT
+/// be reused afterwards: the replay plan is built over it before this call, and
+/// widening THAT set with the closure lineage would change what the replay
+/// claims to re-run.
+///
+/// # Distinctness: what is guaranteed, and the one ceiling that is NOT
+///
+/// Distinctness IS true here, and the argument is about the PREFIXES, which are
+/// this file's to choose, not about the record's validation:
+///
+/// - the two refs cannot collide with each other, because the prefixes
+///   `learning-closure:` and `learning-closure-digest:` first differ at
+///   0-BASED byte index 16 (`:` against `-`; index 17 is `d` in both), so no
+///   choice of `delta_artifact` and `delta_digest` can make the two formatted
+///   strings equal — distinct prefixes are never reconciled by any suffix;
+/// - neither can collide with a decision ref or the family trace ref, which are
+///   spelled `maintenance-trigger:`, `maintenance-scope:` and `maintenance-family:`.
+///   Those differ from `learning-closure:` within their first thirteen bytes, so
+///   no suffix can bridge them.
+///
+/// What is NOT bounded, and is a real ceiling introduced by adding these refs to
+/// the conformance arm's handoff, is their LENGTH. `ArtifactId` is a
+/// `string_id!` whose `validate_text` checks only non-blank and absence of
+/// control characters (`crates/foundation/eliot-contracts/src/lib.rs:334-342`)
+/// — no charset and no length bound — and `StoredLearningDelta::validate` bounds
+/// only `delta_artifact` for NON-EMPTINESS (its 256-character check at
+/// `stored.rs:250` covers `actor_id` and `route_id`). The Self-Quality side, by
+/// contrast, refuses any ref longer than `MAX_SELF_QUALITY_TEXT_BYTES = 1024`
+/// (`crates/foundation/eliot-conformance-contracts/src/self_quality.rs:68`,
+/// `:1898`). So a committed closure whose artifact identity exceeds 1007 bytes
+/// — the 1024-byte bound less this file's 17-byte prefix — makes the CONFORMANCE
+/// arm refuse with a typed `SelfQualityError::Contract`, where before this
+/// change that same closure was accepted. The digest ref cannot trigger it: it
+/// is a 24-byte prefix — a LENGTH, counted like the 17-byte prefix above and
+/// not an index into anything — plus the record's own 64 lowercase hex
+/// characters.
+///
+/// That ceiling is disclosed, not removed. Truncating or re-hashing a committed
+/// identity to fit would be a second spelling for an identity the artifact owner
+/// already issued, and shortening the prefix only moves the number. The refusal
+/// is fail-closed and typed, and the same condition would be caught by the
+/// funnel's own `require_refs` had the bound been there.
+///
+/// # The union this feeds is MONOTONE and has no ceiling — stated, not capped
+///
+/// These two refs are what the merge unions, and
+/// [`eliot_improvement::BoundedBacklog::merge_into`] unions into a `BTreeSet`
+/// and never removes
+/// (`crates/meta/eliot-improvement/src/candidate_bounds.rs:1100-1104`). So the
+/// surviving entry's lineage grows for as long as that entry stays active, and
+/// nothing in this repository prunes it:
+///
+/// - `require_refs` on the funnel side has NO maximum, unlike the Self-Quality
+///   side, which caps a single handoff's ref set at `MAX_SELF_QUALITY_REFS = 64`
+///   (`crates/foundation/eliot-conformance-contracts/src/self_quality.rs:66`).
+///   The two per-closure refs are added to the CONFORMANCE arm's handoff set
+///   too, so that cap bounds one handoff, not the accumulated union;
+/// - `archive_cause_for` has exactly three causes — `Ownerless`, `LowValue`,
+///   `Stale` — and none of them is a lineage size, so a long-lived entry is
+///   never relieved for having accumulated evidence.
+///
+/// The growth is not `3 + 2n`, and the earlier claim of that form was wrong
+/// twice over. Per merge the union gains whatever the incoming candidate's refs
+/// do not already contain, and that is more than the two closure refs:
+///
+/// - the decision's own refs are functions of the admitted fence (see this
+///   module's header on convergence), so an `authority_epoch.sequence` or
+///   `resource_generation` move makes BOTH of them new and adds two more refs to
+///   the union, which never drops the superseded pair;
+/// - `merge_into` unions `evidence_refs` and `source_trace_refs` as two separate
+///   sets, so the counts are per field and must not be added together.
+///
+/// The starting point, per field and measured rather than estimated: before this
+/// change `candidate.evidence_refs` held THREE elements on BOTH arms —
+/// `maintenance-trigger:{trigger_id}`, `maintenance-scope:{scope_ref}` and
+/// `maintenance-family:{family}` — because `candidate_from_evidence` fills
+/// `evidence_refs` from `SourcedEvidence::lineage_refs()`, the UNION of the
+/// bundle's own `evidence_refs` and `trace_refs` (`evidence_sources.rs:98-99`),
+/// and the conformance arm's `trace_refs` are its own symptom/problem/applicability
+/// union, which is the same three refs. `candidate.source_trace_refs` held one
+/// element on the non-conformance arm and three on the conformance arm. After
+/// this change `evidence_refs` is five on both arms and `source_trace_refs` is
+/// unchanged. A fence move between merges adds two to `evidence_refs` again.
+///
+/// The durable FOOTPRINT grows faster than the union does, and that is the part
+/// that was undisclosed. `lineage_merge_record_key` is
+/// `improvement-merge:{candidate_id}@{revision}` and `merge_into` advances the
+/// revision on every merge, so each merge appends a NEW receipt row rather than
+/// updating one; and each receipt document embeds the WHOLE surviving entry
+/// (`{merged_survivor, absorbed_candidate_id}`), which embeds the whole
+/// accumulated lineage. Row `k` is therefore O(k) in the number of merges and the
+/// total durable size is QUADRATIC in the number of observed closures. That is
+/// on top of the pre-existing per-tick candidate-row accumulation the earlier
+/// filing recorded and which this change does not touch: `brief_at_safe_boundary`
+/// mints a fresh `brief_id` and so a fresh `record_digest` on every call, and the
+/// store keys a row by `(record_kind, handle, record_digest)`. Every one of those
+/// rows is re-read and re-hashed every pass, because
+/// `improvement_dedup_read::read_candidate_scope` re-reads the whole candidate
+/// scope and `classify_row` re-hashes it.
+///
+/// No cap, prune or ceiling is added here, and that is a decision rather than an
+/// omission. Retention is a policy question this repository assigns to a
+/// retention owner, and inventing a limit here would be a second retention
+/// scheme beside the one that owner decides. What a retention owner would have
+/// to decide, and what this file deliberately does not decide for them: whether
+/// a candidate's evidence lineage is retained whole for the life of the entry,
+/// bounded per entry, bounded per surface by the `G-19` bound, or aged; whether
+/// merge receipts may be superseded rather than only appended, which is what
+/// would stop the quadratic growth; and whether lineage is prunable at all
+/// without losing the dedup property, since dropping a closure ref would make a
+/// later observation of that same closure look like a different candidate again.
+fn closure_bound_evidence_refs(
+    decision_refs: Vec<String>,
+    observed: &ObservedClosure,
+) -> Vec<String> {
+    let mut evidence_refs = decision_refs;
+    evidence_refs.extend(observed.lineage_evidence_refs());
+    evidence_refs
+}
+
+/// The validated evidence bundle for this observation, over both bound sources.
+///
+/// The bundle is selected by the DERIVED source, not asserted (issue #1867 W2).
+/// Every source but one is the maintenance occurrence itself, and is assembled
+/// by the funnel's own validated constructor. The conformance-audit source is
+/// different in kind: I12.24:50 names the trigger "Architecture/Implementation/
+/// runtime conformance gap", so that evidence enters the funnel through the
+/// Self-Quality conformance diagnosis contract, which owns the finding's inert
+/// owner handoff (`eliot_self_quality::conformance_evidence`), rather than
+/// being labelled as a maintenance occurrence and losing the conformance owner,
+/// the priority axis and the invalidation set the finding recorded. Both arms
+/// terminate in the same `eliot_improvement::sourced_evidence` validation, so
+/// neither can bypass it.
+///
+/// `evidence_refs` is already closure-bound by
+/// [`closure_bound_evidence_refs`]; the conformance arm re-derives its own set
+/// from `observed` rather than reading this argument, because that set is not
+/// this constructor's to shape. The #971 handoff takes TEN ref slots
+/// ([`eliot_conformance_contracts::SelfQualityHandoff`]) that `make_handoff`
+/// fills positionally and then SORTS, and the sorted result is what
+/// `validate_handoff` → `validate_ref_set` checks for repeats
+/// (`crates/foundation/eliot-conformance-contracts/src/self_quality.rs:1227`,
+/// `:1933-1958`). The `ConformanceDiagnosis` field group this file builds is
+/// never itself sorted-checked, so the arm assembles its refs to suit that
+/// constructor's slots and owes exactly one property of its own: that they are
+/// DISTINCT. Building them next to the other nine keeps that visible; inheriting
+/// a set assembled for `sourced_evidence` would make the two arms' ref
+/// construction indistinguishable at a glance for no gain.
+fn maintenance_sourced_evidence(
+    decision: &eliot_maintenance::AutomationTriggerDecision,
+    observed: &ObservedClosure,
+    evidence_refs: &[String],
+    trace_refs: &[String],
+    trigger: &str,
+    validity_scope: &str,
+) -> Result<SourcedEvidence, ImprovementDispatchError> {
+    match maintenance_evidence_source(decision) {
+        EvidenceSource::ConformanceDiagnosis => {
+            conformance_diagnosis_evidence(decision, trigger, validity_scope, observed)
+        }
+        source => sourced_evidence(
+            source,
+            evidence_refs,
+            trace_refs,
+            trigger,
+            &[format!(
+                "unproven-blocked-automation:{}",
+                decision.trigger_id
+            )],
+            validity_scope,
+            IMPROVEMENT_OWNER,
+        )
+        .map_err(ImprovementDispatchError::from),
+    }
+}
+
 /// The diagnostic-only replay plan for this observation (I12.24:76-77).
 ///
 /// The fixed replay, holdout and transfer legs are the decision's own canonical
 /// refs, and the counter metric names what must not regress. Promotion is
 /// separately refused by the budget gate, which this advisory path does not
 /// attempt to satisfy.
+///
+/// The caller passes the DECISION's refs alone, never the combined
+/// closure-bound lineage of [`closure_bound_evidence_refs`]:
+/// `ReplayPlan::fixed_replay_refs` is the set the replay re-runs, and the
+/// closure lineage names the record that was observed rather than work to
+/// re-run, so widening it here would change what the replay claims to fix.
 fn maintenance_replay_plan(
     decision: &eliot_maintenance::AutomationTriggerDecision,
     evidence_refs: &[String],
@@ -872,13 +1247,14 @@ fn maintenance_replay_plan(
     }
 }
 
-/// The material one observed closure contributes to the brief.
+/// The material one observed closure contributes: to the candidate's evidence
+/// lineage and to the brief.
 ///
 /// Owned, not borrowed: the record TYPE cannot be named here — neither `eliotd`
 /// nor `eliot-improvement` has an `eliot-learning-delta` edge, and adding one for
-/// a value the brief only quotes would be a new dependency. The closure's
-/// accessors are read through inference and their results carried by value, so
-/// nothing in this module depends on the record's concrete type.
+/// a value the candidate and brief only quote would be a new dependency. The
+/// closure's accessors are read through inference and their results carried by
+/// value, so nothing in this module depends on the record's concrete type.
 struct ObservedClosure {
     /// Durable lineage handle and canonical digest the record committed.
     lineage_artifact: String,
@@ -901,9 +1277,11 @@ struct ObservedClosure {
 ///
 /// The same mutex-guarded read [`SafeBoundary::from_observed_closure`] performs
 /// on the same image, under the composition guard the caller already holds, so
-/// both see the same newest record. An unreadable or empty image is the same
-/// typed [`ImprovementError::UnsafeBoundary`] refusal, never a substituted
-/// value.
+/// both see the same newest record; this one runs FIRST, because the candidate's
+/// evidence lineage is bound to it (see
+/// [`ObservedClosure::lineage_evidence_refs`]). An unreadable or empty image is
+/// the same typed [`ImprovementError::UnsafeBoundary`] refusal, never a
+/// substituted value.
 fn newest_observed_closure(
     observed_closures: &eliot_governor::CanonicalLearningDeltaStore,
 ) -> Result<ObservedClosure, ImprovementError> {
@@ -924,6 +1302,46 @@ fn newest_observed_closure(
         carries_behavioural_proposal: observed.carries_behavioural_proposal(),
         has_retry_lineage: observed.lineage_for_retry().is_some(),
     })
+}
+
+impl ObservedClosure {
+    /// The committed closure's own durable lineage, as evidence refs.
+    ///
+    /// This is the W2 "task/campaign closure" source, and the values are the
+    /// record's OWN committed identity rather than anything this dispatch layer
+    /// composes: `lineage_ref()` is the record's own accessor for the durable
+    /// delta artifact and the canonical digest of exactly those bytes
+    /// (`StoredLearningDelta::lineage_ref`,
+    /// `crates/smart/eliot-learning-delta/src/stored.rs:306`). The artifact
+    /// handle is namespaced so it cannot collide with a maintenance ref, and
+    /// the digest is prefixed for the same reason and because the bare digest is
+    /// not a resolvable handle on its own.
+    ///
+    /// Why this is the honest binding and not a label. I12.24:60-61 puts a
+    /// durable evidence set at the funnel's second step, and this record IS one:
+    /// the Governor's learning-closure owner committed it from owner-recorded
+    /// lifecycle activities, and [`SafeBoundary::from_observed_closure`] already
+    /// refuses the whole pass when it is absent. Before this, the candidate's
+    /// deduplication lineage was built from the maintenance decision alone, so
+    /// two observations of the same family at the same scope over DIFFERENT
+    /// committed closures were indistinguishable in the registry and in
+    /// `BoundedBacklog::merge_target`'s overlap test — a real closure was
+    /// recorded, cited in the brief, and then absent from the evidence the
+    /// candidate was compared on. Naming it here makes the comparison see it.
+    ///
+    /// Both refs are non-empty by the record's own validation
+    /// (`StoredLearningDelta::validate` requires a non-empty `delta_artifact` and
+    /// a lowercase-hex `delta_digest`), so they satisfy
+    /// [`eliot_improvement::SourcedEvidence`]'s `require_refs` without a
+    /// substituted value. They are distinct from each other and from every
+    /// decision ref by construction, so the conformance arm's `validate_ref_set`
+    /// sorted-unique requirement still holds.
+    fn lineage_evidence_refs(&self) -> Vec<String> {
+        vec![
+            format!("learning-closure:{}", self.lineage_artifact),
+            format!("learning-closure-digest:{}", self.lineage_digest),
+        ]
+    }
 }
 
 /// What the observed closure actually concluded about behaviour.
@@ -1028,19 +1446,56 @@ fn observed_unknowns(
 /// `work_item_ref` is `None` because the candidate records no work item.
 /// Those absences are the fail-closed direction: a candidate whose recorded
 /// surface classifies as `Protected` is refused with
-/// [`ImprovementError::ApplicationClassViolation`] rather than assembled, and
-/// `live_experiments_on_surface` is `0` — this path starts no experiment — but
-/// it is not read, because the tuning class is not representable above.
+/// [`ImprovementError::ApplicationClassViolation`] rather than assembled.
 ///
-/// The refusal is therefore content-bound: it turns on the surface the
-/// candidate actually records. It is not a claim that every class upgrade is
-/// caught, and no such claim is made here.
-fn enforce_advisory_class_gate(
+/// `live_experiments_on_surface` is the REAL count of live candidates on this
+/// candidate's own surface, read from the governed backlog through
+/// [`BoundedBacklog::active_for`]. It used to be a literal `0` here, which
+/// satisfied I12.24:86's "one experiment per control surface" by asserting the
+/// bound instead of measuring it — the same shape-check-as-proof defect this
+/// whole function exists to remove, and it was the last unmeasured argument left
+/// on this call. The count is now the registry's own live entries for the
+/// recorded surface, so if a future change makes the tuning class representable
+/// the bound is compared against the owner registry rather than against a
+/// number this file chose. The registry in hand is the one restored from the
+/// committed records
+/// (`improvement_dedup_read::restored_registry`), i.e. the durable set, not an
+/// in-memory placeholder.
+///
+/// The refusal is therefore content-bound twice over: it turns on the surface the
+/// candidate actually records, and — for the one class that reads the count — on
+/// the live experiments that surface actually has. It is not a claim that every
+/// class upgrade is caught, and no such claim is made here.
+///
+/// # Why the count is read at the admission seam, not at assembly
+///
+/// The registry is the SECOND guarded phase's input
+/// ([`admit_improvement_artifact`], reached from
+/// `daemon_runtime::admit_over_restored_registry` only after the guard is
+/// released for the authenticated read), and
+/// [`assemble_improvement_artifact`] runs before that read with no registry in
+/// hand. Enforcing the gate in both places would mean measuring the count twice
+/// against two different registries, and the assembly-time copy would still be
+/// unmeasured. So the gate runs ONCE, at the admission seam, where the candidate
+/// and the live registry are both real and the count is a fact rather than a
+/// claim. The candidate assembled earlier is the same value this gate reads, so
+/// nothing is decided on a surface the candidate does not record.
+fn enforce_improvement_class_gate(
     candidate: &ImprovementCandidate,
+    backlog: &BoundedBacklog,
 ) -> Result<(), ImprovementDispatchError> {
     let change = ChangeDescriptor::from_recorded_surface(candidate.target_surface);
     let class = classify(&change);
-    check_class_gate(class, &change, 0, &candidate.rollback, None, false, None)?;
+    let live_experiments_on_surface = backlog.active_for(candidate.target_surface).len();
+    check_class_gate(
+        class,
+        &change,
+        live_experiments_on_surface,
+        &candidate.rollback,
+        None,
+        false,
+        None,
+    )?;
     Ok(())
 }
 
@@ -1157,81 +1612,154 @@ fn enforce_advisory_class_gate(
 /// intake. The honest outcome here is the `Attempt` label above plus that
 /// stated ceiling, not a refusal to classify a live observation.
 ///
-/// # The three sources with NO arm, and the producer each waits for
+/// # The two suggestion sources now CONNECTED, and how
 ///
-/// [`EvidenceSource::Watchdog`], [`EvidenceSource::Dreamer`] and
-/// [`EvidenceSource::Concilium`] are the W2 sources that are not merely an
-/// unreachable arm but an ABSENT one: the match below has no pattern that could
-/// produce them, while the closed vocabulary does carry all three honestly
-/// (`evidence_sources.rs:29-31`). They no longer share the reason the
-/// `ASSUMPTION` above used to give them, because that reason is discharged.
-/// What each still lacks is its own producer, and the remaining step differs
-/// per source:
+/// [`EvidenceSource::Watchdog`] and [`EvidenceSource::Dreamer`] are the two of
+/// I12.24:54's "Dreamer/Watchdog/Concilium suggestion" that the closed
+/// [`MaintenanceTrigger`] vocabulary can actually carry, and they are now
+/// selected by [`maintenance_trigger_evidence_source`] from
+/// [`AutomationTriggerDecision::trigger`]. That field is the evaluator's
+/// verbatim copy of the caller-observed origin, so the label is a derivation
+/// from the observation rather than an assertion about it — the same standard
+/// the family match above is held to. The remaining step for each is a
+/// PRODUCER, not a vocabulary, and each is one route away:
 ///
-/// - `Watchdog` is the CLOSEST of the three, and its remaining step is now a
-///   single origin at a single site rather than a missing contract field.
-///   Measured on this tree, not assumed:
-///
-///   1. The origin that denotes a Watchdog/Doctor occurrence,
-///      `MaintenanceTriggerOrigin::AdmittedObservation`, is live and has exactly
-///      ONE construction site in this daemon
-///      (`daemon_runtime.rs:2868`, the store-health poll). The origin→trigger
-///      map is exhaustive over the four-member origin enum
-///      (`maintenance_trigger_evaluator.rs:122-128`), and only
-///      `AdmittedObservation` maps to `MaintenanceTrigger::WatchdogProblem`, so
-///      that one site is the only producer of a `WatchdogProblem` decision.
-///   2. That decision does not reach this function. It is consumed at
-///      `daemon_runtime.rs:2902-2906` by
-///      `note_blocked_automation_notification` and
-///      `publish_maintenance_source_results`; it is never handed to
-///      `run_improvement_intake` (`:5260`), whose only call site is
-///      `maybe_start_improvement_intake` (`:5797`).
-///   3. The one observation that DOES reach this function is built at
-///      `daemon_runtime::improvement_intake_observation` (`:5684`), which names
-///      `MaintenanceTriggerOrigin::IdleTransition` unconditionally (`:5690`).
-///      The intake is therefore the sole consumer of that one origin, and the
-///      decision it assembles over carries `MaintenanceTrigger::Policy`.
-///
-///   **The exact remaining step**, now that the origin travels on the decision:
-///   a trigger site that hands this intake an observation built from
-///   `MaintenanceTriggerOrigin::AdmittedObservation`. The site already exists
-///   and already builds exactly such an observation
-///   (`daemon_runtime.rs:2868`); what is absent is a route carrying it from
-///   there into `improvement_intake_observation`. Once that route exists, this
-///   function can select [`EvidenceSource::Watchdog`] by comparing
-///   `decision.trigger` against [`MaintenanceTrigger::WatchdogProblem`] — a
-///   value it now holds, and the one value in the closed origin map that means
-///   "Watchdog/Doctor problem recipe"
-///   (`maintenance_trigger_evaluator.rs:118-119`). Until then the arm would be
-///   dead on a value the live path provably cannot carry, so it is not wired.
-/// - `Dreamer` needs a Dreamer that SUGGESTS work, and its gap is LARGER than
-///   the Watchdog one in a way the origin map settles. `MaintenanceTrigger` has
-///   a `Dreamer` member (`lib.rs:184-185`), but NO origin maps to it: the
-///   exhaustive map at `maintenance_trigger_evaluator.rs:122-128` names only
-///   `Policy`, `Onboarding` and `WatchdogProblem`. So unlike `Watchdog`, a
-///   `Dreamer` decision cannot be produced by re-routing an existing origin —
-///   it needs a NEW `MaintenanceTriggerOrigin` member, which is a vocabulary
-///   this issue does not own. Independently, no Dreamer instance proposes
-///   anything to this daemon: the route is owner-declared and unassigned on
-///   this base, an omitted Dreamer route resolving to `RouteState::Unassigned`
-///   with no paid route (`eliot_config::first_run::decide_first_run`).
-/// - `Concilium` needs a deliberation verdict with a route into this intake,
-///   and its gap is largest of the three: `MaintenanceTrigger` has NO
+/// - `Watchdog` is the closest. The origin that denotes a Watchdog/Doctor
+///   occurrence, `MaintenanceTriggerOrigin::AdmittedObservation`, is live and has
+///   exactly ONE construction site in this daemon (`daemon_runtime.rs:2868`, the
+///   store-health poll). The origin→trigger map is exhaustive over the
+///   four-member origin enum (`maintenance_trigger_evaluator.rs:122-128`), and
+///   only `AdmittedObservation` maps to
+///   `MaintenanceTrigger::WatchdogProblem`, so that one site is the only
+///   producer of a `WatchdogProblem` decision — and that decision does not reach
+///   this function. It is consumed at `daemon_runtime.rs:2902-2906` by
+///   `note_blocked_automation_notification` and
+///   `publish_maintenance_source_results`, while the one observation that DOES
+///   reach here is built at `daemon_runtime::improvement_intake_observation`
+///   (`:5684`) from `MaintenanceTriggerOrigin::IdleTransition`, which maps to
+///   `MaintenanceTrigger::Policy`. The exact remaining step is therefore a route
+///   carrying that existing site into the intake; the classifier needs no
+///   further change, because it already reads the field the route would deliver.
+/// - `Dreamer` needs a NEW `MaintenanceTriggerOrigin` member. `MaintenanceTrigger`
+///   HAS a `Dreamer` member (`lib.rs:184-185`) and this classifier now reads it,
+///   but NO origin maps to it: the exhaustive map at
+///   `maintenance_trigger_evaluator.rs:122-128` names only `Policy`,
+///   `Onboarding` and `WatchdogProblem`. So unlike `Watchdog`, a `Dreamer`
+///   decision cannot be produced by re-routing an existing origin, and that new
+///   vocabulary member is not this file's to add. Independently, no Dreamer
+///   instance proposes anything to this daemon: the route is owner-declared and
+///   unassigned on this base, an omitted Dreamer route resolving to
+///   `RouteState::Unassigned` with no paid route
+///   (`eliot_config::first_run::decide_first_run`).
+/// - `Concilium` remains the one suggestion source with NO arm, and the reason
+///   is structural rather than a missing route: `MaintenanceTrigger` has NO
 ///   `Concilium` member at all, so a Concilium verdict could not be carried on
 ///   the decision even if the field were consulted. A vocabulary claim with no
 ///   producer behind it is the mirror of the misattribution this function
-///   exists to remove, so none is added here. The funnel's request source is
-///   also absent (see this module's header on `ImprovementRouteRequest` having
-///   no production request source), so a verdict has no path into
+///   exists to remove, so none is added. The funnel's request source is also
+///   absent (see this module's header on `ImprovementRouteRequest` having no
+///   production request source), so a verdict has no path into
 ///   `assemble_improvement_artifact` at all.
 ///
-/// None is filled here because none has a producer this file could read without
-/// inventing the observation it claims. Filling any of them from a decision
-/// would reinstate exactly the misattribution the removed residual was — and
-/// with `trigger` now readable, that misattribution would be materially easier
-/// to commit by accident, which is the reason the `Watchdog` arm waits for a
-/// route rather than being wired speculatively against a field that exists but
-/// can only ever read `Policy` here.
+/// # The three sources with no producer AT ALL
+///
+/// [`EvidenceSource::EvaluatorVerdict`],
+/// [`EvidenceSource::ImplementationDeviation`] and
+/// [`EvidenceSource::Complaint`] are the three variants this function still does
+/// not connect, and they are separated from the suggestion sources above because
+/// their gap is different in kind: not "a route is missing" but "no admitted
+/// owner produces the observation". Measured, not assumed:
+///
+/// - `EvaluatorVerdict` has a constructor and no caller.
+///   [`eliot_improvement::sourced_evidence_from_repeated_verifier_failure`]
+///   exists and is re-exported (`evidence_sources.rs:118`, `lib.rs:379`). Its
+///   occurrences are that definition, that re-export, a prose mention in the
+///   improvement crate's own header (`lib.rs:163`), and citations in this
+///   comment — and ZERO call sites. That is the finding, and it is stated as a
+///   call-site count rather than as an exhaustive hit list deliberately: a hit
+///   list necessarily includes this comment, so no phrasing of one can return
+///   "nothing else" on any tree where the comment exists. The funnel
+///   already has the exact typed constructor for this source and zero producers
+///   of its input. That input is a REPEATED VERIFIER failure, and this daemon
+///   holds none: it has no verification owner on its dependency list
+///   (`git grep -n "eliot-verification\|verifier" -- bins/eliotd/Cargo.toml` is
+///   empty) and its only repeated-failure counter,
+///   [`crate::diagnostics::RepeatedFailureGuard`], is an output cap
+///   (`should_emit` stops emitting after a fixed count, `diagnostics.rs:1571`)
+///   and records no verifier, no attempt and no outcome. Calling the constructor
+///   would mean inventing a `verifier_ref` and a set of `failure_refs` this
+///   process never observed, which is precisely the fabrication this function
+///   exists to refuse.
+/// - `ImplementationDeviation` (I12.24:47, "accepted
+///   `ImplementationDeviation`") names an ACCEPTED deviation, so the evidence
+///   must be an accepted-deviation record. `eliot_problem::ImplementationDeviation`
+///   is that record type (`crates/governor/eliot-problem/src/lib.rs:2897`) and
+///   its only consumer is
+///   `eliot_runtime_status::project_implementation_deviation_status`
+///   (`crates/meta/eliot-runtime-status/src/implementation_deviation_status.rs:62`),
+///   which has no call site either: its occurrences are that definition, the
+///   re-export at `eliot-runtime-status/src/lib.rs:82`, and citations in this
+///   comment. So
+///   there is no admitted writer of an accepted deviation reaching any binary,
+///   and `eliotd` has no dependency on either crate
+///   (`eliotd/Cargo.toml` declares `eliot-improvement`, `eliot-self-quality` and
+///   `eliot-maintenance`, not `eliot-problem` or `eliot-runtime-status`). The
+///   minimal honest producer is a commit path in the deviation owner that makes
+///   an accepted deviation durable and a read route that surfaces it — both
+///   outside this file and outside the two files this item owns.
+/// - `Complaint` (I12.24:48, "Human/agent complaint") would need a complaint
+///   observation. The only carrier in the repository is the
+///   `ExperienceEventKind::CoverageComplaint` enum member
+///   (`crates/foundation/eliot-observation-contracts/src/experience/records.rs:157`),
+///   a vocabulary entry with no writer: its occurrences are that declaration, the
+///   doc comment above it (`records.rs:143`), and citations in this comment, with
+///   no call site. There is no authenticated Human or agent ingress on this daemon
+///   that could raise one (the ingress census is in this module's header: zero
+///   listeners, sockets or stdin readers under `bins/eliotd`, and the only
+///   transport is the outbound authenticated Kernel client), so a complaint has
+///   no route to this process even in principle.
+///
+/// # The campaign-closure source is bound, not labelled
+///
+/// `CampaignClosure` — the issue's "task/campaign closure" phrase — is
+/// connected, and it is worth being explicit about HOW, because it is the one
+/// case where the honest mechanism is not a match arm. The closed vocabulary
+/// spells it
+/// [`EvidenceSource::CampaignClosure`], and no match arm selects it, because
+/// [`EvidenceSource`] is documented as "I12.24 trigger source that RAISED a
+/// piece of improvement evidence" (`evidence_sources.rs:18`) and the campaign
+/// closure did not raise this candidate — the blocked maintenance family did.
+/// Selecting `CampaignClosure` here would relabel every observation and lose
+/// the family, which is the same misattribution the removed Watchdog residual
+/// was. So the closure is connected where the funnel actually consumes
+/// evidence: its own committed lineage is in the candidate's `evidence_refs` on
+/// BOTH arms ([`ObservedClosure::lineage_evidence_refs`]), which is what
+/// [`eliot_improvement::ImprovementCandidate::derive_candidate_id`] digests and
+/// what [`eliot_improvement::BoundedBacklog::merge_target`] compares.
+///
+/// `evidence_refs` and NOT `source_trace_refs`, precisely:
+/// `candidate_from_evidence` fills `source_trace_refs` from
+/// `SourcedEvidence::trace_refs` and `evidence_refs` from `SourcedEvidence::
+/// lineage_refs()`, which is the union of `evidence_refs` and `trace_refs`
+/// (`evidence_sources.rs:98-99`). The two closure refs are added to
+/// `SourcedEvidence::evidence_refs`, so they reach the candidate through
+/// `lineage_refs()` alone. `source_trace_refs` therefore still holds
+/// `[maintenance-family:F]` on this arm and `{T, F, S}` (trigger, family,
+/// scope) on the conformance arm, and contains no `learning-closure:` ref on
+/// either. Before this change, a real committed closure was cited in the brief
+/// and absent from the evidence the candidate was identified and deduplicated
+/// on.
+///
+/// None of the SEVEN unconnected variants is filled here because none has a
+/// producer this file could read without inventing the observation it claims.
+/// The security-incident arm above is the one place where a pattern does exist
+/// and is still dead, which is a different situation and is annotated at the arm
+/// itself. Filling any of the seven from a decision would reinstate exactly the
+/// misattribution the removed residual was — and with `trigger` now readable,
+/// that misattribution would be materially easier to commit by accident, which
+/// is the reason the `Watchdog` arm waits for a route rather than being wired
+/// speculatively against a field that exists but can only ever read `Policy`
+/// here.
 pub fn maintenance_evidence_source(
     decision: &eliot_maintenance::AutomationTriggerDecision,
 ) -> EvidenceSource {
@@ -1290,6 +1818,41 @@ pub fn maintenance_evidence_source(
         // the producer is missing.
         MaintenanceFamily::SecurityDependencyScan => EvidenceSource::SecurityIncident,
         MaintenanceFamily::DonorConformance => EvidenceSource::ConformanceDiagnosis,
+        // A registered family whose own obligation is NOT a suggestion, so a
+        // Watchdog-origin decision over it stays a Watchdog observation. See
+        // the `trigger` match below, which is where the origin is read.
+        _ => maintenance_trigger_evidence_source(decision.trigger),
+    }
+}
+
+/// The I12.24 evidence source a maintenance ORIGIN names, for a family whose own
+/// obligation is not a source in its own right (issue #1867 W2, I12.24:54).
+///
+/// [`AutomationTriggerDecision::trigger`] is the Governor evaluator's verbatim
+/// copy of the caller-observed origin — copied at both construction sites and
+/// never selected, widened or defaulted there
+/// (`crates/governor/eliot-maintenance/src/lib.rs:762`, `:1123`) — so a decision
+/// cannot claim an origin the evaluated trigger did not carry. That makes this a
+/// derivation from the observation, not a label: `WatchdogProblem` is
+/// documented "Watchdog or Doctor recovery/problem recipe"
+/// (`maintenance_trigger_evaluator.rs:118-119`) and `Dreamer` is "Accepted
+/// Dreamer maintenance plan candidate" (`lib.rs:184-185`), which are exactly
+/// the two occurrences I12.24:54 names.
+///
+/// The other four origin members are deliberately not arms:
+/// `MaintenanceTrigger::Human` is a Human request (already covered by the
+/// issue's "relevant complaints" route, which has no producer here),
+/// `Onboarding` and `Installation` are first-run/update occurrences that name
+/// no suggestion source, and `Policy` is the idle/scheduled policy origin the
+/// one live intake observation carries — which is the residual
+/// [`EvidenceSource::Attempt`] above. I12.24:54 closes the trigger set with
+/// "Dreamer/Watchdog/Concilium suggestion", and `Concilium` is absent because
+/// the closed [`MaintenanceTrigger`] vocabulary has no such member, so a
+/// Concilium verdict could not be carried here even if it were consulted.
+fn maintenance_trigger_evidence_source(trigger: MaintenanceTrigger) -> EvidenceSource {
+    match trigger {
+        MaintenanceTrigger::WatchdogProblem => EvidenceSource::Watchdog,
+        MaintenanceTrigger::Dreamer => EvidenceSource::Dreamer,
         _ => EvidenceSource::Attempt,
     }
 }
@@ -1312,12 +1875,19 @@ pub fn maintenance_evidence_source(
 /// `unproven-symptom:{ref}` hypothesis, so a diagnosis never states a proven
 /// cause it did not observe.
 ///
-/// # Every ref is a decision field, never a literal
+/// # Every ref is a decision field or the observed record's own, never a literal
 ///
 /// * `handoff_ref` is the Governor owner's own `trigger_id`;
-/// * symptom and evidence refs are that same `trigger_id` and the decision's
-///   own `scope_ref`, so two evaluations of the same occurrence converge on one
-///   finding rather than minting a new one per cadence tick;
+/// * symptom refs are that same `trigger_id` and the decision's own `scope_ref`
+///   is the applicability ref, so two evaluations of the same occurrence
+///   converge on one finding rather than minting a new one per cadence tick;
+/// * evidence refs are that same `trigger_id`, the decision's own `scope_ref`,
+///   AND the observed campaign-closure record's own committed lineage
+///   ([`ObservedClosure::lineage_evidence_refs`]), so the finding a Self-Quality
+///   owner reads is bound to the closed attempt it was observed against rather
+///   than only to the trigger that raised it; otherwise this arm would keep the
+///   exact gap the non-conformance arm just closed, since it terminates in the
+///   same [`eliot_improvement::sourced_evidence`] validation;
 /// * the problem ref is the decision's own `family`;
 /// * the constraint ref names the family's own evaluator, the same identity
 ///   `ReplayPlan::verifier_refs` binds;
@@ -1325,12 +1895,24 @@ pub fn maintenance_evidence_source(
 ///   ([`admitted_fence_ref`]), so the finding is explicitly invalidated when
 ///   the authority epoch or resource generation it was observed under moves.
 ///
-/// Each ref set is unique by construction, which `validate_handoff` requires
-/// (`make_handoff` sorts but does not de-duplicate).
+/// Each ref set is DISTINCT, and the argument is the PREFIXES, which are this
+/// file's to choose — see [`ObservedClosure::lineage_evidence_refs`] for the
+/// full one. Distinctness is the property this function owes, because
+/// `make_handoff` sorts each set but does not de-duplicate it and the normative
+/// `validate_handoff` → `validate_ref_set` refuses an adjacent repeated value in
+/// the sorted result
+/// (`crates/foundation/eliot-conformance-contracts/src/self_quality.rs:1227`,
+/// `:1947-1956`). Sortedness is NOT this function's to establish — `make_handoff`
+/// establishes it before validation runs, and this `ConformanceDiagnosis` field
+/// group is never itself sorted-checked. A committed closure whose artifact
+/// identity is longer than the handoff's own text bound does make this arm
+/// refuse, and that ceiling is stated on `lineage_evidence_refs` rather than
+/// papered over.
 fn conformance_diagnosis_evidence(
     decision: &eliot_maintenance::AutomationTriggerDecision,
     trigger_problem_or_metric: &str,
     validity_scope: &str,
+    observed: &ObservedClosure,
 ) -> Result<SourcedEvidence, ImprovementDispatchError> {
     use eliot_self_quality::{ConformanceDiagnosis, SelfQualityHandoffOwner};
     let finding = ConformanceDiagnosis {
@@ -1380,10 +1962,14 @@ fn conformance_diagnosis_evidence(
         priority: conformance_priority(decision),
         symptom_refs: vec![format!("maintenance-trigger:{}", decision.trigger_id)],
         problem_refs: vec![format!("maintenance-family:{}", decision.family)],
-        evidence_refs: vec![
-            format!("maintenance-trigger:{}", decision.trigger_id),
-            format!("maintenance-scope:{}", decision.scope_ref),
-        ],
+        evidence_refs: {
+            let mut refs = vec![
+                format!("maintenance-trigger:{}", decision.trigger_id),
+                format!("maintenance-scope:{}", decision.scope_ref),
+            ];
+            refs.extend(observed.lineage_evidence_refs());
+            refs
+        },
         missing_evidence_refs: Vec::new(),
         applicability_refs: vec![format!("maintenance-scope:{}", decision.scope_ref)],
         constraint_refs: vec![format!("maintenance-evaluator:{}", decision.family)],
@@ -1529,10 +2115,17 @@ pub fn improvement_bound_operation(
 
 /// The bound-admission idempotency key for one real maintenance decision.
 ///
-/// The key is derived from the decision's own `trigger_id` and `scope_ref` —
-/// the same two fields the candidate's evidence lineage is built from — so
-/// two identical observations converge on one policy record and one admission
-/// rather than minting a fresh pair per pass.
+/// The key is derived from the decision's own `trigger_id` and `scope_ref`, so
+/// two identical decisions converge on one policy record and one admission
+/// rather than minting a fresh pair per pass. It is deliberately NOT widened to
+/// the candidate's full evidence lineage: the record is the OWNER's bound
+/// decision about one recurring maintenance family at one scope (see
+/// [`improvement_bound_operation`]), so keying it on the observed campaign
+/// closure would ask the owner for a fresh bound decision every time a new
+/// attempt closed. The candidate's own identity does track the closure — see
+/// [`ObservedClosure::lineage_evidence_refs`] and the module documentation's
+/// deduplication section — so the two concerns stay separated rather than one
+/// key serving both.
 pub fn improvement_bound_idempotency_key(
     decision: &eliot_maintenance::AutomationTriggerDecision,
 ) -> String {
@@ -1606,7 +2199,11 @@ pub struct GovernedImprovementAdmission {
 ///    constant), and then enforces the bound, merging by evidence lineage or
 ///    relieving a full bound through the explicit summarized archive
 ///    transition (W3).
-/// 5. [`merged_survivor_entry`] reads the surviving entry back out of the
+/// 5. [`enforce_improvement_class_gate`] runs the I12.24 application-class
+///    boundary here, where the live registry is in hand, so its
+///    one-experiment-per-control-surface bound is a count over the owner's own
+///    durable entries rather than a literal (W5).
+/// 6. [`merged_survivor_entry`] reads the surviving entry back out of the
 ///    backlog on the merge branch. This is the only seam that still holds the
 ///    backlog, so the post-merge state is carried out on
 ///    [`GovernedImprovementAdmission::merged_survivor`] rather than recomputed
@@ -1623,6 +2220,7 @@ pub fn admit_improvement_artifact(
     state_fence: &StateFence,
 ) -> Result<GovernedImprovementAdmission, ImprovementDispatchError> {
     let bound = maintenance_bound(policy)?;
+    enforce_improvement_class_gate(&artifact.candidate, backlog)?;
     let claim = improvement_admission_claim(policy, state_fence);
     let permit = issue_learning_admission(governor, &claim)?;
     let verified = verify_learning_admission(governor, &permit, state_fence)?;
@@ -1985,28 +2583,94 @@ fn improvement_commit_identity(
 /// a process-local receipt that disappears with the backlog (W3; I12.24:291
 /// "Silence is not a disposition, because it hides lost learning").
 ///
-/// `admitted.merged_survivor` is committed, between the candidate's own commit
-/// and the archive receipts, as ONE additional `Candidate` record whenever the
-/// admission deduplicated by evidence lineage. Without it the daemon durably
-/// records THAT a merge happened but never WHAT was merged: the record above
-/// carries the INCOMING candidate, while the surviving entry — enriched by the
-/// merge with the unioned lineage and the absorbed-id list — exists only in the
-/// registry, so the next pass rebuilds from the incoming candidate and the
-/// unioned lineage is gone. [`commit_lineage_merge_receipt`] states the shape;
-/// `improvement_dedup_read::restored_registry` reads it back.
+/// `admitted.merged_survivor` is committed BEFORE the candidate's own commit,
+/// and before the archive receipts, as ONE additional `Candidate` record
+/// whenever the admission deduplicated by evidence lineage. Without it the
+/// daemon durably records THAT a merge happened but never WHAT was merged: the
+/// record below carries the INCOMING candidate, while the surviving entry —
+/// enriched by the merge with the unioned lineage and the absorbed-id list —
+/// exists only in the registry, so the next pass rebuilds from the incoming
+/// candidate and the unioned lineage is gone. [`commit_lineage_merge_receipt`]
+/// states the shape; `improvement_dedup_read::restored_registry` reads it back.
+/// Why that receipt goes FIRST rather than after the candidate's own commit is
+/// argued at the call site, where the orphan it prevents is described.
 ///
-/// Receipt commits are sequenced after the candidate commit and are
-/// individually idempotent under their own key, so a receipt committed on one
-/// pass converges on a later pass instead of duplicating. A refused receipt
-/// commit is a typed `Commit` error carrying the archive that could not be made
-/// durable, and the receipts committed before it stay committed: this is a
-/// partial commit, and it is visible as such rather than hidden.
+/// "whenever the admission deduplicated" is qualified, because it is NOT whenever
+/// the outcome is `Merged`. A merge in which the surviving and absorbed
+/// candidates are the SAME identity writes no receipt at all, and that is the
+/// ordinary steady state rather than a corner: the reader refuses such a receipt
+/// (`improvement_dedup_read.rs:613-617`) and the refusal fails the entire
+/// deduplication read, so producing one would make the read fail permanently
+/// from the next pass onward. The self-merge arm at the call site states why
+/// nothing is lost by omitting it.
+///
+/// Receipt commits are individually idempotent under their own key, so a
+/// receipt committed on one pass converges on a later pass instead of
+/// duplicating. A refused commit is a typed `Commit` error naming what could not
+/// be made durable, and whatever was committed before it stays committed: this
+/// is a partial commit, and it is visible as such rather than hidden. Which
+/// records those are depends on the order, and the order is argued at the call
+/// site: the merge receipt is first, so a refusal can leave a durable merge
+/// without its incoming candidate's brief, but never a durable incoming
+/// candidate row without the receipt that makes the registry read it as
+/// absorbed.
+/// Refuses to make durable any candidate this replay-only intake produced, and
+/// says why through the crate's OWN gate (issue #1867 A3, I12.24:76).
+///
+/// A3 reads "A replay-only local improvement cannot transition to promotion
+/// without a bound budget/economics record and live matched-budget evidence."
+/// Two things make that true on this path, and this function is the second:
+///
+/// 1. The candidate is REPLAY-ONLY by construction. Its evidence is one
+///    maintenance decision plus one committed closure record, its
+///    [`ReplayPlan`] names fixed replay/holdout/transfer refs and one evaluator,
+///    and this daemon runs no experiment — so it holds no
+///    [`eliot_improvement::BudgetProof`], no `BudgetEquivalenceLedger`, no
+///    complexity-economics delta and no matched-budget live shadow or canary
+///    reference. There is nothing here that could satisfy the gate even in
+///    principle.
+/// 2. The lifecycle this intake writes is therefore never a promoting
+///    disposition, and this function PROVES that against the candidate's own
+///    recorded field rather than assuming it from the call site.
+///
+/// The proof is the crate's own predicate
+/// ([`ImprovementLifecycle::is_promoting_disposition`]) read over
+/// [`ImprovementCandidate::lifecycle`], and the refusal is the crate's own gate
+/// ([`require_matched_budget_for_promotion`]) asked with the `None` this path
+/// honestly holds. Neither is recomputed here and neither is spelled: a
+/// candidate whose recorded lifecycle somehow reached `Supported` or `Narrowed`
+/// is refused with the crate's own typed
+/// [`ImprovementError::MissingBudgetProof`] rather than committed, so a
+/// promotion can never become durable through this seam even if a future change
+/// routed one in without a budget record.
+///
+/// Why `None` is the honest argument and not a convenient one:
+/// [`require_matched_budget_for_promotion`] accepts `Option<&BudgetProof>`
+/// precisely so "no proof is bound" is expressible, and `None` maps to
+/// [`ImprovementError::MissingBudgetProof`] through the crate's own arm. Passing
+/// a synthesized proof to get a different error would be fabricating the record
+/// whose absence is the whole point, and the function is only ever called on the
+/// branch where the gate is actually consulted — a non-promoting lifecycle
+/// returns without asking, so no pass is refused for a gate it never entered.
+fn refuse_replay_only_promotion(
+    candidate: &ImprovementCandidate,
+) -> Result<(), ImprovementDispatchError> {
+    if !candidate.lifecycle.is_promoting_disposition() {
+        return Ok(());
+    }
+    require_matched_budget_for_promotion(None)?;
+    Ok(())
+}
+
 pub async fn commit_improvement_artifact(
     composition: &mut DaemonComposition,
     artifact: &ImprovementArtifact,
     admitted: &GovernedImprovementAdmission,
     state_fence: &StateFence,
 ) -> Result<(eliot_store_api::WriteReceipt, bool), ImprovementDispatchError> {
+    // A3: what this path writes must not be promotable, and that is CHECKED
+    // against the candidate's own recorded lifecycle before the bytes exist.
+    refuse_replay_only_promotion(&artifact.candidate)?;
     let record = serde_json::json!({
         "candidate": artifact.candidate,
         "brief": artifact.brief,
@@ -2034,28 +2698,156 @@ pub async fn commit_improvement_artifact(
     let identity = improvement_commit_identity(&record_key, state_fence)?;
     let scope = ScopeId::new(IMPROVEMENT_SCOPE)
         .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))?;
-    // The durable commit is the whole point of this path: any refusal is a
-    // typed diagnostic, never a silent drop.
-    let (receipt, effective) = composition
-        .commit_learning_record(
-            &identity,
-            request,
-            scope.clone(),
-            // Proof refs: the candidate's own evidence lineage, verbatim.
-            artifact.candidate.evidence_refs.clone(),
-            None,
-            false,
-            false,
-            Vec::new(),
-            Vec::new(),
-        )
-        .await
-        .map_err(|error| ImprovementDispatchError::Commit(error.to_string()))?;
-    // The merge result, before the archive receipts: the surviving entry is
-    // what the NEXT pass rebuilds its registry from, so it is made durable
-    // before any relief disposition is.
+    // The merge result is committed BEFORE the candidate's own row, and the
+    // order is the load-bearing part (issue #1867 W2).
+    //
+    // The incoming candidate's row is what the merge receipt SUPPRESSES:
+    // `improvement_dedup_read::restored_registry` drops a candidate record whose
+    // `candidate_id` a committed receipt names as `absorbed_candidate_id`, and
+    // that is the only thing that keeps a merged candidate from restoring as a
+    // second active entry. So the receipt must already exist whenever the
+    // candidate's row does. Committing the row first left a window in which a
+    // refused receipt left the incoming row durable with nothing to suppress it.
+    //
+    // That window used to be self-healing and no longer is, which is stated
+    // here rather than left to be rediscovered. `BoundedBacklog::restored`
+    // collapses two restored rows naming ONE `candidate_id`
+    // (`candidate_bounds.rs:647-663`), so while the incoming candidate and the
+    // survivor shared an identity — which they did, because the candidate's
+    // identity was derived from the maintenance decision alone — the orphan row
+    // collapsed into the survivor on the next tick regardless of the receipt.
+    // The closure lineage bound by
+    // `ObservedClosure::lineage_evidence_refs` now feeds
+    // `ImprovementCandidate::derive_candidate_id`, so a merged incoming
+    // candidate carries a DISTINCT id, that collapse no longer applies, and both
+    // rows would restore as two permanently active entries: `merge_target`
+    // returns the first overlap, so the later one is never a merge target, and
+    // `archive_cause_for` has exactly three causes (`Ownerless`, `LowValue`,
+    // `Stale`) of which none applies to an owned, in-floor, current-epoch entry.
+    //
+    // Committing the receipt first makes the orphan UNREACHABLE rather than
+    // merely unlikely: at every instant at which the candidate's row exists, the
+    // record that makes the registry read it as absorbed already exists — or the
+    // merge was a SELF-merge, which writes no receipt and needs none, because the
+    // candidate IS the surviving entry and its own row already is that entry's
+    // row. It also closes the same window for the outcome-disagreement refusal
+    // below, which now runs before the candidate is committed at all.
+    //
+    // The residual is the mirror image and is stated rather than claimed away: if
+    // the CANDIDATE's own commit is refused after the receipt succeeded, the
+    // merge is durable and that candidate's brief is not. The next tick
+    // re-assembles the same lineage and re-merges it — and the receipt it writes
+    // then is NOT the same row, because the committed receipt already advanced
+    // the survivor's `revision` and the next pass restores the survivor AT that
+    // revision, so `lineage_merge_record_key` yields a new `…@{revision + 1}`
+    // key and a new row. The brief, by contrast, lands under its own stable
+    // `improvement-candidate:<id>` handle. So the retry is an additional receipt,
+    // not a convergence on the failed one, and the receipt sequence advances
+    // monotonically across such retries; the candidate's brief is what appears.
     match (&admitted.report.outcome, admitted.merged_survivor.as_ref()) {
         (AdmitOutcome::Admitted { .. }, None) => {}
+        // SELF-MERGE — no receipt is written, and this is the load-bearing arm.
+        //
+        // `merge_target` (`candidate_bounds.rs:893-917`) has no same-identity
+        // exclusion, so re-admitting a candidate the registry already holds
+        // merges it into ITSELF: `admit_inner` takes the surviving id from the
+        // matched entry and the absorbed id from the incoming candidate
+        // (`:931-932`), and when the two are the same candidate those are the
+        // same string. That is the ORDINARY steady state, not an edge case: one
+        // cadence tick with no fence move and no new closure re-derives the same
+        // `candidate_id` and the lineage overlaps on every ref.
+        //
+        // Writing a receipt for it would be fatal, and the reader's refusal is
+        // correct. `classify_merge_receipt` rejects any receipt whose
+        // `absorbed_candidate_id` equals the survivor's
+        // (`improvement_dedup_read.rs:613-617`, "names no distinct absorbed
+        // candidate"), the rejection propagates through `classify_row` at
+        // `improvement_dedup_read.rs:529`, and `restored_registry` therefore
+        // fails as a WHOLE. Nothing deletes learning rows, so one such receipt
+        // would make every later pass's deduplication read fail permanently.
+        //
+        // Nothing is lost by not writing it, and that is the reason this is a
+        // skip rather than a refusal. The candidate's identity is derived from
+        // its evidence lineage (`ImprovementCandidate::derive_candidate_id`), so
+        // a same-identity merge means the surviving entry's lineage already
+        // CONTAINS the incoming one — `merge_into` unions into a set, and the
+        // entry only ever grew, so the union is the entry's own lineage
+        // unchanged.
+        //
+        // That is the FIRST of the NINE mutations `merge_into` performs on its
+        // local copy (`candidate_bounds.rs:1100-1132`). All nine are enumerated
+        // here rather than assumed away, because the justification for this arm
+        // is exactly that none of the remaining eight leaves durable
+        // consequence. Line references are `candidate_bounds.rs` unless stated.
+        //
+        // 1. `evidence_refs` union (`:1101-1104`) — unchanged. Equal
+        //    `candidate_id` implies equal identity content, because
+        //    `derive_candidate_id` hashes the canonical evidence lineage
+        //    (`lib.rs:782-792`, `:813-827`), so the absorbed set is already a
+        //    subset of the survivor's.
+        // 2. `source_trace_refs` union (`:1105-1108`) — unchanged on the same
+        //    citation: the identity digest hashes that field too (`:822-824`).
+        // 3. `merged_from` (`:1109-1111`) — the push DOES fire, and it pushes
+        //    the survivor's OWN id, because on a self-merge the absorbed id and
+        //    the surviving id are the same string read from the same candidate
+        //    (`:793-794`, and `admit_inner` `:931-932`). It reaches nothing
+        //    durable regardless: this arm writes no receipt, and `into_entry`
+        //    rebuilds `merged_from` empty on every restore (`:249`).
+        // 4. `value` (`:1112-1114`) — DOES fire whenever the incoming
+        //    assessment exceeds the restored floor, and it is a real raise, not
+        //    a no-op: a candidate row restores `value` at
+        //    `enforced_bound.min_value` (`improvement_dedup_read.rs:902`), and
+        //    the crate says so in as many words (`:603-605`). It is discarded
+        //    because the durable record carries no assessed value to carry it
+        //    — `DurableCandidateRecord` has `admitted_value_floor` and no
+        //    `value` (`:218-224`, `:212-217`). Only a merge receipt makes a
+        //    survivor's value durable, by re-reading it as the next floor
+        //    (`improvement_dedup_read.rs:653`), and this arm writes none.
+        // 5. `owner` (`:1115-1117`) — cannot fire on a restored entry. A
+        //    candidate row sets it `Some(candidate.owner_and_decision_authority)`
+        //    only AFTER that candidate validated
+        //    (`improvement_dedup_read.rs:894-900`), and `validate` refuses a
+        //    blank one (`lib.rs:771-774`, whose emptiness test trims, so
+        //    `lib.rs:1295-1300`); a
+        //    receipt row carries the PREVIOUS survivor's, re-validated at
+        //    `improvement_dedup_read.rs:634-642` and copied at `:651`. So the
+        //    entry is inductively never ownerless and the guard never opens.
+        // 6. `admitted_under_authority` (`:1118-1120`) — the same shape: a
+        //    candidate row sets it `Some(enforced_bound.governor_authority_ref)`
+        //    (`improvement_dedup_read.rs:901`) and a receipt row carries the
+        //    previous survivor's (`:652`). `into_entry` filters only a
+        //    trimmed-blank ref (`:250-253`), so the one way the guard can open
+        //    is a blank committed `governor_authority_ref` — and were it so,
+        //    the fill writes the CURRENT permit's `authority_ref` (`:786-787`),
+        //    which is the authority this very admission was verified under, so
+        //    it is a re-derivation and not a forged epoch.
+        // 7. `revision += 1` (`:1121`) — reaches nothing, and cannot move
+        //    identity either: `derive_candidate_id` deliberately EXCLUDES
+        //    `revision` (`lib.rs:788-789`). Only
+        //    `commit_lineage_merge_receipt` commits an advanced revision, and
+        //    this arm skips it, so the next pass restores the survivor at its
+        //    last committed revision and re-derives it.
+        // 8. `updated_at` (`:1122`) — the same fate: a wall-clock stamp into
+        //    the candidate, likewise excluded from the identity digest
+        //    (`lib.rs:788`), and likewise committed only by the receipt this
+        //    arm does not write.
+        // 9. the `lineage_digest` recompute (`:1123-1124`) — unchanged, because
+        //    it is taken over the union, and per (1) and (2) the union IS the
+        //    survivor's own lineage. It is in any case never accepted from a
+        //    caller: `into_entry` recomputes it from the candidate's own refs
+        //    (`:227-245`).
+        //
+        // So none of the nine leaves DURABLE CONSEQUENCE, and that is the whole
+        // reason this arm skips rather than refuses. The durable artifact of
+        // such a pass is the candidate's own row, which is committed below
+        // under its own stable handle.
+        (
+            AdmitOutcome::Merged {
+                absorbed_candidate_id,
+                ..
+            },
+            Some(survivor),
+        ) if absorbed_candidate_id == &survivor.candidate.candidate_id => {}
         (
             AdmitOutcome::Merged {
                 absorbed_candidate_id,
@@ -2076,12 +2868,30 @@ pub async fn commit_improvement_artifact(
             // `admit_improvement_artifact` refuses to produce this pair, so it
             // is unreachable in practice; committing the candidate and silently
             // skipping a merge result it cannot describe is not an option, so
-            // the disagreement is a typed refusal.
+            // the disagreement is a typed refusal. It is raised BEFORE the
+            // candidate is committed, so it cannot orphan a row either.
             return Err(ImprovementDispatchError::Backlog(format!(
                 "the admission outcome {outcome:?} does not agree with the merge state this commit must record"
             )));
         }
     }
+    // The durable commit is the whole point of this path: any refusal is a
+    // typed diagnostic, never a silent drop.
+    let (receipt, effective) = composition
+        .commit_learning_record(
+            &identity,
+            request,
+            scope.clone(),
+            // Proof refs: the candidate's own evidence lineage, verbatim.
+            artifact.candidate.evidence_refs.clone(),
+            None,
+            false,
+            false,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .map_err(|error| ImprovementDispatchError::Commit(error.to_string()))?;
     for archived in &admitted.report.archived {
         commit_archive_receipt(composition, archived, &scope, state_fence).await?;
     }
@@ -2132,9 +2942,12 @@ pub async fn commit_improvement_artifact(
 /// overwrite of the earlier accumulated state.
 ///
 /// A refused commit is a typed `Commit` error naming the surviving candidate
-/// and the one it absorbed, and the candidate's own commit stays committed:
-/// this is the same partial-commit behaviour the archive receipts already
-/// document, not a rollback.
+/// and the one it absorbed. It is sequenced BEFORE the incoming candidate's own
+/// row (see [`commit_improvement_artifact`]), so a refusal here means the merge
+/// is not durable AND the incoming candidate's row was never written — the next
+/// pass re-merges the same lineage and retries both under the same idempotent
+/// key. Nothing is left half-suppressed, and this is a retryable absence rather
+/// than a rollback.
 async fn commit_lineage_merge_receipt(
     composition: &mut DaemonComposition,
     survivor: &TrackedCandidate,

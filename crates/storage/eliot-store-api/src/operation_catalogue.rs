@@ -467,11 +467,18 @@ struct ActivatedMutationDescriptor {
 /// keyed `(skill_id, scope_key)` with the closed capability-evidence typed
 /// contract; the store issues the fenced row revision the Governor orders
 /// same-key evidence by, and the write itself grants no admission, support,
-/// influence, or lifecycle change). All
+/// influence, or lifecycle change); `ApplySwarmOwnerRevisions` persists
+/// `ReversibleMutation` through the `TaskControl` family (issue #1702, I10.15:
+/// owner-separated swarm definition/admission/execution revisions with
+/// separate owner Ordering Scopes, admitted only when the owner-specific
+/// authorization evidence travels with the write and is verified at this
+/// boundary — the record's own owner lease, the transition's authority epoch
+/// and the authenticated request source; committing a revision grants no
+/// admission, dispatch or lifecycle change to anyone). All
 /// activated mutation rows address no store scope, mirroring the scope-free read
 /// descriptors. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 19] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 21] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],
@@ -524,10 +531,42 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 19] = [
         max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
     },
     ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::ApplyProblemOwnerState,
+        transition_classes: &[TransitionClass::RecoverySchema],
+        maximum_effect: EffectClass::ReversibleMutation,
+        // Problem candidates are bounded like the other owner snapshots: a
+        // Problem record is one symptom, its bounded dependency/evidence sets
+        // and its retained history, not a bulk payload.
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
         operation: NamedMutationOperation::UpdateTaskState,
         transition_classes: &[TransitionClass::TaskControl],
         maximum_effect: EffectClass::ReversibleMutation,
         max_input_bytes: READ_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::ApplySwarmOwnerRevisions,
+        transition_classes: &[TransitionClass::TaskControl],
+        // The class maximum, never a wider ceiling: an owner revision is a
+        // create-only row plus a compare-and-set head advance, both reversible
+        // through the next revision, so it is `ReversibleMutation` exactly as
+        // `UpdateTaskState` is. It is never `Candidate` (that would let an
+        // owner record be admitted without a live State Fence) and never
+        // `ExternalEffect`.
+        maximum_effect: EffectClass::ReversibleMutation,
+        // The owner record itself is bounded by `MAX_RECOVERY_RECORD_BYTES`
+        // (512 KiB) inside `SwarmOwnerRevision::validate`, and the
+        // authorization evidence adds a bounded presenter plus a nonzero
+        // epoch. The canonical parameter encoding is the record as a JSON
+        // STRING inside the parameters object, so escaping and the enclosing
+        // structure need headroom over the record's own bound: the 2 MiB bulk
+        // parameter bound covers that without broadening the record bound
+        // itself. `READ_MAX_INPUT_BYTES` (64 KiB) would refuse a legitimately
+        // large-but-valid work-graph digest set, which is why the other
+        // bounded owner-snapshot rows (`RecordModuleCatalogSnapshot`,
+        // `ApplyProblemOwnerState`) use the bulk bound for the same reason.
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
     },
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyErasure,
@@ -815,13 +854,17 @@ pub fn validate_read_against_catalogue(
 /// `ApplyEpistemicRevision`, `ApplyErasure`, `ApplyNotificationState`,
 /// `ApplyReactiveInjectionState`, `ApplyResourceSnapshot`,
 /// `CommitExperienceBank`, `CommitAgentFeedback`,
-/// `RecordLearningRecord`, `RecordCapabilityEvidenceRecord`, and
+/// `RecordLearningRecord`, `RecordCapabilityEvidenceRecord`,
+/// `ApplyProblemOwnerState`, and
 /// `RecordModuleCatalogSnapshot` have activated
 /// mutation entries; any other named
 /// command fails closed here until a later slice proves its handler, schema,
-/// consumer triple, and semantic owner-authority gate. `ApplySwarmOwnerRevisions`
-/// remains known but unactivated until Governor's owner-specific authorization
-/// evidence is carried and verified at this boundary. An `Erasure`-class plan additionally admits only the
+/// consumer triple, and semantic owner-authority gate.
+/// `ApplySwarmOwnerRevisions` is activated (issue #1702): its owner-specific
+/// authorization evidence travels inside the record and is verified by
+/// `validate_swarm_owner_revision_transition`, which this gate reaches through
+/// `PreparedTransition::validate`, so a cross-owner or stale-lease presentation
+/// is refused before any provider I/O. An `Erasure`-class plan additionally admits only the
 /// named `ApplyErasure` operation (`ERASURE_STATE_IRREVERSIBLE`, enforced
 /// below): no generic reversible-effect executor admits the erasure class
 /// through this gate.
@@ -914,6 +957,10 @@ pub fn validate_transition_against_catalogue(
             }
             NamedMutationOperation::RecordAuthorityRevocation => {
                 return Err(StoreError::UnknownOperation);
+            }
+            NamedMutationOperation::ApplyProblemOwnerState => {
+                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+                crate::decode_problem_owner_state_mutation(&command.parameters).map(|_| ())?;
             }
         }
         validate_parameter_size(&command.parameters, entry.max_input_bytes)?;

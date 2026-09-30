@@ -314,15 +314,21 @@ impl AdmittedRequestPort {
     ) -> Result<ProcessIntent, ResearchAuthorityError> {
         let operation = admission.operation_id().clone();
         let generation = admission.process_generation();
-        let artifact_root = artifact_root(admission.module_id(), admission.module_generation_id());
+        // The #13 cell and runtime-bundle identities are the ones the launched
+        // process is bound to: the image cell IS the admitted capability cell,
+        // and the Job/session/tree cells are derived from the admitted runtime
+        // bundle. The observed identity is later compared back against both, so
+        // the running process answers under the cell the registry names.
+        let module_id = admission.module_id().as_str();
+        let module_generation_id = admission.module_generation_id().as_str();
+        let artifact_root = artifact_root(module_id, module_generation_id);
         let intent = ProcessIntent::new(
             operation,
-            eliot_process::ProcessTreeId::new(format!("tree-{}", admission.module_generation_id()))
+            eliot_process::ProcessTreeId::new(format!("tree-{module_generation_id}"))
                 .map_err(|error| invalid(&error))?,
-            JobId::new(format!("job-{}", admission.module_generation_id()))
-                .map_err(|error| invalid(&error))?,
-            ImageId::new(admission.module_id().to_owned()).map_err(|error| invalid(&error))?,
-            SessionId::new(format!("session-{}", admission.module_generation_id()))
+            JobId::new(format!("job-{module_generation_id}")).map_err(|error| invalid(&error))?,
+            ImageId::new(module_id.to_owned()).map_err(|error| invalid(&error))?,
+            SessionId::new(format!("session-{module_generation_id}"))
                 .map_err(|error| invalid(&error))?,
             generation,
             admission.bridge().executable(),

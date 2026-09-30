@@ -1131,12 +1131,13 @@ pub fn derive_finish_decision(
     // Issue #325 W3: `executed_current` is the gate's explicit pass-and-exact
     // outcome check. The canonical owner (`produce_finish_evidence`) records
     // every terminal run in `executed_verifier_run_refs` but stale-marks each
-    // run that is not executed, passing, and exactly fresh
-    // (`certifies_completion`: job, receipt, and run `Succeeded`, outcome
-    // `Pass`, coverage `CompleteForScope`, `Exact*` freshness, unchanged
-    // source, complete artifacts). Only refs surviving this difference are
-    // proven executed/passing/current evidence; set membership in `executed`
-    // alone never suffices below.
+    // run that is not executed, passing, productive, and exactly fresh
+    // (`certifies_completion`: the run's bound invocation profile compared
+    // against the registered productive profile, job, receipt, and run
+    // `Succeeded`, outcome `Pass`, coverage `CompleteForScope`, `Exact*`
+    // freshness, unchanged source, complete artifacts). Only refs surviving
+    // this difference are proven executed/passing/current evidence; set
+    // membership in `executed` alone never suffices below.
     let executed_current: BTreeSet<&str> = executed.difference(&stale).copied().collect();
     let mut verifier_gap = false;
     let mut artifact_gap = false;

@@ -136,19 +136,29 @@
 //! statement carries a binding, so no caller value can reach the provider, and
 //! errors/receipts carry digests and static text, never provider payload or
 //! credentials.
+//!
+//! The same observation also serves `ECXF/1` export. [`capture_ecxf_source`]
+//! projects the rows of the one member batch it already read onto the store
+//! owners' own typed records — `RevisionHead`, `OrderingHead`, `CanonicalEvent`,
+//! `ProjectionPublicationRecord` and `WriteReceipt` — so the export fence can
+//! carry those owners' values instead of re-derived copies, and derives both
+//! its completeness and its evidence gaps from the admitted generation's
+//! baseline and this module's own census. A member the source store does not
+//! hold keeps its gap; nothing here fills a fence member with a default, a zero,
+//! an empty collection or a synthesized digest.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use eliot_store_api::{
-    BlobResidency, BlobResidencyDomain, EcxfExportRequest, MAX_RECOVERY_RECORD_BYTES,
-    MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_MEMBERS, MAX_SNAPSHOT_PAGE_MEMBERS, MAX_SNAPSHOT_PAGES,
-    OperationId, OperationIdentity, OrderingHead, RequestMeta, RevisionHead, ScopeId,
-    SnapshotBeginRequest, SnapshotCompleteness, SnapshotCursor, SnapshotDenominator,
-    SnapshotEndReceipt, SnapshotHandle, SnapshotMember, SnapshotMemberType, SnapshotPage,
-    SnapshotPageCoverage, SnapshotPageState, StateFence, StoreError, canonical_json_bytes,
-    sha256_hex,
+    BlobResidency, BlobResidencyDomain, CanonicalEvent, EcxfExportRequest,
+    MAX_RECOVERY_RECORD_BYTES, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_MEMBERS, MAX_SNAPSHOT_PAGE_MEMBERS,
+    MAX_SNAPSHOT_PAGES, OperationId, OperationIdentity, OrderingHead, ProjectionPublicationRecord,
+    RequestMeta, RevisionHead, ScopeId, SnapshotBeginRequest, SnapshotCompleteness, SnapshotCursor,
+    SnapshotDenominator, SnapshotEndReceipt, SnapshotHandle, SnapshotMember, SnapshotMemberType,
+    SnapshotPage, SnapshotPageCoverage, SnapshotPageState, StateFence, StoreError, WriteReceipt,
+    canonical_json_bytes, sha256_hex,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -179,28 +189,48 @@ pub struct EcxfSourceClassCapture {
 /// Why the observed source rows cannot currently prove a complete ECXF view.
 ///
 /// These are explicit evidence gaps, not zero counts or empty source values.
+///
+/// The list is a *consequence* of what this capture can read, not a fixed list:
+/// [`observed_capture_gaps`] derives each entry from the admitted generation's
+/// own baseline or from the census this module ran, so a generation that
+/// defines the missing evidence closes its gap without a second vocabulary and
+/// without emptying the vector by hand.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EcxfCaptureGap {
-    /// The adapter has no complete scope-to-record closure for the requested scope.
+    /// The admitted generation declares no scope column on a captured member
+    /// table, so no record in the observed set can be proven to belong to the
+    /// requested scope.
     RequestedScopeClosureUnproven,
-    /// The admitted v2 schema does not capture the source erasure/purge ledger.
+    /// The census captures no source erasure/purge ledger class, so the export
+    /// carries no privacy/purge ledger.
     SourcePurgeLedgerUnavailable,
-    /// The adapter is not the `BlobStore` owner and cannot read sealed bytes or
-    /// prove residency-key reachability.
+    /// The census captures no blob-residency class, so the export declares no
+    /// reachable residency key and carries no sealed blob.
     BlobStoreEvidenceUnavailable,
     /// Architecture and `NormativePair` source identity receipts are owned
-    /// outside this adapter.
+    /// outside this adapter and are not columns of the admitted generation.
     ExternalSourceIdentityEvidenceUnavailable,
     /// The adapter has no durable source-side ECXF export receipt.
     SourceExportReceiptUnavailable,
+    /// The capture point reads the schema generation and the canonical fence
+    /// only. `StateFence::resource_generation` is the generation relevant to one
+    /// decision, not the store's own generation, so it cannot stand in for it.
+    StoreResourceGenerationUnavailable,
+    /// The adapter declares no identity or version of its own, and a build
+    /// constant of the running binary is not an observation of the source store.
+    SourceAdapterIdentityUnavailable,
+    /// No owner declares the compression or encryption profile this export
+    /// applies; the emitted package's codecs are not read from the source store.
+    ExportProfileUnavailable,
 }
 
 /// Exact transaction observation available to the ECXF composition owner.
 ///
-/// This carries real canonical source rows and the fence observed beside them,
-/// while explicitly remaining partial. It must not be projected to a complete
-/// ECXF source view until every `missing_evidence` item is supplied by its
-/// owning component and the requested scope closure is established.
+/// This carries real canonical source rows, the typed records those rows
+/// project onto, and the fence observed beside them, while explicitly
+/// remaining partial. It must not be projected to a complete ECXF source view
+/// until every `missing_evidence` item is supplied by its owning component and
+/// the requested scope closure is established.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EcxfSourceCapture {
     /// Requested logical operation identity for which the capture was requested.
@@ -217,6 +247,31 @@ pub struct EcxfSourceCapture {
     pub next_outbox_sequence: u64,
     /// Provider rows retained as canonical JSON source bytes by logical class.
     pub source_classes: Vec<EcxfSourceClassCapture>,
+    /// Revision heads projected from the observed `revision_head` rows of the
+    /// same transaction, in logical key order.
+    ///
+    /// Every head carries `state_fence` and its own index column is cross-checked
+    /// against the head's key, so a head is evidence about *this* point or the
+    /// capture is refused; see [`observed_revision_head`].
+    pub revision_heads: Vec<RevisionHead>,
+    /// Ordering heads projected from the observed `ordering_head` rows of the
+    /// same transaction, in logical scope order; see [`observed_ordering_head`].
+    pub ordering_heads: Vec<OrderingHead>,
+    /// Canonical events projected from the observed `canonical_event` rows of the
+    /// same transaction, in ascending `event_ordinal` order.
+    ///
+    /// `event_ordinal` is the store's own monotonic commit ordinal, so these
+    /// observed ordinals are the evidence for the fence's canonical event
+    /// interval. The interval itself is `eliot_ecxf::EventRange`, a type this
+    /// crate does not depend on; it is projected from these observed ordinals by
+    /// the `eliot-backup` consumer and re-proved by `EventRange::validate`.
+    pub events: Vec<CanonicalEvent>,
+    /// Projection publication records projected from the observed
+    /// `projection_record` rows of the same transaction, in publication order.
+    pub projections: Vec<ProjectionPublicationRecord>,
+    /// Canonical write receipts projected from the observed `write_receipt` rows
+    /// of the same transaction, in operation order.
+    pub receipts: Vec<WriteReceipt>,
     /// Completeness of the ECXF view, not merely success of the DB transaction.
     pub completeness: SnapshotCompleteness,
     /// Concrete evidence still required before export can be complete.
@@ -231,6 +286,9 @@ const SNAPSHOT_CLASS_FIELD: &str = "snapshot.classes";
 
 /// Static error field for an observed scope-projection defect.
 const SCOPE_PROJECTION_FIELD: &str = "snapshot.scope_projection";
+
+/// Static error field for one observed ECXF typed source record.
+const ECXF_SOURCE_RECORD_FIELD: &str = "ecxf.source_record";
 
 /// Enumeration revision bound into every end receipt.
 ///
@@ -711,6 +769,91 @@ fn admitted_generation_ddl(generation: &str) -> Option<&'static str> {
 fn admitted_generation_defines(ddl: &'static str, table: &str) -> bool {
     let marker = format!("DEFINE TABLE {table} ");
     ddl.contains(&marker)
+}
+
+/// Physical tables the single owner declares for the source erasure/purge
+/// ledger.
+///
+/// Named by reference only: [`crate::schema`] stays the single owner of every
+/// physical name. The list exists so [`observed_capture_gaps`] can ask whether
+/// the census actually *captures* the ledger rather than only declaring it.
+const SOURCE_PURGE_LEDGER_TABLES: &[&str] = &[
+    crate::schema::table::ERASURE_INTENT,
+    crate::schema::table::ERASURE_OUTCOME,
+];
+
+/// Reports whether the admitted baseline gives every captured member table a
+/// scope column.
+///
+/// A scope-to-record closure needs a physical column to filter on. This is the
+/// same baseline text the census classifies against, so the answer changes with
+/// the generation the adapter admits and never with a hand-maintained list.
+fn captures_scope_column(ddl: &'static str) -> bool {
+    captured_member_tables()
+        .all(|table| ddl.contains(&format!("DEFINE FIELD scope_id ON {table} ")))
+}
+
+/// Reports whether the census captures any source erasure/purge ledger table.
+fn captures_purge_ledger() -> bool {
+    captured_member_tables().any(|table| SOURCE_PURGE_LEDGER_TABLES.contains(&table))
+}
+
+/// Reports whether the census captures any blob-residency member class.
+///
+/// A fence's blob reachability set is derived from the residency keys of the
+/// blobs the export delivers, so it needs a captured class that *is* a blob
+/// member; a class that is only a record or a reference cannot supply one.
+fn captures_blob_residency() -> bool {
+    captured_member_classes().any(|class| class.member_type == SnapshotMemberType::Blob)
+}
+
+/// The evidence gaps of one ECXF capture, derived from what the capture can read.
+///
+/// The first three entries are *predicates* over the admitted generation's own
+/// baseline and over the census this module ran, not fixed refusals: a baseline
+/// that gives the captured tables a scope column, a census that captures an
+/// erasure ledger, or a census that captures a blob member each close its gap
+/// with no second vocabulary and no edit to this list.
+///
+/// The remaining entries are declared absences of *this owner*, and no baseline
+/// or census can close them:
+///
+/// * the Architecture source digest and the `NormativePair` identity receipt are
+///   sealed by owners outside the store, so they are not columns any baseline
+///   defines;
+/// * a source-side ECXF export receipt has no durable artifact anywhere;
+/// * the capture point reads the schema generation and the canonical fence, and
+///   `StateFence::resource_generation` is the generation relevant to one
+///   decision, not the store's own generation, so it cannot stand in for one;
+/// * this adapter declares no identity or version of its own, and a build
+///   constant of the running binary is not an observation of the source store;
+/// * no owner declares the compression or encryption profile this export
+///   applies, and the emitted package's codecs are not read from the store.
+fn observed_capture_gaps(generation: &str) -> Result<Vec<EcxfCaptureGap>, StoreError> {
+    let Some(ddl) = admitted_generation_ddl(generation) else {
+        return Err(StoreError::InvalidField {
+            field: SNAPSHOT_CLASS_FIELD,
+            reason: "admitted schema generation has no baseline in the schema owner",
+        });
+    };
+    let mut gaps = Vec::new();
+    if !captures_scope_column(ddl) {
+        gaps.push(EcxfCaptureGap::RequestedScopeClosureUnproven);
+    }
+    if !captures_purge_ledger() {
+        gaps.push(EcxfCaptureGap::SourcePurgeLedgerUnavailable);
+    }
+    if !captures_blob_residency() {
+        gaps.push(EcxfCaptureGap::BlobStoreEvidenceUnavailable);
+    }
+    gaps.extend([
+        EcxfCaptureGap::ExternalSourceIdentityEvidenceUnavailable,
+        EcxfCaptureGap::SourceExportReceiptUnavailable,
+        EcxfCaptureGap::StoreResourceGenerationUnavailable,
+        EcxfCaptureGap::SourceAdapterIdentityUnavailable,
+        EcxfCaptureGap::ExportProfileUnavailable,
+    ]);
+    Ok(gaps)
 }
 
 /// Walks every declared canonical source class and proves its one disposition.
@@ -2040,27 +2183,45 @@ async fn read_enumeration(
 /// an ECXF request.
 ///
 /// The rows and fence come from the same fixed `BEGIN`/`COMMIT` member batch.
-/// Caller values never enter the provider statement. The request's scope is
-/// retained but not treated as a filter: this adapter cannot prove the full
-/// scope-to-record closure, so the returned capture is always explicitly
-/// `Partial` and lists the missing purge, `BlobStore` and external identity
-/// evidence. The ECXF exporter must refuse to build or publish from it until
-/// those gaps are resolved by their owners.
+/// Caller values never enter the provider statement.
+///
+/// The typed fence members are projected from *those same rows*, after they are
+/// read and before the batch's result is consumed: [`observed_heads`],
+/// [`observed_events`], [`observed_projections`] and [`observed_receipts`] each
+/// walk the `class_rows` this call already holds, so there is one observation,
+/// one point, and no second query. Every projected value is its owner's own type
+/// and is re-validated by that owner; nothing is re-derived, defaulted or
+/// re-hashed here.
+///
+/// The request's scope is retained but not treated as a filter: this adapter
+/// cannot prove the full scope-to-record closure, so the capture reports that
+/// gap and stays `Partial`. `completeness` and `missing_evidence` are both
+/// derived by [`observed_capture_gaps`] from the admitted generation's baseline
+/// and this module's own census, so the exporter sees a refusal whose reason is
+/// the evidence the owner actually lacks rather than a fixed list.
 pub async fn capture_ecxf_source(
     adapter: &SurrealStoreAdapter,
     request: &EcxfExportRequest,
 ) -> Result<EcxfSourceCapture, StoreError> {
     request.validate()?;
     bind_capture_principal(adapter, crate::client::SNAPSHOT_MEMBERS_OPERATION)?;
-    verify_canonical_source_classes(adapter.config.expected_schema_generation.as_str())?;
+    let generation = adapter.config.expected_schema_generation.as_str();
+    verify_canonical_source_classes(generation)?;
 
     let (point, class_rows) = read_enumeration(adapter).await?;
-    if point.schema_generation != adapter.config.expected_schema_generation.as_str() {
+    if point.schema_generation != generation {
         return Err(StoreError::Unavailable);
     }
     if point.state_fence != request.context.state_fence {
         return Err(StoreError::FenceMismatch);
     }
+
+    // Projected from the rows this call already read, before they are consumed.
+    let (revision_heads, ordering_heads) = observed_heads(&class_rows, &point)?;
+    let events = observed_events(&class_rows)?;
+    let projections = observed_projections(&class_rows)?;
+    let receipts = observed_receipts(&class_rows)?;
+    let missing_evidence = observed_capture_gaps(generation)?;
 
     let mut total_source_bytes = 0_u64;
     let source_classes = captured_member_classes()
@@ -2090,15 +2251,29 @@ pub async fn capture_ecxf_source(
         next_commit_sequence: point.next_commit_sequence,
         next_outbox_sequence: point.next_outbox_sequence,
         source_classes,
-        completeness: SnapshotCompleteness::Partial,
-        missing_evidence: vec![
-            EcxfCaptureGap::RequestedScopeClosureUnproven,
-            EcxfCaptureGap::SourcePurgeLedgerUnavailable,
-            EcxfCaptureGap::BlobStoreEvidenceUnavailable,
-            EcxfCaptureGap::ExternalSourceIdentityEvidenceUnavailable,
-            EcxfCaptureGap::SourceExportReceiptUnavailable,
-        ],
+        revision_heads,
+        ordering_heads,
+        events,
+        projections,
+        receipts,
+        completeness: capture_completeness(&missing_evidence),
+        missing_evidence,
     })
+}
+
+/// Derives the capture's completeness from the evidence it actually lacks.
+///
+/// [`SnapshotCompleteness::Complete`] is reachable only when the derived gap
+/// list is empty, so a complete capture can never be declared over evidence the
+/// owner did not observe; the alternative — a constant `Partial` — would make
+/// the two fields independent and let a future complete capture still be
+/// reported as partial.
+const fn capture_completeness(gaps: &[EcxfCaptureGap]) -> SnapshotCompleteness {
+    if gaps.is_empty() {
+        SnapshotCompleteness::Complete
+    } else {
+        SnapshotCompleteness::Partial
+    }
 }
 
 /// Produces deterministic canonical row bytes under the adapter-owned member
@@ -2534,19 +2709,40 @@ fn observed_head_rows(class_rows: &[Vec<Map<String, Value>>]) -> ObservedHeadRow
     }
 }
 
-/// Decodes one observed head row's own typed body.
+/// Decodes one observed row's own typed body.
 ///
 /// The body is what the canonical write path stored
-/// (`apply/atomic_write.rs` binds `{"revision_key": …, "body": <RevisionHead>}`
-/// and `{"ordering_scope": …, "body": <OrderingHead>}`), so the head is read
-/// from the row the provider returned rather than re-derived from the index
-/// column.
-fn head_body<T: serde::de::DeserializeOwned>(row: &Map<String, Value>) -> Result<T, StoreError> {
+/// (`apply/atomic_write.rs` binds `{"revision_key": …, "body": <RevisionHead>}`,
+/// `{"ordering_scope": …, "body": <OrderingHead>}`,
+/// `{"event_id": …, "operation_id": …, "body": <CanonicalEvent>}`,
+/// `{"publication_id": …, "body": <ProjectionPublicationRecord>}` and
+/// `{"operation_id": …, "idempotency_key": …, "body": <WriteReceipt>}`), so the
+/// record is read from the row the provider returned rather than re-derived
+/// from the row's index columns. The index columns are still read, as a
+/// cross-check, by the caller.
+fn row_body<T: serde::de::DeserializeOwned>(
+    row: &Map<String, Value>,
+    field: &'static str,
+) -> Result<T, StoreError> {
     let body = row.get(HEAD_BODY_FIELD).ok_or(StoreError::InvalidField {
-        field: SCOPE_PROJECTION_FIELD,
-        reason: "observed head row does not carry its typed body",
+        field,
+        reason: "observed row does not carry its typed body",
     })?;
     serde_json::from_value(body.clone()).map_err(snapshot_serialization_error)
+}
+
+/// Reads one observed row's own store-owned index column.
+fn row_index<'row>(
+    row: &'row Map<String, Value>,
+    field: &'static str,
+    index_field: &'static str,
+) -> Result<&'row str, StoreError> {
+    row.get(index_field)
+        .and_then(Value::as_str)
+        .ok_or(StoreError::InvalidField {
+            field,
+            reason: "observed row does not carry its declared index column",
+        })
 }
 
 /// Reads one observed `revision_head` row and proves it belongs to this point.
@@ -2558,19 +2754,12 @@ fn observed_revision_head(
     row: &Map<String, Value>,
     point: &CapturePoint,
 ) -> Result<RevisionHead, StoreError> {
-    let head: RevisionHead = head_body(row)?;
+    let head: RevisionHead = row_body(row, SCOPE_PROJECTION_FIELD)?;
     head.validate()?;
     if head.state_fence != point.state_fence {
         return Err(StoreError::FenceMismatch);
     }
-    let index_key =
-        row.get("revision_key")
-            .and_then(Value::as_str)
-            .ok_or(StoreError::InvalidField {
-                field: SCOPE_PROJECTION_FIELD,
-                reason: "observed revision row does not carry its index key",
-            })?;
-    if index_key != head.key.as_str() {
+    if row_index(row, SCOPE_PROJECTION_FIELD, "revision_key")? != head.key.as_str() {
         return Err(StoreError::IdentityConflict);
     }
     Ok(head)
@@ -2581,22 +2770,159 @@ fn observed_ordering_head(
     row: &Map<String, Value>,
     point: &CapturePoint,
 ) -> Result<OrderingHead, StoreError> {
-    let head: OrderingHead = head_body(row)?;
+    let head: OrderingHead = row_body(row, SCOPE_PROJECTION_FIELD)?;
     head.validate()?;
     if head.state_fence != point.state_fence {
         return Err(StoreError::FenceMismatch);
     }
-    let index_scope =
-        row.get("ordering_scope")
-            .and_then(Value::as_str)
-            .ok_or(StoreError::InvalidField {
-                field: SCOPE_PROJECTION_FIELD,
-                reason: "observed ordering row does not carry its index scope",
-            })?;
-    if index_scope != head.scope.as_str() {
+    if row_index(row, SCOPE_PROJECTION_FIELD, "ordering_scope")? != head.scope.as_str() {
         return Err(StoreError::IdentityConflict);
     }
     Ok(head)
+}
+
+/// Observed rows of one captured class, located by the single owner's table name.
+///
+/// The rows are returned by reference out of the *same* `class_rows` the member
+/// batch already produced inside the one admitted transaction, so projecting a
+/// typed record never issues a second read and never binds a second point.
+fn observed_class_rows<'rows>(
+    class_rows: &'rows [Vec<Map<String, Value>>],
+    table: &'static str,
+) -> impl Iterator<Item = &'rows Map<String, Value>> {
+    captured_member_classes()
+        .zip(class_rows)
+        .filter(move |(class, _)| class.table == table)
+        .flat_map(|(_, rows)| rows.iter())
+}
+
+/// Reads every observed `canonical_event` row as the store's own event record.
+///
+/// Each row's typed body is validated by the single owner
+/// ([`CanonicalEvent::validate`], which re-proves every ordering-link hash over
+/// the event's own payload digest and ordinal) and cross-checked against the
+/// row's own `event_id` and `operation_id` index columns, so a row whose body
+/// and index disagree is refused instead of being projected as one record.
+///
+/// The observed `event_ordinal` is the store's monotonic commit ordinal. A
+/// duplicate ordinal is refused: two events claiming one ordinal make the
+/// canonical event interval ambiguous, and the interval is a fence member.
+fn observed_events(
+    class_rows: &[Vec<Map<String, Value>>],
+) -> Result<Vec<CanonicalEvent>, StoreError> {
+    let mut events = observed_class_rows(class_rows, crate::schema::table::CANONICAL_EVENT)
+        .map(|row| {
+            let event: CanonicalEvent = row_body(row, ECXF_SOURCE_RECORD_FIELD)?;
+            event.validate()?;
+            if row_index(row, ECXF_SOURCE_RECORD_FIELD, "event_id")? != event.event_id.as_str() {
+                return Err(StoreError::IdentityConflict);
+            }
+            if row_index(row, ECXF_SOURCE_RECORD_FIELD, "operation_id")?
+                != event.operation_id.as_str()
+            {
+                return Err(StoreError::IdentityConflict);
+            }
+            Ok(event)
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    // Logical order, never incidental provider row order (I5.27).
+    events.sort_by(|left, right| {
+        (left.event_ordinal, left.event_id.as_str())
+            .cmp(&(right.event_ordinal, right.event_id.as_str()))
+    });
+    if events
+        .windows(2)
+        .any(|pair| pair[0].event_ordinal == pair[1].event_ordinal)
+    {
+        return Err(StoreError::Duplicate {
+            field: ECXF_SOURCE_RECORD_FIELD,
+        });
+    }
+    Ok(events)
+}
+
+/// Reads every observed `projection_record` row as the store's own publication.
+///
+/// The publication is validated by its single owner and cross-checked against the
+/// row's own `publication_id` index column, so the projection stream names the
+/// records the store actually holds.
+fn observed_projections(
+    class_rows: &[Vec<Map<String, Value>>],
+) -> Result<Vec<ProjectionPublicationRecord>, StoreError> {
+    let mut projections = observed_class_rows(class_rows, crate::schema::table::PROJECTION_RECORD)
+        .map(|row| {
+            let record: ProjectionPublicationRecord = row_body(row, ECXF_SOURCE_RECORD_FIELD)?;
+            record.validate()?;
+            if row_index(row, ECXF_SOURCE_RECORD_FIELD, "publication_id")?
+                != record.publication_id.as_str()
+            {
+                return Err(StoreError::IdentityConflict);
+            }
+            Ok(record)
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    projections.sort_by(|left, right| left.publication_id.cmp(&right.publication_id));
+    Ok(projections)
+}
+
+/// Reads every observed `write_receipt` row as the store's own write receipt.
+///
+/// The receipt is validated by its single owner and cross-checked against the
+/// row's own `operation_id` and `idempotency_key` index columns, so the receipt
+/// stream names the receipts the store actually holds. Fence agreement with the
+/// bound point is *not* required here: a receipt is an immutable record of the
+/// write that produced it, and `eliot_backup::prove_coherent_boundary` re-checks
+/// each receipt against the fence the source view declares.
+fn observed_receipts(
+    class_rows: &[Vec<Map<String, Value>>],
+) -> Result<Vec<WriteReceipt>, StoreError> {
+    let mut receipts = observed_class_rows(class_rows, crate::schema::table::WRITE_RECEIPT)
+        .map(|row| {
+            let receipt: WriteReceipt = row_body(row, ECXF_SOURCE_RECORD_FIELD)?;
+            receipt.validate()?;
+            if row_index(row, ECXF_SOURCE_RECORD_FIELD, "operation_id")?
+                != receipt.operation_id.as_str()
+            {
+                return Err(StoreError::IdentityConflict);
+            }
+            if row_index(row, ECXF_SOURCE_RECORD_FIELD, "idempotency_key")?
+                != receipt.idempotency_key.as_str()
+            {
+                return Err(StoreError::IdentityConflict);
+            }
+            Ok(receipt)
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    receipts.sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
+    Ok(receipts)
+}
+
+/// Reads the two head classes of the observed rows as the store's own heads.
+///
+/// This is the same observation [`observed_scope_projection`] digests, returned
+/// in typed form so the ECXF fence carries the owners' own `RevisionHead` and
+/// `OrderingHead` values instead of a re-derived copy. Sharing the readers keeps
+/// one proof of "this head belongs to this point" for both consumers.
+fn observed_heads(
+    class_rows: &[Vec<Map<String, Value>>],
+    point: &CapturePoint,
+) -> Result<(Vec<RevisionHead>, Vec<OrderingHead>), StoreError> {
+    let rows = observed_head_rows(class_rows);
+    let mut revisions = rows
+        .revisions
+        .iter()
+        .map(|row| observed_revision_head(row, point))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut orderings = rows
+        .orderings
+        .iter()
+        .map(|row| observed_ordering_head(row, point))
+        .collect::<Result<Vec<_>, _>>()?;
+    // Logical order, never incidental provider row order (I5.27).
+    revisions.sort_by(|left, right| left.key.as_str().cmp(right.key.as_str()));
+    orderings.sort_by(|left, right| left.scope.as_str().cmp(right.scope.as_str()));
+    ensure_unique_head_keys(&revisions, &orderings)?;
+    Ok((revisions, orderings))
 }
 
 /// Reconciles the caller's claimed scope against the observed projection.
@@ -2781,21 +3107,7 @@ fn observed_scope_projection(
     point: &CapturePoint,
     request: &SnapshotBeginRequest,
 ) -> Result<ObservedScopeProjection, StoreError> {
-    let heads = observed_head_rows(class_rows);
-    let mut observed_revisions = heads
-        .revisions
-        .iter()
-        .map(|row| observed_revision_head(row, point))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut observed_orderings = heads
-        .orderings
-        .iter()
-        .map(|row| observed_ordering_head(row, point))
-        .collect::<Result<Vec<_>, _>>()?;
-    // Logical order, never incidental provider row order (I5.27).
-    observed_revisions.sort_by(|left, right| left.key.as_str().cmp(right.key.as_str()));
-    observed_orderings.sort_by(|left, right| left.scope.as_str().cmp(right.scope.as_str()));
-    ensure_unique_head_keys(&observed_revisions, &observed_orderings)?;
+    let (observed_revisions, observed_orderings) = observed_heads(class_rows, point)?;
     reconcile_scope_projection(&observed_revisions, &observed_orderings, request)?;
     let document = scope_projection_document(request, &observed_revisions, &observed_orderings);
     let digest =

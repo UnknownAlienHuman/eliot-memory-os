@@ -1634,6 +1634,17 @@ impl AgentCoordinator {
     /// coalesced count when a wake was pending, and the drive runs either way:
     /// it is evidence for the caller, not a gate on correctness.
     ///
+    /// **Bounded recovery polling is the authoritative arm; the event is an
+    /// optimisation** (issue #1683 W5, and see the module documentation of
+    /// `fair_pull_loop.rs`). `recovery_poll` records which arm this call is, and
+    /// the two are the same drive over the same projection: the recovery poll
+    /// simply does not wait to be told there is work, which is the only thing
+    /// that makes a dropped or coalesced notification cost latency instead of
+    /// stranding eligible work forever. A caller that passes
+    /// `recovery_poll = true` on a state change it observed has classified an
+    /// event arm as a poll; that is safe but mislabels the evidence, so the
+    /// two call sites name their own arm.
+    ///
     /// What it publishes is the exact disposition I14.8 W7 requires: for every
     /// class that held ready work and was closed, `last_selection.deferrals`
     /// names the limiting dimension, the observed value, the limit reached and
@@ -1648,7 +1659,8 @@ impl AgentCoordinator {
     /// is empty, a drive performs one pull, selects nothing, and stops. That is
     /// the correct bounded behaviour of an empty projection, and the drive goes
     /// live when that owner lands (issue #1678). It is called from production
-    /// by `AgentFabric::drive_fair_pull` in `bins/eliotd/src/agent_fabric.rs`.
+    /// by `AgentFabric::drive_fair_pull` in `bins/eliotd/src/agent_fabric.rs`,
+    /// from both the release event path and the bounded recovery poll.
     ///
     /// Proof ceiling: [`FAIR_PULL_LOOP_PROOF_CEILING`].
     ///
@@ -1662,6 +1674,7 @@ impl AgentCoordinator {
     pub fn drive_fair_pull(
         &mut self,
         profile: &SchedulingProfile,
+        recovery_poll: bool,
     ) -> Result<FairPullOutcome, CoordinatorError> {
         profile.validate()?;
         let consumed_wake = self.fair_pull_loop.take_wake();
@@ -1714,6 +1727,7 @@ impl AgentCoordinator {
             capacity_revision: last_selection.capacity_revision.clone(),
             cursor_event_sequence: cursor,
             consumed_wake,
+            recovery_poll: Some(recovery_poll),
             poll_bound,
             pulls_performed,
             started,

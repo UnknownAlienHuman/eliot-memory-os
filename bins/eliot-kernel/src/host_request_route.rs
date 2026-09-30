@@ -73,10 +73,11 @@ use eliot_protocol::{
     AGENT_BRIDGE_PROCESS_BINDING_WIRE_ID, AGENT_HOST_REQUEST_FAILURE_WIRE_ID,
     AgentActivationResolutionResult, AgentBridgePeerAdmissionReceipt, AgentBridgeProcessBinding,
     AgentHostRequestFailure, AgentResponseDisposition, DeliveryClass, EventEnvelope,
-    HOST_REQUEST_INVOKE_READ_WIRE_ID, HOST_REQUEST_RESULT_BODY_WIRE_ID,
-    HostRequestAdmissionReceipt, HostRequestEnvelope, HostRequestInvokeReadPayload,
-    HostRequestKind, HostRequestResultBody, LocalReadAttempt, WatchdogIntentKind,
-    WatchdogSpoolIntentBatchPayload, WatchdogSpoolIntentSubmission, host_request_operation_id,
+    HOST_REQUEST_INVOKE_READ_WIRE_ID, HOST_REQUEST_PAYLOAD_SCHEMA_ID,
+    HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestAdmissionReceipt, HostRequestEnvelope,
+    HostRequestInvokeReadPayload, HostRequestKind, HostRequestResultBody, LocalReadAttempt,
+    WatchdogIntentKind, WatchdogSpoolIntentBatchPayload, WatchdogSpoolIntentSubmission,
+    host_request_operation_id,
 };
 use eliot_runtime_contracts::RecoveryDirective;
 use eliot_store_api::{
@@ -246,6 +247,17 @@ const BRIDGE_EVENT_ADAPTER_VERSION: &str = "eliot.bridge-event.kernel-ingest.v1"
 /// representation plus its redaction receipt. This is the same closed
 /// vocabulary `eliot-ors` validates (`admitted` | `rejected`).
 const BRIDGE_EVENT_PRIVACY_VERDICT_REJECTED: &str = "rejected";
+/// Withheld scope recorded when the retained session's recipient grant admits
+/// no privacy class at all (issue #1934, I7.23): the session owner admitted
+/// nothing, so raw persistence is withheld on the recipient side. This is the
+/// owner's own out-of-scope label, never a claim about scanned content.
+const BRIDGE_EVENT_WITHHELD_RECIPIENT_GRANT_EMPTY: &str = "recipient_grant_admits_no_class";
+/// Withheld scope recorded when the session grant names admittable classes
+/// but the event proves none of them (issue #1934, I7.23): `EventEnvelope`
+/// carries no source privacy class or provider-restriction field, so no
+/// disclosure class is proven for these exact bytes and no grant membership
+/// can hold. Raw persistence is withheld on the source side.
+const BRIDGE_EVENT_WITHHELD_SOURCE_CLASS_UNADMITTED: &str = "source_class_not_admitted";
 
 /// Bound on queued local-read pairs for the outbound-only eliotd poller.
 ///
@@ -2729,6 +2741,19 @@ impl KernelComposition {
         }
         // Issue #1837: durable audit evidence for queue admission.
         self.audit_observe(AuditEventDraft::queue_local_read_enqueued(envelope, queued));
+        // Issue #1745 R7 persistence tail: the freshly staged pair's
+        // dispatch-owned exposure evidence (eligible/selected from the
+        // admission owner above; every other stage explicitly unresolved)
+        // persists through the existing observation path under the
+        // operation:digest idempotency lineage. Replays never reach this
+        // arm — `AlreadyStaged` returns early above and conflicting
+        // identities fail — so a replay reconciles the recorded original
+        // without new evidence. Best-effort like every observation: a
+        // populate failure is terminal-visible but never changes the staged
+        // admission.
+        super::tool_exposure::observe_dispatch_exposure(envelope, tool, &admission, |draft| {
+            self.audit_observe(draft);
+        });
         // I16.5 (issue #1841): the queue gauges are read from the owner's own
         // live index at admission, so a sample measures the current contour
         // rather than a total carried forward.
@@ -3834,10 +3859,11 @@ pub(crate) enum ObserveDeferDisposition {
 ///
 /// Runs the exact shared linkage gate ([`HostRequestInvokeReadPayload`]:
 /// capability echoes the admitted tool name, canonical tool bytes digest to
-/// the admitted payload digest) plus the observe capability join and the
-/// retained-bytes bound. A changed payload digest, a forged capability, or
-/// over-bound bytes fail closed as `SessionFenced` before the caller stages
-/// anything. Pure: validation performs no IO by construction, which is the
+/// the admitted payload digest) plus the observe capability join, the
+/// payload-schema join, and the retained-bytes bound. A changed payload
+/// digest, a forged capability, a mislabeled schema, or over-bound bytes
+/// fail closed as `SessionFenced` before the caller stages anything. Pure:
+/// validation performs no IO by construction, which is the
 /// rejection-before-staging proof. The Kernel never interprets observe
 /// semantics here — only the closed linkage shape.
 pub(crate) fn check_observe_tool_linkage(
@@ -3853,6 +3879,14 @@ pub(crate) fn check_observe_tool_linkage(
     .validate()
     .map_err(|_| TransportError::SessionFenced)?;
     if envelope.identity.capability != OBSERVE_CAPABILITY {
+        return Err(TransportError::SessionFenced);
+    }
+    // Issue #1739 W2: the schema half of the admission bind. The bridge
+    // stamps one payload schema on tool-byte submits; a mislabeled payload
+    // fails closed here — before any staging, and again at claim — even when
+    // its digest links, so no claim is ever handed out for bytes no executor
+    // schema can interpret.
+    if envelope.identity.payload_schema_id != HOST_REQUEST_PAYLOAD_SCHEMA_ID {
         return Err(TransportError::SessionFenced);
     }
     let bytes = serde_json::to_vec(tool).map_err(|_| TransportError::SessionFenced)?;
@@ -4620,7 +4654,11 @@ impl KernelComposition {
         // and the governed attempt — the same submission join the shared
         // submit leg enforces. Legacy readback versions stay readable
         // through the replay path above but can never complete an operation.
-        body.validate_for_submission()
+        // Issue #1739 W4: the submission must also carry the producer's
+        // explicit result lineage — the actual owner receipt. A body with
+        // unknown lineage carries no semantic admission, so it can never
+        // complete the operation as its retained semantic outcome.
+        body.validate_observe_submission()
             .map_err(|_| TransportError::SessionFenced)?;
         if activation_deadline_expired(unix_ms(), stored.deadline_unix_ms) {
             return self.expired_claim_timeout(ExpiredClaimObservation {
@@ -6059,19 +6097,29 @@ impl KernelComposition {
     /// was measured rather than assumed. `EventEnvelope`
     /// (`crates/foundation/eliot-protocol/src/lib.rs`) has no field carrying a
     /// `WorkScope`, a privacy class, a source/recipient class, or a provider
-    /// retention constraint; the retained agent-bridge `Session` negotiates an
-    /// EMPTY privacy-class grant (`eliot-ipc`'s
-    /// `Session::establish_agent_bridge`, which is the only constructor on this
-    /// route), so there is no recipient-class evidence either; and the
-    /// Governor-owned `DisclosureDecision` has no producer, store, or wire leg
-    /// that reaches this entry. There is consequently no owner that can present
-    /// a positive verdict bound to these exact bytes, this scope, and this
-    /// policy revision.
+    /// retention constraint; and the Governor-owned `DisclosureDecision` has no
+    /// producer, store, or wire leg that reaches this entry. There is
+    /// consequently no owner that can present a positive verdict bound to these
+    /// exact bytes, this scope, and this policy revision.
+    ///
+    /// What the transport DOES carry is the recipient side of the admission
+    /// evidence, and the resolution below evaluates it for THIS event instead
+    /// of assuming it: the retained `Session`'s negotiated `privacy_classes`
+    /// grant is the session owner's recipient-class admission evidence
+    /// (`eliot-ipc`'s `Session::establish_agent_bridge`, the only constructor
+    /// on this route, negotiates it empty — but the verdict reads the retained
+    /// session, so a class-bearing session would resolve through its real
+    /// grant rather than this route's usual one). The event's own disclosure
+    /// class is unproven for these exact bytes — the envelope names no source
+    /// class — so no grant membership can hold for it.
     ///
     /// Absent evidence is UNRESOLVED, never permission. The resolution is
-    /// therefore [`BRIDGE_EVENT_PRIVACY_VERDICT_REJECTED`]:
-    /// [`RedbRecoveryStore::bridge_event_privacy_decision`] takes the
-    /// rejection arm, the event stages as the deterministic redacted
+    /// therefore [`BRIDGE_EVENT_PRIVACY_VERDICT_REJECTED`], with the
+    /// `declared_class` naming the withholding the evaluated evidence
+    /// determined: an empty recipient grant withholds on the recipient side,
+    /// while a non-empty grant still withholds because the event proves no
+    /// admittable source class. [`RedbRecoveryStore::bridge_event_privacy_decision`]
+    /// takes the rejection arm, the event stages as the deterministic redacted
     /// representation plus its redaction receipt, and the conservative
     /// seven-token deny scan still runs inside the ORS owner — where it can
     /// only narrow the recorded reason and classes, never grant. Ingestion
@@ -6111,11 +6159,25 @@ impl KernelComposition {
         if policy_revision == 0 {
             return Err(TransportError::SessionFenced);
         }
+        // Resolve the withholding through the actual admission evidence for
+        // THIS event. The session owner's recipient grant admits a class only
+        // by name; the event proves no source class for these exact bytes, so
+        // no membership holds — but WHICH side withholds is read, not
+        // assumed: an empty grant withholds every class on the recipient side,
+        // while a class-bearing grant still withholds this classless event on
+        // the source side. Either way raw persistence is not admitted, and the
+        // recorded class tells the receipt which evidence determined that.
+        let declared_class = if session.privacy_classes.is_empty() {
+            BRIDGE_EVENT_WITHHELD_RECIPIENT_GRANT_EMPTY
+        } else {
+            BRIDGE_EVENT_WITHHELD_SOURCE_CLASS_UNADMITTED
+        };
         Ok(serde_json::json!({
             "verdict": BRIDGE_EVENT_PRIVACY_VERDICT_REJECTED,
             "source_sha256": source_sha256,
             "scope": scope,
             "policy_revision": policy_revision,
+            "declared_class": declared_class,
         }))
     }
 

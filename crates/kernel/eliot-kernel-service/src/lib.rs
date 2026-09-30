@@ -41,6 +41,7 @@ mod notification_state;
 #[cfg(test)]
 mod notification_state_tests;
 mod notify_grant;
+mod operator_session_token;
 mod owner_history;
 mod process_execution_client;
 mod protocol;
@@ -56,6 +57,7 @@ mod store_write_reservation;
 mod store_write_reservation_tests;
 mod testd_front_door;
 mod user_automation;
+mod user_automation_compiler;
 mod user_automation_execution;
 mod user_automation_execution_client;
 mod user_automation_failure_history;
@@ -143,6 +145,10 @@ pub use notification_state::{
 pub use notify_grant::{
     NOTIFY_GRANT_OPERATION_PREFIX, NOTIFY_IMAGE_FILE_NAME, NotifyGrantInputs,
     NotifyLaunchAuthorization, bind_notify_launch_grant,
+};
+pub use operator_session_token::{
+    OPERATOR_SESSION_TOKEN_OPERATION_PREFIX, OPERATOR_SESSION_TOKEN_TTL_MS,
+    OperatorSessionAuthorization, OperatorSessionTokenInputs, bind_operator_session_token,
 };
 pub use owner_history::{
     GRANT_CLOSURE_CANONICAL_LINKS_VERSION, GrantClosureCanonicalLink,

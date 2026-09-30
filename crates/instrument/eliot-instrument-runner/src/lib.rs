@@ -35,9 +35,9 @@ pub mod verification_profile;
 pub use build_projection::{
     AffectedEdge, BuildCacheDecision, BuildCancellation, BuildClaimOrder, BuildCleanupPass,
     BuildProjectionError, CargoOrigin, CargoScopeRefusal, ClaimedBuild, CleanupCandidate,
-    CleanupDecision, DeclaredWorkItem, PreemptionClass, ProducerClaim, ProducerCompletion,
-    ProducerOutcome, ProjectedBuild, QuarantinedArtifact, TargetClass, TargetRootBuildCoordinator,
-    restrict_agent_argv,
+    CleanupDecision, DeclaredWorkItem, FlightResolution, HeldLease, LiveClaim, PreemptionClass,
+    ProducerClaim, ProducerCompletion, ProducerOutcome, ProjectedBuild, QuarantinedArtifact,
+    TargetClass, TargetRootBuildCoordinator, restrict_agent_argv,
 };
 pub use cache_lane::{CacheLane, CacheLaneAttestations, CacheLaneError, LaneOutcome};
 pub use capsule_binding::{
@@ -56,8 +56,8 @@ pub use dev_fast::{
     require_dev_fast_parity, resolve_verification_route, run_dev_fast_profile,
 };
 pub use eliot_build_test_graph::{
-    BUILD_ROOT_DIRECTORY, BuildMode, CARGO_TARGET_DIR_ENV, CandidateIdentity, GovernedWorkEnvelope,
-    LaneIdentity, RuntimeEnvironmentLease, WorkEnvelopeError,
+    BUILD_ROOT_DIRECTORY, BuildMode, CARGO_HOME_ENV, CARGO_TARGET_DIR_ENV, CandidateIdentity,
+    GovernedWorkEnvelope, LaneIdentity, RuntimeEnvironmentLease, WorkEnvelopeError,
 };
 pub use eliot_test_selection::{FrozenSelection, TestSelectionReceipt};
 pub use package_disposition::{

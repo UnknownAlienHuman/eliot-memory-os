@@ -56,7 +56,10 @@ use super::{
 };
 use eliot_contracts::StateFence;
 use eliot_ipc::{Session, TransportError};
-use eliot_ors::{NativeWorkerClaimRecord, NativeWorkerClaimState, OperationIdentity, OrsError};
+use eliot_ors::{
+    AdmissionReservationSnapshot, NativeWorkerClaimRecord, NativeWorkerClaimState,
+    OperationIdentity, OrsError, reload_staged_admission_reservation,
+};
 use eliot_protocol::{Frame, FrameKind, MessageType, ProtocolPayload};
 
 // ---------------------------------------------------------------------------
@@ -177,6 +180,41 @@ impl KernelComposition {
             .ok_or_else(|| NativeWorkerReconcileError::Unknown {
                 identity: claim_id.to_owned(),
             })
+    }
+
+    /// Reloads the durable `STAGED_INACTIVE` admission reservation for one
+    /// claim, performing no launch (#1678 A2).
+    ///
+    /// This is the restart path for the stage half of the normative admission
+    /// reservation saga. After a crash between stage and canonical admission,
+    /// the coordinator re-derives the SAME `reservation_id` from the immutable
+    /// claim binding and calls this to prove the reservation is durable and
+    /// still inactive before any admission is retried.
+    ///
+    /// It is a pure read plus the owner's own `validate()` and
+    /// `verify_staged_claim_completeness()`: it provisions nothing, launches
+    /// nothing, allocates no environment, mutates no lifecycle position and
+    /// mints no second reservation. A missing reservation is reported as
+    /// `Unknown`, not repaired here — creating one would be a stage, and
+    /// staging on a recovery read is exactly the effect this must not have.
+    fn reload_staged_reservation(
+        &self,
+        reservation_id: &OperationIdentity,
+        now_unix_ms: i64,
+    ) -> Result<AdmissionReservationSnapshot, NativeWorkerReconcileError> {
+        reload_staged_admission_reservation(
+            self.generation_gateway.ors.as_ref(),
+            reservation_id,
+            now_unix_ms,
+        )
+        .map_err(|error| match error {
+            OrsError::ReservationNotFound => NativeWorkerReconcileError::Unknown {
+                identity: reservation_id.as_str().to_owned(),
+            },
+            _ => NativeWorkerReconcileError::Fence {
+                field: "admission_reservation_reload",
+            },
+        })
     }
 
     /// Advances one staged claim to its next mechanical state.
@@ -409,6 +447,37 @@ impl KernelComposition {
             return Err(NativeWorkerReconcileError::Shape { field });
         }
         Ok(digest)
+    }
+
+    /// Reads the admission-reservation identity the reconcile presentation
+    /// carries back from the sealed stage receipt (#1678 A2).
+    ///
+    /// The value is read from the retained receipt first, then from the
+    /// presentation itself, so a worker that simply echoes the sealed
+    /// `admission_reservation_id` gets its OWN reservation reloaded rather
+    /// than a new one. An absent or null value means "did not stage", which
+    /// is not an error on this route; a malformed value is a typed shape
+    /// refusal, never a silently ignored identity.
+    fn presented_reservation_id(
+        payload: &serde_json::Value,
+    ) -> Result<Option<OperationIdentity>, NativeWorkerReconcileError> {
+        let raw = payload
+            .get("receipt")
+            .and_then(|receipt| receipt.get("admission_reservation_id"))
+            .or_else(|| payload.get("admission_reservation_id"));
+        let Some(raw) = raw.filter(|value| !value.is_null()) else {
+            return Ok(None);
+        };
+        let text =
+            native_worker_json_str(raw, "admission_reservation_id", MAX_RECONCILE_IDENTITY_LEN)
+                .map_err(|_| NativeWorkerReconcileError::Shape {
+                    field: "admission_reservation_id",
+                })?;
+        OperationIdentity::new(text)
+            .map(Some)
+            .map_err(|_| NativeWorkerReconcileError::Shape {
+                field: "admission_reservation_id",
+            })
     }
 
     /// Checks an optional retained receipt echo against the durable record.
@@ -661,6 +730,26 @@ impl KernelComposition {
             ));
         }
         Self::check_retained_receipt(payload, &claim_id, &staged)?;
+        // #1678 A2: when the claim presents the admission-reservation identity
+        // that was sealed at stage time, reload that SAME durable reservation
+        // rather than creating a second one. This is a read only: it launches
+        // nothing, provisions nothing and mutates no lifecycle position, so a
+        // restart after stage but before canonical admission cannot produce a
+        // launch. A presentation that names a reservation which is not durable
+        // is `Unknown` and takes no effect.
+        let reservation_state = match Self::presented_reservation_id(payload)? {
+            Some(presented) => {
+                let snapshot = self.reload_staged_reservation(
+                    &presented,
+                    i64::try_from(unix_ms()).unwrap_or(i64::MAX),
+                )?;
+                serde_json::json!({
+                    "admission_reservation_id": presented.as_str(),
+                    "admission_reservation_state": snapshot.record().state,
+                })
+            }
+            None => serde_json::Value::Null,
+        };
         let durable_state = if staged.state == NativeWorkerClaimState::Unknown {
             self.advance_reconcile_record(&claim_id, NativeWorkerClaimState::Reconciling)?
                 .state
@@ -676,6 +765,7 @@ impl KernelComposition {
             "binding_digest": staged.binding_digest,
             "worker_generation": staged.worker_generation,
             "durable_state": durable_state_value,
+            "admission_reservation": reservation_state,
             "admission_receipt_digest": staged.receipt_digest,
             "reconciled_at_unix_ms": unix_ms(),
         });

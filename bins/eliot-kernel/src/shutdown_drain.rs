@@ -905,6 +905,16 @@ impl ShutdownDrainCoordinator {
             pending: state.pending.iter().cloned().collect(),
             fenced_activation_generations: state.fenced_activation_generations.clone(),
         };
+        // The write path is held to the same contract the recovery read path
+        // enforces: a candidate the next process's `load` would refuse is
+        // never written, so a reported success always names resumable durable
+        // state instead of bricking the next resume.
+        if let Err(reason) = validate_durable_state(&durable) {
+            observe_shutdown("kernel.shutdown.persist_failed", "rejected");
+            return Err(format!(
+                "shutdown state candidate fails recovery validation: {reason}"
+            ));
+        }
         let payload = match serde_json::to_vec(&durable) {
             Ok(payload) => payload,
             Err(error) => {
@@ -912,6 +922,13 @@ impl ShutdownDrainCoordinator {
                 return Err(format!("shutdown state serialization failed: {error}"));
             }
         };
+        // The bounded reader refuses files past `DRAIN_STATE_MAX_BYTES`; the
+        // writer refuses to produce one, so no successful persist can brick
+        // the next load through size alone.
+        if payload.len() as u64 > DRAIN_STATE_MAX_BYTES {
+            observe_shutdown("kernel.shutdown.persist_failed", "rejected");
+            return Err("shutdown state payload exceeds the bounded decode limit".to_owned());
+        }
         let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
         if let Err(error) = fs::create_dir_all(parent) {
             observe_shutdown("kernel.shutdown.persist_failed", "rejected");
@@ -1680,8 +1697,11 @@ pub(crate) fn reverse_quiescence_order(live_branches: &[String]) -> Result<Vec<S
     if live.iter().any(|branch| !declared.contains(*branch)) {
         return Err("quiescent contour has an undeclared branch".to_owned());
     }
-    // Kahn's algorithm over the reverse edges: a branch is emittable only once
-    // every branch that requires it has already been emitted.
+    // Kahn's algorithm over the declared edges, keyed so that a branch is
+    // emittable only once every branch that depends on it has already been
+    // emitted: `outstanding[dependency]` holds the dependents still waiting on
+    // that dependency. A dependency therefore never stops before the branches
+    // that ride on it, which is the reverse of the startup order.
     let mut outstanding: BTreeMap<&str, BTreeSet<&str>> = live
         .iter()
         .map(|branch| (*branch, BTreeSet::new()))
@@ -1689,19 +1709,19 @@ pub(crate) fn reverse_quiescence_order(live_branches: &[String]) -> Result<Vec<S
     for edge in &KERNEL_QUIESCENCE_EDGES {
         if live.contains(edge.dependent)
             && live.contains(edge.dependency)
-            && let Some(requires) = outstanding.get_mut(edge.dependent)
+            && let Some(waited_on_by) = outstanding.get_mut(edge.dependency)
         {
-            requires.insert(edge.dependency);
+            waited_on_by.insert(edge.dependent);
         }
     }
     let mut ordered: Vec<String> = Vec::with_capacity(live.len());
     while !outstanding.is_empty() {
-        // The lexical minimum among the branches nothing else is waiting on.
+        // The lexical minimum among the branches nothing depends on any more.
         // Deterministic, and it asserts no dependency the declarations did not
         // make.
         let Some(next) = outstanding
             .iter()
-            .filter(|(_, requires)| requires.is_empty())
+            .filter(|(_, waited_on_by)| waited_on_by.is_empty())
             .map(|(branch, _)| *branch)
             .min()
         else {
@@ -1709,8 +1729,9 @@ pub(crate) fn reverse_quiescence_order(live_branches: &[String]) -> Result<Vec<S
         };
         outstanding.remove(next);
         ordered.push(next.to_owned());
-        for requires in outstanding.values_mut() {
-            requires.remove(next);
+        // This branch is stopped, so it no longer holds anything else back.
+        for waited_on_by in outstanding.values_mut() {
+            waited_on_by.remove(next);
         }
     }
     if ordered.len() != live.len() {

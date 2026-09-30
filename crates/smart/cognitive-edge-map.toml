@@ -106,12 +106,23 @@ reason = "Smart handlers are deterministic/stateless or rebuildable projections 
 # it must use owner contracts and never call the #40-frozen donor algorithm in
 # `eliot-context`. The production call and its `#[allow(deprecated)]` were
 # removed; this remains a no-new-call prohibition, not a live compile edge. The
+# immutable campaign view now enters a current owner cell instead
+# (`eliot-context-candidates::check_campaign_learning_state_view`), and the
 # surviving campaign_publication imports and their #40 removal denominator are
 # recorded separately below.
 [[forbidden_compile_edge]]
 from = "bins/eliotd campaign packet route (eliot.packet)"
 to = "eliot-context legacy ContextCompiler / CampaignCompiledContext"
-reason = "the frozen donor surface takes no new caller; compile_with_campaign_learning_state has zero product callers, so this row is a regression prohibition rather than a current edge. The campaign_publication imports that remain are recorded in legacy_facade_consumer."
+reason = "the frozen donor surface takes no new caller; compile_with_campaign_learning_state has zero product callers, so this row is a regression prohibition rather than a current edge. The campaign view's load-bearing revision and State Fence joins are owned by eliot-context-candidates::check_campaign_learning_state_view, not by this facade. The campaign_publication imports that remain are recorded in legacy_facade_consumer."
+
+# #1862: the campaign view must not reach the current cells as a donor-produced
+# compile DTO. The candidate cell re-derives every join it enforces, so the
+# route carries the immutable view and the Context owner's independently
+# re-derived recipe digest, never a legacy compiler verdict.
+[[forbidden_compile_edge]]
+from = "bins/eliotd campaign packet route (eliot.packet)"
+to = "any donor-produced campaign compile verdict presented to eliot-context-candidates / eliot-context-admission / eliot-context-assembly"
+reason = "the current owner cells own the load-bearing revision and State Fence joins; a caller-carried compile DTO is a second, unverifiable spelling of the same facts and is refused by construction at the candidate cell"
 
 [[legacy_facade_consumer]]
 issue = 1862
@@ -142,7 +153,14 @@ facade_disposition_rows = 62
 campaign_publication_disposition_rows = 10
 compile_with_campaign_learning_state_product_callers = 0
 replacement_owner_chain = ["A-15", "A-16a", "A-17a", "A-18"]
-owner_admission_status = "AUD1_PARTIAL_NO_ADMITTED_OWNER_MINTED_CLOSURE"
+admitted_campaign_view_join = "eliot-context-candidates::check_campaign_learning_state_view, eliot-context-admission::check_campaign_view_for_admission, eliot-context-assembly::check_campaign_view_for_assembly"
+admitted_campaign_view_join_caller = "bins/eliotd/src/campaign_packet.rs::candidate_request_for_packet, bins/eliotd/src/campaign_packet.rs::resolve_compile_and_bind_result, bins/eliotd/src/kernel_context_read_client.rs::KernelContextReadClient::compile_context_packet"
+admitted_campaign_view_join_enforces = "view State Fence against the candidate request binding; task/scope/request identity; load-bearing Context recipe owner revision against the Context owner's independently re-derived recipe body digest; refusal of invalidated, STALE, BLOCKED and missing-Context-row views; and, at the admission cell, the owner-minted Decision Safety Floor resolved by eliot-context::campaign_publication::context_safety_floor_identity. The cell re-derives the closed equality set AdmissionInput::validate_contract states - floor.floor.binding == the decision binding (else InvalidFence), floor.decision == recipe.decision AND floor.decision.decision_id == binding.decision_id (else IdentityConflict), floor.floor.capacity == recipe.capacity (else IdentityConflict), and floor.mandatory_roles covering every recipe.mandatory_roles entry (else MissingFloor) - and validates the floor through the contract owner's own SafetyFloorIdentity::validate. Comparing the full DecisionRevision and the capacity envelope, rather than decision_id alone, is what refuses a floor carrying a foreign recipe_revision or policy_sha256, or a shaved capacity."
+admitted_pre_render_output_identity = "eliot-context-assembly::rendered_output_identity"
+admitted_pre_render_output_identity_reason = "QualityScorecard::output.rendered_digest must be filled before assemble_active_view is called, but the rendered payload is produced inside it from render::render, which is pub(crate) in eliot-context-assembly, so no caller outside that crate could derive it and the composition was unsatisfiable by construction rather than merely unminted. rendered_output_identity returns that identity from the same render::render + measurement::canonical_matches pair assemble_active_view itself runs, so the digest a card is built against and the digest assembly recomputes in require_graded_output are one derivation, not two that must agree."
+unadmitted_campaign_view_joins = ["eliot-context-candidates::construct_context_candidates", "eliot-context-admission::admit_context_traced", "eliot-context-assembly::assemble_active_view"]
+unadmitted_campaign_view_join_reason = "SafetyFloorIdentity is now minted on the live route from the Context owner's own publication and the admission closure is no longer built before the candidate set it must cover, so the two ordering reasons that made compile_context_packet unsatisfiable are gone. What remains is a genuine owner-record absence, measured per identity: the seven provider role projections have no producer on this route and required_projection converts only KnownEmpty; RecipeAdmissionPolicy::admission_rule is an owner reference whose rule record is deliberately not copied into the recipe body and is read nowhere; I2.16 places serializer identity on SerializedContextMeasurement whose inputs are caller-owned MeasurementParams that no route issues; and RecipeLayoutPolicy::role_positions is per-ROLE, not per-atom, so no per-atom priority class exists. PriorityPolicyIdentity, AdmissionRuleIdentity, MeasurementCompositionProfile, the per-atom AdmissionMeasurement set, QualityScorecard, AssemblyPolicy and the measure callback therefore still have zero production construction sites, and minting them would fabricate the I12.26 selection record. The typed CampaignPacketGapCode::AdmissionClosureUnbound reporting carries the per-identity account."
+owner_admission_status = "AUD1_PARTIAL_ALL_THREE_VIEW_JOINS_ADMITTED_MAPPER_AND_ADMISSION_ASSEMBLY_UNADMITTED"
 removal_condition = "Migrate all three bins/eliotd source modules from the frozen campaign_publication surface to admitted owner contracts, then re-verify zero external Cargo dependents and zero imports before #40 A4 facade retirement. The owner chain is not yet an admitted campaign closure."
 
 # Issue #816 uses consumer -> dependency notation for compile edges.  Runtime

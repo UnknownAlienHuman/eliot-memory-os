@@ -7,7 +7,8 @@
 
 #![forbid(unsafe_code)]
 
-use eliot_build_test_graph::{
+pub use eliot_build_test_graph::{
+    BUILD_ROOT_DIRECTORY, BuildFingerprint, BuildMode, CARGO_HOME_ENV, CARGO_TARGET_DIR_ENV,
     CandidateIdentity, GovernedWorkEnvelope, LaneIdentity, RuntimeEnvironmentLease,
 };
 use eliot_contracts::{
@@ -49,7 +50,8 @@ pub use resources::{
 };
 pub use target_layout::{
     BoundTargetRoots, BuildClass, TARGET_LAYOUT_REVISION, TargetLayoutBinding,
-    bound_roots_conflict, derive_layout_path, verify_layout_binding,
+    bound_roots_conflict, derive_layout_path, verify_envelope_layout_binding,
+    verify_layout_binding,
 };
 pub use typed_evidence::{
     EphemeralSourceBytes, ProcessStreamSourceReadbackObservation, ProcessStreamSourceReadbackPort,
@@ -1399,6 +1401,14 @@ pub struct TestJob {
     /// without a lane; it never selects fallback identity.
     #[serde(default)]
     pub work_envelope: Option<GovernedWorkEnvelope>,
+    /// Fixture namespace allocated for this work item at admission (issue
+    /// #1897, W4), derived by the retained envelope from the whole lane
+    /// tuple — work item, build mode, and normalized fingerprint — and never
+    /// from the worktree, the project id, the job id, or a counter. `None`
+    /// preserves the pre-lane authority for rows admitted without a lane; it
+    /// never selects a fallback namespace.
+    #[serde(default)]
+    pub fixture_namespace: Option<String>,
     /// Scheduling priority; larger values run first among ready heads.
     pub priority: i32,
     /// Declared job class. The class, not the raw `priority` integer, is the
@@ -2261,6 +2271,15 @@ pub struct RawArtifact {
     /// Clock captured by TestD at the stream-retention boundary.
     #[serde(default)]
     pub captured_at: ClockReading,
+    /// Retained lane identity this artifact was emitted under (issue #1897).
+    /// `None` while a stream is captured, because capture has no job; the
+    /// artifact-admission seam stamps it from the retained envelope, and
+    /// `VerificationReceipt::validate` refuses an enveloped job whose emitted
+    /// artifact records do not all carry the retained candidate and contract
+    /// revision. Presence alone is never accepted — the content is compared
+    /// against the envelope's own `candidate_identity()`.
+    #[serde(default)]
+    pub lane_identity: Option<CandidateIdentity>,
 }
 
 impl RawArtifact {
@@ -2283,6 +2302,9 @@ impl RawArtifact {
             capture_sequence: 0,
             stream: RawArtifactStream::Unknown,
             captured_at: ClockReading::default(),
+            // Capture has no job, so no retained lane identity exists yet. The
+            // artifact-admission seam binds it before the record is emitted.
+            lane_identity: None,
         };
         artifact.validate()?;
         Ok(artifact)
@@ -2700,9 +2722,12 @@ impl VerificationReceipt {
     /// Validates identity and exact raw-handle lineage before publication.
     pub fn validate(&self, job: &TestJob) -> Result<(), TestdError> {
         job.target_roots.validate()?;
-        if let Some(layout) = job.target_layout.as_ref() {
-            verify_layout_binding(&job.target_roots, layout)?;
-        }
+        verify_job_lane(
+            &job.target_roots,
+            job.target_layout.as_ref(),
+            job.work_envelope.as_ref(),
+            job.fixture_namespace.as_deref(),
+        )?;
         let binding = self.binding();
         validate_receipt_binding(job, &binding)?;
         // Issue #1897 (W5): the emitted result carries the exact lane
@@ -2717,6 +2742,17 @@ impl VerificationReceipt {
                     .map_err(|_| TestdError::InvalidBinding)?;
                 if identity != &expected {
                     return Err(TestdError::InvalidBinding);
+                }
+                // Issue #1897 (W5, audit Exit): every emitted ARTIFACT record
+                // carries the same retained candidate and contract revision as
+                // the result, compared by content. An artifact that names
+                // another lane, or names none, refuses: an artifact produced
+                // under one candidate cannot be published under another one's
+                // verdict.
+                for artifact in &self.raw_artifacts {
+                    if artifact.lane_identity.as_ref() != Some(&expected) {
+                        return Err(TestdError::InvalidBinding);
+                    }
                 }
             }
             (Some(_), None) | (None, Some(_)) => return Err(TestdError::InvalidBinding),
@@ -2943,6 +2979,17 @@ impl EvidenceCollector {
             .raw_artifacts
             .lock()
             .map_or_else(|_| BTreeMap::new(), |artifacts| artifacts.clone());
+        // Issue #1897 (W5): the artifact-admission seam is the one place in the
+        // capture path that holds the job, so it is where every emitted
+        // `RawArtifact` record is bound to the retained lane identity. Capture
+        // itself has no job and deliberately leaves the field absent; the
+        // receipt never publishes an unbound artifact for an enveloped job,
+        // because `VerificationReceipt::validate` compares each artifact's
+        // identity with the retained envelope's own value.
+        let lane_identity = job
+            .work_envelope
+            .as_ref()
+            .and_then(|envelope| envelope.candidate_identity().ok());
         let mut raw_artifacts = Vec::new();
         let mut handles = BTreeSet::new();
         for record in &records {
@@ -2953,7 +3000,9 @@ impl EvidenceCollector {
                 if handles.insert(handle.to_owned())
                     && let Some(artifact) = raw.get(handle)
                 {
-                    raw_artifacts.push(artifact.clone());
+                    let mut artifact = artifact.clone();
+                    artifact.lane_identity.clone_from(&lane_identity);
+                    raw_artifacts.push(artifact);
                 }
             }
         }
@@ -2998,15 +3047,13 @@ impl EvidenceCollector {
             raw_artifacts,
             normalized,
             typed_evidence: self.typed_bundles(),
-            // Issue #1897 (W5): attach the allocated lane identity to the
-            // emitted result. The envelope was validated when the job row
-            // committed, so identity derivation fails only on a corrupt
-            // row; that failure still refuses loudly at `finish` instead
-            // of emitting an unattributed result for an enveloped job.
-            lane_identity: job
-                .work_envelope
-                .as_ref()
-                .and_then(|envelope| envelope.candidate_identity().ok()),
+            // Issue #1897 (W5): attach the retained lane identity to the
+            // emitted result, from the same value every emitted artifact
+            // record was bound to above. The envelope was validated when the
+            // job row committed, so identity derivation fails only on a
+            // corrupt row; that failure still refuses loudly at `finish`
+            // instead of emitting an unattributed result for an enveloped job.
+            lane_identity,
         }
     }
 }
@@ -4024,12 +4071,39 @@ impl TestdStore {
                 return Err(TestdError::InvalidBinding);
             }
         }
+        // Issue #1897 (W4): allocate the fixture namespace for this work item
+        // in the same admitting transaction that allocates and persists its
+        // envelope, and take it from the whole lane tuple through the
+        // envelope's own derivation. It is never taken from the worktree, the
+        // project id, the job id, or a counter, and it is allocated once per
+        // work item rather than derived on demand at each use, so a restart
+        // consumes the retained value instead of a replacement one.
+        let fixture_namespace = work_envelope
+            .as_ref()
+            .map(|envelope| {
+                envelope
+                    .fixture_namespace()
+                    .map_err(|error| TestdError::Contract(error.to_string()))
+            })
+            .transpose()?;
+        // Issue #1897 (W1/W3/AUD4): an allocated lane is the ONE target-root
+        // authority for this job. `TargetRoots` (issue #1806) and
+        // `TargetLayoutBinding` are a second, competing derivation, so for an
+        // enveloped job the layout contributes the admitted build root and the
+        // workspace/checkout identity only, and the envelope contributes the
+        // whole governed root. `TargetRoots::validate` keeps its existing
+        // `cache_root == target_root` equality and its strict-descendant
+        // requirement — this adds no distinctness on either side, it refuses
+        // the disagreement.
         let mut target_roots = target_roots;
         target_roots.allowed_contour_root = grant.contour_root.clone();
         target_roots.validate()?;
-        if let Some(layout) = target_layout.as_ref() {
-            verify_layout_binding(&target_roots, layout)?;
-        }
+        verify_job_lane(
+            &target_roots,
+            target_layout.as_ref(),
+            work_envelope.as_ref(),
+            fixture_namespace.as_deref(),
+        )?;
         let digest = payload_digest(
             &invocation,
             &process,
@@ -4038,6 +4112,7 @@ impl TestdStore {
             job_class,
             &resource_profile,
             work_envelope.as_ref(),
+            fixture_namespace.as_deref(),
         )?;
         let process = ProcessAdmission::from_request(&process);
         let write = self.database.begin_write().map_err(database)?;
@@ -4139,6 +4214,7 @@ impl TestdStore {
             target_roots,
             target_layout,
             work_envelope,
+            fixture_namespace,
             priority,
             job_class,
             resource_profile,
@@ -4296,27 +4372,36 @@ impl TestdStore {
             .allocate(&job.job_id, &job.resource_profile)
             .map_err(|error| TestdError::ResourceConflict(error.to_string()))?;
         job.scheduling = Some(
-            scheduling_decision(job.job_class, &job.resource_profile, leases)
+            scheduling_decision(job.job_class, &job.resource_profile, leases.clone())
                 .map_err(|error| TestdError::ResourceConflict(error.to_string()))?,
         );
-        // Issue #1897 (W1): record the granted leases on the allocated
-        // envelope, so the persisted work item keeps the leases it was
-        // admitted with. The scheduler's allocate-or-refuse above stays the
-        // enforced claims gate: a parallel declaration with no exclusive
-        // claim is legitimate, so the envelope-level non-empty admission
-        // gate is not the claim gate.
-        if let (Some(envelope), Some(decision)) =
-            (job.work_envelope.as_mut(), job.scheduling.as_ref())
-        {
-            envelope.runtime_leases = decision
-                .leases
-                .iter()
-                .map(|lease| RuntimeEnvironmentLease {
-                    kind: lease.kind,
-                    resource: lease.resource.clone(),
-                    holder: lease.holder.clone(),
-                })
-                .collect();
+        // Issue #1897 (W1/W5): record the allocator's ACTUAL grant on the
+        // allocated envelope, so the persisted work item keeps the leases it
+        // was admitted with. `leases` is the live `ResourceLeaseAllocator`
+        // outcome, not a reconstruction of matching field values: the
+        // allocator refused above if any declared resource or serial group was
+        // already held, and `with_granted_leases` additionally refuses a record
+        // whose holder is not this job. The envelope is the only writer of that
+        // record, so two jobs cannot claim one exclusive resource by presenting
+        // identical lease DTOs. The scheduler's allocate-or-refuse above stays
+        // the enforced claims gate: a parallel declaration with no exclusive
+        // claim is legitimate, so the envelope-level non-empty admission gate is
+        // not the claim gate.
+        if let Some(envelope) = job.work_envelope.take() {
+            job.work_envelope = Some(
+                envelope
+                    .with_granted_leases(
+                        leases
+                            .iter()
+                            .map(|lease| RuntimeEnvironmentLease {
+                                kind: lease.kind,
+                                resource: lease.resource.clone(),
+                                holder: lease.holder.clone(),
+                            })
+                            .collect(),
+                    )
+                    .map_err(|error| TestdError::ResourceConflict(error.to_string()))?,
+            );
         }
         job.state = JobState::Running;
         job.attempts = job.attempts.saturating_add(1);
@@ -4369,8 +4454,22 @@ impl TestdStore {
             .get(job_id)?
             .ok_or_else(|| TestdError::Corrupt("job not found".to_owned()))?;
         job.target_roots.validate()?;
-        if let Some(layout) = job.target_layout.as_ref() {
-            verify_layout_binding(&job.target_roots, layout)?;
+        verify_job_lane(
+            &job.target_roots,
+            job.target_layout.as_ref(),
+            job.work_envelope.as_ref(),
+            job.fixture_namespace.as_deref(),
+        )?;
+        // Issue #1897 (W1/W5): requalify the retained envelope with its owner
+        // before this attempt starts. The row just read is the durable
+        // authority — this method never re-derives a tuple from the current
+        // ambient environment — and the retained lease record is checked against
+        // the job that must own it, so a restart cannot execute under a lease
+        // another job holds or under a malformed tuple.
+        if let Some(envelope) = job.work_envelope.as_ref() {
+            envelope
+                .requalify()
+                .map_err(|_| TestdError::InvalidBinding)?;
         }
         let request = permit.request();
         request
@@ -4390,6 +4489,36 @@ impl TestdStore {
             .non_secret()
             .get("CARGO_HOME")
             .ok_or(TestdError::InvalidBinding)?;
+        // Issue #1897 (W3): the governed Cargo invocation must run under the
+        // target root this work item was admitted with. The two values read
+        // above are the invocation's own `CARGO_TARGET_DIR` and `CARGO_HOME`;
+        // they are compared against the environment derived from the RETAINED
+        // envelope, never against a tuple rebuilt from the current ambient
+        // environment. An enveloped job therefore cannot execute in the
+        // repository `target/`, in the user-global Cargo home, or in any root
+        // other than the one its persisted envelope allocated. Both sides bind
+        // the same directory, so this adds no distinctness: the existing
+        // `cache_root == target_root` rule stays the single cache/target
+        // relation, and the process environment resolver that emitted these
+        // values (`TestdProcessToolIntent::validate_for_roots`) already refused
+        // any other pairing.
+        if let Some(envelope) = job.work_envelope.as_ref() {
+            let governed = envelope
+                .cargo_environment()
+                .map_err(|_| TestdError::InvalidBinding)?;
+            for (variable, expected) in [
+                (CARGO_TARGET_DIR_ENV, target_root.as_str()),
+                (CARGO_HOME_ENV, cache_root.as_str()),
+            ] {
+                let bound = governed
+                    .iter()
+                    .find(|(name, _)| name == variable)
+                    .map(|(_, value)| value.as_str());
+                if bound != Some(expected) {
+                    return Err(TestdError::InvalidBinding);
+                }
+            }
+        }
         let expected = ClaimBindingExpectation {
             operation_id: request.operation_id().as_str(),
             process_tree_id: request.process_tree_id().as_str(),
@@ -4507,7 +4636,13 @@ impl TestdStore {
                 let (key, value) = item.map_err(database)?;
                 let job: TestJob = serde_json::from_slice(value.value())
                     .map_err(|error| TestdError::Corrupt(error.to_string()))?;
-                if matches!(job.state, JobState::Running) {
+                // A cancelled attempt that still reports `Running` execution
+                // (issue #1897) holds runtime leases its cancelled process may
+                // still be using, so it is swept with the running rows.
+                if matches!(job.state, JobState::Running)
+                    || (job.state == JobState::Cancelled
+                        && job.execution == Some(ExecutionStatus::Running))
+                {
                     running.push(key.value().to_owned());
                 }
             }
@@ -4534,9 +4669,15 @@ impl TestdStore {
             .map_or("testd-reconciler", |lease| lease.owner.as_str())
             .to_owned();
         let previous = job.state;
+        let cancelled_unresolved =
+            job.state == JobState::Cancelled && job.execution == Some(ExecutionStatus::Running);
         job.execution = Some(decision.execution);
         job.lease = None;
-        let terminal = if job.attempts < self.retry.max_attempts {
+        let terminal = if cancelled_unresolved {
+            // A cancelled attempt stays cancelled: reconciliation here releases
+            // its runtime leases, it does not resurrect the work (issue #1897).
+            JobState::Cancelled
+        } else if job.attempts < self.retry.max_attempts {
             JobState::RetryWait
         } else {
             JobState::Failed
@@ -4682,6 +4823,14 @@ impl TestdStore {
     }
 
     /// Cancels a queued or currently leased job using its current fence.
+    ///
+    /// Cancelling a *running* attempt clears the worker fence but does not
+    /// release its runtime-environment leases: the process may still be alive
+    /// and its effect on a port, service, fixture, or database volume is not yet
+    /// observed. The retained [`SchedulingDecision`](super::SchedulingDecision)
+    /// therefore stays on the row, and the reconciler — not this call — resolves
+    /// the attempt and frees the leases. A queued job holds no lease and is
+    /// released immediately.
     pub fn cancel(
         &self,
         job_id: &str,
@@ -4697,10 +4846,36 @@ impl TestdStore {
         }
         validate_cancellation_lease(&job, lease, actor, now)?;
         validate_text(actor, "actor")?;
+        // Issue #1897 (AUD6): cancellation reads the same retained envelope as
+        // admission and execution. It requalifies the tuple before the worker
+        // fence is cleared, so a cancelled attempt can only stop work whose
+        // retained lease record is its own. A record naming another holder is a
+        // copied DTO and refuses here instead of releasing a resource the
+        // requesting transport never actually held. Nothing is re-derived from
+        // the current ambient environment.
+        if let Some(envelope) = job.work_envelope.as_ref() {
+            envelope
+                .requalify()
+                .map_err(|_| TestdError::InvalidBinding)?;
+        }
         let previous = job.state;
+        let was_running = previous == JobState::Running;
         job.state = JobState::Cancelled;
         job.lease = None;
-        job.execution = Some(ExecutionStatus::Cancelled);
+        // Issue #1897 (W5): cancelling a *running* attempt records the
+        // cancellation, not the outcome. The worker fence is cleared so the
+        // cancelled worker loses write authority, but the process may still be
+        // alive and its effect on a leased port, service, fixture, or database
+        // volume is unobserved. The execution projection therefore stays
+        // `Running` — the one value that means "attempt started, outcome
+        // unproven" — so the lease holder set keeps holding and the reconciler
+        // releases it. A queued job never started, so its outcome is the
+        // cancellation itself.
+        job.execution = Some(if was_running {
+            ExecutionStatus::Running
+        } else {
+            ExecutionStatus::Cancelled
+        });
         job.updated_at_ms = now;
         let write = self.database.begin_write().map_err(database)?;
         let mut table = write.open_table(JOBS).map_err(database)?;
@@ -4819,9 +4994,18 @@ const RESERVED_FOREGROUND_WEIGHT: u32 = 3;
 
 /// Builds the lease state held by every durably running job. Recomputed from
 /// the record rather than cached, so a restart reconstructs the same leases.
+///
+/// A cancelled attempt whose execution is still `Running` holds its leases too:
+/// its worker fence is gone but its process may still be alive, so releasing the
+/// exclusive resource here would let a second job claim a port, service,
+/// fixture, or database volume the cancelled process is still using (issue
+/// #1897).
 fn running_lease_allocator(jobs: &[TestJob]) -> ResourceLeaseAllocator {
     let mut allocator = ResourceLeaseAllocator::new();
-    for job in jobs.iter().filter(|job| job.state == JobState::Running) {
+    for job in jobs.iter().filter(|job| {
+        job.state == JobState::Running
+            || (job.state == JobState::Cancelled && job.execution == Some(ExecutionStatus::Running))
+    }) {
         let leases = job
             .scheduling
             .as_ref()
@@ -4870,6 +5054,82 @@ fn project_head_blocked<'a>(
         })
 }
 
+/// The one lane-root check every lifecycle stage runs.
+///
+/// A job admitted without a lane keeps the pre-lane layout authority: the
+/// owner-issued binding resolves its own root. A job that carries a retained
+/// [`GovernedWorkEnvelope`] has exactly one root authority — the envelope's
+/// governed root — so the layout is verified against the envelope rather than
+/// deriving a second root from its build-class level. Both branches keep the
+/// `cache_root == target_root` relation of
+/// [`TargetRoots::validate`] untouched and add no distinctness.
+///
+/// It also binds the retained fixture namespace (issue #1897, W4) to the
+/// retained envelope BY CONTENT: the namespace the row carries must equal what
+/// its own envelope derives from the whole lane tuple, and a lane without a
+/// namespace is a namespace without a derivation. Presence is never enough, a
+/// mismatched namespace is never repaired, and no namespace is ever derived
+/// from the worktree, the project id, the job id, or a counter.
+///
+/// # Errors
+///
+/// Returns the first [`TestdError`] the selected verification raises.
+fn verify_job_lane(
+    target_roots: &TargetRoots,
+    layout: Option<&TargetLayoutBinding>,
+    envelope: Option<&GovernedWorkEnvelope>,
+    fixture_namespace: Option<&str>,
+) -> Result<(), TestdError> {
+    let lane = match (layout, envelope) {
+        (Some(layout), Some(envelope)) => {
+            verify_envelope_layout_binding(target_roots, layout, envelope).map(|_| ())
+        }
+        (Some(layout), None) => verify_layout_binding(target_roots, layout).map(|_| ()),
+        // A lane without an owner-issued binding still has exactly one root:
+        // the one its retained envelope derives. The strict-descendant and
+        // `TargetRoots` gates above already bound it to the granted contour.
+        (None, Some(envelope)) => {
+            let governed = envelope
+                .derive_target_root()
+                .map_err(|error| TestdError::Contract(error.to_string()))?;
+            let canonical =
+                validate_root_identity(&governed.to_string_lossy(), "work_envelope.governed_root")?;
+            let target =
+                validate_root_identity(&target_roots.target_root, "target_roots.target_root")?;
+            if canonical != target {
+                return Err(TestdError::InvalidBinding);
+            }
+            Ok(())
+        }
+        (None, None) => Ok(()),
+    };
+    lane?;
+    // The namespace is a derived half of the required tuple, not a name the
+    // row may choose: the envelope is its only source, so an enveloped job
+    // whose retained namespace is absent or different was not admitted under
+    // this lane and refuses, and a namespace retained without a lane has no
+    // derivation to agree with and also refuses.
+    match (envelope, fixture_namespace) {
+        (Some(envelope), Some(retained)) => {
+            let expected = envelope
+                .fixture_namespace()
+                .map_err(|error| TestdError::Contract(error.to_string()))?;
+            if retained != expected.as_str() {
+                return Err(TestdError::InvalidBinding);
+            }
+        }
+        (Some(_), None) | (None, Some(_)) => return Err(TestdError::InvalidBinding),
+        (None, None) => {}
+    }
+    Ok(())
+}
+
+// The admitted payload is the whole tuple this job row commits to, so every
+// element is a separate parameter rather than a struct that could be built
+// partially. That makes the arity exceed the lint default by one; the sibling
+// composition entrypoint in this workspace carries the same attribute for the
+// same reason.
+#[allow(clippy::too_many_arguments)]
 fn payload_digest(
     invocation: &InstrumentInvocation,
     process: &ProcessRequest,
@@ -4878,6 +5138,7 @@ fn payload_digest(
     job_class: JobClass,
     resource_profile: &TestResourceProfile,
     work_envelope: Option<&GovernedWorkEnvelope>,
+    fixture_namespace: Option<&str>,
 ) -> Result<String, TestdError> {
     let bytes = serde_json::to_vec(&(
         invocation,
@@ -4887,6 +5148,7 @@ fn payload_digest(
         job_class,
         resource_profile,
         work_envelope,
+        fixture_namespace,
     ))
     .map_err(|error| TestdError::Corrupt(error.to_string()))?;
     Ok(blake3::hash(&bytes).to_hex().to_string())

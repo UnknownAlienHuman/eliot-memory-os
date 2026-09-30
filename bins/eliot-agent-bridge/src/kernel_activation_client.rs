@@ -510,6 +510,17 @@ impl KernelTransportOwner {
             OpenAgentBridgeActivationDisposition::Authenticated { binding } => {
                 let b = *binding;
                 self.activated_session = Some(b.session_id.clone());
+                // Retain the task and `WorkScope` the SAME typed response
+                // resolved (#2857). The session above was kept only, so the
+                // host-request envelope builder had no authenticated task
+                // identity to bind and every production `eliot.query` envelope
+                // was admitted with `task_id: None`. These are the Kernel's own
+                // resolved strings, copied verbatim next to the session they
+                // were issued under; nothing is derived, defaulted or minted.
+                self.activated_task_binding = Some(crate::ActivatedTaskBinding {
+                    task_id: b.task_id.clone(),
+                    work_scope_id: b.work_scope_id.clone(),
+                });
                 let principal_id =
                     PrincipalId::new(b.principal_id).map_err(|_| provider_failure())?;
                 let session_id = SessionId::new(b.session_id).map_err(|_| provider_failure())?;

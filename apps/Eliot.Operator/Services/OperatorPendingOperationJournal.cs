@@ -424,6 +424,21 @@ public sealed class OperatorPendingOperationJournal : IDisposable
                     error);
             }
 
+            // The closed profile refuses an unmapped member, but an ABSENT
+            // `phase` member is not unmapped: with no required-constructor
+            // enforcement it decodes to the enum's numeric default, and an
+            // undefined numeric value casts into the enum without error. Both
+            // reach the recovery promotion, which rewrites every non-terminal
+            // record, so a truncated or tampered phase would be silently
+            // normalized to a real one instead of being refused. The phase is
+            // therefore validated here, where a record is only ever refused
+            // and never dropped or rewritten.
+            if (!IsRetainable(operation.Phase))
+            {
+                throw new OperatorPendingOperationJournalException(
+                    "pending operation journal contains an invalid operation phase");
+            }
+
             if (string.IsNullOrEmpty(operation.EnvelopeJson)
                 || operation.EnvelopeJson.Length > MaxEnvelopeChars)
             {
@@ -538,6 +553,27 @@ public sealed class OperatorPendingOperationJournal : IDisposable
 
     private static bool IsTerminal(OperatorOperationPhase phase) => phase is
         OperatorOperationPhase.Receipted
+        or OperatorOperationPhase.Rejected
+        or OperatorOperationPhase.Cancelled
+        or OperatorOperationPhase.StaleFence;
+
+    /// The phases a retained record may actually hold. This is a closed
+    /// allow-list, so an undefined numeric alias falls out of it by
+    /// construction and is refused rather than promoted.
+    ///
+    /// `Created` is excluded because it is that numeric default and no writer
+    /// ever assigns it: a record carrying it is an absent `phase` member, not a
+    /// state. The four terminal members stay listed on purpose — the owner
+    /// compacts a terminal record by journalling the terminal phase first, so
+    /// a crash inside that window leaves exactly one of them on disk, and the
+    /// recovery promotion is what compacts it. Refusing a terminal phase would
+    /// instead fail the whole load and strand every unproven record beside it.
+    private static bool IsRetainable(OperatorOperationPhase phase) => phase is
+        OperatorOperationPhase.Submitted
+        or OperatorOperationPhase.PossiblyExecuted
+        or OperatorOperationPhase.UnknownReconciling
+        or OperatorOperationPhase.NotAttempted
+        or OperatorOperationPhase.Receipted
         or OperatorOperationPhase.Rejected
         or OperatorOperationPhase.Cancelled
         or OperatorOperationPhase.StaleFence;

@@ -985,7 +985,13 @@ pub(crate) async fn apply_reserved_attempt(
     validate_transition(&attempt.context, &attempt.transition)?;
     let db = client(adapter).await?;
     ensure_ready(adapter, db).await?;
-    apply_with_retry(
+    // Boxed: the retry future holds the multi-kilobyte canonical
+    // `PreparedTransition` across provider awaits, exceeding the default
+    // future-size lint. Same seam and rationale as
+    // `apply_prepared_with_authority`; boxing here also keeps the future of
+    // the `ReservedAttemptTransport::execute_attempt` caller bounded, because
+    // it awaits this one directly.
+    Box::pin(apply_with_retry(
         adapter,
         db,
         &attempt.context,
@@ -994,7 +1000,7 @@ pub(crate) async fn apply_reserved_attempt(
         attempt.expected_ordering_heads.clone(),
         &authorities,
         TxLane::PooledWrite,
-    )
+    ))
     .await
 }
 
@@ -1805,6 +1811,25 @@ fn validate_transition(
         .map_err(AdapterError::Store)?;
     if ctx.state_fence != transition.state_fence {
         return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    // Issue #1702: bind the owner-revision authorization to the AUTHENTICATED
+    // request source. The plan check inside `transition.validate()` can only
+    // compare the presented lease with the record's own owner fields, because a
+    // `PreparedTransition` is a semantic plan and carries no transport identity.
+    // This is the separate act that compares the presenter with `ctx.source_id`,
+    // so a caller relabelling its own role fails closed here, before any
+    // provider I/O, receipt or fence advance.
+    for operation in &transition.named_operations {
+        if operation.operation == eliot_store_api::NamedMutationOperation::ApplySwarmOwnerRevisions
+        {
+            let batch = eliot_store_api::decode_swarm_owner_revisions(
+                operation.operation,
+                &operation.parameters,
+            )
+            .map_err(AdapterError::Store)?;
+            eliot_store_api::validate_swarm_owner_revision_authorization(&batch.record, ctx)
+                .map_err(AdapterError::Store)?;
+        }
     }
     Ok(())
 }

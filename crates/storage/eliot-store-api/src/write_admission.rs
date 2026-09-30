@@ -217,8 +217,10 @@
 //! | `ApplyBlackboardItem` | F7 | `CaptureCandidate` | `Candidate` | 4 |
 //! | `ApplyEpistemicRevision` | F3 | `Epistemic` | `Candidate` | 4 |
 //! | `UpdateTaskState` | F2 | `TaskControl` | `ReversibleMutation` | 4 |
+//! | `ApplySwarmOwnerRevisions` | F2 | `TaskControl` | `ReversibleMutation` | 4 |
 //! | `ApplyLifecyclePolicy` | F8 | `LifecyclePolicy` | `ReversibleMutation` | 4 |
 //! | `ReconcileRecovery` | F8 | `RecoverySchema` | `ReversibleMutation` | 4 |
+//! | `ApplyProblemOwnerState` | F8 | `RecoverySchema` | `ReversibleMutation` | 4 |
 //! | `ApplyErasure` | F8 | `Erasure` | `ReversibleMutation` | 4 |
 //! | `ApplyUserAutomationState` | F8 | `UserAutomation` | `ReversibleMutation` | 4 |
 //! | `RecordFinishDecision` | F5 | `RecoverySchema` | `ReversibleMutation` | 4 |
@@ -236,22 +238,26 @@
 //!
 //! Declared in [`crate::NamedMutationOperation`] but not activated, and therefore
 //! refused pre-stage with `StoreError::UnknownOperation` rather than mapped to a
-//! status or upsert behavior: `RecordAuthorityRevocation`,
-//! `ApplySwarmOwnerRevisions`, and `ApplyInstrumentRegistryState`.
+//! status or upsert behavior: `RecordAuthorityRevocation` and
+//! `ApplyInstrumentRegistryState`.
 //! `RecordAuthorityRevocation` is explicitly known-but-unsupported (issue #686):
 //! its typed parameter contract and the Governor decision edge are closed, but
 //! its catalogue row, proven per-backend handlers, and consumer triple are not.
-//! `ApplySwarmOwnerRevisions` stays known-but-unactivated until Governor's
-//! owner-specific authorization evidence is carried and verified at this
-//! boundary. The genesis bootstrap entry is mutation-shaped and binds to
+//! `ApplySwarmOwnerRevisions` is ACTIVATED (issue #1702) under the
+//! `TaskControl` family with the closed owner-revision typed contract: it is
+//! admitted only when the owner-specific authorization evidence travels inside
+//! the record and matches the record's own owner lease, the transition's
+//! authority epoch and the authenticated request source, so a cross-owner or
+//! stale-lease presentation is refused before persistence or effects. The
+//! genesis bootstrap entry is mutation-shaped and binds to
 //! `TransitionClass::RecoverySchema` under I5.15 rather than under I5.17.
 //!
 //! Issue #1874's body describes seven reachable mutations and names
 //! `RecordAuthorityRevocation` among them. That list is a subset, not the
 //! activated set, and `RecordAuthorityRevocation` is not reachable at all; the
-//! activated set is the eighteen rows above. I5.15's own initial executable set
+//! activated set is the nineteen rows above. I5.15's own initial executable set
 //! is a contract-denomination list and does not enumerate named mutations, so
-//! the eighteen rows activate under I5.17 against this crate's proven
+//! the nineteen rows activate under I5.17 against this crate's proven
 //! handler, schema, and consumer triple.
 //!
 //! # Non-goals

@@ -338,6 +338,10 @@ fn build_response(
     let mut value = load_fixture(shape_fixture);
     value["request_identity"] =
         serde_json::to_value(&edge.request.request_identity).expect("identity json");
+    if let JobOperation::Submit { submission } = &edge.request.operation {
+        value["semantic_input"] =
+            serde_json::to_value(&submission.semantic_input).expect("semantic input json");
+    }
     if with_receipt {
         value["receipt_id"] = Value::String(format!(
             "dreamer-receipt-{}",
@@ -1417,6 +1421,9 @@ mod gateway_cases {
             "job_id": submission.job_id,
             "attempt_id": submission.attempt_id,
             "scope": serde_json::to_value(&submission.work_scope).expect("scope"),
+            "semantic_input": serde_json::to_value(&submission.semantic_input).expect("semantic input"),
+            "semantic_input_bytes": serde_json::to_value(&submission.semantic_input_bytes)
+                .expect("semantic input bytes"),
             "revision": 1u64,
             "state": "QUEUED",
             "disposition": "COMMITTED",

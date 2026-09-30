@@ -50,6 +50,7 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
+time = { workspace = true, features = ["parsing"] }
 
 [dev-dependencies]
 # Issue #2031: Kernel-route tests share the single `KernelRouteEvidence`

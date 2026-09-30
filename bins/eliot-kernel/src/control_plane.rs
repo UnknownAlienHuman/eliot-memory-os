@@ -1636,17 +1636,21 @@ impl KernelComposition {
         Ok(rows)
     }
 
-    /// Terminalizes past-due non-terminal rows through the owner
-    /// [`RuntimeLease::transition_to`] legality and re-records each terminal
-    /// revision through the canonical ORS owner (I1.5 W4, #1751).
+    /// Terminalizes past-due non-terminal rows through reconciliation and
+    /// the disposition-named close, re-recording each terminal revision
+    /// through the canonical ORS owner (I1.5 W4, #1751).
     ///
     /// The tick clock is the only evidence expiry needs — "if renewal cannot
     /// be proved, coverage ends at expiry and is reported honestly" — so no
     /// observation is consumed here; renewal evidence enters only through
     /// [`Self::renew_runtime_leases_for_probe`]. A past-due row in any
-    /// non-terminal state moves to `Expired`; terminal rows are never
-    /// rewritten. The census keeps classifying recorded `expires_at_ms`
-    /// values and never rewrites them itself.
+    /// non-terminal state reaches `Expired` through
+    /// [`Self::terminalize_past_due_runtime_lease`]: an `Active` row enters
+    /// `Reconciling` with `Expired` named from its own past-due condition and
+    /// closes through that named cleanup in the same tick, so orphaned leases
+    /// expire and enter reconciliation without ever blocking the next census.
+    /// Terminal rows are never rewritten. The census keeps classifying
+    /// recorded `expires_at_ms` values and never rewrites them itself.
     fn expire_past_due_runtime_leases(
         &self,
         fence: &StateFence,
@@ -1658,16 +1662,52 @@ impl KernelComposition {
             if runtime_lease_is_terminal(row.state) || now_ms < row.expires_at_ms {
                 continue;
             }
-            let terminal = row
-                .transition_to(LeaseState::Expired)
-                .map_err(|_| TransportError::SessionFenced)?;
-            self.generation_gateway
-                .ors
-                .record_runtime_lease_current(&terminal)
-                .map_err(|_| TransportError::SessionFenced)?;
+            self.terminalize_past_due_runtime_lease(fence, row)?;
             expired += 1;
         }
         Ok(expired)
+    }
+
+    /// Terminalizes one past-due non-terminal row through the owner
+    /// [`RuntimeLease::transition_to`] legality and the canonical ORS owner
+    /// (I1.5 W4, #1751).
+    ///
+    /// An `Active` row enters `Reconciling` through the ORS entry driver with
+    /// `Expired` named from its own past-due condition, then closes through
+    /// the ORS exit driver with that same named cleanup; a `Reconciling` row
+    /// left by a crashed tick closes through the exit driver directly. Rows
+    /// in any other live state move straight to `Expired` — the owner admits
+    /// no other `Reconciling` entry — and terminal rows never reach here. A
+    /// failure fences the request instead of skipping the row silently.
+    fn terminalize_past_due_runtime_lease(
+        &self,
+        fence: &StateFence,
+        row: &RuntimeLease,
+    ) -> Result<(), TransportError> {
+        let ors = &self.generation_gateway.ors;
+        if row.state == LeaseState::Active {
+            ors.reconcile_runtime_lease_for_terminal_disposition(
+                fence,
+                row.lease_id.as_str(),
+                LeaseState::Expired,
+            )
+            .map_err(|_| TransportError::SessionFenced)?;
+        }
+        if row.state == LeaseState::Active || row.state == LeaseState::Reconciling {
+            ors.close_reconciled_runtime_lease_for_disposition(
+                fence,
+                row.lease_id.as_str(),
+                LeaseState::Expired,
+            )
+            .map_err(|_| TransportError::SessionFenced)?;
+            return Ok(());
+        }
+        let terminal = row
+            .transition_to(LeaseState::Expired)
+            .map_err(|_| TransportError::SessionFenced)?;
+        ors.record_runtime_lease_current(&terminal)
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(())
     }
 
     /// Supersedes stale same-scope identities after a new grant through the
@@ -1755,13 +1795,7 @@ impl KernelComposition {
                 continue;
             }
             if now_ms >= row.expires_at_ms {
-                let terminal = row
-                    .transition_to(LeaseState::Expired)
-                    .map_err(|_| TransportError::SessionFenced)?;
-                self.generation_gateway
-                    .ors
-                    .record_runtime_lease_current(&terminal)
-                    .map_err(|_| TransportError::SessionFenced)?;
+                self.terminalize_past_due_runtime_lease(&fence, row)?;
                 outcome.expired += 1;
                 continue;
             }

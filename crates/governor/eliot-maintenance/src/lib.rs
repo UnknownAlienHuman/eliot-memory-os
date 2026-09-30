@@ -78,15 +78,16 @@ pub use improvement_pipeline::{
     ImprovementCandidateIngress, ImprovementCurrentProposal, ImprovementEvidenceExecution,
     ImprovementMaterialEquality, ImprovementOperation, ImprovementPipelineInputs,
     ImprovementProposal, ImprovementProposalCommitmentEnvelope, ImprovementReplayAssessment,
-    ImprovementTerminalDisposition, ImprovementUnknownEffect, KERNEL_CANARY_OWNER,
-    MechanismDeclaration, OP_ADMIT, OP_CANARY_ACTIVATE, OP_CANDIDATE_INGRESS, OP_EVALUATE,
-    OP_EXECUTE_EXPERIMENT, OP_MEASURE, OP_PROMOTE, OP_PROPOSE, OP_ROLLBACK, PipelineError,
-    ProposalCommitment, RetainedImprovementProposal, RollbackContract, TESTD_OWNER,
+    ImprovementTerminalDisposition, ImprovementUnknownEffect, ImprovementUnknownEffectIdentity,
+    KERNEL_CANARY_OWNER, MechanismDeclaration, OP_ADMIT, OP_CANARY_ACTIVATE, OP_CANDIDATE_INGRESS,
+    OP_EVALUATE, OP_EXECUTE_EXPERIMENT, OP_MEASURE, OP_PROMOTE, OP_PROPOSE, OP_ROLLBACK,
+    PipelineError, ProposalCommitment, RetainedImprovementProposal, RollbackContract, TESTD_OWNER,
     UnboundOwnerOutcome, UncheckedRecordIdentity, UncheckedWireRevision, UnestablishedPriorCause,
     VERIFIER_OWNER_FAMILY, assess_improvement_replay, check_checked_record_identity,
     check_handoff_wire_revision, compare_improvement_commitments, improvement_retry_permitted,
-    ingest_improvement_candidate, proposal_digest, reconcile_unknown_activation,
-    retained_improvement_completion, run_improvement_candidate_pipeline,
+    ingest_improvement_candidate, proposal_digest, reconcile_retained_unknown_effect,
+    reconcile_unknown_activation, retained_improvement_completion,
+    run_improvement_candidate_pipeline,
 };
 pub use trigger_intake::{
     MaintenanceTriggerIntake, TriggerIntakeClasses, TriggerIntakeOperation, TriggerIntakePayload,
@@ -716,6 +717,39 @@ pub trait MaintenanceStateStore {
     fn load(&mut self, job_id: &str) -> Result<Option<MaintenanceJob>, MaintenanceError>;
     /// Persists one validated job revision atomically for its identity.
     fn save(&mut self, job: &MaintenanceJob) -> Result<(), MaintenanceError>;
+}
+
+/// Proves one durable job intent from the owner's own committed bytes (I14.22,
+/// issue #1694 W4).
+///
+/// A transport acknowledgement is never commit proof: the caller presents the
+/// intent it saved (`saved`) and the committed revision the durable owner
+/// served back (`committed`), and this function proves the read-back binds
+/// that exact intent. Both revisions are validated — the original first, so a
+/// malformed intent is refused as its own defect rather than as a read-back
+/// mismatch — and the committed revision must carry the same nonblank
+/// `job_id` and `trigger_id`. Anything else (a substituted job, a job for
+/// another trigger, unvalidated bytes) is refused and the trigger stays
+/// retained and unacknowledged; receipt absence or mismatch is never proof of
+/// non-commit, so the caller reconciles through the owning read path instead
+/// of retrying the effect blindly.
+///
+/// # Errors
+///
+/// Returns the owner's own [`MaintenanceError`] when either revision is
+/// invalid, and [`MaintenanceError::InvalidField`] naming `job_ref` when the
+/// committed read-back does not bind the saved intent's job and trigger
+/// identity.
+pub fn prove_job_intent_durable(
+    saved: &MaintenanceJob,
+    committed: &MaintenanceJob,
+) -> Result<(), MaintenanceError> {
+    saved.validate()?;
+    committed.validate()?;
+    if committed.job_id != saved.job_id || committed.trigger_id != saved.trigger_id {
+        return Err(MaintenanceError::InvalidField("job_ref"));
+    }
+    Ok(())
 }
 
 /// Deterministic maintenance decision and job owner.

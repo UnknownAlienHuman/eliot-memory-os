@@ -545,6 +545,7 @@ impl ContextCompiler {
         input: CampaignLearningStateCompileInput<'_>,
     ) -> Result<CampaignCompiledContext, CampaignContextCompileError> {
         let context_recipe = &input.recipe_body.recipe;
+        let context_catalogue = &input.recipe_body.catalogue;
         let context_input = &input.recipe_body.compiler_input;
         validate_campaign_context_binding(
             context_recipe,
@@ -567,8 +568,9 @@ impl ContextCompiler {
             input.current_source_resolutions,
             CampaignSourceRole::ContextDelivery,
         )?;
-        let recipe_publication = context_recipe_publication(context_recipe, context_input)
-            .map_err(|_| ContextError::InvalidCampaignRecipe)?;
+        let recipe_publication =
+            context_recipe_publication(context_recipe, context_catalogue, context_input)
+                .map_err(|_| ContextError::InvalidCampaignRecipe)?;
         let delivery_publication =
             context_delivery_publication(context_recipe, input.prior_delivery).map_err(|_| {
                 ContextError::CampaignSourceMismatch {

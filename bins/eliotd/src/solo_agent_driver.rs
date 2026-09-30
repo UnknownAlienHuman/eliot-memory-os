@@ -71,7 +71,7 @@ use std::sync::{Arc, Mutex};
 
 use eliot_agent_api::{AttemptId, RouteFingerprint};
 use eliot_agent_coordinator::{
-    AdmissionId, CandidateId, RUNTIME_PROFILE_FILE_NAME, StaffingPlanRequest,
+    AdmissionId, CandidateId, RUNTIME_PROFILE_FILE_NAME, SchedulingProfile, StaffingPlanRequest,
     load_runtime_scheduling_profile,
 };
 use eliot_contracts::{fences_match_exact, sha256_hex};
@@ -1056,6 +1056,12 @@ pub fn drive_solo_delegate(
     let ports = solo_fabric_ports(context, kernel, registry);
     let mut fabric = AgentFabric::new_with_admitted_provider(config, ports, capability)
         .map_err(DaemonError::ProviderAdmission)?;
+    // Issue #1702 W2: the drive runs against the daemon state root, so every
+    // owner-separated revision published on this fabric is committed and
+    // verified durably before anything reports it current. Attaching the store
+    // before the first semantic write is what makes the ordering property
+    // reachable from the production path instead of a separate test seam.
+    fabric.attach_semantic_revision_store(composition.state_root());
     let evidence = composition.capability_admission()?;
     let route = fabric.require_model_route(
         &intake.requirements,
@@ -1281,6 +1287,19 @@ fn restore_solo_fabric(
         ports,
         projection.claimed.material(),
     )?;
+    // #1702 W2: every production solo operation restores through this one
+    // seam -- the fair-pull recovery poll, cancellation request, terminal
+    // reconciliation and worker-result ingest all call `restore_solo_fabric`
+    // and drive the fabric it returns. Binding the daemon state root to the
+    // fabric HERE is what makes the ordering property hold on the production
+    // path rather than only under `cfg(test)`: `agent_fabric_restore_verified`
+    // is itself a test-only helper, so it carries no store of its own on this
+    // seam, and without this attach the restored fabric would refuse every
+    // owner-separated revision with `DurabilityUnproven`. Attaching before
+    // the first semantic write means each publish is committed and verified
+    // durably before it is readable as current, across restart, for the
+    // retained history of all three owners.
+    fabric.attach_semantic_revision_store(composition.state_root());
     // Reconcile the unknown: an emitted dispatch with no ingested result
     // cannot relaunch and cannot release; its outcome stays unknown until
     // the worker observation arrives through the ingest leg.
@@ -1320,15 +1339,49 @@ fn repersist_after_control(
     persist_projection(composition.state_root(), projection)
 }
 
+/// Resolves the Kernel-owned nine-class scheduling profile beside the
+/// Host-approved launch config.
+///
+/// The `runtime.toml` is resolved beside the Host-approved launch config — the
+/// same protected runtime root `daemon_config` derives `state_root` from — and
+/// not from an environment variable, a working directory or a legacy Governor
+/// file. An absent, unreadable, malformed, wrongly-versioned or incomplete
+/// document is the loader's own typed refusal and is returned unchanged: it is
+/// never defaulted, because I14.1 requires a bounded byte profile for all nine
+/// classes and I14.2 states an item ceiling for only five of them, so "no file"
+/// cannot compile a nine-class policy without inventing numbers no fragment
+/// states.
+///
+/// Both arms of the I14.8 progress loop resolve the profile through this one
+/// function, so the release event and the bounded recovery poll can never
+/// compile different policies from different places.
+fn load_scheduling_profile(
+    composition: &DaemonComposition,
+) -> Result<SchedulingProfile, DaemonError> {
+    let runtime_root = composition.config_path().parent().ok_or_else(|| {
+        DaemonError::Composition(CompositionError::Recovery(
+            "approved launch config has no runtime parent for the Kernel queue profile".to_owned(),
+        ))
+    })?;
+    load_runtime_scheduling_profile(&runtime_root.join(RUNTIME_PROFILE_FILE_NAME))
+        .map_err(|error| DaemonError::ProviderAdmission(FabricError::from(error)))
+}
+
 /// Drives the coordinator's fair pull over the capacity a settled attempt just
 /// released (issue #1683 W1, I14.8 "Scheduler is pull-based").
 ///
-/// This is the daemon's production call of `AgentFabric::drive_fair_pull`, on
-/// the I14.8 release path: `submit_attempt_result` has just settled an attempt,
-/// so the coordinator is asked for the next currently admissible item instead of
+/// This is the **event arm** of the I14.8 progress loop: the daemon's
+/// production call of `AgentFabric::drive_fair_pull`, on the I14.8 release
+/// path. `submit_attempt_result` has just settled an attempt, so the
+/// coordinator is asked for the next currently admissible item instead of
 /// waiting for another agent command. It runs after
 /// [`repersist_after_control`], so the candidate result and settlement state are
 /// already durable and a refused queue profile cannot lose an observation.
+///
+/// A release that arrives while nobody is listening to a wake still cannot
+/// strand work, because the same drive is also reached by the always-armed
+/// bounded recovery poll in [`solo_fair_pull_recovery`]. This arm is the
+/// low-latency path; it is not the correctness mechanism.
 ///
 /// Reachable in a non-test build: [`solo_ingest_result`] and
 /// [`DaemonComposition::solo_ingest_result`](crate::DaemonComposition::solo_ingest_result)
@@ -1343,29 +1396,13 @@ fn repersist_after_control(
 /// admission owner (issue #1678). The join is placed on the release path
 /// because that is where I14.8 says the wake happens, not on a site that would
 /// be reachable only by pulling over an empty plan-only coordinator.
-///
-/// The Kernel-owned `runtime.toml` is resolved beside the Host-approved launch
-/// config — the same protected runtime root `daemon_config` derives
-/// `state_root` from — and not from an environment variable, a working
-/// directory or a legacy Governor file. An absent, unreadable, malformed,
-/// wrongly-versioned or incomplete document is the loader's own typed refusal
-/// and is returned unchanged: it is never defaulted, because I14.1 requires a
-/// bounded byte profile for all nine classes and I14.2 states an item ceiling
-/// for only five of them, so "no file" cannot compile a nine-class policy
-/// without inventing numbers no fragment states.
 fn drive_fair_pull_after_release(
     composition: &DaemonComposition,
     fabric: &mut AgentFabric,
     projection: &mut SoloPersistedAttempt,
 ) -> Result<(), DaemonError> {
-    let runtime_root = composition.config_path().parent().ok_or_else(|| {
-        DaemonError::Composition(CompositionError::Recovery(
-            "approved launch config has no runtime parent for the Kernel queue profile".to_owned(),
-        ))
-    })?;
-    let profile = load_runtime_scheduling_profile(&runtime_root.join(RUNTIME_PROFILE_FILE_NAME))
-        .map_err(|error| DaemonError::ProviderAdmission(FabricError::from(error)))?;
-    let outcome = fabric.drive_fair_pull(&profile)?;
+    let profile = load_scheduling_profile(composition)?;
+    let outcome = fabric.drive_fair_pull(&profile, false)?;
     // The drive advances the coordinator's fairness credit and may have started
     // attempts, so the digest-bound snapshot is re-persisted after it rather
     // than before.
@@ -1380,7 +1417,122 @@ fn drive_fair_pull_after_release(
     Ok(())
 }
 
-/// Reads the attempt status under the same durable identity.
+/// Exact disposition of one bounded fair-pull recovery poll (issue #1683 W5).
+///
+/// It is deliberately a *poll* outcome, not a success flag: a poll that started
+/// nothing is a fully successful poll that observed an empty or fully closed
+/// projection, and reporting that as an error would train a reader to ignore the
+/// arm that has to stay armed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FairPullRecovery {
+    /// No live admitted operation is retained, so there is no projection to
+    /// poll. This is the idle observation, not a failure: nothing is eligible
+    /// because nothing is admitted, and the next tick observes again.
+    NoLiveProjection,
+    /// The bounded drive ran and started nothing this pass.
+    PolledNothing,
+    /// The bounded drive ran and started these many attempts. Names the
+    /// operation whose projection was polled so a reader can find it.
+    PolledStarted {
+        operation_id: String,
+        started: usize,
+    },
+}
+
+/// The always-armed bounded recovery poll of the I14.8 progress loop (issue
+/// #1683 W5).
+///
+/// **This is the arm that makes the loop correct under a lost notification, and
+/// the event arm in [`drive_fair_pull_after_release`] is only the optimisation.**
+/// An event-only loop deadlocks: if a wake is dropped, coalesced away, or
+/// delivered before anything is waiting, the loop waits forever for work that
+/// is already eligible. So this poll is *armed unconditionally* — the caller
+/// invokes it on every bounded cadence tick without consulting any wake state,
+/// any prior failure, or any "did anything change" flag, and the drive it
+/// performs runs its bounded selector loop whether or not a wake was pending.
+/// That is why a lost wake costs one cadence of latency rather than stranding
+/// work.
+///
+/// It is the same drive over the same projection as the release path, with the
+/// same `SchedulingProfile` resolved from the same Kernel-owned `runtime.toml`
+/// ([`load_scheduling_profile`]) and the same digest-bound re-persist
+/// ([`repersist_after_control`]), so the two arms can never compile different
+/// policies or persist a different snapshot shape. The only difference is that
+/// this one does not wait to be told there is work.
+///
+/// Bound: one drive per call, and the drive's own bound is derived from the
+/// projection (at most one attempt per currently non-terminal admitted attempt).
+/// This function adds no interval, no retry, no cap and no timeout of its own —
+/// the cadence is the caller's existing bounded tick.
+///
+/// Reachable in a non-test build: this is not `cfg(test)`-gated, and its
+/// production caller is `daemon_runtime::maybe_start_fair_pull_recovery`, which
+/// runs it on the daemon's existing `ACTIVATION_POLL_INTERVAL` cadence. The
+/// same fail-closed residual as the release arm applies and is not worked
+/// around here: a non-test `restore_solo_fabric` refuses, so the poll reports
+/// that typed refusal until the Kernel native-worker owner and the G-11
+/// admission owner (#1678) land. Both arms go live together, at the same owner.
+///
+/// The Kernel handle is used only for the restore's live-fence revalidation
+/// that [`restore_solo_fabric`] already performs; this poll performs no
+/// authenticated Kernel request of its own and adds none.
+///
+/// # Errors
+///
+/// Returns the owner rejection unchanged. A refusal is a refusal, not a
+/// degraded poll: the caller records it and the next tick polls again.
+pub async fn solo_fair_pull_recovery(
+    composition: &Arc<tokio::sync::Mutex<DaemonComposition>>,
+    kernel: &Arc<DaemonKernelClient>,
+) -> Result<FairPullRecovery, DaemonError> {
+    // Snapshot the live slot under a short synchronous lock, exactly as the
+    // intake poll does, then release the composition guard before the restore.
+    let operation_id = {
+        let Ok(composition) = composition.try_lock() else {
+            return Ok(FairPullRecovery::NoLiveProjection);
+        };
+        if composition.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        let state = composition.solo_state.lock().map_err(|_| {
+            DaemonError::Composition(CompositionError::Recovery(
+                "solo driver state lock poisoned".to_owned(),
+            ))
+        })?;
+        // Absent live slot: nothing is admitted, so there is no projection that
+        // a missed wake could have stranded. That is the honest idle answer and
+        // it costs no owner IO.
+        let Some(live) = state.live_operation.clone() else {
+            return Ok(FairPullRecovery::NoLiveProjection);
+        };
+        live
+    };
+    let composition = composition.lock().await;
+    let mut projection = load_projection(composition.state_root(), &operation_id)?;
+    let mut fabric = restore_solo_fabric(&composition, kernel, &projection)?;
+    let profile = load_scheduling_profile(&composition)?;
+    let outcome = fabric.drive_fair_pull(&profile, true)?;
+    repersist_after_control(&composition, &fabric, &mut projection)?;
+    let started = outcome.started.len();
+    tracing::debug!(
+        algorithm = outcome.algorithm,
+        profile_revision = outcome.profile_revision.as_str(),
+        started,
+        pulls = outcome.pulls_performed,
+        consumed_wake = outcome.consumed_wake.is_some(),
+        cursor_event_sequence = outcome.cursor_event_sequence,
+        "bounded fair pull recovery poll"
+    );
+    if started == 0 {
+        Ok(FairPullRecovery::PolledNothing)
+    } else {
+        Ok(FairPullRecovery::PolledStarted {
+            operation_id,
+            started,
+        })
+    }
+}
+
 ///
 /// Serves the persisted projection when no live slot exists, so inspect
 /// and post-restart readback address the same attempt without requiring a

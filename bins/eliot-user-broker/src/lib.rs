@@ -59,7 +59,9 @@ mod operation_identity;
 mod own_generation_job;
 mod protected_launch_config;
 use bridge_contract::{user_broker_contract, validate_user_broker_contract};
-use kernel_authority_port::KernelAuthorityPort;
+use kernel_authority_port::{
+    KernelAuthorityPort, OperatorSessionTokenGrant, OperatorSessionTokenRequest,
+};
 pub use notify_fallback_ensure::{
     LiveNotifyFallbackEffects, NotifyFallbackDeclaration, NotifyFallbackEffects,
     NotifyFallbackEnsure, NotifyFallbackRegistration, ensure_notify_fallback_registered,
@@ -223,9 +225,12 @@ pub enum BrokerAdmissionRefusal {
     /// refused rather than narrowed.
     #[error("CAPABILITY_INTRODUCTION_REQUIRED")]
     OperatorHandoffNotAdmitted,
-    /// A presented Kernel session token is not the live registration digest:
-    /// the binding was issued under a superseded Kernel session, or the live
-    /// registration lease already elapsed. A fresh binding is required.
+    /// A presented Kernel session token is not current for this binding: the
+    /// Kernel issued no token for it, the token belongs to another binding or
+    /// another UI process, its own short lease elapsed, or the registration
+    /// the binding was issued under is no longer the live one. A fresh
+    /// challenge against live Kernel admission, and a fresh binding, are the
+    /// only way forward; a token is never refreshed here.
     #[error("STALE_AUTHORITY_EPOCH")]
     OperatorSessionTokenStale,
     /// A presented Windows SID/logon Session is not the installation/SID/
@@ -345,8 +350,9 @@ pub struct OperatorClientBinding {
     pub windows_sid: String,
     /// Interactive logon Session the client proved for that process.
     pub interactive_session_id: String,
-    /// Kernel session token the client's binding was issued under: the live
-    /// Kernel-issued registration digest, never a caller-minted value.
+    /// Kernel session token the client's binding was issued under: the fresh,
+    /// short-lived value the Kernel minted for this exact binding, never a
+    /// caller-minted value and never a long-lived registration identity.
     pub kernel_session_token: String,
 }
 
@@ -378,17 +384,33 @@ pub struct HumanStateAuthority {
 }
 
 /// One Kernel-backed Operator session binding recorded when the broker
-/// issues a handoff (I11.8). The Kernel session token is the live
-/// Kernel-issued registration digest: short-lived, refreshed by the
-/// heartbeat loop, and stable only while the Kernel session is live — every
-/// redemption and state-changing request re-proves it against the live
-/// registration and its lease horizon. Rows are process-memory only, so a
-/// broker restart discards every binding and a restarted UI must acquire a
-/// fresh one.
+/// issues a handoff (I11.8).
+///
+/// Two Kernel-issued values are recorded, and they are not interchangeable:
+///
+/// * `kernel_registration_digest` is the live Kernel-issued registration
+///   identity this handoff was issued under. It is the broker's session
+///   liveness root: every redemption and every state-changing request
+///   re-proves it against the live registration, so a superseded Kernel
+///   session retires the binding.
+/// * `kernel_session_token` is the fresh, short-lived token the Kernel minted
+///   for **this** binding when the connected UI process was challenged, bound
+///   to the one-shot handoff nonce, the OS-observed Windows SID/session/client
+///   tuple, the exact granted role and capability set, and the Kernel's live
+///   authority epoch/fence/generation. It exists only inside its own lease
+///   (`kernel_session_expires_at`), is never refreshed here, and is compared
+///   against the value the client presents - it is a binding proof, not a
+///   bearer credential, and the connected-peer proof remains the OS-observed
+///   pipe peer.
+///
+/// Rows are process-memory only, so a broker restart discards every binding
+/// and a restarted UI must acquire a fresh one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct OperatorSessionBinding {
     endpoint: OperatorEndpoint,
+    kernel_registration_digest: String,
     kernel_session_token: String,
+    kernel_session_expires_at: u64,
     windows_sid: String,
     interactive_session_id: String,
     role: String,
@@ -396,6 +418,22 @@ struct OperatorSessionBinding {
     challenge_peer: Option<ProcessIdentity>,
     redeemed_peer: Option<ProcessIdentity>,
     redeemed: bool,
+    /// The broker-local registration epoch the *core* held its handoff ledger
+    /// under when this row was inserted. It is recorded from the live
+    /// registration receipt, not from the launch declaration, because it is
+    /// one of the three axes the core itself compares
+    /// (`UserBroker::operator_handoff_authority`).
+    core_ledger_broker_epoch: u64,
+    /// The logon Session the *core* held its handoff ledger under when this
+    /// row was inserted. Distinct from `interactive_session_id` above, which
+    /// is the SID/Session tuple this broker was admitted for: the core
+    /// compares the registration's own Session, and the two are the same value
+    /// only because admission refuses a foreign tuple.
+    core_ledger_interactive_session_id: String,
+    /// The installation-approved Operator artifact the *core* built this row's
+    /// ledger for. A different approved image is a different core ledger, and
+    /// the core treats it as one.
+    core_ledger_artifact: OperatorArtifact,
 }
 
 fn is_bounded_text(value: &str) -> bool {
@@ -409,6 +447,14 @@ fn is_exact_approval_hash(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+/// The exact shape of a Kernel-issued Operator session token: a lowercase
+/// SHA-256 over the Kernel's own bound evidence. Shape only - the proof that a
+/// presented token is the one the Kernel issued for this binding is the
+/// comparison against the recorded grant, never this predicate.
+fn is_exact_session_token(value: &str) -> bool {
+    is_exact_approval_hash(value)
 }
 
 impl OperatorClientBinding {
@@ -425,9 +471,12 @@ impl OperatorClientBinding {
             return Err(BrokerAdmissionRefusal::OperatorBindingCrossSession
                 .with_platform("redeeming client session is not a bounded identity value"));
         }
-        if !is_bounded_text(&self.kernel_session_token) {
-            return Err(BrokerAdmissionRefusal::OperatorSessionTokenStale
-                .with_platform("redeeming client session token is not a bounded token value"));
+        if !is_exact_session_token(&self.kernel_session_token) {
+            return Err(
+                BrokerAdmissionRefusal::OperatorSessionTokenStale.with_platform(
+                    "redeeming client session token is not a Kernel-issued token value",
+                ),
+            );
         }
         Ok(())
     }
@@ -465,10 +514,10 @@ impl HumanStateAuthority {
                 "state-changing request carries no exact Kernel-canonicalized approval hash",
             ));
         }
-        if !is_bounded_text(&self.kernel_session_token) {
+        if !is_exact_session_token(&self.kernel_session_token) {
             return Err(
                 BrokerAdmissionRefusal::OperatorSessionTokenStale.with_platform(
-                    "state-changing request session token is not a bounded token value",
+                    "state-changing request session token is not a Kernel-issued token value",
                 ),
             );
         }
@@ -1220,6 +1269,14 @@ pub struct BrokerComposition {
     /// Process-memory only: a broker restart discards every row, so a
     /// restarted UI can only redeem a freshly issued binding.
     operator_session_bindings: BTreeMap<String, OperatorSessionBinding>,
+    /// The authenticated Kernel front door this broker generation holds, kept
+    /// beside the provider port so an Operator binding can ask the Kernel for
+    /// the fresh, short-lived session token I11.8 requires. It is a transport
+    /// to the Kernel owner
+    /// (`crates/kernel/eliot-kernel-service/src/operator_session_token.rs`),
+    /// never a local mint: a composition without it issues no session token,
+    /// so no handoff is challengeable.
+    kernel_authority: Option<KernelAuthorityPort>,
     /// Exact approval hashes bound to broker state-changing operations,
     /// keyed by operation identity (launch idempotency key or control
     /// operation id). One operation owns exactly one approved hash: a
@@ -1317,7 +1374,7 @@ impl BrokerComposition {
         config: BrokerConfig,
         authority: Option<Box<dyn AuthorityPort>>,
         process: Option<Box<dyn ProcessPort>>,
-        _kernel_client: Option<SharedKernelClient>,
+        kernel_client: Option<SharedKernelClient>,
         launch: Option<(BrokerLaunchBinding, ProtectedPathLease)>,
         issuer: IssuerHandle,
     ) -> Result<Self, CompositionError> {
@@ -1432,6 +1489,16 @@ impl BrokerComposition {
         #[cfg(windows)]
         let generation_job =
             own_generation_job::create_owned_generation_job(&process_binding.identity)?;
+        // The same authenticated front door and per-operation identity issuer
+        // the provider port uses, held directly so an Operator binding can
+        // reach the Kernel session-token owner. Both handles are shared arcs
+        // over one client, and each Kernel transaction still mints its own
+        // exact identity. Constructing it cannot fail, so the Job Object
+        // boundary above is not extended by a new `?` path.
+        let kernel_authority = kernel_client.map(|client| KernelAuthorityPort {
+            client,
+            issuer: issuer.clone(),
+        });
         Ok(Self {
             broker,
             snapshot,
@@ -1444,6 +1511,7 @@ impl BrokerComposition {
             registration_digest,
             identity_issuer: issuer,
             operator_session_bindings: BTreeMap::new(),
+            kernel_authority,
             approval_bindings: BTreeMap::new(),
             notify_launch: BrokerNotifyLaunchAuthority::unstaged(NotifyLaunchStage::Deferred {
                 reason: "NOT_STAGED",
@@ -1900,14 +1968,31 @@ impl BrokerComposition {
         // Redeemed rows from a superseded Kernel session can never be
         // presented again, so they leave the ledger; unredeemed rows stay so
         // a late redemption reports stale rather than unknown.
-        let live_token = live.registration_digest.clone();
-        self.operator_session_bindings
-            .retain(|_, row| !row.redeemed || row.kernel_session_token == live_token);
+        let live_registration_digest = live.registration_digest.clone();
+        self.operator_session_bindings.retain(|_, row| {
+            !row.redeemed || row.kernel_registration_digest == live_registration_digest
+        });
+        // Retirement on the core's own ledger key, after the issue above has
+        // already rebuilt that ledger to this key. This is the second, and
+        // only sound, way a row leaves this map.
+        Self::retire_rows_outside_core_ledger(
+            &mut self.operator_session_bindings,
+            &live,
+            &artifact,
+        );
         self.operator_session_bindings.insert(
             endpoint.handoff_nonce.clone(),
             OperatorSessionBinding {
                 endpoint: endpoint.clone(),
-                kernel_session_token: live.registration_digest.clone(),
+                kernel_registration_digest: live.registration_digest.clone(),
+                // The Kernel session token is not minted here and not seeded
+                // from the registration: it is the fresh per-binding value the
+                // Kernel issues in `challenge_operator_handoff`, and it stays
+                // absent until then. An empty token can never equal a
+                // presented bounded token, so an unchallenged binding is not
+                // redeemable.
+                kernel_session_token: String::new(),
+                kernel_session_expires_at: 0,
                 windows_sid: binding.registration.windows_sid.clone(),
                 interactive_session_id: binding.registration.interactive_session_id.clone(),
                 role: endpoint.role.clone(),
@@ -1915,9 +2000,64 @@ impl BrokerComposition {
                 challenge_peer: None,
                 redeemed_peer: None,
                 redeemed: false,
+                core_ledger_broker_epoch: live.user_broker_epoch,
+                core_ledger_interactive_session_id: live.interactive_session_id.clone(),
+                core_ledger_artifact: artifact,
             },
         );
         Ok(endpoint)
+    }
+
+    /// Retires every row whose handoff the core can no longer see, at the one
+    /// insert site. Mirrors `OperatorHandoffAuthority::retire_terminal_rows` in
+    /// `eliot-user-broker-core`.
+    ///
+    /// The predicate is *structural*, not inferred from row state. The core
+    /// retains its handoff ledger under exactly three axes — in
+    /// `UserBroker::operator_handoff_authority`, the retained
+    /// `OperatorHandoffBinding` survives only while
+    /// `binding.broker_epoch == registration.user_broker_epoch &&
+    /// binding.interactive_session_id == registration.interactive_session_id &&
+    /// binding.artifact == artifact`; any mismatch constructs a *fresh*
+    /// `OperatorHandoffAuthority`, and its `handoffs` map starts empty. So for
+    /// a row recorded under a different key, the nonce this map still holds
+    /// is absent from the core's live ledger, and
+    /// `OperatorHandoffAuthority::consume` reads that absence as
+    /// `BrokerError::ReplayConflict`. Removing the row therefore changes no
+    /// refusal into an acceptance: the absent-row branch of
+    /// [`Self::redeem_operator_handoff`] delegates to exactly that core call
+    /// and gets exactly that refusal. The refusal *code* narrows for these
+    /// rows, exactly as it does for the core's own retired rows: a challenge or
+    /// redemption that used to report `STALE_AUTHORITY_EPOCH` from the
+    /// registration check reports `RESOURCE_LEASE_REPLAYED` /
+    /// `CAPABILITY_INTRODUCTION_REQUIRED` from the unknown nonce instead. Both
+    /// are errors and neither grants anything.
+    ///
+    /// The direction does not reverse either. A rebuilt ledger is empty and
+    /// nonces are freshly minted per issue, so a retired row's nonce can
+    /// never reappear under a later key — the key moving *back* would rebuild
+    /// an empty map again, not restore the old one. This is what distinguishes
+    /// this retirement from retiring a row merely because it looks spent: a
+    /// spent row is only safe to drop because its nonce happens to be consumed
+    /// in the core, whereas here the core cannot hold the nonce at all.
+    ///
+    /// What this bounds: the map holds the handoffs issued under the core
+    /// ledger key that is still current, plus redeemed rows the previous
+    /// `retain` still needs. What it does not bound: handoffs issued under
+    /// the *current* key that are never redeemed. Those stay until the key
+    /// moves, because bounding them would need a capacity or age limit this
+    /// boundary does not carry — and an age limit is exactly the coincidence
+    /// this predicate refuses to depend on.
+    fn retire_rows_outside_core_ledger(
+        rows: &mut BTreeMap<String, OperatorSessionBinding>,
+        live: &RegistrationReceipt,
+        artifact: &OperatorArtifact,
+    ) {
+        rows.retain(|_, row| {
+            row.core_ledger_broker_epoch == live.user_broker_epoch
+                && row.core_ledger_interactive_session_id == live.interactive_session_id
+                && &row.core_ledger_artifact == artifact
+        });
     }
 
     /// Returns the existing live Kernel registration token for one exact,
@@ -1951,7 +2091,7 @@ impl BrokerComposition {
                 ),
             );
         }
-        if row.kernel_session_token != live.registration_digest {
+        if row.kernel_registration_digest != live.registration_digest {
             return Err(BrokerAdmissionRefusal::OperatorSessionTokenStale
                 .with_platform("challenge endpoint is not bound to the live Kernel registration"));
         }
@@ -1967,6 +2107,13 @@ impl BrokerComposition {
                 ),
             );
         }
+        // The Kernel issues the session token for this binding. The broker
+        // asks once per challenge with the exact evidence it observed, and
+        // accepts only the Kernel's own answer about that same binding, its
+        // own authority epoch, and its own lease. A closed, fenced, or
+        // unreachable Kernel therefore issues nothing, and this handoff stays
+        // unchallenged rather than receiving a locally invented token.
+        let grant = self.kernel_session_token_grant(&row, peer, &live)?;
         let Some(stored) = self
             .operator_session_bindings
             .get_mut(&endpoint.handoff_nonce)
@@ -1975,7 +2122,46 @@ impl BrokerComposition {
                 .with_platform("challenge binding disappeared before it could be pinned"));
         };
         stored.challenge_peer = Some(peer.process().clone());
-        Ok(row.kernel_session_token)
+        stored.kernel_session_token = grant.token;
+        stored.kernel_session_expires_at = grant.expires_at_unix_ms;
+        Ok(stored.kernel_session_token.clone())
+    }
+
+    /// Asks the Kernel for the fresh, short-lived session token of one
+    /// binding, and returns the Kernel's grant.
+    ///
+    /// The request carries only evidence this broker proved: its live
+    /// registration identity, the one-shot handoff nonce of this binding, the
+    /// OS-observed peer tuple of the connecting UI process, and the exact
+    /// granted role/capability set. Kernel admission, the token, and the
+    /// lease are the Kernel's; see
+    /// `crates/kernel/eliot-kernel-service/src/operator_session_token.rs`.
+    fn kernel_session_token_grant(
+        &self,
+        row: &OperatorSessionBinding,
+        peer: &NamedPipePeerEvidence,
+        live: &RegistrationReceipt,
+    ) -> Result<OperatorSessionTokenGrant, CompositionError> {
+        let port = self.kernel_authority.as_ref().ok_or_else(|| {
+            BrokerAdmissionRefusal::OperatorSessionTokenStale.with_platform(
+                "no authenticated Kernel authority port is composed, so no Kernel session token \
+                 can be issued for this binding",
+            )
+        })?;
+        let request = OperatorSessionTokenRequest {
+            registration_digest: live.registration_digest.clone(),
+            handoff_nonce: row.endpoint.handoff_nonce.clone(),
+            windows_sid: peer.sid().to_owned(),
+            interactive_session_id: peer.session_id().to_string(),
+            client_process_id: peer.process().process_id.to_string(),
+            client_image_path: peer.process().image_path.clone(),
+            role: row.role.clone(),
+            capabilities: row.capabilities.clone(),
+        };
+        port.operator_session_token(&request, live)
+            .map_err(|error| {
+                BrokerAdmissionRefusal::OperatorSessionTokenStale.with_platform(error.to_string())
+            })
     }
 
     /// Redeems one issued Operator handoff exactly once and returns the
@@ -2031,11 +2217,23 @@ impl BrokerComposition {
                 .with_platform("redeemed endpoint differs from the exact issued binding"));
         }
         let live = self.live_registration()?;
-        if client.kernel_session_token != row.kernel_session_token
-            || live.registration_digest != row.kernel_session_token
+        // The presented token is compared with the exact value the Kernel
+        // issued for this binding, inside that token's own lease, and the
+        // registration the binding was issued under must still be the live
+        // one. An unchallenged binding carries no token, a token from another
+        // binding never matches, and an elapsed token is stale rather than
+        // renewable: a new challenge against live Kernel admission is the only
+        // way forward.
+        if !is_exact_session_token(&client.kernel_session_token)
+            || client.kernel_session_token != row.kernel_session_token
+            || row.kernel_session_expires_at <= now
+            || live.registration_digest != row.kernel_registration_digest
         {
-            return Err(BrokerAdmissionRefusal::OperatorSessionTokenStale
-                .with_platform("redeemed handoff does not present the live Kernel session token"));
+            return Err(
+                BrokerAdmissionRefusal::OperatorSessionTokenStale.with_platform(
+                    "redeemed handoff does not present the current Kernel session token",
+                ),
+            );
         }
         if client.windows_sid != row.windows_sid
             || client.interactive_session_id != row.interactive_session_id
@@ -2085,7 +2283,7 @@ impl BrokerComposition {
         self.operator_session_bindings.retain(|nonce, stored| {
             nonce == &endpoint.handoff_nonce
                 || !stored.redeemed
-                || stored.kernel_session_token != row.kernel_session_token
+                || stored.kernel_registration_digest != row.kernel_registration_digest
                 || stored.windows_sid != row.windows_sid
                 || stored.interactive_session_id != row.interactive_session_id
         });
@@ -2177,8 +2375,10 @@ impl BrokerComposition {
     /// * the principal must be present and must be the Windows SID this
     ///   broker session was admitted for (omitted or foreign principals are
     ///   refused);
-    /// * the presented Kernel session token must be the live registration
-    ///   digest inside its lease horizon (missing or stale tokens refused);
+    /// * the presented Kernel session token must be the current token of a
+    ///   redeemed binding in this session, inside that token's own lease, and
+    ///   the registration that binding was issued under must still be the live
+    ///   one (missing, expired, or foreign tokens refused);
     /// * the presented SID/Session must equal the bound tuple
     ///   (cross-session requests refused);
     /// * the presented role/capabilities must be covered by a redeemed
@@ -2217,16 +2417,19 @@ impl BrokerComposition {
                 .with_platform("state-changing request session is not the admitted session"));
         }
         let live = self.live_registration()?;
-        if authority.kernel_session_token != live.registration_digest {
+        let now = now_unix_ms()?;
+        if !is_exact_session_token(&authority.kernel_session_token) {
             return Err(
                 BrokerAdmissionRefusal::OperatorSessionTokenStale.with_platform(
-                    "state-changing request does not present the live Kernel session token",
+                    "state-changing request does not present a Kernel-issued session token",
                 ),
             );
         }
         let granted = self.operator_session_bindings.values().find(|row| {
             row.redeemed
-                && row.kernel_session_token == live.registration_digest
+                && row.kernel_registration_digest == live.registration_digest
+                && row.kernel_session_token == authority.kernel_session_token
+                && row.kernel_session_expires_at > now
                 && row.windows_sid == authority.principal
                 && row.interactive_session_id == authority.interactive_session_id
         });
@@ -2338,8 +2541,9 @@ impl BrokerComposition {
     /// passes the same admitted-role gate as every other state-changing
     /// request. The operation identity it is bound to is the live registration
     /// digest, because that digest *is* the transition being published: the
-    /// caller cannot choose it, and the authenticated Human authority must
-    /// already present it as its live Kernel session token.
+    /// caller cannot choose it. The authenticated Human authority is admitted
+    /// separately, by presenting the current Kernel session token of its own
+    /// redeemed binding.
     ///
     /// The receipt is a record, never a completion signal. This owner cannot
     /// prove termination of the superseded generation's Job Object, so the

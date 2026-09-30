@@ -158,13 +158,17 @@ struct AdmittedConnection {
 /// constructed. `activated_session` keeps the kernel-issued semantic session
 /// captured by the one-shot activation exchange, so invocation envelopes bind
 /// an honest kernel-issued selector instead of host text or a minted
-/// identity. `replay_cache` makes exact host replays byte-identical (the
+/// identity, and `activated_task_binding` keeps the task and `WorkScope` that
+/// SAME exchange resolved, so an admitted envelope can name the task its
+/// daemon-leg read is bound to instead of leaving those two members absent.
+/// `replay_cache` makes exact host replays byte-identical (the
 /// kernel deduplicates by envelope digest) and turns a changed payload under
 /// a known correlation into a local `IdempotencyConflict` with no wire
 /// traffic.
 ///
-/// Durability boundary: `replay_cache` and `activated_session` are process
-/// memory only; both die with this process, which spans exactly one admitted
+/// Durability boundary: `replay_cache`, `activated_session` and
+/// `activated_task_binding` are process
+/// memory only; all three die with this process, which spans exactly one admitted
 /// connection. Durable idempotency and unknown-outcome settlement belong to
 /// the Kernel ORS record, reachable after re-attach through the reconcile and
 /// restore entries owned by `KernelHostRequestClient`
@@ -179,6 +183,12 @@ struct KernelTransportOwner {
     activation_used: bool,
     limits: eliot_ipc::TransportLimits,
     activated_session: Option<String>,
+    /// Task and `WorkScope` the SAME activation exchange resolved, retained
+    /// beside `activated_session` so the host-request envelope builder can
+    /// bind them. Absent until a `Resolved` activation completes, exactly like
+    /// `activated_session`; a pre-activation envelope therefore still carries
+    /// no task identity and the Kernel's own gate keeps refusing it.
+    activated_task_binding: Option<ActivatedTaskBinding>,
     replay_cache: HashMap<String, ReplayCacheEntry>,
     /// Bridge-held digest-verified durable event receipts per stream.
     /// Receipts remain unbound until an exact owner recovery page matches
@@ -207,6 +217,34 @@ struct KernelTransportOwner {
 }
 
 type SharedTransport = Rc<RefCell<KernelTransportOwner>>;
+
+/// The task identity the one-shot activation exchange resolved, retained for
+/// the host-request envelope builder (issue #2857).
+///
+/// The activation response is the ONLY place this bridge learns which task and
+/// `WorkScope` a live connection acts for: `KernelHostActivationPort` decodes
+/// the Kernel's typed `Authenticated` disposition and already constructs
+/// `ActivationPortResult::authenticated(task_id, work_unit_id, work_scope_id,
+/// …)` from it. Retaining only the session from that same value left the two
+/// envelope members an admitted read needs unbound, which is why every
+/// production `eliot.query` envelope was built with `task_id: None`.
+///
+/// This type carries the exact authenticated strings the typed Kernel
+/// response decoded — never host request text, never a derived or defaulted
+/// value, and never a minted identifier. The activation revision is
+/// deliberately NOT retained: `StateFence::I45_KEY_OMISSIONS` gives the
+/// revision dimension to `RevisionHeadExpectation` at the operation's own
+/// owner, and the transport fence an envelope rides structurally carries no
+/// task revision (`host_request_frame_for_envelope` refuses one outright), so
+/// the task revision is compared where the owner read resolves it, not
+/// smuggled in from here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ActivatedTaskBinding {
+    /// Governor-owned task selected at activation time.
+    task_id: String,
+    /// Governor-owned `WorkScope` selected at activation time.
+    work_scope_id: String,
+}
 
 /// Disposition of the one retained consumed-frontier offer (issue #2800).
 ///
@@ -4687,6 +4725,7 @@ fn kernel_faces_from_admission(
         activation_used: false,
         limits,
         activated_session: None,
+        activated_task_binding: None,
         replay_cache: HashMap::new(),
         delivered_sequences: BTreeMap::new(),
         owner_acked: BTreeMap::new(),

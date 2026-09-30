@@ -5,10 +5,14 @@
 //! create-only; each owner stream has a separately keyed compare-and-set head.
 //! The rows, head advances and canonical receipt are emitted by the same
 //! prepared Store transaction. ORS staging/activation remains outside this
-//! module and is not described as atomic with Store. The operation remains
-//! unsupported by the generated operation catalogue until its semantic-owner
-//! authorization evidence is verified at the Store boundary; this handler is
-//! not currently reachable through an admitted write.
+//! module and is not described as atomic with Store.
+//!
+//! Issue #1702: the operation is ACTIVATED in the catalogue and its
+//! owner-specific authorization evidence is verified inside
+//! `PreparedTransition::validate` before this handler runs, so a cross-owner or
+//! stale-lease presentation never reaches these statements. This handler
+//! persists exactly the row the authorized transition names; it grants no
+//! admission, dispatch or lifecycle change of its own.
 
 use std::fmt::Write as _;
 

@@ -206,6 +206,44 @@ struct RetainedActivationIdentity {
     result_sha256: String,
 }
 
+/// Typed terminal failure from the run loop so `run()` selects the shutdown
+/// disposition from the dispatch owner's typed decision, never from free
+/// text. `message` keeps the exact existing terminal record. Only a failure
+/// the dispatch path classified as retained/unknown
+/// (`ActivationDispatchError::Unknown`) carries `activation_unknown`, with
+/// the original ticket/result identity verbatim; every other loop failure —
+/// including a `Hard` dispatch failure whose detail mentions an unknown
+/// ticket — carries `None`. Local only; no protocol change.
+struct RunLoopFailure {
+    message: String,
+    activation_unknown: Option<RetainedActivationIdentity>,
+}
+
+impl RunLoopFailure {
+    fn hard(message: String) -> Self {
+        Self {
+            message,
+            activation_unknown: None,
+        }
+    }
+
+    fn activation_unknown(ticket_id: String, result_sha256: String, detail: String) -> Self {
+        Self {
+            message: detail,
+            activation_unknown: Some(RetainedActivationIdentity {
+                ticket_id,
+                result_sha256,
+            }),
+        }
+    }
+}
+
+impl From<String> for RunLoopFailure {
+    fn from(message: String) -> Self {
+        Self::hard(message)
+    }
+}
+
 /// Completion of one in-flight activation step. Claim, resolve-wait and
 /// dispatch share one flight branch so health and shutdown stay pollable
 /// while any of them is outstanding. The resolve wait lives inside this
@@ -917,6 +955,11 @@ pub(super) fn run() -> Result<(), String> {
         .map_err(|error| error.to_string());
     // #740: shutdown disposition record. The terminal-failure reports below
     // keep their exact existing behavior; this only names the disposition.
+    // #740 A10: the disposition is the typed dispatch decision threaded
+    // through `RunLoopFailure`/`RunLoopExit`, never a free-text match. Only
+    // a retained/unknown activation sets the flag; a `Hard` dispatch failure
+    // keeps `WithError` even when its detail mentions an unknown ticket.
+    let mut shutdown_activation_unknown = false;
     let final_result = match (loop_result, shutdown_result) {
         (Ok(RunLoopExit::Shutdown), Ok(())) => Ok(()),
         (
@@ -926,14 +969,19 @@ pub(super) fn run() -> Result<(), String> {
                 detail,
             }),
             Ok(()),
-        ) => Err(report_terminal_failure(
-            &kernel,
-            format!(
-                "daemon shutdown with activation submit unknown ticket {ticket_id} result {result_sha256}: {detail}"
-            ),
-        )),
-        (Ok(RunLoopExit::Shutdown), Err(error)) | (Err(error), Ok(())) => {
-            Err(report_terminal_failure(&kernel, error))
+        ) => {
+            shutdown_activation_unknown = true;
+            Err(report_terminal_failure(
+                &kernel,
+                format!(
+                    "daemon shutdown with activation submit unknown ticket {ticket_id} result {result_sha256}: {detail}"
+                ),
+            ))
+        }
+        (Ok(RunLoopExit::Shutdown), Err(error)) => Err(report_terminal_failure(&kernel, error)),
+        (Err(failure), Ok(())) => {
+            shutdown_activation_unknown = failure.activation_unknown.is_some();
+            Err(report_terminal_failure(&kernel, failure.message))
         }
         (
             Ok(RunLoopExit::ShutdownActivationUnknown {
@@ -942,16 +990,22 @@ pub(super) fn run() -> Result<(), String> {
                 detail,
             }),
             Err(shutdown_error),
-        ) => Err(report_terminal_failure(
-            &kernel,
-            format!(
-                "daemon shutdown with activation submit unknown ticket {ticket_id} result {result_sha256}: {detail}; shutdown: {shutdown_error}"
-            ),
-        )),
-        (Err(error), Err(shutdown_error)) => Err(report_terminal_failure(
-            &kernel,
-            format!("{error}; shutdown: {shutdown_error}"),
-        )),
+        ) => {
+            shutdown_activation_unknown = true;
+            Err(report_terminal_failure(
+                &kernel,
+                format!(
+                    "daemon shutdown with activation submit unknown ticket {ticket_id} result {result_sha256}: {detail}; shutdown: {shutdown_error}"
+                ),
+            ))
+        }
+        (Err(failure), Err(shutdown_error)) => {
+            shutdown_activation_unknown = failure.activation_unknown.is_some();
+            Err(report_terminal_failure(
+                &kernel,
+                format!("{}; shutdown: {shutdown_error}", failure.message),
+            ))
+        }
     };
     match &final_result {
         Ok(()) => {
@@ -961,7 +1015,7 @@ pub(super) fn run() -> Result<(), String> {
             );
         }
         Err(error) => {
-            let outcome = if error.contains("unknown ticket") {
+            let outcome = if shutdown_activation_unknown {
                 eliotd::diagnostics::ShutdownOutcome::WithActivationUnknown
             } else {
                 eliotd::diagnostics::ShutdownOutcome::WithError
@@ -1589,7 +1643,7 @@ async fn run_loop(
     // late completion can never overwrite newer owner observations.
     startup_readiness: StartupReadinessProjection,
     startup_maintenance_observations: [MaintenanceObservation; 2],
-) -> Result<RunLoopExit, String> {
+) -> Result<RunLoopExit, RunLoopFailure> {
     let mut cadence = LoopCadence::production();
     // One projection instance is shared with the heartbeat future. Both
     // heartbeat observation and local-read adoption use short synchronous
@@ -1625,6 +1679,13 @@ async fn run_loop(
     // keep running while the authenticated response is pending.
     let mut solo_poll_flight = SoloPollFlight::Idle;
     let mut solo_poll_last_refusal: Option<String> = None;
+    // Issue #1683 W5: the always-armed bounded fair-pull recovery poll. It is
+    // the arm that makes I14.8 progress correct under a lost notification, so
+    // unlike the intake poll it is started on every tick of this same cadence
+    // and is never gated on a pending wake or a prior failure. Only its own
+    // in-flight state gates it, so ticks never overlap one poll.
+    let mut fair_pull_recovery_flight = FairPullRecoveryFlight::Idle;
+    let mut fair_pull_recovery_last_refusal: Option<String> = None;
     // #2100: O1 owner-feed trigger state. The runtime retains one trigger
     // across passes so an unchanged provider performs no IO, while a
     // revision advance or a recovery re-presentation republishes through the
@@ -1727,6 +1788,8 @@ async fn run_loop(
                     &mut deferred_supervision_activity,
                     &mut solo_poll_flight,
                     &mut solo_poll_last_refusal,
+                    &mut fair_pull_recovery_flight,
+                    &mut fair_pull_recovery_last_refusal,
                 )
                 .await?;
                 // #1862: the campaign-packet flight keeps its own queue, claim,
@@ -1772,6 +1835,18 @@ async fn run_loop(
                 // flight. The flight snapshots under a short composition
                 // lock and releases it before awaiting owner IO.
                 maybe_start_solo_poll(&kernel, &composition, &mut solo_poll_flight);
+                // Issue #1683 W5: the bounded fair-pull recovery poll rides
+                // this same cadence branch and is started on every tick. It is
+                // the fallback that survives a lost release notification, so
+                // it must never be gated on a pending wake or on a prior
+                // failure — only its own in-flight state keeps ticks from
+                // overlapping. It runs after the intake poll so the two
+                // composition reads are serialized in a fixed order.
+                maybe_start_fair_pull_recovery(
+                    &kernel,
+                    &composition,
+                    &mut fair_pull_recovery_flight,
+                );
                 // #1688 (I14.22): the idle trigger rides this cadence branch
                 // because it is the one place that observes the activation
                 // flight, so the `idle` gate the evaluator consumes is a real
@@ -1854,6 +1929,18 @@ async fn run_loop(
                     solo_poll_completion,
                     &mut solo_poll_flight,
                     &mut solo_poll_last_refusal,
+                );
+            }
+            // The recovery poll settles in its own branch, never the intake
+            // poll's, so a blocked recovery restore cannot delay the intake
+            // poll and vice versa.
+            fair_pull_completion = next_fair_pull_recovery_completion(
+                &mut fair_pull_recovery_flight,
+            ) => {
+                settle_fair_pull_recovery_completion(
+                    fair_pull_completion,
+                    &mut fair_pull_recovery_flight,
+                    &mut fair_pull_recovery_last_refusal,
                 );
             }
             testd_owner_completion = next_testd_owner_completion(&mut testd_owner_flight) => {
@@ -1996,7 +2083,7 @@ fn settle_activation_completion(
     deferred_activity: &mut DeferredSupervisionActivity,
     flight: &mut ActivationFlight,
     completion: ActivationCompletion,
-) -> Result<(), String> {
+) -> Result<(), RunLoopFailure> {
     match completion {
         ActivationCompletion::Claim(claim_outcome) => {
             let claim = claim_outcome?;
@@ -2022,7 +2109,11 @@ fn settle_activation_completion(
             Ok(())
         }
         ActivationCompletion::Resolve(resolve_outcome) => {
+            // Pre-dispatch resolve failure: no dispatch decision exists and no
+            // identity was retained, so it carries typed hard detail and never
+            // the activation-unknown disposition (#740 A10).
             settle_activation_resolve_completion(kernel, flight, resolve_outcome)
+                .map_err(RunLoopFailure::hard)
         }
         ActivationCompletion::Dispatch(dispatch_outcome) => match dispatch_outcome {
             Ok(()) => {
@@ -2041,8 +2132,16 @@ fn settle_activation_completion(
                 *flight = ActivationFlight::Idle;
                 Ok(())
             }
-            Err(ActivationDispatchError::Hard(error)) => Err(error),
-            Err(ActivationDispatchError::Unknown { detail, .. }) => Err(detail),
+            Err(ActivationDispatchError::Hard(error)) => Err(RunLoopFailure::hard(error)),
+            Err(ActivationDispatchError::Unknown {
+                ticket_id,
+                result_sha256,
+                detail,
+            }) => Err(RunLoopFailure::activation_unknown(
+                ticket_id,
+                result_sha256,
+                detail,
+            )),
         },
     }
 }
@@ -3279,6 +3378,11 @@ fn start_activation_dispatch(
 /// grants pending. Only non-heartbeat step failures fail closed. Dropping every
 /// flight here also releases all owned composition references before the
 /// existing final shutdown, without leaking detached work.
+///
+/// The bounded fair-pull recovery poll (issue #1683 W5) drains and drops with
+/// them. A dropped poll starts no attempt and records no selection, because at
+/// shutdown there is no later tick to recover on and therefore no honest
+/// observation to report in its place.
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -3302,7 +3406,9 @@ async fn drain_flights_on_shutdown(
     deferred_activity: &mut DeferredSupervisionActivity,
     solo_poll_flight: &mut SoloPollFlight,
     solo_poll_last_refusal: &mut Option<String>,
-) -> Result<RunLoopExit, String> {
+    fair_pull_recovery_flight: &mut FairPullRecoveryFlight,
+    fair_pull_recovery_last_refusal: &mut Option<String>,
+) -> Result<RunLoopExit, RunLoopFailure> {
     // #740: drain span. Idle drains and unknown-retention drains emit
     // distinct dispositions with the original identity verbatim.
     let _span = tracing::info_span!("eliotd.activation_drain").entered();
@@ -3326,6 +3432,7 @@ async fn drain_flights_on_shutdown(
             )
             && matches!(health_heartbeat_flight, HealthHeartbeatFlight::Idle)
             && matches!(solo_poll_flight, SoloPollFlight::Idle)
+            && matches!(fair_pull_recovery_flight, FairPullRecoveryFlight::Idle)
         {
             return Ok(activation_exit);
         }
@@ -3334,7 +3441,7 @@ async fn drain_flights_on_shutdown(
                 match completion {
                     ActivationCompletion::Claim(claim_outcome) => {
                         let claim = match claim_outcome {
-                            Err(error) => return Err(error),
+                            Err(error) => return Err(error.into()),
                             Ok(claim) => claim,
                         };
                         match settle_activation_claim(
@@ -3364,7 +3471,9 @@ async fn drain_flights_on_shutdown(
                             // settles as a clean shutdown exactly like an
                             // accepted dispatch, never as an unknown identity.
                             Ok(()) | Err(ActivationDispatchError::Expired) => {}
-                            Err(ActivationDispatchError::Hard(error)) => return Err(error),
+                            Err(ActivationDispatchError::Hard(error)) => {
+                                return Err(RunLoopFailure::hard(error));
+                            }
                             Err(ActivationDispatchError::Unknown {
                                 ticket_id,
                                 result_sha256,
@@ -3446,6 +3555,19 @@ async fn drain_flights_on_shutdown(
                     solo_poll_last_refusal,
                 );
             }
+            fair_pull_completion = next_fair_pull_recovery_completion(
+                fair_pull_recovery_flight,
+            ) => {
+                // A dropped recovery poll starts nothing and records nothing,
+                // exactly like the dropped solo poll above: at shutdown there
+                // is no next tick to recover on, and a fabricated prior would
+                // be a lie about what the daemon observed.
+                settle_fair_pull_recovery_completion(
+                    fair_pull_completion,
+                    fair_pull_recovery_flight,
+                    fair_pull_recovery_last_refusal,
+                );
+            }
             () = tokio::time::sleep_until(deadline) => {
                 // Budget exhausted with work still outstanding: drop every
                 // flight without starting anything new. Classify activation
@@ -3465,6 +3587,7 @@ async fn drain_flights_on_shutdown(
                 *improvement_intake_flight = ImprovementIntakeFlight::Idle { retained: None };
                 *health_heartbeat_flight = HealthHeartbeatFlight::Idle;
                 *solo_poll_flight = SoloPollFlight::Idle;
+                *fair_pull_recovery_flight = FairPullRecoveryFlight::Idle;
                 *supervision_progress = None;
                 deferred_activity.clear();
                 return Ok(exit);
@@ -4935,6 +5058,125 @@ fn settle_solo_poll_completion(
                 tracing::warn!(
                     target: "eliotd::diagnostics",
                     event = "eliotd.solo_poll_refused",
+                    detail = %error,
+                );
+                *last_refusal = Some(error);
+            }
+        }
+    }
+}
+
+/// Completion of the bounded fair-pull recovery poll. A refusal is returned
+/// verbatim and never escalates: an unarmed recovery poll is the lost-wakeup
+/// deadlock this arm exists to prevent, so the loop must survive it.
+enum FairPullRecoveryCompletion {
+    Settled(Result<eliotd::solo_agent_driver::FairPullRecovery, String>),
+}
+
+struct FairPullRecoveryFlightState {
+    future: Pin<Box<dyn std::future::Future<Output = FairPullRecoveryCompletion>>>,
+}
+
+/// Sole owner of the always-armed bounded fair-pull recovery poll in
+/// `run_loop` (issue #1683 W5, I14.8).
+///
+/// This is the thirteenth single-owner polled flight, and it is the one that
+/// makes the I14.8 progress loop correct rather than merely fast. The event arm
+/// (`solo_ingest_result`) advances released capacity in the same operation that
+/// released it; that arm is an optimisation. This one exists because an
+/// event-only loop is a lost-wakeup deadlock: a dropped, coalesced or
+/// pre-registered notification would leave the loop waiting forever for work
+/// that is already eligible.
+///
+/// So `maybe_start_fair_pull_recovery` starts the poll on **every** tick of the
+/// shared `ACTIVATION_POLL_INTERVAL` cadence. It is not gated on a pending
+/// wake, on a prior failure, on a "did anything change" flag, or on any
+/// degraded state: the bounded poll is the authoritative arm and the event is
+/// the optimisation, so a fallback that only ran after a failure would invert
+/// that and reintroduce the deadlock. `Idle` means no poll is outstanding;
+/// `InFlight` holds the one pending bounded poll, so ticks never overlap it.
+/// The future remains a select branch, so a pending restore keeps the cadence
+/// and shutdown pollable.
+enum FairPullRecoveryFlight {
+    Idle,
+    InFlight(FairPullRecoveryFlightState),
+}
+
+/// Starts one bounded recovery poll over the live admitted projection.
+fn start_fair_pull_recovery(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: SharedComposition,
+) -> Pin<Box<dyn std::future::Future<Output = FairPullRecoveryCompletion>>> {
+    let kernel = Arc::clone(kernel);
+    Box::pin(async move {
+        let result = eliotd::solo_fair_pull_recovery(&composition, &kernel)
+            .await
+            .map_err(|error| error.to_string());
+        FairPullRecoveryCompletion::Settled(result)
+    })
+}
+
+/// Starts the recovery poll on a cadence tick whenever its own flight is idle.
+///
+/// The gate is the flight's own in-flight state and nothing else. There is
+/// deliberately no "is a wake pending" test here: that is precisely the
+/// event-only design this arm replaces, and consulting it would let a lost wake
+/// suppress the very poll that recovers from it.
+fn maybe_start_fair_pull_recovery(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &SharedComposition,
+    flight: &mut FairPullRecoveryFlight,
+) {
+    if matches!(flight, FairPullRecoveryFlight::Idle) {
+        *flight = FairPullRecoveryFlight::InFlight(FairPullRecoveryFlightState {
+            future: start_fair_pull_recovery(kernel, Arc::clone(composition)),
+        });
+    }
+}
+
+/// Polls the recovery flight, pending forever while idle so the cadence and
+/// shutdown stay pollable with no poll outstanding.
+async fn next_fair_pull_recovery_completion(
+    flight: &mut FairPullRecoveryFlight,
+) -> FairPullRecoveryCompletion {
+    match flight {
+        FairPullRecoveryFlight::Idle => std::future::pending::<FairPullRecoveryCompletion>().await,
+        FairPullRecoveryFlight::InFlight(state) => (&mut state.future).await,
+    }
+}
+
+/// Releases a completed recovery poll so the next cadence tick can arm it
+/// again. Every outcome idles: a poll that started nothing and a poll that
+/// refused are both observations, and neither may stop the arm, because an
+/// unarmed poll is the deadlock. A repeated refusal is de-duplicated against the
+/// last one so a standing per-cadence refusal cannot emit unbounded records,
+/// while a *changed* refusal is still reported.
+fn settle_fair_pull_recovery_completion(
+    completion: FairPullRecoveryCompletion,
+    flight: &mut FairPullRecoveryFlight,
+    last_refusal: &mut Option<String>,
+) {
+    *flight = FairPullRecoveryFlight::Idle;
+    let FairPullRecoveryCompletion::Settled(result) = completion;
+    match result {
+        Ok(eliotd::solo_agent_driver::FairPullRecovery::PolledStarted {
+            operation_id,
+            started,
+        }) => {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.fair_pull_recovery_started",
+                operation_id = %eliotd::diagnostics::sanitize_identity(&operation_id),
+                started,
+            );
+            *last_refusal = None;
+        }
+        Ok(_) => *last_refusal = None,
+        Err(error) => {
+            if last_refusal.as_deref() != Some(error.as_str()) {
+                tracing::warn!(
+                    target: "eliotd::diagnostics",
+                    event = "eliotd.fair_pull_recovery_refused",
                     detail = %error,
                 );
                 *last_refusal = Some(error);

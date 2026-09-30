@@ -17,7 +17,11 @@ use eliot_dreamer_contracts::grounding::{
     AttemptIdentity, GROUNDING_SCHEMA_VERSION, RouteIdentity, StructuredModelDraft, budget_digest,
     bundle_digest, requester_digest, route_fingerprint,
 };
-use eliot_dreamer_contracts::{ContractViolation, DreamJobAdmission};
+use eliot_dreamer_contracts::{
+    ContractViolation, CostUsageReceipt, DreamInputBundle, DreamJobAdmission,
+    MODEL_ROUTE_SCHEMA_VERSION, ModelDraft as TextModelDraft, ModelRouteDisposition,
+    ModelRouteOutcome, ModelRoutePrivacy, ModelRouteRequest, bundle_digest_of, canonical_bytes,
+};
 
 use crate::admitted_material::{admission_of, bundle_of, sha_hex};
 use crate::controller::verify_admitted_binding;
@@ -207,6 +211,129 @@ pub(crate) fn run_admitted_model(
         }
         Ok(owned.draft)
     })
+}
+
+/// Cost/usage receipt for one admitted model-route call.
+///
+/// This is the CC-002 usage record for the call this runtime actually made: the
+/// `input_bytes`/`output_bytes` are the canonical byte lengths of the exact
+/// bundle sent and draft received (measured, never the admitted ceilings), and
+/// `wall_ms` is the observed elapsed wall time. Nothing here is fabricated.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ModelRouteUsage {
+    /// Canonical bytes of the bundle handed to the route.
+    pub input_bytes: u64,
+    /// Canonical bytes of the draft the route returned.
+    pub output_bytes: u64,
+    /// Provider calls performed by the route.
+    pub model_calls: u64,
+    /// Observed elapsed wall milliseconds.
+    pub wall_ms: u64,
+}
+
+impl ModelRouteUsage {
+    /// Measures the usage of one real route call over its exact bytes and
+    /// measured elapsed time.
+    ///
+    /// The provider call count is supplied by the caller because only the
+    /// runtime that performs the route knows it; this constructor never invents
+    /// one.
+    pub(crate) fn measured(
+        bundle: &DreamInputBundle,
+        draft: &TextModelDraft,
+        model_calls: u64,
+        wall_ms: u64,
+    ) -> Result<Self, DreamerError> {
+        let bundle_bytes = canonical_bytes(bundle)
+            .map_err(|_| DreamerError::InvalidAdmission("model route usage encoding"))?;
+        let draft_bytes = canonical_bytes(draft)
+            .map_err(|_| DreamerError::InvalidAdmission("model route usage encoding"))?;
+        Ok(Self {
+            input_bytes: bundle_bytes.len() as u64,
+            output_bytes: draft_bytes.len() as u64,
+            model_calls,
+            wall_ms,
+        })
+    }
+}
+
+/// Composes the CC-002 admitted request for one owner-routed call.
+///
+/// Every field is derived from admitted material: the job/bundle identity and
+/// fence from the admitted bundle, the closed route denominator from the
+/// admitted route list, the wall budget from the admitted budget, and the
+/// privacy class from the admitted privacy profile. No route is selected and no
+/// provider is contacted — this is the request boundary only, proved with the
+/// real [`ModelRouteRequest::validate_binds_bundle`].
+pub(crate) fn model_route_request(
+    admission: &KernelJobAdmission,
+    job: &DreamJobInput,
+    bundle: &DreamInputBundle,
+) -> Result<ModelRouteRequest, DreamerError> {
+    verify_admitted_binding(admission, job)?;
+    let admitted = admission_of(admission, job)?;
+    let request = ModelRouteRequest {
+        schema_version: MODEL_ROUTE_SCHEMA_VERSION,
+        job_id: bundle.job_id.clone(),
+        bundle_digest: bundle_digest_of(bundle)
+            .map_err(|_| DreamerError::InvalidAdmission("model route request bundle"))?,
+        state_fence: bundle.state_fence.clone(),
+        allowed_routes: job.allowed_model_routes.clone(),
+        timeout_ms: admitted
+            .budget
+            .wall_ms
+            .ok_or(DreamerError::InvalidAdmission(
+                "model route request wall budget",
+            ))?,
+        cancelled: false,
+        privacy: ModelRoutePrivacy::parse(admitted.privacy_profile.as_str())
+            .map_err(|_| DreamerError::InvalidAdmission("model route request privacy"))?,
+    };
+    request
+        .validate_binds_bundle(bundle)
+        .map_err(|error| model_denied(&error))?;
+    Ok(request)
+}
+
+/// Composes the CC-002 outcome of the one admitted call this runtime performed.
+///
+/// The chosen route is the admitted request's own first denominator member, the
+/// draft is the closed candidate derivation this binary already produced, and
+/// the receipt is the measured usage of that call. Proved with the real
+/// [`ModelRouteOutcome::validate_binding`] against the exact request, so a
+/// drifted bundle digest, fence, route, or wall budget refuses here rather than
+/// reaching composition.
+pub(crate) fn model_route_outcome(
+    request: &ModelRouteRequest,
+    draft: &TextModelDraft,
+    usage: ModelRouteUsage,
+) -> Result<ModelRouteOutcome, DreamerError> {
+    let Some(route) = request.allowed_routes.first().cloned() else {
+        return Err(DreamerError::InvalidAdmission("model route outcome route"));
+    };
+    let outcome = ModelRouteOutcome {
+        schema_version: MODEL_ROUTE_SCHEMA_VERSION,
+        job_id: request.job_id.clone(),
+        bundle_digest: request.bundle_digest.clone(),
+        provider_route: Some(route),
+        disposition: ModelRouteDisposition::Completed,
+        raw: None,
+        draft: Some(draft.clone()),
+        receipt: CostUsageReceipt {
+            schema_version: MODEL_ROUTE_SCHEMA_VERSION,
+            job_id: request.job_id.clone(),
+            input_bytes: usage.input_bytes,
+            output_bytes: usage.output_bytes,
+            model_calls: usage.model_calls,
+            wall_ms: usage.wall_ms,
+        },
+        state_fence: request.state_fence.clone(),
+        note: "closed local candidate derivation for the admitted route".to_owned(),
+    };
+    outcome
+        .validate_binding(request)
+        .map_err(|error| model_denied(&error))?;
+    Ok(outcome)
 }
 
 /// Maps an owner model refusal to a typed fail-closed refusal.

@@ -1,0 +1,70 @@
+# Externally supplied frozen context-measurement owner map (#866).
+#
+# This file is an input, not a generated artifact. `scripts/context_measurement_inventory.py`
+# reads it offline (`load_owner_map`) and never resolves an owner any other way: there is no
+# normal-runtime GitHub access, no default owner, and no fallback allocation. The generator's
+# SHA-256 over these exact bytes is recorded in the inventory header as `owner_map_digest`, and
+# `check` refuses to certify anything while this file is absent or malformed.
+#
+# Provenance: externally supplied by #866 from the frozen owner allocation already committed in
+# `.github/work-units/context-measurement-inventory.toml` (denominator 72 cases, revision
+# 866.2), cross-checked against the issue's own seam statements:
+#   "algorithm owner #704", "#783 gets its exact app seam",
+#   "#878 gets Context/packet-quality/Host", "#880 gets Skill/memory".
+# The closed #785 parent is never allocated.
+#
+# Rules encoded by this file:
+#   * every row is one exact file path; no prefix, glob, directory or "anything under"
+#     scope is permitted, and the loader rejects `*` and any trailing `/`;
+#   * one exact scope belongs to exactly one owner; the loader rejects a path claimed twice;
+#   * a candidate with no existing exact-scope owner has NO row here and stays `unresolved`.
+#     `crates/eliot-engine/src/control_plane.rs` and `crates/eliot-engine/src/cognition.rs`
+#     are therefore deliberately absent: no #704/#783/#878/#880 seam covers them, and inventing
+#     a plausible owner would be a false ownership claim.
+#   * this map records ownership of a candidate, not write permission. Write scope and
+#     read-only helper spans remain on each consumer workset row of the inventory.
+
+[[owners]]
+issue = "#704"
+source_paths = [
+  "crates/smart/eliot-context-measurement/src/envelope.rs",
+  "crates/smart/eliot-context-measurement/src/lib.rs",
+  "crates/smart/eliot-context-measurement/src/receipt.rs",
+  "crates/smart/eliot-context-measurement/src/stu.rs",
+]
+
+[[owners]]
+issue = "#783"
+source_paths = [
+  "crates/eliot-app/src/commands/data_and_memory.rs",
+  "crates/eliot-app/src/mcp_stdio.rs",
+  "crates/eliot-app/src/mcp_stdio/autonomy.rs",
+  "crates/eliot-app/src/mcp_stdio/dispatch.rs",
+  "crates/eliot-app/src/mcp_stdio/memory.rs",
+  "crates/eliot-app/src/mcp_stdio/operator.rs",
+  "crates/eliot-app/src/mcp_stdio/skill.rs",
+  "crates/eliot-app/src/mcp_stdio/task_handlers.rs",
+  "crates/smart/eliot-context-assembly/src/measurement.rs",
+]
+
+[[owners]]
+issue = "#878"
+source_paths = [
+  "crates/eliot-engine/src/context.rs",
+  "crates/eliot-engine/src/context/packet_quality.rs",
+  "crates/eliot-engine/src/context_contracts.rs",
+  "crates/eliot-engine/src/host.rs",
+  "crates/smart/eliot-context-contracts/src/measurement.rs",
+]
+
+[[owners]]
+issue = "#880"
+source_paths = [
+  "crates/eliot-engine/src/memory_distillation.rs",
+  "crates/eliot-engine/src/memory_lifecycle.rs",
+  "crates/eliot-engine/src/skill.rs",
+  "crates/eliot-engine/src/skill_curator.rs",
+  "crates/smart/eliot-context-measurement/src/capacity.rs",
+  "crates/smart/eliot-context-measurement/src/observation.rs",
+  "crates/smart/eliot-context-measurement/tests/measurement.rs",
+]

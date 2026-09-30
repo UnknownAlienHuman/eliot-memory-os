@@ -32,9 +32,150 @@ use eliot_user_broker_core::{
 use super::SharedKernelClient;
 use crate::operation_identity::{
     AUTHORIZE_LAUNCH_OPERATION, BrokerOperation, FENCE_OPERATION, HEARTBEAT_OPERATION,
-    IssuerHandle, OperationIdentityError, REGISTER_OPERATION,
+    IssuerHandle, OPERATOR_SESSION_TOKEN_OPERATION, OPERATOR_SESSION_TOKEN_OPERATION_PREFIX,
+    OperationIdentityError, REGISTER_OPERATION,
     VALIDATE_NATIVE_RESOURCE_SELECTION_CURRENT_OPERATION,
 };
+
+/// One Operator session-token request, as this broker observes it for a single
+/// connecting UI process.
+///
+/// Every field is broker-observed OS evidence or the exact binding this broker
+/// issued; none of it is a Kernel authority value. The Kernel re-validates the
+/// shape, binds it to its own live authority triple, and mints the token.
+///
+/// The closed Kernel carrier for this request is
+/// `bins/eliot-kernel/src/daemon_request_dispatch.rs::OperatorSessionTokenOperation`;
+/// the two declarations are the same wire contract and are paired field for
+/// field, in the same way the Notify launch grant pairs its Kernel carrier with
+/// `eliot_kernel_service::NotifyGrantInputs`.
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct OperatorSessionTokenRequest {
+    pub(crate) registration_digest: String,
+    pub(crate) handoff_nonce: String,
+    pub(crate) windows_sid: String,
+    pub(crate) interactive_session_id: String,
+    pub(crate) client_process_id: String,
+    pub(crate) client_image_path: String,
+    pub(crate) role: String,
+    pub(crate) capabilities: Vec<String>,
+}
+
+/// The Kernel-issued session token for exactly one binding.
+///
+/// The echoed evidence is compared with the request that produced it, the
+/// observed authority epoch with the live registration this broker holds, and
+/// the lease with this broker's live clock, before the token is recorded
+/// against the binding. A response that names a different binding, a missing
+/// token, or an elapsed lease is refused: a presented value is not proof, and
+/// the only proof of Kernel issuance is the Kernel's own reply.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OperatorSessionTokenGrant {
+    pub(crate) operation_id: String,
+    pub(crate) token: String,
+    pub(crate) issued_at_unix_ms: u64,
+    pub(crate) expires_at_unix_ms: u64,
+    pub(crate) generation: u64,
+    pub(crate) authority_epoch: eliot_contracts::EpochId,
+    pub(crate) state_fence: eliot_contracts::StateFence,
+    pub(crate) registration_digest: String,
+    pub(crate) handoff_nonce: String,
+    pub(crate) windows_sid: String,
+    pub(crate) interactive_session_id: String,
+    pub(crate) client_process_id: String,
+    pub(crate) client_image_path: String,
+    pub(crate) role: String,
+    pub(crate) capabilities: Vec<String>,
+}
+
+impl OperatorSessionTokenGrant {
+    /// Requires the grant to be the Kernel's answer to exactly this request,
+    /// issued under the authority epoch of the live registration, and current
+    /// on this broker's live clock.
+    pub(crate) fn validate_for(
+        &self,
+        request: &OperatorSessionTokenRequest,
+        live: &RegistrationReceipt,
+        observed_at_unix_ms: u64,
+    ) -> Result<(), PortError> {
+        let mismatched = self.registration_digest != request.registration_digest
+            || self.handoff_nonce != request.handoff_nonce
+            || self.windows_sid != request.windows_sid
+            || self.interactive_session_id != request.interactive_session_id
+            || self.client_process_id != request.client_process_id
+            || self.client_image_path != request.client_image_path
+            || self.role != request.role
+            || self.capabilities != request.capabilities;
+        if mismatched {
+            return Err(PortError::Invalid(
+                "operator session token grant names a different binding".to_owned(),
+            ));
+        }
+        if self.token.len() != 64
+            || !self
+                .token
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(PortError::Invalid(
+                "operator session token is not a lowercase SHA-256 token".to_owned(),
+            ));
+        }
+        // The grant must be the answer to *this* operation, not merely some
+        // operation. The Kernel mints the id deterministically from the
+        // one-shot handoff nonce, so the expected id is derivable here and is
+        // compared exactly; a shape check on a non-empty id would accept a
+        // reply about a different operation.
+        let expected_operation_id = format!(
+            "{OPERATOR_SESSION_TOKEN_OPERATION_PREFIX}{}",
+            request.handoff_nonce
+        );
+        if self.operation_id != expected_operation_id || self.generation == 0 {
+            return Err(PortError::Invalid(
+                "operator session token grant carries a different operation identity".to_owned(),
+            ));
+        }
+        // The grant's own authority triple must be internally exact and must
+        // name the authority epoch of the live registration this broker holds.
+        // The broker cannot re-observe the Kernel's generation or fence, so it
+        // records them as the Kernel's own observation rather than pretending
+        // to have proven them a second time.
+        if !self
+            .authority_epoch
+            .is_same_authority(&live.authority_epoch)
+            || !self
+                .state_fence
+                .authority_epoch
+                .is_same_authority(&self.authority_epoch)
+            || self.state_fence.resource_generation.value() != self.generation
+        {
+            return Err(PortError::Invalid(
+                "operator session token was issued under a different Kernel authority epoch or fence"
+                    .to_owned(),
+            ));
+        }
+        if self.issued_at_unix_ms == 0
+            || self.expires_at_unix_ms <= self.issued_at_unix_ms
+            || observed_at_unix_ms >= self.expires_at_unix_ms
+        {
+            return Err(PortError::Invalid(
+                "operator session token is not current on the live clock".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The closed Kernel reply envelope for one session-token request. The Kernel
+/// projects it at `bind_operator_session_token_operation`; a reply of any other
+/// kind is not this operation's answer and is refused.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperatorSessionTokenReply {
+    kind: String,
+    value: OperatorSessionTokenGrant,
+}
 
 fn kernel_port_error(error: eliot_cli::kernel_client::KernelClientError) -> PortError {
     match error {
@@ -114,6 +255,9 @@ impl KernelAuthorityPort {
             BrokerOperation::Register => guard.issue_register(payload, now),
             BrokerOperation::HeartbeatRenewal => guard.issue_heartbeat(payload, now),
             BrokerOperation::FenceLogoff => guard.issue_fence(payload, now),
+            BrokerOperation::OperatorSessionToken => {
+                guard.issue_operator_session_token(payload, now)
+            }
             BrokerOperation::ValidateNativeResourceSelectionCurrent => {
                 guard.issue_native_resource_selection_currentness(payload, now)
             }
@@ -125,6 +269,56 @@ impl KernelAuthorityPort {
         }
         .map_err(identity_port_error)?;
         Ok(issued.identity)
+    }
+}
+
+impl KernelAuthorityPort {
+    /// Requests the fresh, short-lived Kernel session token for one exact
+    /// Operator binding (I11.8).
+    ///
+    /// This is a transport method, not a mint: the broker forwards the exact
+    /// binding evidence it observed, and the returned grant is the Kernel's
+    /// own answer, validated against that same request, against the authority
+    /// epoch of the live registration, and against this broker's live clock.
+    /// A Kernel that is closed, fenced, unreachable, or answers about a
+    /// different binding produces no token at all, so no handoff can be
+    /// challenged while a Kernel session token is unobtainable.
+    pub(crate) fn operator_session_token(
+        &self,
+        request: &OperatorSessionTokenRequest,
+        live: &RegistrationReceipt,
+    ) -> Result<OperatorSessionTokenGrant, PortError> {
+        let payload =
+            serde_json::to_value(request).map_err(|error| PortError::Invalid(error.to_string()))?;
+        let now = now_unix_ms()?;
+        let identity = self
+            .issuer
+            .lock()
+            .map_err(|_| PortError::Unknown)?
+            .issue_operator_session_token(&payload, now)
+            .map_err(identity_port_error)?
+            .identity;
+        let raw = kernel_call(
+            &self.client,
+            OPERATOR_SESSION_TOKEN_OPERATION,
+            payload,
+            identity,
+        )?;
+        let reply: OperatorSessionTokenReply = serde_json::from_value(raw).map_err(|error| {
+            PortError::Invalid(format!("decode operator session token reply: {error}"))
+        })?;
+        if reply.kind != "operator_session_token" {
+            return Err(PortError::Invalid(
+                "Kernel reply is not an operator session token".to_owned(),
+            ));
+        }
+        reply
+            .value
+            .validate_for(request, live, now_unix_ms()?)
+            .map_err(|error| {
+                PortError::Invalid(format!("operator session token refused: {error}"))
+            })?;
+        Ok(reply.value)
     }
 }
 

@@ -15,6 +15,9 @@ use crate::activation_outcome::{
     GovernorActivationOutcome, GovernorCandidateCoverage, GovernorRetryDirective,
     GovernorSelectionDirective,
 };
+use crate::canonical_projections::{
+    GovernorProjectionError, compose_canonical_projections, emit_canonical_projection_set,
+};
 use crate::controlboard_projection::{
     ControlBoardGovernorSnapshot, ControlBoardProjectionParts, compile_controlboard_snapshot,
 };
@@ -55,6 +58,7 @@ use eliot_canonical::{
 };
 use eliot_change_monitor::ChangeMonitor;
 use eliot_config::ConfigPolicySnapshot;
+use eliot_context_contracts::{CanonicalProjectionSet, ContextBinding};
 use eliot_contracts::{
     ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, OperationId,
     ResourceGeneration, SessionId, StateFence, TaskId, canonical_json_bytes, fences_match_exact,
@@ -1390,6 +1394,15 @@ pub struct CanonicalVerifierPlanBinding {
     /// list must still surface as an uncovered acceptance row rather than
     /// vanishing from the gate.
     pub required_acceptance_item_ids: BTreeSet<String>,
+    /// Acceptance-set commitment bound by the canonical plan owner at this
+    /// exact task revision (issue #325 P1, I7.9).
+    ///
+    /// Admission and the finish gate both require this digest to equal
+    /// `task_acceptance_set_commitment(required_acceptance_item_ids)`, so it is
+    /// a commitment over the enumerated set rather than a free label, and a
+    /// plan that declares a different set than the one it committed to is
+    /// refused instead of reporting a smaller set that reads as complete.
+    pub task_acceptance_digest: String,
     /// Explicit join from each acceptance item to the nextest test ids that
     /// establish it (issue #325 P1).
     ///
@@ -1496,6 +1509,7 @@ impl CanonicalVerifierPlanBinding {
             input_artifacts: &self.input_artifacts,
             required_test_ids: &self.required_test_ids,
             required_acceptance_item_ids: &self.required_acceptance_item_ids,
+            task_acceptance_digest: &self.task_acceptance_digest,
             acceptance_verifier_map: &self.acceptance_verifier_map,
             evaluator: &self.evaluator,
             evaluator_version: self.evaluator_version,
@@ -1519,6 +1533,34 @@ impl CanonicalVerifierPlanBinding {
         {
             return Err(CompositionError::Recovery(
                 "canonical verifier plan has no required acceptance item ids".to_owned(),
+            ));
+        }
+        // The contract acceptance digest is what makes the enumerated set the
+        // contract's obligation set rather than the plan's own list, so it must
+        // be a real digest and not an absent or free-text stand-in.
+        if self.task_acceptance_digest.len() != 64
+            || self
+                .task_acceptance_digest
+                .bytes()
+                .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(CompositionError::Recovery(
+                "canonical verifier plan has no contract acceptance digest".to_owned(),
+            ));
+        }
+        // The digest is accepted only when it is the commitment over THIS
+        // enumeration. A format-valid digest that does not commit to the
+        // declared set is refused at admission, so a plan cannot carry a digest
+        // issued for a larger contract set alongside a narrowed item list and
+        // reach the finish gate. Recomputing here also means the digest cannot
+        // be satisfied by restating whatever label the caller already had.
+        if task_acceptance_set_commitment(&self.required_acceptance_item_ids)?
+            != self.task_acceptance_digest
+        {
+            return Err(CompositionError::Recovery(
+                "canonical verifier plan acceptance digest does not commit to its declared \
+                 acceptance item set"
+                    .to_owned(),
             ));
         }
         for (item_id, test_ids) in &self.acceptance_verifier_map {
@@ -1567,6 +1609,9 @@ pub struct CanonicalVerifierInvocationBinding {
     /// invocation; copied from the canonical plan so a persisted fact keeps
     /// the exact denominator its acceptance join used.
     pub required_acceptance_item_ids: BTreeSet<String>,
+    /// `TaskContract` acceptance digest observed with the admitted invocation;
+    /// copied from the canonical plan for the same reason.
+    pub task_acceptance_digest: String,
     /// Acceptance-to-test join observed with the admitted invocation; copied
     /// from the canonical plan for the same reason.
     pub acceptance_verifier_map: BTreeMap<String, BTreeSet<String>>,
@@ -1593,6 +1638,7 @@ impl CanonicalVerifierInvocationBinding {
             input_artifacts: &invocation.input_artifacts,
             required_test_ids: &plan.required_test_ids,
             required_acceptance_item_ids: &plan.required_acceptance_item_ids,
+            task_acceptance_digest: &plan.task_acceptance_digest,
             acceptance_verifier_map: &plan.acceptance_verifier_map,
             evaluator: &plan.evaluator,
             evaluator_version: plan.evaluator_version,
@@ -1607,6 +1653,7 @@ impl CanonicalVerifierInvocationBinding {
             input_artifacts: invocation.input_artifacts.clone(),
             required_test_ids: plan.required_test_ids.clone(),
             required_acceptance_item_ids: plan.required_acceptance_item_ids.clone(),
+            task_acceptance_digest: plan.task_acceptance_digest.clone(),
             acceptance_verifier_map: plan.acceptance_verifier_map.clone(),
             evaluator: plan.evaluator.clone(),
             evaluator_version: plan.evaluator_version,
@@ -1624,6 +1671,11 @@ impl CanonicalVerifierInvocationBinding {
             || self.input_artifacts.is_empty()
             || self.required_test_ids.is_empty()
             || self.required_acceptance_item_ids.is_empty()
+            || self.task_acceptance_digest.len() != 64
+            || self
+                .task_acceptance_digest
+                .bytes()
+                .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
             || self.config_hash.len() != 64
             || self
                 .config_hash
@@ -1675,6 +1727,7 @@ impl CanonicalVerifierInvocationBinding {
             input_artifacts: &self.input_artifacts,
             required_test_ids: &self.required_test_ids,
             required_acceptance_item_ids: &self.required_acceptance_item_ids,
+            task_acceptance_digest: &self.task_acceptance_digest,
             acceptance_verifier_map: &self.acceptance_verifier_map,
             evaluator: &self.evaluator,
             evaluator_version: self.evaluator_version,
@@ -1704,6 +1757,7 @@ struct VerifierInvocationConfig<'a> {
     input_artifacts: &'a [ArtifactId],
     required_test_ids: &'a BTreeSet<String>,
     required_acceptance_item_ids: &'a BTreeSet<String>,
+    task_acceptance_digest: &'a str,
     acceptance_verifier_map: &'a BTreeMap<String, BTreeSet<String>>,
     evaluator: &'a ContractId,
     evaluator_version: ContractVersion,
@@ -1723,6 +1777,7 @@ fn verifier_invocation_config_digest(
         input_artifacts: &'a [ArtifactId],
         required_test_ids: &'a BTreeSet<String>,
         required_acceptance_item_ids: &'a BTreeSet<String>,
+        task_acceptance_digest: &'a str,
         acceptance_verifier_map: &'a BTreeMap<String, BTreeSet<String>>,
         evaluator: &'a ContractId,
         evaluator_version: ContractVersion,
@@ -1737,6 +1792,7 @@ fn verifier_invocation_config_digest(
         input_artifacts: config.input_artifacts,
         required_test_ids: config.required_test_ids,
         required_acceptance_item_ids: config.required_acceptance_item_ids,
+        task_acceptance_digest: config.task_acceptance_digest,
         acceptance_verifier_map: config.acceptance_verifier_map,
         evaluator: config.evaluator,
         evaluator_version: config.evaluator_version,
@@ -2063,6 +2119,36 @@ impl CanonicalVerifierExecutionFact {
     }
 
     /// Whether the bound execution/evaluation is eligible to certify finish.
+    ///
+    /// `I7.9` (`docs/architecture/I07-09-strict-finish-input-and-outcomes.md:30`)
+    /// forbids a verifier with execution status `NOT_EXECUTED` or `SIMULATED`,
+    /// stale scope, a missing artifact binding, or an unknown outcome from
+    /// supporting `VERIFIED_COMPLETE`.  Every clause is answered here by
+    /// comparing the *recorded* axis of this fact, never by observing that a
+    /// record exists:
+    ///
+    /// - simulated — the run's own bound invocation profile is compared against
+    ///   the registered productive profile constant.  Equality with the
+    ///   canonical plan's declared profile, already required by
+    ///   [`Self::validate`] through `check_fact_invocation_matches_plan`, is an
+    ///   identity check between two freely-typed labels and says nothing about
+    ///   whether the run was executed productively.  The productive-profile
+    ///   refusal in `evaluate_testd_verification_current` runs on the
+    ///   publication path; this predicate is what the rehydration path and the
+    ///   persisted evidence read-back in
+    ///   [`CanonicalFinishEvidence::validate`] consult, so a simulated run
+    ///   rehydrated from the canonical owner can be recorded neither as
+    ///   certifying nor as an exact current run.
+    /// - unexecuted and unknown — `ExecutionStatus::Succeeded` is required on
+    ///   both the receipt binding and the run, so an admitted-but-not-started
+    ///   or in-flight execution and an unestablishable outcome both fail; only
+    ///   `VerificationOutcome::Pass` is accepted, so an unknown outcome stays
+    ///   unknown and is never read as success or as absence of objection.
+    /// - stale scope — `Exact*` freshness on the run and on every normalized
+    ///   evidence event, an unchanged source observation, and a recorded
+    ///   finish time.
+    /// - missing artifact binding — non-empty raw artifact bindings, non-empty
+    ///   raw and normalized run evidence, and no truncated artifact.
     #[must_use]
     pub fn certifies_completion(&self) -> bool {
         let fresh = matches!(
@@ -2071,7 +2157,8 @@ impl CanonicalVerifierExecutionFact {
                 | EvidenceFreshness::ExactCommit
                 | EvidenceFreshness::ExactQuiescedWorktree
         );
-        self.job_state == "succeeded"
+        self.invocation.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE
+            && self.job_state == "succeeded"
             && self.receipt.execution == ExecutionStatus::Succeeded
             && self.verification_run.execution == ExecutionStatus::Succeeded
             && self.verification_run.outcome == VerificationOutcome::Pass
@@ -2175,6 +2262,7 @@ fn verifier_invocation_matches_plan(
         && invocation.input_artifacts == verifier_plan.input_artifacts
         && invocation.required_test_ids == verifier_plan.required_test_ids
         && invocation.required_acceptance_item_ids == verifier_plan.required_acceptance_item_ids
+        && invocation.task_acceptance_digest == verifier_plan.task_acceptance_digest
         && invocation.acceptance_verifier_map == verifier_plan.acceptance_verifier_map
         && invocation.evaluator == verifier_plan.evaluator
         && invocation.evaluator_version == verifier_plan.evaluator_version
@@ -2540,19 +2628,140 @@ fn check_fact_terminal_effect_join(
     Ok(())
 }
 
+/// Domain separator for the `TaskContract` acceptance-set commitment, so this
+/// digest can never be confused with a digest over any other collection.
+const TASK_ACCEPTANCE_SET_DOMAIN: &str = "eliot/task-acceptance-set/v1";
+
+/// Derives the acceptance-set commitment from the *enumerated* obligation set.
+///
+/// This is the mechanism that makes the contract acceptance digest load-bearing
+/// rather than a free label. Before it existed, both sides of
+/// [`ContractAcceptanceDenominator::admits`] validated only that the digest was
+/// 64 lowercase hex characters, so a plan could declare a narrowed
+/// `required_acceptance_item_ids` set while carrying a digest copied from a
+/// larger contract set, and the equality check passed while proving nothing
+/// about set identity. Binding the digest to the sorted enumeration closes that:
+/// the plan's declared set and the owner's stated digest are then no longer two
+/// independently typed labels, but one value and a hash of it, so a plan cannot
+/// narrow the denominator without the recomputed commitment no longer matching
+/// what the owner admitted.
+///
+/// The digest is over the sorted item ids only. It deliberately does not read a
+/// submitter `satisfied` flag, a coverage row, or any other party-asserted
+/// status: a claim about an obligation is not an identity of the obligation set.
+///
+/// # Errors
+///
+/// Returns [`CompositionError::Recovery`] when the set cannot be canonicalized.
+fn task_acceptance_set_commitment(item_ids: &BTreeSet<String>) -> Result<String, CompositionError> {
+    #[derive(Serialize)]
+    struct Commitment<'a> {
+        domain: &'a str,
+        item_ids: &'a BTreeSet<String>,
+    }
+    let bytes = canonical_json_bytes(&Commitment {
+        domain: TASK_ACCEPTANCE_SET_DOMAIN,
+        item_ids,
+    })
+    .map_err(|error| {
+        CompositionError::Recovery(format!(
+            "task acceptance set canonicalization failed: {error}"
+        ))
+    })?;
+    Ok(sha256_hex(&bytes))
+}
+
+/// The rehydrated current `TaskContract` acceptance set for one task
+/// revision, read from the owner that holds the contract at the finish
+/// decision.
+///
+/// This is the denominator of acceptance coverage (issue #325 P1, I7.9). It is
+/// deliberately a distinct value from the canonical plan: a plan may *declare*
+/// which obligations it believes exist, but only the contract owner decides
+/// which obligations exist, and a plan that disagrees is refused rather than
+/// silently shrinking the set the gate is computed over.
+///
+/// The set reaches the finish decision already bound to the owner by
+/// [`ContractAcceptanceDenominator::admits`], so `item_ids` may only be a plan
+/// enumeration that survives that proof. The construction site
+/// (`produce_finish_evidence`) therefore still reads the ids from the plan
+/// because the enumeration itself has to travel with the plan, and the owner
+/// supplies the commitment that makes the enumeration provable rather than
+/// merely plausible.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractAcceptanceDenominator {
+    /// Contract identity the acceptance set was rehydrated for.
+    pub task_id: String,
+    /// Exact task revision the contract set was read at.
+    pub task_revision: u64,
+    /// Contract acceptance digest at that revision, from the contract owner.
+    pub acceptance_digest: String,
+    /// Every acceptance item the current contract requires.
+    pub item_ids: BTreeSet<String>,
+}
+
+impl ContractAcceptanceDenominator {
+    /// Whether the plan's declared acceptance set is the set the owner committed
+    /// to.
+    ///
+    /// The plan enumerates the obligations; the task-selection owner states the
+    /// commitment it admitted for this exact task revision. The two are compared
+    /// by *recomputing* the commitment from the plan's enumeration and requiring
+    /// it to equal the owner's digest, so the check has set-identity content
+    /// rather than label-equality content.
+    ///
+    /// This matters because a bare digest comparison proves nothing. Both
+    /// `CanonicalVerifierPlanBinding::task_acceptance_digest` and
+    /// `TaskSelectionEvidence::acceptance_digest` are validated only as 64
+    /// lowercase hex characters, and the intake path that produces the selection
+    /// digest can supply a caller-stated value or `sha256_hex` over the task
+    /// goal. Under a bare comparison a plan could therefore declare one
+    /// obligation of the contract's three and still pass, carrying a digest
+    /// copied from a different (larger) set — a completeness check validated
+    /// against a copy of one party's own list, which is the defect this
+    /// replaces.
+    ///
+    /// The commitment is recomputed here rather than trusted from the plan
+    /// binding, so the plan cannot satisfy this by restating a digest.
+    fn admits(&self, verifier_plan: &CanonicalVerifierPlanBinding) -> bool {
+        if self.item_ids.is_empty() || self.item_ids != verifier_plan.required_acceptance_item_ids {
+            return false;
+        }
+        self.task_acceptance_set_commitment()
+            .is_ok_and(|commitment| commitment == self.acceptance_digest)
+    }
+
+    /// Recomputes the commitment over the enumerated set this denominator
+    /// carries, so `admits` never has to trust a digest reported by the plan.
+    fn task_acceptance_set_commitment(&self) -> Result<String, CompositionError> {
+        task_acceptance_set_commitment(&self.item_ids)
+    }
+}
+
 /// Rebuilds acceptance dispositions from the terminal verifier evidence
 /// joined against the current canonical owner plan. Persisted `satisfied`
 /// flags are never an independent source of acceptance truth.
 ///
-/// I7.9 / issue #325 P1: the denominator is rehydrated from the current
-/// canonical owner plan (`plan`, read by the caller from the canonical owner
-/// at the exact task/fence/revision), never from the selected
-/// `required_test_ids` inventory and never from the fact-embedded plan clone
-/// alone: a fact whose plan drifted from the current owner plan fails closed
-/// here. Every required acceptance item is enumerated before any verifier
-/// evidence is joined; unmapped items stay uncovered and can never yield
-/// `VERIFIED_COMPLETE` downstream.
+/// I7.9 / issue #325 P1: the denominator is the rehydrated current
+/// `TaskContract` acceptance set. The plan's
+/// `required_acceptance_item_ids` is only *admitted* as that set by
+/// [`ContractAcceptanceDenominator::admits`], which recomputes the
+/// acceptance-set commitment from the plan's own enumeration and refuses unless
+/// it equals the digest the caller rehydrated from the contract-owning
+/// task-selection evidence at this exact task revision and fence. A plan that
+/// names fewer obligations than the set the owner committed to therefore cannot
+/// produce a smaller denominator that reads as complete: the coverage call
+/// itself fails closed. The commitment is a hash of the enumeration rather than
+/// a compared label, so it cannot be satisfied by restating a digest.
+///
+/// The denominator is never the selected `required_test_ids` inventory and
+/// never the fact-embedded plan clone alone — a fact whose plan drifted from
+/// the current owner plan fails closed here too. Every required acceptance
+/// item is enumerated before any verifier evidence is joined; unmapped items
+/// stay uncovered and can never yield `VERIFIED_COMPLETE` downstream. A
+/// persisted `satisfied` flag is a submitter claim and is never read here.
 pub(crate) fn acceptance_coverage_from_verifier_fact(
+    contract: &ContractAcceptanceDenominator,
     plan: &CanonicalPlanBinding,
     fact: &CanonicalVerifierExecutionFact,
 ) -> Result<Vec<AcceptanceCoverage>, CompositionError> {
@@ -2564,6 +2773,11 @@ pub(crate) fn acceptance_coverage_from_verifier_fact(
     let verifier_plan = plan.verifier.as_ref().ok_or_else(|| {
         verifier_fact_error("canonical finish plan has no verifier item bindings")
     })?;
+    if !contract.admits(verifier_plan) {
+        return Err(verifier_fact_error(
+            "canonical verifier plan acceptance set disagrees with the rehydrated current TaskContract",
+        ));
+    }
     let run_ref = fact.verification_run.run_id.to_string();
     let run_is_current = matches!(
         fact.verification_run.freshness,
@@ -2571,8 +2785,8 @@ pub(crate) fn acceptance_coverage_from_verifier_fact(
             | EvidenceFreshness::ExactCommit
             | EvidenceFreshness::ExactQuiescedWorktree
     );
-    let mut acceptance = Vec::with_capacity(verifier_plan.required_acceptance_item_ids.len());
-    for item_id in &verifier_plan.required_acceptance_item_ids {
+    let mut acceptance = Vec::with_capacity(contract.item_ids.len());
+    for item_id in &contract.item_ids {
         // Explicit acceptance-to-test join owned by the canonical plan. A
         // missing entry is an unmapped obligation; an empty test set declares
         // a non-test obligation that executed verifier runs alone cannot
@@ -2731,6 +2945,80 @@ pub struct CanonicalAdmissionSnapshot {
     pub finish_evidence: Option<CanonicalFinishEvidence>,
 }
 
+/// The acceptance set the finish coverage was computed over, retained with the
+/// canonical finish evidence so the persisted owner image carries the
+/// denominator rather than only the plan's claim about it.
+///
+/// Issue #325 P1, I7.9. `acceptance_digest` is the contract-side identity,
+/// rehydrated from the task-selection owner; `item_ids` is the enumeration the
+/// plan declares for that digest. The digest is what makes the enumeration
+/// admissible as the contract's obligation set, because `validate` recomputes
+/// it over the retained enumeration — so a plan bound to a different contract
+/// revision, or one that declares a set its digest does not commit to, is
+/// refused instead of quietly reporting a smaller denominator. Recomputing on
+/// the read path also means a persisted record cannot be rehydrated with a
+/// digest that was merely well-formed.
+///
+/// Absent on the wire is a rehydration gap, never an empty obligation set:
+/// [`CanonicalFinishEvidence::validate`] refuses it, so a record persisted
+/// without the contract's acceptance set cannot be read back as complete
+/// coverage.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalContractAcceptance {
+    /// Contract identity the acceptance set was rehydrated for.
+    pub task_id: String,
+    /// Exact task revision the contract set was read at.
+    pub task_revision: u64,
+    /// Contract acceptance digest at that revision, from the contract owner.
+    pub acceptance_digest: String,
+    /// Every acceptance item the current contract requires.
+    pub item_ids: BTreeSet<String>,
+}
+
+impl CanonicalContractAcceptance {
+    fn validate(&self, task_id: &str, task_revision: u64) -> Result<(), CompositionError> {
+        if self.task_id != task_id
+            || self.task_revision != task_revision
+            || self.acceptance_digest.len() != 64
+            || self
+                .acceptance_digest
+                .bytes()
+                .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            || self.item_ids.is_empty()
+            || self
+                .item_ids
+                .iter()
+                .any(|item_id| item_id.trim().is_empty() || item_id.chars().any(char::is_control))
+        {
+            return Err(CompositionError::Recovery(
+                "canonical contract acceptance set is absent, stale, or malformed".to_owned(),
+            ));
+        }
+        // The retained digest is only the contract's acceptance identity when it
+        // commits to the retained enumeration. Without this, a record could be
+        // rehydrated with any 64-hex digest beside any item set and would read
+        // back as an owner-issued acceptance set that was never issued.
+        if task_acceptance_set_commitment(&self.item_ids)? != self.acceptance_digest {
+            return Err(CompositionError::Recovery(
+                "canonical contract acceptance digest does not commit to its retained acceptance \
+                 item set"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn denominator(&self) -> ContractAcceptanceDenominator {
+        ContractAcceptanceDenominator {
+            task_id: self.task_id.clone(),
+            task_revision: self.task_revision,
+            acceptance_digest: self.acceptance_digest.clone(),
+            item_ids: self.item_ids.clone(),
+        }
+    }
+}
+
 /// Canonical owner evidence consumed by the Governor finish path.
 ///
 /// This is deliberately a projection owned by the canonical owner, rather
@@ -2741,6 +3029,13 @@ pub struct CanonicalAdmissionSnapshot {
 pub struct CanonicalFinishEvidence {
     /// Fence at which the evidence was observed.
     pub state_fence: StateFence,
+    /// Rehydrated current `TaskContract` acceptance set: the denominator the
+    /// acceptance coverage below was computed over (issue #325 P1, I7.9).
+    ///
+    /// It is rehydrated from the contract owner with the rest of this record
+    /// and is never accepted from the finish caller, so the persisted receipt
+    /// cannot claim a complete coverage set the contract owner never named.
+    pub contract_acceptance: CanonicalContractAcceptance,
     /// Acceptance, artifact, verifier, and effect evidence from canonical
     /// state.  It is never accepted from the finish caller.
     pub evidence: FinishEvidence,
@@ -2775,6 +3070,12 @@ impl CanonicalFinishEvidence {
                 "canonical finish evidence task identity is invalid".to_owned(),
             ));
         }
+        // The acceptance denominator is rehydrated with the rest of this record
+        // and must name this exact task revision. A missing or drifted
+        // contract acceptance set is a recovery gap, never an empty
+        // obligation set that would let the coverage gate read as complete.
+        self.contract_acceptance
+            .validate(&self.evidence.task_id, self.evidence.current_task_revision)?;
         if self.finish_authority_ref.trim().is_empty()
             || self.finish_authority_ref.chars().any(char::is_control)
         {
@@ -2866,7 +3167,13 @@ impl CanonicalFinishEvidence {
                     .to_owned(),
             ));
         }
-        if self.evidence.acceptance != acceptance_coverage_from_verifier_fact(plan, fact)? {
+        if self.evidence.acceptance
+            != acceptance_coverage_from_verifier_fact(
+                &self.contract_acceptance.denominator(),
+                plan,
+                fact,
+            )?
+        {
             return Err(CompositionError::Recovery(
                 "canonical per-item acceptance dispositions differ from verifier evidence"
                     .to_owned(),
@@ -5221,6 +5528,66 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             observation_receipt_digest: &observation_receipt,
         })
         .map_err(|error| CompositionError::Owner(error.to_string()))
+    }
+
+    /// Composes this ready composition's owner-neutral canonical projection set
+    /// for one task, from its own live owners.
+    ///
+    /// This is the Governor's producer boundary for the value an orientation
+    /// consumer presents. The four inputs are the composition's own retained
+    /// owners — the `task` and `session` lifecycle snapshots, the admitted
+    /// `work_scope` binding read at the retained fence, and the `observation`
+    /// journal's deterministic entries — under the one admitted
+    /// [`StateFence`]. The pure composer returns the Governor's own
+    /// [`GovernorProjectionSet`](crate::GovernorProjectionSet) first, with every
+    /// absent member recorded as a
+    /// [`ProjectionOmission`](crate::ProjectionOmission) rather than filler,
+    /// and the emitted
+    /// [`CanonicalProjectionSet`] is produced only when all four records
+    /// exist; an absent member is a typed
+    /// [`GovernorProjectionError::MemberOmitted`] naming which one.
+    ///
+    /// Only a fully admitted composition composes, matching
+    /// [`Self::controlboard_snapshot`]: a degraded or recovering composition
+    /// fails closed rather than projecting from a partially hydrated owner.
+    ///
+    /// The `work_scope` owner is optional by construction (the Kernel may not
+    /// yet serve the binding); its absence is the same fail-closed refusal here,
+    /// because an affordance projection authorized for no admitted scope is
+    /// exactly the empty-affordance case the consumer contract rejects.
+    pub fn canonical_projections(
+        &self,
+        binding: &ContextBinding,
+        task_id: &TaskId,
+    ) -> Result<CanonicalProjectionSet, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let fence = self.snapshot.state_fence();
+        if !fences_match_exact(&binding.state_fence, &fence) {
+            return Err(CompositionError::Owner(
+                GovernorProjectionError::FenceMismatch.to_string(),
+            ));
+        }
+        let scope_owner = self.owners.work_scope.as_ref().ok_or_else(|| {
+            CompositionError::Owner(
+                GovernorProjectionError::MemberOmitted("affordance").to_string(),
+            )
+        })?;
+        let scope_snapshot = scope_owner
+            .read_current(&fence)
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        let set = compose_canonical_projections(
+            &self.owners.task.snapshot(),
+            &self.owners.session.snapshot(),
+            &scope_snapshot,
+            &self.owners.observation.snapshot(),
+            task_id,
+            &fence,
+        )
+        .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        emit_canonical_projection_set(binding, &set)
+            .map_err(|error| CompositionError::Owner(error.to_string()))
     }
 
     /// Borrows the single Skill lifecycle owner as a canonical

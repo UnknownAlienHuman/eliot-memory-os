@@ -25,6 +25,7 @@ mod reactive_coverage;
 mod reactive_input;
 mod reactive_session;
 mod readback;
+mod recipe;
 mod view;
 
 pub use admission::{
@@ -84,8 +85,9 @@ pub use omission::{ExpansionHandle, NonRecoverableReason, OmissionReason, Omissi
 pub use quality::{
     QUALITY_APPLICABILITY_INPUTS, QUALITY_DIMENSIONS, QUALITY_RESULT_SCHEMA_VERSION,
     QUALITY_SCORECARD_SCHEMA_VERSION, QualityApplicability, QualityApplicabilityInput,
-    QualityDimension, QualityDimensionResult, QualityDimensionState, QualityOperation,
-    QualityOutputBinding, QualityRefusal, QualityRefusalKind, QualityScorecard, QualitySuitability,
+    QualityApplicabilityResolution, QualityApplicabilityResolutionSet, QualityDimension,
+    QualityDimensionResult, QualityDimensionState, QualityOperation, QualityOutputBinding,
+    QualityRefusal, QualityRefusalKind, QualityScorecard, QualitySuitability,
 };
 pub use reactive_attention::{
     AttentionAcknowledgement, AttentionInfluence, AttentionOwnerClosure, AttentionResolution,
@@ -107,6 +109,16 @@ pub use reactive_session::{
 pub use readback::{
     IndexPreview, MAX_EXCERPT_BYTES, MAX_PREVIEW_BYTES, PreviewAuthority, ProjectedCitation,
     ReadbackRefusal, ReadbackRefusalKind, ReadbackRequest,
+};
+pub use recipe::{
+    ApprovedRecipeCatalogue, CONTEXT_RECIPE_POLICY_DIGEST_DOMAIN,
+    CONTEXT_RECIPE_POLICY_SCHEMA_VERSION, CONTEXT_RECIPE_RESOLUTION_DIGEST_DOMAIN,
+    ContextRecipePolicy, ContextSectionBudget, CounterMetricMovement, GoverningContextRequirements,
+    ProtectedReservePolicy, RecipeAdmissionPolicy, RecipeApplicability,
+    RecipeApplicabilityDimension, RecipeCandidateRejection, RecipeCounterMetric,
+    RecipeExecutionContour, RecipeLayoutPolicy, RecipeOmissionPolicy, RecipePolicyIdentity,
+    RecipeQualification, RecipeQualificationState, RecipeRejectionReason, RecipeResolutionRefusal,
+    RecipeRolePosition, RecipeStage, RecipeSupersession, ResolvedContextRecipe,
 };
 pub use view::{ActiveUnderstandingView, RenderedAtom, SelectionIntegrityProof};
 

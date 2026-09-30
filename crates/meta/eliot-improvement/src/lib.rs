@@ -8,11 +8,23 @@
 //!
 //! This is the measured reverse-consumer, state, effect, experiment-path and
 //! test inventory of the whole package. Every count and every consumer below
-//! was read off the source at `main@7eb86a841`; where a claim is "no consumer",
-//! the exact `git grep` that established it is named. Nothing here is a
-//! projection of intent: a name listed as consumed carries its call site, and a
-//! name listed as unconsumed was searched for by `use eliot_improvement` path
-//! form, by bare path form and by method-call form.
+//! was read off the source at `main@7eb86a841`, and the REVERSE-CONSUMER
+//! RECORD (the live-leg chain, the call-site table and the consumer/no-consumer
+//! lists) was re-measured on `main@427e9f53a` in #1145 because its line pins
+//! had drifted with `daemon_runtime.rs` while its counts stayed exact; where a
+//! claim is "no consumer", the exact `git grep` that established it is named.
+//! Nothing here is a projection of intent: a name listed as consumed carries
+//! its call site, and a name listed as unconsumed was searched for by
+//! `use eliot_improvement` path form, by bare path form and by method-call
+//! form. Line pins are the current reading of a hop, not the durable evidence —
+//! the hop names are.
+//!
+//! The INTRA-FILE PINS in the mutable-state, clock and experiment-path sections
+//! below were re-measured in the same #1145 pass, on the base of the branch that
+//! carries them. This module document is itself inserted ABOVE the code it cites,
+//! so any edit here shifts every pin below it; that is why each of those pins
+//! names the SYMBOL it resolves to and carries the line number only as the
+//! current reading of that symbol.
 //!
 //! ## Public surface
 //!
@@ -35,53 +47,58 @@
 //! The live leg, verified by following each hop:
 //!
 //! ```text
-//! bins/eliotd/src/main.rs:30                       daemon_runtime::run()
-//! -> daemon_runtime.rs:895                         runtime.block_on(run_loop(..))
-//! -> daemon_runtime.rs:1573                        run_loop
-//! -> daemon_runtime.rs:1795                        maybe_start_improvement_intake
-//! -> daemon_runtime.rs:5487                        run_improvement_intake(..).await
-//! -> daemon_runtime.rs:5150/5157                   improvement_intake_artifact
-//! -> daemon_runtime.rs:5025/5047                   assemble_improvement_artifact
-//! -> improvement_intake_dispatch.rs:379            pub fn assemble_improvement_artifact
+//! bins/eliotd/src/main.rs:121                      daemon_runtime::run()
+//! -> daemon_runtime.rs:942                         runtime.block_on(run_loop(..))
+//! -> daemon_runtime.rs:1636                        run_loop
+//! -> daemon_runtime.rs:1879                        maybe_start_improvement_intake
+//! -> daemon_runtime.rs:6161                        run_improvement_intake(..).await
+//! -> daemon_runtime.rs:5612                        improvement_intake_artifact
+//! -> daemon_runtime.rs:5484                        assemble_improvement_artifact
+//! -> improvement_intake_dispatch.rs:682            pub fn assemble_improvement_artifact
 //! ```
+//!
+//! These line pins are re-measured on this branch's base. They drift whenever
+//! `daemon_runtime.rs` grows, so the hop NAMES are the durable evidence and the
+//! line numbers are the current reading of it.
 //!
 //! From that entry point the crate is entered through exactly these items:
 //!
 //! | Crate item | Call site on the live leg |
 //! |---|---|
-//! | `evidence_sources::sourced_evidence` | `improvement_intake_dispatch.rs:416` |
-//! | `evidence_sources::candidate_from_evidence` | `improvement_intake_dispatch.rs:430` |
+//! | `evidence_sources::sourced_evidence` | `improvement_intake_dispatch.rs:1209` |
+//! | `evidence_sources::candidate_from_evidence` | `improvement_intake_dispatch.rs:719` |
 //! | `ImprovementCandidate::new` | `evidence_sources.rs:89` |
-//! | `ImprovementCandidate::transition_lifecycle` | `improvement_intake_dispatch.rs:447` |
-//! | `ImprovementCandidate::validate` | `improvement_dedup_read.rs:555` (and internally at `evidence_sources.rs:114`, `brief.rs:279`) |
-//! | `brief::SafeBoundary::from_observed_closure` | `improvement_intake_dispatch.rs:491` |
-//! | `brief::brief_at_safe_boundary` | `improvement_intake_dispatch.rs:538` |
-//! | `brief::record_owner_decision` | `improvement_intake.rs:34` (from `improvement_intake_dispatch.rs:585`) |
-//! | `application_class::classify` | `improvement_intake_dispatch.rs:804` |
-//! | `application_class::check_class_gate` | `improvement_intake_dispatch.rs:805` |
-//! | `application_class::ChangeDescriptor::from_recorded_surface` | `improvement_intake_dispatch.rs:803` |
-//! | `candidate_bounds::BoundedBacklog::restored` | `improvement_dedup_read.rs:483` |
-//! | `candidate_bounds::BoundedBacklog::admit_reporting_pressure` | `improvement_intake_dispatch.rs:1239` |
-//! | `candidate_bounds::BoundedBacklog::entry_for` | `improvement_intake_dispatch.rs:1286` |
-//! | `candidate_bounds::canonical_evidence_lineage` | `improvement_dedup_read.rs:540`, `candidate_dispatch.rs:591` |
-//! | `candidate_bounds::evidence_lineage_digest` | `improvement_dedup_read.rs:546`, `candidate_dispatch.rs:591` |
-//! | `candidate_bounds::CandidateBoundPolicy` | `improvement_intake_dispatch.rs:1060,1085` |
-//! | `ImprovementSurface::closed_name` | `improvement_candidate_dispatch.rs:497` |
-//! | `ImprovementLifecycle::is_terminal` | `improvement_dedup_read.rs:626` |
-//! | `ImprovementCandidate`, `ImprovementSurface`, `ImprovementLifecycle`, `ReplayPlan`, `SourcedEvidence`, `EvidenceSource`, `OwnerDecision`, `OwnerDecisionKind`, `ImprovementBrief`, `SafeBoundary`, `ImprovementError`, `AdmitOutcome`, `AdmitReport`, `TrackedCandidate`, `ArchivedCandidate`, `DurableCandidateRecord`, `BoundsError` | type positions in `improvement_intake.rs`, `improvement_intake_dispatch.rs`, `improvement_dedup_read.rs`, `improvement_candidate_dispatch.rs`, `daemon_runtime.rs:58,5106` |
+//! | `ImprovementCandidate::transition_lifecycle` | `improvement_intake_dispatch.rs:736` |
+//! | `ImprovementCandidate::validate` | `improvement_dedup_read.rs:639` (and internally at `evidence_sources.rs:114`, `brief.rs:317`) |
+//! | `brief::SafeBoundary::from_observed_closure` | `improvement_intake_dispatch.rs:774` |
+//! | `brief::brief_at_safe_boundary` | `improvement_intake_dispatch.rs:823` |
+//! | `brief::record_owner_decision` | `improvement_intake.rs:46` (from `improvement_intake_dispatch.rs:994`) |
+//! | `application_class::classify` | `improvement_intake_dispatch.rs:1488` |
+//! | `application_class::check_class_gate` | `improvement_intake_dispatch.rs:1490` |
+//! | `application_class::ChangeDescriptor::from_recorded_surface` | `improvement_intake_dispatch.rs:1487` |
+//! | `candidate_bounds::BoundedBacklog::restored` | `improvement_dedup_read.rs:558` |
+//! | `candidate_bounds::BoundedBacklog::admit_reporting_pressure` | `improvement_intake_dispatch.rs:2228` |
+//! | `candidate_bounds::BoundedBacklog::entry_for` | `improvement_intake_dispatch.rs:2275` |
+//! | `candidate_bounds::canonical_evidence_lineage` | `improvement_dedup_read.rs:624`, `candidate_dispatch.rs:1208` |
+//! | `candidate_bounds::evidence_lineage_digest` | `improvement_dedup_read.rs:630`, `candidate_dispatch.rs:1208` |
+//! | `candidate_bounds::CandidateBoundPolicy` | type positions at `improvement_intake_dispatch.rs:2036`, `improvement_dedup_read.rs:279` |
+//! | `ImprovementSurface::closed_name` | `improvement_candidate_dispatch.rs:1081` |
+//! | `ImprovementLifecycle::is_promoting_disposition` | `improvement_intake_dispatch.rs:2658` (inside `refuse_replay_only_promotion`, reached from `commit_improvement_artifact` at `:2673`, which `daemon_runtime.rs:5673` calls) |
+//! | `budget_proof::require_matched_budget_for_promotion` | `improvement_intake_dispatch.rs:2661` (same refusal seam; asked with the `None` this path honestly holds) |
+//! | `ImprovementCandidate`, `ImprovementSurface`, `ImprovementLifecycle`, `ReplayPlan`, `SourcedEvidence`, `EvidenceSource`, `OwnerDecision`, `OwnerDecisionKind`, `ImprovementBrief`, `SafeBoundary`, `ImprovementError`, `AdmitOutcome`, `AdmitReport`, `TrackedCandidate`, `ArchivedCandidate`, `DurableCandidateRecord`, `BoundsError` | type positions in `improvement_intake.rs`, `improvement_intake_dispatch.rs`, `improvement_dedup_read.rs`, `improvement_candidate_dispatch.rs`, `daemon_runtime.rs:58` |
 //!
 //! The consumer half of the same pass — the leg that reads a candidate back —
-//! rides the same observation at `daemon_runtime.rs:5263`
+//! rides the same observation at `daemon_runtime.rs:5786`
 //! (`dispatch_improvement_candidate_route` ->
-//! `improvement_candidate_dispatch.rs:260 route_improvement_candidate` ->
-//! `improvement_candidate_route.rs:100`). The path that consumes a candidate
+//! `improvement_candidate_dispatch.rs:677 route_improvement_candidate` ->
+//! `improvement_candidate_route.rs:116`). The path that consumes a candidate
 //! is the path that constructs it.
 //!
 //! One crate reaches in from inside that leg. `crates/meta/eliot-self-quality`
 //! calls `evidence_sources::sourced_evidence` at `improvement_handoff.rs:69`
 //! and returns `SourcedEvidence` at `conformance_evidence.rs:98`;
 //! `git grep -n "sourced_evidence_from_conformance_diagnosis"` shows its
-//! production call at `improvement_intake_dispatch.rs:1003`, so the
+//! production call at `improvement_intake_dispatch.rs:1980`, so the
 //! conformance-diagnosis arm of the live leg reaches this crate through
 //! `eliot_self_quality::conformance_evidence.rs:111`. `eliotd` depends on
 //! `eliot-self-quality` (`bins/eliotd/Cargo.toml:94`), so this is one consumer
@@ -98,10 +115,10 @@
 //!   inside `admit_governed_host`, and
 //!   `crates/smart/eliot-context-compiler-wasm/src/governed_compose.rs:149`.
 //!   `git grep -n "admit_governed_host" -- '*.rs'` returns only its definition,
-//!   the `pub use` in `bins/eliot-wasm-host/src/lib.rs:78`, and one prose
-//!   mention in `eliot-context-admission/src/lib.rs:271` — zero callers.
+//!   the `pub use` in `bins/eliot-wasm-host/src/lib.rs:79`, and one prose
+//!   mention in `eliot-context-admission/src/lib.rs:310` — zero callers.
 //!   `compose_governed_compilation` is likewise only its definition and the
-//!   `lib.rs:55` re-export of a crate that is not in the root `Cargo.toml`
+//!   `lib.rs:53` re-export of a crate that is not in the root `Cargo.toml`
 //!   members list at all. **Open disposition: live contract, bounded reference
 //!   fixture, or delete.**
 //! - `governed_screen::{check_governed_carriage, CarriageMark,
@@ -117,10 +134,10 @@
 //!   `bins/eliot-wasm-host/src/governed_admission.rs` (inside the callerless
 //!   `admit_governed_host`) and the non-member wasm crate. `eliotd` itself
 //!   reaches those crates only through the NON-learning `admit_context_traced`
-//!   (`daemon_runtime`-side `kernel_context_read_client.rs:74`) and
-//!   `assemble_active_view` (`:76`), neither of which touches this crate. That
+//!   (`daemon_runtime`-side `kernel_context_read_client.rs:75`) and
+//!   `assemble_active_view` (`:78`), neither of which touches this crate. That
 //!   crate's own
-//!   `crates/smart/eliot-context-admission/src/lib.rs:258-274` already records
+//!   `crates/smart/eliot-context-admission/src/lib.rs:255-280` already records
 //!   this as a measured absence.
 //!
 //! ### No consumer outside this crate, at all
@@ -130,11 +147,8 @@
 //! `crates/meta/eliot-improvement/**`:
 //!
 //! - `intake_from_evidence` — zero call sites. The three `eliotd` hits at
-//!   `improvement_intake_dispatch.rs:95,100,452` are prose explaining why the
+//!   `improvement_intake_dispatch.rs:242,247,741` are prose explaining why the
 //!   daemon deliberately does NOT call it.
-//! - `require_matched_budget_for_promotion` — zero external call sites. The two
-//!   `eliotd` hits (`improvement_intake_dispatch.rs:88,96`) are prose. Its only
-//!   callers are internal: `intake.rs:284` and `lib.rs:933`.
 //! - `intake_from_evidence_governed`, `IntakeRequest`, `IntakeOutcome`,
 //!   `GovernedIntakeOutcome`, `GovernedIntakeError`,
 //!   `RetainedCampaignLearning`, `RetainedReusableClosure` — no `.rs` hit
@@ -142,7 +156,7 @@
 //!   `crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml`
 //!   projection.
 //! - `stamp_outcome_budget` — exactly one external caller,
-//!   `bins/eliotd/src/improvement_intake.rs:46`, inside
+//!   `bins/eliotd/src/improvement_intake.rs:58`, inside
 //!   `stamp_promotion_budget`. `git grep -n "stamp_promotion_budget"` returns
 //!   only that definition. So the one budget-stamping bridge is itself
 //!   uncalled, and `BudgetProof` and `OutcomeEvidence` are named in
@@ -155,8 +169,12 @@
 //!   `transition_lifecycle(Triaged)`.
 //! - `ImprovementCandidate::transition` (the advisory `CandidateState` machine)
 //!   — zero external call sites; grepped `candidate.transition(`.
-//! - `ImprovementLifecycle::is_promoting_disposition`,
-//!   `CandidateState::is_experimental` — zero external call sites.
+//! - `CandidateState::is_experimental` — zero external call sites.
+//! - `ImprovementLifecycle::is_terminal` — zero external call sites. Its only
+//!   call is internal, `candidate_bounds.rs:1566`, in `archive_cause_lifecycles`.
+//!   The `is_terminal` at `improvement_dedup_read.rs:825` is a DIFFERENT
+//!   method on an `ArchiveReceiptDocument`'s own disposition type, not this
+//!   predicate.
 //! - `route_rejected_surface`, `ImprovementCandidateDraft`,
 //!   `route_overlay_task_policy_change` — the whole
 //!   `overlay_policy_routing` module has no production consumer.
@@ -200,8 +218,8 @@
 //!   `tests/`, or doc prose. The live daemon reaches the backlog only through
 //!   `restored`, `admit_reporting_pressure` and `entry_for`.
 //! - `CrossTaskCarryover::verify` is reached from
-//!   `improvement_intake_dispatch.rs:1486` inside
-//!   `verify_cross_task_carryover`, and `git grep -n
+//!   `improvement_intake_dispatch.rs:2475` inside
+//!   `verify_cross_task_carryover` (`:2461`), and `git grep -n
 //!   "verify_cross_task_carryover"` returns only that definition plus its own
 //!   doc comments — so the cross-task revalidation seam is present and typed
 //!   but uncalled.
@@ -234,7 +252,7 @@
 //!   `BoundedBacklog::{admit, admit_governed, admit_reporting_pressure,
 //!   archive, bind_local_overlay, bind_reusable_candidate}`. `BoundedBacklog`
 //!   is the crate's one stateful aggregate and it is a plain value the CALLER
-//!   owns; `eliotd` constructs one per pass at `daemon_runtime.rs:5106` and
+//!   owns; `eliotd` constructs one per pass at `daemon_runtime.rs:5543` and
 //!   drops it at the end of that pass.
 //! - **No filesystem, process, network, thread, env or async effect.**
 //!   `grep` for `std::fs`, `std::net`, `std::process`, `std::thread`,
@@ -247,24 +265,26 @@
 //!   `[workspace.lints.rust]`, and `overlay_policy_routing.rs:19` repeats it
 //!   at module scope.
 //! - **Clock.** Ten clock reads in total, all in construction or bookkeeping
-//!   paths, none in a gate: `OffsetDateTime::now_utc()` at `lib.rs:646` (`new`),
-//!   `lib.rs:724,863,946` (`set_details`, `transition`,
-//!   `apply_lifecycle_edge`), `lib.rs:969` (`promotion_input`),
-//!   `brief.rs:299,322` (`brief_at_safe_boundary`, `record_owner_decision`) and
-//!   `candidate_bounds.rs:1122` (a lineage merge), plus `Uuid::now_v7()` at
-//!   `lib.rs:961` and `brief.rs:288`. `datetime_from_unix` converts a
-//!   caller-supplied timestamp and reads no clock. No expiry, admission or
-//!   promotion decision in this crate consults the clock on its own behalf;
+//!   paths, none in a gate: `OffsetDateTime::now_utc()` in
+//!   `ImprovementCandidate::new` (`lib.rs:703`), in `set_details` (`lib.rs:781`),
+//!   in `transition` (`lib.rs:920`), in `apply_lifecycle_edge` (`lib.rs:1003`) and
+//!   in `promotion_input` (`lib.rs:1057`); in `brief::brief_at_safe_boundary`
+//!   (`brief.rs:337`) and `brief::record_owner_decision` (`brief.rs:360`); and
+//!   at `candidate_bounds.rs:1122`, a lineage merge. Plus `Uuid::now_v7()` in
+//!   `promotion_input` (`lib.rs:1048`) and in `brief.rs:326`.
+//!   `datetime_from_unix` converts a caller-supplied timestamp and reads no
+//!   clock. No expiry, admission or promotion decision in this crate consults
+//!   the clock on its own behalf;
 //!   `now` is always a parameter (`candidate_bounds.rs:1370,1877,1897,2237,2355`
 //!   and `governed_screen.rs:83,152,190`). The two modules that own the inner
 //!   learning loop are clock-free outright: `Select-String` for
 //!   `OffsetDateTime` over `learning_closure.rs` and `promotion_input.rs`
 //!   returns nothing, so neither module can read a clock even by accident.
-//! - **One owner-held read.** `brief.rs:200` calls
-//!   `CanonicalLearningDeltaStore::load()`, a read of already-committed
-//!   IN-PROCESS state the caller passes in. It opens no transport, no store
-//!   client and no durability path; `brief.rs:176-181` states the caller's
-//!   mutex obligation.
+//! - **One owner-held read.** `brief::SafeBoundary::from_observed_closure`
+//!   calls `CanonicalLearningDeltaStore::load()` (`brief.rs:232`), a read of
+//!   already-committed IN-PROCESS state the caller passes in. It opens no
+//!   transport, no store client and no durability path; the caller's mutex
+//!   obligation is stated at `brief.rs:207-209`.
 //!
 //! Per acceptance item A9 — "cannot edit source/config/policy, install
 //! artifacts, activate generations, issue authority, promote support/truth or
@@ -274,40 +294,64 @@
 //! has no generation API and reads no generation store; authority issuance:
 //! every boundary is a refusal (`SelfPromotionForbidden`,
 //! `ApplicationClassViolation`, `UnsafeBoundary`, `BudgetGateViolation`,
-//! `MissingBudgetProof`), and `validate_base` at `lib.rs:805` refuses
-//!   `advisory_only: false` at `lib.rs:820` outright; support/truth promotion
+//! `MissingBudgetProof`), and `ImprovementCandidate::validate_base`
+//!   (`lib.rs:862`) refuses `advisory_only: false` (`lib.rs:877`) outright;
+//!   support/truth promotion
 //!   and `VERIFIED_COMPLETE`: no name in this crate's source spells either, and
-//!   the only transition into a promoting disposition, `promote_lifecycle`
-//! (`lib.rs:916`), is unreachable from production because it has no caller
-//! and `require_matched_budget_for_promotion` is itself uncalled externally.
+//!   the only transition into a promoting disposition,
+//!   `ImprovementCandidate::promote_lifecycle`, is unreachable from production
+//!   because it has no caller at
+//! all. The daemon's live promotion guard is the opposite shape: it never
+//! calls `promote_lifecycle`, and instead proves non-promotion and then
+//! refuses, asking `require_matched_budget_for_promotion(None)` so a
+//! promotion cannot become durable through that seam.
 //!
 //! ## Experiment path
 //!
 //! Nothing in this crate RUNS an experiment. What it holds is record and
 //! validation only:
 //!
-//! - `ReplayPlan` (`lib.rs:570`) names the fixed-replay, holdout, transfer and
-//!   counter-metric references. `ReplayPlan::validate` (`lib.rs:579`) refuses
+//! - `ReplayPlan` (`lib.rs:627`) names the fixed-replay, holdout, transfer and
+//!   counter-metric references. `ReplayPlan::validate` (`lib.rs:636`) refuses
 //!   empty reference groups and an empty `transfer_refs`. It matches
 //!   I12.24:67, "fixed replay as diagnostic evidence only".
 //! - `canary_plan`, `rollback` and `stop_condition` are `String` REFERENCES on
-//!   the candidate (`lib.rs:617-621`); `validate` (`lib.rs:744-746`) requires
-//!   them to be non-empty and never resolves them.
+//!   the candidate (`lib.rs:674-678`); `ImprovementCandidate::validate`
+//!   (`lib.rs:801-803`) requires them to be non-empty and never resolves them.
 //! - `BudgetProof` / `ComplexityEconomicsDelta` /
 //!   `require_matched_budget_for_promotion` are the I12.24:76 matched-budget
-//!   gate. `OutcomeEvidence::validate_for` (`lib.rs:1008`) refuses a
+//!   gate. `OutcomeEvidence::validate_for` (`lib.rs:1140`) refuses a
 //!   promotion-bound outcome that lacks a budget ledger, a conclusive
 //!   economics delta, affected checks, live shadow/canary evidence or
 //!   delayed-harm visibility. That is I12.24:76's "An unmatched ledger or
 //!   inconclusive complexity delta cannot promote the candidate merely because
 //!   replay or a local metric improved."
+//! - The promotion record carries the BOUND proof, so the two canonical
+//!   bindings are re-checked against the bound RECORDS themselves and not
+//!   against their names: `ImprovementCandidate::promotion_input` takes
+//!   `&BudgetProof` and writes the outcome's ledger record, delta record and
+//!   four evidence references through `stamp_outcome_budget`, the single owner
+//!   of that projection, and the returned `PromotionInput` holds the same
+//!   `BudgetProof`. `PromotionInput::validate` re-runs
+//!   `stamp_outcome_budget` on the bound proof, so the canonical
+//!   `BudgetEquivalenceLedger::validate`, the ledger's recorded `equivalence`
+//!   class and the delta's six recorded slots are checked against the original
+//!   record values, and a record whose ledger or delta differs is refused even
+//!   when it reuses the same `ledger_id`. The four evidence legs stay
+//!   caller-set references, and they are required UNEVENLY: affected checks
+//!   and the delayed-harm window are required individually, while the
+//!   live-evidence leg is satisfied by matched-budget live shadow OR live
+//!   canary (I12.24:68), so a proof carrying only one of the two still
+//!   promotes. Each is required to agree with the bound proof, and none is
+//!   resolved to an observation. No
+//!   ledger or delta is recomputed, re-derived or substituted on either path.
 //! - The lifecycle enums carry the experiment states and enforce the edge
 //!   table: `AcceptedForExperiment` and `Running` exist only as transitions
-//!   `lifecycle_edge_allowed` (`lib.rs:517`) permits, and the promoting step
+//!   `lifecycle_edge_allowed` (`lib.rs:574`) permits, and the promoting step
 //!   "promote, narrow, rollback or archive" (I12.24:70) is gated so that
-//!   `transition_lifecycle` refuses `Supported`/`Narrowed` outright
-//!   (`lib.rs:892`) and only `promote_lifecycle` admits them, and only with a
-//!   budget proof.
+//!   `ImprovementCandidate::transition_lifecycle` refuses `Supported`/`Narrowed`
+//!   outright (`lib.rs:948`) and only `promote_lifecycle` admits them, and only
+//!   with a budget proof.
 //! - `promotion_input::prepare_promotion_input` (`promotion_input.rs:551`) is a
 //!   pure gate over already-supplied evidence, and it has no production caller.
 //!
@@ -333,6 +377,7 @@
 //! effect vocabulary is absent.
 
 use blake3::Hasher;
+use eliot_evaluation_contracts::BudgetEquivalenceLedger;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -959,14 +1004,44 @@ impl ImprovementCandidate {
         Ok(())
     }
 
+    /// Build the I12.24:76 promotion record over a BOUND budget proof.
+    ///
+    /// `proof` is required by signature and is the ORIGINAL [`BudgetProof`]
+    /// value — the `BudgetEquivalenceLedger` itself plus the recorded
+    /// `ComplexityEconomicsDelta` — not a name for one. The ledger record, the
+    /// delta record and the four evidence legs on `outcome` are written by
+    /// [`stamp_outcome_budget`], the single owner of that projection, straight
+    /// out of the records [`BudgetProof::supports_promotion`] validated; a
+    /// hand-written outcome therefore cannot supply a binding, and one already
+    /// bound to a different ledger, delta or evidence leg is refused rather
+    /// than overwritten. [`OutcomeEvidence::validate_for`] then runs on the
+    /// stamped record, and the same bound proof travels on the returned
+    /// [`PromotionInput`] so [`PromotionInput::validate`] can re-check the two
+    /// canonical bindings against the record values.
+    ///
+    /// Stated precisely, because the guarantee is not uniform across the seven
+    /// obligations: MATCHEDNESS and CONCLUSIVENESS are decided by the records —
+    /// the ledger's own `validate()`, its recorded `equivalence` class and the
+    /// delta's six recorded slots — so no caller-set name or Boolean decides
+    /// them. The four evidence legs (affected checks, live shadow, live canary,
+    /// delayed-harm window) are caller-set references that the gate requires to
+    /// agree with the bound proof; it does not resolve them to an observation,
+    /// and nothing here claims it does. They are not all required in the same
+    /// way: affected checks and the delayed-harm window must each be present,
+    /// whereas I12.24:68's matched-budget live shadow/canary leg is satisfied by
+    /// EITHER one, so a record with no live canary reference at all still
+    /// promotes when it carries a live shadow reference. The lifecycle
+    /// promotion itself remains [`ImprovementCandidate::promote_lifecycle`].
     pub fn promotion_input(
         &self,
-        outcome: OutcomeEvidence,
+        mut outcome: OutcomeEvidence,
+        proof: &BudgetProof,
     ) -> Result<PromotionInput, ImprovementError> {
         self.validate()?;
         if !matches!(self.state, CandidateState::Evaluating) {
             return Err(ImprovementError::OutcomeRequiresEvaluation);
         }
+        stamp_outcome_budget(&mut outcome, proof)?;
         outcome.validate_for(self)?;
         let digest = promotion_digest(self, &outcome);
         Ok(PromotionInput {
@@ -976,6 +1051,7 @@ impl ImprovementCandidate {
             candidate_revision: self.revision,
             target_surface: self.target_surface,
             outcome,
+            budget_proof: proof.clone(),
             evidence_digest: digest,
             direct_promotion: false,
             created_at: OffsetDateTime::now_utc(),
@@ -983,6 +1059,36 @@ impl ImprovementCandidate {
     }
 }
 
+/// The I12.24 evaluation record for one candidate revision.
+///
+/// ## The two canonical bindings are RECORDS, the four evidence legs are references
+///
+/// Two of the seven I12.24:76 obligations — a canonical budget-equivalence
+/// ledger and a conclusive complexity-economics delta — are carried here as
+/// the RECORDS themselves, not as names for them. [`stamp_outcome_budget`]
+/// writes both values out of the records [`BudgetProof::supports_promotion`]
+/// validated, [`ImprovementCandidate::promotion_input`] takes that
+/// [`BudgetProof`] by signature, and the resulting [`PromotionInput`] carries
+/// the same bound proof, so [`PromotionInput::validate`] re-checks the two
+/// bindings against the original `BudgetEquivalenceLedger` VALUE and the
+/// recorded delta — a name, or a different ledger that reuses the same
+/// `ledger_id`, cannot satisfy it, and nothing is recomputed, re-derived or
+/// substituted to make it pass.
+///
+/// The remaining four — affected checks, live shadow, live canary and the
+/// delayed-harm window — stay caller-set REFERENCES, exactly as I12.24:68 and
+/// I12.24:69 leave them. The gate requires each to agree with the bound proof;
+/// it does not and cannot resolve any of them to an observation. Required is
+/// NOT the same as required ALL FOUR: affected checks and the delayed-harm
+/// window are each required in their own right, while I12.24:68's
+/// matched-budget live shadow/canary is required as shadow OR canary, so one of
+/// the two is enough and a record carrying only live shadow — or only live
+/// canary — promotes. The honest summary is therefore: no caller-set name or
+/// Boolean decides
+/// MATCHEDNESS or CONCLUSIVENESS (the ledger's own `validate()`, its recorded
+/// `equivalence` class and the delta's six recorded slots do), while the four
+/// evidence legs are required-and-consistent references, not attested records,
+/// required unevenly as set out above.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OutcomeEvidence {
     pub outcome_ref: String,
@@ -998,12 +1104,26 @@ pub struct OutcomeEvidence {
     /// Canonical budget-equivalence ledger binding (I12.24:76, I18.47).
     ///
     /// Names the single `BudgetEquivalenceLedger` record this outcome is
-    /// compared under. Replay-only outcomes leave it empty and are refused
-    /// promotion by [`OutcomeEvidence::validate_for`].
+    /// compared under, written from the bound proof's own
+    /// `BudgetEquivalenceLedger::ledger_id`. Replay-only outcomes leave it
+    /// empty and are refused promotion by [`OutcomeEvidence::validate_for`].
     pub budget_ledger_ref: String,
-    /// Complexity-economics delta record (I12.24:76, I18.47).
+    /// The `BudgetEquivalenceLedger` record itself, written by
+    /// [`stamp_outcome_budget`] from the bound proof; `None` while the outcome
+    /// is unbound. It is carried so a re-binding is detected by the record and
+    /// not by its caller-chosen `ledger_id`.
+    pub budget_ledger: Option<BudgetEquivalenceLedger>,
+    /// Complexity-economics delta record (I12.24:76, I18.47), written from the
+    /// bound proof's recorded `delta_ref`.
     pub complexity_delta_ref: String,
-    /// Whether the bound complexity-economics delta is conclusive.
+    /// The `ComplexityEconomicsDelta` record itself, written by
+    /// [`stamp_outcome_budget`] from the bound proof; `None` while the outcome
+    /// is unbound, for the same reason as
+    /// [`OutcomeEvidence::budget_ledger`].
+    pub complexity_delta: Option<ComplexityEconomicsDelta>,
+    /// Whether the bound complexity-economics delta is conclusive, written from
+    /// the bound delta's six recorded slots through the contract's own
+    /// `ComplexityEconomicsDelta::is_conclusive`.
     /// An inconclusive delta never promotes, however good replay looks.
     pub economics_conclusive: bool,
     /// Affected checks evaluated under the matched budget.
@@ -1063,10 +1183,15 @@ impl OutcomeEvidence {
             return Err(ImprovementError::NonFiniteMetric);
         }
         // I12.24:76 promotion gate: replay-only evidence never promotes.
-        // A promotion-bound outcome must bind the single canonical
-        // budget-equivalence ledger and a conclusive complexity-economics
-        // delta, name the affected checks, carry matched-budget live
-        // shadow/canary evidence, and expose delayed-harm visibility.
+        // A promotion-bound outcome must carry the single canonical
+        // budget-equivalence ledger RECORD and the canonical delta RECORD,
+        // name the affected checks, carry matched-budget live shadow/canary
+        // references, and expose delayed-harm visibility. On the path that
+        // builds this record the stamp has already written both, so a missing
+        // one means the outcome was never bound to a proof.
+        if self.budget_ledger.is_none() || self.complexity_delta.is_none() {
+            return Err(ImprovementError::MissingBudgetProof);
+        }
         if self.budget_ledger_ref.trim().is_empty() {
             return Err(ImprovementError::MissingBudgetProof);
         }
@@ -1102,6 +1227,17 @@ impl OutcomeEvidence {
     }
 }
 
+/// The I12.24:76 promotion record, and the bound budget record it is judged by.
+///
+/// [`PromotionInput::budget_proof`] is the ORIGINAL `BudgetProof`: the
+/// `BudgetEquivalenceLedger` value and the recorded `ComplexityEconomicsDelta`
+/// it was judged under. It is here so the two canonical bindings are
+/// re-checkable against a canonical record rather than against the names
+/// `outcome` carries. The four evidence legs of `outcome` remain caller-set
+/// references, not attested records: the gate requires each to agree with the
+/// bound proof, requires affected checks and the delayed-harm window
+/// individually, and accepts matched-budget live shadow OR live canary for the
+/// live leg.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PromotionInput {
     pub input_id: String,
@@ -1110,12 +1246,48 @@ pub struct PromotionInput {
     pub candidate_revision: u64,
     pub target_surface: ImprovementSurface,
     pub outcome: OutcomeEvidence,
+    /// The bound I18.47 budget/economics record this promotion is judged under
+    /// (I12.24:76). Matchedness and conclusiveness are read from it by
+    /// [`BudgetProof::supports_promotion`], never asserted here.
+    pub budget_proof: BudgetProof,
     pub evidence_digest: String,
     pub direct_promotion: bool,
     pub created_at: OffsetDateTime,
 }
 
 impl PromotionInput {
+    /// Re-check the I12.24:76 promotion obligations against the bound ORIGINAL
+    /// proof.
+    ///
+    /// I12.24:76 — "Replay-only evidence cannot promote a policy/module/Skill/
+    /// retrieval change. The evaluation record binds the single canonical
+    /// `BudgetEquivalenceLedger` and `ComplexityEconomicsDelta` contracts of
+    /// I18.47… An unmatched ledger or inconclusive complexity delta cannot
+    /// promote the candidate merely because replay or a local metric improved."
+    ///
+    /// What each obligation is checked AGAINST is stated here rather than
+    /// implied:
+    ///
+    /// - the two canonical bindings are checked against the bound RECORDS. The
+    ///   outcome must carry both record values and name both, exactly as
+    ///   [`OutcomeEvidence::validate_for`] requires on the path that builds it,
+    ///   so neither a valid proof alone nor a name can stand in for them.
+    /// - [`stamp_outcome_budget`] is then the one owner of the outcome/proof
+    ///   comparison. It runs [`BudgetProof::supports_promotion`] on the bound
+    ///   proof — which calls the existing [`BudgetProof::validate`], and with
+    ///   it the canonical
+    ///   [`eliot_evaluation_contracts::BudgetEquivalenceLedger::validate`] on
+    ///   the ledger value itself — and compares the whole ledger and delta
+    ///   VALUES, so a different ledger that reuses the same `ledger_id` is
+    ///   refused along with any different evidence leg. Nothing here recomputes,
+    ///   re-derives or substitutes a ledger or digest, and the copy it runs
+    ///   that comparison on is local, so no field of `self` is written.
+    /// - the four evidence legs (affected checks, live shadow, live canary,
+    ///   delayed-harm window) are NOT re-derived here and this method does not
+    ///   claim they are: they are caller-set references that the gate requires
+    ///   to agree with the bound proof, and it requires affected checks and the
+    ///   delayed-harm window individually while accepting matched-budget live
+    ///   shadow OR live canary for the live leg (I12.24:68).
     pub fn validate(&self) -> Result<(), ImprovementError> {
         if self.direct_promotion {
             return Err(ImprovementError::SelfPromotionForbidden);
@@ -1123,7 +1295,15 @@ impl PromotionInput {
         non_empty(&self.evidence_digest, "evidence_digest")?;
         non_empty(&self.candidate_id, "candidate_id")?;
         non_empty(&self.project_id, "project_id")?;
-        Ok(())
+        if self.outcome.budget_ledger.is_none()
+            || self.outcome.complexity_delta.is_none()
+            || self.outcome.budget_ledger_ref.trim().is_empty()
+            || self.outcome.complexity_delta_ref.trim().is_empty()
+        {
+            return Err(ImprovementError::MissingBudgetProof);
+        }
+        let mut bound = self.outcome.clone();
+        stamp_outcome_budget(&mut bound, &self.budget_proof)
     }
 }
 

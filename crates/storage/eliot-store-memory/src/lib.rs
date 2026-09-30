@@ -328,9 +328,16 @@ impl MemoryStore {
             .iter()
             .any(|command| command.operation == NamedMutationOperation::ApplySwarmOwnerRevisions)
         {
-            // This backend is an in-memory reference model, not the durable
-            // owner-history implementation. Fail closed instead of returning
-            // a committed receipt for rows it cannot durably retain.
+            // Issue #1702: the operation is ACTIVATED in the catalogue and its
+            // owner authorization is verified by `PreparedTransition::validate`
+            // above, so the write is admitted and authorized. This backend is
+            // still an in-memory reference model, not the durable
+            // owner-history implementation: it cannot retain create-only owner
+            // rows and compare-and-set heads across a restart, so it fails
+            // closed here rather than returning a committed receipt for
+            // history it would lose. The refusal is a BACKEND limit, not an
+            // activation gap — a caller that needs the commit talks to the
+            // durable adapter, which implements the same compare-and-set.
             return Err(StoreError::Unavailable);
         }
         let epistemic = EpistemicCommit::from_prepared(ctx, &transition)?;
@@ -3735,6 +3742,23 @@ fn validate_transaction(
     if ctx.state_fence != transition.state_fence {
         return Err(StoreError::FenceMismatch);
     }
+    // Issue #1702: bind the owner-revision authorization to the AUTHENTICATED
+    // request source, not to anything the record asserts about itself. The plan
+    // check inside `transition.validate()` can only compare the presented lease
+    // with the record's own owner fields, because a `PreparedTransition` is a
+    // semantic plan and carries no transport identity. This is the separate act
+    // that compares the presenter with `ctx.source_id`, so a caller relabelling
+    // its own role fails before any effect. Mirrors the existing
+    // `ReservedWriteRequest::validate` identity binding in eliot-store-api.
+    for operation in &transition.named_operations {
+        if operation.operation == NamedMutationOperation::ApplySwarmOwnerRevisions {
+            let batch = eliot_store_api::decode_swarm_owner_revisions(
+                operation.operation,
+                &operation.parameters,
+            )?;
+            eliot_store_api::validate_swarm_owner_revision_authorization(&batch.record, ctx)?;
+        }
+    }
     Ok(())
 }
 
@@ -4653,9 +4677,10 @@ impl MemoryStore {
     /// Builds the versioned `GetAttentionAndProblems` payload (T11.3).
     ///
     /// Reads only actually admitted problem-leg transitions: the
-    /// `ReconcileRecovery` records stored by the commit path, in commit
-    /// order, filtered by exact scope and, when supplied, exact `problem_id`
-    /// match. Zero matches are an exact empty result, not an error.
+    /// `ReconcileRecovery` and `ApplyProblemOwnerState` records stored by the
+    /// commit path, in commit order, filtered by exact scope and, when
+    /// supplied, exact `problem_id` match. Zero matches are an exact empty
+    /// result, not an error.
     fn attention_problems_payload(
         state: &MemoryState,
         query: &NamedReadRequest,
@@ -4690,7 +4715,11 @@ impl MemoryStore {
             .enumerate()
             .filter(|(_, record)| {
                 record.scope_id == scope_id
-                    && record.operation.operation == NamedMutationOperation::ReconcileRecovery
+                    && matches!(
+                        record.operation.operation,
+                        NamedMutationOperation::ReconcileRecovery
+                            | NamedMutationOperation::ApplyProblemOwnerState
+                    )
                     && problem_id.is_none_or(|wanted| {
                         record
                             .operation

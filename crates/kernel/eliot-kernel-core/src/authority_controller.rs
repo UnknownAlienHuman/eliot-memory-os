@@ -17,9 +17,10 @@ use eliot_ors::{
     OperationalRecordInput, OperationalRecoveryStore, StateFenceSnapshot,
 };
 use eliot_process::{
-    DispatchAuthorityId, DispatchPermit, DispatchPermitAuthority, DispatchValidationContext,
-    KernelDispatchKey, OriginChallenge, OriginChallengeAuthority, OriginChallengeRequest,
-    OriginControlGrant, OriginControlPresentation, PermitIssuance,
+    CancellationReceipt, DispatchAuthorityId, DispatchPermit, DispatchPermitAuthority,
+    DispatchValidationContext, KernelDispatchKey, OriginChallenge, OriginChallengeAuthority,
+    OriginChallengeReplayEntry, OriginChallengeRequest, OriginControlGrant,
+    OriginControlPresentation, OriginGrantEffectOutcome, PermitIssuance,
     ProcessExecutionAdmissionRequest, ProcessIntent, ProcessOwnerBinding, ProcessRequest,
     ProcessStartReceipt, RecoveryCapability, SuspendedProcessIdentity, ValidatedDispatch,
 };
@@ -252,17 +253,26 @@ impl ProcessDispatchAuthorityController {
         binding: &AuthoritySnapshotBinding,
     ) -> KernelResult<OriginChallenge> {
         self.ensure_operational(binding)?;
-        self.ensure_origin_request_binding(request, binding)?;
+        Self::ensure_origin_request_binding(request, binding)?;
         let challenge = self
             .origin_authority
             .issue(request, issued_at_unix_ms, expires_at_unix_ms)
-            .map_err(|error| KernelError::DependencyUnavailable(error.to_string()))?;
+            .map_err(KernelError::ProcessContract)?;
         self.persist_snapshot(binding)?;
         Ok(challenge)
     }
 
     /// Consumes one Kernel-owned process-origin presentation and durably
     /// records its one-shot nonce before returning the grant proof.
+    ///
+    /// One-shot replay discipline (issue #1775 W6/A-crash): the consumed
+    /// nonce is journaled through P-06 before the grant is returned, so an
+    /// exact replay — in this process or after a crash-restart recovery —
+    /// can never mint a second grant for the same challenge. The replay
+    /// keeps the existing dependency-unavailable shape but carries a
+    /// reconciliation directive naming the decided challenge: the caller
+    /// reconciles by challenge id and never mints a fresh nonce to repeat
+    /// an unknown effect.
     pub fn decide_origin_control(
         &mut self,
         presentation: &OriginControlPresentation,
@@ -270,14 +280,105 @@ impl ProcessDispatchAuthorityController {
         binding: &AuthoritySnapshotBinding,
     ) -> KernelResult<OriginControlGrant> {
         self.ensure_operational(binding)?;
-        self.ensure_origin_request_binding(presentation.request(), binding)?;
+        Self::ensure_origin_request_binding(presentation.request(), binding)?;
         let active_epoch = binding_current_epoch(binding)?;
         let grant = self
             .origin_authority
             .decide(presentation, &active_epoch, now_unix_ms)
-            .map_err(|error| KernelError::DependencyUnavailable(error.to_string()))?;
+            .map_err(|error| {
+                if matches!(error, eliot_process::ContractError::DispatchPermitConsumed) {
+                    KernelError::DependencyUnavailable(format!(
+                        "origin challenge {challenge_id} already decided: reconcile by challenge id, never mint a fresh nonce to repeat its effect",
+                        challenge_id = presentation.challenge().challenge_id()
+                    ))
+                } else {
+                    KernelError::ProcessContract(error)
+                }
+            })?;
         self.persist_snapshot(binding)?;
         Ok(grant)
+    }
+
+    /// Records the observed outcome of the one effect a decided origin grant
+    /// funded, through the same durable ORS journal as issuance and
+    /// consumption (issue #1775 W6).
+    ///
+    /// The effect boundary calls this with the consumed one-shot nonce and
+    /// the exact kill receipt the executor observed. The journal then keeps
+    /// the consumed authority plus its proven effect through crash or lost
+    /// response, so reconciliation replays the preserved original through
+    /// [`Self::origin_grant_effect_receipt`] instead of minting a fresh
+    /// nonce to repeat an unknown effect. A persistence failure fences the
+    /// controller through the shared [`Self::persist_snapshot`] path,
+    /// exactly like a failed issuance or consumption persist.
+    pub fn record_origin_grant_effect(
+        &mut self,
+        request_nonce: &str,
+        receipt: &CancellationReceipt,
+        binding: &AuthoritySnapshotBinding,
+    ) -> KernelResult<OriginGrantEffectOutcome> {
+        self.ensure_operational(binding)?;
+        let outcome = self
+            .origin_authority
+            .record_grant_effect(request_nonce, receipt)
+            .map_err(KernelError::ProcessContract)?;
+        self.persist_snapshot(binding)?;
+        Ok(outcome)
+    }
+
+    /// Reads the durable effect outcome for one decided origin challenge
+    /// nonce without touching authority state (issue #1775 W6).
+    ///
+    /// A decided-but-unproven nonce reports `Unknown`: the caller must
+    /// return reconciliation-required for the original target/operation
+    /// instead of re-executing or minting a fresh nonce.
+    pub fn origin_grant_effect_state(
+        &self,
+        request_nonce: &str,
+        binding: &AuthoritySnapshotBinding,
+    ) -> KernelResult<OriginGrantEffectOutcome> {
+        self.ensure_binding(binding)?;
+        self.origin_authority
+            .grant_effect_outcome(request_nonce)
+            .map_err(KernelError::ProcessContract)
+    }
+
+    /// Returns the preserved original kill receipt for one `Effected` entry
+    /// without touching authority state (issue #1775 A-crash).
+    ///
+    /// The exact-replay half of [`Self::record_origin_grant_effect`]: a
+    /// proven effect replays this preserved original instead of re-executing
+    /// or reading live executor evidence. `Unknown` and never-decided nonces
+    /// fail with the existing typed nonce failures.
+    pub fn origin_grant_effect_receipt(
+        &self,
+        request_nonce: &str,
+        binding: &AuthoritySnapshotBinding,
+    ) -> KernelResult<CancellationReceipt> {
+        self.ensure_binding(binding)?;
+        self.origin_authority
+            .grant_effect_receipt(request_nonce)
+            .map_err(KernelError::ProcessContract)
+    }
+
+    /// Reads the original admitted target/operation for one decided origin
+    /// challenge nonce without touching authority state (issue #1775 A-crash).
+    ///
+    /// The reconciliation query path: after crash or lost response the effect
+    /// boundary reads the durable issuance record — installation, operation,
+    /// generation, fence, window and effect outcome — and reconciles the
+    /// original target/operation instead of minting a fresh nonce to repeat
+    /// an unknown effect. A proven remaining action needs a separately
+    /// admitted new proof through [`Self::decide_origin_control`].
+    pub fn origin_grant_reconciliation_source(
+        &self,
+        request_nonce: &str,
+        binding: &AuthoritySnapshotBinding,
+    ) -> KernelResult<OriginChallengeReplayEntry> {
+        self.ensure_binding(binding)?;
+        self.origin_authority
+            .grant_reconciliation_source(request_nonce)
+            .map_err(KernelError::ProcessContract)
     }
 
     /// Issues one permit and durably journals its replay state.
@@ -392,13 +493,10 @@ impl ProcessDispatchAuthorityController {
     }
 
     fn ensure_origin_request_binding(
-        &self,
         request: &OriginChallengeRequest,
         binding: &AuthoritySnapshotBinding,
     ) -> KernelResult<()> {
-        request
-            .validate()
-            .map_err(|error| KernelError::DependencyUnavailable(error.to_string()))?;
+        request.validate().map_err(KernelError::ProcessContract)?;
         binding
             .state_fence()
             .validate_against_epoch(&request.state_fence().authority_epoch)

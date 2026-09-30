@@ -25,11 +25,26 @@ var endpoint = new OperatorEndpoint(
     @"\\.\pipe\eliot\operator\one-shot", 7, "session-1", "nonce-1",
     "human_operator", ["controlboard.read", "operator.command"]);
 RuntimeDiscoveryService.ValidateEndpoint(endpoint);
-var wrongCapabilities = endpoint with { Capabilities = ["operator.command"] };
-var wrongCapabilitiesRejected = false;
-try { RuntimeDiscoveryService.ValidateEndpoint(wrongCapabilities); }
-catch (RuntimeDiscoveryException error) when (error.Code == "endpoint_invalid") { wrongCapabilitiesRejected = true; }
-True(wrongCapabilitiesRejected, "exact Operator capability allowlist");
+// These pin the four refusals `ValidateEndpoint` actually makes, and they are
+// the four that are load-bearing: an empty, duplicated, unknown or wider-than-
+// vocabulary capability set is a real defect vector. A wider set asserts an
+// authority the owner never mints; a duplicate is a decode defect; an unknown
+// name is an unadmitted vocabulary entry.
+//
+// This deliberately does NOT pin that a NARROWER subset is refused.
+// `ValidateEndpoint` accepts a subset by design: the accepted capabilities are
+// "a non-empty list of distinct members of the closed two-capability
+// vocabulary" (RuntimeDiscoveryService.cs:214-241). The owner mints an exact
+// ordered zip against the same constant (`exact_operator_capabilities` in
+// eliot-user-broker-core), so it can never mint a subset, and a client that
+// receives one has narrowed its own authority — which I03-09 permits
+// ("Lower layers may narrow authority ... They cannot expand a higher boundary
+// unless the higher layer explicitly delegates expansion"). Only the owner's
+// check is authoritative; this client check is a fail-early shape gate.
+True(RefusesCapabilities(["controlboard.read", "controlboard.read"]), "duplicated capability refused");
+True(RefusesCapabilities(["controlboard.read", "operator.command", "third.capability"]), "wider capability set refused");
+True(RefusesCapabilities(["controlboard.read", "unknown.capability"]), "unknown capability refused");
+True(RefusesCapabilities([]), "empty capability set refused");
 Environment.SetEnvironmentVariable(
     RuntimeDiscoveryService.EndpointEnvironmentVariable,
     JsonSerializer.Serialize(endpoint));
@@ -296,6 +311,20 @@ void Equal<T>(T expected, T actual, string label)
     executedAssertions++;
     if (!EqualityComparer<T>.Default.Equals(expected, actual))
         throw new Exception($"assertion failed: {label}; expected={expected}; actual={actual}");
+}
+
+// Not an assertion and it moves no counter: it only reports whether
+// `ValidateEndpoint` refused the supplied capability set with the typed
+// `endpoint_invalid` code. Acceptance is a false result, and any other
+// exception propagates rather than being read as a refusal, so the helper can
+// never widen what counts as a refusal. It reuses the already-validated
+// endpoint, so every other field stays valid and the capability set is the
+// only thing under test.
+bool RefusesCapabilities(IReadOnlyList<string> capabilities)
+{
+    try { RuntimeDiscoveryService.ValidateEndpoint(endpoint with { Capabilities = capabilities }); }
+    catch (RuntimeDiscoveryException error) when (error.Code == "endpoint_invalid") { return true; }
+    return false;
 }
 
 sealed class FakeGovernorClient : IGovernorClient

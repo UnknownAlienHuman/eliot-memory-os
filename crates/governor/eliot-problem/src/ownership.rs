@@ -27,10 +27,21 @@
 //!    issuer's own key material, which is the issuer's responsibility.
 //!
 //! A delayed expiry for an already-renewed lease cannot unassign its successor:
-//! the loss event carries the exact [`LeaseIdentity`] it observed dead, and
-//! [`Ownership::record_loss`] refuses when the record's retained identity has
+//! the loss event carries the exact [`LeaseIdentity`] it observed dead, and each
+//! record's `record_owner_loss` refuses when the record's retained identity has
 //! moved on. Loss never implies resolution — [`Ownership::Unassigned`] is a
-//! live obligation, not a terminal state.
+//! live obligation, not a terminal state: the obligation is discharged by
+//! admitting an eligible successor under a strictly greater ownership epoch, and
+//! [`Ownership::retained_epoch`] is what lets that successor clear the fenced
+//! epoch instead of being refused because the record currently has no owner.
+//!
+//! The one obligation with no lease identity behind it is the legacy migration:
+//! a record that never carried a lease has no [`LeaseIdentity`] to lose, so its
+//! [`Ownership::Unassigned`] variant carries `lost_lease: None` and an empty
+//! `loss_evidence`. That absence is the finding rather than a gap to be filled —
+//! it is never back-filled with a synthesized lease — and it is why
+//! `UnassignedOwnership::validate` treats the legacy case and the observed-loss
+//! case differently rather than treating every unassigned record alike.
 
 use eliot_contracts::{EpochId, StateFence, canonical_json_bytes, sha256_hex};
 use schemars::JsonSchema;
@@ -425,6 +436,26 @@ impl Ownership {
     pub const fn is_assigned(&self) -> bool {
         matches!(self, Self::Assigned(_))
     }
+
+    /// The ownership epoch this record currently holds, assigned or not.
+    ///
+    /// Both variants retain the epoch: an assigned record holds the epoch of
+    /// its live lease, and an unassigned one holds the epoch that was fenced
+    /// when ownership was lost. Reading it from either variant is what lets a
+    /// successor be admitted to a record that has lost its owner — the epoch
+    /// still advances past the fenced one instead of restarting from nothing.
+    ///
+    /// This is deliberately *not* [`Self::assigned`]: that one is the fencing
+    /// check and must keep refusing an unassigned record, because it is what
+    /// stops a lost owner from writing. Only the epoch comparison a successor
+    /// has to clear reads the unassigned epoch.
+    #[must_use]
+    pub const fn retained_epoch(&self) -> u64 {
+        match self {
+            Self::Assigned(assigned) => assigned.ownership_epoch,
+            Self::Unassigned(unassigned) => unassigned.ownership_epoch,
+        }
+    }
 }
 
 /// A live, lease-backed owner.
@@ -677,6 +708,85 @@ impl WaiverRecord {
             evidence: self.evidence.clone(),
         }
         .validate()
+    }
+}
+
+/// The accepted replacement obligation an `I13.9` `superseded` Problem points at.
+///
+/// I13.7 closes blocking only on "verified resolution, authorized waiver or
+/// supersession", so supersession is a third, distinct terminal route beside
+/// resolution and waiver. A supersession is only meaningful when it names an
+/// obligation some other authority actually accepted, so the reference is
+/// compared against the Problem being superseded here: a replacement equal to
+/// this record is a cycle, and a reference that names no accepted obligation
+/// lets blocking disappear into a nonexistent identity.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Supersession {
+    /// The accepted replacement obligation this Problem is superseded by.
+    pub replacement_obligation_ref: String,
+    /// The principal that accepted the replacement obligation.
+    pub replacement_holder: OwnerRef,
+    /// Evidence backing that acceptance.
+    pub evidence: Vec<ArtifactId>,
+}
+
+impl Supersession {
+    /// Validates the replacement reference, its accepting holder and evidence.
+    ///
+    /// `superseded` names the Problem being superseded so the cycle refusal is
+    /// exact: a replacement obligation that is this Problem would leave the
+    /// blocking obligation pointing back at itself with nothing behind it.
+    pub fn validate(&self, superseded: &str) -> Result<(), ProblemError> {
+        crate::text(
+            &self.replacement_obligation_ref,
+            "supersession.replacement_obligation_ref",
+        )?;
+        if self.replacement_obligation_ref == superseded {
+            return Err(ProblemError::InvalidField {
+                field: "supersession.replacement_obligation_ref",
+                reason: "a problem cannot be superseded by its own obligation",
+            });
+        }
+        self.replacement_holder.validate()?;
+        crate::nonempty(&self.evidence, "supersession.evidence")?;
+        let evidence = self
+            .evidence
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        crate::unique_text(&evidence, "supersession.evidence")
+    }
+}
+
+/// The retained record of an applied supersession.
+///
+/// Returned by the supersession transition to the caller, which persists it in
+/// the same committed transition as the state change. It is deliberately not a
+/// `Problem` field: `accept_risk` returns its [`WaiverRecord`] the same way, and
+/// the committed transition history is where both closures are read back from.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupersessionRecord {
+    /// The accepted replacement obligation this Problem is superseded by.
+    pub replacement_obligation_ref: String,
+    /// The principal that accepted the replacement obligation.
+    pub replacement_holder: OwnerRef,
+    /// Evidence backing that acceptance.
+    pub evidence: Vec<ArtifactId>,
+}
+
+impl SupersessionRecord {
+    /// Validates the retained supersession against the same rules the input
+    /// faced, so a reloaded record is held to the admission it was admitted
+    /// under.
+    pub fn validate(&self) -> Result<(), ProblemError> {
+        Supersession {
+            replacement_obligation_ref: self.replacement_obligation_ref.clone(),
+            replacement_holder: self.replacement_holder.clone(),
+            evidence: self.evidence.clone(),
+        }
+        .validate("")
     }
 }
 

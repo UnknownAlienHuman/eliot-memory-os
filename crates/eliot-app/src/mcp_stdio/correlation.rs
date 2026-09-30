@@ -156,6 +156,8 @@ pub struct McpInvocationCorrelation {
     pub error_code: Option<i64>,
     /// Canonical receipt write id observed in the result, when present.
     pub receipt_write_id: Option<String>,
+    /// Owner-issued canonical receipt id observed in the result, when present.
+    pub receipt_id: Option<String>,
     /// Exact framed response bytes, once framed.
     pub response_bytes: Option<usize>,
     /// Stdout emission disposition, once emitted or failed.
@@ -208,6 +210,7 @@ impl McpInvocationCorrelation {
             failed_before_handler: false,
             error_code: None,
             receipt_write_id: None,
+            receipt_id: None,
             response_bytes: None,
             emission: None,
             assessments: eliot_agent_bridge_core::AssessmentLog::default(),
@@ -250,22 +253,25 @@ impl McpInvocationCorrelation {
 
     /// Records handler completion and extracts receipt correlation, if any.
     ///
-    /// Reads only the stable receipt carrier (`result.write_receipt.write_id`)
-    /// emitted by committing tools; other results leave it absent, which is
-    /// itself the honest record for read-only invocations.
+    /// Reads only the stable receipt carrier the canonical write owner emits in
+    /// the tool result — `structuredContent.write_receipt`, the
+    /// owner-issued `{receipt_id, write_id}` reference — and records both
+    /// handles verbatim. Other results leave it absent, which is itself the
+    /// honest record for read-only invocations. Nothing here is caller text: a
+    /// caller-supplied `write_id` hint never reaches this path, so the
+    /// owner-issued handle in the record can only have come from the canonical
+    /// owner that admitted the operation.
     pub fn observe_handler_result(&mut self, result: &Result<Value, anyhow::Error>) {
         self.stage = CorrelationStage::HandlerCompleted;
         if let Ok(value) = result {
             self.handler_outcome = HandlerOutcome::CompletedOk;
-            self.receipt_write_id = value
-                .get("write_receipt")
+            let receipt = value.pointer("/structuredContent/write_receipt");
+            self.receipt_id = receipt
+                .and_then(|receipt| receipt.get("receipt_id"))
+                .and_then(receipt_text);
+            self.receipt_write_id = receipt
                 .and_then(|receipt| receipt.get("write_id"))
-                .and_then(|write_id| {
-                    write_id
-                        .as_str()
-                        .map(str::to_owned)
-                        .or_else(|| serde_json::to_string(write_id).ok())
-                });
+                .and_then(receipt_text);
         } else {
             self.handler_outcome = HandlerOutcome::InternalFailure;
             self.error_code = Some(-32603);
@@ -429,6 +435,7 @@ impl McpInvocationCorrelation {
             operation_write_id_present = self.operation.write_id.is_some(),
             owner_operation_bound = self.operation_binding.is_some(),
             receipt_write_id = self.receipt_write_id.as_deref().unwrap_or(""),
+            owner_receipt_id = self.receipt_id.as_deref().unwrap_or(""),
             session_id = self.session_id.as_deref().unwrap_or(""),
             host_profile = self.route_profile.as_deref().unwrap_or(""),
             route_runtime_id = self.route_runtime_id.as_deref().unwrap_or(""),
@@ -466,4 +473,12 @@ fn request_id_string(id: Option<&Value>) -> String {
         Some(Value::String(text)) => text.clone(),
         Some(other) => other.to_string(),
     }
+}
+
+/// Reads one owner-issued receipt handle, preserving the owner's own JSON form.
+fn receipt_text(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| serde_json::to_string(value).ok())
 }

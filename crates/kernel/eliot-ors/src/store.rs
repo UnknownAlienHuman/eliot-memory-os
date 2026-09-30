@@ -60,6 +60,7 @@ use crate::{
     AcceptedPending, ActivationLifecycleRecord, ActivationLifecycleState,
     ActivationRecoverySnapshot, ActivationResultRetentionPhase, ActivationResultRetentionRecord,
     ActiveSessionBinding, AdmissionReservation, AdmissionReservationActivation,
+    AdmissionReservationActivationEvidence, AdmissionReservationActivationRequest,
     AdmissionReservationDisposition, AdmissionReservationReceipt, AdmissionReservationRecord,
     AdmissionReservationRelease, AdmissionReservationSnapshot, AdmissionReservationStage,
     AdmissionReservationState, AdmissionReservationTransitionRequest, AlreadyTerminalWrite,
@@ -3454,6 +3455,17 @@ pub trait OperationalRecoveryStore: Send + Sync {
         &self,
         reservation_id: &OperationIdentity,
     ) -> Result<Option<AdmissionReservationSnapshot>, OrsError>;
+    /// Activates one staged or reconciling reservation from exact owner
+    /// evidence and returns the durable active snapshot carrying the committed
+    /// activation and canonical admission receipts. An exact replay of the
+    /// same operation identity and content returns the original active
+    /// snapshot; a same-identity different-content request, a stale expected
+    /// receipt, a foreign fence/epoch, changed claims or work/attempt, or an
+    /// elapsed expiry refuses before any mutation.
+    fn activate_kernel_admission_reservation(
+        &self,
+        activation: AdmissionReservationActivationRequest,
+    ) -> Result<AdmissionReservationSnapshot, OrsError>;
     /// Marks an inactive reservation as reconciling with exact evidence.
     fn reconcile_kernel_admission_reservation(
         &self,
@@ -25048,6 +25060,138 @@ impl RedbRecoveryStore {
         Ok(())
     }
 
+    /// Begins terminal-disposition reconciliation for one live `RuntimeLease`
+    /// (I1.5 W4, #1751).
+    ///
+    /// The single production entry into `Reconciling` for the runtime-lease
+    /// family: the named exact-fence row must be `Active`; it moves through
+    /// the owner [`RuntimeLease::transition_to`] legality to `Reconciling` and
+    /// is re-recorded through [`Self::record_runtime_lease_current`]. The
+    /// `terminal` argument names the terminal disposition this reconciliation
+    /// will resolve to — one of the owner-legal `Reconciling` exits
+    /// (`Released`, `Expired`, `Revoked`, `Closed`) — so the row enters
+    /// reconciliation carrying exactly which cleanup/effect/receipt
+    /// reconciliation is permitted; no new semantic work is admitted. A
+    /// `Reconciling` row keeps blocking the retirement census
+    /// (`RuntimeLeaseCensus::is_fully_retired`) and the Kernel idle-lease
+    /// census until the disposition-named cleanup closes it.
+    ///
+    /// Fail-closed typed errors, no silent skips: an unnameable disposition
+    /// (`InvalidField`), an unknown lease identity for this fence
+    /// (`InvalidField`), a fence mismatch (`FenceMismatch`), a corrupt row
+    /// (`Contract`), and a non-`Active` row (`InvalidTransition`; terminal
+    /// rows are never rewritten). The `Reconciling`-exit close after the
+    /// named cleanup is [`Self::close_reconciled_runtime_lease_for_disposition`];
+    /// persisting the named disposition on the row itself would need a carrier
+    /// field on the owner `RuntimeLease` contract
+    /// (`crates/foundation/eliot-runtime-contracts`), which this crate does
+    /// not own, so the tick names the disposition at both legs from the row's
+    /// own terminal condition. Production caller: the Kernel control-plane
+    /// expiry tick
+    /// (`bins/eliot-kernel/src/control_plane.rs::expire_past_due_runtime_leases`
+    /// and the past-due leg of `renew_runtime_leases_for_probe`), never a
+    /// test or a faked probe.
+    pub fn reconcile_runtime_lease_for_terminal_disposition(
+        &self,
+        fence: &eliot_contracts::StateFence,
+        lease_id: &str,
+        terminal: eliot_runtime_contracts::LeaseState,
+    ) -> Result<RuntimeLease, OrsError> {
+        use eliot_runtime_contracts::LeaseState;
+        if !matches!(
+            terminal,
+            LeaseState::Released | LeaseState::Expired | LeaseState::Revoked | LeaseState::Closed
+        ) {
+            return Err(OrsError::InvalidField {
+                field: "terminal_disposition",
+                reason: "terminal disposition is not a legal Reconciling exit for a runtime lease",
+            });
+        }
+        let rows = self.load_runtime_leases_by_state_fence(fence)?;
+        let row = rows
+            .iter()
+            .find(|row| row.lease_id.as_str() == lease_id)
+            .ok_or(OrsError::InvalidField {
+                field: "lease_id",
+                reason: "unknown runtime lease identity for fence",
+            })?;
+        if row.state_fence != *fence {
+            return Err(OrsError::FenceMismatch);
+        }
+        row.validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        if row.state != LeaseState::Active {
+            return Err(OrsError::InvalidTransition);
+        }
+        let reconciling = row
+            .transition_to(LeaseState::Reconciling)
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        self.record_runtime_lease_current(&reconciling)?;
+        Ok(reconciling)
+    }
+
+    /// Closes one `Reconciling` `RuntimeLease` through its named terminal
+    /// disposition (I1.5 W4, #1751).
+    ///
+    /// The single production exit from `Reconciling` for the runtime-lease
+    /// family: the named exact-fence row must be `Reconciling`; it moves
+    /// through the owner [`RuntimeLease::transition_to`] legality to the named
+    /// `disposition` — one of the owner-legal `Reconciling` exits (`Released`,
+    /// `Expired`, `Revoked`, `Closed`) — and is re-recorded through
+    /// [`Self::record_runtime_lease_current`]. `Reconciling` therefore admits
+    /// only the terminal-disposition-named cleanup and cannot admit new
+    /// semantic work: renewal never touches a `Reconciling` row (the Kernel
+    /// probe tick fails closed on it) and the row keeps blocking the
+    /// retirement census (`RuntimeLeaseCensus::is_fully_retired`) until this
+    /// close lands.
+    ///
+    /// Fail-closed typed errors, no silent skips: an unnameable disposition
+    /// (`InvalidField`), an unknown lease identity for this fence
+    /// (`InvalidField`), a fence mismatch (`FenceMismatch`), a corrupt row
+    /// (`Contract`), and a non-`Reconciling` row (`InvalidTransition`;
+    /// `Active` rows enter only through
+    /// [`Self::reconcile_runtime_lease_for_terminal_disposition`] and terminal
+    /// rows are never rewritten). Production caller: the Kernel control-plane
+    /// expiry tick beside the entry driver, never a test or a faked probe.
+    pub fn close_reconciled_runtime_lease_for_disposition(
+        &self,
+        fence: &eliot_contracts::StateFence,
+        lease_id: &str,
+        disposition: eliot_runtime_contracts::LeaseState,
+    ) -> Result<RuntimeLease, OrsError> {
+        use eliot_runtime_contracts::LeaseState;
+        if !matches!(
+            disposition,
+            LeaseState::Released | LeaseState::Expired | LeaseState::Revoked | LeaseState::Closed
+        ) {
+            return Err(OrsError::InvalidField {
+                field: "terminal_disposition",
+                reason: "terminal disposition is not a legal Reconciling exit for a runtime lease",
+            });
+        }
+        let rows = self.load_runtime_leases_by_state_fence(fence)?;
+        let row = rows
+            .iter()
+            .find(|row| row.lease_id.as_str() == lease_id)
+            .ok_or(OrsError::InvalidField {
+                field: "lease_id",
+                reason: "unknown runtime lease identity for fence",
+            })?;
+        if row.state_fence != *fence {
+            return Err(OrsError::FenceMismatch);
+        }
+        row.validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        if row.state != LeaseState::Reconciling {
+            return Err(OrsError::InvalidTransition);
+        }
+        let closed = row
+            .transition_to(disposition)
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        self.record_runtime_lease_current(&closed)?;
+        Ok(closed)
+    }
+
     /// Loads the recorded effect operation lease for one exact authorized
     /// operation (issue #1885; I1.9).
     ///
@@ -30043,6 +30187,123 @@ impl RedbRecoveryStore {
     }
 }
 
+/// Target-specific evidence carried by one reservation transition.
+///
+/// Both lifecycle shapes the owner supports — a receipt-backed disposition
+/// (`Reconciling`/`Released`/`Expired`) and a receipt-backed activation
+/// (`Active`) — flow through the same CAS, replay, epoch, fence, source state
+/// and time checks in
+/// `RedbRecoveryStore::prepare_admission_reservation_transition`. This enum
+/// only selects the target state and the evidence that target commits, so
+/// `Active` gets exactly the same concurrency and identity guarantees the
+/// disposition transitions already had, rather than a second scheme.
+#[derive(Clone, Copy)]
+enum AdmissionReservationTransitionSpec<'a> {
+    /// A receipt-backed disposition of an inactive/reconciling reservation.
+    Disposition {
+        /// The caller-supplied disposition with its reason and evidence.
+        disposition: &'a AdmissionReservationDisposition,
+        /// The lifecycle target this disposition names.
+        target: AdmissionReservationState,
+    },
+    /// A receipt-backed activation of a staged/reconciling reservation.
+    Activation {
+        /// The caller-supplied owner evidence for the activation.
+        request: &'a AdmissionReservationActivationRequest,
+    },
+}
+
+impl AdmissionReservationTransitionSpec<'_> {
+    fn reservation_id(&self) -> &OperationIdentity {
+        match self {
+            Self::Disposition { disposition, .. } => &disposition.reservation_id,
+            Self::Activation { request } => &request.reservation_id,
+        }
+    }
+
+    fn operation_id(&self) -> &OperationIdentity {
+        match self {
+            Self::Disposition { disposition, .. } => &disposition.operation_id,
+            Self::Activation { request } => &request.operation_id,
+        }
+    }
+
+    fn expected_current_receipt(&self) -> &OperationalMutationReceipt {
+        match self {
+            Self::Disposition { disposition, .. } => &disposition.expected_current_receipt,
+            Self::Activation { request } => &request.expected_current_receipt,
+        }
+    }
+
+    fn authority_epoch(&self) -> &EpochLineage {
+        match self {
+            Self::Disposition { disposition, .. } => &disposition.authority_epoch,
+            Self::Activation { request } => &request.authority_epoch,
+        }
+    }
+
+    fn state_fence(&self) -> &StateFenceSnapshot {
+        match self {
+            Self::Disposition { disposition, .. } => &disposition.state_fence,
+            Self::Activation { request } => &request.state_fence,
+        }
+    }
+
+    fn now_ms(&self) -> i64 {
+        match self {
+            Self::Disposition { disposition, .. } => disposition.now_ms,
+            Self::Activation { request } => request.now_ms,
+        }
+    }
+
+    fn target_state(&self) -> AdmissionReservationState {
+        match self {
+            Self::Disposition { target, .. } => *target,
+            Self::Activation { .. } => AdmissionReservationState::Active,
+        }
+    }
+
+    /// The exact persisted transition request this transition commits.
+    ///
+    /// Both shapes project onto the owner's one transition record, so the
+    /// replay, CAS, fence and epoch checks below compare one request type
+    /// rather than two. An activation is not a disposition: it is neither
+    /// released nor expired, so it records no disposition reason and no
+    /// disposition evidence — its evidence is the pair of owner receipts.
+    fn persisted_request(&self) -> AdmissionReservationTransitionRequest {
+        match self {
+            Self::Disposition {
+                disposition,
+                target,
+            } => AdmissionReservationTransitionRequest {
+                operation_id: disposition.operation_id.clone(),
+                target_state: *target,
+                reason: Some(disposition.reason.clone()),
+                evidence: Some(disposition.evidence.clone()),
+                expected_current_receipt: disposition.expected_current_receipt.clone(),
+                authority_epoch: disposition.authority_epoch.clone(),
+                state_fence: disposition.state_fence.clone(),
+                now_ms: disposition.now_ms,
+                activation: None,
+            },
+            Self::Activation { request } => AdmissionReservationTransitionRequest {
+                operation_id: request.operation_id.clone(),
+                target_state: AdmissionReservationState::Active,
+                reason: None,
+                evidence: None,
+                expected_current_receipt: request.expected_current_receipt.clone(),
+                authority_epoch: request.authority_epoch.clone(),
+                state_fence: request.state_fence.clone(),
+                now_ms: request.now_ms,
+                activation: Some(AdmissionReservationActivationEvidence {
+                    canonical_admission_receipt: request.canonical_admission_receipt.clone(),
+                    activation_receipt: request.activation_receipt.clone(),
+                }),
+            },
+        }
+    }
+}
+
 impl RedbRecoveryStore {
     pub(super) fn admission_reservation_input(
         record: &AdmissionReservationRecord,
@@ -30121,47 +30382,55 @@ impl RedbRecoveryStore {
 
     fn prepare_admission_reservation_transition(
         record: &mut AdmissionReservationRecord,
-        disposition: &AdmissionReservationDisposition,
-        target: AdmissionReservationState,
+        spec: AdmissionReservationTransitionSpec<'_>,
         current_snapshot: &AdmissionReservationSnapshot,
     ) -> Result<bool, OrsError> {
-        disposition.evidence.validate()?;
-        if disposition.now_ms <= 0 {
+        let target = spec.target_state();
+        match &spec {
+            AdmissionReservationTransitionSpec::Disposition { disposition, .. } => {
+                disposition.evidence.validate()?;
+            }
+            AdmissionReservationTransitionSpec::Activation { request } => {
+                AdmissionReservationActivationEvidence {
+                    canonical_admission_receipt: request.canonical_admission_receipt.clone(),
+                    activation_receipt: request.activation_receipt.clone(),
+                }
+                .validate()?;
+            }
+        }
+        if spec.now_ms() <= 0 {
             return Err(OrsError::InvalidField {
                 field: "admission_reservation_disposition.now_ms",
                 reason: "must be greater than zero",
             });
         }
-        if record.reservation_id != disposition.reservation_id {
+        if record.reservation_id != *spec.reservation_id() {
             return Err(OrsError::IntegrityProblem {
                 record_type: "admission_reservation",
                 reason: "reservation identity does not match its operational key".to_owned(),
             });
         }
-        if disposition.operation_id == record.stage_operation_id {
+        if spec.operation_id() == &record.stage_operation_id {
             return Err(OrsError::DuplicateConflict);
         }
-        let request = AdmissionReservationTransitionRequest {
-            operation_id: disposition.operation_id.clone(),
-            target_state: target,
-            reason: disposition.reason.clone(),
-            evidence: disposition.evidence.clone(),
-            expected_current_receipt: disposition.expected_current_receipt.clone(),
-            authority_epoch: disposition.authority_epoch.clone(),
-            state_fence: disposition.state_fence.clone(),
-            now_ms: disposition.now_ms,
-        };
-        if record.operation_id == disposition.operation_id {
+
+        // Build the exact persisted request identity for this transition so an
+        // exact replay (same operation identity AND same recorded request) is
+        // recognized, while a same-identity different-content request is a
+        // conflict. For an activation the request additionally carries the
+        // committed owner evidence.
+        let request = spec.persisted_request();
+        if record.operation_id == *spec.operation_id() {
             if record.last_transition.as_ref() == Some(&request) && record.state == target {
                 return Ok(false);
             }
             return Err(OrsError::DuplicateConflict);
         }
-        if current_snapshot.receipt() != &disposition.expected_current_receipt {
+        if current_snapshot.receipt() != spec.expected_current_receipt() {
             return Err(OrsError::DuplicateConflict);
         }
-        if record.authority_epoch != disposition.authority_epoch
-            || record.state_fence != disposition.state_fence
+        if record.authority_epoch != *spec.authority_epoch()
+            || record.state_fence != *spec.state_fence()
         {
             return Err(OrsError::FenceMismatch);
         }
@@ -30173,14 +30442,13 @@ impl RedbRecoveryStore {
         {
             return Err(OrsError::InvalidTransition);
         }
-        if disposition.now_ms < record.updated_at_ms {
+        if spec.now_ms() < record.updated_at_ms {
             return Err(OrsError::InvalidField {
                 field: "admission_reservation_disposition.now_ms",
                 reason: "transition time cannot move backwards",
             });
         }
-        if target == AdmissionReservationState::Expired && disposition.now_ms < record.expires_at_ms
-        {
+        if target == AdmissionReservationState::Expired && spec.now_ms() < record.expires_at_ms {
             return Err(OrsError::InvalidExpiry);
         }
         if !matches!(
@@ -30188,14 +30456,48 @@ impl RedbRecoveryStore {
             AdmissionReservationState::Reconciling
                 | AdmissionReservationState::Released
                 | AdmissionReservationState::Expired
+                | AdmissionReservationState::Active
         ) {
             return Err(OrsError::InvalidTransition);
         }
-        record.operation_id = disposition.operation_id.clone();
-        record.updated_at_ms = disposition.now_ms;
+
+        match &spec {
+            AdmissionReservationTransitionSpec::Disposition { disposition, .. } => {
+                record.disposition_reason = Some(disposition.reason.clone());
+                record.disposition_evidence = Some(disposition.evidence.clone());
+            }
+            AdmissionReservationTransitionSpec::Activation { request } => {
+                // The identity/claim commitments the owner must re-check before
+                // it is allowed to write the active row.
+                if record.claims != request.claims
+                    || record.work_item_id != request.work_item_id
+                    || record.proposed_attempt_id != request.proposed_attempt_id
+                {
+                    return Err(OrsError::DuplicateConflict);
+                }
+                // Activation must never resurrect an already-elapsed expiry.
+                if request.now_ms >= record.expires_at_ms {
+                    return Err(OrsError::InvalidExpiry);
+                }
+                record.canonical_admission_receipt =
+                    Some(request.canonical_admission_receipt.clone());
+                // #1678 W3/A3: retain the committed canonical `ADMITTED`
+                // decision and its launch-outbox intent on the row, so a restart
+                // reads the committed decision back instead of re-asking the
+                // canonical owner. The values are the canonical owner's own,
+                // copied verbatim. `record.validate()` below refuses a retained
+                // commit whose `admission_receipt` differs from the slot set
+                // just above, so the retained evidence and the receipt reference
+                // cannot drift apart.
+                if let Some(committed) = &request.canonical_admission {
+                    record.canonical_admission = Some(committed.clone());
+                }
+                record.activation_receipt = Some(request.activation_receipt.clone());
+            }
+        }
+        record.operation_id = spec.operation_id().clone();
+        record.updated_at_ms = spec.now_ms();
         record.state = target;
-        record.disposition_reason = Some(disposition.reason.clone());
-        record.disposition_evidence = Some(disposition.evidence.clone());
         record.last_transition = Some(request);
         record.validate()?;
         Ok(true)
@@ -30203,13 +30505,11 @@ impl RedbRecoveryStore {
 
     fn transition_kernel_admission_reservation(
         &self,
-        disposition: &AdmissionReservationDisposition,
-        target: AdmissionReservationState,
+        spec: AdmissionReservationTransitionSpec<'_>,
     ) -> Result<AdmissionReservationSnapshot, OrsError> {
-        let key = Self::operational_key(
-            OperationalKind::AdmissionReservation,
-            &disposition.reservation_id,
-        );
+        let target = spec.target_state();
+        let key =
+            Self::operational_key(OperationalKind::AdmissionReservation, spec.reservation_id());
         let write = self.database.begin_write().map_err(storage)?;
         let mut durable =
             Self::decode_operational_current(&write, &key)?.ok_or(OrsError::ReservationNotFound)?;
@@ -30229,12 +30529,8 @@ impl RedbRecoveryStore {
                 reason: "reservation identity does not match its operational key".to_owned(),
             });
         }
-        let should_commit = Self::prepare_admission_reservation_transition(
-            &mut record,
-            disposition,
-            target,
-            &current_snapshot,
-        )?;
+        let should_commit =
+            Self::prepare_admission_reservation_transition(&mut record, spec, &current_snapshot)?;
         if !should_commit {
             return Ok(current_snapshot);
         }
@@ -30246,7 +30542,7 @@ impl RedbRecoveryStore {
             AdmissionReservationState::Released | AdmissionReservationState::Expired => {
                 OperationalPhase::Released
             }
-            AdmissionReservationState::Active => return Err(OrsError::InvalidTransition),
+            AdmissionReservationState::Active => OperationalPhase::Active,
         };
         durable.admission_reservation = Some(record);
         durable.operation_order = Self::next_operational_order(&write)?;
@@ -31045,6 +31341,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             authority_epoch: stage.authority_epoch,
             state_fence: stage.state_fence,
             canonical_admission_receipt: None,
+            canonical_admission: None,
             activation_receipt: None,
             expires_at_ms: stage.expires_at_ms,
             state: AdmissionReservationState::StagedInactive,
@@ -31124,13 +31421,26 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         Self::admission_reservation_snapshot(&durable).map(Some)
     }
 
+    fn activate_kernel_admission_reservation(
+        &self,
+        activation: AdmissionReservationActivationRequest,
+    ) -> Result<AdmissionReservationSnapshot, OrsError> {
+        self.transition_kernel_admission_reservation(
+            AdmissionReservationTransitionSpec::Activation {
+                request: &activation,
+            },
+        )
+    }
+
     fn reconcile_kernel_admission_reservation(
         &self,
         disposition: AdmissionReservationDisposition,
     ) -> Result<AdmissionReservationSnapshot, OrsError> {
         self.transition_kernel_admission_reservation(
-            &disposition,
-            AdmissionReservationState::Reconciling,
+            AdmissionReservationTransitionSpec::Disposition {
+                disposition: &disposition,
+                target: AdmissionReservationState::Reconciling,
+            },
         )
     }
 
@@ -31139,8 +31449,10 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         disposition: AdmissionReservationDisposition,
     ) -> Result<AdmissionReservationSnapshot, OrsError> {
         self.transition_kernel_admission_reservation(
-            &disposition,
-            AdmissionReservationState::Released,
+            AdmissionReservationTransitionSpec::Disposition {
+                disposition: &disposition,
+                target: AdmissionReservationState::Released,
+            },
         )
     }
 
@@ -31149,8 +31461,10 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         disposition: AdmissionReservationDisposition,
     ) -> Result<AdmissionReservationSnapshot, OrsError> {
         self.transition_kernel_admission_reservation(
-            &disposition,
-            AdmissionReservationState::Expired,
+            AdmissionReservationTransitionSpec::Disposition {
+                disposition: &disposition,
+                target: AdmissionReservationState::Expired,
+            },
         )
     }
 

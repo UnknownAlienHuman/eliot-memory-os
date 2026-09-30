@@ -343,6 +343,60 @@ public static class OperatorProjectionGuard
         {
             throw new OperatorProtocolException("projection", "count_cap");
         }
+        // The owner derives these page members from each other in
+        // `crates/eliot-app/src/mcp_stdio/operator.rs`, so a page that breaks
+        // one of the relations is a claim the owner never issues. Each refusal
+        // below restates one existing relation; none of them adds a bound, and
+        // every axis check above is unchanged.
+        //
+        // `returned` is the owner's own count of this page's records
+        // (`page.records.len()` over a list built by `.take(page_size)`), so a
+        // page cannot return more than the size it was asked for. `page_size`
+        // is already range-checked above.
+        if (page.Returned > page.PageSize)
+        {
+            throw new OperatorProtocolException("projection", "count_cap");
+        }
+        // The same derivation binds the reported count to the delivered records:
+        // `operator.rs` sets `returned: page.records.len()` and serialises the
+        // same `page.records` in the same struct literal, with nothing between
+        // the two that filters, truncates or replaces the vector, so a page
+        // whose `returned` disagrees with its `records` count is a page whose
+        // own count and own records are two numbers the owner never separated.
+        // `MainViewModel` renders `Records.Count` and never reads `Returned`, so
+        // an unreconciled page would render a count the owner never issued.
+        if (page.Returned != page.Records.Count)
+        {
+            throw new OperatorProtocolException("projection", "count_cap");
+        }
+        // `total_matching` is derived over `matched_seen + records.len()`, so
+        // the total the owner reports can never be smaller than the page it
+        // counts.
+        if (page.TotalMatching < page.Returned)
+        {
+            throw new OperatorProtocolException("projection", "count_cap");
+        }
+        // The owner issues `truncated: !page.total_is_exact`. A page that calls
+        // the total inexact while also claiming no truncation withholds the
+        // completeness qualifier the owner always pairs with it, and that
+        // qualifier is what the whole-page rendering is built on.
+        if (!page.Truncated && !page.TotalIsExact)
+        {
+            throw new OperatorProtocolException("projection", "count_cap");
+        }
+        // `next_cursor` is minted only under `has_more`, from an offset strictly
+        // past the records this page returned, so it never repeats the cursor
+        // the owner just honoured. A non-advancing `next_cursor` is refused
+        // because `MainViewModel` assigns `_nextCursor = page.NextCursor` and
+        // sends that value straight back as the next cursor. An absent
+        // `next_cursor` is the owner's "no more pages" and disables load-more
+        // on its own, so only two present cursors are compared.
+        if (page.Cursor is not null
+            && page.NextCursor is not null
+            && string.Equals(page.Cursor, page.NextCursor, StringComparison.Ordinal))
+        {
+            throw new OperatorProtocolException("projection", "next_cursor_cap");
+        }
         if (page.Records.Count > OperatorProtocol.MaxPageSize
             || page.Records.Count > OperatorProtocol.MaxProjectionRecords)
         {

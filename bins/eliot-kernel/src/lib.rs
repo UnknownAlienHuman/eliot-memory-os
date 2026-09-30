@@ -300,13 +300,13 @@ mod wasm_runtime_port_grant;
 use daemon_session_guard::caller_binding;
 #[cfg(all(windows, test))]
 use daemon_supervision::EliotdSupervisionSuccessorEvidence;
-use daemon_supervision::{DaemonRuntimeState, DaemonRuntimeStatus, daemon_status_proves_ready};
 #[cfg(windows)]
 use daemon_supervision::{
-    DaemonSupervisionContour, DaemonSupervisionProgressState, EliotdLiveReceiptDisposition,
-    classify_eliotd_live_receipt_transition, daemon_refuses_replacement,
-    daemon_restart_refusal_reason,
+    AdmittedDaemonRestartPolicy, DaemonSupervisionContour, DaemonSupervisionProgressState,
+    EliotdLiveReceiptDisposition, classify_eliotd_live_receipt_transition,
+    daemon_class_withholds_replacement, daemon_refuses_replacement, daemon_restart_refusal_reason,
 };
+use daemon_supervision::{DaemonRuntimeState, DaemonRuntimeStatus, daemon_status_proves_ready};
 use generation_recovery::OrsGenerationCoordinator;
 #[cfg(test)]
 use generation_recovery::update_handshake_policy;
@@ -644,6 +644,16 @@ pub struct KernelComposition {
     /// after the previous process effect is known terminal; the original
     /// Host-approved descriptor remains retained in `daemon_launch`.
     daemon_active_launch: Mutex<Option<EliotdLaunchDescriptor>>,
+    /// The admitted restart policy for the Kernel-supervised `eliotd` child
+    /// (I14.10, I08.12), admitted at assembly under the generation and state
+    /// fence that generation was admitted with. `recover_eliotd` consults the
+    /// shared class rule against this exact declaration on the reconciled exit
+    /// evidence, and only while the retained policy digest is still bound to
+    /// the admitted generation being replaced. `None` means no versioned policy
+    /// was admitted, so the child is not automatically restarted at all.
+    /// Immutable after construction, like the launch descriptor it describes.
+    #[cfg(windows)]
+    daemon_restart_policy: Option<AdmittedDaemonRestartPolicy>,
     kernel_artifact_sha256: Option<String>,
     eliotd_descriptor_artifact_sha256: Option<String>,
     /// Host-approved WASM-host executable path retained for the grant-arm
@@ -696,9 +706,11 @@ pub struct KernelComposition {
     /// while no approved blob manifest was injected; `Some` validates the
     /// manifest at startup without starting the generation.
     blob_store: Mutex<Option<BlobStoreController>>,
-    /// Kernel-owned production restore adapter (issue #960). Held without
-    /// effects until the #962 owner-channel turn drives restores through it;
-    /// the durable journal is injected per execution, never constructed here.
+    /// Kernel-owned production restore adapter (issue #960). Reached from the
+    /// production front door by `backup.restore-test`, which obtains the
+    /// owner-issued journal admission and then runs
+    /// [`KernelComposition::backup_restore_with_ors_journal`]; the durable
+    /// journal is injected per execution, never constructed here.
     backup_restore: KernelBackupRestore,
     /// Kernel-owned cross-owner backup capture coordinator (issue #959).
     /// Holds the work root only; every capture consumes already-accepted
@@ -827,8 +839,11 @@ pub struct KernelComposition {
 impl KernelComposition {
     /// Returns the Kernel-owned production restore adapter (issue #960).
     ///
-    /// Invocation arrives with the #962 owner-channel turn; until then the
-    /// adapter is held without effects.
+    /// It is reached on the production front door: `dispatch_backup_frame`'s
+    /// restore-test arm calls `admit_restore_journal` through this accessor
+    /// (`request_dispatch.rs`, `handle_backup_restore_test`) and then
+    /// [`Self::backup_restore_with_ors_journal`], so the durable journal is
+    /// injected per execution from this composition rather than constructed here.
     #[must_use]
     pub fn backup_restore(&self) -> &KernelBackupRestore {
         &self.backup_restore
@@ -878,21 +893,22 @@ impl KernelComposition {
     /// (`crate::dispatch_contour`); there is no other way to construct one, so
     /// a caller cannot name an installation here.
     ///
-    /// ## Chain status: still no production caller
+    /// ## Chain status: reached from the production front door
     ///
-    /// This entry has no caller in this repository, and that is recorded here
-    /// rather than papered over. The Kernel's only front-door backup dispatch
-    /// (`KernelComposition::dispatch_backup_frame`) routes `backup.create`,
-    /// `backup.verify` and `backup.restore-test`; `backup.verify` is read-only,
-    /// and `backup.restore-test` is a rehearsal that answers `plan_gap` naming
-    /// the missing owner evidence, so neither performs a restore. The other two
-    /// workspace consumers of this package are a native worker and an
-    /// instrument harness, not a restore owner. Calling this from any of them
-    /// would be a caller invented for the sake of one, and calling it from the
-    /// rehearsal path would run restore effects off a rehearsal and would still
-    /// refuse for want of owner-issued `DestinationManifestEvidence`, whose
-    /// producer (AUDIT-7) is also open. No placeholder call stands in for the
-    /// missing transport; #963/#2569 own the front-door connection.
+    /// `KernelComposition::dispatch_backup_frame` routes `backup.restore-test`
+    /// to `request_dispatch::handle_backup_restore_test`, which obtains the
+    /// owner-issued admission through
+    /// [`KernelBackupRestore::admit_restore_journal`]
+    /// and calls this entry, so the durable ORS journal a production restore runs
+    /// on is the one this composition opened. `backup.create` still answers
+    /// `plan_gap` naming the absent capture owner, which is the other half of
+    /// this issue and is not reached from here.
+    ///
+    /// What this entry still does not do is reach cutover: it runs in rehearsal
+    /// posture, so nothing here activates, retires or qualifies an installation.
+    /// A caller that reached it from a non-rehearsal posture would need owner
+    /// epoch and destination evidence this front door does not hold, and would
+    /// be refused by the engine's own gates rather than by a rule added here.
     pub fn backup_restore_with_ors_journal(
         &self,
         bundle: &eliot_backup::BackupBundle,
@@ -4541,6 +4557,32 @@ impl KernelComposition {
         }
         coordinator.observe_published_state();
         process_result?;
+        // #1686 (I14.23): the emergency/incomplete path still stops the
+        // executor/runtime above, but its process result must not read as
+        // graceful success. A retained drain halt reaches the requesting
+        // owner as a typed failure; the Incomplete terminal above already
+        // retains the exact residuals for recovery.
+        Self::drain_process_outcome(&drain, runtime_outcome)
+    }
+
+    /// Maps the retained drain outcome to the process result the requesting
+    /// owner observes (#1686, I14.23). A halted drain is a typed failure even
+    /// though the executor/runtime above already stopped; a completed drain
+    /// returns the runtime outcome unchanged.
+    fn drain_process_outcome(
+        drain: &Result<DrainCommitDecision, DrainHalt>,
+        runtime_outcome: ShutdownOutcome,
+    ) -> Result<ShutdownOutcome, ProcessExecutionError> {
+        if let Err(halt) = drain {
+            if halt.pending.is_empty() {
+                return Err(ProcessExecutionError::Unavailable(halt.reason.to_owned()));
+            }
+            return Err(ProcessExecutionError::Unavailable(format!(
+                "{}: {}",
+                halt.reason,
+                halt.pending.join(", ")
+            )));
+        }
         Ok(runtime_outcome)
     }
 
@@ -4556,10 +4598,79 @@ impl KernelComposition {
         coordinator: &Arc<shutdown_drain::ShutdownDrainCoordinator>,
     ) -> Result<DrainCommitDecision, DrainHalt> {
         let generation = coordinator.drain_generation();
+        // Maps one coordinator refusal to the halt the incomplete-shutdown
+        // terminal retains (#1686, I14.23). Known coordinator literals are
+        // kept verbatim as the halt reason; dynamic refusal detail (phase
+        // names, counts, io errors) is classified by its stable shape and the
+        // complete text is retained in the halt pending set, so no refusal is
+        // substituted or dropped on the way to the requesting owner.
+        let refusal_halt = |reason: String, mut pending: Vec<String>| -> DrainHalt {
+            let verbatim: Option<&'static str> = match reason.as_str() {
+                "no shutdown requested" => Some("no shutdown requested"),
+                "drain generation already terminated" => {
+                    Some("drain generation already terminated")
+                }
+                "pre-commit phase after drain linearization" => {
+                    Some("pre-commit phase after drain linearization")
+                }
+                "intentional publication before drain linearization" => {
+                    Some("intentional publication before drain linearization")
+                }
+                "phase evidence cannot be rewritten" => Some("phase evidence cannot be rewritten"),
+                "drain cancelled by pre-linearization wake" => {
+                    Some("drain cancelled by pre-linearization wake")
+                }
+                "drain decision conflicts with linearized commit" => {
+                    Some("drain decision conflicts with linearized commit")
+                }
+                "drain decision carries a foreign generation" => {
+                    Some("drain decision carries a foreign generation")
+                }
+                "drain decision generation is empty" => Some("drain decision generation is empty"),
+                "drain decision carries unreconciled pending snapshot" => {
+                    Some("drain decision carries unreconciled pending snapshot")
+                }
+                "drain decision names no fenced authority epoch" => {
+                    Some("drain decision names no fenced authority epoch")
+                }
+                "drain decision names a blank branch to stop" => {
+                    Some("drain decision names a blank branch to stop")
+                }
+                "drain decision records a no-drain wake disposition" => {
+                    Some("drain decision records a no-drain wake disposition")
+                }
+                "drain decision names no irreversible stage" => {
+                    Some("drain decision names no irreversible stage")
+                }
+                "drain decision names no recovery owner" => {
+                    Some("drain decision names no recovery owner")
+                }
+                "shutdown state payload exceeds the bounded decode limit" => {
+                    Some("shutdown state payload exceeds the bounded decode limit")
+                }
+                _ => None,
+            };
+            if let Some(kept) = verbatim {
+                return DrainHalt::with_pending(kept, pending);
+            }
+            let class: &'static str = if reason.starts_with("shutdown state ") {
+                "shutdown-state-persist-failed"
+            } else if reason.starts_with("phase ") && reason.contains(" missing before ") {
+                "drain-phase-order-unproven"
+            } else if reason.ends_with(" pending receipts unresolved") {
+                "drain-pending-unresolved"
+            } else if reason.starts_with("fenced activation generation is invalid: ") {
+                "fenced-activation-generation-invalid"
+            } else {
+                "coordinator-refusal-unclassified"
+            };
+            pending.push(reason);
+            DrainHalt::with_pending(class, pending)
+        };
         let record = |phase: ShutdownPhase, evidence: String| {
             coordinator
                 .record_phase(phase, evidence)
-                .map_err(|_| DrainHalt::new("phase-record-rejected"))
+                .map_err(|reason| refusal_halt(reason, Vec::new()))
         };
 
         // AdmissionsClosed: the service gate closes normal admission; the
@@ -4813,9 +4924,9 @@ impl KernelComposition {
         if coordinator.cancelled_by_wake() {
             return Err(DrainHalt::new("drain-cancelled-by-wake"));
         }
-        coordinator.commit_drain(decision.clone()).map_err(|_| {
-            DrainHalt::with_pending("drain-commit-rejected", coordinator.pending_receipts())
-        })?;
+        coordinator
+            .commit_drain(decision.clone())
+            .map_err(|reason| refusal_halt(reason, coordinator.pending_receipts()))?;
         // Issue #1837 / I14.23 W1: durable audit evidence for the drain commit,
         // read back from the coordinator *after* the linearization is durable
         // so the record carries the boundary that was actually persisted rather

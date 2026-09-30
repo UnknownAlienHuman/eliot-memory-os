@@ -133,6 +133,7 @@ pub mod provider_transport_policy;
 mod reactive_feed;
 mod route_execution_identity;
 mod route_receipts;
+pub mod semantic_revision_store;
 mod skill_acceptance_read;
 mod skill_bridge_adapter;
 pub mod skill_dispatch;
@@ -290,10 +291,10 @@ pub use improvement_candidate_dispatch::{
     dispatch_improvement_candidate_route,
 };
 pub use improvement_candidate_route::{
-    ImprovementEffectState, ImprovementRouteRequest, UnknownEffectObligation,
-    assess_improvement_repeat, check_improvement_handoff_identity,
-    improvement_candidate_retry_permitted, improvement_operation_owners, improvement_route_owner,
-    read_improvement_effect_state, reconcile_improvement_unknown, route_improvement_candidate,
+    ImprovementEffectState, ImprovementRouteRequest, assess_improvement_repeat,
+    check_improvement_handoff_identity, improvement_candidate_retry_permitted,
+    improvement_operation_owners, improvement_route_owner, read_improvement_effect_state,
+    reconcile_improvement_unknown, route_improvement_candidate,
 };
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
@@ -959,6 +960,25 @@ pub async fn solo_poll_queue_async(
     kernel: &Arc<DaemonKernelClient>,
 ) -> Result<solo_agent_driver::SoloPollOutcome, DaemonError> {
     solo_agent_driver::solo_poll_queue_async(composition, kernel).await
+}
+
+/// The always-armed bounded recovery poll of the I14.8 progress loop (issue
+/// #1683 W5).
+///
+/// This is the arm that makes progress correct under a lost notification, and
+/// the event-driven release path is only the optimisation. The daemon runtime
+/// calls it on its existing bounded activation cadence without consulting any
+/// wake state, so a dropped, coalesced or pre-registered wake costs one cadence
+/// of latency instead of stranding work that is already eligible.
+///
+/// Thin wrapper over
+/// [`solo_agent_driver::solo_fair_pull_recovery`](crate::solo_agent_driver::solo_fair_pull_recovery):
+/// it names no interval, retry, cap or timeout of its own.
+pub async fn solo_fair_pull_recovery(
+    composition: &Arc<tokio::sync::Mutex<DaemonComposition>>,
+    kernel: &Arc<DaemonKernelClient>,
+) -> Result<solo_agent_driver::FairPullRecovery, DaemonError> {
+    solo_agent_driver::solo_fair_pull_recovery(composition, kernel).await
 }
 
 impl DaemonComposition {
@@ -3217,7 +3237,13 @@ impl DaemonComposition {
         let material = self.resolve_verified_material(kernel, material)?;
         let config = daemon_coordinator_config()?;
         Ok(AgentFabric::restore_verified(
-            snapshot, config, ports, material,
+            snapshot,
+            config,
+            ports,
+            Some(crate::semantic_revision_store::SemanticRevisionStore::new(
+                self.state_root(),
+            )),
+            material,
         )?)
     }
 

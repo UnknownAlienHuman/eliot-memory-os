@@ -4,8 +4,8 @@
 //! OS adapter leases for validation. It records typed topology and retained
 //! observations, not authority or lifecycle decisions.
 //!
-//! Normative basis: Architecture A2.3, A12.2, A12.3; Implementation I1.2,
-//! I2.2, I2.23. This module has no canonical or semantic authority,
+//! Normative basis: Architecture A2.3, A12.2, A12.3, A13.7; Implementation
+//! I1.2, I2.2, I2.23, I5.13. This module has no canonical or semantic authority,
 //! lifecycle/SCM/process-tree authority, package-staging mutation,
 //! credential/wire authority, `SurrealDB` connection/query/migration, daemon
 //! authority, or platform implementation authority; it consumes OS adapter
@@ -249,6 +249,13 @@ impl<L> ValidatedRuntimeRootLeases<L> {
 }
 
 impl RuntimeStateRoots {
+    /// Leaf name of the owner-declared isolated restore staging area, one level
+    /// below the profile root and beside `installations` and `packages`.
+    ///
+    /// Declared as its own constant rather than inlined so the installer
+    /// hierarchy, the derivation and any reader agree on the exact name of the
+    /// directory, and so it is lexically distinct from the package staging leaf.
+    const ISOLATED_RESTORE_ROOT_DIR: &'static str = "isolated-restore";
     const ROOT_SUFFIXES: [(&'static str, &'static str); 7] = [
         ("host_state_root", "host"),
         ("kernel_ors_root", "kernel\\state"),
@@ -420,6 +427,58 @@ impl RuntimeStateRoots {
             })
     }
 
+    /// Derives the exact owner-declared parent under which a **new** isolated
+    /// restore destination is created.
+    ///
+    /// I5.13 requires a restore to go "to isolated root" and A13.7 requires
+    /// that "Restore occurs in an isolated area", so this is the root this
+    /// installation owner declares for that area. It is a **sibling** of
+    /// `installations` and of the package staging root, one leaf below the
+    /// profile root, so it is never inside any installation root and therefore
+    /// never inside the source installation a preparation reads from. That
+    /// sibling position is the whole point: a restore destination nested under
+    /// the installation being captured is not isolated from it.
+    ///
+    /// It is deliberately NOT the package staging root
+    /// ([`Self::expected_staging_root`], `<profile_root>\packages`). That root
+    /// materialises installer package material and is consumed by the package
+    /// owner (`package.rs`, `package_planner.rs`); this one holds restore
+    /// destinations and nothing else. Two owners of one directory is the
+    /// condition [`Self::validate`] refuses for the runtime roots, so the two
+    /// stay lexically disjoint names under the same parent.
+    ///
+    /// Derived, not serialized, exactly like [`Self::canary_evidence_root`]: it
+    /// is computed from the already validated profile anchor and installation
+    /// root, so it adds no field to the digest-bound topology, re-keys no
+    /// committed installation, and is not a second independently asserted
+    /// authority. It is published through [`Self::installer_root_hierarchy`],
+    /// which is the one list the installer creates one leaf at a time — so this
+    /// root exists before any preparation may name it, and preparation never
+    /// creates a parent directory for itself.
+    ///
+    /// `portable_dev` is refused rather than answered. Its installation root IS
+    /// its retained portable contour, so there is no root outside the
+    /// preparation source to place a destination in, and handing one back would
+    /// be exactly the in-source parent this root exists to avoid.
+    pub fn isolated_restore_root(&self) -> Result<PlatformHandle, InstallationError> {
+        if self.profile == InstallationProfile::PortableDev {
+            return Err(InstallationError::ProfileViolation(
+                "portable_dev retains no root outside its portable contour, so it declares no \
+                 isolated restore root outside the preparation source"
+                    .to_owned(),
+            ));
+        }
+        let profile_root = self.installer_profile_root()?;
+        PlatformHandle::new(joined_windows_path(
+            profile_root.as_str(),
+            Self::ISOLATED_RESTORE_ROOT_DIR,
+        ))
+        .map_err(|error| InstallationError::InvalidField {
+            field: "runtime_state_roots.isolated_restore_root".to_owned(),
+            reason: error.to_string(),
+        })
+    }
+
     /// Derives the exact per-installation evidence root used by the live
     /// canary harness. The path is derived from the already validated
     /// installation root and is not an independently serialized authority.
@@ -457,6 +516,13 @@ impl RuntimeStateRoots {
             hierarchy.push(("profile_root", profile_root));
             hierarchy.push(("packages_root", packages_root));
             hierarchy.push(("installations_root", installations_root));
+            // The isolated restore area is admitted here, next to the package
+            // staging root and the installations root, so it is created and
+            // ACL'd by the same installer pass that creates every other
+            // declared root. Nothing downstream may create it on demand: a
+            // destination parent that a preparation makes for itself is not an
+            // owner-declared root.
+            hierarchy.push(("isolated_restore_root", self.isolated_restore_root()?));
         }
         hierarchy.push(("installation_root", self.installation_root.clone()));
         if self.profile == InstallationProfile::PortableDev {

@@ -19,7 +19,8 @@
 //! only and depends on nothing Governor-owned.
 
 use super::{
-    ContractError, DispatchAuthorityId, Generation, KernelDispatchKey, PhysicalProcessBinding,
+    CancellationReceipt, ContractError, DispatchAuthorityId, Generation, KernelDispatchKey,
+    OperationId, PhysicalProcessBinding,
 };
 use eliot_contracts::{EpochId, StateFence, fences_match_exact};
 use serde::{Deserialize, Serialize};
@@ -74,6 +75,33 @@ impl OriginControlOperation {
     }
 }
 
+/// Durable outcome of the one effect a decided origin grant funded.
+///
+/// A decided challenge proves authority, never that the physical effect
+/// happened. The entry starts [`Self::Unknown`] at issuance and stays there
+/// through decide and through crash or lost response: the authority journal
+/// then preserves the consumed one-shot plus its possible-effect state, and
+/// reconciliation queries the original target/operation instead of minting a
+/// fresh nonce to repeat an unknown effect. It advances to
+/// [`Self::Effected`] only when the effect boundary observes the effect
+/// receipt, and it never moves back.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OriginGrantEffectOutcome {
+    /// Authority consumed; the physical effect is unproven.
+    Unknown,
+    /// The effect boundary observed the effect receipt.
+    Effected,
+}
+
+impl Default for OriginGrantEffectOutcome {
+    /// Restores the fail-closed state: an effect recorded before this
+    /// outcome existed is unproven until reconciliation re-proves it.
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
 /// Neutral request for a Kernel-issued origin challenge.
 ///
 /// Built by the daemon consumer from a validated Governor observation plus the
@@ -89,11 +117,19 @@ pub struct OriginChallengeRequest {
     state_fence: StateFence,
     operation: OriginControlOperation,
     request_nonce: String,
+    operation_id: OperationId,
 }
 
 impl OriginChallengeRequest {
     /// Builds a challenge request; every authority evaluation still happens
     /// in the Kernel-owned authority.
+    ///
+    /// The `operation_id` is the exact operation the packaged control will
+    /// act on: the front door proves it against its own envelope operation
+    /// before issue and decide, and the authority binds it into the
+    /// challenge, the grant, and the durable journal, so the effect boundary
+    /// can cross-check the presented grant against the operation it is about
+    /// to act on instead of trusting the pair independently.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         physical: PhysicalProcessBinding,
@@ -103,6 +139,7 @@ impl OriginChallengeRequest {
         state_fence: StateFence,
         operation: OriginControlOperation,
         request_nonce: impl Into<String>,
+        operation_id: OperationId,
     ) -> Result<Self, ContractError> {
         let request = Self {
             physical,
@@ -116,6 +153,7 @@ impl OriginChallengeRequest {
             state_fence,
             operation,
             request_nonce: validate_token("request_nonce", request_nonce.into(), MAX_NONCE_LEN)?,
+            operation_id,
         };
         request.validate()?;
         Ok(request)
@@ -130,6 +168,10 @@ impl OriginChallengeRequest {
         )?;
         validate_origin_digest(self.origin_digest.clone())?;
         validate_token("request_nonce", self.request_nonce.clone(), MAX_NONCE_LEN)?;
+        // The operation identity crossed a wire boundary as an opaque string,
+        // so re-running its exact constructor validation here is the only
+        // authority-grade proof it is still well-formed.
+        OperationId::new(self.operation_id.as_str().to_owned()).map(|_| ())?;
         self.state_fence
             .validate()
             .map_err(|_| ContractError::FenceMismatch)?;
@@ -173,6 +215,16 @@ impl OriginChallengeRequest {
     pub fn request_nonce(&self) -> &str {
         &self.request_nonce
     }
+
+    /// Returns the exact operation this challenge was packaged for.
+    ///
+    /// The front door proves this against its own envelope operation before
+    /// issue and decide; the authority then binds it into the challenge, the
+    /// grant, and the durable journal so a grant decided for one operation
+    /// can never authorize the effect of another.
+    pub fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
 }
 
 /// Kernel-issued origin challenge: the single control capability in this cell.
@@ -197,6 +249,7 @@ pub struct OriginChallenge {
     issued_at_unix_ms: u64,
     expires_at_unix_ms: u64,
     nonce: String,
+    operation_id: OperationId,
     authentication_tag: String,
     challenge_digest: String,
 }
@@ -216,6 +269,7 @@ struct UnsignedChallenge<'a> {
     issued_at_unix_ms: u64,
     expires_at_unix_ms: u64,
     nonce: &'a str,
+    operation_id: &'a OperationId,
 }
 
 /// Private decode carrier for the opaque challenge wire.
@@ -238,6 +292,7 @@ struct OriginChallengeWire {
     issued_at_unix_ms: u64,
     expires_at_unix_ms: u64,
     nonce: String,
+    operation_id: OperationId,
     authentication_tag: String,
     challenge_digest: String,
 }
@@ -257,6 +312,7 @@ impl OriginChallengeWire {
             issued_at_unix_ms: self.issued_at_unix_ms,
             expires_at_unix_ms: self.expires_at_unix_ms,
             nonce: self.nonce,
+            operation_id: self.operation_id,
             authentication_tag: self.authentication_tag,
             challenge_digest: self.challenge_digest,
         }
@@ -298,6 +354,7 @@ impl OriginChallenge {
             issued_at_unix_ms: self.issued_at_unix_ms,
             expires_at_unix_ms: self.expires_at_unix_ms,
             nonce: &self.nonce,
+            operation_id: &self.operation_id,
         }
     }
 
@@ -312,6 +369,7 @@ impl OriginChallenge {
         validate_hex_digest(&self.physical_digest)?;
         validate_hex_digest(&self.authentication_tag)?;
         validate_hex_digest(&self.challenge_digest)?;
+        OperationId::new(self.operation_id.as_str().to_owned()).map(|_| ())?;
         if self.issued_at_unix_ms == 0 || self.expires_at_unix_ms < self.issued_at_unix_ms {
             return Err(ContractError::InvalidValue {
                 field: "origin_challenge_window",
@@ -497,6 +555,8 @@ pub struct OriginControlGrant {
     installation_id: String,
     state_fence: StateFence,
     expires_at_unix_ms: u64,
+    request_nonce: String,
+    operation_id: OperationId,
     decided_at_unix_ms: u64,
     grant_digest: String,
 }
@@ -530,6 +590,25 @@ impl OriginControlGrant {
     /// Returns the challenge expiry time (inclusive) this grant inherits.
     pub const fn expires_at_unix_ms(&self) -> u64 {
         self.expires_at_unix_ms
+    }
+
+    /// Returns the one-shot caller nonce this grant was decided for.
+    ///
+    /// The nonce binds the proof to its exact issuance record, so the
+    /// effect boundary can journal and reconcile the funded effect against
+    /// the same identity the authority consumed — never a fresh nonce for
+    /// an unknown effect.
+    pub fn request_nonce(&self) -> &str {
+        &self.request_nonce
+    }
+
+    /// Returns the exact operation this grant was decided for.
+    ///
+    /// The effect boundary cross-checks this against the operation it is
+    /// about to act on, so a grant decided for one operation can never
+    /// authorize the effect of another even when both name live targets.
+    pub fn operation_id(&self) -> &OperationId {
+        &self.operation_id
     }
 
     /// Returns the secret-bound decision tag.
@@ -588,6 +667,22 @@ impl OriginControlGrant {
         self.binds_target(physical, generation)
     }
 
+    /// Checks that this grant was decided for exactly the operation the
+    /// caller is about to act on.
+    ///
+    /// The effect boundary calls this with the operation it is about to
+    /// perform before any journal read or effect, so a grant decided for
+    /// one operation cannot authorize another even when the nonce, the
+    /// target identity, and the operation class all look live. Uses the
+    /// existing `DispatchBindingMismatch` typed failure the target bind
+    /// uses for a substituted target.
+    pub fn binds_operation(&self, operation_id: &OperationId) -> Result<(), ContractError> {
+        if self.operation_id != *operation_id {
+            return Err(ContractError::DispatchBindingMismatch);
+        }
+        Ok(())
+    }
+
     /// Checks that this grant is still current for the effect about to run.
     ///
     /// The effect boundary calls this with the live authority contour and
@@ -635,6 +730,8 @@ impl OriginControlGrant {
             installation_id: &'a str,
             state_fence: &'a StateFence,
             expires_at_unix_ms: u64,
+            request_nonce: &'a str,
+            operation_id: &'a OperationId,
             decided_at_unix_ms: u64,
         }
         let bytes = serde_json::to_vec(&GrantMaterial {
@@ -646,6 +743,8 @@ impl OriginControlGrant {
             installation_id: &challenge.installation_id,
             state_fence: &challenge.state_fence,
             expires_at_unix_ms: challenge.expires_at_unix_ms,
+            request_nonce: &challenge.nonce,
+            operation_id: &challenge.operation_id,
             decided_at_unix_ms: now_unix_ms,
         })
         .map_err(|error| ContractError::Serialization(error.to_string()))?;
@@ -658,6 +757,8 @@ impl OriginControlGrant {
             installation_id: challenge.installation_id.clone(),
             state_fence: challenge.state_fence.clone(),
             expires_at_unix_ms: challenge.expires_at_unix_ms,
+            request_nonce: challenge.nonce.clone(),
+            operation_id: challenge.operation_id.clone(),
             decided_at_unix_ms: now_unix_ms,
             grant_digest,
         })
@@ -675,6 +776,9 @@ struct IssuedOriginChallenge {
     operation: OriginControlOperation,
     issued_at_unix_ms: u64,
     expires_at_unix_ms: u64,
+    operation_id: OperationId,
+    effect: OriginGrantEffectOutcome,
+    effect_receipt: Option<CancellationReceipt>,
     revoked: bool,
 }
 
@@ -691,10 +795,63 @@ pub struct OriginChallengeReplayEntry {
     operation: OriginControlOperation,
     issued_at_unix_ms: u64,
     expires_at_unix_ms: u64,
+    operation_id: OperationId,
+    /// Durable one-shot effect outcome. Older snapshots predate this field
+    /// and restore as `Unknown`: an effect recorded before the journal
+    /// existed is unproven until reconciliation re-proves it.
+    #[serde(default)]
+    effect: OriginGrantEffectOutcome,
+    /// Exact kill receipt the effect boundary observed for an `Effected`
+    /// entry: exact-result replay returns this preserved original instead of
+    /// re-executing or reading live executor evidence. Absent exactly when
+    /// the outcome is `Unknown`.
+    #[serde(default)]
+    effect_receipt: Option<CancellationReceipt>,
     revoked: bool,
 }
 
 impl OriginChallengeReplayEntry {
+    /// Returns the admitted operation class of the original challenge.
+    ///
+    /// The reconciliation query path reads this to bind a separately
+    /// admitted new proof to the same operation the consumed one-shot funded —
+    /// never a fresh nonce for an unknown effect.
+    pub fn operation(&self) -> OriginControlOperation {
+        self.operation
+    }
+
+    /// Returns the durable one-shot effect outcome for the original nonce.
+    ///
+    /// `Unknown` means the funded effect is unproven: the caller returns
+    /// reconciliation-required instead of re-executing.
+    pub fn effect_outcome(&self) -> OriginGrantEffectOutcome {
+        self.effect
+    }
+
+    /// Returns the installation identity the original challenge bound.
+    ///
+    /// The reconciliation path compares this against the live Kernel
+    /// installation instead of trusting the caller's serialized binding.
+    pub fn installation_id(&self) -> &str {
+        &self.installation_id
+    }
+
+    /// Returns the exact operation the original challenge was decided for.
+    ///
+    /// The cancel and reconcile boundaries compare this against the
+    /// operation they are about to act on before any effect or live read.
+    pub fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+
+    /// Returns the preserved original kill receipt for an `Effected` entry.
+    ///
+    /// Exact-result replay returns this instead of re-executing or reading
+    /// live executor evidence; `Unknown` entries carry none.
+    pub const fn effect_receipt(&self) -> Option<&CancellationReceipt> {
+        self.effect_receipt.as_ref()
+    }
+
     fn validate(&self) -> Result<(), ContractError> {
         validate_token("request_nonce", self.nonce.clone(), MAX_NONCE_LEN)?;
         validate_origin_digest(self.origin_digest.clone())?;
@@ -704,6 +861,7 @@ impl OriginChallengeReplayEntry {
             self.installation_id.clone(),
             MAX_INSTALLATION_ID_LEN,
         )?;
+        OperationId::new(self.operation_id.as_str().to_owned()).map(|_| ())?;
         self.state_fence
             .validate()
             .map_err(|_| ContractError::FenceMismatch)?;
@@ -719,7 +877,21 @@ impl OriginChallengeReplayEntry {
                 reason: "replayed issue time and expiry are outside the bounded window",
             });
         }
-        Ok(())
+        // The preserved receipt is the exact-replay evidence: a proven
+        // effect without its original receipt, or an unproven effect
+        // carrying one, is a corrupt journal row and fails closed.
+        match (self.effect, &self.effect_receipt) {
+            (OriginGrantEffectOutcome::Effected, Some(_))
+            | (OriginGrantEffectOutcome::Unknown, None) => Ok(()),
+            (OriginGrantEffectOutcome::Effected, None) => Err(ContractError::InvalidValue {
+                field: "origin_grant_effect",
+                reason: "an effected entry must preserve its original kill receipt",
+            }),
+            (OriginGrantEffectOutcome::Unknown, Some(_)) => Err(ContractError::InvalidValue {
+                field: "origin_grant_effect",
+                reason: "an unproven entry must not carry an effect receipt",
+            }),
+        }
     }
 }
 
@@ -836,6 +1008,9 @@ impl OriginChallengeAuthority {
                         operation: entry.operation,
                         issued_at_unix_ms: entry.issued_at_unix_ms,
                         expires_at_unix_ms: entry.expires_at_unix_ms,
+                        operation_id: entry.operation_id,
+                        effect: entry.effect,
+                        effect_receipt: entry.effect_receipt,
                         revoked: entry.revoked,
                     },
                 )
@@ -868,6 +1043,9 @@ impl OriginChallengeAuthority {
                     operation: entry.operation,
                     issued_at_unix_ms: entry.issued_at_unix_ms,
                     expires_at_unix_ms: entry.expires_at_unix_ms,
+                    operation_id: entry.operation_id.clone(),
+                    effect: entry.effect,
+                    effect_receipt: entry.effect_receipt.clone(),
                     revoked: entry.revoked,
                 })
                 .collect(),
@@ -887,10 +1065,11 @@ impl OriginChallengeAuthority {
 
     /// Issues one challenge bound to exactly one observed origin.
     ///
-    /// Validates the request, enforces a short-lived window, stamps a fresh
-    /// challenge identity with the secret-bound tag, and records the mint.
-    /// The returned challenge verifies only against this authority: same key
-    /// plus a live unrevoked record.
+    /// Validates the request, enforces a short-lived window, refuses a
+    /// fresh nonce for a target whose decided-but-unproven effect is still
+    /// outstanding, stamps a fresh challenge identity with the secret-bound
+    /// tag, and records the mint. The returned challenge verifies only
+    /// against this authority: same key plus a live unrevoked record.
     pub fn issue(
         &mut self,
         request: &OriginChallengeRequest,
@@ -915,13 +1094,33 @@ impl OriginChallengeAuthority {
                 field: "request_nonce",
             });
         }
+        let physical_digest = physical_digest(&request.physical);
+        // A fresh nonce never repeats an unknown effect: when this exact
+        // target still holds a decided-but-unproven journal entry, the
+        // caller reconciles the original nonce instead of minting a second
+        // proof for the same possible effect. A never-decided entry funds
+        // no effect, so it never blocks; a proven (`Effected`) entry
+        // resolved its uncertainty, so it never blocks either. Only a
+        // consumed one-shot whose outcome is still `Unknown` is
+        // outstanding, and only a proven remaining action earns a
+        // separately admitted new proof through `decide`.
+        let outstanding_unknown = self.issued.iter().any(|(nonce, entry)| {
+            entry.physical_digest == physical_digest
+                && entry.effect == OriginGrantEffectOutcome::Unknown
+                && self.consumed_nonces.contains(nonce)
+        });
+        if outstanding_unknown {
+            return Err(ContractError::InvalidValue {
+                field: "request_nonce",
+                reason: "an unknown grant-funded effect is outstanding for this target; reconcile the original nonce instead of minting a fresh one",
+            });
+        }
         let sequence = self.next_sequence;
         self.next_sequence = sequence.checked_add(1).ok_or(ContractError::InvalidValue {
             field: "origin_challenge_sequence",
             reason: "sequence exhausted",
         })?;
         let challenge_id = format!("{}#{sequence:08x}", self.authority_id.as_str());
-        let physical_digest = physical_digest(&request.physical);
         let mut challenge = OriginChallenge {
             schema_version: ORIGIN_CHALLENGE_SCHEMA_VERSION.to_owned(),
             authority_id: self.authority_id.clone(),
@@ -935,6 +1134,7 @@ impl OriginChallengeAuthority {
             issued_at_unix_ms,
             expires_at_unix_ms,
             nonce: request.request_nonce.clone(),
+            operation_id: request.operation_id.clone(),
             authentication_tag: String::new(),
             challenge_digest: String::new(),
         };
@@ -953,6 +1153,12 @@ impl OriginChallengeAuthority {
                 operation: request.operation,
                 issued_at_unix_ms,
                 expires_at_unix_ms,
+                operation_id: request.operation_id.clone(),
+                // Issuing or consuming a challenge never proves the physical
+                // effect: the funded effect starts unknown and advances only
+                // through the effect boundary's durable record.
+                effect: OriginGrantEffectOutcome::Unknown,
+                effect_receipt: None,
                 revoked: false,
             },
         );
@@ -1007,6 +1213,7 @@ impl OriginChallengeAuthority {
             // serialized fence alone never suffices.
             || !fences_match_exact(&entry.state_fence, &challenge.state_fence)
             || entry.operation != challenge.operation
+            || entry.operation_id != challenge.operation_id
             || entry.issued_at_unix_ms != challenge.issued_at_unix_ms
             || entry.expires_at_unix_ms != challenge.expires_at_unix_ms
         {
@@ -1044,6 +1251,9 @@ impl OriginChallengeAuthority {
                 reason: "challenge does not allow this operation class",
             });
         }
+        if challenge.operation_id != request.operation_id {
+            return Err(ContractError::DispatchBindingMismatch);
+        }
         Ok(())
     }
 
@@ -1076,6 +1286,162 @@ impl OriginChallengeAuthority {
             presentation.request.generation,
             now_unix_ms,
         )
+    }
+
+    /// Records that the one effect a decided grant funded was observed.
+    ///
+    /// Called by the effect boundary with the consumed one-shot nonce and
+    /// the exact kill receipt the executor observed, so the durable journal
+    /// keeps the consumed authority plus its proven effect through crash or
+    /// lost response — and exact-result replay later returns this preserved
+    /// original instead of re-executing. The outcome is monotonic: `Unknown`
+    /// advances to `Effected` exactly once and never moves back, so a
+    /// recorded effect can never be un-recorded to fund a second execution.
+    /// Recording for an unknown or never-decided nonce fails with the
+    /// existing typed nonce failures; durability itself rides on the
+    /// caller's snapshot persist, exactly like issuance and consumption.
+    pub fn record_grant_effect(
+        &mut self,
+        request_nonce: &str,
+        receipt: &CancellationReceipt,
+    ) -> Result<OriginGrantEffectOutcome, ContractError> {
+        let consumed = self.consumed_nonces.contains(request_nonce);
+        let entry = self
+            .issued
+            .get_mut(request_nonce)
+            .ok_or(ContractError::InvalidValue {
+                field: "request_nonce",
+                reason: "unknown challenge nonce",
+            })?;
+        if !consumed {
+            return Err(ContractError::InvalidValue {
+                field: "request_nonce",
+                reason: "challenge was never decided",
+            });
+        }
+        if entry.effect == OriginGrantEffectOutcome::Effected {
+            return Err(ContractError::InvalidValue {
+                field: "origin_grant_effect",
+                reason: "effect outcome is already recorded",
+            });
+        }
+        entry.effect = OriginGrantEffectOutcome::Effected;
+        entry.effect_receipt = Some(receipt.clone());
+        Ok(entry.effect)
+    }
+
+    /// Returns the durable effect outcome for one issued challenge nonce.
+    ///
+    /// The reconciliation read half of [`Self::record_grant_effect`]: a
+    /// decided-but-unproven nonce reports `Unknown` so the caller returns
+    /// reconciliation-required instead of minting a fresh nonce to repeat
+    /// the unknown effect. Unknown and never-decided nonces fail with the
+    /// existing typed nonce failures, never with a fresh proof.
+    pub fn grant_effect_outcome(
+        &self,
+        request_nonce: &str,
+    ) -> Result<OriginGrantEffectOutcome, ContractError> {
+        let entry = self
+            .issued
+            .get(request_nonce)
+            .ok_or(ContractError::InvalidValue {
+                field: "request_nonce",
+                reason: "unknown challenge nonce",
+            })?;
+        if !self.consumed_nonces.contains(request_nonce) {
+            return Err(ContractError::InvalidValue {
+                field: "request_nonce",
+                reason: "challenge was never decided",
+            });
+        }
+        Ok(entry.effect)
+    }
+
+    /// Returns the preserved original kill receipt for one `Effected` entry.
+    ///
+    /// The exact-replay half of [`Self::record_grant_effect`]: a proven
+    /// effect replays this preserved original instead of re-executing or
+    /// reading live executor evidence. `Unknown` and never-decided nonces
+    /// fail with the existing typed nonce failures, never with a fresh
+    /// proof or a live read.
+    pub fn grant_effect_receipt(
+        &self,
+        request_nonce: &str,
+    ) -> Result<CancellationReceipt, ContractError> {
+        let entry = self
+            .issued
+            .get(request_nonce)
+            .ok_or(ContractError::InvalidValue {
+                field: "request_nonce",
+                reason: "unknown challenge nonce",
+            })?;
+        if !self.consumed_nonces.contains(request_nonce) {
+            return Err(ContractError::InvalidValue {
+                field: "request_nonce",
+                reason: "challenge was never decided",
+            });
+        }
+        if entry.effect != OriginGrantEffectOutcome::Effected {
+            return Err(ContractError::InvalidValue {
+                field: "request_nonce",
+                reason: "effect is unproven; reconcile instead of replaying",
+            });
+        }
+        entry
+            .effect_receipt
+            .clone()
+            .ok_or(ContractError::InvalidValue {
+                field: "origin_grant_effect",
+                reason: "an effected entry must preserve its original kill receipt",
+            })
+    }
+
+    /// Reads the original admitted target/operation for one decided challenge
+    /// nonce without consuming anything or minting a fresh proof.
+    ///
+    /// The reconciliation query half of [`Self::record_grant_effect`]: after
+    /// crash or lost response the caller reads the durable issuance record —
+    /// installation, operation, generation, fence, window and effect outcome —
+    /// through the validated [`OriginChallengeReplayEntry`] and reconciles
+    /// the original target/operation through the retained owner binding and
+    /// handles. A proven remaining action needs a separately admitted new
+    /// proof through [`Self::decide`]; this read never mints one, so an
+    /// unknown effect is never repeated under a fresh nonce. Unknown and
+    /// never-decided nonces fail with the existing typed nonce failures.
+    pub fn grant_reconciliation_source(
+        &self,
+        request_nonce: &str,
+    ) -> Result<OriginChallengeReplayEntry, ContractError> {
+        let entry = self
+            .issued
+            .get(request_nonce)
+            .ok_or(ContractError::InvalidValue {
+                field: "request_nonce",
+                reason: "unknown challenge nonce",
+            })?;
+        if !self.consumed_nonces.contains(request_nonce) {
+            return Err(ContractError::InvalidValue {
+                field: "request_nonce",
+                reason: "challenge was never decided",
+            });
+        }
+        let replay = OriginChallengeReplayEntry {
+            nonce: request_nonce.to_owned(),
+            origin_digest: entry.origin_digest.clone(),
+            physical_digest: entry.physical_digest.clone(),
+            installation_id: entry.installation_id.clone(),
+            generation: entry.generation,
+            state_fence: entry.state_fence.clone(),
+            operation: entry.operation,
+            issued_at_unix_ms: entry.issued_at_unix_ms,
+            expires_at_unix_ms: entry.expires_at_unix_ms,
+            operation_id: entry.operation_id.clone(),
+            effect: entry.effect,
+            effect_receipt: entry.effect_receipt.clone(),
+            revoked: entry.revoked,
+        };
+        replay.validate()?;
+        Ok(replay)
     }
 
     /// Returns how many challenges were consumed by decisions.
@@ -1115,6 +1481,7 @@ fn check_binding(
         || challenge.generation != request.generation
         || !fences_match_exact(&challenge.state_fence, &request.state_fence)
         || challenge.operation != request.operation
+        || challenge.operation_id != request.operation_id
         || challenge.nonce != request.request_nonce
     {
         return Err(ContractError::DispatchBindingMismatch);
@@ -1221,6 +1588,7 @@ mod tests {
             test_fence(),
             OriginControlOperation::Kill,
             "nonce-0001",
+            OperationId::new("operation-0001").expect("operation"),
         )
         .expect("challenge request")
     }
@@ -1325,6 +1693,7 @@ mod tests {
             issued_at_unix_ms: ISSUED_AT,
             expires_at_unix_ms: EXPIRES_AT,
             nonce: "attacker-nonce".to_owned(),
+            operation_id: OperationId::new("operation-0001").expect("operation"),
             authentication_tag: "0".repeat(64),
             challenge_digest: "1".repeat(64),
         };
@@ -1447,6 +1816,7 @@ mod tests {
             fence,
             OriginControlOperation::Kill,
             "nonce-0002",
+            OperationId::new("operation-0002").expect("operation"),
         );
         assert!(matches!(bad, Err(ContractError::InvalidValue { .. })));
     }
