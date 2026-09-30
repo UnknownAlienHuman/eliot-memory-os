@@ -2815,6 +2815,181 @@ fn restore_test_payload(params: &BackupRestoreTestParams) -> Value {
     })
 }
 
+/// The one bounded outcome shape a restore-test answer is projected into.
+///
+/// This is a pure projection of what the caller has ALREADY decided: every
+/// computed value arrives as a parameter and is written into the field it
+/// belongs to unchanged, so this function grades nothing, checks nothing and
+/// refuses nothing — it only names the struct the caller's own decisions are
+/// written into, so that seam stays readable on its own. The fields written as
+/// explicit `None` or empty are the ones an isolated rehearsal proves nothing
+/// about, and each carries the reason it is absent beside it rather than being
+/// defaulted by omission from a struct literal.
+fn restore_test_outcome(
+    state: &str,
+    operation_id: &str,
+    ceiling: (EffectClass, ProofCeiling),
+    proof_level: BackupStage,
+    source_identity: Option<String>,
+    destination_identity: Option<String>,
+    next_reconciliation: String,
+) -> BackupOperationOutcome {
+    let (effect, proof_ceiling) = ceiling;
+    BackupOperationOutcome {
+        operation: BACKUP_RESTORE_TEST_OPERATION.to_owned(),
+        state: state.to_owned(),
+        requested_class: None,
+        requested_scope: None,
+        archive_id: None,
+        operation_id: operation_id.to_owned(),
+        // Exactly the identities the request DECLARED, and nothing more: the
+        // capture operation the request named as the source of the snapshot,
+        // and the destination store identity the request asked to restore
+        // into. No owner provisioned, admitted or issued either one - the
+        // Kernel rehearsed shape only - so the human projection prints them
+        // under `source:`/`destination:` as the request's own claim, not as a
+        // provisioned destination or an admitted source. Neither is defaulted.
+        source_identity,
+        destination_identity,
+        effect,
+        proof_ceiling,
+        // Graded from the owner's own answer, never assumed: the lifecycle
+        // stage that answer evidences — for `blocked` from the admitted route,
+        // for `ok` from the receipt's rung — and the stage
+        // `require_restore_test_ceiling` has accepted as a legal advance of
+        // this operation's own ladder. An answer that evidenced a later stage
+        // than the surface may claim is refused below and never reaches this
+        // line, so the level here can never be a claim the reply did not make.
+        //
+        // `None` is the grading-failure case, and it reports the FLOOR rather
+        // than a graded stage: the owner answered at a rung this surface cannot
+        // place, so no stage is evidenced by anything this surface can bound.
+        // That answer is refused below through `claim_failure`, before a single
+        // owner field is echoed, so the floor here is never the one an operator
+        // reads — it exists only so this value is well-defined on the path that
+        // refuses.
+        proof_level,
+        // A rehearsal proves no archive VERIFICATION level, no class ceiling, no
+        // capture receipt and no archived-fence relation, whatever the restore
+        // receipt says: those three are the capture and verify owners' fields,
+        // and the restore owner's own evidence level is a different fact that
+        // `apply_accepted_exit` reports as bounded text rather than writing here.
+        // The capture operation identity the request declared above is the
+        // request's own claim, never an owner-issued verification answer, so all
+        // three stay explicitly absent.
+        verification_level: None,
+        class_ceiling: None,
+        capture_receipt: None,
+        // A rehearsal proves no archive result, so there is no result identity to
+        // bind. It stays an explicit absence: the capture operation identity the
+        // request declared above is the request's own claim, never an owner's
+        // answer about a result this command did not produce.
+        result_identity: None,
+        archive_fence_relation: None,
+        archive_fence_proof: None,
+        target_compatibility: None,
+        // Absent until the owner answers with a cancellation of its own: a
+        // rehearsal is not a capture, and no other status here carries a
+        // cancellation reason code or an owner cleanup state. Both stay
+        // explicitly absent rather than borrowed from the blocked rehearsal's
+        // own reason, and only the `cancelled` arm below fills them, from the
+        // owner's own closed-checked answers.
+        cancellation_reason_code: None,
+        owner_cleanup_state: None,
+        gates_passed: Vec::new(),
+        missing_obligations: Vec::new(),
+        next_reconciliation,
+        reason: String::new(),
+    }
+}
+
+/// Writes ONE owner's answer onto the outcome the caller already projected.
+///
+/// The dispatch is the same closed status set the caller's own grading read,
+/// and every arm does exactly what it did in place: the same decode, the same
+/// typed mismatches, the same refusals, and the same owner-written fields. A
+/// status this surface cannot place is still the standing typed mismatch rather
+/// than a projected answer.
+fn apply_restore_test_status(
+    outcome: &mut BackupOperationOutcome,
+    response: &Value,
+    wire_status: &str,
+    state: &str,
+    executed_route: Option<&ExecutedRoute<'_>>,
+    rehearsed: Option<&RestoreTestEvidence>,
+    operation_id: &str,
+) -> Result<(), BackupClientError> {
+    match wire_status {
+        BACKUP_STATE_BLOCKED => {
+            if envelope_text(response, "code")? != "plan_gap" {
+                return Err(BackupClientError::Client(CliError::ResultMismatch));
+            }
+            // The route read above, which `restore_test_claim` already required
+            // to be non-empty on the passed side and disjoint across both sides.
+            // Only the admitted half is reported as `gates_passed`; the gates the
+            // owner did NOT admit each become a bounded missing obligation,
+            // because a gate no owner admitted is an outstanding obligation and
+            // never a passed one.
+            let route = executed_route.ok_or(BackupClientError::Client(CliError::ResultMismatch))?;
+            outcome.gates_passed = route.passed.to_vec();
+            // The Kernel's own owner name comes first, unresolved, exactly as
+            // the reply wrote it. The declaration obligation is this surface's
+            // own: the `source:`/`destination:` lines above are what the request
+            // declared, and no owner provisioned, admitted or issued either
+            // identity, so the projection must not read as a provisioned
+            // destination or an admitted source.
+            outcome.missing_obligations = vec![
+                envelope_text(response, "missing_owner")?.to_owned(),
+                RESTORE_TEST_DECLARED_IDENTITY_OBLIGATION.to_owned(),
+            ];
+            for gate in route.not_admitted {
+                outcome
+                    .missing_obligations
+                    .push(format!("{RESTORE_TEST_GATE_OBLIGATION}: {gate}"));
+            }
+            envelope_text(response, "reason")?.clone_into(&mut outcome.reason);
+        }
+        BACKUP_STATE_INVALID | BACKUP_STATE_REFUSED => {
+            envelope_text(response, "reason")?.clone_into(&mut outcome.reason);
+            let code = envelope_text(response, "code")?.to_owned();
+            outcome.missing_obligations = vec![format!("{state}: {code}")];
+        }
+        BACKUP_WIRE_OK => {
+            // The receipt is required here rather than defaulted: the owner
+            // answered `ok`, so an absent receipt means no owner evidence backs
+            // this outcome at all, which is a typed result mismatch rather than a
+            // floor worth reporting.
+            let evidence = rehearsed.ok_or(BackupClientError::Client(CliError::ResultMismatch))?;
+            // The owner's own code for an executed rehearsal, not the status:
+            // it is what distinguishes this command's success answer from any
+            // other `ok` a future owner might send.
+            if envelope_text(response, "code")? != BACKUP_RESTORE_TEST_REHEARSED_CODE {
+                return Err(BackupClientError::Client(CliError::ResultMismatch));
+            }
+            apply_accepted_exit(outcome, response, evidence, operation_id)?;
+        }
+        BACKUP_STATE_CANCELLED => {
+            // A cancellation is the owner's own answer, not a malformed field,
+            // so it is decoded through the same closed cleanup contract the
+            // capture and verify paths use and never falls into the `invalid`
+            // arm above, which reports a caller mistake and drops the owner's
+            // own cleanup answer. The obligation that projection writes is the
+            // module's shared one and still names the cancelled CAPTURE: the
+            // substance it reports — cleanup evidence was not supplied, so
+            // cleanup is unconfirmed — is exactly true here, and rewording that
+            // shared string would change what the verify path prints, which is
+            // outside this command's contract.
+            apply_cancellation(outcome, response, operation_id)?;
+        }
+        // `restore_test_claim` already refused every status outside the graded
+        // closed set above, so this is the standing guard for a status added to
+        // that vocabulary without a projection: an answer with no stated
+        // relation to this operation is not an answer this surface may report.
+        _ => return Err(BackupClientError::Client(CliError::ResultMismatch)),
+    }
+    Ok(())
+}
+
 pub fn backup_restore_test(
     client: &mut KernelClient,
     request: &CommandRequest,
@@ -2911,74 +3086,15 @@ pub fn backup_restore_test(
         BACKUP_WIRE_OK => BACKUP_STATE_UNKNOWN,
         other => other,
     };
-    let mut outcome = BackupOperationOutcome {
-        operation: BACKUP_RESTORE_TEST_OPERATION.to_owned(),
-        state: state.to_owned(),
-        requested_class: None,
-        requested_scope: None,
-        archive_id: None,
-        operation_id: operation_id.clone(),
-        // Exactly the identities the request DECLARED, and nothing more: the
-        // capture operation the request named as the source of the snapshot,
-        // and the destination store identity the request asked to restore
-        // into. No owner provisioned, admitted or issued either one - the
-        // Kernel rehearsed shape only - so the human projection prints them
-        // under `source:`/`destination:` as the request's own claim, not as a
-        // provisioned destination or an admitted source. Neither is defaulted.
-        source_identity: Some(params.capture_operation_id.clone()),
-        destination_identity: Some(params.dest_store_id.clone()),
-        effect,
-        proof_ceiling,
-        // Graded from the owner's own answer, never assumed: the lifecycle
-        // stage that answer evidences — for `blocked` from the admitted route,
-        // for `ok` from the receipt's rung — and the stage
-        // `require_restore_test_ceiling` has accepted as a legal advance of
-        // this operation's own ladder. An answer that evidenced a later stage
-        // than the surface may claim is refused below and never reaches this
-        // line, so the level here can never be a claim the reply did not make.
-        //
-        // `None` is the grading-failure case, and it reports the FLOOR rather
-        // than a graded stage: the owner answered at a rung this surface cannot
-        // place, so no stage is evidenced by anything this surface can bound.
-        // That answer is refused below through `claim_failure`, before a single
-        // owner field is echoed, so the floor here is never the one an operator
-        // reads — it exists only so this value is well-defined on the path that
-        // refuses.
-        proof_level: claim
-            .as_ref()
-            .map_or(BackupStage::Requested, |claim| claim.stage),
-        // A rehearsal proves no archive VERIFICATION level, no class ceiling, no
-        // capture receipt and no archived-fence relation, whatever the restore
-        // receipt says: those three are the capture and verify owners' fields,
-        // and the restore owner's own evidence level is a different fact that
-        // `apply_accepted_exit` reports as bounded text rather than writing here.
-        // The capture operation identity the request declared above is the
-        // request's own claim, never an owner-issued verification answer, so all
-        // three stay explicitly absent.
-        verification_level: None,
-        class_ceiling: None,
-        capture_receipt: None,
-        // A rehearsal proves no archive result, so there is no result identity to
-        // bind. It stays an explicit absence: the capture operation identity the
-        // request declared above is the request's own claim, never an owner's
-        // answer about a result this command did not produce.
-        result_identity: None,
-        archive_fence_relation: None,
-        archive_fence_proof: None,
-        target_compatibility: None,
-        // Absent until the owner answers with a cancellation of its own: a
-        // rehearsal is not a capture, and no other status here carries a
-        // cancellation reason code or an owner cleanup state. Both stay
-        // explicitly absent rather than borrowed from the blocked rehearsal's
-        // own reason, and only the `cancelled` arm below fills them, from the
-        // owner's own closed-checked answers.
-        cancellation_reason_code: None,
-        owner_cleanup_state: None,
-        gates_passed: Vec::new(),
-        missing_obligations: Vec::new(),
-        next_reconciliation: next_action(state, BACKUP_RESTORE_TEST_OPERATION, &operation_id),
-        reason: String::new(),
-    };
+    let mut outcome = restore_test_outcome(
+        state,
+        &operation_id,
+        (effect, proof_ceiling),
+        claim.as_ref().map_or(BackupStage::Requested, |claim| claim.stage),
+        Some(params.capture_operation_id.clone()),
+        Some(params.dest_store_id.clone()),
+        next_action(state, BACKUP_RESTORE_TEST_OPERATION, &operation_id),
+    );
     // The receipt's OWN relation to this command's authority is refused here,
     // before a single owner field is echoed and alongside the ceiling check
     // below, so a receipt for another target, a receipt that is not a rehearsal,
@@ -3032,78 +3148,15 @@ pub fn backup_restore_test(
             unproven,
         );
     }
-    match wire_status {
-        BACKUP_STATE_BLOCKED => {
-            if envelope_text(&response, "code")? != "plan_gap" {
-                return Err(BackupClientError::Client(CliError::ResultMismatch));
-            }
-            // The route read above, which `restore_test_claim` already required
-            // to be non-empty on the passed side and disjoint across both sides.
-            // Only the admitted half is reported as `gates_passed`; the gates the
-            // owner did NOT admit each become a bounded missing obligation,
-            // because a gate no owner admitted is an outstanding obligation and
-            // never a passed one.
-            let route = executed_route
-                .as_ref()
-                .ok_or(BackupClientError::Client(CliError::ResultMismatch))?;
-            outcome.gates_passed = route.passed.to_vec();
-            // The Kernel's own owner name comes first, unresolved, exactly as
-            // the reply wrote it. The declaration obligation is this surface's
-            // own: the `source:`/`destination:` lines above are what the request
-            // declared, and no owner provisioned, admitted or issued either
-            // identity, so the projection must not read as a provisioned
-            // destination or an admitted source.
-            outcome.missing_obligations = vec![
-                envelope_text(&response, "missing_owner")?.to_owned(),
-                RESTORE_TEST_DECLARED_IDENTITY_OBLIGATION.to_owned(),
-            ];
-            for gate in route.not_admitted {
-                outcome
-                    .missing_obligations
-                    .push(format!("{RESTORE_TEST_GATE_OBLIGATION}: {gate}"));
-            }
-            envelope_text(&response, "reason")?.clone_into(&mut outcome.reason);
-        }
-        BACKUP_STATE_INVALID | BACKUP_STATE_REFUSED => {
-            envelope_text(&response, "reason")?.clone_into(&mut outcome.reason);
-            let code = envelope_text(&response, "code")?.to_owned();
-            outcome.missing_obligations = vec![format!("{state}: {code}")];
-        }
-        BACKUP_WIRE_OK => {
-            // The receipt is required here rather than defaulted: the owner
-            // answered `ok`, so an absent receipt means no owner evidence backs
-            // this outcome at all, which is a typed result mismatch rather than a
-            // floor worth reporting.
-            let evidence = rehearsed
-                .as_ref()
-                .ok_or(BackupClientError::Client(CliError::ResultMismatch))?;
-            // The owner's own code for an executed rehearsal, not the status:
-            // it is what distinguishes this command's success answer from any
-            // other `ok` a future owner might send.
-            if envelope_text(&response, "code")? != BACKUP_RESTORE_TEST_REHEARSED_CODE {
-                return Err(BackupClientError::Client(CliError::ResultMismatch));
-            }
-            apply_accepted_exit(&mut outcome, &response, evidence, &operation_id)?;
-        }
-        BACKUP_STATE_CANCELLED => {
-            // A cancellation is the owner's own answer, not a malformed field,
-            // so it is decoded through the same closed cleanup contract the
-            // capture and verify paths use and never falls into the `invalid`
-            // arm above, which reports a caller mistake and drops the owner's
-            // own cleanup answer. The obligation that projection writes is the
-            // module's shared one and still names the cancelled CAPTURE: the
-            // substance it reports — cleanup evidence was not supplied, so
-            // cleanup is unconfirmed — is exactly true here, and rewording that
-            // shared string would change what the verify path prints, which is
-            // outside this command's contract.
-            apply_cancellation(&mut outcome, &response, &operation_id)?;
-        }
-        // `restore_test_claim` already refused every status outside the graded
-        // closed set above, so this is the standing guard for a status added to
-        // that vocabulary without a projection: an answer with no stated
-        // relation to this operation is not an answer this surface may report.
-        _ => return Err(BackupClientError::Client(CliError::ResultMismatch)),
-    }
+    apply_restore_test_status(
+        &mut outcome,
+        &response,
+        wire_status,
+        state,
+        executed_route.as_ref(),
+        rehearsed.as_ref(),
+        &operation_id,
+    )?;
     respond(request, CommandId::BackupRestoreTest, &outcome)
 }
 
