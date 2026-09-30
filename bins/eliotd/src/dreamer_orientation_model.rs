@@ -25,7 +25,7 @@ use eliot_dreamer_contracts::{
     CostUsageReceipt, DreamInputBundle, DreamJobAdmission, DreamJobInput, MODEL_ROUTE_SCHEMA_VERSION,
     ModelDraft, ModelRouteDisposition, ModelRouteExecutionIdentity, ModelRouteOutcome,
     ModelRoutePrivacy, ModelRouteProviderUsage, ModelRouteRequest, ModelRouteUsageState,
-    bundle_digest_of,
+    ProviderOutputV2, bundle_digest_of,
 };
 use eliot_dreamer_contracts::grounding::{route_fingerprint, RouteIdentity};
 use serde::Serialize;
@@ -33,7 +33,7 @@ use serde_json::Value;
 
 const OPENCODE_DREAMER_HARNESS_ID: &str = "eliot-agent-opencode/admitted-read-only-v1";
 const DREAMER_MODEL_PROMPT_INSTRUCTIONS: &str = concat!(
-    "Return one JSON object matching ModelDraft v1. Use admitted_job_id exactly as ModelDraft.job_id. ",
+    "Return one JSON object matching ProviderOutputV2 schema_version 2. Put the hypothesis in draft using admitted_job_id exactly as draft.job_id. ",
     "Treat every statement as a hypothesis; do not claim confirmed evidence."
 );
 
@@ -75,6 +75,7 @@ pub struct CompletedDreamerProviderOutput<'a> {
     pub raw_output_utf8: &'a str,
     pub raw_output_bytes: &'a [u8],
     pub parsed_output: &'a Value,
+    pub provider_output: &'a ProviderOutputV2,
     pub draft: &'a ModelDraft,
     pub execution: &'a ModelRouteExecutionIdentity,
     pub grounding_route: &'a RouteIdentity,
@@ -109,8 +110,13 @@ impl DreamerOrientationModelAttempt {
         if serde_json::from_str::<Value>(raw_output_utf8).ok()?.ne(parsed_output) {
             return None;
         }
-        let draft = model_route.draft.as_ref()?;
-        if serde_json::to_value(draft).ok()?.ne(parsed_output) {
+        let provider_output = outcome.provider_output.as_ref()?;
+        provider_output.validate().ok()?;
+        if serde_json::to_value(provider_output).ok()?.ne(parsed_output) {
+            return None;
+        }
+        let draft = &provider_output.draft;
+        if model_route.draft.as_ref()? != draft {
             return None;
         }
         let physical_route = outcome.original.route.receipt()?;
@@ -133,6 +139,7 @@ impl DreamerOrientationModelAttempt {
             raw_output_utf8,
             raw_output_bytes: raw_output_utf8.as_bytes(),
             parsed_output,
+            provider_output,
             draft,
             execution,
             grounding_route,
@@ -165,6 +172,10 @@ pub struct DreamerOrientationModelOutcome {
     pub original: AdmittedAttemptOutcome,
     pub agent_result: Result<AgentResult, AdmittedOutcomeProjectionError>,
     pub model_route: Result<Box<ModelRouteOutcome>, ModelRouteProjectionError>,
+    /// Parsed v2 envelope from the same original provider JSON object. Absent
+    /// for malformed or otherwise unqualified output; a valid partial owner
+    /// observation remains available here alongside its partial disposition.
+    pub provider_output: Option<ProviderOutputV2>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -313,24 +324,29 @@ pub async fn run_admitted_model_route(
                         &original.route,
                     )
                 });
-            let model_route = match candidate_validation {
-                Ok(()) => project_admitted_outcome(
+            let (model_route, provider_output) = match candidate_validation {
+                Ok(()) => match project_admitted_outcome(
                     &request,
                     &original,
                     input.selected_route_id,
                     input.selected_route_fingerprint,
                     input_bytes,
                     elapsed_ms,
+                ) {
+                    Ok((model_route, provider_output)) => (Ok(model_route), provider_output),
+                    Err(error) => (Err(error), None),
+                },
+                Err(error) => (
+                    Err(ModelRouteProjectionError::OwnerCandidateRejected(Box::new(error))),
+                    None,
                 ),
-                Err(error) => Err(ModelRouteProjectionError::OwnerCandidateRejected(Box::new(
-                    error,
-                ))),
             };
             DreamerOrientationModelOwnerResult::Outcome(Box::new(
                 DreamerOrientationModelOutcome {
                     original,
                     agent_result,
                     model_route,
+                    provider_output,
                 },
             ))
         }
@@ -500,7 +516,7 @@ fn project_admitted_outcome(
     selected_route: &RouteFingerprint,
     input_bytes: u64,
     elapsed_ms: u64,
-) -> Result<Box<ModelRouteOutcome>, ModelRouteProjectionError> {
+) -> Result<(Box<ModelRouteOutcome>, Option<ProviderOutputV2>), ModelRouteProjectionError> {
     if !original.route.is_observed() {
         return Err(ModelRouteProjectionError::RouteNotObserved {
             disposition: Box::new(original.route.clone()),
@@ -547,32 +563,42 @@ fn project_admitted_outcome(
     };
     let usage = provider_usage_from_availability(&original.run.usage);
     let receipt = measured_receipt(request, input_bytes, raw_bytes.len(), 1, elapsed_ms)?;
-    let (disposition, raw, draft, note) = match serde_json::from_value::<ModelDraft>(output.clone()) {
-        Ok(candidate) if candidate.validate().is_ok() => match original.run.status {
-            RunStatus::Succeeded => (
-                ModelRouteDisposition::Completed,
-                None,
-                Some(candidate),
-                "admitted provider response produced a validated model draft".to_owned(),
-            ),
-            RunStatus::Partial => (
-                ModelRouteDisposition::Partial,
-                Some(raw_provider_output(request, route_id, raw_bytes)),
-                Some(candidate),
-                "admitted provider response retained a draft with partial disposition".to_owned(),
-            ),
-            RunStatus::Failed | RunStatus::Cancelled | RunStatus::Unknown => {
-                return Err(ModelRouteProjectionError::UnsupportedOwnerStatus);
+    let (disposition, raw, draft, provider_output, note) =
+        match serde_json::from_value::<ProviderOutputV2>(output.clone()) {
+            Ok(candidate)
+                if candidate.validate().is_ok() && candidate.draft.job_id == request.job_id =>
+            {
+                match original.run.status {
+                    RunStatus::Succeeded => (
+                        ModelRouteDisposition::Completed,
+                        None,
+                        Some(candidate.draft.clone()),
+                        Some(candidate),
+                        "admitted provider response produced a validated v2 model and grounding payload"
+                            .to_owned(),
+                    ),
+                    RunStatus::Partial => (
+                        ModelRouteDisposition::Partial,
+                        Some(raw_provider_output(request, route_id, raw_bytes)),
+                        Some(candidate.draft.clone()),
+                        Some(candidate),
+                        "admitted provider response retained a v2 draft with partial disposition"
+                            .to_owned(),
+                    ),
+                    RunStatus::Failed | RunStatus::Cancelled | RunStatus::Unknown => {
+                        return Err(ModelRouteProjectionError::UnsupportedOwnerStatus);
+                    }
+                }
             }
-        },
-        _ => (
-            ModelRouteDisposition::Malformed,
-            Some(raw_provider_output(request, route_id, raw_bytes)),
-            None,
-            "provider payload did not satisfy the Dreamer ModelDraft schema; exact bytes retained"
-                .to_owned(),
-        ),
-    };
+            _ => (
+                ModelRouteDisposition::Malformed,
+                Some(raw_provider_output(request, route_id, raw_bytes)),
+                None,
+                None,
+                "provider payload did not satisfy the original Dreamer ProviderOutputV2 schema; exact bytes retained"
+                    .to_owned(),
+            ),
+        };
     let outcome = ModelRouteOutcome {
         schema_version: MODEL_ROUTE_SCHEMA_VERSION,
         job_id: request.job_id.clone(),
@@ -588,7 +614,7 @@ fn project_admitted_outcome(
         note,
     };
     outcome.validate_binding(request)?;
-    Ok(Box::new(outcome))
+    Ok((Box::new(outcome), provider_output))
 }
 
 fn project_malformed_refusal(
