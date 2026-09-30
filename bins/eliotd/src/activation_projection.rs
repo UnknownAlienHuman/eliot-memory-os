@@ -23,10 +23,11 @@ use eliot_protocol::{
     AgentActivationCandidateCoverage, AgentActivationResolutionDisposition,
     AgentActivationResolutionResult, AgentActivationResolutionTicket,
     AgentActivationResolvedBinding, AgentActivationRetryDirective,
-    AgentActivationSelectionDirective,
+    AgentActivationSelectionDirective, AgentResponseDisposition,
 };
 
 use crate::DaemonError;
+use crate::task_binding_admission::{ActivationCorrelation, MaterialBootstrap};
 
 /// Validate-first outcome for one Kernel-claimed activation ticket value.
 ///
@@ -580,6 +581,461 @@ pub fn failed_internal_for_mapping_failure_with_observation(
             .map_or(1, |(revision, _)| *revision),
         successor_observation,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1746 W5/W6 + A4/A5: bootstrap bound to activation, revalidated
+// through dispatch
+// ---------------------------------------------------------------------------
+
+/// I7.20 conflict directive carried by every bootstrap-dispatch conflict.
+///
+/// The old operation is rebound under a new operation identity; it is never
+/// rewritten to the new task/principal/session under its own identity, never
+/// duplicated, and already-possible effects keep their original identity for
+/// reconciliation. Shared safe status/recovery remains available under its own
+/// authority and never passes through the revalidation entry.
+// Issue #1746: dispatch seam consumed by the STITCH composition caller
+// (`DaemonComposition::commit_canonical_and_refresh`); allow until that wiring
+// lands.
+#[allow(dead_code)]
+pub const BOOTSTRAP_DISPATCH_CONFLICT_DIRECTIVE: &str = "rebind-under-new-operation";
+
+/// I7.20 recovery directive carried by a bootstrap bind refusal for an
+/// unresolved activation.
+///
+/// The caller answers with the bounded selection/intake response the
+/// activation already carries; nothing is selected here and no task is created
+/// to remove the missing selection.
+// Issue #1746: dispatch seam consumed by the STITCH composition caller
+// (`DaemonComposition::commit_canonical_and_refresh`); allow until that wiring
+// lands.
+#[allow(dead_code)]
+pub const BOOTSTRAP_SELECTION_INTAKE_DIRECTIVE: &str = "answer-with-bounded-selection-intake";
+
+/// I7.20 agent-facing outcome for the bootstrap↔activation join and for
+/// dispatch revalidation (issue #1746, W5/W6; acceptance A4/A5).
+///
+/// Every value carries the closed control disposition, the exact open reason
+/// code from the I7.20 registry, the applicable recovery/conflict directive,
+/// a bounded detail, and the same operation identity the binding was sealed
+/// under (empty only when no identity was ever presented) — never a rewritten
+/// identity. Bridges switch on the stable disposition and MAY specialize the
+/// reason code; the reason code is never collapsed into prose.
+///
+/// The bind leg ([`bind_bootstrap_to_activation`]) answers selection arms with
+/// `NEEDS_EVIDENCE`/`TASK_SELECTION_REQUIRED` and drifted or denied arms with
+/// `STALE_OR_CONFLICT`; the revalidate leg ([`revalidate_bootstrap_dispatch`])
+/// always answers `STALE_OR_CONFLICT`.
+// Issue #1746: dispatch seam consumed by the STITCH composition caller
+// (`DaemonComposition::commit_canonical_and_refresh`); allow until that wiring
+// lands.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BootstrapDispatchOutcome {
+    disposition: AgentResponseDisposition,
+    reason_code: &'static str,
+    directive: &'static str,
+    detail: &'static str,
+    operation_id: String,
+}
+
+// Issue #1746: see the struct-level seam note; the constructors and
+// accessors are consumed together with the seal once wired.
+#[allow(dead_code)]
+impl BootstrapDispatchOutcome {
+    fn conflict(reason_code: &'static str, detail: &'static str, operation_id: &str) -> Self {
+        Self {
+            disposition: AgentResponseDisposition::StaleOrConflict,
+            reason_code,
+            directive: BOOTSTRAP_DISPATCH_CONFLICT_DIRECTIVE,
+            detail,
+            operation_id: operation_id.to_owned(),
+        }
+    }
+
+    fn needs_evidence(reason_code: &'static str, detail: &'static str, operation_id: &str) -> Self {
+        Self {
+            disposition: AgentResponseDisposition::NeedsEvidence,
+            reason_code,
+            directive: BOOTSTRAP_SELECTION_INTAKE_DIRECTIVE,
+            detail,
+            operation_id: operation_id.to_owned(),
+        }
+    }
+
+    /// Closed I7.20 control disposition for this outcome.
+    #[must_use]
+    pub const fn disposition(&self) -> AgentResponseDisposition {
+        self.disposition
+    }
+
+    /// Exact open I7.20 reason code for this outcome.
+    #[must_use]
+    pub const fn reason_code(&self) -> &'static str {
+        self.reason_code
+    }
+
+    /// Applicable I7.20 recovery/conflict directive.
+    #[must_use]
+    pub const fn directive(&self) -> &'static str {
+        self.directive
+    }
+
+    /// Bounded detail naming the drifted or missing field (never a task guess).
+    #[must_use]
+    pub const fn detail(&self) -> &'static str {
+        self.detail
+    }
+
+    /// Same operation identity the binding was sealed under.
+    #[must_use]
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+}
+
+impl std::fmt::Display for BootstrapDispatchOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: {}: {}: operation {}",
+            self.disposition.as_str(),
+            self.reason_code,
+            self.detail,
+            self.operation_id
+        )
+    }
+}
+
+impl std::error::Error for BootstrapDispatchOutcome {}
+
+/// Bootstrap bound to its exact activation identity for dispatch
+/// (issue #1746, W5/W6; I7.11, I7.20).
+///
+/// The seal joins the owner-resolved activation correlation for the exact
+/// ticket ([`ActivationCorrelation::Resolved`]: principal/session/task/scope,
+/// task revision, owner revision, state fence) to the owner-evidenced
+/// [`MaterialBootstrap`] (receipt/lease, principal/session, scope, task
+/// evidence with acceptance digest, fence, receipt/governance/projection
+/// source revisions) under one stable operation identity. The Decision Safety
+/// Floor (I7.11) travels by value and is never compacted away here:
+/// goal/acceptance via the task evidence and its acceptance digest, current
+/// scope, authority/policy and State Fence, load-bearing source/provenance via
+/// the receipt/lease/profile/projection revisions, and recovery via the
+/// conflict outcome on drift. Sealed only by [`bind_bootstrap_to_activation`];
+/// minted nowhere else; selects nothing.
+// Issue #1746: dispatch seam consumed by the STITCH composition caller
+// (`DaemonComposition::commit_canonical_and_refresh`); allow until that wiring
+// lands.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundBootstrapDispatch {
+    /// Exact ticket-bound activation identity, owner-resolved.
+    pub activation: ActivationCorrelation,
+    /// Owner-evidenced bootstrap bound to the same session/scope/task.
+    pub bootstrap: MaterialBootstrap,
+    /// Stable operation identity; preserved across revalidation, never mutated.
+    pub operation_id: String,
+}
+
+/// Binds one owner-evidenced bootstrap to its exact activation identity
+/// (issue #1746, W5; I7.8 step 4, I7.11; acceptance A4).
+///
+/// The activation correlation is the existing route's typed result for the
+/// exact ticket ([`crate::task_binding_admission::correlate_activation_result`],
+/// behind `GovernorComposition::resolve_activation_outcome`); the bootstrap is
+/// #8's response surface joined to the compiled receipt and the verified
+/// coverage/governance profiles
+/// ([`crate::task_binding_admission::admit_bootstrap_context`]). Both sides
+/// must name the same principal, session, `WorkScope`, task, task revision,
+/// and state fence, or the join fails closed with the agent-facing outcome:
+/// selection arms answer `NEEDS_EVIDENCE`/`TASK_SELECTION_REQUIRED` (answer
+/// with the bounded selection/intake response, never a Material bootstrap),
+/// while retry/stale/denial arms and any drifted
+/// session/scope/task/revision/fence answer `STALE_OR_CONFLICT`
+/// (`TASK_SCOPE_INCOMPATIBLE`: re-resolve the exact ticket, rebind, no
+/// rewrite).
+///
+/// Only a `Material` bootstrap can enter: the signature takes
+/// [`MaterialBootstrap`] itself, so a diagnostic bootstrap (always the no-task
+/// case — never Material authority) or an intake shape cannot be passed at
+/// all. The sealed value is still not Material authority by itself: Material
+/// work proceeds only through the #1742 owner gate
+/// (`GovernorComposition::commit_canonical_with_readiness`, which runs
+/// `check_material_readiness_for_write`). This entry mints no profile,
+/// receipt, lease, or authority; it only binds owner values verbatim.
+///
+/// Designated caller (STITCH, daemon composition lane):
+/// `DaemonComposition::commit_canonical_and_refresh`, between the activation
+/// correlation and the bootstrap admission for the same lease at the write
+/// fence, passing the sealed value toward the dispatch effect gate
+/// ([`revalidate_bootstrap_dispatch`]).
+// Issue #1746: dispatch seam consumed by the STITCH composition caller
+// (`DaemonComposition::commit_canonical_and_refresh`); allow until that wiring
+// lands.
+#[allow(dead_code)]
+pub fn bind_bootstrap_to_activation(
+    activation: ActivationCorrelation,
+    bootstrap: &MaterialBootstrap,
+    operation_id: String,
+) -> Result<BoundBootstrapDispatch, BootstrapDispatchOutcome> {
+    // I7.20: the same operation identity when one exists. A blank identity is
+    // not sealed; the refusal carries no operation to preserve.
+    if operation_id.trim().is_empty() || operation_id.chars().any(char::is_control) {
+        return Err(BootstrapDispatchOutcome::needs_evidence(
+            "TASK_SELECTION_REQUIRED",
+            "bootstrap dispatch names no operation identity",
+            "",
+        ));
+    }
+    match &activation {
+        ActivationCorrelation::TaskSelectionRequired { .. }
+        | ActivationCorrelation::ScopeSelectionRequired { .. }
+        | ActivationCorrelation::ScopeAmbiguous { .. } => {
+            return Err(BootstrapDispatchOutcome::needs_evidence(
+                "TASK_SELECTION_REQUIRED",
+                "bootstrap binds no resolved task; answer with the bounded selection/intake response, never a Material bootstrap",
+                &operation_id,
+            ));
+        }
+        ActivationCorrelation::Retry { .. }
+        | ActivationCorrelation::Stale { .. }
+        | ActivationCorrelation::Denied { .. } => {
+            return Err(BootstrapDispatchOutcome::conflict(
+                "TASK_SCOPE_INCOMPATIBLE",
+                "activation carries no resolved identity to bind a bootstrap to; re-resolve the exact ticket",
+                &operation_id,
+            ));
+        }
+        ActivationCorrelation::Resolved {
+            principal_id,
+            session_id,
+            task_id,
+            work_scope_id,
+            task_revision,
+            owner_revision: _,
+            state_fence,
+        } => {
+            // The ORIGINAL owner evidence sealed in the bootstrap is validated
+            // as compiled before any field is compared: structural validation
+            // of a request-supplied copy is never sufficient.
+            if bootstrap.task.validate().is_err() {
+                return Err(BootstrapDispatchOutcome::needs_evidence(
+                    "TASK_SELECTION_REQUIRED",
+                    "task selection evidence invalid",
+                    &operation_id,
+                ));
+            }
+            if bootstrap.task.is_contaminated() {
+                return Err(BootstrapDispatchOutcome::needs_evidence(
+                    "TASK_SELECTION_REQUIRED",
+                    "task selection is contaminated",
+                    &operation_id,
+                ));
+            }
+            if bootstrap.principal_ref != *principal_id {
+                return Err(BootstrapDispatchOutcome::conflict(
+                    "TASK_SCOPE_INCOMPATIBLE",
+                    "bootstrap names another principal than the exact activation identity",
+                    &operation_id,
+                ));
+            }
+            if bootstrap.session_ref != *session_id {
+                return Err(BootstrapDispatchOutcome::conflict(
+                    "TASK_SCOPE_INCOMPATIBLE",
+                    "bootstrap names another session than the exact activation identity",
+                    &operation_id,
+                ));
+            }
+            if bootstrap.scope_ref != *work_scope_id {
+                return Err(BootstrapDispatchOutcome::conflict(
+                    "TASK_SCOPE_INCOMPATIBLE",
+                    "bootstrap names another WorkScope than the exact activation identity",
+                    &operation_id,
+                ));
+            }
+            if bootstrap.task.task_ref != *task_id || bootstrap.task.task_revision != *task_revision
+            {
+                return Err(BootstrapDispatchOutcome::conflict(
+                    "TASK_SCOPE_INCOMPATIBLE",
+                    "bootstrap names another task revision than the exact activation identity",
+                    &operation_id,
+                ));
+            }
+            if !eliot_contracts::fences_match_exact(&bootstrap.state_fence, state_fence) {
+                return Err(BootstrapDispatchOutcome::conflict(
+                    "TASK_SCOPE_INCOMPATIBLE",
+                    "bootstrap was assembled at another fence than the exact activation identity",
+                    &operation_id,
+                ));
+            }
+        }
+    }
+    Ok(BoundBootstrapDispatch {
+        activation,
+        bootstrap: bootstrap.clone(),
+        operation_id,
+    })
+}
+
+/// Revalidates one bound bootstrap at the dispatch effect gate against the
+/// live owners (issue #1746, W6; acceptance A5; I7.20).
+///
+/// The live task/scope, principal/session, task revision, acceptance digest,
+/// bootstrap receipt revision, governance profile reference/revision,
+/// projection generation, and fence come from the live owners at the existing
+/// queued-claim/launch/effect gate — never from the request and never from a
+/// mutable ambient selection. An intervening rebind, task revision or
+/// acceptance change, logout, or generation change returns the I7.20 conflict
+/// outcome (`STALE_OR_CONFLICT` disposition, exact registry reason code,
+/// rebind directive, same operation identity): the old operation is not
+/// rewritten to the new task/principal/session under its identity, never
+/// duplicated, and already-possible effects keep their original identity for
+/// reconciliation. Shared safe status/recovery remains available under its own
+/// authority and never passes through this entry.
+///
+/// Reason-code mapping (all members of the I7.20 registry): unbound live task
+/// → `TASK_SELECTION_REQUIRED`; moved task → `TASK_SCOPE_INCOMPATIBLE`; moved
+/// scope → `SCOPE_CONFLICT`; moved principal/session (logout/rebind) →
+/// `IDENTITY_CONFLICT`; moved task revision → `STALE_STATE_FENCE`; moved
+/// acceptance digest → `EVIDENCE_STALE`; moved receipt/governance revision →
+/// `EVIDENCE_STALE`; re-projected bootstrap → `STALE_PROJECTION`; moved
+/// generation → `STALE_AUTHORITY_EPOCH`; otherwise moved fence →
+/// `STALE_STATE_FENCE`.
+///
+/// Designated caller (STITCH, daemon composition lane): the pre-commit effect
+/// gate in `DaemonComposition::commit_canonical_and_refresh`, passing the live
+/// Governor task/scope, principal/session, revisions, and kernel-snapshot
+/// fence. This entry mints no binding and installs none.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "revalidation joins the sealed bootstrap identity against every live owner value that can invalidate it in one fail-closed edge"
+)]
+// Issue #1746: dispatch seam consumed by the STITCH composition caller (the
+// pre-commit effect gate in `DaemonComposition::commit_canonical_and_refresh`);
+// allow until that wiring lands.
+#[allow(dead_code)]
+pub fn revalidate_bootstrap_dispatch(
+    bound: &BoundBootstrapDispatch,
+    live_principal_ref: &str,
+    live_session_ref: &str,
+    live_task_ref: Option<&str>,
+    live_scope_ref: &str,
+    live_task_revision: u64,
+    live_acceptance_digest: &str,
+    live_receipt_revision: u64,
+    live_governance_profile_ref: &str,
+    live_governance_revision: u64,
+    live_projection_generation: u64,
+    live_fence: &eliot_contracts::StateFence,
+) -> Result<(), BootstrapDispatchOutcome> {
+    let conflict = |reason_code: &'static str, detail: &'static str| {
+        BootstrapDispatchOutcome::conflict(reason_code, detail, &bound.operation_id)
+    };
+    let ActivationCorrelation::Resolved {
+        task_id,
+        work_scope_id,
+        principal_id,
+        session_id,
+        task_revision,
+        owner_revision: _,
+        state_fence: _,
+    } = &bound.activation
+    else {
+        return Err(conflict(
+            "TASK_SCOPE_INCOMPATIBLE",
+            "bound bootstrap carries no resolved activation identity",
+        ));
+    };
+    // Admitted task evidence is the sealed original; live values below come
+    // from the live owners, never from the request.
+    let evidence = &bound.bootstrap.task;
+    let Some(live_task_ref) = live_task_ref else {
+        return Err(conflict(
+            "TASK_SELECTION_REQUIRED",
+            "live task is unbound; answer with the bounded intake shape, no silent carry",
+        ));
+    };
+    if live_task_ref != task_id || live_task_ref != evidence.task_ref {
+        return Err(conflict(
+            "TASK_SCOPE_INCOMPATIBLE",
+            "live task is not the admitted task; rebind under a new operation, no rewrite",
+        ));
+    }
+    if live_scope_ref != work_scope_id || live_scope_ref != bound.bootstrap.scope_ref {
+        return Err(conflict(
+            "SCOPE_CONFLICT",
+            "live WorkScope is not the admitted WorkScope; rebind, no rewrite",
+        ));
+    }
+    // An intervening logout or rebind moved the live principal/session. The
+    // old operation conflicts for rebind under a new operation identity; it is
+    // never rewritten to the new principal/session.
+    if live_principal_ref != principal_id || live_principal_ref != bound.bootstrap.principal_ref {
+        return Err(conflict(
+            "IDENTITY_CONFLICT",
+            "live principal is not the admitted principal; logout or rebind under a new operation, no rewrite",
+        ));
+    }
+    if live_session_ref != session_id || live_session_ref != bound.bootstrap.session_ref {
+        return Err(conflict(
+            "IDENTITY_CONFLICT",
+            "live session is not the admitted session; logout or rebind under a new operation, no rewrite",
+        ));
+    }
+    // An intervening task revision or acceptance change moved the contract the
+    // bootstrap was bound under. The sealed revision/digest is compared with
+    // the live owner values here, never refreshed in place.
+    if live_task_revision != *task_revision || live_task_revision != evidence.task_revision {
+        return Err(conflict(
+            "STALE_STATE_FENCE",
+            "admitted task revision moved before dispatch; rebind at the live revision, no silent rebind",
+        ));
+    }
+    if live_acceptance_digest != evidence.acceptance_digest {
+        return Err(conflict(
+            "EVIDENCE_STALE",
+            "admitted acceptance digest moved before dispatch; rebind at the live digest, no silent rebind",
+        ));
+    }
+    // Source-revision drift: the bootstrap rests on the receipt, governance
+    // profile, and projection revisions sealed at bind time. Any move conflicts
+    // for rebind; the admitted projection is never silently adopted under the
+    // old operation identity.
+    if live_receipt_revision != bound.bootstrap.receipt_revision {
+        return Err(conflict(
+            "EVIDENCE_STALE",
+            "admitted bootstrap receipt revision moved before dispatch; rebind at the live revision, no silent rebind",
+        ));
+    }
+    if live_governance_profile_ref != bound.bootstrap.governance_profile_ref
+        || live_governance_revision != bound.bootstrap.governance_revision
+    {
+        return Err(conflict(
+            "EVIDENCE_STALE",
+            "admitted governance profile revision moved before dispatch; rebind at the live revision, no silent rebind",
+        ));
+    }
+    if live_projection_generation != bound.bootstrap.projection_generation {
+        return Err(conflict(
+            "STALE_PROJECTION",
+            "admitted bootstrap was re-projected before dispatch; rebind at the live projection, no silent adoption",
+        ));
+    }
+    if live_fence.resource_generation != bound.bootstrap.state_fence.resource_generation {
+        return Err(conflict(
+            "STALE_AUTHORITY_EPOCH",
+            "admitted generation moved before dispatch; rebind at the live fence, no silent rebind",
+        ));
+    }
+    if !eliot_contracts::fences_match_exact(&bound.bootstrap.state_fence, live_fence) {
+        return Err(conflict(
+            "STALE_STATE_FENCE",
+            "admitted fence moved before dispatch; rebind at the live fence, no silent rebind",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
