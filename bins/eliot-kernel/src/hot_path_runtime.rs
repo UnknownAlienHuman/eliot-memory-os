@@ -104,6 +104,17 @@ const LOCAL_READ_OPERATION: &str = "local_read_claim";
 const OWNER_DECISION_OPERATION: &str = "improvement_decision_claim";
 const OWNER_DECISION_QUEUE_ID: &str = "improvement_decision_claim";
 
+/// The marker `frame_dispatch::is_daemon_operation` admits for the owner-decision
+/// claim, named here so the frame selector, the declaration, the registered
+/// operation, the diagnostic label and the operator's answer all read one string
+/// rather than five literals that could drift apart.
+///
+/// It is the operation the DAEMON's claim poll travels under, and it is the
+/// claim leg [`KernelComposition::admit_owner_decision`]'s answer names when it
+/// tells an authenticated owner which leg still owes a readback of their
+/// selection.
+pub(crate) const IMPROVEMENT_DECISION_CLAIM_OPERATION: &str = OWNER_DECISION_OPERATION;
+
 /// The only dispositions this queue admits.
 ///
 /// I12.24:65 names four. `reject` and `investigate` are the two

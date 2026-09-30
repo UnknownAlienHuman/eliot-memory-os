@@ -641,6 +641,14 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "agent_activation_reconcile" => "agent_activation_reconcile",
         "local_read_claim" => "local_read_claim",
         "local_read_result" => "local_read_result",
+        // The owner-decision claim is an admitted daemon operation in its own
+        // right, not an unrecognised one: it is registered in this crate's own
+        // `hot-path.toml` and served by the arm beside `local_read_claim`. Naming
+        // the constant keeps the diagnostic label, the frame selector and the
+        // registered operation one value.
+        hot_path_runtime::IMPROVEMENT_DECISION_CLAIM_OPERATION => {
+            hot_path_runtime::IMPROVEMENT_DECISION_CLAIM_OPERATION
+        }
         "semantic_observe_claim" => "semantic_observe_claim",
         "semantic_observe_result" => "semantic_observe_result",
         "semantic_observe_deferred" => "semantic_observe_deferred",
@@ -3534,6 +3542,62 @@ impl KernelComposition {
                     Err(TransportError::SessionFenced)
                 }
             }
+            "improvement_decision_claim" => {
+                // Outbound-only eliotd poll for the authenticated owners'
+                // non-mutating improvement decisions (issue #1867, I12.24:65):
+                // mirrors `local_read_claim` — same session/auth/ready/fence
+                // gates via the dispatcher head and the `frame_dispatch`
+                // allowlist, same single-`operation`-key payload shape, same
+                // null poll (not error) when empty. This is the read half of the
+                // pair whose write half is
+                // `queue_owner_decision_response` above, and it is the ONLY
+                // reader of this operation's queue, so a queued decision can
+                // never be returned by, completed by, or attributed to any other
+                // operation. An entry whose State Fence or authority epoch this
+                // session may no longer serve is left queued by the ingress
+                // rather than served stale, so an answer here is always an entry
+                // this session is entitled to hold.
+                #[cfg(windows)]
+                {
+                    if payload.as_object().is_none_or(|object| object.len() != 1) {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    self.claim_owner_decision(session).map(|claimed| match claimed {
+                        // Projected field by field rather than serialized whole,
+                        // and the two fields left off are named: `identity` is the
+                        // admitted `RequestIdentity` this daemon never presented
+                        // and cannot re-verify (it is the Kernel's own proof that
+                        // the entry was admitted under a fence), and `held_bytes`
+                        // is this queue's own capacity charge, which is the
+                        // Kernel's ledger and not a fact about the decision. The
+                        // four projected fields are the whole decision, and
+                        // `bins/eliotd`'s closed view refuses any fifth rather
+                        // than reading a field it has no use for.
+                        Some(entry) => serde_json::json!({
+                            "status": "known",
+                            "value": {
+                                "decision": {
+                                    "brief_id": entry.brief_id,
+                                    "decision": entry.decision,
+                                    "note": entry.note,
+                                    "principal": entry.principal,
+                                },
+                            },
+                            "recovery": null,
+                        }),
+                        None => serde_json::json!({
+                            "status": "known",
+                            "value": { "decision": null },
+                            "recovery": null,
+                        }),
+                    })
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
             "local_read_result" => {
                 // Daemon submit leg for the claimed pair (Implements #18):
                 // validates plus fence-checks the submitted
@@ -5317,10 +5381,11 @@ impl KernelComposition {
     /// principal, and no second canonical writer.
     ///
     /// The closed vocabulary is not the same set as `UserAutomationOperation`:
-    /// the I12.24:65 owner decision appears in the latter and is refused at this
-    /// boundary, because the automation Store has no automation identity to
-    /// commit it under and this route will not report a durable outcome for a
-    /// decision it cannot record.
+    /// the I12.24:65 owner decision appears in the latter and is answered here
+    /// on its own admitted path, because the automation Store has no automation
+    /// identity to commit it under — it goes to the bounded owner-decision queue
+    /// and to the daemon that claims it, never to a Store transition this route
+    /// would then have to report a durable outcome for.
     ///
     /// The answer is one post-commit orchestration transition. The canonical
     /// Store commit, the wake publication/cancellation handoff over the
@@ -5335,7 +5400,8 @@ impl KernelComposition {
         request_id: RequestId,
         payload: &serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
-        let request = Self::build_user_automation_operator_request(session, &request_id, payload)?;
+        let (request, request_identity) =
+            Self::build_user_automation_operator_request(session, &request_id, payload)?;
         match eliot_kernel_service::KernelStoreGateway::validate_user_automation_request(&request) {
             Ok(()) => {}
             Err(eliot_kernel_service::UserAutomationExecutionError::Contract(error)) => {
@@ -5356,17 +5422,17 @@ impl KernelComposition {
             }
         }
         // I12.24:65's "decision owner selects reject / investigate / work item /
-        // experiment" is declined here, on an authenticated request, before any
-        // Store dispatch. See `improvement_brief_decision_refusal` for the
-        // closed disposition this returns and for the exact route that is
-        // missing.
+        // experiment" is ANSWERED here, on an authenticated request and before any
+        // Store dispatch. See `queue_owner_decision_response` for the closed
+        // dispositions this returns, for the exact principal the queued entry
+        // carries, and for what remains owed to the owner afterwards.
         if let eliot_kernel_core::UserAutomationOperation::DecideImprovementBrief {
             brief_id, ..
         } = &request.intent.operation
         {
             return Self::bind_user_automation_operator_response(
                 &request,
-                &Self::improvement_brief_decision_refusal(&request, brief_id),
+                &self.queue_owner_decision_response(session, &request, &request_identity, brief_id),
             );
         }
         let transition = match self
@@ -5834,8 +5900,174 @@ impl KernelComposition {
             || eliot_platform_windows::interactive_user_session_available()
     }
 
-    /// Answers an authenticated owner who selected a disposition over an
-    /// improvement brief (I12.24:65).
+    /// Records one authenticated owner's non-mutating disposition over an
+    /// improvement brief, and answers the owner with what is now owed (I12.24:65).
+    ///
+    /// This is the OWNER-side leg of the improvement decision ingress, and it is
+    /// the only production caller of
+    /// [`KernelComposition::admit_owner_decision`]. Everything it does is
+    /// delegated to that ingress rather than re-implemented here: the operation
+    /// shape, the closed non-mutating vocabulary, the request-identity
+    /// re-validation, the State Fence and authority-epoch binding, the
+    /// re-proof that the presented principal IS this Session's authenticated
+    /// peer, the byte charge and the capacity acquisition all live there, so
+    /// this function cannot accept a caller-presented principal, a
+    /// caller-presented identity, or a disposition the ingress does not admit.
+    ///
+    /// # The three answers, and why none of them is a success claim about the
+    /// brief
+    ///
+    /// - admitted: [`Self::owner_decision_queued_response`], the closed
+    ///   `outcome_settled` value with the `ledger_read_owed` recovery. The
+    ///   selection IS recorded; what is still owed is the daemon's claim of it
+    ///   and the improvement owner's commit of it onto the brief's `Candidate`
+    ///   record. The answer says exactly that, and does not claim the brief's
+    ///   record exists.
+    /// - principal not proved: [`Self::improvement_brief_decision_refusal`]
+    ///   with [`TransportError::PeerIdentityUnavailable`]. An unauthenticated
+    ///   peer, or a presented principal that is not the Session's own, cannot
+    ///   select a disposition for anybody. Nothing was queued and nothing needs
+    ///   reconciling, so the answer is the non-reconciling `Rejected` value.
+    /// - ingress refused: the same `Rejected` value, with the refused rule named.
+    ///   The ingress returns `TransportError::SessionFenced` for all of a
+    ///   mutating disposition, an invalid request identity, a State Fence or
+    ///   authority epoch this session may not serve, and a saturated bounded
+    ///   queue, and it returns that BEFORE it queues, drops or evicts anything —
+    ///   so a refusal here is always a clean decline and never a partial write.
+    ///   Those four facts are not distinguished at this boundary because the
+    ///   ingress's own failure type does not distinguish them; naming all four
+    ///   in the reason is honest about that rather than picking one and being
+    ///   wrong three times in four.
+    ///
+    /// # What this route still does not own
+    ///
+    /// The canonical improvement record is a `Candidate` learning record whose
+    /// document is `{candidate, brief, owner_decision, enforced_bound,
+    /// governed_admission_digest}`, committed by
+    /// `improvement_intake_dispatch::commit_improvement_artifact` through the
+    /// single Governor `commit_learning_record` seam. This composition owns no
+    /// such writer and does not add one: `bins/AGENTS.md` forbids adding
+    /// canonical-write or store semantics to a composition binary, and the route
+    /// holds no `ImprovementCandidate` from which the artifact's candidate,
+    /// bound or governed admission digest could be READ rather than fabricated.
+    /// The queue entry is therefore Kernel-owned bounded memory of the same
+    /// class as the bounded local-read pairs, NOT a durable store: a Kernel
+    /// restart before the daemon claims an entry loses that entry, which is
+    /// precisely why the admitted answer reports a `ledger_read_owed` obligation
+    /// rather than a settled disposition.
+    #[cfg(windows)]
+    fn queue_owner_decision_response(
+        &self,
+        session: &Session,
+        request: &eliot_kernel_service::UserAutomationServiceRequest,
+        request_identity: &RequestIdentity,
+        brief_id: &str,
+    ) -> serde_json::Value {
+        match self.admit_owner_decision(
+            session,
+            request_identity,
+            &request.authenticated_principal,
+            &request.intent.operation,
+        ) {
+            Ok(()) => Self::owner_decision_queued_response(request, brief_id),
+            Err(TransportError::PeerIdentityUnavailable) => {
+                Self::improvement_brief_decision_refusal(
+                    request,
+                    brief_id,
+                    "the bounded owner-decision ingress could not bind a principal to this \
+                     Session: the presenting peer identity is unavailable in this composition, or \
+                     it is not the identity this Session authenticated. A disposition is only ever \
+                     recorded against an authenticated principal, so nothing was queued, the \
+                     selection has not been executed, and nothing was changed",
+                )
+            }
+            Err(TransportError::SessionFenced) => Self::improvement_brief_decision_refusal(
+                request,
+                brief_id,
+                "the bounded owner-decision ingress refused this selection: the disposition is \
+                 not one of the two non-mutating kinds it admits (reject, investigate), or the \
+                 admitted request identity or its State Fence is not one this Session may serve, \
+                 or the operation's bounded queue is at its declared capacity. The ingress \
+                 acquires nothing before it refuses, so nothing was queued, nothing was dropped, \
+                 nothing was evicted, the selection has not been executed, and nothing was \
+                 changed; the owner may select again",
+            ),
+            Err(error) => Self::user_automation_runtime_error_response(
+                UserAutomationRuntimeError::UnknownOutcome(format!(
+                    "the bounded owner-decision ingress reported a transport failure that is not \
+                     one of its own closed refusals: {error}; this composition cannot tell whether \
+                     an entry was queued, so the selection's disposition must be reconciled under \
+                     the same operation identity before it is repeated"
+                )),
+            ),
+        }
+    }
+
+    /// The closed answer for an owner decision the bounded ingress RECORDED
+    /// (I12.24:65).
+    ///
+    /// This is the `OutcomeSettled` value of the closed public union, which is
+    /// the only member that can say "this provably happened and a separate
+    /// readback is still owed" — `UserAutomationOperatorResultValue::OutcomeSettled`
+    /// in `eliot-kernel-service`, documented there as "The mutation's
+    /// disposition is proven by exact receipt evidence, but the ledger answer for
+    /// it is still unread", and its `validate_for_request` requires
+    /// `accepted: true`, `outcome: "outcome_settled"`, status `Unknown` and a
+    /// `LedgerReadOwed` recovery. Every other member of that closed union is a
+    /// refusal, a proven absence, or an unreachable owner, and each of those
+    /// would be FALSE here: something provably did happen, the entry is charged
+    /// against this operation's own capacity ledger, and the owner is reachable.
+    ///
+    /// It is deliberately NOT projected through
+    /// [`Self::user_automation_runtime_error_response`], whose
+    /// `OutcomeSettled` arm writes `status: "known"`. That status is refused by
+    /// this value's own `validate_for_request`, so routing an admitted decision
+    /// through that helper would answer a queued selection with a transport
+    /// fence. The shared `status` disagreement between the two closed contracts
+    /// that read this value — `user_automation_runtime_error_response` writes
+    /// `known`, `UserAutomationOperatorResultEnvelope::validate_for_request`
+    /// requires `Unknown`, and
+    /// `apps/Eliot.Operator/Protocol/UserAutomationScheduleContract.cs:1177`
+    /// also requires `known` — is reported rather than silently repaired here:
+    /// `apps/Eliot.Operator` submits no `decide_improvement_brief` operation at
+    /// all (its closed vocabulary is `UserAutomationContracts.cs:1006`), so it
+    /// reads no answer on this route, and this composition follows the contract
+    /// in the crate that owns the envelope.
+    ///
+    /// The reason names the principal the Session proved, the brief the
+    /// selection was made over, and the one claim leg that still owes a
+    /// readback, so a later reader of the answer can tell an owner's selection
+    /// from the daemon's own triage of its own observation.
+    #[cfg(windows)]
+    fn owner_decision_queued_response(
+        request: &eliot_kernel_service::UserAutomationServiceRequest,
+        brief_id: &str,
+    ) -> serde_json::Value {
+        let reason = format!(
+            "the authenticated principal {} recorded a non-mutating disposition over improvement \
+             brief {brief_id} in this composition's bounded owner-decision queue; the entry is \
+             charged against that operation's own capacity ledger and carries the admitted request \
+             identity, the authenticated principal, the brief, the closed disposition and the \
+             owner's own note. The Kernel queue is bounded process memory, not a durable store, so \
+             the daemon's {claim} claim poll and the improvement owner's commit of this decision \
+             onto the brief's Candidate record are both still owed, and this answer does not claim \
+             that record exists",
+            request.authenticated_principal,
+            claim = hot_path_runtime::IMPROVEMENT_DECISION_CLAIM_OPERATION,
+        );
+        serde_json::json!({
+            "status": "unknown",
+            "value": {
+                "accepted": true,
+                "outcome": "outcome_settled",
+                "reason": reason,
+            },
+            "recovery": { "kind": "ledger_read_owed", "reason": reason },
+        })
+    }
+
+    /// Answers an authenticated owner whose disposition over an improvement brief
+    /// was DECLINED, naming the rule that declined it (I12.24:65).
     ///
     /// This is the route's OWN closed, non-reconciling answer, returned through
     /// the existing response machinery rather than as a transport fault:
@@ -5850,51 +6082,10 @@ impl KernelComposition {
     /// Fence, so the answer is addressed to the owner who made the selection
     /// and cannot be mistaken for a foreign or unattributed refusal.
     ///
-    /// # Why a refusal and not a durable record
-    ///
-    /// I12.24:65 places "decision owner selects reject / investigate / work
-    /// item / experiment" as the owner's selection over a brief. The selection
-    /// IS authenticated here — the request is built and validated and its
-    /// principal is bound before this refusal is returned — but no durable
-    /// writer for a brief disposition is reachable from this route, and the
-    /// measured gap is structural, not a missing branch:
-    ///
-    /// - The canonical improvement record is a `Candidate` learning record
-    ///   whose document is `{candidate, brief, owner_decision, enforced_bound,
-    ///   governed_admission_digest}` (I12.24, committed by
-    ///   `improvement_intake_dispatch::commit_improvement_artifact` through the
-    ///   single Governor `commit_learning_record` seam). This Kernel route owns
-    ///   no such writer and must not add one: `bins/AGENTS.md` forbids adding
-    ///   canonical-write or store semantics to a composition binary, and the
-    ///   route holds no `ImprovementCandidate` from which the artifact's
-    ///   candidate, brief, bound or governed admission digest could be READ
-    ///   rather than fabricated.
-    /// - The brief the owner names is owned by the improvement owner and reaches
-    ///   no Kernel surface this route can look it up on: the operation carries
-    ///   only a `brief_id`, this route has no lookup that maps one onto a
-    ///   committed candidate row, and the automation Store below refuses the
-    ///   operation structurally — `CanonicalUserAutomationStore` answers
-    ///   `StoreError::UnknownOperation` both when it executes the operation and
-    ///   when it derives the operation's ordering scope, because every row,
-    ///   scope and mutation projection it owns is keyed by an automation
-    ///   identity this operation does not name.
-    /// - `reject` and `investigate` are both non-mutating by definition
-    ///   (`OwnerDecisionKind::is_non_mutating` admits exactly those two), so
-    ///   this answer records nothing and executes nothing: I12.24:3 "never
-    ///   silently rewrites code, policy or memory authority" and I12.24:82's
-    ///   advisory class "changes nothing until owner acts" both hold. The
-    ///   refusal is the honest ceiling — an owner can select a non-mutating
-    ///   decision here, and the selection is answered as a typed, non-reconciling
-    ///   refusal because the durable record for it does not yet exist, not
-    ///   because the owner lacks authority.
-    ///
-    /// The exact route that would turn this refusal into a durable record — a
-    /// Kernel queue carrying `brief_id`, the closed decision string and the
-    /// authenticated principal, a daemon-side poll, and the improvement owner's
-    /// `record_owner_decision` writing the `Candidate` artifact — is named in
-    /// `improvement_intake_dispatch`'s "The exact missing route, named" section
-    /// and is owned by those three other paths. This route deliberately does not
-    /// stand in for any of them.
+    /// `reason` is the refused rule, supplied by the caller that owns the
+    /// knowledge of WHICH rule fired; this function does not re-derive it and
+    /// does not pick one on the caller's behalf. The principal and the brief are
+    /// added here so the answer names who was refused and over what.
     ///
     /// The refusal is a genuine decline, so it must not be reported as
     /// reconcilable. It is the `Rejected` variant precisely because this
@@ -5902,17 +6093,18 @@ impl KernelComposition {
     /// `prior_attempt_may_have_committed` obligation:
     /// `user_automation_precommit_refusal_response` — the answer that DOES carry
     /// that recovery — is for shape refusals where a prior attempt may have
-    /// committed, and is deliberately not used here.
+    /// committed, and is deliberately not used here. Every caller supplies a
+    /// reason that states the bounded ingress acquired nothing, which is what
+    /// makes the absent recovery obligation true rather than merely convenient.
     #[cfg(windows)]
     fn improvement_brief_decision_refusal(
         request: &eliot_kernel_service::UserAutomationServiceRequest,
         brief_id: &str,
+        reason: &str,
     ) -> serde_json::Value {
         Self::user_automation_runtime_error_response(UserAutomationRuntimeError::Rejected(format!(
             "the authenticated principal {} may select a non-mutating disposition (reject or \
-                 investigate) over improvement brief {brief_id}, but this Kernel route owns no \
-                 durable writer for a brief decision, so the selection is declined rather than \
-                 recorded; the decision has not been executed and nothing was changed",
+             investigate) over improvement brief {brief_id}, but {reason}",
             request.authenticated_principal,
         )))
     }
@@ -5922,7 +6114,13 @@ impl KernelComposition {
         session: &Session,
         request_id: &RequestId,
         payload: &serde_json::Value,
-    ) -> Result<eliot_kernel_service::UserAutomationServiceRequest, TransportError> {
+    ) -> Result<
+        (
+            eliot_kernel_service::UserAutomationServiceRequest,
+            RequestIdentity,
+        ),
+        TransportError,
+    > {
         let route: UserAutomationOperatorRoute =
             serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
         if route.operation != USER_AUTOMATION_OPERATOR_OPERATION {
@@ -5943,9 +6141,9 @@ impl KernelComposition {
         // and it is NOT declined here, because declining it before the principal
         // is bound would answer an authenticated peer with a transport fence
         // instead of a typed disposition. It is answered by
-        // `improvement_brief_decision_refusal` in
-        // `user_automation_operator_operation`, which runs once this request
-        // exists and therefore once the session principal is a real name.
+        // `queue_owner_decision_response` in `user_automation_operator_operation`,
+        // which runs once this request exists and therefore once the session
+        // principal is a real name.
         let principal = authenticated_user_automation_principal(session)?;
         let operation_id = eliot_contracts::OperationId::new(format!(
             "user-automation-operation:{}",
@@ -5958,16 +6156,25 @@ impl KernelComposition {
             state_fence: session.module_generation.state_fence.clone(),
             operation: route.payload.operation,
         };
-        Ok(eliot_kernel_service::UserAutomationServiceRequest {
-            context: identity.request.metadata.clone(),
-            authenticated_principal: principal,
-            identity: OperationIdentity {
-                operation_id,
-                idempotency_key: route.payload.idempotency_key,
-                canonical_request_hash: String::new(),
+        // The admitted `RequestIdentity` travels out beside the request because
+        // the I12.24:65 ingress needs the exact identity the front door proved,
+        // not a re-derivation of it: `KernelComposition::admit_owner_decision`
+        // re-validates it, binds its State Fence and authority epoch to this
+        // session, and RETAINS it on the queued entry, so re-deriving one here
+        // would let a caller-presented identity stand in for the admitted one.
+        Ok((
+            eliot_kernel_service::UserAutomationServiceRequest {
+                context: identity.request.metadata.clone(),
+                authenticated_principal: principal,
+                identity: OperationIdentity {
+                    operation_id,
+                    idempotency_key: route.payload.idempotency_key,
+                    canonical_request_hash: String::new(),
+                },
+                intent,
             },
-            intent,
-        })
+            identity,
+        ))
     }
 
     /// Composes the existing Host runtime and executes the canonical operator

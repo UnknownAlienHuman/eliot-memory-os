@@ -772,6 +772,127 @@ fn validate_finish_claim_request_identity(
     Ok(())
 }
 
+/// The admitted daemon operation marker for the Kernel's bounded
+/// owner-decision claim lane.
+///
+/// One string, read here rather than spelled at the call site, because the same
+/// marker is what `frame_dispatch::is_daemon_operation` admits, what
+/// `bins/eliot-kernel/hot-path.toml` registers, and what the Kernel's operator
+/// answer names as the claim leg still owed.
+pub const IMPROVEMENT_DECISION_CLAIM_OPERATION: &str = "improvement_decision_claim";
+
+/// The only dispositions the owner-decision lane carries.
+///
+/// `reject` and `investigate` are the two `OwnerDecisionKind::is_non_mutating`
+/// admits, so a carried selection is a record and no effect. The Kernel enforces
+/// the same closed set at admission; [`ClaimedOwnerDecision::validate`] re-checks
+/// it here so a decision string this daemon could not map onto a kind is refused
+/// rather than recorded.
+pub const NON_MUTATING_OWNER_DECISIONS: [&str; 2] = ["reject", "investigate"];
+
+/// The most owner decisions one drain of the claim lane may claim.
+///
+/// The Kernel's declaration bounds that queue at `max_items = 64`
+/// (`bins/eliot-kernel/hot-path.toml`), and [`DaemonKernelClient::claim_owner_decision_async`]
+/// is the only reader of it, so a drain cannot exceed the Kernel's own retained
+/// ceiling. The bound is restated rather than read from the declaration because
+/// this binary does not parse that file, and a drain that outran the queue would
+/// only ever cost extra null polls.
+pub const IMPROVEMENT_DECISION_DRAIN_BOUND: usize = 64;
+
+/// One authenticated owner's non-mutating decision over an improvement brief, as
+/// the Kernel's bounded owner-decision queue serves it (issue #1867, I12.24:65).
+///
+/// This is the daemon's own closed VIEW of the entry the Kernel retains
+/// (`bins/eliot-kernel/src/hot_path_runtime.rs::QueuedOwnerDecision`), declared
+/// here rather than imported, exactly as this crate declares its other wire
+/// views: `eliot-kernel` is a composition binary and not a dependency of
+/// `eliotd`.
+///
+/// Two fields of the Kernel's entry are deliberately NOT projected across, and
+/// the Kernel's answer names both: `identity` is the admitted
+/// `RequestIdentity` this daemon never presented and cannot re-verify — it is
+/// the Kernel's own proof that the entry was admitted under a fence — and
+/// `held_bytes` is that queue's own capacity charge, which is the Kernel's
+/// ledger rather than a fact about the decision. `deny_unknown_fields` is what
+/// keeps that narrowing honest: a fifth field on the wire is refused here rather
+/// than read and ignored.
+///
+/// # `principal` is OWNER state, not a caller-presented claim
+///
+/// The value is the identity the Kernel's front-door Session authenticated for
+/// the operation that produced this entry, re-proved at admission against
+/// `Session.peer` and stored by the Kernel. It is therefore recorded owner
+/// state: this daemon copies it verbatim and cannot substitute one, and
+/// `ImprovementDispatchError`'s call site is the only thing that discharges
+/// A12.02:3 ("Identity is not a model's self-declared string") for it.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimedOwnerDecision {
+    /// Stable brief identity the owner selected a disposition over.
+    pub brief_id: String,
+    /// The closed disposition spelling the owner selected.
+    pub decision: String,
+    /// The owner's own note on the disposition. May be empty: the Kernel admits
+    /// an owner's selection without one, and requiring prose the owner did not
+    /// write would be inventing a field.
+    pub note: String,
+    /// The principal the Kernel's front-door Session authenticated.
+    pub principal: String,
+}
+
+impl ClaimedOwnerDecision {
+    /// Re-proves the entry this daemon is about to record against a brief.
+    ///
+    /// Checks what the wire can be checked against, and refuses everything else:
+    /// a blank brief names no brief revision, a blank principal names no
+    /// principal, and a disposition outside [`NON_MUTATING_OWNER_DECISIONS`] has
+    /// no mapping onto an [`eliot_improvement::OwnerDecisionKind`] this daemon
+    /// may record — so it fails closed here rather than reaching a
+    /// caller-supplied default kind.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.brief_id.trim().is_empty() {
+            return Err("claimed owner decision names no brief".to_owned());
+        }
+        if self.principal.trim().is_empty() {
+            return Err("claimed owner decision names no principal".to_owned());
+        }
+        if !NON_MUTATING_OWNER_DECISIONS.contains(&self.decision.as_str()) {
+            return Err(format!(
+                "claimed owner decision {:?} is outside the admitted non-mutating vocabulary {:?}",
+                self.decision, NON_MUTATING_OWNER_DECISIONS
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Parses one unwrapped `improvement_decision_claim` poll answer.
+///
+/// `null` is the empty-queue backoff signal, not an error, exactly as the
+/// activation-ticket and `local_read_claim` `None` cases are. A present entry
+/// must decode as this crate's closed view and pass
+/// [`ClaimedOwnerDecision::validate`]; bytes written before the view existed
+/// therefore do not decode into a current claim rather than being partially
+/// read.
+pub fn parse_claimed_owner_decision(
+    value: &serde_json::Value,
+) -> Result<Option<ClaimedOwnerDecision>, String> {
+    let decision = value
+        .get("decision")
+        .ok_or_else(|| "Kernel improvement_decision_claim answer omits the decision".to_owned())?;
+    if decision.is_null() {
+        return Ok(None);
+    }
+    let claimed: ClaimedOwnerDecision = serde_json::from_value(decision.clone()).map_err(|error| {
+        format!("Kernel improvement_decision_claim decision does not decode: {error}")
+    })?;
+    claimed
+        .validate()
+        .map_err(|error| format!("Kernel improvement_decision_claim decision is invalid: {error}"))?;
+    Ok(Some(claimed))
+}
+
 /// Parses one unwrapped finish poll answer into its exact admitted envelope,
 /// tool, Kernel-issued attempt and derived owner request identity.
 pub fn parse_finish_claimed_pair(
@@ -2604,6 +2725,39 @@ impl DaemonKernelClient {
             .await
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
         parse_finish_claimed_pair(&value).map_err(super::DaemonError::Kernel)
+    }
+
+    /// Claims one authenticated owner's queued non-mutating decision over an
+    /// improvement brief, or `None` when the Kernel's bounded owner-decision
+    /// queue is empty (issue #1867, I12.24:65).
+    ///
+    /// Mirrors [`claim_finish_pair_async`](Self::claim_finish_pair_async): the
+    /// call travels as the single-`operation`-key
+    /// [`IMPROVEMENT_DECISION_CLAIM_OPERATION`] payload, and a null `decision` is
+    /// the empty-queue backoff signal, not an error. The Kernel's ingress has
+    /// already proved the entry's principal against the Session that produced it
+    /// and refuses to serve an entry whose State Fence or authority epoch this
+    /// session may not hold, so a claim that answers carries only an entry this
+    /// daemon is entitled to hold.
+    ///
+    /// This is a CLAIM, not a read: the Kernel removes the entry it returns, and
+    /// that is what releases its capacity permit. A claimed entry is therefore
+    /// the daemon's to record, and an entry this daemon cannot record has been
+    /// removed from the queue — the caller drains the lane
+    /// ([`IMPROVEMENT_DECISION_DRAIN_BOUND`] claims) and reports every entry it
+    /// could not place, so an owner's selection is never silently dropped.
+    #[cfg(windows)]
+    pub async fn claim_owner_decision_async(
+        &self,
+    ) -> Result<Option<ClaimedOwnerDecision>, super::DaemonError> {
+        let value = self
+            .transact_async(
+                IMPROVEMENT_DECISION_CLAIM_OPERATION,
+                serde_json::json!({ "operation": IMPROVEMENT_DECISION_CLAIM_OPERATION }),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        parse_claimed_owner_decision(&value).map_err(super::DaemonError::Kernel)
     }
 
     /// Submits one daemon-produced finish result body for its waiting host
