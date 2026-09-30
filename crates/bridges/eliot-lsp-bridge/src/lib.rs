@@ -2281,6 +2281,10 @@ pub struct LspBridge<E> {
 pub enum LspProcessOwnerError {
     /// The Kernel rejected the original admission.
     Rejected { code: String, detail: String },
+    /// The original process-owner boundary failed before returning a typed
+    /// process receipt. Keep the concrete owner error as the source instead
+    /// of flattening its contract, transport, or outcome category into text.
+    Owner(Box<dyn std::error::Error + Send + Sync>),
     /// The admitted process operation failed at its owner boundary.
     Process(ProcessExecutionError),
 }
@@ -2294,6 +2298,7 @@ impl std::fmt::Display for LspProcessOwnerError {
                     "Kernel rejected LSP process admission ({code}): {detail}"
                 )
             }
+            Self::Owner(error) => write!(f, "LSP process owner failed: {error}"),
             Self::Process(error) => write!(f, "LSP process owner failed: {error}"),
         }
     }
@@ -2303,6 +2308,7 @@ impl std::error::Error for LspProcessOwnerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Rejected { .. } => None,
+            Self::Owner(error) => Some(error.as_ref()),
             Self::Process(error) => Some(error),
         }
     }
