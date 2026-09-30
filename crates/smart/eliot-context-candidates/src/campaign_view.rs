@@ -35,8 +35,8 @@
 use eliot_context_contracts::{ContextError, ContextRecipe};
 use eliot_contracts::fences_match_exact;
 use eliot_learning_contracts::{
-    CampaignLearningStateView, CampaignSourceResolutionStatus, CampaignSourceRole,
-    ContractBinding, Completeness,
+    CampaignLearningStateView, CampaignSourceResolutionStatus, CampaignSourceRole, Completeness,
+    ContractBinding,
 };
 
 use crate::CandidateRequest;
@@ -108,15 +108,15 @@ pub fn check_campaign_learning_state_view(
         } else if resolution.status == CampaignSourceResolutionStatus::Current
             && resolution.reference.is_none()
         {
-            return Err(ContextError::MissingField("campaign_view.context_reference"));
+            return Err(ContextError::MissingField(
+                "campaign_view.context_reference",
+            ));
         }
     }
-    let reference =
-        context_recipe_reference.ok_or(ContextError::MissingField("campaign_view.context_recipe"))?;
+    let reference = context_recipe_reference
+        .ok_or(ContextError::MissingField("campaign_view.context_recipe"))?;
     if reference.content_digest != context_recipe_body_digest {
-        return Err(ContextError::InvalidDigest(
-            "campaign_view.context_recipe",
-        ));
+        return Err(ContextError::InvalidDigest("campaign_view.context_recipe"));
     }
     Ok(())
 }
