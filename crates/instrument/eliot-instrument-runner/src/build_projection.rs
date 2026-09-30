@@ -1169,11 +1169,11 @@ impl TargetRootBuildCoordinator {
                     (item.work_item_id.clone(), operation.clone())
                 }
                 BuildFlight::Waiter { producer } => {
-                    let entry = operations
-                        .get_mut(&target_root)
-                        .ok_or_else(|| BuildProjectionError::NotTheProducer {
+                    let entry = operations.get_mut(&target_root).ok_or_else(|| {
+                        BuildProjectionError::NotTheProducer {
                             work_item_id: producer.clone(),
-                        })?;
+                        }
+                    })?;
                     if entry.2 >= MAX_WAITERS_PER_FLIGHT {
                         return Err(BuildProjectionError::WaiterCapacity {
                             capacity: MAX_WAITERS_PER_FLIGHT,
@@ -1246,7 +1246,8 @@ impl TargetRootBuildCoordinator {
         {
             let live_operation = self.live_operation.borrow();
             match live_operation.get(&target_root) {
-                Some((producer, held, _)) if producer == &item.work_item_id && held == operation => {}
+                Some((producer, held, _))
+                    if producer == &item.work_item_id && held == operation => {}
                 _ => {
                     return Err(BuildProjectionError::NotTheProducer {
                         work_item_id: item.work_item_id.clone(),
