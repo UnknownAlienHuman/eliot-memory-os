@@ -38,6 +38,59 @@ pub const INITIAL_SNAPSHOT_SIGNATURE_BYTES: usize = 64;
 pub const INITIAL_SNAPSHOT_WIRE_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
 /// Setting key carrying the confirmed privacy mode selection.
 pub const PRIVACY_MODE_KEY: &str = "privacy.mode";
+/// Setting key carrying the local observation-capture policy, when explicitly
+/// admitted by deterministic setup.
+pub const OBSERVATION_INGRESS_POLICY_KEY: &str = "eliot.observation.ingress_policy";
+
+/// Closed policy for observations captured under an explicit Local Only
+/// installation choice.
+///
+/// The policy permits local private processing and retained canonical capture.
+/// Raw public capture bytes without a source assurance are conservatively
+/// classified as `CommandLike`; this is not a claim that they were screened.
+/// The policy does not claim an expiry horizon: retention follows the actual
+/// owner record and explicit purge policy, so durable capture is never
+/// described as ephemeral.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ObservationIngressPolicy {
+    /// Keep observations local and private in the durable canonical journal.
+    LocalPrivateRetainedCaptureV1,
+}
+
+impl ObservationIngressPolicy {
+    /// Canonical settings value for this policy.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalPrivateRetainedCaptureV1 => "LOCAL_PRIVATE_RETAINED_CAPTURE_V1",
+        }
+    }
+
+    /// Parses the canonical settings value.
+    ///
+    /// # Errors
+    /// Returns [`InitialSnapshotError::InvalidField`] for an unknown policy.
+    pub fn parse(value: &str) -> Result<Self, InitialSnapshotError> {
+        match value {
+            "LOCAL_PRIVATE_RETAINED_CAPTURE_V1" => Ok(Self::LocalPrivateRetainedCaptureV1),
+            other => Err(InitialSnapshotError::InvalidField {
+                field: OBSERVATION_INGRESS_POLICY_KEY.to_owned(),
+                reason: format!("unknown observation ingress policy {other}"),
+            }),
+        }
+    }
+
+    /// Projects this policy as one immutable configuration setting.
+    #[must_use]
+    pub fn to_setting(self, owner_ref: &str) -> crate::Setting {
+        crate::Setting {
+            key: OBSERVATION_INGRESS_POLICY_KEY.to_owned(),
+            value_ref: format!("literal:{}", self.as_str()),
+            owner_ref: owner_ref.to_owned(),
+        }
+    }
+}
 
 /// The privacy mode selected during deterministic setup (I3.2 milestone 5).
 ///
@@ -171,6 +224,12 @@ pub fn prepare_initial_snapshot_payload(
     let revision = PolicyRevision::genesis();
     let mut settings = crate::first_run::to_settings(first_run, &identity.owner_ref);
     settings.push(privacy.to_setting(&identity.owner_ref));
+    if matches!(privacy, PrivacyChoice::LocalOnly) {
+        settings.push(
+            ObservationIngressPolicy::LocalPrivateRetainedCaptureV1
+                .to_setting(&identity.owner_ref),
+        );
+    }
     let snapshot = ConfigPolicySnapshot {
         snapshot_id: identity.snapshot_id.clone(),
         machine_id: identity.machine_id.clone(),
