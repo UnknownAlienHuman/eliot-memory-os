@@ -915,8 +915,8 @@ struct DispositionedTable {
 /// and there it comes from redb, not from this file.
 ///
 /// Counted against `store.rs`, `store/restore_journal.rs` and `status.rs` at the
-/// time of writing: 74 distinct declared tables, of which 46 back a dispositioned
-/// row family and 28 are explicit source-bound exclusions.
+/// time of writing: 75 distinct declared tables, of which 46 back a dispositioned
+/// row family and 29 are explicit source-bound exclusions.
 /// `row_family_denominator` carries 43 families and every one of them is now bound
 /// to a table by this census.
 ///
