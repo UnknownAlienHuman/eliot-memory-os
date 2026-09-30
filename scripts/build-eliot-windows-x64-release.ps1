@@ -59,6 +59,14 @@ $repo = Split-Path -Parent $PSScriptRoot
 # seam, and offline trust admission. It is dot-sourced beside this builder and
 # beside the finalizer; it is never part of the retiring facade package.
 . (Join-Path $PSScriptRoot 'lib/governor-retirement-approval.ps1')
+# Issue #1858 inventory/manifest slice: the exact-bytes entrypoint
+# inventory and the installed invocation+readback mechanism
+# (Get-LegacyEntrypointDispositions, Invoke-InstalledEntrypointReadback).
+# Dot-sourced beside this builder; it is product code, not part of any
+# staged payload. The slice implements the accepted unconditional cutover:
+# no retained launch config may name the Bridge binary directly or select
+# the cutover flag; either shape drift throws fail-closed.
+. (Join-Path $PSScriptRoot 'lib/entrypoint-inventory.ps1')
 $surrealCatalogRelativePath = 'docs/release/SURREALDB_WINDOWS_X64.lock.json'
 $runtimeArtifactDefinitions = @(
     [pscustomobject]@{
@@ -2970,120 +2978,14 @@ function Assert-ClosedCodeBearingPayload([string]$BundlePath, [object[]]$Signing
     }
 }
 
-function Get-LegacyEntrypointDispositions {
-    $notObserved = [ordered]@{
-        status = 'NOT_PERFORMED'
-        detail = 'No installed Windows runtime invocation was performed by the release builder.'
-    }
-    $consumers = @(
-        [ordered]@{
-            entrypoint = 'Claude Code MCP stdio --host claude'
-            source_config = 'integrations/claude/eliot/.mcp.json'
-            inventory_basis = 'Manually recorded source-config declaration; not checked against installed or staged consumer bytes.'
-            packaged_config = $null
-            command = '${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe'
-            args = @('mcp', 'stdio', '--host', 'claude', '--instance', 'default')
-            configured_environment = 'No env member; ELIOT_CLAUDE_FRONT_DOOR is not declared.'
-            effective_cutover_value = 'NOT_OBSERVED (may be inherited by the process)'
-            behavior = 'Unconditionally emit the stderr REDIRECT receipt and delegate this Claude edge (default profile) to the approved Bridge with no ambient operator flag; success exits with the child status, and resolution/launch failure emits structured ERROR with no legacy fallback. No Governor, Store, WAL, or writer object is constructed on this path.'
-            canonical_route = 'Claude Code agent-bridge declaration and Kernel canonical configuration route.'
-        },
-        [ordered]@{
-            entrypoint = 'Claude Desktop MCP stdio --host claude-desktop'
-            source_config = 'integrations/claude/claude-desktop/mcpb/manifest.json'
-            inventory_basis = 'Manually recorded source-config declaration; not checked against installed or staged consumer bytes.'
-            packaged_config = $null
-            command = '${__dirname}/server/eliot-governor.exe'
-            args = @('mcp', 'stdio', '--host', 'claude-desktop', '--instance', 'default')
-            configured_environment = [ordered]@{}
-            effective_cutover_value = 'NOT_OBSERVED (ELIOT_CLAUDE_FRONT_DOOR is not in env)'
-            behavior = 'Unconditionally emit the stderr REDIRECT receipt and delegate this Claude Desktop edge (default profile) to the approved Bridge with no ambient operator flag; success exits with the child status, and resolution/launch failure emits structured ERROR with no legacy fallback. No Governor, Store, WAL, or writer object is constructed on this path.'
-            canonical_route = 'Claude Desktop agent-bridge declaration and Kernel canonical configuration route.'
-        },
-        [ordered]@{
-            entrypoint = 'OpenCode MCP stdio --host opencode'
-            source_config = 'integrations/opencode/opencode.json'
-            inventory_basis = 'Manually recorded source-config declaration; not checked against installed or staged consumer bytes.'
-            packaged_config = $null
-            command = @('{env:ELIOT_GOVERNOR_EXE}', 'mcp', 'stdio', '--host', 'opencode', '--instance', 'default')
-            configured_environment = 'No MCP env member; command resolves the executable through ELIOT_GOVERNOR_EXE.'
-            effective_cutover_value = 'NOT_OBSERVED (ELIOT_CLAUDE_FRONT_DOOR is not declared)'
-            behavior = 'Unconditionally emit the stderr REDIRECT receipt and delegate this OpenCode edge (default profile) to the approved Bridge with no ambient operator flag; success exits with the child status, and resolution/launch failure emits structured ERROR with no legacy fallback. No Governor, Store, WAL, or writer object is constructed on this path.'
-            canonical_route = 'OpenCode agent-bridge declaration and Kernel canonical configuration route.'
-        },
-        [ordered]@{
-            entrypoint = 'Codex MCP stdio profile codex_controller'
-            source_config = 'plugin/eliot-governor/.mcp.json'
-            inventory_basis = 'Manually recorded source-config declaration; not checked against installed or staged consumer bytes.'
-            packaged_config = 'integrations/codex/plugins/eliot-governor/.mcp.json'
-            command = 'bin/eliot-governor.exe'
-            cwd = '.'
-            args = @('mcp', 'stdio', '--profile', 'codex_controller', '--instance', 'default')
-            configured_environment = 'No env member; ELIOT_CLAUDE_FRONT_DOOR is not declared.'
-            effective_cutover_value = 'NOT_OBSERVED (may be inherited by the process)'
-            behavior = 'Unconditionally return structured ERROR with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER before legacy mcp stdio with no ambient operator flag; the codex_controller profile has no Bridge contour (behavior home is the eliot-mcp track per canon) and is never delegated. No legacy serving path remains.'
-            canonical_route = $null
-        }
-    )
-    $dispositions = @(
-        foreach ($consumer in $consumers) {
-            [ordered]@{
-                entrypoint = $consumer.entrypoint
-                behavior = $consumer.behavior
-                canonical_route = $consumer.canonical_route
-                launch_configuration = $consumer
-                source_behavior_status = 'SOURCE_DECLARED'
-                observed_behavior = $notObserved
-            }
-        }
-        [ordered]@{
-            entrypoint = 'eliot-governor.exe daemon run'
-            behavior = 'Unconditionally refuse with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER at the dispatch entry gate before DbClientSet/CanonicalStore start or ControlWal/WriterActor construction, with no ambient operator flag; no legacy serving path remains.'
-            canonical_route = 'Kernel canonical configuration route; installed route NOT_OBSERVED.'
-            launch_configuration = [ordered]@{ command = 'eliot-governor.exe'; args = @('daemon', 'run'); environment = 'Caller-provided; effective value NOT_OBSERVED.' }
-            source_behavior_status = 'SOURCE_DECLARED'
-            observed_behavior = $notObserved
-        }
-        [ordered]@{
-            entrypoint = 'eliot-governor.exe service run'
-            behavior = 'Unconditionally refuse with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER at the dispatch entry gate before legacy service handling, with no ambient operator flag; no legacy serving path remains.'
-            canonical_route = 'Kernel canonical configuration route; installed route NOT_OBSERVED.'
-            launch_configuration = [ordered]@{ command = 'eliot-governor.exe'; args = @('service', 'run'); environment = 'Caller-provided; effective value NOT_OBSERVED.' }
-            source_behavior_status = 'SOURCE_DECLARED'
-            observed_behavior = $notObserved
-        }
-        [ordered]@{
-            entrypoint = 'eliot-governor.exe hook <event>'
-            behavior = 'Unconditionally refuse with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER at the dispatch entry gate before hook handling, with no ambient operator flag; the Bridge implements no hook/host-event argv, so hooks are refused, never served. No legacy serving path remains.'
-            canonical_route = 'Kernel canonical configuration route; installed route NOT_OBSERVED.'
-            launch_configuration = [ordered]@{
-                source_config = 'plugin/eliot-governor/hooks/hooks.json'
-                commands = @(
-                    '"${PLUGIN_ROOT}\bin\eliot-governor.exe" hook session-start',
-                    '"${PLUGIN_ROOT}\bin\eliot-governor.exe" hook pre-tool-use',
-                    '"${PLUGIN_ROOT}\bin\eliot-governor.exe" hook post-tool-use',
-                    '"${PLUGIN_ROOT}\bin\eliot-governor.exe" hook pre-compact',
-                    '"${PLUGIN_ROOT}\bin\eliot-governor.exe" hook post-compact',
-                    '"${PLUGIN_ROOT}\bin\eliot-governor.exe" hook stop'
-                )
-                environment = 'No cutover flag declared; effective value NOT_OBSERVED.'
-            }
-            source_behavior_status = 'SOURCE_DECLARED'
-            observed_behavior = $notObserved
-        }
-        [ordered]@{
-            entrypoint = 'eliot.exe setup/canary legacy-owner checks'
-            behavior = 'When governor.toml exists, the Governor process is running, or the OS observation is unknown, fail closed with the corresponding legacy cutover code and canonical-route receipt.'
-            canonical_route = 'Kernel canonical configuration route; installed route NOT_OBSERVED.'
-            launch_configuration = [ordered]@{ command = 'eliot.exe'; args = @('setup'); environment = 'Legacy-owner check; installed invocation NOT_OBSERVED.' }
-            source_behavior_status = 'SOURCE_DECLARED'
-            observed_behavior = $notObserved
-        }
-    )
-    return $dispositions
-}
+# Issue #1858: Get-LegacyEntrypointDispositions lives in
+# scripts/lib/entrypoint-inventory.ps1 (dot-sourced above). It enumerates the
+# retained legacy entrypoints from exact pinned/staged bytes (fail closed on
+# drift) under the accepted unconditional cutover; both manifest call sites
+# below invoke that slice with the repository root, pinned source commit,
+# staged bundle root, and staged Bridge record.
 
-function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [object]$RuntimePlan, [string]$CodexPluginBaseVersion, [object]$SurrealArtifact, [object]$SelectedPolicyReceipt, [object]$FrontDoorBridge, [bool]$LegacyGovernorPresent, [string]$GovernorDisposition, [object]$GovernorEvidence, [object]$GovernorApproval, [object[]]$SigningInventory) {
+function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [object]$RuntimePlan, [string]$CodexPluginBaseVersion, [object]$SurrealArtifact, [object]$SelectedPolicyReceipt, [object]$FrontDoorBridge, [bool]$LegacyGovernorPresent, [string]$GovernorDisposition, [object]$GovernorEvidence, [object]$GovernorApproval, [object[]]$SigningInventory, [string]$RepoRoot, [string]$BundleRoot) {
     $entries = @()
     foreach ($artifact in @($RuntimePlan)) {
         $entries += [ordered]@{
@@ -3156,7 +3058,7 @@ function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [obj
             gate = '#1189-legacy-retirement (GATED: retained explicitly by #1719, never by repository presence; full retire/re-home BLOCKED-BY #18)'
             entrypoint_disposition = 'retained-legacy-entrypoints; unconditional cutover owned by #1858: Claude, Claude Desktop and OpenCode MCP stdio (default profile) always redirect to the approved Bridge, every other MCP stdio host/profile and every non-stdio arm always returns structured ERROR; no ambient operator flag, no legacy serving path remains'
             cutover_behavior = 'source-declared unconditional behavior owned by #1858; ELIOT_CLAUDE_FRONT_DOOR survives only as refusal evidence and never gates, source launch configs do not select it, and effective inherited selection is NOT_OBSERVED'
-            entrypoint_behaviors = @(Get-LegacyEntrypointDispositions)
+            entrypoint_behaviors = @(Get-LegacyEntrypointDispositions $RepoRoot $SourceCommit $BundleRoot $FrontDoorBridge)
         }
     }
     if ($FrontDoorBridge) {
@@ -4687,9 +4589,20 @@ try {
             $bundle $runtimeManifest $runtimeReceiptSha256 $operatorReceipt $operatorReceiptSha256 `
             $legacyGovernorPresent ([bool]$frontDoorBridgeStaged) $expectedBridgeSha256 $expectedBridgeBytes)
     Assert-ClosedCodeBearingPayload $bundle $signingInventory
-    $stagedPayloadManifest = Get-StagedPayloadManifest $sourceCommit $Version $runtimeArtifactPlan $codexPluginBaseVersion $verifiedPinnedSurreal $selectedSurrealPolicyReceipt $frontDoorBridgeStaged $legacyGovernorPresent ([string]$plan.governor_disposition) $governorEvidence $governorApprovalReference $signingInventory
+    $stagedPayloadManifest = Get-StagedPayloadManifest $sourceCommit $Version $runtimeArtifactPlan $codexPluginBaseVersion $verifiedPinnedSurreal $selectedSurrealPolicyReceipt $frontDoorBridgeStaged $legacyGovernorPresent ([string]$plan.governor_disposition) $governorEvidence $governorApprovalReference $signingInventory $repo $bundle
     $stagedPayloadManifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $bundle 'STAGED_PAYLOAD_MANIFEST.json') -Encoding utf8
     $stagedPayloadManifestHash = (Get-FileHash -LiteralPath (Join-Path $bundle 'STAGED_PAYLOAD_MANIFEST.json') -Algorithm SHA256).Hash.ToLowerInvariant()
+    # Issue #1858 AUD6/W6: stage the installed-entrypoint readback PLAN beside
+    # the manifest. -WhatIf plans every retained entrypoint invocation without
+    # launching a process; the operator reruns
+    # Invoke-InstalledEntrypointReadback without -WhatIf on the installed
+    # release (TEST-PHASE) and matches the cutover code plus canonical-route
+    # receipt per entrypoint.
+    $entrypointReadbackPlanPath = Join-Path $bundle 'INSTALLED_ENTRYPOINT_READBACK_PLAN.json'
+    if ($legacyGovernorPresent) {
+        Invoke-InstalledEntrypointReadback -InstallRoot $bundle -SnapshotPath $entrypointReadbackPlanPath -WhatIf | Out-Null
+    }
+    $entrypointReadbackPlanHash = if ((Test-Path -LiteralPath $entrypointReadbackPlanPath -PathType Leaf)) { (Get-FileHash -LiteralPath $entrypointReadbackPlanPath -Algorithm SHA256).Hash.ToLowerInvariant() } else { $null }
     $release = [ordered]@{
         component = 'eliot_windows_x64_release'
         version = $Version
@@ -4708,7 +4621,7 @@ try {
             bridge_provisioned = [bool]$frontDoorBridgeStaged
             bridge_sha256 = if ($frontDoorBridgeStaged) { [string]$frontDoorBridgeStaged.sha256 } else { $null }
             bridge_bytes = if ($frontDoorBridgeStaged) { [int64]$frontDoorBridgeStaged.bytes } else { $null }
-            legacy_entrypoint_disposition = if ($legacyGovernorPresent) { @(Get-LegacyEntrypointDispositions) }
+            legacy_entrypoint_disposition = if ($legacyGovernorPresent) { @(Get-LegacyEntrypointDispositions $repo $sourceCommit $bundle $frontDoorBridgeStaged) }
             else {
                 @(
                     [ordered]@{
@@ -4728,11 +4641,12 @@ try {
                 source = 'crates/eliot-app/src/main.rs::dispatch_command'
                 runtime_execution = 'NOT_PERFORMED'
             }
-            observed_behavior = 'Installed runtime observation was NOT_PERFORMED by the release builder; see source_declared_behavior for source behavior.'
+            observed_behavior = 'Installed runtime observation was NOT_PERFORMED by the release builder; see source_declared_behavior for source behavior and installed_entrypoint_readback_plan for the staged TEST-PHASE invocation plan.'
             installed_runtime_observation = [ordered]@{
                 status = 'NOT_PERFORMED'
-                detail = 'No installed Windows release invocation was performed by the release builder.'
+                detail = 'No installed Windows release invocation was performed by the release builder. Rerun scripts/lib/entrypoint-inventory.ps1::Invoke-InstalledEntrypointReadback without -WhatIf against the installed release and match LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER plus the canonical-route receipt per retained entrypoint.'
             }
+            installed_entrypoint_readback_plan = if ($legacyGovernorPresent) { [ordered]@{ path = 'INSTALLED_ENTRYPOINT_READBACK_PLAN.json'; sha256 = [string]$entrypointReadbackPlanHash } } else { $null }
         }
         operator_schema_version = $verifiedOperator.schema_version
         operator_protocol_version = $verifiedOperator.protocol_version
