@@ -5351,7 +5351,7 @@ use journal_append::{
 // branches that set requires. The spellings come from the frozen
 // `ActivationTriggerClass` vocabulary, never from literals at the call site.
 use activation_lifecycle::{
-    CAPABILITY_CANONICAL_STORE, CAPABILITY_INDEPENDENT_SUPERVISION, CAPABILITY_RUNTIME_SUPERVISION,
+    CAPABILITY_INDEPENDENT_SUPERVISION, CAPABILITY_RUNTIME_SUPERVISION,
     is_fresh_admitting_observation, prove_terminal_runtime_release, requires_capability,
 };
 
@@ -10011,7 +10011,6 @@ impl HostComposition {
             ));
         }
         let requires_runtime = requires_capability(&required, CAPABILITY_RUNTIME_SUPERVISION);
-        let requires_store = requires_capability(&required, CAPABILITY_CANONICAL_STORE);
         let requires_supervision =
             requires_capability(&required, CAPABILITY_INDEPENDENT_SUPERVISION);
         if let Some(watchdog_approval) = watchdog_approval.as_ref().filter(|_| requires_supervision)
@@ -10040,16 +10039,28 @@ impl HostComposition {
         let (approved_kernel_path, approved_store_path, approved_config_path) =
             manifest.host_child_paths();
         let config_path = PathBuf::from(approved_config_path.as_str());
-        if !(requires_runtime && requires_store) {
-            // A generation that does not require the full control contour must
-            // not run one. The Host readiness fence refuses `ControlReady`
-            // without a proven Store branch, so admitting a partial contour here
-            // would produce a generation that can never become ready; refusing
-            // the start keeps the unmet requirement visible instead.
-            return self.cleanup_launched_contour(HostError::RecoveryRequired(format!(
-                "activation generation requires runtime={requires_runtime} store={requires_store}; the approved contour needs both"
-            )));
+        if !requires_runtime {
+            // Every trigger class requires the runtime branch: without it no
+            // branch of this contour can start, so the start is refused
+            // fail-closed instead of launching processes no admitted request
+            // required.
+            return self.cleanup_launched_contour(HostError::RecoveryRequired(
+                "activation generation requires no runtime branch; refusing to start a contour"
+                    .to_owned(),
+            ));
         }
+        // I1.5 narrow contours (`ScheduledWake`, `WatchdogRegisteredActivity`):
+        // a generation that does not require the canonical Store is admitted —
+        // its runtime branch starts below, and its supervision branch started
+        // above when required. The Store-proof-fence requirements stay exactly
+        // where they are and still gate every generation that requires the
+        // Store (artifact approval above, single-owner launch, `BootstrapStore`
+        // handoff, probe proof fence, readiness contour): the single launch
+        // owner starts the approved kernel/store pair together (no kernel-only
+        // launch exists), so a narrow generation still reaches `Active` through
+        // fully proven branches rather than being refused for lacking the
+        // Store. Not launching an unrequired Store branch belongs to the
+        // launch owner, not to this gate.
         let (prior_kernel, kernel_generation, kernel_authority_epoch) = match self
             .next_kernel_activation_context(
                 phase_b.launch.authority_state_fence.authority_epoch.clone(),

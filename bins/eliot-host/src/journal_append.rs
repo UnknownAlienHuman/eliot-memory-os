@@ -458,6 +458,55 @@ pub(super) fn transition_activation_record_with_evidence(
     Ok(next)
 }
 
+/// Merges one admitted observable-use trigger's capability requirement into
+/// the generation's durable `requested_capabilities` set and returns the
+/// activation successor that records the union.
+///
+/// I1.5 (external audit 5910248390, defect 3): the durable set read by
+/// `required_generation_capabilities` must be the union of the authenticated
+/// requests that joined the generation, not the bootstrap contour alone. The
+/// merge only ever appends the joining trigger's
+/// `ActivationTriggerClass::requested_capabilities` entries, deduplicated, in
+/// trigger vocabulary order after the retained set: it never removes a
+/// requirement and never invents one, so no ceiling is imposed beyond what the
+/// admitted triggers required.
+///
+/// The successor keeps the current lifecycle state, fence, lineage, leases,
+/// readiness, governance profile and timestamps: coalescing joins the
+/// generation without moving its lifecycle, granting no readiness and no
+/// lease. The joining trigger's evidence and frozen class spelling ride
+/// `trigger_evidence` in the same evidence-then-class order the drain-cancel
+/// path uses; the creation `trigger_class` is never rewritten.
+///
+/// Production caller (STITCH — owned by the `activation_lifecycle.rs`
+/// writer): `HostComposition::note_observable_use`, `Proceed` branch, after
+/// `revalidate_pending_wakes`: build the successor from the snapshot
+/// activation and `trigger.requested_capabilities()`, then
+/// `self.append_record(HostStateRecord::Activation(next))`. The journal admits
+/// the append exactly when its `(state, state)` edge table allows it; surface
+/// a journal refusal as the typed error instead of moving the lifecycle to
+/// manufacture an edge.
+pub(super) fn coalesce_requested_capabilities(
+    current: &EliotActivationRecord,
+    trigger_capabilities: &[&str],
+    trigger_class: &PlatformHandle,
+    evidence: &PlatformHandle,
+    label: &str,
+) -> Result<EliotActivationRecord, HostError> {
+    let mut next = current.clone();
+    next.operation = operation(label)?;
+    for capability in trigger_capabilities {
+        let handle = PlatformHandle::new(*capability)
+            .map_err(|error| HostError::Platform(error.to_string()))?;
+        if !next.requested_capabilities.contains(&handle) {
+            next.requested_capabilities.push(handle);
+        }
+    }
+    next.trigger_evidence.push(evidence.clone());
+    next.trigger_evidence.push(trigger_class.clone());
+    Ok(next)
+}
+
 /// Projects a live contour loss as an explicit recovery state. The caller
 /// supplies the bounded failure reference and recovery directive; this helper
 /// only records that fact and never invents a Watchdog-specific cause.
