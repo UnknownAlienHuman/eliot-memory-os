@@ -153,6 +153,13 @@ scope: it partitions the paths the parent workset already held, in the same
 role. ``check`` re-derives each split from the rows table, the parent workset
 and the measured test-file sizes, and rejects a self-consistent hand edit.
 
+The band itself is never read off the artifact either. The parent workset's
+span bytes come from its own rows in the rows table and its test bytes from the
+measured size of each declared test file, and ``band_disposition`` must follow
+from the recomputed STU. Otherwise an over-band consumer could restate itself
+as within band, drop every split proposal, and be certified. A declared test
+path with no measured size fails closed rather than counting as zero.
+
 Discovery/classification API reuse:
   ``discover_context_measurements`` and ``classify_context_measurement``
   are the single stable entry points. Issue #787 reuses these two
@@ -2240,18 +2247,16 @@ def _validate_artifact(
         )
     if not worksets:
         raise InventoryError("MALFORMED_INVENTORY", "inventory must carry one workset per consumer")
+    # Test-path exactness and single-writer ownership are properties of the
+    # whole set, not of one workset, so they are settled across every workset
+    # before any per-workset accounting runs. Otherwise the first consumer's
+    # own accounting would pre-empt the collision its second consumer causes.
     test_owner: dict[str, str] = {}
-    typed_worksets: list[dict[str, object]] = []
     for workset in worksets:
-        if not isinstance(workset, dict):
-            raise InventoryError("MALFORMED_INVENTORY", "workset must be a table")
-        if set(workset.keys()) != WORKSET_KEYS:
-            raise InventoryError("MALFORMED_INVENTORY", "workset keys are not the closed set")
+        if not isinstance(workset, dict) or set(workset.keys()) != WORKSET_KEYS:
+            # Shape is reported by the per-workset pass below, with its own code.
+            continue
         issue = str(workset["issue"])
-        if issue not in CONSUMER_SEAMS:
-            raise InventoryError("OWNER_NOT_CLOSED", f"workset names a closed-set owner: {issue}")
-        if str(workset["seam"]) != CONSUMER_SEAMS[issue]:
-            raise InventoryError("MALFORMED_INVENTORY", f"workset seam disagrees: {issue}")
         for path in workset["test_paths"]:  # type: ignore[union-attr]
             rel = str(path)
             if "*" in rel or rel.endswith("/"):
@@ -2264,6 +2269,17 @@ def _validate_artifact(
                     f"shared mutable test path {rel} is allocated to {test_owner[rel]} and {issue}",
                 )
             test_owner[rel] = issue
+    typed_worksets: list[dict[str, object]] = []
+    for workset in worksets:
+        if not isinstance(workset, dict):
+            raise InventoryError("MALFORMED_INVENTORY", "workset must be a table")
+        if set(workset.keys()) != WORKSET_KEYS:
+            raise InventoryError("MALFORMED_INVENTORY", "workset keys are not the closed set")
+        issue = str(workset["issue"])
+        if issue not in CONSUMER_SEAMS:
+            raise InventoryError("OWNER_NOT_CLOSED", f"workset names a closed-set owner: {issue}")
+        if str(workset["seam"]) != CONSUMER_SEAMS[issue]:
+            raise InventoryError("MALFORMED_INVENTORY", f"workset seam disagrees: {issue}")
         if not workset["row_ids"] and bool(workset["dispatch_ready"]):
             raise InventoryError(
                 "EMPTY_ALLOCATION", f"dispatch-ready workset carries no rows: {issue}"
@@ -2289,6 +2305,54 @@ def _validate_artifact(
                 "COUNT_MISMATCH",
                 f"workset unresolved count disagrees with its assigned rows: {issue}",
             )
+        # The band decision is the gate: it decides dispatch readiness AND
+        # whether a blocking proposed split is required. It is recomputed here
+        # from the two things the artifact does not control - the span bytes of
+        # this consumer's own rows in the rows table, and the measured size of
+        # each declared test file on disk. Reading `band_disposition` off the
+        # artifact instead would let an over-band consumer restate itself as
+        # within band, drop every split proposal, and be certified.
+        measured_source_bytes = sum(
+            int(r["span_bytes"]) for r in assigned_rows if r["write_scope"] == "writable"
+        )
+        measured_read_only_bytes = sum(
+            int(r["span_bytes"]) for r in assigned_rows if r["write_scope"] == "read-only"
+        )
+        measured_test_bytes = 0
+        for path in workset["test_paths"]:  # type: ignore[union-attr]
+            rel = str(path)
+            if rel not in test_bytes_by_path:
+                raise InventoryError(
+                    "WORKSET_TEST_PATH_UNMEASURED",
+                    f"workset test path has no measured size: {issue}: {rel}",
+                )
+            measured_test_bytes += test_bytes_by_path[rel]
+        measured_workset_bytes = (
+            measured_source_bytes + measured_read_only_bytes + measured_test_bytes
+        )
+        measured_workset_stu = _stu(measured_workset_bytes)
+        expected_accounting: dict[str, object] = {
+            "source_span_bytes": measured_source_bytes,
+            "source_span_stu": _stu(measured_source_bytes),
+            "read_only_bytes": measured_read_only_bytes,
+            "read_only_stu": _stu(measured_read_only_bytes),
+            "test_bytes": measured_test_bytes,
+            "test_stu": _stu(measured_test_bytes),
+            "workset_bytes": measured_workset_bytes,
+            "workset_stu": measured_workset_stu,
+            "band_disposition": (
+                "WITHIN_UPPER_REVIEW_BAND"
+                if measured_workset_stu <= UPPER_REVIEW_BAND_STU
+                else "EXCEEDS_UPPER_REVIEW_BAND_BLOCKING_SPLIT"
+            ),
+        }
+        for key, value in expected_accounting.items():
+            if workset[key] != value:
+                raise InventoryError(
+                    "WORKSET_ACCOUNTING_MISMATCH",
+                    f"workset {key} disagrees with the recomputed value for {issue}: "
+                    f"stated {workset[key]!r}, recomputed {value!r}",
+                )
         if bool(workset["dispatch_ready"]):
             if not workset["test_paths"]:
                 raise InventoryError(
@@ -2669,6 +2733,11 @@ def cmd_sync(root: Path, generation_command: str) -> int:
 
 
 def cmd_check(root: Path) -> int:
+    # Resolve the root exactly as `build_inventory` does. An unresolved root
+    # makes `_inside` reject every declared path as outside the scan root, so
+    # `_measure_test_paths` would silently measure nothing and every measured
+    # comparison below would run against an empty map instead of failing closed.
+    root = _root(root)
     target = root / OWNED_TOML
     if not target.is_file() or target.is_symlink():
         return _fail(
