@@ -60,13 +60,28 @@
 //!
 //! What that lifecycle does NOT establish, stated plainly so the claims are
 //! never read wider than the code: this process still opens no backup listener
-//! and spawns no backup task. `eliot-watchdog` declares no `eliot-ipc` edge, and
-//! the canonical `\\.\pipe\eliot\watchdog\signals` server, its peer SID
-//! expectation and its frame codec all live in `eliot-ipc`, which this issue
-//! may not depend on. The authenticated context above is therefore derived from
-//! this composition's retained admission state rather than from a live transport
-//! peer observation, and the transport peer SID and per-launch nonce checks
-//! belong to that listener, not to this module.
+//! and spawns no backup task.
+//!
+//! The reason is no longer a missing dependency. `eliot-watchdog` DOES declare
+//! the `eliot-ipc` edge and DOES use its bounded framed codec on the path that
+//! already exists here — the outbound Kernel front-door intent exchange in
+//! `watchdog_spool::export_driver`. What is still absent is the *server* side:
+//! no process in this repository creates the canonical
+//! `\\.\pipe\eliot\watchdog\signals` server. `EliotPipeName::watchdog_signals`
+//! names the pipe and `bins/eliot-kernel/src/backup_owner_clients.rs` names it
+//! as the client endpoint, but nothing binds or serves it, and this crate is
+//! only ever the *client* of the Kernel front door. There is therefore no
+//! existing canonical signals-transport message arm for a backup request to be
+//! added beside, and the typed backup request/response carrier this arm would
+//! have to reuse lives in `eliot-host-service`, which this crate does not
+//! depend on.
+//!
+//! So the authenticated context above is derived from this composition's
+//! retained admission state rather than from a live transport peer observation,
+//! and the transport peer SID, service, nonce, and session checks belong to a
+//! listener that does not exist yet — not to this module. Adding that listener
+//! is a separate prerequisite, and until it exists no backup request can reach
+//! this handle over any transport at all.
 //!
 //! Lifecycle scope: the bounded registration table belongs to ONE composition
 //! lifecycle and is opened when that composition starts. Starting supervision
