@@ -60,11 +60,28 @@ public static class OperatorIntentContract
         }
     }
 
+    /// The one character test for an operation identity. Case is part of the
+    /// identity, not a spelling of it: both minters emit lowercase only
+    /// (`Guid.NewGuid().ToString("N")` above, and the lowercase hex digest in
+    /// `UserAutomationOperatorRequest.DeriveIdempotencyKey`), and every
+    /// comparison of an operation id in this application is case-SENSITIVE
+    /// (`StringComparison.Ordinal`, an ordinal `HashSet<string>`, or `==` on
+    /// `string`). The owner keys its operation record on the exact string
+    /// bytes too, so an uppercase twin admitted here would be a SECOND
+    /// identity for one logical transition, not a tolerated spelling: the
+    /// guarded comparison and the guarded admission would disagree about what
+    /// "the same key" means, and the rejection that makes a reused key with a
+    /// different canonical request hash an identity conflict
+    /// (`docs/architecture/I05-05-write-envelope.md:34`) would rest on a
+    /// character rule the guard did not state. This tightens the existing test
+    /// rather than adding a mechanism: `Uri.IsHexDigit` already accepts
+    /// `A`-`F`, so the extra clause only drops values no producer emits, and
+    /// the one refusal sentence this method throws is unchanged.
     public static void RequireOperationId(string? value)
     {
         if (string.IsNullOrWhiteSpace(value)
             || value.Length != 32
-            || !value.All(character => Uri.IsHexDigit(character)))
+            || !value.All(character => Uri.IsHexDigit(character) && !char.IsAsciiLetterUpper(character)))
         {
             throw new InvalidOperationException("Operator intent requires one 32-character hex operation identity.");
         }
@@ -87,7 +104,7 @@ public enum OperatorMutationRoute
 /// the mutation was not admitted. `NotAttempted` is reserved for a request
 /// proven never to have left this process; it is not terminal and is never
 /// assigned to an older retained operation, because a failure before a new
-/// send says nothing about a previous execution. All eight states stay
+/// send says nothing about a previous execution. All nine states stay
 /// distinct.
 public enum OperatorOperationPhase
 {
@@ -126,6 +143,13 @@ public sealed record OperatorPendingOperation(
 /// schema/hash, names the single consumer, states the proof ceiling, and
 /// carries expiry/removal criteria. No new `eliot-app` feature may be added
 /// through it.
+///
+/// Five tool names are admitted, not four: the four legacy `eliot_operator_*`
+/// tools above plus the typed user-automation owner route
+/// (`UserAutomationContract.Route`), which the current Kernel serves and which
+/// is not an `eliot-app` tool. The admission set is the contract, so this
+/// adapter admits five names and its removal condition retires the four
+/// legacy ones.
 public static class LegacyOperatorAdapter
 {
     public const string ToolContract = "eliot_operator_contract";
@@ -145,9 +169,9 @@ public static class LegacyOperatorAdapter
 
     /// Expiry/removal criteria: migrate reads to the current
     /// ControlBoard/runtime-status owner and mutations to the current typed
-    /// Operator-intent owner, then delete these four tools. Every precondition
-    /// below is a fact a maintainer can check in the tree, and ALL of them must
-    /// hold first.
+    /// Operator-intent owner, then delete these four legacy `eliot_operator_*`
+    /// tools. Every precondition below is a fact a maintainer can check in the
+    /// tree, and ALL of them must hold first.
     ///
     /// 1. A current-owner ControlBoard read route is served on the Operator
     ///    pipe and this client consumes it. It is not served today:
@@ -172,10 +196,15 @@ public static class LegacyOperatorAdapter
     ///    and where anything other than `operator_challenge` then
     ///    `redeem_operator_handoff` is answered
     ///    `BROKER_PROTOCOL_SEQUENCE_REJECTED` (`:941` -`:954`, `:979` -`:990`).
-    /// 5. `Consumer` has no remaining call site of the four tools.
+    /// 5. `Consumer` has no remaining call site of the four legacy
+    ///    `eliot_operator_*` tools. The typed user-automation owner route
+    ///    (`UserAutomationContract.Route`, served by the current Kernel) is not
+    ///    one of them: it is not an `eliot-app` tool, it is not removed with
+    ///    this adapter, and `IsAdmittedTool` admits it only while it is served
+    ///    on the same pipe.
     ///
     /// An unmet precondition leaves the adapter exactly as it is. It must never
-    /// gain a fifth tool, a new command shape, or a wider capability.
+    /// gain a sixth admitted tool, a new command shape, or a wider capability.
     ///
     /// The five preconditions are the path that retires this adapter on its own
     /// merits. The second, independent path is unchanged: this adapter is legacy
@@ -185,14 +214,18 @@ public static class LegacyOperatorAdapter
         "Remove when all five preconditions in the comment above hold: a served, " +
         "consumed current-owner ControlBoard read route; an owner-issued State Fence on " +
         "the consumed page; mutations served by the current typed Operator-intent owner; " +
-        "one protocol on the UI pipe; and no remaining call site of the four tools. " +
+        "one protocol on the UI pipe; and no remaining call site of the four legacy " +
+        "eliot_operator_* tools. " +
         "Also remove when the #1189 retirement owner retires this legacy core. " +
         "No new tool or command shape may be added.";
 
-    /// The exact closed set of routes this adapter may issue. A tool outside
-    /// the set is refused before it is written to the pipe, so the adapter
-    /// cannot gain a fifth tool, a second command shape or a wider capability
-    /// by accident.
+    /// The exact closed set of routes this adapter may issue: the four legacy
+    /// `eliot_operator_*` tools plus the typed user-automation owner route.
+    /// `IsAdmittedTool` gates on this array, so its five entries are the
+    /// contract and the prose above counts the four legacy tools separately.
+    /// A tool outside the set is refused before it is written to the pipe, so
+    /// the adapter cannot gain a sixth route, a second command shape or a wider
+    /// capability by accident.
     private static readonly string[] AdmittedTools =
     [
         ToolContract,
@@ -205,10 +238,41 @@ public static class LegacyOperatorAdapter
     public static bool IsAdmittedTool(string? tool) =>
         tool is not null && AdmittedTools.Contains(tool, StringComparer.Ordinal);
 
+    /// The `removal=` value the startup log carries. It is a POINTER to
+    /// `ExpiryRemoval` above, not a paraphrase of it: the full normative
+    /// condition, including the #1189 retirement path, stays in the source,
+    /// and reproducing 400+ characters of a source comment in a log record
+    /// exceeds the one-line record bound, where the formatter clips it
+    /// SILENTLY and severing the text mid-word looks like a whole condition.
+    /// I15.4 governs the shape directly: "Startup diagnostics may record which
+    /// reference/version was used, never the value"
+    /// (`docs/architecture/I15-04-secrets.md:17`). Nothing parses this field:
+    /// "Operational logs never become verifier evidence by themselves"
+    /// (`docs/architecture/I16-17-instrument-plane-observability.md:34`), so a
+    /// named reference is the truthful and sufficient record. The pointer is
+    /// deliberately not a weaker claim: both retirement paths are named here,
+    /// and no precondition, threshold or clause is restated or dropped.
+    public const string RemovalReference =
+        "see OperatorIntent LegacyOperatorAdapter removal conditions " +
+        "(5 preconditions; #1189 legacy-core retirement)";
+
     /// Bounded redacted description of this adapter's boundary. It carries the
-    /// pinned identity, the single consumer, the proof ceiling and the removal
-    /// condition; it carries no endpoint, nonce, credential or payload.
+    /// pinned identity, the single consumer, the admitted-route count, the
+    /// proof ceiling and a pointer to the removal condition; it carries no
+    /// endpoint, nonce, credential or payload.
+    ///
+    /// `tools=` counts the entries of the closed admission set `IsAdmittedTool`
+    /// gates on, so it is five: the four legacy `eliot_operator_*` tool names
+    /// plus the typed user-automation owner route. That is the same count the
+    /// code has always enforced; it is not the "four tools" of the removal
+    /// condition, which names the four legacy tools specifically. Both counts
+    /// are now stated in the prose above, so the field beside them no longer
+    /// contradicts them.
+    ///
+    /// Length: the composed record is 392 characters against
+    /// `OperatorDiagnostics.MaxRecordChars` (512), margin 120, so the
+    /// formatter's clip cannot silently sever this record.
     public static string Describe() =>
         $"legacy adapter schema={SchemaVersion} hash={ContractHash} consumer={Consumer} " +
-        $"tools={AdmittedTools.Length} proof_ceiling={ProofCeiling} removal={ExpiryRemoval}";
+        $"tools={AdmittedTools.Length} proof_ceiling={ProofCeiling} removal={RemovalReference}";
 }

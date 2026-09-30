@@ -48,11 +48,6 @@ public sealed class MainViewModel : INotifyPropertyChanged
     /// from an unknown outcome.
     public const string StaleFenceReasonCode = "STALE_STATE_FENCE";
 
-    private static readonly JsonSerializerOptions UserAutomationRevisionReader = new(OperatorJson.Reader)
-    {
-        PropertyNameCaseInsensitive = false
-    };
-
     private readonly IGovernorClient _client;
     private readonly OperatorPendingOperationJournal? _pendingJournal;
     private OperatorTaskContext? _taskContext;
@@ -395,21 +390,63 @@ public sealed class MainViewModel : INotifyPropertyChanged
             return;
         }
 
+        OperatorIntentEnvelope envelope;
+        try
+        {
+            envelope = BuildCommandRegion(SelectedAction.Command, SelectedRecord, task);
+        }
+        catch (Exception error) when (error is InvalidOperationException or JsonException)
+        {
+            // A typed parameter the operator entered is still a locally
+            // refusable request, not a fault. `ParseJsonObject` caps length and
+            // depth and refuses a non-object root, but well-bounded malformed
+            // JSON only fails here, at the parse -- so without this the
+            // `JsonException` left through the `async void` click handler and
+            // killed the process with no banner shown at all.
+            //
+            // The refusal is displayed under the same closed code the
+            // transport paths use, and the framework message is never shown: a
+            // serializer message can carry a JSON path, an offset and a
+            // character lifted from the bytes the operator typed.
+            //
+            // The containment point is BEFORE `SubmitIntentAsync`, which is
+            // where the first send and the first journal write happen. So this
+            // refusal sends nothing, journals nothing and leaves no pending
+            // operation to reconcile -- the same terminal disposition as the
+            // refusals above, and no partially sent write to recover from.
+            SetBanner(
+                "Command not sent",
+                $"{SelectedAction.Command}: the typed command was refused before submission "
+                    + $"({BoundedRefusalReason(error)}); nothing was journaled and nothing was sent.",
+                OperatorBannerSeverity.Warning);
+            return;
+        }
+        await SubmitIntentAsync(envelope, SelectedAction.Command, isReconcile: false);
+    }
+
+    /// Mints the exact typed envelope one user action sends. Split out of the
+    /// caller so the whole build-and-mint region sits inside a single guard:
+    /// the operator's typed buffer reaches JSON parsing here, and this is the
+    /// only place it does before a send.
+    private OperatorIntentEnvelope BuildCommandRegion(
+        string commandName,
+        OperatorRecordView record,
+        OperatorTaskContext task)
+    {
         var command = BuildCommand(
-            SelectedAction.Command,
-            SelectedRecord,
+            commandName,
+            record,
             task,
             ActionInput.Trim(),
             CandidateDisposition);
         // One identity per user action: the typed envelope mints the
         // operation id once and the exact bytes are retained until a terminal
         // receipt. A retry of this action reconciles the same identity.
-        var envelope = OperatorIntentEnvelope.Create(
+        return OperatorIntentEnvelope.Create(
             task.ProjectId,
             task.TaskId,
             task.Revision,
             JsonSerializer.SerializeToElement(command));
-        await SubmitIntentAsync(envelope, SelectedAction.Command, isReconcile: false);
     }
 
     /// Reconciles every pending unknown-outcome operation under its retained
@@ -473,7 +510,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
         }
         catch (Exception error) when (error is JsonException or InvalidOperationException)
         {
-            WithholdUserAutomation(pending, $"the retained typed request is not a closed UserAutomation envelope ({error.Message});");
+            WithholdUserAutomation(pending, $"the retained typed request is not a closed UserAutomation envelope ({BoundedRefusalReason(error)});");
             return;
         }
 
@@ -621,7 +658,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
         {
             SetBanner(
                 "UserAutomation command not sent",
-                AppendLocalProjectionInspection(error.Message, scheduleProjection),
+                AppendLocalProjectionInspection(BoundedRefusalReason(error), scheduleProjection),
                 OperatorBannerSeverity.Warning);
             return;
         }
@@ -655,7 +692,11 @@ public sealed class MainViewModel : INotifyPropertyChanged
             }
             catch (Exception error)
             {
-                SetBanner("UserAutomation read failed", error.Message, OperatorBannerSeverity.Error);
+                SetBanner(
+                    "UserAutomation read failed",
+                    $"The UserAutomation read did not complete ({OperatorFaultReason.ForException(error)}); "
+                    + "a read has no owner effect, so it can be retried once the session is restored.",
+                    OperatorBannerSeverity.Error);
             }
             finally
             {
@@ -806,7 +847,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
             RefreshPendingState();
             SetBanner(
                 "Command outcome unproven — recovery retained",
-                $"{action}: {error.Message}; use Reconcile before any retry.",
+                $"{action}: the transport did not prove an owner outcome ({OperatorFaultReason.ForException(error)}); use Reconcile before any retry.",
                 OperatorBannerSeverity.Warning);
         }
         finally
@@ -958,9 +999,11 @@ public sealed class MainViewModel : INotifyPropertyChanged
     {
         // This is operator-typed JSON, so apply its independent structural caps
         // and duplicate-key rejection before allocating the typed revision. The
-        // shared closed reader then rejects unknown fields at every schema level.
+        // shared closed reader then rejects unknown fields at every schema level
+        // and matches member names exactly; that is stated once, on
+        // `OperatorJson.Reader`, and is not restated as a local copy here.
         OperatorResponseGuard.ValidateLocalParameter(value, "user_automation_revision");
-        var revision = JsonSerializer.Deserialize<UserAutomationRevision>(value, UserAutomationRevisionReader)
+        var revision = JsonSerializer.Deserialize<UserAutomationRevision>(value, OperatorJson.Reader)
             ?? throw new InvalidOperationException("UserAutomation schedule revision JSON is required.");
         revision.Validate();
         return revision;
@@ -1078,20 +1121,30 @@ public sealed class MainViewModel : INotifyPropertyChanged
             {
                 ResultSummary += " The owner truncated this page: the rendering is incomplete.";
             }
+            // The rotation notice is a statement about the binding, not about
+            // completeness, so it is reported on EVERY banner. A rotation that
+            // happened to arrive on a truncated or degraded page is still a
+            // rotation, and withholding the word there would leave the operator
+            // reading a stale page as if nothing had been dropped. The
+            // invalidation itself happened above, before this page was used;
+            // this only names it.
+            var rotationNotice = rotated
+                ? " Runtime rotated: dependent state was invalidated before use."
+                : string.Empty;
             if (degraded.Count == 0 && !page.Truncated)
             {
                 SetBanner(
                     "Connected",
-                    rotated
-                        ? $"Runtime {page.RuntimeId}; auth generation {page.AuthGeneration}; typed {page.Projection} projection. Runtime rotated: dependent state was invalidated before use."
-                        : $"Runtime {page.RuntimeId}; auth generation {page.AuthGeneration}; typed {page.Projection} projection.",
+                    $"Runtime {page.RuntimeId}; auth generation {page.AuthGeneration}; typed {page.Projection} projection."
+                        + rotationNotice,
                     OperatorBannerSeverity.Success);
             }
             else if (page.Truncated && degraded.Count == 0)
             {
                 SetBanner(
                     "Projection truncated",
-                    $"Runtime {page.RuntimeId} truncated the {page.Projection} page: {Records.Count} record(s) shown, completeness not claimed. Narrow the scope or filters for a whole page.",
+                    $"Runtime {page.RuntimeId} truncated the {page.Projection} page: {Records.Count} record(s) shown, completeness not claimed. Narrow the scope or filters for a whole page."
+                        + rotationNotice,
                     OperatorBannerSeverity.Warning);
             }
             else
@@ -1109,7 +1162,8 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 SetBanner(
                     severe ? "Degraded backend capability" : "Operational notices need attention",
                     $"Runtime {page.RuntimeId} reports {incidentCount} open incident(s) and {backupCount} backup concern(s): {detail}. " +
-                    "Full evidence and recovery references stay expandable on each record.",
+                    "Full evidence and recovery references stay expandable on each record."
+                        + rotationNotice,
                     OperatorBannerSeverity.Warning);
             }
         }
@@ -1148,7 +1202,11 @@ public sealed class MainViewModel : INotifyPropertyChanged
         {
             if (!cancellationToken.IsCancellationRequested || !IsUserAutomationPage)
             {
-                SetBanner("Degraded / reconnect required", error.Message, OperatorBannerSeverity.Error);
+                SetBanner(
+                    "Degraded / reconnect required",
+                    $"The projection read did not complete ({OperatorFaultReason.ForException(error)}); "
+                    + "reconnect through a fresh broker handoff before retrying.",
+                    OperatorBannerSeverity.Error);
             }
         }
         finally
@@ -1416,7 +1474,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
             RefreshPendingState();
             SetBanner(
                 "Command outcome unproven — recovery retained",
-                $"{action}: {error.Message}; use Reconcile before any retry.",
+                $"{action}: the transport did not prove an owner outcome ({OperatorFaultReason.ForException(error)}); use Reconcile before any retry.",
                 OperatorBannerSeverity.Warning);
         }
         finally
@@ -1426,12 +1484,15 @@ public sealed class MainViewModel : INotifyPropertyChanged
         }
     }
 
-    /// Reads one owner-bound command receipt. The receipt is accepted only when
-    /// it is bound to this exact operation identity, this exact expected
-    /// revision, carries a typed terminal disposition, and — when it claims a
-    /// durable mutation — carries a canonical receipt. A refusal whose outcome
-    /// is the owner's `STALE_STATE_FENCE` reason code is terminal and distinct
-    /// from a plain rejection and from an unknown outcome.
+    /// Reads one owner-bound command receipt. The receipt is read only when it is
+    /// bound to this exact operation identity, this exact expected revision, and
+    /// carries a typed terminal disposition. A claim of an executed durable
+    /// mutation must be consistent with the canonical receipt it carries, except
+    /// for the one accepted-but-unproven shape — executed, accepted, and no
+    /// canonical receipt — which is returned so the caller can explain it
+    /// actionably; it is never treated as a success. A refusal whose outcome is
+    /// the owner's `STALE_STATE_FENCE` reason code is terminal and distinct from
+    /// a plain rejection and from an unknown outcome.
     private static (bool Accepted, bool Executed, bool StaleFence, string Outcome, string? ReceiptId) ReadCommandReceipt(
         JsonElement receipt,
         OperatorPendingOperation pending)
@@ -1514,7 +1575,17 @@ public sealed class MainViewModel : INotifyPropertyChanged
             if (string.IsNullOrWhiteSpace(receiptId)) receiptId = null;
         }
 
-        if (executed != (receiptId is not null) || (executed && !accepted))
+        // A claimed durable mutation that carries no canonical receipt is not a
+        // refused disposition: it is the owner's accepted-but-unproven answer,
+        // and the caller turns it into an actionable reconciliation instruction
+        // rather than a bare "inconsistent" refusal. Only that one shape is
+        // exempted. An unexecuted operation that still carries a receipt, and an
+        // executed one the owner did not accept, remain refusals — the second
+        // disjunct is never exempted, so that arm refuses every executed receipt
+        // the owner did not accept, with or without a receipt id.
+        var executedWithoutCanonicalReceipt = executed && receiptId is null;
+        if ((!executedWithoutCanonicalReceipt && executed != (receiptId is not null))
+            || (executed && !accepted))
         {
             throw new InvalidOperationException("operator command receipt has an inconsistent canonical disposition");
         }
@@ -1873,6 +1944,26 @@ public sealed class MainViewModel : INotifyPropertyChanged
     /// evidence and recovery fields expandable.
     private static string ClipSignalSummary(string value) =>
         value.Length <= 200 ? value : $"{value[..200]}…";
+
+    /// One bounded reason for a banner that reports a locally refused typed
+    /// request.
+    ///
+    /// A refusal raised by this application's own closed UserAutomation
+    /// contract keeps its message. Every such message is assembled only from
+    /// locally authored field names, the generated owner refusal table and
+    /// pinned contract constants — the
+    /// <see cref="UserAutomationScheduleContractException"/> shape is the
+    /// generated owner Display sentence joined to a locally authored action —
+    /// so it names the rule that refused the request and carries no value from
+    /// the refused bytes. A framework exception message is never shown — a
+    /// serializer message can carry a JSON path, a line/byte offset and a
+    /// character lifted from the refused bytes — so only its closed
+    /// [`OperatorFaultReason`] code is displayed, exactly as the transport
+    /// paths do.
+    private static string BoundedRefusalReason(Exception error) =>
+        error is JsonException
+            ? OperatorFaultReason.ForException(error)
+            : error.Message;
 
     private void SetBanner(string title, string message, OperatorBannerSeverity severity)
     {
