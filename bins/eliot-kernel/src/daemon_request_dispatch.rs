@@ -2836,6 +2836,15 @@ impl KernelComposition {
                 // Observe bytes ride this entry exactly like the bridge
                 // front-door submit arm (issue #2565): linkage and a bounded
                 // queue reservation precede admission and payload handoff.
+                // Issue #1742 W4 (caller STITCH): the Governor owner's
+                // material gate (`eliot-context-admission` admit, dispatch
+                // binding, and dispatch-time revalidation over
+                // owner-resolved inputs) runs Governor-side, never here:
+                // the Kernel owns only the mechanical dispatch binding and
+                // must not mint floor, lineage, or authority verdicts
+                // (I01-08 canonical write path). That call site is the
+                // Governor owner's to write, and is named here rather than
+                // faked with a consumer in this crate.
                 let envelope = host_request_route::host_request_envelope_from_payload(payload)?;
                 let observe_tool = payload.get("tool").cloned();
                 let (receipt, record) =
@@ -2881,6 +2890,16 @@ impl KernelComposition {
             }
             #[cfg(windows)]
             "agent_host_request_rehydrate" => {
+                // Issue #1742 W6 (caller STITCH): resuming under retained
+                // history (admission over #1730's retained checkpoint plus
+                // its revalidation, then a resume-phase dispatch binding
+                // with dispatch-time revalidation) is the resume owner's
+                // join in `eliot-context-admission`: unavailable or
+                // erased originals stay explicit and a derived summary never
+                // replaces the original checkpoint. This mechanical readback
+                // serves the durable record and stages no new authority
+                // either way; that call site is the resume owner's to write,
+                // and is named here rather than faked with a consumer here.
                 let envelope = host_request_route::host_request_envelope_from_payload(payload)?;
                 let receipt = host_request_route::host_request_receipt_from_payload(payload)?;
                 let record = self.rehydrate_host_request(&envelope, &receipt)?;
