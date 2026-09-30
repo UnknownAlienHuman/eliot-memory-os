@@ -114,6 +114,13 @@ pub struct ControlBoardReviewBatch {
     /// each obligation's own `artifact_revision`, so a review of an older
     /// revision cannot be read as approving the head.
     pub current_artifact_revision: Option<u64>,
+    /// Digest bound at the currently admitted head revision, absent when none
+    /// was admitted. The current target is the (`current_artifact_revision`,
+    /// `current_artifact_digest`) pair: an unchanged digest across a head move
+    /// is not new content, and a changed digest never inherits the old
+    /// approval. Both live in the coordination artifact-revision space, not in
+    /// `ViewRevision` or source-commit space.
+    pub current_artifact_digest: Option<String>,
     /// Owner-recorded expected-review count, absent when unrecorded.
     pub expected: Option<u64>,
     /// Retained obligation count.
@@ -132,8 +139,9 @@ pub struct ControlBoardReviewBatch {
 /// Every field reproduces an owner-retained fact verbatim: the stable
 /// review/request identity, the immutable reviewed revision and digest, the
 /// author session, the submitted anchor, this item's own lifecycle, standing
-/// and recommendation, the retained rejection reason, the carried evidence,
-/// and the record fence the obligation was admitted under. No visibility,
+/// and recommendation, the retained rejection reason and conflict linkage,
+/// the carried evidence, and the record fence the obligation was admitted
+/// under. No visibility,
 /// privacy, role, or recipient fact is carried because the owner retains
 /// none; none is invented here.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -162,6 +170,10 @@ pub struct ControlBoardReviewBatchObligation {
     pub recommendation: ReviewRecommendation,
     /// Reason retained when this obligation was rejected.
     pub rejection_reason: Option<String>,
+    /// Conflict this obligation's recommendation is contested under, when the
+    /// owner retained one. A contested item keeps its own outcome; no other
+    /// item's answer discharges it.
+    pub conflict_id: Option<String>,
     /// Evidence references the obligation itself carries.
     pub evidence_refs: Vec<String>,
     /// Record fence the retained obligation was admitted under.
@@ -320,6 +332,7 @@ fn project_review_batches(coordination: &CoordinationOwner) -> Vec<ControlBoardR
         .map(|batch| ControlBoardReviewBatch {
             artifact_id: batch.artifact_id,
             current_artifact_revision: batch.current_artifact_revision,
+            current_artifact_digest: batch.current_artifact_digest,
             expected: batch.expected,
             submitted: batch.submitted,
             disposed: batch.disposed,
@@ -339,6 +352,7 @@ fn project_review_batches(coordination: &CoordinationOwner) -> Vec<ControlBoardR
                     standing: obligation.standing,
                     recommendation: obligation.recommendation,
                     rejection_reason: obligation.rejection_reason,
+                    conflict_id: obligation.conflict_id,
                     evidence_refs: obligation.evidence_refs,
                     state_fence: obligation.state_fence,
                 })

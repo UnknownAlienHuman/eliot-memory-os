@@ -3910,6 +3910,10 @@ pub struct PeerReviewObligation {
     pub standing: PeerReviewStanding,
     pub recommendation: ReviewRecommendation,
     pub rejection_reason: Option<String>,
+    /// Conflict this obligation's recommendation is contested under, when the
+    /// owner retained one. Naming the conflict is part of the item's own
+    /// outcome: a contested item is never discharged by another item's answer.
+    pub conflict_id: Option<String>,
     pub evidence_refs: Vec<String>,
     pub proof_refs: Vec<String>,
     pub created_at: u64,
@@ -3949,6 +3953,7 @@ impl From<&AnchoredReview> for PeerReviewObligation {
             standing: review.standing,
             recommendation: review.recommendation,
             rejection_reason: review.rejection_reason.clone(),
+            conflict_id: review.conflict_id.clone(),
             evidence_refs: review.evidence_refs.clone(),
             proof_refs: review.proof_refs.clone(),
             created_at: review.created_at,
@@ -3968,8 +3973,20 @@ impl From<&AnchoredReview> for PeerReviewObligation {
 pub struct PeerReviewBatch {
     pub artifact_id: String,
     /// Currently admitted artifact head revision, or `None` when no revision
-    /// has been admitted. This is the current target, not the reviewed one.
+    /// has been admitted. This is the current target, not the reviewed one:
+    /// it lives in the coordination artifact-revision space, exactly like each
+    /// obligation's `artifact_revision`, and is neither a `ViewRevision` nor a
+    /// source-code commit.
     pub current_artifact_revision: Option<u64>,
+    /// Digest bound at the currently admitted head revision, or `None` when no
+    /// revision has been admitted. Together with `current_artifact_revision`
+    /// this separates the current target from every obligation's own
+    /// historical `artifact_revision`/`artifact_digest`: a head that moved with
+    /// an unchanged digest is not new content, and a head with a changed
+    /// digest does not inherit approval of the old content. No resolver runs
+    /// here; current-target candidates and resolution evidence need a producer
+    /// the owner does not have.
+    pub current_artifact_digest: Option<String>,
     /// Owner-recorded expected-review count, or `None` when unrecorded.
     pub expected: Option<u64>,
     /// Number of retained obligations for this artifact.
@@ -4494,12 +4511,11 @@ impl CoordinationOwner {
                     .filter(|obligation| obligation.is_disposed())
                     .count() as u64;
                 let expected = self.peer_review_expectations.get(artifact_id).copied();
+                let head = self.peer_artifact_heads.get(artifact_id);
                 PeerReviewBatch {
                     artifact_id: artifact_id.to_owned(),
-                    current_artifact_revision: self
-                        .peer_artifact_heads
-                        .get(artifact_id)
-                        .map(|head| head.revision),
+                    current_artifact_revision: head.map(|head| head.revision),
+                    current_artifact_digest: head.map(|head| head.digest.clone()),
                     expected,
                     submitted,
                     disposed,
