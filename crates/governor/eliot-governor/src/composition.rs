@@ -6852,11 +6852,13 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     ///
     /// The exact task binding and acceptance digest come from Governor's
     /// retained cold-start terminal, never from a request-supplied
-    /// `TaskSelectionEvidence`. The retained receipt does not carry a typed
-    /// task-selection source, so this method does not synthesize one from an
-    /// unrelated profile reference. Before returning a selection disposition,
-    /// this method validates the retained receipt and exact lease key against
-    /// the live Governor fence and freshly matched `WorkScope`. A current task
+    /// `TaskSelectionEvidence`. The receipt carries the owner-proven selection
+    /// source/evidence refs the promoting owner admitted
+    /// (`TaskIntakeCandidate::promote` via [`Self::promote_task_intake`): the
+    /// admitting decision owner or delegating binding, and the exact intake
+    /// handle. This method validates the retained receipt and exact lease key
+    /// against the live Governor fence and freshly matched `WorkScope` without
+    /// synthesizing any reference. A current task
     /// contract is additionally joined to the unique live activation,
     /// including principal, session, task id and revision.
     ///
@@ -7040,6 +7042,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// task binding the delegation names (`parent`, read from live governor
     /// task state), so a `Current` binding input only ever arises from the
     /// required owner or a proven delegation, never from direct construction.
+    /// The admitted selection act travels with the input: the admitting
+    /// decision owner (or delegating binding) as `selection_source_ref` and
+    /// the exact intake as `evidence_ref`, which the receipt compiler carries
+    /// into the terminal receipt for the bind path to compare.
     /// Live status: owning thin entry for task ingress; no live task ingress
     /// builds a `TaskIntakeCandidate` yet (BLOCKED-BY task-ingress).
     pub fn promote_task_intake(
@@ -12768,6 +12774,8 @@ mod tests {
                 task_ref: "task:one".to_owned(),
                 task_revision: 1,
                 acceptance_digest: "digest:acceptance:one".to_owned(),
+                selection_source_ref: "owner:test".to_owned(),
+                evidence_ref: "intake:test".to_owned(),
             },
         );
         let observed = eliot_workscope::ScopeBinding {

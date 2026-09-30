@@ -33,11 +33,11 @@
 //! - [`admit_canonical_write`] — the composition-root named-mutation intake.
 //!   The caller presents its compiled
 //!   [`OnboardingReadinessReceipt`](eliot_workscope::OnboardingReadinessReceipt),
-//!   so this is the only entry that can see its task binding. The receipt has
-//!   no owner-proven selection source/evidence; a `CurrentTaskContract` binding
-//!   is refused with `TASK_SELECTION_REQUIRED` until the task-intake owner
-//!   supplies it. No source is synthesized from an unrelated profile or
-//!   receipt handle. I5.6 step 4 verbatim — "resolve `TaskSelectionEvidence`
+//!   so this is the only entry that can see its task binding. The receipt
+//!   carries the owner-proven selection source/evidence from the promoting
+//!   task-intake owner, which [`resolve_task_selection`] validates into
+//!   [`TaskSelectionEvidence`]. No source is synthesized from an unrelated
+//!   profile or receipt handle. I5.6 step 4 verbatim — "resolve `TaskSelectionEvidence`
 //!   and `TaskContract` compatibility when the command is task-relative".
 //! - [`admit_named_mutation_capture`] — the transport edge
 //!   (`DaemonKernelClient::apply_prepared`). No typed selection exists there, so
@@ -1623,9 +1623,29 @@ pub fn resolve_task_selection(
         ))
     })?;
     match &receipt.task_binding {
-        TaskBindingState::CurrentTaskContract { .. } => Err(TaskBindingError::selection_required(
-            "current task has no owner-proven selection source/evidence",
-        )),
+        TaskBindingState::CurrentTaskContract {
+            task_ref,
+            task_revision,
+            acceptance_digest,
+            selection_source_ref,
+            evidence_ref,
+        } => {
+            let evidence = TaskSelectionEvidence {
+                task_ref: task_ref.clone(),
+                task_revision: *task_revision,
+                acceptance_digest: acceptance_digest.clone(),
+                work_scope_ref: receipt.scope.scope_ref.clone(),
+                selection_source_ref: selection_source_ref.clone(),
+                evidence_ref: evidence_ref.clone(),
+                contamination_flags: Vec::new(),
+            };
+            evidence.validate().map_err(|error| {
+                TaskBindingError::selection_required(format!(
+                    "current task selection evidence is invalid: {error}"
+                ))
+            })?;
+            Ok(TaskSelectionDisposition::Current(evidence))
+        }
         TaskBindingState::Exploratory {
             task_ref,
             task_revision,
@@ -2013,10 +2033,9 @@ pub fn admit_bootstrap_context(
             next_safe_action: receipt.next_safe_action.clone(),
         }),
         TaskSelectionResponse::Current(task) => {
-            // `resolve_task_selection` refuses `CurrentTaskContract` until the
-            // readiness receipt carries owner-proven selection source/evidence,
-            // so this arm is unreachable today and becomes reachable only
-            // through that owner producer — never through a caller READY flag.
+            // `resolve_task_selection` admits `CurrentTaskContract` only from
+            // the owner-proven selection source/evidence the receipt carries —
+            // never through a caller READY flag.
             if receipt.scope_resolution != ScopeResolutionState::Authenticated
                 || receipt.readiness != ReadinessLifecycle::ReadyMaterial
             {
@@ -2101,10 +2120,9 @@ fn compatibility_for(
 /// - any task-relative write — one that names a task, or a task-control,
 ///   finish, or other task-bearing transition — requires the exact selection
 ///   and is admitted only through [`admit_task_bound`]. Absent, exploratory,
-///   stale, or current-without-owner-proven-source evidence rejects with
-///   `TASK_SELECTION_REQUIRED`; a selection naming a different task,
-///   `WorkScope`, or moved fence rejects with `TASK_SCOPE_INCOMPATIBLE`,
-///   mutating nothing;
+///   or stale evidence rejects with `TASK_SELECTION_REQUIRED`; a selection
+///   naming a different task, `WorkScope`, or moved fence rejects with
+///   `TASK_SCOPE_INCOMPATIBLE`, mutating nothing;
 /// - anything else is [`TaskBindingAdmission::NotTaskRelative`].
 ///
 /// This entry never selects a task the caller did not name and never consults
