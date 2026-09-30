@@ -151,7 +151,7 @@ import tomllib
 from pathlib import Path
 
 SCHEMA = "eliot.context-measurement-inventory.v2"
-RULE_REVISION = "866.2"
+RULE_REVISION = "866.3"
 TOOL_VERSION = "0.2.0"
 OWNED_TOML = Path(".github/work-units/context-measurement-inventory.toml")
 OWNER_MAP_PATH = Path(".github/work-units/context-measurement-owner-map.toml")
@@ -530,7 +530,37 @@ WORKSET_KEYS = frozenset(
     }
 )
 
-TOP_LEVEL_KEYS = frozenset({"header", "rows", "consumer_worksets", "inventory_digest"})
+# One row of a proposed split. It is a proposal only: it never widens a write
+# scope, never introduces a path outside the parent workset, and stays blocking
+# until the integration owner accepts it.
+SPLIT_KEYS = frozenset(
+    {
+        "issue",
+        "split_index",
+        "requirement_ids",
+        "row_ids",
+        "source_paths",
+        "items",
+        "read_only_paths",
+        "read_only_spans",
+        "test_paths",
+        "span_bytes",
+        "span_stu",
+        "test_bytes",
+        "test_stu",
+        "workset_bytes",
+        "workset_stu",
+        "upper_review_band_stu",
+        "band_disposition",
+        "blocking",
+        "acceptance_required_from",
+        "split_digest",
+    }
+)
+
+TOP_LEVEL_KEYS = frozenset(
+    {"header", "rows", "consumer_worksets", "proposed_splits", "inventory_digest"}
+)
 
 TEST_MARKER_ATTR = re.compile(r"#\[(?:cfg\(test\)|test|tokio::test|test_case|rstest|async_std::test)")
 ITEM_RE = re.compile(
@@ -1439,16 +1469,122 @@ def _verify_declared_paths(
     return verified
 
 
+def _split_unit_order(row: dict[str, object]) -> tuple[int, str, str]:
+    """Largest span first, then exact path and span: a total, traversal-free order."""
+    return (
+        -int(row["span_bytes"]),  # type: ignore[arg-type]
+        str(row["path"]),
+        int(row["span_start"]),  # type: ignore[arg-type]
+    )
+
+
+def _build_proposed_split(
+    owner: str,
+    owned_rows: list[dict[str, object]],
+    test_records: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Propose a blocking split of one oversized consumer into band-sized groups.
+
+    The groups are derived only from the finite data this generator already
+    measured for the consumer: the exact owned rows (path, item span, span bytes)
+    and the exact verified test paths. Every owned row lands in exactly one group,
+    so no requirement (case_ref) is dropped or duplicated, and the groups carry the
+    same paths the parent workset already held - a split never widens a write
+    scope. Groups are balanced by the deterministic rule "add the next row to the
+    first group that still fits under the band", which needs no second scanner and
+    no hardcoded per-consumer list.
+    """
+    ordered = sorted(owned_rows, key=_split_unit_order)
+    test_by_path = {str(record["path"]): record for record in test_records}
+    # A test path is not attributable to one row, so it is shared: the first group
+    # that still fits under the band carries it, and it appears in exactly one group.
+    groups: list[dict[str, object]] = []
+    for row in ordered:
+        span = int(row["span_bytes"])  # type: ignore[arg-type]
+        for group in groups:
+            if _stu(int(group["workset_bytes"]) + span) <= UPPER_REVIEW_BAND_STU:  # type: ignore[arg-type]
+                group["rows"].append(row)  # type: ignore[union-attr]
+                group["workset_bytes"] = int(group["workset_bytes"]) + span  # type: ignore[arg-type]
+                break
+        else:
+            groups.append({"rows": [row], "workset_bytes": span})
+    for path in sorted(test_by_path):
+        record = test_by_path[path]
+        size = int(record["bytes"])  # type: ignore[arg-type]
+        for group in groups:
+            if _stu(int(group["workset_bytes"]) + size) <= UPPER_REVIEW_BAND_STU:  # type: ignore[arg-type]
+                group["test_paths"] = list(group.get("test_paths", [])) + [path]  # type: ignore[arg-type]
+                group["workset_bytes"] = int(group["workset_bytes"]) + size  # type: ignore[arg-type]
+                break
+        else:
+            # A single test file larger than the whole band still gets its own exact
+            # group; the row records the overflow instead of hiding it.
+            groups.append(
+                {"rows": [], "test_paths": [path], "workset_bytes": size}
+            )
+    splits: list[dict[str, object]] = []
+    for index, group in enumerate(groups, start=1):
+        group_rows = list(group["rows"])  # type: ignore[arg-type]
+        writable = [row for row in group_rows if row["write_scope"] == "writable"]
+        read_only = [row for row in group_rows if row["write_scope"] == "read-only"]
+        span_bytes = sum(int(row["span_bytes"]) for row in group_rows)  # type: ignore[arg-type]
+        test_paths = sorted(str(p) for p in group.get("test_paths", []))  # type: ignore[arg-type]
+        test_bytes = sum(int(test_by_path[p]["bytes"]) for p in test_paths)  # type: ignore[arg-type]
+        workset_bytes = int(group["workset_bytes"])  # type: ignore[arg-type]
+        workset_stu = _stu(workset_bytes)
+        split: dict[str, object] = {
+            "issue": owner,
+            "split_index": index,
+            # requirement_ids are the preserved case_refs of the original oversized
+            # workset; every one of them appears in exactly one split row.
+            "requirement_ids": sorted(str(row["case_ref"]) for row in group_rows),
+            "row_ids": [str(row["id"]) for row in group_rows],
+            "source_paths": sorted({str(row["path"]) for row in writable}),
+            "items": [
+                f"{row['id']}:{row['path']}:{row['span_start']}-{row['span_end']}"
+                for row in writable
+            ],
+            "read_only_paths": sorted({str(row["path"]) for row in read_only}),
+            "read_only_spans": [
+                f"{row['id']}:{row['path']}:{row['span_start']}-{row['span_end']}"
+                for row in read_only
+            ],
+            "test_paths": test_paths,
+            "span_bytes": span_bytes,
+            "span_stu": _stu(span_bytes),
+            "test_bytes": test_bytes,
+            "test_stu": _stu(test_bytes),
+            "workset_bytes": workset_bytes,
+            "workset_stu": workset_stu,
+            "upper_review_band_stu": UPPER_REVIEW_BAND_STU,
+            "band_disposition": (
+                "WITHIN_UPPER_REVIEW_BAND"
+                if workset_stu <= UPPER_REVIEW_BAND_STU
+                else "SPLIT_ROW_STILL_EXCEEDS_BAND"
+            ),
+            "blocking": True,
+            "acceptance_required_from": INTEGRATION_OWNER,
+        }
+        split["split_digest"] = _sha256(_canonical_bytes(split))
+        if set(split.keys()) != SPLIT_KEYS:
+            raise InventoryError("SPLIT_NOT_CLOSED", f"split keys drifted: {owner}/{index}")
+        splits.append(split)
+    if not splits:
+        raise InventoryError("SPLIT_NOT_CLOSED", f"oversized consumer {owner} produced no split")
+    return splits
+
+
 def _build_consumer_worksets(
     root: Path,
     rows: list[dict[str, object]],
     file_records: list[dict[str, object]],
     map_status: str,
     verify_declared: bool,
-) -> list[dict[str, object]]:
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     bytes_by_path = {str(r["path"]): int(r["bytes"]) for r in file_records}  # type: ignore[arg-type]
     unresolved_denominator = [row for row in rows if row["status"] != "owned"]
     worksets: list[dict[str, object]] = []
+    proposed_splits: list[dict[str, object]] = []
     test_owner: dict[str, str] = {}
     source_owner: dict[str, str] = {}
     for owner in sorted(CONSUMER_SEAMS):
@@ -1525,6 +1661,11 @@ def _build_consumer_worksets(
                 f"workset {workset_stu} STU exceeds the {UPPER_REVIEW_BAND_STU} STU I2.16 upper review band; "
                 f"a blocking split proposal is required"
             )
+            # Proposed split, derived from the rows and test paths measured above.
+            # It proposes; it never widens a write scope and never drops a row.
+            proposed_splits.extend(
+                _build_proposed_split(owner, owned_rows, test_records)
+            )
         if not verify_declared:
             block_reasons.append(
                 "custom denominator: declared consumer source/test/read paths are not verified in this tree"
@@ -1575,7 +1716,7 @@ def _build_consumer_worksets(
         if set(workset.keys()) != WORKSET_KEYS:
             raise InventoryError("WORKSET_NOT_CLOSED", f"workset keys drifted: {owner}")
         worksets.append(workset)
-    return worksets
+    return worksets, proposed_splits
 
 
 def build_inventory(
@@ -1654,7 +1795,7 @@ def build_inventory(
         if not block_reasons
         else "incomplete: " + "; ".join(block_reasons)
     )
-    worksets = _build_consumer_worksets(
+    worksets, proposed_splits = _build_consumer_worksets(
         root, rows, file_records, map_status, default_denominator
     )
     header: dict[str, object] = {
@@ -1696,6 +1837,7 @@ def build_inventory(
         "header": header,
         "rows": rows,
         "consumer_worksets": worksets,
+        "proposed_splits": proposed_splits,
     }
     inventory["inventory_digest"] = _sha256(_canonical_bytes(inventory))
     return inventory
@@ -1779,6 +1921,29 @@ ROW_ORDER = (
     "invalidation",
 )
 
+SPLIT_ORDER = (
+    "issue",
+    "split_index",
+    "requirement_ids",
+    "row_ids",
+    "source_paths",
+    "items",
+    "read_only_paths",
+    "read_only_spans",
+    "test_paths",
+    "span_bytes",
+    "span_stu",
+    "test_bytes",
+    "test_stu",
+    "workset_bytes",
+    "workset_stu",
+    "upper_review_band_stu",
+    "band_disposition",
+    "blocking",
+    "acceptance_required_from",
+    "split_digest",
+)
+
 WORKSET_ORDER = (
     "issue",
     "role",
@@ -1837,7 +2002,13 @@ def _emit_toml(inventory: dict[str, object]) -> bytes:
     assert isinstance(rows, list)
     assert isinstance(worksets, list)
     assert isinstance(digest, str)
-    out: list[str] = [f"inventory_digest = {_toml_string(digest)}", ""]
+    out: list[str] = [f"inventory_digest = {_toml_string(digest)}"]
+    splits = inventory["proposed_splits"]
+    assert isinstance(splits, list)
+    # An empty array-of-tables emits no key at all, so the closed top-level set
+    # would not round-trip; the empty array is written explicitly instead.
+    out.append("proposed_splits = []" if not splits else "")
+    out.append("")
     _emit_table(out, "header", header, HEADER_ORDER)
     for row in rows:
         assert isinstance(row, dict)
@@ -1847,6 +2018,10 @@ def _emit_toml(inventory: dict[str, object]) -> bytes:
         assert isinstance(workset, dict)
         out.append("")
         _emit_table(out, "consumer_worksets", workset, WORKSET_ORDER, array=True)
+    for split in splits:
+        assert isinstance(split, dict)
+        out.append("")
+        _emit_table(out, "proposed_splits", split, SPLIT_ORDER, array=True)
     return ("\n".join(out) + "\n").encode("utf-8")
 
 
@@ -1862,19 +2037,27 @@ def _parse_toml(raw: bytes, *, source: str) -> dict[str, object]:
 
 def _validate_artifact(
     artifact: dict[str, object],
-) -> tuple[dict[str, object], list[dict[str, object]], list[dict[str, object]]]:
+) -> tuple[
+    dict[str, object],
+    list[dict[str, object]],
+    list[dict[str, object]],
+    list[dict[str, object]],
+]:
     if set(artifact.keys()) != TOP_LEVEL_KEYS:
         raise InventoryError(
-            "MALFORMED_INVENTORY", "owned TOML must hold header/rows/consumer_worksets/digest only"
+            "MALFORMED_INVENTORY",
+            "owned TOML must hold header/rows/consumer_worksets/proposed_splits/digest only",
         )
     header = artifact["header"]
     rows = artifact["rows"]
     worksets = artifact["consumer_worksets"]
+    splits = artifact["proposed_splits"]
     digest = artifact["inventory_digest"]
     if (
         not isinstance(header, dict)
         or not isinstance(rows, list)
         or not isinstance(worksets, list)
+        or not isinstance(splits, list)
         or not isinstance(digest, str)
     ):
         raise InventoryError("MALFORMED_INVENTORY", "owned TOML field types are wrong")
@@ -2069,15 +2252,155 @@ def _validate_artifact(
         )
     if _sha256(_canonical_bytes(typed_worksets)) != header["consumer_worksets_digest"]:
         raise InventoryError("DIGEST_MISMATCH", "consumer workset digest disagrees with content")
+    typed_splits = _validate_proposed_splits(typed_rows, typed_worksets, splits)
     recomputed = _sha256(
-        {"header": header, "rows": typed_rows, "consumer_worksets": typed_worksets} and
         _canonical_bytes(
-            {"header": header, "rows": typed_rows, "consumer_worksets": typed_worksets}
+            {
+                "header": header,
+                "rows": typed_rows,
+                "consumer_worksets": typed_worksets,
+                "proposed_splits": typed_splits,
+            }
         )
     )
     if recomputed != digest:
         raise InventoryError("DIGEST_MISMATCH", "inventory digest disagrees with content")
-    return header, typed_rows, typed_worksets
+    return header, typed_rows, typed_worksets, typed_splits
+
+
+def _validate_proposed_splits(
+    typed_rows: list[dict[str, object]],
+    typed_worksets: list[dict[str, object]],
+    splits: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Check the blocking split proposals against the rows and worksets themselves.
+
+    The expected requirement set is rebuilt from the artifact's own `rows` table
+    (owner -> case_ref) and the workset's own row_ids/test_paths, never from the
+    split tables, so a hand-edited split cannot satisfy the check by agreeing with
+    itself. Enforced here: finiteness (exact existing-path shape, no glob or
+    directory), disjointness (no row, span or test path in two split rows) and
+    requirement preservation (every case_ref of the oversized workset appears in
+    exactly one split row).
+    """
+    case_ref_of = {str(row["id"]): str(row["case_ref"]) for row in typed_rows}
+    owner_of = {str(row["id"]): str(row["owner"]) for row in typed_rows}
+    workset_of = {str(w["issue"]): w for w in typed_worksets}
+    oversized = {
+        issue
+        for issue, w in workset_of.items()
+        if str(w["band_disposition"]) == "EXCEEDS_UPPER_REVIEW_BAND_BLOCKING_SPLIT"
+    }
+    typed: list[dict[str, object]] = []
+    seen_rows: set[str] = set()
+    seen_test_paths: set[str] = set()
+    for split in splits:
+        if not isinstance(split, dict):
+            raise InventoryError("MALFORMED_INVENTORY", "proposed split must be a table")
+        if set(split.keys()) != SPLIT_KEYS:
+            raise InventoryError("MALFORMED_INVENTORY", "split keys are not the closed set")
+        issue = str(split["issue"])
+        if issue not in workset_of:
+            raise InventoryError("OWNER_NOT_CLOSED", f"split names a closed-set owner: {issue}")
+        workset = workset_of[issue]
+        for path in (
+            list(split["source_paths"])  # type: ignore[arg-type]
+            + list(split["read_only_paths"])  # type: ignore[arg-type]
+            + list(split["test_paths"])  # type: ignore[arg-type]
+        ):
+            rel = str(path)
+            if "*" in rel or rel.endswith("/") or not rel:
+                raise InventoryError(
+                    "DECLARED_PATH_NOT_EXACT", f"split path is not finite and exact: {rel}"
+                )
+        if not bool(split["blocking"]):
+            raise InventoryError(
+                "SPLIT_NOT_BLOCKING", f"a proposed split is blocking until accepted: {issue}"
+            )
+        if str(split["acceptance_required_from"]) != INTEGRATION_OWNER:
+            raise InventoryError(
+                "SPLIT_NOT_BLOCKING",
+                f"a proposed split is accepted only by {INTEGRATION_OWNER}: {issue}",
+            )
+        row_ids = [str(x) for x in split["row_ids"]]  # type: ignore[union-attr]
+        for row_id in row_ids:
+            if row_id not in case_ref_of:
+                raise InventoryError(
+                    "MALFORMED_INVENTORY", f"split references an unknown row: {row_id}"
+                )
+            if owner_of[row_id] != issue:
+                raise InventoryError(
+                    "SPLIT_SCOPE_EXPANDED",
+                    f"split row {row_id} belongs to {owner_of[row_id]}, not {issue}",
+                )
+            if row_id in seen_rows:
+                raise InventoryError(
+                    "SPLIT_NOT_DISJOINT", f"row {row_id} appears in two proposed split rows"
+                )
+            seen_rows.add(row_id)
+        # A split may only propose a subset of the paths its parent workset already
+        # held. Any new path would be a silent write-scope expansion.
+        parent_paths = set(workset["source_paths"]) | set(workset["read_only_paths"])  # type: ignore[arg-type]
+        for path in split["source_paths"]:  # type: ignore[union-attr]
+            if str(path) not in parent_paths:
+                raise InventoryError(
+                    "SPLIT_SCOPE_EXPANDED",
+                    f"split introduces a source path the workset never held: {path}",
+                )
+        for path in split["read_only_paths"]:  # type: ignore[union-attr]
+            if str(path) not in parent_paths:
+                raise InventoryError(
+                    "SPLIT_SCOPE_EXPANDED",
+                    f"split introduces a read-only path the workset never held: {path}",
+                )
+        for path in split["test_paths"]:  # type: ignore[union-attr]
+            rel = str(path)
+            if rel not in set(workset["test_paths"]):  # type: ignore[arg-type]
+                raise InventoryError(
+                    "SPLIT_SCOPE_EXPANDED",
+                    f"split introduces a test path the workset never held: {rel}",
+                )
+            if rel in seen_test_paths:
+                raise InventoryError(
+                    "SPLIT_NOT_DISJOINT", f"test path {rel} appears in two proposed split rows"
+                )
+            seen_test_paths.add(rel)
+        expected_refs = sorted(case_ref_of[row_id] for row_id in row_ids)
+        if sorted(str(x) for x in split["requirement_ids"]) != expected_refs:  # type: ignore[arg-type]
+            raise InventoryError(
+                "SPLIT_REQUIREMENT_DROPPED",
+                f"split requirement_ids disagree with its own rows: {issue}",
+            )
+        within = int(split["workset_stu"]) <= UPPER_REVIEW_BAND_STU  # type: ignore[arg-type]
+        if within != (str(split["band_disposition"]) == "WITHIN_UPPER_REVIEW_BAND"):
+            raise InventoryError(
+                "MALFORMED_INVENTORY", f"split band disposition disagrees with its STU: {issue}"
+            )
+        recomputed = {k: v for k, v in split.items() if k != "split_digest"}
+        if _sha256(_canonical_bytes(recomputed)) != split["split_digest"]:
+            raise InventoryError("DIGEST_MISMATCH", f"split digest disagrees with content: {issue}")
+        typed.append(split)
+    # Requirement preservation, measured against the rows table, not the split.
+    for issue in sorted(oversized):
+        expected = sorted(
+            case_ref_of[row_id] for row_id in workset_of[issue]["row_ids"]  # type: ignore[union-attr]
+        )
+        present: list[str] = []
+        for split in typed:
+            if str(split["issue"]) == issue:
+                present.extend(str(x) for x in split["requirement_ids"])  # type: ignore[arg-type]
+        if sorted(present) != expected:
+            raise InventoryError(
+                "SPLIT_REQUIREMENT_DROPPED",
+                f"the proposed split of {issue} does not preserve every requirement exactly once; "
+                f"expected {len(expected)} requirement id(s), found {len(present)}",
+            )
+    for issue in sorted({str(s["issue"]) for s in typed} - oversized):
+        raise InventoryError(
+            "SPLIT_NOT_REQUIRED",
+            f"{issue} is within its review band and needs no proposed split",
+        )
+    return typed
 
 
 def _fail(code: str, detail: str, status: str = "error") -> int:
@@ -2141,7 +2464,7 @@ def cmd_check(root: Path) -> int:
         raise InventoryError("ARTIFACT_UNREADABLE", f"cannot read owned TOML: {exc}") from exc
     artifact = _parse_toml(stored_raw, source=OWNED_TOML.as_posix())
     try:
-        header, _rows, worksets = _validate_artifact(artifact)
+        header, _rows, worksets, _splits = _validate_artifact(artifact)
     except InventoryError as exc:
         return _fail(exc.code, exc.detail)
     mapping, map_status, _map_digest = load_owner_map(root)
