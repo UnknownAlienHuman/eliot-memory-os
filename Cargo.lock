@@ -1066,6 +1066,7 @@ name = "eliot-code-cortex"
 version = "0.1.0"
 dependencies = [
  "eliot-blob-api",
+ "eliot-contracts",
  "eliot-graph-api",
  "eliot-instrument-api",
  "eliot-lsp-bridge",

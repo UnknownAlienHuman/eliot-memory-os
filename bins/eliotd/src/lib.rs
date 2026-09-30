@@ -2046,12 +2046,13 @@ impl DaemonComposition {
         let Some(current_task_binding) = current_task_binding else {
             return Ok(Vec::new());
         };
-        self.governor.consume_captured_lsp_observations(
-            current_task_binding,
-            &context.causal_binding,
-            observations,
-        )
-        .map_err(CapturedLspAdoptionError::from)
+        self.governor
+            .consume_captured_lsp_observations(
+                current_task_binding,
+                &context.causal_binding,
+                observations,
+            )
+            .map_err(CapturedLspAdoptionError::from)
     }
 
     /// Computes the digest of the provider-owned recovery snapshot admitted at
