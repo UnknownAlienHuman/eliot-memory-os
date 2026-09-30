@@ -2065,7 +2065,16 @@ fn matches_stream(
 /// read-only open would refuse on the pinned `x86_64-pc-windows-msvc` target and
 /// no journal row would ever be committed. A failed body flush is a refusal:
 /// the durable claim for a sealed record rests on this call.
-fn sync_file(path: &Path) -> Result<(), BackupError> {
+///
+/// This is the single file-durability primitive of the restore lane, not a
+/// journal-only one. The same flush-before-publish convention holds for every
+/// byte a sealed record commits AND for every byte the restore target
+/// publishes before its phase receipt is allowed to advance the ORS journal
+/// (`backup_restore.rs::KernelRestoreTarget::write_file`): a phase receipt
+/// must never be journalled over material a target power loss could remove.
+/// A second helper would be a second, divergent answer to one question, so the
+/// promotion is `pub(crate)` and nothing else about the primitive changes.
+pub(crate) fn sync_file(path: &Path) -> Result<(), BackupError> {
     std::fs::OpenOptions::new()
         .write(true)
         .open(path)
@@ -2084,15 +2093,21 @@ fn sync_file(path: &Path) -> Result<(), BackupError> {
 /// exactly these three kinds, and this follows that precedent. The body itself
 /// is flushed unconditionally by [`sync_file`] before the ORS row is committed,
 /// so the durability claim does not depend on this call.
+///
+/// Publication durability is part of the same guarantee, not an extra layer:
+/// every durable writer in this lane flushes the directory entry that names
+/// what it just published, so the restore target uses this exact call for its
+/// own phase material and there is one answer to "is the name durable yet",
+/// not one per writer.
 #[cfg(unix)]
-fn sync_parent_directory(directory: &Path) -> Result<(), BackupError> {
+pub(crate) fn sync_parent_directory(directory: &Path) -> Result<(), BackupError> {
     std::fs::File::open(directory)
         .and_then(|handle| handle.sync_all())
         .map_err(|error| BackupError::Target(error.to_string()))
 }
 
 #[cfg(windows)]
-fn sync_parent_directory(directory: &Path) -> Result<(), BackupError> {
+pub(crate) fn sync_parent_directory(directory: &Path) -> Result<(), BackupError> {
     use std::os::windows::fs::OpenOptionsExt as _;
 
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
@@ -2111,7 +2126,7 @@ fn sync_parent_directory(directory: &Path) -> Result<(), BackupError> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn sync_parent_directory(_directory: &Path) -> Result<(), BackupError> {
+pub(crate) fn sync_parent_directory(_directory: &Path) -> Result<(), BackupError> {
     Ok(())
 }
 

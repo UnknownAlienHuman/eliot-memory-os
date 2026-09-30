@@ -54,8 +54,10 @@
 //!
 //! Effects whose bindings are absent refuse fail-closed with the exact
 //! responsible capability; reconciliation answers from persisted identity
-//! receipts (`Applied` on exact transaction/phase/input match, `NotApplied`
-//! otherwise, `Unknown` only for undecidable bytes so the engine takes its
+//! receipts and the material those receipts attest (`Applied` only on exact
+//! transaction/phase/input match with the attested material still present and
+//! still the digested bytes, `NotApplied` only on phase-specific positive
+//! no-effect evidence, `Unknown` for everything else so the engine takes its
 //! explicit rollback-required disposition). All effects here are synchronous
 //! and local with a persisted identity receipt per phase, so no ambiguous
 //! external commit exists in this target and no `Unknown` outcome is
@@ -110,6 +112,7 @@ use super::backup_restore_ports::{
     PinnedDestinationAdmission, RESTORE_EVIDENCE_FILE, RESTORE_ISOLATED_AREA,
     RESTORE_JOURNAL_IDENTITY, RESTORE_JOURNAL_PAYLOAD_AREA, RestorePorts, StagedCleanupRefusal,
     backup_to_kernel, check_kernel_effect_fence, ors_to_backup, require_production_admitted,
+    sync_file, sync_parent_directory,
 };
 
 /// Maps one accepted restore step to its responsible owner.
@@ -324,6 +327,17 @@ const STAGED_OUTPUT_BYTES_FIELD: &str = "restore.staged_output_bytes";
 /// this manifest field with, so one disagreement has one name here and in the
 /// seam contract.
 const PURGE_LEDGER_REVISION_SUBJECT: &str = "purge ledger revision";
+/// Directory of the isolated skeleton that
+/// [`RestoreTarget::prepare_isolated`] creates and that
+/// [`KernelRestoreTarget::phase_receipt_path`] writes into.
+///
+/// It is named here because it is the only durable artefact
+/// [`RestorePhase::PrepareIsolatedRoot`] owns unconditionally, so it is also
+/// that phase's positive no-effect evidence: nothing else in this file
+/// creates it, so its absence after an `IntentPersisted` prepare is proof the
+/// phase published nothing, while its presence is proof it published
+/// something.
+const ISOLATED_SKELETON_DIR: &str = "phase-receipts";
 
 /// Checked accumulation for the derived staged-output denominators. Overflow
 /// refuses the archive through the named ceiling rather than wrapping a byte
@@ -1510,6 +1524,52 @@ enum ObservedEffect {
     Undecidable,
 }
 
+/// The exact material one restore phase published under the destination.
+///
+/// Every phase writes through [`KernelRestoreTarget::write_file`] and hands
+/// its evidence to [`KernelRestoreTarget::effect_receipt`], which digests
+/// those bytes into [`RestoreEffectReceipt::evidence_sha256`]. For eight of
+/// the ten phases the evidence bytes ARE the published member's bytes — the
+/// phase reads them back through
+/// [`KernelRestoreTarget::staged_bytes`], or writes that very buffer — so the
+/// receipt's digest is a claim about material on disk and can be compared
+/// against it. The two exceptions are stated in
+/// [`KernelRestoreTarget::phase_material`] rather than papered over: their
+/// evidence is a separate observation document that is never persisted, so
+/// only the presence of what they published is re-provable.
+struct PhaseMaterial {
+    /// The member this phase published, when it publishes one.
+    member: Option<PathBuf>,
+    /// Whether `RestoreEffectReceipt::evidence_sha256` is the digest of
+    /// `member`'s exact bytes.
+    receipt_digests_member: bool,
+    /// Whether this phase owns the isolated directory skeleton.
+    owns_skeleton: bool,
+}
+
+impl PhaseMaterial {
+    /// How many pieces of material this phase owns, so a partially present
+    /// set is distinguishable from a wholly absent one.
+    fn owned(&self) -> usize {
+        usize::from(self.member.is_some()) + usize::from(self.owns_skeleton)
+    }
+}
+
+/// What re-reading a phase's own material established.
+///
+/// Absence is only ever [`Self::Absent`] when EVERY piece the phase owns is
+/// absent; a partially present set is [`Self::Undecidable`] because the
+/// difference between "the phase never ran" and "a power loss removed some of
+/// what it published" is not observable from the survivors.
+enum PhaseMaterialState {
+    /// No material this phase owns is present: the phase published nothing.
+    Absent,
+    /// Every piece of material this phase owns is present and readable.
+    Present,
+    /// Material is there but incomplete, or could not be read at all.
+    Undecidable,
+}
+
 /// Bounded removal disposition for the output one restore execution staged.
 ///
 /// A disposition, not an error: the primary engine failure is returned either
@@ -1530,9 +1590,11 @@ enum StagedCleanup {
 ///
 /// Every applicable phase re-checks the Kernel effect fence before touching
 /// state, executes the genuine responsible-owner operation with the exact
-/// bindings the coordinator supplies, persists exact bytes, and returns an
-/// observed receipt. Reconciliation answers from persisted identity receipts
-/// only.
+/// bindings the coordinator supplies, persists exact bytes — flushed before
+/// they are published, so a phase receipt can never be journalled over bytes a
+/// power loss could remove — and returns an observed receipt. Reconciliation
+/// answers from persisted identity receipts AND the material they attest, never
+/// from a receipt alone.
 ///
 /// It also owns the two bounds the target is responsible for: every staged
 /// write is admitted against [`StagedOutputBudget`] BEFORE it happens, and the
@@ -1752,6 +1814,43 @@ impl<'a> KernelRestoreTarget<'a> {
     /// [`BackupError::LimitExceeded`] naming the exact ceiling, not a
     /// formatted message, and it propagates through the phase and the engine
     /// unchanged.
+    ///
+    /// ## Order: reserved capacity, durable bytes, published name
+    ///
+    /// The byte/member checks above are the "reserve bounded output capacity"
+    /// step and happen BEFORE any I/O, so a refused write never creates a
+    /// directory, a temporary file or a byte. The remaining four steps are
+    /// the same admitted durable-file staging convention the ORS journal
+    /// already applies to its own sealed bodies
+    /// ([`sync_file`](super::backup_restore_ports::sync_file) /
+    /// [`sync_parent_directory`](super::backup_restore_ports::sync_parent_directory),
+    /// called from `OrsRestoreJournal::seal`), in the order the durable claim
+    /// requires:
+    ///
+    /// ```text
+    /// reserve bounded output capacity          (the two LimitExceeded checks)
+    /// -> create/write the exact operation-owned temporary file   (write)
+    /// -> flush the written file               (sync_file, before publishing)
+    /// -> publish it at the admitted destination                 (rename)
+    /// -> establish publication durability     (sync_parent_directory)
+    /// -> publish/flush the phase receipt     (persist_applied's own call)
+    /// -> allow the existing ORS CAS to record ReceiptPersisted
+    /// ```
+    ///
+    /// Atomic naming is not durability: a rename only makes the NAME atomic,
+    /// and the engine CASes `ReceiptPersisted` into a store that does fsync
+    /// afterwards. Without the two flushes the journal would be told
+    /// `ReceiptPersisted` over bytes a power loss could still remove, so a
+    /// recovered row could point at absent material
+    /// ([`load_applied`](Self::load_applied) is the readback half).
+    ///
+    /// A flush failure is a refusal, never a silent success: the error
+    /// propagates as the phase's own `BackupError`, which the engine
+    /// reconciles against that same phase. No ORS transaction is held across
+    /// any of this I/O, and no cross-store atomicity is claimed — the flushes
+    /// bound the window, they do not close it. The staged counters and
+    /// [`Self::staged`] are committed only after both flushes, so a refusal
+    /// never accounts a file that was never published.
     fn write_file(&mut self, relative: &str, bytes: &[u8]) -> Result<(), BackupError> {
         let members = self
             .staged_members
@@ -1789,7 +1888,19 @@ impl<'a> KernelRestoreTarget<'a> {
         }
         let tmp = path.with_extension("tmp-restore");
         std::fs::write(&tmp, bytes).map_err(|error| BackupError::Target(error.to_string()))?;
+        // Flush the operation-owned temporary file BEFORE it is published.
+        // Publishing first and flushing after would let a crash between the
+        // two leave a name that points at bytes the target never made stable.
+        sync_file(&tmp)?;
         std::fs::rename(&tmp, &path).map_err(|error| BackupError::Target(error.to_string()))?;
+        // Flush the directory entry that now names the published file, so the
+        // name itself survives the same power loss the bytes must survive.
+        // `contained_member_path` admits only one or more plain relative
+        // segments, so the joined path always has a parent; it is still
+        // resolved rather than assumed, because a member that named none
+        // would leave the publication above unflushable, and that must be a
+        // refusal rather than a silent skip of the durability step.
+        sync_parent_directory(path.parent().ok_or(BackupError::RestoreJournalCorrupt)?)?;
         self.staged_members = members;
         self.staged_bytes = staged_bytes;
         self.staged.push(path);
@@ -1849,7 +1960,7 @@ impl<'a> KernelRestoreTarget<'a> {
             .map_err(|error| BackupError::Serialization(error.to_string()))?;
         Ok(self
             .root
-            .join("phase-receipts")
+            .join(ISOLATED_SKELETON_DIR)
             .join(format!("{}.json", sha256_hex(&bytes))))
     }
 
@@ -2079,12 +2190,207 @@ impl<'a> KernelRestoreTarget<'a> {
         }
     }
 
+    /// The exact material one restore phase published, and whether the phase
+    /// receipt digests those bytes.
+    ///
+    /// The mapping is the mirror of the `apply_*` methods: each arm names the
+    /// same member that method stages, and each `true` marks a phase whose
+    /// [`Self::effect_receipt`] call digests exactly the bytes that member
+    /// holds. Nothing here is derived from the receipt, from a count, or from
+    /// a name the phase did not write — the material is named by the phase
+    /// itself, so a resumed receipt is checked against the same member the
+    /// phase produced, not against a weaker echo of itself.
+    fn phase_material(&self, phase: &RestorePhase) -> Result<PhaseMaterial, BackupError> {
+        match phase {
+            RestorePhase::Pending => Err(BackupError::RestorePhaseMismatch),
+            RestorePhase::PrepareIsolatedRoot => Ok(PhaseMaterial {
+                // The pinned destination admission is the one durable byte
+                // prepare publishes, and only when this execution has Host
+                // admission to pin; a rehearsal without it publishes no
+                // member, and the skeleton below is then the phase's whole
+                // material.
+                member: self
+                    .manifest_evidence
+                    .as_ref()
+                    .map(|_| self.contained_member_path(DESTINATION_ADMISSION_FILE))
+                    .transpose()?,
+                // `apply_prepare` digests `ObservedPrepare`, an observation
+                // assembled in memory and never persisted, so the admission's
+                // own bytes carry no digest the receipt attests.
+                receipt_digests_member: false,
+                owns_skeleton: true,
+            }),
+            RestorePhase::ApplyPurgeLedger => self.digested_member("purge_ledger.json"),
+            RestorePhase::ImportSealedBlob { hash } => Ok(PhaseMaterial {
+                member: Some(self.contained_member_path(&format!("blobs/{hash}"))?),
+                // `apply_blob` digests `ObservedBlobRestore` — the observed
+                // re-seal, including a `resealed_sha256` that is a
+                // destination-encrypted digest no archive member carries.
+                // That document is never persisted, so the receipt attests no
+                // digest of the re-sealed bytes and only their presence is
+                // re-provable. Stated here rather than papered over; the
+                // content binding this phase does own is
+                // `BlobOwnerClient::restore_blob`, which re-verifies the
+                // plaintext digest and the restoration receipt before it
+                // stages anything.
+                receipt_digests_member: false,
+                owns_skeleton: false,
+            }),
+            RestorePhase::ImportCanonicalEvent { record_id } => {
+                self.digested_member(&format!("events/{record_id}.json"))
+            }
+            RestorePhase::ImportReceipt { operation_id } => {
+                self.digested_member(&format!("receipts/{operation_id}.json"))
+            }
+            RestorePhase::ImportProjection { record_id } => {
+                self.digested_member(&format!("projections/{record_id}.json"))
+            }
+            RestorePhase::SuspendOrsOperations => self.digested_member("suspended_ors.json"),
+            RestorePhase::RebuildProjections => self.digested_member("rebuild.json"),
+            RestorePhase::VerifyReceiptEventChain => self.digested_member("verify.json"),
+            RestorePhase::FinalizeIsolatedRoot => self.digested_member(RESTORE_EVIDENCE_FILE),
+        }
+    }
+
+    /// Material for a phase whose receipt digest IS the digest of the bytes it
+    /// published, because the `apply_*` method either staged that buffer or
+    /// read it back through [`Self::staged_bytes`] and handed it to
+    /// [`Self::effect_receipt`].
+    fn digested_member(&self, relative: &str) -> Result<PhaseMaterial, BackupError> {
+        Ok(PhaseMaterial {
+            member: Some(self.contained_member_path(relative)?),
+            receipt_digests_member: true,
+            owns_skeleton: false,
+        })
+    }
+
+    /// Re-reads the material a recovered phase receipt attests.
+    ///
+    /// This is the readback half of the durability order
+    /// [`Self::write_file`] establishes on the write half. A receipt is only
+    /// an observation of an effect; it is not the effect. Without this, a
+    /// receipt whose material a power loss removed — or that names bytes
+    /// other than the ones now on disk — still reports `Applied` and the
+    /// engine advances to the next phase, over a phase that never produced
+    /// what the journal and the finalize obligations say it produced.
+    ///
+    /// Refusals reuse the file's existing vocabulary rather than a new error
+    /// kind: [`BackupError::RestoreJournalCorrupt`] is what a journaled effect
+    /// without its observation already is here
+    /// ([`Self::group_ref`], [`Self::check_destination_admission`]), and
+    /// [`BackupError::RestoreJournalMismatch`] is what a receipt that
+    /// disagrees with what it names already is. An unreadable path is a
+    /// [`BackupError::Target`], never an absence.
+    fn check_attested_material(
+        &self,
+        material: &PhaseMaterial,
+        evidence_sha256: &str,
+    ) -> Result<(), BackupError> {
+        if let Some(member) = material.member.as_deref() {
+            let bytes = match std::fs::read(member) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(BackupError::RestoreJournalCorrupt);
+                }
+                Err(error) => return Err(BackupError::Target(error.to_string())),
+            };
+            if material.receipt_digests_member && sha256_hex(&bytes) != evidence_sha256 {
+                return Err(BackupError::RestoreJournalMismatch);
+            }
+        }
+        if material.owns_skeleton {
+            match std::fs::read_dir(self.root.join(ISOLATED_SKELETON_DIR)) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(BackupError::RestoreJournalCorrupt);
+                }
+                Err(error) => return Err(BackupError::Target(error.to_string())),
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-reads the material a phase owns, without a receipt to compare it to.
+    ///
+    /// This is what a MISSING receipt is checked against. The receipt is
+    /// written after the material it describes, so its absence is compatible
+    /// with two different histories — the phase never ran, or the phase ran
+    /// and the receipt (or the material) was then lost — and only the
+    /// phase's own material can tell them apart.
+    fn observe_phase_material(&self, material: &PhaseMaterial) -> PhaseMaterialState {
+        let mut present = 0usize;
+        let mut undecidable = false;
+        if let Some(member) = material.member.as_deref() {
+            match std::fs::read(member) {
+                Ok(_) => present += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => undecidable = true,
+            }
+        }
+        if material.owns_skeleton {
+            match std::fs::read_dir(self.root.join(ISOLATED_SKELETON_DIR)) {
+                Ok(_) => present += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => undecidable = true,
+            }
+        }
+        if undecidable {
+            PhaseMaterialState::Undecidable
+        } else if present == 0 {
+            PhaseMaterialState::Absent
+        } else if present == material.owned() {
+            PhaseMaterialState::Present
+        } else {
+            PhaseMaterialState::Undecidable
+        }
+    }
+
+    /// Reads one phase's recovered observation back off the destination.
+    ///
+    /// Two properties, both required by A13.7 ARCH-RES-03 and I14.21, and
+    /// neither of which the previous `Path::exists()` shape had:
+    ///
+    /// 1. the absence test is a FALLIBLE READ, not an existence probe.
+    ///    `Path::exists()` collapses a missing file, a permission denial and a
+    ///    broken path into one silent `false`, so inaccessible evidence was
+    ///    reported as evidence of absence. Only `NotFound` means "no
+    ///    receipt" here; every other error refuses, because a refusal is a
+    ///    fact the coordinator can act on and a false absence is not;
+    /// 2. a receipt that IS there must still be describing material that is
+    ///    still there, with the bytes it digested
+    ///    ([`Self::check_attested_material`]). Validating the receipt's own
+    ///    digests against themselves is not a weaker version of this check, it
+    ///    is the substitution being fixed: a receipt is a description, and a
+    ///    description is not its own evidence.
+    ///
+    /// A missing receipt is NOT downgraded to proven no-effect. The phase's
+    /// own material is consulted instead ([`Self::observe_phase_material`]),
+    /// and only material that is wholly absent — phase-specific positive
+    /// no-effect evidence — yields
+    /// [`ObservedEffect::NotAttempted`]. Material that is present, partially
+    /// present, or unreadable yields [`ObservedEffect::Undecidable`], which
+    /// [`RestoreTarget::reconcile_restore_effect`] reports as
+    /// [`RestoreReconciliation::Unknown`](eliot_backup::RestoreReconciliation::Unknown)
+    /// so the engine takes its explicit rollback-required disposition on that
+    /// same phase. No second phase state machine is introduced: the decision is
+    /// a read of this phase's own bytes, and the engine remains the only
+    /// thing that advances a phase.
     fn load_applied(&self, intent: &RestoreIntent) -> Result<ObservedEffect, BackupError> {
         let path = self.phase_receipt_path(&intent.phase)?;
-        if !path.exists() {
-            return Ok(ObservedEffect::NotAttempted);
-        }
-        let bytes = std::fs::read(&path).map_err(|error| BackupError::Target(error.to_string()))?;
+        let material = self.phase_material(&intent.phase)?;
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(match self.observe_phase_material(&material) {
+                    PhaseMaterialState::Absent => ObservedEffect::NotAttempted,
+                    PhaseMaterialState::Present | PhaseMaterialState::Undecidable => {
+                        ObservedEffect::Undecidable
+                    }
+                });
+            }
+            // Inaccessible receipt state is not absence: it is a refusal.
+            Err(error) => return Err(BackupError::Target(error.to_string())),
+        };
         let applied: RestoreAppliedEffect = match serde_json::from_slice(&bytes) {
             Ok(applied) => applied,
             // Torn or foreign bytes: the effect state cannot be established
@@ -2099,6 +2405,7 @@ impl<'a> KernelRestoreTarget<'a> {
         {
             return Err(BackupError::RestoreJournalCorrupt);
         }
+        self.check_attested_material(&material, &applied.receipt.evidence_sha256)?;
         Ok(ObservedEffect::Applied(Box::new(applied)))
     }
 
@@ -2784,16 +3091,28 @@ impl RestoreTarget for KernelRestoreTarget<'_> {
     ) -> Result<RestoreReconciliation, BackupError> {
         // Every effect in this target is synchronous and local with one
         // persisted identity receipt per phase, so reconciliation reads the
-        // observation back by exact identity: a present receipt bound to this
-        // transaction, phase, and input digest is Applied; its absence is
-        // NotApplied and the coordinator re-applies idempotently (byte
-        // staging overwrites, re-sealing mints fresh bytes with a fresh
-        // receipt — no prior receipt exists to contradict). Bytes that parse
-        // as nothing are Undecidable and propagate as Unknown: the
-        // coordinator takes the explicit rollback-required disposition
-        // (I14.21) with no new identity and no blind retry. Async
-        // owner-channel unknowns belong to the #962 wire layer, which must
-        // upgrade reconciliation there, never downgrade readback here.
+        // observation back by exact identity AND re-reads the material that
+        // receipt attests (`load_applied` / `check_attested_material`). A
+        // receipt that is present, bound to this transaction, phase and input
+        // digest, and still describing material that is still there is
+        // Applied. A receipt is a description of an effect, not the effect, so
+        // a receipt whose material is gone or is now different bytes refuses
+        // rather than advancing the journal over a phase that never produced
+        // what the journal and the finalize obligations say it produced.
+        //
+        // A missing receipt is never on its own proof of no effect. The
+        // phase's own material decides: wholly absent material is the only
+        // positive no-effect evidence, and it yields NotApplied so the
+        // coordinator re-applies idempotently (byte staging overwrites,
+        // re-sealing mints fresh bytes with a fresh receipt — no prior receipt
+        // exists to contradict). Material that is present, partially present
+        // or unreadable is Undecidable and propagates as Unknown, so the
+        // coordinator reconciles THAT SAME phase under its explicit
+        // rollback-required disposition (I14.21) with no new identity and no
+        // blind retry — an unknown outcome is never downgraded to proven
+        // no-effect because a file happens to be gone. Async owner-channel
+        // unknowns belong to the #962 wire layer, which must upgrade
+        // reconciliation there, never downgrade readback here.
         match &intent.phase {
             RestorePhase::Pending => Err(BackupError::RestorePhaseMismatch),
             _ => match self.load_applied(intent)? {
