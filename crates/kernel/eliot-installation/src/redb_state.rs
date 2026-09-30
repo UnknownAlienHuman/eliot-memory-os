@@ -29,7 +29,7 @@ use super::{
     ActivationCommitReceipt, GenerationPackagePlanner, INSTALLATION_TRANSACTION_WIRE_VERSION,
     InstallationError, InstallationRoots, InstallationStage, InstallationStepOutcome,
     InstallationTransaction, InstallationTransactionStore, InstallerEffectPlan,
-    PackageArtifactDigest, SetupBinding, SetupMilestone, SetupStatus,
+    PackageArtifactDigest, SetupBinding, SetupMilestone, SetupStatus, SystemServiceHostRootReceipt,
     decode_installation_transaction_json_from_store, handle, runtime_sha256_handle,
     transaction_store_private::{self, TransactionVersion},
 };
@@ -40,10 +40,10 @@ use eliot_platform::PlatformHandle;
 use eliot_platform_windows::{
     AuthenticodeEvidence, AuthenticodeVerdict, AuthenticodeVerifier, DirectoryPublicationReceipt,
     FileIdentity, OwnedDirectoryPublication, PackageFileSpec, PackageManifest, PeCoffEvidence,
-    RetainedDirectoryContour, TrustedSourceBundle, UserOwnedPathLease, UserOwnedRootLease,
-    WindowsAuthenticodeVerifier, canonical_windows_path, delete_owned_file_handle,
-    file_identity_for_open_handle, open_no_follow_directory, open_no_follow_file,
-    validate_package_relative_path, windows_paths_equal,
+    ProtectedRootLease, RetainedDirectoryContour, TrustedSourceBundle, UserOwnedPathLease,
+    UserOwnedRootLease, WindowsAuthenticodeVerifier, canonical_windows_path,
+    delete_owned_file_handle, file_identity_for_open_handle, open_no_follow_directory,
+    open_no_follow_file, validate_package_relative_path, windows_paths_equal,
 };
 
 const TRANSACTION_TABLE: TableDefinition<&str, &[u8]> =
@@ -805,6 +805,62 @@ impl RedbInstallationTransactionStore {
                 })?;
         let expected = TransactionVersion::of(&transaction)?;
         transaction.record_profile_selection_receipt(receipt)?;
+        if transaction.revision != expected.revision {
+            <Self as transaction_store_private::Sealed>::compare_and_save(
+                &mut store,
+                expected,
+                &transaction,
+            )?;
+        }
+        Ok(transaction)
+    }
+
+    /// Captures the original SystemService Host-root identity in the exact
+    /// transaction store while the retained no-follow root lease is live.
+    /// The existing transaction file is opened by its exact caller-selected
+    /// path; no file or parent is created.
+    pub fn record_system_service_host_root_receipt_at_exact_path(
+        path: impl AsRef<Path>,
+        transaction_id: &PlatformHandle,
+        root: &ProtectedRootLease,
+    ) -> Result<InstallationTransaction, InstallationError> {
+        let mut store = Self::open_existing_exact_path(path)?;
+        let mut transaction =
+            store
+                .load(transaction_id)?
+                .ok_or_else(|| InstallationError::TransactionNotFound {
+                    transaction_id: transaction_id.as_str().to_owned(),
+                })?;
+        let expected = TransactionVersion::of(&transaction)?;
+        transaction.record_system_service_host_root_receipt(root)?;
+        if transaction.revision != expected.revision {
+            <Self as transaction_store_private::Sealed>::compare_and_save(
+                &mut store,
+                expected,
+                &transaction,
+            )?;
+        }
+        Ok(transaction)
+    }
+
+    /// Rehydrates a SystemService transaction from the exact immutable receipt
+    /// already retained by its installation registry. The current Host-root
+    /// lease is compared with that receipt before the transaction CAS.
+    pub fn bind_system_service_host_root_receipt_at_exact_path(
+        path: impl AsRef<Path>,
+        transaction_id: &PlatformHandle,
+        receipt: &SystemServiceHostRootReceipt,
+        root: &ProtectedRootLease,
+    ) -> Result<InstallationTransaction, InstallationError> {
+        let mut store = Self::open_existing_exact_path(path)?;
+        let mut transaction =
+            store
+                .load(transaction_id)?
+                .ok_or_else(|| InstallationError::TransactionNotFound {
+                    transaction_id: transaction_id.as_str().to_owned(),
+                })?;
+        let expected = TransactionVersion::of(&transaction)?;
+        transaction.bind_system_service_host_root_receipt(receipt.clone(), root)?;
         if transaction.revision != expected.revision {
             <Self as transaction_store_private::Sealed>::compare_and_save(
                 &mut store,
@@ -3667,7 +3723,7 @@ fn encode(transaction: &InstallationTransaction) -> Result<Vec<u8>, Installation
 }
 
 fn decode(bytes: &[u8]) -> Result<InstallationTransaction, InstallationError> {
-    let value: serde_json::Value =
+    let mut value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|error| InstallationError::CorruptRegistry {
             reason: error.to_string(),
         })?;
@@ -3683,7 +3739,78 @@ fn decode(bytes: &[u8]) -> Result<InstallationTransaction, InstallationError> {
             reason: "transaction envelope has an unsupported wire discriminator".to_owned(),
         }
     })?;
-    if version != INSTALLATION_TRANSACTION_WIRE_VERSION {
+    if version == ContractVersion::new(29, 0, 0) {
+        let profile = value
+            .get("transaction")
+            .and_then(|transaction| transaction.get("profile"))
+            .and_then(serde_json::Value::as_str);
+        match profile {
+            Some("system_service") => {
+                return Err(InstallationError::MigrationRequired {
+                    reason: "v29 SystemService transaction envelope has no original Host-root object identity; explicit recovery is required before reuse"
+                        .to_owned(),
+                });
+            }
+            Some("user_mode" | "portable_dev") => {
+                let transaction_version = value
+                    .get("transaction")
+                    .and_then(|transaction| transaction.get("transaction_wire_version"))
+                    .cloned()
+                    .and_then(|version| serde_json::from_value::<ContractVersion>(version).ok());
+                if transaction_version != Some(ContractVersion::new(29, 0, 0)) {
+                    return Err(InstallationError::MigrationRequired {
+                        reason: "v29 transaction envelope does not contain a matching v29 transaction payload"
+                            .to_owned(),
+                    });
+                }
+                if value
+                    .get("transaction")
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|transaction| {
+                        transaction.contains_key("system_service_host_root_receipt")
+                    })
+                {
+                    return Err(InstallationError::CorruptRegistry {
+                        reason: "v29 transaction envelope contains a field outside its declared wire shape"
+                            .to_owned(),
+                    });
+                }
+                let transaction_wire_version = serde_json::to_value(
+                    INSTALLATION_TRANSACTION_WIRE_VERSION,
+                )
+                .map_err(|error| InstallationError::CorruptRegistry {
+                    reason: error.to_string(),
+                })?;
+                let envelope =
+                    value
+                        .as_object_mut()
+                        .ok_or_else(|| InstallationError::CorruptRegistry {
+                            reason: "transaction envelope is not an object".to_owned(),
+                        })?;
+                let transaction = envelope
+                    .get_mut("transaction")
+                    .and_then(serde_json::Value::as_object_mut)
+                    .ok_or_else(|| InstallationError::CorruptRegistry {
+                        reason: "transaction envelope payload is not an object".to_owned(),
+                    })?;
+                transaction.insert(
+                    "transaction_wire_version".to_owned(),
+                    transaction_wire_version.clone(),
+                );
+                transaction.insert(
+                    "system_service_host_root_receipt".to_owned(),
+                    serde_json::Value::Null,
+                );
+                envelope.insert("wire_version".to_owned(), transaction_wire_version);
+            }
+            _ => {
+                return Err(InstallationError::MigrationRequired {
+                    reason: "v29 transaction envelope profile is missing or unsupported; explicit migration is required"
+                        .to_owned(),
+                });
+            }
+        }
+    } else if version != INSTALLATION_TRANSACTION_WIRE_VERSION {
         return Err(InstallationError::MigrationRequired {
             reason: format!(
                 "transaction envelope wire {version} requires explicit migration to {INSTALLATION_TRANSACTION_WIRE_VERSION}"

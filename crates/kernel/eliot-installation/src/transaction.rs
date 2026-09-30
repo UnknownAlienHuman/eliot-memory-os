@@ -4,8 +4,9 @@ use std::collections::BTreeSet;
 
 use eliot_platform::GuardRevertOutcome;
 use eliot_platform_windows::{
-    FileIdentity, TERMINAL_CONTAINMENT_OPERATION_DIGEST_BYTES, TerminalContainmentReadback,
-    terminal_containment_operation_digest, validate_terminal_containment_readback_for,
+    FileIdentity, ProtectedRootLease, TERMINAL_CONTAINMENT_OPERATION_DIGEST_BYTES,
+    TerminalContainmentReadback, terminal_containment_operation_digest,
+    validate_terminal_containment_readback_for,
 };
 use eliot_platform_windows::profile_supervision::{
     CurrentUserTaskReceipt, CurrentUserTaskRegistrationError, CurrentUserTaskRequest,
@@ -176,6 +177,114 @@ pub struct RetainedProfileAnchor {
     pub canonical_path: PlatformHandle,
     /// File object identity opened without following reparse points.
     pub identity: FileIdentity,
+}
+
+/// Current wire revision for the original SystemService Host-state root binding.
+pub const SYSTEM_SERVICE_HOST_ROOT_RECEIPT_VERSION: u32 = 1;
+
+/// Original no-follow identity of one SystemService installation's Host-state
+/// root. The receipt is captured from a retained protected-root lease and is
+/// carried by both the installation transaction and approved-generation
+/// registry; a path string alone is never used to recreate this identity.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SystemServiceHostRootReceipt {
+    binding_version: u32,
+    canonical_path: String,
+    identity: FileIdentity,
+}
+
+impl SystemServiceHostRootReceipt {
+    fn from_lease(root: &ProtectedRootLease) -> Result<Self, InstallationError> {
+        root.verify_stable_identity()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let canonical_path = root
+            .canonical_path()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?
+            .into_os_string()
+            .into_string()
+            .map_err(|_| InstallationError::InvalidField {
+                field: "system_service_host_root_receipt.canonical_path".to_owned(),
+                reason: "canonical Host root path is not valid Unicode".to_owned(),
+            })?;
+        let receipt = Self {
+            binding_version: SYSTEM_SERVICE_HOST_ROOT_RECEIPT_VERSION,
+            canonical_path,
+            identity: root.identity(),
+        };
+        root.verify_stable_identity()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), InstallationError> {
+        if self.binding_version != SYSTEM_SERVICE_HOST_ROOT_RECEIPT_VERSION {
+            return Err(InstallationError::MigrationRequired {
+                reason: format!(
+                    "SystemService Host-root receipt wire {} requires explicit migration to {}",
+                    self.binding_version, SYSTEM_SERVICE_HOST_ROOT_RECEIPT_VERSION
+                ),
+            });
+        }
+        super::WindowsPathIdentity::parse_root(
+            &self.canonical_path,
+            "system_service_host_root_receipt.canonical_path",
+        )?;
+        if self.identity.volume_serial_number == 0 || self.identity.file_index == 0 {
+            return Err(InstallationError::IncompleteObservation(
+                "SystemService Host-root receipt has no stable file-object identity".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns the receipt wire revision.
+    #[must_use]
+    pub const fn binding_version(&self) -> u32 {
+        self.binding_version
+    }
+
+    /// Returns the original canonical Host-state root path.
+    #[must_use]
+    pub fn canonical_path(&self) -> &str {
+        &self.canonical_path
+    }
+
+    /// Returns the original Host-state root file-object identity.
+    #[must_use]
+    pub const fn identity(&self) -> FileIdentity {
+        self.identity
+    }
+
+    /// Compares the persisted receipt with a currently retained root lease and
+    /// the immutable runtime descriptor path.
+    pub fn validate_against(
+        &self,
+        root: &ProtectedRootLease,
+        expected_host_state_root: &str,
+    ) -> Result<(), InstallationError> {
+        self.validate()?;
+        root.verify_stable_identity()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        let live_path = root
+            .canonical_path()
+            .map_err(|error| InstallationError::Platform(error.to_string()))?;
+        if root.identity() != self.identity
+            || !eliot_platform_windows::windows_paths_equal(
+                std::path::Path::new(&self.canonical_path),
+                &live_path,
+            )
+            || !eliot_platform_windows::windows_paths_equal(
+                &live_path,
+                std::path::Path::new(expected_host_state_root),
+            )
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        root.verify_stable_identity()
+            .map_err(|error| InstallationError::Platform(error.to_string()))
+    }
 }
 
 impl RetainedProfileAnchor {
@@ -771,6 +880,10 @@ pub struct InstallationTransaction {
     /// roots. Once captured, the original file identities are persisted and
     /// never reconstructed from the descriptor's path strings.
     pub(crate) profile_selection_receipt: Option<ProfileSelectionReceipt>,
+    /// Original SystemService Host-state root object identity, captured from a
+    /// held protected-root lease before the installation registry is created
+    /// or projected. UserMode and PortableDev leave this absent.
+    pub(crate) system_service_host_root_receipt: Option<SystemServiceHostRootReceipt>,
     /// Governing request identity.
     pub request: ManagedEnvironmentChangeRequest,
     /// Previously active generation, if one exists.
@@ -923,6 +1036,70 @@ impl InstallationTransaction {
     #[must_use]
     pub const fn profile_selection_receipt(&self) -> Option<&ProfileSelectionReceipt> {
         self.profile_selection_receipt.as_ref()
+    }
+
+    /// Returns the original retained SystemService Host-state root identity.
+    #[must_use]
+    pub const fn system_service_host_root_receipt(&self) -> Option<&SystemServiceHostRootReceipt> {
+        self.system_service_host_root_receipt.as_ref()
+    }
+
+    /// Records the original SystemService Host-state root while its protected
+    /// directory lease is held. A later observation may confirm the same
+    /// object, but can never replace the original path or file identity.
+    pub(crate) fn record_system_service_host_root_receipt(
+        &mut self,
+        root: &ProtectedRootLease,
+    ) -> Result<(), InstallationError> {
+        if self.current_active_manifest.is_some() && self.system_service_host_root_receipt.is_none() {
+            return Err(InstallationError::MigrationRequired {
+                reason: "an update cannot capture a replacement SystemService Host-root identity; rehydrate the registry receipt first"
+                    .to_owned(),
+            });
+        }
+        let receipt = SystemServiceHostRootReceipt::from_lease(root)?;
+        self.bind_system_service_host_root_receipt(receipt, root)
+    }
+
+    /// Binds the original registry-owned receipt to a new or resumed
+    /// SystemService transaction after comparing it with the held Host-root
+    /// lease and the immutable transaction descriptor.
+    pub(crate) fn bind_system_service_host_root_receipt(
+        &mut self,
+        receipt: SystemServiceHostRootReceipt,
+        root: &ProtectedRootLease,
+    ) -> Result<(), InstallationError> {
+        if self.profile != InstallationProfile::SystemService {
+            return Err(InstallationError::ProfileViolation(
+                "SystemService Host-root receipts are not valid for current-user profiles"
+                    .to_owned(),
+            ));
+        }
+        let expected_host_state_root = self
+            .candidate_manifest
+            .runtime_launch
+            .runtime_state_roots
+            .host_state_root
+            .as_str();
+        receipt.validate_against(root, expected_host_state_root)?;
+        match self.system_service_host_root_receipt.as_ref() {
+            Some(existing) if existing == &receipt => return self.validate(),
+            Some(_) => return Err(InstallationError::IdentityConflict),
+            None => {}
+        }
+        let mut candidate = self.clone();
+        candidate.system_service_host_root_receipt = Some(receipt);
+        candidate.revision =
+            candidate
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| InstallationError::InvalidField {
+                    field: "revision".to_owned(),
+                    reason: "overflow".to_owned(),
+                })?;
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
     }
 
     /// Returns the exact source-publication-time profile anchor pair.
@@ -1318,6 +1495,7 @@ impl InstallationTransaction {
             retained_profile_anchor: None,
             profile_governed_roots,
             profile_selection_receipt: None,
+            system_service_host_root_receipt: None,
             request,
             current_active_manifest,
             candidate_manifest,
@@ -3008,6 +3186,66 @@ impl InstallationTransaction {
         // the crate-private planner constructor may hold it before binding.
         self.rehydrate_profile_binding()?;
         self.validate_retained_profile_anchor()?;
+        match (
+            self.profile,
+            self.system_service_host_root_receipt.as_ref(),
+        ) {
+            (InstallationProfile::SystemService, Some(receipt)) => {
+                receipt.validate()?;
+                if !eliot_platform_windows::windows_paths_equal(
+                    std::path::Path::new(receipt.canonical_path()),
+                    std::path::Path::new(
+                        self.candidate_manifest
+                            .runtime_launch
+                            .runtime_state_roots
+                            .host_state_root
+                            .as_str(),
+                    ),
+                ) {
+                    return Err(InstallationError::IdentityConflict);
+                }
+            }
+            (InstallationProfile::SystemService, None)
+            | (InstallationProfile::UserMode | InstallationProfile::PortableDev, None) => {}
+            (InstallationProfile::UserMode | InstallationProfile::PortableDev, Some(_)) => {
+                return Err(InstallationError::ProfileViolation(
+                    "current-user transactions cannot carry a SystemService Host-root receipt"
+                        .to_owned(),
+                ));
+            }
+        }
+        if self.profile == InstallationProfile::SystemService
+            && self.system_service_host_root_receipt.is_none()
+        {
+            let service_start_progressed = self
+                .installer_effects
+                .iter()
+                .zip(&self.effect_progress)
+                .any(|(effect, progress)| {
+                    matches!(effect, InstallerEffectPlan::StartService { .. })
+                        && !matches!(progress.state, InstallationEffectProgressState::Pending)
+                });
+            let resumed_update = self.current_active_manifest.is_some()
+                && (self.stage != InstallationStage::Planned
+                    || self.effect_progress.iter().any(|progress| {
+                        !matches!(progress.state, InstallationEffectProgressState::Pending)
+                    }));
+            let activation_progressed = self.activation_projection_intent.is_some()
+                || service_start_progressed
+                || matches!(
+                    self.stage,
+                    InstallationStage::Activating
+                        | InstallationStage::ActiveVerified
+                        | InstallationStage::Cleaning
+                        | InstallationStage::Completed
+                );
+            if resumed_update || activation_progressed {
+                return Err(InstallationError::MigrationRequired {
+                    reason: "SystemService transaction passed its first Host bootstrap boundary without the original Host-root receipt"
+                        .to_owned(),
+                });
+            }
+        }
         if let Some(receipt) = self.profile_selection_receipt.as_ref() {
             let roots = self
                 .profile_governed_roots
@@ -4751,6 +4989,9 @@ struct InstallationTransactionWire {
     profile_governed_roots: InstallationRoots,
     /// Explicit null before root selection; omission is a current-wire error.
     profile_selection_receipt: Option<ProfileSelectionReceipt>,
+    /// Explicit null for current-user profiles and not-yet-bound SystemService
+    /// plans; the current decoder separately requires this member's presence.
+    system_service_host_root_receipt: Option<SystemServiceHostRootReceipt>,
     request: ManagedEnvironmentChangeRequest,
     current_active_manifest: Option<CandidateManifest>,
     candidate_manifest: CandidateManifest,
@@ -4786,6 +5027,7 @@ impl InstallationTransactionWire {
             retained_profile_anchor: self.retained_profile_anchor,
             profile_governed_roots: Some(self.profile_governed_roots),
             profile_selection_receipt: self.profile_selection_receipt,
+            system_service_host_root_receipt: self.system_service_host_root_receipt,
             request: self.request,
             current_active_manifest: self.current_active_manifest,
             candidate_manifest: self.candidate_manifest,
@@ -4998,7 +5240,7 @@ fn decode_installation_transaction_json_with_policy(
     bytes: &[u8],
     allow_advanced_state: bool,
 ) -> Result<InstallationTransaction, InstallationError> {
-    let value: serde_json::Value =
+    let mut value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|error| InstallationError::CorruptRegistry {
             reason: error.to_string(),
         })?;
@@ -5012,7 +5254,52 @@ fn decode_installation_transaction_json_with_policy(
             reason: "installation transaction has an unsupported wire discriminator".to_owned(),
         }
     })?;
-    if version != INSTALLATION_TRANSACTION_WIRE_VERSION {
+    if version == ContractVersion::new(29, 0, 0) {
+        let profile = value.get("profile").and_then(serde_json::Value::as_str);
+        match profile {
+            Some("system_service") => {
+                return Err(InstallationError::MigrationRequired {
+                    reason: "v29 SystemService transaction has no original Host-root object identity; explicit recovery is required before reuse"
+                        .to_owned(),
+                });
+            }
+            Some("user_mode" | "portable_dev") => {
+                if value
+                    .as_object()
+                    .is_some_and(|object| object.contains_key("system_service_host_root_receipt"))
+                {
+                    return Err(InstallationError::CorruptRegistry {
+                        reason: "v29 transaction contains a field outside its declared wire shape"
+                            .to_owned(),
+                    });
+                }
+                let object =
+                    value
+                        .as_object_mut()
+                        .ok_or_else(|| InstallationError::CorruptRegistry {
+                            reason: "installation transaction wire is not an object".to_owned(),
+                        })?;
+                object.insert(
+                    "transaction_wire_version".to_owned(),
+                    serde_json::to_value(INSTALLATION_TRANSACTION_WIRE_VERSION).map_err(
+                        |error| InstallationError::CorruptRegistry {
+                            reason: error.to_string(),
+                        },
+                    )?,
+                );
+                object.insert(
+                    "system_service_host_root_receipt".to_owned(),
+                    serde_json::Value::Null,
+                );
+            }
+            _ => {
+                return Err(InstallationError::MigrationRequired {
+                    reason: "v29 transaction profile is missing or unsupported; explicit migration is required"
+                        .to_owned(),
+                });
+            }
+        }
+    } else if version != INSTALLATION_TRANSACTION_WIRE_VERSION {
         return Err(InstallationError::MigrationRequired {
             reason: format!(
                 "installation transaction wire {version} requires explicit migration to {INSTALLATION_TRANSACTION_WIRE_VERSION}"
@@ -5043,6 +5330,15 @@ fn decode_installation_transaction_json_with_policy(
     {
         return Err(InstallationError::MigrationRequired {
             reason: "installation transaction wire is missing the source-publication profile anchor identity; explicit migration to v29 is required"
+                .to_owned(),
+        });
+    }
+    if !value
+        .as_object()
+        .is_some_and(|object| object.contains_key("system_service_host_root_receipt"))
+    {
+        return Err(InstallationError::MigrationRequired {
+            reason: "current installation transaction is missing the original SystemService Host-root receipt member"
                 .to_owned(),
         });
     }
