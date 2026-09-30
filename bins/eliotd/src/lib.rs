@@ -1579,13 +1579,20 @@ impl DaemonComposition {
     /// unmodified and a failed refresh marks the dependent view stale instead
     /// of hiding divergence.
     ///
-    /// `draft` carries admitted ingress identity only: its `session_id`,
+    /// `ingress` carries admitted identity only: its `session_id`,
     /// `work_item_id`, `lease_id`, and `result_id` are supplied by the caller,
     /// and the coordination owner re-checks the lease holder, the lease window,
     /// the authority epoch, and the fence against the image it already holds.
     /// This entry mints no coordination identity, and the admitted receipt stays
     /// capped at `CandidateArtifact`: it is a candidate artifact reference, not
     /// a Task finish decision.
+    ///
+    /// The entry takes the closed
+    /// [`CoordinationResultIngress`](crate::coordination_owner_ingress::CoordinationResultIngress)
+    /// rather than a raw `AgentResultDraft` on purpose. The ingress is the only
+    /// construction path to the owner's draft, so this entry is the production
+    /// caller of the ingress's own closed-shape check and a caller cannot reach
+    /// the owner with a field the ingress would have refused.
     ///
     /// # Not yet reached (issue #370 R1)
     ///
@@ -1607,7 +1614,13 @@ impl DaemonComposition {
     /// - the live Task Controller poll does supply a Kernel-issued
     ///   `TaskControllerAttempt` with a real `session_id`, `task_id`,
     ///   `scope_id`, `state_fence`, and `authority_epoch`, but no work-item or
-    ///   lease identity.
+    ///   lease identity;
+    /// - the durable route deliberately stops short of the claim. It commits a
+    ///   session, a work registration, and a result admission, and has no
+    ///   durable `acquire_work` leg, so a work item cannot reach `Claimed` in
+    ///   the persisted image even once a producer exists. That leg is not added
+    ///   here because it would have no production caller, which would be a
+    ///   second uncalled entry rather than a driver.
     ///
     /// The legitimate caller is therefore the session/work-item driver, and its
     /// issuer is whoever first registers a work item — not this entry. Deriving
@@ -1619,11 +1632,18 @@ impl DaemonComposition {
         &mut self,
         identity: &eliot_protocol::RequestIdentity,
         operation_id: eliot_contracts::OperationId,
-        draft: eliot_governor::AgentResultDraft,
+        ingress: crate::coordination_owner_ingress::CoordinationResultIngress,
     ) -> Result<eliot_governor::CommittedCoordinationResult, DaemonError> {
         if self.readiness() != CompositionReadiness::Ready {
             return Err(DaemonError::Composition(CompositionError::NotReady));
         }
+        // The closed ingress shape is validated before anything is read or
+        // written, so a structural mistake never reaches the compare-and-set
+        // read or the owner. The draft it lowers to is still the owner's own
+        // type and is still re-checked by the owner on the way in.
+        let draft = ingress
+            .into_draft()
+            .map_err(DaemonError::Composition)?;
         // The predecessor revision is read here, from the refresh-consistent
         // named read, rather than inside the owner: a caller-presented integer
         // would be exactly the substituted compare-and-set the fenced CAS
