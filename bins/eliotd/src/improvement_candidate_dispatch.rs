@@ -92,6 +92,22 @@
 //! `improvement_intake_dispatch::enforce_advisory_class_gate` on the artifact
 //! this function is given, so it is not duplicated here.
 //!
+//! # The daemon CONSUMES the handoff, so the daemon checks its revision
+//!
+//! The Governor crate checks the handoff's recorded wire revision where it
+//! builds the record. That is the producer checking its own stamp. This daemon
+//! is the other side of the boundary: it is the first holder of
+//! `ImprovementCanaryHandoff` as a value it did not assemble field by field,
+//! and the last one before the record is presented to the Kernel `#11` owner as
+//! an inspectable, non-authorizing handoff.
+//! [`check_handoff_consumable`] therefore compares the handoff's ORIGINAL
+//! recorded `wire_revision` against this build's
+//! `IMPROVEMENT_PIPELINE_WIRE_REVISION`, through the crate's existing
+//! [`check_handoff_wire_revision`], and a mismatch becomes
+//! [`PipelineError::UncheckedWireRevision`] with no disposition returned. See
+//! that function for why the original value is the one compared, and why a
+//! refusal is propagated rather than resolved into a substitute.
+//!
 //! # No second owner, store, digest or write path
 //!
 //! This module computes no proposal digest: the Governor pipeline computes
@@ -113,6 +129,14 @@
 //! this daemon either. Supplying either would mean inventing a record or adding
 //! a store, so the forwarder stays honestly unreachable and is named here rather
 //! than faked.
+//!
+//! The revision check added here also stops at this boundary. The Kernel `#11`
+//! owner that independently authorizes and EXECUTES canary activation is a
+//! different subsystem, outside `eliotd`; it is where a handoff is finally
+//! decoded from bytes rather than handed over in process, and it needs the same
+//! [`eliot_maintenance::check_handoff_wire_revision`] against the same
+//! constant. That call site is the Kernel owner's to write, and is named here
+//! rather than faked with a consumer in this crate.
 
 #![forbid(unsafe_code)]
 
@@ -125,7 +149,7 @@ use eliot_maintenance::{
     IMPROVEMENT_RISK_CEILING_BOUNDED, ImprovementAdmissionPolicy, ImprovementCandidateView,
     ImprovementEvidenceExecution, ImprovementEvidenceView, ImprovementProposal,
     ImprovementPulseOutcome, ImprovementTerminalDisposition, MechanismDeclaration, PipelineError,
-    RollbackContract, TESTD_OWNER, VERIFIER_OWNER_FAMILY,
+    RollbackContract, TESTD_OWNER, VERIFIER_OWNER_FAMILY, check_handoff_wire_revision,
 };
 
 use super::improvement_candidate_route::{ImprovementRouteRequest, route_improvement_candidate};
@@ -153,7 +177,7 @@ pub fn dispatch_improvement_candidate_route(
     state_fence: &StateFence,
 ) -> Result<ImprovementTerminalDisposition, PipelineError> {
     let candidate = &artifact.candidate;
-    route_improvement_candidate(ImprovementRouteRequest {
+    let disposition = route_improvement_candidate(ImprovementRouteRequest {
         proposal: &route_proposal(candidate, policy, state_fence),
         experiment: &route_experiment(candidate, policy),
         evidence: &route_activation_evidence(candidate),
@@ -161,7 +185,84 @@ pub fn dispatch_improvement_candidate_route(
         candidate: &route_candidate_view(candidate, policy),
         admission_evidence: &route_admission_evidence(candidate, policy),
         policy,
-    })
+    })?;
+    check_handoff_consumable(&disposition)?;
+    Ok(disposition)
+}
+
+/// Consumes the `CanaryAdmitted` handoff under the wire revision THIS build
+/// checks, and refuses a record written under any other one.
+///
+/// # The consuming side, not the producing side
+///
+/// The Governor crate checks the handoff's recorded wire revision inside
+/// `build_canary_handoff`, immediately before the record leaves the producer.
+/// That check proves the producer's own stamp agrees with the producer's own
+/// constant. It does not make the CONSUMER safe, and this is the consumer: the
+/// daemon is the first process that holds
+/// [`eliot_maintenance::ImprovementCanaryHandoff`] as a value it did not
+/// assemble field by field, and the last one before the record is presented to
+/// the Kernel `#11` owner as an inspectable, non-authorizing handoff. Reading
+/// the record's content while declining to read its shape is how a handoff
+/// stamped under a foreign revision gets presented as a current one, so the
+/// shape is checked here against the same
+/// [`eliot_maintenance::IMPROVEMENT_PIPELINE_WIRE_REVISION`] constant, through
+/// the crate's existing [`check_handoff_wire_revision`].
+///
+/// # The ORIGINAL recorded value is what is compared
+///
+/// Nothing is recomputed, defaulted, rounded, or padded, and no second encoder,
+/// hasher, or identity type is introduced. The comparison reads
+/// [`eliot_maintenance::ImprovementCanaryHandoff::wire_revision`] exactly as
+/// the producer recorded it: a handoff carrying revision `7` is refused as
+/// revision `7`, is not padded up to this build's `8`, and is not read as
+/// though the current shape had produced it. The refusal crosses into the
+/// daemon as the typed [`eliot_maintenance::PipelineError::UncheckedWireRevision`]
+/// it wraps, carrying both revisions, so no caller can repair the record by
+/// guessing.
+///
+/// # No substitute on failure
+///
+/// A refusal is propagated, never resolved. There is no fallback digest, no
+/// empty string, no default revision, no legacy value, and no recomputed hash
+/// standing in for a record this build cannot read. The disposition is NOT
+/// returned in a weakened form: a foreign-revision handoff produces the typed
+/// error and no disposition at all, so the caller never sees a handoff it might
+/// present as current.
+///
+/// The same holds for a HASHING failure. The commitment this daemon receives is
+/// the one the pipeline computed; the `?` on `route_improvement_candidate`
+/// carries the pipeline's own [`PipelineError::CommitmentFailed`] — and with it
+/// the canonical serializer's own `detail` text — across this boundary as
+/// itself. Nothing here catches it, matches on its reason text, or substitutes
+/// a digest for the commitment that could not be produced, so a serialization
+/// refusal reaches `run_improvement_intake` still naming what the serializer
+/// said rather than a placeholder.
+///
+/// # The honest limit of this check
+///
+/// On the live path today the Governor crate that produced the handoff is the
+/// same build that stamps the constant, so this comparison can only pass. What
+/// it establishes is that the CONSUMPTION is refused rather than trusted, and
+/// it is the check that holds when the record reaches the daemon as decoded
+/// bytes rather than as a same-process value: the record is
+/// `Serialize`/`Deserialize` with `deny_unknown_fields` and is declared the
+/// wire shape the Kernel owner will later read, so the daemon reading a
+/// `CanaryAdmitted` disposition must not assume the producer's stamp describes
+/// a shape this build understands. The Kernel `#11` owner that independently
+/// authorizes activation is a different subsystem's boundary and is not
+/// reachable from this crate; the symbol it needs is the same
+/// [`check_handoff_wire_revision`].
+///
+/// Every other disposition variant carries no handoff and is passed through
+/// exactly as the pipeline produced it.
+fn check_handoff_consumable(
+    disposition: &ImprovementTerminalDisposition,
+) -> Result<(), PipelineError> {
+    if let ImprovementTerminalDisposition::CanaryAdmitted { handoff } = disposition {
+        check_handoff_wire_revision(handoff)?;
+    }
+    Ok(())
 }
 
 /// The Governor-side proposal this daemon raises over one real observation.
