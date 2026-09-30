@@ -56,6 +56,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use eliot_agent_api::{AttemptId, RouteFingerprint};
+use eliot_agent_bridge_core::ToolResultReceipt;
 use eliot_agent_contracts::{
     ExecutionUpdateProposal, OldWaveDisposition, RevisionId, SupersessionLink, SwarmAdmissionId,
     SwarmCoordinatorLease, SwarmExecutionId, SwarmExecutionRevision, SwarmPlanAdmission,
@@ -930,6 +931,33 @@ pub struct DispatchAck {
     pub retained: bool,
 }
 
+/// Provider-capability dispatch frame for one recorded dispatch intent
+/// (issue #1108, W3).
+///
+/// Carries the exact operation (`dispatch_id`), attempt, and admitted
+/// provider identity with the canonical payload digest of the recorded
+/// intent. The provider identity is read from the coordinator's verified
+/// binding, never caller-supplied; the payload digest is the canonical-JSON
+/// SHA-256 of the recorded [`DispatchIntent`] through the existing
+/// [`digest_json`] helper, never recomputed from caller bytes. The frame is
+/// provider-dispatch evidence only and decides no task Finish.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderCapabilityDispatchFrame {
+    /// Dispatch operation identity; keys the recorded intent.
+    pub dispatch_id: String,
+    /// Attempt the recorded intent dispatches.
+    pub attempt_id: AttemptId,
+    /// Exact admitted provider identity from the verified binding.
+    pub provider_identity: ProviderIdentity,
+    /// Canonical payload digest of the recorded intent.
+    pub payload_digest: String,
+    /// Fence carried verbatim from the recorded intent.
+    pub fence: StateFence,
+    /// Epoch carried verbatim from the recorded intent.
+    pub epoch: EpochId,
+}
+
 /// Worker acknowledgement. Never attempt success.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1472,6 +1500,45 @@ fn verify_snapshot_admissions(snapshot: &FabricSnapshot) -> Result<(), FabricErr
     Ok(())
 }
 
+/// Verifies recorded provider-frame and tool-result evidence still binds
+/// its recorded dispatch operation (issue #1108, W3/A12 restore gate).
+///
+/// Every frame must key the recorded intent it was built from with the same
+/// attempt, fence, and epoch carried verbatim; the payload digest is the
+/// recorded value and is never recomputed here. Every tool result must key a
+/// recorded intent, and the recorded receipt re-runs the bridge owner's
+/// complete-evidence gate on its original value. Orphan or rebound evidence
+/// fails closed instead of restoring detached history.
+fn verify_snapshot_tool_evidence(snapshot: &FabricSnapshot) -> Result<(), FabricError> {
+    for (dispatch_id, frame) in &snapshot.provider_frames {
+        let intent = snapshot.intents.get(dispatch_id).ok_or_else(|| {
+            FabricError::ReceiptBinding(format!(
+                "provider capability frame {dispatch_id} binds no recorded dispatch"
+            ))
+        })?;
+        if frame.dispatch_id != *dispatch_id
+            || frame.attempt_id != intent.attempt_id
+            || !fences_match_exact(&frame.fence, &intent.fence)
+            || frame.epoch != intent.epoch
+        {
+            return Err(FabricError::ReceiptBinding(format!(
+                "provider capability frame {dispatch_id} no longer binds its recorded dispatch"
+            )));
+        }
+    }
+    for (dispatch_id, receipt) in &snapshot.tool_results {
+        if !snapshot.intents.contains_key(dispatch_id) {
+            return Err(FabricError::ReceiptBinding(format!(
+                "tool result {dispatch_id} binds no recorded dispatch"
+            )));
+        }
+        receipt
+            .check_complete_evidence()
+            .map_err(|error| FabricError::Contract(format!("tool result evidence: {error}")))?;
+    }
+    Ok(())
+}
+
 /// Reconstructs the definition-to-admission cache from committed owner
 /// records, rejecting torn or contradictory joins instead of allowing map
 /// insertion to choose one admission silently.
@@ -1722,6 +1789,18 @@ pub struct FabricSnapshot {
     /// unless an explicit policy-authorized degradation was recorded first.
     #[serde(default)]
     pub attempt_routes: BTreeMap<String, RouteFingerprint>,
+    /// Provider-capability dispatch frames by dispatch identity (issue #1108,
+    /// W3). Persisted so the exact operation/attempt/provider/payload binding
+    /// survives restart; absent on older snapshots, which restore without
+    /// frames exactly as before.
+    #[serde(default)]
+    pub provider_frames: BTreeMap<String, ProviderCapabilityDispatchFrame>,
+    /// Bridge-projected tool-result evidence by dispatch identity (issue
+    /// #1108, A12). Attempt evidence only, never task Finish authority;
+    /// absent on older snapshots, which restore without tool evidence exactly
+    /// as before.
+    #[serde(default)]
+    pub tool_results: BTreeMap<String, ToolResultReceipt>,
 }
 
 /// Attempt lifecycle tracked by this composition. Terminal states never
@@ -1783,6 +1862,14 @@ pub struct AgentFabric {
     staffing_receipts: BTreeMap<String, StaffingPlanReceipt>,
     /// Route each already-dispatched attempt runs on.
     attempt_routes: BTreeMap<String, RouteFingerprint>,
+    /// Provider-capability dispatch frames by dispatch identity (issue #1108,
+    /// W3). Recorded on dispatch, persisted with the snapshot, and re-bound
+    /// to the recorded intent by the restore gate.
+    provider_frames: BTreeMap<String, ProviderCapabilityDispatchFrame>,
+    /// Bridge-projected tool-result evidence by dispatch identity (issue
+    /// #1108, A12). Attempt evidence only; recording one never advances an
+    /// attempt lifecycle or task Finish.
+    tool_results: BTreeMap<String, ToolResultReceipt>,
     /// Explicit policy-authorized degradations recorded before an attempt
     /// continues on a different route. In-memory only: a restart drops them,
     /// so a restored fabric re-refuses the switch instead of resuming it.
@@ -1834,6 +1921,8 @@ impl AgentFabric {
             semantic_supersessions: BTreeMap::new(),
             staffing_receipts: BTreeMap::new(),
             attempt_routes: BTreeMap::new(),
+            provider_frames: BTreeMap::new(),
+            tool_results: BTreeMap::new(),
             attempt_degradations: BTreeMap::new(),
             semantic_revisions: None,
             initialized: true,
@@ -1886,6 +1975,8 @@ impl AgentFabric {
             semantic_supersessions: BTreeMap::new(),
             staffing_receipts: BTreeMap::new(),
             attempt_routes: BTreeMap::new(),
+            provider_frames: BTreeMap::new(),
+            tool_results: BTreeMap::new(),
             attempt_degradations: BTreeMap::new(),
             semantic_revisions: None,
             initialized: true,
@@ -3327,6 +3418,102 @@ impl AgentFabric {
         Ok(ack)
     }
 
+    /// Dispatches the provider-capability frame for one recorded intent
+    /// (issue #1108, W3; acceptance A3/A7/A10/A11).
+    ///
+    /// The frame carries the exact operation (`dispatch_id`) and attempt from
+    /// the recorded [`DispatchIntent`], the admitted provider identity read
+    /// from the coordinator's verified binding, and the canonical payload
+    /// digest of the recorded intent. The recorded intent is then emitted
+    /// through the existing [`DispatchEgressPort`], so this is the same
+    /// egress with provider identity bound, never a second dispatch scheme.
+    /// Same identity and payload replay exactly; a changed payload under one
+    /// identity conflicts.
+    ///
+    /// No `DaemonComposition` method drives this yet: the admitted
+    /// Task-Controller production operation that would carry the frozen
+    /// request plus the owner authorities through definition, admission,
+    /// activation, and this dispatch is absent on the current base
+    /// (BLOCKED-BY scope `bins/eliotd/src/lib.rs::DaemonComposition`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FabricError::CoordinatorUnavailable`] on a plan-only fabric
+    /// with no admitted provider binding, [`FabricError::DuplicateLaunch`]
+    /// when the identity is reused with different bytes, or the egress owner
+    /// outcome unchanged.
+    pub fn dispatch_provider_capability_frame(
+        &mut self,
+        dispatch_id: &str,
+    ) -> Result<ProviderCapabilityDispatchFrame, FabricError> {
+        let _span = tracing::info_span!(
+            "eliotd.fabric_provider_frame",
+            dispatch = %crate::diagnostics::sanitize_identity(dispatch_id)
+        )
+        .entered();
+        let outcome = self.dispatch_provider_capability_frame_checked(dispatch_id);
+        if let Err(error) = &outcome {
+            let _ = crate::diagnostics::RejectionRecord::of_fabric_error(error).emit();
+        }
+        outcome
+    }
+
+    fn dispatch_provider_capability_frame_checked(
+        &mut self,
+        dispatch_id: &str,
+    ) -> Result<ProviderCapabilityDispatchFrame, FabricError> {
+        validate_text(dispatch_id, "dispatch_id")?;
+        let intent = self
+            .intents
+            .get(dispatch_id)
+            .cloned()
+            .ok_or_else(|| FabricError::Contract(format!("unknown dispatch {dispatch_id}")))?;
+        let identity = match self.coordinator.snapshot()?.provider_binding {
+            ProviderBindingSnapshot::Verified { identity } => identity,
+            ProviderBindingSnapshot::Gap { .. } => {
+                return Err(FabricError::CoordinatorUnavailable(
+                    "provider capability frame requires an admitted provider binding; a plan-only fabric cannot dispatch"
+                        .to_owned(),
+                ));
+            }
+        };
+        let frame = ProviderCapabilityDispatchFrame {
+            dispatch_id: dispatch_id.to_owned(),
+            attempt_id: intent.attempt_id.clone(),
+            provider_identity: identity,
+            payload_digest: digest_json(&intent)?,
+            fence: intent.fence.clone(),
+            epoch: intent.epoch.clone(),
+        };
+        if let Some(recorded) = self.provider_frames.get(dispatch_id).cloned() {
+            if recorded == frame {
+                self.record("provider_capability_frame_replayed", dispatch_id);
+                return Ok(recorded);
+            }
+            return Err(FabricError::DuplicateLaunch(format!(
+                "provider capability frame {dispatch_id} reused with different bytes"
+            )));
+        }
+        // Same gate and egress as `emit`: a missing egress binding blocks
+        // before any launch, and the ack must match the recorded intent.
+        self.check_port_binding(
+            FabricOperation::Emit,
+            dispatch_id,
+            Some(intent.fence.clone()),
+            Some(intent.epoch.clone()),
+        )?;
+        let ack = self.ports.dispatch_egress.emit(&intent)?;
+        if ack.dispatch_id != dispatch_id {
+            return Err(FabricError::IdentityConflict(
+                "dispatch ack identity does not match the intent".to_owned(),
+            ));
+        }
+        self.provider_frames
+            .insert(dispatch_id.to_owned(), frame.clone());
+        self.record("provider_capability_frame_dispatched", dispatch_id);
+        Ok(frame)
+    }
+
     /// Records a worker acknowledgement. An ack never becomes attempt success.
     ///
     /// # Errors
@@ -3431,6 +3618,72 @@ impl AgentFabric {
             )));
         }
         self.record("observation_accepted", &key);
+        Ok(())
+    }
+
+    /// Observes one bridge-projected tool result as attempt evidence for the
+    /// recorded dispatch operation (issue #1108, A12).
+    ///
+    /// The receipt is the bridge owner's projected value: it is validated
+    /// with the existing [`ToolResultReceipt::check_complete_evidence`] gate
+    /// on its original recorded value, never recomputed here, and it is bound
+    /// to the dispatch identity whose recorded intent is the independent
+    /// expected set. Same identity and payload replay exactly; a changed
+    /// payload under one identity conflicts.
+    ///
+    /// The receipt is stored as evidence only: the attempt lifecycle is left
+    /// untouched and [`AgentFabric::require_finish`] still refuses every
+    /// state, so a tool result can never become task Finish.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FabricError::Contract`] when the receipt fails the
+    /// complete-evidence gate, [`FabricError::Quarantined`] for a dispatch
+    /// with no recorded intent, or [`FabricError::DuplicateLaunch`] when the
+    /// identity is reused with different bytes.
+    pub fn observe_tool_result(
+        &mut self,
+        dispatch_id: &str,
+        receipt: &ToolResultReceipt,
+    ) -> Result<(), FabricError> {
+        let _span = tracing::info_span!(
+            "eliotd.fabric_tool_result",
+            dispatch = %crate::diagnostics::sanitize_identity(dispatch_id)
+        )
+        .entered();
+        let outcome = self.observe_tool_result_checked(dispatch_id, receipt);
+        if let Err(error) = &outcome {
+            let _ = crate::diagnostics::RejectionRecord::of_fabric_error(error).emit();
+        }
+        outcome
+    }
+
+    fn observe_tool_result_checked(
+        &mut self,
+        dispatch_id: &str,
+        receipt: &ToolResultReceipt,
+    ) -> Result<(), FabricError> {
+        validate_text(dispatch_id, "dispatch_id")?;
+        receipt
+            .check_complete_evidence()
+            .map_err(|error| FabricError::Contract(format!("tool result evidence: {error}")))?;
+        if !self.intents.contains_key(dispatch_id) {
+            return Err(FabricError::Quarantined(format!(
+                "orphan tool result for unknown dispatch {dispatch_id}"
+            )));
+        }
+        if let Some(recorded) = self.tool_results.get(dispatch_id).cloned() {
+            if recorded == *receipt {
+                self.record("tool_result_replayed", dispatch_id);
+                return Ok(());
+            }
+            return Err(FabricError::DuplicateLaunch(format!(
+                "tool result {dispatch_id} reused with different bytes"
+            )));
+        }
+        self.tool_results
+            .insert(dispatch_id.to_owned(), receipt.clone());
+        self.record("tool_result_observed", dispatch_id);
         Ok(())
     }
 
@@ -3636,6 +3889,8 @@ impl AgentFabric {
             semantic_supersessions: self.semantic_supersessions.clone(),
             staffing_receipts: self.staffing_receipts.clone(),
             attempt_routes: self.attempt_routes.clone(),
+            provider_frames: self.provider_frames.clone(),
+            tool_results: self.tool_results.clone(),
         })
     }
 
@@ -3695,6 +3950,7 @@ impl AgentFabric {
         // authority. Legacy snapshots carry no semantic records and pass
         // trivially.
         verify_snapshot_semantics(&snapshot)?;
+        verify_snapshot_tool_evidence(&snapshot)?;
         let admission_by_definition = rebuild_admission_by_definition(&snapshot)?;
         let coordinator = AgentCoordinator::restore(
             snapshot.coordinator_snapshot.clone(),
@@ -3739,6 +3995,8 @@ impl AgentFabric {
             semantic_supersessions: snapshot.semantic_supersessions,
             staffing_receipts: snapshot.staffing_receipts,
             attempt_routes: snapshot.attempt_routes,
+            provider_frames: snapshot.provider_frames,
+            tool_results: snapshot.tool_results,
             attempt_degradations: BTreeMap::new(),
             // #1702 W2: a restored fabric re-attaches the same durable
             // carrier, so a revision published after restore is committed
@@ -3780,6 +4038,7 @@ impl AgentFabric {
         // authority. Legacy snapshots carry no semantic records and pass
         // trivially.
         verify_snapshot_semantics(&snapshot)?;
+        verify_snapshot_tool_evidence(&snapshot)?;
         let admission_by_definition = rebuild_admission_by_definition(&snapshot)?;
         let coordinator = AgentCoordinator::restore_with_admitted_provider(
             snapshot.coordinator_snapshot.clone(),
@@ -3822,6 +4081,8 @@ impl AgentFabric {
             semantic_supersessions: snapshot.semantic_supersessions,
             staffing_receipts: snapshot.staffing_receipts,
             attempt_routes: snapshot.attempt_routes,
+            provider_frames: snapshot.provider_frames,
+            tool_results: snapshot.tool_results,
             attempt_degradations: BTreeMap::new(),
             // #1702 W2: same durable carrier as the plan-only restore, so a
             // revision published after a verified restore is committed before
