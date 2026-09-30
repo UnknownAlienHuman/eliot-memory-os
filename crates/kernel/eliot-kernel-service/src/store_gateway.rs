@@ -1027,10 +1027,10 @@ fn validate_staged_protected_envelope(
         );
     }
     match &envelope.payload {
-        eliot_ors::RecoveryPayload::Encrypted { key, ciphertext }
+        eliot_ors::RecoveryPayload::Encrypted { key, .. }
             if key == &binding.payload_key_reference
-                && u64::try_from(ciphertext.len()).ok() == Some(binding.protected_payload_length)
-                && sha256_hex(ciphertext) == binding.protected_payload_sha256 =>
+                && envelope.payload_length == binding.protected_payload_length
+                && envelope.payload_sha256 == binding.protected_payload_sha256 =>
         {
             Ok(())
         }

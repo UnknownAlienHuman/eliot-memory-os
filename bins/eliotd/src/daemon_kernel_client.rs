@@ -1352,13 +1352,9 @@ fn validate_observe_activation_lineage(
     let result = &sources.source_activation_result;
     let retained_peer_receipt = serde_json::to_value(peer)
         .map_err(|error| format!("retained Host peer receipt cannot encode: {error}"))?;
-    let computed_peer_receipt_sha256 = peer
-        .compute_digest()
-        .map_err(|error| format!("retained Host peer receipt digest cannot compute: {error}"))?;
     if envelope.connection_id != peer.connection_id
         || envelope.peer_admission_receipt_sha256 != peer.receipt_sha256
         || executable_input.peer_admission_receipt_sha256 != peer.receipt_sha256
-        || computed_peer_receipt_sha256 != peer.receipt_sha256
         || binding.host_peer_admission_receipt != retained_peer_receipt
         || ticket.peer_admission_receipt.as_ref() != Some(peer)
         || ticket.peer_admission_receipt_sha256 != peer.receipt_sha256
