@@ -8625,6 +8625,20 @@ where
             }
         })?;
         transaction.validate()?;
+        // #1148 W3: a retained unreconciled guard composite authorizes no new
+        // automatic effect attempt. The composite is already in the durable
+        // record; the only authorized forward paths are the dependent
+        // `rollback()` ordered after the record and owner reconciliation
+        // releasing the block. Return the retained evidence through the typed
+        // outcome instead of firing the port, so the composite survives
+        // through both the typed observation and the durable record.
+        if let Some(retained) = transaction.guard_revert()
+            && retained.blocks_adoption()
+        {
+            return Ok(InstallationStepOutcome::RollbackRequired {
+                pending_refs: vec![retained.evidence_ref().clone()],
+            });
+        }
         let Some(index) = transaction.effect_progress.iter().position(|progress| {
             !matches!(
                 progress.state,
@@ -10812,8 +10826,8 @@ where
     /// This is the normal-path persistence seam for a safe-return guard
     /// failure: the composite reaches the durable transaction before any
     /// dependent retry or rollback runs, and it survives restart. A persistence
-    /// failure returns the error with the composite still owned by the caller;
-    /// it never discards the original effects and never invents a cleanup.
+    /// failure propagates the typed store error with the durable record unchanged;
+    /// no recorded effect is discarded and no cleanup is invented.
     ///
     /// # Errors
     ///
@@ -11167,8 +11181,8 @@ where
     /// This is the normal-path persistence seam for a safe-return guard
     /// failure: the composite reaches the durable transaction before any
     /// dependent retry or rollback runs, and it survives restart. A persistence
-    /// failure returns the error with the composite still owned by the caller;
-    /// it never discards the original effects and never invents a cleanup.
+    /// failure propagates the typed store error with the durable record unchanged;
+    /// no recorded effect is discarded and no cleanup is invented.
     ///
     /// The guard owners in `eliot-platform-windows` are the producers of this
     /// composite (#860). Until they are wired, no in-tree caller exists and
