@@ -2195,11 +2195,11 @@ impl OpenCodeClient {
         events: Vec<OpenCodeEvent>,
     ) -> NoAuthorityRunResult {
         let actual_route = self.success_route_receipt(request, prepared, &projection.observed_model);
+        let extra = self.success_result_metadata(prepared, &projection);
         let usage = projection.usage.map_or_else(
             || UsageAvailability::unavailable("OpenCode message contained no complete usage"),
             UsageAvailability::available,
         );
-        let extra = self.success_result_metadata(prepared, &projection);
         NoAuthorityRunResult {
             status: RunStatus::Succeeded,
             candidate_only: true,
