@@ -124,7 +124,9 @@ pub use store::{
     CanonicalEvidenceProvider, OperationalRecoveryStore, OrsCoordinator, RedbRecoveryStore,
     RuntimeLeaseCensusRows, ScanDisclosureRecordOwner,
 };
-pub use user_broker::{UserBrokerHeartbeat, UserBrokerRegistrationSnapshot};
+pub use user_broker::{
+    UserBrokerHeartbeat, UserBrokerRegistrationSnapshot, UserBrokerResourceSelectionSnapshot,
+};
 pub use versioned_artifact::{
     ArtifactGenerationState, CompatibilityEvidence, CompatibilityRefusal, VersionedArtifact,
     VersionedArtifactCutoverRecord, VersionedArtifactEntry, VersionedArtifactRegistry,
