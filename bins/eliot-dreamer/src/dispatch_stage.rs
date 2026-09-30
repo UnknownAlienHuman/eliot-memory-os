@@ -15,12 +15,15 @@
 //! extending the closed taxonomy breaks compilation here until the new class
 //! is assigned an owning slice.
 //!
-//! [`dispatch_admitted`] is the single Slice-7 owner entry: it takes the
+//! [`dispatch_admitted_with_orientation_supply`] is the production Slice-7
+//! owner entry: it takes the
 //! Kernel admission, the semantic job, the A-20 screen binding (for
 //! Curation), the Governor-injected Curation execution carrier (for Curation),
-//! the closed class, and the structured A-05 validated candidate (for every
-//! non-Curation admitted class, carried from the validation stage), and
-//! returns the typed [`DreamResult`]. Typestate: Orientation,
+//! the closed class, the structured A-05 validated candidate (for every
+//! non-Curation admitted class, carried from the validation stage), and the
+//! explicit Orientation owner supply, and returns the typed [`DreamResult`].
+//! A test-only [`dispatch_admitted`] wrapper exercises the absent-supply case.
+//! Typestate: Orientation,
 //! `ResearchSynthesis`, and `Maintenance` cannot dispatch without the
 //! validated receipt — raw unvalidated input is refused before any owner
 //! work — and the native projector is reachable only through the validated
@@ -28,14 +31,15 @@
 //! receipt-bound v1 aggregate.
 //! There is no class-only stub seam: every arm either genuinely invokes its
 //! owner or refuses naming the exact missing governed input. Orientation
-//! derives the v1 hypothesis pair, validates it through the real v1 A-05
-//! entry, then resolves the production carrier prerequisites and returns the
-//! typed [`DreamResult::Orientation`] complete/partial/blocked result (issue
-//! #2901): with no CC-002 outcome, CC-004 set, or stage-owner records
-//! in-binary, production returns blocked, never a packet. Orientation has
-//! exactly one composition path: the packet-only compatibility seam is
-//! deleted, so no alternative route can produce a candidate packet outside
-//! the versioned carrier. Curation genuinely resolves descriptors, validates
+//! gates Missing/Stale before candidate construction and, on Ready, feeds the
+//! exact CC-002 draft and observed route usage through the existing A-05 entry
+//! before resolving the production carrier against the exact closure and
+//! returns the typed [`DreamResult::Orientation`] complete/partial/blocked
+//! result (issue #2901). Missing, stale, malformed, refused, or incoherent
+//! owner supply stays visible in that typed result. The packet-only
+//! compatibility seam remains for existing validation-stage consumers, but
+//! it is not a production dispatch path and cannot satisfy the Product Pulse
+//! gate. Curation genuinely resolves descriptors, validates
 //! registry/policy/screen, and routes the injected batch through the real
 //! A-31 fan-in; `ResearchSynthesis` and `Maintenance` fail closed naming
 //! their missing Governor-resolved inputs; the remaining five classes refuse
@@ -53,14 +57,16 @@
 //! work; tests inject the [`curation_test_support`] carrier to prove the wired
 //! A-31 path end to end.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use eliot_dreamer_candidate_validation::{
-    CandidateValidationOutcome, DreamDraftValidationError, validate_grounded_dream_draft_at,
+    CandidateValidationOutcome, validate_grounded_dream_draft_at,
 };
 use eliot_dreamer_contracts::registry::{CurationHandlerRegistry, canonical_registry};
 use eliot_dreamer_contracts::validation::structured::ValidatedGroundingCandidate;
 use eliot_dreamer_contracts::{
-    ContractViolation, DreamInputBundle, DreamJobAdmission, JobClass, ScreenBinding, ScreenState,
-    SourceDisposition,
+    ContractViolation, DreamInputBundle, DreamJobAdmission, JobClass, ModelRouteDisposition,
+    ScreenBinding, ScreenState, SourceDisposition,
 };
 use eliot_dreamer_curation::{
     CurationCandidateSet, CurationMemberOutcome, CurationRoutingError, MAX_BATCH_ITEMS,
@@ -74,7 +80,7 @@ use eliot_dreamer_orientation::{
 
 use crate::admitted_material::{
     admission_of, bundle_of, orientation_frame_of, preservation_of, usage_of, v1_grounded_of,
-    v1_model_of, validation_policy_of,
+    validation_policy_of,
 };
 use crate::controller::verify_admitted_binding;
 use crate::curation_pulse::compose_curation_pulse;
@@ -185,32 +191,10 @@ fn dispatch_denied(error: &ContractViolation) -> DreamerError {
     }
 }
 
-/// Dispatches one admitted job to its exact native owner.
-///
-/// Takes the Kernel admission, the semantic job, the A-20 screen binding
-/// (`Some` for Curation, carried from the screen stage; `None` elsewhere),
-/// the Governor-injected Curation execution carrier (`Some` only where the
-/// Governor injected one; production passes `None`), the closed class, and
-/// the structured A-05 validated candidate (`Some` for every non-Curation
-/// admitted class, carried from the validation stage; `None` for Curation,
-/// which owns its separate carrier, and for refused classes, which never
-/// reach validation). Returns the owner-typed [`DreamResult`].
-///
-/// Fail-closed: the admission/job binding is verified first, then the class
-/// parameter is bound against the semantic job, then the exhaustive nine-arm
-/// match runs with no wildcard. Orientation proves the structured receipt
-/// binding first ([`require_validated_binding`]), then derives the v1
-/// hypothesis pair, validates it through the real v1 A-05 entry, resolves
-/// the production carrier prerequisites, and returns the typed
-/// [`DreamResult::Orientation`] complete/partial/blocked result (blocked
-/// until the Governor supply channel lands); Curation checks the carrier first
-/// (a missing carrier refuses before any screen or registry work, so no
-/// generic stage burns on a job that cannot route), then the screen binding
-/// together with the protection assessment derived from that binding, then the
-/// real A-31 fan-in; `ResearchSynthesis` and `Maintenance` prove
-/// the structured receipt binding first and then name their missing
-/// Governor-resolved inputs; the five classes `submit` never admits refuse
-/// with `UnsupportedJobClass`.
+/// Compatibility wrapper for unit tests that exercise dispatch without an
+/// Orientation owner supply. Production builds use
+/// [`dispatch_admitted_with_orientation_supply`].
+#[cfg(test)]
 pub(crate) fn dispatch_admitted(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
@@ -219,6 +203,41 @@ pub(crate) fn dispatch_admitted(
     curation_carrier: Option<CurationExecutionCarrier<'_>>,
     job_class: JobClass,
     validated: Option<&ValidatedGroundingCandidate>,
+) -> Result<DreamResult, DreamerError> {
+    dispatch_admitted_with_orientation_supply(
+        admission,
+        job,
+        screen,
+        curation_protection,
+        curation_carrier,
+        job_class,
+        validated,
+        crate::production_orientation::ProductionOrientationSupply::Missing,
+    )
+}
+
+/// Production dispatch entry with an explicit Orientation owner-channel
+/// result. The Kernel/claim path supplies owner-produced records for an
+/// Orientation job; the test-only compatibility wrapper above supplies the
+/// typed `Missing` case and is unavailable in production builds.
+///
+/// The admission/job binding is verified first, then the class parameter is
+/// bound against the semantic job, then the exhaustive match runs. Orientation
+/// proves the structured receipt binding first, validates the admitted v1
+/// candidate through the real A-05 entry, and resolves the supplied production
+/// carrier against the exact identity closure. Curation checks its execution
+/// carrier and screen/protection bindings before the real A-31 fan-in;
+/// `ResearchSynthesis` and `Maintenance` retain their explicit missing-owner
+/// refusals, and unsupported classes refuse without fallthrough.
+pub(crate) fn dispatch_admitted_with_orientation_supply(
+    admission: &KernelJobAdmission,
+    job: &DreamJobInput,
+    screen: Option<ScreenBinding>,
+    curation_protection: Option<CurationProtectionSet>,
+    curation_carrier: Option<CurationExecutionCarrier<'_>>,
+    job_class: JobClass,
+    validated: Option<&ValidatedGroundingCandidate>,
+    orientation_supply: crate::production_orientation::ProductionOrientationSupply<'_>,
 ) -> Result<DreamResult, DreamerError> {
     verify_admitted_binding(admission, job)?;
     if job.job_class != job_class {
@@ -251,7 +270,7 @@ pub(crate) fn dispatch_admitted(
             let Some(candidate) = validated else {
                 return Err(DreamerError::InvalidAdmission(VALIDATION_RECEIPT_REFUSAL));
             };
-            dispatch_orientation(admission, job, candidate)
+            dispatch_orientation(admission, job, candidate, orientation_supply)
         }
         // Native owner: eliot-dreamer-research-synthesis `synthesize`. The
         // owner takes its own `SynthesisRequest` vocabulary (a
@@ -347,60 +366,271 @@ pub(crate) fn require_validated_binding(
 ///
 /// Takes the structured A-05 validated candidate alongside the admitted pair:
 /// typestate makes raw dispatch impossible — without the receipt there is no
-/// call. The structured receipt binding is proved first, then the v1
-/// hypothesis pair validates through the real v1 A-05 entry exactly once,
-/// then the production carrier prerequisites resolve into the typed
-/// [`DreamResult::Orientation`] complete/partial/blocked result. A v1
-/// semantic rejection maps to the static refusal and never reaches
-/// composition, so rejection invokes zero handlers with no fallback dispatch.
+/// call. The structured receipt binding is proved first. Missing/Stale owner
+/// supply returns a typed result before any candidate is derived; Ready uses
+/// the exact CC-002 draft and observed route usage with the existing v1
+/// grounding and A-05 validator before resolving the production carrier.
 fn dispatch_orientation(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
     validated: &ValidatedGroundingCandidate,
+    orientation_supply: crate::production_orientation::ProductionOrientationSupply<'_>,
 ) -> Result<DreamResult, DreamerError> {
     require_validated_binding(admission, job, validated)?;
     let admitted = admission_of(admission, job)?;
     let bundle = bundle_of(admission, job)?;
+    let policy = orientation_dispatch_policy()?;
+    let original_receipt_digest = validated
+        .output_digest()
+        .map_err(|_| DreamerError::InvalidAdmission("validation receipt"))?;
+    let owner = match orientation_supply {
+        crate::production_orientation::ProductionOrientationSupply::Missing => {
+            return Ok(DreamResult::Orientation(
+                crate::production_orientation::owner_supply_blocked(
+                    admission,
+                    &admitted,
+                    &original_receipt_digest,
+                    &bundle,
+                    &policy,
+                    false,
+                ),
+            ));
+        }
+        crate::production_orientation::ProductionOrientationSupply::Stale => {
+            return Ok(DreamResult::Orientation(
+                crate::production_orientation::owner_supply_blocked(
+                    admission,
+                    &admitted,
+                    &original_receipt_digest,
+                    &bundle,
+                    &policy,
+                    true,
+                ),
+            ));
+        }
+        crate::production_orientation::ProductionOrientationSupply::Ready(owner) => owner,
+    };
     let frame_source = orientation_frame_source(&bundle)?;
-    let model = v1_model_of(admission, job)?;
-    let grounded = v1_grounded_of(&model)?;
-    let usage = usage_of(&admitted.budget);
-    let validation_policy = validation_policy_of(admitted.policy_ref.as_str())?;
+    let frame = orientation_frame_of(admission, &admitted, job, frame_source.as_str())?;
+    let admitted_job = orientation_admitted_job(admitted, frame);
+    if owner.cancelled {
+        return Ok(orientation_owner_terminal(
+            &admitted_job,
+            &original_receipt_digest,
+            &bundle,
+            &policy,
+            &owner,
+            eliot_dreamer_orientation::OrientationDisposition::Cancelled,
+            "pulse cancelled",
+        ));
+    }
+    let Some(observation_time_ms) = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+    else {
+        return Ok(orientation_owner_terminal(
+            &admitted_job,
+            &original_receipt_digest,
+            &bundle,
+            &policy,
+            &owner,
+            eliot_dreamer_orientation::OrientationDisposition::RevalidationRequired,
+            "candidate validation clock unavailable",
+        ));
+    };
+    if owner.deadline_unix_ms <= observation_time_ms {
+        return Ok(orientation_owner_terminal(
+            &admitted_job,
+            &original_receipt_digest,
+            &bundle,
+            &policy,
+            &owner,
+            eliot_dreamer_orientation::OrientationDisposition::RevalidationRequired,
+            "pulse deadline exceeded",
+        ));
+    }
+    if owner.model_request.job_id != admitted_job.job.canonical_id()
+        || owner.model_request.privacy.as_str() != admitted_job.job.privacy_profile
+        || owner.model_request.validate_binds_bundle(&bundle).is_err()
+    {
+        return Ok(orientation_owner_blocked(
+            &admitted_job,
+            &original_receipt_digest,
+            &bundle,
+            &policy,
+            &owner,
+            "model request binding",
+        ));
+    }
+    if owner
+        .model_outcome
+        .validate_binding(owner.model_request)
+        .is_err()
+    {
+        return Ok(orientation_owner_blocked(
+            &admitted_job,
+            &original_receipt_digest,
+            &bundle,
+            &policy,
+            &owner,
+            crate::production_orientation::MODEL_OUTCOME_MALFORMED,
+        ));
+    }
+    match owner.model_outcome.disposition {
+        ModelRouteDisposition::Completed | ModelRouteDisposition::Partial => {}
+        ModelRouteDisposition::Malformed => {
+            return Ok(orientation_owner_blocked(
+                &admitted_job,
+                &original_receipt_digest,
+                &bundle,
+                &policy,
+                &owner,
+                crate::production_orientation::MODEL_OUTCOME_MALFORMED,
+            ));
+        }
+        ModelRouteDisposition::Cancelled => {
+            return Ok(orientation_owner_terminal(
+                &admitted_job,
+                &original_receipt_digest,
+                &bundle,
+                &policy,
+                &owner,
+                eliot_dreamer_orientation::OrientationDisposition::Cancelled,
+                crate::production_orientation::MODEL_OUTCOME_CANCELLED,
+            ));
+        }
+        ModelRouteDisposition::Timeout => {
+            return Ok(orientation_owner_terminal(
+                &admitted_job,
+                &original_receipt_digest,
+                &bundle,
+                &policy,
+                &owner,
+                eliot_dreamer_orientation::OrientationDisposition::RevalidationRequired,
+                crate::production_orientation::MODEL_OUTCOME_TIMEOUT,
+            ));
+        }
+    }
+    let Some(model) = owner.model_outcome.draft.as_ref() else {
+        return Ok(orientation_owner_blocked(
+            &admitted_job,
+            &original_receipt_digest,
+            &bundle,
+            &policy,
+            &owner,
+            crate::production_orientation::MODEL_OUTCOME_MALFORMED,
+        ));
+    };
+    let grounded = match v1_grounded_of(model) {
+        Ok(grounded) => grounded,
+        Err(_) => {
+            return Ok(orientation_owner_blocked(
+                &admitted_job,
+                &original_receipt_digest,
+                &bundle,
+                &policy,
+                &owner,
+                "owner model grounding input refused",
+            ));
+        }
+    };
+    let mut usage = usage_of(&admitted_job.job.budget);
+    usage.input_bytes = owner.model_outcome.receipt.input_bytes;
+    usage.output_bytes = owner.model_outcome.receipt.output_bytes;
+    usage.model_calls = owner.model_outcome.receipt.model_calls;
+    usage.wall_ms = owner.model_outcome.receipt.wall_ms;
+    let validation_policy = validation_policy_of(admitted_job.job.policy_ref.as_str())?;
     let preservation = preservation_of()?;
     let candidate = match validate_grounded_dream_draft_at(
-        &admitted,
+        &admitted_job.job,
         &bundle,
-        &model,
+        model,
         &grounded,
         &validation_policy,
         &usage,
         &preservation,
-        Some(0),
+        Some(observation_time_ms),
         false,
     ) {
         Ok(CandidateValidationOutcome::Accepted(candidate)) => *candidate,
         Ok(CandidateValidationOutcome::Rejected(_)) => {
-            return Err(DreamerError::InvalidAdmission(
-                "validation semantic rejection",
+            return Ok(orientation_owner_blocked(
+                &admitted_job,
+                &original_receipt_digest,
+                &bundle,
+                &policy,
+                &owner,
+                "owner model candidate rejected",
             ));
         }
-        Err(error) => return Err(v1_denied(&error)),
+        Err(_) => {
+            return Ok(orientation_owner_blocked(
+                &admitted_job,
+                &original_receipt_digest,
+                &bundle,
+                &policy,
+                &owner,
+                "owner model candidate validation refused",
+            ));
+        }
     };
-    let frame = orientation_frame_of(admission, &admitted, job, frame_source.as_str())?;
-    let admitted_job = orientation_admitted_job(admitted, frame);
-    let policy = orientation_dispatch_policy()?;
     match crate::production_orientation::resolve_production_inputs(
         admission,
+        job,
         &admitted_job,
         &candidate,
         &bundle,
         &policy,
+        crate::production_orientation::ProductionOrientationSupply::Ready(owner),
     ) {
-        Ok(inputs) => crate::production_orientation::compose_production_result(inputs, job)
-            .map(DreamResult::Orientation)
-            .map_err(|error| orientation_denied(&error.into_orientation_error())),
+        Ok(inputs) => Ok(DreamResult::Orientation(
+            crate::production_orientation::compose_production_result(inputs, job),
+        )),
         Err(blocked) => Ok(DreamResult::Orientation(*blocked)),
     }
+}
+
+/// Keeps an unusable but present owner outcome in the typed pulse result.
+fn orientation_owner_blocked(
+    admitted_job: &AdmittedOrientationJob,
+    original_receipt_digest: &str,
+    bundle: &DreamInputBundle,
+    policy: &OrientationPolicy,
+    owner: &crate::production_orientation::ProductionOrientationOwnerInputs<'_>,
+    reason: &'static str,
+) -> DreamResult {
+    DreamResult::Orientation(crate::production_orientation::owner_boundary_blocked(
+        admitted_job,
+        original_receipt_digest,
+        bundle,
+        policy,
+        owner.model_outcome,
+        owner.projections,
+        reason,
+    ))
+}
+
+/// Records a present owner-channel terminal gate without candidate work.
+fn orientation_owner_terminal(
+    admitted_job: &AdmittedOrientationJob,
+    original_receipt_digest: &str,
+    bundle: &DreamInputBundle,
+    policy: &OrientationPolicy,
+    owner: &crate::production_orientation::ProductionOrientationOwnerInputs<'_>,
+    disposition: eliot_dreamer_orientation::OrientationDisposition,
+    reason: &'static str,
+) -> DreamResult {
+    DreamResult::Orientation(crate::production_orientation::owner_boundary_terminal(
+        admitted_job,
+        original_receipt_digest,
+        bundle,
+        policy,
+        owner.model_outcome,
+        owner.projections,
+        disposition,
+        reason,
+    ))
 }
 
 /// Selects the deterministic frame-source handle from admitted bundle material.
@@ -446,22 +676,6 @@ fn orientation_dispatch_policy() -> Result<OrientationPolicy, DreamerError> {
     let mut policy = OrientationPolicy::new("eliot-dreamer-dispatch", 1, 1_048_576);
     policy.seal().map_err(|error| orientation_denied(&error))?;
     Ok(policy)
-}
-
-/// Maps a v1 A-05 validation refusal to a typed fail-closed refusal.
-///
-/// Every mapping is [`DreamerError::InvalidAdmission`] (request-rejected
-/// code), never the Kernel-admission code: the admission itself was valid,
-/// the hypothesis pair was not. Dynamic payloads are dropped in favor of the
-/// bounded static field names the owner variants already carry.
-fn v1_denied(error: &DreamDraftValidationError) -> DreamerError {
-    match error {
-        DreamDraftValidationError::Bound { field, .. }
-        | DreamDraftValidationError::Encoding { field, .. }
-        | DreamDraftValidationError::InvalidContract { field, .. } => {
-            DreamerError::InvalidAdmission(field)
-        }
-    }
 }
 
 /// Projects one native orientation packet onto the crate packet result.
