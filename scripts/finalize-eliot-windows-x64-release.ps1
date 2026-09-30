@@ -51,8 +51,10 @@ function Invoke-ReleaseBundleInputVerification {
 # same root-owned trust policy the builder used, and it is additionally
 # re-verified against the offline approval and trust material the retired
 # bundle carries beside the candidate (no network, no candidate-tree lookup,
-# no copied-body trust). A retired bundle whose approval does not re-verify
-# for the same exact candidate is refused before any signature is applied.
+# no copied-body trust). The original v1 approval remains bound to historical
+# source C; its release reference separately binds D and D's independent
+# candidate closure. A changed approval or release candidate is refused before
+# any signature is applied.
 function Assert-GovernorRetirementApprovalReadback(
     [string]$Bundle,
     [string]$SourceCommit,
@@ -99,12 +101,7 @@ function Assert-GovernorRetirementApprovalReadback(
         throw "the approval carried by the signed bundle does not verify: $([string]$offlineBinding.reason)"
     }
     $offline = New-GovernorRetirementApprovalReference $offlineBinding ([string]$bundleTrust.approval_file_sha256) ([string]$bundleTrust.trust_file_sha256)
-    if ([string]$offline.content_sha256 -cne [string]$recomputed.content_sha256 -or
-        [string]$offline.candidate_tree -cne [string]$recomputed.candidate_tree -or
-        [string]$offline.closure_digest_sha256 -cne [string]$recomputed.closure_digest_sha256 -or
-        [string]$offline.issuer_evidence_sha256 -cne [string]$recomputed.issuer_evidence_sha256) {
-        throw 'the approval carried by the signed bundle does not re-derive the same approval identity as the re-resolved detached approval'
-    }
+    [void](Assert-GovernorApprovalIdentityAgreement $recomputed $offline 'offline bundled approval')
     [pscustomobject]@{
         retired = $true
         approval_reference = $offline
@@ -1709,7 +1706,7 @@ function New-AuthenticodeSigningPlan(
     # already independently reconstructed from builder/source receipts.
     $denominator = Assert-CompleteCodeBearingDenominator $source $roles
     # Issue #2968: independently re-resolve and re-verify the detached owner
-    # approval R(C) against the exact source commit BEFORE any mutation. The
+    # approval R(C) against historical C and release candidate D BEFORE any mutation. The
     # Authenticode role set is chosen by what is present; this gate is what
     # stops signing from retroactively approving an artifact set whose
     # omissions were never authorized.

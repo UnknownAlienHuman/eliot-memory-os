@@ -26,25 +26,23 @@ $ErrorActionPreference = 'Stop'
 # the issuer seam, and the offline trust admission live in
 # scripts/lib/governor-retirement-approval.ps1, OUTSIDE the retiring facade
 # package. A tracked source file may describe the expected contract, but no
-# tracked file is ever the approval instance: the approval digest binds the
-# candidate commit AND the candidate tree, so no approval is part of the tree
-# it certifies and no commit-fixed-point search exists.
+# tracked file is ever the approval instance: the unchanged v1 approval
+# digest binds historical source C and its tree; release evidence separately
+# binds descendant candidate D, so no approval is part of C and no
+# commit-fixed-point search exists.
 # The approval reaches the staging run through exactly one explicit parameter,
 # `-GovernorRetirementApproval <absolute detached artifact>`. There is no
 # environment-variable selection, no default repository path, and no directory
 # search. `-PlanRetiredGovernor` remains a `-PlanOnly`-only simulation sketch:
 # it can neither issue nor substitute that input.
-# Issue #2892: Governor retirement is owner-proven, never ambient. No
-# parameter and no environment variable can select the retired disposition,
-# and no cargo-metadata shape (missing/duplicated package, missing target,
-# metadata failure, unexpected shape) is retirement evidence.
-# Resolve-GovernorDisposition returns a typed disposition (Retained /
-# RetirementCandidate / Retired / MalformedOrAmbiguous). Retained stages
-# today's slice unchanged; Retired stages only from a detached owner-issued
-# approval R(C) that verifies for the exact release candidate commit AND tree
-# against the owner-pinned independent consumer closure (fail closed while no
-# owner-issued approval exists);
-# RetirementCandidate and MalformedOrAmbiguous abort plan/stage explicitly.
+# Issue #2892/#2968: Governor retirement is owner-proven, never ambient. No
+# parameter or environment variable selects the retired disposition, and no
+# cargo-metadata shape (missing/duplicated package, missing target, metadata
+# failure, unexpected shape) grants retirement. Retained stages today's slice
+# unchanged. Retired requires the unchanged v1 approval R(C) validated against
+# historical C and its independent closure, plus a separately bound clean
+# release candidate D, all under the owner-admitted issuer. RetirementCandidate
+# and MalformedOrAmbiguous abort plan/stage explicitly.
 # Already-generated self-declared retired plans/bundles are
 # simulated/unadmitted, must be rebuilt, and are never grandfathered.
 # -PlanRetiredGovernor is a PlanOnly-only simulation sketch of the retired
@@ -704,29 +702,18 @@ function Get-RuntimeArtifactPlan([object]$Metadata) {
 # owner. The client-declaration file itself stays installation-owned
 # (absolute <...>/agent-bridge/client-declaration-v2.json); the bundle
 # never invents it.
-# Retention disposition (explicit, #1719 step 1'): while the legacy
-# `eliot-app` crate is a workspace member, eliot-governor.exe,
-# the governor-gated-legacy include, and the Codex plugin bundled binary
-# stay in this slice: Codex still executes that entry point, the three
-# delegated hosts still launch it as a redirect shim served by the Bridge,
-# and every other entrypoint refuses unconditionally. Test-ReleaseBundle
-# requires it plus the plugin hash match. Neither Work option 1 (retire
-# the artifact) nor option 2 (re-home the Codex entry point) lands here:
-# option 1 would break Codex plus the three redirect shims, and option 2
-# needs the behavior owner (eliot-mcp track per canon; the legacy deletion
-# itself is owned by #18). Full retire/re-home is BLOCKED-BY #18.
-# Retirement disposition (explicit, #2892 owner-proven): only an immutable
-# accepted #18 retirement receipt that verifies for the exact release source
-# commit with the owner-admitted independent consumer closure selects Retired:
-# no governor build, no gated legacy include, and the Codex plugin subtree
-# leaves the release together with the binary, so no shipped plugin ever names
-# a missing command. Source absence, ambient switches, and cargo-metadata
-# shape failures never retire anything; they abort explicitly. Re-home
-# (option 2) is not implemented here: no current-owner entry point exists
-# for the codex_controller profile, and bins/crates are outside this slice.
-# The decision is recorded per plan/bundle in `governor_disposition` plus
-# the `governor_evidence` digest binding, never by silent repository
-# presence.
+# Retention disposition (explicit, #1719 step 1'): with no admitted owner
+# retirement, keep eliot-governor.exe, governor-gated-legacy and the working
+# Codex plugin bundled together. The conditional option 1 path removes the
+# governor executable, gated include and plugin subtree together only after
+# the unchanged owner approval R(C) verifies against historical C and the
+# separately scanned release candidate D is bound under the root trust policy.
+# Source absence, ambient switches and cargo-metadata shape failures never
+# authorize omission. Re-home (option 2) is not implemented here: no current
+# owner entry point exists for the codex_controller profile, and its behavior
+# home is the eliot-mcp track per canon. The decision is recorded per
+# plan/bundle in governor_disposition and governor_evidence, never inferred
+# from repository presence.
 # Issue #2968: there is no tracked candidate receipt path any more. The
 # approval, the closure declaration binding, the release-policy revision, the
 # issuer identity and the owner evidence all arrive through the explicit
@@ -810,9 +797,9 @@ function Get-LegacyGovernorCargoIdentity([object]$Metadata) {
     }
     $candidates = @(@($packages) | Where-Object { [string](Read-ObjectProperty $_ 'name') -ceq 'eliot-app' })
     if ($candidates.Count -eq 0) {
-        # Source absence is not authority (issue #2892/#2968): the resolver must
-        # still resolve a detached owner approval for the exact candidate.
-        # Absence alone is a shape here, never a retirement decision.
+        # Source absence is not authority (issue #2892/#2968): retirement must
+        # validate the detached approval against historical C and bind this
+        # release candidate D separately. Absence alone is never authority.
         return [pscustomobject]@{ status = 'absent'; reason = 'package eliot-app is absent from cargo metadata'; package_id = $null; manifest_path = $null; target_name = $null; target_src = $null }
     }
     if ($candidates.Count -ne 1) {
@@ -865,9 +852,9 @@ function Resolve-GovernorRetirementTrustPolicy([string]$Repo, [string]$SourceCom
 function Resolve-GovernorDisposition([object]$Metadata, [string]$Repo, [string]$SourceCommit, [object]$ApprovalInput, [object]$TrustPolicy, [object]$Issuer) {
     # Typed disposition resolver (issues #2892/#2968). Returns Kind in
     # { Retained, RetirementCandidate, Retired, MalformedOrAmbiguous }.
-    # Retired requires a DETACHED, owner-issued approval R(C) that verifies for
-    # the exact candidate commit AND tree, under an owner-admitted issuer and
-    # trust policy, against an independently recomputed consumer closure.
+    # Retired requires the original detached v1 approval R(C) to verify against
+    # historical source C, then binds release candidate D and its independent
+    # closure separately under the owner-admitted issuer and trust policy.
     # Shape alone, a candidate-controlled body, a nonblank approval_identity and
     # the existing Authenticode signer are never authority. Retained stages
     # today's slice unchanged; RetirementCandidate and MalformedOrAmbiguous
@@ -902,7 +889,7 @@ function Resolve-GovernorDisposition([object]$Metadata, [string]$Repo, [string]$
     }
     $approvalReference = New-GovernorRetirementApprovalReference $binding ([string]$ApprovalInput.sha256) ([string]$TrustPolicy.sha256)
     $retiredEvidence = New-GovernorRetiredGovernorEvidence $SourceCommit $approvalReference
-    $retiredDisposition = "retired (detached owner approval R(C) $($approvalReference.content_sha256) issued by $($approvalReference.issuer) for candidate commit $SourceCommit tree $($approvalReference.candidate_tree); independent closure $($approvalReference.closure_digest_sha256) covers $($approvalReference.closure_count) classified tracked references under rule set $($approvalReference.closure_rule_set); the governor executable, the gated legacy include, and the Codex plugin leave the release together so no shipped plugin names a missing command; the Claude legacy path is unavailable - select agent-bridge; ceiling: $($approvalReference.proof_ceiling))"
+    $retiredDisposition = "retired (detached owner approval R(C) $($approvalReference.content_sha256) issued by $($approvalReference.issuer) for historical source C=$($approvalReference.owner_candidate_commit) tree $($approvalReference.owner_candidate_tree); release candidate D=$SourceCommit tree $($approvalReference.candidate_tree) is independently bound by closure $($approvalReference.candidate_closure_digest_sha256); owner closure $($approvalReference.closure_digest_sha256) covers $($approvalReference.closure_count) classified tracked references under rule set $($approvalReference.closure_rule_set); the governor executable, the gated legacy include, and the Codex plugin leave the release together so no shipped plugin names a missing command; the Claude legacy path is unavailable - select agent-bridge; ceiling: $($approvalReference.proof_ceiling))"
     return [pscustomobject]@{ Kind = 'Retired'; Reason = $null; Identity = $cargo; Evidence = $retiredEvidence; Disposition = $retiredDisposition; ApprovalReference = $approvalReference }
 }
 function Assert-NoRetiredLaunchReferences([string]$BundlePath, [object[]]$LiveReferences) {
@@ -965,10 +952,16 @@ function Assert-GovernorApprovalIdentityAgreement([object]$Recomputed, [object]$
     if (-not $Carried) {
         throw "$Purpose omits the governor_approval identity that authorized the retired disposition"
     }
-    foreach ($field in @('content_sha256', 'candidate_commit', 'candidate_tree', 'closure_digest_sha256',
-            'closure_declaration_blob', 'canonical_request_hash', 'operation_id',
-            'approval_file_sha256', 'trust_file_sha256', 'issuer', 'issuer_state',
-            'issuer_evidence_sha256', 'release_policy_revision', 'proof_ceiling')) {
+    foreach ($field in @('schema', 'state', 'content_sha256', 'candidate_commit', 'candidate_tree',
+            'owner_candidate_commit', 'owner_candidate_tree', 'candidate_closure_digest_sha256',
+            'candidate_closure_count', 'repository', 'product', 'product_contract',
+            'release_policy_revision', 'normative_pair_revision', 'closure_rule_set',
+            'closure_verifier', 'closure_digest_sha256', 'closure_declaration_path',
+            'closure_declaration_blob', 'legacy_package', 'legacy_binary', 'legacy_release_role',
+            'legacy_package_manifest_blob', 'legacy_facade_manifest_blob', 'legacy_plugin_manifest_blob',
+            'canonical_request_hash', 'operation_id', 'issuer', 'issuer_state', 'issuer_receipt_kind',
+            'issuer_evidence_sha256', 'issuer_readback_ref', 'approval_file', 'approval_file_sha256',
+            'trust_file', 'trust_file_sha256', 'proof_ceiling')) {
         if ([string](Read-ObjectProperty $Carried $field) -cne [string](Read-ObjectProperty $Recomputed $field)) {
             throw "$Purpose carries a different governor_approval identity ($field differs from the independently re-resolved detached approval)"
         }
@@ -998,6 +991,17 @@ function Assert-GovernorApprovalReferenceShape([object]$Reference, [string]$Sour
         if ([string](Read-ObjectProperty $Reference $field) -cnotmatch '^[0-9a-f]{40,64}$') {
             throw "governor_approval identity is missing its $field binding"
         }
+    }
+    foreach ($field in @('owner_candidate_commit', 'owner_candidate_tree')) {
+        if ([string](Read-ObjectProperty $Reference $field) -cnotmatch '^[0-9a-f]{40}$') {
+            throw "governor_approval identity is missing its $field source-approval binding"
+        }
+    }
+    if ([string](Read-ObjectProperty $Reference 'candidate_closure_digest_sha256') -cnotmatch '^[0-9a-f]{64}$') {
+        throw 'governor_approval identity is missing its exact release-candidate closure binding'
+    }
+    if ([string](Read-ObjectProperty $Reference 'candidate_closure_count') -notmatch '^(0|[1-9][0-9]*)$') {
+        throw 'governor_approval identity carries a malformed release-candidate closure count'
     }
     foreach ($field in @('canonical_request_hash', 'operation_id', 'repository', 'product',
             'product_contract', 'release_policy_revision', 'normative_pair_revision',
@@ -1080,17 +1084,16 @@ function Assert-GovernorRetirementEvidence([object]$Release, [string]$BundlePath
         if ([string]$recomputed.kind -cne 'retired') {
             throw "RELEASE.json claims the retired governor disposition but the pinned source commit and detached approval resolve $([string]$recomputed.kind) (changed source under the same operation conflicts; no bundle)"
         }
-        if ([string](Read-ObjectProperty $carried 'content_sha256') -cne [string]$recomputed.approval_reference.content_sha256 -or
-            [string](Read-ObjectProperty $carried 'candidate_tree') -cne [string]$recomputed.approval_reference.candidate_tree -or
-            [string](Read-ObjectProperty $carried 'closure_digest_sha256') -cne [string]$recomputed.approval_reference.closure_digest_sha256 -or
-            [string](Read-ObjectProperty $carried 'issuer_evidence_sha256') -cne [string]$recomputed.approval_reference.issuer_evidence_sha256) {
-            throw 'RELEASE.json governor approval identity differs from the recomputed detached owner approval'
-        }
-        if ([string](Read-ObjectProperty $bound 'source_commit') -cne $sourceCommit -or
-            [string](Read-ObjectProperty $bound 'evidence_sha256') -cne [string]$recomputed.evidence.evidence_sha256 -or
-            [string](Read-ObjectProperty $bound 'approval_content_sha256') -cne [string]$recomputed.evidence.approval_content_sha256 -or
-            [string](Read-ObjectProperty $bound 'closure_digest_sha256') -cne [string]$recomputed.evidence.closure_digest_sha256) {
-            throw 'RELEASE.json governor evidence differs from the recomputed retirement evidence'
+        [void](Assert-GovernorApprovalIdentityAgreement $recomputed.approval_reference $carried 'RELEASE.json')
+        foreach ($field in @('kind', 'source_commit', 'candidate_tree', 'owner_candidate_commit',
+                'owner_candidate_tree', 'approval_content_sha256', 'approval_canonical_request_hash',
+                'approval_operation_id', 'approval_file_sha256', 'trust_file_sha256', 'issuer',
+                'issuer_evidence_sha256', 'release_policy_revision', 'closure_rule_set',
+                'closure_digest_sha256', 'denominator_consumers', 'candidate_closure_digest_sha256',
+                'candidate_closure_count', 'evidence_sha256')) {
+            if ([string](Read-ObjectProperty $bound $field) -cne [string](Read-ObjectProperty $recomputed.evidence $field)) {
+                throw "RELEASE.json governor evidence differs from the recomputed retirement evidence ($field)"
+            }
         }
         Assert-NoRetiredLaunchReferences $BundlePath @($recomputed.live_references)
         return [pscustomobject]@{ retired = $true; evidence = $recomputed.evidence; approval_reference = $recomputed.approval_reference }
@@ -3146,8 +3149,8 @@ function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [obj
         # their digests are bound by SHA256SUMS.json like every other entry.
         $entries += [ordered]@{
             path = $script:GovernorRetirementBundleApprovalFile
-            selection = 'detached owner approval R(C) issued outside the candidate tree; the exact approved artifact set'
-            owner = 'root-owned release policy; issued for this exact candidate commit and tree'
+            selection = 'original detached owner approval R(C) issued outside the candidate tree; D is separately release-bound'
+            owner = 'root-owned release policy; historical source C plus exact release candidate D'
             install_destination = './'
             generation = $SourceCommit
             proof_ceiling = $script:GovernorRetirementProofCeiling
@@ -4110,10 +4113,9 @@ $frontDoorBridgePlan = Get-FrontDoorBridgePlan $cargoMetadata $ClaudeCodeFrontDo
 # is decided, and only from an explicit detached approval input. The input is
 # the only caller-supplied retirement artifact; the trust root is one exact
 # root-owned policy inside the candidate tree, so the same caller can never
-# supply both an arbitrary approval and an arbitrary trust root. Only Retained
-# (legacy source still valid, no owner-issued R(C)) and Retired (a detached
-# owner approval verified for the exact candidate commit AND tree against the
-# independently recomputed consumer closure) proceed; RetirementCandidate and
+# supply both an arbitrary approval and an arbitrary trust root. Only Retained (legacy source still valid, no approval) and Retired (the
+# unchanged v1 owner approval verified against historical C, with exact D and
+# its independent closure separately bound) proceed; RetirementCandidate and
 # MalformedOrAmbiguous abort explicitly. Presence keeps today's retained slice
 # byte-identical.
 $sourceCommit = (& git -C $repo rev-parse HEAD 2>$null | Out-String).Trim()
