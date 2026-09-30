@@ -78,6 +78,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{ResourceGeneration, StateFence};
+use eliot_host_service::runtime_control::HostActivationAdmission;
 use eliot_host_state::{
     ActivationState, DrainRecord, DrainState, EliotActivationRecord, EpochIdentity,
     EpochTransition, HostState, HostStateRecord, KernelReadinessObservationRecord,
@@ -340,6 +341,44 @@ impl HostComposition {
         // F-LOG-HOST-1: projection only, never a readiness or lease claim.
         host_lifecycle_observe_requested(BOUNDARY_ACTIVATION_ADMISSION_REQUESTED);
         activation_admission_from(&self.snapshot()?)
+    }
+
+    /// Projects the durable activation admission onto the runtime-control
+    /// wire type owned by `eliot-host-service`.
+    ///
+    /// Read-only 1:1 projection of [`HostComposition::activation_admission`]:
+    /// the same journal snapshot and the same owner types, so the wire
+    /// result carries the activation state, activation generation,
+    /// governance profile, held lease references and drain disposition the
+    /// journal proved. The runtime-control ingress attaches the result to
+    /// the real response path; the local stderr line stays diagnostics-only.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the durable Host state cannot be read or the
+    /// activation record is absent.
+    pub fn activation_admission_wire(&self) -> Result<HostActivationAdmission, HostError> {
+        // F-LOG-HOST-1: projection only, never a readiness or lease claim.
+        let admission = self.activation_admission()?;
+        Ok(HostActivationAdmission {
+            activation_id: admission.activation_id,
+            activation_generation: admission.activation_generation,
+            state: admission.state,
+            host_epoch: admission.host_epoch,
+            kernel_epoch: admission.kernel_epoch,
+            watchdog_epoch: admission.watchdog_epoch,
+            store_generation: admission.store_generation,
+            governance_profile: admission.governance_profile,
+            control_ready: admission.control_ready,
+            supervision_ready: admission.supervision_ready,
+            requested_capabilities: admission.requested_capabilities,
+            admitted_capabilities: admission.admitted_capabilities,
+            runtime_lease_refs: admission.runtime_lease_refs,
+            supervision_lease_refs: admission.supervision_lease_refs,
+            wake_intent_refs: admission.wake_intent_refs,
+            drain_disposition: admission.drain_disposition,
+            coalesced: admission.coalesced,
+        })
     }
 
     /// Records one authenticated observable-use trigger against the current
