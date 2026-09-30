@@ -2317,6 +2317,7 @@ dependencies = [
  "eliot-store-memory",
  "eliot-store-surreal-adapter",
  "eliot-testd-core",
+ "eliot-user-broker-core",
  "redb",
  "secrecy",
  "serde",
