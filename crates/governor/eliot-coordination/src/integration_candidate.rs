@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     CoordinationError, CoordinationEvent, CoordinationEventKind, CoordinationOwner,
-    IntegrationLease, IntegrationLeaseDecision, IntegrationLeaseRequest,
+    IntegrationLease, IntegrationLeaseDecision, IntegrationLeaseRequest, PeerReviewLifecycle,
 };
 
 /// Lifecycle of one immutable integration candidate.
@@ -108,6 +108,116 @@ pub struct IntegrationQueue {
     pub active_leases: Vec<IntegrationLease>,
 }
 
+/// One review correlated to a provenance subject by an exact recorded
+/// identity string.
+///
+/// The match is correlation, never causation (I11.2): the review's
+/// `artifact_id` equals the cited `matched_ref` character-for-character, and
+/// both endpoints are reported so a reader can verify the shared string.
+/// Sharing a string proves co-occurrence in one owner's records, not that
+/// one record caused the other and not that either owns the other.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CorrelatedReview {
+    pub review_id: String,
+    /// Reviewed operation identity exactly as the retained review carries
+    /// it: the navigation start for decision-to-change movement.
+    pub operation: String,
+    pub artifact_revision: u64,
+    pub artifact_digest: String,
+    pub lifecycle: PeerReviewLifecycle,
+    /// Exact recorded string shared with the provenance subject.
+    pub matched_ref: String,
+}
+
+/// One candidate correlated to a code identity by an exact recorded string.
+///
+/// Same correlation contract as [`CorrelatedReview`]: the cited
+/// `matched_ref` is character-for-character equal on both records, and the
+/// candidate's own diff and base commit ride along so navigation reaches the
+/// actual recorded change without choosing an arbitrary single origin.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CorrelatedCandidate {
+    pub candidate_id: String,
+    /// Exact recorded string shared with the code identity.
+    pub matched_ref: String,
+    pub diff_ref: String,
+    pub base_commit: String,
+}
+
+/// One retained revision digest behind a code identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedArtifactRevision {
+    pub revision: u64,
+    pub digest: String,
+}
+
+/// Recorded origins behind one integration candidate, forward from the
+/// retained decision to the retained diff, code and verifier refs.
+///
+/// Every leg cites retained records only. Legs this owner does not retain
+/// are listed in `gaps` with their reason instead of being invented:
+/// public conversation references live outside this owner, and verifier
+/// outcomes are never inferred from worker results, so a
+/// `verification_ref` binds no artifact revision here. A passing run for
+/// different bytes proves nothing about this candidate's bytes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateProvenance {
+    pub candidate_id: String,
+    /// Sequence of the retained submission event (`history[0]`), when that
+    /// event is still present in the event stream and names this candidate.
+    pub submission_event_sequence: Option<u64>,
+    /// Every lease decision recorded against this candidate, in `lease_id`
+    /// order. Indexes are rebuildable from the retained lease records.
+    pub lease_ids: Vec<String>,
+    /// Exact diff reference as retained on the candidate.
+    pub diff_ref: String,
+    /// Exact base commit as retained on the candidate.
+    pub base_commit: String,
+    /// Reviews sharing an exact recorded identity string with this
+    /// candidate, in `review_id` order. Multiple origins are preserved; no
+    /// arbitrary single origin is chosen.
+    pub correlated_reviews: Vec<CorrelatedReview>,
+    /// Verifier references as retained: recorded, unbound strings. They name
+    /// evidence handles only; this owner records no outcome for them.
+    pub verification_refs: Vec<String>,
+    /// Missing legs with reasons: conversation, verifier binding, an absent
+    /// submission event, an absent lease, absent correlated reviews.
+    pub gaps: Vec<String>,
+}
+
+/// Recorded origins behind one code identity, reverse from current code to
+/// the decisions, diffs and reviews that name it.
+///
+/// The lookup starts at the exact requested identity and reports what the
+/// owner retains at and around it: the admitted head, every retained
+/// revision digest, reviews bound to the artifact, and candidates sharing an
+/// exact recorded string. Absence lands in `gaps`, never filled from a
+/// nearest match: an unrun search stays incomplete.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactProvenance {
+    pub artifact_id: String,
+    pub requested_revision: Option<u64>,
+    pub current_revision: Option<u64>,
+    pub current_digest: Option<String>,
+    /// Every retained revision digest for this artifact, in revision order.
+    /// The head entry equals the current pair when a head is admitted.
+    pub retained_revisions: Vec<RetainedArtifactRevision>,
+    /// Reviews retained against this exact artifact identity, in
+    /// `review_id` order.
+    pub reviews: Vec<CorrelatedReview>,
+    /// Candidates sharing an exact recorded string with this artifact, in
+    /// `candidate_id` order, each with the matched string cited.
+    pub correlated_candidates: Vec<CorrelatedCandidate>,
+    /// Missing coverage with reasons: no head, no retained revisions, no
+    /// reviews, no correlated candidates, unavailable conversation.
+    pub gaps: Vec<String>,
+}
+
 /// Marks one candidate stale after its declared base has changed.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -160,6 +270,188 @@ impl CoordinationOwner {
     /// Reads the canonical candidate by identity.
     pub fn integration_candidate(&self, candidate_id: &str) -> Option<&IntegrationCandidate> {
         self.integration_candidates.get(candidate_id)
+    }
+
+    /// Reads the recorded origins behind one integration candidate, forward
+    /// from the retained lease decisions to the retained diff, code and
+    /// verifier refs, with correlated reviews attached.
+    ///
+    /// The view is rebuilt from retained records on every call: the
+    /// submission event is joined through `history[0]` against the retained
+    /// event stream, leases through the retained lease records, and reviews
+    /// through exact recorded-string correlation (see [`CorrelatedReview`]).
+    /// Legs the owner does not retain land in `gaps` with their reason.
+    /// `None` when no candidate carries the identity: a missing link stays
+    /// missing, never synthesized.
+    #[must_use]
+    pub fn candidate_provenance(&self, candidate_id: &str) -> Option<CandidateProvenance> {
+        let candidate = self.integration_candidates.get(candidate_id)?;
+        let submission_event_sequence = candidate.history.first().and_then(|revision| {
+            let index = revision.event_sequence.checked_sub(1)?;
+            let index = usize::try_from(index).ok()?;
+            let event = self.events.get(index)?;
+            (event.sequence == revision.event_sequence
+                && event.kind == CoordinationEventKind::IntegrationCandidateSubmitted
+                && event.subject_id == candidate.candidate_id)
+                .then_some(event.sequence)
+        });
+        let mut lease_ids: Vec<String> = self
+            .integration_lease_by_request
+            .values()
+            .filter(|lease| {
+                lease.candidate_id.as_deref() == Some(candidate.candidate_id.as_str())
+            })
+            .map(|lease| lease.lease_id.clone())
+            .collect();
+        lease_ids.sort();
+        lease_ids.dedup();
+        let identity_strings: BTreeSet<&str> = candidate
+            .worktree_or_artifact_refs
+            .iter()
+            .map(String::as_str)
+            .chain(candidate.producer_lineage.iter().map(String::as_str))
+            .collect();
+        let correlated_reviews: Vec<CorrelatedReview> = self
+            .peer_reviews
+            .values()
+            .filter(|review| identity_strings.contains(review.artifact_id.as_str()))
+            .map(|review| CorrelatedReview {
+                review_id: review.review_id.clone(),
+                operation: review.operation.clone(),
+                artifact_revision: review.artifact_revision,
+                artifact_digest: review.artifact_digest.clone(),
+                lifecycle: review.lifecycle,
+                matched_ref: review.artifact_id.clone(),
+            })
+            .collect();
+        let mut gaps = Vec::new();
+        if submission_event_sequence.is_none() {
+            gaps.push(
+                "submission event absent from the retained event stream".to_owned(),
+            );
+        }
+        if lease_ids.is_empty() {
+            gaps.push(
+                "no integration lease decision recorded against this candidate".to_owned(),
+            );
+        }
+        if correlated_reviews.is_empty() {
+            gaps.push(
+                "no retained review shares an exact recorded identity string with this candidate"
+                    .to_owned(),
+            );
+        }
+        gaps.push("public conversation references are not retained by this owner".to_owned());
+        gaps.push(
+            "verification refs bind no artifact revision here; this owner records no verifier outcome"
+                .to_owned(),
+        );
+        Some(CandidateProvenance {
+            candidate_id: candidate.candidate_id.clone(),
+            submission_event_sequence,
+            lease_ids,
+            diff_ref: candidate.diff_ref.clone(),
+            base_commit: candidate.base_commit.clone(),
+            correlated_reviews,
+            verification_refs: candidate.verification_refs.clone(),
+            gaps,
+        })
+    }
+
+    /// Reads the recorded origins behind one code identity, reverse from the
+    /// current admitted head to the retained revisions, reviews and
+    /// correlated candidates.
+    ///
+    /// Every join is exact: the head and revision digests come from the
+    /// retained artifact maps, reviews from the retained review records for
+    /// the artifact identity, and candidates from exact recorded-string
+    /// correlation (see [`CorrelatedCandidate`]). Requesting a revision the
+    /// owner never retained is a reported gap, not a lookup into current
+    /// code: history is never rewritten to the head.
+    #[must_use]
+    pub fn artifact_provenance(
+        &self,
+        artifact_id: &str,
+        revision: Option<u64>,
+    ) -> ArtifactProvenance {
+        let head = self.peer_artifact_heads.get(artifact_id);
+        let mut retained_revisions: Vec<RetainedArtifactRevision> = self
+            .peer_artifact_revisions
+            .iter()
+            .filter(|((identity, _), _)| identity.as_str() == artifact_id)
+            .map(|((_, retained), digest)| RetainedArtifactRevision {
+                revision: *retained,
+                digest: digest.clone(),
+            })
+            .collect();
+        retained_revisions.sort_by_key(|entry| entry.revision);
+        let reviews: Vec<CorrelatedReview> = self
+            .peer_reviews
+            .values()
+            .filter(|review| review.artifact_id == artifact_id)
+            .map(|review| CorrelatedReview {
+                review_id: review.review_id.clone(),
+                operation: review.operation.clone(),
+                artifact_revision: review.artifact_revision,
+                artifact_digest: review.artifact_digest.clone(),
+                lifecycle: review.lifecycle,
+                matched_ref: review.artifact_id.clone(),
+            })
+            .collect();
+        let correlated_candidates: Vec<CorrelatedCandidate> = self
+            .integration_candidates
+            .values()
+            .filter_map(|candidate| {
+                candidate
+                    .worktree_or_artifact_refs
+                    .iter()
+                    .chain(candidate.producer_lineage.iter())
+                    .find(|entry| entry.as_str() == artifact_id)
+                    .map(|matched| CorrelatedCandidate {
+                        candidate_id: candidate.candidate_id.clone(),
+                        matched_ref: matched.clone(),
+                        diff_ref: candidate.diff_ref.clone(),
+                        base_commit: candidate.base_commit.clone(),
+                    })
+            })
+            .collect();
+        let mut gaps = Vec::new();
+        if head.is_none() {
+            gaps.push("no admitted head for this artifact identity".to_owned());
+        }
+        if retained_revisions.is_empty() {
+            gaps.push("no retained revision digests for this artifact identity".to_owned());
+        }
+        if let Some(requested) = revision {
+            if !retained_revisions
+                .iter()
+                .any(|entry| entry.revision == requested)
+            {
+                gaps.push(
+                    "requested revision is not retained for this artifact identity".to_owned(),
+                );
+            }
+        }
+        if reviews.is_empty() {
+            gaps.push("no retained reviews for this artifact identity".to_owned());
+        }
+        if correlated_candidates.is_empty() {
+            gaps.push(
+                "no retained candidate shares an exact recorded identity string with this artifact"
+                    .to_owned(),
+            );
+        }
+        gaps.push("public conversation references are not retained by this owner".to_owned());
+        ArtifactProvenance {
+            artifact_id: artifact_id.to_owned(),
+            requested_revision: revision,
+            current_revision: head.map(|head| head.revision),
+            current_digest: head.map(|head| head.digest.clone()),
+            retained_revisions,
+            reviews,
+            correlated_candidates,
+            gaps,
+        }
     }
 
     /// Appends a stale transition only when this candidate depends on the changed base.
