@@ -2039,7 +2039,7 @@ impl KernelComposition {
     /// StoreApplyOperation and its ORS reservation pass the same full
     /// validation used by the result-submit path. This is a read-only view:
     /// it does not advance the host-request row or imply a terminal receipt.
-    fn validated_original_staged_observe_submission(
+    pub(crate) fn validated_original_staged_observe_submission(
         &self,
         record: &HostRequestRecord,
     ) -> Result<Option<eliot_store_api::WriteSubmission>, TransportError> {
@@ -5767,7 +5767,7 @@ impl KernelComposition {
                 retained.kernel_owner_bundle_sha256.clone(),
             )
             .map_err(|_| TransportError::SessionFenced)?,
-        });
+        })
     }
 
     fn seal_observe_executable_input(
@@ -7942,7 +7942,11 @@ impl KernelComposition {
         if transition.task_id.as_deref().is_some_and(|task_id| {
             binding.task_ref.as_ref().map(OpaqueLabel::as_str) != Some(task_id)
         }) || binding.task_ref.is_some()
-            && binding.task_revision != transition.state_fence.task_revision
+            && binding.task_revision
+                != transition
+                    .state_fence
+                    .task_revision
+                    .map(eliot_contracts::TaskRevision::value)
         {
             return Err(TransportError::IdentityConflict);
         }
