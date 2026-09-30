@@ -729,9 +729,8 @@ impl ExecutionUnitRouteEvidence {
     ) -> Result<Self, IngestError> {
         admission.validate()?;
         binding.validate_internal()?;
-        let requested_route_digest =
-            route_fingerprint_digest_for(&admission.requested_route)
-                .map_err(|_| IngestError::DigestEncoding)?;
+        let requested_route_digest = route_fingerprint_digest_for(&admission.requested_route)
+            .map_err(|_| IngestError::DigestEncoding)?;
         let Some(observation) = physical_observation else {
             return Ok(Self {
                 requested_route_digest,
