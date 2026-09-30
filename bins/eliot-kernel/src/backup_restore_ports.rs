@@ -615,16 +615,17 @@ pub fn kernel_to_backup(error: KernelRestoreError) -> BackupError {
             BackupError::InvalidField { field, reason }
         }
         KernelRestoreError::TargetFailed(inner) => inner,
-        // The cleanup disposition is a Kernel-owner-local fact about staging
-        // this process staged; the causal class that crosses the seam is still
-        // the engine's own typed failure, so the primary is returned rather
-        // than re-wrapped into a string.
-        KernelRestoreError::StagedCleanupIncomplete { primary, .. } => primary,
-        // Retention is likewise an owner-local disposition. What crosses the
-        // seam is still the engine's typed failure, and the retained bytes
-        // stay on disk whatever this mapping says, so no fact a caller of the
-        // accepted seam could act on differently is lost here.
-        KernelRestoreError::RetainedForResume { primary, .. } => primary,
+        // Both dispositions below are Kernel-owner-local facts about output
+        // this process staged: whether the bounded reap of its own unpublished
+        // temporaries completed, and how much already-published phase material
+        // it retained. Neither is the causal class that crosses the seam — that
+        // is still the engine's own typed failure — so each returns the primary
+        // rather than re-wrapping it into a string. The retained bytes stay on
+        // disk whatever this mapping says, and the retained set is carried by
+        // the owner-local error a caller of THIS function still sees; a caller
+        // of the accepted seam is asking a different question.
+        KernelRestoreError::StagedCleanupIncomplete { primary, .. }
+        | KernelRestoreError::RetainedForResume { primary, .. } => primary,
         KernelRestoreError::CutoverNotAuthorized => BackupError::CutoverNotAuthorized,
         KernelRestoreError::DestinationInvalid(_)
         | KernelRestoreError::FenceMismatch(_)
