@@ -15,17 +15,21 @@ use eliot_artifact::{
     ArtifactReadReceipt, ArtifactReference, VerifiedArtifact,
 };
 use eliot_blob::{
-    BlobRootOwner, BlobServicePorts, BlobStoreService, DpapiUserAeadPort,
-    DpapiUserKeyPort, WindowsBlobPlatform, ZstdBlobCompression,
+    BlobResidencyDomains, BlobRootOwner, BlobServicePorts, BlobStoreService,
+    DpapiUserAeadPort, DpapiUserKeyPort, WindowsBlobPlatform, ZstdBlobCompression,
 };
-use eliot_blob_api::{BlobError, BlobId, BlobReadRequest, BlobReceiptContext};
-use eliot_governor::SourceArtifactAdmission;
+use eliot_blob_api::{
+    BlobError, BlobId, BlobPolicyBinding, BlobReadRequest, BlobReceiptContext, RetentionClass,
+};
+use eliot_governor::{
+    SourceArtifactAdmission, SourceArtifactBlobProfile, SourceArtifactBlobProfileError,
+    SourceArtifactRetentionClass,
+};
+use eliot_platform::PlatformHandle;
 use eliot_platform_windows::WindowsPlatform;
 use eliot_receipts::EffectClass;
 use thiserror::Error;
 
-/// Bounded maximum accepted by the canonical Blob plaintext path.
-const MAX_SOURCE_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
 const SOURCE_BLOB_DIRECTORY: &str = "source-artifacts";
 const SOURCE_BLOB_OWNER_ID: &str = "eliotd-source-artifact-owner-v1";
 const SOURCE_BLOB_KEY_LINEAGE: &str = "eliotd-source-artifact-key-v1";
@@ -38,7 +42,6 @@ type SourceBlobService =
 /// extract or launch a separate D2 process.
 pub struct SourceArtifactOwner {
     root_owner: BlobRootOwner,
-    artifact: ArtifactOwner,
     key_generation: u64,
 }
 
@@ -58,8 +61,10 @@ pub enum SourceArtifactOwnerError {
     Blob(#[from] BlobError),
     #[error("artifact owner refused source binding: {0}")]
     Artifact(#[from] ArtifactError),
-    #[error("source artifact stage requires original owner-issued Blob policy and six-domain residency evidence")]
-    MissingAdmissibilityEvidence,
+    #[error("source artifact policy profile refused this admission: {0}")]
+    Profile(#[from] SourceArtifactBlobProfileError),
+    #[error("source artifact policy reference is invalid: {0}")]
+    PolicyReference(#[from] eliot_platform::PortError),
     #[error("source artifact effect is not admitted for this operation")]
     WrongEffect,
 }
@@ -87,22 +92,20 @@ impl SourceArtifactOwner {
             std::process::id(),
             lifecycle_fence,
         )?;
-        let artifact = ArtifactOwner::new(MAX_SOURCE_ARTIFACT_BYTES)?;
         Ok(Self {
             root_owner,
-            artifact,
             key_generation,
         })
     }
 
-    /// Stages exact archive bytes only after an original source-policy owner
-    /// provides the Blob policy and six-domain residency evidence. The
-    /// current Governor admission proves only effect authorization; it does
-    /// not contain those data-governance facts, so this path refuses until
-    /// that original-owner evidence is threaded into the same call stack.
+    /// Stages exact archive bytes after the original PolicyOwner profile has
+    /// been validated against this live source admission and the active Blob
+    /// key lineage. Blob derives the versioned content digest from these exact
+    /// bytes; neither Governor nor this composition invents residency facts.
     pub fn stage_source_snapshot(
         &self,
         admission: &SourceArtifactAdmission,
+        profile: &SourceArtifactBlobProfile,
         identity: ArtifactIdentity,
         bytes: &[u8],
     ) -> Result<ArtifactReference, SourceArtifactOwnerError> {
@@ -110,7 +113,41 @@ impl SourceArtifactOwner {
             return Err(SourceArtifactOwnerError::WrongEffect);
         }
         identity.verify_content(bytes)?;
-        Err(SourceArtifactOwnerError::MissingAdmissibilityEvidence)
+        profile.validate_for(admission, SOURCE_BLOB_KEY_LINEAGE, self.key_generation)?;
+
+        let policy = BlobPolicyBinding {
+            privacy_class: profile.policy().privacy_class(),
+            retention_class: match profile.policy().retention_class() {
+                SourceArtifactRetentionClass::Session => RetentionClass::Session,
+                SourceArtifactRetentionClass::Task => RetentionClass::Task,
+                SourceArtifactRetentionClass::Durable => RetentionClass::Durable,
+                SourceArtifactRetentionClass::LegalHold => RetentionClass::LegalHold,
+            },
+            policy_ref: PlatformHandle::new(profile.policy().policy_ref().to_owned())?,
+            instruction_taint: profile.policy().instruction_taint(),
+            effect_ceiling: profile.policy().effect_ceiling(),
+        };
+        let domains = profile.residency_domains();
+        let residency = BlobResidencyDomains::new(
+            BlobId::new(domains.scope_domain_id().to_owned())?,
+            BlobId::new(domains.access_domain_id().to_owned())?,
+            BlobId::new(domains.confidentiality_domain_id().to_owned())?,
+            BlobId::new(domains.encryption_key_domain_id().to_owned())?,
+            BlobId::new(domains.retention_domain_id().to_owned())?,
+            BlobId::new(domains.erasure_domain_id().to_owned())?,
+        );
+        let context = receipt_context(admission);
+        let blob = self.blob_for_context(&context)?;
+        let root_lease = self.root_owner.lease_for_request(&context.request)?;
+        let ready = blob.stage_source_with_domains(context, root_lease, bytes, policy, residency)?;
+        ready.validate()?;
+        ArtifactReference::new(
+            identity,
+            ready.locator().clone(),
+            ready.metadata_sha256().to_owned(),
+            ready.receipt().identity.receipt_id.to_string(),
+        )
+        .map_err(SourceArtifactOwnerError::Artifact)
     }
 
     /// Reopens one exact persisted Artifact reference through the original
@@ -133,7 +170,10 @@ impl SourceArtifactOwner {
                 root_owner: &self.root_owner,
                 context,
             };
-            self.artifact
+            // The persisted identity supplies this read's exact byte ceiling;
+            // BlobStoreCore enforces its own canonical plaintext ceiling.
+            let artifact = ArtifactOwner::new(reference.identity.content.size_bytes.max(1))?;
+            artifact
                 .read(reference, &reader)
                 .await
                 .map_err(SourceArtifactOwnerError::Artifact)
