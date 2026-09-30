@@ -7,7 +7,7 @@ use eliot_context_contracts::{
     SerializedContextMeasurement,
 };
 use eliot_cue_activation::CueActivationEvaluation;
-use eliot_dreamer_classification::ClassificationResult;
+use eliot_dreamer_classification::OrientationClassificationResult;
 use eliot_dreamer_conflict_analysis::ConflictAnalysisCandidate;
 use eliot_dreamer_contracts::grounding::GroundedDreamDraft as StructuredGroundedDreamDraft;
 use eliot_dreamer_contracts::{
@@ -60,7 +60,7 @@ pub(crate) struct OrientationOwnerInputs<'a> {
 /// Typed native outputs retained from the exact mandatory owner calls.
 pub(crate) struct StageOutputSet {
     boundary_predecessors: Vec<String>,
-    pub classification: Option<ClassificationResult>,
+    pub classification: Option<OrientationClassificationResult>,
     pub cue_activation: Option<CueActivationEvaluation>,
     pub epistemic_position: Option<CurrentEpistemicPosition>,
     pub understanding: Option<ActiveUnderstandingViewResult>,

@@ -2,7 +2,9 @@
 
 use eliot_contracts::ArtifactId;
 use eliot_dreamer_contracts::{
-    ClassificationInput, ContractViolation, ExternalGradeRef, canonical_bytes, digest_hex,
+    AdmittedTargetRef, ClassificationInput, ContractViolation, ExternalGradeRef,
+    FeatureObservation, NamedEvidence, OrientationClassificationProfile, TaxonomyDenominator,
+    canonical_bytes, digest_hex,
 };
 use eliot_epistemic_contracts::{EvidenceGrade, GradeAssignment};
 use eliot_evidence::EpistemicStatus;
@@ -186,6 +188,39 @@ impl ClassificationPolicy {
         &self,
         input: &ClassificationInput,
     ) -> Result<BudgetReceipt, ContractViolation> {
+        input.preflight()?;
+        self.preflight_fields(
+            input,
+            &input.target,
+            &input.evidence,
+            &input.features,
+            &input.taxonomy,
+        )
+    }
+
+    /// Applies the same bounds to an owner-published Orientation profile.
+    pub(crate) fn preflight_orientation(
+        &self,
+        input: &OrientationClassificationProfile,
+    ) -> Result<BudgetReceipt, ContractViolation> {
+        input.preflight()?;
+        self.preflight_fields(
+            input,
+            &input.target,
+            &input.evidence,
+            &input.features,
+            &input.taxonomy,
+        )
+    }
+
+    fn preflight_fields<I: Serialize>(
+        &self,
+        input: &I,
+        target: &AdmittedTargetRef,
+        evidence: &[NamedEvidence],
+        features: &[FeatureObservation],
+        taxonomy: &TaxonomyDenominator,
+    ) -> Result<BudgetReceipt, ContractViolation> {
         if self.cancellation_requested {
             return Err(ContractViolation::Budget {
                 dimension: "cancellation",
@@ -217,7 +252,6 @@ impl ClassificationPolicy {
                 reason: "policy digest does not match execution policy".to_owned(),
             });
         }
-        input.preflight()?;
         let input_bytes = bounded_len(
             serde_json::to_vec(input)
                 .map_err(|_| ContractViolation::Malformed {
@@ -227,18 +261,16 @@ impl ClassificationPolicy {
                 .len(),
             "input_bytes",
         )?;
-        let feature_count = bounded_len(input.features.len(), "features")?;
-        let alternative_count = bounded_len(input.taxonomy.alternatives.len(), "alternatives")?;
-        let evidence_count = bounded_len(input.evidence.len(), "evidence")?;
-        let source_ref_count = input
-            .evidence
+        let feature_count = bounded_len(features.len(), "features")?;
+        let alternative_count = bounded_len(taxonomy.alternatives.len(), "alternatives")?;
+        let evidence_count = bounded_len(evidence.len(), "evidence")?;
+        let source_ref_count = evidence
             .iter()
-            .try_fold(input.target.source_handles.len(), |acc, e| {
+            .try_fold(target.source_handles.len(), |acc, e| {
                 acc.checked_add(e.source_handles.len())
             })
             .and_then(|n| {
-                input
-                    .features
+                features
                     .iter()
                     .try_fold(n, |acc, f| acc.checked_add(f.evidence_refs.len()))
             })

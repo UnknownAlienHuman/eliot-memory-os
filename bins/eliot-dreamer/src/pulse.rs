@@ -11,7 +11,7 @@
 //! Every stage runs through its named owner entry point; this composer owns no
 //! stage semantics and duplicates no state machine:
 //!
-//! - classification: `eliot_dreamer_classification::classify`;
+//! - classification: `eliot_dreamer_classification::classify_orientation`;
 //! - cue activation: `eliot_cue_activation::evaluate_activation`;
 //! - Current Epistemic Position: `eliot_epistemic::resolve`;
 //! - Active Understanding View:
@@ -70,14 +70,16 @@ use eliot_contracts::StateFence;
 use eliot_cue_activation::{ActivationProfile, CueActivationEvaluation, evaluate_activation};
 use eliot_cue_contracts::{ActivationRequest, CueSnapshotBuildCandidate};
 use eliot_dreamer_claim_grounding::{GroundingRequest, ground_draft_with_controls};
-use eliot_dreamer_classification::{ClassificationPolicy, ClassificationResult, classify};
+use eliot_dreamer_classification::{
+    ClassificationPolicy, OrientationClassificationResult, classify_orientation,
+};
 use eliot_dreamer_conflict_analysis::{
     ConflictAnalysisCandidate, ConflictAnalysisPolicy, ConflictSupplements,
     analyze_grounded_conflict,
 };
 use eliot_dreamer_contracts::{
-    ClassificationInput, CurationAcceptanceCtx, DreamInputBundle, ModelRouteDisposition,
-    ModelRouteOutcome, ValidatedCurationItem,
+    DreamInputBundle, ModelRouteDisposition, ModelRouteOutcome,
+    OrientationClassificationProfile, ValidatedCurationItem,
     ValidatedGroundingCandidate, bundle_digest_of, canonical_bytes, digest_hex,
 };
 use eliot_dreamer_contracts::grounding::GroundedDreamDraft as StructuredGroundedDreamDraft;
@@ -95,10 +97,8 @@ use crate::OrientationStageDisposition;
 
 /// Caller-supplied classification stage inputs (owner-built, never inferred).
 pub(crate) struct ClassificationStage<'a> {
-    /// Frozen classification input bound to the execution policy.
-    pub input: &'a ClassificationInput,
-    /// Governor acceptance context the selector runs under.
-    pub context: &'a CurationAcceptanceCtx<'a>,
+    /// Original owner-published Orientation classification profile.
+    pub input: &'a OrientationClassificationProfile,
     /// Execution policy the input digest binds.
     pub policy: &'a ClassificationPolicy,
 }
@@ -585,33 +585,18 @@ pub(crate) fn run_classification_stage(
     stage.map_or_else(
         || Ok(PulseStage::pending(PulseStageId::Classification)),
         |inputs| {
-            let owner_input_digest =
-                eliot_dreamer_contracts::classification_input_digest(inputs.input)
-                    .map_err(|_| PulseError::Classification)?;
-            let output = classify(inputs.input, inputs.context, inputs.policy)
+            let output = classify_orientation(inputs.input, inputs.policy)
                 .map_err(|_| PulseError::Classification)?;
-            if output
-                .candidate
-                .as_ref()
-                .is_some_and(|candidate| candidate.input_digest != owner_input_digest)
-                || output
-                    .sealed
-                    .as_ref()
-                    .is_some_and(|sealed| sealed.input_digest != owner_input_digest)
+            let profile_digest =
+                canonical_input_commitment(inputs.input).ok_or(PulseError::Classification)?;
+            if output.profile_digest != profile_digest
+                || output.policy_digest != inputs.policy.policy_digest
+                || output.target_id != inputs.input.target.target_id
+                || output.target_revision != inputs.input.target.target_revision
             {
                 return Err(PulseError::Classification);
             }
-            let input_commitment = canonical_input_commitment(&(
-                &owner_input_digest,
-                inputs.context.job,
-                inputs.context.bundle,
-                inputs.context.receipt,
-                inputs.context.screen,
-                inputs.context.grounded,
-                inputs.context.request,
-                inputs.context.usage,
-                inputs.policy,
-            ))
+            let input_commitment = canonical_input_commitment(&(inputs.input, inputs.policy))
             .ok_or(PulseError::Classification)?;
             let canonical = canonical_bytes(&output).ok();
             let commitment = output.result_digest.clone();

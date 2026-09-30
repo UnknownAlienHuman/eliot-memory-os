@@ -995,6 +995,8 @@ pub enum CampaignSourceDocumentSchema {
     AdaptationPosition,
     EvaluationPosition,
     EconomicsProgress,
+    OrientationClassificationProfile,
+    OrientationAdmissionRecord,
     RetrievalPlan,
 }
 
@@ -1231,7 +1233,9 @@ impl CampaignSourceDocument {
             | D::ExperiencePosition
             | D::AdaptationPosition
             | D::EvaluationPosition
-            | D::EconomicsProgress => {
+            | D::EconomicsProgress
+            | D::OrientationClassificationProfile
+            | D::OrientationAdmissionRecord => {
                 let body: CampaignOwnerProjectionBody =
                     serde_json::from_value(self.body.clone())
                         .map_err(|error| StoreError::Serialization(error.to_string()))?;
@@ -1592,7 +1596,9 @@ impl CampaignSourceDocument {
             | D::ExperiencePosition
             | D::AdaptationPosition
             | D::EvaluationPosition
-            | D::EconomicsProgress => {
+            | D::EconomicsProgress
+            | D::OrientationClassificationProfile
+            | D::OrientationAdmissionRecord => {
                 let body: CampaignOwnerProjectionBody =
                     serde_json::from_value(self.body.clone())
                         .map_err(|error| StoreError::Serialization(error.to_string()))?;
@@ -2623,6 +2629,10 @@ pub enum CampaignSourcePublisher {
     EvaluationPosition,
     /// Economics progress-position row.
     EconomicsProgress,
+    /// Governor-owned Orientation classification profile.
+    OrientationClassification,
+    /// Governor-owned Orientation admission decision source.
+    OrientationAdmission,
 }
 
 impl CampaignSourcePublisher {
@@ -2656,6 +2666,8 @@ impl CampaignSourcePublisher {
             Self::AdaptationPosition => CampaignSourceRole::AdaptationPosition,
             Self::EvaluationPosition => CampaignSourceRole::EvaluationPosition,
             Self::EconomicsProgress => CampaignSourceRole::EconomicsProgress,
+            Self::OrientationClassification => CampaignSourceRole::OrientationClassification,
+            Self::OrientationAdmission => CampaignSourceRole::OrientationAdmission,
         }
     }
 
@@ -2689,6 +2701,8 @@ impl CampaignSourcePublisher {
             CampaignSourceRole::AdaptationPosition => Self::AdaptationPosition,
             CampaignSourceRole::EvaluationPosition => Self::EvaluationPosition,
             CampaignSourceRole::EconomicsProgress => Self::EconomicsProgress,
+            CampaignSourceRole::OrientationClassification => Self::OrientationClassification,
+            CampaignSourceRole::OrientationAdmission => Self::OrientationAdmission,
         })
     }
 }
@@ -3003,6 +3017,8 @@ pub const fn campaign_source_owner_id(role: CampaignSourceRole) -> &'static str 
         R::AdaptationPosition => ADAPTATION_POSITION_CAMPAIGN_OWNER_ID,
         R::EvaluationPosition => EVALUATION_POSITION_CAMPAIGN_OWNER_ID,
         R::EconomicsProgress => ECONOMICS_PROGRESS_CAMPAIGN_OWNER_ID,
+        R::OrientationClassification => "owner:eliot-governor/orientation-classification",
+        R::OrientationAdmission => "owner:eliot-governor/orientation-admission",
     }
 }
 
@@ -3040,6 +3056,8 @@ pub const fn campaign_source_schema_for_role(
         R::AdaptationPosition => D::AdaptationPosition,
         R::EvaluationPosition => D::EvaluationPosition,
         R::EconomicsProgress => D::EconomicsProgress,
+        R::OrientationClassification => D::OrientationClassificationProfile,
+        R::OrientationAdmission => D::OrientationAdmissionRecord,
     }
 }
 
@@ -3058,7 +3076,11 @@ fn campaign_source_identity_matches(
 ) -> bool {
     use CampaignSourceRole as R;
     match role {
-        R::TaskObjective | R::TaskAcceptance | R::TaskPlan | R::TaskOpenItems => matches!(
+        R::TaskObjective
+        | R::TaskAcceptance
+        | R::TaskPlan
+        | R::TaskOpenItems
+        | R::OrientationAdmission => matches!(
             (record_id, revision),
             (
                 CampaignOwnerRecordId::Task(_),
@@ -3073,7 +3095,8 @@ fn campaign_source_identity_matches(
         | R::ExperiencePosition
         | R::AdaptationPosition
         | R::EvaluationPosition
-        | R::EconomicsProgress => matches!(
+        | R::EconomicsProgress
+        => matches!(
             (record_id, revision),
             (
                 CampaignOwnerRecordId::Resource(_),
@@ -3085,6 +3108,13 @@ fn campaign_source_identity_matches(
             (
                 CampaignOwnerRecordId::Task(_),
                 CampaignOwnerRevision::Counter(_)
+            )
+        ),
+        R::OrientationClassification => matches!(
+            (record_id, revision),
+            (
+                CampaignOwnerRecordId::Artifact(_),
+                CampaignOwnerRevision::ResourceSnapshot(_)
             )
         ),
         R::GovernorEpoch => matches!(
@@ -3139,7 +3169,11 @@ fn campaign_owner_matches(record: &CampaignSourceRecord) -> bool {
 fn campaign_identity_matches(record: &CampaignSourceRecord) -> bool {
     use CampaignSourceRole as R;
     match record.role {
-        R::TaskObjective | R::TaskAcceptance | R::TaskPlan | R::TaskOpenItems => {
+        R::TaskObjective
+        | R::TaskAcceptance
+        | R::TaskPlan
+        | R::TaskOpenItems
+        | R::OrientationAdmission => {
             matches!(
                 (&record.record_id, &record.revision),
                 (
@@ -3156,7 +3190,8 @@ fn campaign_identity_matches(record: &CampaignSourceRecord) -> bool {
         | R::ExperiencePosition
         | R::AdaptationPosition
         | R::EvaluationPosition
-        | R::EconomicsProgress => matches!(
+        | R::EconomicsProgress
+        => matches!(
             (&record.record_id, &record.revision),
             (
                 CampaignOwnerRecordId::Resource(_),
@@ -3168,6 +3203,13 @@ fn campaign_identity_matches(record: &CampaignSourceRecord) -> bool {
             (
                 CampaignOwnerRecordId::Task(_),
                 CampaignOwnerRevision::Counter(_)
+            )
+        ),
+        R::OrientationClassification => matches!(
+            (&record.record_id, &record.revision),
+            (
+                CampaignOwnerRecordId::Artifact(_),
+                CampaignOwnerRevision::ResourceSnapshot(_)
             )
         ),
         R::GovernorEpoch => matches!(
@@ -3691,6 +3733,14 @@ fn campaign_role_accepts_schema(
             | (R::AdaptationPosition, D::AdaptationPosition)
             | (R::EvaluationPosition, D::EvaluationPosition)
             | (R::EconomicsProgress, D::EconomicsProgress)
+            | (
+                R::OrientationClassification,
+                D::OrientationClassificationProfile
+            )
+            | (
+                R::OrientationAdmission,
+                D::OrientationAdmissionRecord
+            )
     )
 }
 

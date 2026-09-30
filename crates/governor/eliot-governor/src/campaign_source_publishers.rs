@@ -76,6 +76,59 @@ pub fn campaign_owner_source_registry() -> Vec<CampaignOwnerSourceRegistration> 
         .collect()
 }
 
+/// Return the independently-read Orientation classification source role.
+///
+/// This registration is intentionally excluded from the fixed 26-role
+/// campaign learning-view denominator.
+#[must_use]
+pub fn orientation_classification_source_registration(
+) -> Option<CampaignOwnerSourceRegistration> {
+    let role = CampaignSourceRole::OrientationClassification;
+    Some(CampaignOwnerSourceRegistration {
+        role,
+        publisher: CampaignSourcePublisher::for_role(role)?,
+        owner_id: OwnerId::from_artifact(
+            ArtifactId::new(campaign_source_owner_id(role).to_owned()).ok()?,
+        ),
+        schema: campaign_source_schema_for_role(role),
+    })
+}
+
+/// Registration for the independently-read canonical Orientation admission
+/// source. It stays outside the fixed 26-role learning-view denominator.
+#[must_use]
+pub fn orientation_admission_source_registration(
+) -> Option<CampaignOwnerSourceRegistration> {
+    let role = CampaignSourceRole::OrientationAdmission;
+    Some(CampaignOwnerSourceRegistration {
+        role,
+        publisher: CampaignSourcePublisher::for_role(role)?,
+        owner_id: OwnerId::from_artifact(
+            ArtifactId::new(campaign_source_owner_id(role).to_owned()).ok()?,
+        ),
+        schema: campaign_source_schema_for_role(role),
+    })
+}
+
+fn campaign_owner_source_registration(
+    role: CampaignSourceRole,
+) -> Option<CampaignOwnerSourceRegistration> {
+    campaign_owner_source_registry()
+        .into_iter()
+        .find(|registration| registration.role == role)
+        .or_else(|| {
+            match role {
+                CampaignSourceRole::OrientationClassification => {
+                    orientation_classification_source_registration()
+                }
+                CampaignSourceRole::OrientationAdmission => {
+                    orientation_admission_source_registration()
+                }
+                _ => None,
+            }
+        })
+}
+
 /// Build the Task Controller's own bounded campaign-history read result.
 ///
 /// This is deliberately owner-specific and crate-private. The Task Controller
@@ -257,10 +310,7 @@ impl CampaignOwnerSourceInput {
     pub fn into_publication(
         self,
     ) -> Result<CampaignSourcePublication, CampaignSourcePublisherError> {
-        let registration = campaign_owner_source_registry()
-            .into_iter()
-            .find(|registration| registration.role == self.role)
-            .ok_or_else(|| {
+        let registration = campaign_owner_source_registration(self.role).ok_or_else(|| {
                 CampaignSourcePublisherError::Invalid(
                     "owner role is absent from the production registry".to_owned(),
                 )
@@ -700,4 +750,18 @@ pub fn validate_campaign_source_role_matrix() {
         );
         assert!(!registration.owner_id.as_str().is_empty());
     }
+    let orientation = orientation_classification_source_registration()
+        .expect("Orientation classification owner registration is a fixed native contract");
+    assert_eq!(
+        orientation.role,
+        CampaignSourceRole::OrientationClassification
+    );
+    assert_eq!(
+        orientation.publisher.role(),
+        CampaignSourceRole::OrientationClassification
+    );
+    assert_eq!(
+        orientation.schema,
+        campaign_source_schema_for_role(orientation.role)
+    );
 }

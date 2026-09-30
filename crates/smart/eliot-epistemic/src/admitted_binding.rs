@@ -46,7 +46,7 @@ pub enum AdmittedBindingError {
 impl AdmittedBindingError {
     /// Bounded stage disposition identifying the exact typed refusal class.
     #[must_use]
-    pub const fn stage_disposition(&self) -> &'static str {
+    pub fn stage_disposition(&self) -> &'static str {
         match self {
             Self::CandidateContract => "candidate_contract",
             Self::PositionContract => "admitted_position_contract",
@@ -213,10 +213,10 @@ fn validate_admitted_position(
     Ok(())
 }
 
-fn admitted_single_observation(
-    candidate: &EpistemicPositionCandidate,
+fn admitted_single_observation<'a>(
+    candidate: &'a EpistemicPositionCandidate,
     admitted: &AdmittedPosition,
-) -> Result<(&ClaimEntry, &SupportRecord), AdmittedBindingError> {
+) -> Result<(&'a ClaimEntry, &'a SupportRecord), AdmittedBindingError> {
     if candidate.claims.len() != 1 || candidate.support.len() != 1 {
         return Err(AdmittedBindingError::Unsupported {
             field: "candidate must be the existing single-observation producer shape",

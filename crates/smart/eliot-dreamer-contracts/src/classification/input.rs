@@ -28,6 +28,8 @@ const MAX_ITEMS: usize = 256;
 const MAX_INPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CONTEXT_BYTES: usize = 8 * 1024 * 1024;
 const SCHEMA_VERSION: u32 = 1;
+/// First closed schema for owner-published Orientation classification inputs.
+pub const ORIENTATION_CLASSIFICATION_PROFILE_SCHEMA_VERSION: u32 = 1;
 
 /// Opaque externally supplied admission assertion. It authenticates nothing;
 /// A-03 checks only its joins to the retained item and screen.
@@ -243,6 +245,56 @@ pub struct ClassificationInput {
     pub policy_digest: String,
 }
 
+/// Original owner-published classification facts for an Orientation job.
+///
+/// Unlike [`ClassificationInput`], this profile has no Curation item or
+/// ScreenBinding. The source owner supplies its exact target, evidence,
+/// features, taxonomy, prior assignment and preservation record; the live
+/// Orientation job, model route, and campaign read proof are joined by the
+/// Governor stage-source owner at invocation time.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OrientationClassificationProfile {
+    pub schema_version: u32,
+    pub target: AdmittedTargetRef,
+    pub evidence: Vec<NamedEvidence>,
+    pub features: Vec<FeatureObservation>,
+    pub taxonomy: TaxonomyDenominator,
+    pub prior_assignment: Option<PriorAssignmentRef>,
+    pub preservation: ClassificationPreservation,
+    pub policy_digest: String,
+}
+
+impl OrientationClassificationProfile {
+    /// Bound the exact source-owner profile before validation or cloning.
+    pub fn preflight(&self) -> Result<(), ContractViolation> {
+        bounded_json(
+            self,
+            MAX_INPUT_BYTES,
+            "classification.orientation_profile_bytes",
+        )
+    }
+
+    /// Validate the exact non-Curation semantic closure supplied by its owner.
+    pub fn validate(&self) -> Result<(), ContractViolation> {
+        self.preflight()?;
+        crate::error::check_schema_version(
+            self.schema_version,
+            ORIENTATION_CLASSIFICATION_PROFILE_SCHEMA_VERSION,
+        )?;
+        self.target.validate()?;
+        check_digest(&self.policy_digest, "classification.policy_digest")?;
+        self.taxonomy.validate()?;
+        validate_evidence_closure(&self.target, &self.evidence, &self.taxonomy)?;
+        validate_feature_closure(&self.evidence, &self.features, &self.taxonomy)?;
+        validate_history_closure(
+            &self.target,
+            self.prior_assignment.as_ref(),
+            &self.preservation,
+        )
+    }
+}
+
 impl ClassificationInput {
     /// Runs bounded borrowed serialization before any canonical clone/hash.
     pub fn preflight(&self) -> Result<(), ContractViolation> {
@@ -308,140 +360,16 @@ impl ClassificationInput {
     }
 
     fn validate_evidence_phase(&self) -> Result<(), ContractViolation> {
-        check_vec_bound(self.evidence.len(), MAX_ITEMS, "classification.evidence")?;
-        check_vec_bound(self.features.len(), MAX_ITEMS, "classification.features")?;
-        check_unique_evidence(&self.evidence)?;
-        for evidence in &self.evidence {
-            evidence.validate()?;
-            // Raw provenance is an external route address; only the typed
-            // source_handles participate in this retained source closure.
-            let provenance = &evidence.foundation_evidence_envelope.provenance;
-            if evidence.foundation_evidence_envelope.state_fence != self.target.state_fence
-                || provenance.scope != self.target.scope_id.as_str()
-            {
-                return Err(ContractViolation::BindingMismatch {
-                    field: "classification.evidence.scope_fence",
-                    reason: "evidence does not join target scope/fence".to_owned(),
-                });
-            }
-            if evidence
-                .source_handles
-                .iter()
-                .any(|handle| !self.target.source_handles.contains(handle))
-            {
-                return Err(ContractViolation::BindingMismatch {
-                    field: "classification.evidence.source_handles",
-                    reason: "evidence source handle is outside target source closure".to_owned(),
-                });
-            }
-        }
-        for criterion in &self.taxonomy.criteria {
-            if criterion
-                .evidence_refs
-                .iter()
-                .any(|id| !self.evidence.iter().any(|e| e.id == *id))
-            {
-                return Err(ContractViolation::BindingMismatch {
-                    field: "taxonomy.criterion.evidence_refs",
-                    reason: "criterion references missing named evidence".to_owned(),
-                });
-            }
-        }
-        for alternative in &self.taxonomy.alternatives {
-            if alternative
-                .evidence_refs
-                .iter()
-                .chain(alternative.counterevidence_refs.iter())
-                .any(|id| !self.evidence.iter().any(|e| e.id == *id))
-            {
-                return Err(ContractViolation::BindingMismatch {
-                    field: "taxonomy.alternative.evidence_refs",
-                    reason: "alternative references missing named evidence".to_owned(),
-                });
-            }
-        }
-        self.validate_feature_phase()?;
-        Ok(())
-    }
-
-    fn validate_feature_phase(&self) -> Result<(), ContractViolation> {
-        let criterion_ids: Vec<_> = self
-            .taxonomy
-            .criteria
-            .iter()
-            .map(|criterion| criterion.criterion_id.clone())
-            .collect();
-        for (index, feature) in self.features.iter().enumerate() {
-            feature.validate()?;
-            if self.features[..index]
-                .iter()
-                .any(|other| other.feature_id == feature.feature_id)
-            {
-                return Err(ContractViolation::BindingMismatch {
-                    field: "classification.feature_id",
-                    reason: "duplicate feature identity".to_owned(),
-                });
-            }
-            if !criterion_ids.contains(&feature.criterion_id) {
-                return Err(ContractViolation::BindingMismatch {
-                    field: "classification.criterion_id",
-                    reason: "feature criterion is not declared".to_owned(),
-                });
-            }
-            let Some(criterion) = self
-                .taxonomy
-                .criteria
-                .iter()
-                .find(|c| c.criterion_id == feature.criterion_id)
-            else {
-                return Err(ContractViolation::BindingMismatch {
-                    field: "classification.criterion_id",
-                    reason: "feature criterion is not declared".to_owned(),
-                });
-            };
-            if criterion.applicability != feature.applicability {
-                return Err(ContractViolation::BindingMismatch {
-                    field: "classification.feature.applicability",
-                    reason: "feature applicability disagrees with taxonomy criterion".to_owned(),
-                });
-            }
-            if feature
-                .evidence_refs
-                .iter()
-                .any(|id| !self.evidence.iter().any(|e| e.id == *id))
-            {
-                return Err(ContractViolation::BindingMismatch {
-                    field: "classification.feature.evidence_refs",
-                    reason: "feature references missing named evidence".to_owned(),
-                });
-            }
-        }
-        Ok(())
+        validate_evidence_closure(&self.target, &self.evidence, &self.taxonomy)?;
+        validate_feature_closure(&self.evidence, &self.features, &self.taxonomy)
     }
 
     fn validate_history_phase(&self) -> Result<(), ContractViolation> {
-        if let Some(prior) = &self.prior_assignment {
-            prior.validate()?;
-            if prior.target_id != self.target.target_id
-                || prior.target_revision != self.target.target_revision
-            {
-                return Err(ContractViolation::BindingMismatch {
-                    field: "classification.prior_assignment",
-                    reason: "prior assignment target binding drift".to_owned(),
-                });
-            }
-            if prior
-                .source_handles
-                .iter()
-                .any(|handle| !self.target.source_handles.contains(handle))
-            {
-                return Err(ContractViolation::BindingMismatch {
-                    field: "classification.prior_assignment.source_handles",
-                    reason: "prior source handle is outside target source closure".to_owned(),
-                });
-            }
-        }
-        self.preservation.validate()
+        validate_history_closure(
+            &self.target,
+            self.prior_assignment.as_ref(),
+            &self.preservation,
+        )
     }
 
     /// Returns a clone with only set-like fields normalized for identity.
@@ -528,6 +456,155 @@ impl ClassificationInput {
             .sort_by_key(|verdict| preservation_dimension_key(verdict.dimension));
         Ok(normalized)
     }
+}
+
+fn validate_evidence_closure(
+    target: &AdmittedTargetRef,
+    evidence: &[NamedEvidence],
+    taxonomy: &TaxonomyDenominator,
+) -> Result<(), ContractViolation> {
+    check_vec_bound(evidence.len(), MAX_ITEMS, "classification.evidence")?;
+    check_unique_evidence(evidence)?;
+    for item in evidence {
+        item.validate()?;
+        let provenance = &item.foundation_evidence_envelope.provenance;
+        if item.foundation_evidence_envelope.state_fence != target.state_fence
+            || provenance.scope != target.scope_id.as_str()
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "classification.evidence.scope_fence",
+                reason: "evidence does not join target scope/fence".to_owned(),
+            });
+        }
+        if item
+            .source_handles
+            .iter()
+            .any(|handle| !target.source_handles.contains(handle))
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "classification.evidence.source_handles",
+                reason: "evidence source handle is outside target source closure".to_owned(),
+            });
+        }
+    }
+    validate_taxonomy_evidence_refs(evidence, taxonomy)
+}
+
+fn validate_taxonomy_evidence_refs(
+    evidence: &[NamedEvidence],
+    taxonomy: &TaxonomyDenominator,
+) -> Result<(), ContractViolation> {
+    for criterion in &taxonomy.criteria {
+        if criterion
+            .evidence_refs
+            .iter()
+            .any(|id| !evidence.iter().any(|item| item.id == *id))
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "taxonomy.criterion.evidence_refs",
+                reason: "criterion references missing named evidence".to_owned(),
+            });
+        }
+    }
+    for alternative in &taxonomy.alternatives {
+        if alternative
+            .evidence_refs
+            .iter()
+            .chain(alternative.counterevidence_refs.iter())
+            .any(|id| !evidence.iter().any(|item| item.id == *id))
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "taxonomy.alternative.evidence_refs",
+                reason: "alternative references missing named evidence".to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_feature_closure(
+    evidence: &[NamedEvidence],
+    features: &[FeatureObservation],
+    taxonomy: &TaxonomyDenominator,
+) -> Result<(), ContractViolation> {
+    check_vec_bound(features.len(), MAX_ITEMS, "classification.features")?;
+    let criterion_ids: Vec<_> = taxonomy
+        .criteria
+        .iter()
+        .map(|criterion| criterion.criterion_id.clone())
+        .collect();
+    for (index, feature) in features.iter().enumerate() {
+        feature.validate()?;
+        if features[..index]
+            .iter()
+            .any(|other| other.feature_id == feature.feature_id)
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "classification.feature_id",
+                reason: "duplicate feature identity".to_owned(),
+            });
+        }
+        if !criterion_ids.contains(&feature.criterion_id) {
+            return Err(ContractViolation::BindingMismatch {
+                field: "classification.criterion_id",
+                reason: "feature criterion is not declared".to_owned(),
+            });
+        }
+        let Some(criterion) = taxonomy
+            .criteria
+            .iter()
+            .find(|item| item.criterion_id == feature.criterion_id)
+        else {
+            return Err(ContractViolation::BindingMismatch {
+                field: "classification.criterion_id",
+                reason: "feature criterion is not declared".to_owned(),
+            });
+        };
+        if criterion.applicability != feature.applicability {
+            return Err(ContractViolation::BindingMismatch {
+                field: "classification.feature.applicability",
+                reason: "feature applicability disagrees with taxonomy criterion".to_owned(),
+            });
+        }
+        if feature
+            .evidence_refs
+            .iter()
+            .any(|id| !evidence.iter().any(|item| item.id == *id))
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "classification.feature.evidence_refs",
+                reason: "feature references missing named evidence".to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_history_closure(
+    target: &AdmittedTargetRef,
+    prior_assignment: Option<&PriorAssignmentRef>,
+    preservation: &ClassificationPreservation,
+) -> Result<(), ContractViolation> {
+    if let Some(prior) = prior_assignment {
+        prior.validate()?;
+        if prior.target_id != target.target_id || prior.target_revision != target.target_revision {
+            return Err(ContractViolation::BindingMismatch {
+                field: "classification.prior_assignment",
+                reason: "prior assignment target binding drift".to_owned(),
+            });
+        }
+        if prior
+            .source_handles
+            .iter()
+            .any(|handle| !target.source_handles.contains(handle))
+        {
+            return Err(ContractViolation::BindingMismatch {
+                field: "classification.prior_assignment.source_handles",
+                reason: "prior source handle is outside target source closure".to_owned(),
+            });
+        }
+    }
+    preservation.validate()
 }
 
 fn preservation_dimension_key(dimension: ClassificationPreservationDimension) -> u8 {
