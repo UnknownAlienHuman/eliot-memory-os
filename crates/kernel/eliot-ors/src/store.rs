@@ -33608,7 +33608,8 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         let value = table.get(item_id.as_str()).map_err(storage)?;
         value
             .map(|stored| {
-                let record: DurableInboxRecord = decode_named(stored.value(), "recovery_inbox")?;
+                let record: DurableInboxRecord =
+                    decode_named(stored.value(), "recovery_inbox")?;
                 if record.item.item_id.as_str() != item_id.as_str() {
                     return Err(OrsError::IntegrityProblem {
                         record_type: "recovery_inbox",
