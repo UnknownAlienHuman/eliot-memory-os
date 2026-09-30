@@ -1177,6 +1177,7 @@ dependencies = [
  "eliot-cue-contracts",
  "eliot-epistemic-contracts",
  "eliot-evidence",
+ "eliot-learning-contracts",
  "eliot-memory-projection-contracts",
  "eliot-protocol",
  "eliot-receipts",
