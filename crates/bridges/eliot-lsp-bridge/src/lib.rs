@@ -41,6 +41,7 @@ use eliot_artifact::{
     ArtifactError, ArtifactKind, ArtifactOwner, ArtifactReadReceipt, ArtifactReference,
     VerifiedArtifact,
 };
+use eliot_blob_api::BlobReadChunk;
 use eliot_build_test_graph::{BuildFingerprint, CandidateIdentity};
 use eliot_contracts::{ArtifactId, ContractId, ContractVersion};
 use eliot_evidence::{
@@ -900,7 +901,7 @@ pub struct LspSourceArtifactProjectionV1 {
     pub git_tree_id: String,
     /// Exact immutable artifact reference used for the source snapshot.
     pub artifact_reference: ArtifactReference,
-    /// Inert copy of the original non-deserializable ArtifactReadReceipt.
+    /// Inert copy of the original non-deserializable `ArtifactReadReceipt`.
     pub read_receipt: LspArtifactReadReceiptProjectionV1,
 }
 
@@ -2806,7 +2807,7 @@ impl<P: LspProcessOwnerPort, G: GitProcessRunner> LspCurrentBridge<P, G> {
             .await
             .map_err(BridgeError::ProcessOwner)?;
         validate_process_owner_readback(started, &process_evidence)?;
-        let mut retained = self.retain_result(
+        let mut retained = Self::retain_result(
             started,
             process_evidence,
             raw_outputs,
@@ -2886,14 +2887,34 @@ impl<P: LspProcessOwnerPort, G: GitProcessRunner> LspCurrentBridge<P, G> {
                 "received process evidence differs from original process-owner readback".to_owned(),
             ));
         }
-        let currentness = received_result_currentness(&record, current);
-        let mut projection = LspAdoptionProjection {
+        let currentness = self
+            .source_artifact_currentness(
+                &record,
+                started,
+                current,
+                source_root,
+                received_result_currentness(&record, current),
+                current_source_proof,
+            )
+            .await;
+        Ok(LspAdoptionProjection {
             observation: adopt_received_result(record.as_ref().clone(), current)?,
             currentness,
-            retained_observation: Arc::clone(&record),
-        };
+            retained_observation: record,
+        })
+    }
+
+    async fn source_artifact_currentness(
+        &self,
+        record: &RetainedLspObservationV1,
+        started: &LspStartedInvocation,
+        current: &CurrentLspAdoptionContext<'_>,
+        source_root: &RepoRoot,
+        mut currentness: Freshness,
+        current_source_proof: Option<LspSourceArtifactProof>,
+    ) -> Freshness {
         let Some(dispatch_proof) = started.source_artifact_proof.as_ref() else {
-            return Ok(projection);
+            return currentness;
         };
         if let Err(error) = dispatch_proof
             .revalidate_current(
@@ -2903,16 +2924,15 @@ impl<P: LspProcessOwnerPort, G: GitProcessRunner> LspCurrentBridge<P, G> {
             )
             .await
         {
-            projection.currentness = Freshness::Stale {
+            return Freshness::Stale {
                 reason: format!("source changed or became unavailable at adoption: {error}"),
             };
-            return Ok(projection);
         }
         let Some(current_source_proof) = current_source_proof else {
-            return Ok(projection);
+            return currentness;
         };
-        let Some(binding) = projection.observation.receipt().source_binding.as_ref() else {
-            return Ok(projection);
+        let Some(binding) = record.result.receipt().source_binding.as_ref() else {
+            return currentness;
         };
         let current_registry = LspRegistryIdentity::from(current.registry_entry);
         let executable_matches =
@@ -2936,17 +2956,15 @@ impl<P: LspProcessOwnerPort, G: GitProcessRunner> LspCurrentBridge<P, G> {
         {
             Ok(matches) => matches,
             Err(error) => {
-                projection.currentness = Freshness::Stale {
+                return Freshness::Stale {
                     reason: format!("current source workspace is unavailable: {error}"),
                 };
-                return Ok(projection);
             }
         };
         if !workspace_matches {
-            projection.currentness = Freshness::Stale {
+            return Freshness::Stale {
                 reason: "current source artifact belongs to another workspace root".to_owned(),
             };
-            return Ok(projection);
         }
         let current_projection = current_source_proof.projection();
         let owner_matches = dispatch_proof.matches_current_source(&current_source_proof)
@@ -2977,23 +2995,22 @@ impl<P: LspProcessOwnerPort, G: GitProcessRunner> LspCurrentBridge<P, G> {
             process_succeeded(
                 process_evidence_completed(&record.process_evidence),
                 process_evidence_exit_code(&record.process_evidence),
-            ) && !process_outputs_incomplete(&process_evidence, &record.raw_outputs);
+            ) && !process_outputs_incomplete(&record.process_evidence, &record.raw_outputs);
         if executable_matches
             && profile_matches
             && owner_matches
             && process_complete
             && source_binding_matches_current(binding, current)
         {
-            projection.currentness = Freshness::Stale {
+            currentness = Freshness::Stale {
                 reason: "matching endpoint source captures do not prove that the mutable analyzer workspace remained unchanged during indexing".to_owned(),
             };
         }
-        Ok(projection)
+        currentness
     }
 
     #[allow(clippy::too_many_arguments)]
     fn retain_result(
-        &self,
         started: &LspStartedInvocation,
         process_evidence: ProcessEvidence,
         raw_outputs: Vec<LspRawOutput>,
@@ -3118,6 +3135,30 @@ pub fn adopt_retained_observation(
 ) -> Result<NormalizedResult, BridgeError> {
     validate_retained_observation(&record)?;
     Ok(record.result)
+}
+
+/// Decodes and adopts the original retained envelope from an S-04-authenticated
+/// immutable payload read. The returned result preserves the original stale
+/// observation receipt; this readback does not establish source or process
+/// currentness. The consumer that selected the payload reference must join
+/// that reference and its Store task binding before using the decoded record.
+pub fn adopt_captured_observation_from_blob_readback(
+    readback: &BlobReadChunk,
+) -> Result<(RetainedLspObservationV1, NormalizedResult), BridgeError> {
+    readback.validate().map_err(|error| {
+        BridgeError::InconsistentBinding(format!(
+            "authenticated Blob readback failed validation: {error}"
+        ))
+    })?;
+    let record: RetainedLspObservationV1 =
+        serde_json::from_slice(readback.bytes()).map_err(|error| {
+            BridgeError::InconsistentBinding(format!(
+                "authenticated Blob payload is not a retained LSP observation: {error}"
+            ))
+        })?;
+    validate_retained_observation(&record)?;
+    let result = record.result.clone();
+    Ok((record, result))
 }
 
 /// Compares one retained result with current task, source, executable,
