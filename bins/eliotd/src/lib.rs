@@ -3377,6 +3377,13 @@ impl DaemonComposition {
     /// coordinator's closed admission. The `health` half rides input-only
     /// into the capability and never mints admission (issue #265, W6).
     ///
+    /// Projects already-verified material only: the caller runs the
+    /// authenticated Kernel owner probe first (which compares the presented
+    /// executable digest against the ORS-retained binding, issue #2567),
+    /// and the per-operation content comparison binds the projection to the
+    /// exact operation at hand. Any disagreement is the typed
+    /// `IdentityConflict` residual — never a substituted route or provider.
+    ///
     /// # Errors
     ///
     /// Returns the closed-port validation, the per-operation identity
@@ -3449,6 +3456,48 @@ impl DaemonComposition {
         )?)
     }
 
+    /// Requires a verified restore to continue the snapshot's retained
+    /// attempt (issue #2567, AUD17/I6).
+    ///
+    /// Same request resolves the original handle: a snapshot that already
+    /// retains provider frames or dispatch intents for the freshly verified
+    /// attempt restores that attempt, never a second operation. A snapshot
+    /// bound to a different attempt refuses with the typed
+    /// [`FabricError::IdentityConflict`]: changed material gets a separately
+    /// admitted revision instead of a blind relaunch, and uncertain
+    /// ownership is never released. An empty snapshot (nothing dispatched
+    /// yet) restores directly: restore re-verifies and rehydrates, it never
+    /// re-dispatches by itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FabricError::IdentityConflict`] when the retained snapshot
+    /// binds a different attempt than the freshly verified material.
+    fn require_restore_attempt_continuity(
+        snapshot: &FabricSnapshot,
+        material: &VerifiedProviderMaterial,
+    ) -> Result<(), FabricError> {
+        let retains_any = !snapshot.provider_frames.is_empty() || !snapshot.intents.is_empty();
+        let retains_attempt = snapshot
+            .provider_frames
+            .values()
+            .map(|frame| frame.attempt_id.as_str())
+            .chain(
+                snapshot
+                    .intents
+                    .values()
+                    .map(|intent| intent.attempt_id.as_str()),
+            )
+            .any(|attempt| attempt == material.attempt_id.as_str());
+        if !retains_any || retains_attempt {
+            return Ok(());
+        }
+        Err(FabricError::IdentityConflict(
+            "verified restore binds a different attempt than the retained snapshot; admit a separate revision instead of relaunching"
+                .to_owned(),
+        ))
+    }
+
     /// Restores the production fabric on freshly verified owner material in
     /// one call (issue #1108 A6/W2, verified restore for A8).
     ///
@@ -3485,6 +3534,7 @@ impl DaemonComposition {
     ) -> Result<AgentFabric, DaemonError> {
         let _span = tracing::info_span!("eliotd.fabric_restore_verified_async").entered();
         let material = self.resolve_verified_material(kernel, material)?;
+        Self::require_restore_attempt_continuity(&snapshot, &material)?;
         let owner = kernel.owner_session_facts().ok_or_else(|| {
             DaemonError::Kernel(
                 "daemon has no validated Kernel owner session; verified provider restore stays plan-only"
@@ -3548,9 +3598,13 @@ impl DaemonComposition {
     }
 
     /// Drives one solo delegate through the nonblocking authenticated Kernel
-    /// provider-binding check (issue #1108). Until native-worker claim records
-    /// retain an independently owner-verified executable-binding digest, this
-    /// entry fails closed before admitted capability construction or dispatch.
+    /// provider-binding check (issue #1108). The claim owner retains the
+    /// independently owner-verified executable-binding digest
+    /// (`NativeWorkerClaimRecord::executable_binding_digest`, compared
+    /// presented-against-retained Kernel-side, issue #2567); this entry still
+    /// fails closed before admitted capability construction or dispatch until
+    /// the authenticated probe receipt covers that retained binding, and a
+    /// caller-claimed digest is never evidence.
     pub async fn solo_drive_once_async(
         &self,
         kernel: &Arc<DaemonKernelClient>,

@@ -1636,6 +1636,15 @@ fn native_worker_claim_staged_record(
         authority_epoch: request.authority_epoch.sequence.get(),
         binding_digest: request.binding_digest.clone(),
         request_digest: request.request_digest.clone(),
+        // The staged executable digest is the presented v2 join value. It
+        // becomes owner-verified when the route's enforce gate compares this
+        // identical value against the live owner record before Admitted is
+        // emitted; v1/absent joins stage empty and never verify.
+        executable_binding_digest: request
+            .executable_binding
+            .as_ref()
+            .map(|join| join.executable_binding_digest.clone())
+            .unwrap_or_default(),
         execution_unit_schema_version: request.execution_unit_schema_version,
         predecessor_revision: native_worker_claim_identity(
             OpaqueLabel::new(request.predecessor_revision.as_str()),

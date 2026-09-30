@@ -22349,6 +22349,43 @@ impl RedbRecoveryStore {
             .transpose()
     }
 
+    /// Verifies one presented executable-binding digest against the durable
+    /// claim row (issue #2567).
+    ///
+    /// Owner check: the lookup shape is validated with its existing
+    /// [`crate::ProviderCapabilityLookup::validate`], the row is loaded by
+    /// exact claim identity, and the presented digest is compared against
+    /// the retained row through
+    /// [`crate::NativeWorkerClaimRecord::verified_executable_binding_digest`].
+    /// Returns the retained digest on agreement; an unknown identity, a
+    /// foreign attempt/operation, an unadmitted claim, or a digest
+    /// disagreement is a typed refusal, never the caller-claimed value.
+    pub fn verify_native_worker_claim_executable_binding(
+        &self,
+        lookup: &crate::ProviderCapabilityLookup,
+        presented_executable_digest: &str,
+    ) -> Result<String, OrsError> {
+        lookup.validate()?;
+        let claim_id = crate::OperationIdentity::new(lookup.claim_id.as_str())?;
+        let record = self.load_native_worker_claim(&claim_id)?.ok_or_else(|| {
+            OrsError::NativeWorkerClaimIdentityConflict {
+                claim_id: lookup.claim_id.clone(),
+            }
+        })?;
+        if !lookup.matches(&record) {
+            return Err(OrsError::NativeWorkerClaimIdentityConflict {
+                claim_id: lookup.claim_id.clone(),
+            });
+        }
+        record
+            .verified_executable_binding_digest(
+                lookup.attempt_id.as_str(),
+                lookup.operation_id.as_str(),
+                presented_executable_digest,
+            )
+            .map(str::to_owned)
+    }
+
     /// Reverse-resolves one claim identity from its bound attempt and
     /// operation labels (T9-04 supplier core, issue #1108).
     ///
