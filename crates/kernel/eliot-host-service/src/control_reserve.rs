@@ -27,8 +27,28 @@
 //! the live reserve it reports and refuses while that reserve still admits
 //! the request, so pressure evidence is never manufactured.
 //!
+//! W4 Host wave: every [`HostPermit`] is owner-issued non-clone evidence bound
+//! to capacity class, bottleneck/unit/granted amount, typed operation,
+//! operation identity, owner and the typed [`AuthorityEpoch`] observed at
+//! acquisition, mirroring the ORS evidence grade. Every denial names the exact
+//! bottleneck, shed work and observed epoch. A stale epoch, changed operation
+//! or changed owner fails before consumption because the evidence no longer
+//! matches the current owner state; there is no epoch-blind permit to replay.
+//!
+//! Each claimed Host dimension publishes its live partition evidence through
+//! [`HostReserve::publish_owner_rows`] as validated
+//! [`BottleneckCapacityProfile`] rows: exactly one row per Host dimension, in
+//! frozen contract order, each naming exactly its own bottleneck. Every row is
+//! re-validated by the existing [`BottleneckCapacityProfile::validate`] before
+//! it is returned, so a missing owner, generation, physical total, protected
+//! partition, enforcement, proof, evidence or invalidation reference fails
+//! here rather than joining the Kernel profile composition as a claimed
+//! guarantee. Rows for any other bottleneck are never produced here: one
+//! owner's numbers are never presented as proof for another dimension.
+//!
 //! This module has no production caller yet (STITCH): it publishes the owner
-//! evidence the Host profile composition will join. There is no emergency
+//! evidence the Kernel profile composition will join, and the composition join
+//! itself is another wave, so no caller is manufactured here. There is no emergency
 //! partition here; recording reserve loss stays with the front-door
 //! last-resort slot until a later wave wires Host-side loss reporting.
 //! DISCLOSED LIMIT: `profile_revision` on the responses is caller-supplied
@@ -36,18 +56,21 @@
 //! to the live-observed saturation at call time, not to a re-read of the
 //! profile revision. Full installed-saturation proof stays #11 Product scope.
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use eliot_contracts::{ArtifactId, OperationId};
+use eliot_contracts::{ArtifactId, AuthorityEpoch, OperationId};
 use eliot_runtime_contracts::{
     AffectedOperationClass, BackpressureDisposition, BottleneckAvailability,
-    BottleneckCoverageState, BottleneckObservationV1, CapacityBottleneck, CapacityClass,
+    BottleneckCapacityProfile, BottleneckCoverageState, BottleneckObservationV1,
+    CapacityBottleneck, CapacityClass, CapacityEnforcement, CapacityLimit, CapacityUnit,
     ControlOperationClass, EarliestRecoveryCondition, EvidenceCoverageState,
     HumanActionRequirement, I14_BACKPRESSURE_RESPONSE_VERSION, I14BackpressureCause,
     I14BackpressureResponseV1, I14CurrentnessState, I14EscalationCondition, I14ForbiddenAction,
     I14RecoveryAction, I14RecoveryDirectiveV1, I14RequiredAuthority, I14ResolutionState,
     I14WorkOutcome, NormalWorkClass, RecoveryCommitStatus, StatePreservationStatus,
+    frozen_bottleneck_owner_map,
 };
 use thiserror::Error;
 
@@ -76,7 +99,7 @@ pub enum HostReserveError {
     /// The normal partition cannot satisfy the request; the protected
     /// partition is untouched.
     #[error(
-        "Host normal capacity exhausted for {bottleneck:?}: work {work_class:?} operation {operation_id} owned by {owner}"
+        "Host normal capacity exhausted for {bottleneck:?}: work {work_class:?} operation {operation_id} owned by {owner} epoch {epoch:?}"
     )]
     NormalCapacityExhausted {
         /// Bottleneck whose normal partition is saturated.
@@ -87,10 +110,12 @@ pub enum HostReserveError {
         operation_id: String,
         /// Requesting owner.
         owner: String,
+        /// Authority epoch observed at denial.
+        epoch: AuthorityEpoch,
     },
     /// The protected partition cannot satisfy the request.
     #[error(
-        "Host protected reserve exhausted for {bottleneck:?}: control operation {operation:?} operation {operation_id} owned by {owner}"
+        "Host protected reserve exhausted for {bottleneck:?}: control operation {operation:?} operation {operation_id} owned by {owner} epoch {epoch:?}"
     )]
     ProtectedReserveExhausted {
         /// Bottleneck whose protected partition is saturated.
@@ -101,6 +126,8 @@ pub enum HostReserveError {
         operation_id: String,
         /// Requesting owner.
         owner: String,
+        /// Authority epoch observed at denial.
+        epoch: AuthorityEpoch,
     },
 }
 
@@ -149,6 +176,30 @@ impl HostPermitOperation {
     }
 }
 
+/// Composition-resolved references identifying one Host owner-evidence
+/// publication: the live partition capacities read from the reserve itself
+/// and their physical total, and the [`CapacityEnforcement::ConfigurationPartition`]
+/// mechanism those partitions are held under. The composition supplies the
+/// references that identify the observation: its own owner-generation
+/// reference for the Host owner, the independent proof-profile reference, and
+/// the current evidence and invalidation references. Both halves are required:
+/// [`HostReserve::publish_owner_rows`] fails closed through the existing
+/// [`BottleneckCapacityProfile::validate`] when any reference is missing or
+/// non-canonical, so the composition must resolve canonical (strictly
+/// ascending, duplicate-free) reference sets rather than have them defaulted
+/// or sorted here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostOwnerEvidenceContext {
+    /// Owner generation/revision reference for the Host process-tree owner.
+    pub owner_generation_ref: String,
+    /// Independent proof-profile reference produced for the Host dimensions.
+    pub proof_profile_ref: String,
+    /// Current owner evidence references supporting the published rows.
+    pub evidence_refs: Vec<String>,
+    /// Exact invalidation set of the published rows.
+    pub invalidation_set: Vec<String>,
+}
+
 #[derive(Debug)]
 struct HostReserveInner {
     launch_normal_capacity: u64,
@@ -174,12 +225,14 @@ pub struct HostReserve {
     inner: Arc<HostReserveInner>,
 }
 
-/// One held Host capacity permit, bound to dimension, class, operation and
-/// owner. Releasing is automatic on drop and returns exactly the consumed
-/// partition and amount.
+/// One held Host capacity permit, bound to dimension, class, operation, owner
+/// and Authority Epoch. Releasing is automatic on drop and returns exactly
+/// the consumed partition and amount.
 ///
-/// Permits are deliberately not [`Clone`]: duplicating a permit handle must
-/// never duplicate the underlying capacity.
+/// The permit is bound to the typed Authority Epoch the caller resolved at
+/// acquisition: evidence from a fenced epoch never authorizes consumption
+/// under the current one. Permits are deliberately not [`Clone`]: duplicating
+/// a permit handle must never duplicate the underlying capacity.
 #[derive(Debug)]
 pub struct HostPermit {
     inner: Arc<HostReserveInner>,
@@ -189,6 +242,7 @@ pub struct HostPermit {
     operation: HostPermitOperation,
     operation_id: String,
     owner: String,
+    epoch: AuthorityEpoch,
 }
 
 impl HostPermit {
@@ -208,6 +262,12 @@ impl HostPermit {
     #[must_use]
     pub const fn bottleneck(&self) -> CapacityBottleneck {
         self.dimension.bottleneck()
+    }
+
+    /// Returns the exact unit this permit was granted in.
+    #[must_use]
+    pub const fn unit(&self) -> CapacityUnit {
+        self.dimension.bottleneck().unit()
     }
 
     /// Returns the amount held in the bottleneck's exact unit.
@@ -232,6 +292,12 @@ impl HostPermit {
     #[must_use]
     pub fn owner(&self) -> &str {
         &self.owner
+    }
+
+    /// Returns the Authority Epoch bound at acquisition.
+    #[must_use]
+    pub const fn epoch(&self) -> AuthorityEpoch {
+        self.epoch
     }
 }
 
@@ -420,19 +486,23 @@ impl HostReserve {
     /// Attempts to acquire one normal launch slot without blocking.
     ///
     /// Only [`NormalWorkClass`] operations typecheck here, so protected Host
-    /// capacity is unreachable through this path by construction.
+    /// capacity is unreachable through this path by construction. The granted
+    /// permit binds `epoch`; a caller presenting it under a different epoch
+    /// holds evidence that no longer matches the current owner state.
     ///
     /// # Errors
     ///
     /// Returns [`HostReserveError::InvalidField`] for a blank owner/operation
     /// identity, or [`HostReserveError::NormalCapacityExhausted`] naming the
-    /// launch bottleneck and shed work when the normal partition is
-    /// saturated. The protected partition is untouched in every case.
+    /// launch bottleneck, shed work and observed epoch when the normal
+    /// partition is saturated. The protected partition is untouched in every
+    /// case.
     pub fn try_acquire_normal_launch(
         &self,
         work: NormalWorkClass,
         owner: &str,
         operation_id: &str,
+        epoch: AuthorityEpoch,
     ) -> Result<HostPermit, HostReserveError> {
         validate_text(owner, "host_permit.owner")?;
         validate_text(operation_id, "host_permit.operation_id")?;
@@ -446,6 +516,7 @@ impl HostReserve {
                 work_class: work,
                 operation_id: operation_id.to_owned(),
                 owner: owner.to_owned(),
+                epoch,
             });
         }
         Ok(HostPermit {
@@ -456,6 +527,7 @@ impl HostReserve {
             operation: HostPermitOperation::Normal(work),
             operation_id: operation_id.to_owned(),
             owner: owner.to_owned(),
+            epoch,
         })
     }
 
@@ -464,19 +536,23 @@ impl HostReserve {
     ///
     /// Only [`NormalWorkClass`] operations typecheck here, so protected Host
     /// cancellation capacity is unreachable through this path by
-    /// construction.
+    /// construction. The granted permit binds `epoch`; a caller presenting it
+    /// under a different epoch holds evidence that no longer matches the
+    /// current owner state.
     ///
     /// # Errors
     ///
     /// Returns [`HostReserveError::InvalidField`] for a blank owner/operation
     /// identity, or [`HostReserveError::NormalCapacityExhausted`] naming the
-    /// cancellation bottleneck and shed work when the normal partition is
-    /// saturated. The protected partition is untouched in every case.
+    /// cancellation bottleneck, shed work and observed epoch when the normal
+    /// partition is saturated. The protected partition is untouched in every
+    /// case.
     pub fn try_acquire_normal_cancellation(
         &self,
         work: NormalWorkClass,
         owner: &str,
         operation_id: &str,
+        epoch: AuthorityEpoch,
     ) -> Result<HostPermit, HostReserveError> {
         validate_text(owner, "host_permit.owner")?;
         validate_text(operation_id, "host_permit.operation_id")?;
@@ -490,6 +566,7 @@ impl HostReserve {
                 work_class: work,
                 operation_id: operation_id.to_owned(),
                 owner: owner.to_owned(),
+                epoch,
             });
         }
         Ok(HostPermit {
@@ -500,6 +577,7 @@ impl HostReserve {
             operation: HostPermitOperation::Normal(work),
             operation_id: operation_id.to_owned(),
             owner: owner.to_owned(),
+            epoch,
         })
     }
 
@@ -508,19 +586,22 @@ impl HostReserve {
     /// Only [`ControlOperationClass`] operations typecheck here: ordinary work
     /// cannot name a protected operation and therefore cannot acquire this
     /// partition. This is the path an admitted cancellation/recovery record
-    /// keeps while normal launch work is saturated.
+    /// keeps while normal launch work is saturated. The granted permit binds
+    /// `epoch` so the recovery record proves it was admitted under the current
+    /// owner state.
     ///
     /// # Errors
     ///
     /// Returns [`HostReserveError::InvalidField`] for a blank owner/operation
     /// identity, or [`HostReserveError::ProtectedReserveExhausted`] naming
-    /// the launch bottleneck, operation, owner and request when the
-    /// protected partition is saturated.
+    /// the launch bottleneck, operation, owner, request and observed epoch
+    /// when the protected partition is saturated.
     pub fn try_acquire_protected_launch(
         &self,
         operation: ControlOperationClass,
         owner: &str,
         operation_id: &str,
+        epoch: AuthorityEpoch,
     ) -> Result<HostPermit, HostReserveError> {
         validate_text(owner, "host_permit.owner")?;
         validate_text(operation_id, "host_permit.operation_id")?;
@@ -534,6 +615,7 @@ impl HostReserve {
                 operation,
                 operation_id: operation_id.to_owned(),
                 owner: owner.to_owned(),
+                epoch,
             });
         }
         Ok(HostPermit {
@@ -544,6 +626,7 @@ impl HostReserve {
             operation: HostPermitOperation::Protected(operation),
             operation_id: operation_id.to_owned(),
             owner: owner.to_owned(),
+            epoch,
         })
     }
 
@@ -553,19 +636,22 @@ impl HostReserve {
     /// Only [`ControlOperationClass`] operations typecheck here: ordinary work
     /// cannot name a protected operation and therefore cannot acquire this
     /// partition. This is the path an admitted cancellation/recovery record
-    /// keeps while normal cancellation work is saturated.
+    /// keeps while normal cancellation work is saturated. The granted permit
+    /// binds `epoch` so the recovery record proves it was admitted under the
+    /// current owner state.
     ///
     /// # Errors
     ///
     /// Returns [`HostReserveError::InvalidField`] for a blank owner/operation
     /// identity, or [`HostReserveError::ProtectedReserveExhausted`] naming
-    /// the cancellation bottleneck, operation, owner and request when the
-    /// protected partition is saturated.
+    /// the cancellation bottleneck, operation, owner, request and observed
+    /// epoch when the protected partition is saturated.
     pub fn try_acquire_protected_cancellation(
         &self,
         operation: ControlOperationClass,
         owner: &str,
         operation_id: &str,
+        epoch: AuthorityEpoch,
     ) -> Result<HostPermit, HostReserveError> {
         validate_text(owner, "host_permit.owner")?;
         validate_text(operation_id, "host_permit.operation_id")?;
@@ -579,6 +665,7 @@ impl HostReserve {
                 operation,
                 operation_id: operation_id.to_owned(),
                 owner: owner.to_owned(),
+                epoch,
             });
         }
         Ok(HostPermit {
@@ -589,6 +676,7 @@ impl HostReserve {
             operation: HostPermitOperation::Protected(operation),
             operation_id: operation_id.to_owned(),
             owner: owner.to_owned(),
+            epoch,
         })
     }
 
@@ -701,6 +789,53 @@ impl HostReserve {
     }
 }
 
+    /// Publishes the live partition evidence for both Host dimensions as
+    /// claimed [`BottleneckCapacityProfile`] rows, in frozen contract order.
+    ///
+    /// The result carries exactly one row per Host dimension: launch slots
+    /// first, cancellation/termination operations second. Each row names the
+    /// frozen owner the contract binds to that dimension, the exact bottleneck
+    /// unit, the physical total and the disjoint normal and protected
+    /// partitions read from this reserve. There is no emergency partition
+    /// here, so none is claimed. The owner generation, proof profile, evidence
+    /// and invalidation references are composition-supplied metadata echoed
+    /// into the rows from `ctx`; the Kernel composition wraps these rows in
+    /// its own evidence records with the configuration snapshot and Authority
+    /// Epoch it resolved.
+    ///
+    /// Each row is checked by the existing
+    /// [`BottleneckCapacityProfile::validate`] before it is returned, so a
+    /// missing owner, generation, physical total, protected partition,
+    /// enforcement, proof, evidence or invalidation reference fails here
+    /// rather than publishing a row the Kernel composition would have to lower
+    /// to `UNKNOWN`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostReserveError::Contract`] when the frozen owner map binds
+    /// no owner to a Host dimension, when the configured partition capacities
+    /// cannot form a positive physical total, or when either assembled row
+    /// fails the existing contract validation.
+    pub fn publish_owner_rows(
+        &self,
+        ctx: &HostOwnerEvidenceContext,
+    ) -> Result<[BottleneckCapacityProfile; 2], HostReserveError> {
+        let launch = host_owner_capacity_row(
+            HOST_LAUNCH_BOTTLENECK,
+            self.inner.launch_normal_capacity,
+            self.inner.launch_protected_capacity,
+            ctx,
+        )?;
+        let cancellation = host_owner_capacity_row(
+            HOST_CANCELLATION_BOTTLENECK,
+            self.inner.cancellation_normal_capacity,
+            self.inner.cancellation_protected_capacity,
+            ctx,
+        )?;
+        Ok([launch, cancellation])
+    }
+}
+
 /// Exact parts of one Host rejection directive shared by every constructor.
 struct HostRejectionParts {
     affected: AffectedOperationClass,
@@ -754,4 +889,75 @@ impl HostRejectionParts {
             .map_err(|error| HostReserveError::Contract(error.to_string()))?;
         Ok(response)
     }
+}
+
+/// Builds one claimed owner row for a Host dimension from the reserve's
+/// configured partition capacities and the composition-resolved references.
+///
+/// The owner reference is read from the frozen owner map, never restated here;
+/// the unit is the bottleneck's own declared unit. The physical total is
+/// exactly the sum of the two disjoint partitions, so the existing partition
+/// accounting check always bounds them. A zero partition capacity or a missing
+/// frozen owner fails closed: the reserve constructor already refuses zero
+/// partitions, and a dimension without a frozen owner has no claim to publish.
+fn host_owner_capacity_row(
+    bottleneck: CapacityBottleneck,
+    normal_capacity: u64,
+    protected_capacity: u64,
+    ctx: &HostOwnerEvidenceContext,
+) -> Result<BottleneckCapacityProfile, HostReserveError> {
+    let owner = frozen_bottleneck_owner_map()
+        .into_iter()
+        .find(|bound| bound.bottleneck == bottleneck)
+        .map(|bound| bound.owner)
+        .ok_or_else(|| {
+            HostReserveError::Contract(format!(
+                "frozen owner map binds no owner to {bottleneck:?}; no Host row to publish"
+            ))
+        })?;
+    let unit = bottleneck.unit();
+    let limit = |field: &'static str, amount: u64| {
+        NonZeroU64::new(amount)
+            .map(|quantity| CapacityLimit { unit, quantity })
+            .ok_or(HostReserveError::InvalidField {
+                field,
+                reason: "partition capacity must be greater than zero",
+            })
+    };
+    let normal_limit = limit("host_reserve.normal_limit", normal_capacity)?;
+    let protected_limit = limit("host_reserve.protected_limit", protected_capacity)?;
+    let physical_total =
+        normal_capacity
+            .checked_add(protected_capacity)
+            .ok_or(HostReserveError::InvalidField {
+                field: "host_reserve.physical_total_limit",
+                reason: "disjoint partition capacities overflow the physical total",
+            })?;
+    let physical_total_limit =
+        NonZeroU64::new(physical_total).ok_or(HostReserveError::InvalidField {
+            field: "host_reserve.physical_total_limit",
+            reason: "physical total must be greater than zero",
+        })?;
+    let row = BottleneckCapacityProfile {
+        bottleneck,
+        coverage_state: BottleneckCoverageState::Claimed,
+        owner_ref: owner.to_owned(),
+        owner_generation_ref: ctx.owner_generation_ref.clone(),
+        unit,
+        physical_total_limit: Some(CapacityLimit {
+            unit,
+            quantity: physical_total_limit,
+        }),
+        normal_work_applicable: true,
+        normal_limit: Some(normal_limit),
+        protected_limit: Some(protected_limit),
+        emergency_limit: None,
+        enforcement: Some(CapacityEnforcement::ConfigurationPartition),
+        proof_profile_ref: ctx.proof_profile_ref.clone(),
+        evidence_refs: ctx.evidence_refs.clone(),
+        invalidation_set: ctx.invalidation_set.clone(),
+    };
+    row.validate()
+        .map_err(|error| HostReserveError::Contract(error.to_string()))?;
+    Ok(row)
 }

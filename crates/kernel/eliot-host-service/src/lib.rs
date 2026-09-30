@@ -24,8 +24,8 @@ pub mod user_automation_wake;
 mod service;
 
 pub use control_reserve::{
-    HOST_CANCELLATION_BOTTLENECK, HOST_LAUNCH_BOTTLENECK, HostDimension, HostPermit,
-    HostPermitOperation, HostReserve, HostReserveError,
+    HOST_CANCELLATION_BOTTLENECK, HOST_LAUNCH_BOTTLENECK, HostDimension, HostOwnerEvidenceContext,
+    HostPermit, HostPermitOperation, HostReserve, HostReserveError,
 };
 pub use foreign_occupant_recovery::{
     AdmittedCollisionOperation, BlockedRecoveryOperation, CollisionOperationDisposition,
