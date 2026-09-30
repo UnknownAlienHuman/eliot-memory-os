@@ -72,17 +72,20 @@
 //!   recomputed here over the exact presented bytes through the one shared
 //!   canonical codec (`eliot_security_contracts`), which covers the evidence
 //!   version, identity, owner namespace, origin, dependents, reason, state,
-//!   fence, revision, bounds, disposition, omissions and the affected-member
-//!   coordinates; disagreement is [`RevocationHistoryError::IdentityConflict`]
-//!   under I5.27;
+//!   presenting read fence, recorded commit fence/epoch, revision, bounds,
+//!   disposition, omissions and the affected-member coordinates; disagreement
+//!   is [`RevocationHistoryError::IdentityConflict`] under I5.27;
 //! * owner namespace — declared per closure, resolved to the typed
 //!   [`AuthorityRootRef`] and checked against the bound graph by
 //!   `GrantGraph::admit_origin_bound_closure`, so a closure served under a
 //!   namespace this graph does not own, or under a namespace its origin does
 //!   not belong to, refuses as unknown evidence;
 //! * typed origin — resolved by the graph owner, never inferred here;
-//! * graph revision and the full `StateFence`/epoch — the fence is compared
-//!   against the evidence fence here, and the graph revision against the
+//! * graph revision and the two fences — the presenting read fence is compared
+//!   against the evidence fence, and the RECORDED commit fence/epoch is
+//!   compared against that same live fence through
+//!   `recorded_commit_epoch_is_current`, which is the one recorded-versus-live
+//!   comparison on this path; the graph revision is compared against the
 //!   denominator in [`AdmittedRevocationClosure::denominator`];
 //! * declared bounds and disposition — the bounds this crate admits under are
 //!   the bounds the evidence declared, and a disposition that is not
@@ -100,7 +103,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-use eliot_contracts::StateFence;
+use eliot_contracts::{EpochRelation, StateFence};
 use eliot_influence::RevocationBounds;
 use eliot_security_contracts::{
     InfluenceDependencyClosure, InfluenceState, REVOCATION_DISPOSITION_COMPLETE,
@@ -187,9 +190,22 @@ pub struct AuthorityRevocationClosureEvidence {
     pub invalidation_reason: Option<RevocationReason>,
     /// Terminal influence state. Only `Revoked` is revocation evidence.
     pub current_influence: InfluenceState,
-    /// Full fence/epoch the closure was committed at; must equal the
-    /// evidence fence exactly.
+    /// Fence/epoch the history that PRESENTED this closure was read under;
+    /// must equal the evidence fence exactly.
+    ///
+    /// This is the read-time coordinate. It is deliberately NOT the closure's
+    /// commit epoch: it is echoed by the serving read and copied back from that
+    /// echo, so comparing it proves read consistency, not provenance.
     pub state_fence: StateFence,
+    /// Fence/epoch the durable commit that produced this closure was committed
+    /// under, carried verbatim out of that commit's own recorded authority
+    /// binding by the durable history owner.
+    ///
+    /// This is the RECORDED coordinate. It is bound into the canonical request
+    /// digest by `digest_input` and compared against the live recovery fence by
+    /// `recorded_commit_epoch_is_current`, which is what binds the closure to
+    /// its commit epoch instead of to the read that served it.
+    pub commit_state_fence: StateFence,
     /// The closure's own committed revision: nonzero and never newer than
     /// the durable source revision it was observed at.
     pub revision: u64,
@@ -263,7 +279,8 @@ impl AuthorityRevocationClosureEvidence {
     /// [`canonical_request_digest`](Self::canonical_request_digest). The
     /// input covers every presented coordinate — evidence version, closure
     /// identity, owner namespace, origin, sorted dependents, reason,
-    /// terminal state, fence, revision, bounds, disposition, sorted
+    /// terminal state, presenting read fence, recorded commit fence/epoch,
+    /// revision, bounds, disposition, sorted
     /// omissions, and the affected-member count and digest — through the one
     /// shared canonical codec, so both sides hash identical bytes. I5.27
     /// defines idempotency over canonical bytes, so a presentation whose
@@ -287,6 +304,7 @@ impl AuthorityRevocationClosureEvidence {
             invalidation_reason: self.invalidation_reason,
             current_influence: self.current_influence,
             state_fence: &self.state_fence,
+            commit_state_fence: &self.commit_state_fence,
             revision: self.revision,
             bounds: digest_bounds(&self.bounds),
             disposition: disposition_spelling(self.disposition),
@@ -309,6 +327,30 @@ fn digest_bounds(bounds: &RevocationBounds) -> RevocationClosureDigestBounds {
         max_frontier: bounds.max_frontier,
         max_time: bounds.max_time,
     }
+}
+
+/// Whether a fence/epoch RECORDED by a durable commit may back revocation
+/// evidence observed under `live`.
+///
+/// A closure committed at epoch E stays current for a restore at E or at any
+/// later epoch of the SAME lineage, because a later authority legitimately
+/// supersedes it; refusing that would make every recovered revocation
+/// unusable. A recorded epoch from a FOREIGN lineage, or one the live fence
+/// has not yet reached, names an authority this restore is not running under:
+/// a closure cannot have been committed by an epoch that does not exist yet,
+/// and a record from an unrelated lineage is not this authority's history.
+///
+/// This uses [`EpochRelation`], the contract's existing ordering vocabulary, so
+/// the rule adds no second notion of epoch order. It is deliberately NOT
+/// equality: equality would compare the recorded value against the read that
+/// served it and would refuse every legitimately older committed closure.
+fn recorded_commit_epoch_is_current(recorded: &StateFence, live: &StateFence) -> bool {
+    matches!(
+        live.authority_epoch.relation_to(&recorded.authority_epoch),
+        EpochRelation::Same
+            | EpochRelation::DirectChild
+            | EpochRelation::SameLineageNewer
+    )
 }
 
 /// Evidence disposition as its canonical digest spelling. The served row
@@ -362,7 +404,8 @@ impl RevocationHistoryEvidence {
     /// [`RevocationHistoryError::IdentityConflict`]: the committed result
     /// is authoritative and nothing is applied. The comparison covers every
     /// presented coordinate, so a repeat that changes the origin kind,
-    /// owner, bounds, disposition, omissions, revision, fence, transition
+    /// owner, bounds, disposition, omissions, revision, read fence, recorded
+    /// commit fence, transition
     /// evidence, affected set or any declared digest conflicts under its
     /// exact field, never as unknown. An identical repeat still violates
     /// the strictly-increasing shape and refuses as unknown, and an
@@ -405,6 +448,37 @@ impl RevocationHistoryEvidence {
             .map(|closure| ValidatedRevocationClosure::require_current(closure, self))
             .collect()
     }
+
+    /// Requires every closure's RECORDED commit fence/epoch to be current for
+    /// `live`, the caller's own live recovery fence.
+    ///
+    /// This is the recorded-versus-live comparison, and it is not the same check
+    /// as [`require_current`](Self::require_current): that one decides each
+    /// closure's currency against the fence the evidence itself was observed
+    /// under, while this one decides it against the fence the CALLER is
+    /// restoring under. They coincide on the single feed that builds evidence
+    /// from the same read, and differ for a caller that holds a live fence of
+    /// its own, which is why the rule has one definition and two callers rather
+    /// than being open-coded at each boundary.
+    ///
+    /// An empty closure set is a complete attestation of zero recorded
+    /// revocations and has no recorded coordinate to compare, so it passes.
+    pub fn require_recorded_commit_epochs_current(
+        &self,
+        live: &StateFence,
+    ) -> Result<(), RevocationHistoryError> {
+        live.validate()
+            .map_err(|_| RevocationHistoryError::StaleHistory)?;
+        if self
+            .closures
+            .iter()
+            .all(|closure| recorded_commit_epoch_is_current(&closure.commit_state_fence, live))
+        {
+            Ok(())
+        } else {
+            Err(RevocationHistoryError::StaleHistory)
+        }
+    }
 }
 
 /// First canonical field on which two closures sharing one `closure_id`
@@ -413,8 +487,9 @@ impl RevocationHistoryEvidence {
 /// The comparison covers every presented coordinate, so no changed content
 /// can pass as an unknown ordering violation: version first (a legacy
 /// presentation is never read under the current stronger form), then
-/// origin, owner, bounds, disposition, dependents, reason, state, fence,
-/// revision, omissions, and the three declared content addresses.
+/// origin, owner, bounds, disposition, dependents, reason, state, read fence,
+/// recorded commit fence, revision,
+/// omissions, and the three declared content addresses.
 /// Dependent and omission order is spelling, not content: validation
 /// absorbs both into sets and every downstream decision is
 /// order-insensitive, so only the sorted memberships are compared.
@@ -455,6 +530,9 @@ fn conflicted_closure_field(
     }
     if previous.state_fence != closure.state_fence {
         return Some("closure.state_fence");
+    }
+    if previous.commit_state_fence != closure.commit_state_fence {
+        return Some("closure.commit_state_fence");
     }
     if previous.revision != closure.revision {
         return Some("closure.revision");
@@ -527,6 +605,13 @@ pub struct ValidatedRevocationClosure {
     /// Declared traversal bounds the committed affected membership was proven
     /// under. Recovery admits under these exact bounds.
     pub bounds: RevocationBounds,
+    /// Fence/epoch the durable commit that produced the closure recorded,
+    /// proven current against the live evidence fence.
+    ///
+    /// The recorded coordinate survives validation because the currency proof
+    /// above was decided FROM it; discarding it here would re-open exactly the
+    /// gap this coordinate closes.
+    pub commit_state_fence: StateFence,
     /// Declared completeness of the committed affected membership.
     pub disposition: RevocationEvidenceDisposition,
     /// References the committed membership declares it omitted.
@@ -578,6 +663,22 @@ impl ValidatedRevocationClosure {
             .validate()
             .map_err(|_| RevocationHistoryError::UnknownHistory)?;
         if closure.state_fence != evidence.state_fence {
+            return Err(RevocationHistoryError::StaleHistory);
+        }
+        // #1142: the RECORDED commit coordinate, compared against the LIVE
+        // fence this restore runs under. It is re-derived from the ORIGINAL
+        // recorded value with `StateFence::validate`, never recomputed from the
+        // serving read. `closure.state_fence` above is the read-time coordinate
+        // and can only prove that one read was internally consistent;
+        // `closure.commit_state_fence` comes from the durable commit receipt,
+        // so this is the recorded-versus-live comparison on this path.
+        // Comparing the read fence with itself could never refuse, because
+        // both sides carried one value.
+        closure
+            .commit_state_fence
+            .validate()
+            .map_err(|_| RevocationHistoryError::UnknownHistory)?;
+        if !recorded_commit_epoch_is_current(&closure.commit_state_fence, &evidence.state_fence) {
             return Err(RevocationHistoryError::StaleHistory);
         }
         // CURRENT evidence may carry older committed closures, but never a
@@ -648,6 +749,7 @@ impl ValidatedRevocationClosure {
             revision: closure.revision,
             source_revision: evidence.source_revision,
             bounds: closure.bounds.clone(),
+            commit_state_fence: closure.commit_state_fence.clone(),
             disposition: closure.disposition,
             omissions,
             affected_member_count: closure.affected_member_count,
@@ -961,7 +1063,8 @@ pub struct GrantRestoreOutcome {
 pub enum RevocationHistoryError {
     /// No revocation-history evidence was supplied.
     MissingHistory,
-    /// The evidence fence or revision is not current for this restore.
+    /// The evidence fence or a closure's recorded commit epoch is not
+    /// current for this restore.
     StaleHistory,
     /// A closure is invalid, unordered, or not terminal revocation evidence;
     /// it carries an evidence version this crate did not validate; its
@@ -979,8 +1082,9 @@ pub enum RevocationHistoryError {
     OriginTargetMismatch(OriginTargetMismatch),
     /// One closure identity was presented twice in a single evidence input
     /// with different committed content: changed version, origin, owner,
-    /// bounds, disposition, affected set, reason, state, fence, revision,
-    /// omissions, or any declared digest. The committed result is
+    /// bounds, disposition, affected set, reason, state, read fence, recorded
+    /// commit fence, revision, omissions, or any declared digest. The committed
+    /// result is
     /// authoritative and nothing is applied. Exact replay across restores
     /// returns the same suppression result by construction; comparing one
     /// restore against a previous one needs the durable history owner,
@@ -1000,7 +1104,7 @@ impl fmt::Display for RevocationHistoryError {
                 "authority revocation history is unavailable; unavailable history is not absence of revocation",
             ),
             Self::StaleHistory => formatter.write_str(
-                "authority revocation history is stale: fence, source revision, or closure revision drifted",
+                "authority revocation history is stale: fence, recorded commit epoch, source revision, or closure revision drifted",
             ),
             Self::UnknownHistory => formatter.write_str(
                 "authority revocation history is unknown: a closure is invalid, unordered, not a terminal revocation, declares an origin that does not resolve to exactly one entity of this graph, or names a dependent reference that resolves to no entity of this graph",

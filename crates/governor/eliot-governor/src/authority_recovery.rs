@@ -600,7 +600,8 @@ impl AuthorityOwner {
     ///
     /// `None` history refuses: unavailable history is not absence of
     /// revocation and never restores as an empty closure. Stale (fence or
-    /// revision drift, including drift against this snapshot's fence) and
+    /// revision drift, including drift against this snapshot's fence, and a
+    /// recorded commit epoch that is not current for this recovery fence) and
     /// unknown (invalid, unordered, or non-revoked closure) evidence refuse
     /// likewise. A revoked origin and its dependent grants stay suppressed
     /// in the restored owner; unrelated valid grants restore exactly as the
@@ -638,9 +639,30 @@ impl AuthorityOwner {
                     .to_owned(),
             )
         })?;
-        if evidence.state_fence != *expected_fence || evidence.state_fence != snapshot.state_fence {
+        // #1142: the fence the history was READ at is compared against this
+        // live recovery fence. The old second clause compared that same fence
+        // against `snapshot.state_fence`, which the `validate_against` above had
+        // already proven equal by construction, so it could never refuse.
+        if evidence.state_fence != *expected_fence {
             return Err(CompositionError::Recovery(
                 "authority revocation history is stale for this recovery fence".to_owned(),
+            ));
+        }
+        // The fence each closure was actually COMMITTED at, recorded in its own
+        // durable commit receipt, is then compared against the same live fence.
+        // That is the recorded-versus-live comparison on this path: the recorded
+        // value is sourced from the commit and the live value from the Kernel's
+        // current recovery fence, so it can refuse a closure committed under a
+        // foreign lineage or under an epoch this restore has not reached. It
+        // runs before any grant is restored.
+        if evidence
+            .require_recorded_commit_epochs_current(expected_fence)
+            .is_err()
+        {
+            return Err(CompositionError::Recovery(
+                "authority revocation history carries a recorded commit epoch that is not current \
+                 for this recovery fence"
+                    .to_owned(),
             ));
         }
         if evidence.source_revision != snapshot.grant_graph.revision {
