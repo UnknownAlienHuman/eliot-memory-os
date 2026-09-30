@@ -997,6 +997,7 @@ pub enum CampaignSourceDocumentSchema {
     EconomicsProgress,
     OrientationClassificationProfile,
     OrientationAdmissionRecord,
+    OrientationCueBindingsRecord,
     RetrievalPlan,
 }
 
@@ -1235,7 +1236,8 @@ impl CampaignSourceDocument {
             | D::EvaluationPosition
             | D::EconomicsProgress
             | D::OrientationClassificationProfile
-            | D::OrientationAdmissionRecord => {
+            | D::OrientationAdmissionRecord
+            | D::OrientationCueBindingsRecord => {
                 let body: CampaignOwnerProjectionBody =
                     serde_json::from_value(self.body.clone())
                         .map_err(|error| StoreError::Serialization(error.to_string()))?;
@@ -1598,7 +1600,8 @@ impl CampaignSourceDocument {
             | D::EvaluationPosition
             | D::EconomicsProgress
             | D::OrientationClassificationProfile
-            | D::OrientationAdmissionRecord => {
+            | D::OrientationAdmissionRecord
+            | D::OrientationCueBindingsRecord => {
                 let body: CampaignOwnerProjectionBody =
                     serde_json::from_value(self.body.clone())
                         .map_err(|error| StoreError::Serialization(error.to_string()))?;
@@ -2633,6 +2636,8 @@ pub enum CampaignSourcePublisher {
     OrientationClassification,
     /// Governor-owned Orientation admission decision source.
     OrientationAdmission,
+    /// Governor-owned Orientation cue-binding source and closed snapshot.
+    OrientationCueBindings,
 }
 
 impl CampaignSourcePublisher {
@@ -2668,6 +2673,7 @@ impl CampaignSourcePublisher {
             Self::EconomicsProgress => CampaignSourceRole::EconomicsProgress,
             Self::OrientationClassification => CampaignSourceRole::OrientationClassification,
             Self::OrientationAdmission => CampaignSourceRole::OrientationAdmission,
+            Self::OrientationCueBindings => CampaignSourceRole::OrientationCueBindings,
         }
     }
 
@@ -2703,6 +2709,7 @@ impl CampaignSourcePublisher {
             CampaignSourceRole::EconomicsProgress => Self::EconomicsProgress,
             CampaignSourceRole::OrientationClassification => Self::OrientationClassification,
             CampaignSourceRole::OrientationAdmission => Self::OrientationAdmission,
+            CampaignSourceRole::OrientationCueBindings => Self::OrientationCueBindings,
         })
     }
 }
@@ -3019,6 +3026,7 @@ pub const fn campaign_source_owner_id(role: CampaignSourceRole) -> &'static str 
         R::EconomicsProgress => ECONOMICS_PROGRESS_CAMPAIGN_OWNER_ID,
         R::OrientationClassification => "owner:eliot-governor/orientation-classification",
         R::OrientationAdmission => "owner:eliot-governor/orientation-admission",
+        R::OrientationCueBindings => "owner:eliot-governor/orientation-cue-bindings",
     }
 }
 
@@ -3058,6 +3066,7 @@ pub const fn campaign_source_schema_for_role(
         R::EconomicsProgress => D::EconomicsProgress,
         R::OrientationClassification => D::OrientationClassificationProfile,
         R::OrientationAdmission => D::OrientationAdmissionRecord,
+        R::OrientationCueBindings => D::OrientationCueBindingsRecord,
     }
 }
 
@@ -3081,6 +3090,13 @@ fn campaign_source_identity_matches(
         | R::TaskPlan
         | R::TaskOpenItems
         | R::OrientationAdmission => matches!(
+            (record_id, revision),
+            (
+                CampaignOwnerRecordId::Task(_),
+                CampaignOwnerRevision::Task(_)
+            )
+        ),
+        R::OrientationCueBindings => matches!(
             (record_id, revision),
             (
                 CampaignOwnerRecordId::Task(_),
@@ -3181,6 +3197,13 @@ fn campaign_identity_matches(record: &CampaignSourceRecord) -> bool {
                 )
             )
         }
+        R::OrientationCueBindings => matches!(
+            (&record.record_id, &record.revision),
+            (
+                CampaignOwnerRecordId::Task(_),
+                CampaignOwnerRevision::Task(_)
+            )
+        ),
         R::AttemptLineageLatestOutcomes
         | R::MemoryProjection
         | R::ArtifactProjection
@@ -3735,7 +3758,14 @@ fn campaign_role_accepts_schema(
                 R::OrientationClassification,
                 D::OrientationClassificationProfile
             )
-            | (R::OrientationAdmission, D::OrientationAdmissionRecord)
+            | (
+                R::OrientationAdmission,
+                D::OrientationAdmissionRecord
+            )
+            | (
+                R::OrientationCueBindings,
+                D::OrientationCueBindingsRecord
+            )
     )
 }
 
