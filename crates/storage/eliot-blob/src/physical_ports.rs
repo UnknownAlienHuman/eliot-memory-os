@@ -5,7 +5,7 @@
 //! receipts. Zstandard is a real versioned codec with bounded streaming decode.
 
 use std::collections::BTreeMap;
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Write};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
