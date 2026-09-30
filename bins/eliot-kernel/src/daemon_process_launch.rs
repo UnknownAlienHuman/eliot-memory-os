@@ -6,12 +6,30 @@
 //! This module owns exactly `KernelComposition::launch_eliotd` and `KernelComposition::retain_eliotd_path_proof` and no additional route, default, retry, adoption, or mint authority.
 //! Keeps signatures, bodies, ordering, visibility, routes, protocol and authority unchanged; `control_plane.rs` and `daemon_runtime.rs` callers remain untouched.
 //! No Store/Governor/Host semantic decisions, no alternate lease or oracle, no unbounded recovery.
+//!
+//! #1678 W5/REQ7: the `eliotd` process launch is a real process/provider launch
+//! path, so it holds the SAME launch prerequisite the native-worker contour
+//! holds: the ORS owner's
+//! [`verify_admission_reservation_launch_prerequisite`] must prove an `ACTIVE`
+//! admission reservation carrying both its activation and canonical admission
+//! receipts before any process start, path-lease retention or runtime state
+//! transition. The gate is the existing owner verifier, not a second scheme,
+//! and it runs before every effect below.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use eliot_contracts::sha256_hex;
+use eliot_ors::{
+    AdmissionReservationClaimRef, AdmissionReservationClaims,
+    AdmissionReservationIdentityInput, AdmissionReservationLaunchPrerequisite, OpaqueLabel,
+    OperationIdentity, StateFenceSnapshot, admission_reservation_identity, epoch_lineage_for,
+    verify_admission_reservation_launch_prerequisite,
+};
 use eliot_platform_windows::WindowsPlatform;
+use eliot_receipts::ReceiptIdentity;
+use serde::Serialize;
 
 use super::ACTIVE_DAEMON_CALLER;
 use super::ActionLeaseRef;
@@ -116,6 +134,249 @@ impl KernelComposition {
         }
     }
 
+    /// Refuses the `eliotd` process launch unless the ORS owner proves its
+    /// admission reservation is currently `ACTIVE` under this launch's own
+    /// authority (#1678 W5, REQ7, A5, A8).
+    ///
+    /// This calls the existing owner verifier
+    /// [`verify_admission_reservation_launch_prerequisite`] — the single
+    /// issuance point for the sealed `ActiveAdmissionReservation` typestate —
+    /// and owns no decision of its own. Every non-`Active` disposition
+    /// (missing, staged, released, expired, reconciling, stale fence, foreign
+    /// owner, identity conflict) is a typed refusal naming the exact state, so
+    /// a canonical admission without a matching reservation and a staged
+    /// reservation without a matching canonical receipt both stay
+    /// non-launchable.
+    ///
+    /// The reservation identity is DERIVED from the immutable launch binding
+    /// (work item = the launch attempt identity, proposed attempt = the launch
+    /// operation identity, revision = the descriptor digest), exactly as the
+    /// native-worker contour derives it from its claim binding. No identity is
+    /// minted here, so a launch can never point at a reservation it did not
+    /// derive.
+    #[cfg(windows)]
+    fn verify_eliotd_launch_prerequisite(
+        &self,
+        launch: &EliotdLaunchDescriptor,
+        launch_identity: &str,
+        operation_id: &str,
+    ) -> Result<ReceiptIdentity, KernelBuildError> {
+        let authority_epoch = epoch_lineage_for(&launch.authority_epoch, None)
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        // The launch's own State Fence is captured from the same
+        // `FencingToken` the process admission below is built from and
+        // validated with the owner's validator against the canonical
+        // `EpochId`, so the fence/epoch comparison is between owner-validated
+        // values rather than a recomputed digest.
+        let generation = Generation::new(launch.generation.value())
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        let state_fence_token = FencingToken::new(
+            launch.authority_epoch.clone(),
+            generation,
+            format!("eliotd-launch-fence-{launch_identity}"),
+        )
+        .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        let state_fence = StateFenceSnapshot::capture(
+            &state_fence_token,
+            launch.authority_epoch.sequence.get(),
+        )
+        .and_then(|snapshot| {
+            snapshot
+                .validate_against_epoch(&launch.authority_epoch)
+                .map(|()| snapshot)
+        })
+        .map_err(|error| {
+            KernelBuildError::Service(format!(
+                "eliotd admission reservation has no valid State Fence: {error}"
+            ))
+        })?;
+        // The complete claim set is projected from the Host-approved descriptor
+        // the launch already validated. Each reference is the owner identity of
+        // that role and each digest is the descriptor's own content digest, so
+        // nothing durable is recomputed in order to be trusted; the ORS owner
+        // re-validates every value on the row it actually reads back.
+        fn digest<T: Serialize>(value: &T) -> Result<String, KernelBuildError> {
+            serde_json::to_vec(value)
+                .map(|bytes| sha256_hex(&bytes))
+                .map_err(|error| {
+                    KernelBuildError::Service(format!(
+                        "eliotd admission reservation claim digest cannot be canonicalized: {error}"
+                    ))
+                })
+        }
+        let reference = |value: &str, role: &'static str| -> Result<OpaqueLabel, KernelBuildError> {
+            OpaqueLabel::new(value).map_err(|error| {
+                KernelBuildError::Service(format!(
+                    "eliotd admission reservation {role} claim reference is not a usable label: {error}"
+                ))
+            })
+        };
+        let claims = AdmissionReservationClaims {
+            resources: AdmissionReservationClaimRef {
+                reference: reference(launch.executable.as_str(), "resource")?,
+                sha256: digest(&(
+                    launch.executable.as_str(),
+                    launch.executable_sha256.as_str(),
+                    launch.protected_snapshot_digest.as_str(),
+                ))?,
+            },
+            lane: AdmissionReservationClaimRef {
+                reference: reference(launch.wire_id.as_str(), "lane")?,
+                sha256: digest(&(launch.wire_id.as_str(), launch.wire_version))?,
+            },
+            environment: AdmissionReservationClaimRef {
+                reference: reference(launch.config_descriptor.as_str(), "environment")?,
+                sha256: digest(&(
+                    launch.config_descriptor.as_str(),
+                    launch.config_descriptor_sha256.as_str(),
+                    launch.working_directory.as_str(),
+                ))?,
+            },
+            effects: AdmissionReservationClaimRef {
+                reference: reference(operation_id, "effect")?,
+                sha256: digest(&(
+                    operation_id,
+                    launch.launch_nonce.as_str(),
+                    &launch
+                        .arguments
+                        .iter()
+                        .map(|argument| argument.as_str())
+                        .collect::<Vec<_>>(),
+                ))?,
+            },
+            quota_view: AdmissionReservationClaimRef {
+                reference: reference(
+                    &format!("quota-view:{}", launch.generation.value()),
+                    "quota-view",
+                )?,
+                sha256: digest(&(
+                    launch.generation.value(),
+                    launch.authority_epoch.sequence.get(),
+                    launch.authority_epoch.lineage_id.as_str(),
+                ))?,
+            },
+        };
+        claims
+            .validate()
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        let identity_input = AdmissionReservationIdentityInput {
+            work_item_id: OperationIdentity::new(launch_identity)
+                .map_err(|error| KernelBuildError::Service(error.to_string()))?,
+            proposed_attempt_id: OperationIdentity::new(operation_id)
+                .map_err(|error| KernelBuildError::Service(error.to_string()))?,
+            semantic_admission_revision: launch.descriptor_sha256.clone(),
+            claims,
+            state_fence: state_fence.clone(),
+            authority_epoch: authority_epoch.clone(),
+        };
+        let reservation_id = admission_reservation_identity(&identity_input).map_err(|error| {
+            KernelBuildError::Service(format!(
+                "eliotd admission reservation identity cannot be derived from the launch descriptor: {error}"
+            ))
+        })?;
+        let current = self
+            .generation_gateway
+            .ors
+            .load_kernel_admission_reservation(&reservation_id)
+            .map_err(|error| {
+                KernelBuildError::Service(format!(
+                    "eliotd admission reservation {reservation_id} cannot be read back: {error}"
+                ))
+            })?;
+        let prerequisite = verify_admission_reservation_launch_prerequisite(
+            current.as_ref(),
+            &identity_input.work_item_id,
+            &identity_input.proposed_attempt_id,
+            &authority_epoch,
+            &state_fence,
+            i64::try_from(unix_ms()).map_err(|error| {
+                KernelBuildError::Service(format!(
+                    "eliotd admission reservation verification time is not representable: {error}"
+                ))
+            })?,
+        )
+        .map_err(|error| {
+            KernelBuildError::Service(format!(
+                "eliotd admission reservation launch prerequisite for {reservation_id} is not verifiable: {error}"
+            ))
+        })?;
+        match prerequisite {
+            AdmissionReservationLaunchPrerequisite::Active(active) => {
+                let activation_receipt = active.activation_receipt().map_err(|error| {
+                    KernelBuildError::Service(format!(
+                        "active eliotd admission reservation {reservation_id} carries no activation receipt: {error}"
+                    ))
+                })?;
+                active.canonical_admission_receipt().map_err(|error| {
+                    KernelBuildError::Service(format!(
+                        "active eliotd admission reservation {reservation_id} carries no canonical admission receipt: {error}"
+                    ))
+                })?;
+                Ok(activation_receipt.clone())
+            }
+            AdmissionReservationLaunchPrerequisite::Missing {
+                work_item_id,
+                proposed_attempt_id,
+            } => Err(KernelBuildError::Service(format!(
+                "eliotd launch refused: no admission reservation covers work item {work_item_id} and proposed attempt {proposed_attempt_id}"
+            ))),
+            AdmissionReservationLaunchPrerequisite::Staged { reservation } => {
+                Err(KernelBuildError::Service(format!(
+                    "eliotd launch refused: admission reservation {} is STAGED_INACTIVE and grants no launch authority",
+                    reservation.reservation_id
+                )))
+            }
+            AdmissionReservationLaunchPrerequisite::Released { reservation } => {
+                Err(KernelBuildError::Service(format!(
+                    "eliotd launch refused: admission reservation {} is RELEASED with disposition {:?}",
+                    reservation.reservation_id, reservation.disposition_reason
+                )))
+            }
+            AdmissionReservationLaunchPrerequisite::Expired { reservation } => {
+                Err(KernelBuildError::Service(format!(
+                    "eliotd launch refused: admission reservation {} is EXPIRED at {} and grants no launch authority",
+                    reservation.reservation_id, reservation.expires_at_ms
+                )))
+            }
+            AdmissionReservationLaunchPrerequisite::Reconciling { reservation } => {
+                Err(KernelBuildError::Service(format!(
+                    "eliotd launch refused: admission reservation {} is RECONCILING and cannot create a new effect",
+                    reservation.reservation_id
+                )))
+            }
+            AdmissionReservationLaunchPrerequisite::StaleFence {
+                reservation,
+                expected_state_fence,
+            } => Err(KernelBuildError::Service(format!(
+                "eliotd launch refused: admission reservation {} was staged under State Fence {} but the launch verifies against {}",
+                reservation.reservation_id, reservation.state_fence.sha256, expected_state_fence.sha256
+            ))),
+            AdmissionReservationLaunchPrerequisite::ForeignOwner {
+                reservation,
+                expected_authority_epoch,
+            } => Err(KernelBuildError::Service(format!(
+                "eliotd launch refused: admission reservation {} is owned by Authority Epoch {} lineage {}, not by the launching epoch {} lineage {}",
+                reservation.reservation_id,
+                reservation.authority_epoch.current.epoch,
+                reservation.authority_epoch.current.lineage_id.as_str(),
+                expected_authority_epoch.current.epoch,
+                expected_authority_epoch.current.lineage_id.as_str()
+            ))),
+            AdmissionReservationLaunchPrerequisite::IdentityConflict {
+                reservation,
+                expected_work_item_id,
+                expected_proposed_attempt_id,
+            } => Err(KernelBuildError::Service(format!(
+                "eliotd launch refused: admission reservation {} covers work item {} and proposed attempt {}, not {} and {}",
+                reservation.reservation_id,
+                reservation.work_item_id,
+                reservation.proposed_attempt_id,
+                expected_work_item_id,
+                expected_proposed_attempt_id
+            ))),
+        }
+    }
+
     /// Admitted-launch sequence; every authority check precedes the single
     /// process start. See [`KernelComposition::launch_eliotd`].
     #[cfg(windows)]
@@ -159,6 +420,21 @@ impl KernelComposition {
             kernel_process.image_path(),
         )?;
         let operation_id = eliotd_operation_id(generation, &launch_identity)?;
+        // #1678 W5/REQ7/A5/A8: the launch prerequisite gate. This is the
+        // FIRST check that can refuse an `eliotd` process start with no effect,
+        // so it runs before the process intent/lease/owner are built, before
+        // the path lease is retained, before the runtime state moves to
+        // `Launching` and before `gateway.start`. A missing, staged, released,
+        // expired, reconciling, stale-fence, foreign-owner or identity-
+        // conflicting reservation refuses HERE, so no process, provider,
+        // environment, credential or route effect can begin from it. The
+        // returned owner activation receipt is the receipt this launch is
+        // authorized under.
+        let _activation_receipt = self.verify_eliotd_launch_prerequisite(
+            &launch,
+            &launch_identity,
+            operation_id.as_str(),
+        )?;
         let process_tree_id = ProcessTreeId::new(format!("eliotd-tree-{}", &launch_identity[..16]))
             .map_err(|error| KernelBuildError::Service(error.to_string()))?;
         let job_id = JobId::new(format!("eliotd-job-{}", &launch_identity[..16]))
