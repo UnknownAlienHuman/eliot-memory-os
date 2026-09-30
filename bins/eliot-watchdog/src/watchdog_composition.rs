@@ -37,6 +37,7 @@ use crate::watchdog_spool::backup::{
     CaptureFenceParams, SpoolRestoreDisposition, SpoolRestoreStep, WatchdogSpoolBackupLimits,
     WatchdogSpoolFence, WatchdogSpoolSnapshotPage,
 };
+use crate::watchdog_spool::owner_issued_active_installation;
 
 mod authority_state;
 
@@ -1132,13 +1133,11 @@ impl WatchdogBackupPort {
         active: &WatchdogRuntimeBinding,
         steps: &[SpoolRestoreStep],
     ) -> Result<SpoolRestoreDisposition, SpoolError> {
-        let active_installation = active
-            .selected_manifest
-            .runtime_launch
-            .installation_epoch
-            .installation
-            .as_str();
-        if active_installation != self.source_installation {
+        // The active identity is read out of the owner's own retained runtime
+        // admission by the same owner-issued reader the spool import uses, not
+        // from a caller string, so this port and the owner cannot disagree
+        // about which installation is live.
+        if owner_issued_active_installation(active) != self.source_installation {
             return Err(SpoolError::Corrupt(
                 "watchdog backup port refuses an import bound to an active installation that is not this owner's retained admission"
                     .to_owned(),
