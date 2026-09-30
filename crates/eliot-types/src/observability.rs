@@ -197,9 +197,10 @@ impl<'de> Deserialize<'de> for MemoryInfluenceToolInput {
 /// A repeated key is refused before any value is stored, and a key outside the
 /// selected variant is refused before the typed union is returned. Both
 /// accepted shapes are closed, so this composition accepts no argument object
-/// that the stricter owning contract refuses: the full shape is closed by the
-/// `deny_unknown_fields` attribute on `MemoryInfluenceTraceWriteInput`, and the
-/// acknowledgement shape is closed here against the exact declared field set
+/// that the stricter owning contract refuses: the full shape is closed here
+/// against the same three keys the owning `MemoryInfluenceTraceWriteInput`
+/// closes with its `deny_unknown_fields` attribute, and the acknowledgement
+/// shape is closed here against the exact declared field set
 /// its owner `crates/eliot-types/src/ul/injection.rs::MemoryInfluenceAckInput`
 /// publishes as `MEMORY_INFLUENCE_ACK_FIELDS` and refuses in
 /// `MemoryInfluenceAckInputVisitor::visit_map`.
