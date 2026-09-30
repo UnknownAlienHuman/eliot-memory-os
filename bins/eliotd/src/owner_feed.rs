@@ -24,6 +24,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use eliot_authority::RevocationOperationIdentity;
 use eliot_contracts::StateFence;
 use eliot_governor::{
     AuthorityOwnerSnapshot, CompositionError, KernelGenerationSnapshotProvider, OwnerPublishPort,
@@ -62,6 +63,29 @@ const RECEIPT_NOT_FOUND_REASON: &str = "receipt not found";
 const GRANT_CLOSURE_LINKS_VERSION: u32 = 1;
 /// Only an acknowledged `bound` receipt counts as published.
 const OWNER_BOUND_STATUS: &str = "bound";
+
+/// Typed degradation emitted when no admitted revocation operation identity
+/// reaches the owner feed, naming the exact owner that must supply one.
+///
+/// The five coordinates are owner-supplied by construction
+/// (`RevocationOperationIdentity::admit` is the sole constructor, grants.rs
+/// `admit`). Nothing on the O1 owner-feed path holds one, so the pass fails
+/// closed here instead of restoring the authority graph under an invented
+/// identity: A0.3 requires fail-closed behaviour exactly where an error could
+/// cause "restoration of revoked influence after recovery".
+///
+/// The named owner is the daemon maintenance surface that admits the
+/// owner-feed operation — `maintenance_family_catalog.rs` records
+/// `owner_feed.rs::maintain_owner_feed` as that closure pass's owner — because
+/// it is the boundary that observes this durable state and can therefore carry
+/// a principal, an admitted task, a work scope, an observing receipt, and a
+/// causal `transaction_sequence`. Admitting one there is a new owner, so this
+/// pass reports the gap rather than inventing the coordinates.
+const REVOCATION_OPERATION_IDENTITY_ABSENT: &str =
+    "owner feed restore has no admitted revocation operation identity: the \
+     daemon maintenance surface that owns this closure pass must supply a \
+     principal_ref, an admitted_task, a work_scope_ref, an observing_receipt, \
+     and an operation_clock carrying transaction_sequence";
 
 /// Wire shape answered by the Kernel `publish_owner_bundle` arm: the bound
 /// revision plus the acknowledged status. Anything but `bound` is a refusal,
@@ -257,6 +281,50 @@ fn canonical_receipt_identity_is_usable(receipt: &ReceiptIdentity) -> bool {
             .canonical_sha256
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+/// Admits the one revocation operation identity this owner-feed restore runs
+/// under, or degrades the pass naming the owner that must supply it.
+///
+/// `RevocationOperationIdentity` binds a principal, an admitted task, a work
+/// scope, an observing receipt, and a causal `transaction_sequence`, and
+/// `admit` is its only constructor, so a value that exists was already refused
+/// if any coordinate was blank or the clock named no causal position. Nothing
+/// this daemon holds on the O1 owner-feed path is such an operation:
+///
+/// * [`OwnerFeedPlan`] is the authority snapshot, the Kernel-generation State
+///   Fence, the graph revision, and the sorted authority roots — the subject
+///   being restored, not the operation restoring it;
+/// * the canonical closure links are per-root second-phase receipt identities
+///   for the very closures under recheck, so selecting one would name the
+///   evidence being audited as the operation observing it;
+/// * the transport identity this daemon mints
+///   (`DaemonKernelClient::next_identity`) is derived from canonical request
+///   bytes and carries `task_id: None` and `transaction_sequence: None`, so
+///   `admit` refuses it outright rather than letting a host wall-clock
+///   reading stand in for causal order.
+///
+/// A13.9 orders work by cause, and I5.27 defines idempotency over the
+/// `principal_and_scope` of the operation; a restore under an identity
+/// synthesized from the graph it is auditing would make the origin-bound
+/// recheck certify itself. The pass therefore fails closed, naming the exact
+/// missing coordinates, and the daemon retries on a later tick.
+///
+/// # Errors
+///
+/// Returns [`CompositionError::Recovery`] with
+/// [`REVOCATION_OPERATION_IDENTITY_ABSENT`] and the exact plan the pass was
+/// running under. Recovery (not `Owner`) because the trigger is diagnostic
+/// and the pass degrades without gating daemon readiness, exactly as the
+/// tolerated first-bind refusal does.
+fn admitted_revocation_operation(
+    plan: &OwnerFeedPlan,
+) -> Result<RevocationOperationIdentity, CompositionError> {
+    Err(CompositionError::Recovery(format!(
+        "{REVOCATION_OPERATION_IDENTITY_ABSENT} (graph revision {}, {} admitted root(s))",
+        plan.revision,
+        plan.roots.len()
+    )))
 }
 
 /// O1 Kernel publish endpoint for owner bundles: the one production
@@ -469,6 +537,15 @@ pub fn capture_owner_feed_plan(
 /// exact publish was proven, and `Err` with the typed reason when the pass
 /// degraded. The daemon may retry on a later pass; no partial publish is
 /// claimed.
+///
+/// The live restore additionally requires an admitted revocation operation
+/// identity, gated by `admitted_revocation_operation`. Until the owner named
+/// in `REVOCATION_OPERATION_IDENTITY_ABSENT` supplies one, every pass with
+/// roots degrades with that typed reason: the durable closure-link read still
+/// runs, but nothing is restored or published, because a restore under a
+/// synthesized operation identity would make the origin-bound revocation
+/// recheck certify itself (A0.3, "restoration of revoked influence after
+/// recovery").
 pub async fn maintain_owner_feed(
     plan: OwnerFeedPlan,
     kernel: &Arc<DaemonKernelClient>,
@@ -492,6 +569,13 @@ pub async fn maintain_owner_feed(
         REVOCATION_HISTORY_MAX_RECORDS,
     )
     .await?;
+    // The restore below runs under one admitted revocation operation identity.
+    // Nothing on this path holds one, so the pass degrades here rather than
+    // restoring the authority graph under an identity it invented. The gate
+    // sits after the durable closure-link read and before the Governor call so
+    // every read that is honestly available still runs, and no publish is
+    // attempted under a fabricated operation.
+    let operation = admitted_revocation_operation(&plan)?;
     let reads = KernelContextReadClient::new(Arc::clone(kernel));
     let publish = KernelOwnerPublishPort::new(Arc::clone(kernel));
     let published_revision = synchronize_owner_feed_with_canonical_receipts(
@@ -503,6 +587,7 @@ pub async fn maintain_owner_feed(
         REVOCATION_HISTORY_MAX_RECORDS,
         plan.revision,
         canonical_receipts,
+        operation,
     )
     .await?;
     if published_revision != plan.revision {
