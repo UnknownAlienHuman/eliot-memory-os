@@ -77,6 +77,69 @@ is worse than one that states the gap:
   `Get-VerifiedOperatorBuildReceipt`; `scripts/**` is outside this project's
   mutable scope, so the gap is recorded here rather than papered over.
 
+### A default `dotnet build` of this project currently fails, and on which comparison
+
+Stated precisely, because a build error here looks like a stale generated file
+and is not one. Measured on the committed bytes at `main@b25a336fcb`:
+
+- **The build target.** `CheckOperatorScheduleContractMirror`
+  (`Eliot.Operator.csproj:62-64`, `BeforeTargets="CoreCompile"`) runs
+  `python scripts/gen_operator_schedule_contract.py --check` (`:70`).
+  A non-zero exit fails the build through the `Error` at `:75-76`, whose text
+  calls the mirror *stale*; that text describes the intended failure mode, not
+  the one that currently occurs.
+- **The actual failure is a schema-pin mismatch, not a byte comparison.** The
+  generator's `build()` raises `Refused` at
+  `scripts/gen_operator_schedule_contract.py:1806-1810` — *before* the
+  `--check` stale-comparison block at `:1950` — and `main()` prints it at
+  `:1944` and returns exit code 2 (`:1945`). Verbatim stderr:
+
+  ```text
+  refused: Rust UserAutomation result schema changed; update the C# decoder and its explicit schema pin (a33f0f2df3f54d99ac0af98f256bd4766f943552a46be06c98e5f74f4462dc5c != 7f614b34db93940f55f8a0e378645b9e24c3c23304d89028f69db1cd1b1b3210)
+  ```
+
+  Because the refusal precedes `:1950`, `--check` never reaches the
+  byte-for-byte comparison of the committed mirror against freshly rendered
+  output, and never reports a first-difference offset. The mirrored artefact
+  `Protocol/Generated/OperatorScheduleContract.g.cs` is therefore *not* known
+  to be stale from this failure; it is simply never compared.
+- **The two digests are not the same kind of value.** `a33f0f2d…` **is** a
+  committed constant: `SupportedUserAutomationResultSchemaSha256` at
+  `Protocol/UserAutomationScheduleContract.cs:986` (and, independently, at
+  `Protocol/Generated/OperatorScheduleContract.g.cs:34` and `:206`). It is the
+  only one of the two that may be cited as a pinned value. `7f614b34…` is
+  computed at run time — `result_schema_digest` is a SHA-256 over the joined
+  result-schema lines collected from the Rust owner source
+  (`scripts/gen_operator_schedule_contract.py:1785-1787`) — and it appears
+  nowhere in the committed tree. It may only ever be reported as an observed
+  value on a date, never as a pin.
+
+**This README's subject is not what must change.** The contract behind the
+artefact is the Kernel UserAutomation *schedule*/*occurrence* contract, owned in
+`crates/kernel/eliot-kernel-core/src/user_automation.rs` and
+`user_automation_zones.rs` (`Eliot.Operator.csproj:42-48`). Fixing this
+requires the owner-side decision plus a regenerated mirror and a reviewed
+`UserAutomationScheduleContract.cs` pin, none of which is this project's to
+make.
+
+### The check is conditional, and the switch is already documented
+
+Recorded, not recommended: skipping this gate by default is not a fix.
+
+- The target is gated on `Condition="'$(OperatorScheduleContractCheck)' ==
+  'true'"` (`Eliot.Operator.csproj:64`).
+- The property defaults to true when empty (`:59`).
+- `Eliot.Operator.csproj:53-56` already discloses the trade: the gate makes the
+  C# build require `python` on `PATH`; set `OperatorScheduleContractCheck=false`
+  "to skip the gate for a bounded local compile"; and "a skipped build is not
+  evidence of contract parity".
+- `just operator-check` (`Justfile:128-129`) is
+  `dotnet build apps/Eliot.Operator/Eliot.Operator.csproj --configuration
+  Release` with **no** skip flag, so the committed recipe runs the gate. A
+  green `operator-check` on the current bytes is not currently reachable; and
+  reaching it by passing the skip flag would produce a green build that is
+  evidence of nothing about the contract.
+
 ## One-shot handoff and reconnect
 
 The app consumes exactly one owner-issued handoff. `RuntimeDiscoveryService`
