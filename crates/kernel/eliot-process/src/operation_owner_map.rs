@@ -289,7 +289,10 @@ pub fn owner_record_for(operation: OriginControlOperation) -> &'static Operation
 /// owned reconnect second.
 #[must_use]
 pub fn bootstrap_rows() -> [&'static OperationOwnerRecord; 2] {
-    [&FROZEN_OPERATION_OWNER_MAP[0], &FROZEN_OPERATION_OWNER_MAP[1]]
+    [
+        &FROZEN_OPERATION_OWNER_MAP[0],
+        &FROZEN_OPERATION_OWNER_MAP[1],
+    ]
 }
 
 /// Returns the only challenge classes with an admitted production caller.
