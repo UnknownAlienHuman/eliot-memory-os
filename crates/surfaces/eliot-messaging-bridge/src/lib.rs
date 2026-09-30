@@ -29,13 +29,31 @@ const IDENTITY_TEXT_LIMIT: usize = 256;
 /// Exact length of a lowercase hexadecimal SHA-256 digest field.
 const DIGEST_HEX_LENGTH: usize = 64;
 /// Domain separator for the replay-safe inbound event identity.
-const INBOUND_EVENT_DOMAIN: &str = "ELIOT/I10.23/INBOUND-EVENT/V1";
+///
+/// V1 (`ELIOT/I10.23/INBOUND-EVENT/V1`) was an unframed concatenation and is
+/// historical: a V1 key must never be compared against a V2 key. Owners
+/// re-derive identity through [`InboundPlatformUpdate::event_key`].
+const INBOUND_EVENT_DOMAIN: &str = "ELIOT/I10.23/INBOUND-EVENT/V2";
 /// Domain separator for the evidenced bridge profile digest.
-const PROFILE_DOMAIN: &str = "ELIOT/I10.23/BRIDGE-PROFILE/V1";
+///
+/// V1 (`ELIOT/I10.23/BRIDGE-PROFILE/V1`) was an unframed concatenation and is
+/// historical: a V1 digest must never be compared against a V2 digest. Owners
+/// re-derive identity through [`MessagingBridgeProfile::profile_digest`].
+const PROFILE_DOMAIN: &str = "ELIOT/I10.23/BRIDGE-PROFILE/V2";
 /// Domain separator for the approval binding digest.
-const APPROVAL_DOMAIN: &str = "ELIOT/I10.23/APPROVAL-BINDING/V1";
+///
+/// V1 (`ELIOT/I10.23/APPROVAL-BINDING/V1`) was an unframed concatenation and
+/// is historical: a V1 key must never be compared against a V2 key. Owners
+/// re-derive identity through [`ApprovalBinding::approval_key`].
+const APPROVAL_DOMAIN: &str = "ELIOT/I10.23/APPROVAL-BINDING/V2";
 /// Domain separator for the logical delivery message digest.
-const LOGICAL_MESSAGE_DOMAIN: &str = "ELIOT/I10.23/LOGICAL-MESSAGE/V1";
+///
+/// V1 (`ELIOT/I10.23/LOGICAL-MESSAGE/V1`) was an unframed concatenation and
+/// is historical: a V1 key must never be compared against a V2 key. Owners
+/// re-derive identity through [`LogicalMessage::message_key`].
+const LOGICAL_MESSAGE_DOMAIN: &str = "ELIOT/I10.23/LOGICAL-MESSAGE/V2";
+/// Version of the single framed content-identity encoding (I5.27).
+const IDENTITY_ENCODING_VERSION: u32 = 2;
 
 /// Validates one opaque identity text field.
 fn validate_identity_text(value: &str, field: &'static str) -> Result<(), BridgeError> {
@@ -68,6 +86,110 @@ fn validate_digest(value: &str, field: &'static str) -> Result<(), BridgeError> 
 /// Returns the lowercase hexadecimal SHA-256 of the input bytes.
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+/// One bounded private framed encoder for versioned content identities.
+///
+/// This is the only preimage encoding behind
+/// [`MessagingBridgeProfile::profile_digest`],
+/// [`InboundPlatformUpdate::event_key`], [`ApprovalBinding::approval_key`],
+/// and [`LogicalMessage::message_key`]. Every variable-length field is
+/// written as its one-byte tag, a fixed-width big-endian byte length, then
+/// the UTF-8 bytes, so `(session="ab", workscope="c")` and
+/// `(session="a", workscope="bc")` commit different bytes. Integers are
+/// fixed-width big-endian; `Option` is a presence byte followed by the framed
+/// value only when present; the capability set is committed in `Ord` order
+/// with an explicit per-variant discriminant, so insertion order never moves
+/// the digest while any membership change does. Each domain opens with its
+/// framed name and the [`IDENTITY_ENCODING_VERSION`], so identities from
+/// different domains never collide. All inputs are already
+/// constructor-validated (identity text is length-bounded, digests are
+/// fixed-length hex, the capability universe is seven variants), so the
+/// encoding is bounded by construction.
+struct FramedIdentity {
+    hasher: Sha256,
+}
+
+impl FramedIdentity {
+    /// Opens one named identity domain at the current encoding version.
+    fn open(domain: &str) -> Self {
+        let mut encoder = Self {
+            hasher: Sha256::new(),
+        };
+        encoder.bytes(0x00, domain.as_bytes());
+        encoder.u32(0x01, IDENTITY_ENCODING_VERSION);
+        encoder
+    }
+
+    /// Appends raw bytes as tag, fixed-width big-endian length, then bytes.
+    fn bytes(&mut self, tag: u8, value: &[u8]) {
+        let len = u64::try_from(value.len()).unwrap_or(u64::MAX);
+        self.hasher.update([tag]);
+        self.hasher.update(len.to_be_bytes());
+        self.hasher.update(value);
+    }
+
+    /// Appends one UTF-8 text field with its tag and byte length.
+    fn text(&mut self, tag: u8, value: &str) {
+        self.bytes(tag, value.as_bytes());
+    }
+
+    /// Appends one optional UTF-8 text field: a presence byte, then the
+    /// framed value only when present.
+    fn opt_text(&mut self, tag: u8, value: Option<&str>) {
+        match value {
+            Some(text) => {
+                self.hasher.update([tag, 1]);
+                let len = u64::try_from(text.len()).unwrap_or(u64::MAX);
+                self.hasher.update(len.to_be_bytes());
+                self.hasher.update(text.as_bytes());
+            }
+            None => {
+                self.hasher.update([tag, 0]);
+            }
+        }
+    }
+
+    /// Appends one fixed-width big-endian `u32` with its tag.
+    fn u32(&mut self, tag: u8, value: u32) {
+        self.hasher.update([tag]);
+        self.hasher.update(value.to_be_bytes());
+    }
+
+    /// Appends one fixed-width big-endian `u64` with its tag.
+    fn u64(&mut self, tag: u8, value: u64) {
+        self.hasher.update([tag]);
+        self.hasher.update(value.to_be_bytes());
+    }
+
+    /// Appends one enrollment flag with its tag.
+    fn flag(&mut self, tag: u8, value: bool) {
+        self.hasher.update([tag, u8::from(value)]);
+    }
+
+    /// Appends the negotiated capability set in deterministic `Ord` order.
+    fn capability_set(&mut self, tag: u8, supported: &BTreeSet<Capability>) {
+        self.hasher.update([tag]);
+        let len = u64::try_from(supported.len()).unwrap_or(u64::MAX);
+        self.hasher.update(len.to_be_bytes());
+        for capability in supported {
+            let discriminant = match capability {
+                Capability::Threads => 1,
+                Capability::Editing => 2,
+                Capability::Reactions => 3,
+                Capability::MediaInbound => 4,
+                Capability::MediaOutbound => 5,
+                Capability::IdempotencyKeys => 6,
+                Capability::ReadbackAck => 7,
+            };
+            self.hasher.update([discriminant]);
+        }
+    }
+
+    /// Finalizes the framed encoding as lowercase hexadecimal SHA-256.
+    fn finish(self) -> String {
+        sha256_hex(&self.hasher.finalize())
+    }
 }
 
 /// Returns true when the requested outbound value is recognizably a local
@@ -474,20 +596,40 @@ impl MessagingBridgeProfile {
     }
 
     /// Returns the stable evidence digest of the whole profile binding.
+    ///
+    /// The digest commits the complete profile through the single framed
+    /// V2 encoding: generation, principal enrollment (including the
+    /// deliberately encoded revocation flag; construction only evidences
+    /// non-revoked bindings), the full chat binding (chat, optional thread,
+    /// session, optional task, `WorkScope`), the negotiated capability set
+    /// with its numeric text and file limits, the media contract, the
+    /// command and approval surface versions, the scheduled delivery target,
+    /// the canonical outbox projection ref, and the full replay policy. Any
+    /// behavior-changing field change moves the digest. V1 digests are
+    /// historical and are never compared against V2 values.
     #[must_use]
     pub fn profile_digest(&self) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(PROFILE_DOMAIN.as_bytes());
-        hasher.update(self.generation.as_bytes());
-        hasher.update(self.principal_binding.principal.as_bytes());
-        hasher.update(self.principal_binding.platform_fingerprint.as_bytes());
-        hasher.update(self.chat_binding.chat.as_bytes());
-        hasher.update(self.chat_binding.session.as_bytes());
-        hasher.update(self.chat_binding.workscope.as_bytes());
-        hasher.update(self.contracts.media_contract.as_bytes());
-        hasher.update(self.contracts.scheduled_delivery_target.as_bytes());
-        hasher.update(self.contracts.outbox_projection_ref.as_bytes());
-        sha256_hex(&hasher.finalize())
+        let mut encoder = FramedIdentity::open(PROFILE_DOMAIN);
+        encoder.text(0x01, &self.generation);
+        encoder.text(0x02, &self.principal_binding.principal);
+        encoder.text(0x03, &self.principal_binding.platform_fingerprint);
+        encoder.flag(0x04, self.principal_binding.revoked);
+        encoder.text(0x05, &self.chat_binding.chat);
+        encoder.opt_text(0x06, self.chat_binding.thread.as_deref());
+        encoder.text(0x07, &self.chat_binding.session);
+        encoder.opt_text(0x08, self.chat_binding.task.as_deref());
+        encoder.text(0x09, &self.chat_binding.workscope);
+        encoder.capability_set(0x0A, &self.capabilities.supported);
+        encoder.u32(0x0B, self.capabilities.max_text_chars);
+        encoder.u64(0x0C, self.capabilities.max_file_bytes);
+        encoder.text(0x0D, &self.contracts.media_contract);
+        encoder.u32(0x0E, self.contracts.command_surface_version);
+        encoder.u32(0x0F, self.contracts.approval_surface_version);
+        encoder.text(0x10, &self.contracts.scheduled_delivery_target);
+        encoder.text(0x11, &self.contracts.outbox_projection_ref);
+        encoder.u64(0x12, self.replay_policy.freshness_window_ms);
+        encoder.u32(0x13, self.replay_policy.max_attempts);
+        encoder.finish()
     }
 }
 
@@ -536,16 +678,22 @@ impl InboundPlatformUpdate {
     /// generation plus principal binding. An exact replay derives the exact
     /// same key, so webhook and polling duplicates cannot create a second
     /// task or approval.
+    ///
+    /// The key uses the single framed V2 encoding. The inbound event lookup
+    /// identity (platform update identity, generation, principal binding)
+    /// and the payload conflict commitment (payload digest) occupy distinct
+    /// framed sections, so a payload change under a seen update identity
+    /// conflicts instead of merging. V1 keys are historical and are never
+    /// compared against V2 values.
     #[must_use]
     pub fn event_key(&self) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(INBOUND_EVENT_DOMAIN.as_bytes());
-        hasher.update(self.platform_update_id.as_bytes());
-        hasher.update(self.generation.as_bytes());
-        hasher.update(self.principal.as_bytes());
-        hasher.update(self.platform_fingerprint.as_bytes());
-        hasher.update(self.payload_digest.as_bytes());
-        sha256_hex(&hasher.finalize())
+        let mut encoder = FramedIdentity::open(INBOUND_EVENT_DOMAIN);
+        encoder.text(0x01, &self.platform_update_id);
+        encoder.text(0x02, &self.generation);
+        encoder.text(0x03, &self.principal);
+        encoder.text(0x04, &self.platform_fingerprint);
+        encoder.text(0x10, &self.payload_digest);
+        encoder.finish()
     }
 }
 
@@ -825,19 +973,23 @@ impl ApprovalBinding {
     }
 
     /// Returns the stable digest of the whole approval binding.
+    ///
+    /// The key commits the exact action and effect digests, scope,
+    /// principal, revision, `State Fence` sequence, authority epoch, and
+    /// expiry through the single framed V2 encoding. V1 keys are historical
+    /// and are never compared against V2 values.
     #[must_use]
     pub fn approval_key(&self) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(APPROVAL_DOMAIN.as_bytes());
-        hasher.update(self.identity.action_digest.as_bytes());
-        hasher.update(self.identity.effect_digest.as_bytes());
-        hasher.update(self.identity.scope.as_bytes());
-        hasher.update(self.identity.principal.as_bytes());
-        hasher.update(self.identity.revision.as_bytes());
-        hasher.update(self.state_fence_seq.to_le_bytes());
-        hasher.update(self.authority_epoch.to_le_bytes());
-        hasher.update(self.expires_at_ms.to_le_bytes());
-        sha256_hex(&hasher.finalize())
+        let mut encoder = FramedIdentity::open(APPROVAL_DOMAIN);
+        encoder.text(0x01, &self.identity.action_digest);
+        encoder.text(0x02, &self.identity.effect_digest);
+        encoder.text(0x03, &self.identity.scope);
+        encoder.text(0x04, &self.identity.principal);
+        encoder.text(0x05, &self.identity.revision);
+        encoder.u64(0x06, self.state_fence_seq);
+        encoder.u64(0x07, self.authority_epoch);
+        encoder.u64(0x08, self.expires_at_ms);
+        encoder.finish()
     }
 
     /// Authorizes one approval presentation at the given time and revision.
@@ -1124,16 +1276,27 @@ impl LogicalMessage {
     }
 
     /// Returns the stable digest of the whole logical message.
+    ///
+    /// The key commits the complete immutable logical-message content
+    /// through the single framed V2 encoding: the stable outbox/logical
+    /// identity stays distinct from the content commitment (principal,
+    /// target, presence and value of the task and artifact refs, generation,
+    /// disclosure decision, and the original freshness policy), so changed
+    /// bytes under the same operation identity conflict rather than silently
+    /// becoming another delivery. V1 keys are historical and are never
+    /// compared against V2 values.
     #[must_use]
     pub fn message_key(&self) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(LOGICAL_MESSAGE_DOMAIN.as_bytes());
-        hasher.update(self.id.as_bytes());
-        hasher.update(self.principal.as_bytes());
-        hasher.update(self.target.as_bytes());
-        hasher.update(self.generation.as_bytes());
-        hasher.update(self.disclosure_digest.as_bytes());
-        sha256_hex(&hasher.finalize())
+        let mut encoder = FramedIdentity::open(LOGICAL_MESSAGE_DOMAIN);
+        encoder.text(0x01, &self.id);
+        encoder.text(0x02, &self.principal);
+        encoder.text(0x03, &self.target);
+        encoder.opt_text(0x04, self.task_ref.as_deref());
+        encoder.opt_text(0x05, self.artifact_ref.as_deref());
+        encoder.text(0x06, &self.generation);
+        encoder.text(0x07, &self.disclosure_digest);
+        encoder.u64(0x08, self.freshness_window_ms);
+        encoder.finish()
     }
 }
 
@@ -1274,8 +1437,10 @@ pub struct ResendPair {
 ///
 /// The prior attempt must still be [`SinkPhase::Unknown`], it must belong to
 /// the same logical message, and the retry must land inside its freshness
-/// deadline. The new attempt is marked `possible_duplicate`; the old attempt
-/// is preserved, never rewritten.
+/// deadline. The new attempt keeps the prior attempt's absolute freshness
+/// deadline: the retry time never extends it, so a resend remains unavailable
+/// after the original boundary. The new attempt is marked
+/// `possible_duplicate`; the old attempt is preserved, never rewritten.
 pub fn resend_as_marked_attempt(
     logical: &LogicalMessage,
     prior: &DeliveryAttempt,
@@ -1295,7 +1460,7 @@ pub fn resend_as_marked_attempt(
         logical_message_id: logical.id.clone(),
         phase: SinkPhase::Committed,
         possible_duplicate: true,
-        freshness_deadline_ms: now_ms.saturating_add(logical.freshness_window_ms),
+        freshness_deadline_ms: prior.freshness_deadline_ms,
     };
     Ok(ResendPair {
         preserved_unknown: prior.clone(),
