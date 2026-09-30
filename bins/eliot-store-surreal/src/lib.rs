@@ -36,7 +36,7 @@ use eliot_store_api::{
     CanonicalSnapshotPort, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS,
     ExactJsonBytes, IsolatedDestination, IsolatedDestinationReceipt, IsolatedRestorePort,
     NamedReadRequest, NamedReadResponse, OperationId, OperationIdentity, OrderingHead,
-    OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta,
+    OrderingHeadExpectation, OrderingHeadReadback, OrderingScopeId, PreparedTransition, RequestMeta,
     ReservedWriteRequest, RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation,
     RevisionKey, SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle,
     SnapshotPage, StoreBackupStatus, StoreBackupStatusOutcome, StoreError, StoreHealth,
@@ -1321,6 +1321,15 @@ impl StoreComposition {
         self.store.ordering_heads(scopes).await
     }
 
+    /// Reads ordering heads with their canonical source bytes and store-owned
+    /// digests for protected reservation capture.
+    pub async fn ordering_head_readbacks(
+        &self,
+        scopes: Vec<OrderingScopeId>,
+    ) -> Result<Vec<OrderingHeadReadback>, StoreError> {
+        self.store.ordering_head_readbacks(scopes).await
+    }
+
     /// Returns the immutable closed operation manifest digest for the ready
     /// response; no provider-specific data is exposed.
     pub fn operation_manifest_digest(&self) -> &str {
@@ -1952,6 +1961,7 @@ fn enforce_admitted_operation_with_log(
         | Request::Receipt { .. }
         | Request::RevisionHeads { .. }
         | Request::OrderingHeads { .. }
+        | Request::OrderingHeadReadbacks { .. }
         | Request::ValidationSnapshot
         | Request::DreamerJob { .. } => Ok(()),
     };

@@ -33,7 +33,8 @@ use eliot_store_api::{
     EVIDENCE_PACK_MAX_RECORDS, EventId, EventProjectionRelationIntents, MAX_RECOVERY_RECORD_BYTES,
     NamedMutationOperation, NamedReadOperation, NamedReadRequest, NamedReadResponse,
     OWNER_SNAPSHOT_SCHEMA, OperationId, OperationManifestDigest, OrderingHead,
-    OrderingHeadExpectation, OrderingScopeId, OutboxId, OutboxIntent, OutboxState,
+    OrderingHeadExpectation, OrderingHeadReadback, OrderingScopeId, OutboxId, OutboxIntent,
+    OutboxState,
     PreparedTransition, ProjectionMode, ProjectionPublicationId, ProjectionPublicationRecord,
     ProjectionStatus, RecoveryRecord, RecoveryRecordKey, RequestMeta, Resubmission, RevisionDelta,
     RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SplitView,
@@ -5175,6 +5176,26 @@ impl CanonicalStoreClient for MemoryStore {
         scopes: Vec<OrderingScopeId>,
     ) -> Result<Vec<OrderingHead>, StoreError> {
         self.ordering_heads_sync(&scopes)
+    }
+
+    async fn ordering_head_readbacks(
+        &self,
+        scopes: Vec<OrderingScopeId>,
+    ) -> Result<Vec<OrderingHeadReadback>, StoreError> {
+        self.ordering_heads_sync(&scopes)?
+            .into_iter()
+            .map(|head| {
+                let canonical_bytes = canonical_json_bytes(&head)
+                    .map_err(|error| StoreError::Serialization(error.to_string()))?;
+                let readback = OrderingHeadReadback {
+                    head,
+                    canonical_sha256: sha256_hex(&canonical_bytes),
+                    canonical_bytes,
+                };
+                readback.validate()?;
+                Ok(readback)
+            })
+            .collect()
     }
 
     async fn execute_named(
