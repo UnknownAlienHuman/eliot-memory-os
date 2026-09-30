@@ -85,7 +85,7 @@ fn check_identity_binding_with_selection(
         &identity.request.metadata,
         transition,
     )
-    .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+    .map_err(task_binding_kernel_error)?;
     match (&admission, task_selection) {
         (super::task_binding_admission::TaskBindingAdmission::TaskRelative, Some(selection)) => {
             super::task_binding_admission::admit_prepared_transition_with_owner_selection(
@@ -96,19 +96,13 @@ fn check_identity_binding_with_selection(
                 selection.observed_scope,
                 selection.live_fence,
             )
-            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+            .map_err(task_binding_kernel_error)?;
         }
         (super::task_binding_admission::TaskBindingAdmission::TaskRelative, None) => {
-            return Err(KernelPortError::Contract(
-                "TASK_SELECTION_REQUIRED: task-relative transition has no retained owner selection at daemon ingress"
-                    .to_owned(),
-            ));
+            return Err(KernelPortError::TaskSelectionRequired);
         }
         (_, Some(_)) => {
-            return Err(KernelPortError::Contract(
-                "TASK_SELECTION_REQUIRED: selected Task Controller transition is not task-relative"
-                    .to_owned(),
-            ));
+            return Err(KernelPortError::TaskSelectionRequired);
         }
         (_, None) => {}
     }
@@ -179,6 +173,20 @@ fn check_identity_binding_with_selection(
             ))
         })?;
     Ok(())
+}
+
+fn task_binding_kernel_error(
+    error: super::task_binding_admission::TaskBindingError,
+) -> KernelPortError {
+    match error.code() {
+        super::task_binding_admission::TASK_SELECTION_REQUIRED => {
+            KernelPortError::TaskSelectionRequired
+        }
+        super::task_binding_admission::TASK_SCOPE_INCOMPATIBLE => {
+            KernelPortError::TaskScopeIncompatible
+        }
+        _ => KernelPortError::Contract(error.to_string()),
+    }
 }
 
 async fn read_task_controller_source_head(
