@@ -215,17 +215,18 @@
 //!
 //! Reporting a rollback is not the same operation as performing one, so the same
 //! rule is also gated where the route actually moves:
-//! [`StorageReplacement::refuse_unproven_generation_rollback`] reads the
-//! incumbent committed row for the pinned route scope and refuses a switch that
-//! would switch generation back over a
-//! [`StateMigrationDecision::ForwardRepairRequired`] decision, before the
-//! Kernel Generation Registry writes that cutover's own row and before it asks
-//! the semantic gateway to switch. A refusal reported by
+//! [`StorageReplacement::refuse_unproven_generation_rollback`] reads EVERY
+//! committed row of the pinned route scope, not only its newest one, and refuses
+//! a switch whose candidate generation is at or behind the `new_generation` of
+//! any row recording a [`StateMigrationDecision::ForwardRepairRequired`]
+//! decision — before the Kernel Generation Registry writes that cutover's own
+//! row and before it asks the semantic gateway to switch. A refusal reported by
 //! [`StorageReplacement::request_rollback`] while the live route keeps serving
 //! the candidate proves nothing about the route; this is the gate that holds it.
-//! Its decision is the durable row's, so a caller's own `migration` field cannot
-//! mask the incumbent's — which is precisely the claim a
-//! `migration: RetainCompatible` payload would otherwise be able to buy.
+//! Its decision is the durable history's, so a caller's own `migration` field
+//! cannot mask a committed decision — neither by presenting
+//! `migration: RetainCompatible` for its own row, nor by first committing an
+//! ordinary forward cutover whose own row then reads as the newest decision.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -1328,8 +1329,9 @@ impl StorageReplacement {
         }
     }
 
-    /// Refuses a `canonical_store` route switch that would switch generation
-    /// *back* over a committed cutover that recorded an irreversible migration.
+    /// Refuses a `canonical_store` route switch whose destination generation is
+    /// at or behind a generation this route has already committed an
+    /// irreversible migration into.
     ///
     /// `I5.11` states the whole rule: "Rollback switches generation back only if
     /// no irreversible migration/effect occurred; otherwise uses forward repair",
@@ -1346,18 +1348,42 @@ impl StorageReplacement {
     /// committed row and one that already has one — before it writes any row and
     /// before the semantic gateway is asked to switch the live route.
     ///
-    /// The decision is read from the durable ORS row, never from the request.
-    /// The incumbent is the winner of the committed `CUTOVER_OWNERSHIP` rows for
-    /// the pinned route scope *excluding* `cutover_id` — exactly the route state
-    /// that existed before this cutover identity was admitted — resolved through
-    /// the same [`CutoverRouteSnapshot::rebuild`] rule
-    /// [`active_canonical_store_generation`] and Kernel recovery already use (the
-    /// strictly newest committed epoch wins; staged rows are excluded by the
-    /// listing itself). Because the row being admitted is excluded rather than
-    /// consulted, a caller that presents its own `migration` decision cannot
-    /// place that row on top of the incumbent's decision and be admitted: the
+    /// The decision is read from durable ORS rows, never from the request: the
+    /// read is every committed `CUTOVER_OWNERSHIP` row of the pinned route scope
+    /// *excluding* `cutover_id` — exactly the committed history that existed
+    /// before this cutover identity was admitted. A staged (`Armed`) or
+    /// fenced candidate cannot appear, because the listing itself returns
+    /// committed rows only. Because the row being admitted is excluded rather
+    /// than consulted, a caller that presents its own `migration` decision cannot
+    /// place that row on top of the committed decision and be admitted: the
     /// gate runs before the row exists, so the caller's payload never becomes the
     /// durable answer at all.
+    ///
+    /// **Every row is scanned, not the newest one.** `I5.11` asks whether "no
+    /// irreversible migration/effect occurred", and the subject of that question
+    /// is the store this route serves, not one record. An irreversible migration
+    /// or effect is a fact about the data: once a committed row of this scope
+    /// carries it, every store generation at or behind that row's
+    /// `new_generation` is a generation that lacks whatever the migration
+    /// produced, and a later forward cutover does not un-occur it — the forward
+    /// cutover moves the route to a *newer* store, it does not restore the older
+    /// one. A newer row therefore never retracts an older row's decision: it is
+    /// a decision about the transition that follows it, and reading only the
+    /// newest row would let an ordinary forward cutover — one that legitimately
+    /// presents an empty irreversible-effect ledger and so commits
+    /// `RetainCompatible` — launder the earlier requirement out of view, after
+    /// which a rollback to the pre-migration generation looks merely
+    /// "one step back" and is admitted. That is the single reading the newest
+    /// row alone would give, and it is not the guarantee: "no irreversible
+    /// migration/effect occurred" is a statement about the whole committed
+    /// history of the scope, so the predicate is an existential one — any
+    /// committed row recording forward repair at or above the candidate
+    /// generation refuses. No row's position in the route snapshot, and no
+    /// epoch-winner resolution, can change that fact, so
+    /// [`CutoverRouteSnapshot::rebuild`] is deliberately not used here to pick a
+    /// winner the way [`active_canonical_store_generation`] does: the winner
+    /// answers "who owns the route now", which is a different question from "has
+    /// anything irreversible already happened to this route".
     ///
     /// [`StateMigrationDecision::ForwardRepairRequired`] is the
     /// irreversible-effect-bearing state by this module's own standing
@@ -1366,7 +1392,8 @@ impl StorageReplacement {
     /// [`Self::commit_canonical_store_route_cutover`] both require it on a
     /// committed row *exactly* when the coordinator's irreversible-effect ledger
     /// is non-empty, so any other decision on a committed row of this scope is
-    /// durable evidence that no irreversible effect was recorded.
+    /// durable evidence that THAT cutover recorded no irreversible effect — never
+    /// evidence about the cutovers before it.
     ///
     /// The refusal is [`KernelServiceError::GenerationFenced`] — the same typed
     /// refusal [`Self::request_rollback`] already returns for exactly this
@@ -1374,56 +1401,56 @@ impl StorageReplacement {
     /// fenced until forward recovery". Reusing it is what keeps the switch path
     /// and the reporting path indistinguishable when one of them is mislabelled.
     ///
-    /// The one switch that is not a rollback is a switch to a strictly newer
-    /// generation: that is the forward repair both documents name, it moves the
-    /// route forward under a newer epoch like any other cutover (`I14.14`:
-    /// "Rollback is another cutover with a newer epoch"), and it is therefore
-    /// admitted. Refusing that as well would leave a committed forward-repair
-    /// requirement with no transition at all — not forward repair, but a
-    /// permanently frozen route — so the generation counter
-    /// ([`ResourceGeneration`], monotonic by construction) is what separates the
-    /// two. A switch that does not move the generation at all is not a rollback
-    /// either, and is left to the coordinator's own rules, which already refuse
-    /// a replacement that selects its own incumbent.
+    /// The comparison is `candidate <= record.new_generation` on
+    /// [`ResourceGeneration`] (monotonic by construction), so the admitted
+    /// switch is exactly the one that moves strictly past every forward-repair
+    /// row: that is the forward repair both documents name, it moves the route
+    /// forward under a newer epoch like any other cutover (`I14.14`: "Rollback is
+    /// another cutover with a newer epoch"), and it is therefore admitted.
+    /// Refusing that as well would leave a committed forward-repair requirement
+    /// with no transition at all — not forward repair, but a permanently frozen
+    /// route — so the gate refuses the rollback direction and leaves the forward
+    /// direction open. The `<=` (rather than `<`) comparison also covers a switch
+    /// that does not move the generation at all: such a frame names a
+    /// destination that is itself the destination of the recorded irreversible
+    /// migration, so this gate refuses it too rather than passing the question
+    /// on. That refusal is owned here, not by the coordinator: the coordinator's
+    /// own rule in [`StorageReplacement::begin`] refuses a candidate that already
+    /// owns the route through a committed cutover, and that rule runs later,
+    /// after this one, on the other admission path.
     ///
     /// With no committed cutover for this scope there is no committed migration
     /// decision to read, so nothing is refused: the pre-first-commit window is
     /// decided by [`canonical_store_route_owner`], and a first cutover has no
-    /// incumbent irreversible requirement to violate. Every other durable
-    /// refusal — a missing optional table, a projection bound, an integrity
-    /// problem — is classified onto the existing `KernelServiceError` variants
-    /// by `ors_refusal` instead of being read as an absence of irreversible
-    /// effect, so this gate fails closed.
+    /// incumbent irreversible requirement to violate. An ORS database written
+    /// before the optional `CUTOVER_OWNERSHIP` table existed is answered the same
+    /// way, by [`committed_canonical_store_cutovers`]' own documented
+    /// compatibility reading, which maps that single absent-table class onto an
+    /// empty listing; that is a fact about the database — such a database has
+    /// committed no cutover — and it is the same reading
+    /// [`canonical_store_route_owner`] and the Kernel recovery boundary already
+    /// make. It is deliberately NOT described as failing closed here, because it
+    /// does not: it admits. Every other durable refusal — a projection bound, an
+    /// integrity problem, any other typed ORS class — still reaches the caller as
+    /// its existing `KernelServiceError` variant through `ors_refusal`, so those
+    /// do close this gate.
     pub fn refuse_unproven_generation_rollback(
         ors: &RedbRecoveryStore,
         cutover_id: &str,
         candidate_generation: ResourceGeneration,
     ) -> Result<(), KernelServiceError> {
         let scope = canonical_store_route_scope()?;
-        let prior = committed_canonical_store_cutovers(ors, &scope)?
-            .into_iter()
-            .filter(|record| record.cutover_id != cutover_id)
-            .collect::<Vec<_>>();
-        let incumbent_epoch = CutoverRouteSnapshot::rebuild(&prior)
-            .map_err(|error| ors_refusal(&error))?
-            .entry(&scope.route_scope_hash)
-            .map(|entry| entry.authority_epoch);
-        let Some(incumbent_epoch) = incumbent_epoch else {
-            return Ok(());
-        };
-        let incumbent = prior
+        let unproven = committed_canonical_store_cutovers(ors, &scope)?
             .iter()
-            .find(|record| record.new_epoch == incumbent_epoch)
-            .ok_or(KernelServiceError::InvalidField {
-                field: "storage_replacement_incumbent_cutover",
-                reason: "the incumbent canonical_store cutover is absent from the committed rows its route snapshot was rebuilt from",
-            })?;
-        if incumbent.migration != StateMigrationDecision::ForwardRepairRequired
-            || candidate_generation.value() > incumbent.new_generation.value()
-        {
-            return Ok(());
+            .filter(|record| record.cutover_id != cutover_id)
+            .any(|record| {
+                record.migration == StateMigrationDecision::ForwardRepairRequired
+                    && candidate_generation.value() <= record.new_generation.value()
+            });
+        if unproven {
+            return Err(KernelServiceError::GenerationFenced);
         }
-        Err(KernelServiceError::GenerationFenced)
+        Ok(())
     }
 
     /// Refuses any stage that is not the exact next unreached stage.
