@@ -4074,6 +4074,15 @@ impl HostRequestAdmissionReceipt {
 pub const HOST_REQUEST_INVOKE_READ_WIRE_ID: &str = "eliot.protocol.host-request-invoke-read";
 /// Current host-request invoke-read payload wire version.
 pub const HOST_REQUEST_INVOKE_READ_WIRE_VERSION: u16 = 1;
+/// Payload schema every tool-byte host-request submit carries (issue #1739
+/// W2).
+///
+/// Stamped by the bridge on each `ToolRequest` submit envelope. The strict
+/// finish draft carries its own schema and never rides the tool-byte submit
+/// gate. The Kernel linkage gate joins this schema before any staging: a
+/// mislabeled payload — bytes no executor schema can interpret — fails
+/// closed even when its digest links.
+pub const HOST_REQUEST_PAYLOAD_SCHEMA_ID: &str = "eliot.mcp.tool-request.v1";
 /// Stable wire identity for a P-04 host-request result body.
 pub const HOST_REQUEST_RESULT_BODY_WIRE_ID: &str = "eliot.protocol.host-request-result-body";
 /// Current host-request result body wire version.
@@ -4649,6 +4658,25 @@ impl HostRequestResultBody {
             return Err(ProtocolError::InvalidField {
                 field: "host_request_result_body.lineage",
                 reason: "local-read submission requires explicit result lineage",
+            });
+        }
+        Ok(())
+    }
+
+    /// Applies the additional lineage requirement to an observe submission
+    /// (issue #1739 W4).
+    ///
+    /// Mirrors `validate_local_read_submission`: a body with unknown lineage
+    /// carries no semantic admission, so it can never complete an
+    /// `eliot.observe` operation as its retained semantic outcome. The
+    /// lineage is the producer's owner receipt, bound to the exact result
+    /// digest and the completing attempt by `validate`.
+    pub fn validate_observe_submission(&self) -> Result<(), ProtocolError> {
+        self.validate_for_submission()?;
+        if self.lineage.is_none() {
+            return Err(ProtocolError::InvalidField {
+                field: "host_request_result_body.lineage",
+                reason: "observe submission requires explicit result lineage",
             });
         }
         Ok(())

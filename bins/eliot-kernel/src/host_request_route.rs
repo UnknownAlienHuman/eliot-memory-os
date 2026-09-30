@@ -73,7 +73,8 @@ use eliot_protocol::{
     AGENT_BRIDGE_PROCESS_BINDING_WIRE_ID, AGENT_HOST_REQUEST_FAILURE_WIRE_ID,
     AgentActivationResolutionResult, AgentBridgePeerAdmissionReceipt, AgentBridgeProcessBinding,
     AgentHostRequestFailure, AgentResponseDisposition, DeliveryClass, EventEnvelope,
-    HOST_REQUEST_INVOKE_READ_WIRE_ID, HOST_REQUEST_RESULT_BODY_WIRE_ID,
+    HOST_REQUEST_INVOKE_READ_WIRE_ID, HOST_REQUEST_PAYLOAD_SCHEMA_ID,
+    HOST_REQUEST_RESULT_BODY_WIRE_ID,
     HostRequestAdmissionReceipt, HostRequestEnvelope, HostRequestInvokeReadPayload,
     HostRequestKind, HostRequestResultBody, LocalReadAttempt, WatchdogIntentKind,
     WatchdogSpoolIntentBatchPayload, WatchdogSpoolIntentSubmission, host_request_operation_id,
@@ -3858,10 +3859,11 @@ pub(crate) enum ObserveDeferDisposition {
 ///
 /// Runs the exact shared linkage gate ([`HostRequestInvokeReadPayload`]:
 /// capability echoes the admitted tool name, canonical tool bytes digest to
-/// the admitted payload digest) plus the observe capability join and the
-/// retained-bytes bound. A changed payload digest, a forged capability, or
-/// over-bound bytes fail closed as `SessionFenced` before the caller stages
-/// anything. Pure: validation performs no IO by construction, which is the
+/// the admitted payload digest) plus the observe capability join, the
+/// payload-schema join, and the retained-bytes bound. A changed payload
+/// digest, a forged capability, a mislabeled schema, or over-bound bytes
+/// fail closed as `SessionFenced` before the caller stages anything. Pure:
+/// validation performs no IO by construction, which is the
 /// rejection-before-staging proof. The Kernel never interprets observe
 /// semantics here — only the closed linkage shape.
 pub(crate) fn check_observe_tool_linkage(
@@ -3877,6 +3879,14 @@ pub(crate) fn check_observe_tool_linkage(
     .validate()
     .map_err(|_| TransportError::SessionFenced)?;
     if envelope.identity.capability != OBSERVE_CAPABILITY {
+        return Err(TransportError::SessionFenced);
+    }
+    // Issue #1739 W2: the schema half of the admission bind. The bridge
+    // stamps one payload schema on tool-byte submits; a mislabeled payload
+    // fails closed here — before any staging, and again at claim — even when
+    // its digest links, so no claim is ever handed out for bytes no executor
+    // schema can interpret.
+    if envelope.identity.payload_schema_id != HOST_REQUEST_PAYLOAD_SCHEMA_ID {
         return Err(TransportError::SessionFenced);
     }
     let bytes = serde_json::to_vec(tool).map_err(|_| TransportError::SessionFenced)?;
@@ -4644,7 +4654,11 @@ impl KernelComposition {
         // and the governed attempt — the same submission join the shared
         // submit leg enforces. Legacy readback versions stay readable
         // through the replay path above but can never complete an operation.
-        body.validate_for_submission()
+        // Issue #1739 W4: the submission must also carry the producer's
+        // explicit result lineage — the actual owner receipt. A body with
+        // unknown lineage carries no semantic admission, so it can never
+        // complete the operation as its retained semantic outcome.
+        body.validate_observe_submission()
             .map_err(|_| TransportError::SessionFenced)?;
         if activation_deadline_expired(unix_ms(), stored.deadline_unix_ms) {
             return self.expired_claim_timeout(ExpiredClaimObservation {
