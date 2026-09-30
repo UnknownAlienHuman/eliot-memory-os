@@ -3873,16 +3873,30 @@ impl AgentFabric {
     /// state (issue #1702 W7/A6).
     ///
     /// This is the only writer of retained unknown effects, and it publishes
-    /// them through the same durable write as every other owner-separated
-    /// revision: an effect that is only in memory is an effect a crash erases,
-    /// which is the difference between "preserved" and "claimed". Retention is
-    /// additive and exact — re-presenting the stored set replays without a
-    /// second write, and a set that repeats an already-retained effect adds
-    /// nothing, so nothing already retained can be quietly withdrawn or
-    /// double-counted.
+    /// them through the same gate every other owner-separated write uses: the
+    /// retained set is staged into the fabric, the durable commit runs first,
+    /// and an unproven commit leaves the previously retained set current and
+    /// reports a typed failure instead of an in-memory effect a crash could
+    /// erase. Retention is additive and exact — re-presenting the stored set
+    /// replays without a second write, and a set that repeats an
+    /// already-retained effect adds nothing, so nothing already retained can be
+    /// quietly withdrawn or double-counted.
     ///
     /// Only non-blank, control-free effect text is accepted, matching the text
     /// the joined view already validates.
+    ///
+    /// Named seam, deliberately not worked around here: the retained set rides
+    /// [`FabricSnapshot`], so it survives every path that persists the snapshot
+    /// (including both restore paths, which verify it through
+    /// [`verify_snapshot_semantics`]). The persisted revision envelope's own
+    /// field list is [`SemanticRevisionEnvelope`], owned by
+    /// `bins/eliotd/src/semantic_revision_store.rs`, and on the current base it
+    /// still projects only the four owner maps. This module cannot extend that
+    /// envelope, and inventing a second retained-effect file here would be a
+    /// second durable carrier for the same fact, so the missing field is named
+    /// rather than worked around: adding
+    /// `unknown_effects: snapshot.semantic_unknown_effects.clone()` to
+    /// `SemanticRevisionEnvelope::from_snapshot` closes it.
     ///
     /// # Errors
     ///
