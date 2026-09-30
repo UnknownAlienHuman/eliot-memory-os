@@ -18354,6 +18354,25 @@ impl RedbRecoveryStore {
                 let (key, value) = entry.map_err(storage)?;
                 let (namespace, sequence) = Self::parse_bridge_position_key(key.value())?;
                 let position: BridgeEventPosition = decode(value.value())?;
+                // W9: canonical-key and owner-binding checks mirror the live
+                // validators; every contradiction below fails closed as
+                // IntegrityProblem, never a first/latest pick, and the
+                // conflicting row stays preserved for recovery.
+                if key.value() != Self::bridge_position_key(&namespace, sequence) {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "bridge_event_position",
+                        reason:
+                            "position key does not match its canonical owner and sequence binding"
+                                .to_owned(),
+                    });
+                }
+                if !stream_owners.contains_key(&namespace) {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "bridge_event_position",
+                        reason: "position names an unbound owner namespace".to_owned(),
+                    });
+                }
+                position.validate()?;
                 if let Some(prior) = indexed.get(&(namespace.clone(), sequence)) {
                     if prior != &position.event_id {
                         return Err(OrsError::IntegrityProblem {
