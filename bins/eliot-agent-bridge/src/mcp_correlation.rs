@@ -550,7 +550,6 @@ impl BridgeRunner {
                     assessments: &record.assessments,
                     operation_binding: record.binding.as_ref(),
                     canonical: &record.canonical,
-                    ui_confirmed_stale: false,
                     now_unix_ms: Some(now_unix_ms),
                 }
             };
