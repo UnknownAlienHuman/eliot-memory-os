@@ -463,7 +463,7 @@ fn wait_for_durable_admission(
             let mut fence_announced = false;
             match FileWatchdogAdmission::pending_phase_b_fence_readiness(
                 registry_path.clone(),
-                bootstrap.clone(),
+                &bootstrap,
             ) {
                 Ok(fence) => {
                     announce_fence_readiness(&fence, &heartbeat)?;
@@ -495,7 +495,7 @@ fn wait_for_durable_admission(
                         let retry_detail = truncate_failure_detail(&retry.to_string());
                         match FileWatchdogAdmission::pending_phase_b_fence_readiness(
                             registry_path.clone(),
-                            bootstrap.clone(),
+                            &bootstrap,
                         ) {
                             Ok(fence) => {
                                 transient_streak = 0;
