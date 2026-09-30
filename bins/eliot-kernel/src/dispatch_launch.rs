@@ -5027,7 +5027,7 @@ fn finish_native_worker_launch_attempt(
             retain_started_native_worker_launch(attempt, spawned)
         }
         Ok(ChildStartOutcome::Unknown(uncertain)) => {
-            retain_unknown_native_worker_launch(attempt, uncertain)
+            retain_unknown_native_worker_launch(attempt, &uncertain)
         }
         Err(error) => {
             reap_material_file(&attempt.material_path);
@@ -5096,7 +5096,7 @@ fn retain_started_native_worker_launch(
 
 fn retain_unknown_native_worker_launch(
     attempt: NativeWorkerLaunchAttempt,
-    uncertain: UncertainSpawn,
+    uncertain: &UncertainSpawn,
 ) -> Result<NativeWorkerLaunchOutcome, DispatchLaunchError> {
     let NativeWorkerLaunchAttempt {
         contour,
