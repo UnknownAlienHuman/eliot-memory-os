@@ -195,29 +195,10 @@ pub(crate) fn drive_admitted_one_shot_from_store<E: ProcessExecutor + 'static>(
                 .to_owned(),
         ));
     }
-    // Closed-profile Drive gate (issue #20): only registered profiles
-    // drive. Fixed-argv profiles take no caller arguments: the fixed argv
-    // comes from the registry binding, never from the invocation. Slotted
-    // profiles (issue #1802, step 4) validate their arguments through the
-    // slot schema; the sealed argv derives from the binding.
-    if !eliot_testd_core::is_admitted_testd_profile(&presented.invocation.profile) {
-        return Err(TestdError::Contract(
-            "testd admits only the closed cargo-test tool-probe profile".to_owned(),
-        ));
-    }
-    if !presented.invocation.arguments.is_empty() {
-        if eliot_testd_core::is_slotted_testd_profile(&presented.invocation.profile) {
-            eliot_testd_core::parse_testd_slot_suffix(
-                &presented.invocation.profile,
-                &presented.invocation.arguments,
-            )
-            .map_err(|error| TestdError::Contract(error.to_string()))?;
-        } else {
-            return Err(TestdError::Contract(
-                "the admitted profile takes fixed argv; caller arguments are refused".to_owned(),
-            ));
-        }
-    }
+    // Profile and argv admission runs in `drive_claimed` against the shared
+    // profile.rs boundary (`AdmittedStage::admit_testd_launch`), after the
+    // fresh seal below binds the exact durable job. No parallel allowlist
+    // is consulted here; every refusal still lands before any start.
     if !presented
         .epoch
         .is_same_authority(&presented.request.authority_epoch)
@@ -245,6 +226,42 @@ pub(crate) fn drive_admitted_one_shot_from_store<E: ProcessExecutor + 'static>(
         .clone()
         .ok_or_else(|| TestdError::Corrupt("claimed job carries no lease".to_owned()))?;
     drive_claimed(store, &job, &mut lease, presented, contour, owner, lease_ms)
+}
+
+/// Admits one freshly sealed drive claim against the shared profile.rs
+/// boundary (issue #1814) before the consuming start.
+///
+/// The observation is built from the owner-sealed permit only: sealed
+/// executable path and digest, a digest over the sealed environment, and
+/// the sealed argv. No path is resolved and no file is read here — the
+/// productive tool re-read below stays the file-observing check — so the
+/// observation always describes exactly the request about to start.
+fn admit_sealed_drive_claim(
+    invocation: &eliot_instrument_api::InstrumentInvocation,
+    request: &ProcessRequest,
+) -> Result<(), TestdError> {
+    let environment_digest = eliot_contracts::canonical_json_bytes(request.environment())
+        .map(|bytes| eliot_contracts::sha256_hex(&bytes))
+        .map_err(|_| {
+            TestdError::Contract("sealed tool environment does not canonicalize".to_owned())
+        })?;
+    let observed = eliot_instrument_runner::ResolvedExecutableIdentity::new(
+        invocation.instrument.as_str(),
+        request.executable().to_owned(),
+        request.executable_sha256().to_owned(),
+        None,
+        environment_digest,
+        request.argv().to_vec(),
+    )
+    .map_err(|error| TestdError::Contract(error.to_string()))?;
+    eliot_instrument_runner::AdmittedStage::admit_testd_launch(
+        invocation,
+        request.argv(),
+        &observed,
+        None,
+        eliot_testd_core::TESTD_PROFILE_REVISION,
+    )
+    .map_err(|error| TestdError::Contract(error.to_string()))
 }
 
 /// Drives one claimed job against the presented admission to a deterministic
@@ -317,6 +334,23 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
             )?));
         }
     };
+    // Shared admission boundary (issue #1814): the seal above proves
+    // identity, fence, roots, and generation against the claimed durable
+    // job; this admits the invocation against the ONE profile.rs contract
+    // before any start. Refusal finishes unknown without executing, under
+    // the same typed pattern as a seal refusal.
+    if let Err(error) = admit_sealed_drive_claim(&job.invocation, permit.request()) {
+        finish_unknown(
+            store,
+            job,
+            lease,
+            &EvidenceCollector::default(),
+            format!("shared admission refused without executing: {error}"),
+        )?;
+        return Ok(crate::receipt(&store.get(&job.job_id)?.ok_or_else(
+            || TestdError::Corrupt("job disappeared after admission refusal".to_owned()),
+        )?));
+    }
     let collector = Arc::new(EvidenceCollector::default());
     if eliot_testd_core::is_productive_testd_profile(&job.invocation.profile) {
         let observation = match observe_tool_identity(permit.request()) {

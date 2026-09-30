@@ -56,6 +56,7 @@ eliot-receipts.workspace = true
 eliot-runtime-contracts.workspace = true
 eliot-security-contracts.workspace = true
 eliot-store-api.workspace = true
+eliot-instrument-runner = { path = "../../crates/instrument/eliot-instrument-runner", version = "0.1.0" }
 eliot-testd-core.workspace = true
 eliot-user-broker-core.workspace = true
 eliot-process.workspace = true

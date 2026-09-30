@@ -24,6 +24,12 @@ use eliot_instrument_cargo::CONTRACT_NAME as CARGO_CONTRACT_NAME;
 use eliot_instrument_nextest::{MAX_NEXTEST_OUTPUT_BYTES, NEXTEST_INSTRUMENT};
 use eliot_instrument_rustc::{MAX_RUSTC_OUTPUT_BYTES, RUSTC_EXECUTABLE, RUSTC_INSTRUMENT};
 use eliot_instrument_rustfmt::{MAX_RUSTFMT_OUTPUT_BYTES, RUSTFMT_INSTRUMENT};
+use eliot_testd_core::{
+    TESTD_ADMITTED_PROFILE, TESTD_PRODUCTIVE_PROFILE_ARGV, TESTD_PROFILE_ARGV,
+    is_admitted_testd_profile, is_slotted_testd_profile, parse_testd_slot_suffix, profile_limits,
+    render_testd_slotted_argv, testd_definition_digest_for_profile,
+    testd_definition_digest_for_slots,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -78,6 +84,14 @@ pub const ISOLATED_NETWORK_POLICY: &str = "eliot.policy.network.isolated-process
 /// it with its own semaphore and circuit state. A system-wide pool never
 /// overrides the module limit, so no global pool exists here.
 pub const BUILTIN_MAX_CONCURRENCY: u32 = 1;
+/// Closed instrument contract sealed by the harmless testd probe profile.
+///
+/// The productive testd profiles execute as [`NEXTEST_INSTRUMENT`] (see
+/// `testd_profile_dispatch`); the probe launches the cargo tool for
+/// `--version` and produces no test report, so it seals this probe
+/// identity instead of a package contract. The value is closed: only this
+/// string is ever admitted for the probe profile.
+pub const TESTD_PROBE_INSTRUMENT: &str = "eliot.instrument.test";
 /// Stable schema name of the canonical registry snapshot.
 pub const REGISTRY_SNAPSHOT_SCHEMA: &str = "eliot.instrument.registry-snapshot";
 /// Exact schema wire version of the canonical registry snapshot.
@@ -2393,6 +2407,173 @@ impl AdmittedStage {
     ) -> Result<InstrumentAdmissionGrant, AdmissionError> {
         self.refuse_if_revoked(registry)?;
         self.admit(request, observed, profile_revision)
+    }
+}
+
+impl AdmittedStage {
+    /// Builds the shared admission for one testd drive launch from the
+    /// closed testd vocabulary (issue #1814).
+    ///
+    /// This is the ONE admission contract the live testd/kernel lane
+    /// consumes: the admitted profile name and revision, the closed
+    /// instrument contract (the probe seals [`TESTD_PROBE_INSTRUMENT`],
+    /// every productive profile seals [`NEXTEST_INSTRUMENT`]), the exact
+    /// sealed argv template (fixed argv, or the slot schema rendering for
+    /// slotted profiles), and the host-stable spec digest all come from
+    /// the `eliot-testd-core` closed constants, never from caller text.
+    /// The executable file stem binds the owner-sealed observation: digest
+    /// equality with the installed bytes stays enforced by the lane's
+    /// permit seal and the productive tool re-read, which observe the file
+    /// itself. Limits mirror the lane binding; concurrency is one because
+    /// the lane performs exactly one consuming start per admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdmissionError::InvalidRequest`] for a zero revision, an
+    /// unregistered profile, or an unbuildable contract identity, and
+    /// [`AdmissionError::ArgumentMismatch`] for caller arguments on a
+    /// fixed-argv profile, an invalid slot suffix, or sealed argv that
+    /// skews from the admitted template.
+    pub fn for_testd_launch(
+        invocation: &eliot_instrument_api::InstrumentInvocation,
+        sealed_argv: &[String],
+        observed: &ResolvedExecutableIdentity,
+        supply_receipt: Option<SupplyChainReceipt>,
+        profile_revision: u64,
+    ) -> Result<Self, AdmissionError> {
+        if profile_revision == 0 {
+            return Err(AdmissionError::InvalidRequest {
+                detail: "testd profile revision must be non-zero".to_owned(),
+            });
+        }
+        if !is_admitted_testd_profile(&invocation.profile) {
+            return Err(AdmissionError::InvalidRequest {
+                detail: "unknown testd profile".to_owned(),
+            });
+        }
+        let spec = if invocation.profile == TESTD_ADMITTED_PROFILE {
+            ContractId::new(TESTD_PROBE_INSTRUMENT)
+        } else {
+            ContractId::new(NEXTEST_INSTRUMENT)
+        }
+        .map_err(|error| AdmissionError::InvalidRequest {
+            detail: error.to_string(),
+        })?;
+        let slotted = is_slotted_testd_profile(&invocation.profile);
+        if !slotted && !invocation.arguments.is_empty() {
+            return Err(AdmissionError::ArgumentMismatch {
+                detail: "the admitted profile takes fixed argv; caller arguments are refused"
+                    .to_owned(),
+            });
+        }
+        let expected_argv: Vec<String> = if slotted {
+            let slots =
+                parse_testd_slot_suffix(&invocation.profile, &invocation.arguments).map_err(
+                    |error| AdmissionError::ArgumentMismatch {
+                        detail: error.to_string(),
+                    },
+                )?;
+            render_testd_slotted_argv(&invocation.profile, &slots).map_err(|error| {
+                AdmissionError::ArgumentMismatch {
+                    detail: error.to_string(),
+                }
+            })?
+        } else if invocation.profile == TESTD_ADMITTED_PROFILE {
+            TESTD_PROFILE_ARGV
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        } else {
+            TESTD_PRODUCTIVE_PROFILE_ARGV
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
+        if sealed_argv != expected_argv.as_slice() {
+            return Err(AdmissionError::ArgumentMismatch {
+                detail: "sealed process argv differs from the admitted template".to_owned(),
+            });
+        }
+        let spec_digest = if slotted {
+            testd_definition_digest_for_slots(&invocation.profile, &invocation.arguments)
+        } else {
+            testd_definition_digest_for_profile(&invocation.profile)
+        }
+        .map_err(|error| AdmissionError::InvalidRequest {
+            detail: error.to_string(),
+        })?;
+        let credential_policy =
+            ContractId::new(ISOLATED_CREDENTIAL_POLICY).map_err(|error| {
+                AdmissionError::InvalidRequest {
+                    detail: error.to_string(),
+                }
+            })?;
+        let network_policy = ContractId::new(ISOLATED_NETWORK_POLICY).map_err(|error| {
+            AdmissionError::InvalidRequest {
+                detail: error.to_string(),
+            }
+        })?;
+        let limits = profile_limits(&invocation.profile);
+        Ok(Self {
+            stage_id: "testd-drive".to_owned(),
+            spec: spec.clone(),
+            kind: InstrumentKind::Test,
+            required: true,
+            external: true,
+            depends_on: Vec::new(),
+            profile: invocation.profile.clone(),
+            profile_revision,
+            spec_revision: BUILTIN_SPEC_VERSION,
+            spec_digest,
+            kind_version: BUILTIN_KIND_VERSION,
+            executable: observed.executable_file_name(),
+            executable_version: None,
+            supply_receipt,
+            argument_template: invocation.arguments.clone(),
+            schema: spec.clone(),
+            environment_class: ISOLATED_PROCESS_CLASS.to_owned(),
+            credential_policy,
+            network_policy,
+            parser: spec.clone(),
+            parser_generation: BUILTIN_PARSER_GENERATION,
+            max_output_bytes: Some(limits.3),
+            timeout_ms: Some(limits.0),
+            max_concurrency: 1,
+        })
+    }
+
+    /// Admits one testd drive launch against the shared boundary before
+    /// process creation (issue #1814).
+    ///
+    /// Builds the admission with [`AdmittedStage::for_testd_launch`], then
+    /// seals the invocation through [`AdmittedStage::admission_request`]
+    /// and [`AdmittedStage::admit`]: profile label and revision, spec
+    /// identity, kind, exact argument template, and the owner-observed
+    /// executable identity refuse fail-closed here, before any grant or
+    /// process exists. The grant itself stays with the lane's own permit;
+    /// this boundary owns refusal only.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`AdmittedStage::for_testd_launch`] and
+    /// [`AdmittedStage::admit`] failures.
+    pub fn admit_testd_launch(
+        invocation: &eliot_instrument_api::InstrumentInvocation,
+        sealed_argv: &[String],
+        observed: &ResolvedExecutableIdentity,
+        supply_receipt: Option<SupplyChainReceipt>,
+        profile_revision: u64,
+    ) -> Result<(), AdmissionError> {
+        let stage = Self::for_testd_launch(
+            invocation,
+            sealed_argv,
+            observed,
+            supply_receipt,
+            profile_revision,
+        )?;
+        let request = stage.admission_request(invocation, Some(observed));
+        stage.admit(&request, Some(observed), profile_revision)?;
+        Ok(())
     }
 }
 

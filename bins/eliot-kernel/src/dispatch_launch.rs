@@ -125,11 +125,13 @@ use eliot_testd_core::{
     JobState as TestdJobState, JobSubmissionMetadata, KernelProcessAdmissionEvidence,
     KernelProcessAdmissionProvider, KernelProcessAdmissionRequest, LaneIdentity, ProcessAdmission,
     RetryPolicy, TARGET_LAYOUT_REVISION, TESTD_OWNER_SUBMIT_OPERATION,
-    TESTD_OWNER_SUBMIT_WIRE_VERSION, TESTD_PRODUCTIVE_PROFILE, TargetLayoutBinding, TargetRoots,
-    TestdOwnerSubmitDirective, TestdOwnerSubmitRequest, TestdOwnerSubmitResponse, TestdStore,
-    TestdVerifierDispatchBinding, TestdVerifierJobSubmission, issue_process_admission,
-    testd_profile_binding, verification_receipt_sha256, verify_envelope_layout_binding,
+    TESTD_OWNER_SUBMIT_WIRE_VERSION, TESTD_PRODUCTIVE_PROFILE, TESTD_PROFILE_REVISION,
+    TargetLayoutBinding, TargetRoots, TestdOwnerSubmitDirective, TestdOwnerSubmitRequest,
+    TestdOwnerSubmitResponse, TestdStore, TestdVerifierDispatchBinding, TestdVerifierJobSubmission,
+    issue_process_admission, testd_profile_binding, verification_receipt_sha256,
+    verify_envelope_layout_binding,
 };
+use eliot_instrument_runner::{AdmittedStage, ResolvedExecutableIdentity};
 use serde::{Deserialize, Serialize};
 
 /// Protected Dreamer dispatch-launch material and launch lineage (T12-09).
@@ -1615,6 +1617,30 @@ pub(crate) async fn submit_testd_owner_job(
         target_root: target_roots.target_root.clone(),
         cache_root: target_roots.cache_root.clone(),
     };
+    // Shared admission boundary (issue #1814): the sealed process above
+    // carries the closed productive binding; this admits the invocation
+    // against the ONE profile.rs contract — registered profile and
+    // revision, nextest instrument contract, kind, exact argv template —
+    // with the owner-observed tool identity, before any permit exists.
+    let observed_drive = ResolvedExecutableIdentity::new(
+        request.submission.invocation.instrument.as_str(),
+        request.process_tool.observation.nextest_path.clone(),
+        request.process_tool.observation.nextest_sha256.clone(),
+        None,
+        canonical_json_bytes(&environment)
+            .map(|bytes| sha256_hex(&bytes))
+            .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?,
+        profile.fixed_argv.clone(),
+    )
+    .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    AdmittedStage::admit_testd_launch(
+        &request.submission.invocation,
+        &profile.fixed_argv,
+        &observed_drive,
+        None,
+        TESTD_PROFILE_REVISION,
+    )
+    .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let provider = KernelIssuedProcessProvider::new(
         process,
         target_roots.allowed_contour_root.clone(),

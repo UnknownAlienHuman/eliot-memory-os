@@ -47,14 +47,13 @@
 //! composed Kernel advertises the exact testd wire. The Drive path below
 //! already derives its executable binding from the admitted profile registry.
 
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_cli::kernel_client::{KernelClient, KernelClientError};
 use eliot_contracts::{EpochId, canonical_json_bytes, sha256_hex};
 use eliot_instrument_api::{InstrumentInvocation, InstrumentKind};
-use eliot_process::{ProcessEvidenceSink, ProcessExecutionError, ProcessExecutor, ProcessRequest};
+use eliot_process::ProcessRequest;
 use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use eliot_testd_core::{
     KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider, KernelProcessAdmissionRequest,
@@ -1097,31 +1096,6 @@ pub enum TestdDriveOutcome {
     },
 }
 
-/// Closed-profile Drive gate (issue #20): only registered profiles
-/// drive. Fixed-argv profiles take no caller arguments: the fixed argv
-/// comes from the registry binding (see `eliot_testd_core`), never from
-/// the invocation. Slotted profiles (issue #1802, step 4) validate their
-/// arguments through the slot schema. Anything else fails closed before
-/// any submit or process start.
-fn check_drive_profile(invocation: &InstrumentInvocation) -> Result<(), TestdIpcError> {
-    if !eliot_testd_core::is_admitted_testd_profile(&invocation.profile) {
-        return Err(TestdIpcError::Contract(
-            "testd admits only the closed cargo-test tool-probe profile".to_owned(),
-        ));
-    }
-    if !invocation.arguments.is_empty() {
-        if eliot_testd_core::is_slotted_testd_profile(&invocation.profile) {
-            eliot_testd_core::parse_testd_slot_suffix(&invocation.profile, &invocation.arguments)
-                .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
-        } else {
-            return Err(TestdIpcError::Contract(
-                "the admitted profile takes fixed argv; caller arguments are refused".to_owned(),
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// Reconciles one unknown testd admission delivery without admitting again.
 ///
 /// Lost-reply path: the caller retains a previously returned admission and,
@@ -1154,197 +1128,12 @@ pub fn reconcile_testd_delivery(
         && admission.generation == request.generation)
 }
 
-/// Revalidates the consuming process argv against the closed testd template
-/// at dispatch, immediately before process creation.
-///
-/// The envelope, invocation, fence, generation, kernel admission, and slot
-/// schema are already proved above; this compares content. The closed
-/// binding is recomputed from the presented invocation profile, its slot
-/// suffix, and the process request's own executable digest, and the request
-/// argv must equal the binding's sealed fixed argv. A composed request whose
-/// argv skews from the admitted template fails closed here with a typed
-/// admission failure and never reaches the executor.
-fn check_drive_closed_argv(
-    invocation: &InstrumentInvocation,
-    process: &ProcessRequest,
-) -> Result<(), TestdIpcError> {
-    let slot_suffix: &[String] = if eliot_testd_core::is_slotted_testd_profile(&invocation.profile)
-    {
-        &invocation.arguments
-    } else {
-        &[]
-    };
-    let binding = eliot_testd_core::testd_profile_binding_with_slots(
-        &invocation.profile,
-        process.executable_sha256(),
-        slot_suffix,
-    )
-    .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
-    if process.argv() != binding.fixed_argv.as_slice() {
-        return Err(TestdIpcError::Contract(
-            "testd process argv differs from the admitted closed template".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-/// Revalidates the sealed executable object against the platform file at
-/// dispatch, immediately before process creation.
-///
-/// The intent must name a resolved absolute path, the path must
-/// canonicalize to a real file, and the file bytes must re-hash to the
-/// sealed executable digest. A substituted file, or a request that names
-/// an unrelated `PATH` object after the owner hashed the admitted tool,
-/// fails closed here with a typed admission failure and never reaches
-/// the executor.
-fn check_drive_executable_object(process: &ProcessRequest) -> Result<(), TestdIpcError> {
-    let executable = process.intent().executable();
-    if !std::path::Path::new(executable).is_absolute() {
-        return Err(TestdIpcError::Contract(
-            "testd process executable is not a resolved absolute tool path".to_owned(),
-        ));
-    }
-    let canonical = std::fs::canonicalize(executable).map_err(|_| {
-        TestdIpcError::Contract(
-            "testd process executable does not resolve to a platform file".to_owned(),
-        )
-    })?;
-    if !canonical.is_file() {
-        return Err(TestdIpcError::Contract(
-            "testd process executable is not an installed tool file".to_owned(),
-        ));
-    }
-    let bytes = std::fs::read(&canonical).map_err(|_| {
-        TestdIpcError::Contract(
-            "testd process executable bytes cannot be reread before start".to_owned(),
-        )
-    })?;
-    if eliot_testd_core::sha256_hex(&bytes) != process.executable_sha256() {
-        return Err(TestdIpcError::Contract(
-            "testd process executable changed after admission".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-/// Drives exactly one admitted one-shot admission to exactly one typed
-/// outcome.
-///
-/// Sequence: prove envelope/invocation byte-identity; route
-/// diagnose-equivalent (non-TEST) invocations to the read-only path without
-/// touching transport or executor; submit the full envelope once; map
-/// refusal and conflict to fail-closed admission errors without effect;
-/// validate the admitted reply and its echo plus the recomputed
-/// lineage-aware digests; project cancelled admissions without executing;
-/// then run the single consuming process through the bound executor and
-/// return its one typed outcome. A lost submit reply exits the shot as a
-/// transport failure without retry; executor-side unknown outcomes return
-/// [`TestdDriveOutcome::ReconcileRequired`] keyed by the same digest,
-/// never a blind retry.
-pub async fn drive_presented_admission<T, E>(
-    transport: &mut T,
-    executor: Arc<E>,
-    sink: Arc<dyn ProcessEvidenceSink>,
-    presented: PresentedAdmission,
-    _now_unix_ms: u64,
-) -> Result<TestdDriveOutcome, TestdIpcError>
-where
-    T: AdmittedTestdTransport,
-    E: ProcessExecutor + 'static,
-{
-    let PresentedAdmission {
-        request,
-        invocation,
-        process,
-        epoch,
-        evidence_ref,
-        cancelled,
-    } = presented;
-    validate_envelope_invocation_binding(&request, &invocation)?;
-    validate_wire_text(&evidence_ref, "testd_admission.evidence_ref")?;
-    if !epoch.is_same_authority(&request.authority_epoch) {
-        return Err(TestdIpcError::Contract(
-            "testd live epoch disagrees with the envelope epoch".to_owned(),
-        ));
-    }
-    if is_testd_diagnose_only_invocation(&invocation) {
-        return Ok(TestdDriveOutcome::Diagnosed {
-            job_id: request.job_id.clone(),
-        });
-    }
-    check_drive_profile(&invocation)?;
-    validate_process_binding(&process, &invocation, &epoch, request.generation)?;
-    let response = transport
-        .submit_testd_admission(&request)
-        .map_err(|error| match error {
-            TestdIpcError::UnknownOutcome {
-                job_id,
-                request_digest,
-            } => TestdIpcError::UnknownOutcome {
-                job_id,
-                request_digest,
-            },
-            other => other,
-        })?;
-    response.validate()?;
-    let admission = match response {
-        TestdAdmissionResponse::Admitted(admission) => admission,
-        TestdAdmissionResponse::Rejected(rejection) => {
-            if rejection.job_ref != request.job_id {
-                return Err(TestdIpcError::Contract(
-                    "kernel rejection did not echo the submitted job identity".to_owned(),
-                ));
-            }
-            return Err(TestdIpcError::Contract(format!(
-                "kernel refused testd admission: {:?}",
-                rejection.reason
-            )));
-        }
-        TestdAdmissionResponse::Conflict(conflict) => {
-            if conflict.job_id != request.job_id {
-                return Err(TestdIpcError::Contract(
-                    "kernel conflict did not echo the submitted job identity".to_owned(),
-                ));
-            }
-            return Err(TestdIpcError::Contract(
-                "kernel reported testd admission conflict under this job identity".to_owned(),
-            ));
-        }
-    };
-    if admission.job_id != request.job_id {
-        return Err(TestdIpcError::Contract(
-            "kernel admission did not echo the submitted job identity".to_owned(),
-        ));
-    }
-    if admission.invocation_digest != request.invocation_digest {
-        return Err(TestdIpcError::Contract(
-            "kernel admission invocation digest disagrees with the submitted envelope".to_owned(),
-        ));
-    }
-    if !admission.authority_epoch.is_same_authority(&epoch) {
-        return Err(TestdIpcError::Contract(
-            "kernel admission epoch disagrees with the live epoch".to_owned(),
-        ));
-    }
-    if cancelled || admission.cancelled {
-        return Ok(TestdDriveOutcome::Cancelled {
-            job_id: request.job_id.clone(),
-        });
-    }
-    check_drive_closed_argv(&invocation, &process)?;
-    check_drive_executable_object(&process)?;
-    match executor.start(process, sink).await {
-        Ok(_receipt) => Ok(TestdDriveOutcome::Completed {
-            job_id: request.job_id.clone(),
-            evidence_ref,
-        }),
-        Err(ProcessExecutionError::UnknownOutcome) => Ok(TestdDriveOutcome::ReconcileRequired {
-            job_id: request.job_id.clone(),
-            reconciliation_key: request.request_digest.clone(),
-        }),
-        Err(error) => Err(TestdIpcError::Contract(error.to_string())),
-    }
-}
+// Drive admission for one presented one-shot runs against the shared
+// profile.rs boundary (`AdmittedStage::admit_testd_launch`) from the
+// worker, after the fresh seal binds the claimed durable job. The parallel
+// presented drive that lived here recomputed the closed profile, argv, and
+// executable checks on its own allowlist with no production caller, so it
+// is removed: the worker path is the single live drive.
 
 #[cfg(test)]
 #[allow(

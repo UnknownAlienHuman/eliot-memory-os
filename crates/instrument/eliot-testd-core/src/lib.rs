@@ -118,6 +118,12 @@ pub const TESTD_LIST_PROFILE: &str = "cargo-nextest-list";
 /// Separately registered dev-fast scoped-run profile: the productive
 /// nextest run with validated scope slots.
 pub const TESTD_SCOPED_PROFILE: &str = "cargo-nextest-scoped";
+/// Exact profile revision sealed by the shared admission boundary.
+///
+/// The testd lane carries no registry-resolved revision: every admitted
+/// testd profile ships at this revision, and the profile.rs boundary
+/// refuses any other value so a future revision bump fails closed.
+pub const TESTD_PROFILE_REVISION: u64 = 1;
 /// Relative program for the admitted probe, resolved through the platform
 /// tool locator at Drive time. Never absolute, never parent traversal.
 pub const TESTD_PROFILE_PROGRAM: &str = "cargo";
@@ -319,7 +325,11 @@ impl TestdExecutableBinding {
     }
 }
 
-fn profile_limits(profile: &str) -> (u64, Option<u64>, Option<u64>, u64, u64, u32) {
+/// Fixed execution bounds for one admitted profile, in the same order the
+/// closed binding seals them: wall timeout, CPU time, memory, stdout cap,
+/// stderr cap, descendant ceiling. The shared profile.rs admission boundary
+/// reads the wall and stdout caps through this single source.
+pub fn profile_limits(profile: &str) -> (u64, Option<u64>, Option<u64>, u64, u64, u32) {
     if matches!(
         profile,
         TESTD_PRODUCTIVE_PROFILE | TESTD_LIST_PROFILE | TESTD_SCOPED_PROFILE
@@ -1138,38 +1148,11 @@ pub fn issue_process_admission(
     {
         return Err(TestdError::InvalidBinding);
     }
-    // Fixed-argv refusal (issue #1814 W1): the probe and productive
-    // profiles take no caller arguments, so a non-empty invocation
-    // argument vector fails before any grant exists. This mirrors the
-    // drive lane's closed-profile gate: issuance never silently drops
-    // agent-provided arguments off a fixed template. Slotted profiles
-    // keep carrying their validated slot suffix below.
-    if !is_slotted_testd_profile(&request.invocation.profile)
-        && !request.invocation.arguments.is_empty()
-    {
-        return Err(TestdError::InvalidBinding);
-    }
-    // Closed-template argv gate (issue #1814 W1): the sealed process argv
-    // must equal the fixed argv the closed testd binding seals for the
-    // requested profile and slot suffix. Identity, fence, roots, and
-    // generation are proved above; this compares content, so an
-    // agent-composed argv combination fails before any grant exists. No
-    // private map is consulted: the binding is recomputed from the closed
-    // registry in this owner crate on every issuance.
-    let slot_suffix: &[String] = if is_slotted_testd_profile(&request.invocation.profile) {
-        &request.invocation.arguments
-    } else {
-        &[]
-    };
-    let binding = testd_profile_binding_with_slots(
-        &request.invocation.profile,
-        evidence.process.executable_sha256(),
-        slot_suffix,
-    )
-    .map_err(|_| TestdError::InvalidBinding)?;
-    if evidence.process.argv() != binding.fixed_argv.as_slice() {
-        return Err(TestdError::InvalidBinding);
-    }
+    // Argument-template admission lives in the shared profile.rs boundary
+    // (`AdmittedStage::admit_testd_launch`), which the live testd/kernel
+    // lane runs against the sealed request before any start. Issuance here
+    // seals identity, fence, roots, and generation only, so no second
+    // allowlist is consulted on this path.
     let grant = ExecutionContourGrant::issue(
         evidence.contour_root,
         request.job_id.clone(),
