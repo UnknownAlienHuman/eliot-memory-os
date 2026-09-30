@@ -77,7 +77,7 @@
 //!   to — and neither is filled from a substitute value.
 //!
 //! Since #1867 W2/A1 **EvaluatorVerdict** is connected as well: a repeated
-//! verifier failure committed by the TestD terminal-owner lane is read from the
+//! verifier failure committed by the `TestD` terminal-owner lane is read from the
 //! canonical attempt records this same intake already reads, and enters through
 //! [`repeated_verifier_failure_evidence`]. See
 //! [`maintenance_evidence_source`] for the measured reason its arm fires.
@@ -883,30 +883,16 @@ pub fn assemble_improvement_artifact(
     // A recorded repeat is a fact the brief states in its own right, not a
     // clause the owner has to infer from the trigger text: it is the reason this
     // candidate exists on this pass, and I12.24:74 requires the evidence to be
-    // readable without searching raw metrics. `None` leaves every field exactly
-    // as it was, so a pass with no recorded repeat is unchanged.
+    // readable without searching raw metrics. The prose lives on the record
+    // itself (see `RepeatedVerifierFailure::brief_evidence_clause`); `None`
+    // leaves every brief field exactly as it was, so a pass with no recorded
+    // repeat is unchanged.
     let repeat_clause = repeated_failure
         .as_ref()
-        .map_or_else(String::new, |failure| {
-            format!(
-                "; verifier {} failed repeatedly on attempt {} of campaign {} and that repeat is \
-             retained in durable delta {} (digest {})",
-                failure.verifier_ref,
-                failure.attempt_id,
-                failure.campaign_id,
-                failure.lineage_artifact,
-                failure.lineage_digest,
-            )
-        });
+        .map_or_else(String::new, |failure| failure.brief_evidence_clause());
     let next_step_clause = repeated_failure
         .as_ref()
-        .map_or_else(String::new, |failure| {
-            format!(
-                " after triage: read the retained repeat of verifier {} on attempt {} of campaign \
-             {}, which is the recorded evidence this brief rests on",
-                failure.verifier_ref, failure.attempt_id, failure.campaign_id
-            )
-        });
+        .map_or_else(String::new, |failure| failure.brief_next_step_clause());
 
     // Why the brief names the OBSERVED principal, and which brief fields the
     // closure record cannot supply, is stated in the module documentation
@@ -1238,7 +1224,7 @@ fn closure_bound_evidence_refs(
 /// dead.
 ///
 /// The observation this reads instead is the durable ATTEMPT record the
-/// TestD terminal-owner lane already commits for every settled verifier attempt
+/// `TestD` terminal-owner lane already commits for every settled verifier attempt
 /// (`daemon_runtime::run_improvement_intake` reads that same image at
 /// `improvement_intake_artifact`). A repeated verifier failure is recorded there
 /// by the owner that can compare the two independent records it needs — the
@@ -1277,6 +1263,40 @@ struct RepeatedVerifierFailure {
     lineage_digest: String,
     /// The raw trace, artifact and evaluator references that record retained.
     trace_refs: Vec<String>,
+}
+
+impl RepeatedVerifierFailure {
+    /// The clause this recorded repeat contributes to the brief's problem text.
+    ///
+    /// I12.24:74 requires the evidence to be readable by the decision owner
+    /// without searching raw metrics, and this repeat is the reason the
+    /// candidate exists on this pass, so the brief states it in its own words
+    /// rather than leaving it to be inferred from the trigger text. Every value
+    /// is this record's own, quoted by content.
+    fn brief_evidence_clause(&self) -> String {
+        format!(
+            "; verifier {} failed repeatedly on attempt {} of campaign {} and that repeat is \
+             retained in durable delta {} (digest {})",
+            self.verifier_ref,
+            self.attempt_id,
+            self.campaign_id,
+            self.lineage_artifact,
+            self.lineage_digest,
+        )
+    }
+
+    /// The clause this recorded repeat contributes to the next reversible step.
+    ///
+    /// The step stays a triage read and authorizes nothing: it names the repeat
+    /// the owner is being asked to look at, and that repeat is a committed
+    /// durable record rather than anything this pass concluded.
+    fn brief_next_step_clause(&self) -> String {
+        format!(
+            " after triage: read the retained repeat of verifier {} on attempt {} of campaign \
+             {}, which is the recorded evidence this brief rests on",
+            self.verifier_ref, self.attempt_id, self.campaign_id
+        )
+    }
 }
 
 /// Reads the newest committed repeated verifier failure, or `None`.
@@ -1905,7 +1925,7 @@ fn enforce_improvement_class_gate(
 /// `verifier_ref` and a set of `failure_refs` would have had to be invented.
 /// It is called by [`repeated_verifier_failure_evidence`] on the intake path,
 /// and its input is read by [`newest_repeated_verifier_failure`] out of the
-/// durable attempt records the TestD terminal-owner lane commits for every
+/// durable attempt records the `TestD` terminal-owner lane commits for every
 /// settled verifier attempt. That lane — not the campaign-closure assembly,
 /// which dispositions every repeated-failure-shaped episode and never yields a
 /// candidate, which is why the second A1 disjunct stayed dead there — compares
