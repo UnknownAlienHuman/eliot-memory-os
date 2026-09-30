@@ -17,8 +17,9 @@
 //! admission withholds it (see `caller::verify_receipt_for_admission`).
 
 use super::{
-    GoverningSourceSet, IdentityEvidence, PrivacyProfile, ResolutionAuthentication, ScopeBinding,
-    ScopeBindingDisposition, ScopeBindingGuard, ScopeFingerprint, WorkScopeBindingOwner,
+    GoverningSourceSet, IdentityEvidence, PrivacyBoundary, PrivacyProfile,
+    ResolutionAuthentication, ScopeBinding, ScopeBindingDisposition, ScopeBindingGuard,
+    ScopeFingerprint, WorkScopeAdmissionAuthority, WorkScopeBindingOwner,
     WorkScopeBindingSnapshot, WorkScopeDescriptor, WorkScopeError, WorkScopeResolutionReceipt,
     binding_matches_descriptor, text,
 };
@@ -130,14 +131,20 @@ pub fn issuance_refusal(error: &WorkScopeError) -> Option<IssuanceRefusal> {
 /// `binding`, and supplies the current observation as `observed` with the
 /// source closure that authenticates it. Admission requires the binding to
 /// describe the descriptor, the identity legs between binding and observation
-/// to be clear, and a fresh `MATCHED` guard check before the owner is
-/// minted. Anything else fails without creating an owner.
+/// to be clear, the privacy boundary lineage to equal the descriptor lineage,
+/// and a fresh `MATCHED` guard check before the owner is minted. The exact
+/// privacy profile, boundary, and governing-source closure are retained with
+/// the minted owner. Anything else fails without creating an owner.
 ///
 /// # Errors
 ///
 /// Returns an error when inputs are malformed, the binding does not describe
-/// the descriptor, the observation disagrees, the fence is invalid, or source
-/// closure does not match.
+/// the descriptor, the boundary lineage disagrees, the observation disagrees,
+/// the fence is invalid, or source closure does not match.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "initial admission joins the descriptor, observed binding, exact fence, and retained authority inputs"
+)]
 pub fn admit_initial_binding(
     descriptor: &WorkScopeDescriptor,
     owner_revision: u64,
@@ -146,12 +153,17 @@ pub fn admit_initial_binding(
     observed: &ScopeBinding,
     sources: &GoverningSourceSet,
     privacy: &PrivacyProfile,
+    privacy_boundary: &PrivacyBoundary,
 ) -> Result<WorkScopeBindingOwner, WorkScopeError> {
     descriptor.validate()?;
+    privacy_boundary.validate()?;
     binding.validate()?;
     observed.validate()?;
     if !binding_matches_descriptor(binding, descriptor) {
         return Err(WorkScopeError::BindingReceiptMismatch);
+    }
+    if privacy_boundary.lineage != descriptor.lineage {
+        return Err(WorkScopeError::AdmissionAuthorityMismatch);
     }
     if identity_legs(binding, observed) != IdentityLegOutcome::IdentityClear {
         return Err(WorkScopeError::BindingReceiptMismatch);
@@ -160,7 +172,17 @@ pub fn admit_initial_binding(
     if receipt.disposition != ScopeBindingDisposition::Matched {
         return Err(WorkScopeError::BindingReceiptNotMatched);
     }
-    let snapshot =
-        WorkScopeBindingSnapshot::new(fence.clone(), owner_revision, observed.clone(), receipt)?;
+    let authority = WorkScopeAdmissionAuthority {
+        privacy_profile: privacy.clone(),
+        privacy_boundary: privacy_boundary.clone(),
+        governing_sources: sources.clone(),
+    };
+    let snapshot = WorkScopeBindingSnapshot::new_with_authority(
+        fence.clone(),
+        owner_revision,
+        observed.clone(),
+        receipt,
+        authority,
+    )?;
     WorkScopeBindingOwner::new(snapshot)
 }
