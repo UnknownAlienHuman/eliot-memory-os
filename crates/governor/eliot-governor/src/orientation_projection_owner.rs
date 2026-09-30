@@ -126,10 +126,7 @@ pub fn bind_orientation_projections(
             .map(|description| (*description).to_owned())
             .collect(),
         active_decision_task_id: input.task_cognition.active_decision_task_id.cloned(),
-        next_allowed_action: input
-            .task_cognition
-            .next_allowed_action
-            .map(str::to_owned),
+        next_allowed_action: input.task_cognition.next_allowed_action.map(str::to_owned),
     };
     let omissions = input.omissions.map(|records| records.to_vec());
 
@@ -167,7 +164,9 @@ pub fn bind_orientation_projections(
             task_cognition,
             omissions,
             ProjectionState::Stale {
-                reason: "task, WorkScope, source heads, or StateFence differs from the admitted binding".to_owned(),
+                reason:
+                    "task, WorkScope, source heads, or StateFence differs from the admitted binding"
+                        .to_owned(),
             },
             stale_if_current(task_state),
             stale_if_current(continuity_state),
@@ -229,7 +228,9 @@ pub fn bind_orientation_projections(
             input.governor.task.as_ref(),
         );
     }
-    if continuity_state == ProjectionState::Complete || continuity_state == ProjectionState::KnownEmpty {
+    if continuity_state == ProjectionState::Complete
+        || continuity_state == ProjectionState::KnownEmpty
+    {
         continuity_state = continuity_payload_state(
             input.role_inputs.task_frame.payload.as_ref(),
             &input.task_cognition,
@@ -250,7 +251,9 @@ pub fn bind_orientation_projections(
     }
     if !governor_affordance_matches_scope(&input.governor, input.work_scope, &binding) {
         affordance_state = ProjectionState::Unknown {
-            reason: "Governor affordance projection differs from the admitted WorkScope owner snapshot".to_owned(),
+            reason:
+                "Governor affordance projection differs from the admitted WorkScope owner snapshot"
+                    .to_owned(),
         };
     }
     if !negative_memory_matches_safety(
@@ -283,7 +286,9 @@ pub fn bind_orientation_projections(
             task_cognition,
             omissions,
             ProjectionState::Partial {
-                reason: "one or more canonical projection members lack complete retained owner input".to_owned(),
+                reason:
+                    "one or more canonical projection members lack complete retained owner input"
+                        .to_owned(),
             },
             task_state,
             continuity_state,
@@ -417,7 +422,10 @@ fn incomplete(
 }
 
 fn member_is_complete(state: &ProjectionState) -> bool {
-    matches!(state, ProjectionState::Complete | ProjectionState::KnownEmpty)
+    matches!(
+        state,
+        ProjectionState::Complete | ProjectionState::KnownEmpty
+    )
 }
 
 fn role_projection_state(role: &RoleAcquisition) -> ProjectionState {
@@ -447,7 +455,8 @@ fn unknown_if_current(state: ProjectionState) -> ProjectionState {
 fn read_identity_state(role: &RoleAcquisition) -> ProjectionState {
     match &role.state {
         ProjectionState::Complete | ProjectionState::KnownEmpty => ProjectionState::Stale {
-            reason: "retained read identity does not match the admitted projection source".to_owned(),
+            reason: "retained read identity does not match the admitted projection source"
+                .to_owned(),
         },
         state => state.clone(),
     }
@@ -485,7 +494,8 @@ fn task_payload_state(
 ) -> ProjectionState {
     let Some(record) = payload.and_then(|payload| task_record(payload, source.task_id)) else {
         return ProjectionState::Unknown {
-            reason: "retained task-frame payload does not contain the projected task source".to_owned(),
+            reason: "retained task-frame payload does not contain the projected task source"
+                .to_owned(),
         };
     };
     let Some(governor_task) = governor_task else {
@@ -497,7 +507,8 @@ fn task_payload_state(
         record.get("revision").and_then(Value::as_u64) == Some(governor_task.revision);
     if !goal_matches || !revision_matches {
         return ProjectionState::Unknown {
-            reason: "retained task-frame goal or revision differs from the Governor projection".to_owned(),
+            reason: "retained task-frame goal or revision differs from the Governor projection"
+                .to_owned(),
         };
     }
     let contract = record.get("task_contract").unwrap_or(record);
@@ -519,7 +530,8 @@ fn task_payload_state(
         ProjectionState::Complete
     } else {
         ProjectionState::Unknown {
-            reason: "retained task-frame acceptance descriptions differ from TaskCognitionView".to_owned(),
+            reason: "retained task-frame acceptance descriptions differ from TaskCognitionView"
+                .to_owned(),
         }
     }
 }
@@ -531,9 +543,13 @@ fn omission_state(
     let Some(omissions) = omissions else {
         return ProjectionState::Missing;
     };
-    if omissions.iter().any(|record| record.validate(binding).is_err()) {
+    if omissions
+        .iter()
+        .any(|record| record.validate(binding).is_err())
+    {
         return ProjectionState::Unknown {
-            reason: "retained omission record does not match the admitted ContextBinding".to_owned(),
+            reason: "retained omission record does not match the admitted ContextBinding"
+                .to_owned(),
         };
     }
     if omissions.is_empty() {
@@ -622,7 +638,8 @@ fn continuity_payload_state(
     }
     let Some(record) = payload.and_then(|payload| task_record(payload, source.task_id)) else {
         return ProjectionState::Unknown {
-            reason: "retained task-frame payload does not contain the active decision source".to_owned(),
+            reason: "retained task-frame payload does not contain the active decision source"
+                .to_owned(),
         };
     };
     let Some(action) = record
@@ -631,7 +648,8 @@ fn continuity_payload_state(
         .and_then(Value::as_str)
     else {
         return ProjectionState::Unknown {
-            reason: "retained task-frame payload omits active_decision_state.next_allowed_action".to_owned(),
+            reason: "retained task-frame payload omits active_decision_state.next_allowed_action"
+                .to_owned(),
         };
     };
     let stored_task_id = record
