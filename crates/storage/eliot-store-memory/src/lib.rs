@@ -65,7 +65,7 @@ use uuid::Uuid;
 ///
 /// The pack returns exact captured bytes, so consumers match on this version
 /// before interpreting `records` / `provenance`; any shape change bumps it.
-const EVIDENCE_PACK_PAYLOAD_VERSION: u32 = 1;
+const EVIDENCE_PACK_PAYLOAD_VERSION: u32 = 2;
 
 /// 688-B store-side erasure execution (memory contour).
 ///
@@ -4574,6 +4574,10 @@ impl MemoryStore {
         query: &NamedReadRequest,
         fence: &StateFence,
     ) -> Result<Value, StoreError> {
+        if state.fences.as_ref() != Some(fence) {
+            return Err(StoreError::FenceMismatch);
+        }
+        let causal_binding = memory_causal_binding(state, fence, state.next_commit_sequence, None)?;
         let scope_id = query.scope_id.clone().ok_or(StoreError::InvalidField {
             field: "scope_id",
             reason: "evidence pack read requires scope_id",
@@ -4656,6 +4660,7 @@ impl MemoryStore {
         let returned = records.len();
         Ok(json!({
             "version": EVIDENCE_PACK_PAYLOAD_VERSION,
+            "causal_binding": causal_binding,
             "subject": subject,
             "scope_id": scope_id,
             "records": records,
