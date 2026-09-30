@@ -31,8 +31,7 @@ use eliot_kernel_service::{
     UserAutomationDurableJobPort, UserAutomationHorizonOutcome, UserAutomationHorizonPhase,
     UserAutomationHorizonPublicationRefusal, UserAutomationHorizonTrigger,
     UserAutomationHostExecutionClient, UserAutomationHostExecutionOperation,
-    UserAutomationHostExecutionTransport,
-    UserAutomationOperatorRuntime, UserAutomationOwnerLookup,
+    UserAutomationHostExecutionTransport, UserAutomationOperatorRuntime, UserAutomationOwnerLookup,
     UserAutomationRuntimeAdmission, UserAutomationRuntimeError, UserAutomationRuntimeObligation,
     UserAutomationWakeCancellation, UserAutomationWakeEnumerationReceipt,
     UserAutomationWakeEnumerationRequest, UserAutomationWakeHorizonPublication,
@@ -6904,7 +6903,8 @@ impl KernelComposition {
         // owner decided before any effect, or the one execution reference the
         // owner issued is validated against the occurrence the schedule owner
         // resolved and the recurring horizon advances beside it.
-        self.user_automation_due_wake_execution_response(&proven, outcome).await
+        self.user_automation_due_wake_execution_response(&proven, outcome)
+            .await
     }
 
     /// Materialises the execution join's own answer into this route's response
@@ -6986,7 +6986,9 @@ impl KernelComposition {
                 UserAutomationRuntimeError::IdentityConflict,
             ));
         }
-        Ok(self.user_automation_due_wake_admitted_value(proven, execution).await)
+        Ok(self
+            .user_automation_due_wake_admitted_value(proven, execution)
+            .await)
     }
 
     /// Advances the recurring horizon after an owner-acknowledged admission and
@@ -11533,9 +11535,8 @@ struct UserAutomationProvenDueWake<'a> {
     /// Exact occurrence the schedule owner still offers as a pending wake.
     occurrence_id: &'a str,
     /// Authenticated Host execution channel bound to the current State Fence.
-    client: &'a UserAutomationHostExecutionClient<
-        AuthenticatedUserAutomationHostExecutionTransport,
-    >,
+    client:
+        &'a UserAutomationHostExecutionClient<AuthenticatedUserAutomationHostExecutionTransport>,
     /// The admitted due-wake carrier this occurrence was proved from.
     request: &'a UserAutomationRuntimeAdmission,
     /// The owner-proven resolution of that carrier against the canonical revision.
