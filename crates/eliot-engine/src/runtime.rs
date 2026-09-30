@@ -439,7 +439,8 @@ pub fn recover_stale_single_instance_lock(
     confirm_single_instance_identity(&lock_path, &lock_snapshot, pinned_identity)?;
     // Serialize PID retirement with the owned lock: while the pinned lock
     // object/path still blocks successor `create_new`, retire the exact old
-    // PID object (identity + bytes) before the old lock becomes available.
+    // PID object through one retained handle (bytes read from that handle,
+    // that same handle retired) before the old lock becomes available.
     // A successor created after old-lock removal is therefore never touched
     // by this operation. The lock pin above stays live across the PID work.
     let pid_retired =
@@ -497,8 +498,8 @@ fn establish_single_instance_ownership(
         .and_then(|()| file.sync_all())
         .is_err()
     {
-        drop(file);
         let cleanup = abandon_partial_claim(
+            file,
             lock_path,
             &pid_path,
             &startup_marker_path,
@@ -521,11 +522,11 @@ fn establish_single_instance_ownership(
         ));
     }
     if let Err(error) = std::fs::write(&pid_path, &owner_text) {
-        // Close the creation handle first so the partial-claim cleanup below
-        // can remove our own lock; the handle denies delete sharing on
-        // Windows while it is open.
-        drop(file);
+        // The shared cleanup consumes the creation handle (closing it first)
+        // so the partial-claim removal below can remove our own lock; the
+        // handle denies delete sharing on Windows while it is open.
         let cleanup = abandon_partial_claim(
+            file,
             lock_path,
             &pid_path,
             &startup_marker_path,
@@ -543,8 +544,8 @@ fn establish_single_instance_ownership(
     let pid_identity = capture_pid_identity(runtime_dir, &owner_text);
     #[cfg(windows)]
     if pid_identity.is_none() {
-        drop(file);
         let cleanup = abandon_partial_claim(
+            file,
             lock_path,
             &pid_path,
             &startup_marker_path,
@@ -585,13 +586,13 @@ fn finish_single_instance_ownership(
     {
         Ok(backups) => backups,
         Err(failure) => {
-            // Close the creation handle first so the partial-claim cleanup
-            // below can remove our own lock; the handle denies delete sharing
-            // on Windows while it is open. The single shared cleanup policy
-            // lives in `abandon_partial_claim`; the marker helper only returns
-            // the plan (backups + primary failure).
-            drop(file);
+            // The single shared cleanup policy lives in
+            // `abandon_partial_claim`, which consumes the creation handle
+            // (closing it first, since the handle denies delete sharing on
+            // Windows while open); the marker helper only returns the plan
+            // (backups + primary failure).
             let cleanup = abandon_partial_claim(
+                file,
                 lock_path,
                 &pid_path,
                 startup_marker_path,
@@ -608,11 +609,11 @@ fn finish_single_instance_ownership(
         }
     };
     if !verify_owned_establishment(lock_path, &pid_path, startup_marker_path, owner_pid) {
-        // Close the creation handle first so the partial-claim cleanup below
-        // can remove our own lock; the handle denies delete sharing on
-        // Windows while it is open.
-        drop(file);
+        // The shared cleanup consumes the creation handle (closing it first)
+        // so the partial-claim removal below can remove our own lock; the
+        // handle denies delete sharing on Windows while it is open.
         let cleanup = abandon_partial_claim(
+            file,
             lock_path,
             &pid_path,
             startup_marker_path,
@@ -646,10 +647,10 @@ fn finish_single_instance_ownership(
 ///
 /// The caller holds the owned creation handle live across this call. On
 /// Windows that handle denies delete sharing, so cleanup must run only after
-/// the caller deliberately closes it: this function never unlinks anything
-/// itself and instead returns the captured backups with the primary failure
-/// for the caller to clean up through the one shared `abandon_partial_claim`
-/// path.
+/// the handle is closed: this function never unlinks anything itself and
+/// instead returns the captured backups with the primary failure for the
+/// caller to clean up through the one shared `abandon_partial_claim` path,
+/// which takes the handle by value and closes it before any removal.
 #[allow(clippy::too_many_arguments)]
 fn establish_owner_markers(
     startup_marker_path: &Path,
@@ -754,8 +755,15 @@ fn verify_owned_establishment(
 /// and restores the previous marker indications when they were captured.
 /// Never touches objects owned by anyone else; reports what was left behind
 /// so the primary failure preserves its cleanup uncertainty.
+///
+/// The owned creation handle is consumed here and closed before any removal:
+/// the handle denies delete sharing while open (Windows), so running cleanup
+/// while the caller still held it would fail the own-lock removal into stale
+/// residue. Taking the handle by value makes close-before-cleanup structural
+/// instead of a per-call-site discipline.
 #[allow(clippy::too_many_arguments)]
 fn abandon_partial_claim(
+    file: File,
     lock_path: &Path,
     pid_path: &Path,
     startup_marker_path: &Path,
@@ -765,6 +773,10 @@ fn abandon_partial_claim(
     clean_backup: MarkerBackup,
     startup_backup: MarkerBackup,
 ) -> String {
+    // Close the owned creation handle before any removal: while open it
+    // denies delete sharing, so the own-lock removal below would fail into
+    // stale residue if the handle were still live.
+    drop(file);
     let owner_text = owner_pid.to_string();
     let mut notes: Vec<String> = Vec::new();
     // Keep the lock path as this attempt's generation fence until all marker
@@ -1120,8 +1132,10 @@ fn confirm_pid_snapshot_unchanged(
 /// Retires the exact stale PID object while the old lock pin still blocks
 /// successor acquisition. Must be called with the validated lock pin live:
 /// the lock path still exists, so no successor can create its lock or publish
-/// its PID yet. Binds removal to object identity on Windows (same PID text on
-/// a replacement object never authorizes deletion) and preserves the
+/// its PID yet. Removal is bound to the file object, never to a pathname
+/// reread: on Windows one retained handle is opened, its bytes are compared
+/// against the validated snapshot, and that same handle is retired, so no
+/// pin-drop-reopen window can interleave a replacement. Preserves the
 /// Missing vs Inaccessible vs `ReplacementDetected` outcomes. Returns `true`
 /// when the PID evidence is gone (removed or already absent) and `false` only
 /// when there was no PID evidence to retire.
@@ -1142,39 +1156,20 @@ fn retire_stale_pid_while_lock_held(
             Ok(false)
         }
         Some(snapshot) => {
-            confirm_pid_snapshot_unchanged(lock_path, pid_path, Some(snapshot))?;
             #[cfg(windows)]
             {
-                let pinned = pin_single_instance_pid(pid_path, snapshot, lock_path)?;
-                let pinned_identity = pinned.identity();
-                drop(pinned);
-                let mut retirable = open_retirable_single_instance_pid(pid_path, lock_path)?;
-                let bytes = retirable.read_all().map_err(|error| {
-                    single_instance_contention(
-                        lock_path,
-                        SingleInstanceRefusal::InaccessibleEvidence,
-                        format!("cannot read pinned daemon.pid before retirement: {error}"),
-                    )
-                })?;
-                if retirable.identity() != pinned_identity || bytes != snapshot {
-                    return Err(single_instance_contention(
-                        lock_path,
-                        SingleInstanceRefusal::ReplacementDetected,
-                        "daemon.pid was replaced during stale-owner validation; refusing removal",
-                    ));
-                }
-                retirable.retire().map_err(EngineError::Io)?;
+                retire_exact_pid_object(pid_path, snapshot, lock_path)?;
+                Ok(true)
             }
             #[cfg(not(windows))]
             {
+                confirm_pid_snapshot_unchanged(lock_path, pid_path, Some(snapshot))?;
                 match std::fs::remove_file(pid_path) {
                     Ok(()) => Ok(true),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
                     Err(error) => Err(EngineError::Io(error)),
                 }
             }
-            #[cfg(windows)]
-            Ok(true)
         }
     }
 }
@@ -1208,53 +1203,40 @@ fn open_retirable_single_instance_pid(
     }
 }
 
-/// Pins the validated PID path with delete/write sharing denied and proves
-/// the pinned object still carries the validated snapshot bytes. The caller
-/// must hold the old lock pin live across this call, so no successor can
-/// publish a replacement PID while the pin is held.
+/// Retires the exact PID object through one retained handle: opens the PID
+/// path once with delete access, reads the bytes from that same handle, and
+/// retires that same object only when its bytes still equal the validated
+/// snapshot.
+///
+/// The retained handle denies write and delete sharing from open to
+/// retirement, so no successor or stale observer can replace the object or
+/// interleave a pathname swap in between: there is no pin-drop-reopen window
+/// and no path reread authorizes the removal. A vanished path, a non-regular
+/// file, unreadable bytes, or changed bytes all refuse instead of unlinking
+/// by pathname.
 #[cfg(windows)]
-fn pin_single_instance_pid(
+fn retire_exact_pid_object(
     pid_path: &Path,
     pid_snapshot: &[u8],
     lock_path: &Path,
-) -> Result<eliot_windows_ipc::PinnedFile, EngineError> {
-    let mut pinned = match eliot_windows_ipc::PinnedFile::open(pid_path) {
-        Ok(pinned) => pinned,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(single_instance_contention(
-                lock_path,
-                SingleInstanceRefusal::ReplacementDetected,
-                "daemon.pid vanished during stale-owner validation; refusing removal",
-            ));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
-            return Err(single_instance_contention(
-                lock_path,
-                SingleInstanceRefusal::MalformedIdentity,
-                "daemon.pid is not a regular file; refusing removal",
-            ));
-        }
-        Err(error) => {
-            return Err(single_instance_contention(
-                lock_path,
-                SingleInstanceRefusal::InaccessibleEvidence,
-                format!("cannot pin daemon.pid for validated removal: {error}"),
-            ));
-        }
-    };
-    match pinned.read_all() {
-        Ok(bytes) if bytes == pid_snapshot => Ok(pinned),
-        Ok(_) => Err(single_instance_contention(
-            lock_path,
-            SingleInstanceRefusal::ReplacementDetected,
-            "daemon.pid changed during stale-owner validation; refusing removal",
-        )),
-        Err(error) => Err(single_instance_contention(
+) -> Result<(), EngineError> {
+    let mut retirable = open_retirable_single_instance_pid(pid_path, lock_path)?;
+    let bytes = retirable.read_all().map_err(|error| {
+        single_instance_contention(
             lock_path,
             SingleInstanceRefusal::InaccessibleEvidence,
-            format!("cannot read daemon.pid for validated removal: {error}"),
-        )),
+            format!("cannot read pinned daemon.pid before retirement: {error}"),
+        )
+    })?;
+    if bytes != pid_snapshot {
+        return Err(single_instance_contention(
+            lock_path,
+            SingleInstanceRefusal::ReplacementDetected,
+            "daemon.pid was replaced during stale-owner validation; refusing removal",
+        ));
     }
+    retirable.retire().map_err(EngineError::Io)?;
+    Ok(())
 }
 
 /// Removes a validated stale lock. A vanished path means a competing starter
