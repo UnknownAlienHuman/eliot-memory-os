@@ -1519,9 +1519,7 @@ pub fn collect_status_with_observers(
                 receipt
                     .validate_against(&retained_root, expected_host_state_root)
                     .map_err(|error| {
-                        StatusError::Invalid(format!(
-                            "SystemService Host-root receipt: {error}"
-                        ))
+                        StatusError::Invalid(format!("SystemService Host-root receipt: {error}"))
                     })?;
             }
             for generation in registry.generations() {

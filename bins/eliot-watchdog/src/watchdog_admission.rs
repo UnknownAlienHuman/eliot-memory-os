@@ -328,13 +328,11 @@ fn validate_system_service_host_root_receipt(
     selected_manifest: &CandidateManifest,
     host_state_root_lease: &ProtectedRootLease,
 ) -> Result<(), SpoolError> {
-    let receipt = registry
-        .system_service_host_root_receipt()
-        .ok_or_else(|| {
-            SpoolError::InvalidLease(
-                "SystemService registry has no persisted Host-root identity receipt".to_owned(),
-            )
-        })?;
+    let receipt = registry.system_service_host_root_receipt().ok_or_else(|| {
+        SpoolError::InvalidLease(
+            "SystemService registry has no persisted Host-root identity receipt".to_owned(),
+        )
+    })?;
     receipt
         .validate_against(
             host_state_root_lease,
@@ -345,9 +343,7 @@ fn validate_system_service_host_root_receipt(
                 .as_str(),
         )
         .map_err(|error| {
-            SpoolError::InvalidLease(format!(
-                "SystemService Host-root receipt: {error}"
-            ))
+            SpoolError::InvalidLease(format!("SystemService Host-root receipt: {error}"))
         })
 }
 
