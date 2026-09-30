@@ -6,16 +6,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use eliot_cli::kernel_client::{KernelClient, KernelClientError};
 use eliot_contracts::StateFence;
-use eliot_dreamer_contracts::ContractViolation;
-use eliot_dreamer_contracts::ScreenBinding;
+use eliot_dreamer_contracts::{ContractViolation, DreamInputBundle, ScreenBinding};
 use eliot_dreamer_contracts::registry::{CurationHandlerRegistry, canonical_registry};
 use eliot_dreamer_orientation::{AdmittedOrientationJob, OrientationDisposition};
 use eliot_protocol::dreamer_job::{DurableJobResponse, JobState as ProtocolJobState};
 use serde::{Deserialize, Serialize};
 
 use crate::dispatch_stage::CurationExecutionCarrier;
-use crate::production_orientation::OrientationSupply;
 use crate::kernel_port::{ClaimTransport, KernelClaimTransport};
+use crate::production_orientation::OrientationSupply;
 
 mod admitted_material;
 mod bundle_stage;
@@ -712,7 +711,8 @@ impl KernelJobPort for AuthenticatedKernelJobPort<'_> {
             controller::step_admitted_cycle(&state, &observed, &policy, observation_time_ms)?;
         let request = bundle_stage::resolve_bundle_request(admission, job)?;
         let _plan = bundle_stage::plan_admitted_bundle(request)?;
-        let result = run_admitted_pipeline(admission, job, None, self.resolve_orientation_supply(admission, job)?)?;
+        let supply = self.resolve_orientation_supply(admission, job)?;
+        let result = run_admitted_pipeline(admission, job, None, supply)?;
         self.finish_with_result(result)
     }
 

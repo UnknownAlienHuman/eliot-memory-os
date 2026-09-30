@@ -14,7 +14,7 @@
 //! |---|---|---|
 //! | Construct/admit `ModelRouteRequest` | the owner supply channel ([`OrientationSupplySource`](crate::OrientationSupplySource)), which resolves it from admitted material | wired through [`resolve_production_inputs`] |
 //! | Execute the admitted provider route, return `ModelRouteOutcome` | the same supply channel; provider text lives outside the dreamer binary | wired through [`resolve_production_inputs`] |
-//! | Read/build the exact `CanonicalProjectionSet` from Governor/canonical owners | `eliot_governor::compose_canonical_projection_set`, supplied by the same channel | wired through [`resolve_production_inputs`] |
+//! | Read/build the exact `CanonicalProjectionSet` from Governor/canonical owners | `eliot_governor::GovernorComposition::canonical_projections`, supplied by the same channel | wired through [`resolve_production_inputs`] |
 //! | Acquire each mandatory stage's owner input/receipt | the same supply channel, carrying each stage's owner-built record | wired through [`resolve_production_inputs`] |
 //! | Invoke the pure composer | [`compose_production_result`] below (this module) | reachable: `dispatch_stage::dispatch_orientation` calls it on the resolved carrier |
 //! | Publish the typed result | `dispatch_stage::dispatch_orientation` as `DreamResult::Orientation` | all three dispositions reachable |
@@ -164,7 +164,8 @@ pub(crate) struct ProductionOrientationInputs<'a> {
 /// The carrier's mandatory members are owner values, not derivations: the
 /// CC-002 outcome carries provider text and observed usage that live outside
 /// this binary, the CC-004 set is composed by
-/// `eliot_governor::compose_canonical_projection_set`, and every stage input
+/// `eliot_governor::GovernorComposition::canonical_projections`, and every
+/// stage input
 /// is an owner-built record. This is the one shape that carries all of them
 /// across the process boundary, mirroring the Curation
 /// [`CurationExecutionCarrier`](crate::dispatch_stage::CurationExecutionCarrier)
