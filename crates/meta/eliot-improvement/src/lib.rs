@@ -142,7 +142,7 @@
 //!   `crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml`
 //!   projection.
 //! - `stamp_outcome_budget` — exactly one external caller,
-//!   `bins/eliotd/src/improvement_intake.rs:46`, inside
+//!   `bins/eliotd/src/improvement_intake.rs:58`, inside
 //!   `stamp_promotion_budget`. `git grep -n "stamp_promotion_budget"` returns
 //!   only that definition. So the one budget-stamping bridge is itself
 //!   uncalled, and `BudgetProof` and `OutcomeEvidence` are named in
@@ -286,7 +286,7 @@
 //! Nothing in this crate RUNS an experiment. What it holds is record and
 //! validation only:
 //!
-//! - `ReplayPlan` (`lib.rs:570`) names the fixed-replay, holdout, transfer and
+//! - `ReplayPlan` (`lib.rs:598`) names the fixed-replay, holdout, transfer and
 //!   counter-metric references. `ReplayPlan::validate` (`lib.rs:579`) refuses
 //!   empty reference groups and an empty `transfer_refs`. It matches
 //!   I12.24:67, "fixed replay as diagnostic evidence only".
@@ -295,18 +295,37 @@
 //!   them to be non-empty and never resolves them.
 //! - `BudgetProof` / `ComplexityEconomicsDelta` /
 //!   `require_matched_budget_for_promotion` are the I12.24:76 matched-budget
-//!   gate. `OutcomeEvidence::validate_for` (`lib.rs:1008`) refuses a
+//!   gate. `OutcomeEvidence::validate_for` (`lib.rs:1101`) refuses a
 //!   promotion-bound outcome that lacks a budget ledger, a conclusive
 //!   economics delta, affected checks, live shadow/canary evidence or
 //!   delayed-harm visibility. That is I12.24:76's "An unmatched ledger or
 //!   inconclusive complexity delta cannot promote the candidate merely because
 //!   replay or a local metric improved."
+//! - The promotion record carries the BOUND proof, so the two canonical
+//!   bindings are re-checked against the bound RECORDS themselves and not
+//!   against their names: `ImprovementCandidate::promotion_input` takes
+//!   `&BudgetProof` and writes the outcome's ledger record, delta record and
+//!   four evidence references through `stamp_outcome_budget`, the single owner
+//!   of that projection, and the returned `PromotionInput` holds the same
+//!   `BudgetProof`. `PromotionInput::validate` re-runs
+//!   `stamp_outcome_budget` on the bound proof, so the canonical
+//!   `BudgetEquivalenceLedger::validate`, the ledger's recorded `equivalence`
+//!   class and the delta's six recorded slots are checked against the original
+//!   record values, and a record whose ledger or delta differs is refused even
+//!   when it reuses the same `ledger_id`. The four evidence legs stay
+//!   caller-set references, and they are required UNEVENLY: affected checks
+//!   and the delayed-harm window are required individually, while the
+//!   live-evidence leg is satisfied by matched-budget live shadow OR live
+//!   canary (I12.24:68), so a proof carrying only one of the two still
+//!   promotes. Each is required to agree with the bound proof, and none is
+//!   resolved to an observation. No
+//!   ledger or delta is recomputed, re-derived or substituted on either path.
 //! - The lifecycle enums carry the experiment states and enforce the edge
 //!   table: `AcceptedForExperiment` and `Running` exist only as transitions
-//!   `lifecycle_edge_allowed` (`lib.rs:517`) permits, and the promoting step
+//!   `lifecycle_edge_allowed` (`lib.rs:545`) permits, and the promoting step
 //!   "promote, narrow, rollback or archive" (I12.24:70) is gated so that
 //!   `transition_lifecycle` refuses `Supported`/`Narrowed` outright
-//!   (`lib.rs:892`) and only `promote_lifecycle` admits them, and only with a
+//!   (`lib.rs:915`) and only `promote_lifecycle` admits them, and only with a
 //!   budget proof.
 //! - `promotion_input::prepare_promotion_input` (`promotion_input.rs:551`) is a
 //!   pure gate over already-supplied evidence, and it has no production caller.
@@ -333,6 +352,7 @@
 //! effect vocabulary is absent.
 
 use blake3::Hasher;
+use eliot_evaluation_contracts::BudgetEquivalenceLedger;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -959,14 +979,44 @@ impl ImprovementCandidate {
         Ok(())
     }
 
+    /// Build the I12.24:76 promotion record over a BOUND budget proof.
+    ///
+    /// `proof` is required by signature and is the ORIGINAL [`BudgetProof`]
+    /// value — the `BudgetEquivalenceLedger` itself plus the recorded
+    /// `ComplexityEconomicsDelta` — not a name for one. The ledger record, the
+    /// delta record and the four evidence legs on `outcome` are written by
+    /// [`stamp_outcome_budget`], the single owner of that projection, straight
+    /// out of the records [`BudgetProof::supports_promotion`] validated; a
+    /// hand-written outcome therefore cannot supply a binding, and one already
+    /// bound to a different ledger, delta or evidence leg is refused rather
+    /// than overwritten. [`OutcomeEvidence::validate_for`] then runs on the
+    /// stamped record, and the same bound proof travels on the returned
+    /// [`PromotionInput`] so [`PromotionInput::validate`] can re-check the two
+    /// canonical bindings against the record values.
+    ///
+    /// Stated precisely, because the guarantee is not uniform across the seven
+    /// obligations: MATCHEDNESS and CONCLUSIVENESS are decided by the records —
+    /// the ledger's own `validate()`, its recorded `equivalence` class and the
+    /// delta's six recorded slots — so no caller-set name or Boolean decides
+    /// them. The four evidence legs (affected checks, live shadow, live canary,
+    /// delayed-harm window) are caller-set references that the gate requires to
+    /// agree with the bound proof; it does not resolve them to an observation,
+    /// and nothing here claims it does. They are not all required in the same
+    /// way: affected checks and the delayed-harm window must each be present,
+    /// whereas I12.24:68's matched-budget live shadow/canary leg is satisfied by
+    /// EITHER one, so a record with no live canary reference at all still
+    /// promotes when it carries a live shadow reference. The lifecycle
+    /// promotion itself remains [`ImprovementCandidate::promote_lifecycle`].
     pub fn promotion_input(
         &self,
-        outcome: OutcomeEvidence,
+        mut outcome: OutcomeEvidence,
+        proof: &BudgetProof,
     ) -> Result<PromotionInput, ImprovementError> {
         self.validate()?;
         if !matches!(self.state, CandidateState::Evaluating) {
             return Err(ImprovementError::OutcomeRequiresEvaluation);
         }
+        stamp_outcome_budget(&mut outcome, proof)?;
         outcome.validate_for(self)?;
         let digest = promotion_digest(self, &outcome);
         Ok(PromotionInput {
@@ -976,6 +1026,7 @@ impl ImprovementCandidate {
             candidate_revision: self.revision,
             target_surface: self.target_surface,
             outcome,
+            budget_proof: proof.clone(),
             evidence_digest: digest,
             direct_promotion: false,
             created_at: OffsetDateTime::now_utc(),
@@ -983,6 +1034,36 @@ impl ImprovementCandidate {
     }
 }
 
+/// The I12.24 evaluation record for one candidate revision.
+///
+/// ## The two canonical bindings are RECORDS, the four evidence legs are references
+///
+/// Two of the seven I12.24:76 obligations — a canonical budget-equivalence
+/// ledger and a conclusive complexity-economics delta — are carried here as
+/// the RECORDS themselves, not as names for them. [`stamp_outcome_budget`]
+/// writes both values out of the records [`BudgetProof::supports_promotion`]
+/// validated, [`ImprovementCandidate::promotion_input`] takes that
+/// [`BudgetProof`] by signature, and the resulting [`PromotionInput`] carries
+/// the same bound proof, so [`PromotionInput::validate`] re-checks the two
+/// bindings against the original `BudgetEquivalenceLedger` VALUE and the
+/// recorded delta — a name, or a different ledger that reuses the same
+/// `ledger_id`, cannot satisfy it, and nothing is recomputed, re-derived or
+/// substituted to make it pass.
+///
+/// The remaining four — affected checks, live shadow, live canary and the
+/// delayed-harm window — stay caller-set REFERENCES, exactly as I12.24:68 and
+/// I12.24:69 leave them. The gate requires each to agree with the bound proof;
+/// it does not and cannot resolve any of them to an observation. Required is
+/// NOT the same as required ALL FOUR: affected checks and the delayed-harm
+/// window are each required in their own right, while I12.24:68's
+/// matched-budget live shadow/canary is required as shadow OR canary, so one of
+/// the two is enough and a record carrying only live shadow — or only live
+/// canary — promotes. The honest summary is therefore: no caller-set name or
+/// Boolean decides
+/// MATCHEDNESS or CONCLUSIVENESS (the ledger's own `validate()`, its recorded
+/// `equivalence` class and the delta's six recorded slots do), while the four
+/// evidence legs are required-and-consistent references, not attested records,
+/// required unevenly as set out above.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OutcomeEvidence {
     pub outcome_ref: String,
@@ -998,12 +1079,26 @@ pub struct OutcomeEvidence {
     /// Canonical budget-equivalence ledger binding (I12.24:76, I18.47).
     ///
     /// Names the single `BudgetEquivalenceLedger` record this outcome is
-    /// compared under. Replay-only outcomes leave it empty and are refused
-    /// promotion by [`OutcomeEvidence::validate_for`].
+    /// compared under, written from the bound proof's own
+    /// `BudgetEquivalenceLedger::ledger_id`. Replay-only outcomes leave it
+    /// empty and are refused promotion by [`OutcomeEvidence::validate_for`].
     pub budget_ledger_ref: String,
-    /// Complexity-economics delta record (I12.24:76, I18.47).
+    /// The `BudgetEquivalenceLedger` record itself, written by
+    /// [`stamp_outcome_budget`] from the bound proof; `None` while the outcome
+    /// is unbound. It is carried so a re-binding is detected by the record and
+    /// not by its caller-chosen `ledger_id`.
+    pub budget_ledger: Option<BudgetEquivalenceLedger>,
+    /// Complexity-economics delta record (I12.24:76, I18.47), written from the
+    /// bound proof's recorded `delta_ref`.
     pub complexity_delta_ref: String,
-    /// Whether the bound complexity-economics delta is conclusive.
+    /// The `ComplexityEconomicsDelta` record itself, written by
+    /// [`stamp_outcome_budget`] from the bound proof; `None` while the outcome
+    /// is unbound, for the same reason as
+    /// [`OutcomeEvidence::budget_ledger`].
+    pub complexity_delta: Option<ComplexityEconomicsDelta>,
+    /// Whether the bound complexity-economics delta is conclusive, written from
+    /// the bound delta's six recorded slots through the contract's own
+    /// `ComplexityEconomicsDelta::is_conclusive`.
     /// An inconclusive delta never promotes, however good replay looks.
     pub economics_conclusive: bool,
     /// Affected checks evaluated under the matched budget.
@@ -1063,10 +1158,15 @@ impl OutcomeEvidence {
             return Err(ImprovementError::NonFiniteMetric);
         }
         // I12.24:76 promotion gate: replay-only evidence never promotes.
-        // A promotion-bound outcome must bind the single canonical
-        // budget-equivalence ledger and a conclusive complexity-economics
-        // delta, name the affected checks, carry matched-budget live
-        // shadow/canary evidence, and expose delayed-harm visibility.
+        // A promotion-bound outcome must carry the single canonical
+        // budget-equivalence ledger RECORD and the canonical delta RECORD,
+        // name the affected checks, carry matched-budget live shadow/canary
+        // references, and expose delayed-harm visibility. On the path that
+        // builds this record the stamp has already written both, so a missing
+        // one means the outcome was never bound to a proof.
+        if self.budget_ledger.is_none() || self.complexity_delta.is_none() {
+            return Err(ImprovementError::MissingBudgetProof);
+        }
         if self.budget_ledger_ref.trim().is_empty() {
             return Err(ImprovementError::MissingBudgetProof);
         }
@@ -1102,6 +1202,17 @@ impl OutcomeEvidence {
     }
 }
 
+/// The I12.24:76 promotion record, and the bound budget record it is judged by.
+///
+/// [`PromotionInput::budget_proof`] is the ORIGINAL `BudgetProof`: the
+/// `BudgetEquivalenceLedger` value and the recorded `ComplexityEconomicsDelta`
+/// it was judged under. It is here so the two canonical bindings are
+/// re-checkable against a canonical record rather than against the names
+/// `outcome` carries. The four evidence legs of `outcome` remain caller-set
+/// references, not attested records: the gate requires each to agree with the
+/// bound proof, requires affected checks and the delayed-harm window
+/// individually, and accepts matched-budget live shadow OR live canary for the
+/// live leg.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PromotionInput {
     pub input_id: String,
@@ -1110,12 +1221,48 @@ pub struct PromotionInput {
     pub candidate_revision: u64,
     pub target_surface: ImprovementSurface,
     pub outcome: OutcomeEvidence,
+    /// The bound I18.47 budget/economics record this promotion is judged under
+    /// (I12.24:76). Matchedness and conclusiveness are read from it by
+    /// [`BudgetProof::supports_promotion`], never asserted here.
+    pub budget_proof: BudgetProof,
     pub evidence_digest: String,
     pub direct_promotion: bool,
     pub created_at: OffsetDateTime,
 }
 
 impl PromotionInput {
+    /// Re-check the I12.24:76 promotion obligations against the bound ORIGINAL
+    /// proof.
+    ///
+    /// I12.24:76 — "Replay-only evidence cannot promote a policy/module/Skill/
+    /// retrieval change. The evaluation record binds the single canonical
+    /// `BudgetEquivalenceLedger` and `ComplexityEconomicsDelta` contracts of
+    /// I18.47… An unmatched ledger or inconclusive complexity delta cannot
+    /// promote the candidate merely because replay or a local metric improved."
+    ///
+    /// What each obligation is checked AGAINST is stated here rather than
+    /// implied:
+    ///
+    /// - the two canonical bindings are checked against the bound RECORDS. The
+    ///   outcome must carry both record values and name both, exactly as
+    ///   [`OutcomeEvidence::validate_for`] requires on the path that builds it,
+    ///   so neither a valid proof alone nor a name can stand in for them.
+    /// - [`stamp_outcome_budget`] is then the one owner of the outcome/proof
+    ///   comparison. It runs [`BudgetProof::supports_promotion`] on the bound
+    ///   proof — which calls the existing [`BudgetProof::validate`], and with
+    ///   it the canonical
+    ///   [`eliot_evaluation_contracts::BudgetEquivalenceLedger::validate`] on
+    ///   the ledger value itself — and compares the whole ledger and delta
+    ///   VALUES, so a different ledger that reuses the same `ledger_id` is
+    ///   refused along with any different evidence leg. Nothing here recomputes,
+    ///   re-derives or substitutes a ledger or digest, and the copy it runs
+    ///   that comparison on is local, so no field of `self` is written.
+    /// - the four evidence legs (affected checks, live shadow, live canary,
+    ///   delayed-harm window) are NOT re-derived here and this method does not
+    ///   claim they are: they are caller-set references that the gate requires
+    ///   to agree with the bound proof, and it requires affected checks and the
+    ///   delayed-harm window individually while accepting matched-budget live
+    ///   shadow OR live canary for the live leg (I12.24:68).
     pub fn validate(&self) -> Result<(), ImprovementError> {
         if self.direct_promotion {
             return Err(ImprovementError::SelfPromotionForbidden);
@@ -1123,7 +1270,15 @@ impl PromotionInput {
         non_empty(&self.evidence_digest, "evidence_digest")?;
         non_empty(&self.candidate_id, "candidate_id")?;
         non_empty(&self.project_id, "project_id")?;
-        Ok(())
+        if self.outcome.budget_ledger.is_none()
+            || self.outcome.complexity_delta.is_none()
+            || self.outcome.budget_ledger_ref.trim().is_empty()
+            || self.outcome.complexity_delta_ref.trim().is_empty()
+        {
+            return Err(ImprovementError::MissingBudgetProof);
+        }
+        let mut bound = self.outcome.clone();
+        stamp_outcome_budget(&mut bound, &self.budget_proof)
     }
 }
 

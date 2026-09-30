@@ -33,15 +33,25 @@
 //!
 //! ## What this module cannot discharge
 //!
-//! The outcome-side fields of [`OutcomeEvidence`] are a caller-fillable
-//! projection declared in the crate root, and nothing in this file can make
-//! them non-forgeable: a caller that writes the seven fields by hand gets a
-//! projection identical to the one this module writes. Closing that needs the
-//! crate root to carry the bound [`BudgetProof`] instead of the names, which
-//! is out of this file's reach. What this module does discharge is that a
-//! projection is only ever written from records that
-//! [`BudgetProof::supports_promotion`] checked, and that such a projection is
-//! never silently replaced by a different one.
+//! [`BudgetProof`] is a caller-constructed, `Deserialize`-able record, so a
+//! caller that INVENTS a whole [`BudgetEquivalenceLedger`] — its own arms, its
+//! own measurements, `Exact` equivalence — together with invented
+//! live-shadow/canary references, and hands that to this gate, gets a passing
+//! verdict. Matchedness is a field INSIDE the record rather than an
+//! owner-issued attestation, and issuing one would be a different contract from
+//! I18.47's canonical ledger, so this module does not pretend to close that.
+//! It is the honest ceiling of a matched-budget gate over a caller-held record.
+//!
+//! What the crate root adds on top is the BINDING, which this file could not
+//! reach: [`PromotionInput`](crate::PromotionInput) carries the bound
+//! [`BudgetProof`] itself, and [`OutcomeEvidence`] carries the
+//! `BudgetEquivalenceLedger` and `ComplexityEconomicsDelta` values that
+//! [`stamp_outcome_budget`] stamps. The projection is therefore compared back
+//! to the record it came from rather than to a name, and what this module does
+//! discharge is that a projection is only ever written from records
+//! [`BudgetProof::supports_promotion`] checked and is never silently replaced by
+//! a different one — including by a second ledger that reuses the same
+//! `ledger_id`.
 
 use eliot_evaluation_contracts::{
     BudgetEquivalence, BudgetEquivalenceLedger, EvaluationContractError,
@@ -52,10 +62,11 @@ use crate::{ImprovementError, OutcomeEvidence};
 
 /// The six I18.47:78-84 `ComplexityEconomicsDelta` slots, recorded verbatim.
 ///
-/// The `delta_ref` is the identity of the recorded delta record; it is the
-/// binding the outcome carries, not a substitute for the six slots. There is
-/// no `conclusive` field: [`ComplexityEconomicsDelta::is_conclusive`] derives
-/// the answer from the recorded slots, so a caller cannot assert it.
+/// The `delta_ref` is the identity OF this record, not a substitute for the six
+/// slots. The outcome carries the whole record (see [`stamp_outcome_budget`]),
+/// so a different record reusing the same `delta_ref` is not the same binding.
+/// There is no `conclusive` field: [`ComplexityEconomicsDelta::is_conclusive`]
+/// derives the answer from the recorded slots, so a caller cannot assert it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ComplexityEconomicsDelta {
     pub delta_ref: String,
@@ -109,9 +120,11 @@ impl ComplexityEconomicsDelta {
 /// `budget_ledger` IS the `BudgetEquivalenceLedger` value. It is validated
 /// with that contract's own `validate()` — its arm uniqueness, declared
 /// profile coverage and explicit mismatch-and-claim-limit rules — so a name
-/// that happens to look like a ledger proves nothing. `budget_ledger_ref` and
-/// `ledger_matched` are gone: the reference is [`BudgetEquivalenceLedger::ledger_id`]
-/// and the matchedness is [`BudgetEquivalenceLedger::equivalence`].
+/// that happens to look like a ledger proves nothing. This struct carries no
+/// `budget_ledger_ref` and no `ledger_matched`: the ledger's identity is
+/// [`BudgetEquivalenceLedger::ledger_id`] and the matchedness is
+/// [`BudgetEquivalenceLedger::equivalence`], both read out of the value
+/// itself.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BudgetProof {
     pub budget_ledger: BudgetEquivalenceLedger,
@@ -153,6 +166,14 @@ impl BudgetProof {
     /// caller-set Boolean left to flip: matchedness is the ledger's own
     /// `equivalence` class and conclusiveness is the recorded content of the
     /// six I18.47 delta slots.
+    ///
+    /// The three reference legs are required UNEQUALLY, and this gate does not
+    /// require all four references of I12.24:68/69 to be present: affected
+    /// checks and the delayed-harm window are each refused when missing (see
+    /// [`BudgetProof::validate`]), while the matched-budget live shadow/canary
+    /// leg is satisfied by EITHER one, so a proof carrying only live shadow, or
+    /// only live canary, promotes. All of them are caller-set references,
+    /// checked for presence and agreement and never resolved to an observation.
     pub fn supports_promotion(&self) -> Result<(), ImprovementError> {
         self.validate()?;
         if !matches!(
@@ -231,18 +252,28 @@ pub fn require_matched_budget_for_promotion(
 /// proof is validated BEFORE any field is written, and the writes are
 /// validate-then-commit: a refused proof leaves the outcome exactly as it was.
 ///
+/// What is written is not only the names: the [`BudgetEquivalenceLedger`] and
+/// [`ComplexityEconomicsDelta`] VALUES are stamped onto the outcome as well, so
+/// the record itself is carried and can be compared back.
+///
 /// # The binding is not substitutable (I12.24:76)
 ///
 /// I12.24:76 requires the evaluation record to bind THE canonical
 /// `BudgetEquivalenceLedger` and `ComplexityEconomicsDelta`, so a record that
 /// already carries a binding must not be re-pointed at a different one. An
-/// outcome that already names a ledger, a delta or any of the four evidence
-/// legs therefore admits only the SAME proof:
+/// outcome that already carries or names a ledger, a delta or any of the four
+/// evidence legs therefore admits only the SAME proof:
 ///
 /// - no binding recorded yet — the proof's records are written, as before;
 /// - a binding that equals this proof's records — idempotent, `Ok(())`;
 /// - a binding that differs in any way — refused with a typed
 ///   [`ImprovementError::BudgetGateViolation`] and nothing written.
+///
+/// A PARTIAL binding — one canonical record without the other, or an evidence
+/// leg with no record at all — is refused by the same rule, never completed
+/// here: completing it would silently discard whichever half the caller had
+/// already recorded. An outcome that records nothing at all is unbound, and
+/// takes the write path, so a replay-only outcome stays stampable.
 ///
 /// Without that refusal a second promotable proof could silently overwrite the
 /// first, and the record would name a budget the outcome was never evaluated
@@ -251,29 +282,57 @@ pub fn require_matched_budget_for_promotion(
 /// visibility by re-stamping a weaker proof is refused too.
 ///
 /// The comparison is over the ORIGINAL recorded records this function already
-/// holds: the ledger identity is [`BudgetEquivalenceLedger::ledger_id`] and the
-/// delta identity is [`ComplexityEconomicsDelta::delta_ref`], both read from the
-/// bound values. No ledger is recomputed, re-derived or substituted, and the
-/// canonical [`BudgetEquivalenceLedger::validate`] remains the only admissible
-/// check on the ledger.
+/// holds: the whole [`BudgetEquivalenceLedger`] value and the whole
+/// [`ComplexityEconomicsDelta`] value, compared field by field through their own
+/// derived `PartialEq`, with the two names checked as well. Comparing the names
+/// alone would not be a binding: `ledger_id` is a caller-chosen string, so a
+/// DIFFERENT ledger reusing the same one — other arms, other measurements —
+/// would satisfy it and leave the record silently decoupled from the budget it
+/// was evaluated under. No ledger is recomputed, re-derived or substituted, and
+/// the canonical [`BudgetEquivalenceLedger::validate`] remains the only
+/// admissible check on the ledger.
 pub fn stamp_outcome_budget(
     outcome: &mut OutcomeEvidence,
     proof: &BudgetProof,
 ) -> Result<(), ImprovementError> {
     proof.supports_promotion()?;
-    // Both bindings and both evidence legs are read out of the records the gate
-    // just validated; the outcome never carries a name the gate did not check.
+    // The two canonical records, their names and the four evidence legs are read
+    // out of the records the gate just validated; the outcome never carries a
+    // name or a leg the gate did not check.
     let ledger_ref = proof.budget_ledger.ledger_id.to_string();
     let delta_ref = proof.complexity_delta.delta_ref.clone();
     let conclusive = proof.complexity_delta.is_conclusive();
 
-    // A binding exists as soon as either canonical record is named; the
-    // remaining fields are then part of that same binding and are compared
-    // with it.
+    // A binding exists as soon as EITHER canonical record is carried or named,
+    // OR as soon as ANY of the four evidence legs is recorded — the legs are
+    // written by the same call, so an outcome holding a leg is bound just as
+    // surely as one holding a record. The refusal below is therefore
+    // PER-FIELD and fail-closed: a record that carries one canonical record
+    // without the other, or that carries a leg without any record, is
+    // PARTIALLY bound and is REFUSED, never repaired here. Repairing it would
+    // silently drop the leg or the record the caller already recorded.
+    //
+    // An outcome that records nothing at all — every term below false, which is
+    // the replay-only shape: no ledger, no delta, no leg — is UNBOUND and still
+    // takes the write path, so the replay-only outcome stays stampable.
     let already_bound = !outcome.budget_ledger_ref.trim().is_empty()
-        || !outcome.complexity_delta_ref.trim().is_empty();
+        || !outcome.complexity_delta_ref.trim().is_empty()
+        || outcome.budget_ledger.is_some()
+        || outcome.complexity_delta.is_some()
+        || !outcome.affected_check_refs.is_empty()
+        || !outcome.live_shadow_refs.is_empty()
+        || !outcome.live_canary_refs.is_empty()
+        || !outcome.delayed_harm_window_ref.trim().is_empty();
     if already_bound {
-        let same_binding = outcome.budget_ledger_ref == ledger_ref
+        // The comparison is over the RECORD VALUES the outcome carries, not over
+        // the names. `ledger_id` is a caller-chosen string, so a second ledger
+        // that reuses the same one — different arms, different measurements —
+        // would satisfy a name comparison while the record the outcome was
+        // evaluated under changed underneath it. Both types derive
+        // `PartialEq`, so the record itself is the witness.
+        let same_binding = outcome.budget_ledger.as_ref() == Some(&proof.budget_ledger)
+            && outcome.complexity_delta.as_ref() == Some(&proof.complexity_delta)
+            && outcome.budget_ledger_ref == ledger_ref
             && outcome.complexity_delta_ref == delta_ref
             && outcome.economics_conclusive == conclusive
             && outcome.affected_check_refs == proof.affected_check_refs
@@ -292,6 +351,8 @@ pub fn stamp_outcome_budget(
 
     outcome.budget_ledger_ref = ledger_ref;
     outcome.complexity_delta_ref = delta_ref;
+    outcome.budget_ledger = Some(proof.budget_ledger.clone());
+    outcome.complexity_delta = Some(proof.complexity_delta.clone());
     outcome.economics_conclusive = conclusive;
     outcome.affected_check_refs = proof.affected_check_refs.clone();
     outcome.live_shadow_refs = proof.live_shadow_refs.clone();
