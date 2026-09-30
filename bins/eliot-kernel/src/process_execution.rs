@@ -474,12 +474,9 @@ impl KernelGovernedProcessEffectPort {
                 observe_process(
                     "kernel.process.effect_external_transition",
                     match confirmation {
-                        change_monitor::HintConfirmation::VerifiedImmaterial => {
-                            "immaterial"
-                        }
+                        change_monitor::HintConfirmation::VerifiedImmaterial => "immaterial",
                         change_monitor::HintConfirmation::MaterialRecorded {
-                            reconciled,
-                            ..
+                            reconciled, ..
                         } => {
                             if reconciled {
                                 "reconciled"
@@ -492,12 +489,11 @@ impl KernelGovernedProcessEffectPort {
                 Ok(false)
             }
             Err(error) => {
-                let outcome =
-                    if error == change_monitor::ChangeMonitorError::UnstableReadback {
-                        "unstable"
-                    } else {
-                        "unobserved"
-                    };
+                let outcome = if error == change_monitor::ChangeMonitorError::UnstableReadback {
+                    "unstable"
+                } else {
+                    "unobserved"
+                };
                 // I10.21 AUD4: the retained previous digest proves
                 // a real transition, but the ledger could not
                 // record it. The target leaves the baseline with a
@@ -509,17 +505,13 @@ impl KernelGovernedProcessEffectPort {
                     operation,
                     Some(previous.to_owned()),
                 ) {
-                    Ok(_) => observe_process(
-                        "kernel.process.effect_external_transition",
-                        "unresolved",
-                    ),
+                    Ok(_) => {
+                        observe_process("kernel.process.effect_external_transition", "unresolved")
+                    }
                     Err(change_monitor::ChangeMonitorError::LedgerPoisoned) => {
                         return Err(GovernedProcessEffectPortError::LedgerPoisoned);
                     }
-                    Err(_) => observe_process(
-                        "kernel.process.effect_external_transition",
-                        outcome,
-                    ),
+                    Err(_) => observe_process("kernel.process.effect_external_transition", outcome),
                 }
                 Ok(true)
             }
