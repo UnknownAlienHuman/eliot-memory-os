@@ -47,6 +47,7 @@
 
 use crate::EngineError;
 use eliot_types::{ContextPacketL3, MaterialPacketFrame, PacketQualityReport, PacketQualityResult};
+use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PacketQualityService;
@@ -173,9 +174,14 @@ impl PacketQualityService {
         // matching lengths alone do not prove measurement identity. The
         // enclosing PacketBudgetDecision binds the final packet digest after
         // this self-referential report stabilizes.
-        let mut stable = false;
-        for _ in 0..16 {
+        let mut observed_envelopes = BTreeSet::new();
+        loop {
             let serialized = serde_json::to_vec(&packet)?;
+            if !observed_envelopes.insert(serialized.clone()) {
+                return Err(EngineError::WriteRejected(
+                    "packet measurement cycles between serialized envelopes".to_owned(),
+                ));
+            }
             let (structured_bytes, stu_estimate, _) =
                 super::canonical_measurement_for_payload(&serialized)?;
             let structured_bytes =
@@ -198,15 +204,10 @@ impl PacketQualityService {
                 report.estimated_tokens = estimated_tokens;
                 report.signal_density = signal_density;
             }
+            packet.token_budget_report.estimated_tokens = estimated_tokens;
             if serde_json::to_vec(&packet)? == serialized {
-                stable = true;
                 break;
             }
-        }
-        if !stable {
-            return Err(EngineError::WriteRejected(
-                "packet measurement did not converge on final serialized bytes".to_owned(),
-            ));
         }
         *target = packet;
         Ok(())

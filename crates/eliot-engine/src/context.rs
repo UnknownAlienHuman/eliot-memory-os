@@ -3584,7 +3584,7 @@ pub fn packet_section_accounting(
     sections.insert("whole_packet_estimate".to_owned(), estimate_tokens(packet)?);
     sections.insert(
         "whole_packet_serialized".to_owned(),
-        serde_json::to_vec(packet)?.len(),
+        estimate_tokens(packet)?,
     );
     Ok(sections)
 }
