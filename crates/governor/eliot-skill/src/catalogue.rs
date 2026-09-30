@@ -1499,8 +1499,14 @@ impl SkillCatalogue {
     /// to the `eliot-skill` validation, staleness, and delivery-ack records.
     /// Every leg is re-compared against the exact content this call observes
     /// — the persisted structural-validation report, the live catalogue
-    /// state (entry statuses included, so staleness is observable), and the
-    /// exact receipt/ack pair — never re-stated from the presented display.
+    /// state (entry statuses included, so staleness is observable), the full
+    /// displayed content (trigger, budgets, dependency versions, eligibility,
+    /// host/profile versions, scope, status, and the promotion record), and
+    /// the exact receipt/ack pair — never re-stated from the presented
+    /// display. Digests alone do not bind the human-readable content, so a
+    /// substituted display that keeps every digest yet widens the admitted
+    /// scope, forges dependency versions, or claims unearned promotion fails
+    /// with `IdentityMismatch` on the content legs below.
     /// A Skill whose dependency changed is not representable as generally
     /// delivered: the drift mark rotates the catalogue digest, so a display
     /// bound before the mark fails closed here exactly as it does at
@@ -1543,6 +1549,42 @@ impl SkillCatalogue {
             || display.body_digest != entry.body.body_digest
             || display.body_version != entry.body.body_version
         {
+            return Err(SkillError::IdentityMismatch);
+        }
+        // Displayed content binding (issue #1882 A3/A4): the digests above
+        // do not bind the human-readable content, so every descriptive field
+        // is compared against the live entry. A substituted display that
+        // keeps every digest yet widens the admitted scope, forges dependency
+        // versions, or claims unearned promotion is not the record and fails
+        // here; only the served content resolves.
+        if display.trigger != entry.index.trigger || display.status != entry.status {
+            return Err(SkillError::IdentityMismatch);
+        }
+        if display.index_tokens != entry.runtime.index_tokens
+            || display.body_tokens != entry.runtime.body_tokens
+            || display.runtime_tokens != entry.runtime.runtime_tokens
+            || display.index_budget_tokens != entry.runtime.index_budget_tokens
+            || display.body_budget_tokens != entry.runtime.body_budget_tokens
+            || display.runtime_budget_tokens != entry.runtime.runtime_budget_tokens
+        {
+            return Err(SkillError::IdentityMismatch);
+        }
+        if display.dependency_versions != entry.dependencies
+            || display.eligible_routes != entry.index.eligible_routes
+            || display.eligible_profiles != entry.index.eligible_profiles
+            || display.eligible_policies != entry.index.eligible_policies
+            || display.host_version != entry.host_version
+            || display.profile_version != entry.profile_version
+            || display.scope != entry.scope
+        {
+            return Err(SkillError::IdentityMismatch);
+        }
+        let expected_promotion = entry
+            .promotion_evidence
+            .as_ref()
+            .map(PromotionEvidence::evidence_digest)
+            .transpose()?;
+        if display.promotion_digest != expected_promotion {
             return Err(SkillError::IdentityMismatch);
         }
         receipt.validate()?;
