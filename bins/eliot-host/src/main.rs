@@ -301,25 +301,37 @@ fn console_process_exit_code() -> i32 {
 // B13 terminal exit codes (`console_process_exit_code`): unchanged.
 // B14 start-failure capsule/stderr/SCM status: untouched receipt owners.
 
+/// Reads the admitted current-user supervisor switch from the process
+/// arguments, leaving every other launch argument untouched.
+///
+/// Only the one admitted `UserMode` supervisor is supported; an unrecognised
+/// value under that switch is refused rather than silently ignored, because the
+/// switch selects the supervision path the process will commit to.
+#[cfg(windows)]
+fn profile_supervisor_selection_from_args(
+    process_args: &[std::ffi::OsString],
+) -> Option<InstallationProfile> {
+    match process_args.first().and_then(|argument| argument.to_str()) {
+        Some(USER_MODE_SUPERVISOR_SWITCH) => {
+            match process_args.get(1).and_then(|argument| argument.to_str()) {
+                Some("user_mode") => Some(InstallationProfile::UserMode),
+                _ => {
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "eliot-host: only the admitted UserMode supervisor is supported"
+                    );
+                    std::process::exit(HOST_CONSOLE_PROCESS_EXIT_CODE);
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
 fn main() {
     let mut process_args = std::env::args_os().skip(1).collect::<Vec<_>>();
     #[cfg(windows)]
-    let profile_supervisor_selection =
-        match process_args.first().and_then(|argument| argument.to_str()) {
-            Some(USER_MODE_SUPERVISOR_SWITCH) => {
-                match process_args.get(1).and_then(|argument| argument.to_str()) {
-                    Some("user_mode") => Some(InstallationProfile::UserMode),
-                    _ => {
-                        let _ = writeln!(
-                            io::stderr().lock(),
-                            "eliot-host: only the admitted UserMode supervisor is supported"
-                        );
-                        std::process::exit(HOST_CONSOLE_PROCESS_EXIT_CODE);
-                    }
-                }
-            }
-            _ => None,
-        };
+    let profile_supervisor_selection = profile_supervisor_selection_from_args(&process_args);
     #[cfg(not(windows))]
     let profile_supervisor_selection: Option<()> = None;
     if profile_supervisor_selection.is_some() {

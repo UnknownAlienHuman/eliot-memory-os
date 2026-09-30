@@ -201,6 +201,10 @@ pub use owned_directory_retirement::{
     OwnedDirectoryRetirementUnknownReason, observe_owned_directory_exact,
     retire_owned_directory_exact,
 };
+pub use profile_supervision::{
+    ProfileRootLeaseSet, ProfileRootRequest, ProfileSelection, ProfileSelectionReceipt,
+    open_profile_root_leases,
+};
 pub use package_staging::{
     AGENT_BRIDGE_STAGE_WIRE, AGENT_BRIDGE_STAGE_WIRE_VERSION, AgentBridgeStagePrepared,
     AgentBridgeStagingCreateDisposition, AgentBridgeStagingReceipt, AgentBridgeStagingRequest,
