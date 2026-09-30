@@ -4817,6 +4817,7 @@ pub enum CompositionReadiness {
 /// restart recovery still belongs to the `WorkScope` owner path.
 const MAX_RETAINED_SCOPE_QUARANTINE_RECORDS: usize = 8;
 
+#[derive(Clone, Copy)]
 struct ObservationCaptureSessionOwnerRequest<'a> {
     authenticated_principal_ref: &'a str,
     session_id: &'a SessionId,
