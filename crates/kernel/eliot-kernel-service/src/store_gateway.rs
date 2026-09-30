@@ -85,7 +85,7 @@ use crate::store_write_reservation::{
     finalize_reservation, mark_unknown_outcome, reconcile_receipt,
     reservation_record_by_operation,
     reserve_for_transition, reserve_for_transition_with_original_submission,
-    retain_unsupported_prepared_plan, writer_epoch_for_fence_from_epoch,
+    retain_unsupported_prepared_plan, wait_until_eligible, writer_epoch_for_fence_from_epoch,
 };
 use crate::user_automation_execution::{
     UserAutomationDueWakeResolution, UserAutomationDurableJobMaterial,
@@ -1716,10 +1716,15 @@ impl KernelStoreGateway {
         if transition.state_fence != context.state_fence
             || token.operation_id.as_str() != transition.identity.operation_id.as_str()
         {
-            return Err("predecessor wait inputs do not match the original staged operation".into());
+            return Err(StagedReservedWriteError::Refused {
+                detail: "predecessor wait inputs do not match the original staged operation"
+                    .to_owned(),
+            });
         }
         if self.is_fenced() {
-            return Err("canonical-store gateway is fenced for rebind".into());
+            return Err(StagedReservedWriteError::Refused {
+                detail: "canonical-store gateway is fenced for rebind".to_owned(),
+            });
         }
         self.require_active_store_generation()
             .map_err(|error| error.to_string())?;
@@ -1727,30 +1732,39 @@ impl KernelStoreGateway {
             "staged predecessor wait requires the composition-bound ORS".to_owned()
         })?;
         let owner = self.bind_reservation_owner(&commit_ors, context, transition)?;
-        let writer_epoch = owner.writer_epoch().current.clone();
+        let writer_epoch = owner.writer_epoch().clone();
         if token.writer_epoch != writer_epoch {
-            return Err("staged reservation token belongs to a different writer epoch".into());
+            return Err(StagedReservedWriteError::Refused {
+                detail: "staged reservation token belongs to a different writer epoch".to_owned(),
+            });
         }
         let expected_state_fence = StateFenceSnapshot::capture(
             &transition.state_fence,
-            owner.writer_epoch().current.epoch,
+            writer_epoch.current.epoch,
         )
         .map_err(|error| error.to_string())?;
         if token.state_fence != expected_state_fence {
-            return Err("staged reservation token belongs to a different full state fence".into());
+            return Err(StagedReservedWriteError::Refused {
+                detail: "staged reservation token belongs to a different full state fence"
+                    .to_owned(),
+            });
         }
-        let record = owner
-            .ors
-            .wait_until_eligible(token, &writer_epoch)
+        let record = wait_until_eligible(&owner, token)
             .await
             .map_err(|error| error.to_string())?;
         if self.is_fenced() {
-            return Err("canonical-store gateway was fenced while waiting for its predecessor".into());
+            return Err(StagedReservedWriteError::Refused {
+                detail: "canonical-store gateway was fenced while waiting for its predecessor"
+                    .to_owned(),
+            });
         }
         self.require_active_store_generation()
             .map_err(|error| error.to_string())?;
         if record.token != *token || record.state != ReservationState::Eligible {
-            return Err("ORS readiness notification did not return the exact eligible token".into());
+            return Err(StagedReservedWriteError::Refused {
+                detail: "ORS readiness notification did not return the exact eligible token"
+                    .to_owned(),
+            });
         }
         Ok(())
     }
