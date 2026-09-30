@@ -3341,9 +3341,10 @@ fn read_filesystem_content_digest(
 
     // The read-only handle shares only reads, so another writer or path
     // replacement cannot change the file while this one-pass digest is made.
+    // Boxed (not stack) 64 KiB chunk: the digest loop reuses one heap buffer.
     let mut hasher = Sha256::new();
     let mut bytes_read = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
     loop {
         let count = file.read(&mut buffer)?;
         if count == 0 {
