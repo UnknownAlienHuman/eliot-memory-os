@@ -522,7 +522,8 @@ impl SourceSecurityAssessment {
             release_condition,
         )?;
         match resolution.restriction() {
-            Some(restriction) => Ok(restriction.resolve_use(current_assurance, state_fence)?
+            Some(restriction) => Ok(restriction
+                .resolve_use(current_assurance, state_fence)?
                 .narrowed_with(&base)),
             None => Ok(base),
         }

@@ -14,8 +14,8 @@ mod surface_types;
 mod validation;
 
 pub use injection_indicators::{
-    BroadExtractionEvidence, DroppedEvidenceKind, DroppedEvidenceRecord, ExtractionScope,
-    ExternalContentRole, ExternalInstructionEvidence, INDICATOR_CLASS_COUNT, IndicatorClass,
+    BroadExtractionEvidence, DroppedEvidenceKind, DroppedEvidenceRecord, ExternalContentRole,
+    ExternalInstructionEvidence, ExtractionScope, INDICATOR_CLASS_COUNT, IndicatorClass,
     IndicatorCoverage, IndicatorEvidence, IndicatorObservation, IndicatorResolution,
     IndicatorResponse, IndicatorSourceMap, PersistenceRequest, PersistenceRequestEvidence,
     ProposedSourceRestriction, RepeatedLineageEvidence, SummaryAuthorityEvidence,

@@ -24,11 +24,11 @@ use eliot_contracts::StateFence;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::surface_types::{
-    assessment_refs, assessment_text, AssessedSourceRevision, EffectCeiling, EpistemicUse,
-    SourceAssurance, SourceUseAuthority,
-};
 use crate::SecurityContractError;
+use crate::surface_types::{
+    AssessedSourceRevision, EffectCeiling, EpistemicUse, SourceAssurance, SourceUseAuthority,
+    assessment_refs, assessment_text,
+};
 
 /// Number of indicator classes the I8.8 inventory fixes.
 pub const INDICATOR_CLASS_COUNT: usize = 8;
@@ -37,7 +37,9 @@ pub const INDICATOR_CLASS_COUNT: usize = 8;
 ///
 /// This is the whole map. An observation belongs to exactly one of these, or it
 /// is not classified here.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum IndicatorClass {
     /// External document attempts to issue system/tool instructions.
@@ -101,10 +103,8 @@ impl IndicatorClass {
     /// reach a restriction; the empty slice it returns is what stops a
     /// suspected pattern from ever removing a use.
     pub const fn permitted_uses(self) -> &'static [EpistemicUse] {
-        const OBSERVED_CANDIDATE: &[EpistemicUse] = &[
-            EpistemicUse::Observation,
-            EpistemicUse::CandidateEvidence,
-        ];
+        const OBSERVED_CANDIDATE: &[EpistemicUse] =
+            &[EpistemicUse::Observation, EpistemicUse::CandidateEvidence];
         const SUSPECTED_PATTERN_NONE: &[EpistemicUse] = &[];
         match self {
             Self::ExternalInstructionAttempt
@@ -198,7 +198,9 @@ pub enum ExternalContentRole {
 }
 
 /// Which exact approved-schema field a tool definition changed.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ToolDefinitionDelta {
     Name,
@@ -346,7 +348,11 @@ pub struct UndeclaredEffectEvidence {
 
 /// The exact evidence shape that belongs to each indicator class.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "indicator", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[serde(
+    tag = "indicator",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    deny_unknown_fields
+)]
 pub enum IndicatorEvidence {
     ExternalInstructionAttempt(ExternalInstructionEvidence),
     UnexpectedToolDefinitionChange(ToolDefinitionChangeEvidence),
@@ -392,15 +398,16 @@ impl IndicatorEvidence {
     pub const fn has_comparison_inputs(&self) -> bool {
         match self {
             Self::ExternalInstructionAttempt(evidence) => {
-                matches!(evidence.content_role, ExternalContentRole::DirectInstruction)
+                matches!(
+                    evidence.content_role,
+                    ExternalContentRole::DirectInstruction
+                )
             }
             Self::StandingInstructionOrSecretPersistence(_) => true,
             Self::UnexpectedToolDefinitionChange(evidence) => {
                 evidence.approved_schema_revision.is_some()
             }
-            Self::SummaryAuthorityEscalation(evidence) => {
-                evidence.owner_permitted_uses.is_some()
-            }
+            Self::SummaryAuthorityEscalation(evidence) => evidence.owner_permitted_uses.is_some(),
             Self::RepeatedPoisonedLineage(evidence) => evidence.transformation_ref.is_some(),
             Self::OverbroadRemoteDreamExtraction(_) => true,
             Self::DroppedOriginOrMinorityEvidence(evidence) => {
@@ -495,31 +502,21 @@ impl IndicatorEvidence {
                 )
             }
             Self::DroppedOriginOrMinorityEvidence(evidence) => {
-                assessment_text(
-                    &evidence.transformation_ref,
-                    "dropped.transformation_ref",
-                )?;
+                assessment_text(&evidence.transformation_ref, "dropped.transformation_ref")?;
                 // The declared kind must match what was actually dropped, so a
                 // record cannot claim one kind while carrying the other's
                 // handles.
-                let declares_origin = !matches!(
-                    evidence.dropped,
-                    DroppedEvidenceKind::MinorityPosition
-                );
-                let declares_minority = !matches!(
-                    evidence.dropped,
-                    DroppedEvidenceKind::OriginProvenance
-                );
+                let declares_origin =
+                    !matches!(evidence.dropped, DroppedEvidenceKind::MinorityPosition);
+                let declares_minority =
+                    !matches!(evidence.dropped, DroppedEvidenceKind::OriginProvenance);
                 if declares_origin {
                     if evidence.dropped_origin_refs.is_empty() {
                         return Err(SecurityContractError::EmptyCollection {
                             field: "dropped.dropped_origin_refs",
                         });
                     }
-                    assessment_refs(
-                        &evidence.dropped_origin_refs,
-                        "dropped.dropped_origin_refs",
-                    )?;
+                    assessment_refs(&evidence.dropped_origin_refs, "dropped.dropped_origin_refs")?;
                 }
                 if declares_minority {
                     if evidence.dropped_minority_refs.is_empty() {
@@ -559,9 +556,7 @@ impl IndicatorEvidence {
     /// The retained references this record cites, sorted and de-duplicated.
     fn cited_refs(&self) -> Vec<String> {
         let mut refs = match self {
-            Self::ExternalInstructionAttempt(evidence) => {
-                evidence.evidence_handles.clone()
-            }
+            Self::ExternalInstructionAttempt(evidence) => evidence.evidence_handles.clone(),
             Self::StandingInstructionOrSecretPersistence(evidence) => {
                 evidence.evidence_handles.clone()
             }
@@ -600,7 +595,11 @@ pub enum IndicatorCoverage {
 
 /// Who produced the observation behind a resolution.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "origin", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+#[serde(
+    tag = "origin",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    deny_unknown_fields
+)]
 pub enum IndicatorObservation {
     /// An independent observation, optionally bound to a deterministic rule.
     ///
