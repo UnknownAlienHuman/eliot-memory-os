@@ -1921,9 +1921,12 @@ fn host_request_observe_submit_frame(
 /// | `skill.inject` / `skill.display` (non-hot) | invoke-read frame (tool bytes) | `agent_host_request_invoke_read` | Hotset intake served through the linkage-checked leg; never advertised |
 ///
 /// An `Accepted` submit reply is an operation handle, not completed work; only
-/// the row's named owner execution plus a retained result completes it. The
-/// `completion_join` / `missing_route` strings name that exact missing
-/// interface per unresolved row instead of claiming seven tools do not exist.
+/// the row's named owner execution plus a retained result completes it. A
+/// submit-leg row answers completed only with the owner-retained receipt
+/// ([`require_submit_completion_receipt`]); invoke-read rows keep the
+/// digest-chain receipt. The `completion_join` / `missing_route` strings
+/// name that exact missing interface per unresolved row instead of claiming
+/// seven tools do not exist.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CanonicalDispatchEntry {
     /// Linkage-checked invoke-read: the Kernel checks capability and
@@ -3059,30 +3062,41 @@ fn invalid_result(detail: &str) -> PortFailure {
     }
 }
 
-/// Requires the owner-retained receipt before one `eliot.observe` outcome
-/// answers as completed (issue #1739 W4).
+/// Requires the owner-retained receipt before one submit-leg outcome
+/// answers as completed (issue #1739 W4: the retained-outcome rule extended
+/// beyond `eliot.observe` to every other operation the bridge wires on the
+/// shared submit carrier).
 ///
-/// The governed submit leg retains an observe outcome only with the
+/// The governed submit leg retains a submit-leg outcome only with the
 /// producer's explicit result lineage (the submission-side receipt gate);
 /// the lineage is the actual owner receipt, bound to the exact result
 /// digest. The readback leg ([`decode_record_view`]) already refuses a
 /// present-but-invalid lineage through the shared retained rule, so this
 /// gate adds only the missing half: an ABSENT lineage cannot be the
-/// retained outcome. Reads keep their existing receipt (admission receipt
-/// plus the retained digest chain): their producer mints no lineage, so
-/// absence there is the established contract, never a missing receipt.
+/// retained outcome. Invoke-read rows (`eliot.packet`, `eliot.query`,
+/// `eliot.finish`, skill carriers) keep their existing receipt (admission
+/// receipt plus the retained digest chain): their producer mints no
+/// lineage, so absence there is the established contract, never a missing
+/// receipt. The non-hot operator carrier keeps its own leg's contract and
+/// is never subject to this gate.
 ///
-/// A receiptless observe result fails closed as a transport binding
+/// A receiptless submit-leg result fails closed as a transport binding
 /// rejection (the same family as a bodyless result), never as a bare
 /// admission that would lose the answer and never as a completed response
-/// for bytes the owner never retained.
-fn require_observe_completion_receipt(
+/// for bytes the owner never retained. A stale or foreign attempt's result
+/// therefore cannot satisfy this waiter: without the owner receipt bound
+/// to this exact result, there is no completed answer to serve.
+fn require_submit_completion_receipt(
     record: &AdmittedReplyView,
     tool_name: &str,
 ) -> Result<(), PortFailure> {
-    if tool_name == "eliot.observe" && record.result_lineage.is_none() {
+    let submit_leg = matches!(
+        tool_name,
+        "eliot.state" | "eliot.observe" | "eliot.act" | "eliot.verify" | "eliot.coordinate"
+    );
+    if submit_leg && record.result_lineage.is_none() {
         return Err(invalid_result(
-            "observe completion requires the owner-retained result receipt",
+            "submit-leg completion requires the owner-retained result receipt",
         ));
     }
     Ok(())
@@ -3090,8 +3104,8 @@ fn require_observe_completion_receipt(
 
 /// Decodes one stored bounded response and checks it against the admitted
 /// request (Implements #18: local read result; #2564 item 5: the canonical
-/// request digest binds the actual expected request; #1739 W4: an
-/// `eliot.observe` result additionally requires its owner-retained receipt).
+/// request digest binds the actual expected request; #1739 W4: a submit-leg
+/// result additionally requires its owner-retained receipt).
 ///
 /// Mirrors `host_gateway.rs:406-436` (bounded size, tool binding) plus the
 /// `check_response_binding` semantics (request/idempotency/tool/digest joins
@@ -3139,13 +3153,14 @@ fn decode_stored_response(
     if sha256_hex(&bytes) != digest {
         return Err(invalid_result("digest does not bind the exact body"));
     }
-    require_observe_completion_receipt(record, request.tool.canonical_name())?;
+    require_submit_completion_receipt(record, request.tool.canonical_name())?;
     Ok(response)
 }
 
 /// Decodes one owner-resolved stored result against the original admission
-/// (issue #2571; #1739 W4: an `eliot.observe` result additionally requires
-/// its owner-retained receipt).
+/// (issue #2571; #1739 W4: a submit-leg result additionally requires its
+/// owner-retained receipt, so replay serves the same retained result only
+/// with the same owner receipt).
 ///
 /// Mirrors [`decode_stored_response`] with a different trust root: the
 /// presenting resolve envelope is current transport, so the request
@@ -3194,7 +3209,7 @@ fn decode_resolved_response(
     if sha256_hex(&bytes) != digest {
         return Err(invalid_result("digest does not bind the exact body"));
     }
-    require_observe_completion_receipt(record, tool_name)?;
+    require_submit_completion_receipt(record, tool_name)?;
     Ok(response)
 }
 
