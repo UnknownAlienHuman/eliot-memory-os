@@ -1392,17 +1392,7 @@ fn classify_evidence_payload(payload: &Value, scope: &ScopeId, subject: &str) ->
 /// conflated, and none may stand in for an expiring approval boundary, a
 /// task/verifier outcome, or a privacy assessment.
 #[derive(
-    Clone,
-    Copy,
-    Debug,
-    Eq,
-    Hash,
-    JsonSchema,
-    Ord,
-    PartialEq,
-    PartialOrd,
-    Serialize,
-    Deserialize,
+    Clone, Copy, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
 )]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum HumanAttentionReadSlot {
@@ -1447,10 +1437,9 @@ impl HumanAttentionReadSlot {
                 OwnerRead::NotificationDelivery,
                 OwnerRead::NotificationDisposition,
             ],
-            Self::ExpiringApprovals => &[
-                OwnerRead::ExpiringApproval,
-                OwnerRead::TelemetryCollection,
-            ],
+            Self::ExpiringApprovals => {
+                &[OwnerRead::ExpiringApproval, OwnerRead::TelemetryCollection]
+            }
             Self::TaskVerifierOutcome => &[OwnerRead::TaskOutcome, OwnerRead::TaskVerifier],
             Self::PrivacyRecords => &[OwnerRead::PrivacyRecord, OwnerRead::TelemetryCollection],
         }
@@ -1998,9 +1987,7 @@ fn validate_claim_support(
             });
         }
         if !observed_metrics.contains(metric) {
-            return Err(HumanAttentionEvaluationError::UnknownMetricSupport {
-                metric: *metric,
-            });
+            return Err(HumanAttentionEvaluationError::UnknownMetricSupport { metric: *metric });
         }
     }
     Ok(())
