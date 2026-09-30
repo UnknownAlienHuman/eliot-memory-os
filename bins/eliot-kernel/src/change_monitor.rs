@@ -31,6 +31,35 @@
 //! crates), it only mirrors the gate semantics: acceptance is blocked
 //! while a hint is still unverified or an unknown-origin Material change
 //! is still unreconciled.
+//!
+//! Durability (I10.21 AUD3): the ledger is process-local memory, so on its
+//! own pending hints and unreconciled unknown-origin blockers would vanish
+//! on restart instead of being rebuilt. When the host operator points
+//! `ELIOT_KERNEL_CHANGE_LEDGER_SNAPSHOT` at a snapshot file, every ledger
+//! mutation best-effort persists a [`ChangeMonitorSnapshot`] there, and
+//! process start hydrates from it through [`rebuild_from_snapshot`]. The
+//! rebuild replays only immutable admitted observations (ingested hints,
+//! governed records, emitted unknown-origin records, admitted
+//! reconciliation links) and recomputes every derived flag from that
+//! evidence: the operation index is rebuilt, unproven links are dropped,
+//! and each unknown-origin `reconciled` flag is re-derived from matching
+//! governed evidence or a proven link. Stored flags are never trusted, so a
+//! tampered snapshot fails closed to unreconciled rather than to silent
+//! acceptance. Pending hints restore as pending and keep blocking governed
+//! acceptance until a verified readback resolves them. When the variable is
+//! unset the ledger stays purely in-memory (previous behavior); a missing
+//! file on first launch starts empty, which records nothing because there
+//! is nothing admitted yet. Present-but-unparsable bytes, a version
+//! mismatch, or a shape violation poisons the ledger instead: every typed
+//! operation then fails with [`ChangeMonitorError::LedgerPoisoned`] and the
+//! acceptance queries fail closed to blocked, so corruption can never
+//! loosen a gate. Durability retains admitted observations from the moment
+//! persistence is configured; it cannot retro-observe mutations from before
+//! that moment (the Kernel never invents source bytes), but the first
+//! readback of such a file still emits an unknown-origin Material change
+//! with an absent baseline through
+//! [`observe_unbaselined_external_transition`] once the lane supplies
+//! Git-substrate evidence — and stays fail-closed pending without it.
 //! I10.18 anchored review consumes admitted observations; this ledger
 //! preserves immutable original identity (before-revisions are retained
 //! and reconciliation appends a link instead of rewriting), so anchors
@@ -80,6 +109,9 @@ pub(crate) enum ChangeMonitorError {
     UnknownChange,
     /// Reconciliation evidence does not prove the exact recorded transition.
     TransitionMismatch,
+    /// A persisted ledger snapshot is malformed, versioned unknown, or
+    /// fails shape validation, so nothing in it is admitted.
+    InvalidSnapshot,
 }
 
 impl std::fmt::Display for ChangeMonitorError {
@@ -96,6 +128,7 @@ impl std::fmt::Display for ChangeMonitorError {
             Self::OperationReuse => "change_monitor_operation_reuse",
             Self::UnknownChange => "change_monitor_unknown_change",
             Self::TransitionMismatch => "change_monitor_transition_mismatch",
+            Self::InvalidSnapshot => "change_monitor_invalid_snapshot",
         };
         f.write_str(code)
     }
@@ -114,7 +147,7 @@ impl std::error::Error for ChangeMonitorError {}
 /// read-only (see [`GitReadback`]) and performs no porcelain status, so a
 /// filesystem-sourced transition surfaces as an unknown-origin Material
 /// change on real content evidence, never as an invented repository claim.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum HintOrigin {
     HostEvent,
     FilesystemNotification,
@@ -127,7 +160,7 @@ pub(crate) enum HintOrigin {
 /// ingests each governed tool operation as a host-event hint;
 /// [`observe_filesystem_notification`] ingests each received OS filesystem
 /// notification as a filesystem hint with real Git-substrate evidence.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct KernelChangeHint {
     pub hint_id: String,
     pub resource: String,
@@ -243,7 +276,7 @@ pub(crate) enum HintAdmission {
 /// Outcome of confirming one hint: either the re-read proves no Material
 /// transition, or a Material transition was recorded (with whether
 /// matching governed evidence already reconciled it).
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum HintConfirmation {
     VerifiedImmaterial,
     MaterialRecorded { change_id: String, reconciled: bool },
@@ -256,13 +289,13 @@ pub(crate) enum GovernedAdmission {
     Replayed,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct HintEntry {
     hint: KernelChangeHint,
     confirmation: Option<HintConfirmation>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct GovernedChangeRecord {
     resource: String,
     path: String,
@@ -280,7 +313,7 @@ struct GovernedChangeRecord {
     fence_invalidated: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct UnknownOriginRecord {
     resource: String,
     before_digest: Option<String>,
@@ -289,7 +322,7 @@ struct UnknownOriginRecord {
     reconciled: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct UnknownReconciliation {
     unknown_change_id: String,
     evidence_change_id: String,
@@ -302,15 +335,330 @@ struct KernelChangeLedger {
     governed_by_operation: BTreeMap<String, String>,
     unknown: BTreeMap<String, UnknownOriginRecord>,
     reconciliations: Vec<UnknownReconciliation>,
+    /// Set only when the persisted snapshot the ledger hydrated from is
+    /// present but unusable. A poisoned ledger fails closed: every typed
+    /// operation returns [`ChangeMonitorError::LedgerPoisoned`] and the
+    /// acceptance queries report blocked.
+    poisoned: bool,
+}
+
+impl KernelChangeLedger {
+    fn poisoned() -> Self {
+        Self {
+            poisoned: true,
+            ..Self::default()
+        }
+    }
+}
+
+/// Durable image of the Kernel-owned ledger: every immutable admitted
+/// observation, and nothing derived. Hints carry their admitted
+/// confirmations (a pending hint is `confirmation: None`); governed,
+/// unknown-origin, and reconciliation entries are the exact records the
+/// live paths admitted. Derived state — the operation index and every
+/// `reconciled` flag — is recomputed by [`rebuild_from_snapshot`], never
+/// trusted from these bytes.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ChangeMonitorSnapshot {
+    version: u32,
+    hints: BTreeMap<String, HintEntry>,
+    governed: BTreeMap<String, GovernedChangeRecord>,
+    governed_by_operation: BTreeMap<String, String>,
+    unknown: BTreeMap<String, UnknownOriginRecord>,
+    reconciliations: Vec<UnknownReconciliation>,
+}
+
+/// Snapshot schema version this binary rebuilds. A snapshot stamped with
+/// any other version is refused with [`ChangeMonitorError::InvalidSnapshot`]:
+/// its schema is unknown here, so admitting it would be invention.
+const LEDGER_SNAPSHOT_VERSION: u32 = 1;
+
+/// Explicit snapshot file this process persists to and hydrates from, set
+/// by the host operator alongside the other `ELIOT_KERNEL_*` roots. `None`
+/// (unset or blank) keeps the ledger purely in-memory.
+fn snapshot_path() -> Option<std::path::PathBuf> {
+    match std::env::var("ELIOT_KERNEL_CHANGE_LEDGER_SNAPSHOT") {
+        Ok(path) if !path.trim().is_empty() => Some(std::path::PathBuf::from(path)),
+        _ => None,
+    }
+}
+
+fn snapshot_from_ledger(ledger: &KernelChangeLedger) -> ChangeMonitorSnapshot {
+    ChangeMonitorSnapshot {
+        version: LEDGER_SNAPSHOT_VERSION,
+        hints: ledger.hints.clone(),
+        governed: ledger.governed.clone(),
+        governed_by_operation: ledger.governed_by_operation.clone(),
+        unknown: ledger.unknown.clone(),
+        reconciliations: ledger.reconciliations.clone(),
+    }
+}
+
+/// Persists the ledger image after a mutation. Best-effort by contract: a
+/// persistence failure never converts an admitted ledger result into an
+/// error, and an unset snapshot path persists nothing.
+fn persist_ledger_best_effort(ledger: &KernelChangeLedger) {
+    if ledger.poisoned {
+        return;
+    }
+    let Some(path) = snapshot_path() else {
+        return;
+    };
+    let snapshot = snapshot_from_ledger(ledger);
+    let Ok(bytes) = serde_json::to_vec(&snapshot) else {
+        return;
+    };
+    let _ = std::fs::write(path, bytes);
+}
+
+/// Rebuilds a live ledger from a snapshot image (I10.21 AUD3): pending
+/// hints and unreconciled unknown-origin blockers survive restart because
+/// they are admitted data, restored as-is, while every derived flag is
+/// recomputed from immutable evidence. A hint confirmation naming an
+/// unknown-origin change the image does not carry is dropped to pending
+/// (fail-closed block) rather than trusted; an unknown-origin record is
+/// `reconciled` only when a governed record proves the exact same
+/// resource transition or a reconciliation link proven below names it;
+/// reconciliation links that prove nothing against the installed maps are
+/// dropped instead of replayed. Any shape violation refuses the whole
+/// image with [`ChangeMonitorError::InvalidSnapshot`]: a half-admitted
+/// snapshot would be a silent coverage change.
+fn rebuild_from_snapshot(
+    snapshot: &ChangeMonitorSnapshot,
+) -> Result<KernelChangeLedger, ChangeMonitorError> {
+    if snapshot.version != LEDGER_SNAPSHOT_VERSION {
+        return Err(ChangeMonitorError::InvalidSnapshot);
+    }
+    let mut ledger = KernelChangeLedger::default();
+    for (hint_id, entry) in &snapshot.hints {
+        validate_hint(&entry.hint).map_err(|_| ChangeMonitorError::InvalidSnapshot)?;
+        if entry.hint.hint_id != *hint_id {
+            return Err(ChangeMonitorError::InvalidSnapshot);
+        }
+        if let Some(HintConfirmation::MaterialRecorded { change_id, .. }) = &entry.confirmation {
+            expect_material_change_id(&entry.hint.hint_id, change_id)?;
+        }
+        ledger.hints.insert(hint_id.clone(), entry.clone());
+    }
+    for (change_id, record) in &snapshot.governed {
+        validate_snapshot_governed_record(change_id, record)?;
+        if let Some(bound) = ledger.governed_by_operation.get(&record.operation)
+            && *bound != *change_id
+        {
+            return Err(ChangeMonitorError::InvalidSnapshot);
+        }
+        ledger
+            .governed_by_operation
+            .insert(record.operation.clone(), change_id.clone());
+        ledger.governed.insert(change_id.clone(), record.clone());
+    }
+    // The stored operation index is derived data: it must equal the index
+    // rebuilt from the governed records above, or the image was tampered
+    // with and nothing in it is admitted.
+    if snapshot.governed_by_operation != ledger.governed_by_operation {
+        return Err(ChangeMonitorError::InvalidSnapshot);
+    }
+    for (change_id, unknown) in &snapshot.unknown {
+        validate_snapshot_unknown_record(change_id, unknown)?;
+        ledger.unknown.insert(
+            change_id.clone(),
+            UnknownOriginRecord {
+                reconciled: false,
+                ..unknown.clone()
+            },
+        );
+    }
+    for link in &snapshot.reconciliations {
+        if !text(&link.unknown_change_id) || !text(&link.evidence_change_id) {
+            return Err(ChangeMonitorError::InvalidSnapshot);
+        }
+        let Some(unknown) = ledger.unknown.get(&link.unknown_change_id) else {
+            continue;
+        };
+        let transition_link = link
+            .evidence_change_id
+            .strip_prefix("transition:")
+            .is_some_and(|digest| digest == unknown.transition_digest.as_str());
+        let governed_link = ledger
+            .governed
+            .get(&link.evidence_change_id)
+            .is_some_and(|evidence| {
+                let (_, transition) = material_transition_ids(
+                    &link.evidence_change_id,
+                    evidence.before_digest.as_deref(),
+                    evidence.after_digest.as_deref(),
+                );
+                evidence.resource == unknown.resource && transition == unknown.transition_digest
+            });
+        if !transition_link && !governed_link {
+            continue;
+        }
+        if let Some(unknown) = ledger.unknown.get_mut(&link.unknown_change_id) {
+            unknown.reconciled = true;
+        }
+        ledger.reconciliations.push(link.clone());
+    }
+    let auto_reconciled: Vec<String> = ledger
+        .unknown
+        .iter()
+        .filter(|(_, unknown)| {
+            !unknown.reconciled
+                && ledger.governed.values().any(|evidence| {
+                    evidence.resource == unknown.resource
+                        && evidence.before_digest == unknown.before_digest
+                        && evidence.after_digest == unknown.after_digest
+                })
+        })
+        .map(|(change_id, _)| change_id.clone())
+        .collect();
+    for change_id in auto_reconciled {
+        if let Some(unknown) = ledger.unknown.get_mut(&change_id) {
+            unknown.reconciled = true;
+        }
+    }
+    for entry in ledger.hints.values_mut() {
+        let Some(HintConfirmation::MaterialRecorded { change_id, .. }) = entry.confirmation.clone()
+        else {
+            continue;
+        };
+        entry.confirmation = match ledger.unknown.get(&change_id) {
+            Some(unknown) => Some(HintConfirmation::MaterialRecorded {
+                change_id,
+                reconciled: unknown.reconciled,
+            }),
+            None => None,
+        };
+    }
+    Ok(ledger)
+}
+
+/// Checks that a snapshot change identity names a Material transition of
+/// exactly the hint that observed it: the `cmu:{hint}:{transition}` shape
+/// with a 64-hex transition digest.
+fn expect_material_change_id(hint_id: &str, change_id: &str) -> Result<(), ChangeMonitorError> {
+    let invalid = || ChangeMonitorError::InvalidSnapshot;
+    let rest = change_id.strip_prefix("cmu:").ok_or_else(invalid)?;
+    let (owner, transition) = rest.rsplit_once(':').ok_or_else(invalid)?;
+    if owner != hint_id || !is_sha256_hex(transition) {
+        return Err(ChangeMonitorError::InvalidSnapshot);
+    }
+    Ok(())
+}
+
+fn validate_snapshot_governed_record(
+    change_id: &str,
+    record: &GovernedChangeRecord,
+) -> Result<(), ChangeMonitorError> {
+    if !text(change_id)
+        || !text(&record.resource)
+        || !validate_relative_path(&record.path)
+        || !text(&record.session)
+        || !text(&record.action_lease)
+        || !text(&record.operation)
+        || !text(&record.attempt_receipt)
+        || !text(&record.diff_handle)
+    {
+        return Err(ChangeMonitorError::InvalidSnapshot);
+    }
+    if let Some(before_path) = &record.before_path
+        && !validate_relative_path(before_path)
+    {
+        return Err(ChangeMonitorError::InvalidSnapshot);
+    }
+    for revision in [&record.before_revision, &record.after_revision]
+        .into_iter()
+        .flatten()
+    {
+        if !text(revision) {
+            return Err(ChangeMonitorError::InvalidSnapshot);
+        }
+    }
+    let (Some(before_digest), Some(after_digest)) = (&record.before_digest, &record.after_digest)
+    else {
+        return Err(ChangeMonitorError::InvalidSnapshot);
+    };
+    if !is_sha256_hex(before_digest) || !is_sha256_hex(after_digest) || before_digest == after_digest
+    {
+        return Err(ChangeMonitorError::InvalidSnapshot);
+    }
+    let (_, transition) = material_transition_ids(
+        change_id,
+        Some(before_digest.as_str()),
+        Some(after_digest.as_str()),
+    );
+    if record.diff_handle != transition {
+        return Err(ChangeMonitorError::InvalidSnapshot);
+    }
+    Ok(())
+}
+
+fn validate_snapshot_unknown_record(
+    change_id: &str,
+    unknown: &UnknownOriginRecord,
+) -> Result<(), ChangeMonitorError> {
+    let invalid = || ChangeMonitorError::InvalidSnapshot;
+    if !text(&unknown.resource) {
+        return Err(ChangeMonitorError::InvalidSnapshot);
+    }
+    let Some(after_digest) = unknown.after_digest.as_deref() else {
+        return Err(ChangeMonitorError::InvalidSnapshot);
+    };
+    if !is_sha256_hex(after_digest) {
+        return Err(ChangeMonitorError::InvalidSnapshot);
+    }
+    if let Some(before_digest) = unknown.before_digest.as_deref() {
+        if !is_sha256_hex(before_digest) || before_digest == after_digest {
+            return Err(ChangeMonitorError::InvalidSnapshot);
+        }
+    }
+    let rest = change_id.strip_prefix("cmu:").ok_or_else(invalid)?;
+    let (owner, transition) = rest.rsplit_once(':').ok_or_else(invalid)?;
+    let (expected_id, expected_transition) = material_transition_ids(
+        owner,
+        unknown.before_digest.as_deref(),
+        unknown.after_digest.as_deref(),
+    );
+    if expected_id != change_id
+        || expected_transition != unknown.transition_digest
+        || !is_sha256_hex(transition)
+    {
+        return Err(ChangeMonitorError::InvalidSnapshot);
+    }
+    Ok(())
+}
+
+/// Hydrates the process-local ledger once per process. No snapshot path
+/// (or a missing file on first launch) starts empty: there are no admitted
+/// observations yet, so there is nothing to rebuild. Present-but-unusable
+/// bytes poison the ledger instead of starting silently uncovered.
+fn load_persisted_ledger() -> KernelChangeLedger {
+    let Some(path) = snapshot_path() else {
+        return KernelChangeLedger::default();
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(_) => return KernelChangeLedger::default(),
+    };
+    match serde_json::from_slice::<ChangeMonitorSnapshot>(&bytes) {
+        Ok(snapshot) => match rebuild_from_snapshot(&snapshot) {
+            Ok(ledger) => ledger,
+            Err(_) => KernelChangeLedger::poisoned(),
+        },
+        Err(_) => KernelChangeLedger::poisoned(),
+    }
 }
 
 static CHANGE_LEDGER: OnceLock<Mutex<KernelChangeLedger>> = OnceLock::new();
 
 fn ledger() -> Result<std::sync::MutexGuard<'static, KernelChangeLedger>, ChangeMonitorError> {
-    CHANGE_LEDGER
-        .get_or_init(|| Mutex::new(KernelChangeLedger::default()))
+    let guard = CHANGE_LEDGER
+        .get_or_init(|| Mutex::new(load_persisted_ledger()))
         .lock()
-        .map_err(|_| ChangeMonitorError::LedgerPoisoned)
+        .map_err(|_| ChangeMonitorError::LedgerPoisoned)?;
+    if guard.poisoned {
+        return Err(ChangeMonitorError::LedgerPoisoned);
+    }
+    Ok(guard)
 }
 
 fn text(value: &str) -> bool {
@@ -409,6 +757,79 @@ pub(crate) fn filesystem_hint_id(artifact_digest: &str, before_digest: &str) -> 
     format!("cmf:{artifact_digest}:{before_digest}")
 }
 
+/// Observes one external uncorrelated transition for a tracked resource
+/// with no retained baseline (I10.21 A2, AUD3): a mutation before the
+/// first launch, during Kernel downtime, or to a file this gateway never
+/// launched, so no previous digest exists to compare against. The absent
+/// baseline is admitted as absence (`before_digest: None`), never filled
+/// in with an invented digest. With caller-supplied Git-substrate evidence
+/// the confirmation takes the Material branch and emits an unknown-origin
+/// Material change that blocks governed acceptance until reconciled.
+/// Without it the ledger refuses with
+/// [`ChangeMonitorError::InvalidGitEvidence`] — the AUD2 guarantee that a
+/// `FilesystemNotification` never confirms on content polling alone — and
+/// the hint stays pending, which still blocks acceptance fail-closed
+/// instead of silently accepting. The hint identity binds the lane-stable
+/// artifact digest to the exact after digest, so an identical re-read of
+/// the same bytes replays the same hint and confirmation instead of
+/// emitting a duplicate, while a further mutation from those bytes is a
+/// new hint. A recorded governed change can never pre-reconcile this
+/// transition (governed records always carry both digests); only an
+/// explicit [`reconcile_unknown_change`] against the exact transition
+/// clears the block.
+///
+/// Caller (I10.21 A2): `crate::process_execution::KernelGovernedProcessEffectPort`,
+/// on any readback lane that observes tracked bytes without a retained
+/// previous digest for them.
+pub(crate) fn observe_unbaselined_external_transition(
+    resource: &str,
+    path: &str,
+    artifact_digest: &str,
+    after_digest: &str,
+    origin_ref: Option<&str>,
+    git: Option<GitReadback>,
+) -> Result<HintConfirmation, ChangeMonitorError> {
+    if !text(resource) || !validate_relative_path(path) || !text(artifact_digest) {
+        return Err(ChangeMonitorError::InvalidHint);
+    }
+    if !is_sha256_hex(after_digest) {
+        return Err(ChangeMonitorError::InvalidHint);
+    }
+    if let Some(origin_ref) = origin_ref
+        && !text(origin_ref)
+    {
+        return Err(ChangeMonitorError::InvalidHint);
+    }
+    let hint_id = format!("cmf:{artifact_digest}:unbaselined:{after_digest}");
+    let hint = KernelChangeHint {
+        hint_id: hint_id.clone(),
+        resource: resource.to_owned(),
+        path: path.to_owned(),
+        origin: HintOrigin::FilesystemNotification,
+        origin_ref: origin_ref.map(str::to_owned),
+    };
+    match ingest_hint(hint) {
+        Ok(_) => {}
+        // Same transition identity, attribution-only difference: the hint
+        // identity already binds resource, path, artifact, and after
+        // digest, so confirmation below is deterministic for either
+        // attribution ref.
+        Err(ChangeMonitorError::HintConflict) => {}
+        Err(error) => return Err(error),
+    }
+    let verification = HintVerification {
+        before_digest: None,
+        first_read: ContentRead::Present {
+            sha256: after_digest.to_owned(),
+        },
+        reread: ContentRead::Present {
+            sha256: after_digest.to_owned(),
+        },
+        git,
+    };
+    confirm_hint(&hint_id, &verification)
+}
+
 /// Ingests one untrusted hint as a pending re-check (I10.21 W2,
 /// first half). A pending hint is not a Material observation, but it blocks
 /// governed acceptance until a verified readback resolves it.
@@ -430,6 +851,7 @@ pub(crate) fn ingest_hint(hint: KernelChangeHint) -> Result<HintAdmission, Chang
             confirmation: None,
         },
     );
+    persist_ledger_best_effort(&ledger);
     Ok(HintAdmission::Accepted)
 }
 
@@ -513,6 +935,7 @@ pub(crate) fn confirm_hint(
             .get_mut(hint_id)
             .ok_or(ChangeMonitorError::UnknownHint)?;
         entry.confirmation = Some(HintConfirmation::VerifiedImmaterial);
+        persist_ledger_best_effort(&ledger);
         return Ok(HintConfirmation::VerifiedImmaterial);
     }
     let evidence_id = ledger
@@ -559,6 +982,7 @@ pub(crate) fn confirm_hint(
         change_id: change_id.clone(),
         reconciled,
     });
+    persist_ledger_best_effort(&ledger);
     Ok(HintConfirmation::MaterialRecorded {
         change_id,
         reconciled,
@@ -866,6 +1290,7 @@ pub(crate) fn record_governed_tool_change(
             evidence_change_id: evidence_id,
         });
     }
+    persist_ledger_best_effort(&ledger);
     Ok(GovernedAdmission::Accepted)
 }
 
@@ -901,6 +1326,7 @@ pub(crate) fn reconcile_unknown_change(
         unknown_change_id: change_id.to_owned(),
         evidence_change_id: format!("transition:{evidence_transition_digest}"),
     });
+    persist_ledger_best_effort(&ledger);
     Ok(())
 }
 
