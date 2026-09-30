@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use eliot_platform::{PortError, PortOutcome, ProviderError, ProviderErrorCode, UnknownReason};
 use eliot_platform_windows::{
-    AuthenticodeVerdict, FileIdentity, PackageManifest, PackageStager, PackageStagingError,
-    PackageStagingObservation, PackageStagingStage, StagePackageAuthorization,
+    AuthenticodeVerdict, FileIdentity, InstallerRootProfile, PackageManifest, PackageStager,
+    PackageStagingError, PackageStagingObservation, PackageStagingStage, StagePackageAuthorization,
     StagePackageExpectedFile, StagingReceipt, TrustedSourceBundle,
 };
 use schemars::JsonSchema;
@@ -27,6 +27,14 @@ pub(super) fn package_plan_error(error: &PackageStagingError) -> InstallationErr
     }
 }
 
+fn package_staging_profile(profile: super::InstallationProfile) -> InstallerRootProfile {
+    match profile {
+        super::InstallationProfile::SystemService => InstallerRootProfile::SystemService,
+        super::InstallationProfile::UserMode => InstallerRootProfile::UserMode,
+        super::InstallationProfile::PortableDev => InstallerRootProfile::PortableDev,
+    }
+}
+
 pub(super) fn validate_package_relative_text(
     value: &str,
     field: &str,
@@ -39,6 +47,10 @@ pub(super) fn validate_package_relative_text(
         })
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the candidate package and effect ordering are checked in one binding gate"
+)]
 pub(super) fn validate_package_binding(
     candidate_manifest: &CandidateManifest,
     transaction_staging_root: &PlatformHandle,
@@ -63,6 +75,7 @@ pub(super) fn validate_package_binding(
             generation,
             manifest,
             staging_root,
+            destination_root,
             candidate_manifest_digest: bound_manifest_digest,
             package_manifest_digest: bound_package_manifest_digest,
             ..
@@ -79,6 +92,28 @@ pub(super) fn validate_package_binding(
         }
         if !same_windows_root(staging_root.as_str(), transaction_staging_root.as_str())? {
             return Err(InstallationError::IdentityConflict);
+        }
+        let expected_destination = candidate_manifest
+            .runtime_launch
+            .profile_governed_roots
+            .immutable_binaries
+            .as_str();
+        if let Some(destination_root) = destination_root {
+            if !same_windows_root(destination_root.as_str(), expected_destination)? {
+                return Err(InstallationError::ProfileViolation(
+                    "StagePackage destination must equal the candidate's selected immutable_binaries root"
+                        .to_owned(),
+                ));
+            }
+        } else if !same_windows_root(
+            &Path::new(staging_root.as_str())
+                .join(&manifest.generation)
+                .to_string_lossy(),
+            expected_destination,
+        )? {
+            return Err(InstallationError::IncompleteObservation(
+                "profile-bound StagePackage must retain its exact immutable destination".to_owned(),
+            ));
         }
         let validated_package_manifest =
             PackageManifest::new(&manifest.generation, manifest.files.clone())
@@ -137,6 +172,7 @@ pub(super) fn validate_staging_receipt_for_plan(
     let InstallerEffectPlan::StagePackage {
         manifest,
         staging_root,
+        destination_root,
         expected_file_digests,
         ..
     } = effect
@@ -150,7 +186,10 @@ pub(super) fn validate_staging_receipt_for_plan(
     {
         return Err(InstallationError::IdentityConflict);
     }
-    let expected_root = Path::new(staging_root.as_str()).join(&manifest.generation);
+    let expected_root = destination_root.as_ref().map_or_else(
+        || Path::new(staging_root.as_str()).join(&manifest.generation),
+        |root| PathBuf::from(root.as_str()),
+    );
     if !eliot_platform_windows::windows_paths_equal(&receipt.root_path, &expected_root) {
         return Err(InstallationError::IdentityConflict);
     }
@@ -408,6 +447,7 @@ fn package_stager(
         source_bundle_identity,
         manifest,
         staging_root,
+        destination_root,
         ..
     } = &request.plan
     else {
@@ -417,19 +457,30 @@ fn package_stager(
     if source.identity() != *source_bundle_identity {
         return Err(PackageStagingError::IdentityMismatch);
     }
-    let stager = PackageStager::open(source, Path::new(staging_root.as_str()))?;
+    let profile = package_staging_profile(request.profile);
+    let stager = match destination_root {
+        Some(destination_root) => PackageStager::open_for_profile_destination(
+            source,
+            Path::new(staging_root.as_str()),
+            Path::new(destination_root.as_str()),
+            profile,
+        )?,
+        None => PackageStager::open_for_profile(source, Path::new(staging_root.as_str()), profile)?,
+    };
     Ok((stager, manifest.clone()))
 }
 
 fn stage_package_authorization(
     request: &InstallationEffectRequest,
     installation_root_identity: Option<FileIdentity>,
+    destination_parent_identity: Option<FileIdentity>,
 ) -> Result<StagePackageAuthorization, PackageStagingError> {
     let InstallerEffectPlan::StagePackage {
         source_bundle_identity,
         generation,
         manifest,
         staging_root,
+        destination_root,
         ..
     } = &request.plan
     else {
@@ -471,7 +522,11 @@ fn stage_package_authorization(
         source_bundle_identity: *source_bundle_identity,
         source_snapshot_digest: snapshot.digest.as_str().to_owned(),
         staging_root: PathBuf::from(staging_root.as_str()),
+        destination_root: destination_root
+            .as_ref()
+            .map(|root| PathBuf::from(root.as_str())),
         installation_root_identity,
+        destination_parent_identity,
         generation: generation.as_str().to_owned(),
         manifest_sha256: manifest.canonical_digest(),
         marker_nonce,
@@ -956,6 +1011,7 @@ pub(super) fn reconcile_package(
         package_manifest_digest,
         manifest,
         staging_root,
+        destination_root,
         ..
     } = &request.plan
     else {
@@ -982,10 +1038,20 @@ pub(super) fn reconcile_package(
             .map_err(|_| PackageStagingError::IdentityMismatch)?;
         validate_staging_receipt_for_observation(persisted, receipt)
             .map_err(|_| PackageStagingError::IdentityMismatch)?;
-        return match PackageStager::reconcile_destination_only(
-            Path::new(staging_root.as_str()),
-            receipt,
-        )? {
+        let observation = if let Some(destination_root) = destination_root {
+            PackageStager::reconcile_profile_destination_only(
+                Path::new(destination_root.as_str()),
+                receipt,
+                package_staging_profile(request.profile),
+            )?
+        } else {
+            PackageStager::reconcile_profile_root_destination_only(
+                Path::new(staging_root.as_str()),
+                receipt,
+                package_staging_profile(request.profile),
+            )?
+        };
+        return match observation {
             PackageStagingObservation::Absent => Ok(package_absent_observation(request)),
             PackageStagingObservation::Matching(receipt) => {
                 package_matching_observation(request, receipt)
@@ -1004,12 +1070,13 @@ pub(super) fn reconcile_package(
         ownership.create_disposition == InstallationCreateDisposition::Created
             && ownership.lifecycle != InstallationSecretLifecycle::Deleted
     }) {
-        let authorization = stage_package_authorization(request, None)?;
-        return match PackageStager::reconcile_prepared_destination_only(
+        let authorization = stage_package_authorization(request, None, None)?;
+        return match PackageStager::reconcile_prepared_profile_destination_only(
             Path::new(staging_root.as_str()),
             manifest,
             &authorization,
             ownership_key,
+            package_staging_profile(request.profile),
         )? {
             PackageStagingObservation::Absent => Ok(package_absent_observation(request)),
             PackageStagingObservation::Matching(receipt) => {
@@ -1069,6 +1136,7 @@ pub(super) fn execute_package(
         package_manifest_digest,
         manifest,
         staging_root,
+        destination_root,
         ..
     } = &request.plan
     else {
@@ -1091,10 +1159,20 @@ pub(super) fn execute_package(
             if request.expected_external_identity.as_ref() != Some(&expected_external_identity) {
                 return PortOutcome::Unknown(UnknownReason::Indeterminate);
             }
-            match PackageStager::rollback_destination_only(
-                Path::new(staging_root.as_str()),
-                receipt,
-            ) {
+            let rollback = if let Some(destination_root) = destination_root {
+                PackageStager::rollback_profile_destination_only(
+                    Path::new(destination_root.as_str()),
+                    receipt,
+                    package_staging_profile(request.profile),
+                )
+            } else {
+                PackageStager::rollback_profile_root_destination_only(
+                    Path::new(staging_root.as_str()),
+                    receipt,
+                    package_staging_profile(request.profile),
+                )
+            };
+            match rollback {
                 Ok(()) => PortOutcome::Known(InstallationEffectExecution {
                     evidence: vec![
                         PlatformHandle::new(sha256_hex(
@@ -1127,9 +1205,11 @@ pub(super) fn execute_package(
             if snapshot.source_bundle_identity != stager.source().identity() {
                 return PortOutcome::Unknown(UnknownReason::Indeterminate);
             }
-            let Ok(authorization) =
-                stage_package_authorization(request, Some(stager.installation_root_identity()))
-            else {
+            let Ok(authorization) = stage_package_authorization(
+                request,
+                Some(stager.installation_root_identity()),
+                stager.destination_parent_identity(),
+            ) else {
                 return PortOutcome::Unknown(UnknownReason::Indeterminate);
             };
             match stager.stage_authorized(manifest, &authorization, ownership_key) {
@@ -1137,10 +1217,20 @@ pub(super) fn execute_package(
                     if validate_staging_receipt_for_plan(&request.plan, &receipt).is_err()
                         || validate_staging_receipt_for_observation(snapshot, &receipt).is_err()
                     {
-                        return match PackageStager::rollback_destination_only(
-                            Path::new(staging_root.as_str()),
-                            &receipt,
-                        ) {
+                        let rollback = if let Some(destination_root) = destination_root {
+                            PackageStager::rollback_profile_destination_only(
+                                Path::new(destination_root.as_str()),
+                                &receipt,
+                                package_staging_profile(request.profile),
+                            )
+                        } else {
+                            PackageStager::rollback_profile_root_destination_only(
+                                Path::new(staging_root.as_str()),
+                                &receipt,
+                                package_staging_profile(request.profile),
+                            )
+                        };
+                        return match rollback {
                             Ok(()) => PortOutcome::Error(PortError::IdentityConflict),
                             Err(_) => PortOutcome::Unknown(UnknownReason::Indeterminate),
                         };
