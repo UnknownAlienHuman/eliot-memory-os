@@ -157,7 +157,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_canonical::CanonicalWriteEnvelope;
 use eliot_contracts::{
-    ArtifactId, ClockReading, OperationId, StateFence, canonical_json_bytes, sha256_hex,
+    ArtifactId, ClockReading, OperationId, SessionId, StateFence, canonical_json_bytes, sha256_hex,
 };
 use eliot_doctor_core::{IndependentVerification, VerificationReport};
 use eliot_observation::{
@@ -173,20 +173,434 @@ use eliot_problem::{
     SignalSeverity,
 };
 use eliot_receipts::WorkScopeId;
+use eliot_security_contracts::{InstructionTaint, PrivacyClass};
 use eliot_store_api::{
     CONTRACT_VERSION, EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
     NamedMutationRequest, NamedOperationManifest, OperationManifestDigest, OrderingHeadExpectation,
     OrderingScopeId, RevisionHeadExpectation, RevisionKey, ScopeId, SecurityContext,
     TransitionClass, WriteReceipt, WriteReceiptStatus,
 };
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 use crate::problem_owner_transitions::{
     ProblemOwnerTransitionOutcome, ProblemOwnerTransitionRequest, prepare_problem_owner_transition,
 };
 use crate::{
     CanonicalAdmissionOwner, CompositionError, CompositionReadiness, KernelPortError,
-    KernelTransitionPort,
+    FinishAttemptError, KernelTransitionPort, PolicyOwner, TaskSelectionAdmissionBinding,
 };
+
+/// Exact current observation-ingress policy retained from the admitted
+/// configuration owner's signed/canonical policy snapshot.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationIngressPolicyBinding {
+    /// Closed policy selected by the configuration owner.
+    pub policy: eliot_config::ObservationIngressPolicy,
+    /// Original configuration snapshot identity.
+    pub snapshot_id: String,
+    /// Complete immutable configuration snapshot returned by the Policy owner.
+    pub config_policy_snapshot: eliot_config::ConfigPolicySnapshot,
+    /// Actual setting key from the original snapshot.
+    pub setting_key: String,
+    /// Exact source value reference from the original setting.
+    pub setting_value_ref: String,
+    /// Original owner reference on the actual setting.
+    pub setting_owner_ref: String,
+    /// Original durable Policy owner revision.
+    pub policy_revision: u64,
+    /// Exact State Fence carried by the recovered Policy owner.
+    pub state_fence: StateFence,
+    /// Canonical digest returned by the validated Kernel named read.
+    pub canonical_read_digest: String,
+    /// Snapshot digest retained from the validated owner record.
+    pub snapshot_digest: String,
+}
+
+/// Exact WorkScope and Policy owner bindings returned before observation
+/// payload staging. Every digest and revision is copied from its named-read
+/// owner reply or validated owner payload; this projection creates no receipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ObservationCaptureOwnerBinding {
+    /// Wire version for this typed owner projection.
+    pub wire_version: u16,
+    /// Principal authenticated by Kernel and matched to the current Session owner.
+    pub authenticated_principal_ref: String,
+    /// Session authenticated by Kernel and matched to the current Session owner.
+    pub authenticated_session_ref: String,
+    /// Task supplied by the authenticated request, absent for a cold capture.
+    pub authenticated_task_ref: Option<String>,
+    /// Current independently read WorkScope identity.
+    pub authenticated_scope_ref: String,
+    /// Request State Fence at which both named owners were read.
+    pub state_fence: StateFence,
+    /// Original durable Policy owner revision.
+    pub policy_owner_revision: u64,
+    /// Exact Policy named-read revision.
+    pub policy_read_revision: u64,
+    /// Fence from the Policy named-read owner reply.
+    pub policy_read_fence: StateFence,
+    /// Digest from the Policy named-read owner reply.
+    pub policy_named_read_digest: String,
+    /// Exact full Policy snapshot decoded from the canonical owner reply.
+    pub config_policy_snapshot: eliot_config::ConfigPolicySnapshot,
+    /// Snapshot digest retained from the validated Policy owner record.
+    pub config_policy_snapshot_sha256: String,
+    /// Actual Observation ingress setting key.
+    pub ingress_setting_key: String,
+    /// Exact value reference from the actual setting record.
+    pub ingress_setting_value_ref: String,
+    /// Original owner reference on the actual setting record.
+    pub ingress_setting_owner_ref: String,
+    /// Exact WorkScope named-read revision.
+    pub work_scope_owner_revision: u64,
+    /// Exact WorkScope named-read revision.
+    pub work_scope_read_revision: u64,
+    /// Fence from the WorkScope named-read owner reply.
+    pub work_scope_read_fence: StateFence,
+    /// Digest from the WorkScope named-read owner reply.
+    pub work_scope_canonical_read_digest: String,
+    /// Complete exact WorkScope owner snapshot from the named read.
+    pub work_scope_binding: eliot_workscope::WorkScopeBindingSnapshot,
+    /// Exact digest of the WorkScope named-read payload, copied unchanged.
+    pub work_scope_binding_sha256: String,
+    /// Closed enum decoded from the actual Policy setting.
+    pub policy: serde_json::Value,
+    /// WorkScope privacy and the visibility admitted by the explicit policy.
+    pub access: ObservationCapturePolicyAccess,
+}
+
+impl ObservationCaptureOwnerBinding {
+    /// Validates the exact source joins without recomputing named-read digests.
+    pub fn validate(&self) -> Result<(), CompositionError> {
+        if self.wire_version != 1
+            || self.authenticated_principal_ref.trim().is_empty()
+            || self.authenticated_principal_ref.chars().any(char::is_control)
+            || self.authenticated_session_ref.trim().is_empty()
+            || self.authenticated_session_ref.chars().any(char::is_control)
+            || self.authenticated_task_ref.as_ref().is_some_and(|task_ref| {
+                task_ref.trim().is_empty() || task_ref.chars().any(char::is_control)
+            })
+            || self.authenticated_scope_ref.trim().is_empty()
+            || self.authenticated_scope_ref.chars().any(char::is_control)
+            || self.policy_owner_revision == 0
+            || self.policy_read_revision != self.policy_owner_revision
+            || self.work_scope_owner_revision == 0
+            || self.work_scope_read_revision != self.work_scope_owner_revision
+        {
+            return Err(CompositionError::Recovery(
+                "Observation owner binding has invalid identity or revision joins".to_owned(),
+            ));
+        }
+        self.state_fence
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        self.config_policy_snapshot
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        self.work_scope_binding
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if self.policy_read_fence != self.state_fence
+            || self.work_scope_read_fence != self.state_fence
+            || self.config_policy_snapshot.state_fence != self.state_fence
+            || self.config_policy_snapshot.revision.value() != self.policy_read_revision
+            || self.work_scope_binding.state_fence != self.state_fence
+            || self.work_scope_binding.owner_revision != self.work_scope_owner_revision
+            || self.authenticated_scope_ref != self.work_scope_binding.binding.scope.scope_ref
+            || self.access.privacy != self.work_scope_binding.binding.privacy_class
+            || self.access.visibility != ObservationCaptureVisibility::LocalOnly
+            || self.access.instruction_taint != InstructionTaint::CommandLike
+            || !is_sha256(&self.policy_named_read_digest)
+            || !is_sha256(&self.config_policy_snapshot_sha256)
+            || !is_sha256(&self.work_scope_canonical_read_digest)
+            || self.work_scope_binding_sha256 != self.work_scope_canonical_read_digest
+            || self.ingress_setting_key != eliot_config::OBSERVATION_INGRESS_POLICY_KEY
+            || self.ingress_setting_owner_ref != self.config_policy_snapshot.policy_owner.owner_ref
+        {
+            return Err(CompositionError::Recovery(
+                "Observation owner binding does not match its exact named-read owners".to_owned(),
+            ));
+        }
+        let setting = self
+            .config_policy_snapshot
+            .settings
+            .iter()
+            .find(|setting| setting.key == self.ingress_setting_key)
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "Observation owner binding setting is absent from its Policy snapshot"
+                        .to_owned(),
+                )
+            })?;
+        if setting.value_ref != self.ingress_setting_value_ref
+            || setting.owner_ref != self.ingress_setting_owner_ref
+        {
+            return Err(CompositionError::Recovery(
+                "Observation owner binding setting does not match its Policy snapshot".to_owned(),
+            ));
+        }
+        let privacy_setting = self
+            .config_policy_snapshot
+            .settings
+            .iter()
+            .find(|setting| setting.key == eliot_config::PRIVACY_MODE_KEY)
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "Observation owner binding has no explicit privacy choice".to_owned(),
+                )
+            })?;
+        if privacy_setting.owner_ref != self.config_policy_snapshot.policy_owner.owner_ref
+            || eliot_config::PrivacyChoice::parse(
+                privacy_setting
+                    .value_ref
+                    .strip_prefix("literal:")
+                    .ok_or_else(|| {
+                        CompositionError::Recovery(
+                            "Observation privacy choice is not an admitted literal".to_owned(),
+                        )
+                    })?,
+            )
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?
+                != eliot_config::PrivacyChoice::LocalOnly
+        {
+            return Err(CompositionError::Recovery(
+                "Observation owner binding policy conflicts with its LocalOnly source choice"
+                    .to_owned(),
+            ));
+        }
+        let policy: eliot_config::ObservationIngressPolicy =
+            serde_json::from_value(self.policy.clone())
+                .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let value = self
+            .ingress_setting_value_ref
+            .strip_prefix("literal:")
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "Observation ingress policy setting is not a literal value".to_owned(),
+                )
+            })?;
+        if eliot_config::ObservationIngressPolicy::parse(value)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?
+            != policy
+        {
+            return Err(CompositionError::Recovery(
+                "Observation policy value does not match its source setting".to_owned(),
+            ));
+        }
+        if policy != eliot_config::ObservationIngressPolicy::LocalPrivateRetainedCaptureV1 {
+            return Err(CompositionError::Recovery(
+                "Observation policy does not admit local-only visibility".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Serializes the validated typed owner projection for the authenticated
+    /// Kernel readback carrier.
+    pub fn canonical_value(&self) -> Result<serde_json::Value, CompositionError> {
+        self.validate()?;
+        serde_json::to_value(self).map_err(|error| CompositionError::Owner(error.to_string()))
+    }
+
+    /// Returns the SHA-256 of the canonical serialized owner projection.
+    /// The Policy and WorkScope named-read digests inside the projection are
+    /// retained unchanged; this digest binds the projection as a whole.
+    pub fn canonical_digest(&self) -> Result<String, CompositionError> {
+        let value = self.canonical_value()?;
+        let bytes = canonical_json_bytes(&value)
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        Ok(sha256_hex(&bytes))
+    }
+}
+
+/// Owner-derived access policy copied unchanged into the Kernel pre-persistence
+/// readback. Request-specific instruction taint is carried separately from the
+/// actual forwarded source-assurance owner.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationCapturePolicyAccess {
+    /// Privacy classification from the exact current WorkScope owner.
+    pub privacy: PrivacyClass,
+    /// Visibility admitted by the explicit current observation policy.
+    pub visibility: ObservationCaptureVisibility,
+    /// Conservative taint for raw capture bytes with no admitted source
+    /// assurance. This is policy classification, not screening evidence.
+    pub instruction_taint: InstructionTaint,
+}
+
+impl ObservationIngressPolicyBinding {
+    /// Reads the one supported observation policy only from the validated
+    /// current Kernel named-read projection.
+    pub(crate) fn from_policy_owner(owner: &PolicyOwner) -> Result<Self, CompositionError> {
+        let snapshot = owner.snapshot();
+        let setting = snapshot
+            .settings
+            .iter()
+            .find(|setting| setting.key == eliot_config::OBSERVATION_INGRESS_POLICY_KEY)
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "current Policy owner has no admitted Observation ingress policy setting"
+                        .to_owned(),
+                )
+            })?;
+        if setting.owner_ref != snapshot.policy_owner.owner_ref {
+            return Err(CompositionError::Recovery(
+                "Observation ingress policy setting has a foreign original owner".to_owned(),
+            ));
+        }
+        let privacy = snapshot
+            .settings
+            .iter()
+            .find(|setting| setting.key == eliot_config::PRIVACY_MODE_KEY)
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "current Policy owner has no admitted privacy choice".to_owned(),
+                )
+            })?;
+        if privacy.owner_ref != snapshot.policy_owner.owner_ref {
+            return Err(CompositionError::Recovery(
+                "Observation privacy choice has a foreign original owner".to_owned(),
+            ));
+        }
+        let privacy_value = privacy.value_ref.strip_prefix("literal:").ok_or_else(|| {
+            CompositionError::Recovery(
+                "current privacy choice is not an admitted literal setting".to_owned(),
+            )
+        })?;
+        if eliot_config::PrivacyChoice::parse(privacy_value)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?
+            != eliot_config::PrivacyChoice::LocalOnly
+        {
+            return Err(CompositionError::Recovery(
+                "Observation ingress local-private policy conflicts with the admitted privacy choice"
+                    .to_owned(),
+            ));
+        }
+        let value = setting.value_ref.strip_prefix("literal:").ok_or_else(|| {
+            CompositionError::Recovery(
+                "Observation ingress policy setting is not an admitted literal".to_owned(),
+            )
+        })?;
+        let policy = eliot_config::ObservationIngressPolicy::parse(value)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        Ok(Self {
+            policy,
+            snapshot_id: snapshot.snapshot_id.clone(),
+            config_policy_snapshot: snapshot.clone(),
+            setting_key: setting.key.clone(),
+            setting_value_ref: setting.value_ref.clone(),
+            setting_owner_ref: setting.owner_ref.clone(),
+            policy_revision: owner.revision(),
+            state_fence: owner.state_fence().clone(),
+            canonical_read_digest: owner.canonical_digest().to_owned(),
+            snapshot_digest: owner.snapshot_digest().to_owned(),
+        })
+    }
+
+    /// Stable reference to the actual owner setting record.
+    #[must_use]
+    pub fn setting_record_ref(&self) -> String {
+        format!(
+            "config-policy:{}/revision:{}/setting:{}",
+            self.snapshot_id, self.policy_revision, self.setting_key
+        )
+    }
+
+    /// Stable opaque domain identity derived from the actual setting record
+    /// and the independently current WorkScope identity.
+    #[must_use]
+    pub fn privacy_domain_ref(&self, work_scope_ref: &str) -> String {
+        format!("{}/domain/{work_scope_ref}", self.setting_record_ref())
+    }
+
+    /// Stable reference to the retention clause of the actual policy setting.
+    #[must_use]
+    pub fn retention_policy_ref(&self) -> String {
+        format!("{}/retention", self.setting_record_ref())
+    }
+}
+
+/// Recovery access metadata derived before protected persistence. The Kernel
+/// maps this exact value to its ORS `RecoveryAccessClass` without deriving
+/// privacy from source-assurance policy or content labels.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationCaptureAccess {
+    /// Original privacy class read from the current WorkScope owner.
+    pub privacy: PrivacyClass,
+    /// Local-only visibility mandated by the admitted observation policy.
+    pub visibility: ObservationCaptureVisibility,
+    /// Original instruction taint from the admitted source assurance.
+    pub instruction_taint: InstructionTaint,
+}
+
+/// Closed visibility classification carried by the local-only policy.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ObservationCaptureVisibility {
+    /// The capture remains local; no export permission is implied.
+    LocalOnly,
+}
+
+/// Inputs from the exact authenticated Observe claim and its owner reads.
+///
+/// `original_content` is the complete serialized `ObservationContent` object,
+/// including `content`, `affected_resources`, and `source_handles`. The
+/// Governor validates that shape but retains the original value intact.
+#[derive(Clone, Debug)]
+pub struct McpObservationCaptureInput {
+    /// Original request binding authenticated by Kernel.
+    pub identity: eliot_protocol::RequestIdentity,
+    /// Stable operation identity bound to the exact pair claim.
+    pub operation_id: OperationId,
+    /// Complete original MCP observation content object.
+    pub original_content: serde_json::Value,
+    /// Capture clock returned by the retained Kernel/ORS metadata.
+    pub capture_clock: ClockReading,
+    /// Principal from the authenticated Kernel claim.
+    pub authenticated_principal_ref: String,
+    /// Current independent WorkScope owner snapshot at the request fence.
+    pub work_scope: eliot_workscope::WorkScopeBindingSnapshot,
+    /// Current owner-issued selection binding, absent only for a cold capture.
+    pub task_selection: Option<TaskSelectionAdmissionBinding>,
+}
+
+/// One lossless normalized observation and its exact prepared canonical write.
+#[derive(Clone, Debug)]
+pub struct PreparedMcpObservation {
+    submission: ObservationSubmission,
+    exchange: crate::PreparedKernelExchange,
+    policy: ObservationIngressPolicyBinding,
+    access: ObservationCaptureAccess,
+}
+
+impl PreparedMcpObservation {
+    /// The exact lossless submission that the prepared canonical envelope binds.
+    #[must_use]
+    pub const fn submission(&self) -> &ObservationSubmission {
+        &self.submission
+    }
+
+    /// The exact prepared transition/reconciliation exchange.
+    #[must_use]
+    pub const fn exchange(&self) -> &crate::PreparedKernelExchange {
+        &self.exchange
+    }
+
+    /// Current policy binding, with original owner identity and integrity values.
+    #[must_use]
+    pub const fn policy(&self) -> &ObservationIngressPolicyBinding {
+        &self.policy
+    }
+
+    /// Pre-persistence recovery access metadata for the Kernel.
+    #[must_use]
+    pub const fn access(&self) -> &ObservationCaptureAccess {
+        &self.access
+    }
+}
 
 /// Production adapter manifest name from the Surreal adapter.
 const PRODUCTION_MANIFEST_NAME: &str = "eliot.storage.store-surreal-adapter";
@@ -196,12 +610,109 @@ const GOVERNOR_ORDERING_SCOPE: &str = "scope:governor";
 /// Governor canonical scope addressed by both envelopes.
 const GOVERNOR_SCOPE_ID: &str = "governor";
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObservationContentWire {
+    content: serde_json::Value,
+    #[serde(default)]
+    affected_resources: Vec<String>,
+    #[serde(default)]
+    source_handles: Vec<String>,
+}
+
+fn validate_observation_content(
+    content: &ObservationContentWire,
+) -> Result<(), CompositionError> {
+    if content.content.is_null() {
+        return Err(owner_refused("MCP ObservationContent.content must not be null"));
+    }
+    for (references, field) in [
+        (&content.affected_resources, "affected_resources"),
+        (&content.source_handles, "source_handles"),
+    ] {
+        let mut seen = BTreeSet::new();
+        for reference in references {
+            if reference.trim().is_empty() || reference.chars().any(char::is_control) {
+                return Err(owner_refused(format!(
+                    "MCP ObservationContent.{field} contains an invalid reference"
+                )));
+            }
+            if !seen.insert(reference) {
+                return Err(owner_refused(format!(
+                    "MCP ObservationContent.{field} contains a duplicate reference"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn mcp_observation_envelope(
+    identity: &eliot_protocol::RequestIdentity,
+    operation_id: &OperationId,
+    submission: &ObservationSubmission,
+    work_scope_ref: &str,
+) -> Result<CanonicalWriteEnvelope, CompositionError> {
+    let request_digest = submission
+        .request_digest()
+        .map_err(|error| owner_refused(error.to_string()))?;
+    let mut parameters = BTreeMap::new();
+    for (name, value) in [
+        ("record_id", submission.record.record_id.clone()),
+        ("request_digest", request_digest),
+        ("operation_id", submission.operation_id.clone()),
+        ("idempotency_key", submission.idempotency_key.clone()),
+    ] {
+        parameters.insert(name.to_owned(), serde_json::Value::String(value));
+    }
+    let fence = &identity.request.metadata.state_fence;
+    let envelope = CanonicalWriteEnvelope {
+        operation_id: operation_id.clone(),
+        request: identity.request.metadata.clone(),
+        idempotency_key: identity.idempotency_key.clone(),
+        scope_id: ScopeId::new(work_scope_ref)
+            .map_err(|error| owner_refused(error.to_string()))?,
+        task_id: identity
+            .request
+            .metadata
+            .task_id
+            .as_ref()
+            .map(|task| task.as_str().to_owned()),
+        transition_class: TransitionClass::CaptureCandidate,
+        requested_effect_ceiling: EffectClass::Candidate,
+        admission_contract_set_digest: canonical_digest(submission)?,
+        operation_manifest_digest: production_manifest_digest()?,
+        semantic_commands: vec![NamedMutationRequest {
+            operation: NamedMutationOperation::CaptureObservation,
+            parameters,
+        }],
+        event_projection_relation_intents: EventProjectionRelationIntents {
+            event_ids: Vec::new(),
+            projection_kinds: Vec::new(),
+            relation_kinds: Vec::new(),
+        },
+        security: SecurityContext::default(),
+        required_proof_and_approval_refs: Vec::new(),
+        expected_revision_heads: Vec::new(),
+        expected_ordering_heads: vec![OrderingHeadExpectation {
+            scope: OrderingScopeId::new(GOVERNOR_ORDERING_SCOPE)
+                .map_err(|error| owner_refused(error.to_string()))?,
+            expected_sequence: 1,
+            state_fence: fence.clone(),
+        }],
+    };
+    envelope.validate()?;
+    Ok(envelope)
+}
+
 /// Governor-owned observation/verified-repair reconciliation over one
 /// serialized owner triple plus the retained neutral Kernel port.
 pub struct GovernorObservationReconciliation<'a, P: ?Sized> {
     observation: &'a ObservationJournal,
     problem_revisions: &'a BTreeMap<String, u64>,
     canonical: &'a CanonicalAdmissionOwner,
+    policy: Option<&'a PolicyOwner>,
+    work_scope: Option<&'a eliot_workscope::WorkScopeBindingOwner>,
     kernel: &'a P,
     readiness: CompositionReadiness,
 }
@@ -216,6 +727,8 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
         observation: &'a ObservationJournal,
         problem_revisions: &'a BTreeMap<String, u64>,
         canonical: &'a CanonicalAdmissionOwner,
+        policy: Option<&'a PolicyOwner>,
+        work_scope: Option<&'a eliot_workscope::WorkScopeBindingOwner>,
         kernel: &'a P,
         readiness: CompositionReadiness,
     ) -> Self {
@@ -223,9 +736,239 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
             observation,
             problem_revisions,
             canonical,
+            policy,
+            work_scope,
             kernel,
             readiness,
         }
+    }
+
+    /// Returns the current explicit local-private capture policy with its
+    /// unchanged canonical Policy owner provenance.
+    pub fn current_ingress_policy(&self) -> Result<ObservationIngressPolicyBinding, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let owner = self.policy.ok_or_else(|| {
+            CompositionError::Recovery(
+                "current Policy owner is unavailable for Observation capture".to_owned(),
+            )
+        })?;
+        ObservationIngressPolicyBinding::from_policy_owner(owner)
+    }
+
+    /// Normalizes one complete MCP `ObservationContent` value and prepares its
+    /// canonical capture under the exact authenticated request and current
+    /// WorkScope/Policy owner snapshots.
+    pub fn prepare_mcp_observation(
+        &self,
+        input: McpObservationCaptureInput,
+    ) -> Result<PreparedMcpObservation, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        input.identity.validate().map_err(|error| {
+            CompositionError::Provider(format!("Observe request identity is invalid: {error}"))
+        })?;
+        input.capture_clock.validate().map_err(|error| {
+            CompositionError::Provider(format!("Observe capture clock is invalid: {error}"))
+        })?;
+        let fence = &input.identity.request.metadata.state_fence;
+        if input.identity.request.state_fence != *fence
+            || input.work_scope.state_fence != *fence
+            || input.work_scope.owner_revision == 0
+            || self.canonical.state_fence() != fence
+        {
+            return Err(identity_refused(
+                "Observe request, WorkScope, and canonical owner fences must match exactly",
+            ));
+        }
+        if input.authenticated_principal_ref.trim().is_empty()
+            || input.authenticated_principal_ref.chars().any(char::is_control)
+        {
+            return Err(identity_refused(
+                "authenticated Observe principal must be non-blank and free of controls",
+            ));
+        }
+        let policy = self.current_ingress_policy()?;
+        if policy.state_fence != *fence {
+            return Err(identity_refused(
+                "Observation ingress policy is stale for the authenticated request fence",
+            ));
+        }
+        let current_scope = self
+            .current_work_scope(fence)?;
+        if current_scope != input.work_scope {
+            return Err(identity_refused(
+                "supplied WorkScope snapshot is not the current exact owner snapshot",
+            ));
+        }
+
+        let task_selection = match (&input.identity.request.metadata.task_id, &input.task_selection) {
+            (Some(task_id), Some(selection)) => {
+                if selection.task_ref() != task_id.as_str()
+                    || selection.session_ref()
+                        != input
+                            .identity
+                            .request
+                            .metadata
+                            .session_id
+                            .as_ref()
+                            .map(SessionId::as_str)
+                            .unwrap_or_default()
+                    || selection.principal_ref() != input.authenticated_principal_ref
+                    || selection.state_fence() != fence
+                    || selection.work_scope() != &current_scope
+                    || selection.evidence().work_scope_ref
+                        != current_scope.binding.scope.scope_ref
+                {
+                    return Err(CompositionError::Kernel(
+                        KernelPortError::TaskScopeIncompatible,
+                    ));
+                }
+                Some(selection.evidence().clone())
+            }
+            (Some(_), None) => {
+                return Err(CompositionError::Kernel(
+                    KernelPortError::TaskSelectionRequired,
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(CompositionError::Kernel(
+                    KernelPortError::TaskScopeIncompatible,
+                ));
+            }
+            (None, None) => None,
+        };
+
+        let original_content: ObservationContentWire =
+            serde_json::from_value(input.original_content.clone()).map_err(|error| {
+                owner_refused(format!("MCP ObservationContent shape is invalid: {error}"))
+            })?;
+        validate_observation_content(&original_content)?;
+        let observed_delta = String::from_utf8(
+            canonical_json_bytes(&input.original_content)
+                .map_err(|error| owner_refused(error.to_string()))?,
+        )
+        .map_err(|error| owner_refused(error.to_string()))?;
+        let operation = input.operation_id.as_str();
+        let scope_ref = &current_scope.binding.scope.scope_ref;
+        let submission = ObservationSubmission {
+            operation_id: operation.to_owned(),
+            idempotency_key: input.identity.idempotency_key.clone(),
+            state_fence: fence.clone(),
+            record: ObservationRecordEnvelope {
+                record_id: format!("mcp-observation:{operation}"),
+                kind: ObservationRecordKind::Telemetry,
+                event: Some(ObservationEventCore {
+                    event_id_and_time: ObservationEventIdentity {
+                        event_id: format!("mcp-observation-event:{operation}"),
+                        clock: input.capture_clock,
+                    },
+                    producer_generation_and_trace: ProducerTrace {
+                        producer: input.authenticated_principal_ref,
+                        generation: fence.resource_generation.value().to_string(),
+                        trace_ref: Some(operation.to_owned()),
+                    },
+                    kind: ObservationKind::ToolOrRoute,
+                    affected_scope: ObservationScope {
+                        work_scope: WorkScopeId::new(scope_ref)
+                            .map_err(|error| owner_refused(error.to_string()))?,
+                        task_ref: task_selection.as_ref().map(|selection| selection.task_ref.clone()),
+                        attempt_ref: None,
+                        module_or_route_ref: Some(
+                            input.identity.request.metadata.source_id.as_str().to_owned(),
+                        ),
+                    },
+                    observed_delta,
+                    expected_baseline: None,
+                    evidence_and_raw_handles: original_content.source_handles,
+                    coverage_and_blind_intervals: CoverageEvidence {
+                        disposition: CoverageDisposition::Unknown,
+                        denominator_source_ref: operation.to_owned(),
+                        interval: None,
+                        blind_intervals: Vec::new(),
+                        observed_count: 1,
+                    },
+                    privacy_retention_and_disclosure: PrivacyRetentionDisclosure {
+                        privacy_domain_ref: policy.privacy_domain_ref(scope_ref),
+                        retention_policy_ref: policy.retention_policy_ref(),
+                        disclosure_class: policy.policy.as_str().to_owned(),
+                    },
+                    candidate_importance: 0,
+                    dedup_key: operation.to_owned(),
+                }),
+                coverage_gap: None,
+                journal_control_event: false,
+                parent_record_id: None,
+            },
+            record_v2: None,
+            capture_route: CaptureRoute::CanonicalJournal,
+            durability: Durability::Durable,
+            plan: None,
+            task_selection,
+            evidence: None,
+        };
+        submission
+            .validate()
+            .map_err(|error| owner_refused(error.to_string()))?;
+        let mut scratch = self.observation.clone();
+        match scratch
+            .admit(submission.clone())
+            .map_err(|error| owner_refused(error.to_string()))?
+        {
+            ObservationAdmissionResult::Accepted { .. }
+            | ObservationAdmissionResult::Replayed { .. } => {}
+            ObservationAdmissionResult::Rejected { rejection } => {
+                return Err(owner_refused(format!(
+                    "MCP observation is not admissible: {}",
+                    rejection.all_contract_errors.join("; ")
+                )));
+            }
+        }
+        let envelope = mcp_observation_envelope(
+            &input.identity,
+            &input.operation_id,
+            &submission,
+            scope_ref,
+        )?;
+        let exchange = crate::finish_attempt::prepare_exchange(
+            self.canonical,
+            &input.identity,
+            envelope,
+        )
+        .map_err(|error| match error {
+            FinishAttemptError::Composition(error) => error,
+            other => owner_refused(other.to_string()),
+        })?;
+        let access = ObservationCaptureAccess {
+            privacy: current_scope.binding.privacy_class,
+            visibility: ObservationCaptureVisibility::LocalOnly,
+            instruction_taint: InstructionTaint::CommandLike,
+        };
+        Ok(PreparedMcpObservation {
+            submission,
+            exchange,
+            policy,
+            access,
+        })
+    }
+
+    fn current_work_scope(
+        &self,
+        request_fence: &StateFence,
+    ) -> Result<eliot_workscope::WorkScopeBindingSnapshot, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let owner = self.work_scope.ok_or_else(|| {
+            CompositionError::Recovery(
+                "current WorkScope binding is unavailable for Observe capture".to_owned(),
+            )
+        })?;
+        owner
+            .read_current(request_fence)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))
     }
 }
 

@@ -289,7 +289,7 @@ impl PreparedFinishDecision {
 /// the admitted identity is validated, the envelope's request and idempotency
 /// binding must agree with it exactly, and the transition derived from the
 /// envelope must agree with both. Nothing is rehashed or repaired locally.
-fn prepare_exchange(
+pub(crate) fn prepare_exchange(
     canonical: &CanonicalAdmissionOwner,
     identity: &RequestIdentity,
     envelope: CanonicalWriteEnvelope,

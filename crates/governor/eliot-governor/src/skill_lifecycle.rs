@@ -217,8 +217,7 @@ fn map_kernel_error(error: KernelPortError, ctx: &StoreFailureIdentityContext) -
             StoreRecoveryAction::None,
             ctx,
         )
-        .map(SkillError::Store)
-        .unwrap_or(SkillError::IdentityMismatch),
+        .map_or(SkillError::IdentityMismatch, SkillError::Store),
         KernelPortError::TaskScopeIncompatible => store_failure(
             StoreFailureDisposition::DeterministicRejection,
             "TASK_SCOPE_INCOMPATIBLE",
@@ -227,8 +226,7 @@ fn map_kernel_error(error: KernelPortError, ctx: &StoreFailureIdentityContext) -
             StoreRecoveryAction::None,
             ctx,
         )
-        .map(SkillError::Store)
-        .unwrap_or(SkillError::IdentityMismatch),
+        .map_or(SkillError::IdentityMismatch, SkillError::Store),
     }
 }
 

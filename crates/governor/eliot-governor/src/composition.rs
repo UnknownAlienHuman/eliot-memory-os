@@ -6379,9 +6379,187 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             &self.owners.observation,
             &self.owners.problem.revisions,
             &self.owners.canonical,
+            self.owners.policy.as_ref(),
+            self.owners.work_scope.as_ref(),
             self.kernel.as_ref(),
             self.readiness,
         )
+    }
+
+    /// Reads the current `WorkScope` owner snapshot independently of task
+    /// selection, at the exact retained request fence.
+    pub fn current_work_scope_binding_at_retained_fence(
+        &self,
+    ) -> Result<WorkScopeBindingSnapshot, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let owner = self.owners.work_scope.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "current WorkScope binding is unavailable at the retained fence".to_owned(),
+            )
+        })?;
+        owner
+            .read_current(&self.snapshot.state_fence())
+            .map_err(|error| CompositionError::Recovery(error.to_string()))
+    }
+
+    /// Projects the explicit observation-ingress policy from the current
+    /// recovered Policy owner without re-deriving its integrity values.
+    pub fn current_observation_ingress_policy_at_retained_fence(
+        &self,
+    ) -> Result<crate::ObservationIngressPolicyBinding, CompositionError> {
+        self.observation_reconciliation().current_ingress_policy()
+    }
+
+    /// Reads the exact Policy and WorkScope named-read projections needed by
+    /// an Observe request before protected bytes are staged. The authenticated
+    /// session and both owner projections must match the request fence.
+    pub fn observation_capture_owner_binding(
+        &self,
+        identity: &RequestIdentity,
+        authenticated_principal_ref: &str,
+    ) -> Result<crate::ObservationCaptureOwnerBinding, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        identity.validate().map_err(|error| {
+            CompositionError::Provider(format!("Observe request identity is invalid: {error}"))
+        })?;
+        let request_fence = &identity.request.metadata.state_fence;
+        if request_fence != &self.snapshot.state_fence()
+            || request_fence != &self.recovery.state_fence
+        {
+            return Err(CompositionError::Provider(
+                "Observe owner read is not at the exact retained request fence".to_owned(),
+            ));
+        }
+        if authenticated_principal_ref.trim().is_empty()
+            || authenticated_principal_ref.chars().any(char::is_control)
+        {
+            return Err(CompositionError::Provider(
+                "authenticated Observe principal is invalid".to_owned(),
+            ));
+        }
+        let session_id = identity
+            .request
+            .metadata
+            .session_id
+            .as_ref()
+            .ok_or_else(|| {
+                CompositionError::Provider(
+                    "authenticated Observe request has no session binding".to_owned(),
+                )
+            })?;
+        let session = self
+            .owners
+            .session
+            .session(session_id)
+            .ok_or_else(|| CompositionError::Recovery("Session owner has no admitted Observe session".to_owned()))?;
+        if session.session_id != *session_id
+            || session.status != SessionState::Active
+            || session.state_fence != *request_fence
+            || !session.authority_epoch.is_same_authority(&request_fence.authority_epoch)
+        {
+            return Err(CompositionError::Provider(
+                "Observe session owner binding is not current at the request fence".to_owned(),
+            ));
+        }
+        let session_actor = self
+            .owners
+            .session
+            .snapshot()
+            .events
+            .into_iter()
+            .rev()
+            .find(|event| event.session_id == *session_id)
+            .map(|event| event.actor_ref)
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "Session owner has no retained authenticated actor for Observe".to_owned(),
+                )
+            })?;
+        if session_actor != authenticated_principal_ref {
+            return Err(CompositionError::Provider(
+                "authenticated Observe principal does not match the Session owner actor".to_owned(),
+            ));
+        }
+        if session.task_scope.as_deref()
+            != identity
+                .request
+                .metadata
+                .task_id
+                .as_ref()
+                .map(TaskId::as_str)
+        {
+            return Err(CompositionError::Provider(
+                "authenticated Observe task does not match the Session owner task".to_owned(),
+            ));
+        }
+        let policy = self.current_observation_ingress_policy_at_retained_fence()?;
+        let policy_read = self.recovery.policy_read.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "current Policy named read is unavailable for Observe capture".to_owned(),
+            )
+        })?;
+        if policy_read.state_fence != *request_fence
+            || policy_read.revision != policy.policy_revision
+            || policy_read.value_digest != policy.canonical_read_digest
+        {
+            return Err(CompositionError::Recovery(
+                "Policy named-read source changed after its recovered projection".to_owned(),
+            ));
+        }
+        let work_scope = self.current_work_scope_binding_at_retained_fence()?;
+        let work_scope_read = self.recovery.owner_read(RecoveryOwner::WorkScope)?;
+        if work_scope_read.state_fence != *request_fence
+            || work_scope_read.revision != work_scope.owner_revision
+            || !is_sha256(&work_scope_read.value_digest)
+        {
+            return Err(CompositionError::Recovery(
+                "WorkScope named-read source does not match its current owner projection".to_owned(),
+            ));
+        }
+        let policy_value = serde_json::to_value(policy.policy)
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        let work_scope_privacy = work_scope.binding.privacy_class;
+        let binding = crate::ObservationCaptureOwnerBinding {
+            wire_version: 1,
+            authenticated_principal_ref: authenticated_principal_ref.to_owned(),
+            authenticated_session_ref: session_id.as_str().to_owned(),
+            authenticated_task_ref: identity
+                .request
+                .metadata
+                .task_id
+                .as_ref()
+                .map(TaskId::as_str)
+                .map(str::to_owned),
+            authenticated_scope_ref: work_scope.binding.scope.scope_ref.clone(),
+            state_fence: request_fence.clone(),
+            policy_owner_revision: policy.policy_revision,
+            policy_read_revision: policy_read.revision,
+            policy_read_fence: policy_read.state_fence.clone(),
+            policy_named_read_digest: policy_read.value_digest.clone(),
+            config_policy_snapshot: policy.config_policy_snapshot.clone(),
+            config_policy_snapshot_sha256: policy.snapshot_digest.clone(),
+            ingress_setting_key: policy.setting_key.clone(),
+            ingress_setting_value_ref: policy.setting_value_ref.clone(),
+            ingress_setting_owner_ref: policy.setting_owner_ref.clone(),
+            work_scope_owner_revision: work_scope.owner_revision,
+            work_scope_read_revision: work_scope_read.revision,
+            work_scope_read_fence: work_scope_read.state_fence.clone(),
+            work_scope_canonical_read_digest: work_scope_read.value_digest.clone(),
+            work_scope_binding: work_scope,
+            work_scope_binding_sha256: work_scope_read.value_digest.clone(),
+            policy: policy_value,
+            access: crate::ObservationCapturePolicyAccess {
+                privacy: work_scope_privacy,
+                visibility: crate::ObservationCaptureVisibility::LocalOnly,
+                instruction_taint: eliot_security_contracts::InstructionTaint::CommandLike,
+            },
+        };
+        binding.validate()?;
+        Ok(binding)
     }
 
     /// Borrows the single operator-command reconciliation owner as a canonical
