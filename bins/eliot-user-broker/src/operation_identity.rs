@@ -68,6 +68,10 @@ pub(crate) const HEARTBEAT_OPERATION: &str = "eliot.user-broker.heartbeat";
 pub(crate) const AUTHORIZE_LAUNCH_OPERATION: &str = "eliot.user-broker.authorize-launch";
 /// Canonical Kernel operation selectors issued through this broker.
 pub(crate) const FENCE_OPERATION: &str = "eliot.user-broker.fence";
+/// Canonical Kernel operation selector for a one-shot Operator challenge.
+pub(crate) const OPERATOR_CHALLENGE_OPERATION: &str = "eliot.user-broker.operator-challenge";
+/// Canonical Kernel operation selector for redeeming an Operator session grant.
+pub(crate) const OPERATOR_REDEEM_OPERATION: &str = "eliot.user-broker.operator-redeem";
 
 /// Stable broker product/source binding carried by every minted identity.
 const BROKER_PRODUCT_ID: &str = "eliot-user-broker";
@@ -91,6 +95,8 @@ pub(crate) enum BrokerOperation {
     HeartbeatRenewal,
     AuthorizeLaunch,
     FenceLogoff,
+    OperatorChallenge,
+    OperatorRedeem,
 }
 
 impl BrokerOperation {
@@ -102,6 +108,8 @@ impl BrokerOperation {
             Self::HeartbeatRenewal => HEARTBEAT_OPERATION,
             Self::AuthorizeLaunch => AUTHORIZE_LAUNCH_OPERATION,
             Self::FenceLogoff => FENCE_OPERATION,
+            Self::OperatorChallenge => OPERATOR_CHALLENGE_OPERATION,
+            Self::OperatorRedeem => OPERATOR_REDEEM_OPERATION,
         }
     }
 
@@ -112,6 +120,8 @@ impl BrokerOperation {
             Self::HeartbeatRenewal => "heartbeat",
             Self::AuthorizeLaunch => "authorize-launch",
             Self::FenceLogoff => "fence",
+            Self::OperatorChallenge => "operator-challenge",
+            Self::OperatorRedeem => "operator-redeem",
         }
     }
 }
@@ -815,6 +825,36 @@ impl OperationIdentityIssuer {
         )
     }
 
+    /// Issues (or exactly retries) one Kernel-backed Operator challenge
+    /// identity. This is independent from registration and launch identities.
+    pub(crate) fn issue_operator_challenge(
+        &mut self,
+        payload: &Value,
+        now_unix_ms: u64,
+    ) -> Result<IssuedIdentity, OperationIdentityError> {
+        self.issue(
+            BrokerOperation::OperatorChallenge,
+            payload,
+            now_unix_ms,
+            &CallerLink::none(),
+        )
+    }
+
+    /// Issues (or exactly retries) one Kernel-backed Operator redemption
+    /// identity. Redemption has its own selector and idempotency namespace.
+    pub(crate) fn issue_operator_redeem(
+        &mut self,
+        payload: &Value,
+        now_unix_ms: u64,
+    ) -> Result<IssuedIdentity, OperationIdentityError> {
+        self.issue(
+            BrokerOperation::OperatorRedeem,
+            payload,
+            now_unix_ms,
+            &CallerLink::none(),
+        )
+    }
+
     /// Issues with an explicit transport idempotency key. A key already bound
     /// to different canonical bytes fails with identity conflict; the same
     /// key with identical bytes returns the exact prior identity. This is
@@ -1484,7 +1524,12 @@ fn validate_retained_identity(
     }
     let is_kernel_operation = matches!(
         retained.operation.as_str(),
-        REGISTER_OPERATION | HEARTBEAT_OPERATION | AUTHORIZE_LAUNCH_OPERATION | FENCE_OPERATION
+        REGISTER_OPERATION
+            | HEARTBEAT_OPERATION
+            | AUTHORIZE_LAUNCH_OPERATION
+            | FENCE_OPERATION
+            | OPERATOR_CHALLENGE_OPERATION
+            | OPERATOR_REDEEM_OPERATION
     );
     let is_control_operation = matches!(
         retained.operation.as_str(),
