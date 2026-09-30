@@ -118,6 +118,11 @@ pub struct IpcConfig {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IpcAuthenticationProfile {
+    /// Intentionally not decode-pinned: this profile has no in-tree producer
+    /// and no in-tree consumer that compares the value, so there is no emitted
+    /// spelling to pin against. Naming a constant here would invent a wire
+    /// version rather than record one. The negotiation owner is the one place
+    /// that may fix the accepted spelling.
     pub protocol_version: String,
     pub pipe_name: String,
     pub server_identity: String,
@@ -136,6 +141,15 @@ pub struct IpcAuthenticationProfile {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IpcHandshake {
+    /// Intentionally not decode-pinned. The one in-tree negotiation owner,
+    /// `eliot-engine/src/service.rs::NamedPipeIpcServer::handshake`, already
+    /// compares this field against its own `H1_PROTOCOL_VERSION` and reports a
+    /// mismatch as the typed `IpcHandshakeReason::ProtocolMismatch` reason on an
+    /// `IpcHandshakeDecision`. Pinning it at the decoder would replace that typed
+    /// handshake refusal with a decode error, so a wrong-version client could no
+    /// longer be answered with a `reasons` list naming the cause. The negotiated
+    /// value is a server-side setting, not a single wire constant, so any pin
+    /// here would also be wrong for a server configured on a different version.
     pub protocol_version: String,
     pub client_id: String,
     pub runtime_mode: RuntimeMode,
@@ -174,6 +188,25 @@ pub enum IpcHandshakeReason {
 /// `IpcConfig::max_frame_bytes` at the owning server. It carries no authority,
 /// lifecycle, or health meaning, so it is not a protected typed payload. The
 /// envelope fields themselves are closed.
+///
+/// `protocol_version` on this envelope is not decode-pinned, unlike the
+/// `StartupHealthReport` version in `health.rs`. Two owners write it and they do
+/// not agree: response frames copy the server's own version
+/// (`eliot-engine/src/service.rs::handle_frame`), while error frames copy it
+/// back from the request (`eliot-engine/src/service.rs::error_frame`). Echoing
+/// the requester verbatim is what lets the caller read its own version back out
+/// of a rejection, so a decoder pin would suppress exactly the diagnostic this
+/// field carries on the error path.
+///
+/// Named residual, outside this crate: `payload_inline` deserializes through
+/// `serde_json::Value`, whose ingress accepts duplicate keys and keeps the last
+/// occurrence. That duplicate-key loss boundary sits at the `Value` ingress in
+/// `serde_json`, not in `eliot-types`, and is not repairable from this struct
+/// without converting the field to a typed shape — a wire-format break for every
+/// producer of an inert pass-through payload. The field is therefore left as
+/// classified (`NOT_SAFE`, `value_routing = true`, refusal
+/// `refuse-unvalidated-value-conversion`) and this row is not claimed as
+/// end-to-end closed.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IpcFrame {
