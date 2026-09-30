@@ -1972,6 +1972,9 @@ impl persistence_codec::PersistedValue for BridgeEventHandoffRow {
 /// updated; per-stream and total pressure evicts the oldest first, and the
 /// retained compacted boundary on the cursor row still blocks re-admission
 /// afterwards.
+///
+/// Consumed on the `check_bridge_retained_replay_in` commitment path; the
+/// live-row compare lives in `replay_bridge_event_outcome_checked`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BridgeEventReplayCommitment {
@@ -17086,6 +17089,10 @@ impl RedbRecoveryStore {
     /// mutation; otherwise the row, its ordered position binding, its
     /// cursor advance, and its pending handoff commit in this one short
     /// ORS transaction.
+    ///
+    /// Direct caller is [`Self::stage_bridge_event_checked`] (the `None` arm
+    /// of the retained-history decision); the bins `stage_bridge_event_durable`
+    /// route reaches this only transitively through that entry, never directly.
     fn stage_fresh_bridge_event_checked(
         write: &redb::WriteTransaction,
         access: &BridgeStreamAccess,
@@ -17225,6 +17232,12 @@ impl RedbRecoveryStore {
     /// route, or warning set under the same identity conflicts instead of
     /// answering stale provenance as a duplicate. A pre-provenance row never
     /// matches current provenance, so it conflicts rather than duplicating.
+    ///
+    /// This compares the live row only: it takes `row`, never a
+    /// `BridgeEventReplayCommitment`. Retained commitments are consumed on
+    /// the [`Self::check_bridge_retained_replay_in`] commitment path instead
+    /// ([`Self::bridge_commitment_matches`] plus
+    /// [`Self::bridge_event_outcome_from_commitment`]).
     fn replay_bridge_event_outcome_checked(
         write: &redb::WriteTransaction,
         access: &BridgeStreamAccess,
@@ -19792,7 +19805,9 @@ impl RedbRecoveryStore {
     /// hole past the certified frontier or another incarnation's history
     /// fails closed with an integrity error. Performs no cursor or
     /// position mutation itself; the caller advances the boundary over the
-    /// certified prefix in the same transaction. Activation stays gated
+    /// certified prefix in the same transaction. Wired to the retire entry:
+    /// the caller is [`Self::retire_bridge_handoffs_in`] (the
+    /// retire/acknowledge path) — never the stage path. Activation stays gated
     /// behind [`BridgeEventHandoffRow::retirement_eligible`]: with no
     /// receiving-owner terminal evidence in the handoff contract the
     /// eligible prefix is empty and this function is never reached.
