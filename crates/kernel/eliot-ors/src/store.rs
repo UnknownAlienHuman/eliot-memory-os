@@ -25060,6 +25060,75 @@ impl RedbRecoveryStore {
         Ok(())
     }
 
+    /// Begins terminal-disposition reconciliation for one live `RuntimeLease`
+    /// (I1.5 W4, #1751).
+    ///
+    /// The single production entry into `Reconciling` for the runtime-lease
+    /// family: the named exact-fence row must be `Active`; it moves through
+    /// the owner [`RuntimeLease::transition_to`] legality to `Reconciling` and
+    /// is re-recorded through [`Self::record_runtime_lease_current`]. The
+    /// `terminal` argument names the terminal disposition this reconciliation
+    /// will resolve to — one of the owner-legal `Reconciling` exits
+    /// (`Released`, `Expired`, `Revoked`, `Closed`) — so the row enters
+    /// reconciliation carrying exactly which cleanup/effect/receipt
+    /// reconciliation is permitted; no new semantic work is admitted. A
+    /// `Reconciling` row keeps blocking the retirement census
+    /// (`RuntimeLeaseCensus::is_fully_retired`) and the Kernel idle-lease
+    /// census until the disposition-named cleanup closes it.
+    ///
+    /// Fail-closed typed errors, no silent skips: an unnameable disposition
+    /// (`InvalidField`), an unknown lease identity for this fence
+    /// (`InvalidField`), a fence mismatch (`FenceMismatch`), a corrupt row
+    /// (`Contract`), and a non-`Active` row (`InvalidTransition`; terminal
+    /// rows are never rewritten). Terminal rows reach `Reconciling` only
+    /// through the owner legality in
+    /// `eliot-runtime-contracts/src/lib.rs::RuntimeLease::transition_to`,
+    /// which admits no terminal-to-`Reconciling` edge today: that edge, a
+    /// disposition carrier field, and the `Reconciling`-exit close after the
+    /// named cleanup are the exact follow-up seam in
+    /// `bins/eliot-kernel/src/control_plane.rs` (tick/revoke path), not here.
+    /// STITCH: no production caller wires this driver yet; the first caller
+    /// must be the Kernel tick that names the terminal disposition from the
+    /// row's own terminal condition, never a test or a faked probe.
+    pub fn reconcile_runtime_lease_for_terminal_disposition(
+        &self,
+        fence: &eliot_contracts::StateFence,
+        lease_id: &str,
+        terminal: eliot_runtime_contracts::LeaseState,
+    ) -> Result<RuntimeLease, OrsError> {
+        use eliot_runtime_contracts::LeaseState;
+        if !matches!(
+            terminal,
+            LeaseState::Released | LeaseState::Expired | LeaseState::Revoked | LeaseState::Closed
+        ) {
+            return Err(OrsError::InvalidField {
+                field: "terminal_disposition",
+                reason: "terminal disposition is not a legal Reconciling exit for a runtime lease",
+            });
+        }
+        let rows = self.load_runtime_leases_by_state_fence(fence)?;
+        let row = rows
+            .iter()
+            .find(|row| row.lease_id.as_str() == lease_id)
+            .ok_or(OrsError::InvalidField {
+                field: "lease_id",
+                reason: "unknown runtime lease identity for fence",
+            })?;
+        if row.state_fence != *fence {
+            return Err(OrsError::FenceMismatch);
+        }
+        row.validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        if row.state != LeaseState::Active {
+            return Err(OrsError::InvalidTransition);
+        }
+        let reconciling = row
+            .transition_to(LeaseState::Reconciling)
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        self.record_runtime_lease_current(&reconciling)?;
+        Ok(reconciling)
+    }
+
     /// Loads the recorded effect operation lease for one exact authorized
     /// operation (issue #1885; I1.9).
     ///
