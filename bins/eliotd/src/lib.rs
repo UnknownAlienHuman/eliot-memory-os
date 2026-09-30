@@ -60,10 +60,10 @@ pub struct LiveLspCaptureInvocation<'a, G, C> {
     pub identity: &'a RequestIdentity,
     pub source_artifact_admission: &'a eliot_governor::SourceArtifactAdmission,
     /// Owner-formed canonical Store transition shell for this original
-    /// request. The W1 wrapper replaces only its CaptureObservation payload
+    /// request. The W1 wrapper replaces only its `CaptureObservation` payload
     /// pointer with the receipt returned by the live Blob publication.
     pub capture_envelope: eliot_governor::CanonicalWriteEnvelope,
-    /// Exact source closure already observed for the admitted WorkScope.
+    /// Exact source closure already observed for the admitted `WorkScope`.
     pub governing_sources: &'a eliot_governor::GoverningSourceSet,
     pub privacy_profile: &'a eliot_governor::PrivacyProfile,
     pub git_owner: Arc<G>,
@@ -2245,7 +2245,7 @@ impl DaemonComposition {
     /// Runs the internal W1 one-shot LSP capture through the original
     /// current-source process owner, then publishes the bridge-minted live
     /// observation into the original source Blob owner. It attempts to commit
-    /// the exact returned pointer in a task-bound canonical CaptureObservation;
+    /// the exact returned pointer in a task-bound canonical `CaptureObservation`;
     /// its result distinguishes pre-handoff refusal from an outcome requiring
     /// reconciliation, alongside the published pointer.
     /// This is a composition seam for an admitted W1 caller; it adds no external
@@ -2371,8 +2371,8 @@ impl DaemonComposition {
             admission: source_artifact_admission,
             profile: &profile,
         };
-        let (record, projection, payload_ref) = bridge
-            .retain_reconciled_result_with_source_artifact_proof(
+        let (record, projection, payload_ref) = Box::pin(
+            bridge.retain_reconciled_result_with_source_artifact_proof(
                 started,
                 source_scope_after_run,
                 candidate_identity_after_run,
@@ -2380,7 +2380,8 @@ impl DaemonComposition {
                 source_root,
                 after_run_source_proof,
                 &publisher,
-            )
+            ),
+        )
             .await
             .map_err(CapturedLspAdoptionError::from)?;
 

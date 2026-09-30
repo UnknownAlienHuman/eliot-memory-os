@@ -2637,7 +2637,7 @@ enum DispatchedBindingProvenance {
         governance_profile_ref: String,
         projection_generation: u64,
     },
-    LiveTaskSelection(TaskSelectionAdmissionBinding),
+    LiveTaskSelection(Box<TaskSelectionAdmissionBinding>),
 }
 
 /// Seals one admitted task-bound transition into its dispatch identity
@@ -2666,66 +2666,7 @@ pub fn seal_dispatched_binding(
     projection_generation: u64,
     operation_id: String,
 ) -> Result<DispatchedBinding, TaskBindingError> {
-    seal_dispatched_binding_with_provenance(
-        evidence,
-        admitted_task_ref,
-        scope_ref,
-        principal_ref,
-        session_ref,
-        presented_fence,
-        operation_id,
-        DispatchedBindingProvenance::Bootstrap {
-            receipt_revision,
-            governance_profile_ref: governance_profile_ref.to_owned(),
-            projection_generation,
-        },
-    )
-}
-
-fn seal_dispatched_binding_with_provenance(
-    evidence: TaskSelectionEvidence,
-    admitted_task_ref: &str,
-    scope_ref: &str,
-    principal_ref: &str,
-    session_ref: &str,
-    presented_fence: &StateFence,
-    operation_id: String,
-    provenance: DispatchedBindingProvenance,
-) -> Result<DispatchedBinding, TaskBindingError> {
-    evidence.validate().map_err(|error| {
-        TaskBindingError::selection_required(format!("task selection evidence invalid: {error}"))
-    })?;
-    if evidence.is_contaminated() {
-        return Err(TaskBindingError::selection_required(
-            "task selection is contaminated",
-        ));
-    }
-    if evidence.task_ref != admitted_task_ref {
-        return Err(TaskBindingError::scope_incompatible(
-            "task-bound dispatch names a different task than the admitted context",
-        ));
-    }
-    if evidence.work_scope_ref != scope_ref {
-        return Err(TaskBindingError::scope_incompatible(
-            "task-bound dispatch names a different WorkScope than the admitted write",
-        ));
-    }
-    if principal_ref.trim().is_empty() || principal_ref.chars().any(char::is_control) {
-        return Err(TaskBindingError::selection_required(
-            "task-bound dispatch names no admitted principal",
-        ));
-    }
-    if session_ref.trim().is_empty() || session_ref.chars().any(char::is_control) {
-        return Err(TaskBindingError::selection_required(
-            "task-bound dispatch names no admitted session",
-        ));
-    }
-    if operation_id.trim().is_empty() || operation_id.chars().any(char::is_control) {
-        return Err(TaskBindingError::selection_required(
-            "task-bound dispatch names no operation identity",
-        ));
-    }
-    Ok(DispatchedBinding {
+    seal_dispatched_binding_with_provenance(DispatchedBinding {
         evidence,
         admitted_task_ref: admitted_task_ref.to_owned(),
         scope_ref: scope_ref.to_owned(),
@@ -2733,8 +2674,57 @@ fn seal_dispatched_binding_with_provenance(
         session_ref: session_ref.to_owned(),
         presented_fence: presented_fence.clone(),
         operation_id,
-        provenance,
+        provenance: DispatchedBindingProvenance::Bootstrap {
+            receipt_revision,
+            governance_profile_ref: governance_profile_ref.to_owned(),
+            projection_generation,
+        },
     })
+}
+
+fn seal_dispatched_binding_with_provenance(
+    binding: DispatchedBinding,
+) -> Result<DispatchedBinding, TaskBindingError> {
+    binding.evidence.validate().map_err(|error| {
+        TaskBindingError::selection_required(format!("task selection evidence invalid: {error}"))
+    })?;
+    if binding.evidence.is_contaminated() {
+        return Err(TaskBindingError::selection_required(
+            "task selection is contaminated",
+        ));
+    }
+    if binding.evidence.task_ref != binding.admitted_task_ref {
+        return Err(TaskBindingError::scope_incompatible(
+            "task-bound dispatch names a different task than the admitted context",
+        ));
+    }
+    if binding.evidence.work_scope_ref != binding.scope_ref {
+        return Err(TaskBindingError::scope_incompatible(
+            "task-bound dispatch names a different WorkScope than the admitted write",
+        ));
+    }
+    if binding.principal_ref.trim().is_empty()
+        || binding.principal_ref.chars().any(char::is_control)
+    {
+        return Err(TaskBindingError::selection_required(
+            "task-bound dispatch names no admitted principal",
+        ));
+    }
+    if binding.session_ref.trim().is_empty()
+        || binding.session_ref.chars().any(char::is_control)
+    {
+        return Err(TaskBindingError::selection_required(
+            "task-bound dispatch names no admitted session",
+        ));
+    }
+    if binding.operation_id.trim().is_empty()
+        || binding.operation_id.chars().any(char::is_control)
+    {
+        return Err(TaskBindingError::selection_required(
+            "task-bound dispatch names no operation identity",
+        ));
+    }
+    Ok(binding)
 }
 
 /// Admits the task-bound Store capture from the original Governor task-selection
@@ -2770,16 +2760,16 @@ pub fn admit_lsp_capture_from_owner(
         CompatibilityDisposition::Compatible,
     )?;
 
-    seal_dispatched_binding_with_provenance(
-        selection.evidence().clone(),
-        request_task,
-        scope_ref,
-        selection.principal_ref(),
-        selection.session_ref(),
-        presented_fence,
-        transition.identity.operation_id.as_str().to_owned(),
-        DispatchedBindingProvenance::LiveTaskSelection(selection.clone()),
-    )
+    seal_dispatched_binding_with_provenance(DispatchedBinding {
+        evidence: selection.evidence().clone(),
+        admitted_task_ref: request_task.to_owned(),
+        scope_ref: scope_ref.to_owned(),
+        principal_ref: selection.principal_ref().to_owned(),
+        session_ref: selection.session_ref().to_owned(),
+        presented_fence: presented_fence.clone(),
+        operation_id: transition.identity.operation_id.as_str().to_owned(),
+        provenance: DispatchedBindingProvenance::LiveTaskSelection(Box::new(selection.clone())),
+    })
 }
 
 /// Revalidates one sealed LSP capture against a fresh, exact Governor owner
@@ -2799,7 +2789,7 @@ pub fn admit_lsp_capture_with_live_binding(
             "LSP capture effect gate requires an owner-issued live task selection",
         ));
     };
-    if original_selection != current_selection {
+    if original_selection.as_ref() != current_selection {
         return Err(TaskBindingError::scope_incompatible(
             "live TaskSelection owner binding changed before Store exchange; retry under a new operation",
         ));
@@ -2954,6 +2944,13 @@ fn validate_lsp_capture_owner_join(
             "LSP capture changed its original request fence or canonical idempotency binding",
         ));
     }
+    validate_lsp_capture_transition_payload(transition, selection)
+}
+
+fn validate_lsp_capture_transition_payload(
+    transition: &PreparedTransition,
+    selection: &TaskSelectionAdmissionBinding,
+) -> Result<(), TaskBindingError> {
     if transition.named_operations.len() != 1
         || transition.named_operations[0].operation != NamedMutationOperation::CaptureObservation
     {

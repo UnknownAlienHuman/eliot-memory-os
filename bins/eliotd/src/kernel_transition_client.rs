@@ -285,8 +285,8 @@ async fn read_task_controller_source_head(
 
 impl DaemonKernelClient {
     /// Applies one LSP `CaptureObservation` using the original non-Serde
-    /// Governor TaskSelection binding, re-read immediately before this call.
-    /// The generic KernelTransitionPort remains task-binding strict and does
+    /// Governor `TaskSelection` binding, re-read immediately before this call.
+    /// The generic `KernelTransitionPort` remains task-binding strict and does
     /// not admit task-relative captures without this dedicated owner join.
     #[allow(
         clippy::too_many_arguments,
