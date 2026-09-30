@@ -3801,12 +3801,6 @@ impl KernelComposition {
                     }
                     match self.claim_task_controller_pair(session)? {
                         Some((envelope, tool, invocation, attempt)) => {
-                            let native_worker_claim_id = self
-                                .verified_native_worker_claim_id_for_task_controller_claim(
-                                    session,
-                                    &invocation,
-                                    &attempt,
-                                )?;
                             Ok(serde_json::json!({
                                 "status": "known",
                                 "value": {
@@ -3816,7 +3810,6 @@ impl KernelComposition {
                                         "tool": tool,
                                         "operation_id": attempt.operation_id,
                                         "attempt": attempt,
-                                        "native_worker_claim_id": native_worker_claim_id,
                                     }
                                 },
                                 "recovery": null,
