@@ -615,8 +615,7 @@ impl ReceiptOwnerFamily {
         match self {
             Self::StoreRebind => identity.starts_with("store-rebind:"),
             Self::StoreUnknownOutcome => {
-                identity.starts_with("store-unknown:")
-                    || identity.starts_with("unknown-commit:")
+                identity.starts_with("store-unknown:") || identity.starts_with("unknown-commit:")
             }
         }
     }

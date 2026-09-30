@@ -5340,10 +5340,7 @@ impl KernelComposition {
         // the race it could not observe.
         let gate_modules = self.drain_live_branches()?;
         for branch in &gate_modules {
-            if !admission_modules
-                .iter()
-                .any(|admitted| admitted == branch)
-            {
+            if !admission_modules.iter().any(|admitted| admitted == branch) {
                 race_residuals.push(format!("admission-module-raced:{branch}"));
             }
         }
