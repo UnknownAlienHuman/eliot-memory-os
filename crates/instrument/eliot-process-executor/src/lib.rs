@@ -1144,7 +1144,7 @@ struct LiveStdinWriter {
 #[cfg(windows)]
 impl LiveStdinWriter {
     fn spawn(mut stdin: std::fs::File) -> std::io::Result<Self> {
-        let (sender, receiver) = sync_channel(LIVE_STDIN_QUEUE_CAPACITY);
+        let (sender, receiver) = sync_channel::<Vec<u8>>(LIVE_STDIN_QUEUE_CAPACITY);
         let failed = Arc::new(AtomicBool::new(false));
         let thread_failed = Arc::clone(&failed);
         let thread = thread::Builder::new()
