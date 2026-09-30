@@ -717,9 +717,8 @@ pub(crate) fn build_admitted_provider_capability(
     material: VerifiedProviderMaterial,
 ) -> Result<AdmittedProviderCapability, FabricError> {
     let presented_fence_digest = eliot_contracts::sha256_hex(
-        &eliot_contracts::canonical_json_bytes(&material.presented_fence).map_err(|error| {
-            FabricError::Contract(format!("provider presented fence: {error}"))
-        })?,
+        &eliot_contracts::canonical_json_bytes(&material.presented_fence)
+            .map_err(|error| FabricError::Contract(format!("provider presented fence: {error}")))?,
     );
     let loaded = OwnerLoadedClaimRow::new(
         material.claim_id.clone(),
