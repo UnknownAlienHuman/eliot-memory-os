@@ -74,6 +74,8 @@ $script:GovernorRetirementRetainedEvidenceDomain = 'eliot-governor-disposition-v
 $script:GovernorRetirementClosureDomain = 'eliot-governor-retirement-closure-v1'
 $script:GovernorRetirementClosureSchema = 'eliot-governor-retirement-closure-v1'
 $script:GovernorRetirementTrustSchema = 'eliot-governor-retirement-approval-trust-v1'
+$script:GovernorRetirementFreezeSchema = 'eliot-governor-retirement-receipt-v1'
+$script:GovernorRetirementFreezeKind = 'detached-approval-pointer'
 $script:GovernorRetirementBundleTrustFile = 'GOVERNOR_RETIREMENT_APPROVAL_TRUST.json'
 $script:GovernorRetirementBundleApprovalFile = 'GOVERNOR_RETIREMENT_APPROVAL.json'
 $script:GovernorRetirementTrustPolicyPath = 'scripts/lib/governor-retirement-approval-trust.json'
@@ -1186,8 +1188,8 @@ function New-GovernorRetirementCandidateFreeze(
         throw "the detached freeze parent directory does not exist: $parent"
     }
     $record = [ordered]@{
-        schema = 'eliot-governor-retirement-receipt-v1'
-        receipt_kind = 'detached-approval-pointer'
+        schema = [string]$script:GovernorRetirementFreezeSchema
+        receipt_kind = [string]$script:GovernorRetirementFreezeKind
         candidate_commit = [string]$SourceCommit
         candidate_tree = [string]$candidateTree
         closure_rule_set = [string]$script:GovernorRetirementClosureRuleSet
@@ -1210,8 +1212,8 @@ function New-GovernorRetirementCandidateFreeze(
         $stream.Dispose()
     }
     $roundtrip = Read-GovernorRetirementJsonFile $outputFull 'frozen retirement candidate record'
-    if ([string](Read-GovernorApprovalField $roundtrip 'candidate_commit') -cne [string]$SourceCommit -or [string](Read-GovernorApprovalField $roundtrip 'closure_digest_sha256') -cne [string]$closure.digest_sha256) {
-        throw 'the frozen candidate record does not read back its own candidate and closure identity; freeze refused'
+    if ([string](Read-GovernorApprovalField $roundtrip 'candidate_commit') -cne [string]$SourceCommit -or [string](Read-GovernorApprovalField $roundtrip 'closure_digest_sha256') -cne [string]$closure.digest_sha256 -or [string](Read-GovernorApprovalField $roundtrip 'schema') -cne [string]$script:GovernorRetirementFreezeSchema -or [string](Read-GovernorApprovalField $roundtrip 'receipt_kind') -cne [string]$script:GovernorRetirementFreezeKind) {
+        throw 'the frozen candidate record does not read back its own schema, kind, candidate and closure identity; freeze refused'
     }
     [pscustomobject]@{
         path = $outputFull

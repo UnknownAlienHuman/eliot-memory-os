@@ -382,7 +382,7 @@ pub fn current_consumer_inventory() -> &'static [ConsumerEntry] {
             proof: "plugin/eliot-governor/.mcp.json",
             live_reference: "\"command\": \"bin/eliot-governor.exe\"",
             disposition: Disposition::ExtractToCurrentOwner,
-            expiry: "remove when the eliot MCP server is served by bins/eliot-agent-bridge under #13",
+            expiry: "remove when the Codex MCP server is served by the eliot-mcp track entry point (codex_controller has no Bridge contour and is refused at the facade gate per crates/eliot-app/src/main.rs; bins/eliot-agent-bridge under #13 is not the owner)",
         },
         ConsumerEntry {
             consumer: "Claude Code plugin lifecycle hooks",
