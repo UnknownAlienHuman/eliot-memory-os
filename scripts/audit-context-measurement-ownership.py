@@ -145,9 +145,10 @@ CANONICAL_MEASUREMENT_PORT = "measure_serialized_context"
 # Closed disposition set every baseline row must end with. A baseline row
 # that simply disappears is an erased requirement and is rejected; a row
 # that is still present but carries no explicit disposition is rejected.
-# The set stays closed at four: every disposition here is derivable by
-# :func:`_derive_baseline_disposition` from a row's own recorded facts, and
-# none of the four is unreachable from any code path.
+# The set stays closed at four. Three are derived by
+# :func:`_derive_baseline_disposition` from a row's own recorded facts; the
+# fourth is deliberately declared-but-unreachable, and the comment immediately
+# below says exactly why and what would have to change to derive it honestly.
 BASELINE_DISPOSITIONS: tuple[str, ...] = (
     "canonical-owner-consumer",
     "legitimate-non-context-metric",
@@ -155,30 +156,38 @@ BASELINE_DISPOSITIONS: tuple[str, ...] = (
     "explicit-unresolved",
 )
 
-# An *exact* versioned legacy adapter is, per TASK.md:75, an approved adapter
+# An *exact* versioned legacy adapter is, per the issue, an approved adapter
 # that implements/uses #704's port and binds provider/model/tokenizer
-# ID/version/hash to the final serialized bytes. The bound *identity* side of
-# that is carried on an inventory row by the #866 rule-5 route-identity
-# signals (``context_measurement_inventory.py:80-81,1064-1073``), so those two
-# values are the only exact version-identity facts a row can record.
+# ID/version/hash to the final serialized bytes, and that is *closed*: retired
+# by an explicit recorded boundary, not merely unreadable or unwritable.
 #
-# The *closed* (expired/retirement-bound) side is carried by the row's
-# ``write_scope``: the producer writes it from ``_write_scope_of``
-# (``context_measurement_inventory.py:1395-1400``) on every row (``:1462``,
-# closed set at ``:2219``) as exactly ``writable`` / ``read-only`` / ``none``,
-# so a non-writable row is one that is no longer a writable current owner.
-# Reading it is a real recorded-fact comparison, not a presence probe.
+# No row field in #866's closed ``ROW_KEYS``
+# (``context_measurement_inventory.py:502-528``) records a legacy-adapter
+# marker, a version bound, or an expiry date. The two fields a tempting
+# shortcut would reach for are the WRONG vocabulary and are deliberately not
+# used here:
 #
-# An authorised adapter is always ``status == "owned"``: #866's
-# ``_owner_confirmed`` (``context_measurement_inventory.py:1233-1256``) fails
-# closed to ``unresolved`` for any owner/scope the frozen owner map does not
-# confirm, so authorisation cannot be satisfied by an unresolved row.
-BASELINE_LEGACY_ADAPTER_IDENTITY_SIGNALS: frozenset[str] = frozenset(
-    {"tokenizer_hash", "tokenizer_config_digest"}
-)
-BASELINE_LEGACY_ADAPTER_CLOSED_SCOPES: frozenset[str] = frozenset(
-    {"read-only", "none"}
-)
+#   * ``write_scope`` is *mutation permission*, not closure. #866 assigns
+#     ``read-only`` to a baseline row whose declared owner is one of the three
+#     live consumers #783/#878/#880 reading the #704 algorithm crate
+#     (``_write_scope_of`` ``:1395-1400``, and its own module docstring
+#     ``:43-45`` "Read-only sharing is not shared mutable scope"). The owner
+#     map says the same: it "records ownership of a candidate, not write
+#     permission" (``context-measurement-owner-map.toml:24-25``). So a
+#     ``read-only`` row is an ACTIVE consumer seam, the opposite of retired.
+#   * ``dispatch_blocked`` is defined as ``status != "owned"`` (``:1447``) and
+#     re-validated against ``status`` on the read path (``:2213-2214``), so for
+#     any row that is not already ``explicit-unresolved`` it is invariably
+#     ``False`` and could only restate the check the first arm already made.
+#
+# Deriving the disposition from either field would let a live, in-migration
+# consumer be reported as a closed legacy adapter: a label that does not
+# describe its subject, which is the defect class this reconciliation exists to
+# repair. So the disposition stays declared-but-unreachable, and the truthful
+# ``_derive_baseline_disposition`` reports every such row as
+# ``explicit-unresolved`` -- a row that cannot prove it is a closed, exact,
+# versioned adapter is not one. Emitting it needs a closed field added to
+# #866's ``ROW_KEYS`` by its owner, not a second scheme here.
 
 # The frozen pre-migration baseline requirement denominator. Written out here
 # independently of the producer module so that a drift in either direction
@@ -1517,10 +1526,8 @@ def _proof_escalation(
 def _derive_baseline_disposition(row: Mapping[str, Any]) -> str:
     """Derive one baseline row's disposition from the row's own recorded facts.
 
-    The four closed dispositions in :data:`BASELINE_DISPOSITIONS` are mutually
-    exclusive here: every arm below assigns a value no other arm can also
-    assign, so no branch is a duplicate of another and no disposition is
-    declared without a code path that produces it.
+    The arms below are mutually exclusive: each assigns a value no other arm
+    can also assign, so no branch is a duplicate of another.
 
     ``explicit-unresolved``
         The producer itself could not attribute the row: either its ``status``
@@ -1535,30 +1542,22 @@ def _derive_baseline_disposition(row: Mapping[str, Any]) -> str:
         never carried as a token or STU count. Same shape as the pre-existing
         check, so this arm is not a new rule -- it is the one that existed.
     ``exact-versioned-legacy-adapter``
-        Requires BOTH halves of "closed and exact versioned legacy adapter" to
-        be stated by the row itself, and it is read as a conjunction of real
-        comparisons, never as a name match or a per-case list:
-
-          * exact  -- the row's recorded ``signal`` is one of the two bound
-            tokenizer-identity signals #866 classifies as route identity
-            (:data:`BASELINE_LEGACY_ADAPTER_IDENTITY_SIGNALS`), and the row is
-            consequently classified ``route-identity-bound``. An unbound
-            provider/model/tokenizer identity is not an exact adapter.
-          * closed -- the row's recorded ``write_scope`` is a closed scope
-            (not ``writable``), i.e. the row is no longer a writable current
-            owner (:data:`BASELINE_LEGACY_ADAPTER_CLOSED_SCOPES`). A row that
-            is still a writable, dispatch-open current owner is not retired.
-            The producer writes ``write_scope`` from ``_write_scope_of``
-            (``context_measurement_inventory.py:1395-1400``), which yields
-            exactly ``writable`` / ``read-only`` / ``none``.
-          * authorised -- the ``explicit-unresolved`` arm is ordered first, so
-            only a row the producer confirmed against the frozen owner map can
-            reach this disposition. The producer's ``dispatch_blocked`` field
-            is deliberately NOT used as a second closedness test: it is defined
-            as ``status != "owned"`` (``:1447``) and re-validated against
-            ``status`` on the read path (``:2213-2214``), so for any row
-            reaching this arm it is invariably ``False`` and could only restate
-            the check the first arm already made.
+        Declared in :data:`BASELINE_DISPOSITIONS` but deliberately NOT derived
+        here, and that is the honest outcome rather than a missing rule. No
+        field in #866's closed ``ROW_KEYS`` records a legacy-adapter marker, a
+        version bound or an expiry, and the two fields a shortcut would reach
+        for carry the wrong meaning: ``write_scope`` is mutation permission
+        (``read-only`` marks an ACTIVE #783/#878/#880 consumer reading the
+        #704 crate, per ``_write_scope_of`` and its module docstring
+        ``:1395-1400`` / ``:43-45``), and ``dispatch_blocked`` is
+        ``status != "owned"`` and so is always ``False`` for any row that
+        reaches this point. Deriving the disposition from either would report
+        a live, in-migration consumer as a retired legacy adapter — a label
+        that does not describe its subject. A row that cannot prove it is a
+        closed, exact, versioned adapter is therefore reported as
+        ``explicit-unresolved``. See the module comment above
+        :data:`BASELINE_DISPOSITIONS` for the full argument and for what would
+        have to change upstream to emit it honestly.
 
     ``canonical-owner-consumer``
         The honest residual: a present, owned, current writable row in the
@@ -1575,13 +1574,6 @@ def _derive_baseline_disposition(row: Mapping[str, Any]) -> str:
         return "explicit-unresolved"
     if classification == "unrelated_byte_or_character_metric":
         return "legitimate-non-context-metric"
-    signal = str(row["signal"])
-    if (
-        signal in BASELINE_LEGACY_ADAPTER_IDENTITY_SIGNALS
-        and classification == "route-identity-bound"
-        and str(row["write_scope"]) in BASELINE_LEGACY_ADAPTER_CLOSED_SCOPES
-    ):
-        return "exact-versioned-legacy-adapter"
     return "canonical-owner-consumer"
 
 
@@ -1595,10 +1587,12 @@ def _baseline_findings(
 
     An erased baseline row (removed requirement) is rejected. Every surviving
     row's disposition comes from :func:`_derive_baseline_disposition`, which
-    can derive exactly the four closed dispositions of
-    :data:`BASELINE_DISPOSITIONS` -- ``canonical-owner-consumer``,
-    ``legitimate-non-context-metric``, ``exact-versioned-legacy-adapter`` and
-    ``explicit-unresolved`` -- and no other value.
+    derives three of the four closed values in :data:`BASELINE_DISPOSITIONS` --
+    ``canonical-owner-consumer``, ``legitimate-non-context-metric`` and
+    ``explicit-unresolved`` -- and never returns anything else.
+    ``exact-versioned-legacy-adapter`` stays declared but underived by design;
+    see :func:`_derive_baseline_disposition` for why no recorded row fact can
+    establish it.
     """
     dispositions: dict[str, int] = {d: 0 for d in BASELINE_DISPOSITIONS}
     for case_ref, expected_owner in EXPECTED_BASELINE_ROWS:
