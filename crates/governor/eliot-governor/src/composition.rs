@@ -7569,13 +7569,12 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     ///
     /// The exact task binding and acceptance digest come from Governor's
     /// retained cold-start terminal, never from a request-supplied
-    /// `TaskSelectionEvidence`. The retained receipt does not carry a typed
-    /// task-selection source, so this method does not synthesize one from an
-    /// unrelated profile reference. Before returning a selection disposition,
-    /// this method validates the retained receipt and exact lease key against
-    /// the live Governor fence and freshly matched `WorkScope`. A current task
-    /// contract is additionally joined to the unique live activation,
-    /// including principal, session, task id and revision.
+    /// `TaskSelectionEvidence`. The retained receipt's projection and original
+    /// evidence are joined to the exact lease, live Governor fence, freshly
+    /// matched `WorkScope` and unique live activation. This method does not
+    /// synthesize selection evidence or treat the projection as authority.
+    /// A current task contract is additionally joined on principal, session,
+    /// task id and revision.
     ///
     /// Valid no-task, exploratory, stale-selection and ambiguous dispositions
     /// return `None` with the original receipt so the caller can retain the
@@ -7623,33 +7622,56 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     > {
         let (_, receipt) = self.cold_start_readiness_terminal_for_claim(claim, now)?;
         let live_fence = self.snapshot.state_fence();
-        match receipt.task_binding.clone() {
-            TaskBindingState::CurrentTaskContract {
-                task_ref,
-                task_revision,
-                ..
-            } => {
-                if receipt.scope_resolution != eliot_workscope::ScopeResolutionState::Authenticated
-                    || receipt.readiness != eliot_workscope::ReadinessLifecycle::ReadyMaterial
-                {
-                    return Err(CompositionError::ActivationStaleFence);
-                }
+        let projection = receipt
+            .current_task_selection_projection()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        match projection {
+            Some(selection) => {
+                let evidence = receipt
+                    .task_selection_evidence
+                    .as_ref()
+                    .ok_or(CompositionError::ActivationStaleFence)?;
                 let activation = self.read_unique_agent_activation(now)?;
-                if !fences_match_exact(&activation.state_fence, &live_fence)
+                if selection.receipt_ref() != receipt.receipt_ref
+                    || selection.lease_ref() != receipt.lease_ref
+                    || selection.principal_ref() != receipt.principal_ref
+                    || selection.session_ref() != receipt.session_ref
+                    || selection.work_scope_ref() != receipt.scope.scope_ref
+                    || selection.scope_descriptor_revision() != receipt.scope_descriptor_revision
+                    || selection.instance_ref() != receipt.instance.instance_ref
+                    || selection.governing_source_generation()
+                        != receipt.governing_source_generation
+                    || !fences_match_exact(selection.state_fence(), &receipt.state_fence)
+                    || evidence.task_ref != selection.task_ref()
+                    || evidence.task_revision != selection.task_revision()
+                    || evidence.acceptance_digest != selection.acceptance_digest()
+                    || evidence.work_scope_ref != selection.work_scope_ref()
+                    || evidence.is_contaminated()
+                    || !fences_match_exact(selection.state_fence(), &live_fence)
+                    || !fences_match_exact(selection.state_fence(), &activation.state_fence)
+                    || !fences_match_exact(&activation.state_fence, &live_fence)
                     || receipt.principal_ref != activation.principal_id
+                    || selection.principal_ref() != activation.principal_id
                     || receipt.session_ref != activation.session_id
+                    || selection.session_ref() != activation.session_id
                     || receipt.scope.scope_ref != activation.work_scope_id
-                    || task_ref != activation.task_id.as_str()
-                    || task_revision != activation.task_revision
+                    || selection.work_scope_ref() != activation.work_scope_id
+                    || selection.task_ref() != activation.task_id.as_str()
+                    || selection.task_revision() != activation.task_revision
                 {
                     return Err(CompositionError::ActivationStaleFence);
                 }
                 Ok((Some(activation), receipt))
             }
-            TaskBindingState::None_
-            | TaskBindingState::Exploratory { .. }
-            | TaskBindingState::Stale { .. }
-            | TaskBindingState::Ambiguous { .. } => Ok((None, receipt)),
+            None => match &receipt.task_binding {
+                TaskBindingState::CurrentTaskContract { .. } => {
+                    Err(CompositionError::ActivationStaleFence)
+                }
+                TaskBindingState::None_
+                | TaskBindingState::Exploratory { .. }
+                | TaskBindingState::Stale { .. }
+                | TaskBindingState::Ambiguous { .. } => Ok((None, receipt)),
+            },
         }
     }
 
