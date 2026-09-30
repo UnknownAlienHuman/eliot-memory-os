@@ -5082,57 +5082,59 @@ impl KernelStoreGateway {
             // settle. The ordinary classification reports it as unresolved.
             return Ok(None);
         };
-        let acknowledgement =
-            match UserAutomationWakePort::read_wake_horizon_publication(runtime, publication.clone())
-                .await
-            {
-                Ok(acknowledgement) => acknowledgement,
-                Err(refusal) => {
-                    // No answer this boundary may close the question on. The row
-                    // keeps its `Reconciling` disposition and its possible-effect
-                    // state, and the reported reason now names the typed owner
-                    // answer that refused to settle it.
-                    let detail = unretained_horizon_outcome_reason(
-                        &publication.automation_revision,
-                        &obligation.owner_operation_id,
-                        &refusal.to_string(),
-                    );
-                    obligation.disposition =
-                        UserAutomationRuntimeObligationDisposition::Reconciling {
-                            reason: detail.clone(),
-                        };
-                    return Ok(Some(unreached_horizon_phase(
-                        publication,
-                        requested_occurrence_ids,
-                        retry_handle.to_owned(),
-                        UnreachedHorizonKind::UnknownOutcome,
-                        &detail,
-                    )));
-                }
-            };
+        let acknowledgement = match UserAutomationWakePort::read_wake_horizon_publication(
+            runtime,
+            publication.clone(),
+        )
+        .await
+        {
+            Ok(acknowledgement) => acknowledgement,
+            Err(refusal) => {
+                // No answer this boundary may close the question on. The row
+                // keeps its `Reconciling` disposition and its possible-effect
+                // state, and the reported reason now names the typed owner
+                // answer that refused to settle it.
+                let detail = unretained_horizon_outcome_reason(
+                    &publication.automation_revision,
+                    &obligation.owner_operation_id,
+                    &refusal.to_string(),
+                );
+                obligation.disposition = UserAutomationRuntimeObligationDisposition::Reconciling {
+                    reason: detail.clone(),
+                };
+                return Ok(Some(unreached_horizon_phase(
+                    publication,
+                    requested_occurrence_ids,
+                    retry_handle.to_owned(),
+                    UnreachedHorizonKind::UnknownOutcome,
+                    &detail,
+                )));
+            }
+        };
         // The owner's retained acknowledgement becomes this obligation's durable
         // body through the existing settle seam. A refusal here — a foreign
         // identity, a failed horizon accounting, a row that could not be
         // retained — writes nothing and keeps the record reconciling, so a wrong
         // answer can never become a settled horizon.
-        let disposition =
-            match self.settle_wake_horizon_acknowledgement(obligation, publication, &acknowledgement)
-            {
-                Ok(disposition) => disposition,
-                Err(reason) => {
-                    obligation.disposition =
-                        UserAutomationRuntimeObligationDisposition::Reconciling {
-                            reason: reason.clone(),
-                        };
-                    return Ok(Some(unreached_horizon_phase(
-                        publication,
-                        requested_occurrence_ids,
-                        retry_handle.to_owned(),
-                        UnreachedHorizonKind::UnknownOutcome,
-                        &reason,
-                    )));
-                }
-            };
+        let disposition = match self.settle_wake_horizon_acknowledgement(
+            obligation,
+            publication,
+            &acknowledgement,
+        ) {
+            Ok(disposition) => disposition,
+            Err(reason) => {
+                obligation.disposition = UserAutomationRuntimeObligationDisposition::Reconciling {
+                    reason: reason.clone(),
+                };
+                return Ok(Some(unreached_horizon_phase(
+                    publication,
+                    requested_occurrence_ids,
+                    retry_handle.to_owned(),
+                    UnreachedHorizonKind::UnknownOutcome,
+                    &reason,
+                )));
+            }
+        };
         obligation.disposition = disposition;
         Ok(Some(acknowledged_horizon_phase(
             publication,
