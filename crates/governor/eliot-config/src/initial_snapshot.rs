@@ -226,8 +226,7 @@ pub fn prepare_initial_snapshot_payload(
     settings.push(privacy.to_setting(&identity.owner_ref));
     if matches!(privacy, PrivacyChoice::LocalOnly) {
         settings.push(
-            ObservationIngressPolicy::LocalPrivateRetainedCaptureV1
-                .to_setting(&identity.owner_ref),
+            ObservationIngressPolicy::LocalPrivateRetainedCaptureV1.to_setting(&identity.owner_ref),
         );
     }
     let snapshot = ConfigPolicySnapshot {

@@ -7250,7 +7250,10 @@ impl HostRequestAttempt {
             )?;
         }
         if let Some(input_commitment_sha256) = &self.input_commitment_sha256 {
-            validate_digest(input_commitment_sha256, "host_request_attempt_input_commitment")?;
+            validate_digest(
+                input_commitment_sha256,
+                "host_request_attempt_input_commitment",
+            )?;
         }
         if self.fence_digest != fence_digest {
             return Err(OrsError::FenceMismatch);
@@ -7810,8 +7813,8 @@ pub struct HostRequestApplicationBinding {
 impl HostRequestApplicationBinding {
     /// Returns the canonical commitment to this exact retained binding.
     pub fn commitment_sha256(&self) -> Result<String, OrsError> {
-        let bytes = canonical_json_bytes(self)
-            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        let bytes =
+            canonical_json_bytes(self).map_err(|error| OrsError::Encoding(error.to_string()))?;
         Ok(sha256_hex(&bytes))
     }
 
@@ -7820,8 +7823,8 @@ impl HostRequestApplicationBinding {
         if self.wire_version != HOST_REQUEST_EXECUTABLE_INPUT_CONTRACT_VERSION {
             return Err(OrsError::UnsupportedContractVersion(self.wire_version));
         }
-        let binding_bytes = canonical_json_bytes(self)
-            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        let binding_bytes =
+            canonical_json_bytes(self).map_err(|error| OrsError::Encoding(error.to_string()))?;
         if binding_bytes.len() > MAX_HOST_REQUEST_APPLICATION_BINDING_BYTES {
             return Err(OrsError::PayloadTooLarge);
         }
@@ -7861,7 +7864,10 @@ impl HostRequestApplicationBinding {
             validate_digest(digest, "host_request_p07_bundle_sha256")?;
         }
         validate_text(self.principal_ref.as_str(), "host_request_principal_ref")?;
-        validate_text(self.session_ref.as_str(), "host_request_resolved_session_ref")?;
+        validate_text(
+            self.session_ref.as_str(),
+            "host_request_resolved_session_ref",
+        )?;
         self.validate_activation_projection()?;
         Ok(())
     }
@@ -7899,7 +7905,15 @@ impl HostRequestApplicationBinding {
             self.p07_revision,
             self.p07_bundle_sha256.as_ref(),
         ) {
-            (Some(binding), Some(binding_sha), Some(owner), Some(_), Some(result), Some(revision), Some(p07)) => {
+            (
+                Some(binding),
+                Some(binding_sha),
+                Some(owner),
+                Some(_),
+                Some(result),
+                Some(revision),
+                Some(p07),
+            ) => {
                 let expected_fence = serde_json::to_value(&self.state_fence)
                     .map_err(|error| OrsError::Encoding(error.to_string()))?;
                 if owner.get("binding") != Some(binding)
@@ -7927,7 +7941,10 @@ impl HostRequestApplicationBinding {
                 )
             }
             (None, None, None, None, None, None, None)
-                if self.task_ref.is_none() && self.task_revision.is_none() => Ok(()),
+                if self.task_ref.is_none() && self.task_revision.is_none() =>
+            {
+                Ok(())
+            }
             _ => Err(OrsError::InvalidField {
                 field: "host_request_activation_binding",
                 reason: "task activation evidence must be complete together, and absent only for task-free requests",
@@ -8024,7 +8041,11 @@ impl HostRequestApplicationBinding {
         {
             return Err(OrsError::FenceMismatch);
         }
-        match (self.task_ref.as_ref(), self.task_revision, self.state_fence.task_revision) {
+        match (
+            self.task_ref.as_ref(),
+            self.task_revision,
+            self.state_fence.task_revision,
+        ) {
             (Some(_), Some(revision), Some(fence_revision))
                 if revision != 0 && revision == fence_revision.value() => {}
             // A capture can be task-free while retaining a current fence that
@@ -8034,8 +8055,7 @@ impl HostRequestApplicationBinding {
             _ => {
                 return Err(OrsError::InvalidField {
                     field: "host_request_application_task_binding",
-                    reason:
-                        "task applicability and revision must be present and equal to the fence together",
+                    reason: "task applicability and revision must be present and equal to the fence together",
                 });
             }
         }
@@ -8071,9 +8091,7 @@ impl HostRequestApplicationBinding {
             ),
             (
                 "host_request_observation_policy_task",
-                policy
-                    .get("authenticated_task_ref")
-                    .and_then(Value::as_str),
+                policy.get("authenticated_task_ref").and_then(Value::as_str),
                 self.task_ref.as_ref().map(OpaqueLabel::as_str),
             ),
         ] {
@@ -8082,8 +8100,8 @@ impl HostRequestApplicationBinding {
             }
         }
         let policy_fence = policy.get("state_fence").cloned().unwrap_or(Value::Null);
-        let expected_fence =
-            serde_json::to_value(&self.state_fence).map_err(|error| OrsError::Encoding(error.to_string()))?;
+        let expected_fence = serde_json::to_value(&self.state_fence)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
         if policy_fence != expected_fence {
             return Err(OrsError::FenceMismatch);
         }
@@ -8093,20 +8111,20 @@ impl HostRequestApplicationBinding {
             "work_scope_canonical_read_digest",
             "work_scope_binding_sha256",
         ] {
-            let digest = policy
-                .get(field)
-                .and_then(Value::as_str)
-                .ok_or(OrsError::InvalidField {
-                    field: "host_request_observation_policy_digest",
-                    reason: "retained policy and scope evidence is missing a source digest",
-                })?;
+            let digest =
+                policy
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .ok_or(OrsError::InvalidField {
+                        field: "host_request_observation_policy_digest",
+                        reason: "retained policy and scope evidence is missing a source digest",
+                    })?;
             validate_digest(digest, "host_request_observation_policy_digest")?;
         }
         for field in ["policy_read_fence", "work_scope_read_fence"] {
-            let fence: StateFence = serde_json::from_value(
-                policy.get(field).cloned().unwrap_or(Value::Null),
-            )
-            .map_err(|_| OrsError::FenceMismatch)?;
+            let fence: StateFence =
+                serde_json::from_value(policy.get(field).cloned().unwrap_or(Value::Null))
+                    .map_err(|_| OrsError::FenceMismatch)?;
             if fence != self.state_fence {
                 return Err(OrsError::FenceMismatch);
             }
@@ -8131,7 +8149,10 @@ impl HostRequestApplicationBinding {
             "ingress_setting_owner_ref",
         ] {
             validate_text(
-                policy.get(field).and_then(Value::as_str).unwrap_or_default(),
+                policy
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
                 "host_request_observation_policy_setting_ref",
             )?;
         }
@@ -8141,7 +8162,11 @@ impl HostRequestApplicationBinding {
             "work_scope_owner_revision",
             "work_scope_read_revision",
         ] {
-            if policy.get(field).and_then(Value::as_u64).is_none_or(|revision| revision == 0) {
+            if policy
+                .get(field)
+                .and_then(Value::as_u64)
+                .is_none_or(|revision| revision == 0)
+            {
                 return Err(OrsError::InvalidField {
                     field: "host_request_observation_policy_revision",
                     reason: "retained policy and scope owner revisions must be non-zero",
@@ -8157,11 +8182,20 @@ impl HostRequestApplicationBinding {
     }
 
     fn validate_request_identity(&self, record: &HostRequestRecord) -> Result<(), OrsError> {
-        if self.request_identity.get("request_id").and_then(Value::as_str)
+        if self
+            .request_identity
+            .get("request_id")
+            .and_then(Value::as_str)
             != Some(record.request_id.as_str())
-            || self.request_identity.get("idempotency_key").and_then(Value::as_str)
+            || self
+                .request_identity
+                .get("idempotency_key")
+                .and_then(Value::as_str)
                 != Some(record.idempotency_key.as_str())
-            || self.request_identity.get("cancellation_id").and_then(Value::as_str)
+            || self
+                .request_identity
+                .get("cancellation_id")
+                .and_then(Value::as_str)
                 != Some(record.cancellation_id.as_str())
         {
             return Err(OrsError::HostRequestIdentityConflict {
@@ -8172,7 +8206,9 @@ impl HostRequestApplicationBinding {
         for (field, value, expected) in [
             (
                 "host_request_owner_session",
-                self.request_identity.get("session_id").and_then(Value::as_str),
+                self.request_identity
+                    .get("session_id")
+                    .and_then(Value::as_str),
                 record.session_ref.as_ref().map(OpaqueLabel::as_str),
             ),
             (
@@ -8202,19 +8238,31 @@ impl HostRequestApplicationBinding {
             .unwrap_or(Value::Null);
         let retained_correlation = serde_json::to_value(&record.correlation_projection)
             .map_err(|error| OrsError::Encoding(error.to_string()))?;
-        let parent_operation_id = record
-            .parent_operation_id
-            .as_ref()
-            .map(OpaqueLabel::as_str);
-        if self.request_identity.get("parent_operation_id").and_then(Value::as_str)
+        let parent_operation_id = record.parent_operation_id.as_ref().map(OpaqueLabel::as_str);
+        if self
+            .request_identity
+            .get("parent_operation_id")
+            .and_then(Value::as_str)
             != parent_operation_id
-            || self.request_identity.get("deadline_unix_ms").and_then(Value::as_u64)
+            || self
+                .request_identity
+                .get("deadline_unix_ms")
+                .and_then(Value::as_u64)
                 != Some(record.deadline_unix_ms)
-            || self.request_identity.get("capability").and_then(Value::as_str)
+            || self
+                .request_identity
+                .get("capability")
+                .and_then(Value::as_str)
                 != Some(record.capability_ref.as_str())
-            || self.request_identity.get("payload_sha256").and_then(Value::as_str)
+            || self
+                .request_identity
+                .get("payload_sha256")
+                .and_then(Value::as_str)
                 != Some(record.payload_digest.as_str())
-            || self.request_identity.get("payload_schema_id").and_then(Value::as_str)
+            || self
+                .request_identity
+                .get("payload_schema_id")
+                .and_then(Value::as_str)
                 != record.payload_schema_id.as_ref().map(OpaqueLabel::as_str)
             || request_correlation != retained_correlation
         {
@@ -8385,7 +8433,10 @@ impl HostRequestExecutableInput {
     }
 
     fn validate_payload_and_peer(&self, record: &HostRequestRecord) -> Result<(), OrsError> {
-        validate_digest(&self.payload_sha256, "host_request_executable_payload_sha256")?;
+        validate_digest(
+            &self.payload_sha256,
+            "host_request_executable_payload_sha256",
+        )?;
         if self.schema_id.as_str() != HOST_REQUEST_TOOL_REQUEST_SCHEMA_ID
             || self.encoding != HostRequestExecutableInputEncoding::CanonicalJsonV1
             || self.payload_length == 0
@@ -8444,12 +8495,31 @@ impl HostRequestExecutableInput {
             || self.protected_envelope.state_fence
                 != StateFenceSnapshot::capture(
                     &self.application_binding.state_fence,
-                    self.application_binding.state_fence.authority_epoch.sequence.get(),
+                    self.application_binding
+                        .state_fence
+                        .authority_epoch
+                        .sequence
+                        .get(),
                 )?
-            || self.protected_envelope.authority_epoch.current.lineage_id.as_str()
-                != self.application_binding.state_fence.authority_epoch.lineage_id.as_str()
+            || self
+                .protected_envelope
+                .authority_epoch
+                .current
+                .lineage_id
+                .as_str()
+                != self
+                    .application_binding
+                    .state_fence
+                    .authority_epoch
+                    .lineage_id
+                    .as_str()
             || self.protected_envelope.authority_epoch.current.epoch
-                != self.application_binding.state_fence.authority_epoch.sequence.get()
+                != self
+                    .application_binding
+                    .state_fence
+                    .authority_epoch
+                    .sequence
+                    .get()
         {
             return Err(OrsError::FenceMismatch);
         }
@@ -8795,8 +8865,7 @@ impl HostRequestRecord {
             {
                 return Err(OrsError::InvalidField {
                     field: "host_request_executable_input",
-                    reason:
-                        "protected execution requires an Observe invocation with no plaintext payload body",
+                    reason: "protected execution requires an Observe invocation with no plaintext payload body",
                 });
             }
             executable_input.validate_for(self)?;
@@ -8811,8 +8880,7 @@ impl HostRequestRecord {
         match self.executable_input.as_ref() {
             None if attempt.input_commitment_sha256.is_none() => Ok(()),
             Some(input)
-                if attempt.input_commitment_sha256.as_deref()
-                    == Some(&input.commitment_sha256) =>
+                if attempt.input_commitment_sha256.as_deref() == Some(&input.commitment_sha256) =>
             {
                 Ok(())
             }
