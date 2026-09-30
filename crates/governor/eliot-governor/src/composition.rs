@@ -1394,16 +1394,14 @@ pub struct CanonicalVerifierPlanBinding {
     /// list must still surface as an uncovered acceptance row rather than
     /// vanishing from the gate.
     pub required_acceptance_item_ids: BTreeSet<String>,
-    /// `TaskContract` acceptance digest the denominator above was bound to at
-    /// this exact task revision (issue #325 P1, I7.9).
+    /// Acceptance-set commitment bound by the canonical plan owner at this
+    /// exact task revision (issue #325 P1, I7.9).
     ///
-    /// The item set is only the contract's obligation set while this digest
-    /// equals the acceptance digest rehydrated from the contract-owning
-    /// task-selection evidence at the same fence and task revision. The owner
-    /// issues that digest over the whole acceptance set, so a plan selected
-    /// against another contract revision, or one whose declared set is not the
-    /// set the owner issued a digest for, is refused at the finish decision
-    /// instead of reporting a smaller set that reads as complete.
+    /// Admission and the finish gate both require this digest to equal
+    /// `task_acceptance_set_commitment(required_acceptance_item_ids)`, so it is
+    /// a commitment over the enumerated set rather than a free label, and a
+    /// plan that declares a different set than the one it committed to is
+    /// refused instead of reporting a smaller set that reads as complete.
     pub task_acceptance_digest: String,
     /// Explicit join from each acceptance item to the nextest test ids that
     /// establish it (issue #325 P1).
@@ -1548,6 +1546,21 @@ impl CanonicalVerifierPlanBinding {
         {
             return Err(CompositionError::Recovery(
                 "canonical verifier plan has no contract acceptance digest".to_owned(),
+            ));
+        }
+        // The digest is accepted only when it is the commitment over THIS
+        // enumeration. A format-valid digest that does not commit to the
+        // declared set is refused at admission, so a plan cannot carry a digest
+        // issued for a larger contract set alongside a narrowed item list and
+        // reach the finish gate. Recomputing here also means the digest cannot
+        // be satisfied by restating whatever label the caller already had.
+        if task_acceptance_set_commitment(&self.required_acceptance_item_ids)?
+            != self.task_acceptance_digest
+        {
+            return Err(CompositionError::Recovery(
+                "canonical verifier plan acceptance digest does not commit to its declared \
+                 acceptance item set"
+                    .to_owned(),
             ));
         }
         for (item_id, test_ids) in &self.acceptance_verifier_map {
@@ -2584,6 +2597,51 @@ fn check_fact_terminal_effect_join(
     Ok(())
 }
 
+/// Domain separator for the `TaskContract` acceptance-set commitment, so this
+/// digest can never be confused with a digest over any other collection.
+const TASK_ACCEPTANCE_SET_DOMAIN: &str = "eliot/task-acceptance-set/v1";
+
+/// Derives the acceptance-set commitment from the *enumerated* obligation set.
+///
+/// This is the mechanism that makes the contract acceptance digest load-bearing
+/// rather than a free label. Before it existed, both sides of
+/// [`ContractAcceptanceDenominator::admits`] validated only that the digest was
+/// 64 lowercase hex characters, so a plan could declare a narrowed
+/// `required_acceptance_item_ids` set while carrying a digest copied from a
+/// larger contract set, and the equality check passed while proving nothing
+/// about set identity. Binding the digest to the sorted enumeration closes that:
+/// the plan's declared set and the owner's stated digest are then no longer two
+/// independently typed labels, but one value and a hash of it, so a plan cannot
+/// narrow the denominator without the recomputed commitment no longer matching
+/// what the owner admitted.
+///
+/// The digest is over the sorted item ids only. It deliberately does not read a
+/// submitter `satisfied` flag, a coverage row, or any other party-asserted
+/// status: a claim about an obligation is not an identity of the obligation set.
+///
+/// # Errors
+///
+/// Returns [`CompositionError::Recovery`] when the set cannot be canonicalized.
+fn task_acceptance_set_commitment(
+    item_ids: &BTreeSet<String>,
+) -> Result<String, CompositionError> {
+    #[derive(Serialize)]
+    struct Commitment<'a> {
+        domain: &'a str,
+        item_ids: &'a BTreeSet<String>,
+    }
+    let bytes = canonical_json_bytes(&Commitment {
+        domain: TASK_ACCEPTANCE_SET_DOMAIN,
+        item_ids,
+    })
+    .map_err(|error| {
+        CompositionError::Recovery(format!(
+            "task acceptance set canonicalization failed: {error}"
+        ))
+    })?;
+    Ok(sha256_hex(&bytes))
+}
+
 /// The rehydrated current `TaskContract` acceptance set for one task
 /// revision, read from the owner that holds the contract at the finish
 /// decision.
@@ -2593,6 +2651,14 @@ fn check_fact_terminal_effect_join(
 /// which obligations it believes exist, but only the contract owner decides
 /// which obligations exist, and a plan that disagrees is refused rather than
 /// silently shrinking the set the gate is computed over.
+///
+/// The set reaches the finish decision already bound to the owner by
+/// [`ContractAcceptanceDenominator::admits`], so `item_ids` may only be a plan
+/// enumeration that survives that proof. The construction site
+/// (`produce_finish_evidence`) therefore still reads the ids from the plan
+/// because the enumeration itself has to travel with the plan, and the owner
+/// supplies the commitment that makes the enumeration provable rather than
+/// merely plausible.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContractAcceptanceDenominator {
     /// Contract identity the acceptance set was rehydrated for.
@@ -2606,18 +2672,41 @@ pub struct ContractAcceptanceDenominator {
 }
 
 impl ContractAcceptanceDenominator {
-    /// Whether the plan's declared acceptance set is this contract's set.
+    /// Whether the plan's declared acceptance set is the set the owner committed
+    /// to.
     ///
-    /// The plan enumerates the obligations; the contract owner's acceptance
-    /// digest is what admits that enumeration as the contract's obligation set.
-    /// The owner issues the digest over the whole set, so a plan that declares
-    /// fewer obligations than the owner digested — or one selected against
-    /// another contract revision — does not carry this digest and is refused
-    /// here rather than producing a narrower denominator that reads as
-    /// complete. The digest is load-bearing, not a label: it is rehydrated from
-    /// the task-selection owner, not from the plan.
+    /// The plan enumerates the obligations; the task-selection owner states the
+    /// commitment it admitted for this exact task revision. The two are compared
+    /// by *recomputing* the commitment from the plan's enumeration and requiring
+    /// it to equal the owner's digest, so the check has set-identity content
+    /// rather than label-equality content.
+    ///
+    /// This matters because a bare digest comparison proves nothing. Both
+    /// `CanonicalVerifierPlanBinding::task_acceptance_digest` and
+    /// `TaskSelectionEvidence::acceptance_digest` are validated only as 64
+    /// lowercase hex characters, and the intake path that produces the selection
+    /// digest can supply a caller-stated value or `sha256_hex` over the task
+    /// goal. Under a bare comparison a plan could therefore declare one
+    /// obligation of the contract's three and still pass, carrying a digest
+    /// copied from a different (larger) set — a completeness check validated
+    /// against a copy of one party's own list, which is the defect this
+    /// replaces.
+    ///
+    /// The commitment is recomputed here rather than trusted from the plan
+    /// binding, so the plan cannot satisfy this by restating a digest.
     fn admits(&self, verifier_plan: &CanonicalVerifierPlanBinding) -> bool {
-        verifier_plan.task_acceptance_digest == self.acceptance_digest && !self.item_ids.is_empty()
+        if self.item_ids.is_empty() || self.item_ids != verifier_plan.required_acceptance_item_ids
+        {
+            return false;
+        }
+        self.task_acceptance_set_commitment()
+            .is_ok_and(|commitment| commitment == self.acceptance_digest)
+    }
+
+    /// Recomputes the commitment over the enumerated set this denominator
+    /// carries, so `admits` never has to trust a digest reported by the plan.
+    fn task_acceptance_set_commitment(&self) -> Result<String, CompositionError> {
+        task_acceptance_set_commitment(&self.item_ids)
     }
 }
 
@@ -2628,17 +2717,21 @@ impl ContractAcceptanceDenominator {
 /// I7.9 / issue #325 P1: the denominator is the rehydrated current
 /// `TaskContract` acceptance set. The plan's
 /// `required_acceptance_item_ids` is only *admitted* as that set by
-/// [`ContractAcceptanceDenominator::admits`], which refuses unless the plan
-/// carries the same contract acceptance digest the caller rehydrated from the
-/// contract owner at this exact task revision. A plan that names fewer
-/// obligations than the contract carries therefore cannot produce a smaller
-/// denominator that reads as complete: the coverage call itself fails closed.
+/// [`ContractAcceptanceDenominator::admits`], which recomputes the
+/// acceptance-set commitment from the plan's own enumeration and refuses unless
+/// it equals the digest the caller rehydrated from the contract-owning
+/// task-selection evidence at this exact task revision and fence. A plan that
+/// names fewer obligations than the set the owner committed to therefore cannot
+/// produce a smaller denominator that reads as complete: the coverage call
+/// itself fails closed. The commitment is a hash of the enumeration rather than
+/// a compared label, so it cannot be satisfied by restating a digest.
 ///
 /// The denominator is never the selected `required_test_ids` inventory and
 /// never the fact-embedded plan clone alone — a fact whose plan drifted from
 /// the current owner plan fails closed here too. Every required acceptance
 /// item is enumerated before any verifier evidence is joined; unmapped items
-/// stay uncovered and can never yield `VERIFIED_COMPLETE` downstream.
+/// stay uncovered and can never yield `VERIFIED_COMPLETE` downstream. A
+/// persisted `satisfied` flag is a submitter claim and is never read here.
 pub(crate) fn acceptance_coverage_from_verifier_fact(
     contract: &ContractAcceptanceDenominator,
     plan: &CanonicalPlanBinding,
@@ -2831,10 +2924,12 @@ pub struct CanonicalAdmissionSnapshot {
 /// Issue #325 P1, I7.9. `acceptance_digest` is the contract-side identity,
 /// rehydrated from the task-selection owner; `item_ids` is the enumeration the
 /// plan declares for that digest. The digest is what makes the enumeration
-/// admissible as the contract's obligation set, because the contract owner
-/// issues it over the whole set — so a plan bound to a different contract
-/// revision, or one that declares a set the owner did not issue a digest for,
-/// is refused instead of quietly reporting a smaller denominator.
+/// admissible as the contract's obligation set, because `validate` recomputes
+/// it over the retained enumeration — so a plan bound to a different contract
+/// revision, or one that declares a set its digest does not commit to, is
+/// refused instead of quietly reporting a smaller denominator. Recomputing on
+/// the read path also means a persisted record cannot be rehydrated with a
+/// digest that was merely well-formed.
 ///
 /// Absent on the wire is a rehydration gap, never an empty obligation set:
 /// [`CanonicalFinishEvidence::validate`] refuses it, so a record persisted
@@ -2870,6 +2965,17 @@ impl CanonicalContractAcceptance {
         {
             return Err(CompositionError::Recovery(
                 "canonical contract acceptance set is absent, stale, or malformed".to_owned(),
+            ));
+        }
+        // The retained digest is only the contract's acceptance identity when it
+        // commits to the retained enumeration. Without this, a record could be
+        // rehydrated with any 64-hex digest beside any item set and would read
+        // back as an owner-issued acceptance set that was never issued.
+        if task_acceptance_set_commitment(&self.item_ids)? != self.acceptance_digest {
+            return Err(CompositionError::Recovery(
+                "canonical contract acceptance digest does not commit to its retained acceptance \
+                 item set"
+                    .to_owned(),
             ));
         }
         Ok(())
