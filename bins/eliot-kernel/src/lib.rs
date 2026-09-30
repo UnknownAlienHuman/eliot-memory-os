@@ -796,6 +796,15 @@ pub struct KernelComposition {
     /// [`KernelComposition::backup_owner_clients`], so a fresh or fake client
     /// can never stand in for the bound pair.
     backup_owner_clients: BackupOwnerClients,
+    /// The one fail-closed canonical Store evidence bridge shared by the
+    /// installation-bound ORS handle and the authenticated Store gateway.
+    /// It contains evidence only during the gateway's synchronous local ORS
+    /// transaction.
+    #[cfg_attr(
+        not(windows),
+        allow(dead_code, reason = "canonical Store attachment is Windows-only")
+    )]
+    canonical_store_evidence: Option<Arc<eliot_kernel_service::CanonicalStoreEvidence>>,
     #[cfg(windows)]
     canonical_store_gateway: Mutex<Option<Arc<KernelStoreGateway>>>,
     #[cfg(windows)]
@@ -2416,13 +2425,23 @@ impl KernelComposition {
                 ));
             }
         }
-        let gateway = std::sync::Arc::new(KernelStoreGateway::new(
+        let evidence = self
+            .canonical_store_evidence
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| {
+                KernelBuildError::Service(
+                    "canonical Store evidence provider is unavailable".to_owned(),
+                )
+            })?;
+        let gateway = std::sync::Arc::new(KernelStoreGateway::new_with_evidence(
             self.service.clone(),
             std::sync::Arc::new(client),
             route.clone(),
             // I14.21 (#1690): the rebind gateway recovers against the same
             // composition-retained Kernel ORS handle as the live gateway.
             Some(std::sync::Arc::clone(&self.generation_gateway.ors)),
+            evidence,
         ));
         let receipt = {
             let mut svc = self

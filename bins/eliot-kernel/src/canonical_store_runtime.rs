@@ -426,13 +426,23 @@ impl KernelComposition {
                 route.active_generation().value()
             ),
         );
-        let gateway = Arc::new(KernelStoreGateway::new(
+        let evidence = self
+            .canonical_store_evidence
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| {
+                KernelBuildError::Service(
+                    "canonical Store evidence provider is unavailable".to_owned(),
+                )
+            })?;
+        let gateway = Arc::new(KernelStoreGateway::new_with_evidence(
             self.service.clone(),
             Arc::new(client),
             route,
             // I14.21 (#1690): the gateway owns unknown-commit recovery
             // against the composition-retained Kernel ORS handle.
             Some(Arc::clone(&self.generation_gateway.ors)),
+            evidence,
         ));
         attach_then_retain_canonical_store(
             Arc::clone(&gateway),
