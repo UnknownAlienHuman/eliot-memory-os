@@ -53,15 +53,6 @@ use eliot_ors::{
     RecoveryPayloadEnvelope, StateFenceSnapshot, prove_maintenance_trigger_staging,
 };
 use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse, JobOperation};
-use eliot_runtime_contracts::{
-    AffectedOperationClass, BackpressureDisposition, BottleneckAvailability,
-    BottleneckCoverageState, BottleneckObservationV1, CapacityBottleneck,
-    EarliestRecoveryCondition, EvidenceCoverageState, HumanActionRequirement,
-    I14_BACKPRESSURE_RESPONSE_VERSION, I14AlternativeRoute, I14BackpressureCause,
-    I14BackpressureResponseV1, I14CurrentnessState, I14EscalationCondition, I14ForbiddenAction,
-    I14RecoveryAction, I14RecoveryDirectiveV1, I14RequiredAuthority, I14ResolutionState,
-    I14WorkOutcome, NormalWorkClass, RecoveryCommitStatus, StatePreservationStatus,
-};
 #[cfg(windows)]
 use eliot_protocol::{
     MAINTENANCE_TRIGGER_DECISION_RECEIPT_WIRE_ID,
@@ -71,6 +62,15 @@ use eliot_protocol::{
     MaintenanceTriggerIntakeReceipt, MaintenanceTriggerPage, MaintenanceTriggerPendingSummary,
     MaintenanceTriggerRecord, MaintenanceTriggerRevocation, MaintenanceTriggerRoutingClass,
     MaintenanceTriggerTerminalDisposition, MaintenanceTriggerTerminalKind, ProtocolError,
+};
+use eliot_runtime_contracts::{
+    AffectedOperationClass, BackpressureDisposition, BottleneckAvailability,
+    BottleneckCoverageState, BottleneckObservationV1, CapacityBottleneck,
+    EarliestRecoveryCondition, EvidenceCoverageState, HumanActionRequirement,
+    I14_BACKPRESSURE_RESPONSE_VERSION, I14AlternativeRoute, I14BackpressureCause,
+    I14BackpressureResponseV1, I14CurrentnessState, I14EscalationCondition, I14ForbiddenAction,
+    I14RecoveryAction, I14RecoveryDirectiveV1, I14RequiredAuthority, I14ResolutionState,
+    I14WorkOutcome, NormalWorkClass, RecoveryCommitStatus, StatePreservationStatus,
 };
 use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, NamedReadRequest,
@@ -118,6 +118,11 @@ use crate::user_automation_orchestration::{
     retained_user_automation_cancellation_obligation, retained_user_automation_obligation,
     runtime_obligation_payload_digest,
 };
+#[cfg(windows)]
+use crate::{
+    AuthenticatedMaintenanceTriggerSession, KernelServiceError, MaintenanceTriggerDeliveryError,
+    MaintenanceTriggerDeliveryLedger, MaintenanceTriggerDeliveryRow,
+};
 use crate::{
     CanonicalUserAutomationStore, EbpCanonicalStoreClient, EbpStoreTransport, KernelService,
     StoreClientFault, StoreClientFaultHarness, UserAutomationConfigurationPhase,
@@ -130,11 +135,6 @@ use crate::{
     committed_configuration_state, compile_wake_horizon, run_now_wake_read_request,
 };
 use eliot_kernel_core::user_automation::UserAutomationExecutionProjection;
-#[cfg(windows)]
-use crate::{
-    AuthenticatedMaintenanceTriggerSession, KernelServiceError, MaintenanceTriggerDeliveryError,
-    MaintenanceTriggerDeliveryLedger, MaintenanceTriggerDeliveryRow,
-};
 
 const ACTIVE_DAEMON_CALLER: &str = "eliotd";
 
