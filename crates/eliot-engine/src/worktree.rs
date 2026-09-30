@@ -3,9 +3,10 @@ use crate::{
     work_lease_is_active,
 };
 use eliot_types::{
-    ActionLease, AgentId, AgentSessionId, CandidateDiff, CandidateDiffId, CandidateDiffStatus,
-    CandidateReview, CandidateReviewDecision, CommandContext, CompletionGateDecision,
-    CompletionProof, CompletionStatus, LifecycleStatus, PatchRequest, SemanticCommand, TaintClass,
+    ActionLease, AgentId, AgentSessionId, CANDIDATE_SOURCE_SNAPSHOT_SCHEMA_VERSION, CandidateDiff,
+    CandidateDiffId, CandidateDiffStatus, CandidateReview, CandidateReviewDecision,
+    CandidateSourceSnapshotV1, CommandContext, CompletionGateDecision, CompletionProof,
+    CompletionStatus, LifecycleStatus, PatchRequest, SemanticCommand, TaintClass,
     ToolObservationRecordCommand, UnifiedDiff, VerifierRun, VerifierStatus, Visibility, WorkLease,
     WorkScope, WorktreeLease, WorktreeLeaseId, WorktreeLeaseKind, WorktreeLeaseRequest,
     WorktreeLeaseState, WriteId, WriteReceiptRef,
@@ -308,6 +309,7 @@ impl CandidateDiffService {
             &lease.base_commit,
         )
         .await?;
+        let source_tree_oid = snapshot.tree_oid;
         let changed_files = snapshot.changed_files;
 
         let mut status = classify_candidate_diff(
@@ -358,6 +360,10 @@ impl CandidateDiffService {
             work_item_id: lease.work_item_id,
             base_commit: lease.base_commit,
             worktree_head: Some(snapshot.worktree_head),
+            source_snapshot: Some(CandidateSourceSnapshotV1 {
+                schema_version: CANDIDATE_SOURCE_SNAPSHOT_SCHEMA_VERSION,
+                tree_oid: source_tree_oid,
+            }),
             diff_hash: blake3::hash(diff_text.as_bytes()).to_hex().to_string(),
             diff_ref: path_for_record(&diff_ref),
             changed_files: changed_file_paths,
@@ -890,6 +896,7 @@ struct WorktreePayloadInput {
 
 struct CandidateTreeSnapshot {
     worktree_head: String,
+    tree_oid: String,
     changed_files: Vec<StatusFile>,
     diff_text: String,
 }
@@ -1187,6 +1194,13 @@ async fn capture_candidate_snapshot(
     let snapshot_tree =
         snapshot_candidate_tree(worktree_path, diff_root, candidate_diff_id, &worktree_head)
             .await?;
+    if !matches!(snapshot_tree.len(), 40 | 64)
+        || !snapshot_tree
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(rejected("candidate_snapshot_tree_oid_invalid"));
+    }
     let changed_files =
         changed_files_between_trees(worktree_path, base_commit, &snapshot_tree).await?;
     let diff_bytes = git_stdout_bounded(
@@ -1207,6 +1221,7 @@ async fn capture_candidate_snapshot(
         String::from_utf8(diff_bytes).map_err(|_| rejected("git_diff_output_not_utf8"))?;
     Ok(CandidateTreeSnapshot {
         worktree_head,
+        tree_oid: snapshot_tree,
         changed_files,
         diff_text,
     })

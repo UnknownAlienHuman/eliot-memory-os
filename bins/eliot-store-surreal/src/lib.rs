@@ -5,13 +5,12 @@
 //! This process exposes only the store-neutral EBP contract.  `SurrealDB`
 //! credentials, provider transport and query text stay inside
 //! `eliot-store-surreal-adapter`; this root only assembles the adapter and
-//! serializes bounded contract receipts. Blob contributes one process/root
-//! claim identity; it is not a second store or semantic write path.
+//! serializes bounded contract receipts. Source Blob ownership is co-located
+//! in `eliotd` per I5.2; this process never claims a Blob data root.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use eliot_blob::BlobRootOwner;
 use eliot_contracts::StateFence;
 use eliot_installation::{
     InstallationProfile, ValidatedRuntimeRootLeases, WindowsRuntimeRootLease,
@@ -33,8 +32,8 @@ use eliot_protocol::{
 };
 use eliot_store_api::{
     BackupOperationReconciliation, CAPABILITIES, CanonicalRequestView, CanonicalRestoreBatch,
-    CanonicalSnapshotPort, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS,
-    ExactJsonBytes, IsolatedDestination, IsolatedDestinationReceipt, IsolatedRestorePort,
+    CanonicalSnapshotPort, CanonicalStoreClient, CanonicalValidationSnapshot, CausalBinding,
+    EFFECTS, ExactJsonBytes, IsolatedDestination, IsolatedDestinationReceipt, IsolatedRestorePort,
     NamedReadRequest, NamedReadResponse, OperationId, OperationIdentity, OrderingHead,
     OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta,
     ReservedWriteRequest, RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation,
@@ -324,12 +323,10 @@ fn admit_prepared_for_execution(
     Ok(())
 }
 
-/// Canonical store composition. All provider authority is held by the one
-/// adapter and one process/root Blob claim; Blob does not become a semantic
-/// store or alternate transition path.
+/// Canonical store composition. Provider authority is held by the one
+/// canonical adapter; the source-artifact Blob root is owned by the daemon.
 pub struct StoreComposition {
     store: SurrealStoreAdapter,
-    blob: BlobRootOwner,
     state_fence: StateFence,
     schema_bootstrap_binding: StoreSchemaBootstrapBinding,
     schema_bootstrap_cache: tokio::sync::Mutex<Option<StoreSchemaBootstrapCache>>,
@@ -348,7 +345,6 @@ impl std::fmt::Debug for StoreComposition {
         formatter
             .debug_struct("StoreComposition")
             .field("store", &self.store)
-            .field("blob_owner", &self.blob)
             .field("state_fence", &self.state_fence)
             .field("connections", &self.connections)
             .field("health_admission", &self.health_admission)
@@ -365,12 +361,6 @@ impl StoreComposition {
     pub fn new(config: &StoreLaunchConfig) -> Result<Self, String> {
         config.validate()?;
         let schema_bootstrap_binding = StoreSchemaBootstrapBinding::from_config(config);
-        let blob = BlobRootOwner::claim(
-            config.blob_root.clone(),
-            format!("store-composition:{}", config.instance_id),
-            std::process::id(),
-        )
-        .map_err(|error| format!("claim Blob root owner: {error}"))?;
         let platform = WindowsPlatform::new(config.blob_root.clone())
             .map_err(|error| format!("validate Blob root for credential access: {error}"))?;
         let password = resolve_credential(&platform, &config.credential_ref)?;
@@ -440,7 +430,6 @@ impl StoreComposition {
         .map_err(|error| format!("compose bounded bridge client sets: {error}"))?;
         Ok(Self {
             store,
-            blob,
             state_fence,
             schema_bootstrap_binding,
             schema_bootstrap_cache: tokio::sync::Mutex::new(None),
@@ -488,18 +477,6 @@ impl StoreComposition {
             adapter.expected_schema_generation.as_str(),
         )
         .map(|_report| ())
-    }
-
-    /// Rejects attempts to add a second process/root owner after composition.
-    pub fn with_blob_owner(self, _owner: BlobRootOwner) -> Result<Self, String> {
-        Err("exactly one Blob root owner is composed by StoreComposition::new".to_owned())
-    }
-
-    /// Returns the sole process/root claim identity. It carries no semantic
-    /// write authority and does not mint Blob receipts.
-    #[must_use]
-    pub fn blob_owner(&self) -> &BlobRootOwner {
-        &self.blob
     }
 
     /// Returns the one composed canonical provider adapter.
@@ -828,9 +805,12 @@ impl StoreComposition {
             .try_acquire(ClientClass::Write)
             .map_err(StoreCompositionError::Store)?;
         let _access = self.connections.validate_lease(&lease)?;
-        let outcome = CanonicalStoreClient::apply_reserved_write(&self.store, request)
-            .await
-            .map_err(StoreCompositionError::Store);
+        let outcome = Box::pin(CanonicalStoreClient::apply_reserved_write(
+            &self.store,
+            request,
+        ))
+        .await
+        .map_err(StoreCompositionError::Store);
         if matches!(
             outcome,
             Err(StoreCompositionError::Store(StoreError::Unavailable))
@@ -1167,6 +1147,27 @@ impl StoreComposition {
             .reconcile(operation_id)
             .await
             .map_err(AdapterError::into_store_error)
+    }
+
+    /// Re-reads one committed receipt and its DB-owned causal projection,
+    /// then requires the readback to equal the receipt returned by the write.
+    /// Surreal derives the binding from the durable sequence and predecessor
+    /// rows; this composition never treats envelope causal fields as authority.
+    pub async fn committed_receipt_with_causal(
+        &self,
+        expected: &WriteReceipt,
+    ) -> Result<(WriteReceipt, CausalBinding), StoreError> {
+        let Some((receipt, causal)) = self
+            .store
+            .receipt_with_causal(expected.operation_id.clone())
+            .await?
+        else {
+            return Err(StoreError::MissingReceiptEnvelope);
+        };
+        if &receipt != expected {
+            return Err(StoreError::InvalidReceipt);
+        }
+        Ok((receipt, causal))
     }
 
     /// Resolves an unknown write outcome by the original operation identity

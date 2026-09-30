@@ -230,7 +230,8 @@ use eliot_contracts::sha256_hex;
 use eliot_contracts::{RequestMetadata, StateFence, TaskId};
 use eliot_governor::{
     CanonicalWriteEnvelope, ColdStartSurfaceView, GoverningSourceSet, PrivacyProfile, ScopeBinding,
-    WorkScopeDescriptor, derive_observed_resources,
+    SourceArtifactAdmission, TaskSelectionAdmissionBinding, WorkScopeDescriptor,
+    derive_observed_resources,
 };
 use eliot_integration_coverage::{GovernanceProfile, IntegrationCoverageProfile};
 use eliot_observation::TaskSelectionEvidence;
@@ -2350,6 +2351,9 @@ pub fn admit_bootstrap_context(
 /// A moved task, scope, fence, bootstrap/profile revision, or re-projected
 /// bootstrap conflicts for rebind; it is never rewritten
 /// under the old operation identity.
+/// Only bootstrap provenance participates in this join. A live task selection
+/// retains its opaque Governor owner binding and uses the dedicated live
+/// selection revalidation gate.
 ///
 /// Cold/unbound and non-task-relative admissions carry no sealed identity and
 /// pass through untouched. This entry mints nothing and selects nothing.
@@ -2363,6 +2367,26 @@ pub fn require_material_bootstrap_for_task_bound(
     binding: &DispatchedBinding,
     bootstrap: &BootstrapAdmission,
 ) -> Result<(), TaskBindingError> {
+    let (
+        admitted_receipt_revision,
+        admitted_governance_profile_ref,
+        admitted_projection_generation,
+    ) = match &binding.provenance {
+        DispatchedBindingProvenance::Bootstrap {
+            receipt_revision,
+            governance_profile_ref,
+            projection_generation,
+        } => (
+            *receipt_revision,
+            governance_profile_ref.as_str(),
+            *projection_generation,
+        ),
+        DispatchedBindingProvenance::LiveTaskSelection(_) => {
+            return Err(TaskBindingError::selection_required(
+                "live TaskSelection dispatch requires exact Governor owner revalidation",
+            ));
+        }
+    };
     let material = match bootstrap {
         BootstrapAdmission::Material(material) => material,
         BootstrapAdmission::Diagnostic { reason, .. } => {
@@ -2391,8 +2415,8 @@ pub fn require_material_bootstrap_for_task_bound(
             "task-bound dispatch bootstrap was assembled at another fence; rebind at the live fence, no silent rebind",
         ));
     }
-    if material.receipt_revision != binding.receipt_revision
-        || material.governance_profile_ref != binding.governance_profile_ref
+    if material.receipt_revision != admitted_receipt_revision
+        || material.governance_profile_ref != admitted_governance_profile_ref
     {
         return Err(TaskBindingError::scope_incompatible(
             "task-bound dispatch bootstrap/profile revision moved before effect; rebind at the live revision, no silent rebind",
@@ -2401,7 +2425,7 @@ pub fn require_material_bootstrap_for_task_bound(
     // A re-projected bootstrap under the same receipt revision still conflicts
     // for rebind: the admitted projection is never silently adopted under the
     // old operation identity.
-    if material.projection_generation != binding.projection_generation {
+    if material.projection_generation != admitted_projection_generation {
         return Err(TaskBindingError::scope_incompatible(
             "task-bound dispatch bootstrap was re-projected before effect; rebind at the live projection, no silent adoption",
         ));
@@ -2724,14 +2748,23 @@ pub struct DispatchedBinding {
     pub session_ref: String,
     /// Caller-presented fence admission ran against.
     pub presented_fence: StateFence,
-    /// Bootstrap receipt revision admission ran against.
-    pub receipt_revision: u64,
-    /// Governance profile reference admission ran against.
-    pub governance_profile_ref: String,
-    /// Projection generation admission ran against.
-    pub projection_generation: u64,
     /// Stable operation identity; preserved across revalidation, never mutated.
     pub operation_id: String,
+    /// The authority source that produced this binding. Bootstrap receipt
+    /// fields exist only for bootstrap admissions; live task selections retain
+    /// the original opaque Governor owner binding instead of fabricating those
+    /// unrelated readiness fields.
+    provenance: DispatchedBindingProvenance,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DispatchedBindingProvenance {
+    Bootstrap {
+        receipt_revision: u64,
+        governance_profile_ref: String,
+        projection_generation: u64,
+    },
+    LiveTaskSelection(Box<TaskSelectionAdmissionBinding>),
 }
 
 /// Seals one admitted task-bound transition into its dispatch identity
@@ -2760,51 +2793,324 @@ pub fn seal_dispatched_binding(
     projection_generation: u64,
     operation_id: String,
 ) -> Result<DispatchedBinding, TaskBindingError> {
-    evidence.validate().map_err(|error| {
-        TaskBindingError::selection_required(format!("task selection evidence invalid: {error}"))
-    })?;
-    if evidence.is_contaminated() {
-        return Err(TaskBindingError::selection_required(
-            "task selection is contaminated",
-        ));
-    }
-    if evidence.task_ref != admitted_task_ref {
-        return Err(TaskBindingError::scope_incompatible(
-            "task-bound dispatch names a different task than the admitted context",
-        ));
-    }
-    if evidence.work_scope_ref != scope_ref {
-        return Err(TaskBindingError::scope_incompatible(
-            "task-bound dispatch names a different WorkScope than the admitted write",
-        ));
-    }
-    if principal_ref.trim().is_empty() || principal_ref.chars().any(char::is_control) {
-        return Err(TaskBindingError::selection_required(
-            "task-bound dispatch names no admitted principal",
-        ));
-    }
-    if session_ref.trim().is_empty() || session_ref.chars().any(char::is_control) {
-        return Err(TaskBindingError::selection_required(
-            "task-bound dispatch names no admitted session",
-        ));
-    }
-    if operation_id.trim().is_empty() || operation_id.chars().any(char::is_control) {
-        return Err(TaskBindingError::selection_required(
-            "task-bound dispatch names no operation identity",
-        ));
-    }
-    Ok(DispatchedBinding {
+    seal_dispatched_binding_with_provenance(DispatchedBinding {
         evidence,
         admitted_task_ref: admitted_task_ref.to_owned(),
         scope_ref: scope_ref.to_owned(),
         principal_ref: principal_ref.to_owned(),
         session_ref: session_ref.to_owned(),
         presented_fence: presented_fence.clone(),
-        receipt_revision,
-        governance_profile_ref: governance_profile_ref.to_owned(),
-        projection_generation,
         operation_id,
+        provenance: DispatchedBindingProvenance::Bootstrap {
+            receipt_revision,
+            governance_profile_ref: governance_profile_ref.to_owned(),
+            projection_generation,
+        },
     })
+}
+
+fn seal_dispatched_binding_with_provenance(
+    binding: DispatchedBinding,
+) -> Result<DispatchedBinding, TaskBindingError> {
+    binding.evidence.validate().map_err(|error| {
+        TaskBindingError::selection_required(format!("task selection evidence invalid: {error}"))
+    })?;
+    if binding.evidence.is_contaminated() {
+        return Err(TaskBindingError::selection_required(
+            "task selection is contaminated",
+        ));
+    }
+    if binding.evidence.task_ref != binding.admitted_task_ref {
+        return Err(TaskBindingError::scope_incompatible(
+            "task-bound dispatch names a different task than the admitted context",
+        ));
+    }
+    if binding.evidence.work_scope_ref != binding.scope_ref {
+        return Err(TaskBindingError::scope_incompatible(
+            "task-bound dispatch names a different WorkScope than the admitted write",
+        ));
+    }
+    if binding.principal_ref.trim().is_empty()
+        || binding.principal_ref.chars().any(char::is_control)
+    {
+        return Err(TaskBindingError::selection_required(
+            "task-bound dispatch names no admitted principal",
+        ));
+    }
+    if binding.session_ref.trim().is_empty() || binding.session_ref.chars().any(char::is_control) {
+        return Err(TaskBindingError::selection_required(
+            "task-bound dispatch names no admitted session",
+        ));
+    }
+    if binding.operation_id.trim().is_empty() || binding.operation_id.chars().any(char::is_control)
+    {
+        return Err(TaskBindingError::selection_required(
+            "task-bound dispatch names no operation identity",
+        ));
+    }
+    Ok(binding)
+}
+
+/// Admits the task-bound Store capture from the original Governor task-selection
+/// owner binding. The binding is retained privately in the dispatch identity;
+/// its non-Serde provenance is never reconstructed from the request or a
+/// readiness receipt.
+pub fn admit_lsp_capture_from_owner(
+    identity: &eliot_protocol::RequestIdentity,
+    source_admission: &SourceArtifactAdmission,
+    transition: &PreparedTransition,
+    selection: &TaskSelectionAdmissionBinding,
+) -> Result<DispatchedBinding, TaskBindingError> {
+    validate_lsp_capture_owner_join(identity, source_admission, transition, selection)?;
+
+    let request_task = identity
+        .request
+        .metadata
+        .task_id
+        .as_ref()
+        .map(TaskId::as_str)
+        .ok_or_else(|| {
+            TaskBindingError::selection_required(
+                "task-bound LSP capture requires the original request Task",
+            )
+        })?;
+    let scope_ref = selection.work_scope().binding.scope.scope_ref.as_str();
+    let presented_fence = &identity.request.metadata.state_fence;
+    admit_task_bound(
+        Some(selection.evidence()),
+        request_task,
+        scope_ref,
+        presented_fence,
+        CompatibilityDisposition::Compatible,
+    )?;
+
+    seal_dispatched_binding_with_provenance(DispatchedBinding {
+        evidence: selection.evidence().clone(),
+        admitted_task_ref: request_task.to_owned(),
+        scope_ref: scope_ref.to_owned(),
+        principal_ref: selection.principal_ref().to_owned(),
+        session_ref: selection.session_ref().to_owned(),
+        presented_fence: presented_fence.clone(),
+        operation_id: transition.identity.operation_id.as_str().to_owned(),
+        provenance: DispatchedBindingProvenance::LiveTaskSelection(Box::new(selection.clone())),
+    })
+}
+
+/// Revalidates one sealed LSP capture against a fresh, exact Governor owner
+/// read immediately before the canonical Store exchange. Bootstrap dispatches
+/// cannot enter this gate, and live selections cannot use the bootstrap-only
+/// revalidator.
+pub fn admit_lsp_capture_with_live_binding(
+    identity: &eliot_protocol::RequestIdentity,
+    source_admission: &SourceArtifactAdmission,
+    transition: &PreparedTransition,
+    binding: &DispatchedBinding,
+    current_selection: &TaskSelectionAdmissionBinding,
+) -> Result<TaskBindingAdmission, TaskBindingError> {
+    let DispatchedBindingProvenance::LiveTaskSelection(original_selection) = &binding.provenance
+    else {
+        return Err(TaskBindingError::selection_required(
+            "LSP capture effect gate requires an owner-issued live task selection",
+        ));
+    };
+    if original_selection.as_ref() != current_selection {
+        return Err(TaskBindingError::scope_incompatible(
+            "live TaskSelection owner binding changed before Store exchange; retry under a new operation",
+        ));
+    }
+    validate_lsp_capture_owner_join(identity, source_admission, transition, current_selection)?;
+    if binding.evidence != *current_selection.evidence()
+        || binding.admitted_task_ref != current_selection.task_ref()
+        || binding.scope_ref != current_selection.work_scope().binding.scope.scope_ref
+        || binding.principal_ref != current_selection.principal_ref()
+        || binding.session_ref != current_selection.session_ref()
+        || binding.presented_fence != identity.request.metadata.state_fence
+        || binding.operation_id != transition.identity.operation_id.as_str()
+    {
+        return Err(TaskBindingError::scope_incompatible(
+            "sealed LSP capture identity changed before Store exchange; retry under a new operation",
+        ));
+    }
+    revalidate_task_bound_for_effect(
+        &binding.evidence,
+        Some(binding.admitted_task_ref.as_str()),
+        &binding.scope_ref,
+        &binding.presented_fence,
+        current_selection.state_fence(),
+    )?;
+    Ok(TaskBindingAdmission::TaskBound(binding.clone()))
+}
+
+pub(crate) fn validate_lsp_capture_source_admission(
+    identity: &eliot_protocol::RequestIdentity,
+    source_admission: &SourceArtifactAdmission,
+) -> Result<(), TaskBindingError> {
+    identity.validate().map_err(|error| {
+        TaskBindingError::selection_required(format!(
+            "original LSP request identity is invalid: {error}"
+        ))
+    })?;
+    let metadata = &identity.request.metadata;
+    let Some(request_task) = metadata.task_id.as_ref().map(TaskId::as_str) else {
+        return Err(TaskBindingError::selection_required(
+            "task-bound LSP capture requires the original request Task",
+        ));
+    };
+    let fence = &metadata.state_fence;
+    if source_admission.request().metadata != *metadata
+        || source_admission.request_identity() != identity
+        || source_admission.operation().request_id != metadata.request_id
+        || source_admission.operation().operation_kind
+            != eliot_lsp_bridge::LSP_TOOL_OBSERVATION_RECEIPT_KIND
+        || source_admission.operation().effect != eliot_receipts::EffectClass::ReversibleMutation
+    {
+        return Err(TaskBindingError::selection_required(
+            "source Blob publication is not admitted for the exact original LSP request",
+        ));
+    }
+    if source_admission.task().task_id.as_str() != request_task {
+        return Err(TaskBindingError::scope_incompatible(
+            "source admission Task differs from the original LSP request",
+        ));
+    }
+    if source_admission.request().state_fence != *fence
+        || source_admission.operation().state_fence != *fence
+        || source_admission.task().state_fence != *fence
+        || source_admission.session().state_fence != *fence
+        || source_admission.work_scope().state_fence != *fence
+    {
+        return Err(TaskBindingError::scope_incompatible(
+            "source admission does not retain the original LSP request fence",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_lsp_capture_owner_join(
+    identity: &eliot_protocol::RequestIdentity,
+    source_admission: &SourceArtifactAdmission,
+    transition: &PreparedTransition,
+    selection: &TaskSelectionAdmissionBinding,
+) -> Result<(), TaskBindingError> {
+    validate_lsp_capture_source_admission(identity, source_admission)?;
+    transition.validate().map_err(|error| {
+        TaskBindingError::selection_required(format!("prepared LSP capture is invalid: {error}"))
+    })?;
+    let metadata = &identity.request.metadata;
+    let Some(request_task) = metadata.task_id.as_ref().map(TaskId::as_str) else {
+        return Err(TaskBindingError::selection_required(
+            "task-bound LSP capture requires the original request Task",
+        ));
+    };
+    let owner_scope = selection.work_scope().binding.scope.scope_ref.as_str();
+    let fence = &metadata.state_fence;
+    let evidence = selection.evidence();
+
+    evidence.validate().map_err(|error| {
+        TaskBindingError::selection_required(format!(
+            "Governor TaskSelection owner evidence is invalid: {error}"
+        ))
+    })?;
+    if evidence.is_contaminated() {
+        return Err(TaskBindingError::selection_required(
+            "Governor TaskSelection owner evidence is contaminated",
+        ));
+    }
+    if selection.principal_ref().trim().is_empty()
+        || selection.session_ref().trim().is_empty()
+        || selection.task_ref().trim().is_empty()
+        || selection.selection_source_ref().trim().is_empty()
+        || selection.evidence_ref().trim().is_empty()
+    {
+        return Err(TaskBindingError::selection_required(
+            "Governor TaskSelection owner binding is incomplete",
+        ));
+    }
+    if evidence.task_ref != selection.task_ref()
+        || evidence.task_revision != selection.task_revision()
+        || evidence.acceptance_digest != selection.acceptance_digest()
+        || evidence.work_scope_ref != owner_scope
+        || evidence.selection_source_ref != selection.selection_source_ref()
+        || evidence.evidence_ref != selection.evidence_ref()
+    {
+        return Err(TaskBindingError::selection_required(
+            "Governor TaskSelection evidence does not match its opaque owner binding",
+        ));
+    }
+    if request_task != selection.task_ref()
+        || transition.task_id.as_deref() != Some(request_task)
+        || transition.scope_id.as_str() != owner_scope
+        || owner_scope != source_admission.work_scope().scope_id.as_str()
+    {
+        return Err(TaskBindingError::scope_incompatible(
+            "LSP capture Task or WorkScope differs across the admitted request, source effect, Store transition, and live owner selection",
+        ));
+    }
+    if selection.principal_ref() != source_admission.holder().as_str()
+        || selection.session_ref() != source_admission.session().session_id.as_str()
+        || selection.task_ref() != source_admission.task().task_id.as_str()
+    {
+        return Err(TaskBindingError::scope_incompatible(
+            "live TaskSelection principal, session, or task differs from the original source admission",
+        ));
+    }
+    if selection.state_fence() != fence
+        || selection.work_scope().state_fence != *fence
+        || source_admission.request().state_fence != *fence
+        || source_admission.operation().state_fence != *fence
+        || source_admission.task().state_fence != *fence
+        || source_admission.session().state_fence != *fence
+        || source_admission.work_scope().state_fence != *fence
+        || transition.state_fence != *fence
+        || transition.identity.idempotency_key != identity.idempotency_key
+    {
+        return Err(TaskBindingError::scope_incompatible(
+            "LSP capture changed its original request fence or canonical idempotency binding",
+        ));
+    }
+    validate_lsp_capture_transition_payload(transition, selection)
+}
+
+fn validate_lsp_capture_transition_payload(
+    transition: &PreparedTransition,
+    selection: &TaskSelectionAdmissionBinding,
+) -> Result<(), TaskBindingError> {
+    if transition.named_operations.len() != 1
+        || transition.named_operations[0].operation != NamedMutationOperation::CaptureObservation
+    {
+        return Err(TaskBindingError::selection_required(
+            "LSP capture Store transition must contain exactly one CaptureObservation",
+        ));
+    }
+    let capture = &transition.named_operations[0];
+    let payload_ref = eliot_store_api::decode_captured_blob_payload_ref(&capture.parameters)
+        .map_err(|error| {
+            TaskBindingError::selection_required(format!(
+                "LSP capture has no valid owner-published Blob pointer: {error}"
+            ))
+        })?
+        .ok_or_else(|| {
+            TaskBindingError::selection_required(
+                "LSP CaptureObservation omits its owner-published Blob pointer",
+            )
+        })?;
+    if payload_ref.receipt_kind != eliot_lsp_bridge::LSP_TOOL_OBSERVATION_RECEIPT_KIND {
+        return Err(TaskBindingError::selection_required(
+            "LSP CaptureObservation pointer has another producer receipt kind",
+        ));
+    }
+    if !transition
+        .required_proof_and_approval_refs
+        .contains(&selection.selection_source_ref().to_owned())
+        || !transition
+            .required_proof_and_approval_refs
+            .contains(&selection.evidence_ref().to_owned())
+    {
+        return Err(TaskBindingError::selection_required(
+            "canonical LSP capture must carry the exact owner selection-source and evidence handles",
+        ));
+    }
+    Ok(())
 }
 
 /// Renders one non-matched `MaterialEffect` guard report as a stable typed
@@ -2922,6 +3228,26 @@ pub fn revalidate_dispatched_binding(
     live_projection_generation: u64,
     live_fence: &StateFence,
 ) -> Result<(), TaskBindingError> {
+    let (
+        admitted_receipt_revision,
+        admitted_governance_profile_ref,
+        admitted_projection_generation,
+    ) = match &binding.provenance {
+        DispatchedBindingProvenance::Bootstrap {
+            receipt_revision,
+            governance_profile_ref,
+            projection_generation,
+        } => (
+            *receipt_revision,
+            governance_profile_ref.as_str(),
+            *projection_generation,
+        ),
+        DispatchedBindingProvenance::LiveTaskSelection(_) => {
+            return Err(TaskBindingError::selection_required(
+                "live TaskSelection dispatch requires exact Governor owner revalidation",
+            ));
+        }
+    };
     let Some(live_task_ref) = live_task_ref else {
         return Err(TaskBindingError::selection_required(
             "task-bound dispatch revalidation names no live task",
@@ -2987,8 +3313,8 @@ pub fn revalidate_dispatched_binding(
             "admitted acceptance digest moved before effect; rebind at the live digest, no silent rebind",
         ));
     }
-    if live_receipt_revision != binding.receipt_revision
-        || live_governance_profile_ref != binding.governance_profile_ref
+    if live_receipt_revision != admitted_receipt_revision
+        || live_governance_profile_ref != admitted_governance_profile_ref
     {
         return Err(TaskBindingError::scope_incompatible(
             "admitted bootstrap/profile revision moved before effect; rebind at the live revision, no silent rebind",
@@ -2999,7 +3325,7 @@ pub fn revalidate_dispatched_binding(
     // against the live receipt's own generation: a re-projected bootstrap
     // under the same receipt revision still conflicts for rebind, it is never
     // silently adopted under the old operation identity.
-    if live_projection_generation != binding.projection_generation {
+    if live_projection_generation != admitted_projection_generation {
         return Err(TaskBindingError::scope_incompatible(
             "admitted projection generation moved before effect; rebind at the live projection, no silent rebind",
         ));

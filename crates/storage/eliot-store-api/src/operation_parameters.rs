@@ -159,6 +159,9 @@ pub enum ParameterShape {
     /// carry structured values. The value must be a JSON object; leg
     /// completeness is enforced by the notification-state contract.
     NotificationState,
+    /// A closed, receipt-derived immutable Blob pointer retained with one
+    /// `CaptureObservation`; the Blob owner still validates every read.
+    BlobPayloadReference,
     /// Closed exact owner and typed revision selector for issue #1862.
     CampaignSourceLookup,
     /// Closed, owner-bound campaign source publications carried by an
@@ -197,6 +200,7 @@ impl ParameterShape {
             Self::OperationId => "operation-id",
             Self::Subject => "subject-text",
             Self::NotificationState => "eliot.notify.state.v1",
+            Self::BlobPayloadReference => "eliot.blob.payload-reference.v1",
             Self::CampaignSourceLookup => "eliot.learning.campaign-source-lookup.v1",
             Self::CampaignSourcePublications => "eliot.learning.campaign-source-publications.v1",
             Self::CampaignViewLookup => "eliot.learning.campaign-view-lookup.v1",
@@ -240,11 +244,18 @@ static GET_EVIDENCE_PACK_PARAMETERS: [ParameterDeclaration; 2] = [
         required: true,
     },
 ];
-static CAPTURE_OBSERVATION_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
-    name: "subject",
-    shape: ParameterShape::Subject,
-    required: true,
-}];
+static CAPTURE_OBSERVATION_PARAMETERS: [ParameterDeclaration; 2] = [
+    ParameterDeclaration {
+        name: "subject",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "payload_ref",
+        shape: ParameterShape::BlobPayloadReference,
+        required: false,
+    },
+];
 static APPEND_AUDIT_EVENT_PARAMETERS: [ParameterDeclaration; 6] = [
     ParameterDeclaration {
         name: "operation_id",
@@ -1682,6 +1693,7 @@ pub fn verify_declaration_holds_no_payload_encoding(
         | ParameterShape::BlackboardItemLookup => false,
         ParameterShape::EpistemicRevision
         | ParameterShape::NotificationState
+        | ParameterShape::BlobPayloadReference
         | ParameterShape::CampaignSourceLookup
         | ParameterShape::CampaignSourcePublications
         | ParameterShape::CampaignViewLookup
@@ -1824,6 +1836,11 @@ fn check_declared_shape(
                 });
             }
             Ok(())
+        }
+        ParameterShape::BlobPayloadReference => {
+            let reference: crate::CapturedBlobPayloadRefV1 = serde_json::from_value(value.clone())
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            reference.validate()
         }
         ParameterShape::InstrumentRegistrySnapshot => validate_instrument_registry_snapshot(value),
         ParameterShape::CampaignSourceLookup => {

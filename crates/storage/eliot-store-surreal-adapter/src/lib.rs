@@ -28,6 +28,7 @@ mod plan;
 mod readiness;
 mod schema;
 mod schema_inventory;
+mod source_artifact_context;
 mod write_execution;
 mod write_scheduler;
 
@@ -474,7 +475,7 @@ impl SurrealStoreAdapter {
     /// Inert-by-default guarantee: while disarmed, the attempt loop performs
     /// one uncontended `std` mutex lock plus an `is_none` check and returns
     /// without awaiting, allocating, logging, touching the provider, or
-    /// altering the error taxonomy — the canonical transaction path is
+    /// altering the error taxonomy â€” the canonical transaction path is
     /// byte-identical to the unhooked flow. The mutex is never held across an
     /// await and never contended in production, so disarmed writers neither
     /// block nor serialize on it.
@@ -626,6 +627,19 @@ impl SurrealStoreAdapter {
         operation_id: OperationId,
     ) -> Result<Option<WriteReceipt>, AdapterError> {
         apply::read_receipt(self, operation_id).await
+    }
+
+    /// Reads the exact committed receipt together with causal facts rebuilt
+    /// from the canonical receipt row and its sequence-selected predecessor.
+    /// The binding is independently reread from `SurrealDB` and never copied
+    /// from the returned receipt envelope.
+    pub async fn receipt_with_causal(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<Option<(WriteReceipt, eliot_store_api::CausalBinding)>, StoreError> {
+        apply::read_receipt_with_causal(self, operation_id)
+            .await
+            .map_err(AdapterError::into_store_error)
     }
 
     /// Builds the first-generation schema migration for the given target
