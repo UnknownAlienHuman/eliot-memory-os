@@ -129,8 +129,9 @@ impl SubscriberSetup {
 /// the install claim, because `get_or_init` hands the *same* `&Mutex` to every
 /// caller, so "who called `get_or_init` first" proves nothing about who may
 /// attempt. The claim is therefore the explicit state machine in
-/// [`install_host_diagnostics`], and this cell exists from the first
-/// observation so no reader has to invent a state for an uninitialised `None`.
+/// [`install_host_diagnostics`], and the cell is created by the first *claiming*
+/// or settling caller, so no reader has to invent a state for an uninitialised
+/// `None`.
 static SUBSCRIBER_SETUP: OnceLock<Mutex<SubscriberSetup>> = OnceLock::new();
 
 /// One-process state for the facade's single subscriber install attempt.
