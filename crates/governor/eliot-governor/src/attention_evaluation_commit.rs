@@ -21,10 +21,12 @@
 //! [`RequestIdentity`](eliot_protocol::RequestIdentity) plus the principal and
 //! session the owning surface authenticated. This module checks shape and
 //! agreement only — identity validity, session equality with the request
-//! metadata, idempotency-key agreement between caller and named request, and a
-//! non-blank principal claim. Role/authority truth stays with the owning
-//! surface; a stale or foreign role is refused downstream by the Kernel fence
-//! and admission checks, never granted here.
+//! metadata, idempotency-key agreement between caller and named request, a
+//! non-blank principal claim, and principal agreement with the record-bound
+//! evaluator (a stale or foreign operator principal fails here). Role/
+//! authority truth stays with the owning surface; a stale or foreign role is
+//! refused downstream by the Kernel fence and admission checks, never granted
+//! here.
 //!
 //! Operation identity and evidence commitment: the operation id derives
 //! deterministically as `attention-evaluation:{evaluation_id}:{revision}`
@@ -68,7 +70,8 @@
 //! Fail-closed order in [`validate_attention_evaluation_request`]: record
 //! structural validity, caller identity validity, revision/operation/
 //! predecessor agreement, operation-identity agreement, evidence-commitment
-//! agreement, idempotency agreement, session agreement, principal shape.
+//! agreement, idempotency agreement, session agreement, principal shape and
+//! evaluator agreement.
 
 #![forbid(unsafe_code)]
 
@@ -158,8 +161,9 @@ pub struct AttentionEvaluationOperatorRequest {
     /// Presented evidence commitment; must equal the SHA-256 over the
     /// canonical bytes of the record's evidence manifest.
     pub evidence_commitment: String,
-    /// Authenticated principal claim, checked for non-blank shape only.
-    /// Authority truth stays with the owning surface.
+    /// Authenticated principal claim: non-blank text agreeing with the
+    /// record-bound evaluator principal. Authority truth stays with the
+    /// owning surface.
     pub principal_id: String,
     /// Authenticated session claim; must equal the session bound in the
     /// caller request metadata.
@@ -296,8 +300,11 @@ pub fn attention_evaluation_idempotency_key(
 /// Fail-closed order: record validity, caller identity validity,
 /// revision/operation/predecessor agreement, operation-identity agreement,
 /// evidence-commitment agreement, idempotency agreement, session agreement,
-/// principal shape. Returns the derived commit identity the Store-leg binder
-/// must carry into the prepared transition.
+/// principal shape and evaluator agreement. Returns the derived commit
+/// identity the Store-leg binder must carry into the prepared transition.
+/// Foreign evidence cannot reach this gate: the record validator already
+/// refuses references absent from the evidence manifest, and the commitment
+/// agreement above re-binds the exact manifest bytes.
 pub fn validate_attention_evaluation_request(
     record: &HumanAttentionEvaluation,
     prior: Option<&HumanAttentionEvaluation>,
@@ -359,6 +366,16 @@ pub fn validate_attention_evaluation_request(
     if request.principal_id.trim().is_empty() {
         return Err(AttentionEvaluationCommitError::Identity(
             "operator principal claim must be non-blank text".to_owned(),
+        ));
+    }
+    if request.principal_id
+        != record
+            .evaluator_scope_uncertainty_and_invalidation
+            .evaluator
+            .principal_id
+    {
+        return Err(AttentionEvaluationCommitError::Identity(
+            "operator principal claim does not match the record evaluator principal".to_owned(),
         ));
     }
     Ok(AttentionEvaluationCommitIdentity {
