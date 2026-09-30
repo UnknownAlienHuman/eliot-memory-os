@@ -1435,9 +1435,57 @@ pub struct ResearchQueryRequest {
     pub budget_units: u64,
     pub deadline_ms: i64,
     pub required_schema: String,
+    /// Digest of the evidence freeze this request reopens, when it reopens one.
+    ///
+    /// I21.8: "New material, materially changed source content or changed
+    /// protocol requires a recorded reopen/successor freeze with reason and
+    /// expected revision. It must not mutate a prior brief or audit." A reopen is
+    /// exactly this pair, and it has to travel **on the admitted request** for
+    /// two reasons that are not conventions:
+    ///
+    /// - the consumer that builds the successor relation is
+    ///   `eliot_researcher::inquiry_governance::freeze_predecessor`, which reads
+    ///   these two fields off the request the run was admitted under and
+    ///   invents neither of them; a predecessor named anywhere else would be a
+    ///   value the admitted run never carried;
+    /// - the exchange is where a request's custody is sealed. A `ResearchQueryRequest`
+    ///   is the record the exchange stores as an admitted job, so a reopen
+    ///   relation that is not on it is not in the custody chain a later reader
+    ///   replays.
+    ///
+    /// `None` is a first freeze, which is the honest state for a request admitted
+    /// without a predecessor. It is not a default that a caller can ignore:
+    /// [`Self::validate`] refuses the half-present pair, and
+    /// `EvidenceFreeze::freeze` refuses a successor missing either half, so the
+    /// relation cannot be silently half-declared at either layer.
+    ///
+    /// `#[serde(default)]` is on the pair, not on the whole request: the
+    /// `deny_unknown_fields` spelling above means an older peer's record
+    /// deserializes without them and validates as a first freeze rather than
+    /// being unreadable, while a record that carries one half is still refused
+    /// rather than quietly completed.
+    #[serde(default)]
+    pub predecessor_freeze_digest: Option<String>,
+    /// Why this request reopens `predecessor_freeze_digest`, when it reopens one.
+    ///
+    /// Bounded text, not a digest: a digest would say only that some cause
+    /// exists and not which one, and I21.8 requires the reason itself to be
+    /// recorded. Required together with [`Self::predecessor_freeze_digest`].
+    #[serde(default)]
+    pub reopen_reason: Option<String>,
 }
 
 impl ResearchQueryRequest {
+    /// Whether this request declares a reopen of a prior evidence freeze.
+    ///
+    /// One reader for the pair, so the request, its validation and every
+    /// downstream consumer cannot disagree about whether a reopen was declared:
+    /// the answer is the conjunction of the two fields, never one of them.
+    #[must_use]
+    pub fn declares_reopen(&self) -> bool {
+        self.predecessor_freeze_digest.is_some() && self.reopen_reason.is_some()
+    }
+
     pub fn validate(&self) -> Result<(), ResearchContractError> {
         for (value, field) in [
             (&self.exchange_id, "exchange_id"),
@@ -1493,6 +1541,27 @@ impl ResearchQueryRequest {
             return Err(ResearchContractError::EmptyCollection {
                 field: "source_classes",
             });
+        }
+        // The reopen relation is one relation, not two independent optionals, and
+        // it is checked here rather than only where the freeze consumes it: this
+        // is the boundary the request crosses to become an admitted job, so a
+        // request carrying a predecessor with no reason (or a reason with no
+        // predecessor) is refused before it is ever stored. The check is the
+        // conjunction, so neither half can be published on its own.
+        match (
+            self.predecessor_freeze_digest.as_deref(),
+            self.reopen_reason.as_deref(),
+        ) {
+            (None, None) => {}
+            (Some(prior), Some(reason)) => {
+                digest(prior, "predecessor_freeze_digest")?;
+                text(reason, "reopen_reason")?;
+            }
+            _ => {
+                return Err(ResearchContractError::FieldNotAccepted {
+                    field: "predecessor_freeze_digest+reopen_reason",
+                });
+            }
         }
         Ok(())
     }

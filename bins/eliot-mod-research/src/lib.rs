@@ -1472,6 +1472,21 @@ pub fn project_admitted_inquiry(
     // is not an unfetchable source, a policy denial is not incomplete coverage,
     // and an exhausted budget is neither.
     let degradation = acquisition_coverage_degradation(failure);
+    // W2 (`#1765`): this projection carries the admitted request, the provider
+    // admission and the terminal receipt — and no retained source bytes. The
+    // crate that owns the observation states that a handle absent from
+    // `retained_revisions` is "a real finding rather than a skip", so the
+    // honest value here is the EMPTY map: every excerpt offered from a source
+    // this projection admitted then fails verification with
+    // `NoRetainedRevision`, which is the truthful W2 outcome for a run that did
+    // not persist before synthesis.
+    //
+    // It is deliberately NOT populated from the receipt, and no artifact
+    // reference is invented: this subtree has no canonical-store write
+    // authority, so a digest of bytes nobody holds is not a retained original.
+    // The provider path that DOES persist before synthesis supplies this map
+    // through the governed source-admission owner.
+    let retained_revisions = std::collections::BTreeMap::new();
     let observation = InquiryObservation {
         inquiry_id: receipt.exchange_id.clone(),
         evidence_set_id: request.allowed_references.run_id.clone(),
@@ -1498,24 +1513,26 @@ pub fn project_admitted_inquiry(
         candidates: retained_provider_material(request, receipt, &route)
             .into_iter()
             .collect(),
+        retained_revisions,
         outcome: acquisition_outcome(receipt),
         reason_code: degradation
             .inquiry_reason_code()
             .unwrap_or(receipt.reason_code)
             .to_owned(),
         assessment_time_ms,
-        // MEASURED: `ResearchQueryRequest` carries no predecessor-freeze or
-        // reopen-reason custody, and this crate is not the owner of the exchange
-        // wire contract, so a run admitted here has no declared predecessor and
-        // the freeze it produces is an honest first freeze rather than a silent
-        // successor. Both fields are therefore initialised to their honest
-        // first-freeze value rather than to a fabricated relation:
-        // `EvidenceFreeze` will name, re-prove and refuse a successor the moment
-        // an admitted request does carry the pair; supplying that custody on the
-        // request is BLOCKED-BY #1762, which owns inquiry/R6 composition. No
-        // value is invented here to make the successor arm fire.
-        predecessor_freeze_digest: None,
-        reopen_reason: None,
+        // Read straight off the admitted request. `freeze_predecessor` in
+        // `eliot_researcher::inquiry_governance` builds the successor relation
+        // from exactly these two fields and invents neither, and
+        // `ResearchQueryRequest::validate` refuses the half-present pair at the
+        // exchange boundary, so a run admitted with a predecessor and a reason
+        // produces a real successor freeze while a first freeze stays an honest
+        // first freeze. The two move together off one source rather than being
+        // decided here: a projection that could set one without the other would
+        // be the only way to publish a relation the admitted request never
+        // carried, which is exactly what the request-level refusal exists to
+        // prevent.
+        predecessor_freeze_digest: request.predecessor_freeze_digest.clone(),
+        reopen_reason: request.reopen_reason.clone(),
     };
     InquiryGovernance::record(observation).map_err(crate::R6ProjectionError::from)
 }
@@ -1751,6 +1768,8 @@ pub(crate) mod support {
             budget_units: 10,
             deadline_ms: 1_800_000_000_000,
             required_schema: "research-evidence-bundle/v1".to_owned(),
+            predecessor_freeze_digest: None,
+            reopen_reason: None,
         }
     }
 }

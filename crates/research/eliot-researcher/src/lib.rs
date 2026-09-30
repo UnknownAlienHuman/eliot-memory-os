@@ -7,11 +7,17 @@
 
 #![forbid(unsafe_code)]
 
+// `admitted_excerpt` is declared first because `evidence_portfolio` and
+// `inquiry_governance` both name its types in their own public surfaces; module
+// declaration order is not a dependency in Rust, but naming the reason here
+// stops a reader from "tidying" the order and losing the cross-reference.
+pub mod admitted_excerpt;
 pub mod evidence_portfolio;
 pub mod inquiry_governance;
 pub mod inquiry_lanes;
 pub mod inquiry_obligations;
 pub mod source_admissibility;
+pub mod synthesis_input;
 
 use eliot_contracts::StateFence;
 use eliot_research_exchange::{ExchangeError, ExchangeJob, GovernedExchange, ResearchBridge};
@@ -40,10 +46,21 @@ use eliot_research_exchange_api::{
 // removes no door.
 pub use evidence_portfolio::{
     AbsencePreconditions, AbsenceVerdict, AuditBindingError, AuditReferenceBinding,
-    AuthorizedManifest, AuthorizedManifestParams, CLAIM_REQUIREMENTS, ClaimRequirement,
-    DimensionEvaluation, ManifestSource, MemberNoMatchResult, NoMatchApplicability,
-    NoMatchDimension, NoMatchEvaluation, NoMatchEvaluationIssuer, NoMatchEvaluationIssuerParams,
-    ObservedOutsideScope, RequirementOutcome, UnsupportedPrecisionItem,
+    AuthorizedManifest, AuthorizedManifestParams, CLAIM_REQUIREMENTS, ClaimCoverageMap,
+    ClaimRequirement, ClaimVerdict, DimensionEvaluation, ManifestSource, MemberNoMatchResult,
+    NoMatchApplicability, NoMatchDimension, NoMatchEvaluation, NoMatchEvaluationIssuer,
+    NoMatchEvaluationIssuerParams, ObservedOutsideScope, RequirementOutcome,
+    UnsupportedPrecisionItem, audit_claim, audit_claim_with_excerpts,
+};
+// The retained-original and exact-excerpt verification surface. Exported because
+// the governed source-admission/persistence owner outside this crate has to be
+// able to hand in a `RetainedSourceRevision` and read back the typed
+// `OccurrenceFailure` values, and because a release consumer asking "was this
+// crop detected" reads `OccurrenceCheck` rather than prose.
+pub use admitted_excerpt::{
+    AdmittedExcerpt, AdmittedExcerptParams, ContextAxis, ContextFinding, ExcerptPosition,
+    OccurrenceCheck, OccurrenceFailure, RetainedSourceRevision, RetainedSourceRevisionParams,
+    SnippetRegion, verify_excerpt_occurrence,
 };
 // The `R6` typed inquiry-governance surface. Every field type a consumer reads
 // off an exported record is nameable here, so the domain can be consumed without
@@ -84,9 +101,17 @@ pub use inquiry_obligations::{
     TaskGraphCompilationInputs,
 };
 pub use source_admissibility::{
-    GovernorSourceTransitionRequest, PresentedReference, RecordReferenceSurface,
+    FreezeCommitment, GovernorSourceTransitionRequest, PresentedReference, RecordReferenceSurface,
     SourceAdmissibilityReason, SourceAdmissibilityRecord, SourceEligibility, SourceIndependence,
     SourceLimits, SourceTaint, admits_record_reference, record_references,
+};
+// The committed-freeze proof and the governed synthesis-input pack. Exported
+// because the composition root that admits a synthesis run reads the pack, and
+// because a consumer asking "was the freeze committed before synthesis" reads
+// `CommittedFreeze` rather than reconstructing one from request fields.
+pub use synthesis_input::{
+    CommittedFreeze, CommittedFreezeMember, PackLimitation, PackMember, PackOmission,
+    SynthesisInputPack,
 };
 
 pub struct Researcher<B> {
@@ -140,6 +165,67 @@ impl<B: ResearchBridge> Researcher<B> {
         budget_units: u64,
         deadline_ms: i64,
     ) -> Result<ExchangeJob, ExchangeError> {
+        self.request_reopening(
+            exchange_id,
+            bridge_generation,
+            idempotency_key,
+            requester_principal,
+            fence,
+            question,
+            scope,
+            expected_decision,
+            source_classes,
+            allowed_references,
+            budget_units,
+            deadline_ms,
+            None,
+            None,
+        )
+    }
+
+    /// Submits a query that reopens a prior evidence freeze.
+    ///
+    /// I21.8: "New material, materially changed source content or changed
+    /// protocol requires a recorded reopen/successor freeze with reason and
+    /// expected revision. It must not mutate a prior brief or audit." The two
+    /// facts that make a reopen a reopen — which freeze it supersedes and why —
+    /// have to be **declared by the requester**, and the only place they can be
+    /// declared is on the admitted request: the consumer
+    /// (`inquiry_governance::freeze_predecessor`) reads them from there and
+    /// invents neither, and `ResearchQueryRequest::validate` refuses the
+    /// half-present pair at the exchange boundary.
+    ///
+    /// [`Self::request`] delegates here with both halves `None`, which is the
+    /// honest first-freeze state; a caller that HAS a predecessor and a reason
+    /// names them here. One function rather than two keeps a single producer of
+    /// the pair, so a half-declared relation is impossible on this façade for
+    /// the same reason it is impossible on the request.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ResearchContractError::InvalidDigest`] for a predecessor that
+    /// is not a lowercase SHA-256 digest and
+    /// [`ResearchContractError::FieldNotAccepted`] for a half-present pair, both
+    /// from the exchange's own validation of the request this builds, plus every
+    /// [`ExchangeError`] the underlying submit produces.
+    #[allow(clippy::too_many_arguments)]
+    pub fn request_reopening(
+        &mut self,
+        exchange_id: impl Into<String>,
+        bridge_generation: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        requester_principal: impl Into<String>,
+        fence: StateFence,
+        question: impl Into<String>,
+        scope: impl Into<String>,
+        expected_decision: impl Into<String>,
+        source_classes: Vec<SourceClass>,
+        allowed_references: AllowedReferenceManifest,
+        budget_units: u64,
+        deadline_ms: i64,
+        predecessor_freeze_digest: Option<String>,
+        reopen_reason: Option<String>,
+    ) -> Result<ExchangeJob, ExchangeError> {
         // The request inherits the manifest's retention class rather than
         // declaring one of its own. `ResearchQueryRequest::validate` requires
         // `allowed_references.retention_class == retention`, so a façade that
@@ -168,6 +254,13 @@ impl<B: ResearchBridge> Researcher<B> {
             budget_units,
             deadline_ms,
             required_schema: "research-evidence-bundle/v1".into(),
+            // The reopen pair moves together or not at all: `request` supplies
+            // both halves as `None` (the honest first-freeze state) and a caller
+            // reopening a prior freeze supplies both. `validate` refuses the
+            // half-present pair at the exchange boundary, so neither half can
+            // be published on its own.
+            predecessor_freeze_digest,
+            reopen_reason,
         })
     }
 }

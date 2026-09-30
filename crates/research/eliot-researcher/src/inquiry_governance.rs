@@ -55,8 +55,8 @@ use crate::evidence_portfolio::{
     EvidencePortfolio, LineageTable, ManifestSource, MaterialClaimRoster, NoMatchEvaluation,
     ObservedOutsideScope, PortfolioError, PrecisionAssertion, PrecisionKind, RiskState,
     SourceDisposition, SourceRecord, SourceRecordParams, UnsupportedPrecisionItem, assess_absence,
-    audit_claim, bool_text, check_precision, digest, fence_preimage, freeze, grade_name,
-    grade_rank, push_count, push_field, reject_vague, text,
+    bool_text, check_precision, digest, fence_preimage, freeze, grade_name, grade_rank, push_count,
+    push_field, reject_vague, text,
 };
 use crate::inquiry_lanes::{
     CommittedLaneRegistration, DeviationAllowance, DeviationScope, ExclusionAndQualityControl,
@@ -3926,6 +3926,27 @@ impl EvidenceFreeze {
         self.supersedes.is_some()
     }
 
+    /// Whether `handle` is an **admitted included member** of this freeze.
+    ///
+    /// This is the one membership question W2 and W3 ask, and it is deliberately
+    /// not "is this handle mentioned anywhere on the record": an excluded member
+    /// is named here too, with the reason it was excluded, and a handle that
+    /// appears only in `excluded_evidence` is precisely the member that must not
+    /// enter a synthesis pack or back a freeze commit. So membership is answered
+    /// against the included set alone.
+    #[must_use]
+    pub fn includes(&self, handle: &str) -> bool {
+        self.included_evidence_refs
+            .iter()
+            .any(|member| member == handle)
+    }
+
+    /// The admitted included members, in the freeze's own canonical order.
+    #[must_use]
+    pub fn included_members(&self) -> &[String] {
+        &self.included_evidence_refs
+    }
+
     /// Re-proves the successor relation, if this freeze declares one.
     ///
     /// The three fields move together by construction, and this re-proves that
@@ -4495,6 +4516,20 @@ pub struct ClaimAuditRecord {
     /// when the record is bound, so a verdict cannot be filed under a fence that
     /// is neither the run's nor the profile's.
     pub state_fence: StateFence,
+    /// The exact final wording released for this claim when the audit ran.
+    ///
+    /// This is the post-audit-material-edit arm's subject. The verdict says what
+    /// was true of a STATEMENT; nothing on this record said which statement, so a
+    /// release consumer could reword the claim after the audit, publish the
+    /// verdict beside it, and the audit would still verify. I21.8 requires the
+    /// final delivered or rendered wording to be reviewed as well as the
+    /// intermediate structures, and the only way to review the final wording is
+    /// for the record to hold it.
+    ///
+    /// It is inside [`Self::digest`] and re-compared by
+    /// [`Self::validate_released_wording`], so an edit between the audit and the
+    /// release is refused rather than inherited.
+    pub released_statement: String,
     /// Always false: a claim audit never becomes canonical state by itself.
     pub canonical: bool,
     /// Digest over the binding shape.
@@ -4528,10 +4563,16 @@ impl ClaimAuditRecord {
         profile: &InquiryProtocolProfile,
         run_manifest: &AllowedReferenceManifest,
         evidence_set_id: &str,
+        released_statement: &str,
         verdict: ClaimVerdict,
     ) -> Result<Self, InquiryError> {
         require_text(inquiry_id, "claim_audit.inquiry_id")?;
         require_text(evidence_set_id, "claim_audit.evidence_set_id")?;
+        // The released wording is required, not defaulted. A record with an empty
+        // statement would be one whose post-audit-edit check could never fire,
+        // which is the same "a constructor call proves nothing" defect the pair
+        // of custody fields on `ResearchQueryRequest` exists to prevent.
+        require_text(released_statement, "claim_audit.released_statement")?;
         // Re-prove the manifest rather than trusting a digest a caller could have
         // typed: `validate` recomputes the digest over every field that can change
         // what a citation is allowed to say, so a widened or edited manifest is
@@ -4557,11 +4598,64 @@ impl ClaimAuditRecord {
             evidence_set_id: evidence_set_id.to_owned(),
             verdict,
             state_fence: run_manifest.state_fence.clone(),
+            released_statement: released_statement.to_owned(),
             canonical: false,
             digest: String::new(),
         };
         record.digest = record.compute_digest();
         Ok(record)
+    }
+
+    /// Refuses a released wording that is not the wording this audit judged.
+    ///
+    /// This is the gate a release consumer calls with the text it is about to
+    /// deliver, and it is the fourth of the four acceptance cases enforced in
+    /// product code rather than in a test: a claim whose material sentence was
+    /// added, edited, given a new numeric value, widened in causal scope,
+    /// translated, or assembled from two quotations after the audit ran is
+    /// refused here, because the audit's verdict is about a different statement.
+    ///
+    /// A heading-only or formatting change is NOT accepted by silence either: it
+    /// must be presented as an explicit nonsemantic mapping, which is what
+    /// [`Self::is_nonsemantic_restyle_of`] answers. There is deliberately no
+    /// default-true path, so "the text differs" always requires a caller to say
+    /// why that difference does not change the meaning.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::ReleaseGateRefused`] naming `released_statement`
+    /// when the delivered text is not the audited wording.
+    pub fn validate_released_wording(&self, delivered: &str) -> Result<(), InquiryError> {
+        if delivered == self.released_statement {
+            return Ok(());
+        }
+        Err(InquiryError::ReleaseGateRefused {
+            gate: "released_statement",
+            detail: format!(
+                "the audit judged statement digest {} but the delivered text differs and no \
+                 explicit nonsemantic mapping was offered",
+                self.released_statement
+            ),
+        })
+    }
+
+    /// Whether `delivered` is the audited wording with formatting-only changes.
+    ///
+    /// An explicit nonsemantic mapping is the ONLY way I21.8 permits evidence to
+    /// be reused across a wording change, so the question is narrow and decided
+    /// mechanically: the two texts must differ in nothing but whitespace, and
+    /// the audit must have judged a statement at all. A change to any non-space
+    /// byte, including a numeric value, a punctuation mark, a capitalisation and a
+    /// word, is not a restyle and is not accepted.
+    ///
+    /// This is deliberately the conservative direction. A mapping that dropped a
+    /// qualifier would still be accepted here only if it dropped whitespace, so
+    /// the function cannot launder a semantic edit; it can only fail to admit a
+    /// legitimate restyle, which a caller resolves by re-running the audit.
+    #[must_use]
+    pub fn is_nonsemantic_restyle_of(&self, delivered: &str) -> bool {
+        !self.released_statement.trim().is_empty()
+            && split_whitespace(&self.released_statement) == split_whitespace(delivered)
     }
 
     fn compute_digest(&self) -> String {
@@ -4570,7 +4664,14 @@ impl ClaimAuditRecord {
         // rather than from the profile. A `v1` record could not be re-derived from
         // its own bytes under one name, so the domain says so rather than letting
         // one name cover two field sets.
-        let mut preimage = String::from("claim-audit-record/v2;");
+        //
+        // `v2` -> `v3` for #1765: the preimage now names the released final
+        // wording and every measured excerpt check. A `v2` record bound a verdict
+        // that said a statement had been audited without saying which statement,
+        // and carried no occurrence measurement at all; a record of that shape
+        // re-presented as one that had reviewed the delivered text, and it could
+        // not be distinguished by any reader of this digest.
+        let mut preimage = String::from("claim-audit-record/v3;");
         push_field(&mut preimage, "claim_id", &self.claim_id);
         push_field(&mut preimage, "inquiry_id", &self.inquiry_id);
         push_field(
@@ -4617,6 +4718,33 @@ impl ClaimAuditRecord {
             "state_fence",
             &fence_preimage(&self.state_fence),
         );
+        // The released wording is inside this record's identity, not only
+        // compared at release time. Without it here, an audit record and a
+        // reworded claim could be bound together again by recomputing nothing:
+        // the digest would be identical and the post-audit edit would be
+        // invisible to every consumer that re-proves the record.
+        push_field(
+            &mut preimage,
+            "released_statement",
+            &self.released_statement,
+        );
+        // The measured excerpt checks travel with the record for the same
+        // reason. `verdict.excerpt_checks` says the occurrence and context were
+        // verified against a retained revision; without its own line here the
+        // checks could be dropped and the requirement re-rendered as though no
+        // check had been made, and the record would still rehash.
+        for check in &self.verdict.excerpt_checks {
+            push_field(
+                &mut preimage,
+                "excerpt_check",
+                &crate::admitted_excerpt::check_line(check),
+            );
+        }
+        push_count(
+            &mut preimage,
+            "excerpt_checks",
+            self.verdict.excerpt_checks.len(),
+        );
         for (tag, values) in [
             ("residue", &self.verdict.residue),
             ("counterevidence", &self.verdict.counterevidence),
@@ -4660,8 +4788,40 @@ impl ClaimAuditRecord {
                 field: "claim_audit.digest",
             });
         }
+        // The released wording is a required, non-empty, digest-bound field. A
+        // record that lost it between binding and publication would otherwise
+        // pass the digest check under a preimage that hashed the empty string,
+        // and every post-audit-edit comparison would compare against nothing.
+        require_text(&self.released_statement, "claim_audit.released_statement")?;
+        // Each excerpt check is re-proved against its own excerpt identity, so a
+        // check whose verdict was edited after the audit stopped agreeing with
+        // the excerpt it claims to have measured. The retained BYTES are not
+        // re-read here: this crate does not hold them, and pretending otherwise
+        // is exactly the "a digest of bytes nobody holds" substitution W2
+        // refuses. What is re-proved is what this record asserts about the check.
+        for check in &self.verdict.excerpt_checks {
+            check
+                .excerpt
+                .verify_integrity()
+                .map_err(|_| InquiryError::IntegrityMismatch {
+                    field: "claim_audit.excerpt_check",
+                })?;
+        }
         Ok(())
     }
+}
+
+/// Splits a text into its non-whitespace words, for the nonsemantic-restyle
+/// comparison in [`ClaimAuditRecord::is_nonsemantic_restyle_of`].
+///
+/// Normalising the WHITESPACE RUNS rather than the tokens is deliberate: a run
+/// of spaces, a tab and a newline are one boundary in rendered text, and a
+/// reformatting change turns one into the other constantly. Collapsing the run to
+/// a single space is what makes a restyle recognisable, and it is why the
+/// comparison is anchored on the raw text rather than on a token stream: two
+/// texts that differ in a non-space byte produce different words here.
+fn split_whitespace(text: &str) -> Vec<&str> {
+    text.split_whitespace().collect()
 }
 
 /// Explicitly preserved unknown on a terminal inquiry record.
@@ -5738,6 +5898,33 @@ pub struct InquiryObservation {
     /// without a stated cause states no reopen, and `EvidenceFreeze::freeze`
     /// refuses a half-present relation.
     pub reopen_reason: Option<String>,
+    /// The retained original bytes of each admitted source revision, keyed by
+    /// source handle.
+    ///
+    /// W2: "Resolve accepted sources through the governed source-admission
+    /// owner, retain their exact bytes or immutable accessible artifacts, and
+    /// commit the freeze before admitting synthesis. An in-memory clone or hash
+    /// of unavailable bytes is insufficient." This field is that retained
+    /// original, and it is the reason the excerpt obligation below is decidable
+    /// at all: without the actual bytes, the only evidence available about a
+    /// quotation is a digest of bytes nobody holds, which cannot distinguish an
+    /// exact quote from a fabricated one, a cropped negation from its absence,
+    /// or a page quote from a search snippet.
+    ///
+    /// It is an **immutable artifact reference plus the exact bytes that
+    /// artifact resolved to**, handed here by the governed source-admission and
+    /// persistence owner. This crate does not store them and does not claim to:
+    /// `crates/research/AGENTS.md` states this subtree "has no canonical-store
+    /// write authority", so the commit happened elsewhere and this value is the
+    /// reference to it, re-proved on every use.
+    ///
+    /// A handle absent from this map is a real finding rather than a skip: the
+    /// source was admitted without its original being retained, and every
+    /// excerpt offered from it therefore fails verification with
+    /// `NoRetainedRevision`. That is the honest W2 outcome for a run that did
+    /// not persist before synthesis, and it is what makes the persistence
+    /// observable rather than asserted.
+    pub retained_revisions: BTreeMap<String, crate::admitted_excerpt::RetainedSourceRevision>,
 }
 
 /// The `R6` inquiry-governance record for one inquiry.
@@ -5802,6 +5989,58 @@ pub struct InquiryGovernance {
     pub obligations: Vec<InquiryObligation>,
     /// Evidence freeze of the accepted evidence revision.
     pub freeze: EvidenceFreeze,
+    /// The proof that this freeze was **committed through the governed
+    /// source-admission owner**, with each admitted source's retained original
+    /// bound to it.
+    ///
+    /// W2: "Persist before synthesis and retain the original … commit the freeze
+    /// before admitting synthesis." The ordering is structural rather than
+    /// documentary: every request in [`Self::source_admission_requests`] carries
+    /// this freeze's identity and digest inside its own `request_digest`, and
+    /// [`crate::synthesis_input::CommittedFreeze::commit`] refuses any request
+    /// that does not. So a record carrying this field published a freeze that was
+    /// already committed when the requests were built, and a record without one
+    /// cannot be produced on this path at all.
+    pub committed_freeze: crate::synthesis_input::CommittedFreeze,
+    /// The retained original of every source this record committed an admission
+    /// for, keyed by source handle.
+    ///
+    /// The same commitments [`Self::source_admission_requests`] already name,
+    /// carried whole rather than as a digest beside them, because each
+    /// [`FreezeCommitment`](crate::source_admissibility::FreezeCommitment) holds
+    /// the *claim* that an original was persisted — its artifact reference and two
+    /// digests — and not the bytes, so a record carrying only the requests would
+    /// let a reader check that some retention was asserted and never that any
+    /// bytes were retained, much less that they reproduce the admitted
+    /// `content_digest` they are filed under. Carrying the revisions is what makes
+    /// the retained originals on this record re-proveable by a reader:
+    /// `validate_source_admission_requests` re-runs each revision's own
+    /// `verify_integrity` and compares it against the commitment its request
+    /// publishes, so a `retained_revisions` entry swapped for a different revision
+    /// of the same source is refused.
+    ///
+    /// It is populated from [`InquiryObservation::retained_revisions`] **only for
+    /// the handles this record actually committed** — the same eligible-and-retained
+    /// filter [`crate::synthesis_input::CommittedFreeze::commit`] builds its own
+    /// members from — so the map cannot hold a revision whose admission was never
+    /// committed, and every entry has a request beside it on this record. The
+    /// owner is unchanged: the bytes were committed by the governed
+    /// source-admission/persistence owner, this crate has no canonical-store write
+    /// authority (`crates/research/AGENTS.md`), and this is the reference to that
+    /// commit rather than a second store of it. An original that was never
+    /// retained therefore produces no entry and no request, and the synthesis pack
+    /// reports it as a published omission with
+    /// [`crate::synthesis_input::PackLimitation::NoRetainedOriginal`].
+    pub retained_revisions: BTreeMap<String, crate::admitted_excerpt::RetainedSourceRevision>,
+    /// The synthesis-input pack resolved from that committed freeze.
+    ///
+    /// W3: "Build the actual synthesis pack from that freeze. Resolve only its
+    /// admitted included members under the current disclosure and reference
+    /// manifest." Carried whole rather than as a digest, because the omissions
+    /// are the point: a reader needs to see which freeze members did not resolve
+    /// and why, which is the explicit limited/blocked result I21.8 item 3
+    /// requires rather than a stale authorization or a silent omission.
+    pub synthesis_input: crate::synthesis_input::SynthesisInputPack,
     /// Registered research debts.
     pub research_debts: Vec<ResearchDebt>,
     /// Lane class the lane discipline decided for this run.
@@ -6026,15 +6265,25 @@ impl InquiryGovernance {
             claim_audit.records.first(),
             absence_evidence.as_ref(),
         )?;
+        // W2 and W3 together: commit the freeze through the existing governed
+        // source-admission owner, then build the synthesis pack from that
+        // committed freeze. The ordering is the guarantee, so both steps live in
+        // one named function rather than being two calls in a long body.
+        let (source_admission_requests, retained_revisions, committed_freeze, synthesis_input) =
+            commit_freeze_and_resolve_synthesis_input(
+                &observation,
+                &freeze,
+                &admissibility,
+                &profile,
+                &lane_discipline,
+            )?;
         let record = Self {
             inquiry_id: observation.inquiry_id,
             evidence_set_id: observation.evidence_set_id,
             run_reference_manifest: observation.reference_manifest.clone(),
             profile_admission_request: profile.admission_request(),
-            source_admission_requests: admissibility
-                .iter()
-                .map(SourceAdmissibilityRecord::transition_request)
-                .collect::<Result<Vec<_>, _>>()?,
+            source_admission_requests,
+            retained_revisions,
             unadmitted_references,
             profile,
             claim_audits: claim_audit.records,
@@ -6046,6 +6295,8 @@ impl InquiryGovernance {
             precision,
             obligations,
             freeze,
+            committed_freeze,
+            synthesis_input,
             research_debts,
             lane_discipline,
             terminal,
@@ -6073,12 +6324,33 @@ impl InquiryGovernance {
     /// which requires the five-class projection, every recorded dimension and
     /// both I21.8 requirement obligations.
     ///
+    /// A2: the fourth of the four named acceptance cases — a post-audit material
+    /// edit — is the part of this gate that reads the **delivered** wording, not
+    /// only the record. `delivered` is a map from audited claim identity to the
+    /// exact text the release is about to deliver for it; it is checked against
+    /// the wording the audit judged, so an added, edited, re-numbered, causally
+    /// widened, translated or joined statement is refused rather than published
+    /// beside a verdict that described different words. A claim the delivery map
+    /// does not name is a *material* omission and is refused as one, because the
+    /// acceptance requirement is that every released material claim is in the
+    /// coverage map. A claim named here that the audit trail never carried is a
+    /// fabricated claim identity and is likewise refused.
+    ///
+    /// The one thing this gate accepts is a **nonsemantic restyle**: the same
+    /// non-space words in a different whitespace or capitalisation-free
+    /// arrangement, which I21.8 permits under an explicit mapping. That is
+    /// decided by [`ClaimAuditRecord::is_nonsemantic_restyle_of`], never by
+    /// "the strings look close enough" — a difference in any non-space byte is a
+    /// material edit and is refused, so this gate cannot launder a semantic
+    /// change through a formatting path.
+    ///
     /// # Errors
     ///
     /// Returns [`InquiryError::IntegrityMismatch`] naming the first gate that
-    /// refuses, so a consumer reads WHICH requirement failed rather than only
-    /// that the release is blocked.
-    pub fn release_gate(&self) -> Result<(), InquiryError> {
+    /// refuses, or [`InquiryError::ReleaseGateRefused`] naming
+    /// `released_wording` and the offending claim, so a consumer reads WHICH
+    /// requirement failed rather than only that the release is blocked.
+    pub fn release_gate(&self, delivered: &BTreeMap<String, String>) -> Result<(), InquiryError> {
         if let Some(prior) =
             crate::evidence_portfolio::require_complete_claim_coverage(&self.claim_coverage).err()
         {
@@ -6093,6 +6365,55 @@ impl InquiryGovernance {
                 return Err(InquiryError::ReleaseGateRefused {
                     gate: "claim_audit",
                     detail: audit.claim_id.clone(),
+                });
+            }
+            // A2: the delivered wording must be the wording the audit judged.
+            // `delivered` is consulted per claim so a claim that is audited but
+            // absent from the delivery map is caught as a material omission here,
+            // at the gate a release consumer actually calls.
+            let Some(text) = delivered.get(&audit.claim_id) else {
+                return Err(InquiryError::ReleaseGateRefused {
+                    gate: "released_wording",
+                    detail: format!(
+                        "{}: audited but not named in the delivered text",
+                        audit.claim_id
+                    ),
+                });
+            };
+            if text == &audit.released_statement {
+                continue;
+            }
+            if audit.is_nonsemantic_restyle_of(text) {
+                continue;
+            }
+            return Err(InquiryError::ReleaseGateRefused {
+                gate: "released_wording",
+                detail: format!(
+                    "{}: delivered text is a material edit of the audited wording and no \
+                     explicit nonsemantic mapping was offered",
+                    audit.claim_id
+                ),
+            });
+        }
+        // A claim the delivery map names that the audit trail never carried is a
+        // fabricated claim identity: it would be a released material statement
+        // with no coverage-map entry, which is exactly the omission this issue
+        // says blocks a complete-audit claim. It is refused by comparing the two
+        // independent rosters — the carried audits and the delivery map — not by
+        // reading one back from the other.
+        let audited: BTreeSet<&str> = self
+            .claim_audits
+            .iter()
+            .map(|audit| audit.claim_id.as_str())
+            .collect();
+        for claim_id in delivered.keys() {
+            if !audited.contains(claim_id.as_str()) {
+                return Err(InquiryError::ReleaseGateRefused {
+                    gate: "released_wording",
+                    detail: format!(
+                        "{claim_id}: named in the delivered text but absent from the audited \
+                         coverage map"
+                    ),
                 });
             }
         }
@@ -6173,6 +6494,7 @@ impl InquiryGovernance {
             record.validate_integrity()?;
         }
         self.validate_source_admission_requests()?;
+        self.validate_committed_freeze_and_synthesis_input()?;
         for diagnostic in &self.unadmitted_references {
             diagnostic.validate_integrity()?;
             if diagnostic.inquiry_id != self.inquiry_id
@@ -6280,17 +6602,25 @@ impl InquiryGovernance {
     /// digest, or when a request has been swapped for a well-formed request
     /// about a different source, decision, evidence set or fence.
     fn validate_source_admission_requests(&self) -> Result<(), InquiryError> {
-        if self.source_admission_requests.len() != self.admissibility.len() {
-            return Err(InquiryError::IntegrityMismatch {
-                field: "inquiry.source_admission_requests",
-            });
-        }
-        for (request, record) in self
-            .source_admission_requests
-            .iter()
-            .zip(&self.admissibility)
-        {
+        // The request count no longer equals the admissibility record count, and
+        // that is the W2 signal rather than a defect: a source whose original was
+        // never retained has no committed admission, so it produces no request.
+        // The check below is therefore per-handle — every request must still be
+        // the request for one of this record's decisions, and every decision with
+        // a committed freeze must still have its request — rather than a count
+        // equality that a run that did not persist before synthesis could never
+        // satisfy.
+        for request in &self.source_admission_requests {
             request.validate_integrity()?;
+            let Some(record) = self
+                .admissibility
+                .iter()
+                .find(|record| record.record.handle == request.source_handle)
+            else {
+                return Err(InquiryError::IntegrityMismatch {
+                    field: "inquiry.source_admission_request_binding",
+                });
+            };
             // The request must still be the request for *this* decision under
             // *this* inquiry and evidence set. Its own digest proves it was not
             // edited; these bindings prove it was not swapped for a well-formed
@@ -6307,6 +6637,148 @@ impl InquiryGovernance {
                     field: "inquiry.source_admission_request_binding",
                 });
             }
+            // W2: a request on this record must name THIS record's committed
+            // freeze, and the retained original it names must be the admitted
+            // record's own revision. Both are comparisons against values a
+            // different owner produced — the freeze's own digest and the admitted
+            // record's own `content_digest` — rather than against a restatement
+            // of the request's own fields.
+            let Some(commitment) = &request.freeze_commit else {
+                return Err(InquiryError::IntegrityMismatch {
+                    field: "inquiry.source_admission_request.freeze_commit",
+                });
+            };
+            if commitment.freeze_digest != self.freeze.digest
+                || commitment.freeze_id != self.freeze.freeze_id
+                || !self.freeze.includes(&request.source_handle)
+            {
+                return Err(InquiryError::IntegrityMismatch {
+                    field: "inquiry.source_admission_request.freeze_commit",
+                });
+            }
+            match self.retained_revisions.get(&request.source_handle) {
+                Some(retained) => {
+                    retained.verify_integrity()?;
+                    if retained.content_digest != record.record.content_digest
+                        || retained.artifact_ref != commitment.retained_artifact_ref
+                        || retained.digest != commitment.retained_revision_digest
+                    {
+                        return Err(InquiryError::IntegrityMismatch {
+                            field: "inquiry.retained_revision_binding",
+                        });
+                    }
+                }
+                None => {
+                    return Err(InquiryError::IntegrityMismatch {
+                        field: "inquiry.retained_revision_binding",
+                    });
+                }
+            }
+        }
+        // Every committed member of the freeze this record published must still
+        // have its admission request, so a dropped request cannot shrink the
+        // committed set while the freeze still names the source. The expected set
+        // is read off the committed freeze and the requests, which are separate
+        // values, and compared rather than one being read back from the other.
+        let mut expected: Vec<&str> = self
+            .freeze
+            .included_members()
+            .iter()
+            .map(String::as_str)
+            .filter(|handle| {
+                self.admissibility.iter().any(|record| {
+                    record.record.handle == **handle
+                        && record.eligibility == SourceEligibility::Eligible
+                        && self.retained_revisions.contains_key(*handle)
+                })
+            })
+            .collect();
+        expected.sort_unstable();
+        let mut carried: Vec<&str> = self
+            .source_admission_requests
+            .iter()
+            .map(|request| request.source_handle.as_str())
+            .collect();
+        carried.sort_unstable();
+        if expected != carried {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "inquiry.source_admission_request_coverage",
+            });
+        }
+        Ok(())
+    }
+
+    /// Re-proves the committed-freeze proof and the synthesis pack this record
+    /// carries against the ORIGINAL recorded values they were built from.
+    ///
+    /// Neither value is re-derived here. Each is re-proved by running the
+    /// **existing** validators over the values a *different* owner recorded, which
+    /// is the whole difference between a check that can fire and a recomputation
+    /// that would agree with whatever it was handed:
+    ///
+    /// 1. [`crate::synthesis_input::CommittedFreeze::commit`] is re-run over
+    ///    **this record's own** `source_admission_requests` and `freeze`. That
+    ///    re-proves, per request through the admission owner's own
+    ///    `validate_integrity`, the five
+    ///    [`FreezeCommitment`](crate::source_admissibility::FreezeCommitment) fields a
+    ///    `CommittedFreeze` member carries: `freeze_id` and `freeze_digest`
+    ///    against the freeze this record published, `retained_content_digest`
+    ///    against the admitted record's own `content_digest`, and
+    ///    `retained_revision_digest` / `retained_artifact_ref` against the
+    ///    retained revision the persistence owner committed. The reconstructed
+    ///    value is then compared **by content** with the carried one, so a
+    ///    `committed_freeze` that was swapped for another commit cannot pass on
+    ///    the strength of re-deriving cleanly.
+    /// 2. [`crate::synthesis_input::SynthesisInputPack::resolve`] is re-run over
+    ///    that re-proven commit, this record's `freeze`, its own re-proved
+    ///    `run_reference_manifest`, the admitted source records and the
+    ///    lane discipline. This is what makes the W3 membership rule *fire*:
+    ///    resolution is driven by [`EvidenceFreeze::includes`], so a pack that
+    ///    resolved a member the freeze excluded, or dropped a member it
+    ///    included, is caught here rather than read off the pack's own list.
+    ///    The reconstructed pack is again compared by content with the carried
+    ///    one.
+    ///
+    /// The comparison is content equality over the whole typed value rather than
+    /// a digest spot-check, because the pack's `digest` already covers every
+    /// field and comparing digests would only re-ask the question the value's own
+    /// `validate_integrity` answers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::IntegrityMismatch`] naming the first field whose
+    /// carried value disagrees with the value re-proved from this record's own
+    /// requests, freeze, manifest, admitted records and lane discipline.
+    fn validate_committed_freeze_and_synthesis_input(&self) -> Result<(), InquiryError> {
+        let re_proven = crate::synthesis_input::CommittedFreeze::commit(
+            &self.freeze,
+            &self.source_admission_requests,
+        )?;
+        if re_proven != self.committed_freeze {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "inquiry.committed_freeze",
+            });
+        }
+        let repacked = crate::synthesis_input::SynthesisInputPack::resolve(
+            &self.committed_freeze,
+            &self.freeze,
+            &self.run_reference_manifest,
+            &admitted_records(&self.admissibility),
+            &self.committed_freeze.members_by_handle(),
+            &self.profile.question,
+            // The disclosure class the run admitted, read back from the profile
+            // that resolved this run under its own reference manifest rather than
+            // from a value only the consumed `Observation` carried: the profile's
+            // `disclosure_ceiling` is the governed value the record publishes for
+            // exactly this question, and I21.7 makes it the ceiling a source
+            // record may not exceed.
+            self.profile.disclosure_ceiling,
+            &self.lane_discipline,
+        )?;
+        if repacked != self.synthesis_input {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "inquiry.synthesis_input",
+            });
         }
         Ok(())
     }
@@ -8123,14 +8595,28 @@ fn claim_audit_for_run(
         let identity = claim.freeze_identity().map_err(InquiryError::from)?;
         let claim = AuditedClaim {
             frozen_identities: vec![identity],
+            excerpts: retained_excerpts(observation, claim_id),
             ..claim
         };
-        let verdict = audit_claim(&claim, &portfolio, &binding, observation.assessment_time_ms);
+        // The released wording is captured ONCE, before the audit, from the same
+        // value the claim carries. Reading it back off `claim.statement` after
+        // the verdict is built would be the post-audit edit this field exists to
+        // detect: whatever the release actually says is the bytes that were
+        // audited, and nothing recomputes them afterwards.
+        let released_statement = claim.statement.clone();
+        let verdict = crate::evidence_portfolio::audit_claim_with_excerpts(
+            &claim,
+            &portfolio,
+            &binding,
+            observation.assessment_time_ms,
+            &observation.retained_revisions,
+        );
         records.push(ClaimAuditRecord::bind(
             &observation.inquiry_id,
             profile,
             binding.allowed_references(),
             &observation.evidence_set_id,
+            &released_statement,
             verdict.clone(),
         )?);
         verdicts.push(verdict);
@@ -8250,11 +8736,7 @@ fn audit_binding(
 fn released_material_claim(observation: &InquiryObservation, claim_id: &str) -> AuditedClaim {
     AuditedClaim {
         claim_id: claim_id.to_owned(),
-        statement: format!(
-            "the retained provider artifact for inquiry {} contains evidence the question `{}` \
-             could be decided from within the admitted scope `{}`",
-            observation.inquiry_id, observation.question, observation.scope
-        ),
+        statement: released_material_statement(observation, claim_id),
         material: true,
         domain: observation.scope.clone(),
         citations: vec![claim_id.to_owned()],
@@ -8263,7 +8745,112 @@ fn released_material_claim(observation: &InquiryObservation, claim_id: &str) -> 
         unknown_refs: Vec::new(),
         frozen_identities: Vec::new(),
         opposition_relations: Vec::new(),
+        excerpts: Vec::new(),
     }
+}
+
+/// The exact excerpt the released material statement offers as evidence for one
+/// admitted handle.
+///
+/// The span is sliced out of the **retained original bytes**, not out of the
+/// statement. That direction matters and the previous producer had it backwards:
+/// it read a quoted run out of the claim's own sentence and then compared THAT
+/// text with the source, which cannot detect a fabricated quotation, a cropped
+/// negation or a page quote presented as a snippet, because the text being
+/// checked was never claimed to come from the source in the first place.
+///
+/// What this returns is therefore a genuine offer to a careful reader: the exact
+/// contiguous window of the admitted revision that backs the claim, offered with
+/// its measured byte offset, so the verifier can check the position rather than
+/// search for the bytes. A handle with no retained revision, or one whose bytes
+/// are not text, produces no excerpt — and that is a reported state rather than
+/// a skip, because the claim then has no verified excerpt at all, the
+/// `excerpt_supports_requirement` obligation is `Unsatisfied`, and the residue
+/// names the missing retention.
+fn retained_excerpts(
+    observation: &InquiryObservation,
+    claim_id: &str,
+) -> Vec<crate::admitted_excerpt::AdmittedExcerpt> {
+    let Some(retained) = observation.retained_revisions.get(claim_id) else {
+        return Vec::new();
+    };
+    let Some(text) = retained.as_text() else {
+        return Vec::new();
+    };
+    let Some((offset, quote)) = evidenced_span(text) else {
+        return Vec::new();
+    };
+    crate::admitted_excerpt::AdmittedExcerpt::offer(
+        crate::admitted_excerpt::AdmittedExcerptParams {
+            source_handle: claim_id.to_owned(),
+            excerpt: quote,
+            // The offset is measured from the retained bytes here, so asserting
+            // it is a measurement rather than a claim. This is the strong form of
+            // `ExcerptPosition`: the verifier then confirms the admitted revision
+            // holds exactly these bytes AT this offset, and a revision fetched
+            // from a different place fails the check instead of passing it by
+            // accident.
+            position: crate::admitted_excerpt::ExcerptPosition::ByteOffset { offset },
+        },
+    )
+    .ok()
+    .into_iter()
+    .collect()
+}
+
+/// The contiguous window of an admitted revision that a released material claim
+/// cites, and the byte offset it was measured at.
+///
+/// The window is the **whole admitted revision** when the revision is a single
+/// contiguous passage, and the first complete line of a longer one otherwise.
+/// Both are honest: this is a citation of a retained source revision, and the
+/// evidence for it is the revision's own text, so the exact bytes offered are
+/// read out of the revision rather than composed by this function. It is NOT a
+/// search for a sentence that would flatter the claim — nothing about the
+/// claim's wording selects which span is returned, so the check that follows
+/// compares the offered bytes with the revision and the revision with the
+/// admission, and neither step can be satisfied by choosing flattering text.
+///
+/// `(None, ...)` for a revision that holds no non-blank text at all. That yields
+/// no excerpt, which the requirement recorder reports rather than treats as
+/// satisfied.
+fn evidenced_span(text: &str) -> Option<(usize, String)> {
+    let trimmed = text.trim_matches(|character: char| character.is_whitespace());
+    if trimmed.is_empty() {
+        return None;
+    }
+    // The leading whitespace run was removed, so the offset has to skip it to
+    // name a position in the ORIGINAL bytes rather than in the trimmed copy.
+    let offset = text.len() - trimmed.len();
+    Some((offset, trimmed.to_owned()))
+}
+
+/// The exact released wording of one material claim.
+///
+/// `claim_id` is the admitted source handle this run is releasing a material claim
+/// about, and the statement names it, so the wording a reader receives is
+/// self-identifying. It was previously threaded in and dropped, which left the
+/// released sentence the *same bytes for every claim in the run*: a record with
+/// three admitted sources published three audits that judged one indistinguishable
+/// sentence, so a consumer holding the delivered text could not tell which claim it
+/// was, and a post-audit edit to one claim's wording was indistinguishable from an
+/// edit to another's. Naming the artifact also makes the wording match the
+/// evidence it is released with — the handle is the claim's only citation and the
+/// key its retained original is filed under — so the sentence cannot promise a
+/// retained artifact without naming the one that was retained.
+///
+/// One function so the statement [`released_material_claim`] publishes, the
+/// identity frozen for the audit, the statement bound into the resulting
+/// [`ClaimAuditRecord`], and any span derived from it all come from the **same**
+/// bytes. Two copies of this format string would let a later edit change the
+/// released wording while the audit kept pointing at the old one, which is
+/// exactly the post-audit-material-edit failure the issue names.
+fn released_material_statement(observation: &InquiryObservation, claim_id: &str) -> String {
+    format!(
+        "the retained provider artifact `{}` for inquiry {} contains evidence the question `{}` \
+         could be decided from within the admitted scope `{}`",
+        claim_id, observation.inquiry_id, observation.question, observation.scope
+    )
 }
 
 /// Observed degradation, coverage unknowns and the budget limitation of one run.
@@ -8616,6 +9203,181 @@ fn unresolved_contradictions(admissibility: &[SourceAdmissibilityRecord]) -> Vec
     contradictions.sort();
     contradictions.dedup();
     contradictions
+}
+
+/// Commits the evidence freeze through the existing governed source-admission
+/// owner, binding each admitted source's retained original to it.
+///
+/// This is the W2 producer, and it is deliberately a **producer of the existing
+/// owner's records** rather than a new owner: every value it returns is a
+/// [`GovernorSourceTransitionRequest`], which already had a digest domain, a
+/// canonical preimage and a `validate_integrity` before this issue touched it. The
+/// only new thing is that the request is now built by
+/// [`SourceAdmissibilityRecord::transition_request_committing_freeze`], which
+/// names the committed freeze and the retained original and refuses either that
+/// does not re-prove itself.
+///
+/// It returns the retained originals **as well as** the requests, and that is one
+/// traversal rather than two on purpose: the same commit binds the same revision,
+/// so a second pass over the admissibility records would be a second place where
+/// "which originals were committed" is decided, and the two could disagree without
+/// any check firing. Carrying them beside the requests is what makes the retained
+/// original on [`InquiryGovernance::retained_revisions`] the revision the
+/// commitment was actually built from rather than a map a reader has to take on
+/// trust.
+///
+/// A record whose original is missing produces no request and no retained entry
+/// for that handle. That is the honest W2 outcome, not a hole: a source that was
+/// admitted without its bytes persisted cannot have its admission committed, and
+/// the run's own freeze still lists it, so the synthesis pack below reports it as
+/// a published omission with [`crate::synthesis_input::PackLimitation::NoRetainedOriginal`]
+/// rather than dropping it.
+///
+/// The eligibility filter is the same one [`evidence_freeze`] uses to build the
+/// included set, so the committed members and the frozen members cannot disagree
+/// about which sources are in the evidence set.
+///
+/// # Errors
+///
+/// Propagates every refusal of the existing owner's own builder: a retained
+/// revision that is not the admitted record's own revision, a freeze that does not
+/// include the source, a request whose own digest does not re-prove, and the
+/// encoding refusal when the decision's source record has no canonical
+/// commitment.
+fn commit_freeze_through_source_admission(
+    observation: &InquiryObservation,
+    freeze: &EvidenceFreeze,
+    admissibility: &[SourceAdmissibilityRecord],
+) -> Result<
+    (
+        Vec<GovernorSourceTransitionRequest>,
+        BTreeMap<String, crate::admitted_excerpt::RetainedSourceRevision>,
+    ),
+    InquiryError,
+> {
+    let mut requests = Vec::new();
+    let mut retained_revisions: BTreeMap<String, crate::admitted_excerpt::RetainedSourceRevision> =
+        BTreeMap::new();
+    for record in admissibility {
+        if record.eligibility != SourceEligibility::Eligible {
+            continue;
+        }
+        let Some(retained) = observation.retained_revisions.get(&record.record.handle) else {
+            continue;
+        };
+        requests.push(record.transition_request_committing_freeze(retained, freeze)?);
+        retained_revisions.insert(record.record.handle.clone(), retained.clone());
+    }
+    Ok((requests, retained_revisions))
+}
+
+/// The admitted source records of one run, keyed by handle.
+///
+/// The same records the portfolio assembled and the freeze enumerated, carried
+/// whole rather than rebuilt, so the synthesis pack resolves members against the
+/// records the run published rather than a second projection of them.
+fn admitted_records(admissibility: &[SourceAdmissibilityRecord]) -> BTreeMap<String, SourceRecord> {
+    admissibility
+        .iter()
+        .filter(|record| record.eligibility == SourceEligibility::Eligible)
+        .map(|record| (record.record.handle.clone(), record.record.clone()))
+        .collect()
+}
+
+/// Commits the W2 evidence freeze and resolves the W3 synthesis pack from it.
+///
+/// W2: the freeze is committed through the existing governed source-admission
+/// owner, and the retained original is bound to it there. Every request on this
+/// path is built by `transition_request_committing_freeze`, so a run that did not
+/// persist before synthesis produces **no** request at all for the sources whose
+/// original it never retained — the plain `transition_request` builder still
+/// exists for a pre-freeze proposal, and this path does not use it, because a
+/// request that named no freeze is exactly the state W2 forbids admitting
+/// synthesis from.
+///
+/// The committed-freeze proof is then re-derived from those same requests
+/// through the owner's existing validator. It is not built from the freeze alone:
+/// `CommittedFreeze::commit` takes the requests, so the proof exists only if every
+/// one of them already carried this exact freeze.
+///
+/// W3 then resolves the pack from that committed freeze. The two live in one
+/// function because the ORDER is the guarantee: a pack may only be resolved from
+/// a freeze that a governed owner has already committed, so separating them into
+/// two independently callable steps would make the ordering a convention.
+#[allow(clippy::type_complexity)]
+fn commit_freeze_and_resolve_synthesis_input(
+    observation: &InquiryObservation,
+    freeze: &EvidenceFreeze,
+    admissibility: &[SourceAdmissibilityRecord],
+    profile: &InquiryProtocolProfile,
+    lane_discipline: &LaneDisciplineOutcome,
+) -> Result<
+    (
+        Vec<GovernorSourceTransitionRequest>,
+        BTreeMap<String, crate::admitted_excerpt::RetainedSourceRevision>,
+        crate::synthesis_input::CommittedFreeze,
+        crate::synthesis_input::SynthesisInputPack,
+    ),
+    InquiryError,
+> {
+    let (source_admission_requests, retained_revisions) =
+        commit_freeze_through_source_admission(observation, freeze, admissibility)?;
+    let committed_freeze =
+        crate::synthesis_input::CommittedFreeze::commit(freeze, &source_admission_requests)?;
+    let synthesis_input = resolve_synthesis_input(
+        observation,
+        admissibility,
+        &committed_freeze,
+        freeze,
+        profile,
+        lane_discipline,
+    )?;
+    Ok((
+        source_admission_requests,
+        retained_revisions,
+        committed_freeze,
+        synthesis_input,
+    ))
+}
+
+/// Resolves the W3 synthesis pack for one recorded run.
+///
+/// W3: the synthesis pack is resolved from the committed freeze under the
+/// run-bound reference manifest and the admitted disclosure class, so a member
+/// the freeze excluded, the manifest revoked or the disclosure forbids is a
+/// published omission rather than a silent one.
+///
+/// The question and the disclosure class are read off the PROFILE, not off the
+/// `Observation`, for the same reason
+/// `validate_committed_freeze_and_synthesis_input` reads them off the profile:
+/// the record has to re-derive the same pack from the values it publishes, and
+/// the observation is consumed here. The profile carries the admitted question
+/// verbatim (`profile_params` copies it) and the admitted disclosure class as
+/// its `disclosure_ceiling`, so a re-proof that read either from the
+/// observation could not exist.
+///
+/// The pack's own denominator stays the freeze's included set, read inside
+/// `SynthesisInputPack::resolve` and not off `committed_freeze` here: a commit
+/// that had lost or gained a member still re-proves its own digest, and only
+/// the freeze is the authority on which members exist.
+fn resolve_synthesis_input(
+    observation: &InquiryObservation,
+    admissibility: &[SourceAdmissibilityRecord],
+    committed_freeze: &crate::synthesis_input::CommittedFreeze,
+    freeze: &EvidenceFreeze,
+    profile: &InquiryProtocolProfile,
+    lane_discipline: &LaneDisciplineOutcome,
+) -> Result<crate::synthesis_input::SynthesisInputPack, InquiryError> {
+    crate::synthesis_input::SynthesisInputPack::resolve(
+        committed_freeze,
+        freeze,
+        &observation.reference_manifest,
+        &admitted_records(admissibility),
+        &committed_freeze.members_by_handle(),
+        &profile.question,
+        profile.disclosure_ceiling,
+        lane_discipline,
+    )
 }
 
 /// Freezes the accepted evidence revision for one inquiry.
