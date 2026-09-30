@@ -25,10 +25,10 @@ pub use eliot_learning_contracts::{
 use eliot_reactive_context_plan::RetrievalPlan;
 use eliot_receipts::{
     ArtifactBinding, AuthorityBinding, OperationBinding, ProofCeiling, ReceiptCore,
-    ReceiptDisposition, ReceiptKind, RequestBinding, SessionBinding, TaskBinding, WorkScopeBinding,
+    ReceiptDisposition, ReceiptKind, RequestBinding, SessionBinding, WorkScopeBinding,
     contract_identity as receipt_contract_identity,
 };
-pub use eliot_receipts::{CausalBinding, EffectClass, ReceiptEnvelope};
+pub use eliot_receipts::{CausalBinding, EffectClass, ReceiptEnvelope, TaskBinding};
 pub use eliot_security_contracts::{
     DisclosureDependencyClosure, InfluenceDependencyClosure, InfluenceState, PurgeLedgerEntry,
     RevocationReason, SelectionChainHead, SelectionChainSeal, SelectionIntegrityReceipt,
