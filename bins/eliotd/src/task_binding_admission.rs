@@ -116,6 +116,10 @@
 //!   from the request; captures and non-task-relative writes stay on the
 //!   receipt-only [`admit_canonical_write`] leg, so the cold path never needs
 //!   a retained terminal.
+//! - [`require_material_bootstrap_for_task_bound`] has **zero call sites**: the
+//!   designated caller is the same composition, between the admission
+//!   projection and the #1742 material gate, passing the bootstrap admitted
+//!   for the same lease at the write fence.
 //! - `DaemonComposition::commit_canonical_and_refresh` itself has **zero**
 //!   production call sites — its only in-tree mentions are documentation and a
 //!   source-string assertion in `bins/eliotd/tests/agent_fabric_wiring.rs`. It
