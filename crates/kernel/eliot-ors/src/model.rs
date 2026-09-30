@@ -8039,23 +8039,20 @@ impl HostRequestApplicationBinding {
         Ok(())
     }
 
-    fn validate_source_request_identity(
-        &self,
-        record: &HostRequestRecord,
-    ) -> Result<(), OrsError> {
+    fn validate_source_request_identity(&self, record: &HostRequestRecord) -> Result<(), OrsError> {
         self.validate_source_request_identity_ids(record)?;
         self.validate_source_request_identity_fence()?;
         self.validate_source_request_identity_metadata()
     }
 
     fn source_request_parts(&self) -> Result<(&Value, &Value), OrsError> {
-        let request = self
-            .source_request_identity
-            .get("request")
-            .ok_or(OrsError::InvalidField {
-                field: "host_request_source_identity_request",
-                reason: "the original EBP request binding is required",
-            })?;
+        let request =
+            self.source_request_identity
+                .get("request")
+                .ok_or(OrsError::InvalidField {
+                    field: "host_request_source_identity_request",
+                    reason: "the original EBP request binding is required",
+                })?;
         let metadata = request.get("metadata").ok_or(OrsError::InvalidField {
             field: "host_request_source_identity_metadata",
             reason: "the original EBP request metadata is required",
@@ -8068,13 +8065,14 @@ impl HostRequestApplicationBinding {
         record: &HostRequestRecord,
     ) -> Result<(), OrsError> {
         let (_, metadata) = self.source_request_parts()?;
-        let transport_request_id = metadata
-            .get("request_id")
-            .and_then(Value::as_str)
-            .ok_or(OrsError::InvalidField {
-                field: "host_request_source_identity_request_id",
-                reason: "the original EBP request id must be text",
-            })?;
+        let transport_request_id =
+            metadata
+                .get("request_id")
+                .and_then(Value::as_str)
+                .ok_or(OrsError::InvalidField {
+                    field: "host_request_source_identity_request_id",
+                    reason: "the original EBP request id must be text",
+                })?;
         let flat_request_id = self
             .request_identity
             .get("request_id")
@@ -8108,10 +8106,7 @@ impl HostRequestApplicationBinding {
     fn validate_source_request_identity_fence(&self) -> Result<(), OrsError> {
         let (request, metadata) = self.source_request_parts()?;
         let metadata_fence = serde_json::from_value::<StateFence>(
-            metadata
-                .get("state_fence")
-                .cloned()
-                .unwrap_or(Value::Null),
+            metadata.get("state_fence").cloned().unwrap_or(Value::Null),
         )
         .map_err(|_| OrsError::FenceMismatch)?;
         let request_fence = serde_json::from_value::<StateFence>(
@@ -8353,8 +8348,7 @@ impl HostRequestApplicationBinding {
             .request_identity
             .get("work_scope_id")
             .and_then(Value::as_str)
-            && Some(claimed_scope)
-                != record.scope_ref.as_ref().map(OpaqueLabel::as_str)
+            && Some(claimed_scope) != record.scope_ref.as_ref().map(OpaqueLabel::as_str)
         {
             return Err(OrsError::InvalidField {
                 field: "host_request_owner_scope",
