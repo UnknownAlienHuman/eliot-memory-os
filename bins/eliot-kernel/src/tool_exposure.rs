@@ -176,6 +176,36 @@ pub(crate) fn authorize_pre_dispatch(
     eliot_receipts::authorize_pre_dispatch(request)
 }
 
+/// Records the per-evaluation receipt skeleton for one authorized request.
+///
+/// This is the production recording call at the orchestration boundary: it
+/// runs the real pre-dispatch gate ([`authorize_pre_dispatch`]) and, only on
+/// success, stages the [`eliot_receipts::ToolExposureReceiptV2`] admission
+/// skeleton from the request's own admission-derived identities (tool
+/// definition, route fingerprint). Eligibility and selection hold because the
+/// gated request was presented for dispatch and admitted; every unobserved
+/// stage stays `None`, delivery stays `MISSING`, and no representation
+/// evidence is attached. Measurement owners populate the rest through the
+/// `record_*` transitions; nothing is invented here. `receipt_id` must be
+/// infrastructure identity (for example the host-request operation id),
+/// never caller prose.
+///
+/// # Errors
+///
+/// Returns [`eliot_receipts::ToolExposureError`] when the request fails the
+/// pre-dispatch gate or an identity is malformed.
+pub(crate) fn observe_authorized_admission(
+    request: &ToolCallRequest,
+    receipt_id: String,
+) -> Result<eliot_receipts::ToolExposureReceiptV2, eliot_receipts::ToolExposureError> {
+    authorize_pre_dispatch(request)?;
+    eliot_receipts::ToolExposureReceiptV2::admission_observed(
+        receipt_id,
+        request.tool_definition.clone(),
+        request.route_fingerprint.clone(),
+    )
+}
+
 /// Returns whether the accepted admission requires an intent before dispatch.
 ///
 /// The answer reads off the admission-derived class, so cheap exact reads
