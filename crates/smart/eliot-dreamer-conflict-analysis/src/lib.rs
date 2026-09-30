@@ -3490,8 +3490,7 @@ fn check_evidence_joins(
                     .to_owned(),
             });
         }
-        if evidence.envelope.provenance.revision.as_deref()
-            != Some(member.source_revision.as_str())
+        if evidence.envelope.provenance.revision.as_deref() != Some(member.source_revision.as_str())
         {
             return Err(ConflictAnalysisError::Binding {
                 field: "causal_evidence.envelope.provenance.revision".to_owned(),
