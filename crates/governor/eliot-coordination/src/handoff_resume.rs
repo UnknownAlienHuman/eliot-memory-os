@@ -75,8 +75,7 @@ pub fn resume_from_retained_handoff(
     retained.validate()?;
     let expected_digest = handoff_checkpoint_ref_text(&retained.checkpoint);
     let stored = owner.events().iter().any(|event| {
-        event.kind == CoordinationEventKind::Checkpointed
-            && event.payload_digest == expected_digest
+        event.kind == CoordinationEventKind::Checkpointed && event.payload_digest == expected_digest
     });
     if !stored {
         return Err(CoordinationError::InvalidState.into());
