@@ -55,7 +55,6 @@ use eliot_store_api::{
 };
 use serde::{Deserialize, Serialize};
 
-#[cfg(windows)]
 mod lsp_admission;
 
 /// F-LOG-KERNEL-3 (#901): process-execution boundary observations.
@@ -3072,17 +3071,21 @@ impl KernelComposition {
         session: &Session,
         session_binding: ProcessSessionBinding,
         request: ProcessExecutionRequest,
-        _source_identity: Option<&eliot_protocol::RequestIdentity>,
+        source_binding: Option<(&eliot_protocol::RequestIdentity, &eliot_contracts::TaskId)>,
     ) -> ProcessExecutionResponse {
         // F-LOG-KERNEL-3 (#901): process front-door boundary. Receipt is an
         // observation of the gateway outcome; rejections below are typed
         // responses (subordinate infos), while a failed gateway operation
         // emits exactly one terminal through its own boundary.
         observe_process("kernel.process.request_received", "attempt");
-        #[cfg(windows)]
-        if let Some(identity) = _source_identity
+        if let Some((identity, admitted_task_id)) = source_binding
             && let Err(rejection) =
-                lsp_admission::validate_current_source_request(identity, &request, session)
+                lsp_admission::validate_current_source_request(
+                    identity,
+                    admitted_task_id,
+                    &request,
+                    session,
+                )
         {
             observe_process("kernel.process.request_rejected", "source_binding");
             return ProcessExecutionResponse::Rejected(rejection);
@@ -3209,23 +3212,24 @@ impl KernelComposition {
     /// boundary binds that request to the original EBP identity before the
     /// process gateway can issue its one-shot permit; it does not treat the
     /// identity or payload as authority by itself.
-    #[cfg(windows)]
     pub(crate) async fn execute_current_source_process_request(
         &self,
         session: &Session,
         session_binding: ProcessSessionBinding,
         request: ProcessExecutionRequest,
         identity: &eliot_protocol::RequestIdentity,
+        admitted_task_id: &eliot_contracts::TaskId,
     ) -> ProcessExecutionResponse {
         let bound = match lsp_admission::BoundCurrentSourceProcessRequest::bind(
             identity,
+            admitted_task_id,
             request,
             session,
         ) {
             Ok(bound) => bound,
             Err(rejection) => return ProcessExecutionResponse::Rejected(rejection),
         };
-        let (request, original_identity) = bound.into_parts();
+        let (request, original_identity, original_task_id) = bound.into_parts();
         // The exact original identity reaches this Kernel boundary and is
         // rechecked immediately before P-03 delegation.  The gateway then
         // independently checks the live caller, fence, material coverage,
@@ -3234,7 +3238,7 @@ impl KernelComposition {
             session,
             session_binding,
             request,
-            Some(&original_identity),
+            Some((&original_identity, &original_task_id)),
         )
         .await
     }
