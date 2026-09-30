@@ -61,6 +61,7 @@ use eliot_protocol::{
     RequestIdentity,
 };
 use eliot_receipts::RequestBinding;
+use eliot_receipts::tool_exposure::{ResultDelivery, ToolExposureError, ToolExposureHistoryEntry};
 use eliot_runtime::{Runtime, RuntimeConfig};
 
 mod bridge_contract;
@@ -5788,6 +5789,85 @@ impl BridgeRunner {
         // awaits a route-owner attestation; until then the evidence slot
         // carries the preview+handle.
         Some(view)
+    }
+    /// Populates the `transport_completed` stage of an exposure-history entry
+    /// from this bridge's transport owner (I7.24).
+    ///
+    /// `delivered` carries only the admitted-transport outcome this bridge
+    /// observed on its own exchange, cited by `source_ref`. Transport
+    /// completion never implies delivery completeness, and every other stage
+    /// is left verbatim, so recorded evidence is never overwritten and unknown
+    /// stays unknown. The entry-lifecycle seam joining this fact into a
+    /// persisted successor revision is STITCH: it owns the turn/run/attempt
+    /// identities and the observation/receipt/outbox write.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`BridgeError`] when the stage is already recorded or
+    /// the resulting entry is inconsistent.
+    pub fn apply_bridge_transport_fact(
+        entry: ToolExposureHistoryEntry,
+        delivered: bool,
+        source_ref: String,
+    ) -> Result<ToolExposureHistoryEntry, BridgeError> {
+        entry
+            .record_transport_completed(delivered, source_ref)
+            .map_err(|error| {
+                Self::map_exposure_history_error(error, "history.transport_completed")
+            })
+    }
+    /// Populates the `result_delivery` stage of an exposure-history entry from
+    /// this bridge's delivery-projection owner (I7.24).
+    ///
+    /// `delivery` carries only the delivery completeness this bridge observed
+    /// over real bytes (for example via [`Self::observed_hot_delivery`]),
+    /// cited by `source_ref`; the shared four-disposition vocabulary maps one
+    /// to one, so transport completion and token measurement are never re-read
+    /// here and no stage is inferred from another. The entry-lifecycle seam
+    /// joining this fact into a persisted successor revision is STITCH: it
+    /// owns the turn/run/attempt identities and the
+    /// observation/receipt/outbox write.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`BridgeError`] when delivery is already recorded or
+    /// the resulting entry is inconsistent.
+    pub fn apply_bridge_delivery_fact(
+        entry: ToolExposureHistoryEntry,
+        delivery: DeliveryStatus,
+        source_ref: String,
+    ) -> Result<ToolExposureHistoryEntry, BridgeError> {
+        entry
+            .record_delivery(Self::exposure_delivery(delivery), source_ref)
+            .map_err(|error| Self::map_exposure_history_error(error, "history.result_delivery"))
+    }
+    /// Maps the bridge projection's observed delivery vocabulary onto the
+    /// exposure-history delivery vocabulary (I7.24 `FULL | PARTIAL |
+    /// TRUNCATED | MISSING`). The same four dispositions in the same order:
+    /// no inference, no coercion.
+    const fn exposure_delivery(delivery: DeliveryStatus) -> ResultDelivery {
+        match delivery {
+            DeliveryStatus::Full => ResultDelivery::Full,
+            DeliveryStatus::Partial => ResultDelivery::Partial,
+            DeliveryStatus::Truncated => ResultDelivery::Truncated,
+            DeliveryStatus::Missing => ResultDelivery::Missing,
+        }
+    }
+    /// Maps an exposure-history validation failure into the bridge's typed
+    /// error (I7.20). [`ToolExposureError::InvalidField`] carries its stable
+    /// field path and reason across the boundary losslessly; unreachable
+    /// variants fail closed on the populating stage instead of inventing a
+    /// mapping.
+    fn map_exposure_history_error(error: ToolExposureError, stage: &'static str) -> BridgeError {
+        match error {
+            ToolExposureError::InvalidField { field, reason } => {
+                BridgeError::InvalidContract { field, reason }
+            }
+            _ => BridgeError::InvalidContract {
+                field: stage,
+                reason: "exposure history fact failed its owner validation",
+            },
+        }
     }
     /// Re-arms the once-per-session auto-boot when the live attach belongs to
     /// a different application session than the sealed snapshot's (I7.17).
