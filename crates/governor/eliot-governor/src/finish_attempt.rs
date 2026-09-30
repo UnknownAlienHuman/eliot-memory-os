@@ -491,14 +491,15 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
         task: &TaskRecord,
         plan: &CanonicalPlanBinding,
         fence: &StateFence,
-        contract_acceptance_set: &TaskContractAcceptanceSet,
+        contract_acceptance_set: &RehydratedContractAcceptanceSet,
         observation_refs: &mut BTreeSet<String>,
     ) -> Result<String, FinishAttemptError> {
+        let owner_set = contract_acceptance_set.owner_set();
         if plan.task_id != *task_id
             || fence.task_revision.map(TaskRevision::value) != Some(task.revision)
-            || contract_acceptance_set.task_id != *task_id
-            || contract_acceptance_set.task_revision != task.revision
-            || contract_acceptance_set.read_state_fence != *fence
+            || owner_set.task_id != *task_id
+            || owner_set.task_revision != task.revision
+            || owner_set.read_state_fence != *fence
         {
             return Err(FinishAttemptError::Composition(CompositionError::Recovery(
                 "task observation join does not match the current task, plan, acceptance set, and fence"
@@ -518,7 +519,7 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
                     && receipt.state_fence == *fence
                     && selection.task_ref == task_id.as_str()
                     && selection.task_revision == task.revision
-                    && selection.acceptance_digest == contract_acceptance_set.acceptance_digest
+                    && selection.acceptance_digest == owner_set.acceptance_digest
                     && selection.work_scope_ref == plan.work_scope_id
                     && matches_plan(receipt.plan.as_ref(), plan, fence)
             }) else {
