@@ -2622,9 +2622,7 @@ const TASK_ACCEPTANCE_SET_DOMAIN: &str = "eliot/task-acceptance-set/v1";
 /// # Errors
 ///
 /// Returns [`CompositionError::Recovery`] when the set cannot be canonicalized.
-fn task_acceptance_set_commitment(
-    item_ids: &BTreeSet<String>,
-) -> Result<String, CompositionError> {
+fn task_acceptance_set_commitment(item_ids: &BTreeSet<String>) -> Result<String, CompositionError> {
     #[derive(Serialize)]
     struct Commitment<'a> {
         domain: &'a str,
@@ -2695,8 +2693,7 @@ impl ContractAcceptanceDenominator {
     /// The commitment is recomputed here rather than trusted from the plan
     /// binding, so the plan cannot satisfy this by restating a digest.
     fn admits(&self, verifier_plan: &CanonicalVerifierPlanBinding) -> bool {
-        if self.item_ids.is_empty() || self.item_ids != verifier_plan.required_acceptance_item_ids
-        {
+        if self.item_ids.is_empty() || self.item_ids != verifier_plan.required_acceptance_item_ids {
             return false;
         }
         self.task_acceptance_set_commitment()
