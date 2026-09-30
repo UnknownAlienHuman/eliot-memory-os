@@ -70,11 +70,19 @@ pub enum ProfileLaunchComposition {
         /// The four I3.1 roles and every digest-bound runtime root are carried
         /// separately and by name, so the adapter proves the distinct cache
         /// root rather than a single user root.
-        roots: ProfileRootRequest,
+        ///
+        /// Boxed because this request and the receipt below are the two
+        /// multi-root proof structures, and this variant is the only one that
+        /// carries either. Boxing them keeps the enum's size set by the
+        /// discriminant rather than by this single variant, so the two
+        /// profiles that carry no payload do not pay for the one that does.
+        /// `Box` is transparent to `Serialize`, `Deserialize` and
+        /// `JsonSchema`, so the emitted proof JSON is unchanged.
+        roots: Box<ProfileRootRequest>,
         /// Live current-user root selection proof retained for this request,
         /// including the observed owner SID and interactive session that bind
         /// the task to this account rather than to a service account.
-        selection: ProfileSelectionReceipt,
+        selection: Box<ProfileSelectionReceipt>,
     },
     /// `portable_dev`: repository-local disposable supervision, retained under
     /// the caller-named repository contour.
@@ -151,8 +159,8 @@ pub fn compose_profile_launch(
                         ))
                     })?;
             Ok(ProfileLaunchComposition::CurrentUserLauncherTaskScheduler {
-                roots: root_request,
-                selection,
+                roots: Box::new(root_request),
+                selection: Box::new(selection),
             })
         }
     }
