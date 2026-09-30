@@ -116,6 +116,7 @@ mod owner_closure_feed;
 mod owner_closure_provider;
 mod owner_projection_refresh;
 mod problem_owner_transitions;
+mod quality_applicability;
 mod reactive_admission;
 mod route_registry;
 mod scan_disclosure_owner;
@@ -250,6 +251,12 @@ pub use owner_closure_provider::{
 pub use problem_owner_transitions::{
     PreparedProblemOwnerTransition, ProblemOwnerClosure, ProblemOwnerTransitionBody,
     ProblemOwnerTransitionOutcome, ProblemOwnerTransitionRequest, prepare_problem_owner_transition,
+};
+pub use quality_applicability::{
+    ACTIVE_DIRECTIVE_OWNER, GOVERNANCE_PROFILE_OWNER, IMPACT_OWNER, PROTECTED_FLOOR_OWNER,
+    ROUTE_OWNER, TASK_ACCEPTANCE_OWNER, GoverningImpactClassification, GoverningRouteObservation,
+    GoverningTaskAcceptance, QualityApplicabilityError, quality_applicability_of,
+    resolve_quality_applicability,
 };
 pub use reactive_admission::{
     AtomRiskBinding, ReactiveAdmissionError, ReactiveRiskAssessment, ReactiveRiskTier,

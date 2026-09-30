@@ -314,7 +314,152 @@ pub struct QualityApplicability {
     pub unknown: Vec<QualityApplicabilityInput>,
 }
 
+/// The one owner answer for one applicability input, or the typed unknown.
+///
+/// Each input is a question the grading of a packet must be able to answer
+/// *before* any dimension is graded. The two states are deliberately not a
+/// `bool` and not an `Option`: `Resolved` means one owner supplied the exact
+/// answer it holds, and `Unknown` means no owner supplied an answer at all.
+/// `Unknown` is a real result, not a failure to build the value — it is what
+/// keeps "nobody answered" distinguishable from "the weakest answer was chosen".
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "status", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum QualityApplicabilityResolution {
+    /// The named owner supplied this input's governing answer.
+    Resolved {
+        /// Owner that holds this input, in its own stable identity.
+        owner: String,
+        /// The exact owner-issued reference for this answer.
+        answer: String,
+    },
+    /// No owner supplied this input. The dependent action is blocked.
+    Unknown {
+        /// Owner that must issue this input.
+        missing_owner: String,
+    },
+}
+
+impl QualityApplicabilityResolution {
+    /// Whether this input reached a governing answer.
+    #[must_use]
+    pub const fn is_resolved(&self) -> bool {
+        matches!(self, Self::Resolved { .. })
+    }
+}
+
+/// The complete owner-resolved answer set for one packet's six inputs.
+///
+/// This is the value the applicability resolution produces and the value
+/// [`QualityApplicability::from_resolutions`] consumes. It is a closed struct
+/// rather than a map so every one of [`QUALITY_APPLICABILITY_INPUTS`] is a
+/// *required member* on the wire: a producer cannot omit an input it has no
+/// answer for, and a `deny_unknown_fields` payload cannot invent an eighth one.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct QualityApplicabilityResolutionSet {
+    /// The applicable task and its acceptance criteria.
+    pub task_acceptance: QualityApplicabilityResolution,
+    /// The route this packet is compiled for.
+    pub route: QualityApplicabilityResolution,
+    /// The impact classification of the requested effect.
+    pub impact: QualityApplicabilityResolution,
+    /// The governing Governance Profile.
+    pub governance_profile: QualityApplicabilityResolution,
+    /// The protected Safety Floor.
+    pub protected_floor: QualityApplicabilityResolution,
+    /// The currently active directives.
+    pub active_directive: QualityApplicabilityResolution,
+}
+
+impl QualityApplicabilityResolutionSet {
+    /// The six answers paired with the input each one answers.
+    ///
+    /// The pairing is written out explicitly rather than iterated from a
+    /// caller-supplied list, so the set cannot be built with one input missing
+    /// and another supplied twice.
+    #[must_use]
+    pub fn entries(&self) -> [(&'static str, &QualityApplicabilityResolution); 6] {
+        [
+            ("task_acceptance", &self.task_acceptance),
+            ("route", &self.route),
+            ("impact", &self.impact),
+            ("governance_profile", &self.governance_profile),
+            ("protected_floor", &self.protected_floor),
+            ("active_directive", &self.active_directive),
+        ]
+    }
+
+    /// Validate the intrinsic shape of every supplied answer.
+    ///
+    /// A blank owner or answer identity is refused rather than accepted as an
+    /// answer: an owner that cannot name itself has not answered.
+    pub fn validate(&self) -> Result<(), ContextError> {
+        for resolution in self.entries().into_iter().map(|(_, resolution)| resolution) {
+            match resolution {
+                QualityApplicabilityResolution::Resolved { owner, answer } => {
+                    crate::validate_text(owner, "quality.applicability.owner")?;
+                    crate::validate_text(answer, "quality.applicability.answer")?;
+                }
+                QualityApplicabilityResolution::Unknown { missing_owner } => {
+                    crate::validate_text(
+                        missing_owner,
+                        "quality.applicability.missing_owner",
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl QualityApplicability {
+    /// Partition the six owner answers into resolved and unknown inputs.
+    ///
+    /// This is the resolution: every entry of
+    /// [`QUALITY_APPLICABILITY_INPUTS`] is read from its own owner answer and
+    /// placed in exactly one of the two lists. An answer that is absent, typed
+    /// `Unknown`, or malformed never becomes `resolved` and never selects a
+    /// weaker profile — the input lands in `unknown`, and
+    /// [`QualityOperation::blocks_on_unresolved_applicability`] then blocks
+    /// every operation except read-only diagnostic display.
+    ///
+    /// A malformed answer set is a typed [`ContextError`], not a silent
+    /// downgrade: a caller cannot hand in a blank owner identity and have the
+    /// input quietly become permissive.
+    pub fn from_resolutions(
+        resolutions: &QualityApplicabilityResolutionSet,
+    ) -> Result<Self, ContextError> {
+        resolutions.validate()?;
+        let mut resolved = Vec::new();
+        let mut unknown = Vec::new();
+        for (input, resolution) in [
+            (QualityApplicabilityInput::TaskAcceptance, &resolutions.task_acceptance),
+            (QualityApplicabilityInput::Route, &resolutions.route),
+            (QualityApplicabilityInput::Impact, &resolutions.impact),
+            (
+                QualityApplicabilityInput::GovernanceProfile,
+                &resolutions.governance_profile,
+            ),
+            (
+                QualityApplicabilityInput::ProtectedFloor,
+                &resolutions.protected_floor,
+            ),
+            (
+                QualityApplicabilityInput::ActiveDirective,
+                &resolutions.active_directive,
+            ),
+        ] {
+            if resolution.is_resolved() {
+                resolved.push(input);
+            } else {
+                unknown.push(input);
+            }
+        }
+        let applicability = Self { resolved, unknown };
+        applicability.validate()?;
+        Ok(applicability)
+    }
+
     fn distinct(
         values: &[QualityApplicabilityInput],
         field: &'static str,
