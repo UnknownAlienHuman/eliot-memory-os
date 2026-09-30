@@ -102,12 +102,18 @@
 //!
 //! A1 requires the staged record to carry the *complete* claim set, and the
 //! brief requires that completeness be judged against an INDEPENDENT expected
-//! set — never against a copy of the same caller list. [`StagedClaimCarrier`]
-//! is therefore a closed, owner-declared enumeration of the eight required
-//! claim roles, and [`verify_staged_claim_completeness`] walks that closed set
+//! set — never against a copy of the same caller list. [`StagedClaimRole`] is
+//! therefore a closed, owner-declared enumeration of the seven roles a staged
+//! row must bind, and [`verify_staged_claim_completeness`] walks that closed set
 //! to decide completeness. A caller cannot satisfy the check by handing back the
 //! same list it was given, because the list is fixed here, in the owner, and a
 //! missing role is a typed refusal rather than a shorter loop.
+//!
+//! Five of those roles are claim references (`AdmissionReservationClaims` carries
+//! exactly five) and two — the State Fence and the Authority Epoch — are the
+//! authority bindings the record holds alongside its claims. All seven are named
+//! here so the completeness decision has one closed denominator to walk; the two
+//! authority roles are validated as part of that walk rather than assumed from it.
 
 use eliot_contracts::EpochId;
 use eliot_receipts::ReceiptIdentity;
@@ -567,12 +573,15 @@ pub fn reconcile_canonical_admission(
         eliot_store_api::WriteReceiptStatus::Rejected
         | eliot_store_api::WriteReceiptStatus::Cancelled => {
             // Terminal non-commit. Whether the SAME identity may be retried is
-            // decided solely by the owner's resubmission disposition, never by
-            // the status name.
+            // decided solely by the owner's resubmission disposition, never by the
+            // status name. `Resubmission::None` is the store's own "known rollback,
+            // same identity may be retried" classification — the same mapping the
+            // canonical owner's commit-recovery classifier applies to these exact
+            // fields — so this branch is grounded in the store's disposition and
+            // not invented here. Anything else means the store requires a NEW
+            // identity, which ends this saga's identity.
             if receipt.resubmission == eliot_store_api::Resubmission::None {
-                Ok(CanonicalAdmissionResolution::ProvenNonCommit {
-                    retry_same_identity: true,
-                })
+                Ok(CanonicalAdmissionResolution::ProvenNonCommit)
             } else {
                 Ok(CanonicalAdmissionResolution::TerminalFailure {
                     error_code: receipt.error_code.as_ref().map(ToString::to_string),
@@ -596,13 +605,10 @@ pub enum CanonicalAdmissionResolution {
     /// Proven committed `ADMITTED` with the exact launch intent. Eligible for
     /// activation after current revalidation.
     Committed,
-    /// Proven terminal non-commit under a policy that still permits a
-    /// same-identity retry. Retry only under this operation identity.
-    ProvenNonCommit {
-        /// Whether the store's resubmission policy permits a same-identity
-        /// retry.
-        retry_same_identity: bool,
-    },
+    /// Proven terminal non-commit under the store's own "same identity may be
+    /// retried" disposition. Retry only under this operation identity, and only
+    /// under the existing write policy.
+    ProvenNonCommit,
     /// Terminal rejection/rollback/dead-letter. Retain the exact evidence and
     /// disposition the reservation without launch; the same identity is dead.
     TerminalFailure {
@@ -833,42 +839,66 @@ pub fn verify_staged_claim_completeness(
     record: &AdmissionReservationRecord,
 ) -> Result<(), OrsError> {
     for role in REQUIRED_STAGED_CLAIM_ROLES {
-        let reference: Option<&AdmissionReservationClaimRef> = match role {
-            StagedClaimRole::Resource => Some(&record.claims.resources),
-            StagedClaimRole::Lane => Some(&record.claims.lane),
-            StagedClaimRole::Environment => Some(&record.claims.environment),
-            StagedClaimRole::Effect => Some(&record.claims.effects),
-            StagedClaimRole::QuotaView => Some(&record.claims.quota_view),
+        match *role {
+            // The five claim-reference roles each contribute an OWNER REFERENCE the
+            // record must bind; a role whose reference is blank or fails its
+            // existing validator is a typed refusal.
+            StagedClaimRole::Resource => require_claim_reference(*role, &record.claims.resources)?,
+            StagedClaimRole::Lane => require_claim_reference(*role, &record.claims.lane)?,
+            StagedClaimRole::Environment => {
+                require_claim_reference(*role, &record.claims.environment)?;
+            }
+            StagedClaimRole::Effect => require_claim_reference(*role, &record.claims.effects)?,
+            StagedClaimRole::QuotaView => {
+                require_claim_reference(*role, &record.claims.quota_view)?;
+            }
+            // The two authority roles are NOT claim references — the record carries a
+            // `StateFenceSnapshot` and an `EpochLineage` beside its claims. They are
+            // named in the same closed set so completeness has ONE denominator to
+            // walk, and each is validated BY VALUE against what the record holds: the
+            // fence with `validate_against_lineage` against the ORIGINAL recorded
+            // canonical JSON, and the epoch with `EpochLineage::validate`. Neither
+            // digest is recomputed here in order to be trusted.
             StagedClaimRole::StateFence => {
-                // By value against what the record holds, validated with the
-                // existing validator on the ORIGINAL recorded fence.
                 record
                     .state_fence
                     .validate_against_lineage(&record.authority_epoch)?;
-                None
             }
             StagedClaimRole::AuthorityEpoch => {
                 record.authority_epoch.validate()?;
-                None
-            }
-        };
-        if let Some(reference) = reference {
-            reference.validate()?;
-            if reference.reference.as_str().trim().is_empty() {
-                return Err(OrsError::InvalidField {
-                    field: "admission_reservation.claim.reference",
-                    reason: "every staged claim role must name a non-blank owner reference",
-                });
             }
         }
     }
     Ok(())
 }
 
+/// Requires one claim role to be bound to a usable, non-blank owner reference.
+fn require_claim_reference(
+    role: StagedClaimRole,
+    reference: &AdmissionReservationClaimRef,
+) -> Result<(), OrsError> {
+    reference.validate()?;
+    if reference.reference.as_str().trim().is_empty() {
+        return Err(OrsError::InvalidField {
+            field: match role {
+                StagedClaimRole::Resource => "admission_reservation.claim.resources",
+                StagedClaimRole::Lane => "admission_reservation.claim.lane",
+                StagedClaimRole::Environment => "admission_reservation.claim.environment",
+                StagedClaimRole::Effect => "admission_reservation.claim.effects",
+                StagedClaimRole::QuotaView => "admission_reservation.claim.quota_view",
+                StagedClaimRole::StateFence => "admission_reservation.state_fence",
+                StagedClaimRole::AuthorityEpoch => "admission_reservation.authority_epoch",
+            },
+            reason: "every staged claim role must name a non-blank owner reference",
+        });
+    }
+    Ok(())
+}
+
 /// The complete set of inputs for one stage-and-read-back operation.
 ///
-/// This is the single request the coordinator accepts. It carries the eight
-/// W2 claims and the expiry boundary, and it names the reservation by the
+/// This is the single request the coordinator accepts. It carries the complete
+/// claim set and the expiry boundary, and it names the reservation by the
 /// DERIVED identity so a replay and a crash-restart converge on one row.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdmissionReservationStageRequest {
@@ -910,8 +940,8 @@ pub struct AdmissionReservationStagedOutcome {
 /// This is the stage half of the #1678 saga and the only public entry point
 /// that produces a staged reservation. It:
 ///
-/// 1. validates the request and the completeness of the eight required claim
-///    roles against the owner's closed expected set;
+/// 1. validates the request and the completeness of every required claim role
+///    against the owner's closed expected set;
 /// 2. stages the typed `StagedInactive` record through the existing
 ///    [`OperationalRecoveryStore`] owner — no second store, no in-memory
 ///    stand-in, no file the owner does not own;
@@ -1103,14 +1133,24 @@ pub fn epoch_lineage_for(
 /// with any other ORS identity derived from the same immutable inputs.
 const ACTIVATION_OPERATION_DOMAIN: &str = "eliot.ors.admission-reservation.activation.v1";
 
-/// Derives the ORS operation identity for the activation of one reservation
-/// from the exact owner evidence that authorizes it.
+/// Derives the ORS operation identity for the activation of one reservation.
 ///
-/// The identity is bound to the reservation it activates AND to the exact pair
-/// of owner receipts, so a replay after a lost response reuses the one ORS
-/// operation identity and returns the original active snapshot, while the same
-/// reservation activated under different owner evidence is a same-identity
-/// different-content conflict rather than a second activation.
+/// The identity is bound to the RESERVATION it activates and to this contract
+/// revision only. That is deliberate and it is the whole point of this function:
+/// the owner evidence (the canonical admission receipt and the activation
+/// receipt) is the CONTENT of the activation, and it is deliberately NOT part of
+/// the identity preimage.
+///
+/// If the identity were derived from the owner evidence, changed evidence under
+/// one reservation would mint a *different* operation identity, and the store's
+/// same-identity-changed-content conflict check — which fires only when the
+/// replayed operation identity equals the row's current one — would never fire.
+/// The result would be a second activation carrying different content under a
+/// fresh identity, which is exactly what A6 forbids ("same identity with changed
+/// content conflicts"). With the identity bound to the reservation alone, an
+/// exact replay presents the SAME operation and returns the original snapshot,
+/// while changed evidence presents the SAME operation against different content
+/// and is refused by the owner as a conflict.
 ///
 /// # Errors
 ///
@@ -1118,8 +1158,6 @@ const ACTIVATION_OPERATION_DOMAIN: &str = "eliot.ors.admission-reservation.activ
 /// [`OrsError::Encoding`] when the canonical preimage cannot be encoded.
 pub fn activation_operation_identity(
     reservation_id: &OperationIdentity,
-    canonical_admission_receipt: &ReceiptIdentity,
-    activation_receipt: &ReceiptIdentity,
 ) -> Result<OperationIdentity, OrsError> {
     if reservation_id.as_str().trim().is_empty() {
         return Err(OrsError::InvalidField {
@@ -1131,8 +1169,6 @@ pub fn activation_operation_identity(
         ACTIVATION_OPERATION_DOMAIN,
         ADMISSION_RESERVATION_STAGE_VERSION,
         reservation_id,
-        canonical_admission_receipt,
-        activation_receipt,
     ))
     .map_err(|error| OrsError::Encoding(error.to_string()))?;
     OperationIdentity::new(format!(
