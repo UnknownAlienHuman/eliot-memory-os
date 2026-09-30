@@ -6761,7 +6761,8 @@ impl KernelStoreGateway {
         // `validate_phase_joins` excludes it there.
         let wake_proven = matches!(
             &wake,
-            UserAutomationWakePhase::Published { .. } | UserAutomationWakePhase::NotApplicable { .. }
+            UserAutomationWakePhase::Published { .. }
+                | UserAutomationWakePhase::NotApplicable { .. }
         );
         let execution = match assembly {
             RunNowPreflightAssembly::Unknown(reason) if wake_proven => {
@@ -6769,11 +6770,9 @@ impl KernelStoreGateway {
                     reason: unestablished_run_now_preflight_reason(occurrence_id, &reason),
                 }
             }
-            RunNowPreflightAssembly::Unknown(reason) => {
-                UserAutomationExecutionPhase::Unavailable {
-                    reason: unattempted_run_now_preflight_reason(occurrence_id, &reason),
-                }
-            }
+            RunNowPreflightAssembly::Unknown(reason) => UserAutomationExecutionPhase::Unavailable {
+                reason: unattempted_run_now_preflight_reason(occurrence_id, &reason),
+            },
             RunNowPreflightAssembly::Unavailable(reason) => {
                 UserAutomationExecutionPhase::Unavailable { reason }
             }
