@@ -24,7 +24,7 @@
   },
   "source_token_estimate": {
     "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
-    "source_stu": 123597,
+    "source_stu": 124786,
     "test_stu": 0,
     "selected_file_count": 10,
     "inline_cfg_test_modules": 6,
@@ -41,9 +41,9 @@
       },
       {
         "path": "bins/eliot-mod-research/src/capability_cell.rs",
-        "bytes": 9326,
-        "sha256": "7de5e6bd561092c5ad3a111fe34463b8b6259c260fefa9ef165ed7fd1d7b057e",
-        "stu": 3109,
+        "bytes": 10534,
+        "sha256": "88551e48a5029f950d08cfb1ab5446801aa133e3d47bbf2b79d2a70a7a61d5a0",
+        "stu": 3512,
         "inline_cfg_test": false
       },
       {
@@ -62,9 +62,9 @@
       },
       {
         "path": "bins/eliot-mod-research/src/evidence.rs",
-        "bytes": 36369,
-        "sha256": "a45c53a9569507fe5b900c99177fa406eb95fad1acd61641adb263b2674da9c2",
-        "stu": 12123,
+        "bytes": 37633,
+        "sha256": "37ed3d274c950fd01fb04a24c58a82d7910b15535381926d49469cb1af277aa1",
+        "stu": 12545,
         "inline_cfg_test": true
       },
       {
@@ -90,9 +90,9 @@
       },
       {
         "path": "bins/eliot-mod-research/src/main.rs",
-        "bytes": 36156,
-        "sha256": "1512d742fd51df4e9984984cb224078a5d7fa6968db99a84ae48e2ee05cb5440",
-        "stu": 12052,
+        "bytes": 37251,
+        "sha256": "500f0076b9a19b229e868eed6e6517019c81adfd8e83001e789629eac779fcd7",
+        "stu": 12417,
         "inline_cfg_test": true
       },
       {
@@ -104,7 +104,7 @@
       }
     ],
     "selected_tests": [],
-    "source_selection_digest": "c4d6ace6d7798c8a303f313d4175eb045265a2de54ae3c889a699d75a6b27054"
+    "source_selection_digest": "036c8a40349e51b9583dcf6c3fa4a945f5504914acdab3899c56828123cb51a5"
   },
   "one_hop_providers": [
     "eliot-contracts",
@@ -152,7 +152,7 @@
     "qualification": "UNVALIDATED (I2.16, I0.5)",
     "reference_capsule_handle": "I2.20"
   },
-  "bound_contract_digest": "fb418f6a9b83f836cf02da3b6c45afdcd4a858efb6bd01280fe361aceabd0e7c",
+  "bound_contract_digest": "36cde2c7b57974156f67381517be952f352293527e5794feddd9728f70b051ff",
   "source_provenance": {
     "input_digests": {
       "workspace_manifest": {
@@ -178,15 +178,15 @@
       "module_manifest": null,
       "selected_source": {
         "path_count": 10,
-        "sha256": "c4d6ace6d7798c8a303f313d4175eb045265a2de54ae3c889a699d75a6b27054"
+        "sha256": "036c8a40349e51b9583dcf6c3fa4a945f5504914acdab3899c56828123cb51a5"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "5e1cc922f638965cd1ea7885c96dabf7ff7acd4c98234eaf7383a19afe66e705",
+  "artifact_digest": "c63f54eee62eb2b7d6cd1ebe3d140d131d53071634d2e53302bb9e6b4bf239a4",
   "contract_revision": {
     "derivation": "first 16 hex characters of the artifact digest",
-    "value": "5e1cc922f638965c"
+    "value": "c63f54eee62eb2b7"
   }
 }

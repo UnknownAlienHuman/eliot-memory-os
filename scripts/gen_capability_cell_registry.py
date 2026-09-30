@@ -59,7 +59,7 @@ import re
 import subprocess
 import sys
 import tomllib
-from dataclasses import dataclass
+from typing import NamedTuple
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -142,8 +142,7 @@ SHARED_TREE_INPUTS = (
 )
 
 
-@dataclass(frozen=True)
-class CellSource:
+class CellSource(NamedTuple):
     """One declared capability cell: where it is declared and where it lands.
 
     The record is a per-cell projection of one package manifest plus its
@@ -151,6 +150,15 @@ class CellSource:
     package, contract, capsule root, hosting manifest, generated sink, and
     constant prefix each declared cell uses, so a second cell is a declaration
     rather than a second code path.
+
+    This is a `NamedTuple`, not a `dataclass`, on purpose.
+    `scripts/verify-core-daemon-inventory.py` loads this generator through
+    `importlib.util.module_from_spec` without registering the module in
+    `sys.modules`, and `@dataclass` resolves string annotations via
+    `sys.modules.get(cls.__module__).__dict__`, which is `None` under that
+    loader and raises `AttributeError`. A `NamedTuple` keeps the same immutable,
+    keyword-constructible record shape with no dependency on module registration,
+    so both callers can load this file.
     """
 
     key: str
