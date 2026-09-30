@@ -1518,12 +1518,20 @@ fn installer_plan_parts(
                 automatic_start: true,
             });
         }
+        let store_target = test_handle("eliot/store/v1/0123456789abcdef0123456789abcdef");
         let provision = StoreCredentialProvisionPlan {
             host_state_root: roots.host_state_root.clone(),
             expected_host_executable: test_handle(
                 r"C:\ProgramData\Eliot\packages\canary\eliot-host.exe",
             ),
-            target: test_handle("eliot/store/v1/0123456789abcdef0123456789abcdef"),
+            target: store_target.clone(),
+            // Same owner rule and same live-plan shape as the production
+            // `ProvisionStoreCredential` site: the derived provider reference
+            // is present, not a parse-compatibility `None`, because these
+            // effects are planned and validated as a real installation.
+            provider_bootstrap_target: Some(must(
+                crate::provider_bootstrap_credential_target_for_store_target(&store_target),
+            )),
             provider: StoreCredentialProvider::WindowsCredentialManager,
             scope: StoreCredentialScope::LocalService,
             expected_principal_sid: test_handle(LOCAL_SERVICE_SID),

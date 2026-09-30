@@ -128,6 +128,36 @@ fn owner_digest() -> String {
     sha256_hex(b"t9-03 replay route owner-issued executable digest stand-in")
 }
 
+/// The worker cell this Kernel admits, named once so the presented join and
+/// the expectation built from the live registration cannot drift apart.
+fn test_capability_cell() -> eliot_contracts::CapabilityCellId {
+    eliot_contracts::CapabilityCellId::new("native-worker-core").expect("cell id")
+}
+
+/// The generated #13 capability-cell registry digest, read through the same
+/// owner the admission gate reads it through.
+///
+/// `build_executable_expectation` refuses any presented join whose
+/// `capability_cell_registry_digest` is not this exact value, so a canned
+/// constant here would be a fixture that only compiles. Resolved from Kernel's
+/// independently generated registry on every call.
+fn test_capability_cell_registry_digest() -> String {
+    crate::composition_bootstrap::native_worker_cell_registry_digest(&test_capability_cell())
+        .expect("generated capability-cell registry resolves the worker cell")
+        .to_owned()
+}
+
+/// The seven lifecycle joins the worker/Governor owner admits alongside the
+/// cell. Kernel carries them into the expectation verbatim and never re-derives
+/// them (`NativeWorkerLifecycleBinding`: "it does not derive substitutes"), and
+/// no owner that issues them exists in this test context, so they are
+/// deterministic stand-ins over stable seed bytes through the real canonical
+/// hash procedure — the same discipline as `owner_digest` above.
+fn lifecycle_owner_digest(seed: &[u8]) -> String {
+    sha256_hex(seed)
+}
+
+/// Builds one well-formed owner-produced executable join (T9-02 wire v2).
 fn test_join(
     claim_id: &str,
     live: &EpochId,
@@ -142,10 +172,21 @@ fn test_join(
         adapter_revision: 3,
         config_digest: config_digest.to_owned(),
         facet_manifest_ref: "facet-manifest-7".to_owned(),
-        capability_cell: eliot_contracts::CapabilityCellId::new("native-worker-core")
-            .expect("cell id"),
+        capability_cell: test_capability_cell(),
+        capability_cell_registry_digest: test_capability_cell_registry_digest(),
         grant_graph_revision: 5,
         module_catalog_revision: 7,
+        kernel_execution_manifest_digest: lifecycle_owner_digest(
+            b"t9-03 admitted kernel execution manifest",
+        ),
+        job_object_lineage_ref: "job-object-lineage-t9-03-1".to_owned(),
+        resource_limits_digest: lifecycle_owner_digest(
+            b"t9-03 admitted resource limits projection",
+        ),
+        cancellation_policy_ref: "cancel-policy-t9-03-1".to_owned(),
+        checkpoint_policy_digest: lifecycle_owner_digest(b"t9-03 admitted checkpoint policy"),
+        drain_policy_ref: "drain-policy-t9-03-1".to_owned(),
+        restart_policy_digest: lifecycle_owner_digest(b"t9-03 admitted restart policy"),
         replay_stream_id: format!("{claim_id}/gen-1"),
         launch_nonce: "launch-nonce-0123456789abcdef".to_owned(),
         process_invocation_digest: "d".repeat(64),
@@ -333,6 +374,11 @@ fn claim_record_for(
         execution_unit_schema_version: 1,
         predecessor_revision: label("rev-1"),
         resource_envelope_digest: format!("{}0", "f".repeat(63)),
+        // Production binds both from the presented executable join
+        // (`native_worker_claim_staged_record`); this row stands in for a
+        // wire-v2 admitted claim, so it carries the same cell pair.
+        capability_cell: Some(label(test_capability_cell().as_str())),
+        capability_cell_registry_digest: Some(test_capability_cell_registry_digest()),
         state: NativeWorkerClaimState::Admitted,
         receipt_digest: Some("d".repeat(64)),
         admitted_at_unix_ms: Some(1_700_000_000_000),
@@ -475,6 +521,9 @@ fn envelope_mapping_recomputes_the_payload_digest_from_owner_bytes() {
         execution_unit_schema_version: 1,
         predecessor_revision: label("rev-1"),
         resource_envelope_digest: format!("{}0", "f".repeat(63)),
+        // Same wire-v2 cell pair production binds for an admitted claim.
+        capability_cell: Some(label(test_capability_cell().as_str())),
+        capability_cell_registry_digest: Some(test_capability_cell_registry_digest()),
         state: NativeWorkerClaimState::Admitted,
         receipt_digest: Some("d".repeat(64)),
         admitted_at_unix_ms: Some(1_700_000_000_000),

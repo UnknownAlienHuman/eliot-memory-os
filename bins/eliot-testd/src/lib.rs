@@ -2673,10 +2673,15 @@ mod tests {
         let executor = OneShotTestExecutor {
             starts: Mutex::new(0),
         };
+        // The launch contour and the Git port are bound together by
+        // `GovernedContour` so they cannot be passed apart (#1140 AC3); this
+        // fixture offers no Git observation, which is the documented `None`
+        // case, and the productive paths it drives fail closed without one.
+        let contour = worker::GovernedContour::new(&executor, None);
         let receipt = run_admitted_one_shot(
             &fixture.composition,
             presented,
-            &executor,
+            &contour,
             SERVICE_NAME,
             ADMITTED_WORKER_LEASE_MS,
             unix_ms(),
@@ -2704,10 +2709,13 @@ mod tests {
         let executor = OneShotTestExecutor {
             starts: Mutex::new(0),
         };
+        // As above: the contour binds the launch executor to the Git port, and
+        // this fixture has no Git observation to present.
+        let contour = worker::GovernedContour::new(&executor, None);
         let receipt = run_admitted_one_shot(
             &fixture.composition,
             presented,
-            &executor,
+            &contour,
             SERVICE_NAME,
             ADMITTED_WORKER_LEASE_MS,
             unix_ms(),

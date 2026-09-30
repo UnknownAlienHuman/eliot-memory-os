@@ -2590,9 +2590,12 @@ mod tests {
         let mut config = config();
         config.schema_generation = SchemaGeneration::v2().as_str().to_owned();
         config.approved_config_hash = launch_config_digest(&config).expect("v2 config digest");
-        let adapter =
-            materialize_adapter_config(&config, SecretString::new("materialization-secret".into()))
-                .expect("descriptor materializes adapter config");
+        let adapter = materialize_adapter_config(
+            &config,
+            SecretString::new("materialization-secret".into()),
+            SecretString::new("materialization-bootstrap-secret".into()),
+        )
+        .expect("descriptor materializes adapter config");
         assert_eq!(
             adapter.provider_arguments,
             config
@@ -2612,6 +2615,7 @@ mod tests {
             materialize_adapter_config(
                 &substituted,
                 SecretString::new("materialization-secret".into()),
+                SecretString::new("materialization-bootstrap-secret".into()),
             )
             .is_err()
         );

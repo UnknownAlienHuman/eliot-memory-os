@@ -41,7 +41,7 @@ use eliot_installation::{
 use eliot_ipc::{DeliveryOutcome, TransportLimits};
 use eliot_kernel_service::{
     EbpCanonicalStoreClient, EbpStoreTransport, HostStoreBootstrapRequirement,
-    STORE_MODULE_IDENTITY, StoreClientError,
+    STORE_MODULE_IDENTITY, StoreBackupClientError, StoreClientError,
 };
 use eliot_platform::PlatformHandle;
 use eliot_protocol::{
@@ -1437,7 +1437,13 @@ async fn pre_send_refusal_is_distinct_from_post_send_possible_effect() {
         .backup_begin(&refused_context, begin.clone())
         .await
         .expect_err("fence-diverged context is refused before send");
-    assert_eq!(refused, StoreError::FenceMismatch);
+    assert!(
+        matches!(
+            refused,
+            StoreBackupClientError::Store(StoreError::FenceMismatch)
+        ),
+        "fence-diverged context is refused as a fence mismatch, got {refused:?}"
+    );
     assert_eq!(
         sent_backup_requests(&log).len(),
         baseline,
@@ -1457,7 +1463,13 @@ async fn pre_send_refusal_is_distinct_from_post_send_possible_effect() {
         .backup_begin(&backup_context("request-975-a8-unknown"), begin.clone())
         .await
         .expect_err("unknown delivery is possible effect, never success");
-    assert_eq!(unknown, StoreError::MissingReceiptEnvelope);
+    assert!(
+        matches!(
+            unknown,
+            StoreBackupClientError::Store(StoreError::MissingReceiptEnvelope)
+        ),
+        "unknown delivery is a missing receipt envelope, got {unknown:?}"
+    );
     assert_eq!(
         sent_backup_requests(&unknown_log).len() - unknown_baseline,
         1,
@@ -1476,7 +1488,13 @@ async fn pre_send_refusal_is_distinct_from_post_send_possible_effect() {
         .backup_begin(&backup_context("request-975-a8-dropped"), begin.clone())
         .await
         .expect_err("disconnect after send is unknown, never success");
-    assert_eq!(dropped, StoreError::MissingReceiptEnvelope);
+    assert!(
+        matches!(
+            dropped,
+            StoreBackupClientError::Store(StoreError::MissingReceiptEnvelope)
+        ),
+        "disconnect after send is a missing receipt envelope, got {dropped:?}"
+    );
     assert_eq!(
         sent_backup_requests(&dropped_log).len() - dropped_baseline,
         1
@@ -1502,7 +1520,13 @@ async fn unknown_effect_triggers_no_new_operation_or_retry() {
         .backup_begin(&backup_context("request-975-a9"), begin.clone())
         .await
         .expect_err("unknown stays unknown");
-    assert_eq!(outcome, StoreError::MissingReceiptEnvelope);
+    assert!(
+        matches!(
+            outcome,
+            StoreBackupClientError::Store(StoreError::MissingReceiptEnvelope)
+        ),
+        "the projected outcome is a missing receipt envelope, got {outcome:?}"
+    );
     let mutating = sent_backup_requests(&log)
         .into_iter()
         .filter(|(_, _, request)| {
@@ -1728,7 +1752,10 @@ async fn verify_and_status_paths_cannot_restore_cut_over_or_unblock() {
     )
     .await
     .expect_err("default validate performs no restore");
-    assert_eq!(refused, StoreError::Unavailable);
+    assert!(
+        matches!(refused, StoreError::Unavailable),
+        "the default validate refuses as unavailable, got {refused:?}"
+    );
     // The mutating entries refuse the same way: no alternate path imports.
     assert_eq!(
         IsolatedRestorePort::prepare_isolated_destination(

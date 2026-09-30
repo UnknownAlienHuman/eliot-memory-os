@@ -1,12 +1,66 @@
 {
   "base": "9cddf1752596faf971e7c718df76da3a9f2dff00",
-  "delta": "no-manifest-delta: kernel eliot-backup path edge already resolved; kernel lock entry includes eliot-backup; no upgrades",
+  "delta": "explained-no-op: every one of the ten frozen edge declarations is byte-identical at the base blob and in the working tree, and every frozen lock edge resolves at both ends; the base-to-current lock movement is +16/-1 package names and 0 version changes, and among the 430 names present at both ends there is no version-set change and no source or checksum transition, so no frozen package was upgraded and no pre-existing package became a fetched registry dependency",
+  "frozen_lock_edges": [
+    {
+      "package": "eliot-kernel",
+      "dependency": "eliot-backup"
+    },
+    {
+      "package": "eliot-kernel",
+      "dependency": "eliot-ipc"
+    },
+    {
+      "package": "eliot-kernel",
+      "dependency": "eliot-protocol"
+    },
+    {
+      "package": "eliot-kernel",
+      "dependency": "eliot-store-api"
+    },
+    {
+      "package": "eliot-host-control-endpoint",
+      "dependency": "eliot-host-service"
+    },
+    {
+      "package": "eliot-host-control-endpoint",
+      "dependency": "eliot-ipc"
+    },
+    {
+      "package": "eliot-host-service",
+      "dependency": "eliot-protocol"
+    },
+    {
+      "package": "eliot-backup",
+      "dependency": "eliot-blob-api"
+    },
+    {
+      "package": "eliot-backup",
+      "dependency": "eliot-store-api"
+    },
+    {
+      "package": "eliot-blob",
+      "dependency": "eliot-blob-api"
+    }
+  ],
+  "frozen_packages": [
+    "eliot-backup",
+    "eliot-blob-api",
+    "eliot-kernel",
+    "eliot-store-api"
+  ],
   "kernel_lock_includes": [
-    "eliot-backup"
+    "eliot-backup",
+    "eliot-blob-api",
+    "eliot-kernel",
+    "eliot-store-api"
   ],
   "forbidden": [
     "version-upgrade",
+    "registry-source",
+    "checksum-added",
     "unrelated-alias",
-    "members-change"
+    "members-change",
+    "default-members-change"
   ]
 }

@@ -188,12 +188,48 @@ fn test_owner_digest() -> String {
     sha256_hex(b"t9-02 w-b route owner-issued executable digest stand-in")
 }
 
+/// Deterministic owner-issued stand-in over `seed`, through the real hash
+/// procedure. Every owner digest a join carries is derived this way, so no
+/// fixture in this file is a hardcoded digest literal.
+fn test_owner_digest_for(seed: &[u8]) -> String {
+    sha256_hex(seed)
+}
+
+/// The worker cell this Kernel admits, named once so the presented join and
+/// the expectation built from the live registration cannot drift apart.
+fn test_capability_cell() -> eliot_contracts::CapabilityCellId {
+    eliot_contracts::CapabilityCellId::new("native-worker-core").expect("cell id")
+}
+
+/// The generated #13 capability-cell registry digest, read through the same
+/// owner the admission gate reads it through.
+///
+/// `KernelComposition::build_executable_expectation` refuses any presented
+/// join whose `capability_cell_registry_digest` is not this exact value, so a
+/// canned constant here would be a fixture that only compiles. The value is
+/// resolved from Kernel's independently generated registry on every call.
+fn test_capability_cell_registry_digest() -> String {
+    crate::composition_bootstrap::native_worker_cell_registry_digest(&test_capability_cell())
+        .expect("generated capability-cell registry resolves the worker cell")
+        .to_owned()
+}
+
 /// Builds one well-formed owner-produced executable join (T9-02 wire v2).
 ///
 /// The `config_digest` is pinned to the presenting registration's
 /// `worker_config_digest` (`"b".repeat(64)` in these proofs): the route
 /// builds its expectation from the live registration record, so a join
 /// carrying any other config is stale by construction.
+///
+/// The seven lifecycle joins below are the worker/Governor owner's admitted
+/// values, which Kernel carries into the expectation verbatim and never
+/// re-derives (see `NativeWorkerLifecycleBinding`: "it does not derive
+/// substitutes"). No owner that issues them exists in this test context, so
+/// they are deterministic stand-ins over stable seed bytes through the real
+/// canonical hash procedure — the same discipline as `test_owner_digest`
+/// above, and never a hardcoded digest literal. They are carried for shape:
+/// the route compares them only against the presented join, so the proofs
+/// below do not depend on their content.
 fn test_executable_join() -> NativeWorkerExecutableBinding {
     let now = now_ms();
     NativeWorkerExecutableBinding {
@@ -202,10 +238,21 @@ fn test_executable_join() -> NativeWorkerExecutableBinding {
         adapter_revision: 3,
         config_digest: "b".repeat(64),
         facet_manifest_ref: "facet-manifest-7".to_owned(),
-        capability_cell: eliot_contracts::CapabilityCellId::new("native-worker-core")
-            .expect("cell id"),
+        capability_cell: test_capability_cell(),
+        capability_cell_registry_digest: test_capability_cell_registry_digest(),
         grant_graph_revision: 5,
         module_catalog_revision: 7,
+        kernel_execution_manifest_digest: test_owner_digest_for(
+            b"t9-02 w-b admitted kernel execution manifest",
+        ),
+        job_object_lineage_ref: "job-object-lineage-t9-02-1".to_owned(),
+        resource_limits_digest: test_owner_digest_for(
+            b"t9-02 w-b admitted resource limits projection",
+        ),
+        cancellation_policy_ref: "cancel-policy-t9-02-1".to_owned(),
+        checkpoint_policy_digest: test_owner_digest_for(b"t9-02 w-b admitted checkpoint policy"),
+        drain_policy_ref: "drain-policy-t9-02-1".to_owned(),
+        restart_policy_digest: test_owner_digest_for(b"t9-02 w-b admitted restart policy"),
         replay_stream_id: "stream-claim-t9-02-1/gen-1".to_owned(),
         launch_nonce: "launch-nonce-0123456789abcdef".to_owned(),
         process_invocation_digest: "d".repeat(64),
@@ -532,6 +579,14 @@ fn stage_persists_requested_row_with_real_store() {
         predecessor_revision: eliot_ors::OpaqueLabel::new(request.predecessor_revision.as_str())
             .expect("pred"),
         resource_envelope_digest,
+        // The production staged record derives both from the presented
+        // executable join (`native_worker_claim_staged_record`), and this
+        // request is a wire-v2 claim that carries one, so both are bound here
+        // rather than left as the legacy-joinless `None` pair.
+        capability_cell: Some(
+            eliot_ors::OpaqueLabel::new(test_capability_cell().as_str()).expect("capability cell"),
+        ),
+        capability_cell_registry_digest: Some(test_capability_cell_registry_digest()),
         state: NativeWorkerClaimState::Requested,
         receipt_digest: None,
         admitted_at_unix_ms: None,
