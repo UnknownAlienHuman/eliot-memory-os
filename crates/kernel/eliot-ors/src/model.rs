@@ -7975,10 +7975,11 @@ impl HostRequestApplicationBinding {
             .and_then(Value::as_str)
             == Some("HOST_PEER");
         let resolved = disposition == "RESOLVED";
-        if (host_origin && resolved)
-            || (resolved && self.activation_result_sha256.as_deref() != Some(result_digest))
-            || (!resolved && self.activation_result_sha256.is_some())
-        {
+        if resolved {
+            if host_origin || self.activation_result_sha256.as_deref() != Some(result_digest) {
+                return Err(OrsError::FenceMismatch);
+            }
+        } else if self.activation_result_sha256.is_some() {
             return Err(OrsError::FenceMismatch);
         }
         if resolved
