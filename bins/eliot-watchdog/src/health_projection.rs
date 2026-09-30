@@ -57,7 +57,7 @@
 //!
 //! Observation projection only. This module reads, computes, and publishes a
 //! bounded trace. It writes no spool record, mints no lease, epoch, authority,
-//! or intent, performs no canonical, ORS, or HostStateJournal write, and starts
+//! or intent, performs no canonical, `ORS`, or `HostStateJournal` write, and starts
 //! no second escalation path. Persistent or cross-cutting drift is compiled here
 //! into one Diagnostic Brief input with one bounded Dreamer/Watchdog-Agent
 //! analysis request through the existing #1761 [`RiskRoute`] contract
@@ -380,7 +380,7 @@ fn observe_interval(
     let mut blocking_channels = 0_u64;
     let mut non_continuum_channels = 0_u64;
     let mut any_unclosed = false;
-    for capability in SENSOR_CHANNEL_MAP.iter() {
+    for capability in &SENSOR_CHANNEL_MAP {
         expected_lineage += capability.supported_classes.len() as u64;
     }
     for record in report.records() {
@@ -400,12 +400,12 @@ fn observe_interval(
             any_unclosed = true;
         }
         match record.disposition() {
-            CoverageDisposition::Continuous => {}
-            // A channel the map says has no competent source is a measured
-            // structural limitation at this build, not a capability that
-            // degraded between two intervals, so it is neither an unexplained
-            // blocking channel nor a stale capability.
-            CoverageDisposition::Blind => {}
+            // A continuous channel is no blocking channel either. A channel
+            // the map says has no competent source is a measured structural
+            // limitation at this build, not a capability that degraded between
+            // two intervals, so it is neither an unexplained blocking channel
+            // nor a stale capability.
+            CoverageDisposition::Continuous | CoverageDisposition::Blind => {}
             CoverageDisposition::Partial | CoverageDisposition::Unknown => {
                 blocking_channels += 1;
                 if capability.wiring.is_wired() {
@@ -808,7 +808,7 @@ fn consider_diagnostic_brief(
         .iter()
         .any(|rule| state.previous_emission_rules.contains(rule));
     let cross_cutting = rules.len() >= 2;
-    state.previous_emission_rules = rules.clone();
+    state.previous_emission_rules.clone_from(&rules);
     let persistence = match (persistent, cross_cutting) {
         (true, true) => BriefPersistence::PersistentAndCrossCutting,
         (true, false) => BriefPersistence::Persistent,
@@ -836,7 +836,8 @@ fn consider_diagnostic_brief(
         .requested_briefs
         .iter()
         .find(|record| record.brief_id == brief.brief_id)
-        .map_or(0, |record| record.requests);
+        .map(|record| record.requests)
+        .unwrap_or_default();
     let request = request_health_analysis(
         &brief,
         RiskRoute::CheapDiagnosis,
@@ -847,7 +848,7 @@ fn consider_diagnostic_brief(
         .first()
         .map(|signal| signal.revision().target.subject_id.clone())
         .unwrap_or_default();
-    let denied_effects = deny_brief_effects(&brief, &request, subject);
+    let denied_effects = deny_brief_effects(&brief, &request, &subject);
     if let Some(record) = state
         .requested_briefs
         .iter_mut()
@@ -915,7 +916,7 @@ fn risk_route_name(route: RiskRoute) -> &'static str {
 fn deny_brief_effects(
     brief: &HealthDiagnosticBrief,
     request: &HealthAnalysisRequest,
-    subject: String,
+    subject: &str,
 ) -> Vec<ProhibitedEffectDenial> {
     [
         ProhibitedEffectClass::MemoryDelete,
@@ -925,8 +926,9 @@ fn deny_brief_effects(
     .into_iter()
     .flat_map(|class| {
         [
-            ProhibitedEffectAttempt::for_health_brief(class, brief, subject.clone()).deny(),
-            ProhibitedEffectAttempt::for_health_analysis(class, request, subject.clone()).deny(),
+            ProhibitedEffectAttempt::for_health_brief(class, brief, subject.to_owned()).deny(),
+            ProhibitedEffectAttempt::for_health_analysis(class, request, subject.to_owned())
+                .deny(),
         ]
     })
     .collect()

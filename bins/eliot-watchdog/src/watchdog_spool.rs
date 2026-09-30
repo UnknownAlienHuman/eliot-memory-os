@@ -2017,7 +2017,7 @@ impl WatchdogSpool {
     /// Bounded twice. The iteration refuses to exceed the spool's own
     /// [`SPOOL_MAX_RECORDS`] retention ceiling rather than reporting a partial
     /// corpus, and `freshness_window_ms` is the caller's declared owner policy
-    /// - this crate's own backup/export window - not a threshold chosen here.
+    /// (this crate's own backup/export window), not a threshold chosen here.
     /// A record is stale only when it is older than that declared window at the
     /// owner clock the caller supplies.
     ///
