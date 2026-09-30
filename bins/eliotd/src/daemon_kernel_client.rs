@@ -393,15 +393,18 @@ struct CanonicalKernelRequest<'a> {
 fn canonical_kernel_request_digest(
     request: &CanonicalKernelRequest<'_>,
 ) -> Result<String, serde_json::Error> {
+    // Named `DigestInput` rather than `Canonical` so the field names below can
+    // keep I5.27's exact canonical spelling: those names ARE the declared
+    // identity shape, so they are not renamed to satisfy a lint.
     #[derive(Serialize)]
-    struct Canonical<'a> {
+    struct DigestInput<'a> {
         domain_separator: &'a str,
         canonical_encoding_version: u16,
         semantic_command_kind: &'a str,
         principal_and_scope: &'a str,
         canonical_request: &'a serde_json::Value,
     }
-    let bytes = canonical_json_bytes(&Canonical {
+    let bytes = canonical_json_bytes(&DigestInput {
         domain_separator: KERNEL_REQUEST_IDENTITY_DOMAIN,
         canonical_encoding_version: KERNEL_REQUEST_IDENTITY_ENCODING_VERSION,
         semantic_command_kind: request.operation,
