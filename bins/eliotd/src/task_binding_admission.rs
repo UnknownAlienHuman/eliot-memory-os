@@ -843,9 +843,10 @@ pub fn requirement_for_named_mutation(
 /// ([`bind_current_task_selection`] over the Governor-owned snapshot);
 /// anything else stays on the receipt-only cold/non-task-relative legs, so
 /// permitted raw capture remains cold without a retained terminal. Consulted
-/// by [`admit_canonical_write`]; the dispatch effect gate in
-/// [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition)
-/// consults the same split so gating cannot drift from it.
+/// by [`admit_canonical_write`]. The dispatch effect gate
+/// ([`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition))
+/// does not consult it yet (STITCH: production threading pending); thread the
+/// split there before gating relies on it.
 #[must_use]
 pub fn envelope_is_task_relative(envelope: &CanonicalWriteEnvelope) -> bool {
     envelope.task_id.is_some()
@@ -2206,8 +2207,9 @@ pub fn admit_canonical_write(
             .any(|command| requirement_for_named_mutation(command.operation) == requirement)
     };
     let captures = carries_requirement(CanonicalOperationRequirement::SafeRawCapture);
-    // Issue #1746, W4: the same frozen split the dispatch effect gate consults
-    // through `envelope_is_task_relative`, so gating cannot drift from it.
+    // Issue #1746, W4: frozen here so the dispatch effect gate can consult
+    // `envelope_is_task_relative` instead of a local copy (STITCH: lib.rs
+    // threading pending).
     let task_relative = envelope_is_task_relative(envelope);
     // Issue #1746, W4: Absent stays absent and Ambiguous keeps its bounded
     // eligible handles through the single typed response constructor.
