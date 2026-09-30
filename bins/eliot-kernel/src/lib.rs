@@ -153,9 +153,10 @@ use process_execution::{
 };
 pub use process_execution_client::process_execution_client;
 pub(crate) use shutdown_drain::{
-    DRAIN_RECEIPT_DEADLINE, DrainCommitDecision, DrainHalt, DrainWakeDisposition,
-    ReceiptOwnerEvidence, ReceiptOwnerFamily, ReceiptReconciliation, ReceiptRescanObservation,
-    ShutdownPhase, ShutdownTerminal, coordinator_for, reverse_quiescence_order,
+    CutoverFlushSummary, DRAIN_RECEIPT_DEADLINE, DrainCommitDecision, DrainHalt,
+    DrainWakeDisposition, ReceiptOwnerEvidence, ReceiptOwnerFamily, ReceiptReconciliation,
+    ReceiptRescanObservation, ShutdownPhase, ShutdownTerminal, coordinator_for,
+    reverse_quiescence_order,
 };
 pub use trace_manifest::{
     TRACE_MANIFEST_FORMAT_VERSION, TRACE_MANIFEST_REQUIRED_SLOTS, TraceFinish, TraceManifest,
@@ -510,9 +511,9 @@ pub use eliot_runtime_contracts::{
     SupervisionSealedKeyReference, SupervisionTrustAnchor,
 };
 use eliot_runtime_contracts::{
-    HealthVector, LeaseState, ModuleGeneration, ModuleGenerationState, ResumeBrokerIdentity,
-    ResumeIdentitySnapshot, ResumeProcessIdentity, RuntimeLease, SupervisionGenerationBinding,
-    SupervisionJournalEpoch, revalidate_resume_identities,
+    GenerationCutoverState, HealthVector, LeaseState, ModuleGeneration, ModuleGenerationState,
+    ResumeBrokerIdentity, ResumeIdentitySnapshot, ResumeProcessIdentity, RuntimeLease,
+    SupervisionGenerationBinding, SupervisionJournalEpoch, revalidate_resume_identities,
 };
 use eliot_store_api::StoreHealth;
 #[cfg(test)]
@@ -4868,23 +4869,81 @@ impl KernelComposition {
                 .to_owned(),
         )?;
 
-        // FlushesCompleted: reconcile staged ORS generation cutovers.
-        // Audit/outbox flush stays Governor-owned (handoff); Kernel never
-        // fabricates Governor flush evidence.
-        match self
-            .generation_gateway
-            .ors
-            .reconcile_staged_generation_cutovers(eliot_ors::MAX_RECOVERY_PAGE)
-        {
-            Ok(snapshots) => record(
-                ShutdownPhase::FlushesCompleted,
-                format!(
-                    "ors-staged-cutovers-reconciled:{};audit-outbox-flush-owned-by-eliotd-governor-handoff",
-                    snapshots.len()
-                ),
-            )?,
-            Err(_) => return Err(DrainHalt::new("ors-flush-failed")),
+        // FlushesCompleted: ORS staged-cutover flush through the receipt
+        // gateway, then the Governor audit/outbox gate (#1686 item 5, Kernel
+        // half). The owner's reconcile pass fences staged rows through
+        // `FailedRequiresForwardCutover`; this leg registers the observed set
+        // and reconciles it through `reconcile_pending_observation` under the
+        // `CutoverFlush` family, so the fencing is durably published before
+        // any progress is reported, one family's observation can never clear
+        // another family's obligation, and only a current complete observation
+        // authorizes the next step. The acknowledgement carries its exact
+        // cursor/range/remaining-obligation meaning: the durable cursor is the
+        // highest operational order the pass reported, the range is the
+        // covered order interval, and the remaining obligation is every row
+        // still fenced awaiting a forward cutover. A fenced row is terminal
+        // flush evidence — it can never activate a route — but the drain
+        // retains it rather than discharging it: the leg halts with the exact
+        // fenced identities instead of recording the phase. The Governor
+        // audit/outbox flush has no ack port (its owner,
+        // `bins/eliotd/src/maintenance_family_catalog.rs::OUTBOX_RECEIPT_RECONCILIATION`,
+        // declares no admitted implementation), so after the ORS flush proves
+        // out the leg halts typed-unavailable with the proven ORS ack carried
+        // as evidence. Kernel never fabricates Governor flush evidence, and
+        // the phase is never recorded until both owners acknowledge.
+        let (flushed, mut flush_ack) = self
+            .pending_cutover_flush_receipts(DRAIN_RECEIPT_DEADLINE)
+            .map_err(|_| DrainHalt::new("ors-flush-scan-failed"))?;
+        for identity in flushed.pending.iter().map(ReceiptOwnerEvidence::identity) {
+            coordinator
+                .register_pending_receipt(identity)
+                .map_err(|_| DrainHalt::new("durable-pending-receipt-unavailable"))?;
         }
+        match coordinator
+            .reconcile_pending_observation(
+                DRAIN_RECEIPT_DEADLINE,
+                ReceiptOwnerFamily::CutoverFlush,
+                |remaining| {
+                    self.pending_cutover_flush_receipts(remaining).map(
+                        |(observation, summary)| {
+                            flush_ack = summary;
+                            observation
+                        },
+                    )
+                },
+            )
+            .await
+        {
+            ReceiptReconciliation::Reconciled => {}
+            ReceiptReconciliation::Incomplete { pending, reason } => {
+                return Err(DrainHalt::with_pending(reason, pending));
+            }
+            ReceiptReconciliation::Unavailable { reason } => {
+                return Err(DrainHalt::new(reason));
+            }
+        }
+        if !flush_ack.fenced_identities.is_empty() {
+            let mut retained = vec![flush_ack.evidence()];
+            retained.extend(flush_ack.fenced_identities.iter().cloned());
+            return Err(DrainHalt::with_pending(
+                "ors-cutover-flush-fenced-retained",
+                retained,
+            ));
+        }
+        // The ORS flush proved out with no fenced remainder; the Governor
+        // audit/outbox acknowledgement is still missing, so the phase cannot
+        // be recorded. The halt carries the proven ORS ack, never Ok evidence
+        // for the unproven Governor half.
+        return Err(DrainHalt::with_pending(
+            "governor-audit-outbox-flush-unavailable",
+            vec![
+                flush_ack.evidence(),
+                "governor-audit-flush-ack:unimplemented".to_owned(),
+                "outbox-cursor:unobserved".to_owned(),
+                "outbox-ack-owner:bins/eliotd/src/maintenance_family_catalog.rs:OUTBOX_RECEIPT_RECONCILIATION"
+                    .to_owned(),
+            ],
+        ));
 
         // ModulesQuiescedReverse: dependents stop before the stores and
         // bridges they depend on. The contour is the live composition state
@@ -5471,6 +5530,90 @@ impl KernelComposition {
             pending,
             resolved,
         })
+    }
+
+    /// Reads the ORS staged-cutover flush family as one typed, bounded
+    /// observation for the drain gate (#1686 item 5, Kernel half). Read-only
+    /// apart from the owner's own normative fence: the pass moves staged rows
+    /// to fenced evidence, shutdown never activates a route.
+    ///
+    /// The owner fails closed past its bounded limit instead of truncating,
+    /// so a successful pass is complete coverage of the staged family. The
+    /// acknowledgement is exact in cursor (the highest operational order
+    /// reported), range (the covered order interval) and remainder (every row
+    /// still fenced awaiting a forward cutover, plus any row the pass left
+    /// unfenced).
+    ///
+    /// Fenced snapshots are resolved evidence for the flush obligation — the
+    /// owner proved they can never activate a route — while a snapshot the
+    /// pass left outside the fenced state stays pending: absence of fencing
+    /// is never success. The observation reports the durable cursor as its
+    /// revision, so the reconciliation loop's monotonicity guard orders flush
+    /// passes by the owner's own order; a pass over an already-fenced family
+    /// re-reports the same rows with the same orders, so the cursor never
+    /// regresses. The accompanying summary carries the same ack for the leg's
+    /// evidence and halts.
+    ///
+    /// `budget` bounds this tick's owner read: an exhausted tick proves
+    /// nothing rather than overrunning the drain receipt deadline.
+    fn pending_cutover_flush_receipts(
+        &self,
+        budget: Duration,
+    ) -> Result<(ReceiptRescanObservation, CutoverFlushSummary), String> {
+        if budget.is_zero() {
+            return Err("ors-flush-scan-budget-exhausted".to_owned());
+        }
+        let snapshots = self
+            .generation_gateway
+            .ors
+            .reconcile_staged_generation_cutovers(eliot_ors::MAX_RECOVERY_PAGE)
+            .map_err(|_| "ors-flush-scan-failed".to_owned())?;
+        let mut pending = Vec::new();
+        let mut resolved = Vec::new();
+        let mut fenced_identities = Vec::new();
+        for snapshot in &snapshots {
+            // The cutover record carries no request digest; the route scope is
+            // the exact switch binding the owner stored, stable across the
+            // staged-to-fenced transition so a re-read never conflicts with
+            // the pass that fenced it. The owner's operational order is the
+            // revision the reconciliation loop orders passes by.
+            let evidence = ReceiptOwnerEvidence::new(
+                format!("cutover-flush:{}", snapshot.record.cutover_id),
+                snapshot.record.route_scope.clone(),
+                0,
+                snapshot.operation_order(),
+            );
+            if snapshot.record.state == GenerationCutoverState::FailedRequiresForwardCutover {
+                fenced_identities.push(evidence.identity());
+                resolved.push(evidence);
+            } else {
+                pending.push(evidence);
+            }
+        }
+        let summary = CutoverFlushSummary::new(
+            snapshots.len(),
+            snapshots
+                .iter()
+                .map(|snapshot| snapshot.operation_order())
+                .min(),
+            snapshots
+                .iter()
+                .map(|snapshot| snapshot.operation_order())
+                .max()
+                .unwrap_or(0),
+            fenced_identities,
+        );
+        Ok((
+            ReceiptRescanObservation {
+                family: ReceiptOwnerFamily::CutoverFlush,
+                complete: true,
+                absence_resolves: false,
+                revision: summary.durable_cursor,
+                pending,
+                resolved,
+            },
+            summary,
+        ))
     }
 }
 

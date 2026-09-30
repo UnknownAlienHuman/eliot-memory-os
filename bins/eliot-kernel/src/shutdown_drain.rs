@@ -63,8 +63,11 @@
 //! [`DrainWakeDisposition::fences_old_authority`] holds.
 //!
 //! Handoffs (recorded, not implemented here): audit/outbox flush is
-//! Governor/`eliotd`-owned — Kernel flushes ORS staged rows and records the
-//! Governor flush as awaited via daemon quiescence; canonical-store internals
+//! Governor/`eliotd`-owned — Kernel flushes ORS staged rows through the
+//! receipt gateway ([`ReceiptOwnerFamily::CutoverFlush`]) and the
+//! `FlushesCompleted` leg surfaces the Governor flush as typed unavailable
+//! until the owning ack port exists, never as recorded evidence;
+//! canonical-store internals
 //! are store-bridge-owned — Kernel proves the lease-zero precondition and
 //! records the store-stop request for Host to execute; job checkpoint
 //! semantics are Governor-owned — Kernel observes the daemon contour and
@@ -603,6 +606,12 @@ pub(crate) enum ReceiptOwnerFamily {
     /// recovery records: the family whose unreconciled remainder fences the
     /// drain until an evidence-backed resolution is observed.
     StoreUnknownOutcome,
+    /// ORS staged generation-cutover flush rows: the family whose fenced
+    /// remainder the drain retains until a forward cutover resolves it. Only
+    /// the owner's fenced evidence resolves a flush obligation; a row the
+    /// pass left outside the fenced state stays pending through this
+    /// family's own pass.
+    CutoverFlush,
 }
 
 impl ReceiptOwnerFamily {
@@ -617,6 +626,7 @@ impl ReceiptOwnerFamily {
             Self::StoreUnknownOutcome => {
                 identity.starts_with("store-unknown:") || identity.starts_with("unknown-commit:")
             }
+            Self::CutoverFlush => identity.starts_with("cutover-flush:"),
         }
     }
 
@@ -627,8 +637,18 @@ impl ReceiptOwnerFamily {
     /// evidence about another family's rows.
     fn foreign_identity(&self, identity: &str) -> bool {
         match self {
-            Self::StoreRebind => Self::StoreUnknownOutcome.owns_identity(identity),
-            Self::StoreUnknownOutcome => Self::StoreRebind.owns_identity(identity),
+            Self::StoreRebind => {
+                Self::StoreUnknownOutcome.owns_identity(identity)
+                    || Self::CutoverFlush.owns_identity(identity)
+            }
+            Self::StoreUnknownOutcome => {
+                Self::StoreRebind.owns_identity(identity)
+                    || Self::CutoverFlush.owns_identity(identity)
+            }
+            Self::CutoverFlush => {
+                Self::StoreRebind.owns_identity(identity)
+                    || Self::StoreUnknownOutcome.owns_identity(identity)
+            }
         }
     }
 }
@@ -717,6 +737,74 @@ pub(crate) enum ReceiptReconciliation {
     },
     /// A required read or the durable publication failed; nothing was proven.
     Unavailable { reason: &'static str },
+}
+
+/// Exact meaning of one ORS staged-cutover flush acknowledgement for the
+/// drain gate (#1686 item 5, I14.23 "flush audit/outbox/ORS").
+///
+/// Built by the composition root from the owner's reconcile pass over the
+/// staged family, so every field below is owner evidence, never an in-memory
+/// count: `reconciled` is the number of snapshots the pass fenced,
+/// `durable_cursor` is the highest operational order the pass reported (zero
+/// when it fenced nothing), `range_min` bounds the covered interval below,
+/// and `fenced_identities` names the exact drain-gate identities still fenced
+/// awaiting a forward cutover, in deterministic order. A fenced row is
+/// terminal evidence for the flush — it can never activate a route — but it
+/// is a retained remaining obligation, never a discharged one: the drain may
+/// record the fencing through the receipt gateway while still refusing to
+/// treat the flush as complete until a forward cutover resolves it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CutoverFlushSummary {
+    /// Snapshots the pass fenced.
+    pub(crate) reconciled: usize,
+    /// Lowest operational order the pass reported, when it fenced anything.
+    pub(crate) range_min: Option<u64>,
+    /// Highest operational order observed: the durable flush cursor.
+    pub(crate) durable_cursor: u64,
+    /// Exact drain-gate identities still fenced awaiting a forward cutover.
+    pub(crate) fenced_identities: Vec<String>,
+}
+
+impl CutoverFlushSummary {
+    /// Binds one owner pass into its exact gate meaning. The retained
+    /// identities are sorted so halt residuals and evidence read
+    /// deterministically no matter what order the owner walked its table in.
+    pub(crate) fn new(
+        reconciled: usize,
+        range_min: Option<u64>,
+        durable_cursor: u64,
+        fenced_identities: Vec<String>,
+    ) -> Self {
+        let mut fenced_identities = fenced_identities;
+        fenced_identities.sort();
+        Self {
+            reconciled,
+            range_min,
+            durable_cursor,
+            fenced_identities,
+        }
+    }
+
+    /// Bounded evidence rendering of the acknowledgement: the durable cursor,
+    /// the covered operation-order range, the reconciled count and the
+    /// retained fenced remainder. Names orders and counts only, never owner
+    /// row contents; the retained identities travel in the halt residuals.
+    pub(crate) fn evidence(&self) -> String {
+        match self.range_min {
+            Some(min) => format!(
+                "ors-cutover-flush-cursor:{};range:{min}-{};reconciled:{};fenced-awaiting-forward-cutover:{}",
+                self.durable_cursor,
+                self.durable_cursor,
+                self.reconciled,
+                self.fenced_identities.len()
+            ),
+            None => format!(
+                "ors-cutover-flush-cursor:none;reconciled:{};fenced-awaiting-forward-cutover:{}",
+                self.reconciled,
+                self.fenced_identities.len()
+            ),
+        }
+    }
 }
 
 /// What one observation proves about one registered obligation.
