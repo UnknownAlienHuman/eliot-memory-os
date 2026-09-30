@@ -6266,7 +6266,7 @@ impl HostComposition {
             },
         };
 
-        let mut commit_store = self.open_registry_store()?;
+        let commit_store = self.open_registry_store()?;
         let commit_registry = commit_store.load()?;
         if commit_registry.user_mode_task_run_record() != Some(&record)
             || commit_registry.pending_activation().is_some()
