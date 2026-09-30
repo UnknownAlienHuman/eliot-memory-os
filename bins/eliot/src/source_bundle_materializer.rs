@@ -791,9 +791,8 @@ impl PhaseAPeerIdentity {
                                     .to_owned(),
                             ));
                         }
-                        let profile_anchor = Path::new(
-                            input.profile_selection.profile_anchor_root.as_str(),
-                        );
+                        let profile_anchor =
+                            Path::new(input.profile_selection.profile_anchor_root.as_str());
                         if !eliot_platform_windows::windows_paths_equal(
                             &local_app_data,
                             profile_anchor,
@@ -983,12 +982,7 @@ fn build_typed_bundle(
     .map_err(|error| MaterializeError::Platform(error.to_string()))?;
     let selected_profile_anchor =
         SelectedProfileAnchor::retain(input, &selection, &anchor_handle, anchor_identity)?;
-    build_typed_bundle_with_selection(
-        input,
-        executables,
-        &selection,
-        &selected_profile_anchor,
-    )
+    build_typed_bundle_with_selection(input, executables, &selection, &selected_profile_anchor)
 }
 
 struct GovernedBundlePaths {
@@ -1268,10 +1262,8 @@ impl<'a> TypedBundleBuildContext<'a> {
     ) -> Result<Self, MaterializeError> {
         let paths = GovernedBundlePaths::resolve(selection)?;
         let named_executables = BundleExecutables::resolve(executables)?;
-        let peer_identity =
-            PhaseAPeerIdentity::derive(input, selection, selected_profile_anchor)?;
-        let template =
-            BundleTemplateIdentity::derive(input, &named_executables, &peer_identity)?;
+        let peer_identity = PhaseAPeerIdentity::derive(input, selection, selected_profile_anchor)?;
+        let template = BundleTemplateIdentity::derive(input, &named_executables, &peer_identity)?;
         Ok(Self {
             input,
             executables,
@@ -1630,12 +1622,8 @@ fn build_typed_bundle_with_selection(
     selection: &ProfileSelectionResolution,
     selected_profile_anchor: &SelectedProfileAnchor<'_>,
 ) -> Result<TypedBundle, MaterializeError> {
-    let context = TypedBundleBuildContext::new(
-        input,
-        executables,
-        selection,
-        selected_profile_anchor,
-    )?;
+    let context =
+        TypedBundleBuildContext::new(input, executables, selection, selected_profile_anchor)?;
     let arguments = RuntimeLaunchArguments::build(&context)?;
     let (descriptor_bytes, descriptor_sha256) = eliotd_descriptor_binding(&context)?;
     let arguments = arguments.bind_descriptor_digest(&descriptor_sha256)?;
@@ -2385,12 +2373,8 @@ fn materialize_with_resolved_selection(
 
     validate_materializer_selection(input, selection)?;
     selected_profile_anchor.revalidate()?;
-    let typed = build_typed_bundle_with_selection(
-        input,
-        executables,
-        selection,
-        selected_profile_anchor,
-    )?;
+    let typed =
+        build_typed_bundle_with_selection(input, executables, selection, selected_profile_anchor)?;
     selected_profile_anchor.revalidate()?;
     let publication = OwnedDirectoryPublication::create(&input.output_bundle)
         .map_err(|error| MaterializeError::Platform(error.to_string()))?;
@@ -2984,7 +2968,8 @@ mod tests {
         .expect("materialized bundle must feed the real planner");
         let config_bytes = fs::read(output_bundle.join("generation.json")).unwrap();
         let config: StoreLaunchConfig = serde_json::from_slice(&config_bytes).unwrap();
-        let current_peer = eliot_platform_windows::current_process_named_pipe_expectation().unwrap();
+        let current_peer =
+            eliot_platform_windows::current_process_named_pipe_expectation().unwrap();
         assert_eq!(
             config.expected_client_sid,
             current_peer.expected_sid(),
