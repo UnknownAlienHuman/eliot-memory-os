@@ -3525,7 +3525,13 @@ fn rehearsed_reply(
     gates_passed: &[&str],
     gates_not_admitted: &[&str],
 ) -> Result<Value, TransportError> {
-    let unprojectable = |error: serde_json::Error| {
+    // A receipt that cannot be projected is a projection failure, not a
+    // transport one: it answers with the same bounded `refused` envelope the
+    // other refusals on this operation use, carrying the gates that really ran
+    // so the caller can still see what was executed. It is returned as the
+    // reply value, matching how the other projections in this module report an
+    // unserialisable field.
+    let unprojectable = |error: &serde_json::Error| {
         backup_reply(
             BACKUP_RESTORE_TEST_OPERATION,
             "refused",
@@ -3541,13 +3547,19 @@ fn rehearsed_reply(
             ],
         )
     };
-    let receipt = serde_json::to_value(&outcome.receipt).map_err(unprojectable)?;
+    let receipt = match serde_json::to_value(&outcome.receipt) {
+        Ok(value) => value,
+        Err(error) => return Ok(unprojectable(&error)),
+    };
     // Absent means the owner observed none: a run that did not execute finalize
     // reports no evidence, and a resumed run's file is re-validated by the owner
     // before it is reported here. It is never synthesised and never carried over
     // from an earlier execution.
     let evidence = match outcome.evidence.as_ref() {
-        Some(evidence) => serde_json::to_value(evidence).map_err(unprojectable)?,
+        Some(evidence) => match serde_json::to_value(evidence) {
+            Ok(value) => value,
+            Err(error) => return Ok(unprojectable(&error)),
+        },
         None => Value::Null,
     };
     Ok(backup_reply(
