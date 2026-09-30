@@ -74,6 +74,7 @@ impl ProcessStarter for GatewayProcessStarter {
         let gateway = Arc::clone(&self.gateway);
         let owner = self.owner.clone();
         Box::pin(async move {
+            let context = ProcessExecutionGateway::start_context_for(&owner, &admission);
             // F-LOG-KERNEL-3 (#901 W12, case 4 "pre-launch refusal remains
             // not attempted"): the live front-door process start runs the one
             // process-execution material-coverage guard
@@ -88,7 +89,10 @@ impl ProcessStarter for GatewayProcessStarter {
             // that code from the bounded detail prefix). The guard owns the
             // single `kernel.process.request_rejected` observation.
             let outer_binding =
-                match kernel.reject_process_start_without_material_coverage(&admission) {
+                match kernel.reject_process_start_without_material_coverage_in_context(
+                    &admission,
+                    &context,
+                ) {
                     Ok(outer_binding) => outer_binding,
                     Err(rejection) => {
                         return Err(eliot_process::ProcessExecutionError::Unavailable(format!(
@@ -96,9 +100,11 @@ impl ProcessStarter for GatewayProcessStarter {
                             rejection.code, rejection.detail
                         )));
                     }
-                };
+            };
             let proof = kernel.retain_process_path_proof(&admission)?;
-            gateway.start(&owner, admission, proof, outer_binding).await
+            gateway
+                .start_in_context(&owner, admission, proof, outer_binding, &context)
+                .await
         })
     }
 }
