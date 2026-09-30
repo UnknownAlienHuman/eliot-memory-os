@@ -443,7 +443,10 @@ impl IndicatorEvidence {
         match self {
             Self::ExternalInstructionAttempt { retained, .. }
             | Self::StandingInstructionOrSecretPersistence { retained, .. } => {
-                matches!(retained.content_role, ExternalContentRole::DirectInstruction)
+                matches!(
+                    retained.content_role,
+                    ExternalContentRole::DirectInstruction
+                )
             }
             Self::UnexpectedToolDefinitionChange(evidence) => {
                 evidence.approved_schema_revision.is_some()
