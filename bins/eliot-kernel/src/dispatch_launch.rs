@@ -114,10 +114,10 @@ use eliot_kernel_service::{
     reconcile_testd_admission,
 };
 use eliot_ors::{
-    AdmissionReservationClaimRef, AdmissionReservationClaims,
-    AdmissionReservationIdentityInput, AdmissionReservationLaunchPrerequisite, DoctorAttemptRecord,
-    DoctorEffectRecord, DoctorLedgerError, DoctorRecoveryLedger, NativeWorkerClaimRecord,
-    OperationalRecoveryStore, OpaqueLabel, OperationIdentity, StateFenceSnapshot,
+    AdmissionReservationClaimRef, AdmissionReservationClaims, AdmissionReservationIdentityInput,
+    AdmissionReservationLaunchPrerequisite, DoctorAttemptRecord, DoctorEffectRecord,
+    DoctorLedgerError, DoctorRecoveryLedger, EpochLineage, NativeWorkerClaimRecord, OpaqueLabel,
+    OperationIdentity, OperationalRecoveryStore, StateFenceSnapshot,
     admission_reservation_identity, epoch_lineage_for,
     verify_admission_reservation_launch_prerequisite,
 };
@@ -4960,7 +4960,11 @@ fn native_worker_admission_reservation_claims(
                 "admission reservation environment claim reference is not a usable label: {error}"
             ))
         })?,
-        sha256: digest(&(&request.work_scope_id, &request.task_id, &request.decision_id))?,
+        sha256: digest(&(
+            &request.work_scope_id,
+            &request.task_id,
+            &request.decision_id,
+        ))?,
     };
     let effects = AdmissionReservationClaimRef {
         reference: OpaqueLabel::new(request.operation_id.as_str()).map_err(|error| {
@@ -5000,6 +5004,38 @@ fn native_worker_admission_reservation_claims(
     Ok(claims)
 }
 
+/// The derived-identity input for one presented native-worker claim.
+///
+/// The stage half and this launch gate build the identity input from the SAME
+/// claim request, the SAME claims and the SAME owner-captured fence and epoch,
+/// which is what makes the derived reservation identity stable: the gate looks
+/// up the row the stage wrote instead of minting a second one.
+fn native_worker_reservation_identity_input(
+    request: &NativeWorkerClaimRequest,
+    claims: &AdmissionReservationClaims,
+    authority_epoch: &EpochLineage,
+    state_fence: &StateFenceSnapshot,
+) -> Result<AdmissionReservationIdentityInput, DispatchLaunchError> {
+    Ok(AdmissionReservationIdentityInput {
+        work_item_id: OperationIdentity::new(request.claim_id.as_str()).map_err(|error| {
+            DispatchLaunchError::InvalidMaterial(format!(
+                "admission reservation work item identity is not usable: {error}"
+            ))
+        })?,
+        proposed_attempt_id: OperationIdentity::new(request.attempt_id.as_str()).map_err(
+            |error| {
+                DispatchLaunchError::InvalidMaterial(format!(
+                    "admission reservation proposed attempt identity is not usable: {error}"
+                ))
+            },
+        )?,
+        semantic_admission_revision: request.request_digest.clone(),
+        claims: claims.clone(),
+        state_fence: state_fence.clone(),
+        authority_epoch: authority_epoch.clone(),
+    })
+}
+
 /// Refuses one native-worker launch unless the ORS owner proves its admission
 /// reservation is currently `ACTIVE` under this launch's own authority
 /// (#1678 REQ7, W5, A5, A8).
@@ -5029,52 +5065,38 @@ fn verify_native_worker_launch_prerequisite(
     // under and validated with the owner's own validator against the canonical
     // `EpochId`, so the comparison below is between two owner-captured values
     // and never a recomputed digest. A malformed presented fence refuses here.
-    let state_fence = StateFenceSnapshot::capture(
-        &request.state_fence,
-        request.authority_epoch.sequence.get(),
-    )
-    .and_then(|snapshot| {
-        snapshot
-            .validate_against_epoch(&request.authority_epoch)
-            .map(|()| snapshot)
-    })
-    .map_err(|error| {
-        DispatchLaunchError::Gate(format!(
-            "admission reservation launch prerequisite has no valid State Fence: {error}"
-        ))
-    })?;
+    let state_fence =
+        StateFenceSnapshot::capture(&request.state_fence, request.authority_epoch.sequence.get())
+            .and_then(|snapshot| {
+                snapshot
+                    .validate_against_epoch(&request.authority_epoch)
+                    .map(|()| snapshot)
+            })
+            .map_err(|error| {
+                DispatchLaunchError::Gate(format!(
+                    "admission reservation launch prerequisite has no valid State Fence: {error}"
+                ))
+            })?;
     let claims = native_worker_admission_reservation_claims(request)?;
-    let identity_input = AdmissionReservationIdentityInput {
-        work_item_id: OperationIdentity::new(request.claim_id.as_str()).map_err(|error| {
-            DispatchLaunchError::InvalidMaterial(format!(
-                "admission reservation work item identity is not usable: {error}"
-            ))
-        })?,
-        proposed_attempt_id: OperationIdentity::new(request.attempt_id.as_str()).map_err(|error| {
-            DispatchLaunchError::InvalidMaterial(format!(
-                "admission reservation proposed attempt identity is not usable: {error}"
-            ))
-        })?,
-        semantic_admission_revision: request.request_digest.clone(),
-        claims,
-        state_fence: state_fence.clone(),
-        authority_epoch: authority_epoch.clone(),
-    };
+    let identity_input =
+        native_worker_reservation_identity_input(request, &claims, &authority_epoch, &state_fence)?;
     // The identity is derived from the immutable claim binding, never minted,
     // so this looks up the SAME reservation the stage half wrote.
-    let reservation_id =
-        admission_reservation_identity(&identity_input).map_err(|error| {
-            DispatchLaunchError::Gate(format!(
-                "admission reservation identity cannot be derived from the presented claim: {error}"
-            ))
-        })?;
+    let reservation_id = admission_reservation_identity(&identity_input).map_err(|error| {
+        DispatchLaunchError::Gate(format!(
+            "admission reservation identity cannot be derived from the presented claim: {error}"
+        ))
+    })?;
+    // `OpaqueLabel` has no `Display`; its own accessor is the only honest way to
+    // name it, and every refusal below names the reservation it refused on.
+    let reservation_label = reservation_id.as_str();
     let current = kernel
         .generation_gateway
         .ors
         .load_kernel_admission_reservation(&reservation_id)
         .map_err(|error| {
             DispatchLaunchError::Gate(format!(
-                "admission reservation {reservation_id} cannot be read back: {error}"
+                "admission reservation {reservation_label} cannot be read back: {error}"
             ))
         })?;
     let prerequisite = verify_admission_reservation_launch_prerequisite(
@@ -5087,9 +5109,22 @@ fn verify_native_worker_launch_prerequisite(
     )
     .map_err(|error| {
         DispatchLaunchError::Gate(format!(
-            "admission reservation launch prerequisite for {reservation_id} is not verifiable: {error}"
+            "admission reservation launch prerequisite for {reservation_label} is not verifiable: {error}"
         ))
     })?;
+    native_worker_launch_prerequisite_outcome(prerequisite, reservation_label)
+}
+
+/// Turns the owner's launch-prerequisite verdict into this path's outcome.
+///
+/// Only `Active` proceeds, and only after BOTH owner receipts are read off the
+/// sealed typestate. Every other disposition is a typed refusal naming the
+/// exact state, so a refused launch says which state refused it rather than
+/// collapsing into one opaque error.
+fn native_worker_launch_prerequisite_outcome(
+    prerequisite: AdmissionReservationLaunchPrerequisite,
+    reservation_label: &str,
+) -> Result<ReceiptIdentity, DispatchLaunchError> {
     match prerequisite {
         AdmissionReservationLaunchPrerequisite::Active(active) => {
             // The owner only issues `Active` for a row carrying both receipts;
@@ -5097,7 +5132,7 @@ fn verify_native_worker_launch_prerequisite(
             // launch is authorized under.
             let activation_receipt = active.activation_receipt().map_err(|error| {
                 DispatchLaunchError::Gate(format!(
-                    "active admission reservation {reservation_id} carries no activation receipt: {error}"
+                    "active admission reservation {reservation_label} carries no activation receipt: {error}"
                 ))
             })?;
             // The canonical admission receipt must be present too: an `Active`
@@ -5106,7 +5141,7 @@ fn verify_native_worker_launch_prerequisite(
             // alone.
             active.canonical_admission_receipt().map_err(|error| {
                 DispatchLaunchError::Gate(format!(
-                    "active admission reservation {reservation_id} carries no canonical admission receipt: {error}"
+                    "active admission reservation {reservation_label} carries no canonical admission receipt: {error}"
                 ))
             })?;
             Ok(activation_receipt.clone())
@@ -5119,30 +5154,32 @@ fn verify_native_worker_launch_prerequisite(
             work_item_id.as_str(),
             proposed_attempt_id.as_str()
         ))),
-        AdmissionReservationLaunchPrerequisite::Staged { reservation } => Err(
-            DispatchLaunchError::Gate(format!(
+        AdmissionReservationLaunchPrerequisite::Staged { reservation } => {
+            Err(DispatchLaunchError::Gate(format!(
                 "native worker launch refused: admission reservation {} is STAGED_INACTIVE and grants no launch authority",
                 reservation.reservation_id.as_str()
-            )),
-        ),
-        AdmissionReservationLaunchPrerequisite::Released { reservation } => Err(
-            DispatchLaunchError::Gate(format!(
+            )))
+        }
+        AdmissionReservationLaunchPrerequisite::Released { reservation } => {
+            Err(DispatchLaunchError::Gate(format!(
                 "native worker launch refused: admission reservation {} is RELEASED with disposition {:?}",
-                reservation.reservation_id.as_str(), reservation.disposition_reason
-            )),
-        ),
-        AdmissionReservationLaunchPrerequisite::Expired { reservation } => Err(
-            DispatchLaunchError::Gate(format!(
+                reservation.reservation_id.as_str(),
+                reservation.disposition_reason
+            )))
+        }
+        AdmissionReservationLaunchPrerequisite::Expired { reservation } => {
+            Err(DispatchLaunchError::Gate(format!(
                 "native worker launch refused: admission reservation {} is EXPIRED at {} and grants no launch authority",
-                reservation.reservation_id.as_str(), reservation.expires_at_ms
-            )),
-        ),
-        AdmissionReservationLaunchPrerequisite::Reconciling { reservation } => Err(
-            DispatchLaunchError::Gate(format!(
+                reservation.reservation_id.as_str(),
+                reservation.expires_at_ms
+            )))
+        }
+        AdmissionReservationLaunchPrerequisite::Reconciling { reservation } => {
+            Err(DispatchLaunchError::Gate(format!(
                 "native worker launch refused: admission reservation {} is RECONCILING and cannot create a new effect",
                 reservation.reservation_id.as_str()
-            )),
-        ),
+            )))
+        }
         AdmissionReservationLaunchPrerequisite::StaleFence {
             reservation,
             expected_state_fence,
