@@ -695,7 +695,7 @@ struct CurrentSourceProcessOperation {
     /// The exact closed P-03 operation. It is nested because the daemon's
     /// routing envelope also uses the top-level `operation` JSON key.
     request: ProcessExecutionRequest,
-    /// Original Governor owner-read TaskBinding identity. The EBP identity is
+    /// Original Governor owner-read `TaskBinding` identity. The EBP identity is
     /// compared against this value before the process gateway is entered.
     admitted_task_id: eliot_contracts::TaskId,
 }
@@ -8843,7 +8843,7 @@ impl KernelComposition {
                             &campaign_source_operation_id,
                             &campaign_source_request_digest,
                             &campaign_source_publications,
-                            &receipt,
+                            receipt,
                         ) {
                             // Keep the source reservation. An exact replay of
                             // this same canonical operation obtains the

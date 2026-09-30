@@ -3112,6 +3112,79 @@ impl KernelComposition {
             .await
     }
 
+    /// Revalidates the original optional source binding and resolves this
+    /// transport to the server-admitted process owner before P-03 dispatch.
+    /// The source identity and admitted task are borrowed intact so their
+    /// original operation, task metadata, and fence remain the binding used
+    /// by the existing process gateway.
+    fn admit_process_request_owner(
+        &self,
+        session: &Session,
+        session_binding: &ProcessSessionBinding,
+        request: &ProcessExecutionRequest,
+        source_binding: Option<(&eliot_protocol::RequestIdentity, &eliot_contracts::TaskId)>,
+    ) -> Result<
+        ProcessOwnerBinding,
+        eliot_kernel_service::ProcessExecutionRejection,
+    > {
+        if let Some((identity, admitted_task_id)) = source_binding
+            && let Err(rejection) = lsp_admission::validate_current_source_request(
+                identity,
+                admitted_task_id,
+                request,
+                session,
+            )
+        {
+            observe_process("kernel.process.request_rejected", "source_binding");
+            return Err(rejection);
+        }
+
+        let (owner, expected_session_binding) =
+            super::caller_binding(session).map_err(|_| {
+                observe_process("kernel.process.request_rejected", "caller_unavailable");
+                eliot_kernel_service::ProcessExecutionRejection {
+                    code: "AUTHENTICATED_CALLER_REQUIRED".to_owned(),
+                    detail: "the established authenticated session binding is unavailable"
+                        .to_owned(),
+                }
+            })?;
+        if eliot_process::validate_process_transport_binding(
+            session_binding,
+            &expected_session_binding,
+        )
+        .is_err()
+        {
+            observe_process("kernel.process.request_rejected", "session_mismatch");
+            return Err(eliot_kernel_service::ProcessExecutionRejection {
+                code: "SESSION_BINDING_MISMATCH".to_owned(),
+                detail: "process operation session binding does not match the established authenticated session".to_owned(),
+            });
+        }
+
+        // Issue #79: validate the intent against the server-derived admitted
+        // owner/session binding, never against the presenting pipe.
+        if let ProcessExecutionRequest::Start(admission) = request {
+            let caller = self.admitted_process_caller_session(session).map_err(|error| {
+                observe_process("kernel.process.request_rejected", "caller_session");
+                eliot_kernel_service::ProcessExecutionRejection {
+                    code: "ADMITTED_CALLER_SESSION_REQUIRED".to_owned(),
+                    detail: error.to_string().chars().take(512).collect(),
+                }
+            })?;
+            if let Err(error) = eliot_process::validate_process_intent_session(
+                admission.intent(),
+                &caller,
+                &owner,
+                admission.state_fence(),
+            ) {
+                observe_process("kernel.process.request_rejected", "intent_session");
+                return Err(process_session_rejection(error));
+            }
+        }
+
+        Ok(owner)
+    }
+
     async fn execute_process_request_inner(
         &self,
         session: &Session,
@@ -3124,71 +3197,15 @@ impl KernelComposition {
         // responses (subordinate infos), while a failed gateway operation
         // emits exactly one terminal through its own boundary.
         observe_process("kernel.process.request_received", "attempt");
-        if let Some((identity, admitted_task_id)) = source_binding
-            && let Err(rejection) = lsp_admission::validate_current_source_request(
-                identity,
-                admitted_task_id,
-                &request,
-                session,
-            )
-        {
-            observe_process("kernel.process.request_rejected", "source_binding");
-            return ProcessExecutionResponse::Rejected(rejection);
-        }
-        let Ok((owner, expected_session_binding)) = super::caller_binding(session) else {
-            observe_process("kernel.process.request_rejected", "caller_unavailable");
-            return ProcessExecutionResponse::Rejected(
-                eliot_kernel_service::ProcessExecutionRejection {
-                    code: "AUTHENTICATED_CALLER_REQUIRED".to_owned(),
-                    detail: "the established authenticated session binding is unavailable"
-                        .to_owned(),
-                },
-            );
-        };
-        if eliot_process::validate_process_transport_binding(
+        let owner = match self.admit_process_request_owner(
+            session,
             &session_binding,
-            &expected_session_binding,
-        )
-        .is_err()
-        {
-            observe_process("kernel.process.request_rejected", "session_mismatch");
-            return ProcessExecutionResponse::Rejected(
-                eliot_kernel_service::ProcessExecutionRejection {
-                    code: "SESSION_BINDING_MISMATCH".to_owned(),
-                    detail: "process operation session binding does not match the established authenticated session".to_owned(),
-                },
-            );
-        }
-        // Issue #79: the intent session must validate against the
-        // server-derived admitted process-owner/session binding, never
-        // against the presenting pipe. Identity validates before authority
-        // dispatch: a copied `connection_id`, a foreign or stale session, a
-        // stale epoch/fence, and a wrong owner each reject with a distinct
-        // typed code, while cancel and reconcile below stay on
-        // operation/owner identity.
-        if let ProcessExecutionRequest::Start(admission) = &request {
-            let caller = match self.admitted_process_caller_session(session) {
-                Ok(caller) => caller,
-                Err(error) => {
-                    observe_process("kernel.process.request_rejected", "caller_session");
-                    return ProcessExecutionResponse::Rejected(
-                        eliot_kernel_service::ProcessExecutionRejection {
-                            code: "ADMITTED_CALLER_SESSION_REQUIRED".to_owned(),
-                            detail: error.to_string().chars().take(512).collect(),
-                        },
-                    );
-                }
-            };
-            if let Err(error) = eliot_process::validate_process_intent_session(
-                admission.intent(),
-                &caller,
-                &owner,
-                admission.state_fence(),
-            ) {
-                observe_process("kernel.process.request_rejected", "intent_session");
-                return ProcessExecutionResponse::Rejected(process_session_rejection(error));
-            }
-        }
+            &request,
+            source_binding,
+        ) {
+            Ok(owner) => owner,
+            Err(rejection) => return ProcessExecutionResponse::Rejected(rejection),
+        };
         let Some(gateway) = &self.process_gateway else {
             observe_process("kernel.process.request_rejected", "authority_unavailable");
             return ProcessExecutionResponse::Rejected(
