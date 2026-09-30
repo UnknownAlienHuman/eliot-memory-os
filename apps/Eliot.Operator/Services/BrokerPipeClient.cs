@@ -10,9 +10,33 @@ namespace Eliot.Operator.Services;
 /// Redeems the inherited one-shot handoff with the User Broker before the
 /// Governor connection is opened. The client has one owner-issued pipe, one
 /// challenge/redeem exchange and no cached authority or retry path.
+///
+/// The authenticated binding's LIFETIME is the session, not this method. The
+/// bound pipe is the one that proved the OS-observed peer identity and that
+/// carried the Kernel-backed binding, so it is RETAINED after redemption
+/// rather than disposed with the call: a later request leg issues on that same
+/// bound handle and that same authenticated binding, reusing the existing
+/// handle and the existing binding object. No second pipe is opened, the
+/// challenge/redeem exchange is not repeated, no token is re-minted and no
+/// authority is copied into a cache - the only state retained is a live
+/// OS handle plus the object the broker already bound.
+///
+/// Retention is process memory and is never persisted or carried across
+/// processes, so a restarted UI comes up with no retained session at all and
+/// the next request has to earn a fresh Kernel challenge/session token through
+/// the whole exchange again. A restart therefore cannot revive the previous
+/// binding's authority, which is exactly the acceptance this lifetime change
+/// has to keep true.
 internal static class BrokerPipeClient
 {
     private const string Preface = "ELIOT-BROKER-1\n";
+
+    private static readonly object BindingGate = new();
+
+    /// The one bound pipe this process holds, or null when none is retained.
+    /// Cleared and disposed by <see cref="ReleaseOperatorBinding"/> when the
+    /// session ends or the binding is explicitly invalidated.
+    private static BrokerPipeSession? _session;
 
     private static readonly string[] ChallengeProperties =
     [
@@ -37,7 +61,16 @@ internal static class BrokerPipeClient
 
     private static readonly string[] ErrorProperties = ["status", "code", "detail"];
 
-    public static async Task RedeemOperatorHandoffAsync(
+    /// Performs the one challenge/redeem exchange and RETAINS the bound pipe
+    /// for the session, returning the authenticated binding the broker minted
+    /// for this exact process, endpoint and peer. A refusal or fault throws and
+    /// retains nothing, exactly as before.
+    ///
+    /// The accessibility is `internal`, matching the enclosing type's own
+    /// effective accessibility: the returned session type is no wider than this
+    /// class, so declaring the method wider than the type it returns would only
+    /// assert an accessibility the type does not have.
+    internal static async Task<BrokerPipeSession> RedeemOperatorHandoffAsync(
         OperatorEndpoint endpoint,
         OperatorProcessIdentity clientIdentity,
         CancellationToken cancellationToken)
@@ -73,21 +106,22 @@ internal static class BrokerPipeClient
                 endpoint.BrokerEpoch);
         }
 
-        using var pipe = new NamedPipeClientStream(
+        var pipe = new NamedPipeClientStream(
             ".",
             OwnerIssuedPipeName(endpoint),
             PipeDirection.InOut,
             PipeOptions.Asynchronous);
-        await pipe.ConnectAsync(cancellationToken).ConfigureAwait(false);
-
-        await pipe.WriteAsync(Encoding.ASCII.GetBytes(Preface), cancellationToken).ConfigureAwait(false);
-        using var reader = new StreamReader(
+        // The framing is constructed over the handle before the connection is
+        // opened and is read from only after it is, so binding it here changes
+        // nothing the broker sees; it lets the hold own all three resources and
+        // keeps the failure path a single deterministic disposal.
+        var reader = new StreamReader(
             pipe,
             new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true),
             detectEncodingFromByteOrderMarks: false,
             bufferSize: 4096,
             leaveOpen: true);
-        using var writer = new StreamWriter(
+        var writer = new StreamWriter(
             pipe,
             new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true),
             bufferSize: 4096,
@@ -96,95 +130,148 @@ internal static class BrokerPipeClient
             AutoFlush = true,
             NewLine = "\n"
         };
+        try
+        {
+            await pipe.ConnectAsync(cancellationToken).ConfigureAwait(false);
 
-        await WriteRequestAsync(writer, new
-        {
-            operation = "operator_challenge",
-            endpoint
-        }, cancellationToken).ConfigureAwait(false);
+            await pipe.WriteAsync(Encoding.ASCII.GetBytes(Preface), cancellationToken).ConfigureAwait(false);
 
-        using var challenge = await ReadExpectedResponseAsync(
-            reader,
-            "challenge",
-            ChallengeProperties,
-            "broker_challenge",
-            cancellationToken).ConfigureAwait(false);
-        var token = RequiredString(challenge.RootElement, "kernel_session_token", "broker_challenge");
-        RequireBoundedText(token, "broker_challenge", "kernel_session_token");
-        if (RequiredUInt64(challenge.RootElement, "broker_epoch", "broker_challenge") != endpoint.BrokerEpoch)
-        {
-            throw new OperatorHandoffRefusedException(
-                OperatorHandoffInvalidation.EpochRotated,
-                endpoint.BrokerEpoch);
-        }
-        if (!string.Equals(
-                RequiredString(challenge.RootElement, "handoff_nonce", "broker_challenge"),
-                endpoint.HandoffNonce,
-                StringComparison.Ordinal)
-            || !string.Equals(
-                RequiredString(challenge.RootElement, "role", "broker_challenge"),
-                endpoint.Role,
-                StringComparison.Ordinal)
-            || !CapabilitiesMatch(challenge.RootElement, endpoint.Capabilities, "broker_challenge"))
-        {
-            throw new OperatorRestartRequiredException(OperatorFaultReason.HandshakeRefused);
-        }
-
-        await WriteRequestAsync(writer, new
-        {
-            operation = "redeem_operator_handoff",
-            endpoint,
-            client = new
+            await WriteRequestAsync(writer, new
             {
-                client_process_id = processId,
-                windows_sid = clientIdentity.UserSid,
-                interactive_session_id = sessionId,
-                kernel_session_token = token
-            }
-        }, cancellationToken).ConfigureAwait(false);
+                operation = "operator_challenge",
+                endpoint
+            }, cancellationToken).ConfigureAwait(false);
 
-        using var redeemed = await ReadExpectedResponseAsync(
-            reader,
-            "redeemed",
-            RedeemedProperties,
-            "broker_redeem",
-            cancellationToken).ConfigureAwait(false);
-        if (!string.Equals(
-                RequiredString(redeemed.RootElement, "principal", "broker_redeem"),
-                clientIdentity.UserSid,
-                StringComparison.Ordinal)
-            || !string.Equals(
-                RequiredString(redeemed.RootElement, "interactive_session_id", "broker_redeem"),
-                sessionId,
-                StringComparison.Ordinal)
-            || !string.Equals(
-                RequiredString(redeemed.RootElement, "interactive_session_id", "broker_redeem"),
-                endpoint.InteractiveSessionId,
-                StringComparison.Ordinal)
-            )
-        {
-            throw new OperatorHandoffRefusedException(
-                OperatorHandoffInvalidation.SessionMismatch,
-                endpoint.BrokerEpoch);
+            using var challenge = await ReadExpectedResponseAsync(
+                reader,
+                "challenge",
+                ChallengeProperties,
+                "broker_challenge",
+                cancellationToken).ConfigureAwait(false);
+            var token = RequiredString(challenge.RootElement, "kernel_session_token", "broker_challenge");
+            RequireBoundedText(token, "broker_challenge", "kernel_session_token");
+            if (RequiredUInt64(challenge.RootElement, "broker_epoch", "broker_challenge") != endpoint.BrokerEpoch)
+            {
+                throw new OperatorHandoffRefusedException(
+                    OperatorHandoffInvalidation.EpochRotated,
+                    endpoint.BrokerEpoch);
+            }
+            if (!string.Equals(
+                    RequiredString(challenge.RootElement, "handoff_nonce", "broker_challenge"),
+                    endpoint.HandoffNonce,
+                    StringComparison.Ordinal)
+                || !string.Equals(
+                    RequiredString(challenge.RootElement, "role", "broker_challenge"),
+                    endpoint.Role,
+                    StringComparison.Ordinal)
+                || !CapabilitiesMatch(challenge.RootElement, endpoint.Capabilities, "broker_challenge"))
+            {
+                throw new OperatorRestartRequiredException(OperatorFaultReason.HandshakeRefused);
+            }
+
+            await WriteRequestAsync(writer, new
+            {
+                operation = "redeem_operator_handoff",
+                endpoint,
+                client = new
+                {
+                    client_process_id = processId,
+                    windows_sid = clientIdentity.UserSid,
+                    interactive_session_id = sessionId,
+                    kernel_session_token = token
+                }
+            }, cancellationToken).ConfigureAwait(false);
+
+            using var redeemed = await ReadExpectedResponseAsync(
+                reader,
+                "redeemed",
+                RedeemedProperties,
+                "broker_redeem",
+                cancellationToken).ConfigureAwait(false);
+            if (!string.Equals(
+                    RequiredString(redeemed.RootElement, "principal", "broker_redeem"),
+                    clientIdentity.UserSid,
+                    StringComparison.Ordinal)
+                || !string.Equals(
+                    RequiredString(redeemed.RootElement, "interactive_session_id", "broker_redeem"),
+                    sessionId,
+                    StringComparison.Ordinal)
+                || !string.Equals(
+                    RequiredString(redeemed.RootElement, "interactive_session_id", "broker_redeem"),
+                    endpoint.InteractiveSessionId,
+                    StringComparison.Ordinal)
+                )
+            {
+                throw new OperatorHandoffRefusedException(
+                    OperatorHandoffInvalidation.SessionMismatch,
+                    endpoint.BrokerEpoch);
+            }
+            if (RequiredInt32(redeemed.RootElement, "client_process_id", "broker_redeem") != processId)
+            {
+                throw new OperatorHandoffRefusedException(
+                    OperatorHandoffInvalidation.ProcessMismatch,
+                    endpoint.BrokerEpoch);
+            }
+            if (!string.Equals(
+                    RequiredString(redeemed.RootElement, "kernel_session_token", "broker_redeem"),
+                    token,
+                    StringComparison.Ordinal)
+                || !string.Equals(
+                    RequiredString(redeemed.RootElement, "role", "broker_redeem"),
+                    endpoint.Role,
+                    StringComparison.Ordinal)
+                || !CapabilitiesMatch(redeemed.RootElement, endpoint.Capabilities, "broker_redeem"))
+            {
+                throw new OperatorRestartRequiredException(OperatorFaultReason.HandshakeRefused);
+            }
+
+            // Redemption proved the peer and admitted the Kernel-backed
+            // binding, so the handle becomes session state instead of going
+            // out of scope with this call. Publishing is the last step: nothing
+            // is retained unless every check above already passed.
+            return PublishSession(new BrokerPipeSession(pipe, reader, writer));
         }
-        if (RequiredInt32(redeemed.RootElement, "client_process_id", "broker_redeem") != processId)
+        catch
         {
-            throw new OperatorHandoffRefusedException(
-                OperatorHandoffInvalidation.ProcessMismatch,
-                endpoint.BrokerEpoch);
+            // No partial binding survives a failed exchange, exactly as when
+            // this handle was scoped to the method, and releasing it cannot
+            // replace the refusal with a close failure.
+            new BrokerPipeSession(pipe, reader, writer).Dispose();
+            throw;
         }
-        if (!string.Equals(
-                RequiredString(redeemed.RootElement, "kernel_session_token", "broker_redeem"),
-                token,
-                StringComparison.Ordinal)
-            || !string.Equals(
-                RequiredString(redeemed.RootElement, "role", "broker_redeem"),
-                endpoint.Role,
-                StringComparison.Ordinal)
-            || !CapabilitiesMatch(redeemed.RootElement, endpoint.Capabilities, "broker_redeem"))
+    }
+
+    /// Releases the retained binding and closes its pipe. This is the
+    /// deterministic end of the session's hold: after it returns, no bound pipe
+    /// remains and the next request has to run a fresh challenge/redeem
+    /// exchange for a new Kernel challenge/token. Calling it when nothing is
+    /// retained does nothing.
+    internal static void ReleaseOperatorBinding()
+    {
+        BrokerPipeSession? released;
+        lock (BindingGate)
         {
-            throw new OperatorRestartRequiredException(OperatorFaultReason.HandshakeRefused);
+            released = _session;
+            _session = null;
         }
+        released?.Dispose();
+    }
+
+    /// Makes the freshly bound session THE session this process holds and
+    /// releases whatever the previous binding held, so at most one bound pipe
+    /// is ever live and a superseded handle is neither leaked nor reused. The
+    /// swap happens under one lock and the disposal outside it, so disposing a
+    /// pipe can never be observed as the retained session.
+    private static BrokerPipeSession PublishSession(BrokerPipeSession session)
+    {
+        BrokerPipeSession? superseded;
+        lock (BindingGate)
+        {
+            superseded = _session;
+            _session = session;
+        }
+        superseded?.Dispose();
+        return session;
     }
 
     /// The endpoint is the only owner-issued statement of WHICH broker
@@ -429,6 +516,70 @@ internal static class BrokerPipeClient
             || value.Any(char.IsControl))
         {
             throw new OperatorProtocolException(shapeName, $"field:{fieldName}");
+        }
+    }
+}
+
+/// The authenticated binding this process holds on one bound broker pipe: the
+/// handle the broker proved the OS-observed peer identity on, plus the framing
+/// that handle carries. Holding the session rather than the authority is the
+/// point - the grant itself stays in the broker, so retaining this object
+/// grants nothing that a fresh challenge/redeem exchange would not also grant.
+///
+/// Disposal is deterministic and idempotent: it closes the pipe and is the
+/// only way the hold ends, so the session's end and explicit invalidation both
+/// release the handle exactly once. It never propagates a close failure. Every
+/// request line was already flushed by the writer's AutoFlush and nothing is
+/// read from here on, so a failure while releasing is not a lost request and
+/// must not escape into whoever ends the session - and above all must not
+/// escape into the redemption that published this handle, where it would tear
+/// down the freshly proven binding instead of the spent one.
+internal sealed class BrokerPipeSession : IDisposable
+{
+    private readonly NamedPipeClientStream _pipe;
+    private readonly StreamReader _reader;
+    private readonly StreamWriter _writer;
+    private int _disposed;
+
+    internal BrokerPipeSession(NamedPipeClientStream pipe, StreamReader reader, StreamWriter writer)
+    {
+        _pipe = pipe;
+        _reader = reader;
+        _writer = writer;
+    }
+
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) == 1)
+        {
+            return;
+        }
+
+        try
+        {
+            _reader.Dispose();
+        }
+        catch (Exception)
+        {
+            // Release continues: the pipe close below is what ends the hold.
+        }
+
+        try
+        {
+            _writer.Dispose();
+        }
+        catch (Exception)
+        {
+            // As above.
+        }
+
+        try
+        {
+            _pipe.Dispose();
+        }
+        catch (Exception)
+        {
+            // As above.
         }
     }
 }
