@@ -327,10 +327,10 @@
 //!
 //! | candidate ingress surface | measured result |
 //! |---|---|
-//! | listener / socket / stdin in `bins/eliotd` | ZERO. `TcpListener`, `UnixListener`, `UnixStream`, `read_line`, `accept(` and `stdin()` match nothing under `bins/eliotd` |
+//! | listener / socket / stdin in `bins/eliotd` | ZERO. `git grep -n -F -- <token> -- bins/eliotd` for `TcpListener`, `UnixListener`, `UnixStream`, `read_line`, `accept(` and `stdin(` returns exactly one hit EACH, and every one is this documentation line quoting the token. Excluding it, each is zero |
 //! | the daemon's only transport | OUTBOUND. `daemon_kernel_client.rs:2038 connect_authenticated_kernel_front_door` is the authenticated named-pipe CLIENT. `eliotd` dials the Kernel; nothing dials `eliotd` |
 //! | the daemon's pull queues | REAL, but wrong-typed. `local_read_claim` (`frame_dispatch.rs:1493`), `semantic_observe_claim` (`:1495`), `task_controller_claim` (`:1552`), `campaign_packet_claim` (`:1554`) and `finish_claim` (`:1560`) are genuine Kernel→daemon routes, and each carries one fixed attempt type. None carries a brief decision, and adding one is a Kernel operation plus a store record kind |
-//! | `eliot_user_automation` / `UserAutomationOperation` | never reaches `eliotd`: `git grep -c user_automation -- bins/eliotd` is 0. Served inside the Kernel, which dispatches a wake to the Host |
+//! | `eliot_user_automation` / `UserAutomationOperation` | never reaches `eliotd`. `git grep -n -- user_automation -- bins/eliotd` matches only DOC comments - four in this file and one in `task_binding_admission.rs` - and no production statement in `bins/eliotd` names it. Served inside the Kernel, which dispatches a wake to the Host |
 //! | the `DecideImprovementBrief` operation itself | the vocabulary entry is closed, authenticated and live - `daemon_request_dispatch.rs:5393` binds `principal` from `authenticated_user_automation_principal(session)` and `:5399-5403` puts it in `intent.principal_ref` - and it is REFUSED at both ends: the automation Store answers `StoreError::UnknownOperation` at both of its own refusals (`user_automation_store.rs:1027-1029` and `:2527`) and the operator route answers `TransportError::SessionFenced` (`daemon_request_dispatch.rs:5387-5392`, before the principal is bound) |
 //! | a durable decision an owner could write for the daemon to read | none. The daemon's read client admits a closed set of named reads (`kernel_context_read_client.rs:186-253`) and `GetUserAutomationState` is not among them; and the only row the daemon re-reads is its OWN `Candidate` artifact, written by this same pass under the same record key, so an owner cannot pre-empt it |
 //!
@@ -361,6 +361,152 @@
 //!    reaching them would require a work item or an experiment this intake does
 //!    not hold — and both are mutating kinds, which I12.24:82 forbids without
 //!    an owner action that has no route here.
+//!
+//! # What the ARCHITECTURE names for this ingress, quoted
+//!
+//! Each candidate document was opened rather than inferred from the pipeline
+//! arrow. Nothing below is a paraphrase of the one below it.
+//!
+//! | architecture handle | what it says about an owner decision on a brief |
+//! |---|---|
+//! | `I12.24:64-65` | the pipeline names the RECIPIENT and the ACT: "concise Improvement Brief to active Main Agent or Human at a safe boundary", then "decision owner selects reject / investigate / work item / experiment". It names no transport, no operation, no capability and no principal |
+//! | `I12.24:74` | "The named decision owner does not search raw metrics." That is a property of what the owner is SHOWN, not a delivery mechanism, and it cannot be met while the brief reaches nobody |
+//! | `A11.4:3,17` | `ControlBoardView` is "One canonical, role-filtered projection serves the Main Agent, Watchdog, Dreamer, Human UI, and read-only API", and "Improvement Candidates" is in its shown set |
+//! | `A11.4:21` | the enumerated Human actions are "inspect evidence; acknowledge or resolve attention; approve, pause, cancel, or replan a task or swarm; challenge a rule; launch a Dreamer or Watchdog query; and perform a recovery action". **Improvement Candidate disposition is NOT among them** |
+//! | `I11.3:3` | "The Control Plane exposes actions by authenticated role; 'Human' is not one undifferentiated superuser." |
+//! | `I11.3:15` | the ONE sentence that states the required ingress: "Task Controller assignment, swarm launch/stop, **Improvement Candidate disposition** and problem/attention resolution are allowed only when the caller holds the corresponding task, budget, policy or **state-owner capability**. UI must state consequences, affected scope, expiry and current authority—not display raw internal IDs alone or offer a button the principal cannot lawfully execute." |
+//! | `I11.12:53-57` | the CLOSED list of supported `UserAutomation` user operations is "create; list/status/history; pause/resume; edit; run-now; remove; inspect last failure." Eleven operations, and `decide-improvement-brief` is **not** one of them |
+//!
+//! Two consequences, both absences in the book rather than defects here:
+//!
+//! 1. **The architecture names a CAPABILITY CLASS, not a surface.** `I11.3:15`
+//!    makes Improvement Candidate disposition a state-owner-capability-gated act
+//!    and forbids offering it to a principal who cannot lawfully execute it.
+//!    `I6.15:3` places that capability with its owner - "Governor owns canonical
+//!    grant semantics ... Adapters and workers can request or present capability
+//!    evidence but never create a grant or introduction themselves" - and
+//!    `I6.15:18` adds "Availability never creates authority. Authority does not
+//!    create an ambient catalog."
+//! 2. **`git grep -rln "ImprovementBrief" -- docs` returns exactly ONE file**:
+//!    `docs/architecture/I12-24-meta-learning-and-improvement-delivery.md`. No
+//!    other architecture or implementation fragment names a brief, a brief
+//!    handle or a brief ingress. The operation built to carry the selection
+//!    (`UserAutomationOperation::DecideImprovementBrief`,
+//!    `crates/kernel/eliot-kernel-core/src/user_automation.rs:3617-3625`)
+//!    is consequently absent from `I11.12`'s own closed operation list. Both
+//!    facts are absences above this file and neither is repairable from it.
+//!
+//! ## The state-owner capability has no issuer, measured
+//!
+//! | searched handle | result |
+//! |---|---|
+//! | `crates/surfaces/eliot-user-broker-core/src/lib.rs:42-43` | the broker has exactly ONE Human role, `OPERATOR_ROLE = "human_operator"`, with the fixed closed set `OPERATOR_CAPABILITIES = ["controlboard.read", "operator.command"]`. `OperatorEndpoint::validate` (`:96-107`) and `OperatorHandoffAuthority::issue` (`:199`, `:234`) both refuse any other pair, so the granted set is not a policy input anywhere |
+//! | `git grep -ci improvement -- crates/surfaces/` | zero files. No surface crate names an improvement capability, grant or facet |
+//! | literal `CapabilityGrant { .. }` construction sites | `grants.rs:3905`, `authority_revocation.rs:923` and `:942`, `composition.rs:13081`, `owner_closure_provider.rs:2446` all sit inside a `#[cfg(test)]` block (`grants.rs:3861`, `authority_revocation.rs:831`, `composition.rs:10488`, `owner_closure_provider.rs:2380`), and the rest are in `crates/governor/eliot-authority/tests/`. The only non-test construction is `grants.rs:713` `grant_from_recovery_record`, which takes `allowed_operations` from an ALREADY STORED recovery row |
+//! | `AuthoritySet::new` (`crates/governor/eliot-authority/src/grants.rs:179-203`) | `allowed_operations` is a free-form non-empty `BTreeSet<String>`, so a grant COULD carry any spelling. Nothing in the repository constructs one naming an improvement disposition |
+//!
+//! So the missing link is not a transport and not a store arm. It is the
+//! ISSUER `I11.3:15` and `I6.15:3` both require, and this repository has none.
+//! Adding one here would be manufacturing governance: a principal that minted
+//! its own disposition authority is precisely the self-declared identity
+//! `A12.02:3` forbids.
+//!
+//! ## `operator.command`: the one admitted Human command capability, and why it cannot carry this
+//!
+//! `operator.command` is a real broker-granted capability
+//! (`apps/Eliot.Operator/Protocol/OperatorHandoff.cs:75`,
+//! `MainViewModel.cs:245` "known grant without `operator.command` refuses before
+//! anything is") and the daemon really implements its port
+//! (`controlboard_adapters::GovernorOperatorCommand`, `controlboard_adapters.rs:1080`,
+//! built at `:135-138`). It still cannot deliver an owner's decision, for three
+//! measured reasons, and each is separate:
+//!
+//! 1. **It never reaches this poller.** `daemon_runtime.rs:4336-4390` names four
+//!    independent gates — Kernel queue
+//!    (`host_request_route::local_read_admission_from_tool`), Kernel claim
+//!    (`KernelComposition::claim_local_read_pair`), daemon claim
+//!    (`DaemonKernelClient::claim_local_read_pair_async`) and Kernel submit
+//!    (`submit_local_read_result`) — plus a fifth fact that is not a gate: "nothing
+//!    in this repository presents a host request naming this capability".
+//! 2. **Its receipt is candidate-only.** `controlboard_adapters.rs:1075-1077`:
+//!    "The receipt is candidate-only: it acknowledges admission, never execution,
+//!    completion, or a canonical write." `submit` performs no I/O and mints no row,
+//!    so an admitted command leaves nothing `record_owner_decision` could read.
+//! 3. **Its outcome cannot be read back.** `MISSING_OPERATOR_RECEIPT_READ`
+//!    (`controlboard_adapters.rs:1269`) is the exact typed refusal that says why:
+//!    no owner publishes a command-receipt read for the exact `OperationId`, so
+//!    the command stays `UNKNOWN_OUTCOME`/`RECONCILING`.
+//!
+//! Point 2 is the decisive one and it does not depend on the other two: a
+//! capability whose only product is an in-memory admission receipt cannot carry a
+//! decision that `I12.24:65` requires to be durable against a brief.
+//!
+//! ## `Investigate` and `Escalate` are unreachable, and no policy owner can be
+//! ## supplied from here
+//!
+//! [`daemon_disposition_kind`] is one `match`: `AutomationDecision::Block` maps
+//! to [`OwnerDecisionKind::Reject`] and every other value maps to
+//! [`OwnerDecisionKind::Investigate`]. What the Governor's
+//! `evaluate_trigger` can actually return is decided upstream, and it was
+//! measured by enumerating construction sites rather than inferred:
+//!
+//! * `MaintenanceController::evaluate_trigger`'s `match input.mode`
+//!   (`crates/governor/eliot-maintenance/src/lib.rs:820-848`) puts
+//!   `MaintenanceAutomationMode::Off` FIRST, and that arm is
+//!   `(AutomationDecision::Block, DecisionReason::AutomationOff)`. Its
+//!   `input.safety_required` pre-arm (`:807-819`) also yields `Block` under `Off`.
+//! * every one of the fifteen registered catalog entries carries
+//!   `mode: UNRESOLVED_POLICY_MODE` (macro body
+//!   `maintenance_family_catalog.rs:1245`, applied at `:1297`, `:1316`, `:1333`,
+//!   `:1351`, `:1369`, `:1385`, `:1406`, `:1422`, `:1441`, `:1458`, `:1474`,
+//!   `:1490`, `:1507`, `:1523`, `:1540`), and
+//!   `UNRESOLVED_POLICY_MODE = MaintenanceAutomationMode::Off`
+//!   (`maintenance_family_catalog.rs:93`).
+//! * there is exactly ONE `MaintenanceTriggerInput` construction site in the
+//!   workspace (`maintenance_trigger_evaluator.rs:266-287`) and it reads
+//!   `mode: policy.mode()` from `MaintenancePolicyEvidence::unpublished(entry.mode, ..)`
+//!   (`:256-260`), with `active_job_id: None` (`:286`), `explicit_request: false`
+//!   (`:273`) and `safety_required: safety.is_required()` from
+//!   `MaintenanceSafetyEvidence::unpublished()`, which is literally
+//!   `required: false` (`crates/governor/eliot-maintenance/src/lib.rs:1455-1457`).
+//!
+//! Therefore `evaluate_trigger` returns `Block` on every live pass,
+//! `daemon_disposition_kind` returns [`OwnerDecisionKind::Reject`] on every live
+//! pass, and [`OwnerDecisionKind::Investigate`] is unreachable from any
+//! non-constant source. `AutomationDecision::Escalate` has zero producers, and
+//! the stronger statement holds: **no arm of `evaluate_trigger` returns it at
+//! all** - the eight `match input.mode` arms (`:821-847`) yield `Block`,
+//! `Suggest`, `Suggest`, `Defer`, `Defer`, `Defer`, `Defer` and `Start`; the
+//! `input.safety_required` pre-arm (`:813-817`) yields `Block` or `Defer`; and
+//! the deduplication pre-arm (`:801`) yields `SuppressDuplicate`. Its only
+//! references outside this module are the dispatch arm
+//! (`maintenance_dispatch.rs:200`) and the `Display` spelling
+//! (`crates/governor/eliot-maintenance/src/lib.rs:591`). The ones inside it are
+//! documentation and the `Priority` arm, and neither constructs a value.
+//!
+//! The missing policy owner is not an oversight in this file - it is named and
+//! tracked in the maintenance modules themselves:
+//! `maintenance_dispatch.rs:72` records the `missing_owner` as "the Human
+//! maintenance-policy owner that publishes MaintenanceAutomationMode to eliotd
+//! (issue #1692); eliotd holds no such publisher and the registered catalog mode
+//! is off", `maintenance_dispatch.rs:73` records the reopen condition as
+//! "`MaintenanceTriggerInput::mode` reads a published mode other than off for
+//! this registered family", and `maintenance_trigger_evaluator.rs:69` records
+//! the same absence against the same issue. Reaching a non-`Off` mode therefore
+//! requires #1692's owner, and reaching `AutomationDecision::Escalate` requires
+//! that owner AND a new arm in a crate this file does not own.
+//!
+//! Both conclusions are refusals, stated rather than engineered around:
+//!
+//! * Making [`OwnerDecisionKind::Investigate`] reachable from here means
+//!   deriving the kind from a constant, a literal, an env var, a flag or
+//!   caller JSON. Every one of those is a REJECTED outcome however well it
+//!   compiles: it would record the daemon's own disposition under the spelling
+//!   of an owner's, which is the false attribution A12.02:3 exists to prevent and
+//!   which `improvement_dedup_read` then takes at its word.
+//! * The unreachable `AutomationDecision::Escalate` arm is deliberately KEPT.
+//!   Deleting it would make the refusal silent the instant a mode owner appears;
+//!   a documented dead arm warns the next writer, an absent one does not.
 //!
 //! # The exact missing route, named
 //!
