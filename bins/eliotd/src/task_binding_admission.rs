@@ -2770,7 +2770,11 @@ pub fn observe_cold_start_discovery(
     if !facts.manifest_names.is_empty() {
         allowed_reads.push(DiscoveryRead::ManifestNamesAndHashes);
     }
-    let consumption_limit = allowed_reads.len() as u32;
+    let consumption_limit = u32::try_from(allowed_reads.len()).map_err(|_| {
+        TaskBindingError::scope_incompatible(
+            "Host discovery read count exceeds the lease consumption limit",
+        )
+    })?;
     let request = DiscoveryLeaseRequest {
         proposer_ref: ticket.activation_request_id.as_str().to_owned(),
         session_ref: ticket.connection_id.clone(),
