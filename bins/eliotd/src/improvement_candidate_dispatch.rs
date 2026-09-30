@@ -472,9 +472,11 @@ pub fn dispatch_improvement_candidate_route(
 /// record is a named debt plus the denying answer, never a claim that the effect
 /// was settled, completed, or may be retried.
 ///
-/// The commit is idempotent under its own key, so re-committing the same
-/// unresolved obligation on a later pass converges on one durable record instead
-/// of appending duplicates. Proof refs are the candidate's own canonical
+/// The key is a function of the obligation's own checked fields and of nothing
+/// else, so re-committing the SAME unresolved obligation on a later pass
+/// converges on one durable record instead of appending a duplicate, while a
+/// genuinely different debt on the same candidate commits as its own record
+/// rather than colliding with the first. Proof refs are the candidate's own canonical
 /// evidence lineage — the same refs the candidate artifact commits under, so
 /// this record cites the evidence its own obligation was raised over.
 pub async fn commit_unknown_effect_obligation(
@@ -498,11 +500,12 @@ pub async fn commit_unknown_effect_obligation(
     let record_digest = eliot_contracts::sha256_hex(record_json.as_bytes());
     let scope_digest = eliot_contracts::sha256_hex(RECONCILIATION_SCOPE.as_bytes());
     let fence_digest = eliot_contracts::sha256_hex(format!("{state_fence:?}").as_bytes());
-    // The key names THIS record, so the obligation's commit is an operation
+    // The key names THIS DEBT, so the obligation's commit is an operation
     // distinct from the candidate's own commit rather than one key reused for
     // two different documents, and a replay of the same unresolved obligation
-    // converges on it.
-    let record_key = reconciliation_record_key(obligation);
+    // converges on it. Distinct debts on the same candidate get distinct keys,
+    // so neither can absorb the other's operation and experiment binding.
+    let record_key = reconciliation_record_key(obligation)?;
     let request = learning_record_mutation_request(learning_record_commit_params(
         LearningRecordKind::Candidate,
         record_key.clone(),
@@ -541,15 +544,64 @@ pub async fn commit_unknown_effect_obligation(
 
 /// The closed store handle and idempotency key of one reconciliation record.
 ///
-/// Derived from the obligation's own candidate identity, so a repeat of the same
-/// unresolved debt converges on one record instead of appending a duplicate.
-/// The candidate is the only input: the obligation's owner, experiment and
-/// operation are recorded in the document, and folding them into the key would
-/// make two records for one debt whenever the owner re-observed it under a new
-/// pass.
-fn reconciliation_record_key(obligation: &UnknownEffectObligation) -> String {
+/// # The key names the DEBT, not merely the candidate the debt is about
+///
+/// I12.24:69 places "delayed outcome/rework/maintenance window and rollback
+/// reconciliation" in the pipeline as a window of its own, and this record is
+/// that window's durable receipt: one named external effect whose outcome is
+/// unsettled. The identity of such a debt is the whole checked obligation —
+/// its owner, candidate, experiment, committed operation and idempotency
+/// namespace, forward-repair reference and invalidation set — because those are
+/// the bindings an owner settles against. The key therefore folds ALL of them,
+/// not only the candidate.
+///
+/// # Folding the whole obligation duplicates no single debt
+///
+/// Every field is copied verbatim from the committed
+/// `ImprovementUnknownEffect` (`improvement_candidate_route::obligation_of`),
+/// which builds them from checked records only, so re-observing the SAME
+/// unresolved debt on a later pass carries byte-identical values and lands on
+/// the same key. What folding those fields in costs is therefore nothing for a
+/// repeat; what it buys is that two genuinely DIFFERENT debts on one candidate —
+/// a different experiment, a different committed operation, a different owner or
+/// invalidation set — stop converging on one key and stop taking the first
+/// debt's operation and experiment binding with them. The earlier
+/// candidate-only key lost exactly that binding: a second distinct debt on one
+/// candidate could not become a second record, because the store arbitrates
+/// receipts by idempotency key first and refuses changed content under a
+/// retained key.
+///
+/// # Why the identity is folded as a digest rather than spelled inline
+///
+/// The store bounds BOTH this handle and the idempotency key it doubles as at
+/// `MAX_LEARNING_HANDLE_BYTES` (256 bytes), and the obligation's own operation,
+/// experiment and repair references are unbounded owner text, so spelling them
+/// inline could push an honest debt's key past the bound. A canonical digest is
+/// deterministic, adds no nonce, clock read or counter, and is the same
+/// derivation this commit already performs for its `scope_digest` and
+/// `fence_digest`. The candidate stays in the clear prefix so the record family
+/// keeps the `improvement-reconciliation:<candidate>` shape its readers and
+/// diagnostics already name.
+fn reconciliation_record_key(
+    obligation: &UnknownEffectObligation,
+) -> Result<String, ImprovementDispatchError> {
+    let debt_identity = serde_json::json!({
+        "owner_id": &obligation.owner_id,
+        "candidate_id": &obligation.candidate_id,
+        "experiment_id": &obligation.experiment_id,
+        "operation_ref": &obligation.operation_ref,
+        "idempotency_key": &obligation.idempotency_key,
+        "forward_repair_ref": &obligation.forward_repair_ref,
+        "invalidation_set": &obligation.invalidation_set,
+    });
+    let debt_digest = eliot_contracts::sha256_hex(
+        &canonical_json_bytes(&debt_identity)
+            .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))?,
+    );
     let candidate_id = obligation.candidate_id.trim();
-    format!("improvement-reconciliation:{candidate_id}")
+    Ok(format!(
+        "improvement-reconciliation:{candidate_id}:{debt_digest}"
+    ))
 }
 
 /// Derives the admitted commit ingress for one reconciliation record.
