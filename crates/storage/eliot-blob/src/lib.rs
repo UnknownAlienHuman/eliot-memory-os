@@ -5257,10 +5257,7 @@ where
     /// Reads and verifies exact plaintext bytes through the canonical
     /// `BlobStoreCore` path. The returned chunk carries the original
     /// independently verifiable Blob read receipt.
-    pub fn read_source(
-        &self,
-        request: &BlobReadRequest,
-    ) -> Result<BlobReadChunk, BlobError> {
+    pub fn read_source(&self, request: &BlobReadRequest) -> Result<BlobReadChunk, BlobError> {
         self.core.read_sync(request)
     }
 

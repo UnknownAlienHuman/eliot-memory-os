@@ -877,16 +877,12 @@ impl CanonicalStoreClient for BorrowedCanonicalStoreClient<'_> {
         expected_ordering_heads: Vec<OrderingHeadExpectation>,
     ) -> Result<WriteReceipt, StoreError> {
         self.require_active_generation()?;
-        Box::pin(
-            self.gateway
-                .store
-                .apply_prepared(
-                    ctx,
-                    transition,
-                    expected_revision_heads,
-                    expected_ordering_heads,
-                ),
-        )
+        Box::pin(self.gateway.store.apply_prepared(
+            ctx,
+            transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+        ))
         .await
     }
 
