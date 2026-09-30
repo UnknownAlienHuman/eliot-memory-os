@@ -476,7 +476,9 @@ pub(super) async fn write_canonical_transaction(
     // 688-B classifies provider replies after the atomic RPC: deterministic
     // fence/head markers are conflicts, while an unavailable or unclassified
     // reply remains an unknown outcome for identity-based reconciliation.
-    let unknown = || AdapterError::UnknownOutcome { operation_id: operation_id.clone() };
+    let unknown = || AdapterError::UnknownOutcome {
+        operation_id: operation_id.clone(),
+    };
     let mut response = match send_transaction(db, config, &sql, bindings, lane).await {
         Ok(response) => response,
         Err(AdapterError::ProviderUnavailable) => return Err(unknown()),
@@ -490,7 +492,9 @@ pub(super) async fn write_canonical_transaction(
     if expected_statements < 2 {
         return Err(unknown());
     }
-    let proof: AllocationProof = response.take(expected_statements - 2).map_err(|_| unknown())?;
+    let proof: AllocationProof = response
+        .take(expected_statements - 2)
+        .map_err(|_| unknown())?;
     if proof.operation_id != operation_id
         || proof.commit_sequence != plan.commit_sequence
         || proof.next_commit_sequence != plan.next_commit_sequence
@@ -835,9 +839,18 @@ fn build_apply_statements(
 
     sql.push_str(schema::TX_ALLOC_PROOF);
     bindings.insert("alloc_operation_id".to_owned(), json!(operation_id));
-    bindings.insert("alloc_commit_sequence".to_owned(), json!(plan.commit_sequence));
-    bindings.insert("alloc_next_commit_sequence".to_owned(), json!(plan.next_commit_sequence));
-    bindings.insert("alloc_next_outbox_sequence".to_owned(), json!(plan.next_outbox_sequence));
+    bindings.insert(
+        "alloc_commit_sequence".to_owned(),
+        json!(plan.commit_sequence),
+    );
+    bindings.insert(
+        "alloc_next_commit_sequence".to_owned(),
+        json!(plan.next_commit_sequence),
+    );
+    bindings.insert(
+        "alloc_next_outbox_sequence".to_owned(),
+        json!(plan.next_outbox_sequence),
+    );
 
     sql.push_str(schema::TX_COMMIT);
     Ok((sql, bindings))

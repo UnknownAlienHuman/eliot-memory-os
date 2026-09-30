@@ -1569,12 +1569,9 @@ async fn prepare_attempt_erasure_bundle(
     if transition.transition_class != TransitionClass::Erasure {
         return Ok(None);
     }
-    let sealed = read_sealed_erasure_outcomes(
-        db,
-        &adapter.config,
-        &transition.identity.operation_id,
-    )
-    .await?;
+    let sealed =
+        read_sealed_erasure_outcomes(db, &adapter.config, &transition.identity.operation_id)
+            .await?;
     if sealed.is_some() {
         return Ok(None);
     }
@@ -1618,7 +1615,9 @@ async fn verify_durable_commit_bundle(
     expected_ordering_heads: &[eliot_store_api::OrderingHeadExpectation],
 ) -> Result<WriteReceipt, AdapterError> {
     let operation_id = transition.identity.operation_id.to_string();
-    let unknown = || AdapterError::UnknownOutcome { operation_id: operation_id.clone() };
+    let unknown = || AdapterError::UnknownOutcome {
+        operation_id: operation_id.clone(),
+    };
     let committed =
         read_committed_receipt_strict(db, &adapter.config, &transition.identity.operation_id)
             .await?;
@@ -1630,7 +1629,9 @@ async fn verify_durable_commit_bundle(
         expected_ordering_heads,
     )
     .map_err(|_| unknown())?;
-    let fence = read_fence(db, &adapter.config).await.map_err(|_| unknown())?;
+    let fence = read_fence(db, &adapter.config)
+        .await
+        .map_err(|_| unknown())?;
     let Some(fence) = fence else {
         return Err(unknown());
     };

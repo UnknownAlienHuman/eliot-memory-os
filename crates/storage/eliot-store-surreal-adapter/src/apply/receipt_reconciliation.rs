@@ -220,7 +220,9 @@ pub(super) async fn read_committed_receipt_strict(
     config: &SurrealAdapterConfig,
     operation_id: &OperationId,
 ) -> Result<WriteReceipt, AdapterError> {
-    let unknown = || AdapterError::UnknownOutcome { operation_id: operation_id.to_string() };
+    let unknown = || AdapterError::UnknownOutcome {
+        operation_id: operation_id.to_string(),
+    };
     let mut bindings = Map::new();
     bindings.insert("table".to_owned(), json!(schema::table::WRITE_RECEIPT));
     bindings.insert("key".to_owned(), json!(operation_id.to_string()));
@@ -241,7 +243,9 @@ pub(super) async fn read_committed_receipt_strict(
         return Err(unknown());
     };
     receipt.validate().map_err(|_| unknown())?;
-    receipt.require_reconciliation_envelope().map_err(|_| unknown())?;
+    receipt
+        .require_reconciliation_envelope()
+        .map_err(|_| unknown())?;
     Ok(receipt)
 }
 
@@ -259,7 +263,9 @@ pub(super) async fn read_committed_effect_ids(
     config: &SurrealAdapterConfig,
     operation_id: &OperationId,
 ) -> Result<(Vec<String>, Vec<String>), AdapterError> {
-    let unknown = || AdapterError::UnknownOutcome { operation_id: operation_id.to_string() };
+    let unknown = || AdapterError::UnknownOutcome {
+        operation_id: operation_id.to_string(),
+    };
     let mut bindings = Map::new();
     bindings.insert("operation_id".to_owned(), json!(operation_id.to_string()));
     let mut outbox_response = client::query(
