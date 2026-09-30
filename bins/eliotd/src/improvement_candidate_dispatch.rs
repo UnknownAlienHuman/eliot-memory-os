@@ -84,6 +84,136 @@
 //! around: nothing here substitutes a self-report, a model score, or an exit zero
 //! for a real run.
 //!
+//! # The missing producer, named so the next owner does not re-derive it
+//!
+//! The refusals below are only meaningful if what would clear them is absent
+//! for a reason, and not merely unwritten. The absence is measured on this
+//! tree, and each count below is what the stated search returns — not an
+//! estimate and not a recollection.
+//!
+//! ## `ImprovementEvidenceExecution::Executed` is constructed nowhere
+//!
+//! This is the load-bearing count, and it is stronger than "not in
+//! production". A workspace-wide search for the variant returns exactly two
+//! occurrences, and NEITHER constructs it: the doc comment on
+//! [`ImprovementEvidenceExecution::Executed`] itself, and the comparison inside
+//! `check_evaluation_shape` that REFUSES every status but this one. There is no
+//! construction site in `eliotd`, in `eliot-maintenance`, in `eliot-testd-core`,
+//! in `eliot-verifier`, in `eliot-product-evaluation`, or in any test.
+//!
+//! So the one status that could ever support activation under "only independent
+//! executed evidence may support activation" is not merely unexercised on the
+//! live path — it is unreachable by any value this workspace can currently
+//! build, and the positive half of that guarantee has no producer to draw on.
+//! That is the correct state for a boundary nobody has crossed, and it is why
+//! this module sets `NotExecuted` rather than reaching for the nearest thing it
+//! does hold.
+//!
+//! ## The pipeline's `ActivationEvidence` is built in exactly one place, and
+//! it is this file
+//!
+//! A workspace search for `ActivationEvidence {` returns four CONSTRUCTION
+//! sites. Three of them build an UNRELATED same-named type —
+//! `bins/eliotd/src/agent_fabric.rs` declares `ActivationEvidence` for a Kernel
+//! ATTEMPT (`admission_id`, `attempt_id`, `activation_digest`, `fence`), and
+//! `bins/eliotd/src/solo_agent_driver.rs` plus two `bins/eliotd/tests` fixtures
+//! construct it. That is a different record with a different owner and no
+//! relation to improvement admission, so none of the three is a producer for the
+//! Governor type. The fourth is this file's `route_activation_evidence`, and it
+//! is the ONLY one. The Governor `ActivationEvidence` is therefore never built
+//! by a test either: the maintenance crate's own fixtures exercise
+//! [`eliot_maintenance::ImprovementEvidenceView`], a different record.
+//!
+//! ## The product pulse has no production producer
+//!
+//! `ImprovementPulseOutcome` appears in this file once, as the refusal value
+//! [`ImprovementPulseOutcome::Missing`] with `pulse_ref: None`. Every
+//! non-refusal value — `Pass`, `Regression` — is constructed inside the
+//! `#[cfg(test)] mod tests` of `improvement_admission.rs`. A workspace search
+//! for `pulse_ref` additionally finds `ProductPulseEvidence` in
+//! `eliot-improvement`'s own promotion gate and two fixtures for it; that is a
+//! THIRD type with its own `pulse_ref`, not this one, so it does not count.
+//! The honest total is: one production construction, and it is the refusal.
+//!
+//! `eliotd` does depend on `eliot-product-evaluation`, but only through
+//! `campaign_evaluation_owner`, which serializes campaign-source publications
+//! for the campaign cell. That crate names no `ImprovementPulseOutcome` and is
+//! not on this path, so its presence is not a producer.
+//!
+//! ## No reachable independent evaluation, and why, in three parts
+//!
+//! 1. **The executor is not reachable from this daemon.** `eliotd` holds four
+//!    authenticated Testd operations — `pending-dispatches`, `bind-dispatch`,
+//!    `pending-terminals`, `ack-terminal` — and a workspace search finds ZERO
+//!    references to [`eliot_testd_core::TESTD_OWNER_SUBMIT_OPERATION`] in
+//!    `bins/eliotd`. The submit operation is defined in `eliot-testd-core` and
+//!    handled in `bins/eliot-kernel`. So the `ExperimentPlan` this module
+//!    builds has no client that could release it: the experiment cannot be
+//!    started from here even if a submission were written, which it cannot be —
+//!    the submit request additionally requires a `TaskContract` `WorkScope`
+//!    result as `source_root` and an owner-observed `TestdProcessToolIntent`,
+//!    neither of which a maintenance observation produces.
+//! 2. **The evaluator has no executor even in principle.** `eliot-verifier`'s
+//!    `execute` is driven by a `&dyn VerifierExecutionPort`, and a workspace
+//!    search for `impl VerifierExecutionPort` returns ZERO. `eliotd` does not
+//!    depend on `eliot-verifier` at all, so the axis is unreachable from this
+//!    crate in two independent ways.
+//! 3. **This daemon runs no experiment to evaluate.** The call in
+//!    `daemon_runtime::run_improvement_intake` is documented there as pure
+//!    with respect to the Kernel — no exchange, no write — over the artifact,
+//!    the `G-19` policy and the fence the pass already holds. There is no
+//!    experiment on this path to produce an outcome for.
+//!
+//! A14.6 is the reason these three are the same finding rather than three: it
+//! distinguishes the "Production path - what created decisions, actions, and
+//! outcome" from the "Measurement path - how outcome became a score or
+//! quality claim". This daemon is the production path, and by construction it
+//! does not become the measurement path for its own candidate. A14.6 also says
+//! "A same-family model judge is not automatically independent", and A5.5 that
+//! "A model evaluator is admissible for a subjective property, but its model
+//! name does not make it independent" — so the `Evaluate` row read from the
+//! operation map cannot stand in for a run either. Naming the evaluator does
+//! not perform the evaluation.
+//!
+//! # What would have to be true for the activation legs to have evidence
+//!
+//! Stated so the next owner does not have to reconstruct it, and stated as
+//! preconditions rather than as an assignment — none of them is this daemon's
+//! to satisfy, and satisfying one here would be the self-verification A0.3
+//! names as hidden control capture:
+//!
+//! - Owner `#20`/`#1111` supplies a real `VerifierExecutionPort`
+//!   implementation and an independent run over this exact candidate and target,
+//!   whose outcome this daemon can read as
+//!   [`ImprovementEvidenceExecution::Executed`] with a `run_ref` and a
+//!   `raw_evidence_ref` that resolve. A5.5 requires that the Governor bind
+//!   such a verifier "to an acceptance item and checks scope and freshness", so
+//!   the run must carry the acceptance item, not just a passing verdict.
+//! - `eliotd` gains a submit client for
+//!   [`eliot_testd_core::TESTD_OWNER_SUBMIT_OPERATION`], and the maintenance
+//!   observation can supply the `source_root` and owner-observed tool intent
+//!   that request requires, so `ExperimentPlan::testd_owner_id` names an
+//!   executor that can actually be reached.
+//! - Owner `#11` supplies a product pulse, so
+//!   [`ImprovementPulseOutcome`] carries a value other than
+//!   [`ImprovementPulseOutcome::Missing`] with a resolving `pulse_ref`.
+//!   `eliot-improvement`'s own `ProductPulseEvidence` carries `package_green`
+//!   alongside the result, and its own comment is that "package-green never
+//!   substitutes"; a green package is therefore not this pulse, and
+//!   `ImprovementEvidenceView::pulse` stays `Missing` without `#11`.
+//! - The `ImprovementCandidateView` supplies the `meta.learning.closure`
+//!   binding, and an owner privacy-class vocabulary is reachable, so
+//!   `ImprovementProposal::validate` stops refusing the absent `closure_id` and
+//!   `privacy_class`. Those are the FIRST refusals the pipeline reaches on this
+//!   path, ahead of every evidence check, so this precondition gates the
+//!   evaluation ones rather than being independent of them; it is stated at
+//!   "What the daemon does not hold" below.
+//!
+//! Until then the disposition this path produces is a typed refusal, and the
+//! correct outcome of this issue's activation half is that the refusal IS the
+//! guarantee: no self-report, no model score, no exit zero, and no absent
+//! producer is substituted for the run that never happened.
+//!
 //! # What the daemon does not hold, stated rather than filled
 //!
 //! Three things this path would need have no daemon-owned value, and they are
@@ -265,6 +395,38 @@
 //! forgery I12.24 and the audit behind AUD2/AUD3 exist to prevent. So the read
 //! stays a read, and the named gap is the missing effect owner, not a missing
 //! call.
+//!
+//! # The two halves of this issue, stated separately
+//!
+//! "Route experiments through Testd/Instrument and activation through Governor →
+//! Kernel generation/canary paths" splits into a routing half and an execution
+//! half, and only the first is deliverable here.
+//!
+//! - **Routing is wired and load-bearing.** The executor, the evaluator and the
+//!   rollback owner are read from the single
+//!   [`eliot_maintenance::ImprovementOperation::owner`] projection, and the
+//!   Governor pipeline independently re-derives the same questions:
+//!   `check_experiment_owner_routing` refuses any executor other than
+//!   `testd-20` and any evaluator outside `instrument-verifier-20-1111`,
+//!   `check_evaluator_independence` refuses an evaluator that is the executor,
+//!   the admission owner or the rollback owner, and `check_rollback_join`
+//!   refuses a rollback owner that disagrees with the policy or the admission
+//!   evidence. A map row that diverged becomes a typed refusal on the live
+//!   route, so the routing is checked rather than documented.
+//! - **Execution is absent, and the absence is measured.** No experiment is
+//!   run, no executed evaluation exists, and no product pulse exists. The
+//!   counts and the exact missing producers are stated above. Filling them from
+//!   this daemon would be self-verification, so they are stated instead.
+//!
+//! For the guarantee "only independent executed evidence against the exact
+//! candidate/target may support activation; model/self-report/exit zero
+//! cannot", the negative half holds structurally: the pipeline refuses every
+//! non-`Executed` status, refuses a non-independent or non-passing verdict, and
+//! refuses an evaluator that is not the declared one, and the status is machine
+//! state that no self-report can supply. The positive half has no producer to
+//! exercise it, which is stated rather than papered over — and the absence is
+//! the safe direction, since an unproven candidate is refused rather than
+//! promoted.
 
 #![forbid(unsafe_code)]
 
@@ -1048,6 +1210,16 @@ fn route_activation_evidence(
         content_revision_ref: route_content_revision_ref(candidate),
         // The I0.5 execution dimension, at its honest value. This is the field
         // that keeps replay-only evidence from promoting (I12.24:76).
+        //
+        // MEASURED, not assumed: `ImprovementEvidenceExecution::Executed` has
+        // no construction site anywhere in this workspace — not in `eliotd`,
+        // not in `eliot-maintenance`, not in any test. The only other value this
+        // enum could be given from an observation this daemon already holds is
+        // the one set here, and the status is machine state, so it is set from
+        // the fact that no run happened rather than from a verdict. The module
+        // documentation names the exact preconditions under which a real
+        // evaluation could arrive here; none of them is a field this daemon can
+        // fill in without grading its own candidate, which A0.3 forbids.
         execution: ImprovementEvidenceExecution::NotExecuted,
         bound_candidate_id: candidate.candidate_id.clone(),
         bound_experiment_id: format!("maintenance-improvement-experiment:{candidate_id}"),
@@ -1150,6 +1322,15 @@ fn route_admission_evidence(
         verifier_passed: false,
         // No product pulse was observed for this candidate, and a package-green
         // result is never one.
+        //
+        // MEASURED: this is the ONLY production construction of
+        // `ImprovementPulseOutcome` in the workspace, and it is the refusal.
+        // Every non-refusal value is built inside the `#[cfg(test)] mod tests`
+        // of `eliot-maintenance`'s `improvement_admission.rs`. The similarly
+        // named `ProductPulseEvidence` in `eliot-improvement`'s own promotion
+        // gate is a different type on a different record, so its two test
+        // fixtures are not producers of this one. Owner `#11` is what would
+        // supply a real pulse; see the module documentation.
         pulse: ImprovementPulseOutcome::Missing,
         pulse_ref: None,
         // Nothing ran, so nothing was harmed and nothing's outcome is unknown:
