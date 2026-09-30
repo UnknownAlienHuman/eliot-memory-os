@@ -4871,30 +4871,135 @@ async fn run_improvement_intake(
     // repository constructed one.
     //
     // It is pure with respect to the Kernel — no exchange, no write — so it
-    // needs no guard and adds no fifth phase of durability. A typed
-    // `PipelineError` is a diagnostic under the same discipline as the three
-    // refusals above, never a loop failure: the Governor pipeline refusing this
-    // candidate is the advisory outcome I12.24:76 requires, because this daemon
-    // holds no independent executed evaluation and sets
-    // `ImprovementEvidenceExecution::NotExecuted` rather than claiming one.
-    // Nothing on this path promotes, activates, installs, completes, or issues
-    // authority.
+    // needs no guard and adds no fifth phase of durability. The outcome is read
+    // and recorded by [`report_improvement_candidate_route`], which is where a
+    // canary handoff is checked against this build's identity and where an
+    // unresolved external effect is named instead of dropped.
     let routed = eliotd::improvement_candidate_dispatch::dispatch_improvement_candidate_route(
         &artifact, &policy, &fence,
     );
+    report_improvement_candidate_route(&artifact.candidate.candidate_id, routed);
+    Ok(())
+}
+
+/// Reads one improvement-candidate route outcome and records what it actually
+/// decided.
+///
+/// Split out of [`run_improvement_intake`] so the reading of a disposition is
+/// auditable on its own rather than buried at the end of a long pass. It is
+/// where the daemon stops treating the Governor pipeline's answer as an opaque
+/// `Debug` line:
+///
+/// - A `CanaryAdmitted` handoff is the one disposition that CARRIES a record, so
+///   it is the one disposition that has to be READ. The handoff is checked
+///   against this build's own checked identity — the wire revision it was written
+///   under, then the content identity of the commitment, discriminator
+///   projection and material-equality key it records — through the
+///   Governor-owned checks, before any of it is named as more than what the
+///   pipeline wrote. A refusal crosses as the typed `PipelineError` those checks
+///   produced; nothing here recomputes a digest, and no empty, substituted, or
+///   legacy value stands in for one.
+///
+///   Checked is not authorized. `execution_authorized` is false in every handoff
+///   the pipeline builds, and the Kernel owner (#11) must still authorize and
+///   execute activation independently; this leg names what was admitted and
+///   proves nothing beyond that.
+/// - An `UnknownRequiresReconciliation` obligation is a named debt, not a weaker
+///   success and not an absent result. It is named here with its exact identity
+///   and the retry gate read from the effect owner's own stored value, so the
+///   debt is inspectable instead of dropped with the match arm. It is NOT made
+///   durable on this path: `improvement_candidate_dispatch` records why, with the
+///   measurement — the closed learning-record kind set has no kind for an
+///   unresolved effect, and the one kind that fits (`Candidate`) is re-proved
+///   exhaustively by `improvement_dedup_read::classify_row`, which refuses any
+///   document shape beyond the three it knows, so a fourth `Candidate` document
+///   would stop every later pass.
+/// - Every other terminal disposition keeps the verbatim record it always had.
+///
+/// A typed `PipelineError` from the route or from the identity check is a
+/// diagnostic under the same discipline as the other refusals in the pass, never
+/// a loop failure: the Governor pipeline refusing this candidate is the advisory
+/// outcome I12.24:76 requires, because this daemon holds no independent executed
+/// evaluation and sets `ImprovementEvidenceExecution::NotExecuted` rather than
+/// claiming one. Nothing on this path promotes, activates, installs, completes,
+/// or issues authority.
+fn report_improvement_candidate_route(
+    candidate_id: &str,
+    routed: Result<
+        eliotd::improvement_candidate_dispatch::ImprovementRouteOutcome,
+        eliot_maintenance::PipelineError,
+    >,
+) {
     match routed {
-        Ok(disposition) => {
-            tracing::info!(
+        Ok(outcome) => match outcome.disposition {
+            // The identity check is NOT repeated here. `dispatch_improvement_candidate_route`
+            // already ran `check_handoff_consumable`, which applies both
+            // Governor-owned checks against the handoff's OWN recorded wire
+            // revision, commitment, discriminator and material-equality key, bound
+            // to the exact experiment plan this run passed to the pipeline. A
+            // `CanaryAdmitted` disposition therefore arrives here only if that
+            // record passed, and a refusal crossed as the typed `PipelineError`
+            // in the `Err` arm below with no disposition returned at all. Running
+            // the same check twice would be a second opinion about one record.
+            eliot_maintenance::ImprovementTerminalDisposition::CanaryAdmitted { handoff } => {
+                tracing::info!(
+                    target: "eliotd::diagnostics",
+                    event = "eliotd.improvement_canary_handoff_checked",
+                    candidate_id = %handoff.candidate_id,
+                    proposal_id = %handoff.proposal_id,
+                    experiment_id = %handoff.experiment_id,
+                    operation_ref = %handoff.operation_ref,
+                    idempotency_key = %handoff.idempotency_key,
+                    // The identity this build checked and read, named so the
+                    // record's version is visible next to the disposition
+                    // rather than buried in an opaque projection string.
+                    wire_revision = handoff.wire_revision,
+                    commitment_domain = %handoff.proposal_commitment.domain,
+                    commitment_encoding_version = %handoff.proposal_commitment.encoding_version,
+                    commitment_algorithm = %handoff.proposal_commitment.algorithm,
+                    // The recorded digest, read as recorded. This is the
+                    // value the pipeline committed, not one derived here.
+                    proposal_commitment = %handoff.proposal_commitment.digest,
+                    discriminator_domain = %handoff.proposal_discriminator.domain,
+                    material_equality_domain = %handoff.proposal_material_equality.domain,
+                    // Always false: a handoff is a request for the Kernel
+                    // owner to authorize, never an authorization.
+                    execution_authorized = handoff.execution_authorized,
+                    activation_owner_id = %handoff.activation_owner_id,
+                );
+            }
+            eliot_maintenance::ImprovementTerminalDisposition::UnknownRequiresReconciliation {
+                obligation,
+            } => tracing::warn!(
                 target: "eliotd::diagnostics",
-                event = "eliotd.improvement_candidate_routed",
-                candidate_id = %artifact.candidate.candidate_id,
-                // The pipeline's own advisory-only terminal disposition, recorded
-                // verbatim. A `CanaryAdmitted` disposition here would still be a
-                // non-authorizing handoff the Kernel owner (#11) must
-                // independently authorize, never an activation.
-                disposition = ?disposition,
-            );
-        }
+                event = "eliotd.improvement_unknown_effect_outstanding",
+                // Read first, from the effect owner's own stored value and never
+                // asserted here: the gate denies until that owner settles the
+                // effect. The identity fields below are then named verbatim.
+                retry_permitted = obligation.retry_permitted(),
+                candidate_id = %obligation.candidate_id,
+                experiment_id = %obligation.experiment_id,
+                commitment_domain = %obligation.commitment.domain,
+                commitment_encoding_version = %obligation.commitment.encoding_version,
+                commitment_algorithm = %obligation.commitment.algorithm,
+                proposal_commitment = %obligation.commitment.digest,
+                owner_id = %obligation.owner_id,
+                forward_repair_ref = %obligation.forward_repair_ref,
+                invalidation_targets = ?obligation.invalidation_set,
+                // Stated, not implied: this debt is NAMED here, not stored.
+                durable = false,
+            ),
+            disposition => {
+                tracing::info!(
+                    target: "eliotd::diagnostics",
+                    event = "eliotd.improvement_candidate_routed",
+                    candidate_id,
+                    // The pipeline's own advisory-only terminal disposition,
+                    // recorded verbatim.
+                    disposition = ?disposition,
+                );
+            }
+        },
         Err(error) => {
             let _ = eliotd::diagnostics::ErrorRecord::of(
                 eliotd::diagnostics::OwningComponent::DaemonRuntime,
@@ -4904,7 +5009,6 @@ async fn run_improvement_intake(
             .emit();
         }
     }
-    Ok(())
 }
 
 /// Starts one improvement-intake step when its flight is idle. The

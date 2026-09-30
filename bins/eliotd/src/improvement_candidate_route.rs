@@ -21,33 +21,36 @@
 //!
 //! # One checked commitment, never a second one
 //!
-//! Both consumers here read the record the Governor pipeline committed.
+//! Every consumer here reads the record the Governor pipeline committed.
 //! [`route_improvement_candidate`] returns the disposition whose canary handoff
-//! carries that exact commitment and its discriminator projection, and
+//! carries that exact commitment and its discriminator projection,
+//! [`check_improvement_handoff_identity`] reads a returned handoff against this
+//! build's checked wire revision and content identity, and
 //! [`assess_improvement_repeat`] compares a retained prior record against that
-//! same checked record. Neither computes a digest, substitutes a fallback, empty,
-//! or legacy value, or swallows a failure: a hashing or serialization failure is
-//! produced once by the pipeline and crosses into the daemon as the typed
-//! `PipelineError` it is.
+//! same checked record. None of them computes a digest, substitutes a fallback,
+//! empty, or legacy value, or swallows a failure: a hashing or serialization
+//! failure is produced once by the pipeline and crosses into the daemon as the
+//! typed `PipelineError` it is.
 //!
 //! # The consumer checks the producer's version or refuses the record
 //!
 //! Every consumer of a committed record here verifies that the record carries
-//! the identity this daemon's build checks, so a record written under another
-//! domain, encoding revision, or algorithm is a typed refusal
-//! ([`eliot_maintenance::UncheckedRecordIdentity`]) and never a tolerated
-//! value. The recorded digest is validated against the value the producer
-//! recorded; it is never recomputed over local state, and no digest,
-//! placeholder, or empty string stands in for a record this build cannot
-//! read.
+//! the identity this daemon's build checks — its wire revision, and its domain,
+//! encoding revision, or algorithm — so a record written under another identity
+//! is a typed refusal ([`eliot_maintenance::UncheckedWireRevision`] or
+//! [`eliot_maintenance::UncheckedRecordIdentity`]) and never a tolerated value.
+//! The recorded digest is validated against the value the producer recorded; it
+//! is never recomputed over local state, and no digest, placeholder, or empty
+//! string stands in for a record this build cannot read.
 
 use eliot_maintenance::improvement_pipeline::{
     ImprovementCurrentProposal, RetainedImprovementProposal, compare_improvement_commitments,
 };
 use eliot_maintenance::{
     ActivationEvidence, ExperimentPlan, IMPROVEMENT_PIPELINE_OWNER, ImprovementAdmissionDecision,
-    ImprovementAdmissionPolicy, ImprovementCandidateView, ImprovementEvidenceView,
-    ImprovementOperation, ImprovementPipelineInputs, ImprovementProposal, RollbackContract,
+    ImprovementAdmissionPolicy, ImprovementCanaryHandoff, ImprovementCandidateView,
+    ImprovementEvidenceView, ImprovementOperation, ImprovementPipelineInputs, ImprovementProposal,
+    RollbackContract, check_checked_record_identity, check_handoff_wire_revision,
     improvement_retry_permitted, reconcile_unknown_activation, retained_improvement_completion,
     run_improvement_candidate_pipeline,
 };
@@ -106,6 +109,73 @@ pub fn route_improvement_candidate(
         admission_evidence: request.admission_evidence,
         policy: request.policy,
     })
+}
+
+/// Reads one `CanaryAdmitted` handoff against this build's checked identity.
+///
+/// The daemon-side read of a handoff the pipeline committed. A handoff is a
+/// RECORD — the exact commitment, discriminator projection and
+/// material-equality key the pipeline derived from one normalized proposal —
+/// and this is the point at which the daemon checks that record against the
+/// same constants this build commits with, before the handoff is named as
+/// anything other than an opaque log line.
+///
+/// Two existing owner checks are applied, in the order their two questions
+/// differ:
+///
+/// 1. [`eliot_maintenance::check_handoff_wire_revision`] — WHICH serialized
+///    shape the record was written under. The recorded `wire_revision` is
+///    compared against the constant the producer stamps; it is never rounded,
+///    padded, or read as though the current shape had produced it.
+/// 2. [`eliot_maintenance::check_checked_record_identity`] — WHICH content
+///    identity the record carries: the domain, encoding revision and algorithm
+///    of the handoff's own `proposal_commitment`, `proposal_discriminator` and
+///    `proposal_material_equality`.
+///
+/// Nothing is recomputed. The commitment is validated as the ORIGINAL recorded
+/// value against the producer's own constants: no digest is re-derived over
+/// local state and called a match, and no substitute, empty, or legacy digest
+/// stands in for a record this build cannot read. A refusal crosses this
+/// boundary as the typed [`eliot_maintenance::PipelineError`] the owner check
+/// produced — [`eliot_maintenance::UncheckedWireRevision`] or
+/// [`eliot_maintenance::UncheckedRecordIdentity`], each through its own `From`
+/// arm — and never as a tolerated handoff or a log string standing in for one.
+///
+/// # Why an `ImprovementCurrentProposal` view is assembled here
+///
+/// The content-identity check is typed over [`ImprovementCurrentProposal`], and
+/// that is the shape it is compared on everywhere else in the owner crate. The
+/// view below carries the handoff's OWN three identity objects — its recorded
+/// commitment, discriminator and material-equality key, copied, never derived —
+/// together with the candidate identity the handoff itself records and the
+/// exact experiment plan this same route call passed to the pipeline. No field
+/// is invented and no value is derived: the check reads only the three identity
+/// objects, so the view exists solely to reach the existing owner check rather
+/// than to restate it. This is a read view, never a committed record, never a
+/// stored record, and never an input to a progress assessment — a retained
+/// record and a real comparison stay with
+/// [`assess_improvement_repeat`], which is the only function here that compares
+/// records.
+///
+/// A `CanaryAdmitted` handoff is still NOT an activation: nothing here
+/// promotes, activates, installs, completes, or issues authority, and
+/// `execution_authorized` stays false in every construction the pipeline makes.
+pub fn check_improvement_handoff_identity(
+    handoff: &ImprovementCanaryHandoff,
+    experiment: &ExperimentPlan,
+) -> Result<(), eliot_maintenance::PipelineError> {
+    check_handoff_wire_revision(handoff)?;
+    // `From<UncheckedRecordIdentity>` and `From<UncheckedWireRevision>` are
+    // separate arms of `PipelineError`, so each owner refusal keeps its own
+    // type across this boundary instead of collapsing into one reason string.
+    check_checked_record_identity(&ImprovementCurrentProposal {
+        candidate_id: handoff.candidate_id.clone(),
+        commitment: handoff.proposal_commitment.clone(),
+        discriminator: handoff.proposal_discriminator.clone(),
+        material_equality: handoff.proposal_material_equality.clone(),
+        experiment_plan: experiment.clone(),
+    })?;
+    Ok(())
 }
 
 /// Returns the owning identity for each of the eight distinct pipeline operations.
@@ -263,14 +333,16 @@ pub fn improvement_candidate_retry_permitted(
 ///
 /// # What the daemon does not do yet
 ///
-/// This is the route's forwarder, and the honest limit is that it has no live
-/// caller: the daemon does not yet produce a request for this route, so nothing
-/// in `eliotd` invokes this function on a live path today (open item A1/W3).
-/// Reading this forwarder as a running reconciliation would overstate the
-/// daemon. What exists today is the mechanism — the Governor-owned entry point
-/// and this forwarder to it — plus the effect owner's obligation to attach its
-/// own receipt, which nothing in this workspace performs, so in practice the
-/// result is `None` for every disposition the pipeline produces today.
+/// The daemon DOES produce a request for this route now
+/// (`improvement_candidate_dispatch::dispatch_improvement_candidate_route`
+/// builds one per maintenance observation), and it does read the disposition
+/// that comes back. What it still does not do is discharge an effect: the
+/// effect owner's obligation to attach its own validated receipt to an
+/// unknown-outcome obligation is not performed anywhere in this workspace, and
+/// nothing in `eliotd` holds such a receipt. The Governor entry point therefore
+/// returns `None` for every disposition the pipeline produces today, and this
+/// forwarder is a mechanism rather than a running reconciliation — reading it as
+/// one would overstate the daemon.
 #[must_use]
 pub fn retained_improvement_candidate_completion(
     disposition: &eliot_maintenance::ImprovementTerminalDisposition,

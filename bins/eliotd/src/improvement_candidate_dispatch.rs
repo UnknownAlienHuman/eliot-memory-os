@@ -92,7 +92,7 @@
 //! `improvement_intake_dispatch::enforce_advisory_class_gate` on the artifact
 //! this function is given, so it is not duplicated here.
 //!
-//! # The daemon CONSUMES the handoff, so the daemon checks its revision
+//! # The daemon CONSUMES the handoff, so the daemon checks it
 //!
 //! The Governor crate checks the handoff's recorded wire revision where it
 //! builds the record. That is the producer checking its own stamp. This daemon
@@ -100,13 +100,49 @@
 //! `ImprovementCanaryHandoff` as a value it did not assemble field by field,
 //! and the last one before the record is presented to the Kernel `#11` owner as
 //! an inspectable, non-authorizing handoff.
-//! [`check_handoff_consumable`] therefore compares the handoff's ORIGINAL
-//! recorded `wire_revision` against this build's
-//! `IMPROVEMENT_PIPELINE_WIRE_REVISION`, through the crate's existing
-//! [`check_handoff_wire_revision`], and a mismatch becomes
-//! [`PipelineError::UncheckedWireRevision`] with no disposition returned. See
-//! that function for why the original value is the one compared, and why a
-//! refusal is propagated rather than resolved into a substitute.
+//!
+//! [`check_handoff_consumable`] therefore runs BOTH Governor-owned checks this
+//! build performs on any committed record — the recorded wire revision, then
+//! the recorded CONTENT identity of the handoff's own commitment, discriminator
+//! projection and material-equality key — through the crate's existing
+//! [`check_improvement_handoff_identity`], and a refusal becomes the typed
+//! [`PipelineError`] those checks produce with no disposition returned at all,
+//! so a caller never sees a handoff it might present as current. See that
+//! function for why the original values are the ones compared and why a refusal
+//! is propagated rather than resolved into a substitute.
+//!
+//! # An unresolved external effect is not committed here, and why
+//!
+//! `UnknownRequiresReconciliation { obligation }` names a real external debt:
+//! the exact candidate, experiment, commitment, owner and forward-repair /
+//! invalidation bindings whose effect is unsettled. It is read and named by
+//! `daemon_runtime::report_improvement_candidate_route` through the daemon's
+//! existing diagnostics, so the debt is inspectable rather than silently lost —
+//! but it is NOT made durable on this path, and the reason is measured rather
+//! than assumed:
+//!
+//! - The closed [`eliot_store_api::LearningRecordKind`] set has no kind for an
+//!   unresolved external effect. `Candidate` is the only kind that describes a
+//!   record ABOUT a candidate without claiming a promotion, and this daemon
+//!   already uses it that way for the candidate artifact, the lineage-merge
+//!   receipt and the archive receipt. `ActivationReceipt` would assert that an
+//!   activation receipt exists; nothing here activated anything, and
+//!   `execution_authorized` is false in every handoff the pipeline builds.
+//! - A `Candidate` row, however, is read back EXHAUSTIVELY by
+//!   `improvement_dedup_read::read_candidate_scope`, whose `classify_row`
+//!   re-proves exactly three document shapes (the candidate artifact, the
+//!   archive receipt, the lineage-merge receipt) and REFUSES any other row of
+//!   that kind. A fourth `Candidate` document shape would therefore make every
+//!   subsequent pass's deduplication read fail closed and stop the whole
+//!   improvement intake. Teaching that reader a fourth shape is a change to
+//!   `improvement_dedup_read`, outside this change, and guessing at it here
+//!   would trade a named debt for a broken pass.
+//! - Inventing a record kind, or opening a second read or write path for the
+//!   obligation, is exactly the second owner this module does not add.
+//!
+//! So the honest state is: the obligation's exact identity is emitted, the
+//! durable owner for it is undecided, and this module says so rather than
+//! pretending the debt is stored.
 //!
 //! # No second owner, store, digest or write path
 //!
@@ -121,22 +157,40 @@
 //!
 //! # What is still not wired
 //!
-//! [`crate::improvement_candidate_route::assess_improvement_repeat`] has no
-//! caller and this change does not give it one. It needs a
-//! `RetainedImprovementProposal` and an `ImprovementCurrentProposal`, and the
-//! only producer of the latter is the pipeline's private
-//! `current_proposal_of`; no retained proposal record has a durable owner in
-//! this daemon either. Supplying either would mean inventing a record or adding
-//! a store, so the forwarder stays honestly unreachable and is named here rather
-//! than faked.
+//! [`crate::improvement_candidate_route::assess_improvement_repeat`] still has
+//! no caller, and this change does not give it one. Both of its arguments are
+//! records no public entry point in the Governor crate produces for a daemon:
+//! `ImprovementCurrentProposal` has exactly one producer, the pipeline's
+//! PRIVATE `current_proposal_of`, and neither
+//! `run_improvement_candidate_pipeline` nor `compare_improvement_commitments`
+//! hands one out. The public `assess_improvement_replay` builds one internally
+//! and returns an assessment rather than the record, so reaching it would mean
+//! re-committing the proposal — a second digest over the same bytes, which is
+//! precisely what this issue removed.
 //!
-//! The revision check added here also stops at this boundary. The Kernel `#11`
+//! The other half is the retained record. This daemon's durable improvement
+//! records are `ImprovementCandidate` artifacts, archive receipts and
+//! lineage-merge receipts, read back by `improvement_dedup_read`; none of them
+//! is a `RetainedImprovementProposal`, and no owner in this repository retains
+//! one. Manufacturing either argument would mean inventing a record to feed a
+//! comparison, and the retained side of a comparison is caller-supplied, so a
+//! fabricated one would silently decide the question the comparison exists to
+//! answer. That is a different act from the identity read above: the
+//! `ImprovementCurrentProposal` view assembled for
+//! [`check_improvement_handoff_identity`] carries a handoff's OWN recorded
+//! commitment, discriminator and material-equality key and is used only to reach
+//! the existing identity check — it is never compared against anything and
+//! never stored. A record built to be compared would be a second claim. The
+//! forwarder therefore stays honestly unreachable and is named here rather than
+//! faked.
+//!
+//! The identity check added here also stops at this boundary. The Kernel `#11`
 //! owner that independently authorizes and EXECUTES canary activation is a
 //! different subsystem, outside `eliotd`; it is where a handoff is finally
 //! decoded from bytes rather than handed over in process, and it needs the same
-//! [`eliot_maintenance::check_handoff_wire_revision`] against the same
-//! constant. That call site is the Kernel owner's to write, and is named here
-//! rather than faked with a consumer in this crate.
+//! [`eliot_maintenance::check_handoff_wire_revision`] against the same constant.
+//! That call site is the Kernel owner's to write, and is named here rather than
+//! faked with a consumer in this crate.
 
 #![forbid(unsafe_code)]
 
@@ -149,11 +203,32 @@ use eliot_maintenance::{
     IMPROVEMENT_RISK_CEILING_BOUNDED, ImprovementAdmissionPolicy, ImprovementCandidateView,
     ImprovementEvidenceExecution, ImprovementEvidenceView, ImprovementProposal,
     ImprovementPulseOutcome, ImprovementTerminalDisposition, MechanismDeclaration, PipelineError,
-    RollbackContract, TESTD_OWNER, VERIFIER_OWNER_FAMILY, check_handoff_wire_revision,
+    RollbackContract, TESTD_OWNER, VERIFIER_OWNER_FAMILY,
 };
 
-use super::improvement_candidate_route::{ImprovementRouteRequest, route_improvement_candidate};
+use super::improvement_candidate_route::{
+    ImprovementRouteRequest, check_improvement_handoff_identity, route_improvement_candidate,
+};
 use super::improvement_intake_dispatch::ImprovementArtifact;
+
+/// One real dispatch, with the exact records this run committed it over.
+///
+/// The terminal disposition alone would leave a consumer unable to bind a
+/// returned handoff to the experiment that produced it: the handoff carries the
+/// commitment, the discriminator projection and the material-equality key, but
+/// not the full experiment plan those keys were derived from. Carrying the plan
+/// this same call passed to the pipeline — the identical value, never a second
+/// construction — is what lets
+/// [`check_improvement_handoff_identity`] reach the Governor-owned
+/// content-identity check on the handoff's OWN recorded components. It is a
+/// read binding, not a second commitment, a second digest, or a stored record.
+pub struct ImprovementRouteOutcome {
+    /// The pipeline's own advisory-only terminal disposition.
+    pub disposition: ImprovementTerminalDisposition,
+    /// The exact experiment plan this run passed to the pipeline, held so a
+    /// returned handoff is checked against the record that produced it.
+    pub experiment: ExperimentPlan,
+}
 
 /// Builds the Governor improvement-candidate request from one real maintenance
 /// observation and runs the production route over it.
@@ -166,7 +241,8 @@ use super::improvement_intake_dispatch::ImprovementArtifact;
 /// daemon-held values; the seven records this assembles are functions of their
 /// own fields, as the module documentation states field by field.
 ///
-/// Returns the pipeline's own advisory-only terminal disposition, or the typed
+/// Returns the pipeline's own advisory-only terminal disposition together with
+/// the exact experiment plan the run committed it over, or the typed
 /// [`PipelineError`] the pipeline refused with. It never promotes, activates,
 /// installs, completes, or issues authority, and it performs no durability of
 /// its own: the caller commits through the existing
@@ -175,23 +251,29 @@ pub fn dispatch_improvement_candidate_route(
     artifact: &ImprovementArtifact,
     policy: &ImprovementAdmissionPolicy,
     state_fence: &StateFence,
-) -> Result<ImprovementTerminalDisposition, PipelineError> {
+) -> Result<ImprovementRouteOutcome, PipelineError> {
     let candidate = &artifact.candidate;
+    // Bound once, so the plan the request borrows and the plan the consumer
+    // binds the returned handoff to are the same value rather than two
+    // constructions that could drift.
+    let experiment = route_experiment(candidate, policy);
     let disposition = route_improvement_candidate(ImprovementRouteRequest {
         proposal: &route_proposal(candidate, policy, state_fence),
-        experiment: &route_experiment(candidate, policy),
+        experiment: &experiment,
         evidence: &route_activation_evidence(candidate),
         rollback: &route_rollback_contract(candidate, policy),
         candidate: &route_candidate_view(candidate, policy),
         admission_evidence: &route_admission_evidence(candidate, policy),
         policy,
     })?;
-    check_handoff_consumable(&disposition)?;
-    Ok(disposition)
+    check_handoff_consumable(&disposition, &experiment)?;
+    Ok(ImprovementRouteOutcome {
+        disposition,
+        experiment,
+    })
 }
 
-/// Consumes the `CanaryAdmitted` handoff under the wire revision THIS build
-/// checks, and refuses a record written under any other one.
+/// Consumes the `CanaryAdmitted` handoff under the identity THIS build checks.
 ///
 /// # The consuming side, not the producing side
 ///
@@ -204,31 +286,34 @@ pub fn dispatch_improvement_candidate_route(
 /// assemble field by field, and the last one before the record is presented to
 /// the Kernel `#11` owner as an inspectable, non-authorizing handoff. Reading
 /// the record's content while declining to read its shape is how a handoff
-/// stamped under a foreign revision gets presented as a current one, so the
-/// shape is checked here against the same
-/// [`eliot_maintenance::IMPROVEMENT_PIPELINE_WIRE_REVISION`] constant, through
-/// the crate's existing [`check_handoff_wire_revision`].
+/// stamped under a foreign revision gets presented as a current one, so BOTH
+/// identities are checked here against this build's own constants, through the
+/// crate's existing [`check_improvement_handoff_identity`] forwarder, which
+/// applies [`eliot_maintenance::check_handoff_wire_revision`] and then
+/// [`eliot_maintenance::check_checked_record_identity`].
 ///
-/// # The ORIGINAL recorded value is what is compared
+/// # The ORIGINAL recorded values are what is compared
 ///
 /// Nothing is recomputed, defaulted, rounded, or padded, and no second encoder,
 /// hasher, or identity type is introduced. The comparison reads
-/// [`eliot_maintenance::ImprovementCanaryHandoff::wire_revision`] exactly as
-/// the producer recorded it: a handoff carrying revision `7` is refused as
-/// revision `7`, is not padded up to this build's `8`, and is not read as
-/// though the current shape had produced it. The refusal crosses into the
-/// daemon as the typed [`eliot_maintenance::PipelineError::UncheckedWireRevision`]
-/// it wraps, carrying both revisions, so no caller can repair the record by
-/// guessing.
+/// [`eliot_maintenance::ImprovementCanaryHandoff::wire_revision`] and the
+/// handoff's own recorded `proposal_commitment`, `proposal_discriminator` and
+/// `proposal_material_equality` exactly as the producer recorded them: a handoff
+/// carrying revision `7` is refused as revision `7`, is not padded up to this
+/// build's `8`, and a commitment naming another domain, encoding revision or
+/// algorithm is refused as itself rather than reinterpreted. The refusals cross
+/// into the daemon as the typed [`eliot_maintenance::PipelineError`] variants
+/// they wrap, carrying the disagreeing component, so no caller can repair the
+/// record by guessing.
 ///
 /// # No substitute on failure
 ///
 /// A refusal is propagated, never resolved. There is no fallback digest, no
 /// empty string, no default revision, no legacy value, and no recomputed hash
 /// standing in for a record this build cannot read. The disposition is NOT
-/// returned in a weakened form: a foreign-revision handoff produces the typed
-/// error and no disposition at all, so the caller never sees a handoff it might
-/// present as current.
+/// returned in a weakened form: a foreign record produces the typed error and
+/// no disposition at all, so the caller never sees a handoff it might present
+/// as current.
 ///
 /// The same holds for a HASHING failure. The commitment this daemon receives is
 /// the one the pipeline computed; the `?` on `route_improvement_candidate`
@@ -242,7 +327,7 @@ pub fn dispatch_improvement_candidate_route(
 /// # The honest limit of this check
 ///
 /// On the live path today the Governor crate that produced the handoff is the
-/// same build that stamps the constant, so this comparison can only pass. What
+/// same build that stamps the constants, so this comparison can only pass. What
 /// it establishes is that the CONSUMPTION is refused rather than trusted, and
 /// it is the check that holds when the record reaches the daemon as decoded
 /// bytes rather than as a same-process value: the record is
@@ -252,15 +337,18 @@ pub fn dispatch_improvement_candidate_route(
 /// a shape this build understands. The Kernel `#11` owner that independently
 /// authorizes activation is a different subsystem's boundary and is not
 /// reachable from this crate; the symbol it needs is the same
-/// [`check_handoff_wire_revision`].
+/// [`eliot_maintenance::check_handoff_wire_revision`].
 ///
 /// Every other disposition variant carries no handoff and is passed through
-/// exactly as the pipeline produced it.
+/// exactly as the pipeline produced it. `experiment` is the plan this same call
+/// passed to the pipeline, carried so the returned handoff is checked against
+/// the record that produced it rather than against a reconstruction.
 fn check_handoff_consumable(
     disposition: &ImprovementTerminalDisposition,
+    experiment: &ExperimentPlan,
 ) -> Result<(), PipelineError> {
     if let ImprovementTerminalDisposition::CanaryAdmitted { handoff } = disposition {
-        check_handoff_wire_revision(handoff)?;
+        check_improvement_handoff_identity(handoff, experiment)?;
     }
     Ok(())
 }
