@@ -431,6 +431,13 @@ pub enum MaintenanceTriggerIntakeFailure {
         /// Whether staging was not attempted, rejected, committed, or ambiguous.
         commit_outcome: MaintenanceTriggerCommitOutcome,
     },
+    /// Live Kernel authority refused the staged delivery obligation.
+    ///
+    /// ORS staging already committed, so the producer keeps its exact
+    /// retry identity and its cursor must not advance. The exact service
+    /// refusal is preserved for diagnosis; the daemon response maps this
+    /// variant to one stable code.
+    LedgerAuthority(KernelServiceError),
 }
 
 #[cfg(windows)]
@@ -442,6 +449,7 @@ impl MaintenanceTriggerIntakeFailure {
             Self::Ors { commit_outcome, .. } | Self::Protocol { commit_outcome, .. } => {
                 *commit_outcome
             }
+            Self::LedgerAuthority(_) => MaintenanceTriggerCommitOutcome::Committed,
             _ => MaintenanceTriggerCommitOutcome::NotAttempted,
         }
     }
@@ -466,6 +474,43 @@ impl MaintenanceTriggerIntakeFailure {
         Self::Ors {
             error,
             commit_outcome,
+        }
+    }
+
+    /// Maps a delivery-ledger admission refusal after successful ORS staging
+    /// to the closed intake failure (issue #1694 W2).
+    ///
+    /// Protocol refusals, including a changed-content replay conflict, keep
+    /// their exact error with `Committed` staging; a staging re-proof
+    /// failure keeps its exact ORS error with `Unknown` commit state; a
+    /// fenced generation maps to the existing gateway refusal; any other
+    /// live-authority refusal is preserved exactly. Ledger states
+    /// unreachable from fresh admission (unknown trigger, competing claim,
+    /// revoked consumer, expired eligibility, pending mirror recovery) fail
+    /// closed as a replay conflict: the producer retries under the same
+    /// identity and never advances its cursor.
+    pub fn from_ledger_admission_error(error: MaintenanceTriggerDeliveryError) -> Self {
+        match error {
+            MaintenanceTriggerDeliveryError::Protocol(error) => Self::Protocol {
+                error,
+                commit_outcome: MaintenanceTriggerCommitOutcome::Committed,
+            },
+            MaintenanceTriggerDeliveryError::StagingProof(error) => Self::Ors {
+                error,
+                commit_outcome: MaintenanceTriggerCommitOutcome::Unknown,
+            },
+            MaintenanceTriggerDeliveryError::Service(KernelServiceError::GenerationFenced) => {
+                Self::GatewayFenced
+            }
+            MaintenanceTriggerDeliveryError::Service(error) => Self::LedgerAuthority(error),
+            MaintenanceTriggerDeliveryError::UnknownTrigger
+            | MaintenanceTriggerDeliveryError::ClaimConflict
+            | MaintenanceTriggerDeliveryError::RevokedConsumer
+            | MaintenanceTriggerDeliveryError::ExpiredEligibility
+            | MaintenanceTriggerDeliveryError::MirrorRecoveryRequired => Self::Protocol {
+                error: ProtocolError::ReplayConflict,
+                commit_outcome: MaintenanceTriggerCommitOutcome::Committed,
+            },
         }
     }
 }
@@ -3005,9 +3050,11 @@ impl KernelStoreGateway {
     /// source cursor) and its cursor must not advance. The returned rows are
     /// the ledger's durable snapshot for the store owner to persist; the
     /// receipt proves staging only and is not a delivery acknowledgement.
-    /// `handle_maintenance_trigger_intake` stays the seam for guard-free
-    /// front-door callers (STITCH): this owner entry proves staging first so
-    /// no guard is ever held across the ORS read.
+    /// The front-door intake route admits the staged input here before
+    /// acknowledging it; `handle_maintenance_trigger_intake` stays the seam
+    /// for guard-free callers with their own session plumbing. This owner
+    /// entry proves staging first so no guard is ever held across the ORS
+    /// read.
     #[cfg(windows)]
     pub fn admit_maintenance_trigger(
         &self,

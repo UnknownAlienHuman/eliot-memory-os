@@ -4718,6 +4718,21 @@ impl KernelComposition {
                 },
             ));
         }
+        // #1694 W2: the staged input is admitted into the owned delivery
+        // ledger before any intake acknowledgement. Exact identity/hash
+        // replay returns the same obligation; changed content conflicts and
+        // live-authority refusals fail closed here with no acknowledgement,
+        // so the producer keeps its retry identity and its cursor must not
+        // advance. The accepted receipt below stays the staging receipt;
+        // admission is the persist-before-ack gate, not a second receipt.
+        if let Err(error) =
+            gateway.admit_maintenance_trigger(&session.connection_id, record)
+        {
+            return Ok(Self::maintenance_trigger_intake_failure_response(
+                &retry_identity,
+                &MaintenanceTriggerIntakeFailure::from_ledger_admission_error(error),
+            ));
+        }
         Ok(serde_json::json!({
             "status": "known",
             "value": {
@@ -4803,6 +4818,9 @@ impl KernelComposition {
             }
             MaintenanceTriggerIntakeFailure::Ors { error, .. } => {
                 Self::maintenance_trigger_ors_error_code(error)
+            }
+            MaintenanceTriggerIntakeFailure::LedgerAuthority(_) => {
+                "MAINTENANCE_TRIGGER_LEDGER_AUTHORITY_REFUSED"
             }
         }
     }
