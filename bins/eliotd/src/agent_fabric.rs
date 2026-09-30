@@ -4091,6 +4091,22 @@ impl AgentFabric {
         // trivially.
         verify_snapshot_semantics(&snapshot)?;
         verify_snapshot_tool_evidence(&snapshot)?;
+        // Issue #1702 W6/A5: when real storage holds a committed owner-separated
+        // image, recovery must be as strict as fresh admission. The supplied
+        // snapshot is a PROJECTION and cannot be trusted to describe the durable
+        // image, so the two are compared and the durable record set is
+        // re-verified through the same single gate the snapshot path uses.
+        //
+        // The presence probe is what keeps "never committed" and "committed but
+        // unreadable" apart: a fabric that has published no owner revision yet
+        // is an honest empty start, while a store that cannot be read, decoded
+        // or verified leaves recovery explicitly BLOCKED instead of starting
+        // over on empty maps.
+        if let Some(store) = semantic_revisions
+            && store.has_committed_image()
+        {
+            recover_semantic_revisions(store, &snapshot)?;
+        }
         let admission_by_definition = rebuild_admission_by_definition(&snapshot)?;
         let coordinator = AgentCoordinator::restore(
             snapshot.coordinator_snapshot.clone(),
@@ -4179,6 +4195,22 @@ impl AgentFabric {
         // trivially.
         verify_snapshot_semantics(&snapshot)?;
         verify_snapshot_tool_evidence(&snapshot)?;
+        // Issue #1702 W6/A5: when real storage holds a committed owner-separated
+        // image, recovery must be as strict as fresh admission. The supplied
+        // snapshot is a PROJECTION and cannot be trusted to describe the durable
+        // image, so the two are compared and the durable record set is
+        // re-verified through the same single gate the snapshot path uses.
+        //
+        // The presence probe is what keeps "never committed" and "committed but
+        // unreadable" apart: a fabric that has published no owner revision yet
+        // is an honest empty start, while a store that cannot be read, decoded
+        // or verified leaves recovery explicitly BLOCKED instead of starting
+        // over on empty maps.
+        if let Some(store) = semantic_revisions
+            && store.has_committed_image()
+        {
+            recover_semantic_revisions(store, &snapshot)?;
+        }
         let admission_by_definition = rebuild_admission_by_definition(&snapshot)?;
         let coordinator = AgentCoordinator::restore_with_admitted_provider(
             snapshot.coordinator_snapshot.clone(),
