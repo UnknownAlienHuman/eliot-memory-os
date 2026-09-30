@@ -468,14 +468,11 @@ impl KernelComposition {
         let Some(raw) = raw.filter(|value| !value.is_null()) else {
             return Ok(None);
         };
-        let text = native_worker_json_str(
-            raw,
-            "admission_reservation_id",
-            MAX_RECONCILE_IDENTITY_LEN,
-        )
-        .map_err(|_| NativeWorkerReconcileError::Shape {
-            field: "admission_reservation_id",
-        })?;
+        let text =
+            native_worker_json_str(raw, "admission_reservation_id", MAX_RECONCILE_IDENTITY_LEN)
+                .map_err(|_| NativeWorkerReconcileError::Shape {
+                    field: "admission_reservation_id",
+                })?;
         OperationIdentity::new(text)
             .map(Some)
             .map_err(|_| NativeWorkerReconcileError::Shape {
@@ -740,9 +737,12 @@ impl KernelComposition {
         // restart after stage but before canonical admission cannot produce a
         // launch. A presentation that names a reservation which is not durable
         // is `Unknown` and takes no effect.
-        let reservation_state = match Self::presented_reservation_id(payload) {
+        let reservation_state = match Self::presented_reservation_id(payload)? {
             Some(presented) => {
-                let snapshot = self.reload_staged_reservation(&presented, unix_ms() as i64)?;
+                let snapshot = self.reload_staged_reservation(
+                    &presented,
+                    i64::try_from(unix_ms()).unwrap_or(i64::MAX),
+                )?;
                 serde_json::json!({
                     "admission_reservation_id": presented.as_str(),
                     "admission_reservation_state": snapshot.record().state,
