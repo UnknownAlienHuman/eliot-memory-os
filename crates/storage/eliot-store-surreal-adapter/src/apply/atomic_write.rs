@@ -318,6 +318,12 @@ fn build_apply_statements(
     learning: &LearningWrites,
 ) -> Result<(String, Map<String, Value>), AdapterError> {
     let operation_id = transition.identity.operation_id.to_string();
+    // The admitted scope of the transition, recorded verbatim on every captured
+    // canonical row. This is the store's own record of which scope a row
+    // belongs to, so an `ECXF/1` scope export can close over its requested
+    // scope instead of reading every row the store holds. It is the transition's
+    // own admitted `ScopeId`, never a request, argv or default value.
+    let row_scope_id = transition.scope_id.to_string();
     let revision = plan.next_revision_heads.first().ok_or_else(|| {
         AdapterError::Serialization(
             "prepared transition plan is missing its required revision head".to_owned(),
@@ -402,6 +408,7 @@ fn build_apply_statements(
         "revision_record".to_owned(),
         json!({
             "revision_key": revision.key.to_string(),
+            "scope_id": row_scope_id,
             "body": to_value(revision)?,
         }),
     );
@@ -440,6 +447,7 @@ fn build_apply_statements(
             format!("ordering_record{suffix}"),
             json!({
                 "ordering_scope": head.scope.to_string(),
+                "scope_id": row_scope_id,
                 "body": to_value(head)?,
                 "previous_event_hash": link.previous_event_hash,
                 "event_hash": link.event_hash,
@@ -469,6 +477,7 @@ fn build_apply_statements(
             json!({
                 "event_id": event_id.to_string(),
                 "operation_id": operation_id,
+                "scope_id": row_scope_id,
                 "body": to_value(&plan.canonical_event)?,
                 "audit_chain_digest": plan.audit_chain_digest,
             }),
@@ -490,6 +499,7 @@ fn build_apply_statements(
             format!("projection{suffix}"),
             json!({
                 "publication_id": projection.publication_id.to_string(),
+                "scope_id": row_scope_id,
                 "body": to_value(projection)?,
             }),
         );
@@ -515,6 +525,7 @@ fn build_apply_statements(
                 "relation_id": relation_id,
                 "relation_kind": relation_kind,
                 "operation_id": operation_id,
+                "scope_id": row_scope_id,
                 "state_fence": transition.state_fence,
             }),
         );
@@ -536,6 +547,7 @@ fn build_apply_statements(
             json!({
                 "outbox_id": outbox.outbox_id.to_string(),
                 "operation_id": operation_id,
+                "scope_id": row_scope_id,
                 "sequence": outbox.sequence,
                 "body": to_value(outbox)?,
             }),
@@ -575,6 +587,7 @@ fn build_apply_statements(
         json!({
             "operation_id": receipt.operation_id.to_string(),
             "idempotency_key": receipt.idempotency_key,
+            "scope_id": row_scope_id,
             "body": to_value(receipt)?,
             // Opaque payload authorities (issue #10): exact versioned,
             // digest-bound bytes persisted alongside — never inside —
@@ -704,6 +717,10 @@ fn append_module_registry_owner_statement(
         "value_digest".to_owned(),
         json!(eliot_store_api::sha256_hex(payload)),
     );
+    record.insert(
+        "scope_id".to_owned(),
+        json!(transition.scope_id.to_string()),
+    );
 
     sql.push_str(schema::TX_MODULE_REGISTRY_OWNER);
     bindings.insert(
@@ -799,6 +816,10 @@ fn append_finish_evidence_owner_statement(
         "value_digest".to_owned(),
         json!(eliot_store_api::sha256_hex(payload)),
     );
+    record.insert(
+        "scope_id".to_owned(),
+        json!(transition.scope_id.to_string()),
+    );
 
     sql.push_str(schema::TX_CANONICAL_OWNER);
     bindings.insert(
@@ -892,6 +913,10 @@ fn append_finish_owner_statement(
     record.insert(
         "value_digest".to_owned(),
         json!(eliot_store_api::sha256_hex(payload)),
+    );
+    record.insert(
+        "scope_id".to_owned(),
+        json!(transition.scope_id.to_string()),
     );
 
     sql.push_str(schema::TX_FINISH_OWNER);

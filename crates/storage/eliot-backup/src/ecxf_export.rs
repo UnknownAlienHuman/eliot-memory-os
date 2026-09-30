@@ -211,13 +211,93 @@ pub struct CoherentSourceExport {
     pub blobs: Vec<SealedBlobEntry>,
     /// Privacy/purge ledger entries of the view.
     pub purge_ledger: Vec<PurgeLedgerEntry>,
-    /// Compression profile the source applies to the emitted sections.
-    pub compression: eliot_ecxf::CompressionProfile,
-    /// Encryption profile the source declares for the emitted package.
-    pub encryption: eliot_ecxf::EncryptionProfile,
     /// Features the source could not represent in this export.
     pub missing_features: Vec<String>,
 }
+
+/// The section codec this exporter applies, paired with the profiles it declares.
+///
+/// I05-10 requires the manifest to carry "encryption/compression" for the
+/// package that is actually emitted, and the only component that knows which
+/// codec encoded those sections is the exporter itself: the source store never
+/// touches a section byte. That makes the exporter the single owner of the
+/// applied profile, and this type is where it is declared.
+///
+/// The pairing is what keeps the declaration honest. `applied()` returns the
+/// one codec value used both to build the manifest's `compression`/`encryption`
+/// members and as the `SectionCodec` handed to `EcxfArchive::layout`, so the
+/// declared profile and the bytes that were encoded cannot come from two
+/// different places. A profile is never read back from the source view, and
+/// never defaulted per call.
+///
+/// The declared values are this owner's own statement about its own output, not
+/// a digest or an owner-issued attestation: a codec states which algorithm and
+/// version it is, and `eliot-ecxf` re-validates both shapes before the archive
+/// is built. Sections are emitted as canonical NDJSON and blobs as the sealed
+/// bytes their blob owner already produced, so the applied section compression
+/// is the identity codec and no key material is introduced by this exporter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExportSectionCodec {
+    compression: eliot_ecxf::CompressionProfile,
+    encryption: eliot_ecxf::EncryptionProfile,
+}
+
+impl ExportSectionCodec {
+    /// The one codec this exporter applies.
+    ///
+    /// A single named constructor rather than a per-call value, so the codec and
+    /// the profiles describing it cannot drift apart at a call site.
+    fn applied() -> Self {
+        Self {
+            compression: eliot_ecxf::CompressionProfile {
+                algorithm: IDENTITY_COMPRESSION_ALGORITHM.to_owned(),
+                version: IDENTITY_COMPRESSION_VERSION,
+            },
+            encryption: eliot_ecxf::EncryptionProfile {
+                algorithm: IDENTITY_ENCRYPTION_ALGORITHM.to_owned(),
+                version: IDENTITY_ENCRYPTION_VERSION,
+                key_lineage: None,
+                // This exporter introduces no key material: sections are
+                // canonical NDJSON and blobs arrive already sealed from their
+                // own owner, so no plaintext key is ever placed in the package.
+                plaintext_keys_present: false,
+            },
+        }
+    }
+
+    /// The compression profile this codec declares.
+    const fn compression(&self) -> &eliot_ecxf::CompressionProfile {
+        &self.compression
+    }
+
+    /// The encryption profile this codec declares.
+    const fn encryption(&self) -> &eliot_ecxf::EncryptionProfile {
+        &self.encryption
+    }
+
+    /// The codec itself, for `EcxfArchive::layout`.
+    fn codec(&self) -> &'static dyn eliot_ecxf::SectionCodec {
+        // `IdentitySectionCodec` is a unit struct with no interior state, so a
+        // promoted `'static` reference to it is sound and names the one codec
+        // this exporter applies.
+        const IDENTITY: eliot_ecxf::IdentitySectionCodec = eliot_ecxf::IdentitySectionCodec;
+        &IDENTITY
+    }
+}
+
+/// Algorithm label the identity section codec declares (I05-10 manifest
+/// "compression"). The codec stores sections as canonical NDJSON unchanged, so
+/// it is not a placeholder for a codec this exporter does not apply.
+const IDENTITY_COMPRESSION_ALGORITHM: &str = "identity";
+
+/// Version of the identity section codec's declared compression.
+const IDENTITY_COMPRESSION_VERSION: u32 = 1;
+
+/// Algorithm label for "this exporter applies no section encryption".
+const IDENTITY_ENCRYPTION_ALGORITHM: &str = "none";
+
+/// Version of the declared no-encryption profile.
+const IDENTITY_ENCRYPTION_VERSION: u32 = 1;
 
 /// A source store that can hand the exporter one coherent, fenced view.
 ///
@@ -268,6 +348,11 @@ pub async fn export_ecxf_package<S: EcxfSourceStore + ?Sized>(
     let export_id = request.identity.operation_id.to_string();
     let snapshot = source.coherent_export(request).await?;
     prove_coherent_boundary(&snapshot, request)?;
+    // The codec this exporter applies, paired with the profiles that codec
+    // declares. The pairing is the ownership boundary: the same value supplies
+    // the bytes handed to `layout` and the profiles the manifest declares, so
+    // the declared profile cannot describe a codec this export did not use.
+    let codec = ExportSectionCodec::applied();
     let (revision_start, revision_end) = revision_range(&snapshot.revision_heads);
     let fence = eliot_ecxf::ExportFence {
         export_id: export_id.clone(),
@@ -297,8 +382,8 @@ pub async fn export_ecxf_package<S: EcxfSourceStore + ?Sized>(
         // `EcxfArchive::build` from the members it is given, so this crate
         // supplies none of them and cannot disagree with them.
         checksums: BTreeMap::new(),
-        compression: snapshot.compression.clone(),
-        encryption: snapshot.encryption.clone(),
+        compression: codec.compression().clone(),
+        encryption: codec.encryption().clone(),
         missing_features: snapshot.missing_features.clone(),
         purge_state: purge_export_state(snapshot.purge_ledger.len()),
         purge_ledger_revision: None,
@@ -326,9 +411,7 @@ pub async fn export_ecxf_package<S: EcxfSourceStore + ?Sized>(
     // `layout` re-validates the whole archive against its own emitted bytes and
     // returns the complete package in memory, so no byte is written before the
     // fence, residency, checksum and integrity proofs have all held.
-    let files = archive
-        .layout(&eliot_ecxf::IdentitySectionCodec)
-        .map_err(ecxf_error)?;
+    let files = archive.layout(codec.codec()).map_err(ecxf_error)?;
     publish_package(&files, out_dir, &export_id)?;
     // The rename has already made the destination exist, so every refusal from
     // here on is a publication/reconciliation outcome carrying the published

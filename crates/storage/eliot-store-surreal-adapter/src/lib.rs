@@ -47,8 +47,9 @@ pub use backup_snapshot::{
     EcxfCaptureGap, EcxfSourceCapture, EcxfSourceClassCapture, capture_ecxf_source,
 };
 pub use config::{
-    ADAPTER_NAME, ClientSetLimits, ConfigError, MAX_CLIENT_SET_SESSIONS_PER_ROLE,
-    PINNED_SURREALDB_MAJOR, SchemaGeneration, SchemaGenerationError, SurrealAdapterConfig,
+    ADAPTER_CONTRACT_VERSION, ADAPTER_NAME, ClientSetLimits, ConfigError,
+    MAX_CLIENT_SET_SESSIONS_PER_ROLE, PINNED_SURREALDB_MAJOR, SchemaGeneration,
+    SchemaGenerationError, SurrealAdapterConfig,
 };
 use eliot_platform::ClockObservation;
 use eliot_platform_windows::RetainedProcessPathLease;
