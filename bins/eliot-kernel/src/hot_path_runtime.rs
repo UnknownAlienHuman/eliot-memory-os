@@ -668,7 +668,12 @@ mod tests {
         let spine = KernelHotSpine::bind().map_err(|error| format!("{error:?}"))?;
         assert_eq!(
             spine.bound_operations(),
-            ["local_read_claim", "local_read", "local_read_result"],
+            [
+                "local_read_claim",
+                "local_read",
+                "local_read_result",
+                "improvement_decision_claim",
+            ],
         );
         assert_eq!(
             spine.manifest_digest(),
