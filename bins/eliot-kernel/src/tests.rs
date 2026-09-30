@@ -6019,6 +6019,7 @@ fn supervision_lease_renews_from_observed_progress_not_store_health() {
         &mut progress,
         &SUPERVISION_LEASE_RENEWAL_POLICY,
         DUE_MS,
+        &tracing::Span::none(),
     )
     .expect("healthy progress renews");
     assert_eq!(decision.outcome, DaemonSupervisionRenewalOutcome::Renewed);
@@ -6075,6 +6076,7 @@ fn supervision_lease_renews_from_observed_progress_not_store_health() {
         &mut replay_progress,
         &SUPERVISION_LEASE_RENEWAL_POLICY,
         DUE_MS,
+        &tracing::Span::none(),
     )
     .expect("exact replay echoes the recorded successor");
     assert_eq!(replay.outcome, DaemonSupervisionRenewalOutcome::ExactReplay);
@@ -6090,7 +6092,8 @@ fn supervision_lease_renews_from_observed_progress_not_store_health() {
             &mut conflict_progress,
             &SUPERVISION_LEASE_RENEWAL_POLICY,
             DUE_MS,
-        ),
+        &tracing::Span::none(),
+    ),
         Err(SupervisionProgressRenewalError::Heartbeat(
             DaemonSupervisionHeartbeatError::IdentityConflict { .. }
         ))
@@ -6114,7 +6117,8 @@ fn supervision_lease_renews_from_observed_progress_not_store_health() {
             &mut degraded_progress,
             &SUPERVISION_LEASE_RENEWAL_POLICY,
             DUE_MS,
-        );
+        &tracing::Span::none(),
+    );
         if attempt < 2 {
             let blocked_decision = blocked.expect("degraded progress is reported, not renewed");
             assert_eq!(
@@ -6150,7 +6154,8 @@ fn supervision_lease_renews_from_observed_progress_not_store_health() {
             &mut degraded_progress,
             &SUPERVISION_LEASE_RENEWAL_POLICY,
             DUE_MS,
-        ),
+        &tracing::Span::none(),
+    ),
         Err(SupervisionProgressRenewalError::Heartbeat(
             DaemonSupervisionHeartbeatError::SupervisionLeaseExpired
         ))

@@ -28,11 +28,16 @@ use super::*;
 /// plus a bounded stable outcome. Never carries request payloads, digests,
 /// peer identities, pipe names, or owner error strings (I15.4, I07.20).
 fn observe_control(event: &'static str, outcome: &'static str) {
+    observe_control_in_context(event, outcome, &tracing::Span::current());
+}
+
+fn observe_control_in_context(event: &'static str, outcome: &'static str, context: &tracing::Span) {
     use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
     let event_bound = bound_field(event);
     let outcome_bound = bound_field(outcome);
     tracing::info!(
         target: KERNEL_DIAGNOSTICS_TARGET,
+        parent: context,
         event = event_bound.text(),
         outcome = outcome_bound.text(),
         "control plane observation"
@@ -93,6 +98,8 @@ fn control_request_terminal_code(error: &TransportError) -> &'static str {
 enum ControlRequestFailure {
     Transport(TransportError),
     Transition(KernelServiceError),
+    /// The nested process launch already owns the failed operation terminal.
+    TerminalOwned(TransportError),
 }
 
 impl From<TransportError> for ControlRequestFailure {
@@ -230,24 +237,37 @@ impl KernelComposition {
         peer: &PeerIdentity,
         expected_sequence: u64,
     ) -> Result<KernelControlResponse, TransportError> {
-        observe_control("kernel.control.request_received", "attempt");
-        match Box::pin(self.apply_control_request_inner(request, peer, expected_sequence)).await {
+        let validated = request.validate().is_ok();
+        let generation = validated.then(|| request.generation.value().to_string());
+        let epoch = validated.then(|| StateFence::canonical_epoch_digest(&request.candidate.kernel_epoch).ok()).flatten();
+        let context = super::kernel_diagnostics::operation_context(
+            validated.then(|| request.command.operation_id().map_or(request.message_id.as_str(), |value| value.as_str())),
+            generation.as_deref(),
+            None,
+            epoch.as_ref().map(|value| value.as_str()),
+        );
+        observe_control_in_context("kernel.control.request_received", "attempt", &context);
+        match Box::pin(self.apply_control_request_inner(request, peer, expected_sequence, &context)).await {
             Ok(response) => {
-                observe_control("kernel.control.request_admitted", "success");
+                observe_control_in_context("kernel.control.request_admitted", "success", &context);
                 Ok(response)
             }
             Err(error) => {
-                observe_control("kernel.control.request_denied", "rejected");
-                let (terminal_code, transport_error) = match error {
+                observe_control_in_context("kernel.control.request_denied", "rejected", &context);
+                let (terminal_code, transport_error, emit_terminal) = match error {
                     ControlRequestFailure::Transport(error) => {
-                        (control_request_terminal_code(&error), error)
+                        (control_request_terminal_code(&error), error, true)
                     }
                     ControlRequestFailure::Transition(error) => (
                         control_transition_terminal_code(&error),
                         TransportError::SessionFenced,
+                        true,
                     ),
+                    ControlRequestFailure::TerminalOwned(error) => (control_request_terminal_code(&error), error, false),
                 };
-                super::kernel_diagnostics::observe_terminal_error(terminal_code);
+                if emit_terminal {
+                    super::kernel_diagnostics::observe_terminal_error_in_context(terminal_code, &context);
+                }
                 Err(transport_error)
             }
         }
@@ -265,6 +285,7 @@ impl KernelComposition {
         request: KernelControlRequest,
         peer: &PeerIdentity,
         expected_sequence: u64,
+        context: &tracing::Span,
     ) -> Result<KernelControlResponse, ControlRequestFailure> {
         request
             .validate()
@@ -698,7 +719,7 @@ impl KernelComposition {
             #[cfg(windows)]
             {
                 Some(
-                    self.self_authored_ready_receipt(&request, peer)
+                    self.self_authored_ready_receipt_in_context(&request, peer, context)
                         .await
                         .map_err(|_| TransportError::SessionFenced)?,
                 )
@@ -844,7 +865,7 @@ impl KernelComposition {
             let launched = self
                 .launch_eliotd()
                 .await
-                .map_err(|_| TransportError::SessionFenced)?;
+                .map_err(|_| ControlRequestFailure::TerminalOwned(TransportError::SessionFenced))?;
             self.await_daemon_ready(&launched, self.ipc_limits().operation_timeout)
                 .await
                 .map_err(|_| TransportError::SessionFenced)?;

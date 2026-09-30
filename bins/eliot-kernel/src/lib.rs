@@ -190,6 +190,30 @@ fn observe_supervision_lease_expiry() {
     metrics.record(metrics.record_daemon_health(ModuleHealthOutcome::Unavailable));
 }
 
+/// Projects the current renewal request only after its original shape validation.
+/// Missing/refused identity stays unavailable; the previous accepted request is
+/// never substituted for the current operation. This span grants no authority.
+#[cfg(windows)]
+fn daemon_progress_operation_context(request: &DaemonSupervisionRenewalRequest) -> tracing::Span {
+    let observation = request.validate().is_ok().then_some(&request.observation);
+    let generation = observation.map(|value| value.generation_binding.process_generation.value().to_string());
+    let epoch = observation.and_then(|value| StateFence::canonical_epoch_digest(&value.kernel_epoch).ok());
+    let fence = observation.and_then(|value| StateFence::canonical_epoch_digest(&value.state_fence.authority_epoch).ok());
+    let context = kernel_diagnostics::operation_context(
+        observation.map(|value| value.observation_id.as_str()),
+        generation.as_deref(),
+        fence.as_ref().map(|value| value.as_str()),
+        epoch.as_ref().map(|value| value.as_str()),
+    );
+    if let Some(value) = observation {
+        let lease = kernel_diagnostics::bound_field(&value.lease_id);
+        let receipt = kernel_diagnostics::bound_field(&value.predecessor_receipt_sha256);
+        context.record("lease", lease.text());
+        context.record("receipt", receipt.text());
+    }
+    context
+}
+
 /// Records the daemon's supervision health from one renewal decision.
 ///
 /// A decision that advances or echoes the lease (`Renewed`, `ExactReplay`,
@@ -306,7 +330,7 @@ use daemon_supervision::EliotdSupervisionSuccessorEvidence;
 use daemon_supervision::{
     AdmittedDaemonRestartPolicy, DaemonRestartRefusal, DaemonSupervisionContour,
     DaemonSupervisionProgressState, EliotdLiveReceiptDisposition,
-    classify_eliotd_live_receipt_transition, daemon_class_withholds_replacement,
+    classify_eliotd_live_receipt_transition_in_context, daemon_class_withholds_replacement,
     daemon_refuses_replacement, daemon_restart_refusal_reason,
 };
 use daemon_supervision::{DaemonRuntimeState, DaemonRuntimeStatus, daemon_status_proves_ready};
@@ -3777,6 +3801,7 @@ impl KernelComposition {
         progress: &mut DaemonSupervisionProgressState,
         policy: &DaemonSupervisionRenewalPolicy,
         now_ms: u64,
+        context: &tracing::Span,
     ) -> Result<DaemonSupervisionRenewalDecision, SupervisionProgressRenewalError> {
         policy.validate().map_err(|error| {
             SupervisionProgressRenewalError::Authority(
@@ -3796,7 +3821,7 @@ impl KernelComposition {
         let decision = match evaluate_daemon_supervision_renewal(request, current, policy, now_ms) {
             Ok(decision) => decision,
             Err(error) => {
-                progress.note_missed_renewal();
+                progress.note_missed_renewal_in_context(context);
                 if progress.stale_renewal_expired(policy, now_ms) {
                     observe_supervision_lease_expiry();
                     return Err(DaemonSupervisionHeartbeatError::SupervisionLeaseExpired.into());
@@ -3809,7 +3834,7 @@ impl KernelComposition {
             | DaemonSupervisionRenewalOutcome::ExactReplay
             | DaemonSupervisionRenewalOutcome::NotDue => {}
             DaemonSupervisionRenewalOutcome::DegradedNoRenewal => {
-                progress.note_missed_renewal();
+                progress.note_missed_renewal_in_context(context);
                 if progress.stale_renewal_expired(policy, now_ms) {
                     // The third expiry decision of this join, and the same
                     // terminal as the two above: a degraded observation that
@@ -3827,7 +3852,7 @@ impl KernelComposition {
                 }
             }
             DaemonSupervisionRenewalOutcome::ReconciliationRequired => {
-                progress.note_reconciliation_pending();
+                progress.note_reconciliation_pending_in_context(context);
             }
         }
         // The decision is also the Kernel's health observation of the daemon:
@@ -3871,6 +3896,7 @@ impl KernelComposition {
         ),
         SupervisionProgressRenewalError,
     > {
+        let context = daemon_progress_operation_context(request);
         let lease_id = contour.incarnation.supervision_lease_id.as_str();
         let current_snapshot =
             authority
@@ -3888,7 +3914,7 @@ impl KernelComposition {
             // failure replaces the refusal with the fenced authority error
             // and is retried on the next tick through the staged-ticket
             // resume.
-            authority.expire_past_due_lease(lease_id, &contour.state_fence, now_ms)?;
+            authority.expire_past_due_lease_in_context(lease_id, &contour.state_fence, now_ms, &context)?;
             return Err(DaemonSupervisionHeartbeatError::SupervisionLeaseExpired.into());
         }
         authority.verify_active_snapshot(&current_snapshot, lease_id, now_ms)?;
@@ -3900,7 +3926,7 @@ impl KernelComposition {
         }
         let current = daemon_supervision_current_state(&current_snapshot, contour, progress)?;
         let decision = Self::decide_daemon_supervision_progress_renewal(
-            request, &current, progress, policy, now_ms,
+            request, &current, progress, policy, now_ms, &context,
         )?;
         if decision.outcome != DaemonSupervisionRenewalOutcome::Renewed {
             let receipt = daemon_renewal_receipt_for_decision(&decision, None, None)?;
@@ -3951,10 +3977,10 @@ impl KernelComposition {
                 binding,
             })?
         };
-        let renewed = match authority.commit_active(&stage.ticket) {
+        let renewed = match authority.commit_active_in_context(&stage.ticket, &context) {
             Ok(renewed) => renewed,
             Err(error) => {
-                progress.note_reconciliation_pending();
+                progress.note_reconciliation_pending_in_context(&context);
                 return Err(error.into());
             }
         };
@@ -3963,13 +3989,14 @@ impl KernelComposition {
             || renewed.record.revision <= current_snapshot.record.revision
             || !supervision_binding_matches_contour(&renewed.record.binding, contour)?
         {
-            progress.note_reconciliation_pending();
+            progress.note_reconciliation_pending_in_context(&context);
             return Err(SupervisionLeaseAuthorityError::Ors(
                 OrsError::SupervisionLeaseBindingMismatch,
             )
             .into());
         }
-        progress.record_renewed(
+        progress.record_renewed_in_context(
+            &context,
             &request.observation,
             observation_sha256,
             successor_revision,
