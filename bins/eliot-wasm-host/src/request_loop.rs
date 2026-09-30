@@ -375,7 +375,11 @@ pub enum LoopError {
     },
     /// The request source or the result sink could not be read or written.
     ChannelUnavailable,
-    /// The result frame exceeded the admitted result-byte budget.
+    /// An admitted capacity bound was exceeded: one result frame is larger
+    /// than the admitted result-byte budget, or the retained result-event
+    /// sequence is longer than [`MAX_RESULT_SEQUENCE`]. Both are explicit
+    /// typed capacity failures. No prefix is ever dropped, truncated or
+    /// evicted to make room (#2787 audit defect 2).
     ResultTooLarge,
     /// A result frame failed its own consistency validation before
     /// emission (#2787: digest/length/hex agreement, omission semantics,
@@ -3612,8 +3616,14 @@ impl BoundedRequestLoop {
     /// `validate_frame` is the same per-event validator
     /// [`DeliverySetChannel::publish`] runs, not a second or weaker rule. It
     /// is applied to the newest observation — the event that just joined the
-    /// sequence — so the earlier retained events were each proved by the same
-    /// call on their own turn. Once the stream is complete (its last event is
+    /// sequence — and the events before it are already covered because
+    /// `retained` is seeded empty by [`Self::new`] and has exactly two
+    /// mutators, `on_outcome` and `publish_lost_response`, each of which is
+    /// followed by this gate on the turn it appends. A future third mutator
+    /// must therefore call this same gate, or validate the whole sequence
+    /// rather than only its newest event.
+    ///
+    /// Once the stream is complete (its last event is
     /// the terminal one) the existing `validate_result_stream` additionally
     /// proves the whole sequence's shape — gapless `sequence` values from 0,
     /// one closing terminal, one parent identity — so a record that would be
@@ -4419,8 +4429,10 @@ impl RequestLoopReport {
 /// Every observed result event is proved by the real per-frame validator and,
 /// once the stream is complete, by the real stream validator, then written
 /// through `retention` — the existing claim-bound result owner — before it is
-/// published on stdout, and the whole observed sequence travels back with the
-/// loop's disposition, so an observation is never lost to a later failure. The
+/// published on stdout; the same gate covers the failure-edge handoff
+/// ([`hand_off_observed_sequence`]), so no write reaches the durable record
+/// unproved. The whole observed sequence travels back with the loop's
+/// disposition, so an observation is never lost to a later failure. The
 /// loop's own failure is a [`LoopCompletion::Failed`] disposition beside that
 /// sequence rather than a `Result` error, because an error arm returning only
 /// the failure would throw away the only copy of an observed guest result.
@@ -5691,13 +5703,30 @@ fn republish_retained_sequence(
 /// not a new acknowledgement. Whether it lands changes nothing else: the
 /// claim stays uncertain, nothing is reclaimed, the original failure is still
 /// what the caller is told, and the guest is never re-executed.
+///
+/// The handoff is gated by the same real validators the live path uses, so
+/// "every retained observation is proved before it is written" is a property
+/// of the write, not an induction over which path happened to observe an event
+/// first. These bytes were already proved on their own turns, so the gate is
+/// redundant here today; it is kept because a write that can reach the durable
+/// record without passing the validators is exactly what this audit removed
+/// from the live path.
 fn hand_off_observed_sequence(
     directory: &std::path::Path,
     claim: &crate::dispatch_material::DeliveryClaim,
     events: &[OrdinaryOutcome],
 ) {
     let handoff = ObservedResultRetention::new(directory, claim);
-    let _handoff_retained = handoff.retain(events);
+    // A sequence with no closing event is an explicit bounded prefix, and a
+    // prefix is what the failure edge legitimately carries, so only a complete
+    // sequence is held to the stream rule here — the same distinction
+    // `BoundedRequestLoop::retain_observed` makes.
+    if let Some(latest) = events.last()
+        && validate_frame(latest).is_ok()
+        && (!latest.terminal || validate_result_stream(events).is_ok())
+    {
+        let _handoff_retained = handoff.retain(events);
+    }
 }
 
 /// Typed readback of the durable result record for exactly one staged replay
