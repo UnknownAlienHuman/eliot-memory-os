@@ -11,6 +11,8 @@
 //! fence and payload digest are checked against the journal row, while its
 //! contents remain outside this owner's semantics.
 
+use std::collections::BTreeMap;
+
 use eliot_contracts::{EpochId, ResourceGeneration};
 use eliot_runtime_contracts::{CapacityBottleneck, PermitTerminalDisposition};
 use serde::{Deserialize, Serialize};
@@ -832,11 +834,22 @@ fn text(value: &str, field: &'static str) -> Result<(), OrsError> {
 // - "not issued" is the absence of any fate row for the permit identity: the
 //   reconciler returns no disposition, which holds no capacity.
 //
-// The store adapter (STITCH: no production caller yet) persists one
-// [`OrsPermitFateEvidence`] per transition with
-// [`OrsPermitFateEvidence::journal_phase_operation`] as the operation phase
-// and [`OrsPermitFateEvidence::binding_digest`] as both the request and the
-// body digest, then restarts through [`reconcile_permit_fate_at_restart`].
+// The store restart entry `RedbRecoveryStore::reconcile_restart_permit_fate`
+// (crates/kernel/eliot-ors/src/store.rs) reads one dedicated fate stream
+// ([`ORS_PERMIT_FATE_STREAM`]) through a denominator-checked readback, decodes
+// one [`OrsPermitFateEvidence`] per transition row with
+// [`decode_permit_fate_entry`], groups per-permit histories in journal
+// sequence order with [`reconcile_permit_fate_readback`], and reconciles each
+// history through [`reconcile_permit_fate_at_restart`]. Every transition row
+// carries [`OrsPermitFateEvidence::journal_phase_operation`] as the operation
+// phase and [`OrsPermitFateEvidence::binding_digest`] as both the request and
+// the body digest.
+
+/// Dedicated restore-journal stream carrying ORS capacity-permit fate rows.
+///
+/// A fate row's identity carries no stream, so restart reads exactly this
+/// stream; fate rows never share another restore stream's denominator.
+pub const ORS_PERMIT_FATE_STREAM: &str = "ors_permit_fate";
 
 /// Stable fate-row schema tag carried by every permit-fate journal payload.
 pub const ORS_PERMIT_FATE_SCHEMA: &str = "ors-permit-fate-v1";
@@ -899,29 +912,31 @@ impl OrsPermitFate {
     /// silent reissue.
     #[must_use]
     pub const fn allowed_from(self, prior: Option<Self>) -> bool {
-        match (self, prior) {
-            (Self::IssuedHeld, None) => true,
-            (
-                Self::ReleaseRequested
-                | Self::Released
-                | Self::LeakedOrUnknown
-                | Self::StaleOwnerReconciliationRequired,
-                Some(Self::IssuedHeld),
-            ) => true,
-            (
-                Self::Released | Self::LeakedOrUnknown | Self::StaleOwnerReconciliationRequired,
-                Some(Self::ReleaseRequested),
-            ) => true,
-            (
-                Self::Released | Self::StaleOwnerReconciliationRequired,
-                Some(Self::LeakedOrUnknown),
-            ) => true,
-            (
-                Self::Released | Self::LeakedOrUnknown,
-                Some(Self::StaleOwnerReconciliationRequired),
-            ) => true,
-            _ => false,
-        }
+        matches!(
+            (self, prior),
+            (Self::IssuedHeld, None)
+                | (
+                    Self::ReleaseRequested
+                        | Self::Released
+                        | Self::LeakedOrUnknown
+                        | Self::StaleOwnerReconciliationRequired,
+                    Some(Self::IssuedHeld),
+                )
+                | (
+                    Self::Released
+                        | Self::LeakedOrUnknown
+                        | Self::StaleOwnerReconciliationRequired,
+                    Some(Self::ReleaseRequested),
+                )
+                | (
+                    Self::Released | Self::StaleOwnerReconciliationRequired,
+                    Some(Self::LeakedOrUnknown),
+                )
+                | (
+                    Self::Released | Self::LeakedOrUnknown,
+                    Some(Self::StaleOwnerReconciliationRequired),
+                )
+        )
     }
 
     /// Projects a terminal fate onto the frozen contract release vocabulary.
@@ -1062,7 +1077,10 @@ impl OrsPermitRestartView<'_> {
     /// own constructors.
     pub fn validate(&self) -> Result<(), OrsError> {
         text(self.owner, "ors_permit_fate_restart.owner")?;
-        text(self.profile_revision, "ors_permit_fate_restart.profile_revision")?;
+        text(
+            self.profile_revision,
+            "ors_permit_fate_restart.profile_revision",
+        )?;
         Ok(())
     }
 }
@@ -1102,6 +1120,11 @@ pub struct OrsPermitRestartDisposition {
     pub bottleneck: CapacityBottleneck,
     /// What restart concluded.
     pub outcome: OrsPermitRestartOutcome,
+    /// The concluded fate projected onto the frozen contract release
+    /// vocabulary, for release records and owner follow-ups. `None` for
+    /// non-terminal fates, which are still owned capacity rather than release
+    /// records.
+    pub terminal_disposition: Option<PermitTerminalDisposition>,
 }
 
 /// Reconciles one permit's durably observed fate history against the current
@@ -1172,7 +1195,7 @@ pub fn reconcile_permit_fate_at_restart(
         // A durable release already returned the capacity exactly once, so it
         // survives an owner change. Everything else stays excluded until the
         // current owner reconciles it.
-        if last.fate == OrsPermitFate::Released {
+        if last.fate.is_terminal() {
             OrsPermitRestartOutcome::TerminalReleased
         } else {
             OrsPermitRestartOutcome::StaleOwnerRequiresReconciliation
@@ -1180,13 +1203,9 @@ pub fn reconcile_permit_fate_at_restart(
     } else {
         match last.fate {
             OrsPermitFate::IssuedHeld => OrsPermitRestartOutcome::RetainHeld,
-            OrsPermitFate::ReleaseRequested => {
-                OrsPermitRestartOutcome::ReleaseRequestedPending
-            }
+            OrsPermitFate::ReleaseRequested => OrsPermitRestartOutcome::ReleaseRequestedPending,
             OrsPermitFate::Released => OrsPermitRestartOutcome::TerminalReleased,
-            OrsPermitFate::LeakedOrUnknown => {
-                OrsPermitRestartOutcome::ExcludedUnknownOrLeaked
-            }
+            OrsPermitFate::LeakedOrUnknown => OrsPermitRestartOutcome::ExcludedUnknownOrLeaked,
             OrsPermitFate::StaleOwnerReconciliationRequired => {
                 OrsPermitRestartOutcome::StaleOwnerRequiresReconciliation
             }
@@ -1197,5 +1216,81 @@ pub fn reconcile_permit_fate_at_restart(
         operation_id: last.operation_id.clone(),
         bottleneck: last.bottleneck,
         outcome,
+        terminal_disposition: last.fate.terminal_disposition(),
     }))
+}
+
+/// Decodes one permit-fate row from a denominator-checked journal readback.
+///
+/// Returns `None` for rows outside the fate phase namespace: only a phase of
+/// the form `ors_permit_fate/<fate>` names a fate row. A namespaced row whose
+/// payload is not fate evidence, or whose operation does not carry exactly
+/// this row's binding, fails closed instead of being skipped: doubt is never
+/// read as absence.
+///
+/// # Errors
+///
+/// Returns [`OrsError::Encoding`] when a namespaced payload is not fate
+/// evidence, [`OrsError::InvalidField`] for malformed evidence or operation
+/// text, or [`OrsError::IntegrityProblem`] when the row's phase or digests do
+/// not match the decoded evidence.
+pub fn decode_permit_fate_entry(
+    entry: &RestoreJournalEntry,
+) -> Result<Option<OrsPermitFateEvidence>, OrsError> {
+    let Some(suffix) = entry
+        .operation
+        .phase_operation
+        .strip_prefix(ORS_PERMIT_FATE_PHASE_PREFIX)
+    else {
+        return Ok(None);
+    };
+    if suffix.strip_prefix('/').is_none() {
+        return Ok(None);
+    }
+    entry.operation.validate()?;
+    let evidence: OrsPermitFateEvidence = serde_json::from_str(entry.payload.as_str())
+        .map_err(|error| OrsError::Encoding(error.to_string()))?;
+    evidence.validate()?;
+    if !evidence.matches_journal_operation(&entry.operation)? {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "ors_permit_fate",
+            reason: "fate row operation does not carry this row's binding".to_owned(),
+        });
+    }
+    Ok(Some(evidence))
+}
+
+/// Groups one denominator-checked fate readback into per-permit histories in
+/// journal sequence order and reconciles each history against the current
+/// owner view.
+///
+/// `readback.entries` already arrives in journal sequence order, so pushing
+/// each decoded row onto its permit's history preserves that order without
+/// re-sorting. Histories are grouped by the owner-minted permit identity and
+/// reconciled in permit-identity order; an empty fate stream reconciles to no
+/// disposition ("not issued" holds no capacity).
+///
+/// # Errors
+///
+/// Propagates the typed [`decode_permit_fate_entry`] refusal for a corrupt
+/// fate row, or the [`reconcile_permit_fate_at_restart`] refusal for a history
+/// that mixes permit identities or breaks the legal fate chain.
+pub fn reconcile_permit_fate_readback(
+    readback: &RestoreJournalReadback,
+    current: &OrsPermitRestartView<'_>,
+) -> Result<Vec<OrsPermitRestartDisposition>, OrsError> {
+    let mut histories: BTreeMap<String, Vec<OrsPermitFateEvidence>> = BTreeMap::new();
+    for entry in &readback.entries {
+        let Some(evidence) = decode_permit_fate_entry(entry)? else {
+            continue;
+        };
+        histories.entry(evidence.permit_id.clone()).or_default().push(evidence);
+    }
+    let mut dispositions = Vec::with_capacity(histories.len());
+    for history in histories.values() {
+        if let Some(disposition) = reconcile_permit_fate_at_restart(current, history)? {
+            dispositions.push(disposition);
+        }
+    }
+    Ok(dispositions)
 }

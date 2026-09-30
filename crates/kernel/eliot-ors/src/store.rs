@@ -8,8 +8,8 @@ use eliot_contracts::{
     AuthorityEpoch, BRIDGE_RECOVERY_SELECTOR_VERSION, BridgeRecoveryPageCommitment,
     BridgeRecoverySelector, BridgeRecoveryUnresolvedFrontier, BridgeRecoveryWindowDisposition,
     EpochId, EpochRelation, EpochTransition, HostCorrelationProjection, HostJsonRpcCorrelationId,
-    HostRequestLogicalKind, canonical_json_bytes, host_request_legacy_presence_key,
-    host_request_logical_key,
+    HostRequestLogicalKind, ResourceGeneration, canonical_json_bytes,
+    host_request_legacy_presence_key, host_request_logical_key,
 };
 use eliot_platform::PlatformHandle;
 use eliot_process::ProcessStreamKind;
@@ -26328,6 +26328,89 @@ impl RedbRecoveryStore {
             }
         }
         write.commit().map_err(storage)
+    }
+
+    /// Reconciles ORS capacity-permit fate at restart from the durable
+    /// restore-journal fate stream (issue #1679, W5).
+    ///
+    /// The restarting permit owner calls this once per restart, before
+    /// re-accounting any ORS capacity, with its live owner view: the owner
+    /// identity, generation, Authority Epoch and profile revision it restarts
+    /// under. The view must be live owner state, never derived from the fate
+    /// rows themselves: deriving the view from the rows would prove every
+    /// history against itself and restore capacity by counter reset. The store
+    /// cannot manufacture owner continuity, so it takes the view as evidence
+    /// rather than inventing it.
+    ///
+    /// The wire is the existing restore-journal readback, not a new ledger.
+    /// An unbound fate stream holds no fate row ("not issued" for every
+    /// permit), so restart proceeds without restoring capacity instead of
+    /// failing. A bound stream is read against the member denominator derived
+    /// from its durable head record, so a truncated or partially reclaimed
+    /// journal is refused instead of reconciled. Each retained fate row is
+    /// decoded in journal sequence order, grouped into per-permit histories,
+    /// and reconciled against the live view.
+    ///
+    /// The returned canonical JSON dispositions are the complete enforcement
+    /// handoff, in permit-identity order. A durably released permit is
+    /// forgotten here rather than returned: its capacity was already returned
+    /// exactly once. Every other outcome stays out of availability until the
+    /// owner acts on it: a held permit stays accounted, a pending release
+    /// must still be completed exactly once, and unknown or stale ownership
+    /// stays excluded until owner reconciliation supplies a terminal
+    /// disposition. Each returned disposition carries the concluded fate's
+    /// contract projection for release records and owner follow-ups.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrsError::InvalidField`] for a malformed owner view,
+    /// [`OrsError::IntegrityProblem`] when the observed journal does not
+    /// account for the durable-head denominator or a fate row or history is
+    /// corrupt, [`OrsError::Encoding`] when a disposition cannot be encoded,
+    /// or the typed storage and projection refusals of the underlying
+    /// readback when the journal family is unavailable.
+    pub fn reconcile_restart_permit_fate(
+        &self,
+        owner: &str,
+        owner_generation: ResourceGeneration,
+        authority_epoch: &EpochId,
+        profile_revision: &str,
+    ) -> Result<Vec<String>, OrsError> {
+        let current = crate::restore_journal::OrsPermitRestartView {
+            owner,
+            owner_generation,
+            authority_epoch,
+            profile_revision,
+        };
+        current.validate()?;
+        let stream = crate::restore_journal::ORS_PERMIT_FATE_STREAM;
+        if self.load_restore_journal_binding(stream)?.is_none() {
+            return Ok(Vec::new());
+        }
+        let head = self.restore_journal_durable_head(stream)?;
+        let denominator =
+            crate::restore_journal::RestoreJournalMemberDenominator::for_head(head.as_ref())?;
+        let request = crate::restore_journal::RestoreJournalReadbackRequest {
+            stream: stream.to_owned(),
+            limit: crate::restore_journal::MAX_JOURNAL_PAGE_ENTRIES,
+            denominator,
+        };
+        let readback = self.load_restore_journal_readback_against(&request)?;
+        let dispositions =
+            crate::restore_journal::reconcile_permit_fate_readback(&readback, &current)?;
+        let mut enforced = Vec::with_capacity(dispositions.len());
+        for disposition in &dispositions {
+            if disposition.outcome
+                == crate::restore_journal::OrsPermitRestartOutcome::TerminalReleased
+            {
+                continue;
+            }
+            enforced.push(
+                serde_json::to_string(disposition)
+                    .map_err(|error| OrsError::Encoding(error.to_string()))?,
+            );
+        }
+        Ok(enforced)
     }
 
     /// Converts a host request whose claimed owner vanished with the process
