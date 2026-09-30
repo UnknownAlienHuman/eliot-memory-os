@@ -342,8 +342,8 @@ fn evaluate_reconstructed_candidate(
         deadline_ms: None,
         cancelled: false,
     });
-    let evaluation =
-        evaluate_activation(candidate, &request, &profile).map_err(CueActivationSkip::EvaluationRefused)?;
+    let evaluation = evaluate_activation(candidate, &request, &profile)
+        .map_err(CueActivationSkip::EvaluationRefused)?;
     Ok(CueActivationSummary {
         request_id: evaluation.result.request_id.as_str().to_owned(),
         snapshot_id: evaluation.result.snapshot_id.as_str().to_owned(),
