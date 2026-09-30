@@ -142,20 +142,20 @@ fn record_supervision_ticket_operation_context(
         "operation_redaction",
         operation.redaction_status().unwrap_or("none"),
     );
-    let generation_value =
-        ticket
-            .binding
-            .generation_binding
-            .process_generation
-            .value()
-            .to_string();
+    let generation_value = ticket
+        .binding
+        .generation_binding
+        .process_generation
+        .value()
+        .to_string();
     let generation = bound_field(&generation_value);
     context.record("generation", generation.text());
     context.record(
         "generation_redaction",
         generation.redaction_status().unwrap_or("none"),
     );
-    let epoch = StateFence::canonical_epoch_digest(&ticket.binding.state_fence.authority_epoch).ok();
+    let epoch =
+        StateFence::canonical_epoch_digest(&ticket.binding.state_fence.authority_epoch).ok();
     if let Some(epoch) = epoch.as_ref() {
         let authority_epoch = bound_field(epoch.as_str());
         context.record("authority_epoch", authority_epoch.text());
@@ -1011,10 +1011,8 @@ impl KernelSupervisionLeaseAuthority {
         let context = match supplied_context {
             Some(context) => context,
             None => {
-                owned_context = supervision_expiry_operation_context(
-                    supervision_lease_id,
-                    expected_fence,
-                );
+                owned_context =
+                    supervision_expiry_operation_context(supervision_lease_id, expected_fence);
                 &owned_context
             }
         };
