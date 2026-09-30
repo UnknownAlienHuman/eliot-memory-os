@@ -1166,6 +1166,38 @@ impl DaemonComposition {
                 "cold unbound observation candidate admitted at the daemon edge: durably retained by the store evidence record, no task activation, support/influence promotion, or finish relevance"
             );
         }
+        // Issue #1746 (W6/A5): revalidate the sealed dispatch identity at the
+        // effect gate against the live owner fence before any scope-sensitive
+        // trigger or commit. `admit_canonical_write` admits against the
+        // caller-presented readiness fence (bootstrap time, I7.8 step 4);
+        // between that admission and this dispatch the generation may have
+        // moved, and "`MATCHED` is required again after any generation change
+        // that can alter the real target of the task" (I4.2.1). The ORIGINAL
+        // evidence is re-validated with the existing
+        // `TaskSelectionEvidence::validate`, contamination still refuses, and
+        // the presented fence must still match the live Governor
+        // kernel-snapshot fence exactly. A mismatch fails closed with
+        // `TASK_SCOPE_INCOMPATIBLE` for conflict/rebind: the old operation is
+        // never rewritten to a new task under its identity, never duplicated,
+        // and already-possible effects keep their original identity for
+        // reconciliation. Task/scope/revision moves are additionally covered
+        // at this same gate by the retained-binding
+        // `check_canonical_write_work_scope` check and the #1742
+        // `commit_canonical_with_readiness` material gate below. Cold/unbound
+        // and non-task-relative admissions carry no sealed identity and pass
+        // through untouched.
+        if let crate::task_binding_admission::TaskBindingAdmission::TaskBound(binding) =
+            &admission
+        {
+            let live_fence = self.governor.kernel_snapshot().state_fence();
+            crate::task_binding_admission::revalidate_task_bound_for_effect(
+                &binding.evidence,
+                Some(binding.admitted_task_ref.as_str()),
+                binding.scope_ref.as_str(),
+                &binding.presented_fence,
+                &live_fence,
+            )?;
+        }
         // Issue #1787: the scope-sensitive canonical-write trigger runs before
         // any commit. The caller must supply the actual observed `WorkScope` and
         // source closure; the Governor never reconstructs identity from the

@@ -92,6 +92,15 @@
 //!   finish legs.
 //! - [`observe_and_admit_task`] has **zero call sites**, so
 //!   [`admit_task_bound_with_observed_scope`] is transitively dead with it.
+//! - [`revalidate_task_bound_for_effect`] **is** live: its one production call
+//!   site is the pre-commit effect gate in
+//!   [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition),
+//!   which passes the sealed binding's admitted task/scope/presented fence
+//!   against the live Governor kernel-snapshot fence. Its caller seals through
+//!   [`admit_canonical_write`], so the fence leg of the W6/A5 dispatch
+//!   revalidation runs on the direct-internal entrypoint. The fuller
+//!   [`revalidate_dispatched_binding`] (live task/scope plus bootstrap/profile
+//!   revision) stays STITCH: no live owner read supplies those live values.
 //! - [`DaemonComposition::admit_scope_attach`](super::DaemonComposition) — the
 //!   only caller of [`ScopeAttachIngress`] — has **zero call sites**, and
 //!   `GovernorComposition::admit_observed_scope_attach` fails closed unless a
@@ -2584,14 +2593,16 @@ pub fn revalidate_dispatched_binding(
 /// task when the context names none — the same value admission compared),
 /// never the evidence's own value.
 ///
-/// Designated caller (STITCH, daemon composition lane): the pre-commit effect
+/// Designated caller (live, daemon composition lane): the pre-commit effect
 /// gate in `DaemonComposition::commit_canonical_and_refresh`
 /// (`bins/eliotd/src/lib.rs`), between the `ColdUnbound` admission projection
 /// and the scope-sensitive trigger, passing the admitted request task, the
 /// envelope scope, the readiness fence as presented, and the live Governor
 /// kernel-snapshot fence as live. Callers holding a sealed [`DispatchedBinding`]
 /// prefer [`revalidate_dispatched_binding`], which checks the carried
-/// task/scope/bootstrap revision first and delegates here for the fence leg.
+/// task/scope/bootstrap revision first and delegates here for the fence leg;
+/// that fuller entry stays STITCH until a live owner read supplies the live
+/// task/scope and receipt/profile revisions without invention.
 pub fn revalidate_task_bound_for_effect(
     evidence: &TaskSelectionEvidence,
     admitted_task_ref: Option<&str>,
