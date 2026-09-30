@@ -72,11 +72,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use eliot_context_admission::{
-    MaterialRankTraceDelivery, admit_context_traced, check_campaign_view_for_admission,
+    HeadroomAdmissionOutcome, HeadroomContext, HeadroomRefusalRecord, MaterialRankTraceDelivery,
+    admit_context_traced_with_headroom, check_campaign_view_for_admission,
 };
 use eliot_context_assembly::{
-    ActiveUnderstandingViewResult, AssemblyError, AssemblyPolicy, assemble_active_view,
-    check_campaign_view_for_assembly,
+    ActiveUnderstandingViewResult, AssemblyError, AssemblyPolicy, HeadroomHandoffRefusal,
+    assemble_active_view, check_campaign_view_for_assembly, recheck_headroom_handoff,
 };
 use eliot_context_candidates::{
     CANDIDATE_SCHEMA_VERSION, CandidatePolicy, CandidateRequest, ContextCandidateSetResult,
@@ -86,9 +87,10 @@ use eliot_context_candidates::{
 use eliot_context_contracts::{
     AdmissionDisposition, AdmissionInput, AdmissionMeasurement, AdmissionRuleIdentity,
     AdmittedContextSet, CONTEXT_CONTRACT_VERSION, ContextBinding, ContextError, ContextOutcome,
-    ContextRecipe, DecisionContextIncomplete, MeasurementCompositionProfile,
-    PriorityPolicyIdentity, ProviderId, QualityRefusal, QualityScorecard, SafetyFloorIdentity,
-    SerializedContextMeasurement, SuppliedOmissionBinding,
+    ContextRecipe, DecisionContextIncomplete, DownstreamHeadroomRequest, DownstreamHeadroomResult,
+    HeadroomAllocationLedger, MeasurementCompositionProfile, PriorityPolicyIdentity, ProviderId,
+    QualityRefusal, QualityScorecard, SafetyFloorIdentity, SerializedContextMeasurement,
+    SuppliedOmissionBinding,
 };
 use eliot_contracts::{
     ArtifactId, ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence,
@@ -1358,6 +1360,35 @@ pub enum PacketCompositionError {
     /// unattributable context.
     #[error("packet delivery does not match the per-material rank traces: {0}")]
     TraceDelivery(ContextError),
+    /// The Kernel resource owner did not grant the downstream headroom this
+    /// compilation needed, or the grant it issued is stale or revoked.
+    ///
+    /// The attempted recipe digest, the exact compilation binding, the typed
+    /// contract failure and the exact limiting dimensions cross this boundary
+    /// together. No admitted set and no Active View exist for this attempt: a
+    /// dependent operation is blocked by the absence, never by a truncated
+    /// packet that reads as complete. The owner still holds every permit it
+    /// issued, so its release or reconcile duty is unaffected by this refusal.
+    #[error(
+        "packet downstream headroom refused for attempted recipe {refusal.attempted_recipe_digest}"
+    )]
+    HeadroomRefused {
+        /// The admission owner's typed headroom refusal record, carrying the
+        /// attempted recipe digest, the exact compilation binding, the typed
+        /// contract failure and the exact limiting dimensions together.
+        refusal: Box<HeadroomRefusalRecord>,
+    },
+    /// The assembled packet no longer holds against its own reservation.
+    ///
+    /// The final rendered payload, its exact serialized measurement and the
+    /// attempted recipe are re-proved against the reservation before the packet
+    /// becomes action-ready. A stale or revoked reservation, a changed
+    /// route/serializer/profile, or a post-render overflow withholds publication
+    /// with the attempted recipe and the exact omissions preserved, and carries
+    /// the owner's outstanding release instructions so the reservation is
+    /// terminated through its issuer rather than stranded.
+    #[error("packet headroom handoff refused: {0}")]
+    HeadroomHandoff(Box<HeadroomHandoffRefusal>),
 }
 
 /// Owner-supplied admission closure for one packet compilation.
@@ -1689,6 +1720,12 @@ impl KernelContextReadClient {
     /// owner independently re-derives and content-compares every digest the
     /// card names, so a card that does not describe this packet is refused
     /// rather than trusted.
+    /// #1725 headroom join: before optional filling, the caller submits the
+    /// bounded pipeline/attempt/stage/consumer demand through the existing
+    /// Kernel resource/lease owner and hands the owner-issued answer here as
+    /// validated evidence. Admission runs under that reservation, and the
+    /// assembled output is rechecked against it before the packet is
+    /// action-ready.
     #[allow(clippy::too_many_arguments)]
     pub fn compile_context_packet(
         seven: &SevenRoleInputs,
@@ -1698,6 +1735,10 @@ impl KernelContextReadClient {
         campaign_view: &CampaignLearningStateView,
         context_recipe_body_digest: &str,
         floor: &SafetyFloorIdentity,
+        headroom_request: &DownstreamHeadroomRequest,
+        headroom_result: &DownstreamHeadroomResult,
+        headroom_ledger: &HeadroomAllocationLedger,
+        observed_now_ms: u64,
         admission_parts: impl FnOnce(
             &ContextCandidateSetResult,
         ) -> Result<PacketAdmissionParts, PacketCompositionError>,
@@ -1711,6 +1752,16 @@ impl KernelContextReadClient {
         {
             return Err(PacketCompositionError::BindingMismatch);
         }
+        // The bounded headroom request and the owner's answer are supplied by
+        // the caller, which submitted them through the Kernel resource/lease
+        // owner. This composition performs no capacity IO and contacts no
+        // owner; it only hands the validated evidence to the compiler below.
+        let headroom = HeadroomContext {
+            request: headroom_request,
+            result: headroom_result,
+            ledger: headroom_ledger,
+            now_ms: observed_now_ms,
+        };
         request
             .validate()
             .map_err(|error| PacketCompositionError::Candidates(Box::new(error)))?;
@@ -1791,7 +1842,7 @@ impl KernelContextReadClient {
         input
             .validate()
             .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
-        let (admitted, delivery) = admit_packet_candidates(&input)?;
+        let (admitted, delivery) = admit_packet_candidates(&input, &headroom)?;
         Self::require_campaign_view_for_assembly(
             &admitted,
             campaign_view,
@@ -1807,6 +1858,19 @@ impl KernelContextReadClient {
         assembled
             .verify_boundaries()
             .map_err(|error| PacketCompositionError::Assembly(Box::new(error)))?;
+        // Recheck the actual rendered output and handoff against the same
+        // reservation before the packet becomes action-ready. The typed refusal
+        // preserves the attempted recipe and the exact omissions and carries the
+        // owner's outstanding release instructions; nothing here releases a
+        // permit, because the non-clone permit handle stays with its issuer.
+        recheck_headroom_handoff(
+            &assembled,
+            recipe,
+            headroom_request,
+            headroom_result,
+            observed_now_ms,
+        )
+        .map_err(|refusal| PacketCompositionError::HeadroomHandoff(Box::new(refusal)))?;
         Ok((assembled, delivery))
     }
 }
@@ -1868,18 +1932,19 @@ fn composition_failure(
     }
 }
 
-/// Admits one packet candidate set through the admission owner with the
-/// input/result join checked, and returns the per-material rank-trace delivery
-/// record beside the admitted set.
+/// Admits one packet candidate set through the admission owner under one
+/// granted downstream reservation.
 ///
-/// Runs the admission owner's traced join
-/// ([`eliot_context_admission::admit_context_traced`]) over the caller-built
-/// [`AdmissionInput`], proves the result against that same input
-/// ([`AdmissionResult::validate_for`](eliot_context_contracts::AdmissionInput)),
-/// and returns the admitted set only for an explicit `Complete` outcome. An
-/// `Incomplete` outcome returns the owner's gaps as
-/// [`PacketCompositionError::AdmissionIncomplete`]: a partial floor is typed
-/// incompleteness, never a silently cut view.
+/// Runs the admission owner's reservation-aware traced join
+/// ([`admit_context_traced_with_headroom`]) over the caller-built
+/// [`AdmissionInput`] and the caller's owner-issued headroom evidence. The pure
+/// compiler reads the owner-issued permit bindings out of that evidence and
+/// performs no I/O; the reservation owner stays the only party that can release
+/// or reconcile them.
+///
+/// A refused reservation returns [`PacketCompositionError::HeadroomRefused`]
+/// carrying the attempted recipe and binding, so no admitted set and no
+/// nominally complete view exist for a dependent operation to observe.
 ///
 /// I12.26: the returned [`MaterialRankTraceDelivery`] is the delivery
 /// acceptance record for this packet. It carries one handle-bound
@@ -1890,9 +1955,16 @@ fn composition_failure(
 /// location; it is never dropped.
 fn admit_packet_candidates(
     input: &AdmissionInput,
+    headroom: &HeadroomContext<'_>,
 ) -> Result<(AdmittedContextSet, MaterialRankTraceDelivery), PacketCompositionError> {
-    let (result, traces) = admit_context_traced(input)
-        .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
+    let (result, traces) = match admit_context_traced_with_headroom(input, headroom)
+        .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?
+    {
+        HeadroomAdmissionOutcome::Admitted { result, traces, .. } => (*result, traces),
+        HeadroomAdmissionOutcome::Refused(refusal) => {
+            return Err(PacketCompositionError::HeadroomRefused(Box::new(refusal)));
+        }
+    };
     result
         .validate_for(input)
         .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;

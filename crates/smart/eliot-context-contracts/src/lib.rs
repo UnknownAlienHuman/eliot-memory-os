@@ -15,6 +15,7 @@ mod canonical_projections;
 mod decision_lineage;
 mod economy;
 mod error;
+mod headroom;
 mod identity;
 mod learning_ticket;
 mod measurement;
@@ -69,6 +70,12 @@ pub use decision_lineage::{
 pub use economy::{ContextEconomyReceipt, EconomyAllocations};
 pub use error::{
     ContextError, ContextErrorCode, ContextOutcome, DecisionContextIncomplete, ProviderRoleGap,
+};
+pub use headroom::{
+    DOWNSTREAM_HEADROOM_SCHEMA_VERSION, DownstreamHeadroomRequest, DownstreamHeadroomResult,
+    HeadroomAllocationLedger, HeadroomAttempt, HeadroomConsumer, HeadroomDecision, HeadroomDemand,
+    HeadroomDimension, HeadroomOutcome, HeadroomPurpose, HeadroomQuantity, HeadroomRefusal,
+    HeadroomRelease, HeadroomReleaseCondition, HeadroomReleaseInstruction, PurposeAllocation,
 };
 pub use identity::{
     CONTEXT_CONTRACT_NAME, CONTEXT_CONTRACT_VERSION, ContextBinding, DecisionRevision,

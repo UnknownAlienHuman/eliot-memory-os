@@ -1,10 +1,12 @@
 //! Public assembly operation and its explicit phases.
 
 use eliot_context_contracts::{
-    ActiveUnderstandingView, AdmittedContextSet, ContextError, ContextRecipe, MeasurementStatus,
-    QualityOperation, QualityRefusal, QualityRefusalKind, QualityScorecard,
-    SerializedContextMeasurement,
+    ActiveUnderstandingView, AdmittedContextSet, ContextError, ContextRecipe,
+    DownstreamHeadroomRequest, DownstreamHeadroomResult, HeadroomAttempt, HeadroomDimension,
+    HeadroomRefusal, HeadroomReleaseInstruction, MeasurementStatus, QualityOperation,
+    QualityRefusal, QualityRefusalKind, QualityScorecard, SerializedContextMeasurement,
 };
+use thiserror::Error;
 
 use crate::{AssemblyError, boundary, bounds, measurement, render};
 
@@ -61,6 +63,147 @@ impl AssemblyPolicy {
         }
         Ok(())
     }
+}
+
+/// The typed refusal this assembly owner returns instead of an assembled packet.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error("downstream headroom handoff refused for recipe {attempt}")]
+pub struct HeadroomHandoffRefusal {
+    /// The attempted recipe and omissions preserved across the refusal.
+    pub attempt: HeadroomAttempt,
+    /// The release instructions the owner must still execute for the permits it
+    /// issued, so a failed publication cannot strand a reservation silently.
+    ///
+    /// An unknown downstream effect yields the same instruction as a known one:
+    /// the owner reconciles it, and this crate never invents a safe release.
+    pub releases: Vec<HeadroomReleaseInstruction>,
+}
+
+/// Recheck the actual output and handoff against its reservation.
+///
+/// I12.13: bind economy/View to the same budget, recipe and headroom evidence,
+/// include serialized wrappers, advertised tools and retained metadata in the
+/// final measurement, and prevent dependent action-ready publication on a stale
+/// or revoked reservation, a changed route/serializer/profile, or a post-render
+/// overflow, while preserving the attempted recipe and omissions in a typed
+/// result.
+///
+/// The recheck is pure: it reads the assembled result, the recipe, the
+/// reservation evidence and the caller's observed clock, and performs no I/O.
+/// The reservation owner stays the only party that can release or reconcile the
+/// permits named in the returned instructions, which is what makes failure,
+/// cancellation and downstream completion all terminate the reservation through
+/// the owner that issued it.
+pub fn recheck_headroom_handoff(
+    assembled: &ActiveUnderstandingViewResult,
+    recipe: &ContextRecipe,
+    request: &DownstreamHeadroomRequest,
+    headroom: &DownstreamHeadroomResult,
+    now_ms: u64,
+) -> Result<Vec<HeadroomReleaseInstruction>, HeadroomHandoffRefusal> {
+    let attempted_recipe_digest = recipe.recipe_sha256.clone();
+    let reason_ref = assembled.admitted.floor.rule_evidence.clone();
+    let release_instructions = || {
+        request
+            .demands
+            .iter()
+            .filter_map(|demand| headroom.reservation(demand.dimension))
+            .map(|reservation| HeadroomReleaseInstruction {
+                permit_id: reservation.permit_id.clone(),
+                operation_id: reservation.operation_id.clone(),
+                condition: request.release.clone(),
+            })
+            .collect()
+    };
+    let withhold = |refusal: HeadroomRefusal| HeadroomHandoffRefusal {
+        attempt: HeadroomAttempt {
+            attempted_recipe_digest: attempted_recipe_digest.clone(),
+            omissions: assembled.admitted.economy.omissions.clone(),
+            refusal,
+        },
+        // The owner still holds every permit it issued, so the release duty
+        // exists on the refusal path too and must not be dropped.
+        releases: release_instructions(),
+    };
+    // The boundary round trip proves the delivered units against the upstream
+    // admission receipt before anything here reads the packet as final.
+    assembled.verify_boundaries().map_err(|_| {
+        withhold(HeadroomRefusal::IdentityChanged {
+            reason: reason_ref.clone(),
+        })
+    })?;
+    // The final measurement must describe the exact canonical rendered payload,
+    // which is where the serialized wrappers, advertised tools and retained
+    // metadata already are. A view whose measurement is not that exact payload
+    // is not a packet whose overflow any reservation could have covered.
+    assembled.view.validate().map_err(|_| {
+        withhold(HeadroomRefusal::IdentityChanged {
+            reason: reason_ref.clone(),
+        })
+    })?;
+    // Economy, View and reservation resolve to one recipe and one route.
+    if assembled.view.recipe_digest != recipe.recipe_sha256
+        || assembled.admitted.economy.recipe_digest != recipe.recipe_sha256
+        || request.recipe_digest != recipe.recipe_sha256
+        || assembled.view.measurement.route_id != request.route_id
+        || assembled.view.measurement.serializer_id != request.serializer_id
+    {
+        return Err(withhold(HeadroomRefusal::IdentityChanged {
+            reason: reason_ref.clone(),
+        }));
+    }
+    headroom
+        .validate_against(request, &assembled.view.binding, now_ms)
+        .map_err(|error| {
+            let refusal = match error {
+                ContextError::StaleFloor | ContextError::InvalidFence => HeadroomRefusal::Stale {
+                    reason: reason_ref.clone(),
+                },
+                ContextError::CapacityExceeded | ContextError::Overflow => {
+                    HeadroomRefusal::PostRenderOverflow {
+                        reason: reason_ref.clone(),
+                    }
+                }
+                _ => HeadroomRefusal::IdentityChanged {
+                    reason: reason_ref.clone(),
+                },
+            };
+            withhold(refusal)
+        })?;
+    // Post-render overflow against the reserved envelope: the exact rendered
+    // payload plus the referenced output and review reserves must still fit the
+    // route capacity the reservation was compiled under.
+    let capacity = &assembled.admitted.floor.capacity;
+    let reserved = capacity
+        .fixed_overhead
+        .checked_add(capacity.output_reserve)
+        .and_then(|value| value.checked_add(capacity.review_reserve))
+        .and_then(|value| value.checked_add(assembled.view.measurement.rendered_utf8_bytes))
+        .ok_or_else(|| {
+            withhold(HeadroomRefusal::PostRenderOverflow {
+                reason: reason_ref.clone(),
+            })
+        })?;
+    if reserved > capacity.route_capacity {
+        return Err(withhold(HeadroomRefusal::PostRenderOverflow {
+            reason: reason_ref.clone(),
+        }));
+    }
+    // Every demanded dimension must still be granted under the live fence. An
+    // unknown downstream effect names the exact limiting dimensions rather than
+    // resolving into an invented safe release.
+    let limiting: Vec<HeadroomDimension> = request
+        .demands
+        .iter()
+        .map(|demand| demand.dimension)
+        .filter(|dimension| headroom.reservation(*dimension).is_none())
+        .collect();
+    if !limiting.is_empty() {
+        return Err(withhold(HeadroomRefusal::Unavailable {
+            dimensions: limiting,
+        }));
+    }
+    Ok(release_instructions())
 }
 
 fn validate_digest(value: &str, field: &'static str) -> Result<(), AssemblyError> {

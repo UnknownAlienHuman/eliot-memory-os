@@ -517,3 +517,14 @@ reason = "Admit the owner-issued negative-memory rule and run the bounded pure m
 features = ["default"]
 public_exposure = "Negative-memory record, policy and matcher types are public activation and gate parameters; no provider store handle, I/O or runtime state is exposed."
 removal_plan = "Remove when governed negative-memory activation and the Context exposure gate no longer consume eliot_dreamer_failure record, policy and matcher types and the manifest edge is deleted."
+
+[[workspace_dependency_dispositions]]
+consumer = "eliot-context-contracts"
+dependency = "eliot-runtime-contracts"
+dependency_kind = "dependencies"
+target = "all"
+owner = "crates/smart/eliot-context-contracts"
+reason = "I14.29 DownstreamHeadroomReservation validates the owner-issued capacity request, permit binding and release evidence reused verbatim from the Kernel resource/lease owner, so a granted headroom dimension is proven by the owner permit rather than a locally restated reservation."
+features = ["default"]
+public_exposure = "CapacityRequest, CapacityPermitBinding, CapacityReleaseEvidence, CapacityBottleneck and CapacityUnit appear in the public headroom request, result and release contracts; no owner store handle, counter, client or I/O is exposed."
+removal_plan = "Remove when the downstream headroom contract no longer consumes the Kernel capacity vocabulary and the manifest edge is deleted."

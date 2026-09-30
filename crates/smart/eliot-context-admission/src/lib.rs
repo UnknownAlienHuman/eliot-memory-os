@@ -65,9 +65,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use eliot_context_contracts::{
     AdmissionDisposition, AdmissionInput, AdmissionMeasuredCost, AdmissionRecord, AdmissionResult,
-    AdmittedAtom, AdmittedContextSet, AtomAvailability, ContextEconomyReceipt, ContextError,
-    ContextOutcome, DecisionContextIncomplete, EconomyAllocations, MeasurementRef, OmissionReason,
-    OmissionRecord, RepresentationKind,
+    AdmittedAtom, AdmittedContextSet, AtomAvailability, ContextBinding, ContextEconomyReceipt,
+    ContextError, ContextOutcome, DecisionContextIncomplete, DownstreamHeadroomRequest,
+    DownstreamHeadroomResult, EconomyAllocations, HeadroomAllocationLedger, HeadroomDimension,
+    HeadroomRefusal, MeasurementRef, OmissionReason, OmissionRecord, RepresentationKind,
 };
 use eliot_receipts::ProofCeiling;
 
@@ -104,6 +105,253 @@ fn refuse_ungoverned_learning(input: &AdmissionInput) -> Result<(), ContextError
 }
 
 pub(crate) fn admit_context_inner(input: &AdmissionInput) -> Result<AdmissionResult, ContextError> {
+    admit_context_inner_with_headroom(input, None)
+}
+
+/// The validated owner evidence the pure compiler receives before optional
+/// filling.
+///
+/// This is plain data, never an IO client: the request the runtime caller
+/// submitted and the owner-issued result it received. The compiler reads the
+/// owner-issued permit bindings out of the result and never contacts an owner.
+pub struct HeadroomContext<'a> {
+    /// The exact bounded request the caller submitted for this compilation.
+    pub request: &'a DownstreamHeadroomRequest,
+    /// The owner-issued answer to that request.
+    pub result: &'a DownstreamHeadroomResult,
+    /// The no-double-counting ledger over this recipe's declared reserves.
+    pub ledger: &'a HeadroomAllocationLedger,
+    /// The caller's observed clock, in Unix milliseconds.
+    ///
+    /// Staleness is decided against this value, never against a timestamp the
+    /// evidence carries about itself.
+    pub now_ms: u64,
+}
+
+/// Why the compiler withheld dependent action-ready publication.
+///
+/// I12.13 requires the attempted recipe and the exact omissions to survive the
+/// refusal, so a dependent operation is blocked without the packet reading as
+/// nominally complete.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeadroomRefusalRecord {
+    /// Why publication is withheld.
+    pub reason: HeadroomRefusal,
+    /// The contract-level failure that produced the refusal, kept typed.
+    pub error: ContextError,
+    /// The recipe revision this compilation actually attempted.
+    pub attempted_recipe_digest: String,
+    /// The exact task/attempt/scope/decision/fence the attempt was made under.
+    pub attempted_binding: ContextBinding,
+}
+
+/// The compiler's bounded headroom decision before optional filling.
+///
+/// The granted dimensions are proven by owner-issued permit bindings inside
+/// `result`; this record reports only what the compiler concluded from them, so
+/// it can never read as a reservation on its own.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HeadroomCheck {
+    /// The owner reserved every demanded dimension and the declared reserves
+    /// leave room for the required floor.
+    Admitted {
+        /// Occupancy left for admitted material after the declared fixed
+        /// overhead and the referenced output and review reserves.
+        occupancy_available: u64,
+    },
+    /// A demanded dimension was not reserved, or its reservation is stale.
+    Refused(HeadroomRefusal),
+}
+
+impl HeadroomCheck {
+    /// Return the refusal, when this decision withheld publication.
+    #[must_use]
+    pub fn refusal(&self) -> Option<&HeadroomRefusal> {
+        match self {
+            Self::Admitted { .. } => None,
+            Self::Refused(refusal) => Some(refusal),
+        }
+    }
+}
+
+/// The bounded headroom decision and the admission it gates.
+///
+/// `Admitted` carries the admission that ran under the granted reservation;
+/// `Refused` carries the attempted recipe and binding with no admitted set, so
+/// a dependent operation can never observe a nominally complete view.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HeadroomAdmissionOutcome {
+    /// Every demanded dimension is reserved and the admission ran.
+    Admitted {
+        /// The admission result produced under the granted reservation.
+        result: Box<AdmissionResult>,
+        /// The per-material rank traces of that same result.
+        traces: Vec<MaterialRankTrace>,
+        /// The bounded headroom decision that admitted the optional fill.
+        check: HeadroomCheck,
+    },
+    /// The reservation was withheld; no admitted set exists.
+    Refused(HeadroomRefusalRecord),
+}
+
+/// Reject a demanded dimension the owner did not reserve.
+///
+/// A refused, unknown or not-applicable dimension is named explicitly, so the
+/// caller receives the exact limiting dimensions instead of a truncated packet
+/// that looks complete.
+fn headroom_limiting_dimensions(
+    request: &DownstreamHeadroomRequest,
+    result: &DownstreamHeadroomResult,
+) -> Vec<HeadroomDimension> {
+    request
+        .demands
+        .iter()
+        .map(|demand| demand.dimension)
+        .filter(|dimension| result.reservation(*dimension).is_none())
+        .collect()
+}
+
+/// The bounded headroom check the pure compiler runs before optional filling.
+///
+/// Four things are proved here, all from owner evidence and the recipe's own
+/// declared reserves:
+///
+/// 1. The owner result is valid against the exact request, the live fence and
+///    the caller's clock, so a stale or revoked reservation cannot be granted.
+/// 2. Every demanded dimension reached a grant. A dimension the owner could
+///    not determine is `Unknown`, never an empty demand that fits.
+/// 3. The ledger reconciles: each purpose is bound once, and `Output` and
+///    `ReviewReasoning` reference the recipe's existing reserves rather than
+///    adding them a second time.
+/// 4. The declared fixed overhead plus the required floor fit inside the
+///    occupancy those referenced reserves leave, with checked arithmetic.
+///
+/// A failure returns the typed contract error; the caller turns it into the
+/// typed [`HeadroomRefusalRecord`].
+fn check_headroom(
+    input: &AdmissionInput,
+    headroom: &HeadroomContext<'_>,
+) -> Result<HeadroomCheck, ContextError> {
+    if headroom.ledger.capacity != input.recipe.capacity {
+        return Err(ContextError::EconomyMismatch);
+    }
+    headroom.ledger.reconcile()?;
+    headroom
+        .result
+        .validate_against(headroom.request, &input.binding, headroom.now_ms)?;
+    let limiting = headroom_limiting_dimensions(headroom.request, headroom.result);
+    if !limiting.is_empty() {
+        return Ok(HeadroomCheck::Refused(HeadroomRefusal::Unavailable {
+            dimensions: limiting,
+        }));
+    }
+    Ok(HeadroomCheck::Admitted {
+        occupancy_available: headroom.ledger.occupancy_available()?,
+    })
+}
+
+/// Require the declared fixed overhead and the required floor to fit the
+/// occupancy the referenced reserves leave.
+///
+/// This is the reservation-aware form of the pre-existing floor-plus-overhead
+/// fit: it reserves the recipe's own `output_reserve` and `review_reserve`
+/// before optional filling rather than only the nominal route capacity.
+fn check_reserved_occupancy(
+    input: &AdmissionInput,
+    headroom: &HeadroomContext<'_>,
+    required_cost: u64,
+) -> Result<(), ContextError> {
+    let available = headroom.ledger.occupancy_available()?;
+    let occupied = fixed_cost(input)?
+        .checked_add(required_cost)
+        .ok_or(ContextError::Overflow)?;
+    if occupied > available {
+        return Err(ContextError::CapacityExceeded);
+    }
+    Ok(())
+}
+
+/// Admit one candidate set under one granted downstream reservation.
+///
+/// I12.13: "Before filling optional context, Context Compiler requests the
+/// applicable `DownstreamHeadroomReservation`." The runtime caller submits the
+/// bounded request through the existing Kernel resource/lease owner and receives
+/// the owner-issued answer; this entry receives both as validated owner evidence,
+/// performs no I/O, and contacts no owner. The owner stays the only party that
+/// can release or reconcile a granted reservation: the assembly owner's
+/// `recheck_headroom_handoff` returns the release instructions rather than
+/// releasing anything itself.
+///
+/// A withheld reservation returns
+/// [`HeadroomAdmissionOutcome::Refused`] with the attempted recipe and binding
+/// and no admitted set, so a dependent operation can never observe a nominally
+/// complete view built without its headroom.
+pub fn admit_context_traced_with_headroom(
+    input: &AdmissionInput,
+    headroom: &HeadroomContext<'_>,
+) -> Result<HeadroomAdmissionOutcome, ContextError> {
+    // The refusal names an existing owner record, never a minted placeholder:
+    // the recipe's own invalidation identity when it declared one, otherwise
+    // the admission rule evidence that produced the failure.
+    let reason_ref = input
+        .recipe
+        .invalidation
+        .clone()
+        .unwrap_or_else(|| input.floor.floor.rule_evidence.clone());
+    let refusal = |error: ContextError| {
+        HeadroomAdmissionOutcome::Refused(HeadroomRefusalRecord {
+            reason: match &error {
+                ContextError::StaleFloor | ContextError::InvalidFence => HeadroomRefusal::Stale {
+                    reason: reason_ref.clone(),
+                },
+                ContextError::MissingFloor | ContextError::OversizedFloor => {
+                    HeadroomRefusal::Unavailable {
+                        dimensions: headroom_limiting_dimensions(headroom.request, headroom.result),
+                    }
+                }
+                ContextError::CapacityExceeded | ContextError::Overflow => {
+                    HeadroomRefusal::PostRenderOverflow {
+                        reason: reason_ref.clone(),
+                    }
+                }
+                _ => HeadroomRefusal::IdentityChanged {
+                    reason: reason_ref.clone(),
+                },
+            },
+            error,
+            attempted_recipe_digest: input.recipe.recipe_sha256.clone(),
+            attempted_binding: input.binding.clone(),
+        })
+    };
+    let check = check_headroom(input, headroom).map_err(refusal)?;
+    // A refused dimension means no optional filling happened at all, so the
+    // typed refusal carries the same exact error the floor path reports for an
+    // unsatisfiable required floor, plus the limiting dimensions.
+    if let HeadroomCheck::Refused(reason) = &check {
+        return Ok(HeadroomAdmissionOutcome::Refused(HeadroomRefusalRecord {
+            reason: reason.clone(),
+            error: ContextError::MissingFloor,
+            attempted_recipe_digest: input.recipe.recipe_sha256.clone(),
+            attempted_binding: input.binding.clone(),
+        }));
+    }
+    match admit_context_inner_with_headroom(input, Some(headroom)) {
+        Ok(result) => {
+            let traces = trace_material(input, &result)?;
+            Ok(HeadroomAdmissionOutcome::Admitted {
+                result: Box::new(result),
+                traces,
+                check,
+            })
+        }
+        Err(error) => Err(refusal(error)),
+    }
+}
+
+fn admit_context_inner_with_headroom(
+    input: &AdmissionInput,
+    headroom: Option<&HeadroomContext<'_>>,
+) -> Result<AdmissionResult, ContextError> {
     // I12.26 stale-projection fence arm, enforced before exact cue firing: a
     // candidate closure compiled under another fence must refresh the packet
     // and can never silently admit. Today's boundary refusal for exactly this
@@ -153,6 +401,14 @@ pub(crate) fn admit_context_inner(input: &AdmissionInput) -> Result<AdmissionRes
                 return incomplete_result(input, input_digest, profile_digest, &incomplete);
             }
         };
+
+    // Before optional filling: the required floor plus the declared fixed
+    // overhead must fit the occupancy the referenced output and review reserves
+    // leave. Without a granted reservation the pre-existing nominal-capacity
+    // fit above already applies; with one, the reserves are actually held back.
+    if let Some(headroom) = headroom {
+        check_reserved_occupancy(input, headroom, required_cost)?;
+    }
 
     let (optional_cost, failure_causes) = select_optional(OptionalSelectionInput {
         input,
@@ -267,13 +523,11 @@ fn validate_admission_contract(input: &AdmissionInput) -> Result<(), ContextErro
 ///   [`MaterialRankTraceDelivery`] to the packet composition.
 /// - That call site is not itself reachable from `fn main` yet:
 ///   `KernelContextReadClient::compile_context_packet` has no call site in
-///   the tree. It is also uncallable by construction: its eighth parameter is
-///   `&PacketAdmissionBundle`, and that bundle is defined in
-///   `bins/eliotd/src/kernel_context_read_client.rs` and referenced there but
-///   constructed by no production owner. Its four identity fields
-///   (`SafetyFloorIdentity`, `PriorityPolicyIdentity`, `AdmissionRuleIdentity`,
-///   `MeasurementCompositionProfile`) are minted nowhere outside `tests/`
-///   fixtures. The live `eliot.packet` daemon poller
+///   the tree. It is also uncallable by construction: its closure parameters
+///   include the admission-closure supplier, and that closure's four identity
+///   fields (`SafetyFloorIdentity`, `PriorityPolicyIdentity`,
+///   `AdmissionRuleIdentity`, `MeasurementCompositionProfile`) are minted
+///   nowhere outside `tests/` fixtures. The live `eliot.packet` daemon poller
 ///   (`daemon_runtime::run_campaign_packet_poll` ->
 ///   `campaign_packet::serve_campaign_packet_pair`) never reaches any context
 ///   admission *decision*: it compiles through the learning-state view owner
@@ -330,6 +584,15 @@ pub fn admit_context_traced(
 /// `include_with_warning` through the unchanged [`classify_admission`]
 /// arm, and the text is bound into the trace handle. See the join
 /// contract on [`admit_context_traced`]; all obligations apply unchanged.
+///
+/// I12.13 headroom rule: a pipeline that can consume all currently free
+/// capacity reserves its downstream headroom through the existing Kernel
+/// resource/lease owner *before* optional filling. That owner join lives on
+/// [`admit_context_traced_with_headroom`], which additionally requires the
+/// owner-issued reservation evidence. This entry remains the unbounded
+/// reservation-free path and is not the one a production packet composition
+/// uses; see the measured runtime-consumer status on
+/// [`admit_context_traced`].
 pub fn admit_context_traced_with_warnings(
     input: &AdmissionInput,
     warnings: &[SuppliedWarning],
