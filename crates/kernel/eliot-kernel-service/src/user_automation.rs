@@ -434,19 +434,7 @@ fn validate_mutation_result(
                 revision,
                 cancelled_wake_ids,
             },
-        ) => {
-            expected.validate_for_normalization_submission()?;
-            revision.validate()?;
-            if !same_revision_except_store_normalization_receipt(expected, revision)
-                || revision.supersedes.is_some()
-                || !cancelled_wake_ids.is_empty()
-            {
-                return Err(UserAutomationServiceError::ResponseMismatch(
-                    "create revision result",
-                ));
-            }
-            Ok(())
-        }
+        ) => validate_create_result(expected, revision, cancelled_wake_ids),
         (
             UserAutomationOperation::Edit {
                 previous_revision,
@@ -456,18 +444,7 @@ fn validate_mutation_result(
                 revision,
                 cancelled_wake_ids,
             },
-        ) => {
-            expected.validate_supersedes_for_normalization_submission(previous_revision)?;
-            revision.validate_supersedes(previous_revision)?;
-            if !same_revision_except_store_normalization_receipt(expected, revision)
-                || !cancelled_wake_ids.is_empty()
-            {
-                return Err(UserAutomationServiceError::ResponseMismatch(
-                    "edit revision result",
-                ));
-            }
-            Ok(())
-        }
+        ) => validate_edit_result(previous_revision, expected, revision, cancelled_wake_ids),
         (
             UserAutomationOperation::Pause {
                 automation_id,
@@ -509,58 +486,117 @@ fn validate_mutation_result(
                 revision,
                 cancelled_wake_ids,
             },
-        ) => {
-            revision.validate()?;
-            if revision.automation_id != *automation_id
-                || revision.revision != *automation_revision
-                || revision.configuration_state != UserAutomationConfigurationState::Retired
-            {
-                return Err(UserAutomationServiceError::ResponseMismatch(
-                    "remove revision result",
-                ));
-            }
-            validate_text_list(cancelled_wake_ids, "cancelled_wake_ids")
-        }
+        ) => validate_remove_result(
+            revision,
+            automation_id,
+            automation_revision,
+            cancelled_wake_ids,
+        ),
         (
-            UserAutomationOperation::RunNow {
-                automation_id,
-                automation_revision,
-                nonce,
-            },
+            operation @ UserAutomationOperation::RunNow { .. },
             UserAutomationMutationResult::RunNow {
                 invocation,
                 wake_intent,
             },
-        ) => {
-            invocation.validate()?;
-            if invocation.automation_id != *automation_id
-                || invocation.automation_revision != *automation_revision
-                || invocation.trigger
-                    != (eliot_kernel_core::UserAutomationTrigger::Manual {
-                        nonce: nonce.clone(),
-                    })
-                || invocation.trigger_origin
-                    != eliot_kernel_core::UserAutomationTriggerOrigin::Human
-                || invocation.occurrence_identity()? != wake_intent.wake_id
-            {
-                return Err(UserAutomationServiceError::ResponseMismatch(
-                    "run-now invocation identity",
-                ));
-            }
-            wake_intent
-                .validate()
-                .map_err(|_| UserAutomationServiceError::ResponseMismatch("wake intent shape"))?;
-            if wake_intent.state != WakeIntentState::Pending {
-                return Err(UserAutomationServiceError::ResponseMismatch(
-                    "run-now wake state",
-                ));
-            }
-            Ok(())
-        }
+        ) => validate_run_now_result(operation, invocation, wake_intent),
         _ => Err(UserAutomationServiceError::ResponseMismatch(
             "mutation result kind",
         )),
     }
+}
+
+fn validate_create_result(
+    expected: &UserAutomationRevision,
+    revision: &UserAutomationRevision,
+    cancelled_wake_ids: &[String],
+) -> Result<(), UserAutomationServiceError> {
+    expected.validate_for_normalization_submission()?;
+    revision.validate()?;
+    if !same_revision_except_store_normalization_receipt(expected, revision)
+        || revision.supersedes.is_some()
+        || !cancelled_wake_ids.is_empty()
+    {
+        return Err(UserAutomationServiceError::ResponseMismatch(
+            "create revision result",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_edit_result(
+    previous_revision: &UserAutomationRevision,
+    expected: &UserAutomationRevision,
+    revision: &UserAutomationRevision,
+    cancelled_wake_ids: &[String],
+) -> Result<(), UserAutomationServiceError> {
+    expected.validate_supersedes_for_normalization_submission(previous_revision)?;
+    revision.validate_supersedes(previous_revision)?;
+    if !same_revision_except_store_normalization_receipt(expected, revision)
+        || !cancelled_wake_ids.is_empty()
+    {
+        return Err(UserAutomationServiceError::ResponseMismatch(
+            "edit revision result",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_remove_result(
+    revision: &UserAutomationRevision,
+    automation_id: &str,
+    automation_revision: &str,
+    cancelled_wake_ids: &[String],
+) -> Result<(), UserAutomationServiceError> {
+    revision.validate()?;
+    if revision.automation_id != automation_id
+        || revision.revision != automation_revision
+        || revision.configuration_state != UserAutomationConfigurationState::Retired
+    {
+        return Err(UserAutomationServiceError::ResponseMismatch(
+            "remove revision result",
+        ));
+    }
+    validate_text_list(cancelled_wake_ids, "cancelled_wake_ids")
+}
+
+fn validate_run_now_result(
+    operation: &UserAutomationOperation,
+    invocation: &UserAutomationInvocation,
+    wake_intent: &WakeIntent,
+) -> Result<(), UserAutomationServiceError> {
+    let UserAutomationOperation::RunNow {
+        automation_id,
+        automation_revision,
+        nonce,
+    } = operation
+    else {
+        return Err(UserAutomationServiceError::ResponseMismatch(
+            "mutation result kind",
+        ));
+    };
+    invocation.validate()?;
+    if invocation.automation_id != *automation_id
+        || invocation.automation_revision != *automation_revision
+        || invocation.trigger
+            != (eliot_kernel_core::UserAutomationTrigger::Manual {
+                nonce: nonce.clone(),
+            })
+        || invocation.trigger_origin != eliot_kernel_core::UserAutomationTriggerOrigin::Human
+        || invocation.occurrence_identity()? != wake_intent.wake_id
+    {
+        return Err(UserAutomationServiceError::ResponseMismatch(
+            "run-now invocation identity",
+        ));
+    }
+    wake_intent
+        .validate()
+        .map_err(|_| UserAutomationServiceError::ResponseMismatch("wake intent shape"))?;
+    if wake_intent.state != WakeIntentState::Pending {
+        return Err(UserAutomationServiceError::ResponseMismatch(
+            "run-now wake state",
+        ));
+    }
+    Ok(())
 }
 
 fn same_revision_except_store_normalization_receipt(
