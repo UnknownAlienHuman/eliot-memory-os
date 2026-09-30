@@ -5444,56 +5444,7 @@ pub(super) fn prepare_transaction_json_for_current_wire(
         }
     }
     if version == ContractVersion::new(30, 0, 0) {
-        let profile = value.get("profile").and_then(serde_json::Value::as_str);
-        let stage = value.get("stage").and_then(serde_json::Value::as_str);
-        if profile == Some("user_mode")
-            && matches!(stage, Some("ACTIVE_VERIFIED" | "CLEANING" | "COMPLETED"))
-        {
-            return Err(InstallationError::MigrationRequired {
-                reason: "v30 ActiveVerified UserMode transaction has no exact Host readiness acknowledgement; explicit recovery is required"
-                    .to_owned(),
-            });
-        }
-        let progress_entries = value
-            .get_mut("effect_progress")
-            .and_then(serde_json::Value::as_array_mut)
-            .ok_or_else(|| InstallationError::CorruptRegistry {
-                reason: "v30 installation transaction is missing its effect progress array"
-                    .to_owned(),
-            })?;
-        for (index, progress) in progress_entries.iter_mut().enumerate() {
-            let progress = progress
-                .as_object_mut()
-                .ok_or_else(|| InstallationError::CorruptRegistry {
-                    reason: format!(
-                        "v30 installation transaction effect progress entry {index} is not an object"
-                    ),
-                })?;
-            if progress.contains_key("current_user_task_run_host_ack") {
-                return Err(InstallationError::CorruptRegistry {
-                    reason: format!(
-                        "v30 installation transaction effect progress entry {index} contains a field outside its declared wire shape"
-                    ),
-                });
-            }
-            progress.insert(
-                "current_user_task_run_host_ack".to_owned(),
-                serde_json::Value::Null,
-            );
-        }
-        let object = value
-            .as_object_mut()
-            .ok_or_else(|| InstallationError::CorruptRegistry {
-                reason: "installation transaction wire is not an object".to_owned(),
-            })?;
-        object.insert(
-            "transaction_wire_version".to_owned(),
-            serde_json::to_value(INSTALLATION_TRANSACTION_WIRE_VERSION).map_err(|error| {
-                InstallationError::CorruptRegistry {
-                    reason: error.to_string(),
-                }
-            })?,
-        );
+        migrate_v30_transaction_wire_to_current(value)?;
         version = INSTALLATION_TRANSACTION_WIRE_VERSION;
     }
     if version != INSTALLATION_TRANSACTION_WIRE_VERSION {
@@ -5503,6 +5454,62 @@ pub(super) fn prepare_transaction_json_for_current_wire(
             ),
         });
     }
+    Ok(())
+}
+
+fn migrate_v30_transaction_wire_to_current(
+    value: &mut serde_json::Value,
+) -> Result<(), InstallationError> {
+    let profile = value.get("profile").and_then(serde_json::Value::as_str);
+    let stage = value.get("stage").and_then(serde_json::Value::as_str);
+    if profile == Some("user_mode")
+        && matches!(stage, Some("ACTIVE_VERIFIED" | "CLEANING" | "COMPLETED"))
+    {
+        return Err(InstallationError::MigrationRequired {
+            reason: "v30 ActiveVerified-or-later UserMode transaction has no exact Host readiness acknowledgement; explicit recovery is required"
+                .to_owned(),
+        });
+    }
+    let progress_entries = value
+        .get_mut("effect_progress")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| InstallationError::CorruptRegistry {
+            reason: "v30 installation transaction is missing its effect progress array"
+                .to_owned(),
+        })?;
+    for (index, progress) in progress_entries.iter_mut().enumerate() {
+        let progress = progress
+            .as_object_mut()
+            .ok_or_else(|| InstallationError::CorruptRegistry {
+                reason: format!(
+                    "v30 installation transaction effect progress entry {index} is not an object"
+                ),
+            })?;
+        if progress.contains_key("current_user_task_run_host_ack") {
+            return Err(InstallationError::CorruptRegistry {
+                reason: format!(
+                    "v30 installation transaction effect progress entry {index} contains a field outside its declared wire shape"
+                ),
+            });
+        }
+        progress.insert(
+            "current_user_task_run_host_ack".to_owned(),
+            serde_json::Value::Null,
+        );
+    }
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| InstallationError::CorruptRegistry {
+            reason: "installation transaction wire is not an object".to_owned(),
+        })?;
+    object.insert(
+        "transaction_wire_version".to_owned(),
+        serde_json::to_value(INSTALLATION_TRANSACTION_WIRE_VERSION).map_err(|error| {
+            InstallationError::CorruptRegistry {
+                reason: error.to_string(),
+            }
+        })?,
+    );
     Ok(())
 }
 
