@@ -2575,8 +2575,10 @@ struct MaintenanceTriggerIntakeRequest {
 
 /// Closed intake failure for one maintenance-trigger intake (issue #1694 W2).
 ///
-/// Every variant preserves its exact source error and projects one stable
-/// intake code, so an ORS/staging fault, a protocol or changed-content
+/// Variants name the failure kind only: exact source errors stay with their
+/// owners (retry under the same identity re-observes them) and never enter
+/// logs or responses, so a refusal carries its stable code and nothing
+/// privacy-sensitive. An ORS/staging fault, a protocol or changed-content
 /// conflict, a fenced generation, and a live-authority refusal stay
 /// distinguishable and never collapse into an acknowledgement. Any failure
 /// admits nothing and acknowledges nothing: the producer keeps its retry
@@ -2585,22 +2587,22 @@ struct MaintenanceTriggerIntakeRequest {
 enum MaintenanceTriggerIntakeFailure {
     /// The ORS owner could not prove the staged opaque input: capacity, key,
     /// integrity, or durable-write failure.
-    OrsStaging(eliot_ors::OrsError),
+    OrsStaging,
     /// The presented record failed protocol validation, or changed content
     /// under the same identity conflicted with staged bytes (`ReplayConflict`).
     Protocol(ProtocolError),
     /// The live generation is fenced for this intake.
     FencedGeneration,
     /// Live Kernel authority refused session or admission; fails closed.
-    LiveAuthority(KernelServiceError),
+    LiveAuthority,
     /// The Kernel owner could not reach its service or ledger state.
-    OwnerUnavailable(String),
+    OwnerUnavailable,
     /// The canonical Store refused the backing read.
-    Store(StoreError),
+    Store,
     /// A ledger-level refusal owned by another transition (claim/ack paths).
     /// Intake admission never produces one; it is preserved exactly and
     /// fails closed here rather than becoming an acknowledgement.
-    UnexpectedLedgerRefusal(MaintenanceTriggerDeliveryError),
+    UnexpectedLedgerRefusal,
 }
 
 #[cfg(windows)]
@@ -2620,22 +2622,20 @@ impl From<MaintenanceTriggerDeliveryError> for MaintenanceTriggerIntakeFailure {
     /// wildcard arm may absorb it.
     fn from(error: MaintenanceTriggerDeliveryError) -> Self {
         match error {
-            MaintenanceTriggerDeliveryError::StagingProof(error) => Self::OrsStaging(error),
+            MaintenanceTriggerDeliveryError::StagingProof(_) => Self::OrsStaging,
             MaintenanceTriggerDeliveryError::Protocol(error) => Self::Protocol(error),
             MaintenanceTriggerDeliveryError::Service(KernelServiceError::GenerationFenced) => {
                 Self::FencedGeneration
             }
-            MaintenanceTriggerDeliveryError::Service(error) => Self::LiveAuthority(error),
-            MaintenanceTriggerDeliveryError::OwnerUnavailable(reason) => {
-                Self::OwnerUnavailable(reason)
-            }
-            MaintenanceTriggerDeliveryError::Store(error) => Self::Store(error),
+            MaintenanceTriggerDeliveryError::Service(_) => Self::LiveAuthority,
+            MaintenanceTriggerDeliveryError::OwnerUnavailable(_) => Self::OwnerUnavailable,
+            MaintenanceTriggerDeliveryError::Store(_) => Self::Store,
             MaintenanceTriggerDeliveryError::UnknownTrigger
             | MaintenanceTriggerDeliveryError::ClaimConflict
             | MaintenanceTriggerDeliveryError::RevokedConsumer
             | MaintenanceTriggerDeliveryError::ExpiredEligibility
             | MaintenanceTriggerDeliveryError::MirrorRecoveryRequired => {
-                Self::UnexpectedLedgerRefusal(error)
+                Self::UnexpectedLedgerRefusal
             }
         }
     }
@@ -2654,7 +2654,7 @@ fn maintenance_trigger_intake_terminal_code(
     failure: &MaintenanceTriggerIntakeFailure,
 ) -> &'static str {
     match failure {
-        MaintenanceTriggerIntakeFailure::OrsStaging(_) => "INTAKE_STAGING_UNAVAILABLE",
+        MaintenanceTriggerIntakeFailure::OrsStaging => "INTAKE_STAGING_UNAVAILABLE",
         MaintenanceTriggerIntakeFailure::Protocol(error) => {
             if *error == ProtocolError::ReplayConflict {
                 "INTAKE_REPLAY_CONFLICT"
@@ -2663,10 +2663,10 @@ fn maintenance_trigger_intake_terminal_code(
             }
         }
         MaintenanceTriggerIntakeFailure::FencedGeneration => "INTAKE_GENERATION_FENCED",
-        MaintenanceTriggerIntakeFailure::LiveAuthority(_) => "INTAKE_LIVE_AUTHORITY_REFUSED",
-        MaintenanceTriggerIntakeFailure::OwnerUnavailable(_) => "INTAKE_OWNER_UNAVAILABLE",
-        MaintenanceTriggerIntakeFailure::Store(_) => "INTAKE_STORE_REFUSED",
-        MaintenanceTriggerIntakeFailure::UnexpectedLedgerRefusal(_) => "INTAKE_LEDGER_REFUSED",
+        MaintenanceTriggerIntakeFailure::LiveAuthority => "INTAKE_LIVE_AUTHORITY_REFUSED",
+        MaintenanceTriggerIntakeFailure::OwnerUnavailable => "INTAKE_OWNER_UNAVAILABLE",
+        MaintenanceTriggerIntakeFailure::Store => "INTAKE_STORE_REFUSED",
+        MaintenanceTriggerIntakeFailure::UnexpectedLedgerRefusal => "INTAKE_LEDGER_REFUSED",
     }
 }
 
