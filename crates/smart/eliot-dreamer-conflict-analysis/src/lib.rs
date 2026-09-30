@@ -21,6 +21,16 @@
 //! Every new shape below is constructed explicitly through the six typed
 //! parameters of [`analyze_conflict`], never decoded from ambient bytes.
 //!
+//! [`ConflictAnalysisPolicy`] is the one shape here that also carries a closed
+//! wire form, because it is a mandatory member of the production Orientation
+//! carrier (`bins/eliot-dreamer`) that an owner channel must supply across a
+//! process boundary. That form is closed and typed, not an intake path: it
+//! states `deny_unknown_fields`, it decodes nothing on this crate's behalf, and
+//! a decoded value reaches the analysis only through [`analyze_conflict`],
+//! which re-proves its recorded fields before any stage runs. No other shape
+//! below gained a deserializer, and none of the legacy declaration shapes
+//! gained one either.
+//!
 //! Runtime boundary: a malformed, mismatched, over-bound, cancelled, or
 //! past-deadline request fails closed as [`ConflictAnalysisError`] with zero
 //! effects. Semantic shortfalls (partial denominators, blocked probes,
@@ -304,6 +314,7 @@ use eliot_evidence::{
     Assertability, EpistemicStatus, EvidenceAuthority, EvidenceCoverage, EvidenceEnvelope,
     EvidenceFreshness,
 };
+use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // Independent bounds (no cross-subsidy between dimensions).
@@ -581,7 +592,23 @@ pub const KIND_PRECEDENCE: [ConflictKind; 8] = [
 ];
 
 /// Closed policy governing one conflict analysis.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Every field is a bounded scalar or bounded text, so the whole record is data
+/// and crosses a wire without a callback: this policy is a mandatory member of
+/// the production Orientation carrier (`bins/eliot-dreamer`), which receives it
+/// from the Governor supply channel rather than building one locally, and an
+/// in-process reference cannot express that. `deny_unknown_fields` keeps a
+/// decoded record from silently dropping a field this revision does not define.
+///
+/// Decoding proves nothing. A value read off a wire is untrusted input and
+/// reaches this cell through [`analyze_conflict`], which re-proves the ORIGINAL
+/// RECORDED fields of whichever instance it is called on - a non-default
+/// `policy_revision`, ceilings inside their exact bounds, bounded identity
+/// text, and `policy_id` equal to the item receipt's own validator policy. No
+/// field is defaulted on decode and none is read from ambient state, so a
+/// forged ceiling or a drifted policy identity is refused rather than admitted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConflictAnalysisPolicy {
     /// Governing policy identity; must equal the receipt validator policy.
     pub policy_id: String,

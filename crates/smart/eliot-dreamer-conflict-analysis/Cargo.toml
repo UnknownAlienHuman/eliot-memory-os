@@ -24,6 +24,9 @@ eliot-contracts.workspace = true
 eliot-evidence.workspace = true
 eliot-dreamer-contracts = { path = "../eliot-dreamer-contracts", version = "0.1.0" }
 eliot-epistemic-contracts = { path = "../eliot-epistemic-contracts", version = "0.1.0" }
+# Serialization infrastructure only: the closed policy record is data and must
+# cross the Governor supply wire. No provider, model, store, or canonical owner.
+serde.workspace = true
 
 [lints]
 workspace = true
