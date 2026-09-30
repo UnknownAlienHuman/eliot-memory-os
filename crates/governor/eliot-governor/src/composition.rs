@@ -163,10 +163,10 @@ mod native_worker_binding;
 // here as a descendant module rather than as a sibling of `composition`.
 #[path = "coordination_owner_commit.rs"]
 mod coordination_owner_commit;
-pub use coordination_owner_commit::{
-    CommittedCoordinationResult, CoordinationCommitError, commit_coordination_candidate_result,
-    commit_coordination_session, commit_coordination_work, coordination_owner_readback,
-};
+// Only the two genuinely module-level items are re-exported. The four write
+// entries are inherent methods on `GovernorComposition<P>`, not free items, so
+// they are reached as method calls and have no module path to re-export.
+pub use coordination_owner_commit::{CommittedCoordinationResult, CoordinationCommitError};
 pub use native_worker_binding::{
     NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_ID, NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_VERSION,
     NativeWorkerExecutableBinding, NativeWorkerLifecycleBinding, process_invocation_digest_for,
