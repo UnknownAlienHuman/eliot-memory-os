@@ -240,7 +240,9 @@ pub const fn watchdog_rule_table() -> &'static [WatchdogRule] {
 /// so it cannot be evaluated and cannot be cited as one.
 #[must_use]
 pub fn find_watchdog_rule(rule_id: &str) -> Option<&'static WatchdogRule> {
-    watchdog_rule_table().iter().find(|rule| rule.rule_id == rule_id)
+    watchdog_rule_table()
+        .iter()
+        .find(|rule| rule.rule_id == rule_id)
 }
 
 /// Returns the row for `rule_id` only when the table names it at exactly

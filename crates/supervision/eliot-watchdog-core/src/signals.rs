@@ -480,7 +480,10 @@ pub enum SignalValidationError {
     RuleNotApplicable,
     IdentityChanged,
     RevisionOverflow,
-    UnexpectedRevision { expected: u64, actual: u64 },
+    UnexpectedRevision {
+        expected: u64,
+        actual: u64,
+    },
 }
 
 pub(crate) fn text(value: &str, field: &'static str) -> Result<(), SignalValidationError> {
