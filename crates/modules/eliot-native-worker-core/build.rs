@@ -5,7 +5,7 @@ use eliot_contracts::{
     native_worker_resource_facet_v1,
 };
 
-const GENERATOR_VERSION: &str = "eliot-native-resource-facet-stubgen/1";
+const GENERATOR_VERSION: &str = "eliot-native-resource-facet-stubgen/2";
 
 // Controlled regeneration: set ELIOT_REGENERATE_NATIVE_WORKER_FACETS=1 for a
 // one-off cargo check -p eliot-native-worker-core; ordinary builds never
@@ -34,6 +34,7 @@ fn generate_projection() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=src/generated/native_worker_facets_v1.rs");
     println!("cargo:rerun-if-changed=../../foundation/eliot-contracts/src/facet_manifest.rs");
     println!("cargo:rerun-if-changed=../../foundation/eliot-contracts/src/lib.rs");
+    println!("cargo:rerun-if-changed=../../foundation/eliot-protocol/src/lib.rs");
     println!("cargo:rerun-if-env-changed=ELIOT_REGENERATE_NATIVE_WORKER_FACETS");
     println!("cargo:rustc-env=ELIOT_NATIVE_WORKER_RESOURCE_FACET_REF={canonical_ref}");
 
