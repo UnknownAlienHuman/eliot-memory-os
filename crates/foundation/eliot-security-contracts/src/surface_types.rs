@@ -38,16 +38,129 @@ pub struct SourceAssurance {
 
 /// Bounded metadata for one assessed source revision and declared scope.
 ///
-/// The digest identifies bytes supplied by the caller; this contract does not
-/// retrieve or independently authenticate those bytes.
+/// The revision is bound to the exact original input it was assessed from, and
+/// that input names the immutable artifact in the restricted store which holds
+/// its bytes. There is no digest field of its own any more: a bare digest with
+/// no artifact behind it was a hash of bytes nobody could read back, and I8.8
+/// requires preserved raw source. This contract still does not retrieve the
+/// bytes — it requires the binding to exist and states exactly what acquisition
+/// reached, so an unavailable acquisition is recorded rather than implied.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AssessedSourceRevision {
     pub source_ref: String,
     pub revision: String,
-    /// Lowercase SHA-256 of the exact source representation assessed.
-    pub digest: String,
+    /// The original input, bound before any transformation.
+    pub retained_input: RetainedSourceInput,
     pub scope: SourceAssessmentScope,
+}
+
+/// The original external input, retained before any transformation, with the
+/// immutable artifact that holds its bytes.
+///
+/// `retained_input_ref` is that artifact's handle. Raw evidence belongs in the
+/// restricted store and not in a Watchdog log, notification prose or an
+/// automatically remote model prompt, so the handle is the only place the bytes
+/// are named and the only place a readback can start from. It is present in
+/// every acquisition state, including the one that says nothing was retained.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedSourceInput {
+    /// Immutable artifact handle of the exact original bytes, in the restricted
+    /// store.
+    pub retained_input_ref: String,
+    /// What acquisition of this input actually reached.
+    pub acquisition: SourceAcquisition,
+}
+
+/// What acquisition of one external input actually reached.
+///
+/// The three states restate the artifact owner's completeness vocabulary on this
+/// side of the boundary: `eliot-blob-api`, and through it the artifact owner,
+/// sits above this crate in the dependency graph and cannot be referenced from
+/// it. There is no "unstated" variant, and no state carries a digest without the
+/// retained artifact handle beside it, so a digest over bytes that were never
+/// retained is not expressible here.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(
+    tag = "acquisition",
+    rename_all = "SCREAMING_SNAKE_CASE",
+    deny_unknown_fields
+)]
+pub enum SourceAcquisition {
+    /// The complete original input is retained under `retained_input_ref`.
+    Retained {
+        /// Lowercase SHA-256 of the retained original bytes.
+        digest: String,
+    },
+    /// Part of the original input is retained under `retained_input_ref`, and
+    /// the scope that was never retained is named rather than left to
+    /// inference.
+    Partial {
+        /// Lowercase SHA-256 of the retained original bytes.
+        digest: String,
+        /// Scope of the original input that was never retained.
+        unretained_scope_refs: Vec<String>,
+    },
+    /// Nothing of the original input is retained, so nothing read from it is
+    /// preserved evidence.
+    NotRetained {
+        /// Why no bytes were retained.
+        gap: SourceAcquisitionGap,
+    },
+}
+
+/// Why no bytes of an external input were retained.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SourceAcquisitionGap {
+    /// The restricted store could not admit the bytes.
+    RestrictedStoreUnavailable,
+    /// The source itself could not be acquired.
+    SourceUnavailable,
+    /// Applicable privacy or erasure policy withheld the bytes. Forensic
+    /// retention is not a bypass of that obligation.
+    WithheldByPolicy,
+    /// The producer cannot establish which gap applies.
+    Unknown,
+}
+
+impl RetainedSourceInput {
+    /// Whether the exact original bytes are retained and can be read back.
+    ///
+    /// A partial acquisition has retained bytes and a named gap, so it is
+    /// available and its gap stays explicit. Only a total gap is unavailable,
+    /// and it is never silent.
+    pub const fn has_retained_bytes(&self) -> bool {
+        matches!(
+            self.acquisition,
+            SourceAcquisition::Retained { .. } | SourceAcquisition::Partial { .. }
+        )
+    }
+
+    /// Validates the retained artifact handle and the acquisition state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the handle is blank, when a recorded digest is
+    /// malformed, or when a partial acquisition fails to name the scope it did
+    /// not retain.
+    pub fn validate(&self) -> Result<(), crate::SecurityContractError> {
+        assessment_text(&self.retained_input_ref, "retained_input.retained_input_ref")?;
+        match &self.acquisition {
+            SourceAcquisition::Retained { digest } => {
+                assessment_digest(digest, "retained_input.acquisition.digest")
+            }
+            SourceAcquisition::Partial { digest, unretained_scope_refs } => {
+                assessment_digest(digest, "retained_input.acquisition.digest")?;
+                assessment_refs(
+                    unretained_scope_refs,
+                    "retained_input.acquisition.unretained_scope_refs",
+                )
+            }
+            SourceAcquisition::NotRetained { .. } => Ok(()),
+        }
+    }
 }
 
 /// Declared included and excluded scope for an assessment.
@@ -262,15 +375,13 @@ pub(crate) fn assessment_text(
     Ok(())
 }
 
-fn assessment_digest(value: &str) -> Result<(), crate::SecurityContractError> {
+fn assessment_digest(value: &str, field: &'static str) -> Result<(), crate::SecurityContractError> {
     if value.len() != 64
         || value
             .bytes()
             .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
     {
-        return Err(crate::SecurityContractError::InvalidText {
-            field: "source.digest",
-        });
+        return Err(crate::SecurityContractError::InvalidText { field });
     }
     Ok(())
 }
@@ -326,8 +437,9 @@ fn validate_assessment_value(value: &AssessmentValue) -> Result<(), crate::Secur
 /// source content has no field in which to change them.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceUseAuthority {
-    /// Source revision and digest this narrowing is bound to, so the decision
-    /// names the assessed revision rather than the source in the abstract.
+    /// Source revision and retained original input this narrowing is bound to, so
+    /// the decision names the assessed revision rather than the source in the
+    /// abstract.
     pub assessed_source: AssessedSourceRevision,
     /// Allowed epistemic uses, intersected with the current assurance.
     pub permitted_uses: Vec<EpistemicUse>,
@@ -452,13 +564,14 @@ impl SourceSecurityAssessment {
     ///
     /// # Errors
     ///
-    /// Returns an error when the source digest, scope, assurance binding, or any
-    /// per-dimension record is malformed.
+    /// Returns an error when the retained original input, scope, assurance binding,
+    /// or any per-dimension record is malformed, or when a retained indicator
+    /// record cites an original input other than this assessment's own.
     pub fn validate(&self) -> Result<(), crate::SecurityContractError> {
         assessment_text(&self.assessment_ref, "assessment_ref")?;
         assessment_text(&self.source.source_ref, "source.source_ref")?;
         assessment_text(&self.source.revision, "source.revision")?;
-        assessment_digest(&self.source.digest)?;
+        self.source.retained_input.validate()?;
         assessment_text(&self.source.scope.scope_ref, "source.scope.scope_ref")?;
         assessment_refs(
             &self.source.scope.included_refs,
@@ -495,6 +608,23 @@ impl SourceSecurityAssessment {
         // resolution that consumes it.
         for record in &self.indicator_observations {
             record.validate()?;
+            // Retained foreign material is bound to this assessment's own
+            // source owner and to this assessment's own retained original
+            // input, checked against what this record carries rather than
+            // against a second list the caller supplies. A record that cites a
+            // different source or a different artifact is refused instead of
+            // being resolved, so the bytes behind an indicator are always the
+            // bytes this revision retained before transformation.
+            let cited = record.evidence.retained();
+            let bound_to_this_source = cited.is_some_and(|retained| {
+                retained.source_assurance.source_ref == self.source.source_ref
+                    && retained.retained_input == self.source.retained_input
+            });
+            if !bound_to_this_source {
+                return Err(crate::SecurityContractError::StaleSourceAssessment {
+                    field: "indicator_evidence.retained_source",
+                });
+            }
         }
         if REQUIRED_ASSESSMENT_DIMENSIONS
             .iter()

@@ -26,8 +26,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::SecurityContractError;
 use crate::surface_types::{
-    AssessedSourceRevision, EffectCeiling, EpistemicUse, SourceAssurance, SourceUseAuthority,
-    assessment_refs, assessment_text,
+    AssessedSourceRevision, EffectCeiling, EpistemicUse, RetainedSourceInput, SourceAssurance,
+    SourceUseAuthority, assessment_refs, assessment_text,
 };
 
 /// Number of indicator classes the I8.8 inventory fixes.
@@ -241,16 +241,24 @@ pub enum DroppedEvidenceKind {
 /// Retained foreign material an indicator class cites.
 ///
 /// The instruction-attempt class and the standing-instruction/secret-persistence
-/// class cite retained material the same way — an immutable artifact the
-/// passage was read from, plus retained handles for the passage inside it — and
-/// differ only in what they conclude from it. They therefore share this one
-/// shape and are distinguished by their [`IndicatorEvidence`] variant and its
-/// class-specific field, rather than by two near-identical payload structs.
+/// class cite retained material the same way — the existing source owner for the
+/// bytes, the original input bound to the immutable artifact that holds them,
+/// plus retained handles for the passage inside it — and differ only in what
+/// they conclude from it. They therefore share this one shape and are
+/// distinguished by their [`IndicatorEvidence`] variant and its class-specific
+/// field, rather than by two near-identical payload structs.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RetainedExternalEvidence {
-    /// Retained immutable artifact the passage was read from.
-    pub retained_source_ref: String,
+    /// The existing source owner for these exact bytes.
+    ///
+    /// Instruction taint, privacy class, permitted uses and effect ceilings are
+    /// read from here rather than restated, so this record cannot widen what the
+    /// source owner grants and cannot carry a second, conflicting taint value.
+    pub source_assurance: SourceAssurance,
+    /// The original document, bound to the retained bytes before any
+    /// transformation, with what acquisition of it actually reached.
+    pub retained_input: RetainedSourceInput,
     /// Retained handles for the passage itself, in the restricted store.
     pub evidence_handles: Vec<String>,
 }
@@ -378,7 +386,10 @@ impl IndicatorEvidence {
     /// name: binding one name across two differently-typed payload variants is
     /// a type error, and giving the two classes one payload shape is both the
     /// true statement and the legal way to dispatch on them together.
-    fn retained(&self) -> Option<&RetainedExternalEvidence> {
+    ///
+    /// The assessment that retains a record uses this to check that the
+    /// retained input the record cites is its own.
+    pub fn retained(&self) -> Option<&RetainedExternalEvidence> {
         match self {
             Self::ExternalInstructionAttempt { retained, .. }
             | Self::StandingInstructionOrSecretPersistence { retained, .. } => Some(retained),
@@ -422,6 +433,11 @@ impl IndicatorEvidence {
     /// example or as narration establishes no attempt by this source at all, so
     /// it reports unknown coverage rather than complete.
     ///
+    /// The standing-instruction/secret-persistence class depends on the retained
+    /// original bytes being available at all: a source whose acquisition
+    /// retained nothing leaves nothing to read the request from, so the class
+    /// bounds nothing rather than resting on a digest of bytes nobody holds.
+    ///
     /// The two classes with no optional baseline name the field their
     /// comparison rests on instead of asserting a bare `true`, so each arm
     /// states what it actually depends on.
@@ -431,7 +447,7 @@ impl IndicatorEvidence {
                 matches!(content_role, ExternalContentRole::DirectInstruction)
             }
             Self::StandingInstructionOrSecretPersistence { retained, .. } => {
-                !retained.retained_source_ref.is_empty()
+                retained.retained_input.has_retained_bytes()
             }
             Self::UnexpectedToolDefinitionChange(evidence) => {
                 evidence.approved_schema_revision.is_some()
@@ -679,7 +695,7 @@ impl RecordedIndicatorObservation {
 pub struct ProposedSourceRestriction {
     /// The indicator class this restriction came from.
     pub indicator: IndicatorClass,
-    /// The exact source revision, digest and scope it is bound to.
+    /// The exact source revision, retained original input and scope it is bound to.
     pub assessed_source: AssessedSourceRevision,
     /// Uses this indicator may leave admissible, before intersection.
     pub permitted_uses: &'static [EpistemicUse],
@@ -848,14 +864,17 @@ impl IndicatorSourceMap {
     }
 }
 
-/// Retained foreign material must name its artifact and cite retained handles.
+/// Retained foreign material must name its source owner, bind its original
+/// input, and cite retained handles.
 ///
 /// # Errors
 ///
-/// Returns an error when the artifact reference is blank or when the handle
-/// collection is empty or contains duplicates.
+/// Returns an error when the source owner, the retained artifact binding or a
+/// recorded digest is malformed, or when the handle collection is empty or
+/// contains duplicates.
 fn validate_retained(retained: &RetainedExternalEvidence) -> Result<(), SecurityContractError> {
-    assessment_text(&retained.retained_source_ref, "retained_source_ref")?;
+    retained.source_assurance.validate()?;
+    retained.retained_input.validate()?;
     assessment_refs(&retained.evidence_handles, "evidence_handles")
 }
 
