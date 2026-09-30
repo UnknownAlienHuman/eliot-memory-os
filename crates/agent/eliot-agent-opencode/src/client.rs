@@ -7,11 +7,10 @@ use crate::{
     OPENCODE_PROVIDER_RAW_OUTPUT_UTF8_KEY, OPENCODE_ROUTE_RECONCILIATION_REF, OpenCodeEvent,
     OpenCodeObservationConversionError, OpenCodeWireRouteReceipt, PhysicalObservationBody,
     ProviderCatalog, ProviderOutputObservation, QuotaAvailability, ReadOnlyRunRequest,
-    RunRequestError, RunStatus,
-    SealedRouteDisposition, Session, SessionDiff, SessionStatus, SessionStatusMap, SseConnection,
-    SseDecodeError, SseDecoder, SseEvent, SseLimits, UnknownFields, UsageAvailability,
-    UsageTelemetry, bound_session_identity, committed_message_id, wire_receipt_evidence,
-    wire_route_locator,
+    RunRequestError, RunStatus, SealedRouteDisposition, Session, SessionDiff, SessionStatus,
+    SessionStatusMap, SseConnection, SseDecodeError, SseDecoder, SseEvent, SseLimits,
+    UnknownFields, UsageAvailability, UsageTelemetry, bound_session_identity, committed_message_id,
+    wire_receipt_evidence, wire_route_locator,
 };
 use eliot_agent_api::{
     AgentResult, EffectCeiling, EventCursor, ExecutionOutcome, ResultDisposition,
@@ -576,11 +575,7 @@ fn provider_output_observation_from_events(
     let mut usage = None;
     for event in events {
         if event.event_type == "message.updated"
-            && event
-                .properties
-                .get("sessionID")
-                .and_then(Value::as_str)
-                == Some(session_id)
+            && event.properties.get("sessionID").and_then(Value::as_str) == Some(session_id)
         {
             if let Some(info) = event.properties.get("info").and_then(Value::as_object)
                 && info.get("role").and_then(Value::as_str) == Some("assistant")
@@ -590,16 +585,16 @@ fn provider_output_observation_from_events(
                     assistant_ids.insert(assistant_id.to_owned());
                 }
                 observed_model = attest_message_route(info, requested).ok();
-                usage = info
-                    .get("tokens")
-                    .and_then(Value::as_object)
-                    .map(|tokens| UsageTelemetry {
-                        input_tokens: tokens.get("input").and_then(Value::as_u64),
-                        output_tokens: tokens.get("output").and_then(Value::as_u64),
-                        total_tokens: tokens.get("total").and_then(Value::as_u64),
-                        cost_usd: info.get("cost").and_then(Value::as_f64),
-                        extra: UnknownFields::new(),
-                    });
+                usage =
+                    info.get("tokens")
+                        .and_then(Value::as_object)
+                        .map(|tokens| UsageTelemetry {
+                            input_tokens: tokens.get("input").and_then(Value::as_u64),
+                            output_tokens: tokens.get("output").and_then(Value::as_u64),
+                            total_tokens: tokens.get("total").and_then(Value::as_u64),
+                            cost_usd: info.get("cost").and_then(Value::as_f64),
+                            extra: UnknownFields::new(),
+                        });
             }
         }
     }
@@ -613,17 +608,11 @@ fn provider_output_observation_from_events(
                     .and_then(Value::as_object)
                     .is_some_and(|info| {
                         info.get("role").and_then(Value::as_str) == Some("assistant")
-                            && info.get("parentID").and_then(Value::as_str)
-                                == Some(user_message_id)
-                            && info.get("sessionID").and_then(Value::as_str)
-                                == Some(session_id)
+                            && info.get("parentID").and_then(Value::as_str) == Some(user_message_id)
+                            && info.get("sessionID").and_then(Value::as_str) == Some(session_id)
                     })
             } else if event.event_type == "message.part.updated"
-                && event
-                    .properties
-                    .get("sessionID")
-                    .and_then(Value::as_str)
-                    == Some(session_id)
+                && event.properties.get("sessionID").and_then(Value::as_str) == Some(session_id)
             {
                 event
                     .properties
@@ -1538,8 +1527,8 @@ impl OpenCodeClient {
             Err(_) => {
                 return Err(retain_observed_output_failure(
                     admitted_deadline_unknown(
-                    "terminal-message reconciliation",
-                    "a terminal assistant event was observed but its full owner result was not reconciled",
+                        "terminal-message reconciliation",
+                        "a terminal assistant event was observed but its full owner result was not reconciled",
                     ),
                     observation,
                     "terminal assistant events were observed before reconciliation stopped",
@@ -2340,13 +2329,7 @@ fn seal_admitted_outcome(
         })
         .collect();
     crate::ensure_no_open_child_sessions(&session_id, &children).map_err(|error| {
-        retain_sealed_run_failure(
-            error,
-            &run,
-            None,
-            "open child-session validation",
-            None,
-        )
+        retain_sealed_run_failure(error, &run, None, "open child-session validation", None)
     })?;
     // Attempt-bound heartbeat/progress/quota summaries sealed into the
     // result extra, reusing the already-reconciled status map with no new
@@ -2386,13 +2369,7 @@ fn seal_admitted_outcome(
     // over the reconciled execution state — never unconditionally — so the
     // marker rides the seal digest below.
     crate::admitted_edge_proof_gate(&session_id, statuses).map_err(|error| {
-        retain_sealed_run_failure(
-            error,
-            &run,
-            None,
-            "candidate edge-proof gate",
-            None,
-        )
+        retain_sealed_run_failure(error, &run, None, "candidate edge-proof gate", None)
     })?;
     run.extra.insert(
         "edge".to_owned(),
@@ -2445,15 +2422,16 @@ fn seal_admitted_outcome(
     // classify it — and a legacy artifact predating this field decodes as
     // explicitly unverified rather than a current receipt.
     candidate.route_disposition = Some(route.clone());
-    slot.confirm(admitted, &session_id, message_id).map_err(|error| {
-        retain_sealed_run_failure(
-            error,
-            &run,
-            Some(&route),
-            "admitted slot confirmation after original candidate seal",
-            Some(&candidate),
-        )
-    })?;
+    slot.confirm(admitted, &session_id, message_id)
+        .map_err(|error| {
+            retain_sealed_run_failure(
+                error,
+                &run,
+                Some(&route),
+                "admitted slot confirmation after original candidate seal",
+                Some(&candidate),
+            )
+        })?;
     // The terminal observation is emitted bound to the exact attempt,
     // quoting the seal it follows; the seal digest covers the run at seal
     // time, and this observation references that digest instead of
@@ -2671,7 +2649,9 @@ fn merge_provider_output_observation(
         retained.raw_output = Some(raw_output);
         retained.observed_model = newer.observed_model;
     } else if retained.raw_output.is_none() {
-        retained.observed_model = newer.observed_model.or_else(|| retained.observed_model.clone());
+        retained.observed_model = newer
+            .observed_model
+            .or_else(|| retained.observed_model.clone());
     }
     retained.usage = newer.usage.or_else(|| retained.usage.clone());
     retained.usage_availability = newer
@@ -2684,7 +2664,9 @@ fn merge_provider_output_observation(
         }
     }
     retained.actual_route = newer.actual_route.or_else(|| retained.actual_route.clone());
-    retained.physical_route = newer.physical_route.or_else(|| retained.physical_route.clone());
+    retained.physical_route = newer
+        .physical_route
+        .or_else(|| retained.physical_route.clone());
 }
 
 fn provider_output_observation_from_run(run: &NoAuthorityRunResult) -> ProviderOutputObservation {
@@ -2716,14 +2698,12 @@ fn retain_sealed_run_failure(
     if !observation.has_evidence() {
         return cause;
     }
-    AdmittedAttemptError::ObservedOutputFailure(Box::new(
-        crate::AdmittedAttemptOutputFailure {
-            cause: Box::new(cause),
-            observation: Box::new(observation),
-            candidate: candidate.cloned().map(Box::new),
-            reconciliation: reconciliation.to_owned(),
-        },
-    ))
+    AdmittedAttemptError::ObservedOutputFailure(Box::new(crate::AdmittedAttemptOutputFailure {
+        cause: Box::new(cause),
+        observation: Box::new(observation),
+        candidate: candidate.cloned().map(Box::new),
+        reconciliation: reconciliation.to_owned(),
+    }))
 }
 
 /// A wall-budget expiry after an admitted slot may have had provider work is
@@ -3113,70 +3093,72 @@ fn inspect_messages(
         })?;
     let observation = provider_output_observation_from_message(assistant, requested);
     let projection = (|| {
-    let info = assistant
-        .get("info")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            OpenCodeRunError::Protocol("assistant message info is not an object".to_owned())
-        })?;
-    if info.get("error").is_some_and(|error| !error.is_null()) {
-        return Err(provider_error(info.get("error"), "MessageError"));
-    }
-    if info
-        .get("time")
-        .and_then(Value::as_object)
-        .and_then(|time| time.get("completed"))
-        .and_then(Value::as_u64)
-        .is_none()
-    {
-        return Err(OpenCodeRunError::Protocol(
-            "assistant message has no completion timestamp".to_owned(),
-        ));
-    }
-    let completed_at_ms = info
-        .get("time")
-        .and_then(Value::as_object)
-        .and_then(|time| time.get("completed"))
-        .and_then(Value::as_u64)
-        .ok_or_else(|| {
-            OpenCodeRunError::Protocol("assistant message has no completion timestamp".to_owned())
-        })?;
-    let observed_model = attest_message_route(info, requested)?;
+        let info = assistant
+            .get("info")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                OpenCodeRunError::Protocol("assistant message info is not an object".to_owned())
+            })?;
+        if info.get("error").is_some_and(|error| !error.is_null()) {
+            return Err(provider_error(info.get("error"), "MessageError"));
+        }
+        if info
+            .get("time")
+            .and_then(Value::as_object)
+            .and_then(|time| time.get("completed"))
+            .and_then(Value::as_u64)
+            .is_none()
+        {
+            return Err(OpenCodeRunError::Protocol(
+                "assistant message has no completion timestamp".to_owned(),
+            ));
+        }
+        let completed_at_ms = info
+            .get("time")
+            .and_then(Value::as_object)
+            .and_then(|time| time.get("completed"))
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                OpenCodeRunError::Protocol(
+                    "assistant message has no completion timestamp".to_owned(),
+                )
+            })?;
+        let observed_model = attest_message_route(info, requested)?;
 
-    let parts = assistant
-        .get("parts")
-        .and_then(Value::as_array)
-        .ok_or_else(|| OpenCodeRunError::Protocol("assistant parts are missing".to_owned()))?;
-    let terminal_stop = parts.iter().any(|part| {
-        part.get("type").and_then(Value::as_str) == Some("step-finish")
-            && part.get("reason").and_then(Value::as_str) == Some("stop")
-    }) || info.get("finish").and_then(Value::as_str) == Some("stop");
-    if !terminal_stop {
-        return Err(OpenCodeRunError::Protocol(
-            "assistant message has no terminal stop attestation".to_owned(),
-        ));
-    }
-    let tokens = info.get("tokens").and_then(Value::as_object);
-    let usage = tokens.map(|tokens| UsageTelemetry {
-        input_tokens: tokens.get("input").and_then(Value::as_u64),
-        output_tokens: tokens.get("output").and_then(Value::as_u64),
-        total_tokens: tokens.get("total").and_then(Value::as_u64),
-        cost_usd: info.get("cost").and_then(Value::as_f64),
-        extra: UnknownFields::new(),
-    });
-    let (output, raw_output) = parse_text_json_output(
-        parts,
-        expected_output_schema,
-        &observed_model,
-        usage.as_ref(),
-    )?;
-    Ok(MessageProjection {
-        observed_model,
-        output,
-        raw_output,
-        usage,
-        completed_at_ms,
-    })
+        let parts = assistant
+            .get("parts")
+            .and_then(Value::as_array)
+            .ok_or_else(|| OpenCodeRunError::Protocol("assistant parts are missing".to_owned()))?;
+        let terminal_stop = parts.iter().any(|part| {
+            part.get("type").and_then(Value::as_str) == Some("step-finish")
+                && part.get("reason").and_then(Value::as_str) == Some("stop")
+        }) || info.get("finish").and_then(Value::as_str) == Some("stop");
+        if !terminal_stop {
+            return Err(OpenCodeRunError::Protocol(
+                "assistant message has no terminal stop attestation".to_owned(),
+            ));
+        }
+        let tokens = info.get("tokens").and_then(Value::as_object);
+        let usage = tokens.map(|tokens| UsageTelemetry {
+            input_tokens: tokens.get("input").and_then(Value::as_u64),
+            output_tokens: tokens.get("output").and_then(Value::as_u64),
+            total_tokens: tokens.get("total").and_then(Value::as_u64),
+            cost_usd: info.get("cost").and_then(Value::as_f64),
+            extra: UnknownFields::new(),
+        });
+        let (output, raw_output) = parse_text_json_output(
+            parts,
+            expected_output_schema,
+            &observed_model,
+            usage.as_ref(),
+        )?;
+        Ok(MessageProjection {
+            observed_model,
+            output,
+            raw_output,
+            usage,
+            completed_at_ms,
+        })
     })();
     projection.map_err(|error| {
         retain_observed_output_failure(

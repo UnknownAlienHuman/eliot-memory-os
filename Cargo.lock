@@ -1962,6 +1962,7 @@ dependencies = [
 name = "eliot-governor"
 version = "0.1.0"
 dependencies = [
+ "eliot-agent-api",
  "eliot-authority",
  "eliot-budget",
  "eliot-canonical",
@@ -3312,6 +3313,7 @@ name = "eliot-task"
 version = "0.1.0"
 dependencies = [
  "eliot-contracts",
+ "eliot-types",
  "schemars",
  "serde",
  "thiserror",

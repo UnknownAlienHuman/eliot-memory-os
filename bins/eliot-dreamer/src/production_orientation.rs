@@ -55,8 +55,10 @@ use eliot_dreamer_claim_grounding::GroundingRequest;
 use eliot_dreamer_classification::ClassificationPolicy;
 use eliot_dreamer_conflict_analysis::{ConflictAnalysisPolicy, ConflictSupplements};
 use eliot_dreamer_contracts::{
-    ClassificationInput, CurationAcceptanceCtx, DreamInputBundle, DreamJobAdmission, GroundedDreamDraft, JobClass, ModelRouteDisposition, ModelRouteOutcome,
-    ModelRouteRequest, ValidatedCandidate, ValidatedCurationItem, ValidatedDreamDraft, ValidatedGroundingCandidate, bundle_digest_of,
+    ClassificationInput, CurationAcceptanceCtx, DreamInputBundle, DreamJobAdmission,
+    GroundedDreamDraft, JobClass, ModelRouteDisposition, ModelRouteOutcome, ModelRouteRequest,
+    ValidatedCandidate, ValidatedCurationItem, ValidatedDreamDraft, ValidatedGroundingCandidate,
+    bundle_digest_of,
 };
 use eliot_dreamer_orientation::{
     AdmittedOrientationJob, CurrentEpistemicPositionHandle, OrientationDisposition,
@@ -331,7 +333,7 @@ pub(crate) fn borrow_governor_supply<'a>(
         understanding: UnderstandingStage {
             admitted: supply.admitted_context_set,
             recipe: supply.recipe,
-            quality: supply.quality.clone(),
+            quality: supply.quality,
             policy: supply.assembly_policy,
             measure: supply.measure,
         },
@@ -1100,7 +1102,7 @@ fn missing_prerequisites_blocked(
             reason: Some(if stale {
                 ORIENTATION_SUPPLY_STALE.to_owned()
             } else {
-                CC002_MISSING.to_owned()
+                MODEL_OUTCOME_MISSING.to_owned()
             }),
         },
         projections: OrientationBoundaryRecord {
@@ -1119,7 +1121,7 @@ fn missing_prerequisites_blocked(
             vec![ORIENTATION_SUPPLY_STALE.to_owned()]
         } else {
             vec![
-                CC002_MISSING.to_owned(),
+                MODEL_OUTCOME_MISSING.to_owned(),
                 CC004_MISSING.to_owned(),
                 ORIENTATION_SUPPLY_MISSING.to_owned(),
             ]
@@ -1135,7 +1137,11 @@ pub(crate) fn absent_owner_supply(
     job: &DreamJobInput,
     stale: bool,
 ) -> OrientationPulseResult {
-    let reason = if stale { ORIENTATION_SUPPLY_STALE } else { ORIENTATION_SUPPLY_MISSING };
+    let reason = if stale {
+        ORIENTATION_SUPPLY_STALE
+    } else {
+        ORIENTATION_SUPPLY_MISSING
+    };
     let boundary = |name: &str| OrientationBoundaryRecord {
         boundary: name.to_owned(),
         present: false,
@@ -1143,11 +1149,16 @@ pub(crate) fn absent_owner_supply(
         disposition: None,
         reason: Some(reason.to_owned()),
     };
-    let stages = PulseStageId::ORDER.iter().map(|id| {
-        let mut record = blocked_stage_record(*id, reason);
-        if stale { record.disposition = OrientationStageDisposition::Stale; }
-        record
-    }).collect();
+    let stages = PulseStageId::ORDER
+        .iter()
+        .map(|id| {
+            let mut record = blocked_stage_record(*id, reason);
+            if stale {
+                record.disposition = OrientationStageDisposition::Stale;
+            }
+            record
+        })
+        .collect();
     terminal_pulse_result(BlockedParts {
         disposition: OrientationDisposition::Blocked,
         identity: BlockedIdentity {
@@ -1167,8 +1178,12 @@ pub(crate) fn absent_owner_supply(
         stages,
         omissions: vec![reason.to_owned()],
         missing_owners: std::iter::once(OWNER_PROJECTIONS.to_owned())
-            .chain(PulseStageId::ORDER.iter().filter(|id| **id != PulseStageId::Packet)
-                .map(|id| id.owner_entry().to_owned()))
+            .chain(
+                PulseStageId::ORDER
+                    .iter()
+                    .filter(|id| **id != PulseStageId::Packet)
+                    .map(|id| id.owner_entry().to_owned()),
+            )
             .collect(),
     })
 }

@@ -165,6 +165,7 @@ pub struct CurationExecutionCarrier<'a> {
 /// port per owner family, Orientation needs the Governor-resolved owner supply.
 /// Each stays an independent optional so one class's absence never implies the
 /// other's, and both are `None` in the worker role where no owner is attached.
+#[cfg(test)]
 pub(crate) struct OwnerCarriers<'a> {
     /// Curation owner records, present only for an admitted Curation job.
     pub curation: Option<CurationExecutionCarrier<'a>>,

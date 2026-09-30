@@ -625,7 +625,10 @@ fn run_admitted_pipeline(
                 Some(source.validated_draft),
                 production_orientation::borrow_governor_supply(admission, source),
             ),
-            None => (None, production_orientation::ProductionOrientationSupply::Missing),
+            None => (
+                None,
+                production_orientation::ProductionOrientationSupply::Missing,
+            ),
         };
         return dispatch_stage::dispatch_admitted_with_orientation_supply(
             admission,

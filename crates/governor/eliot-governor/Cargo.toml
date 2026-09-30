@@ -7,6 +7,7 @@ license.workspace = true
 description = "Production Governor orchestration and readiness owner"
 
 [dependencies]
+eliot-agent-api.workspace = true
 eliot-authority.workspace = true
 eliot-budget.workspace = true
 eliot-canonical.workspace = true

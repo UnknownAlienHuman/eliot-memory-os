@@ -7,6 +7,7 @@ license.workspace = true
 description = "Deterministic, fenced owner of the governed task lifecycle"
 
 [dependencies]
+eliot-types.workspace = true
 eliot-contracts.workspace = true
 schemars.workspace = true
 serde.workspace = true

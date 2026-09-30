@@ -4,20 +4,20 @@ use eliot_context_assembly::ActiveUnderstandingViewResult;
 use eliot_context_candidates::ContextCandidateSetResult;
 use eliot_context_contracts::{CanonicalProjectionSet, ContextError, SerializedContextMeasurement};
 use eliot_cue_activation::CueActivationEvaluation;
+use eliot_dreamer_claim_grounding::GroundingRequest;
 use eliot_dreamer_classification::ClassificationResult;
 use eliot_dreamer_conflict_analysis::ConflictAnalysisCandidate;
 use eliot_dreamer_contracts::grounding::GroundedDreamDraft as StructuredGroundedDreamDraft;
+use eliot_dreamer_contracts::rival::RivalModelSet as ProbeRivalModelSet;
 use eliot_dreamer_contracts::{
     DreamInputBundle, ModelDraft, ModelRouteOutcome, ValidatedGroundingCandidate, canonical_bytes,
 };
-use eliot_dreamer_claim_grounding::GroundingRequest;
 use eliot_dreamer_orientation::{
     InertProbe, OrientationInterpretation, OrientationResidue, OrientationSemanticView,
     OrientationStageOutput,
 };
 use eliot_dreamer_probe_plan::{ProbePlan, ProbePlanParams};
 use eliot_dreamer_rival_model::RivalModelSet;
-use eliot_dreamer_contracts::rival::RivalModelSet as ProbeRivalModelSet;
 use eliot_epistemic::{CurrentEpistemicPosition, PositionRequest};
 use serde::Serialize;
 
@@ -142,11 +142,9 @@ impl StageOutputSet {
             StageOwnerOutput::Classification(output) => self.classification = Some(output),
             StageOwnerOutput::CueActivation(output) => self.cue_activation = Some(output),
             StageOwnerOutput::EpistemicPosition(output) => {
-                let Some(position) = canonical_residue(
-                    "epistemic_position",
-                    &output,
-                    "epistemic_position",
-                ) else {
+                let Some(position) =
+                    canonical_residue("epistemic_position", &output, "epistemic_position")
+                else {
                     return false;
                 };
                 self.rival_items.push(position);
@@ -163,12 +161,18 @@ impl StageOutputSet {
                 ) {
                     return false;
                 }
-                self.gaps.extend(output.unknowns.iter().map(|text| {
-                    residue("epistemic_unknown", text, "epistemic_position")
-                }));
-                self.gaps.extend(output.required_inquiry.iter().map(|text| {
-                    residue("required_inquiry", text, "epistemic_position")
-                }));
+                self.gaps.extend(
+                    output
+                        .unknowns
+                        .iter()
+                        .map(|text| residue("epistemic_unknown", text, "epistemic_position")),
+                );
+                self.gaps.extend(
+                    output
+                        .required_inquiry
+                        .iter()
+                        .map(|text| residue("required_inquiry", text, "epistemic_position")),
+                );
                 self.epistemic_position = Some(output);
             }
             StageOwnerOutput::Understanding(output) => self.understanding = Some(output),
@@ -234,8 +238,7 @@ impl StageOutputSet {
                     "probe_plan_omissions_count",
                     output.omissions.len(),
                     source,
-                )
-                {
+                ) {
                     return false;
                 }
                 for (index, probe) in output.probes.iter().enumerate() {
@@ -413,9 +416,7 @@ pub(crate) fn run_mandatory_stages(
         run_grounding_stage(Some(inputs.grounding)),
         PulseStageId::Grounding
     );
-    if outputs.grounding.as_ref()
-        != inputs.rivals.validated_draft.input.grounded.as_ref()
-    {
+    if outputs.grounding.as_ref() != Some(inputs.rivals.validated_draft.input.grounded.as_ref()) {
         return failed_run(
             stages,
             outputs,
@@ -714,7 +715,11 @@ fn residue(kind: &str, text: &str, source: &str) -> OrientationResidue {
     }
 }
 
-fn canonical_residue<T: Serialize>(kind: &str, value: &T, source: &str) -> Option<OrientationResidue> {
+fn canonical_residue<T: Serialize>(
+    kind: &str,
+    value: &T,
+    source: &str,
+) -> Option<OrientationResidue> {
     Some(residue(kind, &canonical_text(value)?, source))
 }
 
@@ -745,7 +750,8 @@ fn push_string_sequence(
         return false;
     }
     for (index, value) in values.iter().enumerate() {
-        let Some(entry) = canonical_residue(kind, value, &format!("{source}:{kind}:{index}")) else {
+        let Some(entry) = canonical_residue(kind, value, &format!("{source}:{kind}:{index}"))
+        else {
             return false;
         };
         target.push(entry);
@@ -904,7 +910,8 @@ fn retain_conflict_semantics(
             return false;
         }
         for (compatibility_index, compatibility) in position.compatibility.iter().enumerate() {
-            let compatibility_source = format!("{position_source}:compatibility:{compatibility_index}");
+            let compatibility_source =
+                format!("{position_source}:compatibility:{compatibility_index}");
             push!(
                 &mut target.gaps,
                 "conflict_compatibility_other_source",
@@ -975,7 +982,10 @@ fn retain_conflict_semantics(
                             &outcome_source
                         );
                     }
-                    eliot_dreamer_conflict_analysis::DimensionOutcome::Differing { left, right } => {
+                    eliot_dreamer_conflict_analysis::DimensionOutcome::Differing {
+                        left,
+                        right,
+                    } => {
                         push!(
                             &mut target.gaps,
                             "conflict_compatibility_outcome_kind",
@@ -995,7 +1005,9 @@ fn retain_conflict_semantics(
                             &outcome_source
                         );
                     }
-                    eliot_dreamer_conflict_analysis::DimensionOutcome::Unnormalizable { reason } => {
+                    eliot_dreamer_conflict_analysis::DimensionOutcome::Unnormalizable {
+                        reason,
+                    } => {
                         push!(
                             &mut target.gaps,
                             "conflict_compatibility_outcome_kind",
@@ -1059,7 +1071,12 @@ fn retain_conflict_semantics(
     }
     for (index, risk) in output.common_mode_risks.iter().enumerate() {
         let risk_source = format!("{source}:common_mode_risk:{index}");
-        push!(&mut target.gaps, "conflict_risk_kind", &risk.kind, &risk_source);
+        push!(
+            &mut target.gaps,
+            "conflict_risk_kind",
+            &risk.kind,
+            &risk_source
+        );
         push!(
             &mut target.gaps,
             "conflict_risk_description",

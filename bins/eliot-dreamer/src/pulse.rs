@@ -114,7 +114,7 @@ pub(crate) struct UnderstandingStage<'a, F> {
     /// Recipe the admitted set must satisfy.
     pub recipe: &'a ContextRecipe,
     /// Quality scorecard bound to the admitted binding.
-    pub quality: QualityScorecard,
+    pub quality: &'a QualityScorecard,
     /// Caller-owned immutable assembly parameters.
     pub policy: &'a AssemblyPolicy,
     /// Route measurement invoked once over the canonical payload bytes.
@@ -350,8 +350,8 @@ pub(crate) const CONFLICT_OUTPUT_QUALIFIED: bool = false;
 /// The member's owner output is deliberately not retained here: each stage
 /// entry invokes its named owner, digests the exact owner output into
 /// `output_commitment`, and returns the disposition record. The typed output
-/// value itself had no reader — the ledger records the commitment, not the
-/// value — so retaining it duplicated a digest the stage had already proved.
+/// value itself had no reader â€” the ledger records the commitment, not the
+/// value â€” so retaining it duplicated a digest the stage had already proved.
 pub(crate) struct PulseStage {
     /// Denominator member identity.
     pub id: PulseStageId,
@@ -711,7 +711,7 @@ where
             let input_commitment = canonical_input_commitment(&UnderstandingInput {
                 admitted: inputs.admitted,
                 recipe: inputs.recipe,
-                quality: &inputs.quality,
+                quality: inputs.quality,
                 fence_digest: &inputs.policy.fence_digest,
                 max_serialized_bytes: inputs.policy.max_serialized_bytes,
                 serializer_id: &inputs.policy.serializer_id,
@@ -732,7 +732,7 @@ where
             .map_err(|_| PulseError::Understanding)?;
             if output.admitted != *inputs.admitted
                 || output.view.binding != inputs.admitted.binding
-                || output.view.quality != inputs.quality
+                || output.view.quality != *inputs.quality
                 || output.view.recipe_digest != inputs.recipe.recipe_sha256
                 || output.view.fence_digest != inputs.policy.fence_digest
                 || output.verify_boundaries().is_err()
@@ -942,7 +942,8 @@ pub(crate) fn run_probe_stage(
                 inputs.policy,
             ))
             .ok_or(PulseError::Probes)?;
-            let output = plan_discriminative_probes(inputs).map_err(|_| PulseError::Probes)?;
+            let output =
+                plan_discriminative_probes(inputs.clone()).map_err(|_| PulseError::Probes)?;
             output.validate().map_err(|_| PulseError::Probes)?;
             if output.task_id.as_str() != inputs.bundle.task_id
                 || output.scope != inputs.bundle.scope_id
