@@ -3813,7 +3813,13 @@ const fn restore_error_code(error: &KernelRestoreError) -> &'static str {
         KernelRestoreError::OwnerEvidenceInvalid(_) => "restore-owner-evidence-invalid",
         KernelRestoreError::CutoverNotAuthorized => "cutover-not-authorized",
         KernelRestoreError::TargetFailed(_)
-        | KernelRestoreError::StagedCleanupIncomplete { .. } => "restore-engine-failed",
+        | KernelRestoreError::StagedCleanupIncomplete { .. }
+        // A retained-for-resume disposition does not change the causal class that
+        // crosses this front door: the engine's own typed failure is still the
+        // cause, and the retained bytes and cleanup outcome are owner-local facts
+        // this wire does not carry. So it answers as the same engine-failure
+        // class rather than inventing one.
+        | KernelRestoreError::RetainedForResume { .. } => "restore-engine-failed",
     }
 }
 
