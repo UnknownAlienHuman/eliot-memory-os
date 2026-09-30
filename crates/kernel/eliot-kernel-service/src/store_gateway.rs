@@ -76,8 +76,9 @@ use eliot_ors::{
     HostRequestAttemptPhase, HostRequestDeliveryReceipt, HostRequestKind, HostRequestNoSendProof,
     HostRequestOwnerReadbackEvidence, HostRequestRecord, HostRequestResponseSource,
     HostRequestState, HostRequestTransportBoundary, HostRequestTransportObservation, OpaqueLabel,
-    OperationIdentity as OrsOperationIdentity, RecoveryPayloadEnvelope, RedbRecoveryStore,
-    ReservationRecord, UnknownCommitOutcome, UnknownCommitRecord, WriterReservationToken,
+    OperationIdentity as OrsOperationIdentity, RedbRecoveryStore, RecoveryPayloadEnvelope,
+    ReservationRecord, ReservationState, UnknownCommitOutcome, UnknownCommitRecord,
+    WriterReservationToken,
 };
 use eliot_ors::{OrsError, prove_maintenance_trigger_staging};
 use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse, JobOperation};
@@ -119,10 +120,11 @@ use crate::commit_recovery::{
 use crate::store_client::DreamerCommitEvidence;
 use crate::store_write_reservation::{
     CompositionReservation, ReservationSeed, ReservedSubmission, ResolvedSendOutcome,
-    StagedWriteRecovery, begin_execute_after_send, cancel_before_send, ensure_eligible,
-    finalize_reservation, mark_unknown_outcome, reconcile_receipt, reserve_for_transition,
-    reserve_for_transition_with_original_submission, retain_unsupported_prepared_plan,
-    writer_epoch_for_fence_from_epoch,
+    SealedReservation, StagedWriteRecovery, accept_reservation_for_transition_with_original_submission,
+    claim_execute_before_send, begin_execute_after_send, cancel_before_send, ensure_eligible,
+    finalize_reservation, mark_unknown_outcome, reconcile_receipt, reservation_record_by_order,
+    reserve_for_transition, reserve_for_transition_with_original_submission,
+    retain_unsupported_prepared_plan, writer_epoch_for_fence_from_epoch,
 };
 use crate::user_automation_execution::{
     UserAutomationDueWakeResolution, UserAutomationDurableJobMaterial,
@@ -586,8 +588,8 @@ fn retained_terminal_evidence(
 /// The normalization receipt is owner evidence over the compiled occurrence set,
 /// so it is read from the owner that retained it and is never assembled, derived
 /// or defaulted here. Retention lives on the revision row the revision leg wrote
-/// — the `normalization_receipt_json` mechanism `ApplyNotificationState` already
-/// uses for `source_receipt_json` — and NOT in the canonical Store's own
+/// â€” the `normalization_receipt_json` mechanism `ApplyNotificationState` already
+/// uses for `source_receipt_json` â€” and NOT in the canonical Store's own
 /// `WriteReceipt` history, which provably cannot carry this digest:
 /// `receipt_artifacts` emits exactly `store-transition:{op}` (the committed
 /// transition digest) and `store-plan:{commit_id}`, and that envelope's
@@ -597,8 +599,8 @@ fn retained_terminal_evidence(
 /// would be circular, because the transition digest already covers the very
 /// `revision_json` that names the envelope id.
 ///
-/// Selection is by the envelope's own content-derived identity — exactly the id
-/// the immutable revision names — and the binding is then closed by
+/// Selection is by the envelope's own content-derived identity â€” exactly the id
+/// the immutable revision names â€” and the binding is then closed by
 /// `UserAutomationPreflightProjection::assemble`, which validates the envelope
 /// through its own `validate()` and requires its canonical bytes to carry the
 /// revision's compiled-occurrence digest. `check_normalization_receipt_binding`
@@ -867,6 +869,26 @@ pub struct KernelStoreGateway {
     /// receipt binds (decision), and startup restores through
     /// [`Self::restore_maintenance_trigger_ledger`].
     maintenance_triggers: Mutex<MaintenanceTriggerDeliveryLedger>,
+}
+
+/// A real ORS-accepted staged write plus the exact immutable Store request
+/// needed by the existing bounded execution path. The response token is made
+/// only from the Store admission projection after the ORS acceptance and
+/// durable token readback have been joined.
+pub struct AcceptedReservedWrite {
+    submission: WriteSubmission,
+    request: ReservedWriteRequest,
+    token: WriterReservationToken,
+    created_at_ms: i64,
+}
+
+impl AcceptedReservedWrite {
+    /// The actual public typed acknowledgement projected from ORS and Store
+    /// admission identities. Clone it before moving this bundle to a runtime
+    /// continuation.
+    pub fn submission(&self) -> &WriteSubmission {
+        &self.submission
+    }
 }
 
 impl std::fmt::Debug for KernelStoreGateway {
@@ -1192,7 +1214,7 @@ impl KernelStoreGateway {
         // `GenerationRoute` carries its own complete `(lineage_id, sequence)`
         // tuple, so this gateway keeps no second epoch mirror: route currency
         // is read from `route.authority_epoch()` and proven with
-        // `is_same_authority` against live authority — never by coercing a
+        // `is_same_authority` against live authority â€” never by coercing a
         // sequence to `u64`. Mint stays Host-owned; the gateway only pins and
         // re-checks the tuple.
         Self {
@@ -1384,7 +1406,7 @@ impl KernelStoreGateway {
             }
             // Canonical route/epoch gate (Implements #64): route currency is
             // the exact-tuple match between the composition-bound route epoch
-            // and live authority — never a scalar `sequence.get()` coercion.
+            // and live authority â€” never a scalar `sequence.get()` coercion.
             // Cross-lineage same-sequence routes never authorize: the route
             // carries its own lineage. The durable active-generation gate ran
             // above, before this lock.
@@ -1540,15 +1562,374 @@ impl KernelStoreGateway {
         seed: ReservationSeed,
         original_submission: &OriginalWriteSubmission,
     ) -> Result<WriteReceipt, String> {
-        self.apply_reserved_inner(
+        let accepted = self
+            .stage_reserved_with_original_submission(
+                context,
+                transition,
+                expected_revision_heads,
+                expected_ordering_heads,
+                seed,
+                original_submission,
+            )
+            .await?;
+        self.execute_staged_reserved(accepted).await
+    }
+
+    /// Durably stages the complete protected original Store operation and
+    /// returns only after the ORS accepted-stage response has been joined to
+    /// its exact durable reservation token and Store admission projection.
+    /// This method deliberately does not wait for predecessor eligibility or
+    /// hold a lease while doing so.
+    pub async fn stage_reserved_with_original_submission(
+        &self,
+        context: &RequestMetadata,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+        seed: ReservationSeed,
+        original_submission: &OriginalWriteSubmission,
+    ) -> Result<AcceptedReservedWrite, String> {
+        let _flight = self.flight.enter()?;
+        if self.is_fenced() {
+            return Err("canonical-store gateway is fenced for rebind".to_owned());
+        }
+        self.refuse_shadow_mutation()?;
+        apply_reserved_admission(context, &transition)?;
+        let view = CanonicalRequestView::from_apply(
             context,
-            transition,
+            &transition,
+            &expected_revision_heads,
+            &expected_ordering_heads,
+        );
+        verify_canonical_request_hash(&view, &transition.identity.canonical_request_hash)
+            .map_err(|error| error.to_string())?;
+        original_submission
+            .validate()
+            .map_err(|error| error.to_string())?;
+        if !transition
+            .named_operations
+            .iter()
+            .any(|operation| operation.operation == eliot_store_api::NamedMutationOperation::CaptureObservation)
+        {
+            return Err("original Observe submission requires CaptureObservation".to_owned());
+        }
+        let commit_ors = self.commit_ors.clone().ok_or_else(|| {
+            "reserved writes require the composition-bound ORS; refusing without unreserved Apply fallback"
+                .to_owned()
+        })?;
+        let evidence = self.canonical_store_evidence.as_ref().ok_or_else(|| {
+            "reserved writes require the shared canonical Store evidence provider".to_owned()
+        })?;
+        self.require_active_store_generation()
+            .map_err(|error| error.to_string())?;
+        let ordering_scopes = expected_ordering_heads
+            .iter()
+            .map(|head| head.scope.clone())
+            .collect::<Vec<_>>();
+        let ordering_readbacks = self
+            .store
+            .ordering_head_readbacks(ordering_scopes)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.require_active_store_generation()
+            .map_err(|error| error.to_string())?;
+        if self.is_fenced() {
+            return Err("canonical-store gateway is fenced for rebind".to_owned());
+        }
+        let owner = self.bind_reservation_owner(&commit_ors, context, &transition)?;
+        let transition_digest = eliot_store_api::prepared_transition_digest(&transition)
+            .map_err(|error| error.to_string())?;
+        let (sealed, accepted_pending) = evidence
+            .with_ordering_readbacks(
+                transition.identity.operation_id.as_str(),
+                &transition_digest,
+                &context.state_fence,
+                &ordering_readbacks,
+                || {
+                    accept_reservation_for_transition_with_original_submission(
+                        &owner,
+                        &seed,
+                        context,
+                        &transition,
+                        &expected_revision_heads,
+                        &expected_ordering_heads,
+                        original_submission,
+                    )
+                },
+            )
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        let staged_request = ReservedSubmission::from_sealed_with_original_submission(
+            &sealed,
+            context,
+            &transition,
             expected_revision_heads,
             expected_ordering_heads,
-            seed,
-            Some(original_submission),
+            original_submission,
         )
-        .await
+        .map_err(|error| error.to_string())?;
+        let request = staged_request.request().clone();
+        if accepted_pending.operation_id.as_str() != request.admission.operation_id.as_str()
+            || accepted_pending.reservation_id.as_str() != request.admission.reservation_id
+            || accepted_pending.reservation_order != request.admission.reservation_order
+            || accepted_pending.prepared_transition_sha256
+                != request.admission.prepared_transition_digest
+            || accepted_pending.write_binding != sealed.token.write_binding.clone().ok_or_else(|| {
+                "accepted ORS reservation token omitted its original write binding".to_owned()
+            })?
+        {
+            return Err("accepted ORS stage differs from the exact Store admission projection".to_owned());
+        }
+        let submission = WriteSubmission::staged(&request.admission)
+            .map_err(|error| error.to_string())?;
+        Ok(AcceptedReservedWrite {
+            submission,
+            request,
+            token: sealed.token,
+            created_at_ms: sealed.created_at_ms,
+        })
+    }
+
+    /// Executes one already accepted reservation. Eligibility and the normal
+    /// lease are checked first; ORS `Executing` is committed before the Store
+    /// call. If that boundary or the call is ambiguous, this method never
+    /// retransmits and leaves exact-receipt recovery as the only path.
+    pub async fn execute_staged_reserved(
+        &self,
+        accepted: AcceptedReservedWrite,
+    ) -> Result<WriteReceipt, String> {
+        let _flight = self.flight.enter()?;
+        self.execute_staged_request(accepted.request, accepted.token, accepted.created_at_ms)
+            .await
+    }
+
+    /// Restores and continues one reservation from its complete original
+    /// operation and the actual ORS token readback. `Executing` and
+    /// `Reconciling` states are receipt-only and are never blind-sent.
+    pub async fn restore_staged_reserved(
+        &self,
+        context: &RequestMetadata,
+        transition: PreparedTransition,
+        expected_revision_heads: Vec<RevisionHeadExpectation>,
+        expected_ordering_heads: Vec<OrderingHeadExpectation>,
+        original_submission: &OriginalWriteSubmission,
+        actual_token: WriterReservationToken,
+    ) -> Result<WriteReceipt, String> {
+        let _flight = self.flight.enter()?;
+        original_submission
+            .validate()
+            .map_err(|error| error.to_string())?;
+        let binding = actual_token
+            .write_binding
+            .as_ref()
+            .ok_or_else(|| "restored CaptureObservation token has no original write binding".to_owned())?;
+        if binding.write_intent_id.as_str() != original_submission.write_intent_id.as_str()
+            || binding.write_envelope_protocol_version != original_submission.protocol_version
+            || binding.write_response_mode.as_deref() != Some(original_submission.response_mode.as_str())
+        {
+            return Err("restored original submission differs from the durable ORS token".to_owned());
+        }
+        let created_at_ms = binding.payload_created_at_ms;
+        let sealed = SealedReservation {
+            token: actual_token,
+            created_at_ms,
+        };
+        let request = ReservedSubmission::from_sealed_with_original_submission(
+            &sealed,
+            context,
+            &transition,
+            expected_revision_heads,
+            expected_ordering_heads,
+            original_submission,
+        )
+        .map_err(|error| error.to_string())?
+        .into_request();
+        self.execute_staged_request(request, sealed.token, sealed.created_at_ms)
+            .await
+    }
+
+    async fn execute_staged_request(
+        &self,
+        request: ReservedWriteRequest,
+        token: WriterReservationToken,
+        created_at_ms: i64,
+    ) -> Result<WriteReceipt, String> {
+        request.validate().map_err(|error| error.to_string())?;
+        self.refuse_shadow_mutation()?;
+        apply_reserved_admission(&request.context, &request.transition)?;
+        if self.is_fenced() {
+            return Err("canonical-store gateway is fenced for rebind".to_owned());
+        }
+        self.require_active_store_generation()
+            .map_err(|error| error.to_string())?;
+        let commit_ors = self.commit_ors.clone().ok_or_else(|| {
+            "reserved writes require the composition-bound ORS".to_owned()
+        })?;
+        let evidence = self.canonical_store_evidence.as_ref().ok_or_else(|| {
+            "reserved writes require the shared canonical Store evidence provider".to_owned()
+        })?;
+        let owner = self.bind_reservation_owner(&commit_ors, &request.context, &request.transition)?;
+        let operation_id = token.operation_id.as_str().to_owned();
+        let binding = token
+            .write_binding
+            .as_ref()
+            .ok_or_else(|| "staged CaptureObservation token has no original write binding".to_owned())?;
+        let source = request
+            .original_write_submission
+            .as_ref()
+            .ok_or_else(|| "staged CaptureObservation request omitted its original source".to_owned())?;
+        if request.admission.operation_id.as_str() != operation_id
+            || request.admission.reservation_id != token.reservation_id.as_str()
+            || request.admission.reservation_order != token.reservation_order
+            || request.admission.prepared_transition_digest != token.prepared_transition_sha256
+            || binding.operation_id != token.operation_id
+            || binding.idempotency_key.as_str()
+                != request.transition.identity.idempotency_key.as_str()
+            || binding.canonical_request_sha256.as_str()
+                != request.transition.identity.canonical_request_hash.as_str()
+            || binding.prepared_transition_sha256.as_str()
+                != token.prepared_transition_sha256.as_str()
+            || binding.admission_contract_set_digest.as_str()
+                != request.transition.admission_contract_set_digest.as_str()
+            || binding.operation_manifest_digest.as_str()
+                != request.transition.operation_manifest_digest.as_str()
+            || binding.authority_epoch != token.writer_epoch
+            || binding.state_fence != token.state_fence
+            || binding.payload_created_at_ms != created_at_ms
+            || request.admission.created_at_ms != created_at_ms
+            || binding.write_intent_id.as_str() != source.write_intent_id.as_str()
+            || binding.write_envelope_protocol_version != source.protocol_version
+            || binding.write_response_mode.as_deref() != Some(source.response_mode.as_str())
+        {
+            return Err("restored Store request does not exactly join its ORS token".to_owned());
+        }
+        let mut expected_scopes = request
+            .transition
+            .ordering_scopes
+            .iter()
+            .map(|scope| scope.as_str().to_owned())
+            .collect::<Vec<_>>();
+        expected_scopes.sort();
+        let bound_scopes = binding
+            .ordering_scopes
+            .iter()
+            .map(|scope| scope.as_str().to_owned())
+            .collect::<Vec<_>>();
+        if expected_scopes != bound_scopes {
+            return Err("durable write binding scopes differ from the exact transition scopes".to_owned());
+        }
+        let record = reservation_record_by_order(
+            &owner,
+            token.reservation_order,
+            &token.operation_id,
+        )
+        .map_err(|error| error.to_string())?;
+        if record.token != token {
+            return Err("current ORS reservation token differs from the staged request".to_owned());
+        }
+        let envelope = owner
+            .verify_staged_envelope(&token.operation_id)
+            .map_err(|error| error.to_string())?;
+        if envelope.write_binding.as_ref() != Some(binding)
+            || envelope.contract_version != binding.recovery_envelope_contract_version
+            || envelope.operation_or_checkpoint_id != token.operation_id
+            || envelope.authority_epoch != token.writer_epoch
+            || envelope.state_fence != token.state_fence
+            || envelope.created_at_ms != binding.payload_created_at_ms
+            || envelope.known_at_ms != binding.payload_known_at_ms
+            || envelope.expires_at_ms != Some(token.expires_at_ms)
+            || envelope.privacy_and_visibility_class != binding.recovery_access_class
+        {
+            return Err("protected ORS envelope differs from the original durable write binding".to_owned());
+        }
+        match &envelope.payload {
+            eliot_ors::RecoveryPayload::Encrypted { key, ciphertext }
+                if key == &binding.payload_key_reference
+                    && u64::try_from(ciphertext.len()).ok() == Some(binding.protected_payload_length)
+                    && sha256_hex(ciphertext) == binding.protected_payload_sha256 => {}
+            _ => {
+                return Err("protected ORS payload does not match the original write binding".to_owned());
+            }
+        }
+        match record.state {
+            ReservationState::Executing | ReservationState::Reconciling => {
+                return self
+                    .reconcile_staged_receipt(&owner, evidence, &token)
+                    .await;
+            }
+            ReservationState::Reserved | ReservationState::Eligible => {}
+            ReservationState::Finalized | ReservationState::Released => {
+                return self.reconcile_staged_receipt(&owner, evidence, &token).await;
+            }
+        }
+        ensure_eligible(&owner, &token).map_err(|error| error.to_string())?;
+        let lease = self.acquire_send_lease(&request.transition)?;
+        if self.is_fenced() {
+            return Err("canonical-store gateway is fenced for rebind".to_owned());
+        }
+        self.require_active_store_generation()
+            .map_err(|error| error.to_string())?;
+        // This durable transition is the send-start boundary. Any failure
+        // after it remains receipt-only, including a crash before the socket
+        // call or an ambiguous transport result.
+        claim_execute_before_send(&owner, &token).map_err(|error| error.to_string())?;
+        let outcome = self.store.apply_reserved_write(request).await;
+        match outcome {
+            Ok(receipt) => {
+                let reconciliation = reconcile_receipt(&token, &receipt)
+                    .map_err(|error| error.to_string())?;
+                evidence
+                    .with_store_receipt(&token, &reconciliation, &receipt, || {
+                        finalize_reservation(&owner, &reconciliation)
+                    })
+                    .map_err(|error| error.to_string())?
+                    .map_err(|error| error.to_string())?;
+                drop(lease);
+                Ok(receipt)
+            }
+            Err(error) => {
+                let unknown = mark_unknown_outcome(&owner, &token)
+                    .map_err(|mark_error| format!("{error}; reservation remains executing ({mark_error})"));
+                drop(lease);
+                unknown?;
+                Err(format!(
+                    "reserved write outcome unknown for operation {operation_id}: exact Store receipt reconciliation required ({error})"
+                ))
+            }
+        }
+    }
+
+    async fn reconcile_staged_receipt(
+        &self,
+        owner: &CompositionReservation,
+        evidence: &CanonicalStoreEvidence,
+        token: &WriterReservationToken,
+    ) -> Result<WriteReceipt, String> {
+        let operation_id = OperationId::new(token.operation_id.as_str())
+            .map_err(|error| error.to_string())?;
+        self.require_active_store_generation()
+            .map_err(|error| error.to_string())?;
+        let receipt = self
+            .store
+            .receipt(operation_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| {
+                format!(
+                    "reserved write outcome unknown for operation {}: no exact Store receipt is available; resend refused",
+                    token.operation_id.as_str()
+                )
+            })?;
+        self.require_active_store_generation()
+            .map_err(|error| error.to_string())?;
+        let reconciliation = reconcile_receipt(token, &receipt).map_err(|error| error.to_string())?;
+        evidence
+            .with_store_receipt(token, &reconciliation, &receipt, || {
+                finalize_reservation(owner, &reconciliation)
+            })
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        Ok(receipt)
     }
 
     async fn apply_reserved_inner(
@@ -1838,7 +2219,7 @@ impl KernelStoreGateway {
     /// follow-up binding for 994/11-12).
     ///
     /// Read-through delegation only: no dispatch, admission, or reservation
-    /// behavior changes. Harness-gated like `arm_fault` itself — only `test`
+    /// behavior changes. Harness-gated like `arm_fault` itself â€” only `test`
     /// or `--features test-support` builds can construct the token, so
     /// production callers cannot arm faults. The 994 follow-up cases arm the
     /// hook on the proven kernel route, then drive `apply_reserved` through
@@ -2043,7 +2424,7 @@ impl KernelStoreGateway {
     ///
     /// Gates: the flight counter, the rebind fence, the I14.16 step 4 shadow
     /// refusal (reconciliation is an ORS mutation), and the same
-    /// generation/route/authority binding the reserved write uses — a fence from
+    /// generation/route/authority binding the reserved write uses â€” a fence from
     /// another generation or authority never reaches ORS. A composition with no
     /// bound ORS refuses explicitly instead of reporting an empty clean scan.
     ///
@@ -2636,7 +3017,7 @@ impl KernelStoreGateway {
     /// Records a visible recovery gap for unrepairable damage (issue #1694).
     ///
     /// Missing keys, corrupt payloads, inaccessible sources, and incomplete
-    /// enumeration produce this record — never a plaintext fallback and
+    /// enumeration produce this record â€” never a plaintext fallback and
     /// never silent deletion. The returned rows are the durable snapshot
     /// after this transition.
     ///
@@ -3015,7 +3396,7 @@ impl KernelStoreGateway {
     ///
     /// It is read before anything is staged, so a replay of a parent operation
     /// that already has a record never compares its own live fence, epoch,
-    /// generation and clock against the staged request's era binding — a replay
+    /// generation and clock against the staged request's era binding â€” a replay
     /// legitimately carries a different one.
     fn read_user_automation_obligation(
         &self,
@@ -4104,7 +4485,7 @@ impl KernelStoreGateway {
     ///
     /// This is the gateway-level entry for runtime boundaries that must inspect
     /// the canonical Durable Job projection before crossing into an effect owner
-    /// — the due-wake consumer's duplicate guard, for example. It delegates to
+    /// â€” the due-wake consumer's duplicate guard, for example. It delegates to
     /// [`UserAutomationService::owner_execution_view`], so it inherits the
     /// complete-denominator gate: a denominator the owner could not prove
     /// complete is refused instead of answered as "no admitted job". It reuses
@@ -4323,12 +4704,12 @@ impl KernelStoreGateway {
     ///
     /// Joins the canonical owner revision and live state, the B-owned policy
     /// snapshot, the committed Store receipt envelope, the complete owner
-    /// execution view, and — when the owner reports `blocked_config` — the last
+    /// execution view, and â€” when the owner reports `blocked_config` â€” the last
     /// owner-issued failure. The declared Skill/Tool closure and the delivery
     /// capability of the declared channels are readable from owners this
     /// boundary already holds, so an active deterministic revision assembles the
-    /// complete projection. The one member with no Kernel-side owner — the
-    /// observed provider/model/adapter fingerprint an agent revision needs —
+    /// complete projection. The one member with no Kernel-side owner â€” the
+    /// observed provider/model/adapter fingerprint an agent revision needs â€”
     /// stays absent and is reported as the named missing owner rather than
     /// synthesized. No model, provider, scheduler, or notification call is
     /// reachable from this join.
@@ -4771,10 +5152,10 @@ impl KernelStoreGateway {
     /// session: the Control Board is a persistent in-process inbox projection,
     /// and the Windows Event Log and recovery-fallback routes are owned by
     /// services that run without one. `eliot_platform_windows::
-    /// interactive_user_session_available` is exactly that named observation —
+    /// interactive_user_session_available` is exactly that named observation â€”
     /// it "exposes" the condition "so a delivery caller can name the no-session
     /// condition honestly instead of inferring it from a generic adapter
-    /// failure" — and `eliot-platform-windows` is already a production
+    /// failure" â€” and `eliot-platform-windows` is already a production
     /// dependency of this crate, so no new edge is introduced.
     ///
     /// The result is never defaulted to `true`: a declared `NativeToast` target
@@ -6098,9 +6479,9 @@ impl KernelStoreGateway {
     /// live owner proves that revision is still the current accepted one under
     /// this principal and fence, with the same normalized denominator this
     /// publication compiled. An unreadable owner means nothing was proven and
-    /// nothing is sent (`Unavailable`); a moved owner — another current
+    /// nothing is sent (`Unavailable`); a moved owner â€” another current
     /// revision, a different principal binding, a fence drift, a changed
-    /// denominator, or a no-longer-active admission state — means the wake
+    /// denominator, or a no-longer-active admission state â€” means the wake
     /// disposition now belongs to that newer transition and must be reconciled
     /// (`UnknownOutcome`). Neither case publishes from a stale commit.
     async fn revalidate_horizon_owner(
@@ -6708,9 +7089,9 @@ impl KernelStoreGateway {
             }
         };
         // The owner's retained acknowledgement becomes this obligation's durable
-        // body through the existing settle seam. A refusal here — a foreign
+        // body through the existing settle seam. A refusal here â€” a foreign
         // identity, a failed horizon accounting, a row that could not be
-        // retained — writes nothing and keeps the record reconciling, so a wrong
+        // retained â€” writes nothing and keeps the record reconciling, so a wrong
         // answer can never become a settled horizon.
         let disposition = match self.settle_wake_horizon_acknowledgement(
             obligation,
@@ -7372,8 +7753,8 @@ impl KernelStoreGateway {
     /// Every answer the Durable Job owner could give about an effect it may
     /// already have issued is the occurrence's `UnknownOutcome` disposition, not
     /// a route error and never an admission. This leg's wake phase names the
-    /// occurrence at this point — the owner's retained record or its complete
-    /// negative beside the committed owner intent that binds it — so the
+    /// occurrence at this point â€” the owner's retained record or its complete
+    /// negative beside the committed owner intent that binds it â€” so the
     /// occurrence exists, its Durable Job identity is the occurrence identity,
     /// and the disposition names exactly that occurrence: the caller is told
     /// what must be reconciled instead of being handed a route error that
@@ -7654,7 +8035,7 @@ impl KernelStoreGateway {
         // `true` means this operation is making its ONE bounded same-identity
         // retry under a still-open retained record; `false` means no retained
         // state existed. A retained state that has already been reached and
-        // settled never returns here — that answer leaves as the typed
+        // settled never returns here â€” that answer leaves as the typed
         // `DreamerJobGatewayError::Uncertain` instead.
         let retried_under_retained_record = self
             .reach_retained_dreamer_recovery(&identity, &scope_proof, effect)
@@ -7760,7 +8141,7 @@ impl KernelStoreGateway {
     /// before a receipt is queried, and before any send is authorized, so a
     /// caller-spelled identity can never reach recovery. The digest that leaves
     /// this function is the contract-derived one, and it is what the identity
-    /// carries into retained-state comparison — not the string the caller
+    /// carries into retained-state comparison â€” not the string the caller
     /// presented.
     fn admit_dreamer_operation(
         &self,
@@ -7845,8 +8226,8 @@ impl KernelStoreGateway {
     ///
     /// An unreadable record is never absent: [`classify_retained_commit`]
     /// returns the typed ORS failure rather than an empty answer, and the
-    /// comparison runs against the operation's own proven scope set — the exact
-    /// set the record was staged with — so a record that paused a different
+    /// comparison runs against the operation's own proven scope set â€” the exact
+    /// set the record was staged with â€” so a record that paused a different
     /// scope set is a conflict at classification time.
     async fn reach_retained_dreamer_recovery(
         &self,
@@ -7878,8 +8259,8 @@ impl KernelStoreGateway {
         // The typed answer is the caller-facing report. It travels as itself so
         // the caller can act on the distinction between a reconciled commit, a
         // preserved earlier disposition, a disposition whose pause release is
-        // incomplete, and a still-open Problem State. The obligation it names —
-        // a ledger `Status`/`Reconcile` read — is why this can never be
+        // incomplete, and a still-open Problem State. The obligation it names â€”
+        // a ledger `Status`/`Reconcile` read â€” is why this can never be
         // reported as a completed operation.
         match self
             .reconcile_retained_dreamer_operation(identity, &scope_proof.scopes, record)
@@ -7908,13 +8289,13 @@ impl KernelStoreGateway {
     /// The retry's `DurableJobResponse` is the ledger answer, not receipt
     /// evidence, so the record is settled by reading the exact mutation
     /// receipt and binding its digest. This is the observation-only exact
-    /// receipt client again — a pure read, so it is not counted as another
-    /// mutation attempt and the retry budget is not consumed — and it is the
+    /// receipt client again â€” a pure read, so it is not counted as another
+    /// mutation attempt and the retry budget is not consumed â€” and it is the
     /// only thing that can resolve the record: a ledger `Status` alone cannot.
     ///
     /// A missing or unavailable receipt leaves the record open and its pauses
     /// in force: no second send, no rollback, and no claim that nothing
-    /// happened. The service mutex is not held across this `await` — the
+    /// happened. The service mutex is not held across this `await` â€” the
     /// caller's admission lease is an owned guard, not a lock, and the
     /// `commit_ors` handle is read before the query.
     async fn settle_after_same_identity_retry(
@@ -8021,7 +8402,7 @@ impl KernelStoreGateway {
     /// mutation send, and it never calls `dreamer_job_recovery`.
     ///
     /// Admission is the *protected* recovery lane
-    /// (`reconciliation:<key>` → `UnknownOutcomeReconciliation`), so
+    /// (`reconciliation:<key>` â†’ `UnknownOutcomeReconciliation`), so
     /// exhausted normal capacity cannot make an admitted operation's own
     /// recovery unreachable (I14.3). Caller authorization, route currency and
     /// fence equality were already checked by `dreamer_job` before this runs;
@@ -8041,7 +8422,7 @@ impl KernelStoreGateway {
     /// * a committed receipt persists K's terminal disposition, retains its
     ///   digest, releases only the scopes no other open record covers, and
     ///   returns committed-recovery evidence with the remaining ledger-read
-    ///   obligation — no resend;
+    ///   obligation â€” no resend;
     /// * a proven noncommit whose `Resubmission` still allows the identical
     ///   identity, observed while K is open, permits one bounded
     ///   same-identity retry through the caller's normal path;
@@ -8217,7 +8598,7 @@ impl KernelStoreGateway {
     /// survives a restart and an operator can read what the commit was. The
     /// terminal outcome is the receipt's own classification, so a proven
     /// rollback is recorded as `RolledBack` and a dead-lettered one as
-    /// `DeadLetter` — this leg never upgrades a non-commit into a commit. A
+    /// `DeadLetter` â€” this leg never upgrades a non-commit into a commit. A
     /// proven outcome pauses nothing: it only lifts the pause an earlier
     /// unknown outcome opened for the same key, through
     /// [`Self::release_dreamer_scopes`]. A key already dispositioned keeps its
@@ -8364,8 +8745,8 @@ impl KernelStoreGateway {
     /// Projects one already-terminal retained Dreamer record into the typed
     /// answer its caller must be given (issue #2764 items 5 and 6).
     ///
-    /// This is the single terminal projection for the two RECONCILING sites —
-    /// the retained-replay path and the receipt-adoption path — so neither can
+    /// This is the single terminal projection for the two RECONCILING sites â€”
+    /// the retained-replay path and the receipt-adoption path â€” so neither can
     /// reach a differently-shaped copy of the same decision, and the two no
     /// longer have to be kept in agreement by hand. It is not the only place in
     /// this file where a terminal record can become a caller answer:
@@ -8443,8 +8824,8 @@ impl KernelStoreGateway {
         let key = identity.idempotency_key.as_str();
         let staged = ors.load_unknown_commit(key).map_err(ors_unavailable)?;
         if let Some(record) = staged {
-            // The presented set is this operation's own proven scope set — the
-            // same set the record was staged with — so a record that paused a
+            // The presented set is this operation's own proven scope set â€” the
+            // same set the record was staged with â€” so a record that paused a
             // different scope set is a conflict, not a shortcut to "already
             // dispositioned".
             verify_retained_binding(&record, identity, ordering_scopes)?;
@@ -8506,9 +8887,9 @@ impl KernelStoreGateway {
     /// `None`, because it holds no handle to read either owner with. That is the
     /// behaviour that existed before this gate, and it is reachable only from a
     /// gateway no production composition builds: both production construction
-    /// sites — `KernelComposition`'s initial canonical-store connect
+    /// sites â€” `KernelComposition`'s initial canonical-store connect
     /// (`canonical_store_runtime.rs`) and `KernelComposition::rebind_store`
-    /// (`lib.rs`) — pass the retained ORS handle.
+    /// (`lib.rs`) â€” pass the retained ORS handle.
     fn active_store_generation(&self) -> Result<Option<ResourceGeneration>, StoreError> {
         let Some(commit_ors) = self.commit_ors.as_deref() else {
             return Ok(None);
@@ -8530,8 +8911,8 @@ impl KernelStoreGateway {
     /// candidate could not serve either. Resolving the owner from the durable
     /// cutover ownership table instead makes the governed Store path follow the
     /// route, so from the commit onward the incumbent generation is not the
-    /// owner and every Store operation reaching this gateway — fenced or
-    /// unfenced, direct or through the borrowed client — is refused.
+    /// owner and every Store operation reaching this gateway â€” fenced or
+    /// unfenced, direct or through the borrowed client â€” is refused.
     ///
     /// The same comparison decides the pre-first-commit window, because the
     /// owner read also returns the generation the route scope was established
@@ -8544,7 +8925,7 @@ impl KernelStoreGateway {
     /// of the retired store. The reading implemented here is the strictest one
     /// the Kernel can enforce on its own path: from the cutover onward the
     /// incumbent generation is admitted by nobody, and `I14.14`'s "rollback is
-    /// another cutover with a newer epoch" is the only way it is served again —
+    /// another cutover with a newer epoch" is the only way it is served again â€”
     /// which is exactly what the window exists to make possible.
     fn require_active_store_generation(&self) -> Result<(), StoreError> {
         let Some(active) = self.active_store_generation()? else {
@@ -9344,7 +9725,7 @@ fn acknowledged_horizon_phase(
     // One flight is bounded (issue #2806 item 10): the owner acknowledged only
     // the requested prefix, so the denominator tail past this flight is still
     // owed. It joins the owner's own remaining set, and a non-empty combined
-    // remainder forces `Partial` with a handle over the exact combined set —
+    // remainder forces `Partial` with a handle over the exact combined set â€”
     // never a `Published` horizon for occurrences that were never sent.
     let tail = publication
         .uncapped_tail_ids()
@@ -9920,7 +10301,7 @@ fn refuse_determinate_reserved_write(
 ///
 /// A passing gate returns no submission at all. This is the I5.6 steps 1-12
 /// boundary, before the step 13 ORS staging act, and I5.19's `staged` state
-/// means "ORS accepted the exact operation identity" — so the accepted path has
+/// means "ORS accepted the exact operation identity" â€” so the accepted path has
 /// no I5.19 front-door result to report and must not borrow the `staged` token
 /// for a value nothing staged. The unit return carries the only claim this
 /// boundary can make: this exact transition is admitted to be sent, and its
@@ -9946,7 +10327,7 @@ fn admit_prepared_transition(
         // RECHECK-63 slice B: recompute the canonical request hash from the
         // exact values about to be executed (context + transition + expected
         // heads) and reject divergence before any store work. The view is
-        // built from these references — not re-forwarded copies — so a
+        // built from these references â€” not re-forwarded copies â€” so a
         // mutation after admission fails here with the typed mismatch.
         let view = CanonicalRequestView::from_apply(
             context,
@@ -10184,7 +10565,7 @@ pub enum NamedReadGatewayError {
 /// reconciliation: this is [`RecoveryCommitStatus::None`] with
 /// [`I14WorkOutcome::NotAccepted`], which is why the read may be re-issued under
 /// its own identity once the condition is met. The typed cause is read off the
-/// [`StoreError`] variant — never off a rendered sentence — so the closed cause
+/// [`StoreError`] variant â€” never off a rendered sentence â€” so the closed cause
 /// `CANONICAL_STORE_UNAVAILABLE` is produced by pattern-matching the enum, not by
 /// comparing text a transport happened to produce.
 ///
@@ -10266,8 +10647,8 @@ pub fn store_read_unavailable_response(
 /// The owner-produced compiled read-profile artifact identity every
 /// `DB_UNAVAILABLE` read directive is bound to.
 ///
-/// This is the generated Store operation-manifest set digest — the exact
-/// catalogue the read was validated against — not a caller-supplied string, so
+/// This is the generated Store operation-manifest set digest â€” the exact
+/// catalogue the read was validated against â€” not a caller-supplied string, so
 /// the directive names the profile it was actually issued under. It is derived
 /// from crate constants and is therefore the same value on every process, which
 /// is what makes it a usable artifact reference rather than per-process noise.
@@ -10777,7 +11158,7 @@ mod named_read_gateway_tests {
                 return self.typed_failure(request_id, StoreError::Unavailable);
             };
             let limit = usize::try_from(max_records).expect("u32 fits usize");
-            // Exact subject match only — never substring, never a default.
+            // Exact subject match only â€” never substring, never a default.
             let matched: Vec<(u64, String)> = captured
                 .lines()
                 .enumerate()
@@ -11132,7 +11513,7 @@ mod live_surreal_evidence_pack_e2e {
     //! (schema migration, one `CaptureObservation` mutation, one
     //! `GetEvidencePack` named read), and serves the `eliot.query`
     //! acceptance through the production Governor
-    //! [`ReadService`](eliot_read::ReadService) — the exact service type
+    //! [`ReadService`](eliot_read::ReadService) â€” the exact service type
     //! `DaemonComposition::context_read_client` pairs with the daemon's
     //! `KernelContextReadClient` over the same `CanonicalReadClient`
     //! interface. The memory adapter is never used here; it remains the
@@ -11140,14 +11521,14 @@ mod live_surreal_evidence_pack_e2e {
     //!
     //! Coverage in two tests sharing one fixture builder:
     //!
-    //! * `daemon_query_gates_fail_closed_before_store_io` — the #1465
+    //! * `daemon_query_gates_fail_closed_before_store_io` â€” the #1465
     //!   residuals through the real `ReadService` over a real (unconnected)
     //!   adapter instance: smuggled `query`/`exact_resource_uri` parameters
     //!   and a `QueryRequest`-level `exact_resource_uri` fail closed, and
     //!   `state()` rejects `GetEvidencePack`. These gates sit before any
     //!   transport by contract, so no provider is needed; this test is green.
     //! * `live_surreal_capture_then_eliot_query_returns_exact_evidence_pack`
-    //!   — the T11.1 acceptance live: one real capture, then `eliot.query`
+    //!   â€” the T11.1 acceptance live: one real capture, then `eliot.query`
     //!   returns the exact record/provenance with an explicit `Verification`
     //!   intent (free-text `query` stays intent data, never a selector), and
     //!   wrong-fence / over-bound requests fail. Green on base `67a1af95`
@@ -11354,7 +11735,7 @@ mod live_surreal_evidence_pack_e2e {
     ///
     /// The adapter's canonical argv carries no `--user/--pass` (credentials
     /// never enter argv or the environment), so a fresh datastore must first
-    /// observe its installation root user exactly once — the same bootstrap
+    /// observe its installation root user exactly once â€” the same bootstrap
     /// the Host-managed installation performs. This fixture spawns the
     /// provider briefly with the test credential, waits for its bound
     /// endpoint, then kills and reaps it; the adapter spawns and owns its own
@@ -11507,7 +11888,7 @@ mod live_surreal_evidence_pack_e2e {
 
         // A retired `query` selector can no longer be built through
         // `NamedParameters`, but the newtype is `#[serde(transparent)]` with a
-        // derived `Deserialize` that does not validate — so the wire can still
+        // derived `Deserialize` that does not validate â€” so the wire can still
         // present one. The gate that must hold is the service's, before any
         // transport.
         let smuggled = serde_json::from_value::<NamedParameters>(json!({
@@ -11541,7 +11922,7 @@ mod live_surreal_evidence_pack_e2e {
 
         // Exact expansion belongs to `ResourceRequest`, never to
         // `QueryRequest`. The request-level selector is now structurally
-        // unrepresentable — `QueryRequest` has no `exact_resource_uri` field —
+        // unrepresentable â€” `QueryRequest` has no `exact_resource_uri` field â€”
         // so the only remaining bypass is the wire-decoded parameter key, and
         // that is what this proves.
         let smuggled_uri = serde_json::from_value::<NamedParameters>(json!({
@@ -11578,7 +11959,7 @@ mod live_surreal_evidence_pack_e2e {
         // held by the type, not by this assertion; the wire-smuggled parameter
         // key above covers the one bypass that still exists.
 
-        // `state()` owns current-state operations only — `GetEvidencePack`
+        // `state()` owns current-state operations only â€” `GetEvidencePack`
         // is rejected before any transport.
         let state_rejected = service
             .state(
@@ -11666,7 +12047,7 @@ mod live_surreal_evidence_pack_e2e {
 
         // `eliot.query` acceptance: the Governor read facade over the SAME
         // live adapter returns the exact record/provenance. Free text cannot
-        // be supplied at all now — the closed named operation and the closed
+        // be supplied at all now â€” the closed named operation and the closed
         // selectors fully determine the read.
         let service = ReadService::new(adapter);
         let result = service
