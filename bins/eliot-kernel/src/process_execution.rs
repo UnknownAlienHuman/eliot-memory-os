@@ -280,10 +280,14 @@ pub(crate) struct GovernedProcessEffectSource {
 /// itself compares, with disagreement refused as `UnstableReadback`). The
 /// admission-pinned digest is only the lease authority the capture
 /// validates against: any transition between the retained previous digest
-/// and two fresh agreeing reads is ingested as a
-/// `FilesystemNotification` hint and confirmed Material on the spot, so an
-/// external uncorrelated mutation emits an unknown-origin change and blocks
-/// governed acceptance until a recorded governed change reconciles it.
+/// and two fresh agreeing reads is confirmed through the filesystem/Git
+/// observation adapter ([`change_monitor::observe_filesystem_notification`])
+/// against actual Git-substrate plus content re-read evidence for the real
+/// hinted source, so an external uncorrelated mutation emits an
+/// unknown-origin change and blocks governed acceptance until a recorded
+/// governed change reconciles it. A transition the adapter cannot confirm
+/// keeps the retained digest for the next capture instead of advancing
+/// past evidence the ledger never admitted.
 /// Per-artifact last-observed
 /// digests are retained here under one mutex (atomic publish); the ledger
 /// itself stays the only acceptance gate.
@@ -309,20 +313,40 @@ impl KernelGovernedProcessEffectPort {
         (first == second).then_some((first_bytes, first, second))
     }
 
-    /// Confirms one unexplained tracked-image transition: the previously
-    /// observed digest against two fresh agreeing reads. Ingest and
-    /// confirmation are one atomic pair with pairwise-independent values,
-    /// so the Material branch and its unknown-origin record are reachable
-    /// in production. Best-effort: ledger contention never fences the tool.
-    fn confirm_external_transition(
-        hint_id: &str,
-        hint: change_monitor::KernelChangeHint,
-        verification: &change_monitor::HintVerification,
-    ) -> bool {
-        if change_monitor::ingest_hint(hint).is_err() {
-            return false;
-        }
-        change_monitor::confirm_hint(hint_id, verification).is_ok()
+    /// Confirms one unexplained tracked-source transition through the
+    /// filesystem/Git observation adapter
+    /// ([`change_monitor::observe_filesystem_notification`]): the retained
+    /// previous digest against actual Git-substrate plus content re-read
+    /// evidence the adapter collects itself, admitted through the existing
+    /// ingest-plus-confirm path. The adapter takes the real hinted source —
+    /// the lease-owned file the capture reads just proved moved, named
+    /// relative to the lease-owned working directory — never a synthesized
+    /// OS event: a source that cannot be named under that root has no valid
+    /// hint shape and is refused as
+    /// [`change_monitor::ChangeMonitorError::InvalidHint`] without touching
+    /// the ledger. Failures stay typed so the caller keeps failing closed
+    /// (the retained digest is preserved for the next capture) without
+    /// inventing evidence; ledger contention never fences the tool.
+    fn observe_external_filesystem_transition(
+        workspace_root: &Path,
+        hinted_source: &Path,
+        resource: &str,
+        event_ref: &str,
+        before_digest: &str,
+    ) -> Result<change_monitor::HintConfirmation, change_monitor::ChangeMonitorError> {
+        let relative = hinted_source
+            .strip_prefix(workspace_root)
+            .map_err(|_| change_monitor::ChangeMonitorError::InvalidHint)?;
+        let notification = change_monitor::FilesystemEventNotification {
+            event_ref: event_ref.to_owned(),
+            resource: resource.to_owned(),
+            path: relative.to_string_lossy().replace('\\', "/"),
+        };
+        change_monitor::observe_filesystem_notification(
+            workspace_root,
+            &notification,
+            Some(before_digest),
+        )
     }
 }
 
@@ -335,8 +359,10 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
         // The lane-stable artifact path derives from the admitted image
         // identity (never a bare constant), so distinct images never share
         // one artifact record.
-        let artifact = super::sha256_hex(source.image_id.as_bytes());
-        let lane_path = format!("process-image/{artifact}");
+        let lane_path = format!(
+            "process-image/{}",
+            super::sha256_hex(source.image_id.as_bytes())
+        );
         let resource = source.executable.to_string_lossy().into_owned();
         let unobserved = || GovernedProcessEffectBaseline {
             binding: binding.clone(),
@@ -365,7 +391,7 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
             observe_process("kernel.process.effect_baseline_unavailable", "unobserved");
             return Ok(unobserved());
         }
-        let Some((before_bytes, first_digest, reread_digest)) =
+        let Some((before_bytes, first_digest, _reread_digest)) =
             Self::read_tracked_source(&source.executable)
         else {
             observe_process("kernel.process.effect_baseline_unavailable", "unobserved");
@@ -385,28 +411,48 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
             // no admission explains by itself (a re-pinned admission digest
             // only proves the lease scope, not who wrote the bytes), so the
             // transition is external and uncorrelated until a recorded
-            // governed change reconciles it. Both agreeing capture reads
-            // become the confirmation evidence.
-            let hint_id = change_monitor::filesystem_hint_id(&artifact, &previous);
-            let hint = change_monitor::KernelChangeHint {
-                hint_id: hint_id.clone(),
-                resource: resource.clone(),
-                path: lane_path.clone(),
-                origin: change_monitor::HintOrigin::FilesystemNotification,
-                origin_ref: Some(binding.owner.module_id().to_owned()),
-            };
-            let verification = change_monitor::HintVerification {
-                before_digest: Some(previous),
-                first_read: change_monitor::ContentRead::Present {
-                    sha256: first_digest.clone(),
-                },
-                reread: change_monitor::ContentRead::Present {
-                    sha256: reread_digest,
-                },
-                git: None,
-            };
-            transition_unrecorded =
-                !Self::confirm_external_transition(&hint_id, hint, &verification);
+            // governed change reconciles it. The real hinted source goes
+            // through the filesystem/Git observation adapter against actual
+            // Git-substrate plus content re-read evidence; a typed refusal
+            // keeps the retained digest so the next capture retries instead
+            // of advancing past evidence the ledger never admitted.
+            match Self::observe_external_filesystem_transition(
+                &source.working_directory,
+                &source.executable,
+                &resource,
+                binding.owner.module_id(),
+                &previous,
+            ) {
+                Ok(confirmation) => {
+                    observe_process(
+                        "kernel.process.effect_external_transition",
+                        match confirmation {
+                            change_monitor::HintConfirmation::VerifiedImmaterial => "immaterial",
+                            change_monitor::HintConfirmation::MaterialRecorded {
+                                reconciled,
+                                ..
+                            } => {
+                                if reconciled {
+                                    "reconciled"
+                                } else {
+                                    "material"
+                                }
+                            }
+                        },
+                    );
+                }
+                Err(error) => {
+                    transition_unrecorded = true;
+                    observe_process(
+                        "kernel.process.effect_external_transition",
+                        if error == change_monitor::ChangeMonitorError::UnstableReadback {
+                            "unstable"
+                        } else {
+                            "unobserved"
+                        },
+                    );
+                }
+            }
         }
         if !transition_unrecorded && let Ok(mut last) = self.last_observed.lock() {
             last.insert(resource.clone(), first_digest.clone());

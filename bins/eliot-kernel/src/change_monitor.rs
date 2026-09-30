@@ -8,17 +8,24 @@
 //! handles, and State-Fence invalidations", and that "unknown-origin
 //! Material mutation blocks governed acceptance until reconciliation".
 //! This module is the Kernel-owned half of that contract: an in-memory
-//! ledger over host-event/filesystem hint ingest, content checksum/re-read
-//! confirmation, governed-tool records, and the acceptance block the
-//! host-request route queries. The sole in-tree producer is the Kernel
+//! ledger over host-event/filesystem hint ingest, Git plus content
+//! checksum/re-read confirmation, governed-tool records, and the acceptance
+//! block the host-request route queries. Two producers feed it: the Kernel
 //! process-effect lane (`crate::process_execution::KernelGovernedProcessEffectPort`,
-//! attached in the owning crate): it opens the lease-owned governed image,
-//! checksums exact bytes twice per observation, and confirms each hint with
-//! pairwise-independent reads, so the Material branch is reachable on real
-//! transitions instead of comparing one digest with itself. No VCS substrate
-//! is claimed: confirmations carry `git: None` until a real Git-state port
-//! exists (see `HintVerification`), and the ledger never invents source
-//! bytes or repository state. The Governor-owned semantic projection
+//! attached in the owning crate) for host-event hints over the lease-owned
+//! governed image, and the filesystem/Git observation adapter in this module
+//! ([`observe_filesystem_notification`]) for received OS filesystem
+//! notifications. The adapter opens the hinted tracked source twice per
+//! observation and reads the real Git substrate (`.git/HEAD` plus the
+//! resolved ref, loose or packed) around those reads, so a filesystem hint
+//! confirms against actual Git/content re-read evidence instead of content
+//! polling over one image. A filesystem hint without that Git readback is
+//! refused with [`ChangeMonitorError::InvalidGitEvidence`]: an inferred
+//! transition no admission explains never becomes a `FilesystemNotification`
+//! on polling alone. No porcelain status is claimed: the Kernel observes the
+//! HEAD substrate read-only (see [`GitReadback`]), worktree status beyond
+//! HEAD is decided by the content re-reads, and the ledger never invents
+//! source bytes or repository state. The Governor-owned semantic projection
 //! lives in `eliot-change-monitor` under `crates/governor`; this module
 //! must not depend on it (a `bins` root never depends on Governor/Smart
 //! crates), it only mirrors the gate semantics: acceptance is blocked
@@ -51,11 +58,17 @@ pub(crate) enum ChangeMonitorError {
     HintConflict,
     /// Confirmation names a hint the ledger never ingested.
     UnknownHint,
-    /// The first content read and the independent re-read disagree, so the
-    /// readback proves nothing about this operation.
+    /// The first content read and the independent re-read disagree, the
+    /// tracked source cannot be read twice, the Git substrate moved under
+    /// observation, so the readback proves nothing about this operation.
     UnstableReadback,
-    /// The Git readback evidence fails shape validation.
+    /// The Git readback evidence fails shape validation, or a filesystem
+    /// hint arrives without any Git readback at all.
     InvalidGitEvidence,
+    /// No readable Git substrate exists under the supplied workspace root
+    /// (missing or unparsable `.git/HEAD`, unresolvable symref): the ledger
+    /// invents no repository state, so Git-bound confirmation is refused.
+    NoGitSubstrate,
     /// A governed-tool record is immaterial, unbound, or conflicts with the
     /// record already stored under its identity.
     InvalidGovernedChange,
@@ -78,6 +91,7 @@ impl std::fmt::Display for ChangeMonitorError {
             Self::UnknownHint => "change_monitor_unknown_hint",
             Self::UnstableReadback => "change_monitor_unstable_readback",
             Self::InvalidGitEvidence => "change_monitor_invalid_git_evidence",
+            Self::NoGitSubstrate => "change_monitor_no_git_substrate",
             Self::InvalidGovernedChange => "change_monitor_invalid_governed_change",
             Self::OperationReuse => "change_monitor_operation_reuse",
             Self::UnknownChange => "change_monitor_unknown_change",
@@ -89,17 +103,17 @@ impl std::fmt::Display for ChangeMonitorError {
 
 impl std::error::Error for ChangeMonitorError {}
 
-/// Route of one untrusted hint observed Kernel-side. The Kernel
-/// process-effect lane is the only in-crate producer, and it constructs
-/// both origins: `HostEvent` for an admitted tool operation whose effect is
-/// read back, `FilesystemNotification` for a tracked-image transition the
-/// pre-effect capture observes against independently retained state that no
-/// admission explains. Filesystem, Git, tool, and artifact semantics beyond
-/// that live in the Governor-owned projection (`eliot-change-monitor`
-/// under `crates/governor`); Git state in particular is never claimed here
-/// (confirmations carry no VCS substrate), so a filesystem-sourced
-/// transition surfaces as an unknown-origin Material change on real
-/// content evidence, never as an invented repository claim.
+/// Route of one untrusted hint observed Kernel-side. `HostEvent` is built
+/// by the Kernel process-effect lane for an admitted tool operation whose
+/// effect is read back; `FilesystemNotification` is built only by the
+/// filesystem/Git observation adapter ([`observe_filesystem_notification`])
+/// from a received OS notification confirmed against actual Git-substrate
+/// plus content re-read evidence. Filesystem, tool, and artifact semantics
+/// beyond that live in the Governor-owned projection (`eliot-change-monitor`
+/// under `crates/governor`); the Kernel observes the Git HEAD substrate
+/// read-only (see [`GitReadback`]) and performs no porcelain status, so a
+/// filesystem-sourced transition surfaces as an unknown-origin Material
+/// change on real content evidence, never as an invented repository claim.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HintOrigin {
     HostEvent,
@@ -109,9 +123,10 @@ pub(crate) enum HintOrigin {
 /// Untrusted host event: a re-check hint, never a Material observation by
 /// itself.
 ///
-/// Caller (I10.21 W2): `crate::process_execution::KernelGovernedProcessEffectPort`,
-/// which ingests each governed tool operation as a host-event hint and each
-/// unexplained tracked-image transition as a filesystem hint.
+/// Caller (I10.21 W2): `crate::process_execution::KernelGovernedProcessEffectPort`
+/// ingests each governed tool operation as a host-event hint;
+/// [`observe_filesystem_notification`] ingests each received OS filesystem
+/// notification as a filesystem hint with real Git-substrate evidence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct KernelChangeHint {
     pub hint_id: String,
@@ -138,11 +153,17 @@ impl ContentRead {
 }
 
 /// Readback evidence bound to the same hinted artifact as the two direct
-/// content reads. `None` is the explicit no-VCS-substrate claim: the Kernel
-/// owns no Git-state port, so confirmations decide on content checksum and
-/// re-read evidence alone instead of inventing repository state. A `Some`
-/// value must pass [`validate_git`]; half-filled repository claims are
-/// refused rather than confirmed.
+/// content reads. `None` means the confirming lane supplied no Git
+/// readback: accepted only for `HostEvent` hints, which decide on content
+/// checksum and re-read evidence. A `FilesystemNotification` hint with
+/// `None` is refused by [`confirm_hint`] with
+/// [`ChangeMonitorError::InvalidGitEvidence`]. A `Some` value must pass
+/// [`validate_git`]; half-filled repository claims are refused rather than
+/// confirmed. The Kernel observes the Git HEAD substrate read-only and
+/// performs no porcelain status: `status_ref` names the exact
+/// HEAD-substrate receipt the adapter read around the content reads, and
+/// `status_sha256` is the SHA-256 over those exact substrate bytes, so the
+/// head values are bound to real bytes, never invented.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GitReadback {
     pub repository: String,
@@ -447,6 +468,12 @@ pub(crate) fn material_transition_ids(
 /// Confirmation is evidence-driven, never sticky: identical evidence
 /// replays the identical outcome, while new evidence under a retried
 /// operation re-evaluates and emits the transition it actually proves.
+/// A `FilesystemNotification` hint confirms only against actual Git plus
+/// content re-read evidence: `git: None` is refused with
+/// [`ChangeMonitorError::InvalidGitEvidence`], so an inferred transition no
+/// admission explains never becomes a filesystem observation on content
+/// polling alone. The refusal leaves the hint pending, which keeps governed
+/// acceptance blocked until a Git-backed readback resolves it.
 /// History is still never rewritten: unknown records are keyed by their
 /// exact transition and reconciliation only appends links.
 ///
@@ -468,13 +495,18 @@ pub(crate) fn confirm_hint(
         Some(after_digest.as_str()),
     );
     let mut ledger = ledger()?;
-    let resource = ledger
+    let (resource, origin) = ledger
         .hints
         .get(hint_id)
-        .ok_or(ChangeMonitorError::UnknownHint)?
-        .hint
-        .resource
-        .clone();
+        .ok_or(ChangeMonitorError::UnknownHint)
+        .map(|entry| (entry.hint.resource.clone(), entry.hint.origin))?;
+    // I10.21 W2: a filesystem hint is an OS notification confirmed against
+    // actual Git/content re-reads, never content polling over one image. A
+    // filesystem confirmation without Git readback proves no repository
+    // state and is refused instead of recorded.
+    if origin == HintOrigin::FilesystemNotification && verification.git.is_none() {
+        return Err(ChangeMonitorError::InvalidGitEvidence);
+    }
     if before_digest.as_deref() == Some(after_digest.as_str()) {
         let entry = ledger
             .hints
@@ -531,6 +563,188 @@ pub(crate) fn confirm_hint(
         change_id,
         reconciled,
     })
+}
+
+/// One operating-system filesystem notification received by the Kernel
+/// (I10.21 W2, AUD2 defect 2). Unlike the inferred executable-image
+/// transition the process-effect lane polls at pre-effect capture, this is
+/// a delivered OS event: the watcher observed `path` change and handed over
+/// `event_ref`. It is still only a hint until
+/// [`observe_filesystem_notification`] confirms it against actual
+/// Git-substrate plus content re-read evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FilesystemEventNotification {
+    pub event_ref: String,
+    pub resource: String,
+    pub path: String,
+}
+
+/// One real Git HEAD-substrate read: the repository handle, the observed
+/// HEAD commit, and the exact substrate bytes those values came from. The
+/// bytes are retained so the confirmation receipt binds real observations,
+/// never invented repository state.
+struct GitHeadObservation {
+    repository: String,
+    head: String,
+    exact_bytes: Vec<u8>,
+}
+
+/// Reads the real Git HEAD substrate under one workspace root: `.git/HEAD`
+/// plus the symref target (loose ref first, then the packed-refs file), or
+/// the detached HEAD commit directly. Every byte that feeds the returned
+/// observation comes from those files. Anything else — a missing `.git`,
+/// an unparsable HEAD, an unresolvable symref — is
+/// [`ChangeMonitorError::NoGitSubstrate`], never a synthesized claim.
+fn read_git_head_substrate(
+    workspace_root: &std::path::Path,
+) -> Result<GitHeadObservation, ChangeMonitorError> {
+    let repository = workspace_root.to_string_lossy().into_owned();
+    if !text(&repository) {
+        return Err(ChangeMonitorError::NoGitSubstrate);
+    }
+    let git_dir = workspace_root.join(".git");
+    let head_bytes =
+        std::fs::read(git_dir.join("HEAD")).map_err(|_| ChangeMonitorError::NoGitSubstrate)?;
+    let mut exact_bytes = head_bytes.clone();
+    let head_text = String::from_utf8(head_bytes)
+        .map(|contents| contents.trim().to_owned())
+        .map_err(|_| ChangeMonitorError::NoGitSubstrate)?;
+    if !text(&head_text) {
+        return Err(ChangeMonitorError::NoGitSubstrate);
+    }
+    let head = if let Some(refname) = head_text.strip_prefix("ref: ") {
+        if refname.is_empty()
+            || refname.contains('\\')
+            || refname.contains(':')
+            || refname
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == ".." || part == ".git")
+        {
+            return Err(ChangeMonitorError::NoGitSubstrate);
+        }
+        if let Ok(ref_bytes) = std::fs::read(git_dir.join(refname)) {
+            exact_bytes.extend_from_slice(&ref_bytes);
+            String::from_utf8(ref_bytes)
+                .map(|contents| contents.trim().to_owned())
+                .map_err(|_| ChangeMonitorError::NoGitSubstrate)?
+        } else {
+            let packed_bytes = std::fs::read(git_dir.join("packed-refs"))
+                .map_err(|_| ChangeMonitorError::NoGitSubstrate)?;
+            exact_bytes.extend_from_slice(&packed_bytes);
+            let packed =
+                String::from_utf8(packed_bytes).map_err(|_| ChangeMonitorError::NoGitSubstrate)?;
+            let mut found = None;
+            for line in packed.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
+                    continue;
+                }
+                let mut parts = line.split_whitespace();
+                if let (Some(sha), Some(name)) = (parts.next(), parts.next())
+                    && name == refname
+                {
+                    found = Some(sha.to_owned());
+                    break;
+                }
+            }
+            found.ok_or(ChangeMonitorError::NoGitSubstrate)?
+        }
+    } else {
+        head_text
+    };
+    if !text(&head) {
+        return Err(ChangeMonitorError::NoGitSubstrate);
+    }
+    Ok(GitHeadObservation {
+        repository,
+        head,
+        exact_bytes,
+    })
+}
+
+/// Observes one received OS filesystem notification against actual
+/// Git/content re-read evidence and feeds the result through the existing
+/// owner port ([`ingest_hint`] + [`confirm_hint`], I10.21 W2): no second
+/// ledger, no parallel evidence channel. The adapter opens the hinted
+/// tracked source itself twice (pairwise-independent reads that must
+/// agree), with a real Git HEAD-substrate read before the first content
+/// read and another after the re-read; a HEAD move under observation is
+/// [`ChangeMonitorError::UnstableReadback`], exactly like disagreeing
+/// content reads. `before_digest` is the previously admitted content digest
+/// for the hinted source when the caller retains one (`None` on first
+/// observation, which the transition binder records as `absent`).
+/// Fail-closed and typed throughout: unreadable substrate is
+/// [`ChangeMonitorError::NoGitSubstrate`], an unreadable or unstable
+/// tracked source is [`ChangeMonitorError::UnstableReadback`], a conflicting
+/// identity under the derived hint is [`ChangeMonitorError::HintConflict`].
+/// (Deletion readback is a separate lane: an absent tracked source is
+/// refused here rather than represented.)
+///
+/// Caller (I10.21 W2): the OS-watcher lane once attached. No in-tree caller
+/// wires an OS watcher yet; until that lane lands, the process-effect lane
+/// keeps its host-event leg and its polling-inferred filesystem path — the
+/// latter now fails closed under [`confirm_hint`] instead of recording a
+/// `FilesystemNotification` on content polling alone.
+pub(crate) fn observe_filesystem_notification(
+    workspace_root: &std::path::Path,
+    notification: &FilesystemEventNotification,
+    before_digest: Option<&str>,
+) -> Result<HintConfirmation, ChangeMonitorError> {
+    if !text(&notification.event_ref)
+        || !text(&notification.resource)
+        || !validate_relative_path(&notification.path)
+    {
+        return Err(ChangeMonitorError::InvalidHint);
+    }
+    if let Some(before) = before_digest
+        && !is_sha256_hex(before)
+    {
+        return Err(ChangeMonitorError::InvalidGitEvidence);
+    }
+    let tracked = workspace_root.join(notification.path.as_str());
+    let substrate_before = read_git_head_substrate(workspace_root)?;
+    let first_bytes = std::fs::read(&tracked).map_err(|_| ChangeMonitorError::UnstableReadback)?;
+    let reread_bytes = std::fs::read(&tracked).map_err(|_| ChangeMonitorError::UnstableReadback)?;
+    let first = crate::sha256_hex(&first_bytes);
+    let reread = crate::sha256_hex(&reread_bytes);
+    if first != reread {
+        return Err(ChangeMonitorError::UnstableReadback);
+    }
+    let substrate_after = read_git_head_substrate(workspace_root)?;
+    if substrate_before.head != substrate_after.head {
+        return Err(ChangeMonitorError::UnstableReadback);
+    }
+    let mut status_bytes = substrate_before.exact_bytes.clone();
+    status_bytes.extend_from_slice(&substrate_after.exact_bytes);
+    let repository = substrate_before.repository.clone();
+    let status_ref = format!("git-head-substrate:{repository}");
+    let git = GitReadback {
+        repository,
+        head_before: substrate_before.head,
+        head_after: substrate_after.head,
+        status_ref,
+        status_sha256: crate::sha256_hex(&status_bytes),
+        before_revision: None,
+        after_revision: None,
+        diff_handle: None,
+    };
+    let artifact = crate::sha256_hex(notification.resource.as_bytes());
+    let hint_id = filesystem_hint_id(&artifact, before_digest.unwrap_or("absent"));
+    let hint = KernelChangeHint {
+        hint_id: hint_id.clone(),
+        resource: notification.resource.clone(),
+        path: notification.path.clone(),
+        origin: HintOrigin::FilesystemNotification,
+        origin_ref: Some(notification.event_ref.clone()),
+    };
+    ingest_hint(hint).map(|_| ())?;
+    let verification = HintVerification {
+        before_digest: before_digest.map(str::to_owned),
+        first_read: ContentRead::Present { sha256: first },
+        reread: ContentRead::Present { sha256: reread },
+        git: Some(git),
+    };
+    confirm_hint(&hint_id, &verification)
 }
 
 /// Records one governed-tool mutation with exact before/after revisions,
