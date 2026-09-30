@@ -1,0 +1,774 @@
+{
+  "attestation_required": true,
+  "bundle_bytes": 272689,
+  "bundle_sha256": "0fe8738708c2c1a103188cbe253833dc9cbc427989b78b715087eb3566313f12",
+  "matched_routes": [
+    "instrument-verification",
+    "release-migration",
+    "workspace-governance"
+  ],
+  "pair_key": "sha256:ab2011bd67557d89b2f094061d350a297389f7f57d0478be5e1ff8d2da8ed1c1",
+  "paths": [
+    ".github/workflows/ci.yml",
+    ".github/workflows/integration.yml",
+    ".github/workflows/repository-policy.yml",
+    ".github/workflows/source-candidate.yml",
+    "scripts/testdata/github-workflows/accept-locked-restore.yml",
+    "scripts/testdata/github-workflows/accept-privilege.yml",
+    "scripts/testdata/github-workflows/global-accept.json",
+    "scripts/testdata/github-workflows/global-drift.json",
+    "scripts/testdata/github-workflows/lock-stale.csproj",
+    "scripts/testdata/github-workflows/lock-stale.packages.lock.json",
+    "scripts/testdata/github-workflows/operator-net10.csproj",
+    "scripts/testdata/github-workflows/reject-oidc-token.yml",
+    "scripts/testdata/github-workflows/reject-overbroad-permissions.yml",
+    "scripts/testdata/github-workflows/reject-persist-credentials.yml",
+    "scripts/testdata/github-workflows/reject-secret-interpolation.yml",
+    "scripts/testdata/github-workflows/reject-unlocked-restore.yml",
+    "scripts/verify-github-workflows.py"
+  ],
+  "read_receipt_id": "sha256:93a83243290ae9022a345b47ae7cf654e189d921ae2d4eddc1fe961868e62f8a",
+  "required": [
+    {
+      "bytes": 25875,
+      "kind": "file",
+      "path": ".github/workflows/source-candidate.yml",
+      "sha256": "6ac26b1b3fe6c35ba58f4a8a30e29b31fbf4ee1e66662d7adf82aa389177eed6"
+    },
+    {
+      "bytes": 2790,
+      "kind": "file",
+      "path": "AGENTS.md",
+      "sha256": "c0a1322afc3550f343ae61cbc02a52bf623dc40d013887de2a60d245a1a64017"
+    },
+    {
+      "bytes": 21011,
+      "kind": "file",
+      "path": "Cargo.toml",
+      "sha256": "a891e950d5279e3db35b0640f8fb12541471224412fb6762eb82d2859f85be47"
+    },
+    {
+      "bytes": 8465,
+      "kind": "file",
+      "path": "WORKFLOW.md",
+      "sha256": "ceb5fa3190a88386c6e5a9fd233b5ef1a591a50f243f720036bffa9e6d3f6291"
+    },
+    {
+      "bytes": 5646,
+      "kind": "file",
+      "path": "docs/ARCHITECTURE_CONTRACT.md",
+      "sha256": "b047585cc9be9abeab7e7699cbbcfe160fa7d88e099611e80f5f7c1ff83d3df7"
+    },
+    {
+      "bytes": 14448,
+      "kind": "file",
+      "path": "docs/DEPENDENCY_POLICY.md",
+      "sha256": "ff3dbfeadc5db7f315df59dc419ae481306b215bf810c43b73571c8d4355742b"
+    },
+    {
+      "bytes": 2611,
+      "kind": "file",
+      "path": "docs/architecture/READING_PROTOCOL.md",
+      "sha256": "253cca0f078acd49545baed814c9319d72659ef1e2428edf1ead789beaa4e1c3"
+    },
+    {
+      "bytes": 62538,
+      "kind": "file",
+      "path": "scripts/verify.ps1",
+      "sha256": "add9739ff39eacf05221a345770e7910f0afb658f668d1c4700e70fac672889c"
+    },
+    {
+      "bytes": 2357,
+      "kind": "file",
+      "path": "workstreams/ACTIVE.toml",
+      "sha256": "13fc14e9d197b09256371a704dd02204eda087356602bd32285687e48308cc19"
+    },
+    {
+      "anchors": [
+        "a01-purpose-of-the-architecture"
+      ],
+      "bytes": 1871,
+      "handles": [
+        "A0.1"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A00-01-purpose-of-the-architecture.md",
+      "sha256": "ee540ede56579ec388e26da2b290759e78ad3bb8a70ba57d56364800a1692750"
+    },
+    {
+      "anchors": [
+        "a02-hierarchy-of-architectural-decisions"
+      ],
+      "bytes": 1867,
+      "handles": [
+        "A0.2"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A00-02-hierarchy-of-architectural-decisions.md",
+      "sha256": "342c67f670714c83bb4c68693447fd7597bc4a662b87d4fa6bae09df3cbaf6e5"
+    },
+    {
+      "anchors": [
+        "a03-hard-boundaries"
+      ],
+      "bytes": 821,
+      "handles": [
+        "A0.3"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A00-03-hard-boundaries.md",
+      "sha256": "695fe5e156e0dde052556e23c34b008009348742d4fc4a1146393b8b13a48bc0"
+    },
+    {
+      "anchors": [
+        "a04-conflict-resolution"
+      ],
+      "bytes": 1318,
+      "handles": [
+        "A0.4"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A00-04-conflict-resolution.md",
+      "sha256": "732d3b9a63973398e07e48691ba56f6538d9168f3102e0702a5ca2e08910f556"
+    },
+    {
+      "anchors": [
+        "a06-changing-the-architecture"
+      ],
+      "bytes": 858,
+      "handles": [
+        "A0.6"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A00-06-changing-the-architecture.md",
+      "sha256": "c086ee01cc243b7d7dee465bc0ddfca0c36cc3a344b3b3e803a5eb94ff6f68a8"
+    },
+    {
+      "anchors": [
+        "a55-verifier-and-evaluation-contract"
+      ],
+      "bytes": 860,
+      "handles": [
+        "A5.5"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A05-05-verifier-and-evaluation-contract.md",
+      "sha256": "e984f70ce61942adbdd003278f553fdb51c95b79f2a140ba6b96edde874aece3"
+    },
+    {
+      "anchors": [
+        "a104-delegation"
+      ],
+      "bytes": 1980,
+      "handles": [
+        "A10.4"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A10-04-delegation.md",
+      "sha256": "fd9c93b5e66ea93a0a2bb171706449ca8d07d2d48caeb99d1acdc57360014cd9"
+    },
+    {
+      "anchors": [
+        "a108-verification-and-finish"
+      ],
+      "bytes": 751,
+      "handles": [
+        "A10.8"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A10-08-verification-and-finish.md",
+      "sha256": "e557865aae5dc3d0e8864b4fa0ba1559989a0790c6429656b5f5f647cdab3ba7"
+    },
+    {
+      "anchors": [
+        "a133-module-supervision-and-doctor"
+      ],
+      "bytes": 2232,
+      "handles": [
+        "A13.3"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A13-03-module-supervision-and-doctor.md",
+      "sha256": "ef3e4c4ee9dcf883a4f16aa09a9eb04e4133d3af534c7334c0d2af958463c217"
+    },
+    {
+      "anchors": [
+        "a137-backups-restore-and-migration"
+      ],
+      "bytes": 1196,
+      "handles": [
+        "A13.7"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A13-07-backups-restore-and-migration.md",
+      "sha256": "19926d78353470c3422dcdad01825c3830aa4b48213fec7582b073946e491867"
+    },
+    {
+      "anchors": [
+        "a138-integrity"
+      ],
+      "bytes": 523,
+      "handles": [
+        "A13.8"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A13-08-integrity.md",
+      "sha256": "921362d9b07ef6008b4a319582d45f0e50efba28b407097fe257db4c0259b784"
+    },
+    {
+      "anchors": [
+        "a146-evaluation"
+      ],
+      "bytes": 1181,
+      "handles": [
+        "A14.6"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A14-06-evaluation.md",
+      "sha256": "d911b53fbc1f2f79f54774ebf1bf1cb261eb05243657fa1f6a2ce47b8e5f0c39"
+    },
+    {
+      "anchors": [
+        "a147-cost-authority"
+      ],
+      "bytes": 724,
+      "handles": [
+        "A14.7"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A14-07-cost-authority.md",
+      "sha256": "2966f4625f57327acc3bfce251109048a3ea867171caf3e79fb07733ce2c66e8"
+    },
+    {
+      "anchors": [
+        "a148-development-doctrine"
+      ],
+      "bytes": 3740,
+      "handles": [
+        "A14.8"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/A14-08-development-doctrine.md",
+      "sha256": "c7da919cd6112e97780407b7a7ae9806185994c2de6a275ed2449cb1b9ca78bb"
+    },
+    {
+      "anchors": [
+        "appendix-j-developer-commands"
+      ],
+      "bytes": 1176,
+      "handles": [
+        "APPENDIX-J"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/APPENDIX-J-developer-commands.md",
+      "sha256": "6bc9df8413b16297bd01607e6136178c6852ab5c6ffb03473c7c23b8717a533d"
+    },
+    {
+      "anchors": [
+        "appendix-p-rust-public-boundary-interfaces"
+      ],
+      "bytes": 1612,
+      "handles": [
+        "APPENDIX-P"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/APPENDIX-P-rust-public-boundary-interfaces.md",
+      "sha256": "7424b3b8ae9b079a65359bbdc2b2152dc6542a95f439ee375cf5ac9c964abfee"
+    },
+    {
+      "anchors": [
+        "i03-decision-sources"
+      ],
+      "bytes": 1265,
+      "handles": [
+        "I0.3"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I00-03-decision-sources.md",
+      "sha256": "c5d7586399d8640484edaa3cb949495bc99a82b50dabddac029b2d08c2d716e8"
+    },
+    {
+      "anchors": [
+        "i04-change-classes"
+      ],
+      "bytes": 3252,
+      "handles": [
+        "I0.4"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I00-04-change-classes.md",
+      "sha256": "3c1fc91d692bee9494327b7f5375fbe45cddc00c27d5a0bf0dc3b40300a2ae45"
+    },
+    {
+      "anchors": [
+        "i05-conformance-support-and-evidence-status"
+      ],
+      "bytes": 6368,
+      "handles": [
+        "I0.5"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I00-05-conformance-support-and-evidence-status.md",
+      "sha256": "bfb599eb462ebfb904ec97ba199a8447371bce91ab73b7bad9e71f150cb837f9"
+    },
+    {
+      "anchors": [
+        "i08-donor-migration-and-retirement-policy"
+      ],
+      "bytes": 3368,
+      "handles": [
+        "I0.8"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I00-08-donor-migration-and-retirement-policy.md",
+      "sha256": "8c5313d9ea33b45b1a318a698157674f9449059837aa72ca42c5ff8712bbc9ba"
+    },
+    {
+      "anchors": [
+        "i09-contract-maturity"
+      ],
+      "bytes": 671,
+      "handles": [
+        "I0.9"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I00-09-contract-maturity.md",
+      "sha256": "3014a09ff66e38dbe47e5c5091e62d947900d7cb62a5fb4a50d2f6f8d7758966"
+    },
+    {
+      "anchors": [
+        "i013-current-support-conformance-and-product-status"
+      ],
+      "bytes": 996,
+      "handles": [
+        "I0.13"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I00-13-current-support-conformance-and-product-status.md",
+      "sha256": "2d691986e973b4c9191cf5718f32b5035a8470b8355c5d82489df48c18651d2e"
+    },
+    {
+      "anchors": [
+        "i014-documentation-and-evidence-build-integrity"
+      ],
+      "bytes": 3413,
+      "handles": [
+        "I0.14"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I00-14-documentation-and-evidence-build-integrity.md",
+      "sha256": "e645a72c291c89a4bc3e2eae99527aa2476dcfab0280e429df80405dbebe3fd9"
+    },
+    {
+      "anchors": [
+        "i217-parallel-agent-development-contract"
+      ],
+      "bytes": 1834,
+      "handles": [
+        "I2.17"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I02-17-parallel-agent-development-contract.md",
+      "sha256": "6c333908b112859dbffe00c04a9e942b38c5d369a85d89d78788ab576a1d7cb1"
+    },
+    {
+      "anchors": [
+        "i220-module-contract-kit-crate-context-capsule-and-module-test-capsule"
+      ],
+      "bytes": 5497,
+      "handles": [
+        "I2.20"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I02-20-module-contract-kit-crate-context-capsule-and-module-test-capsule.md",
+      "sha256": "8a5d8276f2e1357eb58dd06acc7e5ac4017a4515048a5049c84e33849c381ef5"
+    },
+    {
+      "anchors": [
+        "i221-crate-and-boundary-validation"
+      ],
+      "bytes": 1549,
+      "handles": [
+        "I2.21"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I02-21-crate-and-boundary-validation.md",
+      "sha256": "f727b6627cf6151321e0b962c34f636b8b8df923abdf790c7b0cdeb84ef26002"
+    },
+    {
+      "anchors": [
+        "i222-parallel-build-cache-artifact-and-environment-lanes"
+      ],
+      "bytes": 2620,
+      "handles": [
+        "I2.22"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I02-22-parallel-build-cache-artifact-and-environment-lanes.md",
+      "sha256": "8cc78b566defb73be543c873648e0639694986510b32a25353c6e1cdebe92d4e"
+    },
+    {
+      "anchors": [
+        "i223-capability-family-topology-and-crate-extraction-decisions"
+      ],
+      "bytes": 6889,
+      "handles": [
+        "I2.23"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I02-23-capability-family-topology-and-crate-extraction-decisions.md",
+      "sha256": "e003d8e17b414ee0715028d7d3997d1b109c18df20ad0294ae2856d3e21e4e49"
+    },
+    {
+      "anchors": [
+        "i1081-purpose-and-ownership"
+      ],
+      "bytes": 1687,
+      "handles": [
+        "I10.8.1"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I10-08-01-purpose-and-ownership.md",
+      "sha256": "1691e9388db08eff53dae5190104965e8be9abe8b70fd8ad4921ffa6cdadc210"
+    },
+    {
+      "anchors": [
+        "i1082-ip0--one-windows-processexecutor"
+      ],
+      "bytes": 3853,
+      "handles": [
+        "I10.8.2"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I10-08-02-ip0-one-windows-processexecutor.md",
+      "sha256": "0731da943684498a61cf649fd91d9fef4068450943a96bdea73d78e32978c075"
+    },
+    {
+      "anchors": [
+        "i1083-ip1--typed-extensible-instrument-contracts"
+      ],
+      "bytes": 2675,
+      "handles": [
+        "I10.8.3"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I10-08-03-ip1-typed-extensible-instrument-contracts.md",
+      "sha256": "c82b346cb4b6d7e313c4790c8f5496d8ae9bb50a7166eead8fa83e71ffe26f16"
+    },
+    {
+      "anchors": [
+        "i1084-ip2--instrumentrunner"
+      ],
+      "bytes": 2333,
+      "handles": [
+        "I10.8.4"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I10-08-04-ip2-instrumentrunner.md",
+      "sha256": "b9a020dd270e278e5834a775186c0100c52ab85c35dd1e5e102bedb1e115b638"
+    },
+    {
+      "anchors": [
+        "i1085-ip3--streaming-evidence-and-normalization"
+      ],
+      "bytes": 1401,
+      "handles": [
+        "I10.8.5"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I10-08-05-ip3-streaming-evidence-and-normalization.md",
+      "sha256": "f11854df258b52e472e703f9dcbd60d0c2774a52d19181d9b5eafcc2d0bb91f4"
+    },
+    {
+      "anchors": [
+        "i1086-negative-result-contract"
+      ],
+      "bytes": 670,
+      "handles": [
+        "I10.8.6"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I10-08-06-negative-result-contract.md",
+      "sha256": "4a43e161471e98bd58e1fef0a065b2c331c4d475d5087c32d80e4027aff5c76d"
+    },
+    {
+      "anchors": [
+        "i1087-ip4--instrument-profiles"
+      ],
+      "bytes": 1903,
+      "handles": [
+        "I10.8.7"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I10-08-07-ip4-instrument-profiles.md",
+      "sha256": "ec5294d8aaa39b29194e1132adb3e36c27e175d4032fceba88778774a1516ad7"
+    },
+    {
+      "anchors": [
+        "i1088-ip5--rust-understanding-stack"
+      ],
+      "bytes": 1635,
+      "handles": [
+        "I10.8.8"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I10-08-08-ip5-rust-understanding-stack.md",
+      "sha256": "f8e138a5729fb8fc2c6b7821d38e393992f1fd597e59a5f8b4053886caf5c862"
+    },
+    {
+      "anchors": [
+        "i1089-agent-facing-projection"
+      ],
+      "bytes": 1217,
+      "handles": [
+        "I10.8.9"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I10-08-09-agent-facing-projection.md",
+      "sha256": "d923dfef45091245ee612caa7dd64b183de0c0782f9b2c8ed723995ecfc08f2c"
+    },
+    {
+      "anchors": [
+        "i10810-migration-from-overlapping-verification-paths"
+      ],
+      "bytes": 1205,
+      "handles": [
+        "I10.8.10"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I10-08-10-migration-from-overlapping-verification-paths.md",
+      "sha256": "6ed9f50e8a96891e66631f744599fd7579f69397f8ec86af98ad33107413ad77"
+    },
+    {
+      "anchors": [
+        "i10811-instrument-failure-and-replacement"
+      ],
+      "bytes": 864,
+      "handles": [
+        "I10.8.11"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I10-08-11-instrument-failure-and-replacement.md",
+      "sha256": "b3fc004a562442c651b8f17d221466159ec2954d58e51fdb9e4b3f1a333655da"
+    },
+    {
+      "anchors": [
+        "i10812-source-ownership-and-first-crate-extraction-wave"
+      ],
+      "bytes": 2745,
+      "handles": [
+        "I10.8.12"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I10-08-12-source-ownership-and-first-crate-extraction-wave.md",
+      "sha256": "dc1cc576bb78a0038f1efe98e08e80606d456fcb7ba83c6090f5a76c3a3ef498"
+    },
+    {
+      "anchors": [
+        "i10813-durable-instrument-job-lifecycle"
+      ],
+      "bytes": 1399,
+      "handles": [
+        "I10.8.13"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I10-08-13-durable-instrument-job-lifecycle.md",
+      "sha256": "a0fb5e13600e7b5aa12081b3e5a0a08fc4d720ce0eff3a1dcb2f0b10b7cca389"
+    },
+    {
+      "anchors": [
+        "i10814-build-artifact-and-evidence-reuse"
+      ],
+      "bytes": 966,
+      "handles": [
+        "I10.8.14"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I10-08-14-build-artifact-and-evidence-reuse.md",
+      "sha256": "67d8e85fe000e7290ca12e12d84ed7a7d4ce577b1f716376504b5631644f5553"
+    },
+    {
+      "anchors": [
+        "i10815-ip7--isolated-eliot-testd-execution-plane"
+      ],
+      "bytes": 1723,
+      "handles": [
+        "I10.8.15"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I10-08-15-ip7-isolated-eliot-testd-execution-plane.md",
+      "sha256": "77dd90cfe9ec8ad4c710a1c634bdf0bad214556445f8c6c7b37d61015212dd52"
+    },
+    {
+      "anchors": [
+        "i10816-ip8--component-build-and-generation-promotion-service"
+      ],
+      "bytes": 1051,
+      "handles": [
+        "I10.8.16"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I10-08-16-ip8-component-build-and-generation-promotion-service.md",
+      "sha256": "8de02a0eca6fcb15b82572788609f16f2fedd6448f1481aa7f32f2ce96e30cb8"
+    },
+    {
+      "anchors": [
+        "i10817-code-intelligence-capability-planes-and-query-semantics"
+      ],
+      "bytes": 3453,
+      "handles": [
+        "I10.8.17"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I10-08-17-code-intelligence-capability-planes-and-query-semantics.md",
+      "sha256": "d97434c148bd5a702de560f1d16ca74708138c852ab6eb4f06acac4e24183a2b"
+    },
+    {
+      "anchors": [
+        "i10818-derived-index-reference-path-impact-directives-and-source-views"
+      ],
+      "bytes": 4271,
+      "handles": [
+        "I10.8.18"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I10-08-18-derived-index-reference-path-impact-directives-and-source-views.md",
+      "sha256": "4472aa0aa1137bff7d7598c1b5edf58b357cb0ff103b6e6d053d239ad30a5230"
+    },
+    {
+      "anchors": [
+        "i10819-code-intelligence-adapter-arbitration-and-repowise-pilot"
+      ],
+      "bytes": 4039,
+      "handles": [
+        "I10.8.19"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I10-08-19-code-intelligence-adapter-arbitration-and-repowise-pilot.md",
+      "sha256": "99dd27e2dad5cdc34f9fd52ec93c8d8de90920d0aca105219dcdb513a1879a14"
+    },
+    {
+      "anchors": [
+        "i108-instrument-plane-canonical-verification-and-code-intelligence"
+      ],
+      "bytes": 74,
+      "handles": [
+        "I10.8"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I10-08-instrument-plane-canonical-verification-and-code-intelligence.md",
+      "sha256": "3f8c2562da7decde426501cc3d932d33aafca8d346ceedee2bb92256616b3ece"
+    },
+    {
+      "anchors": [
+        "i109-git-bridge"
+      ],
+      "bytes": 615,
+      "handles": [
+        "I10.9"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I10-09-git-bridge.md",
+      "sha256": "bca8c4727f01829de89e1adfde22f8b6714107d6ecb5dc5fbf8ab6c645ff47ae"
+    },
+    {
+      "anchors": [
+        "i1010-lsp-and-diagnostics"
+      ],
+      "bytes": 566,
+      "handles": [
+        "I10.10"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I10-10-lsp-and-diagnostics.md",
+      "sha256": "fbd98ea953d7339a1961c8f15f2f0aa3bd6b0ad48640e9c3089e096e94151455"
+    },
+    {
+      "anchors": [
+        "i1617-instrument-plane-observability"
+      ],
+      "bytes": 1294,
+      "handles": [
+        "I16.17"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I16-17-instrument-plane-observability.md",
+      "sha256": "d2fd3980a440f1fae1b8b2edddefd601bafd4230ad3b4d6f832b57053bc673b9"
+    },
+    {
+      "anchors": [
+        "i17-development-sequence"
+      ],
+      "bytes": 29,
+      "handles": [
+        "I17"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I17-development-sequence.md",
+      "sha256": "bce8bda02a5f57e7f1b11f4a037cc5481d6bc2615d1521e072f632f5b4c67b63"
+    },
+    {
+      "anchors": [
+        "i1843-agent-behavior-evaluation"
+      ],
+      "bytes": 3736,
+      "handles": [
+        "I18.43"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I18-43-agent-behavior-evaluation.md",
+      "sha256": "56113cde56e8b25f5254516f80c399fbd83654b21fea31a8a2c6a919ebdf56a6"
+    },
+    {
+      "anchors": [
+        "i1847-evaluator-benchmark-budget-and-credit-assignment-integrity"
+      ],
+      "bytes": 8166,
+      "handles": [
+        "I18.47"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I18-47-evaluator-benchmark-budget-and-credit-assignment-integrity.md",
+      "sha256": "651626bc8aed3265d4c9d9d105276a6ff5fa15109f2c8b4ea0894b085e7107d5"
+    },
+    {
+      "anchors": [
+        "i18-testing-and-instrumental-grounding-strategy"
+      ],
+      "bytes": 52,
+      "handles": [
+        "I18"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I18-testing-and-instrumental-grounding-strategy.md",
+      "sha256": "facd29dfe4a6fdb98a70f5a5decb7d960f8ca95419924828a44596c57940fb10"
+    },
+    {
+      "anchors": [
+        "i19-migration-from-current-implementation-and-documents"
+      ],
+      "bytes": 60,
+      "handles": [
+        "I19"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I19-migration-from-current-implementation-and-documents.md",
+      "sha256": "eca863ec6fff341d201d21cfd35d1264399d3ece0386aa33b274b880b745e5d5"
+    },
+    {
+      "anchors": [
+        "i20-future-replacement-points"
+      ],
+      "bytes": 34,
+      "handles": [
+        "I20"
+      ],
+      "kind": "fragment",
+      "path": "docs/architecture/I20-future-replacement-points.md",
+      "sha256": "ba5209ce594ffebe218bf63dd80751cfd70d81522d59e8d15edf28ccbe8045cf"
+    }
+  ],
+  "route_receipt_id": "sha256:a9792fc7f87f1a3f69984b8069542584af245963a11486547ea95ad561ffdc58",
+  "schema_version": "eliot-doc-read-v1",
+  "topic": "common workflow verifier dispatch probes and oracle identity"
+}
