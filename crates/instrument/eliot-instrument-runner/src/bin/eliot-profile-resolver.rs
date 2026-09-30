@@ -11,6 +11,18 @@
 //! schema, and the fail-closed identity/provenance checks are all decided by
 //! the same code on either side of the network boundary.
 //!
+//! "local profile revision == CI profile revision" is decided by that same code
+//! rather than asserted in prose. Given `--compare-against <receipt.json>`, this
+//! entry deserialises the counterpart `VerificationProfileReceipt` and hands
+//! both receipts to the one owner [`verify_profile_parity`], which refuses a
+//! changed profile revision, a divergent schema/definition/stage-graph digest, a
+//! missing declared environment dependency, a divergent tool identity, and a CI
+//! verifier command the local receipt never declared. A refused comparison is
+//! this entry's fail-closed nonzero exit, never a warning or a run that
+//! proceeds anyway. The comparison is not implicit: a run that supplies no
+//! `--compare-against` performs none, because the counterpart artifact is the
+//! caller's exactly as `--receipt-out` is.
+//!
 //! Everything the receipt records is machine-observed or registry-admitted:
 //!
 //! - the route is named by a closed [`PROFILE_ALIASES`] entry and resolved
@@ -54,8 +66,13 @@
 //! ```text
 //! eliot-profile-resolver --alias package-verification --source-root <abs> \
 //!     --target-root <abs> --cache-root <abs> [--declared-environment NAME]... \
-//!     [--receipt-out <path>]
+//!     [--receipt-out <path>] [--compare-against <counterpart-receipt.json>]
 //! ```
+//!
+//! `--compare-against` is the caller's counterpart receipt — the artifact the
+//! other side of the network boundary produced with the same alias. It is
+//! compared by the shared [`verify_profile_parity`] owner, so the revision
+//! equality is a computed verdict and a divergence refuses the run.
 //!
 //! Value discipline: `--alias` is matched exactly against the closed table
 //! rather than normalized; the three roots must be existing absolute,
@@ -86,12 +103,12 @@ use eliot_contracts::{
 use eliot_instrument_api::{InstrumentContractError, InstrumentInvocation};
 use eliot_instrument_runner::{
     ADMITTED_SCOPE_CLASS, AdmittedProfile, DeclaredEnvironmentDependency, ISOLATED_PROCESS_CLASS,
-    InstrumentRegistry, InstrumentRequestPort, InstrumentRunner, InstrumentSpec, PlannedStage,
-    ProfileAggregate, ProfileCompiler, RunnerError, StageEnvironment, StageLauncher,
+    InstrumentRegistry, InstrumentRequestPort, InstrumentRunner, InstrumentSpec, ParityVerdict,
+    PlannedStage, ProfileAggregate, ProfileCompiler, RunnerError, StageEnvironment, StageLauncher,
     StageOrchestrator, SupplyChainReceipt, TargetLayout, VerificationProfileReceipt,
     VerificationRouteRequest, WorkScope, admitted_profile_for_alias,
     profile::{PROFILE_ALIASES, builtin_specs},
-    resolve_verification_route,
+    parity_summary, resolve_verification_route, verify_profile_parity,
 };
 use eliot_process::{
     ActionLeaseRef, CancellationReceipt, DispatchAuthorityId, DispatchPermitAuthority,
@@ -195,6 +212,9 @@ struct Request {
     declared_environments: Vec<String>,
     /// Caller-chosen receipt path, when the caller wants the receipt on disk.
     receipt_out: Option<PathBuf>,
+    /// Caller-chosen counterpart receipt this run compares against, when the
+    /// caller has one.
+    compare_against: Option<PathBuf>,
 }
 
 /// Fail-closed refusals of the verification-route resolution entry.
@@ -312,6 +332,14 @@ fn run() -> i32 {
             return EXIT_REFUSED;
         }
     };
+    // The comparison is part of this run's outcome, not a side report: when the
+    // caller supplied a counterpart receipt, the shared parity owner decides
+    // whether this run may proceed, and a refusal exits here — after this run's
+    // own receipt was issued, never instead of one.
+    if let Err(error) = require_receipt_parity(&request, &receipt) {
+        eprintln!("{error}");
+        return EXIT_REFUSED;
+    }
     match serde_json::to_string_pretty(&receipt) {
         Ok(json) => println!("{json}"),
         Err(error) => {
@@ -328,6 +356,56 @@ fn run() -> i32 {
         EXIT_PASS
     } else {
         EXIT_REFUSED
+    }
+}
+
+/// Requires this run's receipt and the caller's counterpart receipt to agree.
+///
+/// The comparison itself belongs to [`verify_profile_parity`]; this only reads
+/// the counterpart artifact the caller named and routes its verdict. A run with
+/// no `--compare-against` compares nothing — the counterpart receipt is the
+/// caller's exactly as the receipt path is — and a caller that wants I18.21's
+/// "local profile revision == CI profile revision" checked must therefore name
+/// it. Deserialization is the only thing this adds: a receipt read off disk
+/// bypassed every check in the issuance builder, and [`verify_profile_parity`]
+/// already runs `VerificationProfileReceipt::validate()` on both sides, so
+/// there is deliberately no second validation layer here.
+///
+/// # Errors
+///
+/// Returns a [`CliError::Contract`] refusal when the counterpart receipt cannot
+/// be read, is not a `VerificationProfileReceipt`, is internally inconsistent,
+/// or diverges from this run's receipt. Every one of those is a refusal that
+/// becomes [`EXIT_REFUSED`] in [`run`], never a warning and never a run that
+/// proceeds as if parity had held.
+fn require_receipt_parity(
+    request: &Request,
+    receipt: &VerificationProfileReceipt,
+) -> Result<(), CliError> {
+    let Some(path) = request.compare_against.as_deref() else {
+        return Ok(());
+    };
+    let bytes = std::fs::read(path).map_err(|error| {
+        CliError::Contract(format!(
+            "counterpart receipt {} is unreadable: {error}",
+            path.display()
+        ))
+    })?;
+    let counterpart: VerificationProfileReceipt =
+        serde_json::from_slice(&bytes).map_err(|error| {
+            CliError::Contract(format!(
+                "counterpart receipt {} is not a VerificationProfileReceipt: {error}",
+                path.display()
+            ))
+        })?;
+    let verdict = verify_profile_parity(receipt, &counterpart)?;
+    println!("{}", parity_summary(&verdict));
+    match verdict {
+        ParityVerdict::Pass { .. } => Ok(()),
+        ParityVerdict::NonPass { reason } => Err(CliError::Contract(format!(
+            "local/CI profile parity refused against '{}': {reason}",
+            path.display()
+        ))),
     }
 }
 
@@ -809,6 +887,7 @@ fn read_request() -> Result<Request, CliError> {
     let mut cache_root = None;
     let mut declared_environments = Vec::new();
     let mut receipt_out = None;
+    let mut compare_against = None;
     while let Some(option) = args.next() {
         let mut value = |option: &str| {
             args.next()
@@ -823,6 +902,7 @@ fn read_request() -> Result<Request, CliError> {
                 declared_environments.push(value("--declared-environment")?);
             }
             "--receipt-out" => receipt_out = Some(PathBuf::from(value("--receipt-out")?)),
+            "--compare-against" => compare_against = Some(PathBuf::from(value("--compare-against")?)),
             other => return Err(CliError::Usage(format!("unknown option '{other}'"))),
         }
     }
@@ -842,6 +922,7 @@ fn read_request() -> Result<Request, CliError> {
             .ok_or_else(|| CliError::Usage("--cache-root is required".to_owned()))?,
         declared_environments,
         receipt_out,
+        compare_against,
     })
 }
 

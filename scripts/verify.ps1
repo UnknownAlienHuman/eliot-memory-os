@@ -7,7 +7,15 @@ param(
     [ValidateSet('Quick', 'Review', 'MergeCompile')]
     [string] $Profile = 'Quick',
     [switch] $List,
-    [switch] $SkipCargoCheck
+    [switch] $SkipCargoCheck,
+    # Counterpart `VerificationProfileReceipt` (issue #1914 A3, I18.21). When
+    # supplied, the resolver compares this run's receipt against it through the
+    # one shared `verify_profile_parity` owner and a non-PASS parity outcome
+    # refuses this run before any gate executes. The path is optional: this
+    # script adds no default and never invents a counterpart receipt, because
+    # a locally produced one is this run's OWN receipt and comparing it with
+    # itself would be a check that can never fire.
+    [string] $CompareProfileReceipt = ''
 )
 
 Set-StrictMode -Version Latest
@@ -680,6 +688,18 @@ try {
     foreach ($declaredEnvironmentDependency in $profileDeclaredEnvironmentDependencies) {
         $resolverArgs += @('--declared-environment', $declaredEnvironmentDependency)
     }
+    # Local/CI parity (issue #1914 A3, I18.21 "local profile revision == CI
+    # profile revision"). When the caller supplied a counterpart receipt, the
+    # SAME binary compares this run's receipt against it through the one shared
+    # `verify_profile_parity` owner and prints `PARITY_PASS` or
+    # `PARITY_NON_PASS reason=...` on its own stdout. This script adds no
+    # comparison of its own: the decision is the library's, and a non-PASS
+    # verdict leaves the resolver with a nonzero exit that the guard below
+    # turns into a refusal before a single gate executes, rather than a
+    # warning printed beside a run that continued.
+    if (-not [string]::IsNullOrWhiteSpace($CompareProfileReceipt)) {
+        $resolverArgs += @('--compare-against', $CompareProfileReceipt)
+    }
     $resolverArgs += @('--receipt-out', $profileReceiptPath)
     $resolverOutput = @(& $resolverExecutable @resolverArgs 2>&1)
     $resolverExit = $LASTEXITCODE
@@ -689,6 +709,18 @@ try {
     Write-Host "VERIFY_PROFILE_RESOLVER: raised $($_.Exception.Message)"
 }
 Write-Host "VERIFY_PROFILE_ALIAS: $verificationRouteAlias exit=$resolverExit"
+# A refused local/CI parity comparison is a refusal, not a report. The resolver
+# already exits nonzero for both a non-PASS aggregate and a non-PASS parity
+# verdict (see src/bin/eliot-profile-resolver.rs run()/
+# require_receipt_parity), so the comparison and this run's own outcome are one
+# decision over one receipt value. This guard is what makes a non-PASS
+# comparison stop the run instead of being recorded beside gates that then
+# execute anyway: the resolver's `PARITY_NON_PASS reason=...` line above is the
+# reason, and this exit is the refusal.
+if ($resolverExit -ne 0) {
+    [Console]::Error.WriteLine("VERIFY_PROFILE_ADMISSION_REFUSED: the shared resolver refused profile '$verificationRouteAlias' (exit $resolverExit); the PARITY_NON_PASS line above, if any, is the exact local/CI divergence it compared, and no gate ran under a refused profile revision.")
+    exit 1
+}
 if (-not (Test-Path -LiteralPath $profileReceiptPath -PathType Leaf)) {
     [Console]::Error.WriteLine("VERIFY_PROFILE_ADMISSION_REFUSED: the shared resolver issued no VerificationProfileReceipt at '$profileReceiptPath' (exit $resolverExit); a missing receipt is incomplete evidence, never a pass, and no gate ran under an unadmitted profile revision.")
     exit 1
@@ -718,9 +750,9 @@ if ($profileReceipt.profile -ne $expectedRoute) {
 # non-PASS outcome with a zero exit is therefore impossible by construction, so
 # there is no "disagreement" branch to warn on here: adding one would be a check
 # that can never fire. A genuinely non-PASS outcome arrives as a nonzero
-# resolver exit and is surfaced verbatim in the VERIFY_PROFILE_ALIAS and
-# VERIFY_PROFILE_REVISION lines below, and a route that could not be admitted at
-# all issues no receipt and is refused above.
+# resolver exit, is refused above before any gate ran, and is surfaced verbatim
+# in the VERIFY_PROFILE_ALIAS and VERIFY_PROFILE_REVISION lines below; a route
+# that could not be admitted at all issues no receipt and is refused above.
 Write-Host "VERIFY_PROFILE_REVISION: $($profileReceipt.profile)@$($profileReceipt.profile_revision) schema=$($profileReceipt.schema.schema)@$($profileReceipt.schema.version) outcome=$($profileReceipt.outcome)"
 foreach ($identity in @($profileReceipt.tool_identities)) {
     Write-Host "VERIFY_PROFILE_TOOL: $($identity.stage_id) instrument=$($identity.instrument) executable=$($identity.executable) sha256=$($identity.executable_digest)"
@@ -728,6 +760,17 @@ foreach ($identity in @($profileReceipt.tool_identities)) {
 foreach ($dependency in @($profileReceipt.environment_dependencies)) {
     Write-Host "VERIFY_PROFILE_ENVIRONMENT: $($dependency.name) expected=$($dependency.expected_class) observed=$($dependency.observed_class)"
 }
+
+# What the local/CI comparison actually did this run, stated in the summary
+# rather than left to a reader who has to notice whether a counterpart receipt
+# was supplied at all. The verdict itself is the resolver's `PARITY_PASS` /
+# `PARITY_NON_PASS` line above and nothing here recomputes it.
+$profileParitySummary = if ([string]::IsNullOrWhiteSpace($CompareProfileReceipt)) {
+    'not compared; no -CompareProfileReceipt was supplied, so this run reports its own profile revision without a counterpart verdict'
+} else {
+    "compared against $CompareProfileReceipt through the shared verify_profile_parity owner (resolver exit $resolverExit); a non-PASS verdict refused this run before any gate executed"
+}
+Write-Host "VERIFY_PROFILE_PARITY: $profileParitySummary"
 
 # Exact already-produced run evidence reused for the summary denominator.
 $script:verifyMetadataJson = ''
@@ -973,6 +1016,7 @@ $summaryLines = @(
     'VERIFY_CACHE: workflow-owned only; this script implements no gate cache, so a cache hit cannot skip a gate or supply a pass receipt',
     "VERIFY_PROFILE_ALIAS: $verificationRouteAlias",
     "VERIFY_PROFILE_RESOLVER: $profileResolver built at $resolverExecutable and invoked with alias $verificationRouteAlias (exit $resolverExit); the shared receipt, not a PATH lookup, is the admission evidence",
+    "VERIFY_PROFILE_PARITY: $profileParitySummary",
     "VERIFY_PROFILE_RECEIPT_CLEANUP: $profileReceiptCleanupState",
     "VERIFY_PROFILE_REVISION: $($profileReceipt.profile)@$($profileReceipt.profile_revision) schema=$($profileReceipt.schema.schema)@$($profileReceipt.schema.version) profile_digest=$($profileReceipt.profile_digest) dag_digest=$($profileReceipt.dag_digest) outcome=$($profileReceipt.outcome)",
     "VERIFY_PROFILE_RECEIPT: shared owner crates/instrument/eliot-instrument-runner/src/bin/eliot-profile-resolver.rs issued this run's VerificationProfileReceipt through resolve_verification_route/build_verification_profile_receipt; this script performs the minimal bootstrap build (I18.21:14) and then invokes it, and ci.yml, integration.yml and source-candidate.yml all enter this same script, so the revision resolved here is the revision every CI lane resolves",
