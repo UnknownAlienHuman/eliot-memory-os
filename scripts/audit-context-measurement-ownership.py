@@ -18,21 +18,23 @@ Design constraints that shape the whole file
    counts, digests and finding codes are identical by construction. The
    result is built once per invocation and is never mutated afterwards.
 2. **No second scanner.** Candidate accounting is obtained from the
-   accepted #866 producer by *importing and calling* its public functions
+   accepted #866 producer by *importing and calling* its read-only functions
    (``discover_context_measurements``, ``classify_context_measurement``,
-   ``load_owner_map``, ``build_inventory``); this file never re-implements
-   the producer's discovery, classification or denominator. The unaccounted-
+   ``load_owner_map``, ``_validate_artifact``, ``_parse_toml``, ``_load_files``,
+   ``_locate_signal``, ``_scope_of``); this file never re-implements the
+   producer's discovery, classification or denominator. The unaccounted-
    estimator detector reuses the producer's *own* declared needle vocabulary
    and the producer's *own* classifier, so an estimator added to a declared
    scan root is seen through #866, not through an independent second scanner
-   or a fixed local list. ``_866_rows_equal`` and ``_unaccounted_candidates``
-   are the only two consumers of the producer's row/candidate contract.
+   or a fixed local list. ``_producer_candidates`` and ``_unaccounted_candidates``
+   are the consumers of the producer's row/candidate contract; the oracle
+   never calls the producer's ``cmd_sync``/``build_inventory`` write path.
 3. **Read-only.** No network, no ambient clock, no writes, no auto-fallback
-   during normal checking. The only file the normal path ever opens for
-   writing is nothing: the tool is write-free by construction
-   (``_FORBIDDEN_CALLS`` is asserted empty in the self-test). Regeneration
-   of the shared artifact is the #866 ``sync`` single-writer path, never an
-   oracle auto-repair.
+   during normal checking. The self-test proves the evaluation region contains
+   no filesystem mutation, no broad directory walk and no banned retrieval,
+   clock, child-process or measurement-admission surface. Regeneration of the
+   shared artifact is the #866 ``sync`` single-writer path, never an oracle
+   auto-repair.
 4. **Independent expected set.** The baseline reconciliation denominator is
    the *frozen* ``EXPECTED_BASELINE_ROWS`` table below, which is written out
    here independently of the producer's live row order, and is compared
@@ -128,8 +130,12 @@ FAIL_CODES: tuple[str, ...] = (
 # are NOT copied from the producer's live rows: the oracle validates the
 # producer's rows *against* these independent facts.
 # ---------------------------------------------------------------------------
-CANONICAL_MEASUREMENT_OWNER = MEASUREMENT_OWNER_ISSUE  # "#704"
-CANONICAL_SCHEMA_OWNER = SCHEMA_OWNER_ISSUE  # "#584"
+# Owner identities are the *string* form the #866 inventory rows carry
+# ("#704"/"#783"/"#878"/"#880"). The bare issue numbers above are used only in
+# prose; every owner key, lookup and evidence map uses the "#NNN" string so a
+# numeric id can never silently miss an owner and report a false failure.
+CANONICAL_MEASUREMENT_OWNER = f"#{MEASUREMENT_OWNER_ISSUE}"
+CANONICAL_SCHEMA_OWNER = f"#{SCHEMA_OWNER_ISSUE}"
 CANONICAL_SCHEMA_PATH = "crates/smart/eliot-context-contracts/src/measurement.rs"
 CANONICAL_SCHEMA_TYPE = "SerializedContextMeasurement"
 CANONICAL_STU_PATH = "crates/smart/eliot-context-measurement/src/stu.rs"
@@ -211,7 +217,7 @@ CONSUMER_DEPENDENCY_MARKERS: dict[str, tuple[str, ...]] = {
         "measure_exact_utf8",
         "eliot_context_contracts",
     ),
-    MEASUREMENT_OWNER_ISSUE: (
+    CANONICAL_MEASUREMENT_OWNER: (
         "eliot_context_contracts",
     ),
 }
@@ -468,45 +474,125 @@ def _read_inventory_artifact(
     return header, rows, worksets, str(artifact["inventory_digest"]), raw
 
 
-def _producer_rebuild(
-    root: Path, producer: Any, header: dict[str, Any], rows: list[dict[str, Any]], stored_raw: bytes
-) -> tuple[str, str, list[dict[str, Any]], list[dict[str, Any]]]:
-    """Re-derive the inventory through the producer and judge freshness.
+def _producer_candidates(
+    root: Path, producer: Any
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Obtain the producer's own file records and candidates through the
+    accepted #866 read-only API.
 
-    This is the same operation the producer's own ``check`` performs, scoped
-    to *the universe the stored artifact declares* rather than to the
-    producer's hardcoded global default, so it is equally authoritative for
-    the real repository and for a bounded synthetic tree. Freshness is decided
-    by asking the producer to rebuild from its own rules and byte-comparing
-    the emitted artifact to the stored one -- never by recomputing a digest to
-    trust it, and never by trusting a commit SHA.
+    This is the *sole* candidate accounting for the oracle. It calls the
+    producer's own :func:`discover_context_measurements` over the producer's own
+    ``DENOMINATOR_CASES`` -- the declared scan universe and needle vocabulary --
+    so an added estimator is seen because the producer saw it. It does not call
+    the producer's ``sync``, does not emit or write anything, and does not
+    re-implement discovery, classification or the denominator.
 
-    Returns ``(status, detail, file_records, candidates)`` where ``status`` is
-    ``ok`` when the producer's re-emission is byte-identical to the stored
-    artifact, and a typed non-ok token otherwise. The ``candidates`` are the
-    producer's freshly discovered candidates for the declared universe and are
-    the oracle's sole candidate accounting.
+    A read, masking or classification failure raises a typed
+    :class:`OracleError` rather than escaping as a traceback.
     """
-    # Reconstruct the declared case set from the stored rows: this is the
-    # artifact's own declared universe (case_ref, owner, path, signal).
-    declared_cases = tuple(
-        (str(r["case_ref"]), str(r["owner"]), str(r["path"]), str(r["signal"])) for r in rows
-    )
     try:
-        owner_map_tuple = producer.load_owner_map(root)
+        return producer.discover_context_measurements(root, producer.DENOMINATOR_CASES)
     except producer.InventoryError as exc:
-        return "error", f"{exc.code}: {exc.detail}", [], []
+        raise OracleError(
+            "PRODUCER_CHECK_FAILED",
+            f"#{PRODUCER_ISSUE} discovery failed: {exc.code}: {exc.detail}",
+        ) from exc
+
+
+def _producer_check(
+    root: Path, producer: Any, raw: bytes
+) -> tuple[str, str]:
+    """Decide the producer's freshness verdict and validate its declared
+    source/rule/owner-map input digests against the live tree.
+
+    The stored artifact's *raw* bytes are exactly the bytes the producer's
+    re-emission is compared to, and exactly the bytes a consumer of this
+    result reasons about; they are used here so freshness is decided by the
+    producer's own re-emission rather than by trusting a recorded digest or a
+    commit SHA. Separately, the *recorded* ``source_sha``/``rule_digest``/
+    ``owner_digest``/``owner_map_digest`` header values are validated against
+    the values the producer itself derives from the live tree, so a relevant
+    source/rule/allocation change is caught even when the re-emission happens
+    to be compared separately.
+
+    Returns ``(status, detail)``; ``status`` is ``"ok"`` or a typed non-ok
+    token (``"stale"``, ``"blocked"``, ``"error"``, ``"digest-mismatch"``).
+    """
+    # The recorded inventory digest must equal a digest computed over the
+    # artifact's own content -- recomputing to *validate* the recorded value,
+    # never to trust a stored digest blindly.
     try:
-        # The sole producer builds; we never build the inventory ourselves.
-        fresh = producer.build_inventory(root, declared_cases, str(header.get("generation_command", "")), owner_map_tuple)
-        fresh_candidates = producer.discover_context_measurements(root, declared_cases)[1]
+        artifact = producer._parse_toml(raw, source=INVENTORY_REL)
+        header, rows, worksets = producer._validate_artifact(artifact)
     except producer.InventoryError as exc:
-        return "error", f"{exc.code}: {exc.detail}", [], []
-    fresh_raw = producer._emit_toml(fresh)
-    if fresh_raw == stored_raw:
-        return "ok", "producer re-emission is byte-identical to the stored artifact", [], fresh_candidates
-    # Distinguish a coverage block (unresolved rows / absent owner map) from a
-    # genuine staleness (the re-emission differs because an input moved).
+        return "error", f"{exc.code}: {exc.detail}"
+    recorded_inventory_digest = str(artifact.get("inventory_digest", ""))
+    try:
+        # Validate the recorded inventory_digest over the artifact content.
+        recomputed_inventory_digest = _sha256(
+            _canonical_bytes(
+                {
+                    "header": header,
+                    "rows": rows,
+                    "consumer_worksets": worksets,
+                }
+            )
+        )
+    except (TypeError, KeyError) as exc:
+        return "error", f"artifact content could not be re-canonicalised: {exc}"
+    if recorded_inventory_digest != recomputed_inventory_digest:
+        return (
+            "digest-mismatch",
+            f"recorded inventory_digest {recorded_inventory_digest[:16]} does not match the "
+            f"digest computed over the artifact's own content "
+            f"{recomputed_inventory_digest[:16]}",
+        )
+
+    # Validate the recorded source/rule/owner digests against the live tree,
+    # using the producer's own derivation of each.
+    try:
+        measured_rule_digest = producer._rule_digest()
+        measured_owner_digest = producer._owner_digest(producer.DENOMINATOR_CASES)
+        file_records, _candidates = producer.discover_context_measurements(
+            root, producer.DENOMINATOR_CASES
+        )
+        source_pairs = sorted(f"{r['path']}:{r['sha256']}" for r in file_records)
+        measured_source_sha = _sha256("\n".join(source_pairs).encode("utf-8"))
+        owner_map = producer.load_owner_map(root)
+        measured_map_digest = owner_map[2]
+    except producer.InventoryError as exc:
+        return "error", f"{exc.code}: {exc.detail}"
+    for label, recorded, measured in (
+        ("rule_digest", str(header.get("rule_digest", "")), measured_rule_digest),
+        ("owner_digest", str(header.get("owner_digest", "")), measured_owner_digest),
+        ("source_sha", str(header.get("source_sha", "")), measured_source_sha),
+        ("owner_map_digest", str(header.get("owner_map_digest", "")), measured_map_digest),
+    ):
+        if recorded != measured:
+            return (
+                "digest-mismatch",
+                f"recorded {label} {recorded[:16]} does not match the value derived from the "
+                f"live tree {measured[:16]}; a relevant source/rule/allocation/owner-map "
+                f"input changed since the artifact was generated",
+            )
+
+    # Byte-identity freshness: the producer's own re-emission of the declared
+    # universe must equal the stored bytes. This is the same operation the
+    # producer's own ``check`` performs, and it is what makes an unrelated HEAD
+    # move (which changes no scan input) NOT stale the artifact, while any
+    # change to a scan root, rule, or owner allocation does.
+    try:
+        mapping, map_status, _map_digest = producer.load_owner_map(root)
+        fresh = producer.build_inventory(
+            root, producer.DENOMINATOR_CASES,
+            str(header.get("generation_command", "")),
+            (mapping, map_status, owner_map[2]),
+        )
+        fresh_raw = producer._emit_toml(fresh)
+    except producer.InventoryError as exc:
+        return "error", f"{exc.code}: {exc.detail}"
+    if fresh_raw == raw:
+        return "ok", "producer re-emission is byte-identical to the stored artifact"
     fresh_header = fresh["header"] if isinstance(fresh, dict) else {}
     if str(fresh_header.get("coverage_disposition", "")) != "COMPLETE" or str(
         fresh_header.get("owner_map_status", "")
@@ -514,11 +600,10 @@ def _producer_rebuild(
         return (
             "blocked",
             f"producer rebuild leaves coverage {fresh_header.get('coverage_disposition')!r} / "
-            f"owner map {fresh_header.get('owner_map_status')!r}: {fresh_header.get('coverage_reason')}",
-            [],
-            fresh_candidates,
+            f"owner map {fresh_header.get('owner_map_status')!r}: "
+            f"{fresh_header.get('coverage_reason')}",
         )
-    return "stale", "producer re-emission differs from the stored artifact", [], fresh_candidates
+    return "stale", "producer re-emission differs from the stored artifact"
 
 
 def _unaccounted_candidates(
@@ -815,8 +900,14 @@ def evaluate(root: Path) -> OwnershipResult:
     producer = load_producer(root)
 
     # --- Inventory artifact present, closed, and producer-consistent. -----
+    # ``raw`` is the artifact's exact serialized bytes. They are what a
+    # freshness digest is computed over, so they are bound here and used by
+    # ``_producer_check`` -- never left unused, and never replaced by a
+    # recorded digest value that would have to be taken on trust.
     try:
-        header, rows, worksets, inventory_digest = _read_inventory_artifact(root, producer)
+        header, rows, worksets, inventory_digest, raw = _read_inventory_artifact(
+            root, producer
+        )
     except OracleError as exc:
         add(exc.code, exc.detail, rule="inventory-lifecycle")
         return _finalize(
@@ -835,9 +926,9 @@ def evaluate(root: Path) -> OwnershipResult:
         )
 
     # --- Producer freshness verdict (read-only, once). ---------------------
-    check_status, check_detail = _producer_check(root, producer)
+    check_status, check_detail = _producer_check(root, producer, raw)
     if check_status not in ("ok",):
-        if check_status in ("blocked",):
+        if check_status == "blocked":
             add(
                 "PRODUCER_CHECK_BLOCKED",
                 f"#{PRODUCER_ISSUE} check is blocked: {check_detail}",
@@ -848,6 +939,15 @@ def evaluate(root: Path) -> OwnershipResult:
                 "INVENTORY_STALE",
                 f"#{PRODUCER_ISSUE} check reports the artifact is stale: {check_detail}",
                 rule="producer-freshness",
+            )
+        elif check_status == "digest-mismatch":
+            # A recorded digest that disagrees with the measured one is a
+            # malformed artifact, reported against the exact named input.
+            add(
+                "INVENTORY_MALFORMED",
+                f"#{PRODUCER_ISSUE} recorded input digests disagree with the measured tree: "
+                f"{check_detail}",
+                rule="producer-input-digests",
             )
         else:
             add(
@@ -997,7 +1097,7 @@ def evaluate(root: Path) -> OwnershipResult:
             add(
                 "GENERIC_ESTIMATOR_OWNER",
                 f"a second definition of the canonical measurement entry point appears at "
-                f"{site['path']}:{site['span_start']} outside the {MEASUREMENT_OWNER_ISSUE} owner",
+                f"{site['path']}:{site['span_start']} outside the {CANONICAL_MEASUREMENT_OWNER} owner",
                 path=site["path"],
                 span_start=site["span_start"],
                 span_end=site["span_end"],
@@ -1041,8 +1141,12 @@ def evaluate(root: Path) -> OwnershipResult:
             )
 
     # --- Consumer dependency evidence (canonical use w/o dependency). -----
+    # Owner identity is the *string* owner form the inventory rows carry
+    # ("#704"/"#783"/"#878"/"#880"), so the lookup and the evidence map -- both
+    # keyed by that same string -- agree. A numeric issue id would silently miss
+    # every owner and report a false dependency failure.
     dependency = _dependency_evidence(root, producer, rows)
-    for owner in ("#783", "#878", "#880", MEASUREMENT_OWNER_ISSUE):
+    for owner in ("#783", "#878", "#880", CANONICAL_MEASUREMENT_OWNER):
         if owner not in CONSUMER_DEPENDENCY_MARKERS:
             continue
         hits = dependency.get(owner, [])
@@ -1051,7 +1155,7 @@ def evaluate(root: Path) -> OwnershipResult:
                 "MISSING_DEPENDENCY",
                 f"consumer {owner} has no exact canonical-measurement dependency or approved "
                 f"adapter marker in its declared seam source; a migrated consumer reaches "
-                f"measurement only through the {MEASUREMENT_OWNER_ISSUE} port or an exact "
+                f"measurement only through the {CANONICAL_MEASUREMENT_OWNER} port or an exact "
                 f"approved adapter, never a local ratio",
                 rule="dependency",
             )
