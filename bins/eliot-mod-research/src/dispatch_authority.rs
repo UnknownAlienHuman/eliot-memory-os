@@ -326,8 +326,7 @@ impl AdmittedRequestPort {
             operation,
             eliot_process::ProcessTreeId::new(format!("tree-{module_generation_id}"))
                 .map_err(|error| invalid(&error))?,
-            JobId::new(format!("job-{module_generation_id}"))
-                .map_err(|error| invalid(&error))?,
+            JobId::new(format!("job-{module_generation_id}")).map_err(|error| invalid(&error))?,
             ImageId::new(module_id.to_owned()).map_err(|error| invalid(&error))?,
             SessionId::new(format!("session-{module_generation_id}"))
                 .map_err(|error| invalid(&error))?,

@@ -322,7 +322,6 @@ impl ProviderBridge {
     /// attempt before the executor handoff. Nothing is recomputed and nothing
     /// defaults: a missing or mismatching field is a refusal.
     fn prove_operation_ownership(
-        &self,
         admission: &ProviderAdmission,
         operation: &OperationId,
         expected_digest: &str,
@@ -568,7 +567,7 @@ impl ProviderBridge {
             // The deadline arm below cancels a live process tree, so ownership is
             // re-proven on the observation the kill would act on rather than
             // inherited from start time.
-            self.prove_operation_ownership(admission, &bound.operation, &bound.digest, &view)?;
+            Self::prove_operation_ownership(admission, &bound.operation, &bound.digest, &view)?;
             if view.lifecycle().is_terminal() {
                 return Ok(view);
             }
@@ -589,7 +588,7 @@ impl ProviderBridge {
                         // obligation.
                         undischarged.push(UndischargedObligation {
                             obligation: Obligation::Cancellation,
-                            refusal: BridgeError::Process(refusal),
+                            refusal,
                         });
                         CancellationOutcome::Unresolved
                     }
@@ -772,9 +771,9 @@ impl ProviderBridge {
         operation: &OperationId,
         expected_digest: &str,
     ) -> Result<eliot_process::ProcessExecutionView, BridgeError> {
-        let view = block_on(self.executor.inspect(operation.clone()))
-            .map_err(BridgeError::Process)?;
-        self.prove_operation_ownership(admission, operation, expected_digest, &view)?;
+        let view =
+            block_on(self.executor.inspect(operation.clone())).map_err(BridgeError::Process)?;
+        Self::prove_operation_ownership(admission, operation, expected_digest, &view)?;
         Ok(view)
     }
 

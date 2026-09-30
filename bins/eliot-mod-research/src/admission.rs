@@ -544,10 +544,7 @@ mod tests {
         assert_eq!(admission.config_digest(), DIGEST_B);
         assert_eq!(admission.protocol_digest(), DIGEST_C);
         assert_eq!(admission.module_id().as_str(), "mod-research-provider");
-        assert_eq!(
-            admission.module_generation_id().as_str(),
-            "gen-mod-24-a"
-        );
+        assert_eq!(admission.module_generation_id().as_str(), "gen-mod-24-a");
         assert_eq!(
             admission.process_generation(),
             Generation::new(3).expect("gen")

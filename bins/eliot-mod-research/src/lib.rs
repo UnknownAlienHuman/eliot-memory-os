@@ -1080,7 +1080,10 @@ impl AdmittedResearchBridge {
             reason: "no submitted attempt owns the operation",
         })?;
         if let Some(context) = &state.start_attempt {
-            return Ok((context.operation_id.clone(), context.invocation_digest.clone()));
+            return Ok((
+                context.operation_id.clone(),
+                context.invocation_digest.clone(),
+            ));
         }
         let submission = state.submission.as_ref().ok_or(BridgeError::NotAdmitted {
             reason: "submitted attempt has no sealed operation binding",
@@ -1095,7 +1098,10 @@ impl AdmittedResearchBridge {
                 reason: "sealed submit targets a foreign operation",
             });
         }
-        Ok((self.admission.operation_id().clone(), envelope.invocation_digest))
+        Ok((
+            self.admission.operation_id().clone(),
+            envelope.invocation_digest,
+        ))
     }
 }
 
@@ -1211,9 +1217,11 @@ impl ResearchBridge for AdmittedResearchBridge {
             // digest. Cancelling by a bare job id would let a stale generation
             // or a retargeted request reach another operation's process tree.
             let (target_operation, expected_digest) = self.retained_attempt_binding()?;
-            let receipt = self
-                .runner
-                .cancel_operation(&self.admission, &target_operation, &expected_digest)?;
+            let receipt = self.runner.cancel_operation(
+                &self.admission,
+                &target_operation,
+                &expected_digest,
+            )?;
             if let BridgePhase::Submitted(state) = &mut self.phase {
                 state.cancellation = Some(CancellationEvidence::from_receipt(&receipt));
             }
