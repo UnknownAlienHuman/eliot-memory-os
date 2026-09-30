@@ -191,7 +191,10 @@ fn observe_supervision_lease_expiry() {
 /// Missing/refused identity stays unavailable; the previous accepted request is
 /// never substituted for the current operation. This span grants no authority.
 #[cfg(windows)]
-fn daemon_progress_operation_context(request: &DaemonSupervisionRenewalRequest) -> tracing::Span {
+fn record_daemon_progress_operation_context(
+    context: &tracing::Span,
+    request: &DaemonSupervisionRenewalRequest,
+) {
     let observation = request.validate().is_ok().then_some(&request.observation);
     let generation = observation.map(|value| {
         value
@@ -205,19 +208,26 @@ fn daemon_progress_operation_context(request: &DaemonSupervisionRenewalRequest) 
     let fence = observation.and_then(|value| {
         StateFence::canonical_epoch_digest(&value.state_fence.authority_epoch).ok()
     });
-    let context = kernel_diagnostics::operation_context(
-        observation.map(|value| value.observation_id.as_str()),
-        generation.as_deref(),
-        fence.as_ref().map(|value| value.as_str()),
-        epoch.as_ref().map(|value| value.as_str()),
-    );
+    for (field, original) in [
+        (
+            "operation",
+            observation.map(|value| value.observation_id.as_str()),
+        ),
+        ("generation", generation.as_deref()),
+        ("state_fence", fence.as_deref()),
+        ("authority_epoch", epoch.as_deref()),
+    ] {
+        if let Some(original) = original {
+            let value = kernel_diagnostics::bound_field(original);
+            context.record(field, value.text());
+        }
+    }
     if let Some(value) = observation {
         let lease = kernel_diagnostics::bound_field(&value.lease_id);
         let receipt = kernel_diagnostics::bound_field(&value.predecessor_receipt_sha256);
         context.record("lease", lease.text());
         context.record("receipt", receipt.text());
     }
-    context
 }
 
 /// Records the daemon's supervision health from one renewal decision.
@@ -3538,6 +3548,8 @@ impl KernelComposition {
     fn supersede_predecessor(
         authority: &KernelSupervisionLeaseAuthority,
         contour: &DaemonSupervisionContour,
+        context: &tracing::Span,
+        terminal_owned: &mut bool,
     ) -> Result<(), SupervisionLeaseAuthorityError> {
         let Some(predecessor) = contour.incarnation.predecessor.as_ref() else {
             return Ok(());
@@ -3612,7 +3624,8 @@ impl KernelComposition {
                 binding,
             })?
         };
-        let terminal = authority.commit_terminal(&stage.ticket)?;
+        let terminal =
+            authority.commit_terminal_in_context(&stage.ticket, context, terminal_owned)?;
         if terminal.record.state != LeaseState::Superseded
             || terminal.record.projection != eliot_ors::SupervisionLeaseProjection::Terminal
             || terminal
@@ -3637,9 +3650,11 @@ impl KernelComposition {
         contour: &DaemonSupervisionContour,
         now_ms: u64,
         kernel_artifact_sha256: &str,
+        context: &tracing::Span,
+        terminal_owned: &mut bool,
     ) -> Result<SupervisionLeaseSnapshot, SupervisionLeaseAuthorityError> {
         let lease_id = contour.incarnation.supervision_lease_id.as_str();
-        Self::supersede_predecessor(authority, contour)?;
+        Self::supersede_predecessor(authority, contour, context, terminal_owned)?;
         if let Some(current) = authority.current_snapshot(lease_id)? {
             authority.verify_active_snapshot(&current, lease_id, now_ms)?;
             if !supervision_binding_matches_contour(&current.record.binding, contour)? {
@@ -3677,7 +3692,12 @@ impl KernelComposition {
                 binding,
             })?
         };
-        let current = authority.commit_active(&stage.ticket)?;
+        let current = authority
+            .commit_active_in_context(&stage.ticket, context)
+            .map_err(|error| {
+                *terminal_owned = true;
+                error
+            })?;
         authority.verify_active_snapshot(&current, lease_id, now_ms)?;
         if !supervision_binding_matches_contour(&current.record.binding, contour)? {
             return Err(SupervisionLeaseAuthorityError::Ors(
@@ -4012,6 +4032,8 @@ impl KernelComposition {
         &self,
         session: &Session,
         process: &ProcessStartReceipt,
+        context: &tracing::Span,
+        terminal_owned: &mut bool,
     ) -> Result<(DaemonSupervisionContour, SupervisionLeaseSnapshot), KernelServiceError> {
         // The one live point where this composition issues a supervision lease.
         // The shared Kernel-unavailability guard runs first, so an unavailable
@@ -4032,6 +4054,8 @@ impl KernelComposition {
             &contour,
             unix_ms(),
             kernel_artifact_sha256,
+            context,
+            terminal_owned,
         )
         .map_err(|_| KernelServiceError::ReadinessNotProven)?;
         // Issue #1837: durable audit evidence for lease establishment.
@@ -4099,8 +4123,9 @@ impl KernelComposition {
         // reconcile the publication from that successor; it must not submit the
         // predecessor again as a new renewal request.
         if observation.predecessor_receipt_sha256 != head.receipt.receipt_sha256 {
-            let published =
-                self.publish_eliotd_live_receipt(launch, process, ready, contour, Some(head))?;
+            let published = self
+                .publish_eliotd_live_receipt(launch, process, ready, contour, Some(head), context)
+                .inspect_err(|_| *terminal_owned = true)?;
             return Ok(Some((head.clone(), published)));
         }
         let predecessor = eliot_runtime_contracts::SupervisionLeasePredecessorProof {
@@ -4168,7 +4193,17 @@ impl KernelComposition {
                         DaemonSupervisionHeartbeatError::SupervisionLeaseExpired
                     )
                 );
-                put_back(progress, Some(expired))?;
+                put_back(progress, Some(expired)).inspect_err(|_| {
+                    if *terminal_owned {
+                        tracing::warn!(
+                            target: kernel_diagnostics::KERNEL_DIAGNOSTICS_TARGET,
+                            parent: context,
+                            event = "kernel.supervision.progress_cleanup_refused",
+                            outcome = "unavailable",
+                            "cleanup failed after an already-owned operation terminal"
+                        );
+                    }
+                })?;
                 if expired {
                     self.promote_agent_bridge_profile(None)
                         .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
@@ -4182,8 +4217,9 @@ impl KernelComposition {
         put_back(progress, Some(false))?;
         // A non-renewing decision still publishes the unchanged head
         // so the live receipt tracks the durable revision.
-        let published =
-            self.publish_eliotd_live_receipt(launch, process, ready, contour, Some(&snapshot))?;
+        let published = self
+            .publish_eliotd_live_receipt(launch, process, ready, contour, Some(&snapshot), context)
+            .inspect_err(|_| *terminal_owned = true)?;
         if decision.outcome == DaemonSupervisionRenewalOutcome::Renewed {
             let live_sha256 = sha256_hex(
                 &eliot_contracts::canonical_json_bytes(&published)
@@ -4288,12 +4324,7 @@ impl KernelComposition {
             // refuses the probe closed and is retried on the next probe
             // through the staged-ticket resume.
             if authority
-                .expire_past_due_lease_in_context(
-                    lease_id,
-                    &contour.state_fence,
-                    now_ms,
-                    context,
-                )
+                .expire_past_due_lease_in_context(lease_id, &contour.state_fence, now_ms, context)
                 .is_err()
             {
                 *terminal_owned = true;
@@ -4311,20 +4342,26 @@ impl KernelComposition {
         // A retry first reconciles any exact current ORS successor left by an
         // earlier ambiguous publication. This prevents a second Renew from
         // skipping over the receipt that still names the older ORS head.
-        let _ =
-            self.publish_eliotd_live_receipt(&launch, &process, &ready, &contour, Some(&before))?;
-        let (renewed, published) = if let Some(pair) = self
-            .progress_renewal_for_probe(
-                authority,
-                &contour,
+        let _ = self
+            .publish_eliotd_live_receipt(
                 &launch,
                 &process,
                 &ready,
-                &before,
+                &contour,
+                Some(&before),
                 context,
-                terminal_owned,
-            )?
-        {
+            )
+            .inspect_err(|_| *terminal_owned = true)?;
+        let (renewed, published) = if let Some(pair) = self.progress_renewal_for_probe(
+            authority,
+            &contour,
+            &launch,
+            &process,
+            &ready,
+            &before,
+            context,
+            terminal_owned,
+        )? {
             pair
         } else {
             // Front-door continuity only. This fallback cannot satisfy I1.11
@@ -4340,13 +4377,16 @@ impl KernelComposition {
                 terminal_owned,
             )
             .map_err(|_| KernelServiceError::ReadinessNotProven)?;
-            let published = self.publish_eliotd_live_receipt(
-                &launch,
-                &process,
-                &ready,
-                &contour,
-                Some(&renewed),
-            )?;
+            let published = self
+                .publish_eliotd_live_receipt(
+                    &launch,
+                    &process,
+                    &ready,
+                    &contour,
+                    Some(&renewed),
+                    context,
+                )
+                .inspect_err(|_| *terminal_owned = true)?;
             (renewed, published)
         };
         // Issue #1837: durable audit evidence for lease renewal.
