@@ -2983,6 +2983,158 @@ pub struct AbsenceEvidence {
     pub evaluation: NoMatchEvaluation,
 }
 
+/// The exact owner-issued absence evidence one terminal closure decision rests
+/// on, re-proved at the point of closure.
+///
+/// # #2893 item 12
+///
+/// Item 12 asks that final `NO_MATCH`/closure be connected here once the
+/// evidence record exists. This is that connection, and it is deliberately a
+/// *closure-side* value rather than another receipt field, for two reasons:
+///
+/// * the receipt already retains the record's identity
+///   ([`CoverageReceipt::absence_evidence_digest`]) and its ceiling
+///   ([`CoverageReceipt::absence_proof_ceiling_grade`]) inside
+///   `coverage-receipt/v3`, and it re-proves the record itself inside
+///   [`AbsencePreconditions::derive`] before the verdict is derived. A third copy
+///   of the same fact on the receipt would be a second owner of it;
+/// * a closure decision needs the *record*, not its digest. "The digest of a
+///   record that once existed" cannot be re-proved against the State Fence, the
+///   frozen scope snapshot or the assessment instant of the operation that is
+///   closing, and those are precisely the commitments `NoMatchEvaluation`
+///   carries and `AbsencePreconditions::derive` checked. Carrying the record is
+///   what lets a releasing owner re-run those checks against *this* operation
+///   instead of trusting a closure that a different one published.
+///
+/// Every field is private and there is exactly one way to obtain a value,
+/// [`Self::verify`], which refuses rather than returns an optional. A record
+/// that cannot re-prove itself, or that does not name this run's own profile,
+/// State Fence and frozen scope snapshot, produces `None` — so
+/// [`terminal_disposition`] has no value to read and the closure stays
+/// [`CompletionDisposition::IncompleteCoverage`]. There is no constructor that
+/// mints one from a caller-supplied digest or a bare `Proven` verdict.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AbsenceClosureEvidence {
+    /// The re-proved owner-issued evaluation.
+    evaluation: NoMatchEvaluation,
+    /// Its canonical identity, so a reader compares it against the receipt's
+    /// retained `absence_evidence_digest` by recomputation, not by trust.
+    evaluation_digest: String,
+    /// The authorized manifest the evaluation was issued under, re-proved.
+    manifest: AuthorizedManifest,
+    /// The proof ceiling this closure may not exceed.
+    proof_ceiling_grade: Option<u8>,
+}
+
+impl AbsenceClosureEvidence {
+    /// Re-proves one presented record against *this* operation and, only if
+    /// every commitment joins, produces the value a closure may rest on.
+    ///
+    /// The join is against the same run the receipt was computed over: the
+    /// evaluation's State Fence must be the profile's, its held `scope_digest`
+    /// must be the admitted denominator snapshot this receipt accounts over, its
+    /// named manifest must be the presented manifest's, and the record must
+    /// re-prove its own identity and still declare a proof ceiling. A mismatch
+    /// is `None`, never a relaxed closure.
+    pub fn verify(
+        evidence: &AbsenceEvidence,
+        profile: &InquiryProtocolProfile,
+        receipt: &CoverageReceipt,
+    ) -> Option<Self> {
+        evidence.evaluation.verify_integrity().ok()?;
+        evidence.manifest.verify_integrity().ok()?;
+        let evaluation_digest = evidence.evaluation.canonical_digest().ok()?;
+        // Bound to *this* operation rather than merely to a digest the receipt
+        // already holds: an evaluation admitted under a different fence, or over
+        // a different frozen scope snapshot, is a different run's evidence even
+        // if the receipt were handed a matching digest.
+        if !evidence.evaluation.is_admitted_under(&profile.state_fence)
+            || !evidence
+                .evaluation
+                .covers_scope(&receipt.admitted_denominator_digest)
+        {
+            return None;
+        }
+        // Kept as the record's own `Option`, not unwrapped: a record that never
+        // established a ceiling publishes `none` here, and `closes_negative`
+        // compares it with the receipt's own retained value, so a receipt that
+        // published no ceiling and a record that established none still agree
+        // while a record that established one can never be published under a
+        // receipt that published none.
+        let proof_ceiling_grade = evidence.evaluation.proof_ceiling_grade();
+        Some(Self {
+            evaluation: evidence.evaluation.clone(),
+            evaluation_digest,
+            manifest: evidence.manifest.clone(),
+            proof_ceiling_grade,
+        })
+    }
+
+    /// Whether this evidence supports a scoped-negative closure over `receipt`.
+    ///
+    /// Every conjunct below is a fact the record itself carries, re-proved by
+    /// [`Self::verify`]; none of them is read off a caller flag, and
+    /// `denominator_kind` is deliberately *not* re-implemented here — the
+    /// receipt's own field already encodes every other condition
+    /// (`all_closed`, `accounted`, no provider degradation, counter-search
+    /// satisfied) and re-deciding them would be the second validator #2893
+    /// forbids. What this adds is the one check the receipt's own gate cannot
+    /// make: that the record a reader is being asked to trust is the same record
+    /// the receipt retained, and that it is the record of a *negative* over this
+    /// exact accounting.
+    fn closes_negative(&self, receipt: &CoverageReceipt) -> bool {
+        // The identity the receipt retained must be this record's own, so the
+        // verdict and the record it was derived from cannot be re-pointed.
+        receipt.absence_evidence_digest.as_deref() == Some(self.evaluation_digest.as_str())
+            // The record's held manifest must be the one presented with it.
+            // Compared by RECOMPUTING the presented manifest's canonical digest
+            // rather than by reading its frozen field, so the join is against a
+            // value derived from the record's own bytes and not a field a
+            // caller could have written. `verify` already re-proved that digest
+            // against the manifest's own frozen identity.
+            && self
+                .manifest
+                .canonical_digest()
+                .is_ok_and(|digest| digest == self.evaluation.named_manifest_digest())
+            // The record must be *proven* absence, and it must not have been
+            // published over a scope snapshot this run did not account over.
+            && self.evaluation.proves_absence()
+            && self.evaluation.covers_scope(&receipt.frozen_scope_digest)
+            // The retained ceiling must not be weaker than what the receipt
+            // published, so the two facts a reader reads cannot disagree.
+            && self.proof_ceiling_grade == receipt.absence_proof_ceiling_grade
+            // The denominator kind is the receipt's own verdict over the whole
+            // conjunction; reading it here rather than re-deriving it keeps one
+            // owner for it.
+            && receipt.denominator_kind.supports_scoped_absence()
+            && receipt.all_closed
+            && receipt.scope_snapshot_matches_admission
+    }
+
+    /// Canonical digest of the owner-issued evaluation this closure rests on.
+    ///
+    /// Read by a releasing owner to confirm it is holding the record the
+    /// disposition was taken over, which is what
+    /// [`InquiryTerminalRecord::absence_closure_evidence_digest`] publishes.
+    #[must_use]
+    pub fn evaluation_digest(&self) -> &str {
+        &self.evaluation_digest
+    }
+
+    /// Proof ceiling this closure may not be published past.
+    #[must_use]
+    pub fn proof_ceiling_grade(&self) -> Option<u8> {
+        self.proof_ceiling_grade
+    }
+
+    /// The members this record carries an owner-issued per-member result for, in
+    /// canonical order.
+    #[must_use]
+    pub fn evaluated_members(&self) -> Vec<String> {
+        self.evaluation.evaluated_members()
+    }
+}
+
 /// Coverage receipt for one inquiry (I21.6).
 ///
 /// "No result" is not absence or completeness without a declared denominator
@@ -4603,6 +4755,17 @@ pub struct InquiryTerminalRecord {
     pub unsupported_precision: Vec<UnsupportedPrecisionItem>,
     /// State Fence the disposition was taken under.
     pub state_fence: StateFence,
+    /// Identity of the owner-issued absence record this closure rests on
+    /// (#2893 item 12).
+    ///
+    /// `None` for every non-closing disposition, and also for a closing one whose
+    /// record could not be re-proved against this run's fence and frozen scope
+    /// snapshot — in which case the disposition is `IncompleteCoverage` and this
+    /// is `None` too. It is the canonical digest of the record computed by
+    /// recomputation, never a value a caller supplied, so a reader can compare it
+    /// against the coverage receipt's own retained `absence_evidence_digest` and
+    /// see whether the same record closed the run.
+    pub absence_closure_evidence_digest: Option<String>,
     /// Always true: a terminal inquiry record stays candidate-only.
     pub candidate_only: bool,
     /// Always false: closing a task stays in the existing Governor path.
@@ -4679,6 +4842,7 @@ impl InquiryTerminalRecord {
         freeze: EvidenceFreeze,
         claim_audit: Option<ClaimAuditRecord>,
         unsupported_precision: Vec<UnsupportedPrecisionItem>,
+        absence_closure_evidence_digest: Option<String>,
     ) -> Result<Self, InquiryError> {
         require_text(evidence_set_id, "terminal.evidence_set_id")?;
         require_text(reason_code, "terminal.reason_code")?;
@@ -4701,6 +4865,23 @@ impl InquiryTerminalRecord {
         if debt_restriction.refuses(disposition) {
             return Err(InquiryError::DebtRestrictedDisposition {
                 field: "terminal.disposition",
+            });
+        }
+        if let Some(digest) = &absence_closure_evidence_digest {
+            require_digest(digest, "terminal.absence_closure_evidence_digest")?;
+        }
+        // #2893 item 12: a scoped-negative closure is the claim that needs the
+        // owner-issued record behind it, so a record that CLOSES over
+        // `NO_MATCH_IN_COMPLETE_SCOPE` without naming that record is refused
+        // here rather than published and explained in a doc comment. The
+        // converse direction is not imposed: a positive closure is the other
+        // owner's decision (the claim-audit release gate) and does not rest on
+        // absence evidence, so it is not required to carry this field.
+        if disposition == CompletionDisposition::NoMatchInCompleteScope
+            && absence_closure_evidence_digest.is_none()
+        {
+            return Err(InquiryError::UnknownHandle {
+                field: "terminal.absence_closure_evidence_digest",
             });
         }
         let may_close = disposition.may_close_inquiry();
@@ -4741,6 +4922,7 @@ impl InquiryTerminalRecord {
             claim_audit,
             unsupported_precision,
             state_fence: profile.state_fence.clone(),
+            absence_closure_evidence_digest,
             candidate_only: true,
             canonical_write_authorized: false,
             digest: String::new(),
@@ -4818,6 +5000,22 @@ impl InquiryTerminalRecord {
                 "terminal.unsupported_precision.required_probe",
             )?;
         }
+        // #2893 item 12, readback side: the same rule `bind` enforces, re-proved
+        // from this record's own bytes rather than trusted from a field. A
+        // record read back from storage that closes over a scoped negative
+        // without naming the record behind it is the same contradiction the
+        // constructor refuses, and `validate_integrity` is the only method a
+        // reader is required to run.
+        if let Some(digest) = &self.absence_closure_evidence_digest {
+            require_digest(digest, "terminal.absence_closure_evidence_digest")?;
+        }
+        if self.disposition == CompletionDisposition::NoMatchInCompleteScope
+            && self.absence_closure_evidence_digest.is_none()
+        {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "terminal.absence_closure_evidence_digest",
+            });
+        }
         Ok(())
     }
 
@@ -4853,7 +5051,14 @@ impl InquiryTerminalRecord {
         // transitively binds moved. #1765 later grew that field set (the State
         // Fence and the three successor-relation fields), which is the bump that
         // took the freeze to `v2`.
-        let mut preimage = String::from("inquiry-terminal-record/v2;");
+        // `v2` -> `v3` by #2893 for the same reason as the earlier bumps above:
+        // the preimage field set GREW. The terminal record now names the
+        // identity of the owner-issued absence record a scoped-negative closure
+        // rests on, and under `v2` two records with the same disposition and
+        // different evidence behind it hashed identically. The bound value is
+        // `none` for every non-closing and every refused-closure record, so this
+        // is a shape change and not a value change under one name.
+        let mut preimage = String::from("inquiry-terminal-record/v3;");
         push_field(&mut preimage, "inquiry_id", &self.inquiry_id);
         push_field(&mut preimage, "profile_id", &self.profile_id);
         push_field(
@@ -4886,6 +5091,16 @@ impl InquiryTerminalRecord {
             self.acquisition_outcome.wire_name(),
         );
         push_field(&mut preimage, "reason_code", &self.reason_code);
+        // The record identity behind a scoped-negative closure. Bound explicitly
+        // so a terminal record cannot be re-pointed at a different owner-issued
+        // evaluation while keeping its disposition and every other field.
+        push_field(
+            &mut preimage,
+            "absence_closure_evidence_digest",
+            self.absence_closure_evidence_digest
+                .as_deref()
+                .unwrap_or("none"),
+        );
         if let Some(unknown) = &self.explicit_unknown {
             push_field(&mut preimage, "unknown_subject", &unknown.subject);
             push_field(&mut preimage, "unknown_detail", &unknown.detail);
@@ -5809,6 +6024,7 @@ impl InquiryGovernance {
             &research_debts,
             &freeze,
             claim_audit.records.first(),
+            absence_evidence.as_ref(),
         )?;
         let record = Self {
             inquiry_id: observation.inquiry_id,
@@ -8510,9 +8726,31 @@ struct FreezePredecessor {
 /// Submission and provider acknowledgement are not inquiry outcomes: a completed
 /// provider operation still closes nothing unless the frozen denominator closed
 /// intact, and every other outcome keeps an explicit disposition.
+///
+/// # #2893 item 12: what closure actually reads
+///
+/// The previous body decided `ANSWERED_WITH_SUPPORTED_RESULT` from two
+/// `CoverageReceipt` fields — `all_closed` and
+/// `denominator_kind.supports_scoped_absence()` — and consulted the receipt's
+/// retained absence evidence nowhere. `denominator_kind` is itself decided over
+/// the evidence record (see [`denominator_kind`]), so the *kind* was already
+/// evidence-gated, but the terminal record published neither the verdict class
+/// nor the record's identity: a reader of the disposition could not tell whether
+/// the closure rested on an owner-issued evaluation, and a closure published
+/// from a receipt whose evidence had since been rewritten was indistinguishable
+/// from one published over the intact record.
+///
+/// So the decision is now made from the same [`AbsenceClosureEvidence`] this
+/// record carries and binds, never from a bare enum read. That value is built
+/// only from an [`AbsenceEvidence`] the receipt itself re-proved while deriving
+/// the preconditions, and it is refused — not defaulted — when the receipt holds
+/// no record. A run with no owner-issued evaluation therefore stays
+/// [`CompletionDisposition::IncompleteCoverage`], which is the honest result,
+/// not a failure of this function.
 fn terminal_disposition(
     observation: &InquiryObservation,
     coverage_receipt: &CoverageReceipt,
+    closure_evidence: Option<&AbsenceClosureEvidence>,
 ) -> CompletionDisposition {
     match observation.outcome {
         AcquisitionOutcome::TimedOut => CompletionDisposition::Inconclusive,
@@ -8522,13 +8760,23 @@ fn terminal_disposition(
             CompletionDisposition::SourceUnavailable
         }
         AcquisitionOutcome::Completed => {
-            if coverage_receipt.all_closed
-                && coverage_receipt.denominator_kind.supports_scoped_absence()
+            // I21.9: only `ANSWERED_WITH_SUPPORTED_RESULT` or a properly scoped
+            // `NO_MATCH_IN_COMPLETE_SCOPE` may close. #2893 makes the second of
+            // those the disposition this path can actually reach, because a
+            // `NO_MATCH` closure is the scoped-negative claim and is exactly the
+            // claim that needs the owner-issued record behind it; an inquiry that
+            // did find support closes through the claim-audit release gate
+            // (`InquiryGovernance::release_gate`), which is the other owner and
+            // is not reachable from an acquisition receipt. Before this, both
+            // closing classes collapsed onto the positive one, so
+            // `NO_MATCH_IN_COMPLETE_SCOPE` had no producer on the live path at
+            // all even though I21.6's receipt publishes `absence_verdict` as a
+            // first-class field.
+            if !closure_evidence.is_some_and(|evidence| evidence.closes_negative(coverage_receipt))
             {
-                CompletionDisposition::AnsweredWithSupportedResult
-            } else {
-                CompletionDisposition::IncompleteCoverage
+                return CompletionDisposition::IncompleteCoverage;
             }
+            CompletionDisposition::NoMatchInCompleteScope
         }
     }
 }
@@ -8622,9 +8870,18 @@ fn terminal_record(
     debts: &[ResearchDebt],
     freeze: &EvidenceFreeze,
     claim_audit: Option<&ClaimAuditRecord>,
+    absence_evidence: Option<&AbsenceEvidence>,
 ) -> Result<InquiryTerminalRecord, InquiryError> {
     let debt_restriction = ResearchDebtRestriction::derive(&observation.inquiry_id, debts);
-    let derived = terminal_disposition(observation, coverage_receipt);
+    // #2893 item 12: the closure decision is made over the re-proved record, not
+    // over a bare enum read. This is the only construction site of
+    // `AbsenceClosureEvidence`, and it is refused rather than defaulted: a run
+    // whose receipt retained no record, or whose record does not re-prove
+    // against THIS run's fence and frozen scope snapshot, yields `None` and
+    // therefore `IncompleteCoverage`.
+    let closure_evidence = absence_evidence
+        .and_then(|evidence| AbsenceClosureEvidence::verify(evidence, profile, coverage_receipt));
+    let derived = terminal_disposition(observation, coverage_receipt, closure_evidence.as_ref());
     // A restricted disposition is downgraded to the typed incomplete-coverage
     // outcome rather than dropped: the run did complete, but the claim it could
     // have carried is blocked, and I21.13 requires the honest limited outcome
@@ -8675,6 +8932,15 @@ fn terminal_record(
         freeze.clone(),
         claim_audit.cloned(),
         precision.residue.clone(),
+        // The record identity behind the closure decision, taken from the very
+        // value `terminal_disposition` just read. If the disposition is not a
+        // scoped-negative closure this is `None` even when a re-proved record
+        // exists, because a record that did not close the inquiry is not what
+        // the terminal record claims to rest on.
+        closure_evidence
+            .as_ref()
+            .filter(|_| disposition == CompletionDisposition::NoMatchInCompleteScope)
+            .map(|evidence| evidence.evaluation_digest().to_owned()),
     )
 }
 
