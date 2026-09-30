@@ -25,8 +25,8 @@ use eliot_receipts::{
 };
 use eliot_receipts::tool_exposure::{
     DeliveredToolRepresentation, EXPOSURE_HISTORY_VERSION, ExposureIdentities, ExposureReplaySignal,
-    OwnerStageFact, ProducedToolResultIdentity, ToolExposureHistoryEntry, ToolExposureReceiptV2,
-    detect_exposure_replay,
+    OwnerStageFact, ProducedToolResultIdentity, ResultDelivery, ToolExposureHistoryEntry,
+    ToolExposureReceiptV2, detect_exposure_replay,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -1161,7 +1161,97 @@ pub fn link_expanded_delivery(
     }
 }
 
-/// Populates the exposure-history stages owned at the publish seam.
+/// Revision lineage binding one advertised exposure-history entry to the
+/// durable observation/receipt/outbox path.
+///
+/// The lineage carries no payload of its own: `receipt_id` names this
+/// immutable revision, `prior_delivery_receipt_id` links it to the recorded
+/// prior (a later authorized expansion or redelivery), and `idempotency_key`
+/// is the dedupe identity the durable path replays on. All-`None` means no
+/// durable identity is bound yet — a visible pending obligation on the owning
+/// persistence seam, never a silent gap. This seam mints no identities and
+/// opens no second store: the values arrive from the owning caller and are
+/// validated for shape only.
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExposureRevisionLineage {
+    /// Stable identity of this immutable revision, when bound.
+    pub receipt_id: Option<String>,
+    /// Recorded prior revision this revision links to; requires `receipt_id`.
+    pub prior_delivery_receipt_id: Option<String>,
+    /// Idempotency key the durable path dedupes on, when bound.
+    pub idempotency_key: Option<String>,
+}
+
+/// Owner-supplied evidence for the exposure stages the publish seam never
+/// observes.
+///
+/// Each stage arrives as the owning boundary's [`OwnerStageFact`] — or `None`
+/// to leave explicitly unresolved unknown coverage. A supplied fact without
+/// its owner source reference fails admission at [`ToolExposureHistoryEntry::validate`];
+/// model-authored flags without an owner reference therefore never validate.
+/// No stage is inferred from another and `None` is never coerced to `false`.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerExposureEvidence {
+    /// Selection fact from the planner/model owner.
+    pub selected: Option<OwnerStageFact>,
+    /// Call fact from the execution owner.
+    pub called: Option<OwnerStageFact>,
+    /// Transport fact from the transport owner.
+    pub transport: Option<OwnerStageFact>,
+    /// Delivery completeness from the bridge/host projection owner.
+    pub delivery: Option<ResultDelivery>,
+    /// Owner evidence reference for the delivery observation.
+    pub delivery_source_ref: Option<String>,
+    /// Retry/expansion fact from the retry owner.
+    pub retried: Option<OwnerStageFact>,
+    /// Observable-use fact from the public decision/action/verifier owner.
+    /// Hidden reasoning is not use and never supplies this fact.
+    pub observed_use: Option<OwnerStageFact>,
+    /// Terminal task/product outcome reference, when its owner knows it.
+    pub outcome_ref: Option<String>,
+    /// Revision lineage for the durable observation/receipt/outbox path.
+    pub lineage: ExposureRevisionLineage,
+}
+
+/// One advertised exposure-history entry with its durable revision lineage.
+///
+/// The owning persistence seam keys its write on `lineage` through the
+/// existing observation/receipt path; this seam never persists.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdvertisedExposureHistory {
+    /// Owner-populated history entry: every applicable I7.24 field supplied
+    /// or explicitly unresolved, never omitted.
+    pub entry: ToolExposureHistoryEntry,
+    /// Lineage the durable path persists and replays on.
+    pub lineage: ExposureRevisionLineage,
+}
+
+fn validate_revision_lineage(
+    lineage: &ExposureRevisionLineage,
+) -> Result<(), SurfaceDecisionError> {
+    if let Some(receipt) = &lineage.receipt_id {
+        bounded_text(receipt, "history.revision.receipt_id")?;
+    }
+    if let Some(prior) = &lineage.prior_delivery_receipt_id {
+        bounded_text(prior, "history.revision.prior_delivery_receipt_id")?;
+        if lineage.receipt_id.is_none() {
+            return Err(SurfaceDecisionError::InvalidField {
+                field: "history.revision.receipt_id",
+                reason: "a linked revision requires its own receipt identity",
+            });
+        }
+    }
+    if let Some(key) = &lineage.idempotency_key {
+        bounded_text(key, "history.revision.idempotency_key")?;
+    }
+    Ok(())
+}
+
+/// Populates the exposure-history stages owned at the publish seam and binds
+/// the remaining stages from their owners.
 ///
 /// Registered and advertised facts come from the compiled decision joined
 /// with the derived permitted subset: a considered method carries its live
@@ -1170,26 +1260,47 @@ pub fn link_expanded_delivery(
 /// same owner join — permitted (admitted with a live grant standing and a
 /// compatible owner binding) implies eligible, a forbidden disposition
 /// implies ineligible, and anything else stays explicitly unresolved for the
-/// dispatch seam to revalidate at call time. Selection, call, transport,
-/// retry, use, delivery, and outcome stay explicitly unresolved: the planner,
-/// execution, transport, bridge/host projection, and verifier owners populate
-/// them, never this seam. Unknown coverage is recorded as `None`, never
-/// coerced to `false` and never inferred from a neighbouring stage.
+/// dispatch seam to revalidate at call time.
+///
+/// Selection, call, transport, delivery, retry, use, and outcome arrive in
+/// `owner` from the planner/model, execution, transport, bridge/host
+/// projection, retry, and public decision/action/verifier owners: each
+/// supplied [`OwnerStageFact`] binds with its owner source reference, and
+/// every unsupplied stage stays explicitly unresolved. Unknown coverage is
+/// recorded as `None`, never coerced to `false` and never inferred from a
+/// neighbouring stage.
 ///
 /// The surface identity defaults to the decision's task reference when the
 /// caller supplies none, so every entry joins a revision lineage; turn, run,
 /// and attempt identities arrive from their owners or stay unresolved.
+/// `owner.lineage` exposes the `receipt_id` / `prior_delivery_receipt_id` /
+/// idempotency key the durable path keys on; an unbound lineage is a visible
+/// pending obligation, never persistence.
+///
+/// Pure and total: reads only, never stages, never executes, never persists.
+///
+/// STITCH(bridge/host projection + eliot.observe): no production caller
+/// exists on main at this seam. The owning caller — the bridge/host
+/// projection that renders the advertised surface, joined with the
+/// execution/transport/retry/verifier owners for their stages — supplies
+/// `owner` and persists the returned revision through the existing
+/// observation/receipt path (`eliot.observe` capture via
+/// ReceiptEnvelope/CausalBinding), keyed by the returned lineage. Lost
+/// acknowledgements reconcile the original event; unavailable writeback
+/// leaves the pending obligation visible on that seam.
 ///
 /// # Errors
 ///
 /// Returns an error when the decision is invalid, the method is outside the
-/// decision's considered set, or the populated entry is inconsistent.
+/// decision's considered set, the revision lineage is malformed or links
+/// without its own receipt identity, or the populated entry is inconsistent.
 pub fn advertise_exposure_history(
     decision: &ToolSurfaceDecision,
     surface: &PermittedTaskSurface,
     method: &str,
     mut identities: ExposureIdentities,
-) -> Result<ToolExposureHistoryEntry, SurfaceDecisionError> {
+    owner: OwnerExposureEvidence,
+) -> Result<AdvertisedExposureHistory, SurfaceDecisionError> {
     decision.validate()?;
     let considered = decision
         .considered
@@ -1233,6 +1344,7 @@ pub fn advertise_exposure_history(
         }
         (false, _) => OwnerStageFact::unresolved(),
     };
+    validate_revision_lineage(&owner.lineage)?;
     let entry = ToolExposureHistoryEntry {
         schema_version: EXPOSURE_HISTORY_VERSION,
         tool_definition: method.to_owned(),
@@ -1242,17 +1354,22 @@ pub fn advertise_exposure_history(
         registered,
         advertised_to_route: advertised,
         eligible_under_scope_policy_and_grant: eligible,
-        selected_by_planner_or_model: OwnerStageFact::unresolved(),
-        called: OwnerStageFact::unresolved(),
-        transport_completed: OwnerStageFact::unresolved(),
-        result_delivery: None,
-        delivery_source_ref: None,
-        expanded_or_retried: OwnerStageFact::unresolved(),
-        observably_used_in_decision_action_or_verifier: OwnerStageFact::unresolved(),
-        terminal_task_or_product_outcome_ref: None,
+        selected_by_planner_or_model: owner.selected.unwrap_or_else(OwnerStageFact::unresolved),
+        called: owner.called.unwrap_or_else(OwnerStageFact::unresolved),
+        transport_completed: owner.transport.unwrap_or_else(OwnerStageFact::unresolved),
+        result_delivery: owner.delivery,
+        delivery_source_ref: owner.delivery_source_ref,
+        expanded_or_retried: owner.retried.unwrap_or_else(OwnerStageFact::unresolved),
+        observably_used_in_decision_action_or_verifier: owner
+            .observed_use
+            .unwrap_or_else(OwnerStageFact::unresolved),
+        terminal_task_or_product_outcome_ref: owner.outcome_ref,
     };
     entry.validate().map_err(map_exposure_error)?;
-    Ok(entry)
+    Ok(AdvertisedExposureHistory {
+        entry,
+        lineage: owner.lineage,
+    })
 }
 
 /// Admits an owner-populated exposure-history entry against the independent
