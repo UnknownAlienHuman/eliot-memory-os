@@ -54,10 +54,12 @@
 //! exact projection; candidate mapping consumes the executed cue result and
 //! exact analyzed conflict set alongside its other admitted source records.
 
-use eliot_context_assembly::{ActiveUnderstandingViewResult, AssemblyPolicy, assemble_active_view};
+use eliot_context_assembly::{
+    ActiveUnderstandingViewResult, AssemblyPolicy, assemble_active_view,
+};
 use eliot_context_candidates::{
-    AttentionInput, CandidatePolicy, CandidateRequest, CanonicalProjectionInput,
-    ContextCandidateSetResult, CueInput, EpistemicInput, EvidenceInput, MemberMeasurement,
+    AttentionInput, CandidatePolicy, CandidateRequest, CanonicalProjectionInput, CueInput,
+    ContextCandidateSetResult, EpistemicInput, EvidenceInput, MemberMeasurement,
     construct_context_candidates_with_canonical,
 };
 use eliot_context_contracts::{
@@ -73,12 +75,12 @@ use eliot_dreamer_conflict_analysis::{
     ConflictAnalysisCandidate, ConflictAnalysisPolicy, ConflictSupplements,
     analyze_grounded_conflict,
 };
-use eliot_dreamer_contracts::grounding::GroundedDreamDraft as StructuredGroundedDreamDraft;
 use eliot_dreamer_contracts::{
     ClassificationInput, CurationAcceptanceCtx, DreamInputBundle, GroundedDreamDraft,
     ModelRouteDisposition, ModelRouteOutcome, ValidatedCurationItem, ValidatedDreamDraft,
     ValidatedGroundingCandidate, bundle_digest_of, canonical_bytes, digest_hex,
 };
+use eliot_dreamer_contracts::grounding::GroundedDreamDraft as StructuredGroundedDreamDraft;
 use eliot_dreamer_orientation::OrientationError;
 use eliot_dreamer_probe_plan::{ProbePlan, ProbePlanParams, plan_discriminative_probes};
 use eliot_dreamer_rival_model::{RivalModelSet, RivalPolicy, structure_rival_models};
@@ -885,11 +887,6 @@ pub(crate) fn run_conflict_stage(
             {
                 return Err(PulseError::Boundary("conflict A05 receipt predecessor"));
             }
-            // A05 owns the exact original structured-candidate preimage and
-            // recorded input digest. The conflict owner result separately
-            // records its own candidate digest over conflict inputs; this
-            // runner never relabels or reissues either commitment.
-            let input_commitment = candidate.validated.receipt.input_digest.clone();
             let output = analyze_grounded_conflict(
                 inputs.item,
                 candidate,
@@ -898,6 +895,18 @@ pub(crate) fn run_conflict_stage(
                 inputs.policy,
             )
             .map_err(|_| PulseError::Conflict)?;
+            // The stage ledger binds every exact native analyzer input. The
+            // original A05 receipt input digest remains independently checked
+            // by `candidate.validate_binding()` above; it does not bind the
+            // conflict set, supplements, or policy and is never reused here.
+            let input_commitment = canonical_input_commitment(&(
+                inputs.item,
+                candidate,
+                inputs.conflict_set,
+                inputs.supplements,
+                inputs.policy,
+            ))
+            .ok_or(PulseError::Conflict)?;
             let commitment = output.candidate_digest.clone();
             Ok(PulseStage::executed(
                 PulseStageId::Conflict,
@@ -970,13 +979,11 @@ pub(crate) fn run_candidate_stage(
                 || inputs.attention_and_conflicts.is_none()
                 || conflict_set.is_none_or(|expected| {
                     !inputs.attention_and_conflicts.is_some_and(|attention| {
-                        attention.conflicts.iter().any(|value| value == expected)
+                        attention.conflicts.as_slice() == std::slice::from_ref(expected)
                     })
                 })
             {
-                return Err(PulseError::Boundary(
-                    "candidate projection or conflict predecessor",
-                ));
+                return Err(PulseError::Boundary("candidate projection or conflict predecessor"));
             }
             let supplied_cue = inputs.cue_activation_result;
             let cue_input = match (supplied_cue, cue_activation) {
