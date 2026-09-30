@@ -749,10 +749,109 @@ fn validate_materializer_selection(
     Ok(())
 }
 
+#[derive(Clone, Debug)]
+struct PhaseAPeerIdentity {
+    sid: String,
+    session_id: u32,
+}
+
+impl PhaseAPeerIdentity {
+    fn derive(
+        input: &CanarySourceBundleMaterializeInput,
+        selection: &ProfileSelectionResolution,
+        selected_profile_anchor: &SelectedProfileAnchor<'_>,
+    ) -> Result<Self, MaterializeError> {
+        if input.profile_selection.profile != selection.governance.profile {
+            return Err(MaterializeError::Invalid(
+                "profile selection differs from the resolved profile".to_owned(),
+            ));
+        }
+
+        match selection.governance.profile {
+            InstallationProfile::SystemService => Ok(Self {
+                sid: LOCAL_SERVICE_SID.to_owned(),
+                session_id: 0,
+            }),
+            InstallationProfile::UserMode | InstallationProfile::PortableDev => {
+                selected_profile_anchor.revalidate()?;
+                let expected = eliot_platform_windows::current_process_named_pipe_expectation()
+                    .map_err(|error| MaterializeError::Platform(error.to_string()))?;
+
+                match selection.governance.profile {
+                    InstallationProfile::UserMode => {
+                        let local_app_data =
+                            eliot_platform_windows::current_user_local_app_data_root()
+                                .map_err(|error| MaterializeError::Platform(error.to_string()))?;
+                        if !eliot_platform_windows::windows_paths_equal(
+                            &local_app_data,
+                            Path::new(input.profile_selection.anchors.local_app_data.as_str()),
+                        ) {
+                            return Err(MaterializeError::Invalid(
+                                "selected LocalAppData differs from the OS current-user anchor"
+                                    .to_owned(),
+                            ));
+                        }
+                        let profile_anchor = Path::new(
+                            input.profile_selection.profile_anchor_root.as_str(),
+                        );
+                        if !eliot_platform_windows::windows_paths_equal(
+                            &local_app_data,
+                            profile_anchor,
+                        ) || !eliot_platform_windows::windows_paths_equal(
+                            &local_app_data,
+                            &selected_profile_anchor.canonical_path,
+                        ) {
+                            return Err(MaterializeError::Invalid(
+                                "UserMode profile anchor differs from OS current-user LocalAppData"
+                                    .to_owned(),
+                            ));
+                        }
+                    }
+                    InstallationProfile::PortableDev => {
+                        let repository_root = input
+                            .profile_selection
+                            .anchors
+                            .repository_root
+                            .as_ref()
+                            .ok_or_else(|| {
+                                MaterializeError::Invalid(
+                                    "PortableDev profile requires a selected repository root"
+                                        .to_owned(),
+                                )
+                            })?;
+                        let selected_root = Path::new(repository_root.as_str());
+                        if !eliot_platform_windows::windows_paths_equal(
+                            selected_root,
+                            Path::new(input.profile_selection.profile_anchor_root.as_str()),
+                        ) || !eliot_platform_windows::windows_paths_equal(
+                            selected_root,
+                            &selected_profile_anchor.canonical_path,
+                        ) {
+                            return Err(MaterializeError::Invalid(
+                                "PortableDev repository root differs from the retained profile anchor"
+                                    .to_owned(),
+                            ));
+                        }
+                    }
+                    InstallationProfile::SystemService => unreachable!(),
+                }
+
+                selected_profile_anchor.revalidate()?;
+
+                Ok(Self {
+                    sid: expected.expected_sid().to_owned(),
+                    session_id: expected.expected_session_id(),
+                })
+            }
+        }
+    }
+}
+
 fn governor_bytes(
     generation: &PlatformHandle,
     installation_epoch: &InstallationEpoch,
     kernel_sha256: &str,
+    kernel_principal: &str,
 ) -> Result<Vec<u8>, MaterializeError> {
     let generation_number = ResourceGeneration::new(1)
         .map_err(|error| MaterializeError::Contract(error.to_string()))?;
@@ -773,7 +872,7 @@ fn governor_bytes(
             protocol: "eliot.kernel.v1".to_owned(),
             artifact_digest: kernel_sha256.to_owned(),
             protected_snapshot_digest: protected.clone(),
-            principal: LOCAL_SERVICE_SID.to_owned(),
+            principal: kernel_principal.to_owned(),
             generation: generation_number,
             authority_epoch,
         },
@@ -878,7 +977,18 @@ fn build_typed_bundle(
 ) -> Result<TypedBundle, MaterializeError> {
     let selection = GenerationPackagePlanner::resolve_profile_selection(&input.profile_selection)
         .map_err(|error| MaterializeError::Contract(error.to_string()))?;
-    build_typed_bundle_with_selection(input, executables, &selection)
+    let (anchor_identity, anchor_handle) = open_no_follow_directory(Path::new(
+        input.profile_selection.profile_anchor_root.as_str(),
+    ))
+    .map_err(|error| MaterializeError::Platform(error.to_string()))?;
+    let selected_profile_anchor =
+        SelectedProfileAnchor::retain(input, &selection, &anchor_handle, anchor_identity)?;
+    build_typed_bundle_with_selection(
+        input,
+        executables,
+        &selection,
+        &selected_profile_anchor,
+    )
 }
 
 struct GovernedBundlePaths {
@@ -1012,11 +1122,13 @@ impl BundleTemplateIdentity {
     fn derive(
         input: &CanarySourceBundleMaterializeInput,
         executables: &BundleExecutables<'_>,
+        peer_identity: &PhaseAPeerIdentity,
     ) -> Result<Self, MaterializeError> {
         let governor_bytes = governor_bytes(
             &input.generation,
             &input.installation_epoch,
             &executables.kernel.sha256,
+            &peer_identity.sid,
         )?;
         let protected_snapshot_digest =
             protected_snapshot_digest_from_governor_bytes(&governor_bytes)?;
@@ -1143,6 +1255,7 @@ struct TypedBundleBuildContext<'a> {
     selection: &'a ProfileSelectionResolution,
     paths: GovernedBundlePaths,
     named_executables: BundleExecutables<'a>,
+    peer_identity: PhaseAPeerIdentity,
     template: BundleTemplateIdentity,
 }
 
@@ -1151,16 +1264,21 @@ impl<'a> TypedBundleBuildContext<'a> {
         input: &'a CanarySourceBundleMaterializeInput,
         executables: &'a [ValidatedExecutable],
         selection: &'a ProfileSelectionResolution,
+        selected_profile_anchor: &SelectedProfileAnchor<'_>,
     ) -> Result<Self, MaterializeError> {
         let paths = GovernedBundlePaths::resolve(selection)?;
         let named_executables = BundleExecutables::resolve(executables)?;
-        let template = BundleTemplateIdentity::derive(input, &named_executables)?;
+        let peer_identity =
+            PhaseAPeerIdentity::derive(input, selection, selected_profile_anchor)?;
+        let template =
+            BundleTemplateIdentity::derive(input, &named_executables, &peer_identity)?;
         Ok(Self {
             input,
             executables,
             selection,
             paths,
             named_executables,
+            peer_identity,
             template,
         })
     }
@@ -1424,8 +1542,8 @@ fn store_config_bytes(
             context.template.credential_token
         ),
         launch_nonce: format!("store:{}", context.template.credential_token),
-        expected_client_sid: LOCAL_SERVICE_SID.to_owned(),
-        expected_client_session_id: 0,
+        expected_client_sid: context.peer_identity.sid.clone(),
+        expected_client_session_id: context.peer_identity.session_id,
         approved_artifact_hash: context.named_executables.store_bridge.sha256.clone(),
         approved_config_hash: String::new(),
         endpoint: RUNTIME_LIVE_STORE_ENDPOINT.to_owned(),
@@ -1510,8 +1628,14 @@ fn build_typed_bundle_with_selection(
     input: &CanarySourceBundleMaterializeInput,
     executables: &[ValidatedExecutable],
     selection: &ProfileSelectionResolution,
+    selected_profile_anchor: &SelectedProfileAnchor<'_>,
 ) -> Result<TypedBundle, MaterializeError> {
-    let context = TypedBundleBuildContext::new(input, executables, selection)?;
+    let context = TypedBundleBuildContext::new(
+        input,
+        executables,
+        selection,
+        selected_profile_anchor,
+    )?;
     let arguments = RuntimeLaunchArguments::build(&context)?;
     let (descriptor_bytes, descriptor_sha256) = eliotd_descriptor_binding(&context)?;
     let arguments = arguments.bind_descriptor_digest(&descriptor_sha256)?;
@@ -2261,7 +2385,12 @@ fn materialize_with_resolved_selection(
 
     validate_materializer_selection(input, selection)?;
     selected_profile_anchor.revalidate()?;
-    let typed = build_typed_bundle_with_selection(input, executables, selection)?;
+    let typed = build_typed_bundle_with_selection(
+        input,
+        executables,
+        selection,
+        selected_profile_anchor,
+    )?;
     selected_profile_anchor.revalidate()?;
     let publication = OwnedDirectoryPublication::create(&input.output_bundle)
         .map_err(|error| MaterializeError::Platform(error.to_string()))?;
@@ -2855,15 +2984,23 @@ mod tests {
         .expect("materialized bundle must feed the real planner");
         let config_bytes = fs::read(output_bundle.join("generation.json")).unwrap();
         let config: StoreLaunchConfig = serde_json::from_slice(&config_bytes).unwrap();
+        let current_peer = eliot_platform_windows::current_process_named_pipe_expectation().unwrap();
         assert_eq!(
-            config.expected_client_sid, LOCAL_SERVICE_SID,
-            "Store peer binding must match the LocalService Host/Kernel contour"
+            config.expected_client_sid,
+            current_peer.expected_sid(),
+            "Store peer binding must match the selected current-user token"
+        );
+        assert_eq!(
+            config.expected_client_session_id,
+            current_peer.expected_session_id(),
+            "Store peer session must match the selected current-user token"
         );
         let governor_bytes = fs::read(output_bundle.join("eliotd-governor.json")).unwrap();
         let governor: GovernorLaunchConfig = serde_json::from_slice(&governor_bytes).unwrap();
         assert_eq!(
-            governor.kernel.principal, LOCAL_SERVICE_SID,
-            "Governor Kernel principal must match the LocalService child-token contour"
+            governor.kernel.principal,
+            current_peer.expected_sid(),
+            "Governor Kernel principal must match the selected current-user token"
         );
         config
             .validate_materialized_at(Path::new(
