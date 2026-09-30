@@ -38,12 +38,67 @@
 //! predictable path as ownership.
 //!
 //! The created directory is **not** an installation allocated through the
-//! installation authority: `ApprovedGenerationRegistry` exposes no public
-//! mutation seam (every mutator is `pub(crate)`), so the created root has no
-//! `ApprovedGeneration` row, no registry CAS and no activation fence of its
-//! own. It is a fenced empty root under a protected staging parent. Allocating
-//! a real new installation is an owner correction in
-//! `crates/kernel/eliot-installation`, outside this module.
+//! installation authority: it has no `ApprovedGeneration` row, no registry
+//! compare-and-swap and no activation fence of its own. What it *does* now have
+//! is an exact protected-root lease owned by this operation — the private
+//! `prove_created_destination`, which proves the created object through
+//! [`ProtectedRootLease`] before [`PreparedDestination::root_identity`] is
+//! recorded, so the receipt carries an owner-issued identity instead of a
+//! by-name observation.
+//!
+//! # Why the installation-authority allocation is not closed here
+//!
+//! Measured on this base rather than asserted. An `ApprovedGeneration` row is
+//! not merely unreachable from this module; at preparation time it does not
+//! exist to be reached:
+//!
+//! * Every row of `ApprovedGenerationRegistry::generations` structurally
+//!   carries an `InstallationActivationApproval`. That type's only constructor
+//!   is `InstallationActivationApproval::from_verified_parts`, a `pub(crate)`
+//!   seam reachable from exactly two places, both the **activation** boundary:
+//!   `RedbInstallationRegistry::stage_pending_activation_signed`, which also
+//!   demands a detached authority signature verified against
+//!   `WindowsInstallationAuthorityKeyStore` and a stopped SCM contour — the
+//!   source's own services must be stopped — and the first-install bootstrap
+//!   `stage_pending_activation_bootstrap`, which demands the whole applied
+//!   pre-activation effect prefix. A13.7 keeps that separate from preparation
+//!   ("Cutover requires separate authority"), and this issue forbids an automatic
+//!   source stop.
+//! * `ApprovedGenerationRegistry::activate` is `pub(crate)`. The narrower and
+//!   accurate statement is not "every mutator is private" —
+//!   `RedbInstallationRegistry::commit_cutover_activation` is `pub` and is
+//!   reached from `backup_cutover.rs` — but that no public seam **inserts** a
+//!   generation; the public mutators only flip or retire one that already
+//!   exists.
+//! * This module holds no installation-registry writer and no
+//!   `HostOwnerEpochCapability`, by design (see the source/API guard below).
+//!   `prepare_isolated_destination` takes only a [`PreparationJournal`] and a
+//!   [`DestinationAdmission`], so neither is reachable from it; handing either in
+//!   is a change to a signature the declared #958 suite calls directly.
+//!
+//! The three seams that must move together, none of which is this module:
+//!
+//! 1. `HostComposition::prepare_backup_destination` (`bins/eliot-host/src/lib.rs`)
+//!    must open the installation registry writer and the owner capability and
+//!    pass them into this chain. Its present delegation builds
+//!    `DelegatedPreparation::new(HostStatePreparationJournal::new(&self.journal))`,
+//!    which carries the Host journal only.
+//! 2. `prepare_isolated_destination` must take that authority, and
+//!    `bins/eliot-host/tests/backup_preparation.rs` must move with it.
+//! 3. `HostComposition::dispatch_backup_owner_operation`'s
+//!    `BackupDispatchTarget::Prepare` arm (`lib.rs`) still returns a permanent
+//!    pre-effect refusal, and it cannot be lifted by this module alone: the
+//!    admitted `#954` body `BackupIsolatedRestorePrepare`
+//!    (`crates/foundation/eliot-protocol/src/backup.rs`) carries no
+//!    `staging_parent`, `class`, `target_build`, `target_profile`,
+//!    `build_digests`, `operation_id`, `authority_generation` or `state_fence`,
+//!    so no [`PresentedPreparationRequest`] can be built from an admitted
+//!    envelope without inventing every one of those values.
+//!
+//! Writing an owner allocation seam in `crates/kernel/eliot-installation` while
+//! none of these can call it would add a public function with no caller, which
+//! is worse than the named gap: it would look like the closed item. The gap is
+//! therefore recorded here in symbols rather than papered over.
 //!
 //! # Destination identity and epoch
 //!
@@ -456,6 +511,14 @@ pub enum PreparationError {
 // passthroughs reached by the caller of the returned handle rather than by this
 // port, and this issue arms no second guard for them.
 //
+// Two protected-root owner proofs are observation points, not no-event steps,
+// and each emits its own phase/refusal record under its own static op token:
+// `verify_staging_parent_lease` (`staging_lease`) proves the admitted parent,
+// and `prove_created_destination` (`destination_lease`) proves the destination
+// this operation created before its identity is recorded. Both project facts the
+// owner already produced, and both refuse through the same
+// `protected_path_to_preparation` mapping.
+//
 // Explicit no-event list: `DelegatedPreparation::{reconcile, cancel, cleanup}`
 // (pure passthroughs; the inner operation owns the record),
 // `OwnerEvidence::approved_binding` (mapping adapter covered by the inner bind
@@ -496,6 +559,7 @@ const OP_DELEGATE: &str = "delegate_prepare";
 const OP_OWNER_EVIDENCE: &str = "owner_evidence";
 const OP_SOURCE_ROOT: &str = "source_root";
 const OP_STAGING_LEASE: &str = "staging_lease";
+const OP_DESTINATION_LEASE: &str = "destination_lease";
 const OP_CALLER_AUTH: &str = "caller_auth";
 /// The durable Host-state journal sink this module writes intent/result through.
 const OP_JOURNAL_SINK: &str = "journal_sink";
@@ -755,11 +819,16 @@ pub struct RootIdentity {
 
 /// Prepared isolated destination: the only success output.
 ///
-/// It is a fenced empty root under a protected staging parent, **not** an
-/// installation allocated through the installation authority: no
-/// `ApprovedGeneration` row, registry CAS or activation fence is created for
-/// it, because the registry exposes no public mutation seam. Nothing here is
-/// restored, launched, activated or retired.
+/// It is an isolated root this operation owns — proved at creation through the
+/// real protected-root owner (the private `prove_created_destination`), whose
+/// owner-issued identity is what [`PreparedDestination::root_identity`] records —
+/// but it is **not** an installation allocated through the installation
+/// authority: no `ApprovedGeneration` row, registry compare-and-swap or
+/// activation fence is created for it, because no approval exists at
+/// preparation time and the approval type has no constructor this module could
+/// use. The module documentation names the exact owner symbols and the three
+/// seams that must move together. Nothing here is restored, launched, activated
+/// or retired.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PreparedDestination {
     /// Operation identity that produced it.
@@ -2062,6 +2131,82 @@ fn admit_staging_parent(admission: &DestinationAdmission) -> Result<PathBuf, Pre
     verify_staging_parent_lease(&admission.operation_id, parent)
 }
 
+/// Proves the destination **this operation just created** through the real
+/// protected-root owner, and returns the owner-issued identity for the receipt.
+///
+/// The other two owner-lease proofs in this module answer different questions.
+/// [`verify_staging_parent_lease`] proves the *parent* an admission may write
+/// into, and [`reverify_recorded_destination`] re-proves a destination some
+/// earlier call recorded. Neither covers the moment that matters most: between
+/// [`prepare_isolated_destination`]'s own `std::fs::create_dir` and its
+/// `record_result`. In that window the destination is named but not owned —
+/// [`capture_identity`] observes the object *currently* at that pathname, which
+/// is exactly the object a substitution would have put there — so the identity
+/// written into [`PreparedDestination::root_identity`] was a by-name
+/// observation rather than an owner-issued proof, and nothing had pinned the
+/// directory contour.
+///
+/// This closes that window with the owner that already owns it. The destination
+/// is re-opened through [`ProtectedRootLease::open_existing`] — the owner that
+/// containment-checks the path and pins the whole contour by retained handle —
+/// then the retained-handle alias defence
+/// ([`ProtectedRootLease::verify_stable_identity`]) and the object's own current
+/// final path ([`ProtectedRootLease::canonical_path`]) are proved against the
+/// exact root this call created, and the returned [`RootIdentity`] is rendered
+/// from the owner's retained handle ([`FileIdentity`]) through the same
+/// [`file_identity_text`] encoding [`reverify_recorded_destination`] compares
+/// against, so a recorded identity and a freshly observed one cannot drift into
+/// a false conflict through two formats.
+///
+/// The recorded value is also unchanged for a destination prepared before this
+/// proof existed. Both routes read the same `GetFileInformationByHandle` pair
+/// off the same object — `ProtectedRootLease` pins it by retained handle,
+/// [`capture_identity`] opens it with `FILE_FLAG_OPEN_REPARSE_POINT` — so the
+/// `(volume_serial_number, file_index)` pair, and therefore the rendered
+/// receipt identity, is identical either way. A receipt already on disk keeps
+/// reconciling and keeps comparing equal; nothing here re-keys an existing
+/// result.
+///
+/// This is ownership of the root, not allocation of an installation. It proves
+/// *this operation's* object, and it deliberately proves nothing about what that
+/// object is registered as; see the module documentation for the installation
+/// authority gap this does not close.
+///
+/// Every owner refusal maps through the existing [`protected_path_to_preparation`]
+/// into its typed [`PreparationError`], so no variant is invented and no owner
+/// error string is echoed.
+fn prove_created_destination(
+    operation_id: &str,
+    root: &Path,
+) -> Result<RootIdentity, PreparationError> {
+    let lease = ProtectedRootLease::open_existing(root)
+        .map_err(|error| protected_path_to_preparation(operation_id, root, error))
+        .map_err(|error| note_prepare_error(OP_DESTINATION_LEASE, "verify", error, 0))?;
+    lease
+        .verify_stable_identity()
+        .map_err(|error| protected_path_to_preparation(operation_id, root, error))
+        .map_err(|error| note_prepare_error(OP_DESTINATION_LEASE, "verify", error, 0))?;
+    let canonical = lease
+        .canonical_path()
+        .map_err(|error| protected_path_to_preparation(operation_id, root, error))
+        .map_err(|error| note_prepare_error(OP_DESTINATION_LEASE, "verify", error, 0))?;
+    if !windows_paths_equal(&canonical, root) {
+        return Err(note_prepare_error(
+            OP_DESTINATION_LEASE,
+            "verify",
+            PreparationError::AliasSubstitution {
+                path: root.to_string_lossy().into_owned(),
+            },
+            0,
+        ));
+    }
+    let identity = RootIdentity {
+        identity: file_identity_text(lease.identity()),
+    };
+    observe_prepare_progress(OP_DESTINATION_LEASE, "verify", "verified", 0, 0);
+    Ok(identity)
+}
+
 /// Builds the durable intent frame for one admitted preparation.
 ///
 /// `destination_id` and `destination_epoch` are carried here because the
@@ -2491,8 +2636,12 @@ pub fn prepare_isolated_destination<J: PreparationJournal>(
             reason: format!("destination creation failed: {error}"),
         })
         .map_err(|error| note_prepare_error(OP_PREPARE, "create_root", error, generation))?;
-    let identity = capture_identity(&root)
-        .map_err(|error| note_prepare_error(OP_PREPARE, "capture_identity", error, generation))?;
+    // The destination is proved through the protected-root owner that owns it
+    // before its identity is recorded, so the receipt carries an owner-issued
+    // identity and not a by-name observation of whatever currently occupies the
+    // pathname this call just created.
+    let identity = prove_created_destination(&admission.operation_id, &root)
+        .map_err(|error| note_prepare_error(OP_PREPARE, "prove_root", error, generation))?;
     let destination = PreparedDestination {
         operation_id: admission.operation_id.clone(),
         root: root.clone(),
@@ -3390,7 +3539,7 @@ impl<J: PreparationJournal> DelegatedPreparation<J> {
 /// Maps owner-binding projection failures to static fail-closed preparation
 /// errors, preserving the offending field name without echoing owner
 /// internals.
-fn projection_to_preparation(error: ProjectionError) -> PreparationError {
+fn projection_to_preparation(error: &ProjectionError) -> PreparationError {
     match error {
         ProjectionError::InvalidDigest { field } => PreparationError::InvalidRequest {
             field,
@@ -3749,7 +3898,7 @@ impl OwnerEvidence {
             &self.fence,
             self.registry.active_phase_b_rebind(),
         )
-        .map_err(projection_to_preparation)
+        .map_err(|error| projection_to_preparation(&error))
     }
 
     /// Returns the **owner-issued** lease reference for this source, re-proving
@@ -3996,7 +4145,8 @@ impl OwnerEvidence {
         // than after being carried into a projection. This is a shape guard on
         // owner-issued content, never a substitute for the projector's
         // presented-versus-owner comparison.
-        note.validate().map_err(projection_to_preparation)?;
+        note.validate()
+            .map_err(|error| projection_to_preparation(&error))?;
         Ok(note)
     }
 
@@ -4415,12 +4565,12 @@ impl OwnerEvidence {
             &owner_audit,
             &self.fence.authority_state_fence,
         )
-        .map_err(projection_to_preparation)
+        .map_err(|error| projection_to_preparation(&error))
     }
 
     /// Returns the registry CAS revision observed at inspection time.
     ///
-    /// Binds "current": HostComposition compares revisions to detect
+    /// Binds the *current* value: [`HostComposition`] compares revisions to detect
     /// registry movement between inspection and preparation. This is the
     /// registry revision, not the purge-ledger revision, whose authority
     /// belongs to the backup domain.
