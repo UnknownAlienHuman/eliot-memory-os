@@ -95,11 +95,8 @@ pub fn admit_provider_capability(
         material.worker_generation,
         material.presented_fence.clone(),
     )?;
-    let currentness = OwnerCurrentness::new(
-        material.expectation.clone(),
-        material.live_fence.clone(),
-        material.session_binding.clone(),
-    )?;
+    let currentness =
+        OwnerCurrentness::new(material.expectation.clone(), material.live_fence.clone())?;
     Ok(AdmittedProviderCapability::new(
         material.identity.clone(),
         presented,

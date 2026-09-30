@@ -3742,9 +3742,9 @@ impl DaemonComposition {
     /// Readiness plus the exact live fence and the validated session binding
     /// gate the resolution: the threaded expectation must be current under
     /// the live session epoch (`is_same_authority`, the same rule the
-    /// coordinator enforces), and caller-supplied `live_fence` /
-    /// `session_binding` values are replaced with the session-observed
-    /// ones. Presented halves and the Governor expectation travel through
+    /// coordinator enforces), and the caller-supplied `live_fence` is replaced
+    /// with the session-observed one; a validated session must exist.
+    /// Presented halves and the Governor expectation travel through
     /// untouched for the coherence gates downstream to judge.
     fn resolve_verified_material(
         &self,
@@ -3755,16 +3755,12 @@ impl DaemonComposition {
             return Err(DaemonError::Composition(CompositionError::NotReady));
         }
         let live_fence = kernel.kernel_fence();
-        let session_binding = self
-            .owner_session
-            .as_ref()
-            .map(|facts| facts.session_binding().to_owned())
-            .ok_or_else(|| {
-                DaemonError::Kernel(
-                    "daemon has no validated Kernel session binding; verified provider admission stays plan-only"
-                        .to_owned(),
-                )
-            })?;
+        if self.owner_session_binding().is_none() {
+            return Err(DaemonError::Kernel(
+                "daemon has no validated Kernel session binding; verified provider admission stays plan-only"
+                    .to_owned(),
+            ));
+        }
         if !material
             .expectation
             .live_authority_epoch
@@ -3777,8 +3773,21 @@ impl DaemonComposition {
             .into());
         }
         material.live_fence = live_fence;
-        material.session_binding = session_binding;
         Ok(material)
+    }
+
+    /// Returns the validated Kernel session binding held by the composition,
+    /// if any (issue #1108 A12).
+    ///
+    /// Production solo-restore seam: the restore resolves the owner session
+    /// half over the live authenticated session by the same rule as the
+    /// session-bound resolution above, without a re-handshake and without
+    /// touching the retained facts. `None` (no validated handshake yet)
+    /// fails the restore closed; the daemon stays plan-only.
+    pub fn owner_session_binding(&self) -> Option<String> {
+        self.owner_session
+            .as_ref()
+            .map(|facts| facts.session_binding().to_owned())
     }
 
     /// Borrows the daemon-held Governor capability admission view (#1957).
