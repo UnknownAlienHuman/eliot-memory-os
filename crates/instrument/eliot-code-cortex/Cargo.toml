@@ -9,6 +9,7 @@ description = "Task-relative semantic evidence compositor and rebuildable code i
 [dependencies]
 eliot-graph-api.workspace = true
 eliot-instrument-api.workspace = true
+eliot-lsp-bridge = { path = "../../bridges/eliot-lsp-bridge", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

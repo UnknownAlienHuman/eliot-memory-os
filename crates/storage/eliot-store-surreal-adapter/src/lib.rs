@@ -588,6 +588,19 @@ impl SurrealStoreAdapter {
         apply::read_receipt(self, operation_id).await
     }
 
+    /// Reads the exact committed receipt together with causal facts rebuilt
+    /// from the canonical receipt row and its sequence-selected predecessor.
+    /// The binding is independently reread from SurrealDB and never copied
+    /// from the returned receipt envelope.
+    pub async fn receipt_with_causal(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<Option<(WriteReceipt, eliot_store_api::CausalBinding)>, StoreError> {
+        apply::read_receipt_with_causal(self, operation_id)
+            .await
+            .map_err(AdapterError::into_store_error)
+    }
+
     /// Builds the first-generation schema migration for the given target
     /// generation. The composition owner applies it through
     /// [`SurrealStoreAdapter::apply_migration`] under migration authority.

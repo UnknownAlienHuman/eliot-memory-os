@@ -100,6 +100,7 @@ pub(crate) use read_boundary::{
     read_validation_snapshot,
 };
 pub(crate) use receipt_reconciliation::read_receipt;
+pub(crate) use receipt_reconciliation::read_receipt_with_causal;
 use receipt_reconciliation::{read_fence, read_idempotency, read_receipt_by_operation};
 use recovery::{
     RecoverySnapshotInput, build_recovery_bindings, build_recovery_snapshot, build_recovery_sql,

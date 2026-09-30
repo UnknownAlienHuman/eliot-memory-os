@@ -33,7 +33,7 @@ use eliot_protocol::{
 };
 use eliot_store_api::{
     BackupOperationReconciliation, CAPABILITIES, CanonicalRequestView, CanonicalRestoreBatch,
-    CanonicalSnapshotPort, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS,
+    CanonicalSnapshotPort, CanonicalStoreClient, CanonicalValidationSnapshot, CausalBinding, EFFECTS,
     ExactJsonBytes, IsolatedDestination, IsolatedDestinationReceipt, IsolatedRestorePort,
     NamedReadRequest, NamedReadResponse, OperationId, OperationIdentity, OrderingHead,
     OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta,
@@ -107,6 +107,7 @@ pub use ecxf_export::{EcxfExportArgs, export_ecxf_once};
 mod request_dispatch;
 pub use request_dispatch::StoreDispatchBackend;
 pub use request_dispatch::dispatch;
+pub use request_dispatch::dispatch_admitted_with_log;
 pub use request_dispatch::dispatch_with_log;
 /// Structured bridge diagnostics projection (issue #742). Observability-only:
 /// the module owns vocabulary, redaction, bounded capture, and typed result
@@ -117,6 +118,7 @@ use diagnostics::{
     operation_name, report_events,
 };
 pub mod task_binding_gate;
+pub mod source_artifact_request_context;
 #[cfg(test)]
 use request_dispatch::map_recovery_dispatch_result;
 #[cfg(test)]
@@ -337,10 +339,11 @@ impl StoreComposition {
     pub fn new(config: &StoreLaunchConfig) -> Result<Self, String> {
         config.validate()?;
         let schema_bootstrap_binding = StoreSchemaBootstrapBinding::from_config(config);
-        let blob = BlobRootOwner::claim(
+        let blob = BlobRootOwner::claim_with_lifecycle_fence(
             config.blob_root.clone(),
             format!("store-composition:{}", config.instance_id),
             std::process::id(),
+            config.runtime_launch.authority_state_fence.clone(),
         )
         .map_err(|error| format!("claim Blob root owner: {error}"))?;
         let platform = WindowsPlatform::new(config.blob_root.clone())
@@ -1133,6 +1136,27 @@ impl StoreComposition {
             .map_err(AdapterError::into_store_error)
     }
 
+    /// Re-reads one committed receipt and its DB-owned causal projection,
+    /// then requires the readback to equal the receipt returned by the write.
+    /// Surreal derives the binding from the durable sequence and predecessor
+    /// rows; this composition never treats envelope causal fields as authority.
+    pub async fn committed_receipt_with_causal(
+        &self,
+        expected: &WriteReceipt,
+    ) -> Result<(WriteReceipt, CausalBinding), StoreError> {
+        let Some((receipt, causal)) = self
+            .store
+            .receipt_with_causal(expected.operation_id.clone())
+            .await?
+        else {
+            return Err(StoreError::MissingReceiptEnvelope);
+        };
+        if &receipt != expected {
+            return Err(StoreError::InvalidReceipt);
+        }
+        Ok((receipt, causal))
+    }
+
     /// Resolves an unknown write outcome by the original operation identity
     /// before any new transaction attempt (I5.19, issue #1933).
     ///
@@ -1751,6 +1775,41 @@ pub fn validate_request_frame(
     let outcome = validate_request_frame_with_log(session, frame, &mut events);
     report_events(&events);
     outcome
+}
+
+/// Validates one request and retains its original wire identity, payload
+/// authorities and authenticated session projection for an owner-side typed
+/// operation.
+///
+/// The returned context proves only that this request crossed the Store's
+/// existing transport/session admission boundary. It does not issue a Blob
+/// receipt, Store grant, causal binding or source authority.
+pub fn validate_request_frame_with_context(
+    session: &mut StoreEbpSession,
+    frame: &Frame,
+    events: &mut BoundedEventLog,
+) -> Result<(Request, source_artifact_request_context::AdmittedStoreRequestContext), String> {
+    let request = validate_request_frame_with_log(session, frame, events)?;
+    validate_session_peer_binding(session)?;
+    let authenticated_peer_principal_binding = session
+        .authenticated_peer
+        .as_ref()
+        .map(|peer| peer.principal_binding.clone())
+        .ok_or_else(|| "Store EBP session has no authenticated pipe peer".to_owned())?;
+    let projection = source_artifact_request_context::AdmittedStoreSessionProjection::from_store_session_parts(
+        session.connection_id.clone(),
+        session.protocol_version,
+        session.module_generation.clone(),
+        session.state_fence.clone(),
+        session.session_principal_binding.clone(),
+        authenticated_peer_principal_binding,
+    )?;
+    let context = source_artifact_request_context::AdmittedStoreRequestContext::from_validated_parts(
+        frame,
+        &request,
+        projection,
+    )?;
+    Ok((request, context))
 }
 
 /// Validates one request against the admitted session and replay ledger
