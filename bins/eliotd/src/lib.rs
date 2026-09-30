@@ -3333,50 +3333,30 @@ impl DaemonComposition {
         Ok(fabric)
     }
 
-    /// Builds the sealed admission capability from session-resolved material
-    /// (issue #1108, production counterpart of the test-only
-    /// `agent_fabric::build_admitted_provider_capability`, which is
-    /// `cfg(test)`-gated and therefore unreachable from production code).
+    /// Builds the sealed admission capability through the closed
+    /// provider-admission port (issue #1108, items A4/A5).
     ///
-    /// Forwards the daemon-resolved halves into the same coordinator owners
-    /// in the same order — presented claim, owner currentness, then the
-    /// admitted capability — so production construction enforces the
-    /// identical presented-versus-owner coherence (route/capacity revision,
-    /// authority epoch, resource generation) plus the pure T9-04 owner
-    /// tuple. The `health` half rides input-only into the capability: route
-    /// selection projects its refs into the selection lineage, the verifier
-    /// never reads it, and it never mints admission (issue #265, W6).
+    /// Thin integration over [`crate::provider_admission::ProviderAdmission`]
+    /// (session-half overwrite + owner validation) and
+    /// [`crate::provider_capability::admit_provider_capability`]
+    /// (per-operation content comparison against the driven `claimed`
+    /// halves): the only production path from resolved material to the
+    /// coordinator's closed admission. The `health` half rides input-only
+    /// into the capability and never mints admission (issue #265, W6).
     ///
     /// # Errors
     ///
-    /// Returns the coordinator owner rejection unchanged (shape, coherence,
-    /// or stale/revoked binding).
+    /// Returns the closed-port validation, the per-operation identity
+    /// conflict, or the coordinator owner rejection unchanged, each typed.
     fn build_production_provider_capability(
         material: VerifiedProviderMaterial,
+        owner: &crate::daemon_kernel_client::OwnerSessionFacts,
+        live_fence: eliot_contracts::StateFence,
+        claimed: &crate::solo_agent_driver::SoloClaimedHalves,
     ) -> Result<eliot_agent_coordinator::AdmittedProviderCapability, FabricError> {
-        let presented = eliot_agent_coordinator::PresentedClaimMaterial::new(
-            material.claim_id,
-            material.attempt_id,
-            material.operation_id,
-            material.binding_digest,
-            material.executable_digest,
-            material.route_revision,
-            material.capacity_revision,
-            material.worker_generation,
-            material.presented_fence,
-        )?;
-        let currentness = eliot_agent_coordinator::OwnerCurrentness::new(
-            material.expectation,
-            material.live_fence,
-            material.session_binding,
-        )?;
-        Ok(eliot_agent_coordinator::AdmittedProviderCapability::new(
-            material.identity,
-            presented,
-            currentness,
-            material.health,
-            material.minimum_event_sequence,
-        )?)
+        let admission =
+            crate::provider_admission::ProviderAdmission::new(material, owner, live_fence)?;
+        crate::provider_capability::admit_provider_capability(&admission, claimed)
     }
 
     /// Constructs the production fabric on a sealed admitted provider
@@ -3409,14 +3389,23 @@ impl DaemonComposition {
         kernel: &Arc<DaemonKernelClient>,
         ports: FabricPorts,
         material: VerifiedProviderMaterial,
+        claimed: &crate::solo_agent_driver::SoloClaimedHalves,
     ) -> Result<AgentFabric, DaemonError> {
         let _span = tracing::info_span!("eliotd.fabric_new_verified_async").entered();
         let material = self.resolve_verified_material(kernel, material)?;
+        let owner = kernel.owner_session_facts().ok_or_else(|| {
+            DaemonError::Kernel(
+                "daemon has no validated Kernel owner session; verified provider admission stays plan-only"
+                    .to_owned(),
+            )
+        })?;
+        let live_fence = kernel.kernel_fence();
         kernel
             .verify_provider_binding_async(&material)
             .await
             .map_err(|error| DaemonError::Kernel(error.to_string()))?;
-        let capability = Self::build_production_provider_capability(material)?;
+        let capability =
+            Self::build_production_provider_capability(material, &owner, live_fence, claimed)?;
         let config = daemon_coordinator_config()?;
         Ok(AgentFabric::new_with_admitted_provider(
             config, ports, capability,
@@ -3451,14 +3440,23 @@ impl DaemonComposition {
         snapshot: FabricSnapshot,
         ports: FabricPorts,
         material: VerifiedProviderMaterial,
+        claimed: &crate::solo_agent_driver::SoloClaimedHalves,
     ) -> Result<AgentFabric, DaemonError> {
         let _span = tracing::info_span!("eliotd.fabric_restore_verified_async").entered();
         let material = self.resolve_verified_material(kernel, material)?;
+        let owner = kernel.owner_session_facts().ok_or_else(|| {
+            DaemonError::Kernel(
+                "daemon has no validated Kernel owner session; verified provider restore stays plan-only"
+                    .to_owned(),
+            )
+        })?;
+        let live_fence = kernel.kernel_fence();
         kernel
             .verify_provider_binding_async(&material)
             .await
             .map_err(|error| DaemonError::Kernel(error.to_string()))?;
-        let capability = Self::build_production_provider_capability(material)?;
+        let capability =
+            Self::build_production_provider_capability(material, &owner, live_fence, claimed)?;
         let config = daemon_coordinator_config()?;
         let store = crate::semantic_revision_store::SemanticRevisionStore::new(self.state_root());
         Ok(AgentFabric::restore_with_admitted_provider(
