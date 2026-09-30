@@ -252,6 +252,44 @@ pub struct SubmitEnvelope {
 }
 
 impl SubmitEnvelope {
+    /// Builds the retained reconciliation record from the delivered binding and
+    /// the sealed process-request digest the execution ran under.
+    ///
+    /// The two records differ by exactly that one field, so this is the
+    /// INVERSE of [`Self::binding`] and the pair is total in both directions:
+    /// `SubmitEnvelope::from_binding(&b, d).binding() == b` for every binding
+    /// `b`, and no admitted identity the provider was bound to can be dropped
+    /// on the way into the retained record.
+    ///
+    /// The `invocation_digest` cannot exist while the binding is being built —
+    /// the binding's own digest is projected into the argv that the process
+    /// request seals, so the envelope is strictly later — which is why this is
+    /// a separate constructor and not a field on [`SubmitBinding`].
+    pub fn from_binding(binding: &SubmitBinding, invocation_digest: &str) -> Self {
+        Self {
+            wire_version: binding.wire_version,
+            operation_id: binding.operation_id.clone(),
+            exchange_id: binding.exchange_id.clone(),
+            idempotency_key: binding.idempotency_key.clone(),
+            invocation_digest: invocation_digest.to_owned(),
+            protocol_revision: binding.protocol_revision,
+            required_schema: binding.required_schema.clone(),
+            request_sha256: binding.request_sha256.clone(),
+            executable_sha256: binding.executable_sha256.clone(),
+            config_digest: binding.config_digest.clone(),
+            protocol_digest: binding.protocol_digest.clone(),
+            module_id: binding.module_id.clone(),
+            module_generation_id: binding.module_generation_id.clone(),
+            process_generation: binding.process_generation,
+            authority_epoch: binding.authority_epoch.clone(),
+            state_fence: binding.state_fence.clone(),
+            disclosure: binding.disclosure.clone(),
+            budget_units: binding.budget_units,
+            deadline_ms: binding.deadline_ms,
+            cancellation_id: binding.cancellation_id.clone(),
+        }
+    }
+
     /// Returns the bounded submit projection of this envelope.
     ///
     /// # Errors

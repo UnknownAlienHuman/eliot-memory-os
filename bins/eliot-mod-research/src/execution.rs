@@ -380,10 +380,7 @@ impl ProviderBridge {
         // The envelope is the delivered binding plus the sealed process-request
         // digest, so the retained reconciliation record keeps every admitted
         // identity the provider was bound to instead of only its correlation.
-        let envelope = SubmitEnvelope {
-            invocation_digest: digest.clone(),
-            ..submit_binding.clone()
-        };
+        let envelope = SubmitEnvelope::from_binding(submit_binding, &digest);
         // These three refusals happen before the executor is contacted, so no
         // provider output exists to retain: `NotAttempted` says exactly that,
         // and is deliberately not the digest of an empty stream.
@@ -470,7 +467,7 @@ impl ProviderBridge {
             operation,
             digest,
             wire_bytes,
-            submit_binding_sha256: submit_binding_sha256.clone(),
+            submit_binding_sha256: submit_binding_sha256.to_owned(),
         })
     }
 
