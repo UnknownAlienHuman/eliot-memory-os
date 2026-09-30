@@ -1,5 +1,6 @@
 use crate::EngineError;
-use eliot_context_measurement::stu_for_bytes;
+use eliot_context_contracts::ContextError;
+use eliot_context_measurement::bytes_for_stu;
 use eliot_types::{
     CanonicalMemoryUtilityLedger, ForgettingOperator, MemoryCompressionArtifact,
     MemoryDistillationAction, MemoryDistillationApplyReceipt, MemoryDistillationApplySelection,
@@ -86,7 +87,7 @@ impl MemoryDistillationService {
                 "utility ledger is not bound to the distillation snapshot".to_owned(),
             ));
         }
-        let profile = corpus_profile(&input.items, &input.utility_ledger);
+        let profile = corpus_profile(&input.items, &input.utility_ledger)?;
         let ledger = input
             .utility_ledger
             .entries
@@ -203,10 +204,10 @@ impl MemoryDistillationService {
             .filter(|candidate| candidate.automatic_apply_allowed)
             .filter_map(|candidate| candidate.target_refs.first())
             .filter_map(|target| input.items.iter().find(|item| item.target_ref == *target))
-            .map(|item| {
-                -i64::try_from(canonical_bytes_for_measured_units(item.token_units))
-                    .unwrap_or(i64::MAX)
-            })
+            .map(|item| canonical_bytes_for_measured_units(item.token_units))
+            .collect::<Result<Vec<_>, EngineError>>()?
+            .into_iter()
+            .map(|bytes| -i64::try_from(bytes).unwrap_or(i64::MAX))
             .sum();
         let plan_material = (
             input.project_id,
@@ -850,7 +851,7 @@ fn candidate(
 fn corpus_profile(
     items: &[MemoryDistillationCorpusItem],
     ledger: &CanonicalMemoryUtilityLedger,
-) -> MemoryDistillationCorpusProfile {
+) -> Result<MemoryDistillationCorpusProfile, EngineError> {
     let utility = ledger
         .entries
         .iter()
@@ -858,29 +859,32 @@ fn corpus_profile(
         .collect::<BTreeMap<_, _>>();
     let mut tier_counts = BTreeMap::new();
     let mut active_bytes = 0_u64;
+    let mut total_bytes = 0_u64;
     for item in items {
         let tier =
             MemoryDistillationService::tier(item, utility.get(item.target_ref.as_str()).copied());
         *tier_counts.entry(tier).or_insert(0) += 1;
+        let item_bytes = canonical_bytes_for_measured_units(item.token_units)?;
+        total_bytes = total_bytes
+            .checked_add(item_bytes)
+            .ok_or(EngineError::ContextMeasurement(ContextError::Overflow))?;
         if matches!(tier, MemoryTier::Hot | MemoryTier::Warm) {
-            active_bytes =
-                active_bytes.saturating_add(canonical_bytes_for_measured_units(item.token_units));
+            active_bytes = active_bytes
+                .checked_add(item_bytes)
+                .ok_or(EngineError::ContextMeasurement(ContextError::Overflow))?;
         }
     }
-    MemoryDistillationCorpusProfile {
+    Ok(MemoryDistillationCorpusProfile {
         physical_records: items.len(),
         logical_items: items
             .iter()
             .map(|item| item.target_ref.as_str())
             .collect::<BTreeSet<_>>()
             .len(),
-        total_bytes: items
-            .iter()
-            .map(|item| canonical_bytes_for_measured_units(item.token_units))
-            .sum(),
+        total_bytes,
         active_bytes,
         tier_counts,
-    }
+    })
 }
 
 fn distillation_operator(action: MemoryDistillationAction) -> Option<ForgettingOperator> {
@@ -967,23 +971,27 @@ fn canonical_context_cost_from_payload(payload: &Value) -> Option<u64> {
     measure.get("stu_estimate")?.get("value")?.as_u64()
 }
 
-/// Canonical #704 byte length for one measured corpus unit count.
+/// Canonical #704 byte length that covers one measured corpus unit count.
 ///
-/// `MemoryDistillationCorpusItem::token_units` is a measured unit count, and
+/// `MemoryDistillationCorpusItem::token_units` is a measured unit count and
 /// the byte fields (`total_bytes`, `active_bytes`, `expected_active_bytes_delta`)
-/// are true storage metrics that stay in bytes. The previous local `* 4` ratio
-/// is not a byte count and is removed; the byte figure is now the exact inverse
-/// of the normative `STU(bytes) = ceil(bytes / 3)` unit owned by #704, so a
-/// measured unit count maps to the smallest canonical byte length whose STU
-/// covers it. One integer never silently means two units, and this conversion
-/// never produces a token or STU claim.
+/// are true storage metrics that stay in bytes, so the stored figure is the
+/// covering byte length `bytes_for_stu(u) = 3 * u` from #704 - the smallest
+/// byte length whose normative `STU(bytes) = ceil(bytes / 3)` estimate still
+/// covers `u`, and its exact inverse (`stu_for_bytes(3u) == u`). The conversion
+/// reaches #704's canonical helper rather than repeating the factor locally,
+/// and an unrepresentable length fails closed through `EngineError` instead of
+/// saturating to a figure that no longer covers `u`. One integer never
+/// silently means two units, and this conversion never produces a token or STU
+/// claim.
 ///
-/// Corrected-evidence note: for a corpus whose unit counts are exact byte
-/// multiples, the canonical byte figure is `3x` where the removed local ratio
-/// reported `4x`. No threshold, retention or distillation policy is retuned;
-/// only the unit conversion is corrected.
-fn canonical_bytes_for_measured_units(measured_units: u64) -> u64 {
-    stu_for_bytes(measured_units).unwrap_or(0).saturating_mul(3)
+/// The figure is a storage length, not an observed one: `token_units` carries no
+/// serialized length, so `3 * u` is the covering lower bound, never evidence of
+/// an actual byte count. The removed local `* 4` ratio reported 1.33x the
+/// covering figure it replaced; no threshold, retention or distillation policy
+/// is retuned here, and only the unit conversion is corrected.
+fn canonical_bytes_for_measured_units(measured_units: u64) -> Result<u64, EngineError> {
+    bytes_for_stu(measured_units).map_err(EngineError::from)
 }
 
 fn normalize(value: &str) -> String {
