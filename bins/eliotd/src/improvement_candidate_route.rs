@@ -193,18 +193,57 @@ pub fn check_improvement_handoff_identity(
     Ok(())
 }
 
-/// Returns the owning identity for each of the eight distinct pipeline operations.
+/// Returns the owning identity for each of the nine distinct pipeline operations.
 ///
-/// Production caller of [`ImprovementOperation::owner`]: Propose/Admit/Promote
-/// resolve to Governor maintenance, Execute/Measure to Testd, Evaluate to the
+/// Production caller of [`ImprovementOperation::owner`]:
+/// Propose/IngestCandidate/Admit/Promote resolve to Governor maintenance,
+/// Execute/Measure to Testd, Evaluate to the
 /// independent Instrument verifier, `CanaryActivate` to Kernel (handoff only),
 /// and Rollback to the bound rollback-contract owner.
+///
+/// # This map is READ on the live route, not merely published
+///
+/// The daemon consults this map at the ONE point where it decides the routing of
+/// its own records:
+/// `improvement_candidate_dispatch::dispatch_improvement_candidate_route` reads
+/// it before it builds anything, and the owner identities it then writes into
+/// its `ExperimentPlan`, `ActivationEvidence`, `ImprovementEvidenceView` and
+/// `RollbackContract` come from here rather than from a constant re-spelled at
+/// the field. The Governor crate then re-checks those very fields independently —
+/// `check_experiment_owner_routing` refuses an executor that is not the Testd
+/// owner, `check_evaluator_independence` refuses an evidence verifier that is not
+/// the planned one or that is the executor, the admission owner or the rollback
+/// owner (A14.6, A5.5), and `check_rollback_join` refuses a rollback owner that
+/// disagrees with the admission policy — so a map entry that ever resolved
+/// elsewhere would REFUSE the route rather than be recorded and discarded.
+///
+/// `rollback_owner_id` is the map's only input because Rollback is the one
+/// operation with no fixed pipeline owner. On the live path the value passed is
+/// the same `G-19` admission policy record's own
+/// [`eliot_maintenance::ImprovementAdmissionPolicy::rollback_owner_id`] the
+/// request already carries, so the owner the map names and the owner the
+/// pipeline compares against are one value read once, never a literal.
+///
+/// The map projects all nine operations and the daemon reads three of them
+/// (`ExecuteExperiment`, `Evaluate`, `Rollback`), because those are the three
+/// whose owner the daemon has to state in a record it builds. The remaining six
+/// are stamped or decided inside the Governor crate this route calls — including
+/// the `CanaryActivate` owner the pipeline writes into the handoff's
+/// `activation_owner_id` and the daemon only reads — so there is no daemon-side
+/// field for them to appear in, and the map is left complete rather than trimmed
+/// to what one caller happens to read.
 #[must_use]
-pub fn improvement_operation_owners(rollback_owner_id: &str) -> [(&'static str, String); 8] {
+pub fn improvement_operation_owners(rollback_owner_id: &str) -> [(&'static str, String); 9] {
     [
         (
             ImprovementOperation::Propose.as_str(),
             ImprovementOperation::Propose
+                .owner(rollback_owner_id)
+                .to_string(),
+        ),
+        (
+            ImprovementOperation::IngestCandidate.as_str(),
+            ImprovementOperation::IngestCandidate
                 .owner(rollback_owner_id)
                 .to_string(),
         ),

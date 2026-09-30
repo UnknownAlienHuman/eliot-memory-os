@@ -31,16 +31,49 @@
 //! resource generation); its operation and idempotency namespaces are the `G-19`
 //! policy record's own; its risk and effect ceilings are the pipeline's own
 //! admitted constants; and its rollback owner is the one the same policy record
-//! names. See each field's `ASSUMPTION` note for what a value is and is not.
+//! names, read back out of the operation owner map's `Rollback` row rather than
+//! re-spelled. See each field's `ASSUMPTION` note for what a value is and is not.
+//!
+//! # One map, one read: the daemon names owners it does not own
+//!
+//! This daemon raises exactly one proposal and drives the pipeline, so it never
+//! executes, measures, evaluates, admits, activates, promotes or rolls back
+//! anything itself. It nevertheless has to STATE who owns each of those, in the
+//! four records that name an owner: the `ExperimentPlan`'s executor and
+//! evaluator, the `ActivationEvidence` and `ImprovementEvidenceView` verifiers,
+//! and the `RollbackContract` and `ImprovementEvidenceView` rollback owners. All
+//! six fields are read from [`improvement_operation_owners`] — the production
+//! projection of [`eliot_maintenance::ImprovementOperation::owner`] — at the one
+//! point in [`dispatch_improvement_candidate_route`] where this daemon decides
+//! what it is routing. That is what makes the map load-bearing rather than
+//! decorative: `check_experiment_owner_routing`, `check_evaluator_independence`
+//! and `check_rollback_join` in the Governor crate all re-derive the same
+//! question from these fields, so a map entry that diverged from the pipeline's
+//! expectation becomes a typed [`PipelineError::UnboundRelation`] on the live
+//! route instead of a routing nobody notices.
+//!
+//! The map's single input is the rollback owner, and it is the same `G-19`
+//! admission policy record's own
+//! [`eliot_maintenance::ImprovementAdmissionPolicy::rollback_owner_id`] the
+//! request already carries — read on the live path from
+//! `DaemonComposition::maintenance_improvement_admission_policy`, which hands the
+//! `G-19` owner this daemon's own service identity rather than a caller's
+//! string. No literal is introduced at this seam, and an operation the map does
+//! not resolve is refused rather than defaulted.
 //!
 //! # The owner routing a plan declares is not a claim that anything ran
 //!
-//! [`ExperimentPlan::testd_owner_id`] and [`ExperimentPlan::evaluator_id`] name
-//! the Testd owner and the independent Instrument verifier family because the
-//! Governor pipeline REQUIRES that routing (W5) — a plan routed to any other
-//! executor or evaluator is refused as unbound. Declaring the routing is a
-//! statement about who would run and who would grade the bounded experiment; it
-//! is not a statement that either happened.
+//! [`ExperimentPlan::testd_owner_id`] and [`ExperimentPlan::evaluator_id`] are
+//! read from the one operation owner map
+//! ([`improvement_operation_owners`]) at the start of
+//! [`dispatch_improvement_candidate_route`], so the executor and the evaluator
+//! are two rows of the same `ImprovementOperation::owner` projection rather than
+//! two constants this module spells beside each other. The Governor pipeline
+//! REQUIRES that routing (W5) — a plan routed to any other executor or evaluator
+//! is refused as unbound — so if the map ever resolved elsewhere the route
+//! REFUSES rather than recording a routing nothing checks. Declaring the routing
+//! is a statement about who would run and who would grade the bounded experiment;
+//! it is not a statement that either happened.
 //!
 //! The claim that something ran lives in
 //! [`ActivationEvidence::execution`], and this module sets it to its honest
@@ -50,6 +83,136 @@
 //! evidence cannot promote") and `I0.5` are honoured by that value, not worked
 //! around: nothing here substitutes a self-report, a model score, or an exit zero
 //! for a real run.
+//!
+//! # The missing producer, named so the next owner does not re-derive it
+//!
+//! The refusals below are only meaningful if what would clear them is absent
+//! for a reason, and not merely unwritten. The absence is measured on this
+//! tree, and each count below is what the stated search returns — not an
+//! estimate and not a recollection.
+//!
+//! ## `ImprovementEvidenceExecution::Executed` is constructed nowhere
+//!
+//! This is the load-bearing count, and it is stronger than "not in
+//! production". A workspace-wide search for the variant returns exactly two
+//! occurrences, and NEITHER constructs it: the doc comment on
+//! [`ImprovementEvidenceExecution::Executed`] itself, and the comparison inside
+//! `check_evaluation_shape` that REFUSES every status but this one. There is no
+//! construction site in `eliotd`, in `eliot-maintenance`, in `eliot-testd-core`,
+//! in `eliot-verifier`, in `eliot-product-evaluation`, or in any test.
+//!
+//! So the one status that could ever support activation under "only independent
+//! executed evidence may support activation" is not merely unexercised on the
+//! live path — it is unreachable by any value this workspace can currently
+//! build, and the positive half of that guarantee has no producer to draw on.
+//! That is the correct state for a boundary nobody has crossed, and it is why
+//! this module sets `NotExecuted` rather than reaching for the nearest thing it
+//! does hold.
+//!
+//! ## The pipeline's `ActivationEvidence` is built in exactly one place, and
+//! it is this file
+//!
+//! A workspace search for `ActivationEvidence {` returns four CONSTRUCTION
+//! sites. Three of them build an UNRELATED same-named type —
+//! `bins/eliotd/src/agent_fabric.rs` declares `ActivationEvidence` for a Kernel
+//! ATTEMPT (`admission_id`, `attempt_id`, `activation_digest`, `fence`), and
+//! `bins/eliotd/src/solo_agent_driver.rs` plus two `bins/eliotd/tests` fixtures
+//! construct it. That is a different record with a different owner and no
+//! relation to improvement admission, so none of the three is a producer for the
+//! Governor type. The fourth is this file's `route_activation_evidence`, and it
+//! is the ONLY one. The Governor `ActivationEvidence` is therefore never built
+//! by a test either: the maintenance crate's own fixtures exercise
+//! [`eliot_maintenance::ImprovementEvidenceView`], a different record.
+//!
+//! ## The product pulse has no production producer
+//!
+//! `ImprovementPulseOutcome` appears in this file once, as the refusal value
+//! [`ImprovementPulseOutcome::Missing`] with `pulse_ref: None`. Every
+//! non-refusal value — `Pass`, `Regression` — is constructed inside the
+//! `#[cfg(test)] mod tests` of `improvement_admission.rs`. A workspace search
+//! for `pulse_ref` additionally finds `ProductPulseEvidence` in
+//! `eliot-improvement`'s own promotion gate and two fixtures for it; that is a
+//! THIRD type with its own `pulse_ref`, not this one, so it does not count.
+//! The honest total is: one production construction, and it is the refusal.
+//!
+//! `eliotd` does depend on `eliot-product-evaluation`, but only through
+//! `campaign_evaluation_owner`, which serializes campaign-source publications
+//! for the campaign cell. That crate names no `ImprovementPulseOutcome` and is
+//! not on this path, so its presence is not a producer.
+//!
+//! ## No reachable independent evaluation, and why, in three parts
+//!
+//! 1. **The executor is not reachable from this daemon.** `eliotd` holds four
+//!    authenticated Testd operations — `pending-dispatches`, `bind-dispatch`,
+//!    `pending-terminals`, `ack-terminal` — and a workspace search finds ZERO
+//!    references to [`eliot_testd_core::TESTD_OWNER_SUBMIT_OPERATION`] in
+//!    `bins/eliotd`. The submit operation is defined in `eliot-testd-core` and
+//!    handled in `bins/eliot-kernel`. So the `ExperimentPlan` this module
+//!    builds has no client that could release it: the experiment cannot be
+//!    started from here even if a submission were written, which it cannot be —
+//!    the submit request additionally requires a `TaskContract` `WorkScope`
+//!    result as `source_root` and an owner-observed `TestdProcessToolIntent`,
+//!    neither of which a maintenance observation produces.
+//! 2. **The evaluator has no executor even in principle.** `eliot-verifier`'s
+//!    `execute` is driven by a `&dyn VerifierExecutionPort`, and a workspace
+//!    search for `impl VerifierExecutionPort` returns ZERO. `eliotd` does not
+//!    depend on `eliot-verifier` at all, so the axis is unreachable from this
+//!    crate in two independent ways.
+//! 3. **This daemon runs no experiment to evaluate.** The call in
+//!    `daemon_runtime::run_improvement_intake` is documented there as pure
+//!    with respect to the Kernel — no exchange, no write — over the artifact,
+//!    the `G-19` policy and the fence the pass already holds. There is no
+//!    experiment on this path to produce an outcome for.
+//!
+//! A14.6 is the reason these three are the same finding rather than three: it
+//! distinguishes the "Production path - what created decisions, actions, and
+//! outcome" from the "Measurement path - how outcome became a score or
+//! quality claim". This daemon is the production path, and by construction it
+//! does not become the measurement path for its own candidate. A14.6 also says
+//! "A same-family model judge is not automatically independent", and A5.5 that
+//! "A model evaluator is admissible for a subjective property, but its model
+//! name does not make it independent" — so the `Evaluate` row read from the
+//! operation map cannot stand in for a run either. Naming the evaluator does
+//! not perform the evaluation.
+//!
+//! # What would have to be true for the activation legs to have evidence
+//!
+//! Stated so the next owner does not have to reconstruct it, and stated as
+//! preconditions rather than as an assignment — none of them is this daemon's
+//! to satisfy, and satisfying one here would be the self-verification A0.3
+//! names as hidden control capture:
+//!
+//! - Owner `#20`/`#1111` supplies a real `VerifierExecutionPort`
+//!   implementation and an independent run over this exact candidate and target,
+//!   whose outcome this daemon can read as
+//!   [`ImprovementEvidenceExecution::Executed`] with a `run_ref` and a
+//!   `raw_evidence_ref` that resolve. A5.5 requires that the Governor bind
+//!   such a verifier "to an acceptance item and checks scope and freshness", so
+//!   the run must carry the acceptance item, not just a passing verdict.
+//! - `eliotd` gains a submit client for
+//!   [`eliot_testd_core::TESTD_OWNER_SUBMIT_OPERATION`], and the maintenance
+//!   observation can supply the `source_root` and owner-observed tool intent
+//!   that request requires, so `ExperimentPlan::testd_owner_id` names an
+//!   executor that can actually be reached.
+//! - Owner `#11` supplies a product pulse, so
+//!   [`ImprovementPulseOutcome`] carries a value other than
+//!   [`ImprovementPulseOutcome::Missing`] with a resolving `pulse_ref`.
+//!   `eliot-improvement`'s own `ProductPulseEvidence` carries `package_green`
+//!   alongside the result, and its own comment is that "package-green never
+//!   substitutes"; a green package is therefore not this pulse, and
+//!   `ImprovementEvidenceView::pulse` stays `Missing` without `#11`.
+//! - The `ImprovementCandidateView` supplies the `meta.learning.closure`
+//!   binding, and an owner privacy-class vocabulary is reachable, so
+//!   `ImprovementProposal::validate` stops refusing the absent `closure_id` and
+//!   `privacy_class`. Those are the FIRST refusals the pipeline reaches on this
+//!   path, ahead of every evidence check, so this precondition gates the
+//!   evaluation ones rather than being independent of them; it is stated at
+//!   "What the daemon does not hold" below.
+//!
+//! Until then the disposition this path produces is a typed refusal, and the
+//! correct outcome of this issue's activation half is that the refusal IS the
+//! guarantee: no self-report, no model score, no exit zero, and no absent
+//! producer is substituted for the run that never happened.
 //!
 //! # What the daemon does not hold, stated rather than filled
 //!
@@ -232,6 +395,38 @@
 //! forgery I12.24 and the audit behind AUD2/AUD3 exist to prevent. So the read
 //! stays a read, and the named gap is the missing effect owner, not a missing
 //! call.
+//!
+//! # The two halves of this issue, stated separately
+//!
+//! "Route experiments through Testd/Instrument and activation through Governor →
+//! Kernel generation/canary paths" splits into a routing half and an execution
+//! half, and only the first is deliverable here.
+//!
+//! - **Routing is wired and load-bearing.** The executor, the evaluator and the
+//!   rollback owner are read from the single
+//!   [`eliot_maintenance::ImprovementOperation::owner`] projection, and the
+//!   Governor pipeline independently re-derives the same questions:
+//!   `check_experiment_owner_routing` refuses any executor other than
+//!   `testd-20` and any evaluator outside `instrument-verifier-20-1111`,
+//!   `check_evaluator_independence` refuses an evaluator that is the executor,
+//!   the admission owner or the rollback owner, and `check_rollback_join`
+//!   refuses a rollback owner that disagrees with the policy or the admission
+//!   evidence. A map row that diverged becomes a typed refusal on the live
+//!   route, so the routing is checked rather than documented.
+//! - **Execution is absent, and the absence is measured.** No experiment is
+//!   run, no executed evaluation exists, and no product pulse exists. The
+//!   counts and the exact missing producers are stated above. Filling them from
+//!   this daemon would be self-verification, so they are stated instead.
+//!
+//! For the guarantee "only independent executed evidence against the exact
+//! candidate/target may support activation; model/self-report/exit zero
+//! cannot", the negative half holds structurally: the pipeline refuses every
+//! non-`Executed` status, refuses a non-independent or non-passing verdict, and
+//! refuses an evaluator that is not the declared one, and the status is machine
+//! state that no self-report can supply. The positive half has no producer to
+//! exercise it, which is stated rather than papered over — and the absence is
+//! the safe direction, since an unproven candidate is refused rather than
+//! promoted.
 
 #![forbid(unsafe_code)]
 
@@ -245,9 +440,9 @@ use eliot_maintenance::{
     ActivationEvidence, ExperimentPlan, IMPROVEMENT_CANDIDATE_BOUNDS_REVISION,
     IMPROVEMENT_EFFECT_CEILING, IMPROVEMENT_PROOF_CEILING, IMPROVEMENT_REQUESTED_EFFECT,
     IMPROVEMENT_RISK_CEILING_BOUNDED, ImprovementAdmissionPolicy, ImprovementCandidateView,
-    ImprovementEvidenceExecution, ImprovementEvidenceView, ImprovementProposal,
-    ImprovementPulseOutcome, ImprovementReplayAssessment, ImprovementTerminalDisposition,
-    MechanismDeclaration, PipelineError, RollbackContract, TESTD_OWNER, VERIFIER_OWNER_FAMILY,
+    ImprovementEvidenceExecution, ImprovementEvidenceView, ImprovementOperation,
+    ImprovementProposal, ImprovementPulseOutcome, ImprovementReplayAssessment,
+    ImprovementTerminalDisposition, MechanismDeclaration, PipelineError, RollbackContract,
 };
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::RequestBinding;
@@ -259,8 +454,8 @@ use eliot_store_api::{
 use super::DaemonComposition;
 use super::improvement_candidate_route::{
     ImprovementEffectState, ImprovementRouteRequest, UnknownEffectObligation,
-    assess_improvement_repeat, check_improvement_handoff_identity, read_improvement_effect_state,
-    route_improvement_candidate,
+    assess_improvement_repeat, check_improvement_handoff_identity, improvement_operation_owners,
+    read_improvement_effect_state, route_improvement_candidate,
 };
 use super::improvement_intake_dispatch::{ImprovementArtifact, ImprovementDispatchError};
 
@@ -353,6 +548,75 @@ pub struct ImprovementRouteOutcome {
     pub effect: ImprovementEffectState,
 }
 
+/// The three owner identities this dispatch reads out of the operation map.
+///
+/// Read once, before any record is built, from
+/// [`improvement_operation_owners`] — the single projection of
+/// [`eliot_maintenance::ImprovementOperation::owner`]. Every owner field below is
+/// assigned from one of these three values, never from a constant re-spelled at
+/// the field, so the routing this daemon commits and the routing the Governor
+/// pipeline independently re-checks are one decision expressed once.
+///
+/// A14.6 separates the production path, the measurement path and the
+/// optimization-feedback path; A5.5 adds that "a model evaluator is admissible
+/// for a subjective property, but its model name does not make it independent".
+/// That is why the executor and the evaluator are two separate reads of the map
+/// rather than one identity used twice: the daemon that proposes is not the
+/// owner that executes the bounded experiment, and the owner that executes it is
+/// not the owner that independently evaluates the result (A0.3, "hidden control
+/// capture").
+struct RouteOwners {
+    /// Owner of the bounded experiment's execution — `ExecuteExperiment`.
+    executor: String,
+    /// Owner of the independent evaluation — `Evaluate`.
+    evaluator: String,
+    /// Owner bound by the rollback contract — `Rollback`.
+    rollback: String,
+}
+
+impl RouteOwners {
+    /// Reads this dispatch's owner identities from the single operation map.
+    ///
+    /// `rollback_owner_id` is the map's one input and it is the SAME
+    /// `G-19` admission policy record's own
+    /// [`eliot_maintenance::ImprovementAdmissionPolicy::rollback_owner_id`] that
+    /// the request already carries — read on the live path at
+    /// `daemon_runtime::improvement_intake_artifact` from
+    /// `DaemonComposition::maintenance_improvement_admission_policy`, which
+    /// forwards this daemon's own service identity to the `G-19` owner rather
+    /// than accepting a caller's string. It is a real owner identity, not a
+    /// literal, and not a value invented at this call site: it is the very value
+    /// `check_rollback_join` in the Governor crate compares the rollback
+    /// contract and the admission evidence against.
+    fn read(rollback_owner_id: &str) -> Result<Self, PipelineError> {
+        let map = improvement_operation_owners(rollback_owner_id);
+        Ok(Self {
+            executor: route_operation_owner(&map, ImprovementOperation::ExecuteExperiment)?,
+            evaluator: route_operation_owner(&map, ImprovementOperation::Evaluate)?,
+            rollback: route_operation_owner(&map, ImprovementOperation::Rollback)?,
+        })
+    }
+}
+
+/// Reads one operation's owner out of the operation map.
+///
+/// A map that does not carry the requested operation is an unbound relation, not
+/// a missing field to be filled with a default: there is no literal here to fall
+/// back to, and an owner this daemon cannot resolve must not be guessed, so the
+/// dispatch returns the typed [`PipelineError::UnboundRelation`] the Governor
+/// pipeline uses for every other diverging owner relation and builds nothing.
+fn route_operation_owner(
+    map: &[(&'static str, String)],
+    operation: ImprovementOperation,
+) -> Result<String, PipelineError> {
+    map.iter()
+        .find(|(name, _)| *name == operation.as_str())
+        .map(|(_, owner)| owner.clone())
+        .ok_or(PipelineError::UnboundRelation {
+            relation: "operation-owner-map: no-owner-for-this-operation",
+        })
+}
+
 /// Routes one real maintenance observation through the Governor-owned
 /// improvement pipeline.
 ///
@@ -390,22 +654,33 @@ pub fn dispatch_improvement_candidate_route(
     dispatch: ImprovementRouteDispatch<'_>,
 ) -> Result<ImprovementRouteOutcome, PipelineError> {
     let candidate = &dispatch.artifact.candidate;
+    // # The one point where this daemon consults the operation owner map
+    //
+    // This daemon raises exactly one proposal and drives the pipeline, so every
+    // owner it has to STATE is read here, once, from the same projection
+    // `ImprovementOperation::owner` defines — rather than each record builder
+    // naming an owner for itself. I12.24:66-68 puts the experiment, its
+    // measurement and the affected-checks/live-shadow evaluation in the hands of
+    // the execution and verification owners rather than in the proposer's hands,
+    // and the operation map is how the code says so.
+    //
+    // The rollback owner is the same `G-19` policy record's own value the
+    // request already carries, read on the live path from
+    // `DaemonComposition::maintenance_improvement_admission_policy` — never a
+    // literal at this call site.
+    let owners = RouteOwners::read(dispatch.policy.rollback_owner_id.as_str())?;
     // Bound once, so the plan the request borrows, the plan the returned handoff
     // is checked against, and the plan the outcome carries are the same value
     // rather than two constructions that could drift.
-    let experiment = route_experiment(candidate, dispatch.policy);
+    let experiment = route_experiment(candidate, dispatch.policy, &owners);
     let proposal = route_proposal(candidate, dispatch.policy, dispatch.state_fence);
     let disposition = route_improvement_candidate(ImprovementRouteRequest {
         proposal: &proposal,
         experiment: &experiment,
-        evidence: &route_activation_evidence(candidate),
-        rollback: &route_rollback_contract(candidate, dispatch.policy),
+        evidence: &route_activation_evidence(candidate, &owners),
+        rollback: &route_rollback_contract(candidate, &owners),
         candidate: &route_candidate_view(candidate, dispatch.policy),
-        admission_evidence: &route_admission_evidence(
-            candidate,
-            dispatch.policy,
-            dispatch.retained,
-        ),
+        admission_evidence: &route_admission_evidence(candidate, &owners, dispatch.retained),
         policy: dispatch.policy,
     })?;
     // The handoff is consumed under this build's identity BEFORE anything reads
@@ -928,6 +1203,7 @@ fn route_data_identity(candidate: &ImprovementCandidate) -> String {
 fn route_experiment(
     candidate: &ImprovementCandidate,
     policy: &ImprovementAdmissionPolicy,
+    owners: &RouteOwners,
 ) -> ExperimentPlan {
     let candidate_id = candidate.candidate_id.as_str();
     // The experiment identity of this candidate. Derived from the candidate's
@@ -936,10 +1212,16 @@ fn route_experiment(
     let experiment_id = format!("maintenance-improvement-experiment:{candidate_id}");
     ExperimentPlan {
         experiment_id,
-        // Owner routing the pipeline requires (W5), declared and not claimed to
-        // have happened; see the module documentation.
-        testd_owner_id: TESTD_OWNER.to_owned(),
-        evaluator_id: VERIFIER_OWNER_FAMILY.to_owned(),
+        // Owner routing read from the operation map rather than spelled here, and
+        // declared rather than claimed to have happened; see the module
+        // documentation. I12.24:66-67 keeps the isolated experiment and its fixed
+        // replay outside the proposer's own hands.
+        testd_owner_id: owners.executor.clone(),
+        // A14.6: the measurement/evaluation path is distinct from the production
+        // path, and A5.5: a model evaluator's name does not make it independent.
+        // The evaluator is the map's own `Evaluate` owner, a different read from
+        // the executor above.
+        evaluator_id: owners.evaluator.clone(),
         scope_ref: candidate.validity_scope.clone(),
         // Identical to the proposal's admitted budget and deadline, so no scope
         // refinement is claimed: `scope_refinement` stays absent rather than
@@ -953,14 +1235,20 @@ fn route_experiment(
 }
 
 /// The independent activation evidence bound to this candidate and experiment.
-fn route_activation_evidence(candidate: &ImprovementCandidate) -> ActivationEvidence {
+fn route_activation_evidence(
+    candidate: &ImprovementCandidate,
+    owners: &RouteOwners,
+) -> ActivationEvidence {
     let candidate_id = candidate.candidate_id.as_str();
     ActivationEvidence {
         evidence_id: format!("maintenance-activation-evidence:{candidate_id}"),
-        // The verifier family the plan declared, as a routing identity. It is
-        // NOT a claim that this family evaluated anything: `execution` below is
-        // the machine state that says so, and the pipeline reads it first.
-        verifier_id: VERIFIER_OWNER_FAMILY.to_owned(),
+        // The verifier family the plan declared, read from the same map row the
+        // plan's `evaluator_id` was read from, as a routing identity. It is NOT a
+        // claim that this family evaluated anything: `execution` below is the
+        // machine state that says so, and the pipeline reads it first. A14.6 is
+        // the reason the two fields cannot be the same value: the executor of a
+        // change is not the independent evaluator of it.
+        verifier_id: owners.evaluator.clone(),
         // Honest: no independent evaluation of this candidate exists, and none
         // passed. Both are false because this daemon starts no experiment, not
         // because a weaker success is being downgraded.
@@ -974,6 +1262,16 @@ fn route_activation_evidence(candidate: &ImprovementCandidate) -> ActivationEvid
         content_revision_ref: route_content_revision_ref(candidate),
         // The I0.5 execution dimension, at its honest value. This is the field
         // that keeps replay-only evidence from promoting (I12.24:76).
+        //
+        // MEASURED, not assumed: `ImprovementEvidenceExecution::Executed` has
+        // no construction site anywhere in this workspace — not in `eliotd`,
+        // not in `eliot-maintenance`, not in any test. The only other value this
+        // enum could be given from an observation this daemon already holds is
+        // the one set here, and the status is machine state, so it is set from
+        // the fact that no run happened rather than from a verdict. The module
+        // documentation names the exact preconditions under which a real
+        // evaluation could arrive here; none of them is a field this daemon can
+        // fill in without grading its own candidate, which A0.3 forbids.
         execution: ImprovementEvidenceExecution::NotExecuted,
         bound_candidate_id: candidate.candidate_id.clone(),
         bound_experiment_id: format!("maintenance-improvement-experiment:{candidate_id}"),
@@ -995,7 +1293,7 @@ fn route_content_revision_ref(candidate: &ImprovementCandidate) -> String {
 /// The repair path named before any experiment is admitted.
 fn route_rollback_contract(
     candidate: &ImprovementCandidate,
-    policy: &ImprovementAdmissionPolicy,
+    owners: &RouteOwners,
 ) -> RollbackContract {
     RollbackContract {
         // The candidate's OWN recorded repair references, bound verbatim.
@@ -1009,8 +1307,13 @@ fn route_rollback_contract(
         // default.
         reopen_ref: String::new(),
         expiry_ref: String::new(),
-        // The rollback owner is the one the same `G-19` policy record declares.
-        rollback_owner_id: policy.rollback_owner_id.clone(),
+        // The rollback owner, read from the map's own `Rollback` row. The map
+        // resolves `Rollback` to the owner it was given, and the owner it was
+        // given is the same `G-19` policy record's `rollback_owner_id` the
+        // request carries — so this value is the real rollback-contract owner
+        // that `check_rollback_join` compares this contract and the admission
+        // evidence against, not a copy that could drift from it.
+        rollback_owner_id: owners.rollback.clone(),
         forward_repair_ref: String::new(),
         invalidation_set: vec![candidate.validity_scope.clone()],
     }
@@ -1047,17 +1350,22 @@ fn route_candidate_view(
 }
 
 /// The admission-review evidence the Governor owner would read.
+///
+/// The `policy` argument this builder used to take is gone: every owner it
+/// declared is now read from the map, and the one remaining field it took from
+/// the policy record (`rollback_owner_id`) is the map's `Rollback` row, so the
+/// parameter had no honest reader left.
 fn route_admission_evidence(
     candidate: &ImprovementCandidate,
-    policy: &ImprovementAdmissionPolicy,
+    owners: &RouteOwners,
     retained: Option<&RetainedImprovementProposal>,
 ) -> ImprovementEvidenceView {
     let candidate_id = candidate.candidate_id.as_str();
     ImprovementEvidenceView {
-        // The admission-review evaluator identity the plan declared. No
-        // admission review ran; the `independent` / `verifier_passed` pair below
-        // is what says so.
-        verifier_id: VERIFIER_OWNER_FAMILY.to_owned(),
+        // The admission-review evaluator identity the plan declared, read from
+        // the same map row rather than spelled here. No admission review ran; the
+        // `independent` / `verifier_passed` pair below is what says so.
+        verifier_id: owners.evaluator.clone(),
         bound_candidate_id: candidate.candidate_id.clone(),
         bound_experiment_id: format!("maintenance-improvement-experiment:{candidate_id}"),
         content_revision_ref: route_content_revision_ref(candidate),
@@ -1066,6 +1374,15 @@ fn route_admission_evidence(
         verifier_passed: false,
         // No product pulse was observed for this candidate, and a package-green
         // result is never one.
+        //
+        // MEASURED: this is the ONLY production construction of
+        // `ImprovementPulseOutcome` in the workspace, and it is the refusal.
+        // Every non-refusal value is built inside the `#[cfg(test)] mod tests`
+        // of `eliot-maintenance`'s `improvement_admission.rs`. The similarly
+        // named `ProductPulseEvidence` in `eliot-improvement`'s own promotion
+        // gate is a different type on a different record, so its two test
+        // fixtures are not producers of this one. Owner `#11` is what would
+        // supply a real pulse; see the module documentation.
         pulse: ImprovementPulseOutcome::Missing,
         pulse_ref: None,
         // Nothing ran, so nothing was harmed and nothing's outcome is unknown:
@@ -1083,7 +1400,10 @@ fn route_admission_evidence(
         rollback_ref: Some(candidate.rollback.clone()),
         disable_ref: Some(route_deadline_ref(candidate)),
         reopen_ref: None,
-        rollback_owner_id: policy.rollback_owner_id.clone(),
+        // The same map row the rollback contract above was read from, so the
+        // evidence and the contract name one owner. `check_rollback_join` refuses
+        // the pair if they ever disagree.
+        rollback_owner_id: owners.rollback.clone(),
         expiry_ref: None,
         // The caller's own checked prior record, or the pipeline's own
         // no-retained-record case. This is a record, never a verdict: the gate
