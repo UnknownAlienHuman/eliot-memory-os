@@ -1482,6 +1482,8 @@ struct StoreApplyOperation {
     transition: PreparedTransition,
     expected_revision_heads: Vec<RevisionHeadExpectation>,
     expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    #[serde(default)]
+    original_write_submission: Option<eliot_store_api::OriginalWriteSubmission>,
 }
 
 /// Canonical notification transition carrier for the
@@ -8700,17 +8702,47 @@ impl KernelComposition {
             Ok(seed) => seed,
             Err(error) => return Ok(Self::store_error_response_text("write_receipt", &error)),
         };
+        let is_observation_capture = operation.transition.transition_class
+            == eliot_store_api::TransitionClass::CaptureCandidate
+            && operation.transition.named_operations.iter().any(|named| {
+                named.operation == eliot_store_api::NamedMutationOperation::CaptureObservation
+            });
+        if is_observation_capture && reserved_seed.is_none() {
+            return Ok(Self::store_error_response_text(
+                "write_receipt",
+                "observation capture lacks its protected original host request binding",
+            ));
+        }
         let apply_result = if let Some(seed) = reserved_seed {
-            Box::pin(gateway.apply_reserved(
+            let Some(original_submission) = operation.original_write_submission.as_ref() else {
+                return Ok(Self::store_error_response_text(
+                    "write_receipt",
+                    "protected Observe apply has no original write submission",
+                ));
+            };
+            if original_submission.validate().is_err() {
+                return Ok(Self::store_error_response_text(
+                    "write_receipt",
+                    "original write submission is invalid",
+                ));
+            }
+            Box::pin(gateway.apply_reserved_with_original_submission(
                 &operation.context,
                 operation.transition,
                 operation.expected_revision_heads,
                 operation.expected_ordering_heads,
                 seed,
+                original_submission,
             ))
             .await
-                .map_err(|error| Self::store_error_response_text("write_receipt", &error))
+            .map_err(|error| Self::store_error_response_text("write_receipt", &error))
         } else {
+            if operation.original_write_submission.is_some() {
+                return Ok(Self::store_error_response_text(
+                    "write_receipt",
+                    "original write submission is only valid for protected Observe capture",
+                ));
+            }
             match gateway
                 .apply(
                     &operation.context,
