@@ -83,6 +83,12 @@ $script:GovernorRetirementClosureSchema = 'eliot-governor-retirement-closure-v1'
 $script:GovernorRetirementTrustSchema = 'eliot-governor-retirement-approval-trust-v2'
 $script:GovernorRetirementFreezeSchema = 'eliot-governor-retirement-receipt-v1'
 $script:GovernorRetirementFreezeKind = 'detached-approval-pointer'
+# AUD-5847600066-1: the certified candidate C must never track its own receipt.
+# The freeze record above is valid only as a detached artifact outside C; the
+# legacy in-tree path below is refused by the shape gate whenever it is still
+# tracked at the certified commit, so no commit/amend workflow can produce an
+# exact accepted receipt inside the tree it certifies.
+$script:GovernorRetirementForbiddenSelfReceiptPath = 'crates/eliot-app/retirement-receipt.json'
 $script:GovernorRetirementBundleTrustFile = 'GOVERNOR_RETIREMENT_APPROVAL_TRUST.json'
 $script:GovernorRetirementBundleApprovalFile = 'GOVERNOR_RETIREMENT_APPROVAL.json'
 $script:GovernorRetirementTrustPolicyPath = 'scripts/lib/governor-retirement-approval-trust.json'
@@ -1102,6 +1108,10 @@ function Test-GovernorRetirementApprovalShape(
         }
         if ($boundTree -cne $CandidateTree) {
             return (& $rejected "APPROVAL_CANDIDATE_TREE_MISMATCH (approved=$boundTree candidate=$CandidateTree)")
+        }
+        $selfReceiptBlob = Get-GovernorRetirementTrackedPathDigest $Repo $SourceCommit $script:GovernorRetirementForbiddenSelfReceiptPath
+        if ($selfReceiptBlob) {
+            return (& $rejected "APPROVAL_CANDIDATE_CARRIES_SELF_RECEIPT (candidate=$SourceCommit still tracks $($script:GovernorRetirementForbiddenSelfReceiptPath); freeze a receipt-free candidate first, then issue R(C) detached)")
         }
         $normativeRevision = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Approval 'normative_pair_revision')
         $normativeDigest = (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Approval 'normative_pair_sha256')).ToLowerInvariant()
