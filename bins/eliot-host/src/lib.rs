@@ -1556,11 +1556,12 @@ fn host_lifecycle_frozen_event(boundary: &'static HostLifecycleBoundary) -> &'st
 
 pub use credential_control::{HostCredentialControl, HostPhaseBRequest, HostPhaseBRequestQueue};
 pub use eliot_host_control_endpoint::{
-    AcceptedOwnerMethod, BackupDispatchRefusal, HOST_RUNTIME_CONTROL_PIPE, HostBackupOwner,
-    HostBackupOwnerRegistration, HostRuntimeControl, HostRuntimeControlQueue,
-    HostUserAutomationExecutionEnvelope, HostUserAutomationExecutionQueue,
-    UserAutomationHostExecutionEndpoint, UserAutomationHostExecutionRequest,
-    UserAutomationHostExecutionResponse, UserAutomationRuntimeError, pop_user_automation_execution,
+    AcceptedOwnerMethod, BackupDispatchRefusal, BackupOwnerOutcome, BackupRetainedOperation,
+    HOST_RUNTIME_CONTROL_PIPE, HostBackupOwner, HostBackupOwnerRegistration, HostRuntimeControl,
+    HostRuntimeControlQueue, HostUserAutomationExecutionEnvelope,
+    HostUserAutomationExecutionQueue, UserAutomationHostExecutionEndpoint,
+    UserAutomationHostExecutionRequest, UserAutomationHostExecutionResponse,
+    UserAutomationRuntimeError, pop_user_automation_execution,
     process_user_automation_execution_queue, reject_unbound_user_automation_execution,
 };
 use eliot_host_service::runtime_control::runtime_control_unknown_ref;
@@ -5703,12 +5704,44 @@ const BACKUP_DISPATCH_ANSWER_DEADLINE: std::time::Duration = std::time::Duration
 /// One admitted backup operation handed from the registered owner to the live
 /// Host composition, with the single-slot answer channel the pipe server thread
 /// is blocked on.
+///
+/// The answer carries the owner's typed outcome, not a bare success. A channel
+/// typed `Result<(), BackupDispatchRefusal>` forces every owner result to
+/// collapse into `Ok(())` or into a refusal that claims no effect existed,
+/// which is exactly the distinction this carrier exists to preserve (#962).
 #[cfg(windows)]
 struct BackupDispatchWork {
     /// The exact admitted request the endpoint already gated and validated.
     request: eliot_host_control_endpoint::BackupRuntimeControlRequest,
     /// Answers this one operation back to the blocked owner call.
-    answer: std::sync::mpsc::SyncSender<Result<(), BackupDispatchRefusal>>,
+    answer: std::sync::mpsc::SyncSender<Result<BackupOwnerOutcome, BackupDispatchRefusal>>,
+}
+
+/// Names the operation this Host still retains for one admitted request.
+///
+/// This is the owner's own retained-operation reference, not a requester retry
+/// token: the operation, the canonical `#954` request-identity digest of the
+/// admitted body, and the admitted owner are read back from the request the
+/// endpoint already gated, never from a value the composition selects here. An
+/// operation whose retained identity cannot be named from the admitted request
+/// is refused, because a reference the owner cannot name is evidence about no
+/// operation at all.
+#[cfg(windows)]
+fn retained_backup_operation(
+    request: &eliot_host_control_endpoint::BackupRuntimeControlRequest,
+) -> Result<BackupRetainedOperation, BackupDispatchRefusal> {
+    let identity_digest =
+        PlatformHandle::new(request.body.identity().identity_digest.clone()).map_err(|_| {
+            BackupDispatchRefusal::new(
+                request.operation,
+                "the admitted backup request carries no nameable retained operation identity",
+            )
+        })?;
+    Ok(BackupRetainedOperation {
+        operation: request.operation,
+        identity_digest,
+        owner: request.owner.clone(),
+    })
 }
 
 /// The bounded handoff state shared by the registered owner and the composition.
@@ -5764,15 +5797,23 @@ impl HostBackupDispatchQueue {
     /// Hands one admitted request to the live composition and blocks for the
     /// owner's answer within the bounded deadline.
     ///
-    /// `Ok(())` is returned only after the composition ran the exact owner
-    /// operation that request resolved to, so a transport acknowledgement is
-    /// never reported as backup semantic success. A full handoff, a closed
-    /// handoff, and an unanswered operation are three distinct typed refusals,
-    /// the first two produced before the composition is entered at all.
+    /// The returned value is the owner's typed outcome, so a transport
+    /// acknowledgement is never reported as backup semantic success and an
+    /// operation whose effect is unestablished is never reported as an
+    /// effect-free refusal. The two failures of this handoff are deliberately
+    /// different in kind and stay that way:
+    ///
+    /// - a full or closed handoff refuses **before** the composition is
+    ///   entered, so no effect can exist and a pre-effect
+    ///   [`BackupDispatchRefusal`] is exact;
+    /// - an operation that was handed over and then went unanswered may or may
+    ///   not have run, so it is reported as
+    ///   [`BackupOwnerOutcome::PossibleEffect`] over the retained operation,
+    ///   never as a refusal.
     fn submit(
         &self,
         request: &eliot_host_control_endpoint::BackupRuntimeControlRequest,
-    ) -> Result<(), BackupDispatchRefusal> {
+    ) -> Result<BackupOwnerOutcome, BackupDispatchRefusal> {
         let operation = request.operation;
         let (answer, answered) = std::sync::mpsc::sync_channel(1);
         self.handoff
@@ -5789,13 +5830,14 @@ impl HostBackupDispatchQueue {
             })?;
         match answered.recv_timeout(BACKUP_DISPATCH_ANSWER_DEADLINE) {
             Ok(outcome) => outcome,
-            // A disconnected requester and an unanswered operation are the
-            // same honest answer here: the operation stays admitted at the
-            // owner, and this refusal is not a claim that no effect exists.
-            Err(_) => Err(BackupDispatchRefusal::new(
-                operation,
-                "the live Host composition did not answer this admitted backup operation within its bounded deadline",
-            )),
+            // The work was handed to the live composition before this deadline,
+            // so it may already have run and only its answer was lost. That is
+            // precisely the possible-effect state: the operation is preserved
+            // and reconciled by identity, and a refusal here would falsely
+            // claim that no effect exists.
+            Err(_) => Ok(BackupOwnerOutcome::PossibleEffect {
+                retained: retained_backup_operation(request)?,
+            }),
         }
     }
 
@@ -5833,9 +5875,11 @@ impl HostBackupDispatchQueue {
 /// [`HostComposition::backup_dispatch_prepare`] and
 /// [`HostComposition::backup_dispatch_cutover`], still refuse — and each names
 /// the exact owner obligation that is absent rather than being a blanket
-/// error: the closed `#954` [`BackupRuntimeControlRequest`] envelope carries no
-/// admitted preparation body, and retained Host state carries no owner-issued
-/// isolated-restore staging parent for a prepare to write into.
+/// error: retained Host state carries no owner-issued isolated-restore staging
+/// parent for a prepare to write into, and the Host cutover-intent owner has
+/// issued no separately admitted cutover body. Both refusals are pre-effect:
+/// each is decided before its arm is entered, so neither leaves an unresolved
+/// effect that would have to be reconciled.
 #[cfg(windows)]
 pub struct HostBackupDispatchOwner {
     /// The live composition's bounded handoff. This is the owner's real state,
@@ -5858,7 +5902,7 @@ impl eliot_host_control_endpoint::HostBackupOwner for HostBackupDispatchOwner {
     fn dispatch_backup_operation(
         &self,
         request: &eliot_host_control_endpoint::BackupRuntimeControlRequest,
-    ) -> Result<(), eliot_host_control_endpoint::BackupDispatchRefusal> {
+    ) -> Result<BackupOwnerOutcome, BackupDispatchRefusal> {
         use eliot_host_control_endpoint::BackupDispatchRefusal;
         let operation = request.operation;
         let refusal = |reason: &'static str| BackupDispatchRefusal::new(operation, reason);
@@ -6125,10 +6169,21 @@ impl HostComposition {
     /// Runs the one owner operation an admitted backup request resolved to,
     /// against this composition's real retained owner state (#962).
     ///
-    /// `Ok(())` means the owner operation really ran and reached its own
-    /// success case; every other outcome is the typed
-    /// [`BackupDispatchRefusal`] naming the owner obligation that is missing,
-    /// and is produced before any effect.
+    /// The answer is this owner's own retained evidence, and the four states
+    /// stay distinct because they are four different facts about the admitted
+    /// operation, not four spellings of one:
+    ///
+    /// - [`BackupOwnerOutcome::Admitted`] — the owner still retains this exact
+    ///   operation and it is in flight: nothing is claimed as done;
+    /// - [`BackupOwnerOutcome::Completed`] — the owner re-proved the retained
+    ///   record against the live root and issues its own attestation;
+    /// - [`BackupOwnerOutcome::PossibleEffect`] — the operation is retained but
+    ///   its effect may or may not have committed, so the original operation
+    ///   must be reconciled rather than retried;
+    /// - [`BackupDispatchRefusal`] — refused **before** any effect.
+    ///
+    /// An owner result is never a refusal. A refusal is only ever produced by
+    /// a gate that ran before this composition entered its operation.
     ///
     /// # Terminal ownership (F-LOG-HOST-8, #983 W4)
     ///
@@ -6169,11 +6224,12 @@ impl HostComposition {
     fn dispatch_backup_owner_operation(
         &self,
         request: &eliot_host_control_endpoint::BackupRuntimeControlRequest,
-    ) -> Result<(), BackupDispatchRefusal> {
-        // Armed on entry, disarmed on the operation's own `Ok` return below, so
-        // every other outcome — the closed-table miss, the reconciliation read's
-        // typed refusals, and the two named owner refusals for the prepare and
-        // cutover arms — emits exactly one terminal record for this operation.
+    ) -> Result<BackupOwnerOutcome, BackupDispatchRefusal> {
+        // Armed on entry, disarmed only where this composition reached a real
+        // owner success, so every other outcome — the closed-table miss, the
+        // reconciliation read's possible-effect and refusal arms, and the two
+        // named owner refusals for the prepare and cutover arms — emits exactly
+        // one terminal record for this operation.
         let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_BACKUP_DISPATCH_TERMINAL);
         let operation = request.operation;
         let Some(target) = HostComposition::backup_dispatch_target(operation) else {
@@ -6191,61 +6247,100 @@ impl HostComposition {
             BackupDispatchTarget::Reconcile => {
                 match self.backup_dispatch_reconcile(request.request_id.as_str()) {
                     // The owner re-verified this operation's recorded result
-                    // against the live root. That is the owner's own success,
-                    // not a transport acknowledgement.
-                    Ok(crate::backup_preparation::ReconcileDisposition::Current(_)) => Ok(()),
+                    // against the live root. This is the owner's own read
+                    // result, so it is reported as the owner retained the
+                    // operation and nothing further is claimed: the retained
+                    // preparation is the evidence, and the requester reads that
+                    // same retained operation rather than resubmitting.
+                    //
+                    // It is deliberately NOT `Completed`. A `Completed` outcome
+                    // carries a `#954` `BackupPhaseAttestation`, and this Host
+                    // holds none of what one requires: it is no attested backup
+                    // role for the reconciled stage, issues no backup
+                    // `ReceiptId`, and retains no archive identity or `#954`
+                    // `StateFence` for it. Minting one here would be exactly the
+                    // fabricated owner receipt the audit forbids, and the
+                    // endpoint would refuse it at re-validation anyway.
+                    Ok(crate::backup_preparation::ReconcileDisposition::Current(_)) => {
+                        Ok(BackupOwnerOutcome::Admitted {
+                            retained: retained_backup_operation(request)?,
+                        })
+                    }
+                    // No record at all: nothing was ever admitted for this
+                    // operation, so no effect can be outstanding and a
+                    // pre-effect refusal is exact.
                     Ok(crate::backup_preparation::ReconcileDisposition::Absent) => {
                         Err(BackupDispatchRefusal::new(
                             operation,
                             "this Host retains no isolated-restore preparation for the admitted operation",
                         ))
                     }
+                    // Intent is durable, no result was ever recorded, and the
+                    // derived root is not observable. The owner's own record
+                    // calls the outcome UNKNOWN and says the effect "may or may
+                    // not have happened before the process stopped". That is
+                    // the possible-effect state, NOT an in-flight admitted one:
+                    // reporting it as `Admitted` would tell the requester the
+                    // operation is still running and invite a second
+                    // preparation under the same operation id.
                     Ok(
                         crate::backup_preparation::ReconcileDisposition::AdmittedWithoutResult {
                             ..
                         },
-                    ) => Err(BackupDispatchRefusal::new(
-                        operation,
-                        "the admitted preparation is durable without a recorded result and must be reconciled, never re-prepared",
-                    )),
+                    ) => Ok(BackupOwnerOutcome::PossibleEffect {
+                        retained: retained_backup_operation(request)?,
+                    }),
+                    // A recorded result that cannot be re-proved against the
+                    // live root. The effects are unverified, so the retained
+                    // operation is preserved and reconciled, never deleted and
+                    // never retried blindly.
                     Ok(crate::backup_preparation::ReconcileDisposition::Uncertain { .. }) => {
-                        Err(BackupDispatchRefusal::new(
-                            operation,
-                            "the retained preparation outcome is unestablished and is preserved, never re-prepared",
-                        ))
+                        Ok(BackupOwnerOutcome::PossibleEffect {
+                            retained: retained_backup_operation(request)?,
+                        })
                     }
-                    Err(_) => Err(BackupDispatchRefusal::new(
-                        operation,
-                        "the Host preparation journal refused to reconcile this admitted operation",
-                    )),
+                    // The journal refused the read itself. This is a real read
+                    // failure, not a claim that no preparation ran, so the
+                    // operation is reported as possibly-effected rather than
+                    // refused.
+                    Err(_) => Ok(BackupOwnerOutcome::PossibleEffect {
+                        retained: retained_backup_operation(request)?,
+                    }),
                 }
             }
-            // Named owner refusal, not a blanket error. Preparing needs an
-            // owner-issued isolated-restore staging parent, and retained Host
-            // state has none: every root `RuntimeStateRoots` derives
-            // (host/kernel/store/watchdog) lives under the installation root,
-            // which IS the preparation source, and `admit_staging_parent`
-            // refuses any staging parent nested under the source. The missing
-            // owner is the installation root contract, which must derive a
-            // destination parent outside the source installation root.
+            // Named owner refusal, not a blanket error, and PRE-EFFECT: this
+            // arm refuses before `prepare_backup_destination` is entered.
+            // Preparing needs an owner-issued isolated-restore staging parent,
+            // and retained Host state has none: every root `RuntimeStateRoots`
+            // derives (host/kernel/store/watchdog) lives under the installation
+            // root, which IS the preparation source, and
+            // `admit_staging_parent` refuses any staging parent nested under
+            // the source. The missing owner is the installation root contract,
+            // which must derive a destination parent outside the source
+            // installation root. No destination is created, so a refusal here
+            // still means no effect.
             BackupDispatchTarget::Prepare => Err(BackupDispatchRefusal::new(
                 operation,
                 "no owner-issued isolated-restore staging parent exists in retained Host state: every derived runtime root is the preparation source, and a staging parent nested under the source is refused",
             )),
-            // Named owner refusal. A cutover needs a separately admitted
-            // `CutoverRequest` body that the closed `#954` envelope does not
-            // carry and that the Host cutover-intent owner has issued no record
-            // of, so no body can be constructed here without fabricating one.
+            // Named owner refusal, also PRE-EFFECT: it refuses before
+            // `backup_dispatch_cutover` is entered. A cutover needs a separately
+            // admitted `CutoverRequest` body that the closed `#954` envelope does
+            // not carry and that the Host cutover-intent owner has issued no
+            // record of, so no body can be constructed here without fabricating
+            // one. Nothing is activated, so a refusal here still means no
+            // effect.
             BackupDispatchTarget::Cutover => Err(BackupDispatchRefusal::new(
                 operation,
                 "no separately admitted cutover body is retained by the Host cutover-intent owner for this operation",
             )),
         };
-        // The operation reached its own success case, so it owns no terminal
-        // record. This is the only disarm on the path: every `Err` arm above
-        // drops armed and emits exactly one, and the returned refusal is the
-        // owner's own value, unchanged.
-        if outcome.is_ok() {
+        // Only a real owner success releases the terminal record. An
+        // `Admitted` read and a `PossibleEffect` answer are both genuine
+        // answers this owner reached, so neither is an operation failure; every
+        // `Err` arm above drops armed and emits exactly one, and the returned
+        // value is the owner's own, unchanged.
+        if matches!(&outcome, Ok(BackupOwnerOutcome::Admitted { .. })) {
             host_terminal.disarm();
         }
         outcome
