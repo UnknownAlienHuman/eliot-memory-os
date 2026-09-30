@@ -609,23 +609,61 @@ pub fn require_production_admitted(
 /// re-checked at each phase boundary by the target. The durable journal
 /// itself is NOT carried here: it is injected as `J: RestoreJournalPort`
 /// (see [`require_production_admitted`]) so no substitute can hide inside
-/// this bundle. Owner channels that are not yet bound here (canonical Store,
-/// ORS recovery, the #955 Watchdog reconciliation channel, Blob, installation
-/// identity) arrive as evidence obligations in the finalized receipt, never as
-/// live handles in this struct.
+/// this bundle. The owner channels that are genuinely NOT reached by any live
+/// restore route — the #955 Watchdog reconciliation channel, Blob key/scope
+/// admission, and the installation/configuration admission this struct's own
+/// `manifest_evidence` field exists for — arrive as evidence obligations in the
+/// finalized receipt, never as live handles in this struct.
 ///
-/// The #955 side is bound only as far as the ARCHIVE allows: the mandatory
-/// `watchdog_spool` member is now read and its unresolved critical signals are
-/// carried as suspended historical evidence, so the member is neither dropped
-/// nor published as reconciled. Reconciliation is the #955 owner's own decision
-/// and no Watchdog authority is ever activated here, so `watchdog_signals`
-/// stays an unsatisfied obligation. The issues that delivered those owner
-/// sides — #952 (PR #3881),
-/// #953 (PR #3833), #955 (PR #2716), #956 (PR #2435) and #958 (PR #3879, whose
-/// destination-evidence producer this file now carries) — are
-/// coordination history, not code in this repository: what is absent is the
-/// Kernel-side producer of the corresponding evidence, not the owner itself.
-/// Nothing on this struct's behalf is proved by those merge records.
+/// ## Which named owner ports the live chain actually reaches, measured
+///
+/// Stated here because the previous wording of this paragraph asserted that the
+/// canonical Store and ORS recovery owner sides had no Kernel-side producer at
+/// all. That is false on this tree, and a reachability claim that overstates a
+/// gap is a defect in its own right:
+///
+/// - **#952 canonical Store — REACHED, on a different selector.** The
+///   `IsolatedRestorePort::restore_canonical_batch` port is reached from `fn
+///   main` through the `backup.restore-store` route
+///   (`KernelComposition::execute_backup_store_restore` →
+///   `KernelBackupRestore::publish_retained_archive_members` →
+///   `KernelStoreGateway::backup_restore_batch`), not through this struct and
+///   not through the rehearsal selector. Its refusal here is therefore a
+///   statement about the rehearsal's isolated substrate, not about a missing
+///   owner.
+/// - **#953 ORS recovery and #957 durable journal — REACHED.** Both run inside
+///   the journalled engine this bundle feeds: `OrsOwnerClient::suspend` derives
+///   the suspended-recovery entries the `SuspendOrsOperations` phase stages, and
+///   the injected `J: RestoreJournalPort` is the composition-owned
+///   `OrsRestoreJournal` over the durable ORS store. Neither is absent.
+/// - **#955 Watchdog spool — READ, not reconciled.** The mandatory
+///   `watchdog_spool` member is read and its unresolved critical signals are
+///   carried as suspended historical evidence, so the member is neither dropped
+///   nor published as reconciled. Reconciliation is the #955 owner's own
+///   decision, no Watchdog authority is activated here, and the
+///   `WatchdogBackupOwnerClient` bound on the composition is never consulted by
+///   any restore route, so `watchdog_signals` stays an unsatisfied obligation.
+/// - **#956 Blob — reached but refused on the live entry.** `BlobOwnerClient` is
+///   constructed by the `ImportSealedBlob` phase, and it refuses there because
+///   the rehearsal route supplies no owner channel for `keys` or `blob_scope`.
+///   That refusal is the owner's own typed answer, not an absent port.
+/// - **#958 installation/configuration — genuinely not reached.** The producer
+///   exists here ([`DestinationManifestEvidence::issue_from_owner_manifest`])
+///   and the composition-side bundle method
+///   [`RestorePorts::with_owner_destination_evidence`] exists beside it, but that
+///   method has no production caller: the live rehearsal route leaves
+///   `manifest_evidence` at `None`. The three values it binds are Host-issued,
+///   and no Host-to-Kernel route carries them into this composition — in
+///   particular the Host's registry revision, which
+///   `DestinationManifestEvidence::registry_revision` names, is injected into no
+///   Kernel process at all. Supplying it from here would be a fabricated owner
+///   value, which is exactly what this struct exists to prevent.
+///
+/// So of the named owner ports, two are reached by the live chain through other
+/// routes (#952, #953/#957), one is read but deliberately not acted on (#955),
+/// one is reached and correctly refuses (#956), and one has a producer with no
+/// route to it (#958). Nothing on this struct's behalf is proved by the merge
+/// records that delivered the owner sides.
 pub struct RestorePorts<'a> {
     /// Owner-issued journal admission for the injected durable journal.
     pub journal_admission: &'a RestoreJournalAdmission,
@@ -674,11 +712,32 @@ impl RestorePorts<'_> {
     /// evidence, built by [`DestinationManifestEvidence::issue_from_owner_manifest`]
     /// (issue #962, AUDIT-7).
     ///
-    /// This is the wiring point for the owner-issued evidence: the journal
-    /// admission on a bundle is replaced by the value the durable owner issued
-    /// for this exact plan (`admitted_restore_ports` in `backup_restore.rs`,
-    /// called from [`KernelBackupRestore`](super::backup_restore::KernelBackupRestore)'s
-    /// production entry) because the Kernel re-issues that value itself. The
+    /// ## Its measured caller count is ZERO, and that is the honest state
+    ///
+    /// On this tree `git grep -nw with_owner_destination_evidence` over
+    /// `bins/` and `crates/` returns exactly two hits: this definition and the
+    /// prose reference in `request_dispatch.rs`. There is no production caller,
+    /// so this method is currently reachable only from tests. The adjacent
+    /// `admitted_restore_ports` in `backup_restore.rs` is NOT a caller of it —
+    /// that helper replaces `journal_admission` only and leaves
+    /// `manifest_evidence` exactly as the bundle presented it.
+    ///
+    /// This is a real gap, not a completed port, and it is recorded here on the
+    /// method that owns it rather than left for a reader to discover. It is
+    /// also not repairable from the Kernel side alone: the three values this
+    /// binds are Host-issued, the Host produces them at
+    /// `OwnerEvidence::owner_manifest_binding` (itself with zero callers in this
+    /// repository), and no Host-to-Kernel channel carries them into a restore
+    /// route — the composition holds no registry revision at all. Calling this
+    /// method from the rehearsal route with Kernel-computed or request-presented
+    /// digests would manufacture the owner evidence the type exists to require,
+    /// so the `None` stays the honest answer until that owner route exists.
+    ///
+    /// The journal admission, by contrast, IS replaced before execution:
+    /// `admitted_restore_ports` in `backup_restore.rs`, called from
+    /// [`KernelBackupRestore`](super::backup_restore::KernelBackupRestore)'s
+    /// production entry, substitutes the value the durable owner re-issued for
+    /// this exact plan, because the Kernel re-issues that value itself. The
     /// destination manifest evidence is the opposite case — nothing on the
     /// Kernel side observes the Host's manifest binding, so the Kernel cannot
     /// re-issue it, and the only honest thing it can do is admit the owner value
