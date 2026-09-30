@@ -10,12 +10,7 @@ use eliot_contracts::sha256_hex;
 use eliot_runtime::{
     ChildClass, Runtime, ShutdownOutcome, SupervisionOutcome, SupervisionStrategy, TaskFailure,
 };
-use eliot_watchdog_core::{
-    BriefBuildError, BriefPersistence, CoverageGapExplanation, CoverageManifestMismatch,
-    CoverageManifestProjection, EvidenceRef, HealthAnalysisRequest, ObservationCoverageInput,
-    ProhibitedEffectAttempt, ProhibitedEffectClass, RiskRoute, Signal, compile_health_brief,
-    request_health_analysis, validate_observation_coverage_against_manifest,
-};
+use eliot_watchdog_core::{CoverageGapExplanation, CoverageManifestProjection, EvidenceRef};
 
 use crate::AdmittedIsolatedDestination;
 use crate::CompositionError;
@@ -169,11 +164,10 @@ fn publish_interval_coverage(publication: &IntervalCoveragePublication, interval
 /// This is the A4 adapter's read of the owner's own record: the interval
 /// identity, the manifest evidence handle, and the gap verdict are all derived
 /// from the closed [`IntervalCoverageReport`] through its public claims only.
-/// A supplied [`ObservationCoverageInput`] built anywhere else — a restated
+/// A supplied coverage input built anywhere else — a restated
 /// label, a stale interval, or a verdict the manifest does not carry — cannot
-/// match this projection, so [`validate_supplied_coverage_against_manifest`]
-/// refuses it instead of letting two coverage claims disagree about one
-/// interval.
+/// match this projection: supplied values are judged against the actual
+/// manifest record above, never against a restatement of the detector's input.
 ///
 /// The verdict categories are the rule's own: an internally inconsistent
 /// manifest, or one no tick closed, establishes no verdict; a manifest whose
@@ -194,134 +188,6 @@ pub fn project_actual_coverage_manifest(
         },
         explanation: manifest_gap_verdict(manifest),
     }
-}
-
-/// Validates supplied coverage values against the actual #1755 manifest on the
-/// interval.
-///
-/// A4: an `ObservationCoverageGap` that names a different interval, cites
-/// different evidence, or claims a different explanation than the actual
-/// manifest on that interval is a contradictory coverage claim and must not
-/// stand. Each mismatch class is typed by the existing
-/// [`CoverageManifestMismatch`] so the supplying caller can project the exact
-/// correction. This adapter reads no store and authorizes no effect: it
-/// compares a supplied input against the owner's own manifest record.
-///
-/// # Errors
-///
-/// Returns the exact mismatch when the supplied interval, evidence, or
-/// explanation disagrees with the actual manifest on that interval.
-#[must_use]
-pub fn validate_supplied_coverage_against_manifest(
-    manifest: &IntervalCoverageReport,
-    input: &ObservationCoverageInput,
-) -> Result<(), CoverageManifestMismatch> {
-    let actual = project_actual_coverage_manifest(manifest);
-    validate_observation_coverage_against_manifest(input, &actual)
-}
-
-/// Compiles persistent/cross-cutting drift into one Diagnostic Brief input and
-/// requests one bounded Dreamer/Watchdog-Agent analysis through #1761 routes.
-///
-/// W3 (#2381): the production caller of [`compile_health_brief`] and
-/// [`request_health_analysis`]. The member signals are the persistent or
-/// cross-cutting drift the caller holds; the [`BriefPersistence`]
-/// classification travels on the brief so the analysis route sees which claim
-/// it is asked about. The [`RiskRoute`] is the caller's #1761 selection —
-/// this owner selects no route and opens no parallel escalation path — and the
-/// core degrades it with the ineffective-analysis history per I09-17's
-/// rollback rule. Exactly one request leaves per call, never a campaign.
-///
-/// The question names the persistence class and every member rule identity, so
-/// the bounded analysis is asked about the drift it actually holds; the stop
-/// condition bounds it to one analysis and denies it any
-/// memory-delete/policy-alter/work-terminate authority. This adapter reads no
-/// store and authorizes no effect: every [`BriefBuildError`] from the
-/// underlying contract — empty or overfull member set, duplicate identity,
-/// unvalidated original, or unusable question/stop text — passes through
-/// unchanged.
-///
-/// Step 4 (#2381): before the request leaves, every [`ProhibitedEffectClass`]
-/// is refused against both the compiled brief (via
-/// [`ProhibitedEffectAttempt::for_health_brief`]) and the request (via
-/// [`ProhibitedEffectAttempt::for_health_analysis`]) through
-/// [`ProhibitedEffectAttempt::deny`], and each refusal is traced with the
-/// untouched subject named. There is no branch that admits such an effect, so
-/// an attempt citing either output fails closed here.
-///
-/// # Errors
-///
-/// Returns the exact [`BriefBuildError`] when the member set is empty,
-/// overfull, not an independent set, carries an unvalidated original, or the
-/// derived question/stop text is unusable.
-#[must_use]
-pub fn request_persistent_drift_analysis(
-    signals: Vec<Signal>,
-    persistence: BriefPersistence,
-    route: RiskRoute,
-    prior_ineffective_analyses: u32,
-) -> Result<HealthAnalysisRequest, BriefBuildError> {
-    let mut rules: Vec<&str> = signals
-        .iter()
-        .map(|signal| signal.revision().rule.rule_id.as_str())
-        .collect();
-    rules.sort_unstable();
-    rules.dedup();
-    let brief = compile_health_brief(
-        format!(
-            "health drift classified as {} across {} member signal(s) from rule(s) [{}]: what observed delta persists across the member intervals, and what single bounded observation would discriminate continued drift from recovery?",
-            persistence.as_str(),
-            signals.len(),
-            rules.join(", ")
-        ),
-        "stop after one bounded analysis, or earlier when the next closed interval shows no applicable delta for the member rules; the analysis carries no authority to delete memory, alter policy, or terminate work."
-            .to_owned(),
-        persistence,
-        signals,
-    )?;
-    let request = request_health_analysis(&brief, route, prior_ineffective_analyses);
-    // I8.18 (#2381 step 4): the brief and the request compiled above carry no
-    // memory-delete, policy-alter, or work-terminate authority. Each class is
-    // refused here through the core deny contract before the request leaves,
-    // so an attempt citing either output fails closed with the untouched
-    // subject named. The refusals are bounded operator evidence on the trace;
-    // nothing is written, dispatched, or authorized here.
-    let subject = brief
-        .signals
-        .first()
-        .map(|signal| signal.revision().target.subject_id.clone())
-        .unwrap_or_default();
-    for class in [
-        ProhibitedEffectClass::MemoryDelete,
-        ProhibitedEffectClass::PolicyAlter,
-        ProhibitedEffectClass::WorkTerminate,
-    ] {
-        let brief_denial =
-            ProhibitedEffectAttempt::for_health_brief(class, &brief, subject.clone()).deny();
-        tracing::debug!(
-            event = "watchdog.health_output_effect_refused",
-            observation = "refused",
-            brief_id = brief.brief_id.as_str(),
-            output = "diagnostic_brief",
-            class = class.as_str(),
-            reason = brief_denial.reason,
-            subject = subject.as_str(),
-            "I8.18 health output carries no authority for the attempted effect"
-        );
-        let analysis_denial =
-            ProhibitedEffectAttempt::for_health_analysis(class, &request, subject.clone()).deny();
-        tracing::debug!(
-            event = "watchdog.health_output_effect_refused",
-            observation = "refused",
-            brief_id = request.brief_id.as_str(),
-            output = "analysis_request",
-            class = class.as_str(),
-            reason = analysis_denial.reason,
-            subject = subject.as_str(),
-            "I8.18 health output carries no authority for the attempted effect"
-        );
-    }
-    Ok(request)
 }
 
 /// The actual manifest's own interval identity: the declared owner-clock
@@ -455,16 +321,6 @@ pub struct WatchdogComposition {
     /// coverage a readiness projection claims and the coverage a fence carries
     /// are one publication, not two.
     coverage: Arc<IntervalCoverageCell>,
-    /// This owner's I8.18 health-projection comparison state.
-    ///
-    /// The single reason this composition is the caller of the five I8.18
-    /// rules: it is the one owner of the bounded supervised loop, so it is the
-    /// only place where a closed coverage interval, a verified lease, and the
-    /// retained observation bank are all in hand at the same instant. Retained
-    /// here, not in the kernel port, because the projection is a property of
-    /// supervision rather than of the injected port - a second composition
-    /// gets its own cell and can never compare against the first one's state.
-    health: Arc<HealthProjectionCell>,
 }
 
 impl WatchdogComposition {
@@ -898,7 +754,6 @@ impl WatchdogComposition {
             heartbeat,
             backup_control_registration: BackupControlRegistration::open(),
             coverage,
-            health,
         })
     }
 

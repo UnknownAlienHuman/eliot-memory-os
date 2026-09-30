@@ -2158,20 +2158,17 @@ impl WatchdogSpool {
                 newest_sequence = row.sequence;
                 newest_payload_class.clone_from(&row.payload_class);
             }
-            match first_sequence_by_digest.get(row.content_digest.as_str()) {
-                Some(first) => {
-                    content_duplicates += 1;
-                    if *first <= acknowledged_sequence {
-                        reused_acknowledged_content += 1;
-                    }
-                    if receipts.contains(first) {
-                        reactivated_after_receipt += 1;
-                    }
+            if let Some(first) = first_sequence_by_digest.get(row.content_digest.as_str()) {
+                content_duplicates += 1;
+                if *first <= acknowledged_sequence {
+                    reused_acknowledged_content += 1;
                 }
-                None => {
-                    distinct_content += 1;
-                    first_sequence_by_digest.insert(row.content_digest.as_str(), row.sequence);
+                if receipts.contains(first) {
+                    reactivated_after_receipt += 1;
                 }
+            } else {
+                distinct_content += 1;
+                first_sequence_by_digest.insert(row.content_digest.as_str(), row.sequence);
             }
         }
         // A gap reason is deferred when no accepted heartbeat was recorded at or
