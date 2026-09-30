@@ -13,28 +13,27 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::TaskId;
-use eliot_ipc::Session;
 use eliot_git_bridge::{
-    AsyncProcessRunner, GitProcessProfile, GitProcessRunError, GitProcessRunFuture,
-    ProcessOutcome,
+    AsyncProcessRunner, GitProcessProfile, GitProcessRunError, GitProcessRunFuture, ProcessOutcome,
 };
+use eliot_ipc::Session;
 use eliot_kernel_service::{
-    ProcessExecutionClient, ProcessExecutionFuture, ProcessExecutionRejection,
-    ProcessExecutionRequest, ProcessExecutionResponse, ProcessStreamReadRequest,
-    PROCESS_STREAM_READ_CHUNK_MAX_BYTES,
-};
-use eliot_lsp_bridge::{LspProcessOwnerError, LspProcessOwnerFuture, LspProcessOwnerPort};
-use eliot_protocol::RequestIdentity;
-use eliot_process::{
-    ExitDisposition, OperationId, ProcessEvidence, ProcessExecutionAdmissionRequest,
-    ProcessLifecycle, ProcessStartReceipt, ProcessSessionBinding, ProcessStreamEvidence,
-    ProcessStreamKind, StreamEvidenceGap, StreamTransportStatus,
+    PROCESS_STREAM_READ_CHUNK_MAX_BYTES, ProcessExecutionClient, ProcessExecutionFuture,
+    ProcessExecutionRejection, ProcessExecutionRequest, ProcessExecutionResponse,
+    ProcessStreamReadRequest,
 };
 use eliot_lsp_bridge::LspCurrentBridge;
+use eliot_lsp_bridge::{LspProcessOwnerError, LspProcessOwnerFuture, LspProcessOwnerPort};
+use eliot_process::{
+    ExitDisposition, OperationId, ProcessEvidence, ProcessExecutionAdmissionRequest,
+    ProcessLifecycle, ProcessSessionBinding, ProcessStartReceipt, ProcessStreamEvidence,
+    ProcessStreamKind, StreamEvidenceGap, StreamTransportStatus,
+};
+use eliot_protocol::RequestIdentity;
 use sha2::{Digest as _, Sha256};
 
-use super::process_execution_client::authenticated_process_route;
 use super::KernelComposition;
+use super::process_execution_client::authenticated_process_route;
 
 /// Identity-preserving adapter into the existing Kernel P-03 front door. Each
 /// instance retains the original request identity and TaskBinding task for
@@ -76,7 +75,11 @@ impl CurrentSourceProcessClient {
         // Keep the same eager caller/session/P-03 readiness rejection as the
         // generic production client. Actual operations still enter the
         // identity-aware Kernel route below, which revalidates these bindings.
-        drop(authenticated_process_route(kernel, session, session_binding)?);
+        drop(authenticated_process_route(
+            kernel,
+            session,
+            session_binding,
+        )?);
         Ok(Self {
             kernel: Arc::clone(kernel),
             session: session.clone(),
@@ -136,7 +139,6 @@ impl KernelLspProcessOwnerPort {
             client: Arc::new(client),
         })
     }
-
 }
 
 impl LspProcessOwnerPort for KernelLspProcessOwnerPort {
@@ -151,9 +153,7 @@ impl LspProcessOwnerPort for KernelLspProcessOwnerPort {
                 .await
             {
                 ProcessExecutionResponse::Started(receipt) => Ok(receipt),
-                ProcessExecutionResponse::Rejected(rejection) => {
-                    Err(owner_rejection(rejection))
-                }
+                ProcessExecutionResponse::Rejected(rejection) => Err(owner_rejection(rejection)),
                 _ => Err(LspProcessOwnerError::Rejected {
                     code: "PROCESS_RESPONSE_MISMATCH".to_owned(),
                     detail: "Kernel returned a non-start response for an admitted process start"
@@ -163,10 +163,7 @@ impl LspProcessOwnerPort for KernelLspProcessOwnerPort {
         })
     }
 
-    fn reconcile(
-        &self,
-        operation_id: OperationId,
-    ) -> LspProcessOwnerFuture<'_, ProcessEvidence> {
+    fn reconcile(&self, operation_id: OperationId) -> LspProcessOwnerFuture<'_, ProcessEvidence> {
         let client: Arc<dyn ProcessExecutionClient> = self.client.clone();
         Box::pin(async move {
             match client
@@ -174,9 +171,7 @@ impl LspProcessOwnerPort for KernelLspProcessOwnerPort {
                 .await
             {
                 ProcessExecutionResponse::Reconciled(evidence) => Ok(evidence),
-                ProcessExecutionResponse::Rejected(rejection) => {
-                    Err(owner_rejection(rejection))
-                }
+                ProcessExecutionResponse::Rejected(rejection) => Err(owner_rejection(rejection)),
                 _ => Err(LspProcessOwnerError::Rejected {
                     code: "PROCESS_RESPONSE_MISMATCH".to_owned(),
                     detail: "Kernel returned a non-reconcile response for a process reconciliation"
@@ -405,9 +400,9 @@ impl KernelGitProcessRunner {
                 "Git process evidence omitted a required output stream",
             )
         })?;
-        let expected_stream_digest = stream
-            .identity_sha256()
-            .map_err(|error| git_rejection("PROCESS_STREAM_IDENTITY_INVALID", &error.to_string()))?;
+        let expected_stream_digest = stream.identity_sha256().map_err(|error| {
+            git_rejection("PROCESS_STREAM_IDENTITY_INVALID", &error.to_string())
+        })?;
         let receipt_bytes = eliot_contracts::canonical_json_bytes(started).map_err(|error| {
             git_rejection("PROCESS_RECEIPT_IDENTITY_INVALID", &error.to_string())
         })?;
@@ -420,13 +415,10 @@ impl KernelGitProcessRunner {
         let mut offset = 0_u64;
         loop {
             let max_bytes = PROCESS_STREAM_READ_CHUNK_MAX_BYTES;
-            let request = ProcessStreamReadRequest::new(
-                started.clone(),
-                kind,
-                offset,
-                max_bytes,
-            )
-            .map_err(|error| git_rejection("PROCESS_STREAM_READ_INVALID", &error.to_string()))?;
+            let request = ProcessStreamReadRequest::new(started.clone(), kind, offset, max_bytes)
+                .map_err(|error| {
+                git_rejection("PROCESS_STREAM_READ_INVALID", &error.to_string())
+            })?;
             let chunk = match client
                 .execute(ProcessExecutionRequest::ReadStream { request })
                 .await
@@ -442,12 +434,15 @@ impl KernelGitProcessRunner {
                     ));
                 }
             };
-            chunk
-                .validate()
-                .map_err(|error| git_rejection("PROCESS_STREAM_CHUNK_INVALID", &error.to_string()))?;
+            chunk.validate().map_err(|error| {
+                git_rejection("PROCESS_STREAM_CHUNK_INVALID", &error.to_string())
+            })?;
             let page = chunk.bytes();
             let next_offset = offset.checked_add(page.len() as u64).ok_or_else(|| {
-                git_rejection("PROCESS_STREAM_OFFSET_OVERFLOW", "Git stream read offset overflowed")
+                git_rejection(
+                    "PROCESS_STREAM_OFFSET_OVERFLOW",
+                    "Git stream read offset overflowed",
+                )
             })?;
             if chunk.operation_id() != started.operation_id()
                 || chunk.binding() != started.binding()
@@ -524,9 +519,7 @@ impl KernelLspCurrentExecutor {
     }
 
     /// Borrows the one bridge instance that owns launch/reconcile/adoption.
-    pub fn bridge(
-        &self,
-    ) -> &LspCurrentBridge<KernelLspProcessOwnerPort, KernelGitProcessRunner> {
+    pub fn bridge(&self) -> &LspCurrentBridge<KernelLspProcessOwnerPort, KernelGitProcessRunner> {
         &self.bridge
     }
 }
@@ -545,21 +538,29 @@ fn validate_git_admission(
     cwd: &Path,
     profile: &GitProcessProfile,
 ) -> Result<(), GitProcessRunError> {
-    admission.validate().map_err(|error| {
-        git_rejection("GIT_ADMISSION_INVALID", &error.to_string())
-    })?;
+    admission
+        .validate()
+        .map_err(|error| git_rejection("GIT_ADMISSION_INVALID", &error.to_string()))?;
     let intent = admission.intent();
     let expected_cwd = cwd.to_str().ok_or_else(|| {
-        git_rejection("GIT_WORKSPACE_PATH_INVALID", "Git workspace path is not UTF-8")
+        git_rejection(
+            "GIT_WORKSPACE_PATH_INVALID",
+            "Git workspace path is not UTF-8",
+        )
     })?;
     let executable_name = Path::new(intent.executable())
         .file_stem()
         .and_then(|name| name.to_str());
     let expected_index = profile
         .index_file()
-        .map(|path| path.to_str().ok_or_else(|| {
-            git_rejection("GIT_INDEX_PATH_INVALID", "isolated Git index path is not UTF-8")
-        }))
+        .map(|path| {
+            path.to_str().ok_or_else(|| {
+                git_rejection(
+                    "GIT_INDEX_PATH_INVALID",
+                    "isolated Git index path is not UTF-8",
+                )
+            })
+        })
         .transpose()?;
     let actual_index = intent.environment().non_secret().get("GIT_INDEX_FILE");
     if !exe.eq_ignore_ascii_case("git")
@@ -585,7 +586,12 @@ async fn wait_for_terminal(
     loop {
         let now_unix_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|_| git_rejection("PROCESS_CLOCK_UNAVAILABLE", "system clock predates Unix epoch"))?
+            .map_err(|_| {
+                git_rejection(
+                    "PROCESS_CLOCK_UNAVAILABLE",
+                    "system clock predates Unix epoch",
+                )
+            })?
             .as_millis();
         if now_unix_ms >= u128::from(deadline_unix_ms) {
             return Err(git_rejection(
@@ -666,7 +672,10 @@ fn validate_complete_stream(
 
 fn process_exit_code(evidence: &ProcessEvidence) -> Result<i32, GitProcessRunError> {
     let exit = evidence.view().exit().ok_or_else(|| {
-        git_rejection("GIT_EXIT_UNKNOWN", "Git process has no terminal exit observation")
+        git_rejection(
+            "GIT_EXIT_UNKNOWN",
+            "Git process has no terminal exit observation",
+        )
     })?;
     if exit.disposition() != ExitDisposition::Completed {
         return Err(git_rejection(

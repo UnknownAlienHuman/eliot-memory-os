@@ -2476,14 +2476,12 @@ impl ProcessStreamReadChunk {
         bytes: Vec<u8>,
     ) -> Result<Self, KernelServiceError> {
         let chunk_sha256 = sha256_hex(&bytes);
-        let chunk_eof = offset
-            .checked_add(u64::try_from(bytes.len()).map_err(|_| {
-                KernelServiceError::InvalidField {
-                    field: "stream_read.bytes",
-                    reason: "length is outside the protocol range",
-                }
-            })?)
-            == Some(observed_bytes);
+        let chunk_eof = offset.checked_add(u64::try_from(bytes.len()).map_err(|_| {
+            KernelServiceError::InvalidField {
+                field: "stream_read.bytes",
+                reason: "length is outside the protocol range",
+            }
+        })?) == Some(observed_bytes);
         let value = Self {
             operation_id,
             binding,
@@ -2504,12 +2502,11 @@ impl ProcessStreamReadChunk {
 
     /// Revalidates the chunk shape after wire deserialization.
     pub fn validate(&self) -> Result<(), KernelServiceError> {
-        let bytes_len = u64::try_from(self.bytes.len()).map_err(|_| {
-            KernelServiceError::InvalidField {
+        let bytes_len =
+            u64::try_from(self.bytes.len()).map_err(|_| KernelServiceError::InvalidField {
                 field: "stream_read.bytes",
                 reason: "length is outside the protocol range",
-            }
-        })?;
+            })?;
         let end = self
             .offset
             .checked_add(bytes_len)
@@ -2536,7 +2533,10 @@ impl ProcessStreamReadChunk {
         }
         for (field, value) in [
             ("start_receipt_sha256", self.start_receipt_sha256.as_str()),
-            ("stream_evidence_sha256", self.stream_evidence_sha256.as_str()),
+            (
+                "stream_evidence_sha256",
+                self.stream_evidence_sha256.as_str(),
+            ),
             ("observed_sha256", self.observed_sha256.as_str()),
             ("chunk_sha256", self.chunk_sha256.as_str()),
         ] {

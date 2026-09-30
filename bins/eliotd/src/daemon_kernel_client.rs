@@ -1997,9 +1997,10 @@ impl DaemonKernelClient {
             if admission.recipient_module_id() != current.service.as_str()
                 || admission.deadline_unix_ms() != identity.deadline_unix_ms
                 || admission.intent().operation_id().as_str() != operation_id.as_str()
-                || !admission.state_fence().authority_epoch().is_same_authority(
-                    &binding.state_fence.authority_epoch,
-                )
+                || !admission
+                    .state_fence()
+                    .authority_epoch()
+                    .is_same_authority(&binding.state_fence.authority_epoch)
                 || admission.state_fence().generation().get()
                     != binding.state_fence.resource_generation.value()
             {
@@ -2016,8 +2017,7 @@ impl DaemonKernelClient {
                 identity,
             )
             .await?;
-        serde_json::from_value(value)
-            .map_err(|error| KernelClientError::Unknown(error.to_string()))
+        serde_json::from_value(value).map_err(|error| KernelClientError::Unknown(error.to_string()))
     }
 
     #[cfg(windows)]

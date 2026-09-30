@@ -13,8 +13,7 @@ use eliot_kernel_service::{
 };
 use eliot_process::{
     ProcessExecutionError, ProcessOwnerBinding, ProcessStreamEvidence, ProcessStreamKind,
-    StreamEvidenceGap, StreamPersistenceStatus,
-    StreamPreviewRepresentation, StreamTransportStatus,
+    StreamEvidenceGap, StreamPersistenceStatus, StreamPreviewRepresentation, StreamTransportStatus,
 };
 use eliot_process_executor::CapturedStream;
 
@@ -134,7 +133,8 @@ pub(crate) async fn read_stream_chunk(
     }
 
     let stream_evidence = select_stream(&process_evidence, request.stream())?;
-    if stream_evidence.binding() != receipt.binding() || stream_evidence.stream() != request.stream()
+    if stream_evidence.binding() != receipt.binding()
+        || stream_evidence.stream() != request.stream()
     {
         return Err(unknown());
     }

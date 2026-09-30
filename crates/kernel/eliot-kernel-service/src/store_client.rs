@@ -19,17 +19,17 @@ use eliot_protocol::{ClientHello, Frame, ProtocolRange, ProtocolVersion, ServerH
 use eliot_runtime_contracts::{ModuleContract, ModuleGeneration, ModuleGenerationState};
 use eliot_store_api::{
     BackupOperationReconciliation, CAPABILITIES, CanonicalRequestView, CanonicalRestoreBatch,
-    CanonicalStoreClient, CanonicalValidationSnapshot, CausalWriteReceipt, EFFECTS, IsolatedDestination,
-    IsolatedDestinationReceipt, NamedReadOperation, NamedReadRequest, NamedReadResponse,
-    OperationId, OperationIdentity, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
-    PreparedTransition, ReadConsistency, RecoveryRecordKey, RequestMeta, ReservedWriteRequest,
-    RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId,
-    ScopeRevisionView, SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle,
-    SnapshotPage, StoreBackupStatus, StoreError, StoreGenesisRequest, StoreHealth,
-    StoreRecoveryRequest, StoreRecoverySnapshot, StoreRequest, StoreResponse, StoreWireError,
-    WriteReceipt, dreamer_job_capability, map_durable_error, validate_genesis_receipt_envelope,
-    validate_store_receipt_envelope_with_causal, verify_canonical_request_hash,
-    verify_ordering_scope_binding,
+    CanonicalStoreClient, CanonicalValidationSnapshot, CausalWriteReceipt, EFFECTS,
+    IsolatedDestination, IsolatedDestinationReceipt, NamedReadOperation, NamedReadRequest,
+    NamedReadResponse, OperationId, OperationIdentity, OrderingHead, OrderingHeadExpectation,
+    OrderingScopeId, PreparedTransition, ReadConsistency, RecoveryRecordKey, RequestMeta,
+    ReservedWriteRequest, RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation,
+    RevisionKey, ScopeId, ScopeRevisionView, SnapshotBeginRequest, SnapshotCursor,
+    SnapshotEndReceipt, SnapshotHandle, SnapshotPage, StoreBackupStatus, StoreError,
+    StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, StoreRequest,
+    StoreResponse, StoreWireError, WriteReceipt, dreamer_job_capability, map_durable_error,
+    validate_genesis_receipt_envelope, validate_store_receipt_envelope_with_causal,
+    verify_canonical_request_hash, verify_ordering_scope_binding,
 };
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -731,7 +731,7 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
                     operation_id,
                     &canonical_request_hash,
                 )
-                    .await
+                .await
             }
             Err(RequestFailure::Unknown {
                 operation_id: observed,
@@ -746,7 +746,7 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
                     operation_id,
                     &canonical_request_hash,
                 )
-                    .await
+                .await
             }
             // A typed unknown-outcome failure was already bound to the
             // admitted operation in `execute_raw`; reconcile exactly it.
@@ -757,7 +757,7 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
                     operation_id,
                     &canonical_request_hash,
                 )
-                    .await
+                .await
             }
             Err(error) => Err(error.into_store_error()),
         }

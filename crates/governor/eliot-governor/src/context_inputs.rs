@@ -783,11 +783,8 @@ impl<R: ReadApi + ?Sized> GovernorContextInputs<'_, R> {
             &request.scope_id,
             &request.evidence_subject,
         );
-        let state = classify_evidence_payload_for_task(
-            state,
-            &response.view.payload,
-            &request.task_id,
-        );
+        let state =
+            classify_evidence_payload_for_task(state, &response.view.payload, &request.task_id);
         Ok(RoleAcquisition {
             operation: response.view.operation,
             state,

@@ -3125,13 +3125,12 @@ impl KernelComposition {
         // emits exactly one terminal through its own boundary.
         observe_process("kernel.process.request_received", "attempt");
         if let Some((identity, admitted_task_id)) = source_binding
-            && let Err(rejection) =
-                lsp_admission::validate_current_source_request(
-                    identity,
-                    admitted_task_id,
-                    &request,
-                    session,
-                )
+            && let Err(rejection) = lsp_admission::validate_current_source_request(
+                identity,
+                admitted_task_id,
+                &request,
+                session,
+            )
         {
             observe_process("kernel.process.request_rejected", "source_binding");
             return ProcessExecutionResponse::Rejected(rejection);

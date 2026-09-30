@@ -57,7 +57,8 @@ use eliot_runtime_contracts::{
 };
 use eliot_store_api::{
     CanonicalRequestView, CanonicalRestoreBatch, CanonicalStoreClient, CanonicalValidationSnapshot,
-    CausalWriteReceipt, NamedReadRequest, NamedReadResponse, OperationIdentity, OrderingHead, OrderingHeadExpectation,
+    CausalWriteReceipt, NamedReadRequest, NamedReadResponse, OperationIdentity, OrderingHead,
+    OrderingHeadExpectation,
     OrderingScopeId, PreparedTransition, RecoveryRecord, RecoveryRecordKey, RequestMeta,
     ReservedWriteRequest, RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation,
     RevisionKey, ScopeId, ScopeRevisionView, StoreError, StoreGenesisRequest, StoreHealth,

@@ -6,19 +6,16 @@
 //! and the source owner consumes it in the same request stack.
 
 use eliot_authority::{
-    ActionContract, ActionLease, AuthorizedEffect, AuthorityError,
-    EffectiveCapabilitySnapshot, GrantId, LeaseId, LogicalTime, PrincipalRef, ReceiptObligation,
-    SnapshotId,
+    ActionContract, ActionLease, AuthorityError, AuthorizedEffect, EffectiveCapabilitySnapshot,
+    GrantId, LeaseId, LogicalTime, PrincipalRef, ReceiptObligation, SnapshotId,
 };
 use eliot_contracts::canonical_json_bytes;
-use eliot_ors::{
-    ActiveAdmissionReservation, AdmissionReservationState, OperationIdentity,
-};
-use eliot_receipts::{
-    AuthorityBinding, CausalBinding, EffectClass, OperationBinding, RequestBinding,
-    SessionBinding, TaskBinding, WorkScopeBinding,
-};
+use eliot_ors::{ActiveAdmissionReservation, AdmissionReservationState, OperationIdentity};
 use eliot_protocol::RequestIdentity;
+use eliot_receipts::{
+    AuthorityBinding, CausalBinding, EffectClass, OperationBinding, RequestBinding, SessionBinding,
+    TaskBinding, WorkScopeBinding,
+};
 use thiserror::Error;
 
 use crate::AuthorityOwner;
@@ -165,7 +162,9 @@ pub enum SourceArtifactAdmissionError {
     FenceEncoding,
     #[error("source effect admission could not read an original Governor owner: {0}")]
     Owner(String),
-    #[error("source effect admission lacks the original canonical ADMITTED or ORS activation receipt")]
+    #[error(
+        "source effect admission lacks the original canonical ADMITTED or ORS activation receipt"
+    )]
     MissingReservationReceipt,
 }
 
