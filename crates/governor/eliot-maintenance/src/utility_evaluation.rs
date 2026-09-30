@@ -44,12 +44,11 @@
 //! enforces. This module never decides direction itself and never relaxes a
 //! threshold.
 
-use std::collections::BTreeMap;
-
 use eliot_observation_contracts::{
-    BlindInterval, CoverageDisposition, CoverageEvidence, CoverageInterval, MaintenanceDeliveryState,
-    MaintenanceMetricAssessment, MaintenanceMetricEvaluationV1, MaintenanceMetricResult,
-    MaintenanceMetricValueBasis, MaintenanceUtilityEvidenceV1, MaintenanceUtilityVerdict,
+    BlindInterval, CoverageDisposition, CoverageEvidence, CoverageInterval,
+    MaintenanceDeliveryState, MaintenanceMetricAssessment, MaintenanceMetricEvaluationV1,
+    MaintenanceMetricResult, MaintenanceMetricValueBasis, MaintenanceUtilityEvidenceV1,
+    MaintenanceUtilityVerdict,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -251,10 +250,10 @@ pub struct MaintenanceUtilityEvaluation {
 /// evaluation window, or when a measurement's baseline is not strictly earlier
 /// in the chain than its follow-up. Returns [`MaintenanceError::IdentityConflict`]
 /// when two measurements claim the same metric.
-#[allow(
-    clippy::too_many_lines,
-    reason = "one fail-closed evidence-binding clause per rule, checked together so none can be reordered past another"
-)]
+///
+/// The evidence binding itself is one private helper that checks every clause
+/// together before returning, so this function holds no binding clause to
+/// reorder and no path that skips one.
 pub fn evaluate_maintenance_utility(
     source: &MaintenanceResultObligation,
     chain: &[MaintenanceResultObligation],
@@ -269,56 +268,19 @@ pub fn evaluate_maintenance_utility(
             "utility_evaluation.evaluation_window",
         ));
     }
-    let position = |publication_id: &str| {
-        chain
-            .iter()
-            .position(|entry| entry.publication_id == publication_id)
-    };
     // The chain must hold the source result. Evaluating a result the retained
     // chain does not contain would bind the comparison to nothing.
-    if position(&source.publication_id).is_none() {
+    if !chain
+        .iter()
+        .any(|entry| entry.publication_id == source.publication_id)
+    {
         return Err(MaintenanceError::InvalidField(
             "utility_evaluation.source_publication_id",
         ));
     }
-    let mut by_metric = BTreeMap::new();
-    for measurement in &evidence.measurements {
-        if measurement.coverage.interval != Some(measurement.comparison_window) {
-            return Err(MaintenanceError::InvalidField("utility_evaluation.coverage"));
-        }
-        if measurement.comparison_window.start < evaluation_window.start
-            || measurement.comparison_window.end > evaluation_window.end
-        {
-            return Err(MaintenanceError::InvalidField(
-                "utility_evaluation.comparison_window",
-            ));
-        }
-        // Evidence is bound to the operation it compares: both references must
-        // name obligations this job's own retained chain holds, and the
-        // baseline must precede the follow-up in that chain. A reversed
-        // comparison is refused rather than reported.
-        let (Some(baseline), Some(follow_up)) = (
-            position(&measurement.baseline_observation_ref),
-            position(&measurement.follow_up_observation_ref),
-        ) else {
-            return Err(MaintenanceError::InvalidField(
-                "utility_evaluation.observation_ref",
-            ));
-        };
-        if baseline >= follow_up {
-            return Err(MaintenanceError::InvalidField(
-                "utility_evaluation.observation_ref",
-            ));
-        }
-        if by_metric
-            .insert(measurement.metric, measurement.to_metric_evaluation())
-            .is_some()
-        {
-            return Err(MaintenanceError::IdentityConflict);
-        }
-    }
-    let metric = |metric: RequiredUtilityMetric| match by_metric.get(&metric) {
-        Some(measured) => measured.clone(),
+    let bound = bound_utility_measurements(chain, evaluation_window, evidence)?;
+    let metric = |metric: RequiredUtilityMetric| match bound.measured(metric).cloned() {
+        Some(measured) => measured,
         // A metric with no observed comparison is reported as explicitly
         // unknown over the same window, so a reader sees which evidence is
         // missing rather than a missing metric.
@@ -352,6 +314,117 @@ pub fn evaluate_maintenance_utility(
         utility,
         comparison_window: evaluation_window,
     })
+}
+
+/// The measured comparisons this job's own chain actually holds, one slot per
+/// required metric.
+///
+/// Slots rather than a sorted set: the four required metrics are named quantities
+/// with no order among them — recurrence, recovery delta, false changes and
+/// operator burden are not comparable to each other — so nothing here ranks
+/// them. A slot is present or absent, which is exactly what the caller supplied
+/// and exactly what the evidence needs to report.
+#[derive(Default)]
+struct BoundUtilityMetrics {
+    recurrence: Option<MaintenanceMetricEvaluationV1>,
+    product_recovery_delta: Option<MaintenanceMetricEvaluationV1>,
+    false_changes: Option<MaintenanceMetricEvaluationV1>,
+    operator_burden: Option<MaintenanceMetricEvaluationV1>,
+}
+
+impl BoundUtilityMetrics {
+    /// Binds one measurement into the slot its metric owns.
+    ///
+    /// A second measurement for the same metric is an identity conflict rather
+    /// than an overwrite, so a caller cannot quietly drop one measurement of a
+    /// required metric by presenting another.
+    fn bind(
+        &mut self,
+        metric: RequiredUtilityMetric,
+        measured: MaintenanceMetricEvaluationV1,
+    ) -> Result<(), MaintenanceError> {
+        let slot = match metric {
+            RequiredUtilityMetric::Recurrence => &mut self.recurrence,
+            RequiredUtilityMetric::ProductRecoveryDelta => &mut self.product_recovery_delta,
+            RequiredUtilityMetric::FalseChanges => &mut self.false_changes,
+            RequiredUtilityMetric::OperatorBurden => &mut self.operator_burden,
+        };
+        if slot.is_some() {
+            return Err(MaintenanceError::IdentityConflict);
+        }
+        *slot = Some(measured);
+        Ok(())
+    }
+
+    /// The comparison bound to one required metric, when one was observed.
+    fn measured(&self, metric: RequiredUtilityMetric) -> Option<&MaintenanceMetricEvaluationV1> {
+        match metric {
+            RequiredUtilityMetric::Recurrence => self.recurrence.as_ref(),
+            RequiredUtilityMetric::ProductRecoveryDelta => self.product_recovery_delta.as_ref(),
+            RequiredUtilityMetric::FalseChanges => self.false_changes.as_ref(),
+            RequiredUtilityMetric::OperatorBurden => self.operator_burden.as_ref(),
+        }
+    }
+}
+
+/// Binds the caller's measured comparisons to obligations this job's chain holds.
+///
+/// These clauses are the whole fail-closed surface of the comparison and they are
+/// checked here, together, in this order, so none can be reordered past another
+/// into a path that skips a binding: the declared coverage must match the stated
+/// comparison window; the comparison window must lie inside the evaluation window;
+/// both observation references must name obligations in this job's own retained
+/// chain; the baseline must precede the follow-up in that chain; and one metric
+/// may be claimed once. A measurement failing any of them is refused, not
+/// believed.
+///
+/// This is a pure read of the chain. It opens, closes and commits nothing, and it
+/// appends nothing to the chain: the appended evaluation revision is built by
+/// `append_utility_evaluation` after this returns.
+fn bound_utility_measurements(
+    chain: &[MaintenanceResultObligation],
+    evaluation_window: CoverageInterval,
+    evidence: &UtilityEvaluationEvidence,
+) -> Result<BoundUtilityMetrics, MaintenanceError> {
+    let position = |publication_id: &str| {
+        chain
+            .iter()
+            .position(|entry| entry.publication_id == publication_id)
+    };
+    let mut bound = BoundUtilityMetrics::default();
+    for measurement in &evidence.measurements {
+        if measurement.coverage.interval != Some(measurement.comparison_window) {
+            return Err(MaintenanceError::InvalidField(
+                "utility_evaluation.coverage",
+            ));
+        }
+        if measurement.comparison_window.start < evaluation_window.start
+            || measurement.comparison_window.end > evaluation_window.end
+        {
+            return Err(MaintenanceError::InvalidField(
+                "utility_evaluation.comparison_window",
+            ));
+        }
+        // Evidence is bound to the operation it compares: both references must
+        // name obligations this job's own retained chain holds, and the
+        // baseline must precede the follow-up in that chain. A reversed
+        // comparison is refused rather than reported.
+        let (Some(baseline), Some(follow_up)) = (
+            position(&measurement.baseline_observation_ref),
+            position(&measurement.follow_up_observation_ref),
+        ) else {
+            return Err(MaintenanceError::InvalidField(
+                "utility_evaluation.observation_ref",
+            ));
+        };
+        if baseline >= follow_up {
+            return Err(MaintenanceError::InvalidField(
+                "utility_evaluation.observation_ref",
+            ));
+        }
+        bound.bind(measurement.metric, measurement.to_metric_evaluation())?;
+    }
+    Ok(bound)
 }
 
 /// Appends one delayed evaluation revision to a job's obligation chain.
@@ -417,10 +490,7 @@ pub fn append_utility_evaluation(
     // re-evaluating the same source against the same evidence republishes one
     // identity and the store reconciles it rather than writing a second record.
     let evaluation_revision = source.evaluation_revision + 1;
-    let publication_id = format!(
-        "{}:evaluated-r{evaluation_revision}",
-        source.publication_id
-    );
+    let publication_id = format!("{}:evaluated-r{evaluation_revision}", source.publication_id);
     let appended = MaintenanceResultObligation {
         publication_id: publication_id.clone(),
         source_outcome_revision: format!(

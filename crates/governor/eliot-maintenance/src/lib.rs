@@ -657,6 +657,10 @@ pub fn decision_result_obligation(
         },
         evaluation_revision: 1,
         predecessor_obligation_ref: None,
+        // A non-execution decision is a source result like any other: the
+        // delayed comparison has not run, so this revision carries no verdict
+        // rather than one reached from the decision alone.
+        utility_evaluation: None,
     }
 }
 
