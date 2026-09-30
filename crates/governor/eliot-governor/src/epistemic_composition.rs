@@ -23,7 +23,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    CanonicalAdmissionOwner, CompositionError, CompositionReadiness, KernelTransitionPort,
+    CanonicalAdmissionOwner, CompositionError, CompositionReadiness, ContextReconstructionRequest,
+    KernelTransitionPort, SevenRoleInputs,
 };
 
 #[cfg(test)]
@@ -401,28 +402,23 @@ impl<P: KernelTransitionPort + ?Sized, R: CanonicalReadClient + ?Sized>
         self.read_committed(proposal, &receipt).await
     }
 
-    /// Re-reads one exact committed observed candidate together with the
-    /// original source observation for a downstream Orientation owner call.
+    /// Retains the original admitted candidate and exact source observation
+    /// from the existing Governor context-input read closure.
     ///
-    /// This method is read-only. It uses the same committed-receipt readback,
-    /// capture receipt, and evidence-pack acquisition path as admission, then
-    /// validates the source-derived candidate again before returning the
-    /// non-deserializable owner read value.
-    pub async fn read_committed_for_orientation(
+    /// The original context request and `SevenRoleInputs` are passed through
+    /// from acquisition. This method validates their named read identities,
+    /// dependencies, fence, exact evidence selector, retained rows, and
+    /// candidate proof; it performs no write and constructs no capture
+    /// envelope or receipt.
+    pub fn read_orientation_source<'a>(
         &self,
-        proposal: &ObservedEpistemicProposal,
-        receipt: &WriteReceipt,
-    ) -> Result<crate::EpistemicOrientationRead, CompositionError> {
-        let readback = self.read_committed(proposal, receipt).await?;
-        let observation = self.acquired_observation(proposal).await?;
-        let candidate = Self::validate_source_candidate(proposal, &observation)?;
-        if readback.candidate != candidate {
-            return Err(refused(
-                "orientation readback candidate differs from the source-derived candidate",
-            ));
-        }
-        crate::EpistemicOrientationRead::from_validated_source(readback, observation)
-            .map_err(refused)
+        request: &'a ContextReconstructionRequest,
+        role_inputs: &'a SevenRoleInputs,
+    ) -> Result<
+        crate::EpistemicOrientationRead<'a>,
+        crate::EpistemicOrientationReadError,
+    > {
+        crate::EpistemicOrientationRead::from_context_readback(request, role_inputs)
     }
 
     fn validate_semantics(

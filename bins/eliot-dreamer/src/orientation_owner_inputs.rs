@@ -712,7 +712,11 @@ fn failed_run(
     failed_stage: PulseStageId,
     failure: PulseError,
 ) -> MandatoryStageRun {
-    stages.push(PulseStage::blocked(failed_stage, "mandatory owner refused"));
+    let reason = match &failure {
+        PulseError::EpistemicBinding(error) => error.stage_disposition(),
+        _ => "mandatory owner refused",
+    };
+    stages.push(PulseStage::blocked(failed_stage, reason));
     let mut failed_at = false;
     for id in MANDATORY_STAGES {
         if id == failed_stage {
