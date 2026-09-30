@@ -17,8 +17,8 @@
 //! | Build the `GroundingRequest` | `grounding_stage::resolve_grounding_inputs` over the same admitted pair | wired |
 //! | Ground the admitted draft | `grounding_stage::ground_admitted_draft` | wired |
 //! | Validate the grounded draft | `validation_stage::validate_admitted_draft` (`ValidatedGroundingCandidate`) | wired |
-//! | Read/build the exact `CanonicalProjectionSet` from Governor/canonical owners | `eliot_governor::canonical_projections::emit_canonical_projection_set`, delivered over [`OrientationSupply`] | producer exists in the Governor; no production source wired |
-//! | Acquire the remaining mandatory stages' owner input/receipt | Governor owner records over the same [`OrientationSupply`] channel | producer exists in the Governor; no production source wired |
+//! | Read/build the exact `CanonicalProjectionSet` from Governor/canonical owners | `eliot_governor::canonical_projections::emit_canonical_projection_set`, delivered over [`OrientationSupply`] | producer exists in the Governor; the production channel is wired and measures it absent |
+//! | Acquire the remaining mandatory stages' owner input/receipt | Governor owner records over the same [`OrientationSupply`] channel | producer exists in the Governor; the production channel is wired and measures them absent |
 //! | Invoke the pure composer | [`compose_production_result`] below (this module) | wired |
 //! | Publish the typed result | `dispatch_stage::dispatch_orientation` as `DreamResult::Orientation` | wired |
 //!
@@ -31,17 +31,27 @@
 //! `dispatch_orientation` is what derived and validated that pair. Only values
 //! a Governor/canonical owner publishes travel over [`OrientationSupply`].
 //!
-//! The last two owner-channel rows are measured, not aspirational: the
-//! Governor's producer exists (`eliot_governor::canonical_projections::emit_canonical_projection_set`),
-//! but no `OrientationSupplySource` is wired in production —
-//! `AuthenticatedKernelJobPort::connect` sets none and `with_orientation_source`
-//! has no caller, so the channel is unconstructible in-binary. The absence is
-//! reported through the typed disposition this module already publishes:
-//! [`resolve_production_inputs`] returns the [`OrientationDisposition::Blocked`]
-//! result from [`supply_missing_blocked`], carrying no packet, `CC004_MISSING`
-//! on the CC-004 boundary record, and `missing_owners` naming the canonical
-//! projection owner plus every stage owner. The carrier is not relaxed, no
-//! member is defaulted, and no check is skipped to make a stage fire.
+//! The last two owner-channel rows are measured, not aspirational. The
+//! Governor's producer exists
+//! (`eliot_governor::canonical_projections::emit_canonical_projection_set`) and
+//! a production [`OrientationSupplySource`](crate::OrientationSupplySource) is
+//! wired: `AuthenticatedKernelJobPort::connect` installs
+//! [`KERNEL_STAGED_OWNER_RECORD_SOURCE`](crate::orientation_supply_source::KERNEL_STAGED_OWNER_RECORD_SOURCE),
+//! which reads the Kernel-staged owner record and reports, per member, whether
+//! that record publishes it. It does not: the staged semantic input publishes no
+//! canonical projection set, no Current Epistemic Position handle, and no
+//! stage-owner record, because those are separate owner records this worker is
+//! not handed. So the channel is consulted, and the answer is absence.
+//!
+//! That absence is reported through the typed disposition this module already
+//! publishes: [`resolve_production_inputs`] returns the
+//! [`OrientationDisposition::Blocked`] result from [`supply_missing_blocked`],
+//! carrying no packet, `CC004_MISSING` on the CC-004 boundary record, and
+//! `missing_owners` naming the canonical projection owner plus every stage
+//! owner. The carrier is not relaxed, no member is defaulted, no lookalike value
+//! is synthesized, and no check is skipped to make a stage fire. The difference
+//! from the unwired channel is only that the verdict now comes from a real read
+//! of a real owner record rather than from a hardcoded `None`.
 //!
 //! A missing adapter is implementation work, never substituted with local
 //! data: the v1 hypothesis pair derived in dispatch is reported only as the
