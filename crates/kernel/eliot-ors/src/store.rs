@@ -21779,8 +21779,7 @@ impl RedbRecoveryStore {
                         Self::bridge_cursor_stable_and_scan_bytes(value.value())?;
                     let cursor: BridgeEventCursorRow = decode(value.value())?;
                     cursor.validate()?;
-                    if cursor.owner_namespace != namespace
-                        || cursor.stream_id != owner.local_stream
+                    if cursor.owner_namespace != namespace || cursor.stream_id != owner.local_stream
                     {
                         return Err(OrsError::IntegrityProblem {
                             record_type: "bridge_event_cursor",
