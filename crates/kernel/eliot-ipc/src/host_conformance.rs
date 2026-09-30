@@ -15,7 +15,7 @@
 
 use std::collections::BTreeMap;
 
-use eliot_protocol::{HandoffCausalLink, ProtocolError, RehydrationBundle};
+use eliot_protocol::{ContinuityKind, HandoffCausalLink, ProtocolError, RehydrationBundle};
 use thiserror::Error;
 
 /// Fail-closed validation failures for fingerprint conformance.
@@ -918,7 +918,9 @@ impl AttemptGate {
     }
 
     /// Creates the causally linked new attempt required after the boundary,
-    /// carrying the sealed handoff from this attempt. Production
+    /// carrying the sealed handoff from this attempt. The handoff is
+    /// validated under [`ContinuityKind::Rehydrated`]: this gate only ever
+    /// issues a new attempt, never a native resume. Production
     /// substitution must additionally verify target-route admission; see
     /// [`AttemptGate::next_attempt_after_effect_for_admitted_target`].
     /// Persisting the handoff and retaining source effects belong to the
@@ -933,7 +935,7 @@ impl AttemptGate {
         if !is_token(&id) || id == self.attempt_id {
             return Err(ConformanceError::InvalidInput);
         }
-        handoff.validate()?;
+        handoff.validate_for_continuity(ContinuityKind::Rehydrated)?;
         rehydration_bundle.validate()?;
         if handoff.source_attempt_id != self.attempt_id {
             return Err(ConformanceError::HandoffSourceMismatch);
