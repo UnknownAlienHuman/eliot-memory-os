@@ -3779,9 +3779,10 @@ pub(crate) const ACT_CAPABILITY: &str = "eliot.act";
 /// [`KernelComposition::admit_and_queue_observe_submit`]. The Kernel owns
 /// only the mechanical dispatch binding here — capability plus invocation
 /// kind, checked before any staging — never the verification verdict or the
-/// not-executed/partial/unknown evidence: those belong to the verifier owner
-/// the bridge dispatch row names (I01-08 canonical write path; I07-08 step
-/// 10).
+/// not-executed/partial/unknown evidence: those belong to `eliot-verifier`
+/// (`eliot.instrument.verifier`) plan/execute/verdict at the future live
+/// verify claim/flight, the owner the bridge dispatch row names (I01-08
+/// canonical write path; I07-08 step 10).
 pub(crate) const VERIFY_CAPABILITY: &str = "eliot.verify";
 
 /// Whether one requested capability is task-relative or effectful and
@@ -3971,8 +3972,9 @@ pub(crate) fn check_act_submit_binding(
 /// digest to link here — the envelope digest already commits to the exact
 /// canonical request through admission, and the live session/fence/
 /// connection binding is enforced by the frame gateway plus the admission
-/// gates. The verification verdict itself stays the verifier owner's,
-/// never a Kernel verdict (I01-08 canonical write path; I07-08 step 10).
+/// gates. The verification verdict itself stays `eliot-verifier`'s
+/// (`eliot.instrument.verifier`), never a Kernel verdict (I01-08 canonical
+/// write path; I07-08 step 10).
 pub(crate) fn check_verify_submit_binding(
     envelope: &HostRequestEnvelope,
 ) -> Result<(), TransportError> {
@@ -4014,7 +4016,8 @@ impl KernelComposition {
     /// Digest-only `eliot.verify` invocations take the same entry next, in
     /// row order: the Kernel-owned dispatch binding
     /// ([`check_verify_submit_binding`]) is revalidated before admission,
-    /// while the verification verdict stays the verifier owner's.
+    /// while the verification verdict stays `eliot-verifier`'s
+    /// (`eliot.instrument.verifier`).
     pub(crate) fn admit_and_queue_observe_submit(
         &self,
         envelope: &HostRequestEnvelope,
@@ -4034,8 +4037,8 @@ impl KernelComposition {
         // Verify effect dispatch (issue #1739 W5): digest-only
         // `eliot.verify` submits ride this same entry, serially after the
         // act gate. Revalidate the Kernel-owned dispatch binding before
-        // staging; the verification verdict itself stays the verifier
-        // owner's, never a Kernel verdict (I01-08).
+        // staging; the verification verdict itself stays `eliot-verifier`'s
+        // (`eliot.instrument.verifier`), never a Kernel verdict (I01-08).
         if !is_observe && envelope.identity.capability == VERIFY_CAPABILITY {
             check_verify_submit_binding(envelope)?;
         }

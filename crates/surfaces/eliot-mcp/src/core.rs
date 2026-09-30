@@ -4,7 +4,8 @@ use std::collections::BTreeSet;
 
 use eliot_contracts::{HostCorrelationDomain, HostCorrelationProjection, HostJsonRpcCorrelationId};
 use eliot_protocol::{
-    AgentHostRequestFailure, HARD_STRUCTURED_RESPONSE_BYTES, MAX_HOST_REQUEST_TEXT_BYTES,
+    AgentHostRequestFailure, AgentResponseDisposition, HARD_STRUCTURED_RESPONSE_BYTES,
+    MAX_HOST_REQUEST_TEXT_BYTES,
 };
 use eliot_receipts::{
     ArtifactBinding, GrantClosureReceipt, ProofCeiling, SessionBinding, admit_dispatch_surface,
@@ -993,16 +994,25 @@ impl KernelGovernorPort for NoProviderPort {
 /// Returns whether one port failure already carries its exact MCP-visible
 /// negative shape (issue #1739 W6).
 ///
-/// The absent-provider gaps plus the Kernel-authored failure envelope: its
-/// stable disposition, open reason code, recovery directive and original
-/// operation identity reach the caller unchanged through
-/// [`negative_response`] instead of degrading to a generic port error.
+/// Every [`PortFailure`] variant is a typed negative: the absent-provider
+/// gaps, the Kernel-authored failure envelope, and the six mechanical owner
+/// negatives below all reach the caller through [`negative_response`] with
+/// their stable code, closed disposition, reason, recovery directive and
+/// original operation identity instead of degrading to a generic port error.
+/// Recognized-but-unimplemented stays the explicit [`ResponseKind::Unsupported`]
+/// residual; it is never folded into the owner-rejected shape.
 fn is_typed_negative(failure: &PortFailure) -> bool {
     matches!(
         failure,
         PortFailure::PlanGap { .. }
             | PortFailure::Unsupported { .. }
             | PortFailure::AgentResponse { .. }
+            | PortFailure::IdempotencyConflict
+            | PortFailure::LegacyCorrelationUnresolved
+            | PortFailure::DeadlineExceeded
+            | PortFailure::Cancelled
+            | PortFailure::FenceMismatch
+            | PortFailure::TransportBindingRejected { .. }
     )
 }
 
@@ -1055,7 +1065,78 @@ fn negative_response(
                 "envelope_sha256": failure.envelope_sha256,
             }),
         ),
-        other => return Err(BridgeError::Port(other)),
+        // Issue #1739 W6: the six mechanical owner negatives ride the same
+        // `OwnerRejected` shape with their exact stable code, closed
+        // disposition, reason, recovery directive and original operation
+        // identity. The match is exhaustive over `PortFailure` on purpose: a
+        // future variant is a compile error here until its exact negative is
+        // recorded. Recognized-but-unimplemented stays `Unsupported` above.
+        PortFailure::IdempotencyConflict => mechanical_negative(
+            request_id,
+            idempotency_key,
+            canonical_request_sha256,
+            canonical_tool_name,
+            "IDEMPOTENCY_CONFLICT",
+            AgentResponseDisposition::StaleOrConflict,
+            "IDEMPOTENCY_CONFLICT",
+            "the same idempotency identity was bound to different request bytes",
+            "reconcile the existing operation or resubmit the exact request bytes; never retry changed bytes under the same identity",
+        ),
+        PortFailure::LegacyCorrelationUnresolved => mechanical_negative(
+            request_id,
+            idempotency_key,
+            canonical_request_sha256,
+            canonical_tool_name,
+            "LEGACY_CORRELATION_UNRESOLVED",
+            AgentResponseDisposition::RecoveryRequired,
+            "LEGACY_CORRELATION_UNRESOLVED",
+            "a durable occurrence exists but cannot be assigned a typed owner",
+            "reconcile the existing operation; no handle is issued",
+        ),
+        PortFailure::DeadlineExceeded => mechanical_negative(
+            request_id,
+            idempotency_key,
+            canonical_request_sha256,
+            canonical_tool_name,
+            "DEADLINE_EXCEEDED",
+            AgentResponseDisposition::UnavailableOrCapacity,
+            "DEADLINE_EXCEEDED",
+            "the request deadline was reached by the semantic owner",
+            "reconcile the exact operation before resubmitting with a later deadline",
+        ),
+        PortFailure::Cancelled => mechanical_negative(
+            request_id,
+            idempotency_key,
+            canonical_request_sha256,
+            canonical_tool_name,
+            "CANCELLED",
+            AgentResponseDisposition::Failed,
+            "CANCELLED",
+            "the request was cancelled by its canonical cancellation identity",
+            "do not retry the cancelled operation; submit a new operation when the work is still required",
+        ),
+        PortFailure::FenceMismatch => mechanical_negative(
+            request_id,
+            idempotency_key,
+            canonical_request_sha256,
+            canonical_tool_name,
+            "FENCE_MISMATCH",
+            AgentResponseDisposition::StaleOrConflict,
+            "STALE_STATE_FENCE",
+            "the owner rejected a stale or mismatched state fence",
+            "reconnect through the authenticated session and reconcile the exact operation before resubmitting",
+        ),
+        PortFailure::TransportBindingRejected { reason } => mechanical_negative(
+            request_id,
+            idempotency_key,
+            canonical_request_sha256,
+            canonical_tool_name,
+            "TRANSPORT_BINDING_REJECTED",
+            AgentResponseDisposition::InvalidRequest,
+            "TRANSPORT_BINDING_REJECTED",
+            reason.as_str(),
+            "correct the rejected binding and resubmit through the authenticated session",
+        ),
     };
     bounded_response(McpResponse {
         request_id: request_id.to_owned(),
@@ -1069,6 +1150,56 @@ fn negative_response(
         resource: None,
         job: None,
     })
+}
+
+/// Builds the exact MCP-visible negative for one mechanical owner failure
+/// (issue #1739 W6).
+///
+/// Reuses the [`ResponseKind::OwnerRejected`] shape the Kernel-authored
+/// envelope already rides: stable variant code, closed
+/// [`AgentResponseDisposition`], open reason code, the recovery directive the
+/// caller must follow, and the exact correlation the failure reports on as
+/// its operation identity. There is no envelope digest at this seam — the
+/// canonical request digest inside the operation identity binds the exact
+/// request instead; nothing is fabricated. Like every negative it renders
+/// with `isError: true` and carries no deliverable bytes, so the bridge
+/// retains no preview for it and the Kernel serves it as-is instead of
+/// converting it into a plan gap.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "W6 negative shape: the four correlation identities plus the five per-variant fields travel together from negative_response; grouping them would hide the exact wire fields"
+)]
+fn mechanical_negative(
+    request_id: &str,
+    idempotency_key: &str,
+    canonical_request_sha256: &str,
+    canonical_tool_name: &str,
+    code: &'static str,
+    disposition: AgentResponseDisposition,
+    reason_code: &str,
+    reason: &str,
+    next_action: &'static str,
+) -> (ResponseKind, Value) {
+    (
+        ResponseKind::OwnerRejected,
+        json!({
+            "code": code,
+            "disposition": disposition.as_str(),
+            "reason_code": reason_code,
+            "directive": {
+                "reason": reason,
+                "next_action": next_action,
+                "required_authority": "the authenticated session bound to this request",
+                "evidence_refs": [],
+            },
+            "operation_identity": {
+                "request_id": request_id,
+                "idempotency_key": idempotency_key,
+                "canonical_request_sha256": canonical_request_sha256,
+                "canonical_tool_name": canonical_tool_name,
+            },
+        }),
+    )
 }
 
 /// Bounded typed recovery code for source-assurance admission failures.
