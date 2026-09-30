@@ -204,16 +204,18 @@ fn daemon_restart_evidence(
             RestartIdentityEvidence::MissingOrAmbiguous,
             RestartFailureEvidence::NoRestartCondition,
         ),
-        ExitDisposition::Signalled | ExitDisposition::ResourceLimit => {
-            (RestartIdentityEvidence::Exact, RestartFailureEvidence::AbnormalExit)
-        }
+        ExitDisposition::Signalled | ExitDisposition::ResourceLimit => (
+            RestartIdentityEvidence::Exact,
+            RestartFailureEvidence::AbnormalExit,
+        ),
         ExitDisposition::Cancelled => (
             RestartIdentityEvidence::Exact,
             RestartFailureEvidence::NoRestartCondition,
         ),
-        ExitDisposition::Completed if !daemon_status_proves_ready(previous_status) => {
-            (RestartIdentityEvidence::Exact, RestartFailureEvidence::FailedHealthContract)
-        }
+        ExitDisposition::Completed if !daemon_status_proves_ready(previous_status) => (
+            RestartIdentityEvidence::Exact,
+            RestartFailureEvidence::FailedHealthContract,
+        ),
         ExitDisposition::Completed => (
             RestartIdentityEvidence::Exact,
             RestartFailureEvidence::NormalExit,
@@ -274,7 +276,9 @@ pub(crate) fn daemon_class_withholds_replacement(
     if decision == AutomaticRestartDecision::Eligible {
         return None;
     }
-    Some(DaemonRestartRefusal::ClassWithholds(daemon_restart_decision_reason(decision)))
+    Some(DaemonRestartRefusal::ClassWithholds(
+        daemon_restart_decision_reason(decision),
+    ))
 }
 
 /// Bounded reason for a refusal, for the diagnostics facade. It is a fixed
