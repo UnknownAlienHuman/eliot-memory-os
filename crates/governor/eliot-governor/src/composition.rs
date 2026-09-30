@@ -265,18 +265,87 @@ pub enum KernelPortError {
     NotAdmitted(String),
 }
 
+/// The proved canonical second phase of one grant closure, carried across the
+/// process boundary in transport-neutral types.
+///
+/// The daemon composition root does not depend on `eliot-ors` and must never
+/// gain it (the Kernel owns ORS inside the Kernel process, so the daemon has
+/// to reach the link through the authenticated transport). This record is
+/// therefore the port's return type instead of an in-process ORS projection:
+/// it names exactly the two facts the reconciliation proof reads — the
+/// ORIGINAL committed first-phase closure row and the exact Store-issued
+/// canonical receipt identity durably linked to it — and both are re-served
+/// verbatim from the owner's own committed bytes. No digest is recomputed and
+/// no field is re-derived here or by any implementor.
+///
+/// The link is mandatory, not optional: the durable second phase either exists
+/// and is returned, or the implementor answers `Err`. An absent link is an
+/// unestablished outcome, so a type that could carry "no link" as a success
+/// value would be a fabricated receipt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GrantClosureSecondPhaseLink {
+    /// The ORIGINAL committed first-phase closure row, served verbatim. The
+    /// first-phase bytes are never rewritten by the second phase.
+    closure: GrantClosureReceipt,
+    /// The exact Store-issued canonical receipt identity durably linked to
+    /// `closure` by this call.
+    canonical_receipt: ReceiptIdentity,
+}
+
+impl GrantClosureSecondPhaseLink {
+    /// Binds the ORIGINAL committed first-phase closure to the exact durable
+    /// canonical receipt linked against it.
+    ///
+    /// An implementor MUST pass the owner's verbatim committed closure and the
+    /// owner's verbatim linked receipt identity. It is not a constructor for an
+    /// unrecorded link: a first phase that did not commit, or a link the owner
+    /// does not hold, is a typed [`KernelPortError`], never a value here.
+    pub fn new(closure: GrantClosureReceipt, canonical_receipt: ReceiptIdentity) -> Self {
+        Self {
+            closure,
+            canonical_receipt,
+        }
+    }
+
+    /// Returns the ORIGINAL committed first-phase closure the link was recorded
+    /// against. The caller compares its `operation_id` and `declaration` by
+    /// content against the closure it read back, never by shape.
+    pub const fn closure(&self) -> &GrantClosureReceipt {
+        &self.closure
+    }
+
+    /// Returns the exact durable canonical second-phase receipt link.
+    pub const fn canonical_receipt(&self) -> &ReceiptIdentity {
+        &self.canonical_receipt
+    }
+}
+
 /// Narrow durable boundary for the canonical second phase of a grant
 /// closure. The Kernel-side adapter must delegate this call to
 /// `eliot_ors::OperationalRecoveryStore::link_grant_closure_canonical_receipt`;
 /// Governor never edits the first-phase closure row.
+///
+/// Like [`GrantClosureReceiptPort`], this port is transport-neutral: every type
+/// in its signature is reachable from a daemon-side dependency set that holds
+/// no in-process ORS, so the saga arm that records the canonical second phase
+/// is implementable by the process that owns the decision. `operation_id` is
+/// the ORIGINAL closure operation identity string already recorded in the
+/// first-phase [`GrantClosureReceipt`]; an adapter that needs a typed ORS
+/// operation identity constructs it from these exact bytes at the boundary
+/// that calls the store, which is where that validation belongs.
 pub trait GrantClosureCanonicalLinkPort: Send + Sync {
     /// Links the exact Store-issued `ReceiptIdentity` to the immutable
-    /// first-phase closure operation.
+    /// first-phase closure operation, and returns the proved read-back so the
+    /// caller re-checks it instead of taking the owner's word for it.
+    ///
+    /// Returns a typed [`KernelPortError`] when the first phase has not
+    /// committed for `operation_id`, when the link conflicts with an existing
+    /// one, or when the owner's read-back does not bind the presented receipt.
     fn link_grant_closure_canonical_receipt(
         &self,
-        operation_id: &eliot_ors::OperationIdentity,
+        operation_id: &str,
         canonical_receipt: &ReceiptIdentity,
-    ) -> Result<eliot_ors::GrantClosureProjection, KernelPortError>;
+    ) -> Result<GrantClosureSecondPhaseLink, KernelPortError>;
 }
 
 /// Readback boundary for the durable closure committed by the first P-07
@@ -4359,9 +4428,10 @@ pub enum AuthorityActionReceipt {
     /// The three durable phases of one reconciled grant revocation. A grant
     /// revocation never reports a single-phase receipt: either the whole saga
     /// committed and proved its read-backs, or it returns `Err`. The record is
-    /// boxed because it carries the whole committed ORS closure projection,
-    /// which is far larger than the other two terminal receipts; the box is a
-    /// representation choice only and changes no field or proof.
+    /// boxed because it carries the whole committed first-phase closure
+    /// together with its second-phase link, which is far larger than the other
+    /// two terminal receipts; the box is a representation choice only and
+    /// changes no field or proof.
     ReconciledGrantRevocation(Box<AuthorityRevocationReconciliation>),
 }
 
@@ -4372,8 +4442,10 @@ pub struct AuthorityRevocationReconciliation {
     pub authority_receipt: AuthorityRevocationReceipt,
     /// Canonical write receipt proving the second phase committed.
     pub canonical_receipt: WriteReceipt,
-    /// ORS projection carrying the exact second-phase link.
-    pub closure_projection: eliot_ors::GrantClosureProjection,
+    /// Proved canonical second phase: the ORIGINAL committed first-phase
+    /// closure together with the exact Store-issued receipt durably linked to
+    /// it, as the neutral [`GrantClosureSecondPhaseLink`] carries it.
+    pub closure_projection: GrantClosureSecondPhaseLink,
 }
 
 /// Agent- and Human-facing projection of one retained terminal cold-start
@@ -8168,20 +8240,26 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 error,
             }
         })?;
-        let closure_operation_id = eliot_ors::OperationIdentity::new(closure.operation_id.as_str())
-            .map_err(|error| PendingCanonicalHandoff {
-                phase: CanonicalRevocationPhase::SecondPhaseLink,
-                error: CompositionError::Recovery(error.to_string()),
-            })?;
+        // The ORIGINAL recorded first-phase operation identity, not a
+        // re-derived or freshly minted one. `closure.validate()` above already
+        // revalidated this exact field under the closure receipt contract, and
+        // an adapter that needs a typed ORS operation identity rebuilds it from
+        // these same bytes at the boundary that actually calls the store.
         let closure_projection = durable_link
-            .link_grant_closure_canonical_receipt(&closure_operation_id, &receipt_identity)
+            .link_grant_closure_canonical_receipt(
+                closure.operation_id.as_str(),
+                &receipt_identity,
+            )
             .map_err(|error| PendingCanonicalHandoff {
                 phase: CanonicalRevocationPhase::SecondPhaseLink,
                 error: CompositionError::Owner(error.to_string()),
             })?;
-        if closure_projection.commit().operation_id != closure.operation_id
-            || closure_projection.commit().declaration != closure.declaration
-            || closure_projection.second_phase() != Some(&receipt_identity)
+        // Content equality on the owner's committed bytes, never existence and
+        // never shape: the linked operation identity, the whole declared
+        // closure membership, and the exact linked canonical receipt.
+        if closure_projection.closure().operation_id != closure.operation_id
+            || closure_projection.closure().declaration != closure.declaration
+            || closure_projection.canonical_receipt() != &receipt_identity
         {
             return Err(PendingCanonicalHandoff {
                 phase: CanonicalRevocationPhase::SecondPhaseLink,

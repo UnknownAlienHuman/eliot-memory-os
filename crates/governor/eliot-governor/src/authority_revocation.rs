@@ -31,6 +31,13 @@
 //!   index. Both answer with durable evidence or a typed
 //!   [`KernelPortError`]; neither synthesizes a receipt.
 //!
+//!   Both ports are transport-neutral: every type in their signatures is
+//!   reachable from a daemon-side dependency set that holds no in-process ORS.
+//!   The link arm therefore stays completable from the process that owns the
+//!   revocation decision — over the authenticated transport to the Kernel,
+//!   which owns ORS in its own process — instead of being nameable only by a
+//!   Kernel-process type.
+//!
 //! Validation order (fail-closed): admitted [`RequestIdentity`] shape and
 //! exact fence agreement first, then non-blank revocation binding fields
 //! with nonzero revision/count, then the closed typed parameters. On the
@@ -59,7 +66,7 @@ use std::sync::Arc;
 use eliot_canonical::CanonicalWriteEnvelope;
 use eliot_contracts::{OperationId, canonical_json_bytes, sha256_hex};
 use eliot_kernel_core::GrantActivationPort;
-use eliot_ors::{GrantClosureProjection, OperationIdentity, OperationalRecoveryStore, OrsError};
+use eliot_ors::{OperationIdentity, OperationalRecoveryStore, OrsError};
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::{
     GrantClosureReceipt, GrantClosureState, ReceiptDispositionKind, ReceiptIdentity,
@@ -74,7 +81,8 @@ use eliot_store_api::{
 };
 
 use crate::{
-    CompositionError, GrantClosureCanonicalLinkPort, GrantClosureReceiptPort, KernelPortError,
+    CompositionError, GrantClosureCanonicalLinkPort, GrantClosureReceiptPort,
+    GrantClosureSecondPhaseLink, KernelPortError,
 };
 use eliot_authority::{
     AuthorityRevocationClosureEvidence, GrantRevocationRequest,
@@ -724,15 +732,33 @@ fn closure_link_error(error: OrsError) -> KernelPortError {
 /// agree with the presented identity. A store that answers with a different
 /// identity or an absent link is a typed [`KernelPortError`], never a success
 /// and never a rewritten first phase.
+///
+/// It returns the neutral [`GrantClosureSecondPhaseLink`] rather than the
+/// in-process `eliot_ors::GrantClosureProjection`: the ORS projection's
+/// lifecycle phase, operation order and store receipt are operational evidence
+/// no Governor proof or caller reads, while the three facts the saga actually
+/// proves — the committed `GrantClosureReceipt` and the linked
+/// `ReceiptIdentity` — are store-neutral and are copied out verbatim. That is
+/// what lets a transport client with no in-process ORS implement the same port
+/// from the far side of the authenticated transport.
 impl GrantClosureCanonicalLinkPort for Arc<dyn OperationalRecoveryStore> {
     fn link_grant_closure_canonical_receipt(
         &self,
-        operation_id: &OperationIdentity,
+        operation_id: &str,
         canonical_receipt: &ReceiptIdentity,
-    ) -> Result<GrantClosureProjection, KernelPortError> {
+    ) -> Result<GrantClosureSecondPhaseLink, KernelPortError> {
+        // The typed ORS operation identity is rebuilt here, from the ORIGINAL
+        // recorded first-phase bytes the caller presents, because this is the
+        // boundary that calls the store. `OperationIdentity::new` applies the
+        // bounded non-blank/control-character check the neutral port signature
+        // cannot express, so the constraint is enforced rather than dropped; an
+        // unusable identity is a determinate contract refusal, not a link.
+        let operation_id = OperationIdentity::new(operation_id).map_err(|error| {
+            KernelPortError::Contract(format!("unusable grant closure operation identity: {error}"))
+        })?;
         let projection = OperationalRecoveryStore::link_grant_closure_canonical_receipt(
             self.as_ref(),
-            operation_id,
+            &operation_id,
             canonical_receipt,
         )
         .map_err(closure_link_error)?;
@@ -748,7 +774,13 @@ impl GrantClosureCanonicalLinkPort for Arc<dyn OperationalRecoveryStore> {
                 "canonical closure receipt link read-back disagrees".to_owned(),
             ));
         }
-        Ok(projection)
+        // The ORIGINAL committed first-phase bytes, copied verbatim out of the
+        // owner's own read-back. The first-phase row is not edited here; only
+        // the second-phase link was added, above, by the store itself.
+        Ok(GrantClosureSecondPhaseLink::new(
+            commit.clone(),
+            canonical_receipt.clone(),
+        ))
     }
 }
 
