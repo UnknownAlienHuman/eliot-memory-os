@@ -9,19 +9,21 @@
 #![forbid(unsafe_code)]
 
 use eliot_blob_api::BlobReadChunk;
+use eliot_contracts::ArtifactId;
 use eliot_graph_api::{
     CoordinateKind, GraphCoordinate, GraphCoverage, GraphEdge, GraphFreshness, GraphNode,
     GraphQueryResult, GraphRevision,
 };
 use eliot_instrument_api::{EvidenceAxes, EvidenceCoverage, EvidenceFreshness, NormalizedEvidence};
-use eliot_lsp_bridge::{
-    BridgeError as LspBridgeError, Coverage as LspCoverage, DiagnosticSeverity, FailureDisposition,
-    Freshness as LspFreshness, LspAdoptionProjection, LspRawOutputKind, NormalizedResult,
-    RetainedLspObservationV1, SemanticOperation, adopt_captured_observation_from_blob_readback,
-    adopt_retained_observation,
-};
 use eliot_receipts::{CausalBinding, TaskBinding};
 use eliot_store_api::CapturedBlobPayloadRefV1;
+use eliot_lsp_bridge::{
+    adopt_captured_observation_from_blob_readback, adopt_retained_observation,
+    BridgeError as LspBridgeError, Coverage as LspCoverage, DiagnosticObservation,
+    DiagnosticSeverity, FailureDisposition, Freshness as LspFreshness, LspAdoptionProjection,
+    LspRawOutputKind, NormalizedResult, RenameCandidate, RetainedLspObservationV1,
+    SemanticOperation, SymbolInfo,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -106,28 +108,31 @@ fn validate_captured_lsp_task_join(
 ) -> Result<(), CodeCortexError> {
     let invalid = || CodeCortexError::CapturedLspBindingMismatch;
     let readback = &captured.readback;
-    let ready = readback.ready_receipt();
-    let ready_receipt = ready.receipt();
-    let read_receipt = readback.receipt();
+    let ready_capability = readback.ready_receipt();
+    let staged_payload_receipt = ready_capability.receipt();
+    let current_read_receipt = readback.receipt();
     let reference = &captured.reference;
-    if &reference.locator != ready.locator()
-        || reference.metadata_sha256 != ready.metadata_sha256()
-        || reference.ready_receipt_id != ready_receipt.identity.receipt_id.to_string()
-        || reference.plaintext_length != ready.plaintext_length()
-        || reference.plaintext_sha256 != ready.plaintext_sha256()
-        || ready_receipt.core.task.as_ref() != Some(&captured.historical_task_binding)
-        || ready_receipt.core.request.metadata.task_id.as_ref()
+    if &reference.locator != ready_capability.locator()
+        || reference.metadata_sha256 != ready_capability.metadata_sha256()
+        || reference.ready_receipt_id != staged_payload_receipt.identity.receipt_id.to_string()
+        || reference.plaintext_length != ready_capability.plaintext_length()
+        || reference.plaintext_sha256 != ready_capability.plaintext_sha256()
+        || staged_payload_receipt.core.task.as_ref() != Some(&captured.historical_task_binding)
+        || staged_payload_receipt.core.request.metadata.task_id.as_ref()
             != Some(&captured.historical_task_binding.task_id)
-        || ready_receipt.core.request.state_fence != captured.historical_task_binding.state_fence
-        || ready_receipt.core.request.metadata.state_fence
+        || staged_payload_receipt.core.request.state_fence
             != captured.historical_task_binding.state_fence
-        || ready_receipt.core.causal.state_fence != captured.historical_task_binding.state_fence
-        || read_receipt.core.task.as_ref() != Some(current_read_task_binding)
-        || &read_receipt.core.causal != current_read_causal_binding
-        || read_receipt.core.request.metadata.task_id.as_ref()
+        || staged_payload_receipt.core.request.metadata.state_fence
+            != captured.historical_task_binding.state_fence
+        || staged_payload_receipt.core.causal.state_fence
+            != captured.historical_task_binding.state_fence
+        || current_read_receipt.core.task.as_ref() != Some(current_read_task_binding)
+        || &current_read_receipt.core.causal != current_read_causal_binding
+        || current_read_receipt.core.request.metadata.task_id.as_ref()
             != Some(&current_read_task_binding.task_id)
-        || read_receipt.core.request.state_fence != current_read_task_binding.state_fence
-        || read_receipt.core.request.metadata.state_fence != current_read_task_binding.state_fence
+        || current_read_receipt.core.request.state_fence != current_read_task_binding.state_fence
+        || current_read_receipt.core.request.metadata.state_fence
+            != current_read_task_binding.state_fence
         || record.instrument_invocation.request.task_id.as_ref()
             != Some(&captured.historical_task_binding.task_id)
         || record.instrument_invocation.request.state_fence
@@ -336,7 +341,7 @@ impl SemanticIndex {
         let result = adopt_retained_observation(record.clone())
             .map_err(|error| CodeCortexError::InvalidEvidence(error.to_string()))?;
         self.admit_lsp_observation(
-            record,
+            &record,
             result,
             process_operation_id,
             LspFreshness::Stale {
@@ -348,7 +353,7 @@ impl SemanticIndex {
     /// Admits an original LSP observation together with the separate
     /// currentness projection produced by its live process/source owners.
     /// The projection is bound to this exact retained envelope, and the
-    /// bridge revalidates the original raw bytes before CodeCortex indexes
+    /// bridge revalidates the original raw bytes before `CodeCortex` indexes
     /// the unchanged normalized result.
     pub fn admit_lsp_adoption_projection(
         &mut self,
@@ -369,7 +374,7 @@ impl SemanticIndex {
             ));
         }
         self.admit_lsp_observation(
-            record,
+            &record,
             result,
             process_operation_id,
             projection.currentness().clone(),
@@ -378,7 +383,7 @@ impl SemanticIndex {
 
     fn admit_lsp_observation(
         &mut self,
-        record: RetainedLspObservationV1,
+        record: &RetainedLspObservationV1,
         result: NormalizedResult,
         process_operation_id: String,
         currentness: LspFreshness,
@@ -408,73 +413,7 @@ impl SemanticIndex {
             .map(|output| output.evidence.artifact_id.to_string())
             .collect::<Vec<_>>();
         let workspace_root = record.source_candidate.workspace_root.clone();
-        let normalizer = record.registry_identity.normalizer.clone();
-        let raw_metadata = record
-            .raw_outputs
-            .iter()
-            .map(|output| {
-                serde_json::json!({
-                    "kind": output.kind,
-                    "artifact_id": output.evidence.artifact_id.to_string(),
-                    "sha256": output.evidence.sha256,
-                    "source": output.evidence.source,
-                    "truncated": output.evidence.truncated,
-                })
-            })
-            .collect::<Vec<_>>();
-        if !matches!(&result.receipt().freshness, LspFreshness::Stale { .. }) {
-            return Err(CodeCortexError::InvalidEvidence(
-                "LSP adoption did not preserve the original stale observation receipt".to_owned(),
-            ));
-        }
-        let coverage = match (&result.receipt().coverage, &result.receipt().disposition) {
-            (LspCoverage::ProbeOnly, _) => EvidenceCoverage::NotApplicable,
-            (LspCoverage::Workspace { .. }, FailureDisposition::Success) => {
-                EvidenceCoverage::CompleteForScope
-            }
-            _ => EvidenceCoverage::PartialForScope,
-        };
-        let value = serde_json::json!({
-            "receipt_kind": eliot_lsp_bridge::LSP_TOOL_OBSERVATION_RECEIPT_KIND,
-            "operation": &record.operation,
-            "config": &record.config,
-            "source_candidate": &record.source_candidate,
-            "instrument_invocation": &record.instrument_invocation,
-            "process_intent": &record.process_intent,
-            "invocation_digest": &record.invocation_digest,
-            "resolved_executable": &record.resolved_executable,
-            "instrument_spec": &record.instrument_spec,
-            "registry_identity": &record.registry_identity,
-            "process_evidence": &record.process_evidence,
-            "adoption_currentness": &currentness,
-            "result": &result,
-            "raw_outputs": raw_metadata,
-        });
-        let evidence = NormalizedEvidence {
-            evidence_id: raw_artifact_id.clone(),
-            raw_artifact_id,
-            normalizer,
-            kind: LSP_NORMALIZED_EVIDENCE_KIND.to_owned(),
-            summary: match &currentness {
-                LspFreshness::Current => {
-                    "bridge-validated LSP observation with live source-owner currentness".to_owned()
-                }
-                LspFreshness::Stale { .. } => {
-                    "bridge-validated LSP observation with stale or unavailable currentness"
-                        .to_owned()
-                }
-            },
-            value,
-            axes: EvidenceAxes::observed(),
-            freshness: match &currentness {
-                LspFreshness::Current => EvidenceFreshness::ExactCandidate,
-                LspFreshness::Stale { .. } => EvidenceFreshness::Stale,
-            },
-            coverage,
-        };
-        evidence
-            .validate()
-            .map_err(|error| CodeCortexError::InvalidEvidence(error.to_string()))?;
+        let evidence = normalized_lsp_evidence(record, &result, &currentness, raw_artifact_id)?;
         if self.retained_lsp.contains_key(&process_operation_id) {
             return Err(CodeCortexError::InvalidEvidence(
                 "the original process operation is already retained".to_owned(),
@@ -521,6 +460,80 @@ impl SemanticIndex {
             .ok_or(CodeCortexError::RevisionOverflow)?;
         self.revision()
     }
+}
+
+fn normalized_lsp_evidence(
+    record: &RetainedLspObservationV1,
+    result: &NormalizedResult,
+    currentness: &LspFreshness,
+    raw_artifact_id: ArtifactId,
+) -> Result<NormalizedEvidence, CodeCortexError> {
+    if !matches!(&result.receipt().freshness, LspFreshness::Stale { .. }) {
+        return Err(CodeCortexError::InvalidEvidence(
+            "LSP adoption did not preserve the original stale observation receipt".to_owned(),
+        ));
+    }
+    let raw_metadata = record
+        .raw_outputs
+        .iter()
+        .map(|output| {
+            serde_json::json!({
+                "kind": output.kind,
+                "artifact_id": output.evidence.artifact_id.to_string(),
+                "sha256": output.evidence.sha256,
+                "source": output.evidence.source,
+                "truncated": output.evidence.truncated,
+            })
+        })
+        .collect::<Vec<_>>();
+    let coverage = match (&result.receipt().coverage, &result.receipt().disposition) {
+        (LspCoverage::ProbeOnly, _) => EvidenceCoverage::NotApplicable,
+        (LspCoverage::Workspace { .. }, FailureDisposition::Success) => {
+            EvidenceCoverage::CompleteForScope
+        }
+        _ => EvidenceCoverage::PartialForScope,
+    };
+    let value = serde_json::json!({
+        "receipt_kind": eliot_lsp_bridge::LSP_TOOL_OBSERVATION_RECEIPT_KIND,
+        "operation": &record.operation,
+        "config": &record.config,
+        "source_candidate": &record.source_candidate,
+        "instrument_invocation": &record.instrument_invocation,
+        "process_intent": &record.process_intent,
+        "invocation_digest": &record.invocation_digest,
+        "resolved_executable": &record.resolved_executable,
+        "instrument_spec": &record.instrument_spec,
+        "registry_identity": &record.registry_identity,
+        "process_evidence": &record.process_evidence,
+        "adoption_currentness": currentness,
+        "result": result,
+        "raw_outputs": raw_metadata,
+    });
+    let evidence = NormalizedEvidence {
+        evidence_id: raw_artifact_id.clone(),
+        raw_artifact_id,
+        normalizer: record.registry_identity.normalizer.clone(),
+        kind: LSP_NORMALIZED_EVIDENCE_KIND.to_owned(),
+        summary: match currentness {
+            LspFreshness::Current => {
+                "bridge-validated LSP observation with live source-owner currentness".to_owned()
+            }
+            LspFreshness::Stale { .. } => {
+                "bridge-validated LSP observation with stale or unavailable currentness".to_owned()
+            }
+        },
+        value,
+        axes: EvidenceAxes::observed(),
+        freshness: match currentness {
+            LspFreshness::Current => EvidenceFreshness::ExactCandidate,
+            LspFreshness::Stale { .. } => EvidenceFreshness::Stale,
+        },
+        coverage,
+    };
+    evidence
+        .validate()
+        .map_err(|error| CodeCortexError::InvalidEvidence(error.to_string()))?;
+    Ok(evidence)
 }
 
 pub struct CodeCortexService {
@@ -594,10 +607,13 @@ impl CodeCortexService {
     /// preserves each original LSP observation receipt unchanged.
     pub fn with_captured_lsp_observations(
         current_read_task_binding: TaskBinding,
-        current_read_causal_binding: CausalBinding,
+        current_read_causal_binding: &CausalBinding,
         observations: Vec<CapturedLspObservation>,
     ) -> Result<Self, CodeCortexError> {
-        validate_current_read_binding(&current_read_task_binding, &current_read_causal_binding)?;
+        validate_current_read_binding(
+            &current_read_task_binding,
+            current_read_causal_binding,
+        )?;
         let mut index = SemanticIndex::new();
         for observation in observations {
             validate_captured_lsp_payload_reference(&observation.reference)?;
@@ -607,11 +623,11 @@ impl CodeCortexService {
                 &observation,
                 &record,
                 &current_read_task_binding,
-                &current_read_causal_binding,
+                current_read_causal_binding,
             )?;
             let process_operation_id = record.process_evidence.operation_id().as_str().to_owned();
             index.admit_lsp_observation(
-                record,
+                &record,
                 result,
                 process_operation_id,
                 LspFreshness::Stale {
@@ -621,7 +637,7 @@ impl CodeCortexService {
         }
         Ok(Self {
             index,
-            current_task_binding: Some(current_read_task_binding),
+                current_task_binding: Some(current_read_task_binding),
         })
     }
 
@@ -638,11 +654,9 @@ impl CodeCortexService {
         request: &CompositionRequest,
     ) -> Result<CodeCortexReport, CodeCortexError> {
         request.validate()?;
-        if self
-            .current_task_binding
-            .as_ref()
-            .is_some_and(|binding| request.task_id != binding.task_id.to_string())
-        {
+        if self.current_task_binding.as_ref().is_some_and(|binding| {
+            request.task_id != binding.task_id.to_string()
+        }) {
             return Err(CodeCortexError::TaskBindingMismatch);
         }
         let mut report = compose_snapshot(request, &self.index.snapshot())?;
@@ -779,283 +793,342 @@ fn project_retained_lsp_observations(
             });
             continue;
         }
-        let observation_is_current = matches!(&observation.currentness, LspFreshness::Current);
-        let node_freshness = if observation_is_current {
-            "current"
-        } else {
-            "stale"
-        };
-        let relation_freshness = if observation_is_current {
-            RelationFreshness::Current
-        } else {
-            RelationFreshness::Stale
-        };
-        for handle in &observation.raw_handles {
-            if !report.evidence_handles.contains(handle) {
-                report.evidence_handles.push(handle.clone());
-            }
-        }
-        if !report
-            .evidence_handles
-            .contains(&observation.process_operation_id)
-        {
-            report
-                .evidence_handles
-                .push(observation.process_operation_id.clone());
-        }
-        let receipt = observation.result.receipt();
-        let workspace_complete = matches!(&receipt.coverage, LspCoverage::Workspace { .. })
-            && matches!(&receipt.disposition, FailureDisposition::Success);
-        if let LspFreshness::Stale { reason } = &observation.currentness {
-            report.coverage_gaps.push(CoverageGap {
-                scope: request.scope.clone(),
-                reason: format!("LSP evidence {evidence_id} is stale at owner adoption: {reason}"),
-                cheapest_probe: Some(
-                    "obtain a current source-bound observation through the owning process path"
-                        .to_owned(),
-                ),
-            });
-        } else if !workspace_complete {
-            report.coverage_gaps.push(CoverageGap {
-                scope: request.scope.clone(),
-                reason: format!(
-                    "current LSP evidence {evidence_id} covers only its declared operation scope, not the requested workspace scope"
-                ),
-                cheapest_probe: Some(
-                    "obtain a successful workspace-scoped observation for workspace coverage"
-                        .to_owned(),
-                ),
-            });
-        }
-        if has_empty_lookup_result(&observation.result) {
-            report.coverage_gaps.push(CoverageGap {
-                scope: request.scope.clone(),
-                reason: format!(
-                    "empty LSP lookup evidence {evidence_id} is not a qualified absence result; #1815 owns absence qualification"
-                ),
-                cheapest_probe: None,
-            });
-        }
-
-        let mut node_limit_reached = false;
-        let mut relation_limit_reached = false;
-        match &observation.result {
-            NormalizedResult::Definitions { items, .. } => {
-                for item in items {
-                    let symbol = lsp_symbol_coordinate(&observation.workspace_root, &item.symbol);
-                    let location = lsp_span_coordinate(
-                        &observation.workspace_root,
-                        &item.path,
-                        Some(&item.symbol),
-                        item.line,
-                        item.column,
-                    );
-                    if !admit_lsp_node(
-                        request,
-                        report,
-                        symbol.clone(),
-                        format!("{node_freshness}_lsp_symbol_observation"),
-                        Some(item.symbol.clone()),
-                        &observation.process_operation_id,
-                    )? || !admit_lsp_node(
-                        request,
-                        report,
-                        location.clone(),
-                        format!("{node_freshness}_lsp_definition_observation"),
-                        Some(item.symbol.clone()),
-                        &observation.process_operation_id,
-                    )? {
-                        node_limit_reached = true;
-                        break;
-                    }
-                    if !admit_lsp_relation(
-                        request,
-                        report,
-                        symbol,
-                        location,
-                        "lsp_definition_observed",
-                        &observation.process_operation_id,
-                        relation_freshness,
-                    ) {
-                        relation_limit_reached = true;
-                        break;
-                    }
-                }
-            }
-            NormalizedResult::References { items, .. } => {
-                for item in items {
-                    let symbol = lsp_symbol_coordinate(&observation.workspace_root, &item.symbol);
-                    let location = lsp_span_coordinate(
-                        &observation.workspace_root,
-                        &item.path,
-                        Some(&item.symbol),
-                        item.line,
-                        item.column,
-                    );
-                    if !admit_lsp_node(
-                        request,
-                        report,
-                        symbol.clone(),
-                        format!("{node_freshness}_lsp_symbol_observation"),
-                        Some(item.symbol.clone()),
-                        &observation.process_operation_id,
-                    )? || !admit_lsp_node(
-                        request,
-                        report,
-                        location.clone(),
-                        format!("{node_freshness}_lsp_reference_observation"),
-                        Some(item.symbol.clone()),
-                        &observation.process_operation_id,
-                    )? {
-                        node_limit_reached = true;
-                        break;
-                    }
-                    if !admit_lsp_relation(
-                        request,
-                        report,
-                        symbol,
-                        location,
-                        "lsp_reference_observed",
-                        &observation.process_operation_id,
-                        relation_freshness,
-                    ) {
-                        relation_limit_reached = true;
-                        break;
-                    }
-                }
-            }
-            NormalizedResult::Symbols { items, receipt } => {
-                let path_scope = match &receipt.coverage {
-                    LspCoverage::SymbolSubset { path_scope } if !path_scope.is_empty() => {
-                        Some(path_scope.clone())
-                    }
-                    _ => None,
-                };
-                for item in items {
-                    let coordinate = GraphCoordinate {
-                        kind: CoordinateKind::Symbol,
-                        package: observation.workspace_root.clone(),
-                        path: path_scope.clone(),
-                        symbol: Some(item.symbol.clone()),
-                        line: None,
-                        column: None,
-                    };
-                    if !admit_lsp_node(
-                        request,
-                        report,
-                        coordinate,
-                        format!("{node_freshness}_lsp_symbol_kind_{}", item.kind),
-                        item.display_name.clone(),
-                        &observation.process_operation_id,
-                    )? {
-                        node_limit_reached = true;
-                        break;
-                    }
-                }
-            }
-            NormalizedResult::Diagnostics { observations, .. } => {
-                for item in observations {
-                    let severity = match item.severity {
-                        DiagnosticSeverity::Error => "error",
-                        DiagnosticSeverity::Warning => "warning",
-                        DiagnosticSeverity::Information => "information",
-                        DiagnosticSeverity::Hint => "hint",
-                        DiagnosticSeverity::Unknown => "unknown",
-                    };
-                    if !admit_lsp_node(
-                        request,
-                        report,
-                        lsp_span_coordinate(
-                            &observation.workspace_root,
-                            &item.file,
-                            None,
-                            item.line,
-                            item.column,
-                        ),
-                        format!("{node_freshness}_lsp_diagnostic_{severity}"),
-                        Some(item.code.clone()),
-                        &observation.process_operation_id,
-                    )? {
-                        node_limit_reached = true;
-                        break;
-                    }
-                }
-            }
-            NormalizedResult::Rename { candidate, .. } => {
-                if candidate.applied {
-                    return Err(CodeCortexError::InvalidEvidence(
-                        "bridge adoption returned an applied rename candidate".to_owned(),
-                    ));
-                }
-                let symbol = lsp_symbol_coordinate(&observation.workspace_root, &candidate.symbol);
-                if !admit_lsp_node(
-                    request,
-                    report,
-                    symbol.clone(),
-                    format!("{node_freshness}_lsp_symbol_observation"),
-                    Some(candidate.symbol.clone()),
-                    &observation.process_operation_id,
-                )? {
-                    node_limit_reached = true;
-                }
-                for edit in &candidate.edits {
-                    if node_limit_reached || relation_limit_reached {
-                        break;
-                    }
-                    let location = lsp_span_coordinate(
-                        &observation.workspace_root,
-                        &edit.path,
-                        Some(&candidate.symbol),
-                        edit.line,
-                        edit.column,
-                    );
-                    if !admit_lsp_node(
-                        request,
-                        report,
-                        location.clone(),
-                        format!("{node_freshness}_lsp_unapplied_rename_candidate"),
-                        Some(candidate.new_name.clone()),
-                        &observation.process_operation_id,
-                    )? {
-                        node_limit_reached = true;
-                        break;
-                    }
-                    if !admit_lsp_relation(
-                        request,
-                        report,
-                        symbol.clone(),
-                        location,
-                        "lsp_rename_candidate_observed",
-                        &observation.process_operation_id,
-                        relation_freshness,
-                    ) {
-                        relation_limit_reached = true;
-                        break;
-                    }
-                }
-            }
-            NormalizedResult::Version { .. } => {}
-        }
-        if node_limit_reached {
-            report.coverage_gaps.push(CoverageGap {
-                scope: request.scope.clone(),
-                reason: format!(
-                    "retained LSP evidence {evidence_id} was projected only up to the requested node limit"
-                ),
-                cheapest_probe: None,
-            });
-        }
-        if relation_limit_reached {
-            report.coverage_gaps.push(CoverageGap {
-                scope: request.scope.clone(),
-                reason: format!(
-                    "retained LSP evidence {evidence_id} was projected only up to the requested relation limit"
-                ),
-                cheapest_probe: None,
-            });
-        }
+        project_retained_lsp_observation(request, evidence_id, observation, report)?;
     }
     Ok(())
+}
+
+fn project_retained_lsp_observation(
+    request: &CompositionRequest,
+    evidence_id: &str,
+    observation: &RetainedLspProjection,
+    report: &mut CodeCortexReport,
+) -> Result<(), CodeCortexError> {
+    let observation_is_current = matches!(&observation.currentness, LspFreshness::Current);
+    for handle in &observation.raw_handles {
+        if !report.evidence_handles.contains(handle) {
+            report.evidence_handles.push(handle.clone());
+        }
+    }
+    if !report
+        .evidence_handles
+        .contains(&observation.process_operation_id)
+    {
+        report
+            .evidence_handles
+            .push(observation.process_operation_id.clone());
+    }
+    let receipt = observation.result.receipt();
+    let workspace_complete = matches!(&receipt.coverage, LspCoverage::Workspace { .. })
+        && matches!(&receipt.disposition, FailureDisposition::Success);
+    if let LspFreshness::Stale { reason } = &observation.currentness {
+        report.coverage_gaps.push(CoverageGap {
+            scope: request.scope.clone(),
+            reason: format!("LSP evidence {evidence_id} is stale at owner adoption: {reason}"),
+            cheapest_probe: Some(
+                "obtain a current source-bound observation through the owning process path"
+                    .to_owned(),
+            ),
+        });
+    } else if !workspace_complete {
+        report.coverage_gaps.push(CoverageGap {
+            scope: request.scope.clone(),
+            reason: format!(
+                "current LSP evidence {evidence_id} covers only its declared operation scope, not the requested workspace scope"
+            ),
+            cheapest_probe: Some(
+                "obtain a successful workspace-scoped observation for workspace coverage"
+                    .to_owned(),
+            ),
+        });
+    }
+    if has_empty_lookup_result(&observation.result) {
+        report.coverage_gaps.push(CoverageGap {
+            scope: request.scope.clone(),
+            reason: format!(
+                "empty LSP lookup evidence {evidence_id} is not a qualified absence result; #1815 owns absence qualification"
+            ),
+            cheapest_probe: None,
+        });
+    }
+    let freshness = if observation_is_current {
+        RelationFreshness::Current
+    } else {
+        RelationFreshness::Stale
+    };
+    let (node_limit_reached, relation_limit_reached) =
+        project_lsp_result(request, observation, report, freshness)?;
+    if node_limit_reached {
+        report.coverage_gaps.push(CoverageGap {
+            scope: request.scope.clone(),
+            reason: format!(
+                "retained LSP evidence {evidence_id} was projected only up to the requested node limit"
+            ),
+            cheapest_probe: None,
+        });
+    }
+    if relation_limit_reached {
+        report.coverage_gaps.push(CoverageGap {
+            scope: request.scope.clone(),
+            reason: format!(
+                "retained LSP evidence {evidence_id} was projected only up to the requested relation limit"
+            ),
+            cheapest_probe: None,
+        });
+    }
+    Ok(())
+}
+
+fn project_lsp_result(
+    request: &CompositionRequest,
+    observation: &RetainedLspProjection,
+    report: &mut CodeCortexReport,
+    freshness: RelationFreshness,
+) -> Result<(bool, bool), CodeCortexError> {
+    let node_freshness = if freshness == RelationFreshness::Current {
+        "current"
+    } else {
+        "stale"
+    };
+    match &observation.result {
+        NormalizedResult::Definitions { items, .. } => project_lsp_locations(
+            request,
+            observation,
+            report,
+            items
+                .iter()
+                .map(|item| (item.symbol.as_str(), item.path.as_str(), item.line, item.column)),
+            "definition_observation",
+            "lsp_definition_observed",
+            freshness,
+        ),
+        NormalizedResult::References { items, .. } => project_lsp_locations(
+            request,
+            observation,
+            report,
+            items
+                .iter()
+                .map(|item| (item.symbol.as_str(), item.path.as_str(), item.line, item.column)),
+            "reference_observation",
+            "lsp_reference_observed",
+            freshness,
+        ),
+        NormalizedResult::Symbols { items, receipt } => project_lsp_symbols(
+            request,
+            observation,
+            report,
+            items,
+            &receipt.coverage,
+            node_freshness,
+        ),
+        NormalizedResult::Diagnostics { observations, .. } => project_lsp_diagnostics(
+            request,
+            observation,
+            report,
+            observations,
+            node_freshness,
+        ),
+        NormalizedResult::Rename { candidate, .. } => project_lsp_rename(
+            request,
+            observation,
+            report,
+            candidate,
+            node_freshness,
+            freshness,
+        ),
+        NormalizedResult::Version { .. } => Ok((false, false)),
+    }
+}
+
+fn project_lsp_locations<'a>(
+    request: &CompositionRequest,
+    observation: &RetainedLspProjection,
+    report: &mut CodeCortexReport,
+    items: impl Iterator<Item = (&'a str, &'a str, u32, u32)>,
+    location_node_kind: &str,
+    relation_kind: &str,
+    freshness: RelationFreshness,
+) -> Result<(bool, bool), CodeCortexError> {
+    let node_freshness = if freshness == RelationFreshness::Current {
+        "current"
+    } else {
+        "stale"
+    };
+    let mut node_limit_reached = false;
+    let mut relation_limit_reached = false;
+    for (symbol_name, path, line, column) in items {
+        let symbol = lsp_symbol_coordinate(&observation.workspace_root, symbol_name);
+        let location = lsp_span_coordinate(
+            &observation.workspace_root,
+            path,
+            Some(symbol_name),
+            line,
+            column,
+        );
+        if !admit_lsp_node(
+            request,
+            report,
+            symbol.clone(),
+            format!("{node_freshness}_lsp_symbol_observation"),
+            Some(symbol_name.to_owned()),
+            &observation.process_operation_id,
+        )? || !admit_lsp_node(
+            request,
+            report,
+            location.clone(),
+            format!("{node_freshness}_lsp_{location_node_kind}"),
+            Some(symbol_name.to_owned()),
+            &observation.process_operation_id,
+        )? {
+            node_limit_reached = true;
+            break;
+        }
+        if !admit_lsp_relation(
+            request,
+            report,
+            &symbol,
+            &location,
+            relation_kind,
+            &observation.process_operation_id,
+            freshness,
+        ) {
+            relation_limit_reached = true;
+            break;
+        }
+    }
+    Ok((node_limit_reached, relation_limit_reached))
+}
+
+fn project_lsp_symbols(
+    request: &CompositionRequest,
+    observation: &RetainedLspProjection,
+    report: &mut CodeCortexReport,
+    items: &[SymbolInfo],
+    coverage: &LspCoverage,
+    node_freshness: &str,
+) -> Result<(bool, bool), CodeCortexError> {
+    let path_scope = match coverage {
+        LspCoverage::SymbolSubset { path_scope } if !path_scope.is_empty() => {
+            Some(path_scope.clone())
+        }
+        _ => None,
+    };
+    for item in items {
+        let coordinate = GraphCoordinate {
+            kind: CoordinateKind::Symbol,
+            package: observation.workspace_root.clone(),
+            path: path_scope.clone(),
+            symbol: Some(item.symbol.clone()),
+            line: None,
+            column: None,
+        };
+        if !admit_lsp_node(
+            request,
+            report,
+            coordinate,
+            format!("{node_freshness}_lsp_symbol_kind_{}", item.kind),
+            item.display_name.clone(),
+            &observation.process_operation_id,
+        )? {
+            return Ok((true, false));
+        }
+    }
+    Ok((false, false))
+}
+
+fn project_lsp_diagnostics(
+    request: &CompositionRequest,
+    observation: &RetainedLspProjection,
+    report: &mut CodeCortexReport,
+    items: &[DiagnosticObservation],
+    node_freshness: &str,
+) -> Result<(bool, bool), CodeCortexError> {
+    for item in items {
+        let severity = match item.severity {
+            DiagnosticSeverity::Error => "error",
+            DiagnosticSeverity::Warning => "warning",
+            DiagnosticSeverity::Information => "information",
+            DiagnosticSeverity::Hint => "hint",
+            DiagnosticSeverity::Unknown => "unknown",
+        };
+        if !admit_lsp_node(
+            request,
+            report,
+            lsp_span_coordinate(
+                &observation.workspace_root,
+                &item.file,
+                None,
+                item.line,
+                item.column,
+            ),
+            format!("{node_freshness}_lsp_diagnostic_{severity}"),
+            Some(item.code.clone()),
+            &observation.process_operation_id,
+        )? {
+            return Ok((true, false));
+        }
+    }
+    Ok((false, false))
+}
+
+fn project_lsp_rename(
+    request: &CompositionRequest,
+    observation: &RetainedLspProjection,
+    report: &mut CodeCortexReport,
+    candidate: &RenameCandidate,
+    node_freshness: &str,
+    freshness: RelationFreshness,
+) -> Result<(bool, bool), CodeCortexError> {
+    if candidate.applied {
+        return Err(CodeCortexError::InvalidEvidence(
+            "bridge adoption returned an applied rename candidate".to_owned(),
+        ));
+    }
+    let symbol = lsp_symbol_coordinate(&observation.workspace_root, &candidate.symbol);
+    let mut node_limit_reached = !admit_lsp_node(
+        request,
+        report,
+        symbol.clone(),
+        format!("{node_freshness}_lsp_symbol_observation"),
+        Some(candidate.symbol.clone()),
+        &observation.process_operation_id,
+    )?;
+    let mut relation_limit_reached = false;
+    for edit in &candidate.edits {
+        if node_limit_reached || relation_limit_reached {
+            break;
+        }
+        let location = lsp_span_coordinate(
+            &observation.workspace_root,
+            &edit.path,
+            Some(&candidate.symbol),
+            edit.line,
+            edit.column,
+        );
+        if !admit_lsp_node(
+            request,
+            report,
+            location.clone(),
+            format!("{node_freshness}_lsp_unapplied_rename_candidate"),
+            Some(candidate.new_name.clone()),
+            &observation.process_operation_id,
+        )? {
+            node_limit_reached = true;
+            break;
+        }
+        if !admit_lsp_relation(
+            request,
+            report,
+            &symbol,
+            &location,
+            "lsp_rename_candidate_observed",
+            &observation.process_operation_id,
+            freshness,
+        ) {
+            relation_limit_reached = true;
+        }
+    }
+    Ok((node_limit_reached, relation_limit_reached))
 }
 
 fn has_empty_lookup_result(result: &NormalizedResult) -> bool {
@@ -1102,8 +1175,8 @@ fn admit_lsp_node(
 fn admit_lsp_relation(
     request: &CompositionRequest,
     report: &mut CodeCortexReport,
-    from: GraphCoordinate,
-    to: GraphCoordinate,
+    from: &GraphCoordinate,
+    to: &GraphCoordinate,
     kind: &str,
     evidence_id: &str,
     freshness: RelationFreshness,
