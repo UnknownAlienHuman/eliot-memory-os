@@ -10059,8 +10059,7 @@ impl ColdStartReadinessOrsRecord {
         if terminal.receipt_revision != self.record_revision {
             return Err(OrsError::IntegrityProblem {
                 record_type: COLD_START_READINESS_RECORD_TYPE,
-                reason: "terminal readiness revision does not match its lease revision"
-                    .to_owned(),
+                reason: "terminal readiness revision does not match its lease revision".to_owned(),
             });
         }
         if terminal.receipt_bytes.is_empty() {
@@ -10075,14 +10074,13 @@ impl ColdStartReadinessOrsRecord {
                 reason: "terminal receipt bytes do not match their digest".to_owned(),
             });
         }
-        let value: Value = serde_json::from_str(&terminal.receipt_bytes).map_err(|_| {
-            OrsError::InvalidField {
+        let value: Value =
+            serde_json::from_str(&terminal.receipt_bytes).map_err(|_| OrsError::InvalidField {
                 field: "cold_start_receipt_bytes",
                 reason: "terminal receipt bytes must be JSON",
-            }
-        })?;
-        let canonical = canonical_json_bytes(&value)
-            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+            })?;
+        let canonical =
+            canonical_json_bytes(&value).map_err(|error| OrsError::Encoding(error.to_string()))?;
         if canonical.as_slice() != terminal.receipt_bytes.as_bytes() {
             return Err(OrsError::InvalidField {
                 field: "cold_start_receipt_bytes",
@@ -10108,8 +10106,7 @@ impl ColdStartReadinessOrsRecord {
             == Some(terminal.receipt_ref.as_str())
             && value.get("lease_ref").and_then(Value::as_str)
                 == Some(self.claim.lease_ref.as_str())
-            && value.get("receipt_revision").and_then(Value::as_u64)
-                == Some(self.record_revision)
+            && value.get("receipt_revision").and_then(Value::as_u64) == Some(self.record_revision)
             && value
                 .get("governing_source_generation")
                 .and_then(Value::as_u64)
@@ -10136,9 +10133,9 @@ impl ColdStartReadinessOrsRecord {
                 .and_then(|instance| instance.get("root_identity"))
                 .and_then(Value::as_str)
                 == Some(self.claim.key.filesystem_identity_ref.as_str())
-            && instance.and_then(|instance| instance.get("vcs_identity_ref")) == Some(&expected_vcs)
-            && value.get("expiry_tick").and_then(Value::as_u64)
-                == Some(self.claim.lease_deadline);
+            && instance.and_then(|instance| instance.get("vcs_identity_ref"))
+                == Some(&expected_vcs)
+            && value.get("expiry_tick").and_then(Value::as_u64) == Some(self.claim.lease_deadline);
         if !identity_matches {
             return Err(OrsError::IntegrityProblem {
                 record_type: COLD_START_READINESS_RECORD_TYPE,
