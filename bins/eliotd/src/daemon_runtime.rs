@@ -5082,8 +5082,11 @@ struct FairPullRecoveryFlightState {
 ///
 /// This is the thirteenth single-owner polled flight, and it is the one that
 /// makes the I14.8 progress loop correct rather than merely fast. The event arm
-/// (`solo_ingest_result`) advances released capacity in the same operation that
-/// released it; that arm is an optimisation. This one exists because an
+/// (`solo_ingest_result`) is *meant* to advance released capacity in the same
+/// operation that released it, but nothing in the tree calls that function, so
+/// today this poll is the only wired arm and the only one holding I14.8:14 —
+/// that requirement is that progress need no external prompt, not that every
+/// transition synchronously drives a pull. This one exists because an
 /// event-only loop is a lost-wakeup deadlock: a dropped, coalesced or
 /// pre-registered notification would leave the loop waiting forever for work
 /// that is already eligible.

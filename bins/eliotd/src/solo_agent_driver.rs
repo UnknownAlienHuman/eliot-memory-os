@@ -1370,24 +1370,34 @@ fn load_scheduling_profile(
 /// Drives the coordinator's fair pull over the capacity a settled attempt just
 /// released (issue #1683 W1, I14.8 "Scheduler is pull-based").
 ///
-/// This is the **event arm** of the I14.8 progress loop: the daemon's
-/// production call of `AgentFabric::drive_fair_pull`, on the I14.8 release
-/// path. `submit_attempt_result` has just settled an attempt, so the
-/// coordinator is asked for the next currently admissible item instead of
-/// waiting for another agent command. It runs after
+/// This is the **event arm** of the I14.8 progress loop: the low-latency join
+/// on the I14.8 release path, where `submit_attempt_result` has just settled an
+/// attempt, so the coordinator is asked for the next currently admissible item
+/// instead of waiting for another agent command. It runs after
 /// [`repersist_after_control`], so the candidate result and settlement state are
 /// already durable and a refused queue profile cannot lose an observation.
 ///
 /// A release that arrives while nobody is listening to a wake still cannot
 /// strand work, because the same drive is also reached by the always-armed
-/// bounded recovery poll in [`solo_fair_pull_recovery`]. This arm is the
-/// low-latency path; it is not the correctness mechanism.
+/// bounded recovery poll in [`solo_fair_pull_recovery`]. That poll, not this
+/// join, is what holds I14.8:14 — "Mechanical queue progress never depends on
+/// an LLM remembering to start another agent" — because that requirement is that
+/// progress need *no external prompt*, not that every transition synchronously
+/// drives a pull. This arm is the low-latency path; it is not the correctness
+/// mechanism.
 ///
-/// Reachable in a non-test build: [`solo_ingest_result`] and
+/// **Not currently wired.** This join is not `cfg(test)`-gated, so it is
+/// compiled and callable in production, but its only caller is
+/// [`solo_ingest_result`], which has no caller in this tree: the sole remaining
+/// reference to it is the public
 /// [`DaemonComposition::solo_ingest_result`](crate::DaemonComposition::solo_ingest_result)
-/// are not `cfg(test)`-gated, so this join is compiled and callable in
-/// production. It is one documented fail-closed hop short of live work today,
-/// and that hop is not this issue's: in a non-test build
+/// wrapper, which nothing calls either. So no released capacity is advanced by
+/// the operation that released it today, and this path stays correct only
+/// because the bounded poll is always armed. Wiring it is a caller decision,
+/// not a defect in the mechanism, and no caller is invented here.
+///
+/// The arm is also one documented fail-closed hop short of live work, and that
+/// hop is not this issue's: in a non-test build
 /// `restore_solo_fabric` refuses with "solo restore is blocked until Kernel
 /// retains an independently owner-verified executable-binding digest", and
 /// `drive_solo_delegate_async` refuses before any fabric effect, so no
@@ -1650,7 +1660,9 @@ pub fn solo_ingest_result(
     repersist_after_control(composition, &fabric, &mut projection)?;
     // Issue #1683 W1 / I14.8: the settled attempt released its slot, so the
     // coordinator's bounded fair pull runs now instead of on the next agent
-    // command. The candidate result is already durable above.
+    // command. The candidate result is already durable above. This whole
+    // function currently has no caller in the tree, so this join does not run
+    // in production yet; see `drive_fair_pull_after_release`.
     drive_fair_pull_after_release(composition, &mut fabric, &mut projection)?;
     solo_status(composition, operation_id)
 }

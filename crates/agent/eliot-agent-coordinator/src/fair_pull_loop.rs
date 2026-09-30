@@ -72,22 +72,38 @@
 //!
 //! # Production reachability
 //!
-//! Reachable in a non-test build, and the two arms are separate callers:
+//! Only one of the two arms is wired into the daemon. Read that as a difference
+//! in *reachability*, not as a difference in correctness:
 //!
-//! - **Event arm.** `AgentFabric::drive_fair_pull` in
-//!   `bins/eliotd/src/agent_fabric.rs` calls
-//!   [`AgentCoordinator::drive_fair_pull`] on the daemon's live coordinator, and
-//!   `solo_agent_driver::solo_ingest_result` calls that on the production
-//!   worker settle path, so released capacity advances work in the same
-//!   operation that released it. Neither is `cfg(test)`-gated.
-//! - **Recovery-poll arm.** `solo_agent_driver::solo_fair_pull_recovery` in
+//! - **Recovery-poll arm — live.**
+//!   `solo_agent_driver::solo_fair_pull_recovery` in
 //!   `bins/eliotd/src/solo_agent_driver.rs` calls the same
 //!   [`AgentCoordinator::drive_fair_pull`] on the daemon's existing bounded
 //!   activation cadence, and `daemon_runtime::maybe_start_fair_pull_recovery`
 //!   starts it on **every** tick of that cadence. It is not gated on a pending
 //!   wake, on a prior failure, or on anything else: that is what makes it a
 //!   fallback rather than a degraded mode, and it is the arm that survives a
-//!   lost notification.
+//!   lost notification. It is bounded on four axes: `MissedTickBehavior::Skip`
+//!   on the shared cadence, one single-flight poll at a time so ticks never
+//!   overlap it, at most one drive per tick whose own bound is the active
+//!   attempt count the projection itself reports, and a completion settle that
+//!   re-arms on *every* outcome, refusal included.
+//! - **Event arm — not wired.** `AgentFabric::drive_fair_pull` in
+//!   `bins/eliotd/src/agent_fabric.rs` calls
+//!   [`AgentCoordinator::drive_fair_pull`] on the daemon's coordinator, but the
+//!   release-side join that calls it — `drive_fair_pull_after_release` — is
+//!   reached only from `solo_ingest_result`, and nothing calls that: its sole
+//!   remaining reference is the public `DaemonComposition::solo_ingest_result`
+//!   wrapper in `bins/eliotd/src/lib.rs`, which nothing calls either. So the
+//!   event arm is correct, non-`cfg(test)` code with no caller, and it does
+//!   **not** today advance released capacity in the same operation that
+//!   released it. No caller is invented here to make it look otherwise.
+//!
+//! That does not weaken I14.8:14 ("Mechanical queue progress never depends on
+//! an LLM remembering to start another agent"). The requirement is that progress
+//! needs *no external prompt*, not that every transition synchronously drives a
+//! pull, and the always-armed bounded poll is what satisfies it. Wiring the
+//! event arm would change *when* eligible work is noticed, never *whether*.
 //!
 //! The recovery poll reuses the same `ACTIVATION_POLL_INTERVAL` tick every
 //! other bounded step in `run_loop` already rides. No new timer, no new
@@ -95,14 +111,27 @@
 //! drive over the *same* projection, differing only in that it does not wait
 //! to be told there is work.
 //!
-//! Still blocked, and stated here rather than hidden: this coordinator's
-//! `attempts` map is empty in production because nothing in the tree
-//! constructs the provider-verified `ProviderAdmissionReceipt` that
-//! `AgentCoordinator::admit` requires — the G-11 admission owner, issue #1678.
-//! A production drive therefore performs one pull, selects nothing and stops,
-//! which is the correct bounded behaviour of an empty projection, and it
-//! becomes live the moment that owner lands. Nothing here waits for it and
-//! nothing here forges an admission to make it look live.
+//! Two production residuals, stated here rather than hidden, and neither is
+//! worked around here:
+//!
+//! 1. This coordinator's `attempts` map is empty in production, because no
+//!    production code supplies the provider-verified `ProviderAdmissionReceipt`
+//!    that `AgentCoordinator::admit` requires — the G-11 admission owner, issue
+//!    #1678. (The one non-test call of `admit` is the snapshot replay inside
+//!    `restore_with_admitted_provider`, which re-admits receipts its caller
+//!    must already hold; it does not issue one.)
+//! 2. Through the daemon the poll does not even reach that empty projection: in
+//!    a non-test build `restore_solo_fabric` returns `Err` unconditionally and
+//!    `drive_solo_delegate_async` refuses before any fabric effect, so no
+//!    production run ever sets a live operation and every tick reports
+//!    `FairPullRecovery::NoLiveProjection` without performing a drive. **The
+//!    poll therefore does not select work in production today.**
+//!
+//! Called directly over an empty admitted projection, a drive *does* perform
+//! one pull, select nothing and stop, which is the correct bounded behaviour of
+//! that projection. Both residuals close at the same two owners — the Kernel
+//! native-worker owner and the G-11 admission owner. Nothing here waits for
+//! them and nothing here forges an admission to make either arm look live.
 //!
 //! Proof ceiling: [`FAIR_PULL_LOOP_PROOF_CEILING`]. This loop starts
 //! coordinator attempts and nothing else: no process, no provider/admission/
