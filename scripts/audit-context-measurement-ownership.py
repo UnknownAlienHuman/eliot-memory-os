@@ -463,14 +463,22 @@ def _read_inventory_artifact(
             "INVENTORY_MALFORMED",
             f"the inventory artifact could not be read: {exc}",
         ) from exc
-    artifact = producer._parse_toml(raw, source=INVENTORY_REL)
+    # A malformed or unreadable artifact must produce a TYPED failure, never a
+    # producer traceback escaping to the user: both the parse and the closed
+    # schema/aggregate validation are translated here.
     try:
+        artifact = producer._parse_toml(raw, source=INVENTORY_REL)
         header, rows, worksets = producer._validate_artifact(artifact)
     except producer.InventoryError as exc:
         raise OracleError(
             "INVENTORY_MALFORMED",
             f"the inventory artifact is malformed or internally inconsistent: {exc.code}: {exc.detail}",
         ) from exc
+    if not isinstance(artifact.get("inventory_digest"), str):
+        raise OracleError(
+            "INVENTORY_MALFORMED",
+            f"the inventory artifact declares no string inventory_digest: {INVENTORY_REL}",
+        )
     return header, rows, worksets, str(artifact["inventory_digest"]), raw
 
 
@@ -895,7 +903,7 @@ def evaluate(root: Path) -> OwnershipResult:
         span_end: int = 0,
         rule: str = "",
     ) -> None:
-        findings.append(Finding(code, detail, row_id, case_ref, path, span_start, span_end, rule))
+        _record(findings, code, detail, row_id, case_ref, path, span_start, span_end, rule)
 
     producer = load_producer(root)
 
@@ -1397,6 +1405,23 @@ def _baseline_findings(
     return dispositions
 
 
+def _record(
+    findings: list[Finding],
+    code: str,
+    detail: str,
+    row_id: str = "",
+    case_ref: str = "",
+    path: str = "",
+    span_start: int = 0,
+    span_end: int = 0,
+    rule: str = "",
+) -> None:
+    """Append one typed finding. The single writer used by every finding site,
+    so the ``add`` closure in :func:`evaluate` and the reconciliation in
+    :func:`_finalize` share one construction path."""
+    findings.append(Finding(code, detail, row_id, case_ref, path, span_start, span_end, rule))
+
+
 def _finalize(
     root: Path,
     findings: list[Finding],
@@ -1415,7 +1440,22 @@ def _finalize(
     """Assemble the single immutable result, computing its digest over the
     full body (which excludes the digest itself)."""
     by_case = {str(r["case_ref"]): r for r in rows}
-    dispositions = _baseline_findings(rows, by_case, findings.append)  # type: ignore[arg-type]
+
+    def add(
+        code: str,
+        detail: str,
+        row_id: str = "",
+        case_ref: str = "",
+        path: str = "",
+        span_start: int = 0,
+        span_end: int = 0,
+        rule: str = "",
+    ) -> None:
+        _record(findings, code, detail, row_id, case_ref, path, span_start, span_end, rule)
+
+    dispositions = _baseline_findings(rows, by_case, add) if rows else {
+        d: 0 for d in BASELINE_DISPOSITIONS
+    }
     if extra_finding_check is not None:
         extra_finding_check()
 
