@@ -2355,9 +2355,10 @@ async fn publish_maintenance_source_results(
                     obligations.extend(job.result_obligations.iter().cloned());
                     jobs.push(job);
                 }
-                // No retained job is unavailable, not resolved: the decision's
-                // own result still publishes, and the job's results publish on
-                // the pass that observes the job.
+                // No retained job is unavailable, not resolved. The decision's
+                // own result still publishes, and the expected set keeps naming
+                // this job so its owed observation is reported as outstanding
+                // rather than quietly dropping out of coverage.
                 Ok(None) => {}
                 Err(error) => {
                     if failure_guard.should_emit() {
@@ -2455,6 +2456,17 @@ async fn publish_maintenance_source_results(
     // an outcome written after the fact, and never read as improvement.
     match eliot_maintenance::outcome_observation_coverage(&expected, &jobs, &admitted) {
         Ok(coverage) => {
+            // The summary states only what coverage is, never what utility is: a
+            // fully covered set means every declared result observation is
+            // admitted, not that the maintained subsystem improved.
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.maintenance_outcome_observation_coverage",
+                declared = expected.len(),
+                observed = coverage.observed.len(),
+                outstanding = coverage.outstanding.len(),
+                complete = coverage.is_complete(),
+            );
             for outstanding in coverage.outstanding {
                 let (job_ref, publication_id, detail) = match outstanding {
                     eliot_maintenance::OutstandingOutcome::ObservationOwed(obligation) => (
