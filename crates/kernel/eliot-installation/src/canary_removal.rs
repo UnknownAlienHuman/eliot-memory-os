@@ -36,6 +36,9 @@ use std::collections::BTreeSet;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use super::approved_generation_registry::{
+    PendingActivationTerminalDisposition, activation_terminal_digest,
+};
 use super::{
     ApprovedGenerationRegistry, ContractVersion, InstallationCoordinator, InstallationEffectAction,
     InstallationEffectObservation, InstallationEffectPort, InstallationEffectRequest,
@@ -336,8 +339,26 @@ pub struct CanaryRemovalQuiesce {
     pub active_generation: Option<PlatformHandle>,
     /// Last-known-good generation observed at plan time.
     pub last_known_good_generation: Option<PlatformHandle>,
-    /// Observed activation-owner handoff that retired the target from the
-    /// active pointer, when the registry records one.
+    /// Observed activation-owner handoff that keeps production serving a safe
+    /// generation while the target stays retired, when the registry records
+    /// one.
+    ///
+    /// The registry records a settled handoff in exactly one owner form: the
+    /// attributable cutover operation that installed the serving generation,
+    /// or the committed activation terminal digest carrying the Host-owned
+    /// readiness fence observed for the serving generation. The two forms are
+    /// mutually exclusive by registry construction — a pending-activation
+    /// commit clears the cutover binding when it flips the active pointer,
+    /// and a cutover is refused while a committed terminal names another
+    /// generation — so the barrier is the handoff identity in whichever form
+    /// the owner recorded it, bound to this installation and to a serving
+    /// generation that is not the target. The cutover receipt alone is never
+    /// treated as authority to retire: retirement stays the separately
+    /// authorized terminal registry step this removal commits last. A registry
+    /// with neither form — a staged but uncommitted activation, an abort, a
+    /// foreign handoff, or no recorded handoff at all — yields `None`, which
+    /// planning and admission both refuse. A removal without an observed safe
+    /// serving handoff is never admitted.
     pub retirement_barrier: Option<PlatformHandle>,
     /// Original installer effects that were not authoritatively applied.
     pub open_install_effects: u32,
@@ -1130,7 +1151,10 @@ pub fn canary_removal_operation_id(
 /// transaction and any already admitted removal record read-only and creates
 /// no file, secret, service, reservation or transaction row. A foreign,
 /// ambiguous, replaced, production or last-known-good target is refused here,
-/// before any destructive path exists. A reused removal identity with changed
+/// before any destructive path exists. A target without an observed
+/// activation-owner handoff to a serving safe generation is refused here as
+/// well: without that owner evidence production cannot be proven safely served
+/// elsewhere. A reused removal identity with changed
 /// inputs is refused here as well, so a conflicting re-admission fails fast
 /// at the plan boundary instead of only at apply.
 #[allow(
@@ -1221,10 +1245,27 @@ where
     }
     let survivors = surviving_generations(&projection, generation);
     let effects = freeze_effect_graph(&install, &survivors)?;
+    // The serving handoff is observed here, read-only, from the owner's own
+    // settled activation record for this installation. A registry with no
+    // settled handoff — a staged but uncommitted activation, an abort, a
+    // foreign handoff, or no recorded handoff at all — cannot prove production
+    // is safely served elsewhere, so the target is refused at the plan
+    // boundary before any destructive path exists.
+    let retirement_barrier = observed_handoff_barrier(
+        &projection,
+        generation,
+        &install.installation_epoch.installation,
+    )?
+    .ok_or_else(|| {
+        InstallationError::IncompleteObservation(
+            "canary removal requires an observed activation-owner handoff to a serving safe generation"
+                .to_owned(),
+        )
+    })?;
     let quiesce = CanaryRemovalQuiesce {
         active_generation: projection.active_generation().cloned(),
         last_known_good_generation: projection.last_known_good_generation().cloned(),
-        retirement_barrier: observed_retirement_barrier(&projection, generation),
+        retirement_barrier: Some(retirement_barrier),
         open_install_effects: open_install_effect_count(&install)?,
         pending_external_changes: pending_external_change_count(&install)?,
         pending_activation_generation: projection
@@ -1599,17 +1640,25 @@ fn observe_admission_fence(
             "the removal target is staged in a pending activation".to_owned(),
         ));
     }
-    // The retirement barrier is the drain evidence a dependent stop/delete has
-    // to follow. It must be recorded in the frozen plan and re-observed in this
-    // same observation, so no stop/delete is ever issued for a target whose
-    // retirement this attempt did not see.
+    // The serving handoff is re-observed in this same observation: the
+    // recorded barrier must still be the handoff the owner currently records
+    // for this installation with production served away from the target. A
+    // superseding activation, a return of the target to a serving pointer, a
+    // foreign handoff, or a lost handoff refuses the dependent stop/delete
+    // instead of inheriting a stale observation, so no stop/delete is ever
+    // issued for a target whose safe serving handoff this attempt did not see.
     let Some(recorded) = &plan.quiesce.retirement_barrier else {
         return Err(InstallationError::IncompleteObservation(
             "a dependent canary stop/delete requires the observed activation-owner retirement barrier"
                 .to_owned(),
         ));
     };
-    if observed_retirement_barrier(projection, &plan.generation).as_ref() != Some(recorded) {
+    let observed = observed_handoff_barrier(
+        projection,
+        &plan.generation,
+        &plan.installation_epoch.installation,
+    )?;
+    if observed.as_ref() != Some(recorded) {
         return Err(InstallationError::IdentityConflict);
     }
     Ok(())
@@ -1702,20 +1751,53 @@ fn pending_external_change_count(
     })
 }
 
-/// Returns the exact observed handoff that retired the target from the active
-/// pointer, when the activation owner recorded one.
+/// Observes the activation owner's settled handoff to the serving safe
+/// generation for one installation, when the registry records one.
 ///
-/// A caller-supplied replacement generation is never accepted here: the only
-/// admissible handoff evidence is the activation owner's own committed cutover
-/// receipt naming the target as the predecessor it consumed.
-fn observed_retirement_barrier(
+/// The caller reads the owner's current durable projection, never a list
+/// supplied alongside the removal request. The handoff counts only when
+/// production is served away from the removal target by this installation's
+/// own activation owner:
+///
+/// * the attributable cutover binding whose operation installed the serving
+///   generation, bound to this installation; the receipt's target is the
+///   serving generation by registry invariant, so a binding that serves the
+///   dying canary itself is no safe handoff;
+/// * otherwise the committed activation terminal digest, which carries the
+///   Host-owned readiness fence the activation owner observed for the serving
+///   generation; an aborted terminal, a terminal without a readiness fence,
+///   or a terminal for the dying canary itself is no safe handoff.
+///
+/// A caller-supplied replacement generation is never accepted here, and the
+/// cutover receipt is never treated as retirement authority: it proves only
+/// that the serving flip was committed under its operation identity, while
+/// retirement stays the separately authorized terminal registry step. `None`
+/// means the registry records no settled safe serving handoff — a staged but
+/// uncommitted activation, an abort, a foreign handoff, or no handoff at
+/// all — and every caller refuses it rather than defaulting it.
+fn observed_handoff_barrier(
     projection: &ApprovedGenerationRegistry,
     generation: &PlatformHandle,
-) -> Option<PlatformHandle> {
-    projection
-        .committed_cutover_activation()
-        .filter(|committed| committed.expected_predecessor == *generation)
-        .map(|committed| committed.operation_id.clone())
+    installation: &PlatformHandle,
+) -> Result<Option<PlatformHandle>, InstallationError> {
+    if let Some(committed) = projection.committed_cutover_activation() {
+        if committed.target_generation == *generation
+            || committed.installation != *installation
+        {
+            return Ok(None);
+        }
+        return Ok(Some(committed.operation_id.clone()));
+    }
+    let Some(terminal) = projection.last_terminal_activation.as_ref() else {
+        return Ok(None);
+    };
+    if terminal.disposition != PendingActivationTerminalDisposition::Committed
+        || terminal.commit_fence.is_none()
+        || terminal.generation == *generation
+    {
+        return Ok(None);
+    }
+    Ok(Some(activation_terminal_digest(terminal)?))
 }
 
 fn surviving_generations(
