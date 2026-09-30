@@ -237,16 +237,10 @@ fn map_composition_store_failure(
 fn map_composition_error(error: CompositionError, ctx: &StoreFailureIdentityContext) -> SkillError {
     match error {
         CompositionError::Kernel(inner) => map_kernel_error(inner, ctx),
-        CompositionError::TaskContractAcceptance(_) => map_composition_store_failure(
-            StoreFailureDisposition::DeterministicRejection,
-            "TASK_CONTRACT_ACCEPTANCE_INVALID",
-            StoreRetryDirective::DoNotRetry,
-            StoreRecoveryAction::None,
-            ctx,
-        ),
+        CompositionError::TaskContractAcceptance(error) => map_store_error(*error, ctx),
         CompositionError::TaskSelectionEvidence(_) => map_composition_store_failure(
             StoreFailureDisposition::DeterministicRejection,
-            "TASK_SELECTION_EVIDENCE_INVALID",
+            "TASK_SELECTION_REQUIRED",
             StoreRetryDirective::DoNotRetry,
             StoreRecoveryAction::None,
             ctx,

@@ -64,6 +64,7 @@ use thiserror::Error;
 
 use crate::{
     CanonicalAdmissionOwner, CompositionError, KernelPortError, KernelTransitionPort,
+    TaskSelectionAdmissionBinding,
     campaign_source_publishers::assemble_task_owner_matrix,
     campaign_task_sources::{
         TaskControllerCampaignSources, build_task_controller_campaign_sources,
@@ -84,6 +85,14 @@ pub struct PreparedTaskTransition {
     fence: StateFence,
     manifest_digest: OperationManifestDigest,
     failure_context: StoreFailureIdentityContext,
+}
+
+/// Additional owner-verified selection inputs for one Task Controller apply.
+pub struct TaskSelectionTransitionInput<'a> {
+    /// The owner-issued binding proved before the transition is prepared.
+    pub selection: &'a TaskSelectionAdmissionBinding,
+    /// Complete owner publications, when the caller read them before locking.
+    pub owner_publications: Option<Vec<CampaignSourcePublication>>,
 }
 
 impl PreparedTaskTransition {
@@ -359,6 +368,45 @@ impl<'a, P: ?Sized> GovernorTaskLifecycle<'a, P> {
             Some(&sources),
             Some(&publications),
         )?;
+        prepare_task_exchange(self.canonical, identity, envelope, manifest_digest)
+    }
+
+    /// Prepares a Task Controller transition carrying the exact owner-issued
+    /// task-selection evidence in the canonical envelope before hashing.
+    ///
+    /// The selection binding is rechecked against the request, task record,
+    /// scope owner snapshot, and fence. Its source/evidence handles and the
+    /// original task revision and acceptance digest become envelope fields
+    /// before `PreparedTransition` is created.
+    pub fn prepare_apply_task_with_selection(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: OperationId,
+        guarded: GuardedTaskCommand,
+        recipe: LearningStateViewRecipe,
+        source_heads: crate::campaign_task_sources::TaskControllerCampaignSourceHeads,
+        input: TaskSelectionTransitionInput<'_>,
+    ) -> Result<PreparedTaskTransition, TaskLifecycleError> {
+        let (event, record, expected_revision) = self.checked_apply(identity, guarded)?;
+        let manifest_digest = production_manifest_digest()?;
+        let sources =
+            build_task_controller_campaign_sources(&event, &record, recipe, source_heads)?;
+        let publications = input
+            .owner_publications
+            .map(|values| complete_campaign_publications(&sources, values))
+            .transpose()?;
+        let mut envelope = task_envelope(
+            identity,
+            operation_id,
+            &event,
+            &record,
+            expected_revision,
+            manifest_digest.clone(),
+            Some(&sources.recipe),
+            Some(&sources),
+            publications.as_deref(),
+        )?;
+        bind_task_selection_to_envelope(&mut envelope, identity, &record, input.selection)?;
         prepare_task_exchange(self.canonical, identity, envelope, manifest_digest)
     }
 
@@ -709,6 +757,77 @@ fn task_envelope(
         .validate()
         .map_err(|_| TaskLifecycleError::Owner(TaskError::InvalidField("task_envelope")))?;
     Ok(envelope)
+}
+
+fn bind_task_selection_to_envelope(
+    envelope: &mut CanonicalWriteEnvelope,
+    identity: &eliot_protocol::RequestIdentity,
+    record: &TaskRecord,
+    selection: &TaskSelectionAdmissionBinding,
+) -> Result<(), TaskLifecycleError> {
+    let evidence = selection.evidence();
+    evidence
+        .validate()
+        .map_err(|error| TaskLifecycleError::Composition(CompositionError::from(error)))?;
+    let fence = &identity.request.state_fence;
+    if identity.request.metadata.session_id.as_ref().map(|id| id.as_str())
+        != Some(selection.session_ref())
+        || identity.request.metadata.task_id.as_ref().map(|id| id.as_str())
+            != Some(record.task_id.as_str())
+        || selection.task_ref() != record.task_id.as_str()
+        || evidence.task_ref != record.task_id.as_str()
+        || evidence.task_revision != selection.task_revision()
+        || evidence.acceptance_digest != selection.acceptance_digest()
+        || selection.state_fence() != fence
+        || selection.work_scope().state_fence != *fence
+        || selection.work_scope().binding.scope.scope_ref != evidence.work_scope_ref
+        || fence.task_revision.map(TaskRevision::value) != Some(selection.task_revision())
+    {
+        return Err(TaskLifecycleError::Composition(
+            CompositionError::ActivationStaleFence,
+        ));
+    }
+
+    let operation = envelope.semantic_commands.first_mut().ok_or_else(|| {
+        TaskLifecycleError::Owner(TaskError::InvalidField("task_envelope"))
+    })?;
+    let parameters = &mut operation.parameters;
+    parameters.insert(
+        "task_selection_evidence_json".to_owned(),
+        serde_json::Value::String(
+            serde_json::to_string(evidence)
+                .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?,
+        ),
+    );
+    parameters.insert(
+        "task_selection_revision".to_owned(),
+        serde_json::Value::String(selection.task_revision().to_string()),
+    );
+    parameters.insert(
+        "task_selection_acceptance_digest".to_owned(),
+        serde_json::Value::String(evidence.acceptance_digest.clone()),
+    );
+    parameters.insert(
+        "task_selection_scope_ref".to_owned(),
+        serde_json::Value::String(evidence.work_scope_ref.clone()),
+    );
+    parameters.insert(
+        "task_selection_source_ref".to_owned(),
+        serde_json::Value::String(selection.selection_source_ref().to_owned()),
+    );
+    parameters.insert(
+        "task_selection_evidence_ref".to_owned(),
+        serde_json::Value::String(selection.evidence_ref().to_owned()),
+    );
+    envelope
+        .required_proof_and_approval_refs
+        .extend([
+            selection.selection_source_ref().to_owned(),
+            selection.evidence_ref().to_owned(),
+        ]);
+    envelope
+        .validate()
+        .map_err(|_| TaskLifecycleError::Owner(TaskError::InvalidField("task_envelope")))
 }
 
 fn validate_campaign_recipe_anchor(
