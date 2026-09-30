@@ -359,6 +359,13 @@ fn genesis_payload(
             serde_json::to_value(snap).map_err(|e| CompositionError::Recovery(e.to_string()))?
         }
         RecoveryOwner::ChangeMonitor => {
+            // Genesis seeds the all-absent default; this payload must stay
+            // exact because validate() requires the canonical all-absent
+            // bytes. The live payload arrives through the Store named-read
+            // once the snapshot write-back leg persists
+            // ChangeMonitor::snapshot() (no such Store mutation exists yet),
+            // while GovernorComposition::ingest_kernel_change_transfer
+            // hydrates live Governor state from Kernel evidence meanwhile.
             serde_json::to_value(eliot_change_monitor::ChangeMonitorSnapshot::default())
                 .map_err(|e| CompositionError::Recovery(e.to_string()))?
         }

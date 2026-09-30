@@ -5853,6 +5853,102 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         )
     }
 
+    /// Admits one Kernel-side change observation transfer into the live
+    /// Governor change-monitor owner (issue #1824, I10.21 AUD7).
+    ///
+    /// This is the Governor head of the Kernel-to-Governor observation
+    /// bridge: the transfer carries the hint, the previously admitted
+    /// original, two independent direct content reads, and the read-only
+    /// Git receipts, and admission runs the existing
+    /// [`ChangeMonitor::confirm_kernel_readback`](eliot_change_monitor::ChangeMonitor::confirm_kernel_readback)
+    /// owner path with its validators, so a failed transfer stays a pending
+    /// hint and governed acceptance stays blocked (fail-closed). The daemon
+    /// bridge that builds the transfer from Kernel evidence is the remaining
+    /// caller.
+    ///
+    /// Live-state hydration only: [`Self::refresh_from_kernel`] rebuilds
+    /// every owner from the Store named-read snapshot, so transfers admitted
+    /// here persist across restart only once the snapshot write-back leg
+    /// persists [`ChangeMonitor::snapshot`](eliot_change_monitor::ChangeMonitor::snapshot)
+    /// through a Store owner mutation (no such mutation exists yet; the
+    /// Store record still carries the genesis default).
+    pub fn ingest_kernel_change_transfer(
+        &mut self,
+        transfer: &eliot_change_monitor::KernelHintReadback,
+    ) -> Result<eliot_change_monitor::ChangeHintConfirmation, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        self.owners
+            .change_monitor
+            .confirm_kernel_readback(transfer)
+            .map_err(|error| {
+                CompositionError::Recovery(format!(
+                    "governor change-monitor transfer refused: {error}"
+                ))
+            })
+    }
+
+    /// Resolves one historical anchor against the live Governor
+    /// change-monitor owner and returns the published evidence-bearing
+    /// observation (issue #1824, I10.21 AUD6).
+    ///
+    /// Candidates are constructed from the owner's own admitted
+    /// after-states for the original target through
+    /// [`AnchorCandidate::from_admitted_after_state`](eliot_change_monitor::AnchorCandidate::from_admitted_after_state),
+    /// in snapshot insertion order, with caller-supplied extra candidates
+    /// (VCS/content/code-intelligence adapters own that discovery)
+    /// appended; the resolution itself runs the existing deterministic
+    /// order over the live snapshot. The returned observation records the
+    /// algorithm version, every input, the matching evidence tier, and
+    /// confidence, and is serializable through the contract identity
+    /// schema set. `ambiguous` carries no chosen target, `deleted` stays
+    /// historically addressable through admitted deletion evidence, and
+    /// neither is ever auto-attached here: attachment stays with the
+    /// anchored-review route, which I10.18 forbids from creating a second
+    /// store. The daemon review trigger that supplies the original anchor
+    /// is the remaining caller.
+    pub fn resolve_anchored_review(
+        &self,
+        original: &eliot_change_monitor::AnchorReference,
+        extra_candidates: &[eliot_change_monitor::AnchorCandidate],
+    ) -> Result<eliot_change_monitor::AnchorResolutionObservation, CompositionError> {
+        let snapshot = self.owners.change_monitor.snapshot();
+        let mut candidates = Vec::new();
+        for record in &snapshot.observations {
+            let Some(after) = record.observation.after.as_ref() else {
+                continue;
+            };
+            if after.resource_ref != original.target.id.as_str() {
+                continue;
+            }
+            let candidate = eliot_change_monitor::AnchorCandidate::from_admitted_after_state(
+                original,
+                after,
+                None,
+                false,
+            )
+            .map_err(|error| {
+                CompositionError::Recovery(format!(
+                    "governor anchor candidate refused admitted state: {error}"
+                ))
+            })?;
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+        for candidate in extra_candidates {
+            if !candidates.contains(candidate) {
+                candidates.push(candidate.clone());
+            }
+        }
+        eliot_change_monitor::EvolvingAnchorResolver
+            .resolve_observed(original, &candidates, &snapshot)
+            .map_err(|error| {
+                CompositionError::Recovery(format!("governor anchor resolution refused: {error}"))
+            })
+    }
+
     /// Returns the terminal product-proof record this composition's
     /// ProductProof/FinishService acceptance owner builds for the parked
     /// Windows acceptance item (issue #1903).
