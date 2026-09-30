@@ -11,6 +11,11 @@
 //! authority, or persist canonical transitions.
 
 use super::*;
+use super::user_broker_registration_route::{
+    USER_BROKER_FENCE_OPERATION, USER_BROKER_HEARTBEAT_OPERATION,
+    USER_BROKER_REGISTER_OPERATION,
+    USER_BROKER_VALIDATE_NATIVE_RESOURCE_SELECTION_CURRENT_OPERATION,
+};
 
 fn observe_front_door_session(event: &'static str, outcome: &'static str) {
     use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
@@ -1339,10 +1344,10 @@ impl KernelComposition {
         Ok(())
     }
 
-    /// Binds the installer-pinned User Broker role to a registration-only
+    /// Binds the installer-pinned User Broker role to a scoped lifecycle
     /// session. The listener selected this role from the live OS peer, and
-    /// this second gate joins the hello's module and artifact to that selected
-    /// role and to the current Kernel authority fence.
+    /// this second gate joins the hello's exact module generation and artifact
+    /// to that selected role and to the current Kernel authority fence.
     #[cfg(windows)]
     pub fn bind_user_broker_session(
         &self,
@@ -1351,7 +1356,12 @@ impl KernelComposition {
         selection: &eliot_platform_windows::NamedPipePeerSelection,
         client: &eliot_protocol::ClientHello,
     ) -> Result<HandshakeResult, TransportError> {
-        const REGISTER: &str = "eliot.user-broker.register";
+        let broker_capabilities = [
+            USER_BROKER_REGISTER_OPERATION,
+            USER_BROKER_HEARTBEAT_OPERATION,
+            USER_BROKER_FENCE_OPERATION,
+            USER_BROKER_VALIDATE_NATIVE_RESOURCE_SELECTION_CURRENT_OPERATION,
+        ];
 
         observe_front_door_session("kernel.front_door_user_broker_bind", "attempt");
         let connection_id = connection_id.into();
@@ -1375,10 +1385,18 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
-        let only_registration_capability =
-            |capabilities: &[String]| capabilities.len() == 1 && capabilities[0] == REGISTER;
-        if !only_registration_capability(&client.capabilities)
-            || !only_registration_capability(&client.module_contract.required_capabilities)
+        let exactly_broker_capabilities = |capabilities: &[String]| {
+            capabilities.len() == broker_capabilities.len()
+                && broker_capabilities.iter().all(|expected| {
+                    capabilities
+                        .iter()
+                        .filter(|capability| capability.as_str() == *expected)
+                        .count()
+                        == 1
+                })
+        };
+        if !exactly_broker_capabilities(&client.capabilities)
+            || !exactly_broker_capabilities(&client.module_contract.required_capabilities)
         {
             return Err(TransportError::SessionFenced);
         }
@@ -1389,7 +1407,8 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?
             .clone();
         client.validate()?;
-        if !client
+        if client.module_generation != policy.module_generation
+            || !client
             .authority_epoch
             .is_same_authority(&policy.module_generation.state_fence.authority_epoch)
             || client.module_generation.state_fence != policy.module_generation.state_fence
@@ -1398,7 +1417,10 @@ impl KernelComposition {
         }
 
         let mut session = Session::establish(connection_id, peer, client, policy.protocol_range)?;
-        session.capabilities = vec![REGISTER.to_owned()];
+        session.capabilities = broker_capabilities
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
         session
             .privacy_classes
             .retain(|class| policy.allowed_privacy_classes.contains(class));

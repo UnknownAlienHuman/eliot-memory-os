@@ -10,9 +10,14 @@ use std::sync::Mutex;
 
 use eliot_contracts::{EpochId, StateFence};
 use eliot_ipc::{PeerIdentity, Session};
-use eliot_ors::{OperationIdentity, UserBrokerRegistrationReceipt};
+use eliot_ors::{
+    OperationIdentity, OperationalRecordInput, UserBrokerRegistrationReceipt,
+};
 use eliot_protocol::{ProtocolVersion, RequestIdentity};
-use eliot_user_broker_core::{RegistrationGrant, RegistrationReceipt, RegistrationRequest};
+use eliot_user_broker_core::{
+    RegistrationFenceReceipt, RegistrationFenceRequest, RegistrationGrant, RegistrationReceipt,
+    RegistrationRequest,
+};
 
 /// One exact authenticated transport binding retained with a registration.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -75,6 +80,34 @@ pub(crate) struct LiveUserBrokerRegistration {
     pub(crate) state_fence: StateFence,
     pub(crate) store_receipt: UserBrokerRegistrationReceipt,
     pub(crate) store_operation_order: u64,
+    pub(crate) store_record: OperationalRecordInput,
+    pub(crate) last_observed_at: u64,
+    pub(crate) heartbeat_replay: Option<UserBrokerHeartbeatReplay>,
+}
+
+/// The exact last heartbeat revision may be replayed only while it still
+/// names the current active registration snapshot.
+#[derive(Clone, Debug)]
+pub(crate) struct UserBrokerHeartbeatReplay {
+    pub(crate) registration: RegistrationReceipt,
+    pub(crate) observed_at: u64,
+    pub(crate) identity: RequestIdentity,
+    pub(crate) grant: RegistrationGrant,
+}
+
+/// Terminal response evidence for one exact explicit fence retry. This row
+/// holds no live authority and is removed when its transport session ends.
+#[derive(Clone, Debug)]
+pub(crate) struct UserBrokerFenceReplay {
+    pub(crate) session: UserBrokerSessionBinding,
+    pub(crate) registration: RegistrationRequest,
+    pub(crate) request: RegistrationFenceRequest,
+    pub(crate) identity: RequestIdentity,
+    pub(crate) receipt: RegistrationFenceReceipt,
+    pub(crate) subject_id: OperationIdentity,
+    pub(crate) store_receipt: UserBrokerRegistrationReceipt,
+    pub(crate) store_operation_order: u64,
+    pub(crate) store_record: OperationalRecordInput,
 }
 
 /// The Kernel-owned current registration table. It is deliberately not a
@@ -83,4 +116,5 @@ pub(crate) struct LiveUserBrokerRegistration {
 #[derive(Default)]
 pub(crate) struct UserBrokerRegistrationAuthority {
     pub(crate) live: Mutex<BTreeMap<String, LiveUserBrokerRegistration>>,
+    pub(crate) fenced_replays: Mutex<BTreeMap<String, UserBrokerFenceReplay>>,
 }
