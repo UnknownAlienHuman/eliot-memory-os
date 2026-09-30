@@ -23,8 +23,6 @@ use eliot_kernel_service::AuthenticatedHostSession;
 // import is the closed wire vocabulary the ingress projects out of it, never a
 // second stage machine or a second cutover gate.
 #[cfg(windows)]
-use eliot_kernel_service::{MaintenanceTriggerClaimRequest, MaintenanceTriggerDeliveryError};
-#[cfg(windows)]
 use eliot_kernel_service::{
     AuthenticatedUserAutomationHostExecutionTransport, NamedReadGatewayError, PreStageRejection,
     StoreApplyRefusal, UserAutomationDueWakeRejection, UserAutomationDueWakeResolution,
@@ -43,6 +41,8 @@ use eliot_kernel_service::{
     IrreversibleStorageEffect, StorageReplacement, StorageReplacementCutoverReceipt,
     StorageReplacementStage, StorageReplacementTransfer, StorageRollbackDisposition,
 };
+#[cfg(windows)]
+use eliot_kernel_service::{MaintenanceTriggerClaimRequest, MaintenanceTriggerDeliveryError};
 use eliot_process::{
     OperationId, OriginChallengeRequest, OriginControlGrant, OriginControlOperation,
     OriginControlPresentation, ProcessExecutionView, ProcessLifecycle,
