@@ -1582,6 +1582,80 @@ fn converge_experience_row(
     }
 }
 
+/// Unpacks one decoded experience mutation into its row address and family.
+///
+/// The three families carry the same row fields, so this only names which
+/// table the row belongs to; it never reads or rewrites a record value.
+fn experience_row_parts(
+    decoded: eliot_store_api::DecodedExperienceMutation,
+) -> (String, u64, String, String, ExperienceFamily) {
+    match decoded {
+        eliot_store_api::DecodedExperienceMutation::Bank {
+            handle,
+            revision,
+            record_json,
+            record_digest,
+            ..
+        } => (
+            handle,
+            revision,
+            record_json,
+            record_digest,
+            ExperienceFamily::Bank,
+        ),
+        eliot_store_api::DecodedExperienceMutation::Feedback {
+            handle,
+            revision,
+            record_json,
+            record_digest,
+            ..
+        } => (
+            handle,
+            revision,
+            record_json,
+            record_digest,
+            ExperienceFamily::Feedback,
+        ),
+        eliot_store_api::DecodedExperienceMutation::SessionEpisode {
+            handle,
+            revision,
+            record_json,
+            record_digest,
+            ..
+        } => (
+            handle,
+            revision,
+            record_json,
+            record_digest,
+            ExperienceFamily::SessionEpisode,
+        ),
+    }
+}
+
+/// Routes one admitted experience row to its own family's table.
+///
+/// The three families are separate tables by design, not three copies of one
+/// authority: a bank, feedback and session-episode row with the same joined
+/// key are different facts, so each arm names its own table explicitly.
+fn converge_family_row(
+    state: &mut MemoryState,
+    family: ExperienceFamily,
+    key: &str,
+    row: &ExperienceRow,
+) -> Result<(), StoreError> {
+    match family {
+        ExperienceFamily::Bank => {
+            converge_experience_row(&mut state.experience_bank_rows, key, row)
+        }
+        ExperienceFamily::Feedback => {
+            converge_experience_row(&mut state.experience_feedback_rows, key, row)
+        }
+        ExperienceFamily::SessionEpisode => {
+            converge_experience_row(&mut state.experience_session_episode_rows, key, row)
+        }
+    }
+}
+
 /// Executes admitted experience bank/feedback/session-episode legs on
 /// already-locked state (issue #223; session episodes issue #1778).
 ///
@@ -1624,70 +1698,20 @@ fn dispatch_apply_experience_state(
             }
             _ => continue,
         };
-        let (handle, revision, record_json, record_digest, family) = match decoded {
-            eliot_store_api::DecodedExperienceMutation::Bank {
-                handle,
-                revision,
-                record_json,
-                record_digest,
-                ..
-            } => (
-                handle,
-                revision,
-                record_json,
-                record_digest,
-                ExperienceFamily::Bank,
-            ),
-            eliot_store_api::DecodedExperienceMutation::Feedback {
-                handle,
-                revision,
-                record_json,
-                record_digest,
-                ..
-            } => (
-                handle,
-                revision,
-                record_json,
-                record_digest,
-                ExperienceFamily::Feedback,
-            ),
-            eliot_store_api::DecodedExperienceMutation::SessionEpisode {
-                handle,
-                revision,
-                record_json,
-                record_digest,
-                ..
-            } => (
-                handle,
-                revision,
-                record_json,
-                record_digest,
-                ExperienceFamily::SessionEpisode,
-            ),
-        };
+        let (handle, revision, record_json, record_digest, family) = experience_row_parts(decoded);
         let key = experience_row_key(&handle, revision);
         let row_json = serde_json::to_value(&record_json)
             .map_err(|error| StoreError::Serialization(error.to_string()))?;
         let row = ExperienceRow {
             handle,
             revision,
-            record_json: record_json.clone(),
+            record_json,
             record_digest,
             state_fence: transition.state_fence.clone(),
             scope_id: transition.scope_id.to_string(),
             task_id: transition.task_id.clone(),
         };
-        match family {
-            ExperienceFamily::Bank => {
-                converge_experience_row(&mut state.experience_bank_rows, &key, &row)?
-            }
-            ExperienceFamily::Feedback => {
-                converge_experience_row(&mut state.experience_feedback_rows, &key, &row)?
-            }
-            ExperienceFamily::SessionEpisode => {
-                converge_experience_row(&mut state.experience_session_episode_rows, &key, &row)?
-            }
-        }
+        converge_family_row(state, family, &key, &row)?;
         let payload_digest = sha256_hex(
             &canonical_json_bytes(&row_json)
                 .map_err(|error| StoreError::Serialization(error.to_string()))?,
@@ -1695,23 +1719,45 @@ fn dispatch_apply_experience_state(
         let sequence = plan.next_outbox_sequence;
         plan.next_outbox_sequence =
             checked_increment(sequence, "outbox.sequence", "sequence overflow")?;
-        let outbox = OutboxIntent {
-            outbox_id: OutboxId::new(format!(
-                "outbox-{operation_key}-experience-{experience_index}"
-            ))?,
-            operation_id: transition.identity.operation_id.clone(),
+        let outbox = experience_outbox_intent(
+            transition,
+            &operation_key,
+            experience_index,
             sequence,
             payload_digest,
-            state_fence: transition.state_fence.clone(),
-            arrival_fence: format!("arrival-{operation_key}"),
-            claim_fence: None,
-            state: OutboxState::Arrived,
-        };
-        outbox.validate()?;
+        )?;
         plan.outbox_records.push(outbox);
         experience_index = experience_index.saturating_add(1);
     }
     Ok(())
+}
+
+/// Builds the one outbox intent that binds an experience row's bytes.
+///
+/// The intent is the only publication leg for the row, so it carries the
+/// canonical digest of the same row document the family table received: a
+/// row and its outbox intent commit atomically or not at all.
+fn experience_outbox_intent(
+    transition: &PreparedTransition,
+    operation_key: &str,
+    experience_index: usize,
+    sequence: u64,
+    payload_digest: String,
+) -> Result<OutboxIntent, StoreError> {
+    let outbox = OutboxIntent {
+        outbox_id: OutboxId::new(format!(
+            "outbox-{operation_key}-experience-{experience_index}"
+        ))?,
+        operation_id: transition.identity.operation_id.clone(),
+        sequence,
+        payload_digest,
+        state_fence: transition.state_fence.clone(),
+        arrival_fence: format!("arrival-{operation_key}"),
+        claim_fence: None,
+        state: OutboxState::Arrived,
+    };
+    outbox.validate()?;
+    Ok(outbox)
 }
 
 /// Joins one learning row address. Collision-free by the same

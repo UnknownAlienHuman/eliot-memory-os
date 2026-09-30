@@ -887,61 +887,7 @@ pub fn validate_transition_against_catalogue(
         ) {
             return Err(StoreError::TransitionClassExceeded);
         }
-        match command.operation {
-            NamedMutationOperation::CaptureObservation
-            | NamedMutationOperation::AppendAuditEvent
-            | NamedMutationOperation::ApplyLifecyclePolicy
-            | NamedMutationOperation::ReconcileRecovery
-            | NamedMutationOperation::RecordFinishDecision
-            | NamedMutationOperation::RecordFinishEvidence
-            | NamedMutationOperation::RecordModuleCatalogSnapshot
-            | NamedMutationOperation::UpdateTaskState
-            | NamedMutationOperation::ApplyEpistemicRevision
-            | NamedMutationOperation::ApplyErasure
-            | NamedMutationOperation::ApplySwarmOwnerRevisions
-            | NamedMutationOperation::ApplyInstrumentRegistryState => {
-                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
-            }
-            NamedMutationOperation::ApplyNotificationState => {
-                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
-                crate::validate_notification_mutation_params(&command.parameters)?;
-            }
-            NamedMutationOperation::ApplyReactiveInjectionState
-            | NamedMutationOperation::ApplyResourceSnapshot => {
-                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
-                crate::validate_reactive_mutation_params(command.operation, &command.parameters)?;
-            }
-            NamedMutationOperation::ApplyUserAutomationState => {
-                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
-                crate::validate_automation_mutation_params(command.operation, &command.parameters)?;
-            }
-            NamedMutationOperation::CommitExperienceBank
-            | NamedMutationOperation::CommitAgentFeedback
-            | NamedMutationOperation::CommitSessionEpisode => {
-                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
-                crate::validate_experience_mutation_params(command.operation, &command.parameters)?;
-            }
-            NamedMutationOperation::ApplyBlackboardItem => {
-                validate_blackboard_transition(transition, &command.parameters)?;
-            }
-            NamedMutationOperation::RecordLearningRecord => {
-                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
-                crate::decode_learning_mutation(command.operation, &command.parameters)
-                    .map(|_| ())?;
-            }
-            NamedMutationOperation::RecordCapabilityEvidenceRecord => {
-                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
-                crate::decode_capability_evidence_mutation(command.operation, &command.parameters)
-                    .map(|_| ())?;
-            }
-            NamedMutationOperation::RecordAuthorityRevocation => {
-                return Err(StoreError::UnknownOperation);
-            }
-            NamedMutationOperation::ApplyProblemOwnerState => {
-                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
-                crate::decode_problem_owner_state_mutation(&command.parameters).map(|_| ())?;
-            }
-        }
+        validate_mutation_command_parameters(transition, command)?;
         validate_parameter_size(&command.parameters, entry.max_input_bytes)?;
     }
     Ok(())
@@ -1000,6 +946,72 @@ fn validate_blackboard_transition(
             field: "blackboard.task_id",
             reason: "must match the prepared transition task",
         });
+    }
+    Ok(())
+}
+/// Routes one named mutation command to its owner-approved typed parameters.
+///
+/// The routing is dispatch only: it selects which owner validator speaks for
+/// the operation and never inspects the parameter values itself. Every arm
+/// calls `validate_typed_mutation_parameters` first, so no operation reaches
+/// its family decoder without passing the shared typed-parameter gate.
+fn validate_mutation_command_parameters(
+    transition: &PreparedTransition,
+    command: &NamedMutationRequest,
+) -> Result<(), StoreError> {
+    match command.operation {
+        NamedMutationOperation::CaptureObservation
+        | NamedMutationOperation::AppendAuditEvent
+        | NamedMutationOperation::ApplyLifecyclePolicy
+        | NamedMutationOperation::ReconcileRecovery
+        | NamedMutationOperation::RecordFinishDecision
+        | NamedMutationOperation::RecordFinishEvidence
+        | NamedMutationOperation::RecordModuleCatalogSnapshot
+        | NamedMutationOperation::UpdateTaskState
+        | NamedMutationOperation::ApplyEpistemicRevision
+        | NamedMutationOperation::ApplyErasure
+        | NamedMutationOperation::ApplySwarmOwnerRevisions
+        | NamedMutationOperation::ApplyInstrumentRegistryState => {
+            validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+        }
+        NamedMutationOperation::ApplyNotificationState => {
+            validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+            crate::validate_notification_mutation_params(&command.parameters)?;
+        }
+        NamedMutationOperation::ApplyReactiveInjectionState
+        | NamedMutationOperation::ApplyResourceSnapshot => {
+            validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+            crate::validate_reactive_mutation_params(command.operation, &command.parameters)?;
+        }
+        NamedMutationOperation::ApplyUserAutomationState => {
+            validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+            crate::validate_automation_mutation_params(command.operation, &command.parameters)?;
+        }
+        NamedMutationOperation::CommitExperienceBank
+        | NamedMutationOperation::CommitAgentFeedback
+        | NamedMutationOperation::CommitSessionEpisode => {
+            validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+            crate::validate_experience_mutation_params(command.operation, &command.parameters)?;
+        }
+        NamedMutationOperation::ApplyBlackboardItem => {
+            validate_blackboard_transition(transition, &command.parameters)?;
+        }
+        NamedMutationOperation::RecordLearningRecord => {
+            validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+            crate::decode_learning_mutation(command.operation, &command.parameters).map(|_| ())?;
+        }
+        NamedMutationOperation::RecordCapabilityEvidenceRecord => {
+            validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+            crate::decode_capability_evidence_mutation(command.operation, &command.parameters)
+                .map(|_| ())?;
+        }
+        NamedMutationOperation::RecordAuthorityRevocation => {
+            return Err(StoreError::UnknownOperation);
+        }
+        NamedMutationOperation::ApplyProblemOwnerState => {
+            validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+            crate::decode_problem_owner_state_mutation(&command.parameters).map(|_| ())?;
+        }
     }
     Ok(())
 }

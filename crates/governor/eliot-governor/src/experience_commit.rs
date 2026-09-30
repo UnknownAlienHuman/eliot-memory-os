@@ -460,7 +460,11 @@ pub enum SessionEpisodePublication {
     /// The canonical owner committed this exact episode revision.
     Published {
         /// The owner `WriteReceipt` returned unmodified.
-        receipt: WriteReceipt,
+        ///
+        /// Boxed, as in [`eliot_store_api::ReservedWriteOutcome::Committed`], because a
+        /// [`WriteReceipt`] is far larger than the pending arm's reason string
+        /// and the pending arm is the common shape on a refused write.
+        receipt: Box<WriteReceipt>,
     },
     /// The write did not commit, so the conversation is not saved yet.
     PendingPublication {
@@ -577,7 +581,9 @@ pub async fn commit_session_episode<P: KernelGenerationPort + ?Sized>(
     )
     .await
     {
-        Ok(receipt) => SessionEpisodePublication::Published { receipt },
+        Ok(receipt) => SessionEpisodePublication::Published {
+            receipt: Box::new(receipt),
+        },
         // The owner refused or rejected the write. The episode is admitted in
         // shape but not durable, so it is pending publication, not saved.
         Err(error) => SessionEpisodePublication::PendingPublication {
