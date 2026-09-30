@@ -787,10 +787,28 @@ fn bind_task_selection_to_envelope(
     record: &TaskRecord,
     selection: &TaskSelectionAdmissionBinding,
 ) -> Result<(), TaskLifecycleError> {
+    bind_task_selection_evidence_to_envelope(
+        envelope,
+        identity,
+        record.task_id.as_str(),
+        selection,
+    )
+    .map_err(TaskLifecycleError::Composition)
+}
+
+/// Adds the existing task-selection evidence contract to a canonical
+/// envelope whose subject is task-bound but is not itself a Task record
+/// mutation (for example an Observation capture).
+pub(crate) fn bind_task_selection_evidence_to_envelope(
+    envelope: &mut CanonicalWriteEnvelope,
+    identity: &eliot_protocol::RequestIdentity,
+    task_ref: &str,
+    selection: &TaskSelectionAdmissionBinding,
+) -> Result<(), CompositionError> {
     let evidence = selection.evidence();
     evidence
         .validate()
-        .map_err(|error| TaskLifecycleError::Composition(CompositionError::from(error)))?;
+        .map_err(CompositionError::from)?;
     let fence = &identity.request.state_fence;
     if identity
         .request
@@ -805,9 +823,9 @@ fn bind_task_selection_to_envelope(
             .task_id
             .as_ref()
             .map(TaskId::as_str)
-            != Some(record.task_id.as_str())
-        || selection.task_ref() != record.task_id.as_str()
-        || evidence.task_ref != record.task_id.as_str()
+            != Some(task_ref)
+        || selection.task_ref() != task_ref
+        || evidence.task_ref != task_ref
         || evidence.task_revision != selection.task_revision()
         || evidence.acceptance_digest != selection.acceptance_digest()
         || selection.state_fence() != fence
@@ -815,23 +833,18 @@ fn bind_task_selection_to_envelope(
         || selection.work_scope().binding.scope.scope_ref != evidence.work_scope_ref
         || fence.task_revision.map(TaskRevision::value) != Some(selection.task_revision())
     {
-        return Err(TaskLifecycleError::Composition(
-            CompositionError::ActivationStaleFence,
-        ));
+        return Err(CompositionError::ActivationStaleFence);
     }
 
-    let operation = envelope
-        .semantic_commands
-        .first_mut()
-        .ok_or(TaskLifecycleError::Owner(TaskError::InvalidField(
-            "task_envelope",
-        )))?;
+    let operation = envelope.semantic_commands.first_mut().ok_or_else(|| {
+        CompositionError::Owner("task-selection envelope has no operation".to_owned())
+    })?;
     let parameters = &mut operation.parameters;
     parameters.insert(
         "task_selection_evidence_json".to_owned(),
         serde_json::Value::String(
             serde_json::to_string(evidence)
-                .map_err(|error| TaskLifecycleError::Serialization(error.to_string()))?,
+                .map_err(|error| CompositionError::Owner(error.to_string()))?,
         ),
     );
     parameters.insert(
@@ -860,7 +873,7 @@ fn bind_task_selection_to_envelope(
     ]);
     envelope
         .validate()
-        .map_err(|_| TaskLifecycleError::Owner(TaskError::InvalidField("task_envelope")))
+        .map_err(|error| CompositionError::Owner(error.to_string()))
 }
 
 fn validate_campaign_recipe_anchor(
