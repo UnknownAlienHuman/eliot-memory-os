@@ -635,10 +635,9 @@ fn run_admitted_pipeline(
             job,
             None,
             None,
-            None,
+            dispatch_stage::DispatchOwnerInputs { curation: None, orientation: supply },
             job.job_class,
             validated,
-            supply,
         );
     }
     let model_inputs = model_stage::resolve_model_inputs(admission, job)?;
@@ -660,10 +659,12 @@ fn run_admitted_pipeline(
         job,
         screen_binding,
         None,
-        None,
+        dispatch_stage::DispatchOwnerInputs {
+            curation: None,
+            orientation: production_orientation::ProductionOrientationSupply::Missing,
+        },
         job.job_class,
         Some(&validated),
-        production_orientation::ProductionOrientationSupply::Missing,
     )
 }
 

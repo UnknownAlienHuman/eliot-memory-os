@@ -174,6 +174,12 @@ pub(crate) struct OwnerCarriers<'a> {
     pub orientation: Option<&'a OrientationSupply<'a>>,
 }
 
+/// Independent runtime owner channels retained for one class dispatch.
+pub(crate) struct DispatchOwnerInputs<'a> {
+    pub curation: Option<CurationExecutionCarrier<'a>>,
+    pub orientation: crate::production_orientation::ProductionOrientationSupply<'a>,
+}
+
 /// Maps a native owner refusal to a typed fail-closed refusal.
 ///
 /// Every mapping is [`DreamerError::InvalidAdmission`] (request-rejected code),
@@ -226,10 +232,12 @@ pub(crate) fn dispatch_admitted(
         job,
         screen,
         curation_protection,
-        carriers.curation,
+        DispatchOwnerInputs {
+            curation: carriers.curation,
+            orientation: crate::production_orientation::ProductionOrientationSupply::Missing,
+        },
         job_class,
         validated,
-        crate::production_orientation::ProductionOrientationSupply::Missing,
     )
 }
 
@@ -251,10 +259,9 @@ pub(crate) fn dispatch_admitted_with_orientation_supply(
     job: &DreamJobInput,
     screen: Option<ScreenBinding>,
     curation_protection: Option<CurationProtectionSet>,
-    curation_carrier: Option<CurationExecutionCarrier<'_>>,
+    owners: DispatchOwnerInputs<'_>,
     job_class: JobClass,
     validated: Option<&ValidatedGroundingCandidate>,
-    orientation_supply: crate::production_orientation::ProductionOrientationSupply<'_>,
 ) -> Result<DreamResult, DreamerError> {
     verify_admitted_binding(admission, job)?;
     if job.job_class != job_class {
@@ -267,7 +274,7 @@ pub(crate) fn dispatch_admitted_with_orientation_supply(
         // the precise carrier refusal names the missing governed input
         // even when the screen is absent too.
         JobClass::Curation => {
-            let Some(carrier) = curation_carrier else {
+            let Some(carrier) = owners.curation else {
                 return Err(DreamerError::InvalidAdmission(CURATION_CARRIER_REFUSAL));
             };
             let Some(binding) = screen else {
@@ -284,7 +291,7 @@ pub(crate) fn dispatch_admitted_with_orientation_supply(
         // there is no proved pre-handler gate, so the arm refuses before any
         // v1 derivation or owner projection work.
         JobClass::Orientation => {
-            match orientation_supply {
+            match owners.orientation {
                 crate::production_orientation::ProductionOrientationSupply::Missing => {
                     return Ok(DreamResult::Orientation(
                         crate::production_orientation::absent_owner_supply(admission, job, false),
@@ -300,7 +307,7 @@ pub(crate) fn dispatch_admitted_with_orientation_supply(
             let Some(candidate) = validated else {
                 return Err(DreamerError::InvalidAdmission(VALIDATION_RECEIPT_REFUSAL));
             };
-            dispatch_orientation(admission, job, candidate, orientation_supply)
+            dispatch_orientation(admission, job, candidate, owners.orientation)
         }
         // Native owner: eliot-dreamer-research-synthesis `synthesize`. The
         // owner takes its own `SynthesisRequest` vocabulary (a
@@ -442,139 +449,110 @@ fn dispatch_orientation(
     };
     let frame_source = orientation_frame_source(&bundle)?;
     let frame = orientation_frame_of(admission, &admitted, job, frame_source.as_str())?;
-    let admitted_job = orientation_admitted_job(admitted, frame);
-    if owner.cancelled {
-        return Ok(orientation_owner_terminal(
-            &admitted_job,
-            &original_receipt_digest,
-            &bundle,
-            &policy,
-            &owner,
-            eliot_dreamer_orientation::OrientationDisposition::Cancelled,
-            "pulse cancelled",
-        ));
-    }
-    let Some(observation_time_ms) = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
-    else {
-        return Ok(orientation_owner_terminal(
-            &admitted_job,
-            &original_receipt_digest,
-            &bundle,
-            &policy,
-            &owner,
-            eliot_dreamer_orientation::OrientationDisposition::RevalidationRequired,
-            "candidate validation clock unavailable",
-        ));
+    let joined = JoinedOrientation {
+        admitted_job: orientation_admitted_job(admitted, frame),
+        bundle,
+        policy,
+        original_receipt_digest,
+        owner,
     };
-    if owner.deadline_unix_ms <= observation_time_ms {
-        return Ok(orientation_owner_terminal(
-            &admitted_job,
-            &original_receipt_digest,
-            &bundle,
-            &policy,
-            &owner,
-            eliot_dreamer_orientation::OrientationDisposition::RevalidationRequired,
-            "pulse deadline exceeded",
-        ));
+    let observation_time_ms = match ready_owner_time(&joined) {
+        Ok(time) => time,
+        Err(result) => return Ok(result),
+    };
+    let candidate = match validate_owner_candidate(&joined, observation_time_ms)? {
+        Ok(candidate) => candidate,
+        Err(reason) => return Ok(joined.blocked(reason)),
+    };
+    match crate::production_orientation::resolve_production_inputs(
+        admission,
+        job,
+        &joined.admitted_job,
+        &candidate,
+        &joined.bundle,
+        &joined.policy,
+        crate::production_orientation::ProductionOrientationSupply::Ready(joined.owner),
+    ) {
+        Ok(inputs) => Ok(DreamResult::Orientation(
+            crate::production_orientation::compose_production_result(inputs, job),
+        )),
+        Err(blocked) => Ok(DreamResult::Orientation(*blocked)),
     }
-    if owner.model_request.job_id != admitted_job.job.canonical_id()
-        || owner.model_request.privacy.as_str() != admitted_job.job.privacy_profile
-        || owner.model_request.validate_binds_bundle(&bundle).is_err()
-    {
-        return Ok(orientation_owner_blocked(
-            &admitted_job,
-            &original_receipt_digest,
-            &bundle,
-            &policy,
-            &owner,
-            "model request binding",
-        ));
+}
+
+struct JoinedOrientation<'a> {
+    admitted_job: AdmittedOrientationJob,
+    bundle: DreamInputBundle,
+    policy: OrientationPolicy,
+    original_receipt_digest: String,
+    owner: Box<crate::production_orientation::ProductionOrientationOwnerInputs<'a>>,
+}
+
+impl JoinedOrientation<'_> {
+    fn terminal(&self, disposition: eliot_dreamer_orientation::OrientationDisposition, reason: &'static str) -> DreamResult {
+        orientation_owner_terminal(&self.admitted_job, &self.original_receipt_digest, &self.bundle, &self.policy, &self.owner, disposition, reason)
     }
-    if owner
-        .model_outcome
-        .validate_binding(owner.model_request)
-        .is_err()
-    {
-        return Ok(orientation_owner_blocked(
-            &admitted_job,
-            &original_receipt_digest,
-            &bundle,
-            &policy,
-            &owner,
-            crate::production_orientation::MODEL_OUTCOME_MALFORMED,
-        ));
+
+    fn blocked(&self, reason: &'static str) -> DreamResult {
+        orientation_owner_blocked(&self.admitted_job, &self.original_receipt_digest, &self.bundle, &self.policy, &self.owner, reason)
+    }
+}
+
+/// Validates owner time and the original admitted model boundaries before candidate use.
+fn ready_owner_time(joined: &JoinedOrientation<'_>) -> Result<u64, DreamResult> {
+    use eliot_dreamer_orientation::OrientationDisposition;
+    let owner = &joined.owner;
+    if owner.cancelled {
+        return Err(joined.terminal(OrientationDisposition::Cancelled, "pulse cancelled"));
+    }
+    let Some(now) = SystemTime::now().duration_since(UNIX_EPOCH).ok().and_then(|duration| u64::try_from(duration.as_millis()).ok()) else {
+        return Err(joined.terminal(OrientationDisposition::RevalidationRequired, "candidate validation clock unavailable"));
+    };
+    if owner.deadline_unix_ms <= now {
+        return Err(joined.terminal(OrientationDisposition::RevalidationRequired, "pulse deadline exceeded"));
+    }
+    if owner.model_request.job_id != joined.admitted_job.job.canonical_id()
+        || owner.model_request.privacy.as_str() != joined.admitted_job.job.privacy_profile
+        || owner.model_request.validate_binds_bundle(&joined.bundle).is_err() {
+        return Err(joined.blocked("model request binding"));
+    }
+    if owner.model_outcome.validate_binding(owner.model_request).is_err() {
+        return Err(joined.blocked(crate::production_orientation::MODEL_OUTCOME_MALFORMED));
     }
     match owner.model_outcome.disposition {
-        ModelRouteDisposition::Completed | ModelRouteDisposition::Partial => {}
-        ModelRouteDisposition::Malformed => {
-            return Ok(orientation_owner_blocked(
-                &admitted_job,
-                &original_receipt_digest,
-                &bundle,
-                &policy,
-                &owner,
-                crate::production_orientation::MODEL_OUTCOME_MALFORMED,
-            ));
-        }
-        ModelRouteDisposition::Cancelled => {
-            return Ok(orientation_owner_terminal(
-                &admitted_job,
-                &original_receipt_digest,
-                &bundle,
-                &policy,
-                &owner,
-                eliot_dreamer_orientation::OrientationDisposition::Cancelled,
-                crate::production_orientation::MODEL_OUTCOME_CANCELLED,
-            ));
-        }
-        ModelRouteDisposition::Timeout => {
-            return Ok(orientation_owner_terminal(
-                &admitted_job,
-                &original_receipt_digest,
-                &bundle,
-                &policy,
-                &owner,
-                eliot_dreamer_orientation::OrientationDisposition::RevalidationRequired,
-                crate::production_orientation::MODEL_OUTCOME_TIMEOUT,
-            ));
-        }
+        ModelRouteDisposition::Completed | ModelRouteDisposition::Partial => {},
+        ModelRouteDisposition::Malformed => return Err(joined.blocked(crate::production_orientation::MODEL_OUTCOME_MALFORMED)),
+        ModelRouteDisposition::Cancelled => return Err(joined.terminal(OrientationDisposition::Cancelled, crate::production_orientation::MODEL_OUTCOME_CANCELLED)),
+        ModelRouteDisposition::Timeout => return Err(joined.terminal(OrientationDisposition::RevalidationRequired, crate::production_orientation::MODEL_OUTCOME_TIMEOUT)),
     }
+    if owner.model_outcome.draft.is_none() {
+        return Err(joined.blocked(crate::production_orientation::MODEL_OUTCOME_MALFORMED));
+    }
+    Ok(now)
+}
+
+/// Reuses the native candidate validator over the exact original model draft and usage.
+fn validate_owner_candidate(
+    joined: &JoinedOrientation<'_>,
+    observation_time_ms: u64,
+) -> Result<Result<eliot_dreamer_contracts::ValidatedCandidate, &'static str>, DreamerError> {
+    let owner = &joined.owner;
     let Some(model) = owner.model_outcome.draft.as_ref() else {
-        return Ok(orientation_owner_blocked(
-            &admitted_job,
-            &original_receipt_digest,
-            &bundle,
-            &policy,
-            &owner,
-            crate::production_orientation::MODEL_OUTCOME_MALFORMED,
-        ));
+        return Ok(Err(crate::production_orientation::MODEL_OUTCOME_MALFORMED));
     };
-    let grounded = match v1_grounded_of(model) {
-        Ok(grounded) => grounded,
-        Err(_) => {
-            return Ok(orientation_owner_blocked(
-                &admitted_job,
-                &original_receipt_digest,
-                &bundle,
-                &policy,
-                &owner,
-                "owner model grounding input refused",
-            ));
-        }
+    let Ok(grounded) = v1_grounded_of(model) else {
+        return Ok(Err("owner model grounding input refused"));
     };
-    let mut usage = usage_of(&admitted_job.job.budget);
+    let mut usage = usage_of(&joined.admitted_job.job.budget);
     usage.input_bytes = owner.model_outcome.receipt.input_bytes;
     usage.output_bytes = owner.model_outcome.receipt.output_bytes;
     usage.model_calls = owner.model_outcome.receipt.model_calls;
     usage.wall_ms = owner.model_outcome.receipt.wall_ms;
-    let validation_policy = validation_policy_of(admitted_job.job.policy_ref.as_str())?;
+    let validation_policy = validation_policy_of(joined.admitted_job.job.policy_ref.as_str())?;
     let preservation = preservation_of()?;
-    let candidate = match validate_grounded_dream_draft_at(
-        &admitted_job.job,
-        &bundle,
+    Ok(match validate_grounded_dream_draft_at(
+        &joined.admitted_job.job,
+        &joined.bundle,
         model,
         &grounded,
         &validation_policy,
@@ -583,42 +561,10 @@ fn dispatch_orientation(
         Some(observation_time_ms),
         false,
     ) {
-        Ok(CandidateValidationOutcome::Accepted(candidate)) => *candidate,
-        Ok(CandidateValidationOutcome::Rejected(_)) => {
-            return Ok(orientation_owner_blocked(
-                &admitted_job,
-                &original_receipt_digest,
-                &bundle,
-                &policy,
-                &owner,
-                "owner model candidate rejected",
-            ));
-        }
-        Err(_) => {
-            return Ok(orientation_owner_blocked(
-                &admitted_job,
-                &original_receipt_digest,
-                &bundle,
-                &policy,
-                &owner,
-                "owner model candidate validation refused",
-            ));
-        }
-    };
-    match crate::production_orientation::resolve_production_inputs(
-        admission,
-        job,
-        &admitted_job,
-        &candidate,
-        &bundle,
-        &policy,
-        crate::production_orientation::ProductionOrientationSupply::Ready(owner),
-    ) {
-        Ok(inputs) => Ok(DreamResult::Orientation(
-            crate::production_orientation::compose_production_result(inputs, job),
-        )),
-        Err(blocked) => Ok(DreamResult::Orientation(*blocked)),
-    }
+        Ok(CandidateValidationOutcome::Accepted(candidate)) => Ok(*candidate),
+        Ok(CandidateValidationOutcome::Rejected(_)) => Err("owner model candidate rejected"),
+        Err(_) => Err("owner model candidate validation refused"),
+    })
 }
 
 /// Keeps an unusable but present owner outcome in the typed pulse result.
@@ -658,8 +604,7 @@ fn orientation_owner_terminal(
         policy,
         owner.model_outcome,
         owner.projections,
-        disposition,
-        reason,
+        (disposition, reason),
     ))
 }
 
