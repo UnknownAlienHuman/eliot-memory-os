@@ -7777,7 +7777,8 @@ pub struct HostRequestApplicationBinding {
     pub task_ref: Option<OpaqueLabel>,
     /// Resolved WorkScope, if one is selected.
     pub scope_ref: Option<OpaqueLabel>,
-    /// Exact TaskContract revision, absent for task-free application scope.
+    /// Task revision to which this capture applies, absent when task selection
+    /// is not part of the capture even if the retained live fence has one.
     pub task_revision: Option<u64>,
     /// Exact activation State Fence retained by the application owner.
     pub state_fence: StateFence,
@@ -7925,7 +7926,8 @@ impl HostRequestApplicationBinding {
                     "host_request_activation_owner_evidence_digest",
                 )
             }
-            (None, None, None, None, None, None, None) if self.task_ref.is_none() => Ok(()),
+            (None, None, None, None, None, None, None)
+                if self.task_ref.is_none() && self.task_revision.is_none() => Ok(()),
             _ => Err(OrsError::InvalidField {
                 field: "host_request_activation_binding",
                 reason: "task activation evidence must be complete together, and absent only for task-free requests",
@@ -7978,11 +7980,6 @@ impl HostRequestApplicationBinding {
                 Some(self.session_ref.as_str()),
             ),
             (
-                "host_request_application_task",
-                binding.get("task_id").and_then(Value::as_str),
-                self.task_ref.as_ref().map(OpaqueLabel::as_str),
-            ),
-            (
                 "host_request_application_scope",
                 binding.get("work_scope_id").and_then(Value::as_str),
                 self.scope_ref.as_ref().map(OpaqueLabel::as_str),
@@ -7992,12 +7989,15 @@ impl HostRequestApplicationBinding {
                 return Err(OrsError::FenceMismatch);
             }
         }
-        let task_revision = binding
-            .get("task_revision")
-            .and_then(Value::as_str)
-            .and_then(|revision| revision.parse::<u64>().ok());
-        if task_revision != self.task_revision {
-            return Err(OrsError::FenceMismatch);
+        if let Some(task_ref) = self.task_ref.as_ref() {
+            let task_revision = self.task_revision.ok_or(OrsError::FenceMismatch)?;
+            let expected_task_revision = task_revision.to_string();
+            if binding.get("task_id").and_then(Value::as_str) != Some(task_ref.as_str())
+                || binding.get("task_revision").and_then(Value::as_str)
+                    != Some(expected_task_revision.as_str())
+            {
+                return Err(OrsError::FenceMismatch);
+            }
         }
         Ok(())
     }
@@ -8027,12 +8027,15 @@ impl HostRequestApplicationBinding {
         match (self.task_ref.as_ref(), self.task_revision, self.state_fence.task_revision) {
             (Some(_), Some(revision), Some(fence_revision))
                 if revision != 0 && revision == fence_revision.value() => {}
-            (None, None, None) => {}
+            // A capture can be task-free while retaining a current fence that
+            // has a task revision. That revision remains fence provenance and
+            // does not select the task for this capture.
+            (None, None, _) => {}
             _ => {
                 return Err(OrsError::InvalidField {
                     field: "host_request_application_task_binding",
                     reason:
-                        "task, task revision, and fenced revision must be present and equal together",
+                        "task applicability and revision must be present and equal to the fence together",
                 });
             }
         }
