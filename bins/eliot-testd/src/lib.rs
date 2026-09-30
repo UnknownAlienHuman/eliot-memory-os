@@ -493,9 +493,10 @@ pub(crate) async fn start_claimed_from_store<E: ProcessExecutor + 'static>(
     })?;
     validate_running_lease(&current, lease, now)?;
     current.target_roots.validate()?;
-    if let (Some(layout), Some(envelope)) =
-        (current.target_layout.as_ref(), current.work_envelope.as_ref())
-    {
+    if let (Some(layout), Some(envelope)) = (
+        current.target_layout.as_ref(),
+        current.work_envelope.as_ref(),
+    ) {
         // Issue #1897 (AUD4): a job that carries the retained work envelope has
         // exactly one root authority — the envelope's governed root — so the
         // owner-issued layout is verified against the envelope instead of

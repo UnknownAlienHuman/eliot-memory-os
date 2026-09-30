@@ -423,13 +423,13 @@ pub fn verify_envelope_layout_binding(
 ) -> Result<BoundTargetRoots, TestdError> {
     layout.validate()?;
     roots.validate()?;
-    if envelope.workspace_id != layout.workspace_id
-        || envelope.worktree_id != layout.checkout_id
-    {
+    if envelope.workspace_id != layout.workspace_id || envelope.worktree_id != layout.checkout_id {
         return Err(TestdError::InvalidBinding);
     }
     let build_root = validate_root_identity(&layout.build_root, "target_layout.build_root")?;
-    let lane_root = build_root.join(&layout.workspace_id).join(&layout.checkout_id);
+    let lane_root = build_root
+        .join(&layout.workspace_id)
+        .join(&layout.checkout_id);
     let canonical_lane_root =
         validate_root_identity(&lane_root.to_string_lossy(), "target_layout.lane_root")?;
     let governed = envelope
@@ -444,8 +444,12 @@ pub fn verify_envelope_layout_binding(
         .normalized_fingerprint()
         .map_err(|error| TestdError::Contract(error.to_string()))?;
     let mut remaining = levels.components();
-    let mode = remaining.next().map(|component| component.as_os_str().to_owned());
-    let digest = remaining.next().map(|component| component.as_os_str().to_owned());
+    let mode = remaining
+        .next()
+        .map(|component| component.as_os_str().to_owned());
+    let digest = remaining
+        .next()
+        .map(|component| component.as_os_str().to_owned());
     if remaining.next().is_some()
         || mode.as_deref() != Some(std::ffi::OsStr::new(envelope.build_mode.as_str()))
         || digest.as_deref() != Some(std::ffi::OsStr::new(&fingerprint))

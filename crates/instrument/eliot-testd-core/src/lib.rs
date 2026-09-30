@@ -4074,7 +4074,11 @@ impl TestdStore {
         let mut target_roots = target_roots;
         target_roots.allowed_contour_root = grant.contour_root.clone();
         target_roots.validate()?;
-        verify_job_lane(&target_roots, target_layout.as_ref(), work_envelope.as_ref())?;
+        verify_job_lane(
+            &target_roots,
+            target_layout.as_ref(),
+            work_envelope.as_ref(),
+        )?;
         let digest = payload_digest(
             &invocation,
             &process,
@@ -5052,11 +5056,10 @@ fn verify_job_lane(
             let governed = envelope
                 .derive_target_root()
                 .map_err(|error| TestdError::Contract(error.to_string()))?;
-            let canonical = validate_root_identity(
-                &governed.to_string_lossy(),
-                "work_envelope.governed_root",
-            )?;
-            let target = validate_root_identity(&target_roots.target_root, "target_roots.target_root")?;
+            let canonical =
+                validate_root_identity(&governed.to_string_lossy(), "work_envelope.governed_root")?;
+            let target =
+                validate_root_identity(&target_roots.target_root, "target_roots.target_root")?;
             if canonical != target {
                 return Err(TestdError::InvalidBinding);
             }

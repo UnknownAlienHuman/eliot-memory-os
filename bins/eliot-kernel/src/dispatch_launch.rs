@@ -1434,9 +1434,10 @@ pub(crate) async fn submit_testd_owner_job(
     // execution contour: the I2.22 target root must be a strict descendant of
     // the granted contour, and the governed build root is the only contour
     // that can hold it.
-    let local_app_data = eliot_platform_windows::current_user_local_app_data_root().map_err(
-        |error| DispatchLaunchError::Gate(format!("local application-data root: {error:?}")),
-    )?;
+    let local_app_data =
+        eliot_platform_windows::current_user_local_app_data_root().map_err(|error| {
+            DispatchLaunchError::Gate(format!("local application-data root: {error:?}"))
+        })?;
     let governed_build_root = local_app_data.join("Eliot").join(BUILD_ROOT_DIRECTORY);
     std::fs::create_dir_all(&governed_build_root)
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
@@ -1448,41 +1449,47 @@ pub(crate) async fn submit_testd_owner_job(
         ));
     }
     let contour_root = governed_build_root.clone();
-    let lane_identity = admitted_lane_identity(
-        LaneIdentityInput {
-            work_item_id: job_id.clone(),
-            workspace_id: workspace_component.clone(),
-            worktree_id: checkout_component.clone(),
-            local_app_data,
-            source_root: source_root.clone(),
-            product: request.submission.invocation.request.product_id.as_str().to_owned(),
-            candidate: request.submission.invocation.request.source_id.as_str().to_owned(),
-            profile: request.submission.invocation.profile.clone(),
-            target: request.submission.invocation.target.clone(),
-            declared_scope: request.submission.invocation.declared_scope.clone(),
-            input_artifacts: request.submission.invocation.input_artifacts.clone(),
-            contract_revision: format!(
-                "task-revision-{}",
-                request
-                    .submission
-                    .invocation
-                    .request
-                    .state_fence
-                    .task_revision
-                    .as_ref()
-                    .map_or(0u64, |revision| revision.value())
-            ),
-            nextest_sha256: request.process_tool.observation.nextest_sha256.clone(),
-            cargo_sha256: request.process_tool.observation.cargo_sha256.clone(),
-            rustc_sha256: request.process_tool.observation.rustc_sha256.clone(),
-            toolchain: request
-                .process_tool
-                .observation
-                .selected_toolchain
-                .clone(),
-            build_class,
-        },
-    )?;
+    let lane_identity = admitted_lane_identity(LaneIdentityInput {
+        work_item_id: job_id.clone(),
+        workspace_id: workspace_component.clone(),
+        worktree_id: checkout_component.clone(),
+        local_app_data,
+        source_root: source_root.clone(),
+        product: request
+            .submission
+            .invocation
+            .request
+            .product_id
+            .as_str()
+            .to_owned(),
+        candidate: request
+            .submission
+            .invocation
+            .request
+            .source_id
+            .as_str()
+            .to_owned(),
+        profile: request.submission.invocation.profile.clone(),
+        target: request.submission.invocation.target.clone(),
+        declared_scope: request.submission.invocation.declared_scope.clone(),
+        input_artifacts: request.submission.invocation.input_artifacts.clone(),
+        contract_revision: format!(
+            "task-revision-{}",
+            request
+                .submission
+                .invocation
+                .request
+                .state_fence
+                .task_revision
+                .as_ref()
+                .map_or(0u64, |revision| revision.value())
+        ),
+        nextest_sha256: request.process_tool.observation.nextest_sha256.clone(),
+        cargo_sha256: request.process_tool.observation.cargo_sha256.clone(),
+        rustc_sha256: request.process_tool.observation.rustc_sha256.clone(),
+        toolchain: request.process_tool.observation.selected_toolchain.clone(),
+        build_class,
+    })?;
     // Issue #1806 + #1897: the layout carries the admitted identity the lane
     // was built from and the fingerprint digest that is now a real level of the
     // governed root, but it no longer derives a competing root of its own: the
@@ -1737,8 +1744,8 @@ struct LaneIdentityInput {
 /// digest.
 fn admitted_lane_identity(input: LaneIdentityInput) -> Result<LaneIdentity, DispatchLaunchError> {
     let manifest = input.source_root.join("Cargo.toml");
-    let manifest_bytes = std::fs::read(&manifest)
-        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let manifest_bytes =
+        std::fs::read(&manifest).map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let source_root_text = input.source_root.to_string_lossy().into_owned();
     let input_artifacts = input
         .input_artifacts
