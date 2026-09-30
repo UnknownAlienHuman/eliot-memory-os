@@ -89,6 +89,7 @@ pub(crate) const PRODUCTION_ORIENTATION_INPUTS_SCHEMA_VERSION: u32 = 1;
 pub(crate) const CC004_MISSING: &str = "production orientation requires a canonical projection set";
 /// Blocked reason naming the absent Governor supply channel.
 pub(crate) const ORIENTATION_SUPPLY_MISSING: &str = "governor orientation supply channel absent";
+pub(crate) const MODEL_OUTCOME_MISSING: &str = "admitted model-route outcome is absent";
 /// Blocked reason when the admitted outcome is malformed.
 pub(crate) const MODEL_OUTCOME_MALFORMED: &str = "admitted model-route outcome is malformed";
 /// Blocked reason when the admitted outcome is cancelled.
@@ -268,19 +269,17 @@ pub(crate) fn resolve_production_inputs<'a>(
     candidate: &'a ValidatedCandidate,
     bundle: &'a DreamInputBundle,
     policy: &'a OrientationPolicy,
-    model_request: &'a ModelRouteRequest,
-    model_outcome: &'a ModelRouteOutcome,
+    route: Option<(&'a ModelRouteRequest, &'a ModelRouteOutcome)>,
     supply: Option<&'a OrientationSupply<'a>>,
 ) -> Result<ProductionOrientationInputs<'a>, Box<OrientationPulseResult>> {
-    let Some(supply) = supply else {
+    let (Some(supply), Some((model_request, model_outcome))) = (supply, route) else {
         return Err(Box::new(supply_missing_blocked(
             admission,
             admitted_job,
             candidate,
             bundle,
             policy,
-            model_request,
-            model_outcome,
+            route,
         )));
     };
     Ok(ProductionOrientationInputs {
@@ -326,7 +325,7 @@ pub(crate) fn resolve_production_inputs<'a>(
             supplements: supply.supplements,
             policy: supply.conflict_policy,
         },
-        probes: supply.probes,
+        probes: supply.probes.clone(),
         candidates: CandidateStage {
             request: supply.candidate_request,
             recipe: supply.candidate_recipe,
@@ -827,8 +826,7 @@ fn supply_missing_blocked(
     candidate: &ValidatedCandidate,
     bundle: &DreamInputBundle,
     policy: &OrientationPolicy,
-    model_request: &ModelRouteRequest,
-    model_outcome: &ModelRouteOutcome,
+    route: Option<(&ModelRouteRequest, &ModelRouteOutcome)>,
 ) -> OrientationPulseResult {
     let stages = PulseStageId::ORDER
         .iter()
@@ -858,10 +856,10 @@ fn supply_missing_blocked(
         },
         model_outcome: OrientationBoundaryRecord {
             boundary: "cc002_model_route".to_owned(),
-            present: true,
-            commitment: output_digest(model_request),
-            disposition: Some(model_outcome.disposition.as_str().to_owned()),
-            reason: None,
+            present: route.is_some(),
+            commitment: route.and_then(|(request, _)| output_digest(request)),
+            disposition: route.map(|(_, outcome)| outcome.disposition.as_str().to_owned()),
+            reason: (route.is_none()).then(|| MODEL_OUTCOME_MISSING.to_owned()),
         },
         projections: OrientationBoundaryRecord {
             boundary: "cc004_canonical_projections".to_owned(),
@@ -871,7 +869,10 @@ fn supply_missing_blocked(
             reason: Some(CC004_MISSING.to_owned()),
         },
         stages,
-        omissions: vec![CC004_MISSING.to_owned(), ORIENTATION_SUPPLY_MISSING.to_owned()],
+        omissions: vec![
+            CC004_MISSING.to_owned(),
+            ORIENTATION_SUPPLY_MISSING.to_owned(),
+        ],
         missing_owners,
     })
 }

@@ -18,9 +18,9 @@ use eliot_dreamer_contracts::grounding::{
     bundle_digest, requester_digest, route_fingerprint,
 };
 use eliot_dreamer_contracts::{
-    ContractViolation, CostUsageReceipt, MODEL_ROUTE_SCHEMA_VERSION, ModelDraft as TextModelDraft,
-    ModelRouteDisposition, ModelRouteOutcome, ModelRoutePrivacy, ModelRouteRequest,
-    DreamInputBundle, DreamJobAdmission, bundle_digest_of, canonical_bytes,
+    ContractViolation, CostUsageReceipt, DreamInputBundle, DreamJobAdmission,
+    MODEL_ROUTE_SCHEMA_VERSION, ModelDraft as TextModelDraft, ModelRouteDisposition,
+    ModelRouteOutcome, ModelRoutePrivacy, ModelRouteRequest, bundle_digest_of, canonical_bytes,
 };
 
 use crate::admitted_material::{admission_of, bundle_of, sha_hex};
@@ -309,9 +309,7 @@ pub(crate) fn model_route_outcome(
     usage: ModelRouteUsage,
 ) -> Result<ModelRouteOutcome, DreamerError> {
     let Some(route) = request.allowed_routes.first().cloned() else {
-        return Err(DreamerError::InvalidAdmission(
-            "model route outcome route",
-        ));
+        return Err(DreamerError::InvalidAdmission("model route outcome route"));
     };
     let outcome = ModelRouteOutcome {
         schema_version: MODEL_ROUTE_SCHEMA_VERSION,

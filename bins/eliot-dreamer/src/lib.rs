@@ -637,10 +637,12 @@ fn run_admitted_pipeline(
         job,
         screen_binding,
         None,
-        None,
+        dispatch_stage::OwnerCarriers {
+            curation: None,
+            orientation: orientation_supply,
+        },
         job.job_class,
         Some(&validated),
-        orientation_supply,
     )
 }
 

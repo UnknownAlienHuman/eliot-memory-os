@@ -154,6 +154,20 @@ pub struct CurationExecutionCarrier<'a> {
     pub ports: NativeCurationPortSet<'a>,
 }
 
+/// The per-job owner carriers one admitted dispatch may carry.
+///
+/// Curation and Orientation are the two admitted classes whose owner records
+/// live outside this binary: Curation needs its validated batch plus one live
+/// port per owner family, Orientation needs the Governor-resolved owner supply.
+/// Each stays an independent optional so one class's absence never implies the
+/// other's, and both are `None` in the worker role where no owner is attached.
+pub(crate) struct OwnerCarriers<'a> {
+    /// Curation owner records, present only for an admitted Curation job.
+    pub curation: Option<CurationExecutionCarrier<'a>>,
+    /// Orientation owner records, present only for an admitted Orientation job.
+    pub orientation: Option<&'a OrientationSupply<'a>>,
+}
+
 /// Maps a native owner refusal to a typed fail-closed refusal.
 ///
 /// Every mapping is [`DreamerError::InvalidAdmission`] (request-rejected code),
@@ -219,10 +233,9 @@ pub(crate) fn dispatch_admitted(
     job: &DreamJobInput,
     screen: Option<ScreenBinding>,
     curation_protection: Option<CurationProtectionSet>,
-    curation_carrier: Option<CurationExecutionCarrier<'_>>,
+    carriers: OwnerCarriers<'_>,
     job_class: JobClass,
     validated: Option<&ValidatedGroundingCandidate>,
-    orientation_supply: Option<&OrientationSupply<'_>>,
 ) -> Result<DreamResult, DreamerError> {
     verify_admitted_binding(admission, job)?;
     if job.job_class != job_class {
@@ -235,7 +248,7 @@ pub(crate) fn dispatch_admitted(
         // the precise carrier refusal names the missing governed input
         // even when the screen is absent too.
         JobClass::Curation => {
-            let Some(carrier) = curation_carrier else {
+            let Some(carrier) = carriers.curation else {
                 return Err(DreamerError::InvalidAdmission(CURATION_CARRIER_REFUSAL));
             };
             let Some(binding) = screen else {
@@ -255,7 +268,7 @@ pub(crate) fn dispatch_admitted(
             let Some(candidate) = validated else {
                 return Err(DreamerError::InvalidAdmission(VALIDATION_RECEIPT_REFUSAL));
             };
-            dispatch_orientation(admission, job, candidate, orientation_supply)
+            dispatch_orientation(admission, job, candidate, carriers.orientation)
         }
         // Native owner: eliot-dreamer-research-synthesis `synthesize`. The
         // owner takes its own `SynthesisRequest` vocabulary (a
@@ -415,8 +428,7 @@ fn dispatch_orientation(
         &candidate,
         &bundle,
         &policy,
-        &model_request,
-        &model_outcome,
+        Some((&model_request, &model_outcome)),
         orientation_supply,
     ) {
         Ok(inputs) => crate::production_orientation::compose_production_result(inputs, job)
@@ -2229,15 +2241,8 @@ mod slice_7_native_owner_tests {
             let admission = admission();
             let job = semantic_job(class);
             let validated = validated_for(&admission, &job);
-            let refused = dispatch_admitted(
-                &admission,
-                &job,
-                None,
-                None,
-                class,
-                Some(&validated),
-                None,
-            );
+            let refused =
+                dispatch_admitted(&admission, &job, None, None, class, Some(&validated), None);
             assert!(
                 matches!(refused, Err(DreamerError::InvalidAdmission(got)) if got == reason),
                 "class {class:?} must name its governed input, got {refused:?}"
@@ -2263,16 +2268,15 @@ mod slice_7_native_owner_tests {
             JobClass::OrchestrationPlanning,
             JobClass::ConfigurationAssistance,
         ] {
-            let refused =
-                dispatch_admitted(
-                    &admission(),
-                    &semantic_job(class),
-                    None,
-                    None,
-                    class,
-                    None,
-                    None,
-                );
+            let refused = dispatch_admitted(
+                &admission(),
+                &semantic_job(class),
+                None,
+                None,
+                class,
+                None,
+                None,
+            );
             assert!(
                 matches!(refused, Err(DreamerError::UnsupportedJobClass(refused_class)) if refused_class == class),
                 "class {class:?} must refuse with UnsupportedJobClass({class:?}), got {refused:?}"

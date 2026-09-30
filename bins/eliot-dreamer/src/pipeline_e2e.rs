@@ -483,15 +483,7 @@ fn submit_chain_curation_stops_before_generic_stages_without_carrier() {
     assert_eq!(error.code(), "DREAMER_REQUEST_REJECTED");
     assert_ne!(error.code(), KERNEL_ADMISSION_REQUIRED);
     // Dispatch level: the same missing carrier refuses with the same reason.
-    let refused = dispatch_admitted(
-        &admission,
-        &job,
-        None,
-        None,
-        JobClass::Curation,
-        None,
-        None,
-    );
+    let refused = dispatch_admitted(&admission, &job, None, None, JobClass::Curation, None, None);
     let Err(error) = refused else {
         panic!("carrier-less dispatch must refuse at the carrier check");
     };
