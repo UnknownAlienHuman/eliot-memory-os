@@ -32,6 +32,12 @@ pub enum ToolExposureError {
     /// A materially repeated call carried no new expected delta.
     #[error("repeated tool call without a new expected delta: {signal:?}")]
     NoProgress { signal: LoopSignal },
+    /// A Material dispatch arrived without a current grant standing.
+    #[error("material dispatch requires a current grant")]
+    GrantRequired,
+    /// A Material dispatch arrived under a revoked grant.
+    #[error("grant is revoked")]
+    GrantRevoked,
 }
 
 pub(crate) fn text(value: &str, field: &'static str) -> Result<(), ToolExposureError> {
@@ -809,11 +815,18 @@ impl ToolExposureReceiptV2 {
     /// truncated receipt never satisfies [`Self::is_delivered_full`] or
     /// [`Self::is_evidence_used`].
     ///
+    /// First delivery only: a receipt that already carries delivered
+    /// representation evidence never has it overwritten here. A later
+    /// authorized delivery for the same result links through
+    /// [`Self::record_expanded_delivery`], which preserves the original
+    /// truncation instead of rewriting it.
+    ///
     /// # Errors
     ///
     /// Returns an error when the receipt already records the call as
-    /// not-called, when transport is already recorded as not completed, or
-    /// when the resulting receipt is inconsistent.
+    /// not-called, when transport is already recorded as not completed, when
+    /// a delivery outcome was already recorded, or when the resulting receipt
+    /// is inconsistent.
     pub fn record_truncated_delivery(
         mut self,
         produced: ProducedToolResultIdentity,
@@ -831,6 +844,20 @@ impl ToolExposureReceiptV2 {
                 reason: "a truncated delivery requires completed transport",
             });
         }
+        if self.delivered_representation.is_some()
+            || !matches!(self.result_delivery, ResultDelivery::Missing)
+        {
+            return Err(ToolExposureError::InvalidField {
+                field: "receipt.delivered_representation",
+                reason: "recorded delivery evidence is never overwritten; later deliveries link through record_expanded_delivery",
+            });
+        }
+        if delivered.prior_delivery_receipt_id.is_some() {
+            return Err(ToolExposureError::InvalidField {
+                field: "receipt.delivered_representation.prior_delivery_receipt_id",
+                reason: "a first truncated delivery is not an expansion and carries no prior link",
+            });
+        }
         self.called = Some(true);
         self.transport_completed = Some(true);
         self.result_delivery = ResultDelivery::Truncated;
@@ -838,6 +865,151 @@ impl ToolExposureReceiptV2 {
         self.delivered_representation = Some(delivered);
         self.validate()?;
         Ok(self)
+    }
+
+    /// Records a first complete delivery on an evaluated receipt.
+    ///
+    /// The direct path from an unevaluated (`MISSING`, nothing recorded)
+    /// receipt to `FULL`: the call keeps `transport_completed` as `Some(true)`
+    /// while `result_delivery` becomes `FULL` with the produced identity and
+    /// the exact delivered representation supplied by their observation
+    /// owners. Only a receipt returned by this constructor (or by
+    /// [`Self::record_expanded_delivery`]) satisfies
+    /// [`Self::is_delivered_full`].
+    ///
+    /// A recorded `TRUNCATED` outcome — or a completed call whose delivery
+    /// outcome is already recorded — is never rewritten as `FULL` here. The
+    /// original truncation stays intact; a later authorized delivery links a
+    /// new receipt through [`Self::record_expanded_delivery`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the receipt already records the call as
+    /// not-called, when transport is already recorded as not completed, when
+    /// a delivery outcome was already recorded, when the supplied
+    /// representation already links a prior delivery, or when the resulting
+    /// receipt is inconsistent.
+    pub fn record_full_delivery(
+        mut self,
+        produced: ProducedToolResultIdentity,
+        delivered: DeliveredToolRepresentation,
+    ) -> Result<Self, ToolExposureError> {
+        if matches!(self.called, Some(false)) {
+            return Err(ToolExposureError::InvalidField {
+                field: "receipt.called",
+                reason: "a full delivery requires an executed call",
+            });
+        }
+        if matches!(self.transport_completed, Some(false)) {
+            return Err(ToolExposureError::InvalidField {
+                field: "receipt.transport_completed",
+                reason: "a full delivery requires completed transport",
+            });
+        }
+        if self.delivered_representation.is_some()
+            || !matches!(self.result_delivery, ResultDelivery::Missing)
+            || matches!(self.called, Some(true))
+        {
+            return Err(ToolExposureError::InvalidField {
+                field: "receipt.delivered_representation",
+                reason: "a recorded truncated or missing delivery outcome is never rewritten as full; later deliveries link through record_expanded_delivery",
+            });
+        }
+        if delivered.prior_delivery_receipt_id.is_some() {
+            return Err(ToolExposureError::InvalidField {
+                field: "receipt.delivered_representation.prior_delivery_receipt_id",
+                reason: "a direct full delivery is not an expansion and carries no prior link",
+            });
+        }
+        self.called = Some(true);
+        self.transport_completed = Some(true);
+        self.result_delivery = ResultDelivery::Full;
+        self.produced_result = Some(produced);
+        self.delivered_representation = Some(delivered);
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Links a later authorized delivery for a recorded truncated (or
+    /// completed-missing) outcome without rewriting it.
+    ///
+    /// The original receipt is untouched: this builds a NEW receipt with its
+    /// own identity whose delivered representation links
+    /// `prior_delivery_receipt_id` to the original. The expansion delivers
+    /// the SAME produced result — a supplied produced identity whose digest
+    /// disagrees with the retained one is refused — with its own exact
+    /// representation evidence, and records `FULL` plus
+    /// `expanded_or_retried`. Eligibility, selection, registration,
+    /// advertisement, use, and terminal stages carry over verbatim; unknown
+    /// stays unknown and is never inferred.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the original receipt is inconsistent, when it
+    /// records no expandable truncated or completed-missing outcome, when the
+    /// new identity is blank or self-linking, when the supplied produced
+    /// digest disagrees with the retained one, when the supplied
+    /// representation already links a prior delivery, or when the resulting
+    /// receipt is inconsistent.
+    pub fn record_expanded_delivery(
+        &self,
+        new_receipt_id: String,
+        produced: ProducedToolResultIdentity,
+        mut delivered: DeliveredToolRepresentation,
+    ) -> Result<Self, ToolExposureError> {
+        self.validate()?;
+        let expandable = matches!(self.result_delivery, ResultDelivery::Truncated)
+            || (matches!(self.result_delivery, ResultDelivery::Missing)
+                && matches!(self.called, Some(true)));
+        if !expandable {
+            return Err(ToolExposureError::InvalidField {
+                field: "receipt.result_delivery",
+                reason: "only a recorded truncated or completed-missing delivery can be expanded",
+            });
+        }
+        text(&new_receipt_id, "receipt.receipt_id")?;
+        if new_receipt_id == self.receipt_id {
+            return Err(ToolExposureError::InvalidField {
+                field: "receipt.delivered_representation.prior_delivery_receipt_id",
+                reason: "an expansion links a prior delivery receipt, never itself",
+            });
+        }
+        if let Some(retained) = &self.produced_result
+            && retained.result_digest != produced.result_digest
+        {
+            return Err(ToolExposureError::InvalidField {
+                field: "receipt.produced_result.result_digest",
+                reason: "an expansion delivers the same produced result, never a different one",
+            });
+        }
+        if delivered.prior_delivery_receipt_id.is_some() {
+            return Err(ToolExposureError::InvalidField {
+                field: "receipt.delivered_representation.prior_delivery_receipt_id",
+                reason: "the expansion link is set here, never supplied by the caller",
+            });
+        }
+        delivered.prior_delivery_receipt_id = Some(self.receipt_id.clone());
+        let expanded = Self {
+            schema_version: TOOL_EXPOSURE_RECEIPT_V2_VERSION,
+            receipt_id: new_receipt_id,
+            tool_definition: self.tool_definition.clone(),
+            route_fingerprint: self.route_fingerprint.clone(),
+            registered: self.registered,
+            advertised_to_route: self.advertised_to_route,
+            eligible_under_scope_policy_and_grant: self.eligible_under_scope_policy_and_grant,
+            selected_by_planner_or_model: self.selected_by_planner_or_model,
+            called: Some(true),
+            transport_completed: Some(true),
+            result_delivery: ResultDelivery::Full,
+            produced_result: Some(produced),
+            delivered_representation: Some(delivered),
+            expanded_or_retried: Some(true),
+            observably_used_in_decision_action_or_verifier: self
+                .observably_used_in_decision_action_or_verifier,
+            terminal_task_or_product_outcome_ref: self.terminal_task_or_product_outcome_ref.clone(),
+        };
+        expanded.validate()?;
+        Ok(expanded)
     }
 }
 

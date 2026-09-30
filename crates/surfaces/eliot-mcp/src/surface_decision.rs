@@ -14,10 +14,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_protocol::HARD_STRUCTURED_RESPONSE_BYTES;
+use eliot_receipts::surface::{
+    MaterialGrantStanding, authorize_material_grant, resolve_material_grant,
+};
 use eliot_receipts::{
-    BudgetCoverage, BudgetOverflow, OverflowDisposition, RenderedToolCost, SurfaceBudgetInput,
-    TOOL_SURFACE_CONTRACT_VERSION, TokenCountObservation, TokenCountUnavailableReason,
-    ToolExposureError, ToolSurfaceBudget, compile_surface_budget,
+    BudgetCoverage, BudgetOverflow, GrantClosureReceipt, OverflowDisposition, RenderedToolCost,
+    SurfaceBudgetInput, TOOL_SURFACE_CONTRACT_VERSION, TokenCountObservation,
+    TokenCountUnavailableReason, ToolExposureError, ToolSurfaceBudget, compile_surface_budget,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -551,6 +554,15 @@ impl ToolSurfaceDecision {
 /// Dispositions derive deterministically from the owner conditions plus
 /// profile-owned facts; no method is inferred from names or prose.
 ///
+/// The live grant-closure verdict is the grant/revocation owner join: the
+/// claimed `grant_revision` in `conditions` authorizes Material (non-read-only)
+/// advertisement only when the verdict is `Active` and covers it. A missing
+/// verdict, a revoked closure, or an uncovered revision withholds every
+/// Material method to `Hidden` with a recorded reason — a missing or revoked
+/// grant can never enable Material dispatch through advertisement, while
+/// read-only methods keep the narrowest observable capability. A blank grant
+/// revision still fails the whole compile through [`TaskSurfaceConditions::validate`].
+///
 /// # Errors
 ///
 /// Returns an error when the conditions are malformed or the compiled
@@ -558,8 +570,10 @@ impl ToolSurfaceDecision {
 pub fn compile_surface_decision(
     registry: &SemanticRegistry,
     conditions: &TaskSurfaceConditions,
+    grant_closure: Option<&GrantClosureReceipt>,
 ) -> Result<ToolSurfaceDecision, SurfaceDecisionError> {
     conditions.validate()?;
+    let grant = resolve_material_grant(grant_closure, &conditions.grant_revision).ok();
     let mut considered = Vec::new();
     let mut visible = Vec::new();
     let mut lazy_visible = Vec::new();
@@ -573,7 +587,8 @@ pub fn compile_surface_decision(
             .get(&name)
             .cloned()
             .unwrap_or_default();
-        let (disposition, reason) = decide_disposition(profile, conditions, &evidence);
+        let (disposition, reason) =
+            decide_disposition(profile, conditions, &evidence, grant.as_ref());
         considered.push(ConsideredSurfaceMethod {
             method: profile.method.clone(),
             profile_version: profile.profile_version.clone(),
@@ -639,6 +654,7 @@ fn decide_disposition(
     profile: &crate::ToolSemanticProfile,
     conditions: &TaskSurfaceConditions,
     evidence: &[String],
+    grant: Option<&MaterialGrantStanding>,
 ) -> (SurfaceDisposition, &'static str) {
     let name = profile.method.canonical_name.as_str();
     if conditions.forbidden.contains(name) {
@@ -658,6 +674,31 @@ fn decide_disposition(
             SurfaceDisposition::Forbidden,
             "effect class exceeds the task effect ceiling",
         );
+    }
+    // A2: a missing or revoked grant cannot enable Material dispatch. Only
+    // read-only methods keep the narrowest observable capability without a
+    // live standing; every Material method is withheld from advertisement
+    // with its reason recorded, never merely discouraged in prose. The typed
+    // grant gate fails closed on every error: a missing standing
+    // (GrantRequired) and a revoked standing (GrantRevoked) withhold with
+    // distinct recorded reasons so the two acceptance cases stay
+    // distinguishable in the decision evidence.
+    if effect_rank(profile.effect_class) > effect_rank(EffectClass::ReadOnly) {
+        match authorize_material_grant(grant) {
+            Ok(()) => {}
+            Err(ToolExposureError::GrantRevoked) => {
+                return (
+                    SurfaceDisposition::Hidden,
+                    "grant revoked; Material use withheld from advertisement",
+                );
+            }
+            Err(_) => {
+                return (
+                    SurfaceDisposition::Hidden,
+                    "no live grant standing; Material use withheld from advertisement",
+                );
+            }
+        }
     }
     if !profile.introduction_requirements.is_empty() && evidence.is_empty() {
         return (
@@ -888,7 +929,10 @@ pub struct TaskRelativeSurface {
 /// ([`published_mcp_tool_surface`]: generated descriptors with validated live
 /// semantic-owner bindings, failing closed on version disagreement), applies
 /// the owner-supplied task conditions deterministically, and withholds
-/// unavailable or forbidden methods.
+/// unavailable or forbidden methods. The live grant-closure
+/// verdict is the grant/revocation owner: Material methods are withheld
+/// without a live standing covering the claimed grant revision, so a
+/// missing or revoked grant can never enable Material advertisement.
 ///
 /// # Errors
 ///
@@ -897,10 +941,11 @@ pub struct TaskRelativeSurface {
 pub fn compile_task_relative_surface(
     registry: &SemanticRegistry,
     conditions: &TaskSurfaceConditions,
+    grant_closure: Option<&GrantClosureReceipt>,
 ) -> Result<TaskRelativeSurface, SurfaceDecisionError> {
     let descriptors =
         published_mcp_tool_surface().map_err(|_| SurfaceDecisionError::DescriptorsUnavailable)?;
-    let decision = compile_surface_decision(registry, conditions)?;
+    let decision = compile_surface_decision(registry, conditions, grant_closure)?;
     let derived = derive_permitted_surface(registry, &decision, &descriptors)?;
     Ok(TaskRelativeSurface {
         decision,
