@@ -48,7 +48,7 @@ use super::{
 use eliot_contracts::{
     CapabilityCellExpectation, CapabilityCellId, CapabilityCellProof, CapabilityCellProofError,
     CapabilityCellRegistry, ContractDigest, ExecutionContour, ProofEntrypointRef, ResourceGeneration,
-    SourceCrateRef, SupportStatus,
+    RuntimeBundleId, SourceCrateRef, SupportStatus,
 };
 use eliot_platform_windows::ProtectedPathLease;
 use std::collections::BTreeMap;
@@ -97,6 +97,11 @@ static NATIVE_WORKER_CELL_REGISTRY: OnceLock<
 /// second reading of the same declaration inputs rather than a second,
 /// independent authority.
 ///
+/// `CapabilityCellExpectation::new` is infallible by construction: it takes
+/// values that are already #13 types, so every shape check below is the
+/// *validating* constructor that has to reject a blank or control-bearing
+/// declaration, and this function is fallible only because of them.
+///
 /// What that buys is that the comparison against the record is BY VALUE, which
 /// is the whole point of resolving here. Presence is not a proof surface: any
 /// non-empty entrypoint satisfies a presence test, and a support claim is not
@@ -107,7 +112,7 @@ static NATIVE_WORKER_CELL_REGISTRY: OnceLock<
 /// ORIGINAL recorded value the sources declare is what the record is compared
 /// against.
 fn native_worker_cell_expectation() -> Result<CapabilityCellExpectation, CapabilityCellProofError> {
-    CapabilityCellExpectation::new(
+    Ok(CapabilityCellExpectation::new(
         CapabilityCellId::new(NATIVE_WORKER_CAPABILITY_CELL_ID)
             .map_err(|_| CapabilityCellProofError::InvalidRegistry)?,
         SourceCrateRef::new(NATIVE_WORKER_CAPABILITY_SOURCE_PACKAGE)
@@ -117,7 +122,7 @@ fn native_worker_cell_expectation() -> Result<CapabilityCellExpectation, Capabil
         ContractDigest::new(NATIVE_WORKER_CAPABILITY_CONTRACT_DIGEST)
             .map_err(|_| CapabilityCellProofError::InvalidRegistry)?,
         native_worker_declared_support()?,
-    )
+    ))
 }
 
 /// Parses the declared support claim through #13's own closed vocabulary.
@@ -195,6 +200,14 @@ pub(super) enum NativeWorkerCellRefusal {
         /// Runtime bundle the admitted Module generation names.
         admitted: String,
     },
+    /// The admitted Module identity is not a well-formed runtime bundle name, so
+    /// it cannot be bound to the record at all. Reported rather than compared as
+    /// text, because a blank or control-bearing identity would otherwise satisfy
+    /// any comparison made against it as a string.
+    MalformedAdmittedModuleId {
+        /// Module identity the admitted generation presented.
+        module_id: String,
+    },
 }
 
 impl std::fmt::Display for NativeWorkerCellRefusal {
@@ -219,6 +232,10 @@ impl std::fmt::Display for NativeWorkerCellRefusal {
             } => write!(
                 formatter,
                 "capability cell '{cell}' declares runtime bundle '{declared}', but the admitted Module generation names '{admitted}'"
+            ),
+            Self::MalformedAdmittedModuleId { module_id } => write!(
+                formatter,
+                "admitted Module identity '{module_id}' is not a well-formed runtime bundle name, so it cannot be bound to the cell record"
             ),
         }
     }
@@ -274,10 +291,16 @@ pub(super) fn native_worker_cell_registry_digest(
 /// the record declares `execution_contour = "DELEGATED_BUNDLE"` with
 /// `runtime_bundle = "eliot-native-worker"`, and Kernel admits the worker
 /// session under exactly that Module identity
-/// (`front_door_session::NATIVE_MODULE_ID`). `admitted_module_id` is therefore
-/// compared **by value** against the declared bundle: a record that delegated to
-/// another bundle, or claimed no bundle at all while a Module generation is
-/// admitted, is refused instead of being read as if it agreed.
+/// (`front_door_session::NATIVE_MODULE_ID`).
+///
+/// Both sides of the comparison are #13 [`RuntimeBundleId`] values. The declared
+/// side is the record's own typed bundle; the admitted side is put through the
+/// same validating constructor, so a blank or control-bearing Module identity is
+/// refused instead of being compared as text. Neither side is ever reduced to a
+/// string before the comparison, and `RuntimeBundleId` is a validated newtype
+/// rather than free text, so a record that delegated to another bundle — or that
+/// claimed no bundle at all while a Module generation is admitted — is refused
+/// instead of being read as if it agreed.
 ///
 /// A `None` bundle is a real declared value, not missing evidence, and it is
 /// refused here for the same reason the research provider's `HOST_INLINE` cell
@@ -285,7 +308,7 @@ pub(super) fn native_worker_cell_registry_digest(
 /// so a record describing inline execution is describing a different cell.
 pub(super) fn native_worker_cell_admits_module_generation(
     selected_cell: &CapabilityCellId,
-    admitted_module_id: &str,
+    admitted_module_id: &ContractId,
 ) -> Result<(), NativeWorkerCellRefusal> {
     let loaded = validated_native_worker_cell_registry()?;
     if loaded.proof.cell().as_str() != selected_cell.as_str() {
@@ -301,11 +324,16 @@ pub(super) fn native_worker_cell_admits_module_generation(
             contour: loaded.proof.execution_contour(),
         });
     };
-    if declared.as_str() != admitted_module_id {
+    let admitted = RuntimeBundleId::new(admitted_module_id.as_str()).map_err(|_| {
+        NativeWorkerCellRefusal::MalformedAdmittedModuleId {
+            module_id: admitted_module_id.as_str().to_owned(),
+        }
+    })?;
+    if *declared != admitted {
         return Err(NativeWorkerCellRefusal::RuntimeBundleMismatch {
             cell: cell.to_owned(),
             declared: declared.as_str().to_owned(),
-            admitted: admitted_module_id.to_owned(),
+            admitted: admitted.as_str().to_owned(),
         });
     }
     Ok(())
