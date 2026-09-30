@@ -58,6 +58,29 @@ pub enum OrientationProductStageSources<'a> {
     Stale(Vec<PulseStageId>),
 }
 
+/// Original CC-002/CC-004 inputs available when a claimed worker discovers
+/// that one or more additional native stage-owner records are absent.
+///
+/// This path preserves a truthful incomplete result without requiring callers
+/// to fabricate a `ValidatedCandidate`, packet policy, CEP handle, or stage
+/// wrapper merely to report the exact missing stage owners.
+pub struct OrientationProductMissingInput<'a> {
+    /// Original source-bound Orientation job.
+    pub admitted_job: &'a AdmittedOrientationJob,
+    /// Exact bounded bundle admitted for the job.
+    pub bundle: &'a DreamInputBundle,
+    /// Original request returned by the CC-002 model owner.
+    pub model_request: &'a ModelRouteRequest,
+    /// Native draft retained by the completed provider owner.
+    pub model_draft: &'a ModelDraft,
+    /// Original outcome returned by the CC-002 model owner.
+    pub model_outcome: &'a ModelRouteOutcome,
+    /// Whole original runtime-owner publication retained by the claimed job.
+    pub runtime_owner_input: &'a DurableJobRuntimeOwnerExecutionInput,
+    /// Exact mandatory owners whose original input source was absent.
+    pub missing_stages: Vec<PulseStageId>,
+}
+
 /// Retained product result. Source absence and owner refusal remain distinct.
 pub enum OrientationProductOwnerResult {
     /// One or more mandatory owner inputs are absent from the current source set.
@@ -73,6 +96,54 @@ pub enum OrientationProductOwnerResult {
         /// `None` means a mandatory owner refused or blocked before projection.
         packet: Result<Option<Box<OrientationPacketCandidate>>, OrientationError>,
     },
+}
+
+/// Preserve a typed missing-owner outcome after validating the exact original
+/// model, bundle, admitted job, and runtime publication boundary.
+///
+/// The caller may use this when source acquisition reports absence before it
+/// can construct the full stage input view. A missing list can lower the result
+/// ceiling only; this function can never produce a packet or a complete pulse.
+pub fn report_missing_orientation_product(
+    input: OrientationProductMissingInput<'_>,
+) -> OrientationProductOwnerResult {
+    if !valid_unavailable_stage_list(&input.missing_stages) {
+        return OrientationProductOwnerResult::BoundaryRefused(OrientationError::Invalid(
+            "missing stage source list",
+        ));
+    }
+    if input.admitted_job.validate_for(input.bundle).is_err() {
+        return OrientationProductOwnerResult::BoundaryRefused(OrientationError::Binding(
+            "admitted job bundle",
+        ));
+    }
+    if input
+        .model_request
+        .validate_binds_bundle(input.bundle)
+        .is_err()
+        || input.model_outcome.validate().is_err()
+        || input.model_outcome.draft.as_ref() != Some(input.model_draft)
+        || input.model_request.job_id != input.model_outcome.job_id
+        || input.model_request.bundle_digest != input.model_outcome.bundle_digest
+        || input.model_request.state_fence != input.model_outcome.state_fence
+        || input.model_outcome.job_id != input.bundle.job_id
+        || input.model_outcome.state_fence != input.bundle.state_fence
+    {
+        return OrientationProductOwnerResult::BoundaryRefused(OrientationError::Binding(
+            "model route bundle closure",
+        ));
+    }
+    if input.runtime_owner_input.validate().is_err()
+        || input.runtime_owner_input.task_id.as_str() != input.bundle.task_id
+        || input.runtime_owner_input.work_scope.scope_id.as_str() != input.bundle.scope_id
+        || input.runtime_owner_input.state_fence != input.bundle.state_fence
+        || input.runtime_owner_input.work_scope.state_fence != input.bundle.state_fence
+    {
+        return OrientationProductOwnerResult::BoundaryRefused(OrientationError::Binding(
+            "runtime owner bundle closure",
+        ));
+    }
+    OrientationProductOwnerResult::Missing(input.missing_stages)
 }
 
 /// Executes the native mandatory owners once and projects only a complete run.
