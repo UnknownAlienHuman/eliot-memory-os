@@ -172,9 +172,7 @@ impl SourceArtifactAdmission {
         self.reservation_id.as_ref()
     }
 
-    pub fn canonical_admission_receipt(
-        &self,
-    ) -> Option<&eliot_receipts::ReceiptIdentity> {
+    pub fn canonical_admission_receipt(&self) -> Option<&eliot_receipts::ReceiptIdentity> {
         self.canonical_admission_receipt.as_ref()
     }
 
@@ -219,71 +217,70 @@ pub(crate) fn issue_source_artifact_admission(
     input: SourceArtifactAdmissionRequest,
 ) -> Result<SourceArtifactAdmission, SourceArtifactAdmissionError> {
     validate_request(&input)?;
-    let (reservation_id, canonical_receipt, activation_receipt) =
-        match input.operation.effect {
-            EffectClass::Read => {
-                if input.active_reservation.is_some()
-                    || input.expected_work_item_id.is_some()
-                    || input.expected_proposed_attempt_id.is_some()
-                {
-                    return Err(SourceArtifactAdmissionError::Binding(
-                        "Read admission cannot carry a write reservation or its identity",
-                    ));
-                }
-                (None, None, None)
-            }
-            EffectClass::ReversibleMutation => {
-                let active_reservation = input
-                    .active_reservation
-                    .as_ref()
-                    .ok_or(SourceArtifactAdmissionError::MissingReservation)?;
-                let expected_work_item_id = input
-                    .expected_work_item_id
-                    .as_ref()
-                    .ok_or(SourceArtifactAdmissionError::MissingReservation)?;
-                let expected_proposed_attempt_id = input
-                    .expected_proposed_attempt_id
-                    .as_ref()
-                    .ok_or(SourceArtifactAdmissionError::MissingReservation)?;
-                let active = active_reservation.record();
-                if active.state != AdmissionReservationState::Active
-                    || &active.work_item_id != expected_work_item_id
-                    || &active.proposed_attempt_id != expected_proposed_attempt_id
-                {
-                    return Err(SourceArtifactAdmissionError::Binding(
-                        "reservation is not the exact active work-item/attempt pair",
-                    ));
-                }
-                let canonical_receipt = active
-                    .canonical_admission_receipt
-                    .clone()
-                    .ok_or(SourceArtifactAdmissionError::MissingReservationReceipt)?;
-                let activation_receipt = active
-                    .activation_receipt
-                    .clone()
-                    .ok_or(SourceArtifactAdmissionError::MissingReservationReceipt)?;
-                let fence_json = canonical_json_bytes(&input.work_scope.state_fence)
-                    .map_err(|_| SourceArtifactAdmissionError::FenceEncoding)?;
-                if active.state_fence.canonical_json.as_bytes() != fence_json.as_slice()
-                    || active.state_fence.observed_authority_epoch
-                        != input.work_scope.state_fence.authority_epoch.sequence.get()
-                {
-                    return Err(SourceArtifactAdmissionError::Binding(
-                        "active reservation fence or epoch differs from the current WorkScope",
-                    ));
-                }
-                (
-                    Some(active.reservation_id.clone()),
-                    Some(canonical_receipt),
-                    Some(activation_receipt),
-                )
-            }
-            EffectClass::Candidate | EffectClass::ExternalEffect => {
+    let (reservation_id, canonical_receipt, activation_receipt) = match input.operation.effect {
+        EffectClass::Read => {
+            if input.active_reservation.is_some()
+                || input.expected_work_item_id.is_some()
+                || input.expected_proposed_attempt_id.is_some()
+            {
                 return Err(SourceArtifactAdmissionError::Binding(
-                    "source artifact operations admit only Read or reversible-mutation effects",
+                    "Read admission cannot carry a write reservation or its identity",
                 ));
             }
-        };
+            (None, None, None)
+        }
+        EffectClass::ReversibleMutation => {
+            let active_reservation = input
+                .active_reservation
+                .as_ref()
+                .ok_or(SourceArtifactAdmissionError::MissingReservation)?;
+            let expected_work_item_id = input
+                .expected_work_item_id
+                .as_ref()
+                .ok_or(SourceArtifactAdmissionError::MissingReservation)?;
+            let expected_proposed_attempt_id = input
+                .expected_proposed_attempt_id
+                .as_ref()
+                .ok_or(SourceArtifactAdmissionError::MissingReservation)?;
+            let active = active_reservation.record();
+            if active.state != AdmissionReservationState::Active
+                || &active.work_item_id != expected_work_item_id
+                || &active.proposed_attempt_id != expected_proposed_attempt_id
+            {
+                return Err(SourceArtifactAdmissionError::Binding(
+                    "reservation is not the exact active work-item/attempt pair",
+                ));
+            }
+            let canonical_receipt = active
+                .canonical_admission_receipt
+                .clone()
+                .ok_or(SourceArtifactAdmissionError::MissingReservationReceipt)?;
+            let activation_receipt = active
+                .activation_receipt
+                .clone()
+                .ok_or(SourceArtifactAdmissionError::MissingReservationReceipt)?;
+            let fence_json = canonical_json_bytes(&input.work_scope.state_fence)
+                .map_err(|_| SourceArtifactAdmissionError::FenceEncoding)?;
+            if active.state_fence.canonical_json.as_bytes() != fence_json.as_slice()
+                || active.state_fence.observed_authority_epoch
+                    != input.work_scope.state_fence.authority_epoch.sequence.get()
+            {
+                return Err(SourceArtifactAdmissionError::Binding(
+                    "active reservation fence or epoch differs from the current WorkScope",
+                ));
+            }
+            (
+                Some(active.reservation_id.clone()),
+                Some(canonical_receipt),
+                Some(activation_receipt),
+            )
+        }
+        EffectClass::Candidate | EffectClass::ExternalEffect => {
+            return Err(SourceArtifactAdmissionError::Binding(
+                "source artifact operations admit only Read or reversible-mutation effects",
+            ));
+        }
+    };
 
     let snapshot: EffectiveCapabilitySnapshot = authority.grants.snapshot(
         input.snapshot_id,

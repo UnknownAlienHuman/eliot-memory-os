@@ -14,15 +14,14 @@ use eliot_graph_api::{
     GraphQueryResult, GraphRevision,
 };
 use eliot_instrument_api::{EvidenceAxes, EvidenceCoverage, EvidenceFreshness, NormalizedEvidence};
-use eliot_receipts::{CausalBinding, TaskBinding};
-use eliot_store_api::CapturedBlobPayloadRefV1;
 use eliot_lsp_bridge::{
-    BridgeError as LspBridgeError, Coverage as LspCoverage, DiagnosticSeverity,
-    FailureDisposition, Freshness as LspFreshness, LspAdoptionProjection, LspRawOutputKind,
-    NormalizedResult, RetainedLspObservationV1,
-    SemanticOperation, adopt_captured_observation_from_blob_readback,
+    BridgeError as LspBridgeError, Coverage as LspCoverage, DiagnosticSeverity, FailureDisposition,
+    Freshness as LspFreshness, LspAdoptionProjection, LspRawOutputKind, NormalizedResult,
+    RetainedLspObservationV1, SemanticOperation, adopt_captured_observation_from_blob_readback,
     adopt_retained_observation,
 };
+use eliot_receipts::{CausalBinding, TaskBinding};
+use eliot_store_api::CapturedBlobPayloadRefV1;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -119,12 +118,10 @@ fn validate_captured_lsp_task_join(
         || ready_receipt.core.task.as_ref() != Some(&captured.historical_task_binding)
         || ready_receipt.core.request.metadata.task_id.as_ref()
             != Some(&captured.historical_task_binding.task_id)
-        || ready_receipt.core.request.state_fence
-            != captured.historical_task_binding.state_fence
+        || ready_receipt.core.request.state_fence != captured.historical_task_binding.state_fence
         || ready_receipt.core.request.metadata.state_fence
             != captured.historical_task_binding.state_fence
-        || ready_receipt.core.causal.state_fence
-            != captured.historical_task_binding.state_fence
+        || ready_receipt.core.causal.state_fence != captured.historical_task_binding.state_fence
         || read_receipt.core.task.as_ref() != Some(current_read_task_binding)
         || &read_receipt.core.causal != current_read_causal_binding
         || read_receipt.core.request.metadata.task_id.as_ref()
@@ -600,10 +597,7 @@ impl CodeCortexService {
         current_read_causal_binding: CausalBinding,
         observations: Vec<CapturedLspObservation>,
     ) -> Result<Self, CodeCortexError> {
-        validate_current_read_binding(
-            &current_read_task_binding,
-            &current_read_causal_binding,
-        )?;
+        validate_current_read_binding(&current_read_task_binding, &current_read_causal_binding)?;
         let mut index = SemanticIndex::new();
         for observation in observations {
             validate_captured_lsp_payload_reference(&observation.reference)?;
@@ -644,9 +638,11 @@ impl CodeCortexService {
         request: &CompositionRequest,
     ) -> Result<CodeCortexReport, CodeCortexError> {
         request.validate()?;
-        if self.current_task_binding.as_ref().is_some_and(|binding| {
-            request.task_id != binding.task_id.to_string()
-        }) {
+        if self
+            .current_task_binding
+            .as_ref()
+            .is_some_and(|binding| request.task_id != binding.task_id.to_string())
+        {
             return Err(CodeCortexError::TaskBindingMismatch);
         }
         let mut report = compose_snapshot(request, &self.index.snapshot())?;

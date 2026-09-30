@@ -1,8 +1,6 @@
 //! Original-owner READ admission for one retained source-artifact Blob pointer.
 
-use eliot_authority::{
-    ActionContract, ImpactClass, LeaseId, ReceiptObligation, SnapshotId,
-};
+use eliot_authority::{ActionContract, ImpactClass, LeaseId, ReceiptObligation, SnapshotId};
 use eliot_contracts::{
     ClockReading, OperationId, RequestId, ResourceGeneration, StateFence, TaskRevision,
     canonical_json_bytes,
@@ -105,16 +103,19 @@ fn validate_original_read_request<'a>(
         .ok_or(SourceArtifactAdmissionError::Binding(
             "context reconstruction request lacks its original WorkScope identity",
         ))?;
-    let metadata_task = metadata.task_id.as_ref().ok_or(
-        SourceArtifactAdmissionError::Binding(
+    let metadata_task = metadata
+        .task_id
+        .as_ref()
+        .ok_or(SourceArtifactAdmissionError::Binding(
             "context reconstruction metadata lacks its task identity",
-        ),
-    )?;
-    let metadata_session = metadata.session_id.as_ref().ok_or(
-        SourceArtifactAdmissionError::Binding(
-            "context reconstruction metadata lacks its session identity",
-        ),
-    )?;
+        ))?;
+    let metadata_session =
+        metadata
+            .session_id
+            .as_ref()
+            .ok_or(SourceArtifactAdmissionError::Binding(
+                "context reconstruction metadata lacks its session identity",
+            ))?;
 
     if identity.capability != "eliot.query"
         || identity.request_id.as_str().trim().is_empty()
@@ -150,9 +151,9 @@ fn validate_original_read_request<'a>(
         deadline_unix_ms: identity.deadline_unix_ms,
         cancellation_id: identity.cancellation_id.clone(),
     };
-    request_identity
-        .validate()
-        .map_err(|_| SourceArtifactAdmissionError::Binding("original request identity is invalid"))?;
+    request_identity.validate().map_err(|_| {
+        SourceArtifactAdmissionError::Binding("original request identity is invalid")
+    })?;
 
     let task_frame = &input.task_frame_readback;
     let task_frame_principal = task_frame.principal();
@@ -200,8 +201,11 @@ fn read_current_owner_bindings<P: KernelGenerationPort + ?Sized>(
     let current_scope = work_scope_owner
         .read_current(fence)
         .map_err(|error| SourceArtifactAdmissionError::Owner(error.to_string()))?;
-    ensure_snapshot_fresh(&current_scope, "source-artifact READ WorkScope is not fresh")
-        .map_err(|error| SourceArtifactAdmissionError::Owner(error.to_string()))?;
+    ensure_snapshot_fresh(
+        &current_scope,
+        "source-artifact READ WorkScope is not fresh",
+    )
+    .map_err(|error| SourceArtifactAdmissionError::Owner(error.to_string()))?;
     let current_scope_identity = &current_scope.binding.scope;
     if current_scope.state_fence != *fence
         || current_scope_identity.scope_ref != original.work_scope_ref
@@ -220,20 +224,22 @@ fn read_current_owner_bindings<P: KernelGenerationPort + ?Sized>(
         state_fence: fence.clone(),
     };
 
-    let metadata_task = input
-        .request_metadata
-        .task_id
-        .as_ref()
-        .ok_or(SourceArtifactAdmissionError::Binding(
-            "context reconstruction metadata lacks its task identity",
-        ))?;
-    let metadata_session = input
-        .request_metadata
-        .session_id
-        .as_ref()
-        .ok_or(SourceArtifactAdmissionError::Binding(
-            "context reconstruction metadata lacks its session identity",
-        ))?;
+    let metadata_task =
+        input
+            .request_metadata
+            .task_id
+            .as_ref()
+            .ok_or(SourceArtifactAdmissionError::Binding(
+                "context reconstruction metadata lacks its task identity",
+            ))?;
+    let metadata_session =
+        input
+            .request_metadata
+            .session_id
+            .as_ref()
+            .ok_or(SourceArtifactAdmissionError::Binding(
+                "context reconstruction metadata lacks its session identity",
+            ))?;
     let current_task = composition
         .owners
         .task

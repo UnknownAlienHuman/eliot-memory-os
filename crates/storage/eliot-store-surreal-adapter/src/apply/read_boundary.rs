@@ -430,12 +430,9 @@ async fn read_evidence_pack_causal_binding(
     config: &SurrealAdapterConfig,
     expected_state_fence: &StateFence,
 ) -> Result<CausalBinding, AdapterError> {
-    let (allocation_fence, projection) = super::receipt_reconciliation::read_causal_allocation(
-        db,
-        config,
-        expected_state_fence,
-    )
-    .await?;
+    let (allocation_fence, projection) =
+        super::receipt_reconciliation::read_causal_allocation(db, config, expected_state_fence)
+            .await?;
     allocation_fence.ok_or(StoreError::ReceiptNotFound)?;
     Ok(projection.binding().clone())
 }
