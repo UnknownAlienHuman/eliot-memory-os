@@ -1073,19 +1073,6 @@ pub enum ObserveSubmitOutcome {
 /// Typed outcome of one `semantic_observe_deferred` deferral (issue #2565).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObserveDeferOutcome {
-    /// Kernel retired the queue pair and advanced the durable record
-    /// `Admitted -> Routed`: the pending handle stays live with its exact
-    /// resume condition. No effect was produced and none was claimed.
-    Deferred,
-    /// The durable record already closed the operation: consult it through
-    /// the waiter path instead of deferring.
-    Settled,
-    /// The absolute deadline elapsed before the deferral could record. This
-    /// is the expected claim/defer race, projected as a known outcome.
-    Expired,
-    /// The presented attempt is not the current fencing generation. The
-    /// waiter never observes the stale deferral; the poller idles.
-    StaleAttempt,
     /// The protected Observe pair was already published to the daemon. A
     /// later no-op/defer request is reconciled as Unknown, never as a safe
     /// no-effect deferral or an invitation to reschedule.
@@ -1614,61 +1601,31 @@ pub fn watchdog_export_result_for_acknowledgement(
 ///
 /// The Kernel arm
 /// (`bins/eliot-kernel/src/daemon_request_dispatch.rs::semantic_observe_deferred`)
-/// answers `{"accepted": true, "deferred": true, ...}` when the pair retired
-/// and the durable record advanced to `Routed`,
-/// `{"accepted": true, "settled": true, ...}` when the record already
-/// closed, `{"accepted": false, "expired": true}` on the deadline race, and
-/// `{"accepted": false, "stale": true, ...}` on a superseded attempt.
-/// Anything else is a contract violation, never a silent accept.
+/// must return the exact Unknown/reconciliation disposition for a pair already
+/// published as Submitted. Every other status would falsely imply no effect or
+/// permit rescheduling and is rejected.
 pub fn parse_observe_defer_outcome(
     value: &serde_json::Value,
 ) -> Result<ObserveDeferOutcome, String> {
     let _span = tracing::info_span!("eliotd.observe_defer").entered();
-    if value.get("status").and_then(serde_json::Value::as_str) == Some("unknown") {
+    if value.get("status").and_then(serde_json::Value::as_str) == Some("unknown")
+        && value
+            .pointer("/value/outcome")
+            .and_then(serde_json::Value::as_str)
+            == Some("unknown_outcome")
+        && value
+            .pointer("/recovery/kind")
+            .and_then(serde_json::Value::as_str)
+            == Some("unknown_outcome")
+        && value
+            .pointer("/recovery/reason")
+            .and_then(serde_json::Value::as_str)
+            == Some("published_observe_pair_requires_reconciliation")
+    {
         return Ok(ObserveDeferOutcome::ReconciliationRequired);
     }
-    let accepted = value
-        .get("accepted")
-        .and_then(serde_json::Value::as_bool)
-        .ok_or_else(|| {
-            "Kernel semantic_observe_deferred answer omits the accepted outcome".to_owned()
-        })?;
-    if accepted {
-        if value
-            .get("deferred")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        {
-            return Ok(ObserveDeferOutcome::Deferred);
-        }
-        if value
-            .get("settled")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        {
-            return Ok(ObserveDeferOutcome::Settled);
-        }
-        return Err(
-            "Kernel semantic_observe_deferred answer is accepted but neither deferred nor settled"
-                .to_owned(),
-        );
-    }
-    if value
-        .get("expired")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Ok(ObserveDeferOutcome::Expired);
-    }
-    if value
-        .get("stale")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Ok(ObserveDeferOutcome::StaleAttempt);
-    }
     Err(
-        "Kernel semantic_observe_deferred answer is neither deferred, settled, expired, stale, nor unknown"
+        "Kernel semantic_observe_deferred answer is not the exact published-pair Unknown disposition"
             .to_owned(),
     )
 }
@@ -3149,11 +3106,11 @@ impl DaemonKernelClient {
     /// Defers one claimed observe pair the daemon flight cannot execute yet
     /// (issue #2565).
     ///
-    /// The presenting attempt must be the live Kernel-minted triple the claim
-    /// returned. Kernel retires the queue pair and advances the durable
-    /// record `Admitted -> Routed`, so the pending handle stays live with its
-    /// exact resume condition while no queue entry spins. No effect is
-    /// produced and none is claimed by this leg.
+    /// The presenting attempt must be the exact Kernel-minted attempt returned
+    /// with the claimed pair. The pair was already durably published as
+    /// `Submitted`; therefore this leg marks that attempt `Unknown` and
+    /// requires reconciliation. It never reports a no-effect deferral or
+    /// requeues the pair.
     #[cfg(windows)]
     pub async fn defer_observe_claim_async(
         &self,
@@ -3164,6 +3121,11 @@ impl DaemonKernelClient {
         attempt
             .validate()
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        if attempt.operation_id != operation_id {
+            return Err(super::DaemonError::Kernel(
+                "Observe defer operation does not match the exact claimed attempt".to_owned(),
+            ));
+        }
         let value = self
             .transact_async(
                 "semantic_observe_deferred",
@@ -3175,6 +3137,15 @@ impl DaemonKernelClient {
             )
             .await
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        if value
+            .pointer("/value/operation_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(operation_id)
+        {
+            return Err(super::DaemonError::Kernel(
+                "Observe Unknown reconciliation response names another operation".to_owned(),
+            ));
+        }
         parse_observe_defer_outcome(&value).map_err(super::DaemonError::Kernel)
     }
 
