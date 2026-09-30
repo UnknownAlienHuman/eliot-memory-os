@@ -1835,9 +1835,7 @@ fn runtime_control_trigger_class(
 /// inventing one. A Human run-now, an admitted child, a wake cancellation,
 /// or a missing carrier proves no scheduler wake and stays the attempt.
 #[cfg(windows)]
-fn user_automation_proves_scheduled_wake(
-    request: &eliot_host::HostRuntimeControlRequest,
-) -> bool {
+fn user_automation_proves_scheduled_wake(request: &eliot_host::HostRuntimeControlRequest) -> bool {
     let Some(carrier) = request.user_automation.as_ref() else {
         return false;
     };
@@ -2041,7 +2039,8 @@ fn publish_next_generation_wake(host: &mut HostComposition) {
             let _ = writeln!(
                 io::stderr().lock(),
                 "eliot-host: next-generation wake is due; the demand-start owner starts the next activation generation inside deadline_ms={} (expiry_ms={})",
-                due.deadline_ms, due.expiry_ms
+                due.deadline_ms,
+                due.expiry_ms
             );
         }
         Ok(NextGenerationWakePublication::PastDeadline(due)) => {

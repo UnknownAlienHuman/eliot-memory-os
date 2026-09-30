@@ -1130,9 +1130,7 @@ impl HostComposition {
     /// # Errors
     ///
     /// Returns an error when the durable Host state cannot be read.
-    pub fn pending_next_generation_wake_record(
-        &self,
-    ) -> Result<Option<WakeRecord>, HostError> {
+    pub fn pending_next_generation_wake_record(&self) -> Result<Option<WakeRecord>, HostError> {
         let state = self.snapshot()?;
         Ok(state
             .wakes
