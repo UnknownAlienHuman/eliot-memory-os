@@ -1257,10 +1257,12 @@ fn validate_revision_lineage(
 /// with the derived permitted subset: a considered method carries its live
 /// profile revision as registration evidence, and the permitted check carries
 /// the decision reference as advertisement evidence. Eligibility follows the
-/// same owner join — permitted (admitted with a live grant standing and a
-/// compatible owner binding) implies eligible, a forbidden disposition
-/// implies ineligible, and anything else stays explicitly unresolved for the
-/// dispatch seam to revalidate at call time.
+/// decision disposition — the Governor/Kernel owner join — never the
+/// advertisement outcome: visible and lazy-visible dispositions were admitted
+/// with a live grant standing and imply eligible, a forbidden disposition
+/// implies ineligible, and a hidden method stays explicitly unresolved for
+/// the dispatch seam to revalidate at call time. A stale descriptor withholds
+/// advertisement without revoking eligibility.
 ///
 /// Selection, call, transport, delivery, retry, use, and outcome arrive in
 /// `owner` from the planner/model, execution, transport, bridge/host
@@ -1330,19 +1332,21 @@ pub fn advertise_exposure_history(
     let registered = OwnerStageFact::supplied(true, profile_source).map_err(map_exposure_error)?;
     let advertised =
         OwnerStageFact::supplied(permitted, decision_source.clone()).map_err(map_exposure_error)?;
-    let eligible = match (permitted, disposition) {
-        (true, _) => OwnerStageFact::supplied(
-            true,
-            format!(
-                "surface-decision:{}+grant:{}",
-                decision.task_ref, decision.grant_revision
-            ),
-        )
-        .map_err(map_exposure_error)?,
-        (false, SurfaceDisposition::Forbidden) => {
+    let eligible = match disposition {
+        SurfaceDisposition::Visible | SurfaceDisposition::LazyVisible => {
+            OwnerStageFact::supplied(
+                true,
+                format!(
+                    "surface-decision:{}+grant:{}",
+                    decision.task_ref, decision.grant_revision
+                ),
+            )
+            .map_err(map_exposure_error)?
+        }
+        SurfaceDisposition::Forbidden => {
             OwnerStageFact::supplied(false, decision_source).map_err(map_exposure_error)?
         }
-        (false, _) => OwnerStageFact::unresolved(),
+        SurfaceDisposition::Hidden => OwnerStageFact::unresolved(),
     };
     validate_revision_lineage(&owner.lineage)?;
     let entry = ToolExposureHistoryEntry {
