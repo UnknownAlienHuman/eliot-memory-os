@@ -42,8 +42,11 @@ pub use learning_gate::{
 #[cfg(not(target_arch = "wasm32"))]
 pub use material_floor::{
     AdmittedDecisionFloor, AffectedLineageReference, AllowedFloorAction, ApplicableFloor,
-    DecisionFloorRefusal, FloorAtomPolicy, FloorEvidenceStatus, MaterialDecisionRefusal,
-    OperationOwnerInputs, RequiredFloorAtom, admit_material_decision, derive_applicable_floor,
+    BoundSourceRevision, DecisionFloorRefusal, DispatchOwnerState, FloorAtomPolicy,
+    FloorEvidenceStatus, MaterialDecisionRefusal, MaterialDispatchBinding, MaterialEntrypointKind,
+    OperationOwnerInputs, RequiredFloorAtom, ResumeHistoryInputs, admit_material_decision,
+    admit_material_resume, bind_material_dispatch, derive_applicable_floor,
+    revalidate_material_dispatch,
 };
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};

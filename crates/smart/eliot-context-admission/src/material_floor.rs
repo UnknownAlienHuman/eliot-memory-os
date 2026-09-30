@@ -60,9 +60,11 @@ use eliot_context_contracts::{
     DecisionLineageSupersession, LossPolicy, OmissionRecord, RepresentationKind, RoleLossRule,
     SemanticRole, canonical_digest,
 };
+use eliot_agent_contracts::{PublicReference, RetainedHandoffCheckpoint};
 use eliot_contracts::{
     ArtifactId, DecisionId, StateFence, TaskId, TaskRevision, fences_match_exact,
 };
+use eliot_security_contracts::EffectCeiling;
 use eliot_receipts::ProofCeiling;
 use serde::{Deserialize, Serialize};
 
@@ -1261,4 +1263,629 @@ fn action_text(action: AllowedFloorAction) -> String {
         }
     };
     text.to_owned()
+}
+
+/// The material dispatch path an admitted operation is bound for (issue #1742,
+/// work item 4).
+///
+/// `I7.8` requires the pre-action check before Material action on every route:
+/// the actual action, a delegated worker, a verifier with effects, and a resume
+/// dispatch all reach the one shared suitability-and-authority check
+/// ([`admit_material_decision`]), never a per-route permit. The kind names which
+/// dispatch path the binding below was issued for; every kind carries the same
+/// bound facts and the same dispatch revalidation, so mislabelling a path
+/// cannot weaken the gate — and a resume dispatch at any other phase (or any
+/// other kind at resume phase) fails closed at bind time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MaterialEntrypointKind {
+    /// The authenticated runtime caller invoking the material action itself.
+    DirectAction,
+    /// A delegated worker invoked with the admitted operation's bound facts.
+    DelegatedWorker,
+    /// A verifier whose verification itself carries effects.
+    VerifierWithEffects,
+    /// A resume dispatch continuing compacted work under retained history.
+    ResumeDispatch,
+}
+
+/// One source revision bound into the dispatch binding.
+///
+/// The admitted packet's canonical digest already covers source content; these
+/// triples additionally pin the exact source revision each delivered atom was
+/// compiled from, so a source substitution under an identical packet shape
+/// still fails the dispatch comparison.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundSourceRevision {
+    /// Exact identity of the delivered atom.
+    pub atom_id: ArtifactId,
+    /// Source revision the atom was compiled from.
+    pub revision: String,
+    /// Content digest of the complete source snapshot.
+    pub content_sha256: String,
+}
+
+/// The admitted operation bound for effect dispatch (issue #1742, work item 4).
+///
+/// This is the record the dispatch path presents back at effect dispatch: the
+/// checked action parameters and resources, the packet and output digest, the
+/// recipe, task and source revisions, the phase-aware lineage outcome, and the
+/// authority owner's effect ceiling, all content-compared by
+/// [`revalidate_material_dispatch`] against current owner evidence. The embedded
+/// [`AdmittedDecisionFloor`] already binds the complete checked floor set with
+/// its content handle; this binding extends that handle over the dispatch facts
+/// so a swapped packet, a widened ceiling, a moved fence, or a saved valid
+/// lease from another operation cannot pass as this one. It creates no permit
+/// authority and no evaluator: admission stays in [`admit_material_decision`]
+/// and authority stays with its owners.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaterialDispatchBinding {
+    /// Dispatch path this binding was issued for.
+    pub entrypoint: MaterialEntrypointKind,
+    /// Decision identity the operation was admitted for.
+    pub decision_id: DecisionId,
+    /// Retained fence the operation was admitted at.
+    pub state_fence: StateFence,
+    /// Owner-resolved task identity.
+    pub task_id: TaskId,
+    /// Owner-resolved task/acceptance revision.
+    pub acceptance_revision: TaskRevision,
+    /// Owner-resolved resources the operation may touch.
+    pub requested_resources: BTreeSet<String>,
+    /// Owner-resolved impact class of the actual operation.
+    pub impact_class: ImpactClass,
+    /// Authority-owner effect ceiling checked at admission.
+    pub effect_ceiling: EffectCeiling,
+    /// Owner-issued Governance Profile reference.
+    pub governance_profile_ref: String,
+    /// Owner-issued authority reference backing the operation.
+    pub authority_ref: String,
+    /// Recipe digest the packet was compiled under.
+    pub recipe_sha256: String,
+    /// Exact source revisions of the delivered atoms, ordered by atom identity.
+    pub sources: Vec<BoundSourceRevision>,
+    /// Canonical digest of the admitted packet the effect must run under.
+    pub packet_digest: String,
+    /// The admitted applicable floor, with its own content handle.
+    pub floor: AdmittedDecisionFloor,
+    /// Decision phase the lineage was validated for.
+    pub phase: DecisionLineagePhase,
+    /// Phase-relative completeness of the validated lineage (always complete
+    /// on a bound operation; anything else never reaches dispatch).
+    pub lineage_completeness: DecisionLineageCompleteness,
+    /// Content-addressed handle (`dispatch-binding:<sha256>`) resolving to
+    /// exactly this bound operation.
+    pub handle: String,
+}
+
+impl MaterialDispatchBinding {
+    /// Re-resolve the content-addressed handle and the embedded floor handle.
+    ///
+    /// Any swapped entrypoint, parameter, digest, revision, ceiling, floor or
+    /// lineage outcome fails closed here, before any current-owner comparison.
+    pub fn validate(&self) -> Result<(), ContextError> {
+        if self.handle != dispatch_binding_handle(self)? {
+            return Err(ContextError::InvalidField("dispatch_binding.handle"));
+        }
+        self.floor.validate()
+    }
+}
+
+fn dispatch_binding_handle(binding: &MaterialDispatchBinding) -> Result<String, ContextError> {
+    let unsigned = MaterialDispatchBinding {
+        handle: String::new(),
+        ..binding.clone()
+    };
+    Ok(format!("dispatch-binding:{}", canonical_digest(&unsigned)?))
+}
+
+/// Current owner observations presented at effect dispatch.
+///
+/// Every field is read from its owner at dispatch time, never carried over
+/// from admission: the fence from the Kernel, the ceiling and authority from
+/// the authority owner, the packet as presented for dispatch, and the lineage
+/// for revalidation. The revalidation compares these contents against the
+/// binding; a missing or moved owner input fails rather than falling back to
+/// the bound copy.
+pub struct DispatchOwnerState<'a> {
+    /// Fence the dispatch owner observes now.
+    pub state_fence: &'a StateFence,
+    /// Task/acceptance revision the dispatch owner observes now.
+    pub acceptance_revision: TaskRevision,
+    /// Effect ceiling the authority owner asserts now.
+    pub effect_ceiling: EffectCeiling,
+    /// Authority reference backing the dispatch now.
+    pub authority_ref: &'a str,
+    /// Packet presented for dispatch.
+    pub packet: &'a AdmittedContextSet,
+    /// Lineage presented for dispatch revalidation.
+    pub lineage: &'a DecisionExecutionLineageRefs,
+}
+
+/// Bind one admitted operation for effect dispatch on one entrypoint.
+///
+/// The binding captures the owner-resolved parameters, the recipe digest, the
+/// per-delivered-atom source revisions, the admitted packet digest, the
+/// admitted floor with its handle, the phase-aware lineage outcome, and the
+/// authority owner's effect ceiling. Coherence is checked with the same
+/// predicates admission uses — packet and floor decision, task and fence
+/// against the owner inputs — plus entrypoint/phase coherence, so a resume
+/// dispatch is bound only at resume phase and any other path only away from
+/// it. The presented lineage must validate complete for the phase; binding is
+/// for execution, and an incomplete lineage never reaches dispatch.
+///
+/// This binds facts; it admits nothing. Suitability and authority were decided
+/// by [`admit_material_decision`]; a binding over an unadmitted floor cannot
+/// exist because the floor handle check requires the admission's own digest.
+///
+/// # Errors
+///
+/// [`MaterialDecisionRefusal::Incomplete`] with
+/// [`FloorEvidenceStatus::LineageIncomplete`] when the presented lineage is not
+/// complete for the phase. [`MaterialDecisionRefusal::Boundary`] for an
+/// entrypoint/phase mismatch, an incoherent packet, floor or recipe, or a
+/// malformed owner input.
+pub fn bind_material_dispatch(
+    entrypoint: MaterialEntrypointKind,
+    owners: &OperationOwnerInputs<'_>,
+    effect_ceiling: EffectCeiling,
+    closure: &AdmissionInput,
+    packet: &AdmittedContextSet,
+    floor: &AdmittedDecisionFloor,
+    lineage: &DecisionExecutionLineageRefs,
+) -> Result<MaterialDispatchBinding, MaterialDecisionRefusal> {
+    owners
+        .validate()
+        .map_err(MaterialDecisionRefusal::Boundary)?;
+    let is_resume = owners.phase == DecisionLineagePhase::Resume;
+    let wants_resume = matches!(entrypoint, MaterialEntrypointKind::ResumeDispatch);
+    if is_resume != wants_resume {
+        return Err(MaterialDecisionRefusal::Boundary(ContextError::InvalidField(
+            "dispatch.entrypoint",
+        )));
+    }
+    if !fences_match_exact(&packet.binding.state_fence, owners.state_fence) {
+        return Err(MaterialDecisionRefusal::Boundary(
+            ContextError::InvalidFence,
+        ));
+    }
+    if packet.binding.decision_id != *owners.decision_id
+        || packet.binding.task_id.as_str() != owners.task_id.as_str()
+    {
+        return Err(MaterialDecisionRefusal::Boundary(
+            ContextError::IdentityConflict,
+        ));
+    }
+    if floor.floor.decision_id != *owners.decision_id
+        || floor.floor.acceptance_revision != owners.acceptance_revision
+        || !fences_match_exact(&floor.floor.state_fence, owners.state_fence)
+    {
+        return Err(MaterialDecisionRefusal::Boundary(
+            ContextError::IdentityConflict,
+        ));
+    }
+    floor
+        .validate()
+        .map_err(MaterialDecisionRefusal::Boundary)?;
+    if !owner_text(&closure.recipe.recipe_sha256) {
+        return Err(MaterialDecisionRefusal::Boundary(ContextError::InvalidField(
+            "dispatch.recipe",
+        )));
+    }
+    let completeness = lineage
+        .validate_for_phase(owners.phase)
+        .map_err(MaterialDecisionRefusal::Boundary)?;
+    if completeness != DecisionLineageCompleteness::Complete {
+        let references = affected_lineage_references(lineage, owners.phase);
+        return Err(typed_refusal(
+            owners,
+            FloorEvidenceStatus::LineageIncomplete,
+            allowed_lineage_action(completeness),
+            std::slice::from_ref(&owners.rule_evidence),
+            "the decision lineage is not complete for the current decision phase",
+            None,
+            references,
+        ));
+    }
+    let packet_digest = packet
+        .canonical_payload_digest()
+        .map_err(MaterialDecisionRefusal::Boundary)?;
+    let mut sources = Vec::with_capacity(floor.delivered.len());
+    for atom_id in &floor.delivered {
+        let Some(record) = packet
+            .records
+            .iter()
+            .find(|record| record.candidate.atom_id == *atom_id)
+        else {
+            return Err(MaterialDecisionRefusal::Boundary(
+                ContextError::IdentityConflict,
+            ));
+        };
+        sources.push(BoundSourceRevision {
+            atom_id: atom_id.clone(),
+            revision: record.candidate.source.revision.clone(),
+            content_sha256: record.candidate.source.content_sha256.clone(),
+        });
+    }
+    sources.sort_by(|left, right| left.atom_id.cmp(&right.atom_id));
+    let mut binding = MaterialDispatchBinding {
+        entrypoint,
+        decision_id: owners.decision_id.clone(),
+        state_fence: owners.state_fence.clone(),
+        task_id: owners.task_id.clone(),
+        acceptance_revision: owners.acceptance_revision,
+        requested_resources: owners.requested_resources.clone(),
+        impact_class: owners.impact_class,
+        effect_ceiling,
+        governance_profile_ref: owners.governance_profile_ref.to_owned(),
+        authority_ref: owners.authority_ref.to_owned(),
+        recipe_sha256: closure.recipe.recipe_sha256.clone(),
+        sources,
+        packet_digest,
+        floor: floor.clone(),
+        phase: owners.phase,
+        lineage_completeness: completeness,
+        handle: String::new(),
+    };
+    binding.handle =
+        dispatch_binding_handle(&binding).map_err(MaterialDecisionRefusal::Boundary)?;
+    binding
+        .validate()
+        .map_err(MaterialDecisionRefusal::Boundary)?;
+    Ok(binding)
+}
+
+/// Revalidate one bound operation against current owner evidence at effect
+/// dispatch (issue #1742, work item 4).
+///
+/// Every bound fact is content-compared, never trusted from the handle alone:
+/// the current fence must still equal the bound fence, the acceptance revision
+/// and authority reference must be unchanged, the authority owner's ceiling
+/// must equal the checked ceiling, the presented packet must digest to the
+/// bound packet digest with identical per-atom source revisions, and the
+/// presented lineage must still validate complete for the bound phase. A
+/// swapped packet after admission, an effect invoked without the admitted
+/// packet, a saved valid lease from another operation, or a widened ceiling
+/// each fail here, before any effectful owner call. `I7.20` applies unchanged:
+/// fence and identity mismatches are boundary failures, stale or drifted owner
+/// evidence is `DECISION_CONTEXT_INCOMPLETE` with a refresh action, and an
+/// incomplete lineage keeps its exact affected references.
+///
+/// # Errors
+///
+/// [`MaterialDecisionRefusal::Incomplete`] for drifted revision, ceiling or
+/// authority evidence (refresh) or a lineage that no longer validates complete
+/// for the phase. [`MaterialDecisionRefusal::Boundary`] for a tampered
+/// binding, a moved fence, or a substituted packet or source.
+pub fn revalidate_material_dispatch(
+    binding: &MaterialDispatchBinding,
+    current: &DispatchOwnerState<'_>,
+) -> Result<(), MaterialDecisionRefusal> {
+    binding
+        .validate()
+        .map_err(MaterialDecisionRefusal::Boundary)?;
+    if !fences_match_exact(current.state_fence, &binding.state_fence) {
+        return Err(MaterialDecisionRefusal::Boundary(
+            ContextError::InvalidFence,
+        ));
+    }
+    if current.acceptance_revision != binding.acceptance_revision {
+        return Err(dispatch_refusal(
+            binding,
+            FloorEvidenceStatus::RequiredAtomMissing,
+            AllowedFloorAction::Refresh,
+            "the task/acceptance revision moved after admission; re-resolve the owner inputs and recompile the closure at the current fence",
+        ));
+    }
+    if current.effect_ceiling != binding.effect_ceiling {
+        return Err(dispatch_refusal(
+            binding,
+            FloorEvidenceStatus::RequiredAtomMissing,
+            AllowedFloorAction::Refresh,
+            "the authority owner's effect ceiling changed after admission; the bound ceiling no longer covers this dispatch",
+        ));
+    }
+    if !owner_text(current.authority_ref) || current.authority_ref != binding.authority_ref {
+        return Err(dispatch_refusal(
+            binding,
+            FloorEvidenceStatus::RequiredAtomMissing,
+            AllowedFloorAction::Refresh,
+            "the authority backing the operation changed after admission; obtain the current authority and rebind",
+        ));
+    }
+    let packet_digest = current
+        .packet
+        .canonical_payload_digest()
+        .map_err(MaterialDecisionRefusal::Boundary)?;
+    if packet_digest != binding.packet_digest {
+        return Err(MaterialDecisionRefusal::Boundary(
+            ContextError::IdentityConflict,
+        ));
+    }
+    for bound in &binding.sources {
+        let source_matches = current
+            .packet
+            .records
+            .iter()
+            .find(|record| record.candidate.atom_id == bound.atom_id)
+            .is_some_and(|record| {
+                record.candidate.source.revision == bound.revision
+                    && record.candidate.source.content_sha256 == bound.content_sha256
+            });
+        if !source_matches {
+            return Err(MaterialDecisionRefusal::Boundary(
+                ContextError::IdentityConflict,
+            ));
+        }
+    }
+    let completeness = current
+        .lineage
+        .validate_for_phase(binding.phase)
+        .map_err(MaterialDecisionRefusal::Boundary)?;
+    if completeness != DecisionLineageCompleteness::Complete {
+        let references = affected_lineage_references(current.lineage, binding.phase);
+        return Err(dispatch_lineage_refusal(binding, completeness, references));
+    }
+    Ok(())
+}
+
+/// Build one dispatch-time `DECISION_CONTEXT_INCOMPLETE` refusal over the
+/// binding's own rule evidence, phase and floor context.
+fn dispatch_refusal(
+    binding: &MaterialDispatchBinding,
+    evidence_status: FloorEvidenceStatus,
+    allowed_action: AllowedFloorAction,
+    reason: &str,
+) -> MaterialDecisionRefusal {
+    let mut incomplete =
+        DecisionContextIncomplete::new(binding.floor.floor.rule_evidence.clone());
+    incomplete.missing.push(binding.floor.floor.rule_evidence.clone());
+    incomplete
+        .reopening_requirements
+        .push(action_text(allowed_action));
+    if owner_text(reason) {
+        incomplete.reopening_requirements.push(reason.to_owned());
+    }
+    DecisionFloorRefusal {
+        incomplete,
+        phase: binding.phase,
+        evidence_status,
+        affected_references: Vec::new(),
+        allowed_action,
+        missing_owner: None,
+    }
+    .into_material()
+}
+
+/// Build the dispatch-time lineage refusal with the exact affected references.
+fn dispatch_lineage_refusal(
+    binding: &MaterialDispatchBinding,
+    completeness: DecisionLineageCompleteness,
+    references: Vec<AffectedLineageReference>,
+) -> MaterialDecisionRefusal {
+    let mut incomplete =
+        DecisionContextIncomplete::new(binding.floor.floor.rule_evidence.clone());
+    incomplete.missing.push(binding.floor.floor.rule_evidence.clone());
+    let allowed_action = allowed_lineage_action(completeness);
+    incomplete
+        .reopening_requirements
+        .push(action_text(allowed_action));
+    incomplete.reopening_requirements.push(
+        "the decision lineage is no longer complete for the bound decision phase".to_owned(),
+    );
+    DecisionFloorRefusal {
+        incomplete,
+        phase: binding.phase,
+        evidence_status: FloorEvidenceStatus::LineageIncomplete,
+        affected_references: references,
+        allowed_action,
+        missing_owner: None,
+    }
+    .into_material()
+}
+
+/// Retained history a resumed material decision must consume (issue #1742,
+/// work item 6).
+///
+/// This is #1730's retained checkpoint plus its resume-time revalidation,
+/// reused verbatim — never reimplemented, re-sealed, or treated as a fresh
+/// authority source — together with the rebuilt current delta View the resume
+/// owner presents. The checkpoint carries the capture boundary: the task and
+/// attempt, the retained fence and generations, the in-flight effects with
+/// their dispositions, the known losses, and the unavailable work members.
+/// Compaction keeps those; it mints no authority, so continuing under the
+/// retained fence after a generation or fence change is refused until the
+/// current delta View and the current authority are bound instead.
+pub struct ResumeHistoryInputs<'a> {
+    /// Retained checkpoint with the resume-time revalidation the resume owner
+    /// computed over current observations.
+    pub retained: &'a RetainedHandoffCheckpoint,
+    /// Rebuilt current delta View: a digest-bound immutable artifact observed
+    /// now, never the retained diff restamped.
+    pub current_delta_view: &'a PublicReference,
+}
+
+/// Admit one resumed material decision under retained history (issue #1742,
+/// work item 6).
+///
+/// History is consumed before the shared check runs, in fail-closed order:
+///
+/// 1. The decision phase must be resume: any other phase has no retained
+///    history to consume and is a boundary misuse of this entrypoint.
+/// 2. The retained checkpoint with its revalidation must pass the owner's own
+///    [`RetainedHandoffCheckpoint::validate`]; a reassigned or mismatched
+///    revalidation is a boundary failure, never a silent pass.
+/// 3. The rebuilt delta View must be a valid digest-bound reference: an
+///    undigested view proves no immutable current content.
+/// 4. The decision fence must be the applicable fence — the unchanged retained
+///    fence when no generation or fence moved, the revalidated current fence
+///    otherwise. A changed world resumed under the retained fence, or any
+///    third fence, is `DECISION_CONTEXT_INCOMPLETE` with a refresh action:
+///    rebuild the delta View and obtain the new authority first.
+/// 5. When a generation or the fence changed, the delta View must differ from
+///    the retained digest-bound diff: restamping the old diff is not a
+///    rebuild.
+/// 6. A blocking critical attention item surviving the boundary keeps the
+///    dependent action blocked: the resume is refused as incomplete until the
+///    item is resolved or a new explicitly narrower proposal is submitted.
+/// 7. The lineage `handoff` slot must presently cite exactly the retained
+///    checkpoint reference: a summary, a different checkpoint, or an explicit
+///    unknown in place of the consumed checkpoint fails the resume.
+/// 8. Every retained known loss must be named by the lineage `omissions`
+///    relation, and any known loss or unavailable member requires that
+///    relation to exist explicitly: unavailable or erased originals stay
+///    visible, never compacted away.
+/// 9. The shared suitability-and-authority check
+///    ([`admit_material_decision`]) then runs unchanged, so the resume-phase
+///    lineage rule — already-due execution and outcome records present or
+///    explicitly unknown — and the full floor, coverage and delivery proofs
+///    apply to resumed work exactly as to new effects.
+///
+/// Traceability is preserved by these bindings; it proves no beneficial use,
+/// causal improvement, or task completion.
+///
+/// # Errors
+///
+/// [`MaterialDecisionRefusal::Incomplete`] for a stale fence, a restamped
+/// delta, a blocking survivor, an uncited checkpoint, or unnamed losses, and
+/// for every refusal the shared check itself produces.
+/// [`MaterialDecisionRefusal::Boundary`] for a non-resume phase or a malformed
+/// retained, delta, or owner input.
+#[allow(clippy::too_many_lines)]
+pub fn admit_material_resume(
+    owners: &OperationOwnerInputs<'_>,
+    policies: &[FloorAtomPolicy],
+    closure: &AdmissionInput,
+    lineage: &DecisionExecutionLineageRefs,
+    history: &ResumeHistoryInputs<'_>,
+) -> Result<AdmittedDecisionFloor, MaterialDecisionRefusal> {
+    if owners.phase != DecisionLineagePhase::Resume {
+        return Err(MaterialDecisionRefusal::Boundary(ContextError::InvalidField(
+            "resume.phase",
+        )));
+    }
+    history
+        .retained
+        .validate()
+        .map_err(|_| MaterialDecisionRefusal::Boundary(ContextError::InvalidField(
+            "resume.retained_checkpoint",
+        )))?;
+    history
+        .current_delta_view
+        .validate()
+        .map_err(|_| MaterialDecisionRefusal::Boundary(ContextError::InvalidField(
+            "resume.current_delta_view",
+        )))?;
+    if history.current_delta_view.digest.is_none() {
+        return Err(MaterialDecisionRefusal::Boundary(ContextError::InvalidField(
+            "resume.current_delta_view.digest",
+        )));
+    }
+    let checkpoint = &history.retained.checkpoint;
+    let revalidation = &history.retained.revalidation;
+    let changed = history.retained.requires_fresh_authority_before_execution();
+    let applicable = if changed {
+        &revalidation.current_fence
+    } else {
+        &checkpoint.state_fence
+    };
+    if !fences_match_exact(owners.state_fence, applicable) {
+        return Err(typed_refusal(
+            owners,
+            FloorEvidenceStatus::RequiredAtomMissing,
+            AllowedFloorAction::Refresh,
+            &[],
+            "the resumed decision is not bound to the applicable fence: the unchanged retained fence, or the revalidated current fence once a generation or the fence moved",
+            None,
+            Vec::new(),
+        ));
+    }
+    if changed && history.current_delta_view.digest == checkpoint.diff_ref.digest {
+        return Err(typed_refusal(
+            owners,
+            FloorEvidenceStatus::RequiredAtomMissing,
+            AllowedFloorAction::Refresh,
+            &[],
+            "a generation or the fence moved, but the presented delta View restamps the retained diff; rebuild a current delta View and obtain the new authority before continuing",
+            None,
+            Vec::new(),
+        ));
+    }
+    if checkpoint.dependent_action_blocked() {
+        return Err(typed_refusal(
+            owners,
+            FloorEvidenceStatus::RepresentationNotDeliverable,
+            AllowedFloorAction::Narrow,
+            &[],
+            "a blocking critical attention item survives the capture boundary; the dependent action stays blocked until the item is resolved",
+            None,
+            Vec::new(),
+        ));
+    }
+    let checkpoint_ref = history
+        .retained
+        .checkpoint_ref()
+        .map_err(|_| MaterialDecisionRefusal::Boundary(ContextError::InvalidField(
+            "resume.checkpoint_ref",
+        )))?;
+    let cites_checkpoint = matches!(
+        &lineage.handoff,
+        DecisionLineageSlot::Present { value } if value.reference == checkpoint_ref
+    );
+    if !cites_checkpoint {
+        return Err(typed_refusal(
+            owners,
+            FloorEvidenceStatus::LineageIncomplete,
+            AllowedFloorAction::Expand,
+            std::slice::from_ref(&owners.rule_evidence),
+            "the resumed lineage does not cite the retained checkpoint; derived summaries never replace the original rationale and evidence",
+            None,
+            affected_lineage_references(lineage, owners.phase),
+        ));
+    }
+    if !checkpoint.known_losses.is_empty() || !checkpoint.work.unavailable.is_empty() {
+        let named = omissions_named_references(lineage);
+        let unnamed = checkpoint
+            .known_losses
+            .iter()
+            .any(|loss| !named.iter().any(|candidate| *candidate == &loss.subject_ref));
+        let explicit = matches!(
+            &lineage.omissions,
+            DecisionLineageSlot::Present { .. } | DecisionLineageSlot::Unknown { .. }
+        );
+        if !explicit || unnamed {
+            return Err(typed_refusal(
+                owners,
+                FloorEvidenceStatus::LineageIncomplete,
+                AllowedFloorAction::Expand,
+                std::slice::from_ref(&owners.rule_evidence),
+                "a retained known loss or unavailable member is not explicit in the resumed lineage omissions; unavailable and erased originals stay named",
+                None,
+                affected_lineage_references(lineage, owners.phase),
+            ));
+        }
+    }
+    admit_material_decision(owners, policies, closure, lineage)
+}
+
+/// Every public reference the lineage `omissions` relation names, whatever its
+/// slot shape: present values, policy references behind an inapplicable or
+/// deferred relation, or evidence behind an explicit unknown.
+fn omissions_named_references(lineage: &DecisionExecutionLineageRefs) -> Vec<&PublicReference> {
+    let mut named = Vec::new();
+    match &lineage.omissions {
+        DecisionLineageSlot::Present { value } => {
+            named.extend(value.iter().map(|reference| &reference.reference));
+        }
+        DecisionLineageSlot::NotApplicable { policy, .. }
+        | DecisionLineageSlot::NotYetProduced { policy, .. } => {
+            named.push(&policy.reference);
+        }
+        DecisionLineageSlot::Unknown { evidence, .. } => {
+            named.push(&evidence.reference);
+        }
+    }
+    named
 }
