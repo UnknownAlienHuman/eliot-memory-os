@@ -2513,7 +2513,10 @@ pub fn admit_canonical_write(
 /// `GovernorComposition::current_task_selection` and passes it here at the
 /// write fence. Captures and non-task-relative writes stay on the
 /// receipt-only [`admit_canonical_write`] leg, so the cold path never needs a
-/// retained terminal.
+/// retained terminal. That routing is enforced in-function as well as by the
+/// caller: a task-free non-task-relative envelope takes the receipt-only leg
+/// below even when invoked directly, so a permitted raw capture still stays
+/// cold (issue #1746, A3) instead of failing on a missing activation.
 pub fn admit_canonical_write_with_activation(
     candidate_id: String,
     context: &RequestMetadata,
@@ -2522,6 +2525,16 @@ pub fn admit_canonical_write_with_activation(
     write_fence: &StateFence,
     activation: Option<&eliot_governor::GovernorActivationSnapshot>,
 ) -> Result<TaskBindingAdmission, TaskBindingError> {
+    // A task-free non-task-relative envelope can only ever admit `ColdUnbound`
+    // or `NotTaskRelative` (no admitted task, so no `TaskBound` arm is
+    // reachable in `admit_canonical_write`); the live activation recheck could
+    // only add refusals here, including refusing a permitted raw capture that
+    // must stay cold. Keep it on the receipt-only leg, never weaker: anything
+    // naming a task, or carrying a task-relative/effectful mutation, still
+    // binds first below.
+    if !envelope_is_task_relative(envelope) && context.task_id.is_none() {
+        return admit_canonical_write(candidate_id, context, envelope, receipt, write_fence);
+    }
     bind_current_task_selection(activation, receipt, write_fence)?;
     admit_canonical_write(candidate_id, context, envelope, receipt, write_fence)
 }
@@ -2822,7 +2835,6 @@ pub fn revalidate_dispatched_binding(
         live_fence,
     )
 }
-
 
 /// Revalidates one admitted task-bound transition at the effect gate against
 /// the live fence (issue #1746, W6/A5).
