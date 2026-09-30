@@ -1653,9 +1653,13 @@ impl DaemonComposition {
     /// # Errors
     ///
     /// [`DaemonError::Composition`] with [`CompositionError::NotReady`] when the
-    /// Governor is not ready, and [`DaemonError::Maintenance`] with the owner's
-    /// own [`eliot_maintenance::MaintenanceError`] when the durable-job read or
-    /// the retained revision's validation is refused.
+    /// Governor is not ready, [`CompositionError::Kernel`] carrying the
+    /// transport's own [`eliot_governor::KernelPortError`] when the durable-job
+    /// read is refused, and the composition's own `Recovery` variant when the
+    /// retained revision fails validation or is not bound to this fence and
+    /// identity. The Governor route refuses with a [`CompositionError`], so the
+    /// refusal keeps that type instead of being restated as a maintenance-owner
+    /// refusal the read never produced.
     pub fn retained_maintenance_job(
         &self,
         job_id: &str,
@@ -1665,7 +1669,7 @@ impl DaemonComposition {
         }
         self.governor
             .retained_durable_job(job_id)
-            .map_err(DaemonError::Maintenance)
+            .map_err(DaemonError::Composition)
     }
 
     /// Commits the durable learning-closure edge for one consequential attempt.

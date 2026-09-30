@@ -41,7 +41,7 @@ use eliot_maintenance::{
     MaintenanceBudgetEvidence, MaintenanceError, MaintenanceFamily, MaintenancePolicyEvidence,
     MaintenanceResultObligation, MaintenanceRouteEvidence, MaintenanceSafetyEvidence,
     MaintenanceScheduleEvidence, MaintenanceTrigger, MaintenanceTriggerInput,
-    decision_result_obligation, maintenance_observation_record,
+    maintenance_observation_record,
 };
 use eliot_protocol::{
     MAINTENANCE_TRIGGER_DECISION_RECEIPT_WIRE_ID,
@@ -492,10 +492,16 @@ impl DaemonComposition {
         // The live admitted fence is read here, never taken from the caller.
         let live_fence = self.governor.kernel_snapshot().state_fence().clone();
         let identity = publication_identity(&obligation.publication_id, &live_fence)?;
+        // The canonical route's own admission refusal is a
+        // `CompositionError`, and this enum reuses [`DaemonError::Composition`]
+        // to carry it unchanged rather than restating the cause or reducing it
+        // to prose. The readiness refusal of `observation_reconciliation` and
+        // the admission refusal below therefore stay distinguishable by variant.
         let receipt = self
             .observation_reconciliation()?
             .admit_maintenance_result(&identity, &base_operation, &record)
-            .await?;
+            .await
+            .map_err(DaemonError::Composition)?;
         Ok(MaintenanceResultPublication::Reconciled { receipt })
     }
 }
