@@ -3580,8 +3580,8 @@ impl DaemonComposition {
     /// (`DaemonKernelClient::verify_provider_binding_async`) before the
     /// capability is rebuilt, so a stored snapshot or a stored `Verified`
     /// label alone restores nothing. Restores through
-    /// `AgentFabric::restore_with_admitted_provider` over the daemon state
-    /// root store: missing, stale, or revoked evidence stays
+    /// `AgentFabric::restore_durable_snapshot_with_admitted_provider` over the
+    /// daemon state root store: missing, stale, or revoked evidence stays
     /// plan-only/blocked instead of silently resuming effecting operations
     /// (ARCH-RES-01). The #265 `health` half rides input-only and never
     /// mints admission.
