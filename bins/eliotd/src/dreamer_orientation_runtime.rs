@@ -33,6 +33,9 @@ pub struct OrientationQueuedOwnerPublication {
     /// Exact versioned Context compiler supplier input preserved from the
     /// authenticated Orientation Task Controller invocation.
     pub context_compilation_input: serde_json::Value,
+    /// Exact original Governor classification source readback retained by
+    /// the authenticated Orientation Task Controller invocation.
+    pub orientation_classification_source_readback: serde_json::Value,
     /// Durable queue response bound to the exact request and original source.
     pub response: DurableJobResponse,
     /// Original semantic reference and exact canonical DreamJobInput bytes.
@@ -128,6 +131,8 @@ pub async fn submit_task_controller_orientation_claim(
     let PreparedTaskControllerOrientation { claimed, input } = prepared;
     let context_reconstruction_result = input.context_reconstruction_result.clone();
     let context_compilation_input = input.context_compilation_input.clone();
+    let orientation_classification_source_readback =
+        input.orientation_classification_source_readback.clone();
     let (readiness, admitted_fence) = {
         let guard = composition.lock().await;
         (
@@ -213,6 +218,7 @@ pub async fn submit_task_controller_orientation_claim(
         request,
         context_reconstruction_result,
         context_compilation_input,
+        orientation_classification_source_readback,
         response,
         semantic_input,
         runtime_owner_execution_input,
