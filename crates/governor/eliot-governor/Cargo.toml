@@ -64,6 +64,20 @@ eliot-receipts.workspace = true
 eliot-reports.workspace = true
 eliot-session.workspace = true
 eliot-skill.workspace = true
+# Issue #1741 W3: the finish acceptance denominator must terminate at the
+# `TaskContract` owner record, not at a task-selection commitment. That record
+# is owned by `eliot-store` (`CanonicalStore::task_acceptance_items_at_revision`
+# -> `TaskAcceptanceItemSet`), so the Governor names the owner's own record type
+# in the read port and in the fail-closed rehydration that consumes it. The
+# edge is one-way and cycle-free: `crates/eliot-store/Cargo.toml` declares no
+# ELIOT semantic owner and does not depend on this crate, and the Governor adds
+# no SurrealDB SDK, query string, or vendor type to any public contract — the
+# read stays a typed record behind [`KernelRecoveryPort`]-shaped owner reads.
+# Kernel does not depend on this crate and never will
+# (crates/kernel/AGENTS.md), so this edge can never be reached from the Kernel
+# authority boundary, and the finish semantics stay in the Governor where
+# crates/governor/AGENTS.md puts them.
+eliot-store.workspace = true
 eliot-store-api.workspace = true
 eliot-task.workspace = true
 eliot-testd-core.workspace = true

@@ -2004,6 +2004,7 @@ dependencies = [
  "eliot-security-contracts",
  "eliot-session",
  "eliot-skill",
+ "eliot-store",
  "eliot-store-api",
  "eliot-task",
  "eliot-testd-core",
