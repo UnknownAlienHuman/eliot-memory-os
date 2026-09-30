@@ -42,7 +42,7 @@ pub use admission_input::{
     AdmissionDecisionEvidence, AdmissionInput, AdmissionMeasuredCost, AdmissionMeasurement,
     AdmissionMeasurementBinding, AdmissionPriorityClass, AdmissionResult, AdmissionRuleIdentity,
     CandidatePriority, MeasurementAggregationMode, MeasurementCompositionProfile, MeasurementUnit,
-    PriorityPolicyIdentity, SafetyFloorIdentity, SuppliedOmissionBinding,
+    PacketAdmissionParts, PriorityPolicyIdentity, SafetyFloorIdentity, SuppliedOmissionBinding,
 };
 pub use atom::{
     AdmissionDisposition, AdmittedAtom, AtomAvailability, AtomRepresentation, AuthorityClass,
