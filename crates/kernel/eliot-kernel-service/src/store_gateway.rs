@@ -5839,11 +5839,20 @@ impl KernelStoreGateway {
     where
         R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
     {
-        let Some(UserAutomationMutationResult::RunNow { invocation, .. }) =
-            configuration.mutation_result()
+        let Some(UserAutomationMutationResult::RunNow {
+            invocation,
+            wake_intent,
+        }) = configuration.mutation_result()
         else {
             return Err("run-now did not return a run-now projection".to_owned());
         };
+        // The committed `WakeIntent` the canonical Store minted for this manual
+        // occurrence beside the invocation is the owner record this join binds
+        // through. It is kept rather than discarded in favour of a journal
+        // readback, because a manual nonce is deliberately not a published
+        // calendar occurrence (I11.12:33) and therefore never appears in the
+        // Host wake journal at all.
+        let committed_wake_intent = wake_intent.clone();
         let occurrence_id = invocation
             .occurrence_identity()
             .map_err(|error| error.to_string())?;
@@ -5877,37 +5886,41 @@ impl KernelStoreGateway {
                 },
             ));
         };
-        let wake_request = run_now_wake_read_request(
-            sealed.context.clone(),
-            sealed.authenticated_principal.clone(),
-            sealed.identity.clone(),
-            invocation.clone(),
-        );
-        let wake = match UserAutomationWakePort::read_pending_wake(runtime, wake_request).await {
-            Ok(readback) => UserAutomationWakePhase::Published { readback },
-            Err(error) => UserAutomationWakePhase::UnknownOutcome {
-                reason: error.to_string(),
-            },
-        };
+        let wake = Self::resolve_run_now_wake_phase(sealed, &invocation, runtime).await;
         if let Some(reason) = defer_reason {
             return Ok((wake, UserAutomationExecutionPhase::Deferred { reason }));
         }
-        // The committed occurrence joins the existing Durable Job execution
-        // path through deterministic preflight: the complete projection is
-        // assembled from the live owners, the service runs the model-free
-        // preflight, and an admitted occurrence reaches the Durable Job owner
-        // over the composed runtime channel. Without a proven pending wake
-        // there is no occurrence to join, so the execution stays unavailable
-        // beside the unresolved wake instead of inventing an admission.
-        let UserAutomationWakePhase::Published { readback } = &wake else {
+        // The committed occurrence joins the existing Durable Job execution path
+        // through deterministic preflight: the complete projection is assembled
+        // from the live owners, the service runs the model-free preflight, and
+        // an admitted occurrence reaches the Durable Job owner over the composed
+        // runtime channel.
+        //
+        // The occurrence binding this join needs is proved from the committed
+        // owner record itself, not from a journal record that cannot exist for a
+        // manual occurrence: the committed `WakeIntent` must name this exact
+        // occurrence under this exact State Fence, which is the same pair
+        // `UserAutomationExecutionRequest::validate` and the Durable Job
+        // admission both re-check. A gate that no committed manual occurrence
+        // could ever open is therefore replaced by a proof that one can, and
+        // nothing is defaulted or substituted: a committed intent that does not
+        // bind leaves the occurrence unadmitted beside its named reason.
+        //
+        // A retained readback, when the owner does answer with one, is still
+        // held to full equality with that committed intent by
+        // `UserAutomationOperatorTransition::validate_phase_joins`, so the
+        // owner's own proof is never traded away for the committed one.
+        if committed_wake_intent.wake_id != occurrence_id
+            || committed_wake_intent.state_fence != sealed.context.state_fence
+        {
             return Ok((
                 wake,
                 UserAutomationExecutionPhase::Unavailable {
                     reason: unproven_run_now_wake_reason(&occurrence_id),
                 },
             ));
-        };
-        let wake_intent = readback.intent.clone();
+        }
+        let wake_intent = committed_wake_intent;
         let projection = match self
             .assemble_run_now_preflight_projection(sealed, &owner, &invocation)
             .await
@@ -5980,6 +5993,47 @@ impl KernelStoreGateway {
     /// without one: the join's own owner boundary is where that typed refusal is
     /// already produced, so the reported disposition stays the join's own answer
     /// rather than the same refusal restated under another error type.
+    /// Resolves the wake phase of one committed `RunNow` occurrence over the
+    /// authenticated runtime channel.
+    ///
+    /// The request reuses the admitted parent identity and the committed
+    /// invocation, so a replayed Store mutation asks about the same original
+    /// occurrence instead of minting another manual nonce.
+    async fn resolve_run_now_wake_phase<R>(
+        sealed: &UserAutomationServiceRequest,
+        invocation: &UserAutomationInvocation,
+        runtime: &R,
+    ) -> UserAutomationWakePhase
+    where
+        R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
+    {
+        let wake_request = run_now_wake_read_request(
+            sealed.context.clone(),
+            sealed.authenticated_principal.clone(),
+            sealed.identity.clone(),
+            invocation.clone(),
+        );
+        match UserAutomationWakePort::read_pending_wake(runtime, wake_request).await {
+            Ok(readback) => UserAutomationWakePhase::Published { readback },
+            // A complete negative from the sole writer of that journal. The Host
+            // journal publishes only the calendar occurrences the immutable
+            // revision compiles, and an explicit manual `run-now` nonce is
+            // deliberately outside that set (I11.12:33), so "the owner retains
+            // no such wake" is the expected and correct answer here rather than
+            // a lost one. Reporting it as an unknown would leave every committed
+            // run-now permanently reconciling over a proven absence. Every other
+            // answer - an owner that could not be reached, an answer that was
+            // lost, a record about another occurrence - proves nothing and stays
+            // unresolved.
+            Err(UserAutomationRuntimeError::NotRetained(reason)) => {
+                UserAutomationWakePhase::NotApplicable { reason }
+            }
+            Err(error) => UserAutomationWakePhase::UnknownOutcome {
+                reason: error.to_string(),
+            },
+        }
+    }
+
     fn run_now_durable_job_material(
         sealed: &UserAutomationServiceRequest,
         invocation: &UserAutomationInvocation,
@@ -6109,15 +6163,16 @@ impl KernelStoreGateway {
     ///
     /// Every answer the Durable Job owner could give about an effect it may
     /// already have issued is the occurrence's `UnknownOutcome` disposition, not
-    /// a route error and never an admission. This leg's wake phase is always
-    /// `Published` at this point, so the occurrence exists, its Durable Job
-    /// identity is the occurrence identity, and the disposition names exactly
-    /// that occurrence: the caller is told what must be reconciled instead of
-    /// being handed a route error that discards the committed configuration and
-    /// every phase beside it. A refusal the owner answered before any effect,
-    /// and every precondition this leg could not establish locally, stay route
-    /// errors: those provably admitted nothing, and no phase member may claim
-    /// otherwise.
+    /// a route error and never an admission. This leg's wake phase names the
+    /// occurrence at this point — the owner's retained record or its complete
+    /// negative beside the committed owner intent that binds it — so the
+    /// occurrence exists, its Durable Job identity is the occurrence identity,
+    /// and the disposition names exactly that occurrence: the caller is told
+    /// what must be reconciled instead of being handed a route error that
+    /// discards the committed configuration and every phase beside it. A
+    /// refusal the owner answered before any effect, and every precondition
+    /// this leg could not establish locally, stay route errors: those provably
+    /// admitted nothing, and no phase member may claim otherwise.
     fn project_run_now_execution_outcome(
         wake: UserAutomationWakePhase,
         outcome: Result<UserAutomationExecutionOutcome, UserAutomationExecutionError>,
@@ -8249,12 +8304,14 @@ fn unproven_execution_channel_reason() -> String {
         .to_owned()
 }
 
-/// Execution phase reason for a committed occurrence whose wake handoff did
-/// not prove a pending wake.
+/// Execution phase reason for a committed occurrence whose committed
+/// `WakeIntent` does not bind it.
 ///
-/// The preflight execution join needs the retained pending wake as its
-/// occurrence binding. An unreadable or absent wake proves nothing to join, so
-/// no admission is invented and the Durable Job owner is never asked.
+/// The preflight execution join needs the committed pending wake as its
+/// occurrence binding, and the Durable Job admission re-checks the same pair. A
+/// committed intent that names another occurrence or another State Fence proves
+/// nothing to join, so no admission is invented and the Durable Job owner is
+/// never asked.
 fn unproven_run_now_wake_reason(occurrence_id: &str) -> String {
     format!(
         "the wake handoff of committed occurrence {occurrence_id} did not prove a pending wake, \
