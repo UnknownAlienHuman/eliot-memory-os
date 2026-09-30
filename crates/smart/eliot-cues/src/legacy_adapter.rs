@@ -25,7 +25,7 @@ use serde_json::Value;
 
 use crate::{
     FacadeError, LegacyEliotCuesV1Row, V1MigrationRejection, V1RowMigration, is_blank_or_control,
-    validate_legacy_row_id,
+    require_normalizer_reobservation, require_retained_bytes, validate_legacy_row_id,
 };
 
 /// The single owner of the bound-identity check for a parsed legacy row.
@@ -350,10 +350,7 @@ pub fn require_reobservation(
 ) -> Result<std::convert::Infallible, FacadeError> {
     row.validate()?;
     decode_legacy_kind(&row.kind)?;
-    Err(FacadeError::MigrationRequired {
-        owner: "eliot-cue-normalizer",
-        revision: eliot_cue_normalizer::A11_CONTRACT_REVISION,
-    })
+    Err(require_normalizer_reobservation())
 }
 
 /// Normalizes one legacy-anchored observation through A-11 exactly once.
@@ -498,10 +495,7 @@ pub fn legacy_row_id_v2(
     target: &TargetHandle,
 ) -> Result<String, FacadeError> {
     let _ = (scope, kind, mode, value, target);
-    Err(FacadeError::MigrationRequired {
-        owner: "eliot-cue-normalizer",
-        revision: eliot_cue_normalizer::A11_CONTRACT_REVISION,
-    })
+    Err(require_normalizer_reobservation())
 }
 
 /// Computes a v2 row identity only from a fresh owner observation and its
@@ -517,10 +511,10 @@ pub fn legacy_row_id_v2_from_fresh_observation(
 ) -> Result<String, FacadeError> {
     row.validate_for_conversion()?;
     let kind = decode_legacy_kind(&row.kind)?;
-    let mode_text = row.mode.as_deref().ok_or(FacadeError::MigrationRequired {
-        owner: "eliot-cue-normalizer",
-        revision: eliot_cue_normalizer::A11_CONTRACT_REVISION,
-    })?;
+    let mode_text = row
+        .mode
+        .as_deref()
+        .ok_or_else(require_normalizer_reobservation)?;
     let mode = decode_legacy_mode(mode_text)?;
     let revision_text = row.revision.to_string();
     let revision_matches = observed
@@ -547,19 +541,13 @@ pub fn legacy_row_id_v2_from_fresh_observation(
     }
     normalized.validate().map_err(FacadeError::Contract)?;
     if !normalized.observed.context.lifecycle.is_active() {
-        return Err(FacadeError::MigrationRequired {
-            owner: "eliot-cue-normalizer",
-            revision: eliot_cue_normalizer::A11_CONTRACT_REVISION,
-        });
+        return Err(require_normalizer_reobservation());
     }
     let key = normalized
         .comparison_keys
         .iter()
         .find(|key| key.match_mode == mode)
-        .ok_or(FacadeError::MigrationRequired {
-            owner: "eliot-cue-normalizer",
-            revision: eliot_cue_normalizer::A11_CONTRACT_REVISION,
-        })?;
+        .ok_or_else(require_normalizer_reobservation)?;
     let id = eliot_cue_contracts::cue_row_id(
         &row.scope,
         kind,
@@ -596,11 +584,7 @@ pub fn convert_v1_row(
     row.validate_for_conversion()?;
     crate::bind_v1_row_payload(legacy_row_id, row, legacy_bytes)?;
     validate_legacy_row_id(legacy_row_id)?;
-    if legacy_bytes.is_empty() {
-        return Err(FacadeError::EnvelopeInvalid {
-            field: "legacy_bytes",
-        });
-    }
+    require_retained_bytes(legacy_bytes, "legacy_bytes")?;
     if row.revision == 0 {
         return crate::reject_v1_row_conversion(
             legacy_row_id,
