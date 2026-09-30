@@ -3478,8 +3478,9 @@ fn check_evidence_joins(
         {
             return Err(ConflictAnalysisError::Binding {
                 field: "causal_evidence.envelope.provenance.revision".to_owned(),
-                detail: "envelope names a revision other than the one its retained material was read at"
-                    .to_owned(),
+                detail:
+                    "envelope names a revision other than the one its retained material was read at"
+                        .to_owned(),
             });
         }
         if let Some(handle) = &evidence.envelope.provenance.raw_handle
@@ -3487,8 +3488,9 @@ fn check_evidence_joins(
         {
             return Err(ConflictAnalysisError::Binding {
                 field: "causal_evidence.envelope.provenance.raw_handle".to_owned(),
-                detail: "envelope names a raw handle other than the retained material it is joined to"
-                    .to_owned(),
+                detail:
+                    "envelope names a raw handle other than the retained material it is joined to"
+                        .to_owned(),
             });
         }
     }
@@ -4437,45 +4439,57 @@ fn effective_causal_claim(
     rivals: &RivalDenominator,
 ) -> CausalClaimRecord {
     let coverage = rivals.derived_coverage();
-    let mut effective = claim.declared_state;
-    let mut reduction_reason = String::new();
-    match claim.declared_state.relation_status() {
-        FailureCausalStatus::CausalHypothesis | FailureCausalStatus::InterventionSupported => {
-            effective = CausalClaimState::Unknown;
-            reduction_reason = format!(
+    // The seven-value relation vocabulary is matched exhaustively, and every one
+    // of its readings decides a distinct pair of outcomes: the state the
+    // declaration may keep and the reason it is reported at that state. The
+    // match therefore RETURNS the pair rather than assigning into two
+    // pre-seeded locals — there is no reading of the vocabulary for which the
+    // reason is unset, so an empty initializer would assert a value the arms
+    // immediately discard.
+    let (effective, reason) = match claim.declared_state.relation_status() {
+        FailureCausalStatus::CausalHypothesis | FailureCausalStatus::InterventionSupported => (
+            CausalClaimState::Unknown,
+            format!(
                 "declared {} retained as legacy v1 unverified: owner-bound evidence and coverage are absent; rival coverage over the frozen scope is {}",
                 claim.declared_state.as_str(),
                 coverage_spelling(coverage)
-            );
-        }
-        FailureCausalStatus::Structural | FailureCausalStatus::BehavioralCorrelation => {
-            reduction_reason = format!(
+            ),
+        ),
+        FailureCausalStatus::Structural | FailureCausalStatus::BehavioralCorrelation => (
+            claim.declared_state,
+            format!(
                 "declared {} retained as legacy v1 unverified; declaration is not support evidence; rival coverage over the frozen scope is {}",
                 claim.declared_state.as_str(),
                 coverage_spelling(coverage)
-            );
-        }
-        FailureCausalStatus::PredictionSupported | FailureCausalStatus::Refuted => {
-            effective = CausalClaimState::Unknown;
-            reduction_reason = format!(
+            ),
+        ),
+        FailureCausalStatus::PredictionSupported | FailureCausalStatus::Refuted => (
+            CausalClaimState::Unknown,
+            format!(
                 "declared {} retained as legacy v1 unverified: outcome and verifier records are absent; rival coverage over the frozen scope is {}",
                 claim.declared_state.as_str(),
                 coverage_spelling(coverage)
-            );
-        }
-        FailureCausalStatus::Unknown => {
-            reduction_reason = format!(
+            ),
+        ),
+        FailureCausalStatus::Unknown => (
+            CausalClaimState::Unknown,
+            format!(
                 "declared unknown retained as legacy v1 unverified; rival coverage over the frozen scope is {}",
                 coverage_spelling(coverage)
-            );
-        }
-    }
-    if !rivals.omitted.is_empty() {
-        reduction_reason = format!(
-            "{reduction_reason}; {} rival member(s) omitted and named",
+            ),
+        ),
+    };
+    // The omission count is appended here rather than folded into each arm
+    // above, because it is a property of the DERIVED denominator rather than of
+    // the declared state: every reading reports it identically.
+    let reduction_reason = if rivals.omitted.is_empty() {
+        reason
+    } else {
+        format!(
+            "{reason}; {} rival member(s) omitted and named",
             rivals.omitted.len()
-        );
-    }
+        )
+    };
     CausalClaimRecord {
         source_handle: claim.source_handle.clone(),
         declared_state: claim.declared_state,

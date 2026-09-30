@@ -76,7 +76,12 @@ pub fn derive_rival_denominator(
         if position.source.as_str() != position_source {
             continue;
         }
-        expected.extend(position.counters.iter().map(|counter| counter.as_str().to_owned()));
+        expected.extend(
+            position
+                .counters
+                .iter()
+                .map(|counter| counter.as_str().to_owned()),
+        );
     }
     let expected = canonical_members(&expected);
     let omitted = expected.clone();
