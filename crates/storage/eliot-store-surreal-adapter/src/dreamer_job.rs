@@ -2309,7 +2309,7 @@ fn reconcile_response(
         selection_frontier: None,
     };
     response
-        .validate_for(&request)
+        .validate_for(request)
         .map_err(map_durable_error)
         .map_err(AdapterError::Store)?;
     Ok(response)
