@@ -114,28 +114,7 @@ impl<'a> EpistemicOrientationRead<'a> {
         request: &'a ContextReconstructionRequest,
         role_inputs: &'a SevenRoleInputs,
     ) -> Result<Self, EpistemicOrientationReadError> {
-        request
-            .validate()
-            .map_err(|_| EpistemicOrientationReadError::InvalidRequest)?;
-        if request.scope_id != role_inputs.scope_id {
-            return Err(EpistemicOrientationReadError::ReadClosureMismatch { field: "scope_id" });
-        }
-        if role_inputs.heads_before != role_inputs.heads_after {
-            return Err(EpistemicOrientationReadError::ReadClosureMismatch {
-                field: "before/after dependency heads",
-            });
-        }
-        if role_inputs.heads_before.scope_id != role_inputs.scope_id {
-            return Err(EpistemicOrientationReadError::ReadClosureMismatch {
-                field: "dependency-head scope",
-            });
-        }
-        if role_inputs.heads_before.state_fence != role_inputs.state_fence {
-            return Err(EpistemicOrientationReadError::ReadClosureMismatch {
-                field: "dependency-head state fence",
-            });
-        }
-
+        validate_context_read_closure(request, role_inputs)?;
         validated_role_identity(
             &role_inputs.epistemic,
             NamedReadOperation::GetCurrentEpistemicPosition,
@@ -149,221 +128,13 @@ impl<'a> EpistemicOrientationRead<'a> {
             request,
             role_inputs,
         )?;
-
         let readback = role_inputs
             .epistemic_readback
             .as_ref()
             .ok_or(EpistemicOrientationReadError::MissingPositionReadback)?;
-        let position_payload = role_inputs
-            .epistemic
-            .payload
-            .as_ref()
-            .ok_or(EpistemicOrientationReadError::MissingPositionPayload)?;
-        let decoded_readback: EpistemicPositionReadback =
-            serde_json::from_value(position_payload.clone())
-                .map_err(|_| EpistemicOrientationReadError::InvalidPositionPayload)?;
-        if decoded_readback != *readback {
-            return Err(EpistemicOrientationReadError::PositionReadbackMismatch {
-                field: "retained decoded payload",
-            });
-        }
-        if readback.schema != eliot_store_api::epistemic_revision::EPISTEMIC_REVISION_SCHEMA {
-            return Err(EpistemicOrientationReadError::PositionReadbackMismatch {
-                field: "schema",
-            });
-        }
-        if readback.receipt.status != WriteReceiptStatus::Committed {
-            return Err(EpistemicOrientationReadError::PositionReadbackMismatch {
-                field: "committed receipt status",
-            });
-        }
-        if readback.receipt.operation_id != readback.candidate.operation_id {
-            return Err(EpistemicOrientationReadError::PositionReadbackMismatch {
-                field: "receipt operation id",
-            });
-        }
-        if readback.receipt.idempotency_key != readback.candidate.idempotency_key {
-            return Err(EpistemicOrientationReadError::PositionReadbackMismatch {
-                field: "receipt idempotency key",
-            });
-        }
-        if readback.receipt.state_fence != readback.candidate.fence {
-            return Err(EpistemicOrientationReadError::PositionReadbackMismatch {
-                field: "receipt state fence",
-            });
-        }
-        if readback.candidate.validate().is_err() {
-            return Err(EpistemicOrientationReadError::PositionReadbackMismatch {
-                field: "original candidate contract",
-            });
-        }
-        if readback.transition.validate().is_err() {
-            return Err(EpistemicOrientationReadError::PositionReadbackMismatch {
-                field: "original transition contract",
-            });
-        }
-        if readback.positions.len() != 1 {
-            return Err(EpistemicOrientationReadError::PositionReadbackMismatch {
-                field: "current position cardinality",
-            });
-        }
-        if readback.candidate.claims.len() != 1 {
-            return Err(EpistemicOrientationReadError::PositionReadbackMismatch {
-                field: "candidate claim cardinality",
-            });
-        }
-        let position = readback
-            .positions
-            .first()
-            .ok_or(EpistemicOrientationReadError::MissingCurrentPosition)?;
-        position
-            .validate()
-            .map_err(|_| EpistemicOrientationReadError::InvalidCurrentPosition)?;
-        let receipt_envelope =
-            readback
-                .receipt
-                .require_reconciliation_envelope()
-                .map_err(
-                    |_| EpistemicOrientationReadError::PositionReadbackMismatch {
-                        field: "receipt reconciliation envelope",
-                    },
-                )?;
-        for (mismatch, field) in [
-            (
-                position.currentness != Currentness::Current,
-                "position currentness",
-            ),
-            (!position.supersession.is_empty(), "position supersession"),
-            (
-                position.claim != readback.candidate.claims[0].claim,
-                "admitted claim",
-            ),
-            (
-                position.admission.position.as_str() != request.epistemic_position.as_str(),
-                "position selector",
-            ),
-            (
-                position.admission.payload_digest != readback.candidate.digest,
-                "original payload digest",
-            ),
-            (
-                position.admission.scope != readback.candidate.scope,
-                "admitted scope",
-            ),
-            (
-                position.admission.fence != readback.candidate.fence,
-                "admitted state fence",
-            ),
-            (
-                position.admission.coverage_digest != readback.candidate.coverage_digest,
-                "coverage digest",
-            ),
-            (
-                position.admission.proof_digest != readback.candidate.proof_digest,
-                "proof digest",
-            ),
-            (
-                position.admission.receipt_id != receipt_envelope.identity.receipt_id,
-                "original receipt id",
-            ),
-            (
-                readback.candidate.scope.as_str() != role_inputs.scope_id.as_str(),
-                "candidate scope",
-            ),
-            (
-                readback.candidate.fence != role_inputs.state_fence,
-                "candidate state fence",
-            ),
-        ] {
-            if mismatch {
-                return Err(EpistemicOrientationReadError::PositionAdmissionMismatch { field });
-            }
-        }
-
-        let support_digest = digest(&readback.candidate.support, "support")?;
-        let conflict_digest = digest(&readback.candidate.conflict_digests, "conflict digests")?;
-        if position.admission.evidence_digest != support_digest
-            || position.admission.conflict_digest != conflict_digest
-        {
-            return Err(EpistemicOrientationReadError::CandidateDigestMismatch {
-                field: "support or conflict preimage",
-            });
-        }
-
-        let payload = evidence
-            .payload
-            .as_ref()
-            .ok_or(EpistemicOrientationReadError::MissingEvidencePayload)?;
-        let rows = payload.get("records").and_then(Value::as_array).ok_or(
-            EpistemicOrientationReadError::EvidencePayloadMismatch {
-                field: "records array",
-            },
-        )?;
-        if payload.get("version").and_then(Value::as_u64) != Some(1)
-            || payload.get("subject").and_then(Value::as_str)
-                != Some(request.evidence_subject.as_str())
-            || payload.get("scope_id").and_then(Value::as_str) != Some(request.scope_id.as_str())
-            || payload["provenance"]["state_fence"] != json!(role_inputs.state_fence)
-            || payload["provenance"]["truncated"] != false
-            || payload["provenance"]["returned"].as_u64() != Some(1)
-            || payload["provenance"]["matched_total"].as_u64() != Some(1)
-            || rows.len() != 1
-        {
-            return Err(EpistemicOrientationReadError::EvidencePayloadMismatch {
-                field: "version, subject, scope, provenance, or exact row count",
-            });
-        }
-        let row = rows
-            .first()
-            .ok_or(EpistemicOrientationReadError::MissingEvidenceRow)?;
-        let expected_parameters = json!({"subject": request.evidence_subject});
-        if row.get("operation").and_then(Value::as_str) != Some("CaptureObservation") {
-            return Err(EpistemicOrientationReadError::EvidenceRowMismatch { field: "operation" });
-        }
-        if row.get("parameters") != Some(&expected_parameters) {
-            return Err(EpistemicOrientationReadError::EvidenceRowMismatch {
-                field: "exact source selector",
-            });
-        }
-        let observation: ObservationRecord = serde_json::from_str(&request.evidence_subject)
-            .map_err(|_| EpistemicOrientationReadError::InvalidObservationPayload)?;
-        observation
-            .validate()
-            .map_err(|_| EpistemicOrientationReadError::InvalidObservation)?;
-        let candidate = &readback.candidate;
-        if candidate.proof_digest != digest(&observation, "observation")? {
-            return Err(EpistemicOrientationReadError::ObservationBindingMismatch {
-                field: "original observation proof digest",
-            });
-        }
-        if candidate.support.len() != 1 || candidate.support[0].handles.len() != 1 {
-            return Err(EpistemicOrientationReadError::ObservationBindingMismatch {
-                field: "single original support handle",
-            });
-        }
-        if !candidate.support[0]
-            .handles
-            .contains(&observation.observation_id)
-        {
-            return Err(EpistemicOrientationReadError::ObservationBindingMismatch {
-                field: "source observation handle",
-            });
-        }
-        if candidate.support[0].proof_digest != candidate.proof_digest {
-            return Err(EpistemicOrientationReadError::ObservationBindingMismatch {
-                field: "support proof digest",
-            });
-        }
-        if observation.evidence.provenance.scope.as_str() != role_inputs.scope_id.as_str() {
-            return Err(EpistemicOrientationReadError::ObservationBindingMismatch {
-                field: "source observation scope",
-            });
-        }
-        if observation.evidence.state_fence != role_inputs.state_fence {
-            return Err(EpistemicOrientationReadError::ObservationBindingMismatch {
-                field: "source observation state fence",
-            });
-        }
+        validate_original_position_readback(request, role_inputs, readback)?;
+        let observation = read_original_observation(request, role_inputs, evidence)?;
+        validate_observation_candidate(request, role_inputs, readback, &observation)?;
 
         Ok(Self {
             request,
@@ -413,6 +184,250 @@ impl<'a> EpistemicOrientationRead<'a> {
     pub fn evidence_read_identity(&self) -> Option<&ReadIdentity> {
         self.role_inputs.evidence.identity.as_ref()
     }
+}
+
+fn validate_context_read_closure(
+    request: &ContextReconstructionRequest,
+    role_inputs: &SevenRoleInputs,
+) -> Result<(), EpistemicOrientationReadError> {
+    request
+        .validate()
+        .map_err(|_| EpistemicOrientationReadError::InvalidRequest)?;
+    if request.scope_id != role_inputs.scope_id {
+        return Err(EpistemicOrientationReadError::ReadClosureMismatch {
+            field: "scope_id",
+        });
+    }
+    if role_inputs.heads_before != role_inputs.heads_after {
+        return Err(EpistemicOrientationReadError::ReadClosureMismatch {
+            field: "before/after dependency heads",
+        });
+    }
+    if role_inputs.heads_before.scope_id != role_inputs.scope_id {
+        return Err(EpistemicOrientationReadError::ReadClosureMismatch {
+            field: "dependency-head scope",
+        });
+    }
+    if role_inputs.heads_before.state_fence != role_inputs.state_fence {
+        return Err(EpistemicOrientationReadError::ReadClosureMismatch {
+            field: "dependency-head state fence",
+        });
+    }
+    Ok(())
+}
+
+fn validate_original_position_readback(
+    request: &ContextReconstructionRequest,
+    role_inputs: &SevenRoleInputs,
+    readback: &EpistemicPositionReadback,
+) -> Result<(), EpistemicOrientationReadError> {
+    let position_payload = role_inputs
+        .epistemic
+        .payload
+        .as_ref()
+        .ok_or(EpistemicOrientationReadError::MissingPositionPayload)?;
+    let decoded_readback: EpistemicPositionReadback =
+        serde_json::from_value(position_payload.clone())
+            .map_err(|_| EpistemicOrientationReadError::InvalidPositionPayload)?;
+    if decoded_readback != *readback {
+        return Err(EpistemicOrientationReadError::PositionReadbackMismatch {
+            field: "retained decoded payload",
+        });
+    }
+    if readback.schema != eliot_store_api::epistemic_revision::EPISTEMIC_REVISION_SCHEMA {
+        return Err(EpistemicOrientationReadError::PositionReadbackMismatch {
+            field: "schema",
+        });
+    }
+    if readback.receipt.status != WriteReceiptStatus::Committed {
+        return Err(EpistemicOrientationReadError::PositionReadbackMismatch {
+            field: "committed receipt status",
+        });
+    }
+    if readback.receipt.operation_id != readback.candidate.operation_id {
+        return Err(EpistemicOrientationReadError::PositionReadbackMismatch {
+            field: "receipt operation id",
+        });
+    }
+    if readback.receipt.idempotency_key != readback.candidate.idempotency_key {
+        return Err(EpistemicOrientationReadError::PositionReadbackMismatch {
+            field: "receipt idempotency key",
+        });
+    }
+    if readback.receipt.state_fence != readback.candidate.fence {
+        return Err(EpistemicOrientationReadError::PositionReadbackMismatch {
+            field: "receipt state fence",
+        });
+    }
+    if readback.candidate.validate().is_err() {
+        return Err(EpistemicOrientationReadError::PositionReadbackMismatch {
+            field: "original candidate contract",
+        });
+    }
+    if readback.transition.validate().is_err() {
+        return Err(EpistemicOrientationReadError::PositionReadbackMismatch {
+            field: "original transition contract",
+        });
+    }
+    if readback.positions.len() != 1 {
+        return Err(EpistemicOrientationReadError::PositionReadbackMismatch {
+            field: "current position cardinality",
+        });
+    }
+    if readback.candidate.claims.len() != 1 {
+        return Err(EpistemicOrientationReadError::PositionReadbackMismatch {
+            field: "candidate claim cardinality",
+        });
+    }
+    let position = readback
+        .positions
+        .first()
+        .ok_or(EpistemicOrientationReadError::MissingCurrentPosition)?;
+    position
+        .validate()
+        .map_err(|_| EpistemicOrientationReadError::InvalidCurrentPosition)?;
+    validate_position_admission(request, role_inputs, readback, position)
+}
+
+fn validate_position_admission(
+    request: &ContextReconstructionRequest,
+    role_inputs: &SevenRoleInputs,
+    readback: &EpistemicPositionReadback,
+    position: &CurrentEpistemicPosition,
+) -> Result<(), EpistemicOrientationReadError> {
+    let receipt_envelope = readback
+        .receipt
+        .require_reconciliation_envelope()
+        .map_err(|_| EpistemicOrientationReadError::PositionReadbackMismatch {
+            field: "receipt reconciliation envelope",
+        })?;
+    let candidate = &readback.candidate;
+    for (mismatch, field) in [
+        (position.currentness != Currentness::Current, "position currentness"),
+        (!position.supersession.is_empty(), "position supersession"),
+        (position.claim != candidate.claims[0].claim, "admitted claim"),
+        (
+            position.admission.position.as_str() != request.epistemic_position.as_str(),
+            "position selector",
+        ),
+        (position.admission.payload_digest != candidate.digest, "original payload digest"),
+        (position.admission.scope != candidate.scope, "admitted scope"),
+        (position.admission.fence != candidate.fence, "admitted state fence"),
+        (
+            position.admission.coverage_digest != candidate.coverage_digest,
+            "coverage digest",
+        ),
+        (position.admission.proof_digest != candidate.proof_digest, "proof digest"),
+        (
+            position.admission.receipt_id != receipt_envelope.identity.receipt_id,
+            "original receipt id",
+        ),
+        (candidate.scope.as_str() != role_inputs.scope_id.as_str(), "candidate scope"),
+        (candidate.fence != role_inputs.state_fence, "candidate state fence"),
+    ] {
+        if mismatch {
+            return Err(EpistemicOrientationReadError::PositionAdmissionMismatch { field });
+        }
+    }
+    let support_digest = digest(&candidate.support, "support")?;
+    let conflict_digest = digest(&candidate.conflict_digests, "conflict digests")?;
+    if position.admission.evidence_digest != support_digest
+        || position.admission.conflict_digest != conflict_digest
+    {
+        return Err(EpistemicOrientationReadError::CandidateDigestMismatch {
+            field: "support or conflict preimage",
+        });
+    }
+    Ok(())
+}
+
+fn read_original_observation(
+    request: &ContextReconstructionRequest,
+    role_inputs: &SevenRoleInputs,
+    evidence: &RoleAcquisition,
+) -> Result<ObservationRecord, EpistemicOrientationReadError> {
+    let payload = evidence
+        .payload
+        .as_ref()
+        .ok_or(EpistemicOrientationReadError::MissingEvidencePayload)?;
+    let rows = payload
+        .get("records")
+        .and_then(Value::as_array)
+        .ok_or(EpistemicOrientationReadError::EvidencePayloadMismatch {
+            field: "records array",
+        })?;
+    if payload.get("version").and_then(Value::as_u64) != Some(1)
+        || payload.get("subject").and_then(Value::as_str)
+            != Some(request.evidence_subject.as_str())
+        || payload.get("scope_id").and_then(Value::as_str) != Some(request.scope_id.as_str())
+        || payload["provenance"]["state_fence"] != json!(role_inputs.state_fence)
+        || payload["provenance"]["truncated"] != false
+        || payload["provenance"]["returned"].as_u64() != Some(1)
+        || payload["provenance"]["matched_total"].as_u64() != Some(1)
+        || rows.len() != 1
+    {
+        return Err(EpistemicOrientationReadError::EvidencePayloadMismatch {
+            field: "version, subject, scope, provenance, or exact row count",
+        });
+    }
+    let row = rows
+        .first()
+        .ok_or(EpistemicOrientationReadError::MissingEvidenceRow)?;
+    if row.get("operation").and_then(Value::as_str) != Some("CaptureObservation") {
+        return Err(EpistemicOrientationReadError::EvidenceRowMismatch {
+            field: "operation",
+        });
+    }
+    let expected_parameters = json!({"subject": request.evidence_subject});
+    if row.get("parameters") != Some(&expected_parameters) {
+        return Err(EpistemicOrientationReadError::EvidenceRowMismatch {
+            field: "exact source selector",
+        });
+    }
+    let observation: ObservationRecord = serde_json::from_str(&request.evidence_subject)
+        .map_err(|_| EpistemicOrientationReadError::InvalidObservationPayload)?;
+    observation
+        .validate()
+        .map_err(|_| EpistemicOrientationReadError::InvalidObservation)?;
+    Ok(observation)
+}
+
+fn validate_observation_candidate(
+    request: &ContextReconstructionRequest,
+    role_inputs: &SevenRoleInputs,
+    readback: &EpistemicPositionReadback,
+    observation: &ObservationRecord,
+) -> Result<(), EpistemicOrientationReadError> {
+    let candidate = &readback.candidate;
+    if candidate.proof_digest != digest(observation, "observation")? {
+        return Err(EpistemicOrientationReadError::ObservationBindingMismatch {
+            field: "original observation proof digest",
+        });
+    }
+    if candidate.support.len() != 1 || candidate.support[0].handles.len() != 1 {
+        return Err(EpistemicOrientationReadError::ObservationBindingMismatch {
+            field: "single original support handle",
+        });
+    }
+    if !candidate.support[0].handles.contains(&observation.observation_id) {
+        return Err(EpistemicOrientationReadError::ObservationBindingMismatch {
+            field: "source observation handle",
+        });
+    }
+    if candidate.support[0].proof_digest != candidate.proof_digest {
+        return Err(EpistemicOrientationReadError::ObservationBindingMismatch {
+            field: "support proof digest",
+        });
+    }
+    if observation.subject != request.evidence_subject
+        || observation.evidence.provenance.scope.as_str() != role_inputs.scope_id.as_str()
+        || observation.evidence.state_fence != role_inputs.state_fence
+    {
+        return Err(EpistemicOrientationReadError::ObservationBindingMismatch {
+            field: "source observation selector, scope, or state fence",
+        });
+    }
+    Ok(())
 }
 
 fn validated_role_identity<'a>(

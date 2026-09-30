@@ -5,8 +5,9 @@ use std::collections::BTreeSet;
 
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_epistemic_contracts::{
-    ClaimAuditOutcome, ClaimVerdict, CurrentEpistemicPosition as AdmittedPosition, Currentness,
-    EpistemicPositionCandidate, PositionAssertability, SupportResult,
+    ClaimAuditOutcome, ClaimEntry, ClaimVerdict,
+    CurrentEpistemicPosition as AdmittedPosition, Currentness, EpistemicPositionCandidate,
+    PositionAssertability, SupportRecord, SupportResult,
 };
 use eliot_evidence::{
     EpistemicStatus, EvidenceAuthority, EvidenceFreshness, LifecycleState, ObservationRecord,
@@ -14,7 +15,7 @@ use eliot_evidence::{
 use serde::Serialize;
 use thiserror::Error;
 
-use crate::{CurrentEpistemicPosition, PositionRequest, PositionState};
+use crate::{CurrentEpistemicPosition, EpistemicRecord, PositionRequest, PositionState};
 
 /// Refusal to join the observed-candidate owner record to native resolver input.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -132,7 +133,7 @@ impl<'a> AdmittedPositionBinding<'a> {
 /// result against the original candidate and captured observation.
 ///
 /// The supported path deliberately matches the existing observed-candidate
-/// producer: one active, fresh, SourceIdentity observation yields one withheld
+/// producer: one active, fresh, `SourceIdentity` observation yields one withheld
 /// claim and an Unknown support result. Other candidate families have no
 /// faithful mapping to this resolver algebra and are refused explicitly.
 pub fn bind_admitted_position<'a>(
@@ -155,6 +156,24 @@ pub fn bind_admitted_position<'a>(
         .validate()
         .map_err(|_| AdmittedBindingError::Observation)?;
 
+    validate_admitted_position(candidate, admitted, request)?;
+    let (claim, support) = admitted_single_observation(candidate, admitted)?;
+    let record = validate_observation_request(observation, request)?;
+    validate_observation_record(record, observation)?;
+    validate_candidate_source_semantics(candidate, claim, support, observation)?;
+    validate_native_resolver_result(resolved, request, observation)?;
+
+    Ok(AdmittedPositionBinding {
+        candidate,
+        position: admitted,
+    })
+}
+
+fn validate_admitted_position(
+    candidate: &EpistemicPositionCandidate,
+    admitted: &AdmittedPosition,
+    request: &PositionRequest,
+) -> Result<(), AdmittedBindingError> {
     if admitted.currentness != Currentness::Current || !admitted.supersession.is_empty() {
         return Err(AdmittedBindingError::Mismatch {
             field: "position currentness",
@@ -195,22 +214,39 @@ pub fn bind_admitted_position<'a>(
             field: "original proof digest preimage",
         });
     }
+    Ok(())
+}
 
+fn admitted_single_observation(
+    candidate: &EpistemicPositionCandidate,
+    admitted: &AdmittedPosition,
+) -> Result<(&ClaimEntry, &SupportRecord), AdmittedBindingError> {
     if candidate.claims.len() != 1 || candidate.support.len() != 1 {
         return Err(AdmittedBindingError::Unsupported {
             field: "candidate must be the existing single-observation producer shape",
         });
     }
-    let claim = &candidate.claims[0];
-    let support = &candidate.support[0];
+    let claim = candidate
+        .claims
+        .first()
+        .ok_or(AdmittedBindingError::ResolverRequest)?;
+    let support = candidate
+        .support
+        .first()
+        .ok_or(AdmittedBindingError::ResolverRequest)?;
     if admitted.claim != claim.claim {
         return Err(AdmittedBindingError::Mismatch {
             field: "admitted claim identity",
         });
     }
-    if candidate.scope != request.scope
-        || candidate.fence != request.state_fence
-        || observation.subject != request.question
+    Ok((claim, support))
+}
+
+fn validate_observation_request<'a>(
+    observation: &ObservationRecord,
+    request: &'a PositionRequest,
+) -> Result<&'a EpistemicRecord, AdmittedBindingError> {
+    if observation.subject != request.question
         || observation.evidence.provenance.scope != request.scope
         || observation.evidence.state_fence != request.state_fence
         || observation.evidence.authority != EvidenceAuthority::SourceIdentity
@@ -232,9 +268,16 @@ pub fn bind_admitted_position<'a>(
             field: "non-current observation freshness",
         });
     }
-    let Some(record) = request.records.first() else {
-        return Err(AdmittedBindingError::ResolverRequest);
-    };
+    request
+        .records
+        .first()
+        .ok_or(AdmittedBindingError::ResolverRequest)
+}
+
+fn validate_observation_record(
+    record: &EpistemicRecord,
+    observation: &ObservationRecord,
+) -> Result<(), AdmittedBindingError> {
     if record.handle != observation.observation_id
         || record.subject != observation.subject
         || record.scope != observation.evidence.provenance.scope
@@ -246,7 +289,15 @@ pub fn bind_admitted_position<'a>(
             field: "native resolver record and original observation",
         });
     }
+    Ok(())
+}
 
+fn validate_candidate_source_semantics(
+    candidate: &EpistemicPositionCandidate,
+    claim: &ClaimEntry,
+    support: &SupportRecord,
+    observation: &ObservationRecord,
+) -> Result<(), AdmittedBindingError> {
     let source_proof = digest(observation)?;
     if candidate.proof_digest != source_proof || support.proof_digest != source_proof {
         return Err(AdmittedBindingError::Mismatch {
@@ -282,7 +333,14 @@ pub fn bind_admitted_position<'a>(
             field: "observed candidate claim and support semantics",
         });
     }
+    Ok(())
+}
 
+fn validate_native_resolver_result(
+    resolved: &CurrentEpistemicPosition,
+    request: &PositionRequest,
+    observation: &ObservationRecord,
+) -> Result<(), AdmittedBindingError> {
     let record_handles = vec![observation.observation_id.clone()];
     let source_ids = vec![observation.evidence.provenance.source_id.to_string()];
     let raw_handles = observation
@@ -321,11 +379,7 @@ pub fn bind_admitted_position<'a>(
             field: "native resolver result and original observation",
         });
     }
-
-    Ok(AdmittedPositionBinding {
-        candidate,
-        position: admitted,
-    })
+    Ok(())
 }
 
 fn digest<T: Serialize>(value: &T) -> Result<String, AdmittedBindingError> {
