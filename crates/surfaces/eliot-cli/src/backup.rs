@@ -2826,11 +2826,9 @@ pub fn backup_restore_test(
     // it, which is the module's one refusal shape for a claim this surface cannot
     // believe. It is raised after the outcome exists so the refusal carries the
     // same operation identity as every other answer.
-    let unproven_receipt = rehearsed
-        .as_ref()
-        .and_then(|evidence| {
-            require_restore_receipt_claim(evidence, params.target_id.as_str()).err()
-        });
+    let unproven_receipt = rehearsed.as_ref().and_then(|evidence| {
+        require_restore_receipt_claim(evidence, params.target_id.as_str()).err()
+    });
     // The reply is graded BEFORE any state or proven level is decided, so no
     // owner answer below is projected on the strength of a status this surface
     // has not first related to the owner's own evidence and to the catalogue
@@ -2975,8 +2973,9 @@ pub fn backup_restore_test(
             // answered `ok`, so an absent receipt means no owner evidence backs
             // this outcome at all, which is a typed result mismatch rather than a
             // floor worth reporting.
-            let evidence =
-                rehearsed.as_ref().ok_or(BackupClientError::Client(CliError::ResultMismatch))?;
+            let evidence = rehearsed
+                .as_ref()
+                .ok_or(BackupClientError::Client(CliError::ResultMismatch))?;
             // The owner's own code for an executed rehearsal, not the status:
             // it is what distinguishes this command's success answer from any
             // other `ok` a future owner might send.
