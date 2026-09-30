@@ -88,8 +88,8 @@ jobs:
       # invoke #1229's one declared preparation entrypoint on the clean runner
       # before the read-only offline gate, exactly as
       # scripts/verify-dependency-policy.py names it (PREPARATION_ENTRYPOINT,
-      # line 3769) and for the profile that gate actually runs (offline-source,
-      # scripts/verify.ps1 line 72). That entrypoint owns discovery of the
+      # line 3769) and for the profile that gate actually runs (offline-source).
+      # That entrypoint owns discovery of
       # pinned scanner identity, of the project-local Surreal provisioner, and
       # of the standalone resolver inputs; this file no longer re-implements
       # that discovery and no longer declines a leg. The only operations kept
@@ -213,9 +213,73 @@ jobs:
           python -m scripts.work_unit_gate doc-read-evidence --base $baseSha --candidate $candidateSha --pr-body $prBodyPath
           exit $LASTEXITCODE
 
+      # Minimal bootstrap build (I18.21:14). The ELIOT verifier/runner
+      # bootstrap is the only unavoidable pre-run exception, so this step builds
+      # exactly the owning crate and nothing else; every later verification
+      # stage is derived from the resolved profile definition, never from a
+      # command list written down in this file.
+      - name: Build the verification profile bootstrap
+        shell: pwsh
+        run: cargo build --locked -p eliot-instrument-runner --bin eliot-profile-resolver
+
+      # Versioned profile admission (issue #1914 W2/W4, I18.21:3). This step
+      # calls the SAME shared owner the local entrypoint calls, with the same
+      # closed profile alias, so "local profile revision == CI profile revision"
+      # is a computed equality rather than a claim in a report. The alias is a
+      # name resolved through eliot_instrument_runner::profile::PROFILE_ALIASES;
+      # an alias outside that closed table, a missing executable identity, or an
+      # absent provenance receipt fails the run here, before any gate executes.
+      - name: Resolve the versioned verification profile
+        shell: pwsh
+        run: |
+          $resolverPath = Join-Path $env:CARGO_TARGET_DIR 'debug\eliot-profile-resolver.exe'
+          if (-not (Test-Path -LiteralPath $resolverPath -PathType Leaf)) {
+            throw "VERIFY_PROFILE_ADMISSION_REFUSED: the shared profile resolver was not built at $resolverPath"
+          }
+          $targetRoot = $env:CARGO_TARGET_DIR
+          $cacheRoot = (Resolve-Path (Join-Path $env:GITHUB_WORKSPACE '.cargo') -ErrorAction SilentlyContinue)
+          if ($null -eq $cacheRoot) {
+            $cacheRoot = Join-Path $env:RUNNER_TEMP 'eliot-pr-check-cache'
+            New-Item -ItemType Directory -Path $cacheRoot -Force | Out-Null
+            $cacheRoot = (Resolve-Path $cacheRoot).Path
+          }
+          $receiptPath = Join-Path $env:RUNNER_TEMP 'ci-verification-profile-receipt.json'
+          $resolverArgs = @(
+            '--alias', 'package-verification',
+            '--source-root', $env:GITHUB_WORKSPACE,
+            '--target-root', $targetRoot,
+            '--cache-root', $cacheRoot.Path,
+            '--declared-environment', 'eliot-ci-merge-compile',
+            '--receipt-out', $receiptPath
+          )
+          $resolverOutput = @(& $resolverPath @resolverArgs 2>&1)
+          $resolverExit = $LASTEXITCODE
+          foreach ($resolverLine in $resolverOutput) { Write-Host "VERIFY_PROFILE_RESOLVER: $resolverLine" }
+          Write-Host "VERIFY_PROFILE_ALIAS: package-verification exit=$resolverExit"
+          if ($resolverExit -ne 0) {
+            throw "VERIFY_PROFILE_ADMISSION_REFUSED: the shared resolver refused alias 'package-verification' (exit $resolverExit); no gate runs under an unadmitted profile revision."
+          }
+          if (-not (Test-Path -LiteralPath $receiptPath -PathType Leaf)) {
+            throw "VERIFY_PROFILE_ADMISSION_REFUSED: no VerificationProfileReceipt was issued at $receiptPath"
+          }
+          $receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "### Versioned verification profile (I18.21)"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Alias: package-verification (eliot_instrument_runner::profile::PROFILE_ALIASES)"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Revision: $($receipt.profile)@$($receipt.profile_revision) schema=$($receipt.schema.schema)@$($receipt.schema.version)"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Profile digest: $($receipt.profile_digest)"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Stage DAG digest: $($receipt.dag_digest)"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Normalized outcome: $($receipt.outcome); proof ceiling: $($receipt.proof_ceiling)"
+          foreach ($tool in @($receipt.tool_identities)) {
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Tool identity: $($tool.stage_id) $($tool.instrument) executable=$($tool.executable) sha256=$($tool.executable_digest)"
+          }
+          foreach ($dependency in @($receipt.environment_dependencies)) {
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Declared environment dependency: $($dependency.name) expected=$($dependency.expected_class) observed=$($dependency.observed_class)"
+          }
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Receipt path: $receiptPath (this run's own CI-side receipt; the local run issues the same schema at the same revision)"
+
       # Quarantined legacy lane (issue #1813 W6): the MergeCompile gates
-      # execute cargo/dotnet directly with no governed profile receipt.
-      # Thin-invoker migration awaits W4 stage-execution provisions.
+      # execute cargo/dotnet directly with no governed PER-GATE receipt. The
+      # profile ADMISSION above is governed; each gate in the table is not.
       - name: Run MergeCompile verification profile
         shell: pwsh
         run: pwsh -NoProfile -File scripts/verify.ps1 -Profile MergeCompile
@@ -257,7 +321,7 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Operator harness: built, zero execution; no Operator test claim"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Profile: MergeCompile (sole gate-definition owner scripts/verify.ps1, closed MergeCompile profile); the versioned verification routes are named only by their closed profile aliases (package-verification, bundle-verification), never as a command list"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Package denominator: exact count bound at runtime by VERIFY_WORKSPACE_MEMBERS and VERIFY_DENOMINATOR lines (cargo metadata --locked --no-deps)"
-          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Gate order: not restated here (issue #1914 W4). This run names closed profile aliases only — package-verification, bundle-verification (eliot_instrument_runner::profile::PROFILE_ALIASES) — and the authoritative order, every gate state, and the denominator come solely from the shared owner scripts/verify.ps1 -Profile MergeCompile, recorded in this run's VERIFY_RESULT / VERIFY_GATE / VERIFY_DENOMINATOR lines. A gate this file names but the owner does not select, or the reverse, fails here; there is no second gate-order source"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Gate order: not restated in this file (issue #1914 W4). The single executed gate list is the shared owner's, and the single executed profile admission is the resolver step above, which named the closed alias package-verification and issued this run's receipt. No step in this workflow restates a verifier command list, and no gate exists here that the owner does not select."
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Gate states: every mandatory gate reports pass/fail-exit/fail-exception/cancelled/not-run via VERIFY_GATE; any nonpass fails this check"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Cache: key binds OS+toolchain+lockfile+profile+event-class; fork pull requests restore-only; hit/miss run the same gates; no pass receipt from cache"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Proof ceiling: MERGE_COMPILE_SOURCE_ONLY (compile-only; zero test execution; no lint-cleanliness claim; not Review/release/source-candidate, not installed-runtime/store/Product-Pulse proof)"
