@@ -50,7 +50,7 @@ use eliot_watchdog_core::{
     AcceptedSourceEvent, FailureClass, FailureEpisodeIdentity, FailureEpisodeKey, ReopenCondition,
     RuleRevision, SignalTarget, SourceEventAdmission, classify_source_event, reopen_permitted,
 };
-use redb::{ReadableDatabase, TableDefinition, WriteTransaction};
+use redb::{ReadableTable, TableDefinition, WriteTransaction};
 
 use crate::{GapRecoveryReason, SpoolError};
 
@@ -819,7 +819,15 @@ pub(crate) fn episode_ledger_key(episode_key: &str) -> String {
     sha256_hex(episode_key.as_bytes())
 }
 
-/// Reads and validates one stored episode row inside a caller's transaction.
+/// Reads and validates one stored episode row from a caller's already-open
+/// table.
+///
+/// The parameter is the episode table itself, not a database or a transaction.
+/// `open_table` is an inherent method of redb's concrete transaction types
+/// rather than a trait method, so no single trait bound can carry it across
+/// both a read transaction and a write transaction; the opened table is the one
+/// thing those two do share, and it is the same idiom the rest of this spool
+/// already uses on its read paths (see `codec::read_high_water`).
 ///
 /// A missing row reports `None` for an episode this owner has never accepted
 /// anything under; a present row is decoded strictly and validated, including
@@ -832,19 +840,14 @@ pub(crate) fn episode_ledger_key(episode_key: &str) -> String {
 ///
 /// Returns [`SpoolError::Corrupt`] when the stored row does not decode, is not
 /// canonical, or does not match the ledger key it was read under, and
-/// [`SpoolError::Database`] when the table cannot be opened.
-pub(crate) fn read_episode<D>(
-    database: &D,
+/// [`SpoolError::Database`] when the table cannot be read.
+pub(crate) fn read_episode<T>(
+    table: &T,
     ledger_key: &str,
 ) -> Result<Option<StoredSignalEpisode>, SpoolError>
 where
-    D: ReadableDatabase,
+    T: ReadableTable<&'static str, &'static [u8]>,
 {
-    let table = match database.open_table(SIGNAL_EPISODE_TABLE) {
-        Ok(table) => table,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-        Err(error) => return Err(SpoolError::Database(error.to_string())),
-    };
     let Some(value) = table
         .get(ledger_key)
         .map_err(|error| SpoolError::Database(error.to_string()))?
@@ -894,21 +897,17 @@ pub(crate) fn write_episode(
 
 /// Returns every stored episode ledger key, for the bounded closer.
 ///
-/// Read-only. The caller bounds how many it closes, so a spool with a large
-/// episode history cannot make one admission unbounded.
+/// Read-only, and over the caller's already-open episode table for the same
+/// reason as [`read_episode`]. The caller bounds how many it closes, so a spool
+/// with a large episode history cannot make one admission unbounded.
 ///
 /// # Errors
 ///
 /// Returns [`SpoolError::Database`] when the table cannot be read.
-pub(crate) fn stored_episode_keys<D>(database: &D) -> Result<Vec<String>, SpoolError>
+pub(crate) fn stored_episode_keys<T>(table: &T) -> Result<Vec<String>, SpoolError>
 where
-    D: ReadableDatabase,
+    T: ReadableTable<&'static str, &'static [u8]>,
 {
-    let table = match database.open_table(SIGNAL_EPISODE_TABLE) {
-        Ok(table) => table,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-        Err(error) => return Err(SpoolError::Database(error.to_string())),
-    };
     let mut keys = Vec::new();
     for item in table
         .iter()

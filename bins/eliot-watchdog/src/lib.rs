@@ -1280,29 +1280,31 @@ impl IndependentKernelSensor {
             Ok(episode::SignalEpisodeOutcome::Accepted {
                 revision,
                 independent_occurrences,
-                sequence,
+                record,
                 reopened,
-                ..
             }) => tracing::warn!(
                 event = "watchdog.signal_episode_accepted",
                 observation = "accepted",
                 revision = revision,
                 independent_occurrences = independent_occurrences,
-                sequence = sequence,
+                sequence = record.sequence,
+                record_digest = record.record_digest.as_str(),
                 reopened = reopened,
                 "a genuinely new source event advanced one durable failure episode and appended its record"
             ),
             Ok(episode::SignalEpisodeOutcome::Reused {
                 revision,
                 independent_occurrences,
-                sequence,
-                ..
+                record,
+                evidence_observed_at_ms,
             }) => tracing::debug!(
                 event = "watchdog.signal_episode_reused",
                 observation = "retransmission",
                 revision = revision,
                 independent_occurrences = independent_occurrences,
-                sequence = sequence,
+                sequence = record.sequence,
+                record_digest = record.record_digest.as_str(),
+                evidence_observed_at_ms = evidence_observed_at_ms,
                 "a retransmitted source event reused the revision this episode already accepted"
             ),
             Ok(episode::SignalEpisodeOutcome::Refused(refusal)) => {

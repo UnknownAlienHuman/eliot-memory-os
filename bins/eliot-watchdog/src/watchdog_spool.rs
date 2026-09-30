@@ -16,7 +16,7 @@ use eliot_watchdog_core::{
     acknowledgement_advances_cursor, is_duplicate_ack, validate_acknowledgement, validate_batch,
     validate_batch_freshness, validate_cursor,
 };
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
+use redb::{Database, ReadableTable, TableDefinition, WriteTransaction};
 
 use crate::{
     AdmittedIsolatedDestination, SERVICE_NAME, SpoolError, WatchdogRuntimeBinding, current_unix_ms,
@@ -1662,25 +1662,34 @@ impl WatchdogSpool {
             .database
             .begin_write()
             .map_err(|error| SpoolError::Database(error.to_string()))?;
-        let mut state = match episode::read_episode(&write, ledger_key.as_str())? {
-            Some(state) => state,
-            None => {
-                // A new episode takes one table slot, and the table is bounded.
-                // The check is against the real retained row count rather than a
-                // caller's number, so an over-full table refuses the new episode
-                // instead of the closer later walking past it.
-                let stored = episode::stored_episode_keys(&write)?.len();
-                if stored >= episode::MAX_SIGNAL_EPISODES {
-                    return Err(SpoolError::Corrupt(
-                        "watchdog signal episode table is at its bound; refusing to open another episode rather than dropping an existing one"
-                            .to_owned(),
-                    ));
+        // The episode table is opened through the write transaction's own
+        // inherent `open_table`, which creates it when absent, and the read
+        // guard is released before anything else opens it for writing.
+        let mut state = {
+            let table = write
+                .open_table(episode::SIGNAL_EPISODE_TABLE)
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+            match episode::read_episode(&table, ledger_key.as_str())? {
+                Some(state) => state,
+                None => {
+                    // A new episode takes one table slot, and the table is
+                    // bounded. The check is against the real retained row count
+                    // rather than a caller's number, so an over-full table
+                    // refuses the new episode instead of the closer later walking
+                    // past it.
+                    let stored = episode::stored_episode_keys(&table)?.len();
+                    if stored >= episode::MAX_SIGNAL_EPISODES {
+                        return Err(SpoolError::Corrupt(
+                            "watchdog signal episode table is at its bound; refusing to open another episode rather than dropping an existing one"
+                                .to_owned(),
+                        ));
+                    }
+                    episode::StoredSignalEpisode::fresh(
+                        &observation.identity,
+                        &episode_key,
+                        &observation.reopen_condition,
+                    )
                 }
-                episode::StoredSignalEpisode::fresh(
-                    &observation.identity,
-                    &episode_key,
-                    &observation.reopen_condition,
-                )
             }
         };
         let admission = state.classify(&observation.source_event)?;
@@ -1788,7 +1797,11 @@ impl WatchdogSpool {
         source_event: &eliot_watchdog_core::AcceptedSourceEvent,
     ) -> Option<episode::SignalEpisodeOutcome> {
         let read = self.database.begin_read().ok()?;
-        let state = episode::read_episode(&read, ledger_key).ok()??;
+        // A read transaction's `open_table` is the other half of the same
+        // inherent pair, and unlike the write path it does not create the table:
+        // a spool that never opened an episode simply has nothing to reconcile.
+        let table = read.open_table(episode::SIGNAL_EPISODE_TABLE).ok()?;
+        let state = episode::read_episode(&table, ledger_key).ok()??;
         if state.classify(source_event).ok()?.is_new_evidence() {
             return None;
         }
@@ -1829,22 +1842,35 @@ impl WatchdogSpool {
             .database
             .begin_write()
             .map_err(|error| SpoolError::Database(error.to_string()))?;
-        let keys = episode::stored_episode_keys(&write)?;
-        if keys.len() > episode::MAX_SIGNAL_EPISODES {
-            return Err(SpoolError::Corrupt(
-                "watchdog signal episode table exceeds its bound; refusing to close a prefix of it"
-                    .to_owned(),
-            ));
-        }
-        let mut closed = 0;
-        for ledger_key in &keys {
-            let Some(mut state) = episode::read_episode(&write, ledger_key.as_str())? else {
-                continue;
-            };
-            if !state.close()? {
-                continue;
+        // One read pass over the episode table decides which rows actually
+        // change, and its read guard is released before the write pass reopens
+        // the same table for writing: redb gives a write transaction one guard
+        // per open table, and this closer must not hold two at once.
+        let to_close = {
+            let table = write
+                .open_table(episode::SIGNAL_EPISODE_TABLE)
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+            let keys = episode::stored_episode_keys(&table)?;
+            if keys.len() > episode::MAX_SIGNAL_EPISODES {
+                return Err(SpoolError::Corrupt(
+                    "watchdog signal episode table exceeds its bound; refusing to close a prefix of it"
+                        .to_owned(),
+                ));
             }
-            episode::write_episode(&write, ledger_key.as_str(), &state)?;
+            let mut to_close = Vec::new();
+            for ledger_key in &keys {
+                let Some(mut state) = episode::read_episode(&table, ledger_key.as_str())? else {
+                    continue;
+                };
+                if state.close()? {
+                    to_close.push((ledger_key.clone(), state));
+                }
+            }
+            to_close
+        };
+        let mut closed: u64 = 0;
+        for (ledger_key, state) in &to_close {
+            episode::write_episode(&write, ledger_key.as_str(), state)?;
             closed = closed.saturating_add(1);
         }
         write
