@@ -19,7 +19,8 @@ use eliot_blob::{
     DpapiUserAeadPort, DpapiUserKeyPort, WindowsBlobPlatform, ZstdBlobCompression,
 };
 use eliot_blob_api::{
-    BlobError, BlobId, BlobPolicyBinding, BlobReadRequest, BlobReceiptContext, RetentionClass,
+    BlobError, BlobId, BlobPolicyBinding, BlobReadRequest, BlobReceiptContext,
+    ObjectResidencyKey, RetentionClass,
 };
 use eliot_governor::{
     SourceArtifactAdmission, SourceArtifactBlobProfile, SourceArtifactBlobProfileError,
@@ -112,30 +113,12 @@ impl SourceArtifactOwner {
         if admission.operation().effect != EffectClass::ReversibleMutation {
             return Err(SourceArtifactOwnerError::WrongEffect);
         }
+        identity.validate()?;
         identity.verify_content(bytes)?;
         profile.validate_for(admission, SOURCE_BLOB_KEY_LINEAGE, self.key_generation)?;
 
-        let policy = BlobPolicyBinding {
-            privacy_class: profile.policy().privacy_class(),
-            retention_class: match profile.policy().retention_class() {
-                SourceArtifactRetentionClass::Session => RetentionClass::Session,
-                SourceArtifactRetentionClass::Task => RetentionClass::Task,
-                SourceArtifactRetentionClass::Durable => RetentionClass::Durable,
-                SourceArtifactRetentionClass::LegalHold => RetentionClass::LegalHold,
-            },
-            policy_ref: PlatformHandle::new(profile.policy().policy_ref().to_owned())?,
-            instruction_taint: profile.policy().instruction_taint(),
-            effect_ceiling: profile.policy().effect_ceiling(),
-        };
-        let domains = profile.residency_domains();
-        let residency = BlobResidencyDomains::new(
-            BlobId::new(domains.scope_domain_id().to_owned())?,
-            BlobId::new(domains.access_domain_id().to_owned())?,
-            BlobId::new(domains.confidentiality_domain_id().to_owned())?,
-            BlobId::new(domains.encryption_key_domain_id().to_owned())?,
-            BlobId::new(domains.retention_domain_id().to_owned())?,
-            BlobId::new(domains.erasure_domain_id().to_owned())?,
-        );
+        let policy = blob_policy_binding(profile)?;
+        let residency = blob_residency_domains(profile)?;
         let context = receipt_context(admission);
         let blob = self.blob_for_context(&context)?;
         let root_lease = self.root_owner.lease_for_request(&context.request)?;
@@ -151,11 +134,14 @@ impl SourceArtifactOwner {
     }
 
     /// Reopens one exact persisted Artifact reference through the original
-    /// Blob owner. The returned proof preserves the S-04 read receipt lineage
-    /// and verifies the artifact identity against the bytes a second time.
+    /// Blob owner. The current PolicyOwner profile must match the authenticated
+    /// policy and six residency domains on that reference; the returned proof
+    /// preserves the S-04 read receipt lineage and verifies the artifact
+    /// identity against the bytes a second time.
     pub fn read_source_reference<'a>(
         &'a self,
         admission: &'a SourceArtifactAdmission,
+        profile: &'a SourceArtifactBlobProfile,
         reference: ArtifactReference,
     ) -> impl Future<Output = Result<(VerifiedArtifact, ArtifactReadReceipt), SourceArtifactOwnerError>> + 'a
     {
@@ -163,12 +149,20 @@ impl SourceArtifactOwner {
             if admission.operation().effect != EffectClass::Read {
                 return Err(SourceArtifactOwnerError::WrongEffect);
             }
+            profile.validate_for(admission, SOURCE_BLOB_KEY_LINEAGE, self.key_generation)?;
+            let policy = blob_policy_binding(profile)?;
+            let residency = blob_residency_domains(profile)?;
+            if !matches_residency_domains(&reference.locator.residency, &residency) {
+                return Err(BlobError::MetadataPayloadMismatch.into());
+            }
             let context = receipt_context(admission);
             let blob = self.blob_for_context(&context)?;
             let reader = AdmissionBlobReader {
                 blob: &blob,
                 root_owner: &self.root_owner,
                 context,
+                policy,
+                residency,
             };
             // The persisted identity supplies this read's exact byte ceiling;
             // BlobStoreCore enforces its own canonical plaintext ceiling.
@@ -209,6 +203,8 @@ struct AdmissionBlobReader<'a> {
     blob: &'a SourceBlobService,
     root_owner: &'a BlobRootOwner,
     context: BlobReceiptContext,
+    policy: BlobPolicyBinding,
+    residency: BlobResidencyDomains,
 }
 
 impl ArtifactBlobReader for AdmissionBlobReader<'_> {
@@ -218,16 +214,67 @@ impl ArtifactBlobReader for AdmissionBlobReader<'_> {
                 BlobError::InvalidContract(format!("artifact read request refused: {error}"))
             })?;
             let root_lease = self.root_owner.lease_for_request(&self.context.request)?;
-            self.blob.read_source(BlobReadRequest {
+            let chunk = self.blob.read_source(BlobReadRequest {
                 context: self.context.clone(),
                 root_lease,
                 locator: request.locator,
                 expected_metadata_sha256: request.expected_metadata_sha256,
                 expected_ready_receipt_id: request.expected_ready_receipt_id,
                 max_bytes: request.max_bytes,
-            })
+            })?;
+            chunk.validate()?;
+            let ready = chunk.ready_receipt();
+            if ready.policy() != &self.policy
+                || !matches_residency_domains(&ready.locator().residency, &self.residency)
+            {
+                return Err(BlobError::MetadataPayloadMismatch);
+            }
+            Ok(chunk)
         })
     }
+}
+
+fn blob_policy_binding(
+    profile: &SourceArtifactBlobProfile,
+) -> Result<BlobPolicyBinding, SourceArtifactOwnerError> {
+    Ok(BlobPolicyBinding {
+        privacy_class: profile.policy().privacy_class(),
+        retention_class: match profile.policy().retention_class() {
+            SourceArtifactRetentionClass::Session => RetentionClass::Session,
+            SourceArtifactRetentionClass::Task => RetentionClass::Task,
+            SourceArtifactRetentionClass::Durable => RetentionClass::Durable,
+            SourceArtifactRetentionClass::LegalHold => RetentionClass::LegalHold,
+        },
+        policy_ref: PlatformHandle::new(profile.policy().policy_ref().to_owned())?,
+        instruction_taint: profile.policy().instruction_taint(),
+        effect_ceiling: profile.policy().effect_ceiling(),
+    })
+}
+
+fn blob_residency_domains(
+    profile: &SourceArtifactBlobProfile,
+) -> Result<BlobResidencyDomains, SourceArtifactOwnerError> {
+    let domains = profile.residency_domains();
+    Ok(BlobResidencyDomains::new(
+        BlobId::new(domains.scope_domain_id().to_owned())?,
+        BlobId::new(domains.access_domain_id().to_owned())?,
+        BlobId::new(domains.confidentiality_domain_id().to_owned())?,
+        BlobId::new(domains.encryption_key_domain_id().to_owned())?,
+        BlobId::new(domains.retention_domain_id().to_owned())?,
+        BlobId::new(domains.erasure_domain_id().to_owned())?,
+    ))
+}
+
+fn matches_residency_domains(
+    observed: &ObjectResidencyKey,
+    expected: &BlobResidencyDomains,
+) -> bool {
+    observed.scope_domain_id == expected.scope_domain_id
+        && observed.access_domain_id == expected.access_domain_id
+        && observed.confidentiality_domain_id == expected.confidentiality_domain_id
+        && observed.encryption_key_domain_id == expected.encryption_key_domain_id
+        && observed.retention_domain_id == expected.retention_domain_id
+        && observed.erasure_domain_id == expected.erasure_domain_id
 }
 
 fn receipt_context(admission: &SourceArtifactAdmission) -> BlobReceiptContext {
