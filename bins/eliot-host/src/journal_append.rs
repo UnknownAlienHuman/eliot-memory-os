@@ -5,6 +5,7 @@ pub(super) use readiness_append::{
 };
 
 use super::{HostError, fresh_identity, fresh_lineage_id, operation, record_fence, sha256_json};
+use std::fmt::Write as _;
 use eliot_host_state::{
     ActivationState, AppendReceipt, CleanMarker, DrainCommitRecord, DrainRecord, DrainState,
     EliotActivationRecord, EpochTransition, FailureRecoveryDirective, HostInstallationEpoch,
@@ -738,11 +739,11 @@ fn bounded_residual_list(handles: &[PlatformHandle]) -> String {
     let mut text = handles
         .iter()
         .take(MAX_LISTED)
-        .map(|handle| handle.as_str())
+        .map(PlatformHandle::as_str)
         .collect::<Vec<_>>()
         .join(", ");
     if handles.len() > MAX_LISTED {
-        text.push_str(&format!(", and {} more", handles.len() - MAX_LISTED));
+        let _ = write!(text, ", and {} more", handles.len() - MAX_LISTED);
     }
     text
 }
