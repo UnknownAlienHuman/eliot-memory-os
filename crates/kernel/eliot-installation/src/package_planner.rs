@@ -1549,6 +1549,14 @@ impl GenerationPackagePlanner {
                 "package plan inputs differ from the resolved I3.1 profile selection".to_owned(),
             ));
         }
+        if input.agent_bridge_source.is_some()
+            && input.profile != InstallationProfile::SystemService
+        {
+            return Err(InstallationError::ProfileViolation(
+                "Agent Bridge requires the SystemService Kernel identity (LocalService/session 0) and SCM bootstrap; UserMode and PortableDev use current-user supervision"
+                    .to_owned(),
+            ));
+        }
         publication_binding.retained_profile_anchor.validate()?;
         if !crate::same_windows_root(
             publication_binding
