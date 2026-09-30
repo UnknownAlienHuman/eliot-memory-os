@@ -101,9 +101,9 @@ pub use inquiry_obligations::{
     TaskGraphCompilationInputs,
 };
 pub use source_admissibility::{
-    FreezeCommitment, GovernorSourceTransitionRequest, PresentedReference,
-    RecordReferenceSurface, SourceAdmissibilityReason, SourceAdmissibilityRecord, SourceEligibility,
-    SourceIndependence, SourceLimits, SourceTaint, admits_record_reference, record_references,
+    FreezeCommitment, GovernorSourceTransitionRequest, PresentedReference, RecordReferenceSurface,
+    SourceAdmissibilityReason, SourceAdmissibilityRecord, SourceEligibility, SourceIndependence,
+    SourceLimits, SourceTaint, admits_record_reference, record_references,
 };
 // The committed-freeze proof and the governed synthesis-input pack. Exported
 // because the composition root that admits a synthesis run reads the pack, and

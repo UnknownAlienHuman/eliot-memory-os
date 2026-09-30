@@ -176,8 +176,7 @@ impl CommittedFreeze {
                     field: "committed_freeze.freeze_commit",
                 });
             };
-            if commitment.freeze_digest != freeze.digest
-                || commitment.freeze_id != freeze.freeze_id
+            if commitment.freeze_digest != freeze.digest || commitment.freeze_id != freeze.freeze_id
             {
                 return Err(InquiryError::IntegrityMismatch {
                     field: "committed_freeze.freeze_identity",
@@ -221,7 +220,11 @@ impl CommittedFreeze {
         push_count(&mut preimage, "members", self.members.len());
         for member in &self.members {
             push_field(&mut preimage, "member", &member.source_handle);
-            push_field(&mut preimage, "member_content_digest", &member.content_digest);
+            push_field(
+                &mut preimage,
+                "member_content_digest",
+                &member.content_digest,
+            );
             push_field(
                 &mut preimage,
                 "member_retained_revision_digest",
@@ -644,7 +647,11 @@ impl SynthesisInputPack {
             "committed_freeze_digest",
             &self.committed_freeze_digest,
         );
-        push_field(&mut preimage, "committed_freeze_id", &self.committed_freeze_id);
+        push_field(
+            &mut preimage,
+            "committed_freeze_id",
+            &self.committed_freeze_id,
+        );
         push_field(&mut preimage, "inquiry_id", &self.inquiry_id);
         push_field(&mut preimage, "evidence_set_id", &self.evidence_set_id);
         push_field(
@@ -825,12 +832,14 @@ fn resolve_member(
         limitation: PackLimitation::RecordIdentityUnproven,
         reason: "the admitted source record has no computable canonical commitment".to_owned(),
     })?;
-    record.verify_identity(&record_digest).map_err(|_| PackOmission {
-        source_handle: handle.to_owned(),
-        limitation: PackLimitation::RecordIdentityUnproven,
-        reason: "the admitted source record no longer re-proves its own canonical identity"
-            .to_owned(),
-    })?;
+    record
+        .verify_identity(&record_digest)
+        .map_err(|_| PackOmission {
+            source_handle: handle.to_owned(),
+            limitation: PackLimitation::RecordIdentityUnproven,
+            reason: "the admitted source record no longer re-proves its own canonical identity"
+                .to_owned(),
+        })?;
     // The retained original, with its own three refusals; see `retained_original`.
     let retained_member = retained_original(handle, committed, retained, record)?;
     // I21.7: never wider than the run admitted.
@@ -928,8 +937,11 @@ fn retained_original<'a>(
             ),
         });
     }
-    if text(&retained_member.retained_artifact_ref, "synthesis_input.retained_artifact_ref")
-        .is_err()
+    if text(
+        &retained_member.retained_artifact_ref,
+        "synthesis_input.retained_artifact_ref",
+    )
+    .is_err()
     {
         return Err(PackOmission {
             source_handle: handle.to_owned(),

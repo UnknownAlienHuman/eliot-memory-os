@@ -4800,11 +4800,12 @@ impl ClaimAuditRecord {
         // is exactly the "a digest of bytes nobody holds" substitution W2
         // refuses. What is re-proved is what this record asserts about the check.
         for check in &self.verdict.excerpt_checks {
-            check.excerpt.verify_integrity().map_err(|_| {
-                InquiryError::IntegrityMismatch {
+            check
+                .excerpt
+                .verify_integrity()
+                .map_err(|_| InquiryError::IntegrityMismatch {
                     field: "claim_audit.excerpt_check",
-                }
-            })?;
+                })?;
         }
         Ok(())
     }
@@ -6264,31 +6265,18 @@ impl InquiryGovernance {
             claim_audit.records.first(),
             absence_evidence.as_ref(),
         )?;
-        // W2: the freeze is committed through the existing governed
-        // source-admission owner, and the retained original is bound to it there.
-        // Every request on this path is built by
-        // `transition_request_committing_freeze`, so a run that did not persist
-        // before synthesis produces **no** request at all for the sources whose
-        // original it never retained — the plain `transition_request` builder
-        // still exists for a pre-freeze proposal, and this record does not use
-        // it, because a request that named no freeze is exactly the state W2
-        // forbids admitting synthesis from.
-        let (source_admission_requests, retained_revisions) =
-            commit_freeze_through_source_admission(&observation, &freeze, &admissibility)?;
-        // The committed-freeze proof, re-derived from those same requests through
-        // the owner's existing validator. It is not built from the freeze alone:
-        // `CommittedFreeze::commit` takes the requests, so the proof exists only
-        // if every one of them already carried this exact freeze.
-        let committed_freeze =
-            crate::synthesis_input::CommittedFreeze::commit(&freeze, &source_admission_requests)?;
-        let synthesis_input = resolve_synthesis_input(
-            &observation,
-            &admissibility,
-            &committed_freeze,
-            &freeze,
-            &profile,
-            &lane_discipline,
-        )?;
+        // W2 and W3 together: commit the freeze through the existing governed
+        // source-admission owner, then build the synthesis pack from that
+        // committed freeze. The ordering is the guarantee, so both steps live in
+        // one named function rather than being two calls in a long body.
+        let (source_admission_requests, retained_revisions, committed_freeze, synthesis_input) =
+            commit_freeze_and_resolve_synthesis_input(
+                &observation,
+                &freeze,
+                &admissibility,
+                &profile,
+                &lane_discipline,
+            )?;
         let record = Self {
             inquiry_id: observation.inquiry_id,
             evidence_set_id: observation.evidence_set_id,
@@ -6386,7 +6374,10 @@ impl InquiryGovernance {
             let Some(text) = delivered.get(&audit.claim_id) else {
                 return Err(InquiryError::ReleaseGateRefused {
                     gate: "released_wording",
-                    detail: format!("{}: audited but not named in the delivered text", audit.claim_id),
+                    detail: format!(
+                        "{}: audited but not named in the delivered text",
+                        audit.claim_id
+                    ),
                 });
             };
             if text == &audit.released_statement {
@@ -9285,14 +9276,68 @@ fn commit_freeze_through_source_admission(
 /// The same records the portfolio assembled and the freeze enumerated, carried
 /// whole rather than rebuilt, so the synthesis pack resolves members against the
 /// records the run published rather than a second projection of them.
-fn admitted_records(
-    admissibility: &[SourceAdmissibilityRecord],
-) -> BTreeMap<String, SourceRecord> {
+fn admitted_records(admissibility: &[SourceAdmissibilityRecord]) -> BTreeMap<String, SourceRecord> {
     admissibility
         .iter()
         .filter(|record| record.eligibility == SourceEligibility::Eligible)
         .map(|record| (record.record.handle.clone(), record.record.clone()))
         .collect()
+}
+
+/// Commits the W2 evidence freeze and resolves the W3 synthesis pack from it.
+///
+/// W2: the freeze is committed through the existing governed source-admission
+/// owner, and the retained original is bound to it there. Every request on this
+/// path is built by `transition_request_committing_freeze`, so a run that did not
+/// persist before synthesis produces **no** request at all for the sources whose
+/// original it never retained — the plain `transition_request` builder still
+/// exists for a pre-freeze proposal, and this path does not use it, because a
+/// request that named no freeze is exactly the state W2 forbids admitting
+/// synthesis from.
+///
+/// The committed-freeze proof is then re-derived from those same requests
+/// through the owner's existing validator. It is not built from the freeze alone:
+/// `CommittedFreeze::commit` takes the requests, so the proof exists only if every
+/// one of them already carried this exact freeze.
+///
+/// W3 then resolves the pack from that committed freeze. The two live in one
+/// function because the ORDER is the guarantee: a pack may only be resolved from
+/// a freeze that a governed owner has already committed, so separating them into
+/// two independently callable steps would make the ordering a convention.
+#[allow(clippy::type_complexity)]
+fn commit_freeze_and_resolve_synthesis_input(
+    observation: &InquiryObservation,
+    freeze: &EvidenceFreeze,
+    admissibility: &[SourceAdmissibilityRecord],
+    profile: &InquiryProtocolProfile,
+    lane_discipline: &LaneDisciplineOutcome,
+) -> Result<
+    (
+        Vec<GovernorSourceTransitionRequest>,
+        BTreeMap<String, crate::admitted_excerpt::RetainedSourceRevision>,
+        crate::synthesis_input::CommittedFreeze,
+        crate::synthesis_input::SynthesisInputPack,
+    ),
+    InquiryError,
+> {
+    let (source_admission_requests, retained_revisions) =
+        commit_freeze_through_source_admission(observation, freeze, admissibility)?;
+    let committed_freeze =
+        crate::synthesis_input::CommittedFreeze::commit(freeze, &source_admission_requests)?;
+    let synthesis_input = resolve_synthesis_input(
+        observation,
+        admissibility,
+        &committed_freeze,
+        freeze,
+        profile,
+        lane_discipline,
+    )?;
+    Ok((
+        source_admission_requests,
+        retained_revisions,
+        committed_freeze,
+        synthesis_input,
+    ))
 }
 
 /// Resolves the W3 synthesis pack for one recorded run.

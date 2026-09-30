@@ -1140,7 +1140,11 @@ pub fn excerpt_requirement_from_checks(
                     .iter()
                     .map(|failure| failure.wire_name())
                     .collect();
-                format!("excerpt from {}: {}", check.excerpt.source_handle, names.join(","))
+                format!(
+                    "excerpt from {}: {}",
+                    check.excerpt.source_handle,
+                    names.join(",")
+                )
             })
             .collect();
         reasons.sort();
@@ -1181,7 +1185,8 @@ pub fn excerpt_requirement_from_checks(
 /// the dimension evaluations do, rather than a second spelling of it.
 pub const ADMITTED_ROUTE: &str = crate::evidence_portfolio::ADMITTED_EVALUATION_ROUTE;
 /// Version of the admitted semantic-sufficiency route contract.
-pub const ADMITTED_ROUTE_VERSION: &str = crate::evidence_portfolio::ADMITTED_EVALUATION_ROUTE_VERSION;
+pub const ADMITTED_ROUTE_VERSION: &str =
+    crate::evidence_portfolio::ADMITTED_EVALUATION_ROUTE_VERSION;
 
 /// A compact, order-stable rendering of one check for a digest preimage or a
 /// bounded diagnostic.

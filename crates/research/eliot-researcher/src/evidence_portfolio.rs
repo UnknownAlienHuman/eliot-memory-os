@@ -7499,7 +7499,8 @@ fn audit_claim_with_retained(
     // absent from the admitted revision, were cropped out of a negated clause,
     // were stitched across sections, or were never compared with the original at
     // all.
-    let excerpt_obligation = crate::admitted_excerpt::excerpt_requirement_from_checks(&excerpt_checks);
+    let excerpt_obligation =
+        crate::admitted_excerpt::excerpt_requirement_from_checks(&excerpt_checks);
     // Any excerpt that did not verify is a support gap, and the fail-closed
     // arm is what turns it into a terminal class. `Unknown` (every excerpt
     // verified for occurrence and context, semantic sufficiency still
