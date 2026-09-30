@@ -51,8 +51,7 @@ fn activation_ingress(
         Some(pending) => ActivationIngress {
             trigger_class: ActivationTriggerClass::ApprovedMaintenanceJob.as_str(),
             requester: format!("pending-activation:{}", pending.transaction_id.as_str()),
-            capabilities: ActivationTriggerClass::ApprovedMaintenanceJob
-                .requested_capabilities(),
+            capabilities: ActivationTriggerClass::ApprovedMaintenanceJob.requested_capabilities(),
         },
         None => ActivationIngress {
             trigger_class: HOST_LIFECYCLE_TRIGGER_CLASS,
