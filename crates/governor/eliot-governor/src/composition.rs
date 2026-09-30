@@ -5311,8 +5311,12 @@ pub struct ColdStartTriggerCompilation {
 }
 
 /// Ephemeral capability held only by the composition invocation that won the
-/// durable ORS claim. Restart recovery uses ORS readback and never restores
-/// this process-local compile capability from serialized data.
+/// durable ORS claim. Restart recovery never restores this process-local
+/// compile capability from serialized data: it re-derives it by re-reading
+/// and re-validating the exact durable owner record for the rebuilt claim
+/// (`recover_retained_cold_start_claim`), so a restarted trigger adopts the
+/// one retained lease instead of minting a second compilation under the same
+/// key.
 #[derive(Clone)]
 struct ColdStartReadinessOwnerClaim {
     claim: ColdStartReadinessClaim,
@@ -8076,6 +8080,54 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         Self::readiness_join_from_record(&record, now, created)
     }
 
+    /// Re-derives the compile capability for the exact durable in-flight
+    /// lease after restart (issue #1790, retained lease recovery).
+    ///
+    /// The process-local win map does not survive restart, but the ORS
+    /// readiness owner does. When this composition rebuilds the identical
+    /// claim (identical binding digest) and the owner still holds the exact
+    /// record for it — same key, same binding digest, same lease — the lease
+    /// is adopted instead of re-claimed, so a restarted trigger joins the one
+    /// durable lease rather than minting a second compilation under the same
+    /// key. The adopted claim flows through every guard below unchanged: the
+    /// row is reloaded by record key, a terminal record returns its shared
+    /// `JoinedTerminal` without recompiling, an expired record fails closed,
+    /// and only an unexpired in-flight record reaches compilation — whose
+    /// ORS publication gate keeps the terminal single even if a pre-restart
+    /// winner still survives to publish alongside the adopted compilation.
+    /// Adoption never restores capability from serialized data: every field
+    /// is re-read and re-validated from the live owner before use.
+    fn recover_retained_cold_start_claim(
+        &mut self,
+        owner: &Arc<dyn ColdStartReadinessRecordOwner>,
+        claim: &ColdStartReadinessClaim,
+    ) -> Result<ColdStartReadinessOwnerClaim, CompositionError> {
+        let record = owner
+            .load_cold_start_readiness_for_binding(&claim.binding_digest)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "this composition did not win the durable cold-start lease claim".to_owned(),
+                )
+            })?;
+        record
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if record.claim.key != claim.key
+            || record.claim.binding_digest != claim.binding_digest
+            || record.claim.lease_ref != claim.lease_ref
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        let adopted = ColdStartReadinessOwnerClaim {
+            claim: record.claim.clone(),
+            record_key: record.record_key.clone(),
+        };
+        self.cold_start_readiness_claims
+            .insert(claim.binding_digest.clone(), adopted.clone());
+        Ok(adopted)
+    }
+
     /// Drives one I4.4.1 trigger end to end — join, compile, publish — against
     /// the retained registry (issue #1790, cold-start compilation production
     /// caller; issue #2900, durable scan receipt reference).
@@ -8103,9 +8155,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// Live status: owning thin entry for attach/onboarding ingress; no live
     /// attach ingress builds the compilation inputs yet (same residual as the
     /// lease join: no admitted privacy/source evidence, BLOCKED-BY
-    /// attach-transport/source-owners). The return carries the exact validated
-    /// claim retained by ORS alongside its lease disposition, so a caller can
-    /// read back the same terminal without reconstructing the full claim.
+    /// attach-transport/source-owners). Restart recovery is owner-backed: a
+    /// composition that lost its process-local win re-derives it from the
+    /// exact durable owner record (`recover_retained_cold_start_claim`), so a
+    /// restarted trigger adopts the one retained lease — returning the shared
+    /// terminal when one exists — instead of minting a second compilation.
+    /// The return carries the exact validated claim retained by ORS alongside
+    /// its lease disposition, so a caller can read back the same terminal
+    /// without reconstructing the full claim.
     /// Caller: STITCH.
     #[allow(
         clippy::too_many_arguments,
@@ -8168,24 +8225,26 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         if !fences_match_exact(&claim.key.state_fence, state_fence) {
             return Err(CompositionError::ActivationStaleFence);
         }
-        let retained_claim = self
+        let owner = self.cold_start_readiness_owner.clone().ok_or_else(|| {
+            CompositionError::Recovery("cold-start readiness ORS owner is not bound".to_owned())
+        })?;
+        let retained_claim = match self
             .cold_start_readiness_claims
             .get(&claim.binding_digest)
             .cloned()
-            .ok_or_else(|| {
-                CompositionError::Recovery(
-                    "this composition did not win the durable cold-start lease claim".to_owned(),
-                )
-            })?;
+        {
+            Some(retained) => retained,
+            // Restart path: the win map is empty but the durable owner may
+            // still hold this composition's exact lease. Adopting it joins the
+            // one retained lease instead of minting a second compilation.
+            None => self.recover_retained_cold_start_claim(&owner, &claim)?,
+        };
         if retained_claim.claim.key != claim.key
             || retained_claim.claim.binding_digest != claim.binding_digest
             || retained_claim.claim.lease_ref != claim.lease_ref
         {
             return Err(CompositionError::ActivationStaleFence);
         }
-        let owner = self.cold_start_readiness_owner.as_ref().ok_or_else(|| {
-            CompositionError::Recovery("cold-start readiness ORS owner is not bound".to_owned())
-        })?;
         let record = owner
             .load_cold_start_readiness(&retained_claim.record_key)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?

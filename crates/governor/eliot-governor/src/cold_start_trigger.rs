@@ -41,17 +41,23 @@
 //! fails closed before any join or compile, and compilation without the
 //! durable scan receipt is refused by the compile leg.
 //!
-//! Live status: owning driver for attach/onboarding ingress. Live caller for
-//! `AttachOrLaunch`: `bins/eliotd/src/daemon_runtime.rs::trigger_cold_start_controller`
+//! Live status: owning driver for attach/onboarding ingress. Live production
+//! caller for `AttachOrLaunch`:
+//! `bins/eliotd/src/daemon_runtime.rs::trigger_cold_start_controller`
 //! (post-Kernel-ACK via `trigger_accepted_cold_start`) drives the sequenced
-//! scan leg; the pre-acceptance question ingress
+//! scan leg through `GovernorComposition::run_cold_start_trigger_scan`; the
+//! pre-acceptance question ingress
 //! (`DaemonComposition::attach_cold_start_question`) runs the storeless
-//! scanner leg. Residual: the other five I4.4.1 producers, the owner
-//! store/binding supply, and the lease join/compile evidence (privacy
-//! profile, source-content digests) owned by the attach-transport and
-//! source/owner lanes — same as the sequenced legs. Caller:
-//! `bins/eliotd/src/daemon_runtime.rs::trigger_cold_start_controller` for the
-//! scan leg; STITCH for the full drive.
+//! scanner leg. The compile leg re-derives its capability from the durable
+//! ORS owner after restart
+//! (`GovernorComposition::recover_retained_cold_start_claim`), so a restarted
+//! trigger adopts the one retained lease and never mints a second compilation
+//! under the same key. Residual: the lease join/compile/drive evidence
+//! (admitted privacy profile, source-content digests) is still not threaded
+//! through attach transport — `trigger_cold_start_controller` documents the
+//! gap — and the other five I4.4.1 producers do not exist yet; that threading
+//! lives with the attach-transport/source-owner lanes. Caller: daemon (scan
+//! leg); STITCH for join/compile/full drive.
 
 use crate::composition::{
     ColdStartTriggerCompilation, CompositionError, GovernorComposition, KernelGenerationPort,
