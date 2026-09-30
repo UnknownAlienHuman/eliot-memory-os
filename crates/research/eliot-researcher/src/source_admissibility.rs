@@ -482,17 +482,87 @@ impl SourceAdmissibilityRecord {
     ///
     /// # Errors
     ///
-    /// Returns [`InquiryError::UnknownHandle`] when the retained revision is for
-    /// a different handle or its bytes do not reproduce this record's
-    /// `content_digest`, [`InquiryError::IntegrityMismatch`] when the retained
-    /// revision or the freeze does not re-prove its own commitment or when the
-    /// freeze does not include this source, and the encoding refusal when the
-    /// decision's own source record has no computable canonical commitment.
+    /// Returns [`InquiryError::IntegrityMismatch`] when this decision does not
+    /// re-prove its own digest, [`InquiryError::UnknownHandle`] when the retained
+    /// revision is for a different handle or its bytes do not reproduce this
+    /// record's `content_digest`, [`InquiryError::IntegrityMismatch`] when the
+    /// retained revision or the freeze does not re-prove its own commitment or
+    /// when the freeze does not include this source, and the encoding refusal when
+    /// the decision's own source record has no computable canonical commitment.
+    ///
+    /// # Whether the foreign-revision comparison is independent, and what it is
+    /// compared against
+    ///
+    /// The comparison at the `retained.content_digest != self.record.content_digest`
+    /// arm IS genuinely independent, and it stays a real gate on a real run. Two
+    /// separate owners produce its two halves and neither recomputes the other:
+    ///
+    /// - the left half is `retained.content_digest`, which
+    ///   [`crate::admitted_excerpt::RetainedSourceRevision::verify_integrity`]
+    ///   has just re-proved **against the retained bytes themselves** — the
+    ///   constructor and the validator both recompute
+    ///   `freeze(&String::from_utf8_lossy(&self.bytes))` and refuse a mismatch. It
+    ///   therefore says "these bytes hash to this digest" and nothing about which
+    ///   revision they are.
+    /// - the right half is `self.record.content_digest`, the
+    ///   [`SourceRecord::content_digest`] the governed source-admission owner
+    ///   committed at acquisition, now re-proved by the `self.validate_integrity()`
+    ///   call above before it is read.
+    ///
+    /// A revision of the same source re-fetched at a different time, or carried
+    /// over from a prior freeze, produces bytes that re-prove themselves and a
+    /// different `content_digest`, so the arm fires. It is not a restatement: the
+    /// provider path populates `SourceRecord::content_digest` from
+    /// `receipt.raw.stdout.sha256` — the Kernel's own drain of the provider
+    /// process's stdout — while the retained revision is constructed independently
+    /// by the persistence owner from the bytes it committed under an artifact
+    /// reference, so a run that paired one revision's digest with another's bytes
+    /// is refused.
+    ///
+    /// # What still bounds its reach on the current run
+    ///
+    /// The comparison is correct and is not the reason this surface is unexercised.
+    /// Its only product caller is
+    /// `inquiry_governance::commit_freeze_through_source_admission`, which emits
+    /// ZERO requests on a real run: `bins/eliot-mod-research` builds
+    /// `InquiryObservation.retained_revisions` as an empty map, so the
+    /// `observation.retained_revisions.get(&record.record.handle)` guard
+    /// `continue`s for every eligible record before this method is ever called. The
+    /// same emptiness makes every excerpt `NoRetainedRevision` upstream, and the
+    /// same empty set is why the `InsideSnippetRegion` arm has nothing to test
+    /// against. Those are all one root cause — no run persists the original before
+    /// synthesis — and they are owned by the lane fixing the provider path, not
+    /// here. What is fixed here is the ordering hole above, which is the one part
+    /// of this comparison that was wrong.
     pub fn transition_request_committing_freeze(
         &self,
         retained: &RetainedSourceRevision,
         freeze: &EvidenceFreeze,
     ) -> Result<GovernorSourceTransitionRequest, InquiryError> {
+        // The decision re-proves its own commitment BEFORE its bound source record
+        // is read as an expected value. This is ordering, not ceremony, and it was
+        // the one hole in this comparison.
+        //
+        // `SourceAdmissibilityRecord` carries `record` as a public field, so the
+        // `self.record.content_digest` read below is only as trustworthy as the
+        // decision holding it. Without this line the expected value was unproven at
+        // the moment it was compared: a decision whose `record` had been substituted
+        // for one carrying a different `content_digest` would have had the
+        // foreign-revision comparison pass, and the run would have committed a
+        // foreign revision as the admitted one. The refusal would have arrived
+        // later and from a different check — `InquiryGovernance::validate_integrity`
+        // re-proves each `admissibility` record — but it would have arrived as
+        // "the decision was tampered with", not as the foreign-revision refusal
+        // this method exists to make, and the W2 gate would have read as satisfied
+        // in the interval.
+        //
+        // `validate_integrity` is the EXISTING validator over the ORIGINAL recorded
+        // digest. Nothing is recomputed to stand in for it, and the expected value
+        // is still `self.record.content_digest` from the governed admission owner —
+        // the comparison is not replaced, it is given a re-proved left-hand side.
+        // An honest decision, which is the only kind `evaluate` produces, re-proves
+        // here, so this cannot change the outcome of a well-formed run.
+        self.validate_integrity()?;
         retained
             .verify_integrity()
             .map_err(|_| InquiryError::IntegrityMismatch {
