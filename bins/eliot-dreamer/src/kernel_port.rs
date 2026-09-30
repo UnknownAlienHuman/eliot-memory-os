@@ -177,6 +177,11 @@ pub(crate) struct DreamerDispatchedEnvelope {
     /// a typed missing-input refusal rather than making a local replacement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) semantic_input: Option<OpaqueContentRef>,
+    /// Exact inline bytes retained beside the opaque owner reference, when
+    /// present. The child transports and verifies them without interpreting
+    /// UserAutomation content as a Dreamer orientation payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) semantic_input_bytes: Option<Vec<u8>>,
     /// Scope the ledger bound to this job (never caller bytes).
     pub(crate) scope_id: String,
     /// Fence the ledger bound to this job (never caller bytes).
@@ -206,6 +211,8 @@ pub(crate) struct ValidatedDreamerMaterial {
     pub(crate) revision: u64,
     /// Exact original semantic input reference retained by the Store owner.
     pub(crate) semantic_input: Option<OpaqueContentRef>,
+    /// Exact original inline bytes, when supplied by the Store owner.
+    pub(crate) semantic_input_bytes: Option<Vec<u8>>,
     /// Scope the ledger bound to this job.
     pub(crate) scope_id: String,
     /// Fence the ledger bound to this job.
@@ -274,8 +281,9 @@ pub(crate) enum KernelPortError {
     /// A legacy material or owner reply carries no original semantic input.
     #[error("dreamer durable owner semantic input reference is unavailable")]
     SemanticInputUnavailable,
-    /// A claim/status reply changed the original semantic input reference.
-    #[error("dreamer Kernel reply semantic input reference is stale or foreign: {0}")]
+    /// A claim/status reply changed the original semantic input reference or
+    /// its exact inline bytes.
+    #[error("dreamer Kernel reply semantic input reference or bytes are stale: {0}")]
     SemanticInputStale(String),
     /// A claim/status reply changed the claimed job identity or fence.
     #[error("dreamer Kernel reply job, attempt, scope, or fence changed")]
@@ -436,6 +444,15 @@ fn validate_envelope(
             .validate("semantic_input.sha256")
             .map_err(|error| KernelPortError::SemanticInputStale(error.to_string()))?;
     }
+    if let Some(bytes) = &envelope.semantic_input_bytes {
+        let semantic_input = envelope
+            .semantic_input
+            .as_ref()
+            .ok_or(KernelPortError::SemanticInputUnavailable)?;
+        semantic_input
+            .validate_semantic_input_bytes(bytes)
+            .map_err(|error| KernelPortError::SemanticInputStale(error.to_string()))?;
+    }
     envelope
         .fence
         .validate()
@@ -464,6 +481,7 @@ fn validate_envelope(
         attempt_id: envelope.attempt_id.clone(),
         revision: envelope.revision,
         semantic_input: envelope.semantic_input.clone(),
+        semantic_input_bytes: envelope.semantic_input_bytes.clone(),
         scope_id: envelope.scope_id.clone(),
         fence: envelope.fence.clone(),
         epoch: envelope.epoch.clone(),
@@ -1263,6 +1281,11 @@ fn validate_owner_response_binding(
     if echoed != original {
         return Err(KernelPortError::SemanticInputStale(
             "Kernel owner reply changed the original semantic input reference".to_owned(),
+        ));
+    }
+    if response.semantic_input_bytes != material.semantic_input_bytes {
+        return Err(KernelPortError::SemanticInputStale(
+            "Kernel owner reply changed the original semantic input bytes".to_owned(),
         ));
     }
     if response.job_id.as_str() != material.job_id
