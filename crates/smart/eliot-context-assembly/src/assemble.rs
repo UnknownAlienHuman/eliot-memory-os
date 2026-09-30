@@ -1,7 +1,7 @@
 //! Public assembly operation and its explicit phases.
 
 use eliot_context_contracts::{
-ActiveUnderstandingView, AdmittedContextSet, ContextError, ContextExecutionIdentity,
+    ActiveUnderstandingView, AdmittedContextSet, ContextError, ContextExecutionIdentity,
     ContextRecipe, DownstreamHeadroomRequest, DownstreamHeadroomResult, HeadroomAttempt,
     HeadroomDimension, HeadroomRefusal, HeadroomReleaseInstruction, MeasurementStatus,
     QualityOperation, QualityRefusal, QualityRefusalKind, QualityScorecard,
