@@ -66,15 +66,9 @@ impl KernelComposition {
             .task_controller_attempt_owner(session, &request.task_controller_attempt)?
             .ok_or(TransportError::SessionFenced)?;
         let attempt = &request.task_controller_attempt;
-        let published_claim_id = invocation
-            .task_input
-            .get("native_worker_claim_id")
-            .and_then(serde_json::Value::as_str)
-            .ok_or(TransportError::SessionFenced)?;
         if invocation.task_id != attempt.task_id
             || invocation.work_scope_id != attempt.scope_id
             || envelope.state_fence != attempt.state_fence
-            || published_claim_id != request.native_worker_claim_id
         {
             return Err(TransportError::SessionFenced);
         }
@@ -99,7 +93,7 @@ impl KernelComposition {
             &invocation,
             attempt,
             &evidence.request,
-            published_claim_id,
+            &request.native_worker_claim_id,
         )?;
         self.validate_prelaunch_native_worker_execution_admission(&evidence)
             .map_err(|_| TransportError::SessionFenced)?;
@@ -117,33 +111,6 @@ impl KernelComposition {
         Ok(response)
     }
 
-    /// Verifies and returns the exact original Kernel claim ID embedded in
-    /// one claimed Orientation invocation. The nested durable owner payload
-    /// must name the same opaque ID and bind the native claim's original job,
-    /// attempt, task, scope, and complete fence before it can be echoed.
-    #[cfg(windows)]
-    pub(crate) fn verified_native_worker_claim_id_for_task_controller_claim(
-        &self,
-        session: &Session,
-        invocation: &TaskControllerInvocation,
-        attempt: &TaskControllerAttempt,
-    ) -> Result<Option<String>, TransportError> {
-        let Some(claim_id) = invocation
-            .task_input
-            .get("native_worker_claim_id")
-            .and_then(Value::as_str)
-        else {
-            return Ok(None);
-        };
-        let request = NativeWorkerExecutionAdmissionReadRequest {
-            wire_id: NATIVE_WORKER_EXECUTION_ADMISSION_READ_WIRE_ID.to_owned(),
-            wire_version: NATIVE_WORKER_EXECUTION_ADMISSION_READ_WIRE_VERSION,
-            task_controller_attempt: attempt.clone(),
-            native_worker_claim_id: claim_id.to_owned(),
-        };
-        let response = self.read_native_worker_execution_admission(session, &request)?;
-        Ok(Some(response.execution_admission.request.claim_id))
-    }
 }
 
 #[cfg(windows)]
@@ -151,7 +118,7 @@ fn validate_original_orientation_job_binding(
     invocation: &TaskControllerInvocation,
     attempt: &TaskControllerAttempt,
     native: &eliot_kernel_service::NativeWorkerClaimRequest,
-    published_claim_id: &str,
+    native_worker_claim_id: &str,
 ) -> Result<(), TransportError> {
     let request = invocation
         .task_input
@@ -246,11 +213,7 @@ fn validate_original_orientation_job_binding(
         .and_then(|scope| scope.get("scope_id"))
         .and_then(Value::as_str);
     let runtime_fence = runtime.get("state_fence");
-    if runtime
-        .get("native_worker_claim_id")
-        .and_then(Value::as_str)
-        != Some(published_claim_id)
-        || runtime.get("job_id").and_then(Value::as_str) != Some(job_id)
+    if runtime.get("job_id").and_then(Value::as_str) != Some(job_id)
         || runtime.get("attempt_id").and_then(Value::as_str) != Some(durable_attempt_id)
         || runtime.get("task_id").and_then(Value::as_str) != Some(attempt.task_id.as_str())
         || runtime_scope != Some(scope_id)
@@ -261,7 +224,7 @@ fn validate_original_orientation_job_binding(
         || request_metadata_fence != &state_fence
         || request_task_id != attempt.task_id.as_str()
         || request_session_id != attempt.session_id
-        || native.claim_id != published_claim_id
+        || native.claim_id != native_worker_claim_id
         || native.parent_job_id != job_id
         || native.attempt_id != durable_attempt_id
         || native.task_id != attempt.task_id.as_str()
