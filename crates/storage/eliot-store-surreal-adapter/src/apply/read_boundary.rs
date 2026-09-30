@@ -404,6 +404,9 @@ async fn named_read_payload(
         NamedReadOperation::GetCapabilityEvidenceRecordRange => {
             capability_evidence_record_range_payload(db, &adapter.config, query, state_fence).await
         }
+        NamedReadOperation::GetTaskContractAcceptanceSet => {
+            task_contract_acceptance_set_payload(db, &adapter.config, query, state_fence).await
+        }
         NamedReadOperation::GetAuditRange => {
             audit_range_payload(db, &adapter.config, query, state_fence).await
         }
@@ -414,6 +417,109 @@ async fn named_read_payload(
 }
 
 const READ_BLACKBOARD_ITEM_HEAD: &str = "SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision, schema: schema, payload: payload, value_digest: value_digest } FROM recovery_owner WHERE namespace = $blackboard_namespace AND key = $blackboard_key LIMIT 1;";
+
+const READ_TASK_CONTRACT_ACCEPTANCE_RECORD: &str = "SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision, schema: schema, payload: payload, value_digest: value_digest } FROM recovery_owner WHERE namespace = $acceptance_namespace AND key = $acceptance_key LIMIT 1;";
+
+/// Serves one task's owner-persisted `TaskContract` acceptance-item set at the
+/// exact task revision the caller was admitted against (issue #325 P1, I7.9).
+///
+/// I7.9 requires the Finish service to rehydrate the current `TaskContract` and
+/// its acceptance items before it derives per-acceptance coverage, and the only
+/// party that knows which obligations exist is the owner that holds the
+/// contract. This handler therefore serves the owner's durable record verbatim
+/// and nothing else: it never substitutes a plan's declared obligation list, a
+/// selected test inventory, or a summary count for the enumeration.
+///
+/// Fail-closed in every direction. The row is addressed by
+/// `(task_id, task_revision)`, so an owner that never published a set at this
+/// exact revision selects no row at all and the read is refused; it is never
+/// answered with an empty obligation list, which would let a caller-supplied or
+/// absent set satisfy the completion gate. A row bound to another task or
+/// revision, another schema, a digest that does not bind its own bytes, or an
+/// obligation list the existing closed validator refuses is the same refusal.
+/// `Value::Null` is returned only for a genuinely absent row, so the typed
+/// decoder above the read is what decides refusal; the adapter never
+/// manufactures a set.
+///
+/// The row's issuing `State Fence` is NOT required to equal the read fence.
+/// The obligation set is bound to one contract revision, and because each row is
+/// create-only the obligations for that revision cannot change afterwards, so a
+/// later fence at the same revision serves the same set rather than refusing it.
+/// Staleness is refused where it actually means something: the read is addressed
+/// at the exact `task_revision` the caller was admitted against, and the
+/// Governor already refuses a fence whose live task revision is not that one.
+/// The payload's `read_state_fence` is the fence this read was executed under,
+/// which is what the neutral contract and the Governor's fence check compare.
+async fn task_contract_acceptance_set_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+) -> Result<Value, AdapterError> {
+    let task_id = query
+        .parameters
+        .get("task_id")
+        .and_then(Value::as_str)
+        .ok_or(StoreError::ManifestMismatch)?;
+    let task_revision = query
+        .parameters
+        .get("task_revision")
+        .and_then(Value::as_str)
+        .ok_or(StoreError::ManifestMismatch)?;
+    let task_revision = task_revision
+        .parse::<u64>()
+        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+    eliot_store_api::validate_acceptance_record_identity(task_id, task_revision)
+        .map_err(AdapterError::Store)?;
+
+    let key = eliot_store_api::task_contract_acceptance_record_key(task_id, task_revision);
+    let mut bindings = Map::new();
+    bindings.insert(
+        "acceptance_namespace".to_owned(),
+        json!(eliot_store_api::TASK_CONTRACT_ACCEPTANCE_RECORD_NAMESPACE),
+    );
+    bindings.insert("acceptance_key".to_owned(), json!(key.key));
+    let mut response = client::query(
+        db,
+        config,
+        "read.task_contract_acceptance_set",
+        READ_TASK_CONTRACT_ACCEPTANCE_RECORD,
+        bindings,
+    )
+    .await?;
+    let rows = take_vec::<eliot_store_api::RecoveryRecord>(&mut response, 0)?;
+    let Some(row) = rows.first() else {
+        return Ok(Value::Null);
+    };
+    if row.namespace != eliot_store_api::TASK_CONTRACT_ACCEPTANCE_RECORD_NAMESPACE
+        || row.key != key.key
+        || row.schema != eliot_store_api::TASK_CONTRACT_ACCEPTANCE_RECORD_SCHEMA_V1
+        || row.revision != task_revision
+        || row.revision == 0
+        || row.revision > i64::MAX as u64
+        || eliot_store_api::sha256_hex(&row.payload) != row.value_digest
+    {
+        return Err(AdapterError::Store(StoreError::InvalidReceipt));
+    }
+    let record: eliot_store_api::TaskContractAcceptanceRecord =
+        serde_json::from_slice(&row.payload)
+            .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+    record.validate().map_err(AdapterError::Store)?;
+    if record.task_id.as_str() != task_id || record.task_revision != task_revision {
+        return Err(AdapterError::Store(StoreError::InvalidReceipt));
+    }
+    // The row's fence column must be the fence the owner recorded inside the
+    // payload it sealed. A row whose two fences disagree was not written by one
+    // admitted transaction and is refused rather than reconciled.
+    if record.state_fence != row.state_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    // The neutral payload is a faithful projection of the retained owner bytes,
+    // re-stamped with the fence the row was read under; the existing closed
+    // validator has already proved the owner's recorded digest against the
+    // enumeration beside it, and nothing here recomputes it.
+    to_value(&record.acceptance_set(state_fence))
+}
 
 /// Reads the exact current task/item head from durable recovery-owner rows.
 /// The referenced candidate is returned as a typed Store payload; messages

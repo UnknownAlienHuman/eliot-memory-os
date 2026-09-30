@@ -52,6 +52,7 @@ pub(crate) mod surreal_learning;
 pub(crate) mod surreal_notification;
 pub(crate) mod surreal_reactive;
 pub(crate) mod surreal_swarm;
+pub(crate) mod surreal_task_acceptance;
 use atomic_write::{TxLane, to_value, write_transaction};
 #[cfg(test)]
 use atomic_write::{ordering_write_template, revision_write_template};
