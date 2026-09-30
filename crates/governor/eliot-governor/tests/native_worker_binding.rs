@@ -308,6 +308,7 @@ fn activation_canonical_snapshot(fence: &StateFence) -> CanonicalAdmissionSnapsh
             verifier: None,
         }),
         verifier_execution_fact: None,
+        verifier_attempt_observations: Vec::new(),
         finish_evidence: None,
     }
 }

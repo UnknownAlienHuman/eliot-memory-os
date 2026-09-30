@@ -288,6 +288,7 @@ fn genesis_payload(
             owner_revision: revision,
             current_plan: None,
             verifier_execution_fact: None,
+            verifier_attempt_observations: Vec::new(),
             finish_evidence: None,
         })
         .map_err(|e| CompositionError::Recovery(e.to_string()))?,

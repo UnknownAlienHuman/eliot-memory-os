@@ -84,7 +84,8 @@ use eliot_testd_core::{JobState as TestdJobState, TestdTerminalCompletionEvidenc
 use thiserror::Error;
 
 use crate::composition::{
-    CanonicalVerifierExecutionFact, GovernorComposition, KernelGenerationPort,
+    CanonicalVerifierAttemptObservation, CanonicalVerifierExecutionFact, GovernorComposition,
+    KernelGenerationPort,
 };
 use crate::learning_delta_integration::{StoredDeltaIdentity, delta_delivery_refusal};
 use crate::learning_promotion::{LearningPromotionOutcome, PromotionBoundaryInput};
@@ -658,15 +659,29 @@ fn strategy_fingerprint(
     Ok(sha256_hex(&bytes))
 }
 
-/// Exact raw trace, artifact, and evaluator references the canonical fact
-/// observed for this attempt.
+/// Exact raw trace, artifact, and evaluator references the canonical owner
+/// observed for this attempt and for every earlier attempt it retained.
+///
+/// The current fact's own handles are read from the fact; the earlier attempts'
+/// run identities come from the owner's per-attempt series, each one the
+/// verifier's own durable `run_id` as the evaluator recorded it. Nothing here
+/// is synthesised from an ordinal: an attempt with no retained observation
+/// contributes no reference, so a record over a truncated series is visibly
+/// shorter rather than quietly padded.
 fn observed_evidence_refs(
     fact: &CanonicalVerifierExecutionFact,
+    observations: &[CanonicalVerifierAttemptObservation],
 ) -> Result<Vec<ArtifactId>, LearningClosureError> {
     let mut refs: BTreeSet<ArtifactId> = fact.input_artifact_bindings.iter().cloned().collect();
     refs.extend(fact.verification_run.raw_evidence.iter().cloned());
     for raw in &fact.raw_artifact_bindings {
         refs.insert(artifact_id(&raw.handle, "verifier raw artifact handle")?);
+    }
+    for observation in observations {
+        refs.insert(artifact_id(
+            &observation.run_id,
+            "retained verifier run identity",
+        )?);
     }
     refs.insert(artifact_id(
         &fact.verification_run.run_id.to_string(),
@@ -832,7 +847,36 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             ));
         }
         let fingerprint = strategy_fingerprint(&fact)?;
-        let evidence_refs = observed_evidence_refs(&fact)?;
+        // The owner retains EVERY observed attempt, not only the last one, and
+        // the committed record must be able to name them all: the evidence set
+        // of an attempt is what a later reader compares against, so a record
+        // that names only the current run cannot show that an earlier attempt
+        // failed. This is the storage-side half of
+        // `docs/architecture/I10-08-13-durable-instrument-job-lifecycle.md:51`
+        // ("Re-execution never hides the first failed/unknown attempt"), and it
+        // is read here from the durable owner rather than recomputed.
+        //
+        // The retained last fact MUST appear in the series. It is not assumed:
+        // the owner appends an observation in the same transition that installs
+        // the fact, so a fact absent from its own series is an owner image whose
+        // history was truncated somewhere, and closing against it would record a
+        // delta over an incomplete denominator.
+        let observations = self
+            .owners()
+            .canonical
+            .read_verifier_attempt_observations(&fence)
+            .map_err(|error| LearningClosureError::Canonical(error.to_string()))?;
+        let current_run_id = fact.verification_run.run_id.to_string();
+        if !observations
+            .iter()
+            .any(|observation| observation.run_id == current_run_id)
+        {
+            return Err(LearningClosureError::Canonical(
+                "canonical verifier attempt series does not retain the current verifier run"
+                    .to_owned(),
+            ));
+        }
+        let evidence_refs = observed_evidence_refs(&fact, observations)?;
         let identity = ClosureIdentityInput {
             task_id: fact.task_id.clone(),
             job_id: job.job_id.clone(),

@@ -2216,6 +2216,153 @@ impl CanonicalVerifierExecutionFact {
     }
 }
 
+/// Upper bound on the retained per-attempt verifier-outcome series.
+///
+/// This is a CAPACITY bound and nothing else: it decides how many observed
+/// attempts one canonical owner image may carry, never whether any of them
+/// failed. Reaching it refuses the next append rather than evicting an older
+/// entry, because evicting the earliest attempt is exactly the
+/// "re-execution hides the first failed attempt" failure
+/// `docs/architecture/I10-08-13-durable-instrument-job-lifecycle.md:51`
+/// forbids ("Re-execution never hides the first failed/unknown attempt").
+/// The refusal is a typed [`CompositionError::Recovery`], so a series that
+/// cannot record the next observation stops the owner transition instead of
+/// publishing an owner image whose history has been silently shortened.
+const MAX_RETAINED_VERIFIER_ATTEMPT_OBSERVATIONS: usize = 256;
+
+/// One observed verifier attempt, retained per attempt rather than collapsed
+/// into the single "last run" scalar.
+///
+/// # Why this record exists
+///
+/// The canonical owner retained only [`CanonicalAdmissionSnapshot::verifier_execution_fact`],
+/// which is the LAST terminal verifier execution fact. A second attempt on the
+/// same task and plan replaced the first attempt's record, so the first
+/// failed/unknown attempt stopped being readable from the owner that had
+/// observed it. That contradicts
+/// `docs/architecture/I10-08-13-durable-instrument-job-lifecycle.md:51`
+/// verbatim — *"Re-execution never hides the first failed/unknown attempt."* —
+/// and it is why no honest caller could derive a repeated-verifier-failure
+/// signal from this owner. This series is the record that closes the gap.
+///
+/// # What it is derived from, and what it never is
+///
+/// Every field is copied from a [`CanonicalVerifierExecutionFact`] that
+/// [`CanonicalVerifierExecutionFact::validate`] has already accepted at this
+/// fence. There is no ordinal, no attempt counter and no formatted handle: the
+/// series key is `(task_id, plan_id@plan_revision, verifier identity)` and the
+/// attempt identity inside it is the verifier run's own durable `run_id`. A
+/// caller cannot append an observation without presenting a fact that passes
+/// the same validation the owner already applies to its retained last fact,
+/// and it cannot choose the `run_id`, the `VerificationOutcome`, the
+/// `finished_at` or the evidence handles — those are the evaluator's and
+/// TestD's recorded values.
+///
+/// `receipt_sha256` is retained as the integrity digest over the ORIGINAL
+/// durable TestD verification receipt, so a reader can confirm the observation
+/// is the one the receipt commits to rather than a restatement of it.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalVerifierAttemptObservation {
+    /// Task the observed attempt ran under.
+    pub task_id: String,
+    /// Exact task revision the attempt was admitted at.
+    pub task_revision: u64,
+    /// Canonical plan identity the attempt ran under.
+    pub plan_id: String,
+    /// Canonical plan revision the attempt ran under; the plan key is
+    /// `plan_id@plan_revision`.
+    pub plan_revision: String,
+    /// Registered evaluator identity the observed run was bound to.
+    pub verifier: ContractId,
+    /// Registered evaluator version the observed run was bound to.
+    pub evaluator_version: ContractVersion,
+    /// Registered instrument profile the attempt ran under.
+    pub profile: String,
+    /// Registered instrument that performed the run.
+    pub instrument: ContractId,
+    /// The verifier run's own durable identity. Never synthesized.
+    pub run_id: String,
+    /// Execution status the run recorded, kept separate from the outcome.
+    pub execution: ExecutionStatus,
+    /// Semantic outcome the evaluator recorded for the run.
+    pub outcome: VerificationOutcome,
+    /// Completion reading the run recorded, absent when it recorded none.
+    pub finished_at: Option<ClockReading>,
+    /// Raw and normalized evidence handles the run itself retained.
+    pub evidence_refs: Vec<ArtifactId>,
+    /// Integrity digest over the ORIGINAL durable TestD verification receipt.
+    pub receipt_sha256: String,
+}
+
+impl CanonicalVerifierAttemptObservation {
+    /// Projects one observed attempt out of an already-validated fact.
+    ///
+    /// This is the ONLY constructor, and it takes no caller-supplied value, so
+    /// a series entry can never assert an outcome, a time, an identity or an
+    /// evidence handle the fact does not already carry.
+    fn from_fact(fact: &CanonicalVerifierExecutionFact) -> Self {
+        let mut evidence_refs: BTreeSet<ArtifactId> =
+            fact.verification_run.raw_evidence.iter().cloned().collect();
+        evidence_refs.extend(
+            fact.verification_run
+                .evidence
+                .iter()
+                .map(|evidence| evidence.evidence_id.clone()),
+        );
+        Self {
+            task_id: fact.task_id.clone(),
+            task_revision: fact.task_revision,
+            plan_id: fact.plan.plan_id.clone(),
+            plan_revision: fact.plan.plan_revision.clone(),
+            verifier: fact.verification_run.verifier.clone(),
+            evaluator_version: fact.invocation.evaluator_version,
+            profile: fact.invocation.profile.clone(),
+            instrument: fact.invocation.instrument.clone(),
+            run_id: fact.verification_run.run_id.to_string(),
+            execution: fact.verification_run.execution,
+            outcome: fact.verification_run.outcome,
+            finished_at: fact.verification_run.finished_at,
+            evidence_refs: evidence_refs.into_iter().collect(),
+            receipt_sha256: fact.receipt.receipt_sha256.clone(),
+        }
+    }
+
+    /// Validates one retained observation's own recorded shape.
+    ///
+    /// No comparison against the current plan or fence happens here: history
+    /// stays readable after the plan moves on, which is the whole point of
+    /// retaining it. The joins that must hold are enforced where they are
+    /// established — on append, and in
+    /// [`CanonicalAdmissionSnapshot::validate`] for the entries the owner still
+    /// presents alongside its last fact.
+    fn validate(&self) -> Result<(), CompositionError> {
+        let text_fields = [
+            (&self.task_id, "task_id"),
+            (&self.plan_id, "plan_id"),
+            (&self.plan_revision, "plan_revision"),
+            (&self.profile, "profile"),
+            (&self.run_id, "run_id"),
+        ];
+        if self.task_revision == 0
+            || text_fields.iter().any(|(value, _)| {
+                value.trim().is_empty() || value.chars().any(char::is_control)
+            })
+            || self.receipt_sha256.len() != 64
+            || self
+                .receipt_sha256
+                .bytes()
+                .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            || !self.execution.is_terminal()
+        {
+            return Err(verifier_fact_error(
+                "retained verifier attempt observation is malformed or non-terminal",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Rejects a receipt that fails owner validation or a non-terminal job.
 fn check_testd_receipt_terminal(
     job: &TestJob,
@@ -3023,6 +3170,66 @@ fn verifier_fact_error(reason: impl Into<String>) -> CompositionError {
     ))
 }
 
+/// Appends one observed attempt to the durable per-attempt series.
+///
+/// # The single growth site of the series
+///
+/// Every entry in the owner's series arrives through this function, and the
+/// only argument it takes is a [`CanonicalVerifierExecutionFact`] whose
+/// `validate` has already succeeded at this fence (the caller does that). That
+/// makes the growth condition a single, checkable statement: the series grows
+/// if and only if the owner admitted a fact, and the owner admits a fact only
+/// for a real, terminal, receipt-bound verifier run.
+///
+/// # What a caller cannot do here
+///
+/// A caller cannot append an entry describing a verdict it chose, a run id it
+/// minted, a time it invented or evidence it never saw: every one of those is
+/// copied out of the fact by
+/// [`CanonicalVerifierAttemptObservation::from_fact`], which takes no
+/// caller-supplied value. It cannot grow the series without a durable TestD
+/// job row, its retained verification receipt and a registered evaluator's
+/// recorded outcome, because `from_testd` refuses a fact whose receipt is not
+/// the one the job row itself retains.
+///
+/// # Why it refuses rather than evicts
+///
+/// At [`MAX_RETAINED_VERIFIER_ATTEMPT_OBSERVATIONS`] the append is refused.
+/// Dropping the OLDEST entry instead would make room while destroying the
+/// record of the first failed/unknown attempt, which is the exact loss
+/// `docs/architecture/I10-08-13-durable-instrument-job-lifecycle.md:51` names
+/// ("Re-execution never hides the first failed/unknown attempt"). A refused
+/// transition keeps the previous owner image, so the already-recorded history
+/// stays readable and the condition is visible instead of silent.
+///
+/// # Idempotence on re-publication
+///
+/// Re-committing the same run id is a no-op rather than a second entry. The
+/// owner image is compared for equality and re-published through the Kernel
+/// CAS, so a retried publication of one attempt must not be able to inflate the
+/// series into an apparent repetition of itself.
+fn append_verifier_attempt_observation(
+    mut retained: Vec<CanonicalVerifierAttemptObservation>,
+    fact: &CanonicalVerifierExecutionFact,
+) -> Result<Vec<CanonicalVerifierAttemptObservation>, CompositionError> {
+    let observation = CanonicalVerifierAttemptObservation::from_fact(fact);
+    observation.validate()?;
+    if retained
+        .iter()
+        .any(|existing| existing.run_id == observation.run_id)
+    {
+        return Ok(retained);
+    }
+    if retained.len() >= MAX_RETAINED_VERIFIER_ATTEMPT_OBSERVATIONS {
+        return Err(verifier_fact_error(
+            "retained verifier attempt series is at its bound; the owner transition is refused \
+             rather than dropping an earlier observed attempt",
+        ));
+    }
+    retained.push(observation);
+    Ok(retained)
+}
+
 fn canonical_job_state(state: JobState) -> &'static str {
     match state {
         JobState::Succeeded => "succeeded",
@@ -3073,6 +3280,22 @@ pub struct CanonicalAdmissionSnapshot {
     /// plan, artifact lineage, and fence.
     #[serde(default)]
     pub verifier_execution_fact: Option<CanonicalVerifierExecutionFact>,
+    /// Every verifier attempt this owner observed, oldest first, rather than
+    /// only the last one.
+    ///
+    /// `verifier_execution_fact` above answers "what does the current attempt
+    /// look like"; this answers "what has this owner actually seen". Without
+    /// it a second attempt on the same task and plan overwrites the first
+    /// attempt's record, so the first failed/unknown attempt stops being
+    /// readable from the owner that observed it
+    /// (`docs/architecture/I10-08-13-durable-instrument-job-lifecycle.md:51`).
+    /// Each entry is projected from the very fact that was admitted, so an entry
+    /// exists only where a real recorded `VerificationOutcome` was committed.
+    /// The bound is [`MAX_RETAINED_VERIFIER_ATTEMPT_OBSERVATIONS`], and the
+    /// bound refuses rather than evicts, so no earlier attempt is ever dropped
+    /// to make room.
+    #[serde(default)]
+    pub verifier_attempt_observations: Vec<CanonicalVerifierAttemptObservation>,
     /// Canonical evidence required to evaluate a finish candidate.  The
     /// candidate draft never supplies this record; it is rehydrated with the
     /// current canonical owner image and must carry the same fence as it.
@@ -3330,6 +3553,7 @@ impl CanonicalAdmissionSnapshot {
             owner_revision,
             current_plan,
             verifier_execution_fact: None,
+            verifier_attempt_observations: Vec::new(),
             finish_evidence: None,
         };
         snapshot.validate()?;
@@ -3362,6 +3586,26 @@ impl CanonicalAdmissionSnapshot {
                 ));
             }
         }
+        // The per-attempt series is validated as history, not as a view of the
+        // current plan: an entry recorded under an earlier plan revision stays
+        // readable, which is exactly what re-execution must not take away. What
+        // IS refused is a repeated attempt identity, because one durable run id
+        // is one observed attempt and a second entry claiming it would let a
+        // single recorded failure be counted twice.
+        if self.verifier_attempt_observations.len() > MAX_RETAINED_VERIFIER_ATTEMPT_OBSERVATIONS {
+            return Err(CompositionError::Recovery(
+                "canonical verifier attempt series exceeds its retained bound".to_owned(),
+            ));
+        }
+        let mut retained_runs = BTreeSet::new();
+        for observation in &self.verifier_attempt_observations {
+            observation.validate()?;
+            if !retained_runs.insert(observation.run_id.as_str()) {
+                return Err(CompositionError::Recovery(
+                    "canonical verifier attempt series records one run identity twice".to_owned(),
+                ));
+            }
+        }
         if let Some(finish_evidence) = &self.finish_evidence {
             finish_evidence.validate(&self.state_fence)?;
             let current_plan = self.current_plan.as_ref().ok_or_else(|| {
@@ -3389,6 +3633,8 @@ struct CanonicalAdmissionSnapshotWire {
     #[serde(default)]
     verifier_execution_fact: Option<CanonicalVerifierExecutionFact>,
     #[serde(default)]
+    verifier_attempt_observations: Vec<CanonicalVerifierAttemptObservation>,
+    #[serde(default)]
     finish_evidence: Option<CanonicalFinishEvidence>,
 }
 
@@ -3403,6 +3649,7 @@ impl<'de> Deserialize<'de> for CanonicalAdmissionSnapshot {
             owner_revision: wire.owner_revision,
             current_plan: wire.current_plan,
             verifier_execution_fact: wire.verifier_execution_fact,
+            verifier_attempt_observations: wire.verifier_attempt_observations,
             finish_evidence: wire.finish_evidence,
         };
         snapshot
@@ -3622,15 +3869,54 @@ impl CanonicalAdmissionOwner {
         let owner_revision = self.snapshot.owner_revision.checked_add(1).ok_or_else(|| {
             CompositionError::Recovery("canonical owner revision overflow".to_owned())
         })?;
+        let verifier_attempt_observations =
+            append_verifier_attempt_observation(self.snapshot.verifier_attempt_observations.clone(), &fact)?;
         let snapshot = CanonicalAdmissionSnapshot {
             state_fence: self.state_fence.clone(),
             owner_revision,
             current_plan: self.snapshot.current_plan.clone(),
             verifier_execution_fact: Some(fact),
+            verifier_attempt_observations,
             finish_evidence: self.snapshot.finish_evidence.clone(),
         };
         snapshot.validate()?;
         Ok(snapshot)
+    }
+
+    /// Reads every verifier attempt this owner observed, oldest first.
+    ///
+    /// This is the owner-level answer to "has this task and plan failed
+    /// verification more than once", and it is a READ of recorded history
+    /// rather than a count over a launch counter: every element is a committed
+    /// `VerificationOutcome` with the evaluator's own `run_id`, `finished_at`
+    /// and evidence handles.
+    ///
+    /// The retained last fact is NOT synthesised into the series and a single
+    /// observed failure is never presented as repetition. A caller that wants a
+    /// repetition verdict must compare the recorded entries themselves, at
+    /// their recorded outcomes; this method deliberately does not decide one,
+    /// because deciding it here would let the observer assert the conclusion
+    /// the improvement funnel is supposed to derive from the evidence.
+    ///
+    /// An empty series is an honest "no attempt has been observed under this
+    /// owner yet", never a default entry.
+    pub fn read_verifier_attempt_observations(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<&[CanonicalVerifierAttemptObservation], CompositionError> {
+        state_fence
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if self.state_fence != *state_fence
+            || self.scope.state_fence != *state_fence
+            || self.snapshot.state_fence != *state_fence
+        {
+            return Err(CompositionError::Recovery(
+                "canonical verifier attempt series read used a stale state fence".to_owned(),
+            ));
+        }
+        self.snapshot.validate()?;
+        Ok(&self.snapshot.verifier_attempt_observations)
     }
 
     /// Reads the exact verifier execution fact retained by the canonical
@@ -3688,6 +3974,11 @@ impl CanonicalAdmissionOwner {
             owner_revision,
             current_plan: self.snapshot.current_plan.clone(),
             verifier_execution_fact: self.snapshot.verifier_execution_fact.clone(),
+            // A finish-evidence transition does not observe a verifier attempt,
+            // so it CARRIES the series forward untouched. Rebuilding this list
+            // here would be the precise defect I10-08-13:51 forbids — a later
+            // transition silently erasing the attempts an earlier one recorded.
+            verifier_attempt_observations: self.snapshot.verifier_attempt_observations.clone(),
             finish_evidence: Some(evidence),
         };
         snapshot.validate()?;
@@ -10911,6 +11202,7 @@ mod tests {
                 owner_revision: 1,
                 current_plan: None,
                 verifier_execution_fact: None,
+                verifier_attempt_observations: Vec::new(),
                 finish_evidence: None,
             }),
             RecoveryOwner::Task => serde_json::to_value(TaskLifecycleSnapshot {
@@ -11027,6 +11319,7 @@ mod tests {
                 verifier: None,
             }),
             verifier_execution_fact: None,
+            verifier_attempt_observations: Vec::new(),
             finish_evidence: None,
         }
     }
@@ -11925,6 +12218,7 @@ mod tests {
                 verifier: None,
             }),
             verifier_execution_fact: None,
+            verifier_attempt_observations: Vec::new(),
             finish_evidence: None,
         };
         mismatched_plan.validate().expect("plan shape");
