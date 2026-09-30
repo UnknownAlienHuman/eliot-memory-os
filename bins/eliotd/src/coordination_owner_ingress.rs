@@ -17,10 +17,10 @@
 //!
 //! | Field | Issuer | Meaning |
 //! |---|---|---|
-//! | `session_id` | the coordination owner, via `register_session` | the registered actor |
-//! | `work_item_id` | the coordination owner, via `register_work` | the claimed durable item |
-//! | `lease_id` | the coordination owner, via `acquire_work` | the fenced claim on that item |
-//! | `result_id` | the submitting attempt | this one candidate result reference |
+//! | `session_id` | the Kernel, on the admitted attempt | the registered actor |
+//! | `work_item_id` | the Governor issuer, from the admitted attempt | the claimed durable item |
+//! | `lease_id` | the Governor issuer, from the admitted attempt | the fenced claim on that item |
+//! | `result_id` | the Governor issuer, from the admitted attempt | this one candidate result reference |
 //!
 //! Every one of those is a *presented* handle that the coordination owner
 //! re-checks against the image it already holds; none of them is derived here.
@@ -30,30 +30,27 @@
 //! cannot express anything stronger, because the ceiling has exactly one
 //! representable variant.
 //!
-//! # Not yet produced in production (issue #370 R1)
+//! # Production producer (issue #370 R1)
 //!
-//! This ingress is now the live, total shape on the durable route, but nothing
-//! constructs it in production yet, and the blocker is upstream of the route,
-//! measured on this tree rather than inferred:
+//! This ingress is the live, total shape on the durable route, and it now has
+//! one production construction site:
+//! `campaign_task_controller::record_task_controller_coordination_candidate`.
+//! That site fills `session_id`, `work_item_id`, `lease_id`, and `result_id`
+//! from `eliot_governor::IssuedCoordinationWork`, which derives them from the
+//! Kernel-issued `TaskControllerAttempt` for the exact admitted claim, and it
+//! fills `result_ref` from the Kernel-validated `result_digest` of the response
+//! bytes the Kernel durably accepted. No field here is a literal and none is
+//! defaulted; a caller with no issued identity has nothing to construct.
 //!
-//! - `CoordinationOwner::register_session`, `register_work`, `acquire_work`, and
-//!   `acquire_work_with_issuance` have no non-test caller anywhere in the
-//!   workspace, so the persisted `owner/coordination` image holds no session, no
-//!   work item, and no lease;
-//! - the only production consumers of that image, including
-//!   `GovernorComposition::read_unique_agent_activation`, therefore observe an
-//!   empty coordination owner and can never admit anything;
-//! - no owner in the workspace issues a coordination `work_item_id` or
-//!   `lease_id`. The Kernel-issued `TaskControllerAttempt` and
-//!   `NativeWorkerClaim` carry a session, task, scope, fence, epoch, attempt,
-//!   and operation identity but no work-item or lease identity, and the Kernel's
-//!   own `AdmissionReservation` work-item projection is a different ORS record in
-//!   a different process.
-//!
-//! Deriving a `work_item_id` or `lease_id` here would fabricate exactly the
-//! coordination authority the owner validates on the way in, so it was not
-//! done. The legitimate issuer is the missing session/work-item driver, and
-//! producing it requires an owner decision this issue does not own.
+//! What this ingress still cannot express is recorded rather than papered over:
+//! it carries no provider identity, no #361 execution-unit binding, and no
+//! #369 physical route observation. The architecture contract's
+//! `agent.coordinator.attempt-reconciliation` entrypoint owns the typed provider
+//! result, and `eliot_coordination::AgentResultDraft` carries no such member, so
+//! an admitted coordination receipt is a candidate *reference* for one admitted
+//! attempt and not a provider result binding. The ceiling below is therefore the
+//! strongest thing this route can say, and it is enforced by the owner, not by
+//! this type.
 
 use eliot_contracts::{EpochId, StateFence};
 use eliot_governor::{AgentResultDraft, CompositionError, ResultAdmissionCeiling};
@@ -108,7 +105,7 @@ pub struct CoordinationResultIngress {
 /// `Owner` error and never dressed as an owner verdict or a provider admission.
 fn require_field(value: &str, field: &'static str) -> Result<(), CompositionError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) || value.len() > MAX_FIELD_LEN
->    {
+    {
         return Err(CompositionError::Owner(format!(
             "coordination ingress field {field} is blank, control-bearing, or longer than {MAX_FIELD_LEN} bytes"
         )));
