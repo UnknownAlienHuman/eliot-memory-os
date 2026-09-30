@@ -6320,12 +6320,33 @@ impl InquiryGovernance {
     /// which requires the five-class projection, every recorded dimension and
     /// both I21.8 requirement obligations.
     ///
+    /// A2: the fourth of the four named acceptance cases — a post-audit material
+    /// edit — is the part of this gate that reads the **delivered** wording, not
+    /// only the record. `delivered` is a map from audited claim identity to the
+    /// exact text the release is about to deliver for it; it is checked against
+    /// the wording the audit judged, so an added, edited, re-numbered, causally
+    /// widened, translated or joined statement is refused rather than published
+    /// beside a verdict that described different words. A claim the delivery map
+    /// does not name is a *material* omission and is refused as one, because the
+    /// acceptance requirement is that every released material claim is in the
+    /// coverage map. A claim named here that the audit trail never carried is a
+    /// fabricated claim identity and is likewise refused.
+    ///
+    /// The one thing this gate accepts is a **nonsemantic restyle**: the same
+    /// non-space words in a different whitespace or capitalisation-free
+    /// arrangement, which I21.8 permits under an explicit mapping. That is
+    /// decided by [`ClaimAuditRecord::is_nonsemantic_restyle_of`], never by
+    /// "the strings look close enough" — a difference in any non-space byte is a
+    /// material edit and is refused, so this gate cannot launder a semantic
+    /// change through a formatting path.
+    ///
     /// # Errors
     ///
     /// Returns [`InquiryError::IntegrityMismatch`] naming the first gate that
-    /// refuses, so a consumer reads WHICH requirement failed rather than only
-    /// that the release is blocked.
-    pub fn release_gate(&self) -> Result<(), InquiryError> {
+    /// refuses, or [`InquiryError::ReleaseGateRefused`] naming
+    /// `released_wording` and the offending claim, so a consumer reads WHICH
+    /// requirement failed rather than only that the release is blocked.
+    pub fn release_gate(&self, delivered: &BTreeMap<String, String>) -> Result<(), InquiryError> {
         if let Some(prior) =
             crate::evidence_portfolio::require_complete_claim_coverage(&self.claim_coverage).err()
         {
@@ -6340,6 +6361,52 @@ impl InquiryGovernance {
                 return Err(InquiryError::ReleaseGateRefused {
                     gate: "claim_audit",
                     detail: audit.claim_id.clone(),
+                });
+            }
+            // A2: the delivered wording must be the wording the audit judged.
+            // `delivered` is consulted per claim so a claim that is audited but
+            // absent from the delivery map is caught as a material omission here,
+            // at the gate a release consumer actually calls.
+            let Some(text) = delivered.get(&audit.claim_id) else {
+                return Err(InquiryError::ReleaseGateRefused {
+                    gate: "released_wording",
+                    detail: format!("{}: audited but not named in the delivered text", audit.claim_id),
+                });
+            };
+            if text == &audit.released_statement {
+                continue;
+            }
+            if audit.is_nonsemantic_restyle_of(text) {
+                continue;
+            }
+            return Err(InquiryError::ReleaseGateRefused {
+                gate: "released_wording",
+                detail: format!(
+                    "{}: delivered text is a material edit of the audited wording and no \
+                     explicit nonsemantic mapping was offered",
+                    audit.claim_id
+                ),
+            });
+        }
+        // A claim the delivery map names that the audit trail never carried is a
+        // fabricated claim identity: it would be a released material statement
+        // with no coverage-map entry, which is exactly the omission this issue
+        // says blocks a complete-audit claim. It is refused by comparing the two
+        // independent rosters — the carried audits and the delivery map — not by
+        // reading one back from the other.
+        let audited: BTreeSet<&str> = self
+            .claim_audits
+            .iter()
+            .map(|audit| audit.claim_id.as_str())
+            .collect();
+        for claim_id in delivered.keys() {
+            if !audited.contains(claim_id.as_str()) {
+                return Err(InquiryError::ReleaseGateRefused {
+                    gate: "released_wording",
+                    detail: format!(
+                        "{claim_id}: named in the delivered text but absent from the audited \
+                         coverage map"
+                    ),
                 });
             }
         }
@@ -6645,7 +6712,8 @@ impl InquiryGovernance {
     /// 1. [`crate::synthesis_input::CommittedFreeze::commit`] is re-run over
     ///    **this record's own** `source_admission_requests` and `freeze`. That
     ///    re-proves, per request through the admission owner's own
-    ///    `validate_integrity`, the five [`FreezeCommitment`] fields a
+    ///    `validate_integrity`, the five
+    ///    [`FreezeCommitment`](crate::source_admissibility::FreezeCommitment) fields a
     ///    `CommittedFreeze` member carries: `freeze_id` and `freeze_digest`
     ///    against the freeze this record published, `retained_content_digest`
     ///    against the admitted record's own `content_digest`, and

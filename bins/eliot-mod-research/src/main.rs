@@ -18,6 +18,7 @@
 //! because a provider failure degrades only acquisition coverage, never the
 //! Kernel, the Governor, or independent work.
 
+use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::sync::Arc;
 
@@ -433,7 +434,21 @@ fn report_admitted_inquiry(
             // is a renderer, not an authority — it does not refuse the run and does
             // not change this process's exit code — but the gate answer it prints is
             // the one a release consumer has to see before it promotes anything.
-            let gate = match inquiry.release_gate() {
+            //
+            // A2: the delivered text is the wording this run actually publishes,
+            // read off each audited claim's own `released_statement` — the exact
+            // wording that was judged. A renderer that reworded a claim between the
+            // audit and this print would hand the gate text that disagrees with
+            // what the audit saw, and the gate refuses it. Building the map here
+            // (rather than passing an empty one) is what makes the post-audit
+            // material-edit check fire on the real run instead of existing only as
+            // an uncalled method.
+            let delivered: BTreeMap<String, String> = inquiry
+                .claim_audits
+                .iter()
+                .map(|audit| (audit.claim_id.clone(), audit.released_statement.clone()))
+                .collect();
+            let gate = match inquiry.release_gate(&delivered) {
                 Ok(()) => eliot_mod_research::RELEASE_GATE_ADMITTED.to_owned(),
                 Err(error) => format!("{}:{error}", eliot_mod_research::RELEASE_GATE_BLOCKED),
             };
