@@ -1421,8 +1421,8 @@ impl ContextRecipePolicy {
         let section_budgets = canonical_budgets(self.section_budgets.clone());
         let role_positions = canonical_role_positions(self.layout.role_positions.clone());
         let omission = RecipeOmissionPolicy {
-            permitted_reasons: canonical_set(self.omission.permitted_reasons),
-            non_recoverable_reasons: canonical_set(self.omission.non_recoverable_reasons),
+            permitted_reasons: canonical_set(self.omission.permitted_reasons.clone()),
+            non_recoverable_reasons: canonical_set(self.omission.non_recoverable_reasons.clone()),
         };
         let blocking_dimensions = canonical_set(self.blocking_dimensions.clone());
         let qualification = RecipeQualification {
