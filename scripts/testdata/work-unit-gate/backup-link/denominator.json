@@ -23,6 +23,8 @@
     "bins/eliot-watchdog/Cargo.toml",
     "crates/kernel/eliot-host-control-endpoint/Cargo.toml",
     "crates/kernel/eliot-host-service/Cargo.toml",
+    "crates/storage/eliot-backup/Cargo.toml",
+    "crates/storage/eliot-blob/Cargo.toml",
     "Cargo.toml",
     "Cargo.lock"
   ],
@@ -50,6 +52,18 @@
       "base_blob_sha256": "63e4631364efa40781793bbe271f19b93866650ea0b98ebb24cd13fc78aed4df",
       "current_blob_sha256": "63e4631364efa40781793bbe271f19b93866650ea0b98ebb24cd13fc78aed4df",
       "byte_identical_since_base": true
+    },
+    {
+      "manifest": "crates/storage/eliot-backup/Cargo.toml",
+      "base_blob_sha256": "e76fc58cdb7af04a3e8c95933d0e5d7f495f734d91e07d7bb4295f7e7da42dbf",
+      "current_blob_sha256": "bd920450260159d44462195703308943ad2e40bebffc091c608fc34db431cbff",
+      "byte_identical_since_base": false
+    },
+    {
+      "manifest": "crates/storage/eliot-blob/Cargo.toml",
+      "base_blob_sha256": "808b4167eb4b4667067561bf5ba461274ae42412be61deb66eb5247af9f0edca",
+      "current_blob_sha256": "344c98cdec1c82a77d19a57c18e2d66748c6e6de643023434174a0d8fdb023d5",
+      "byte_identical_since_base": false
     },
     {
       "manifest": "Cargo.toml",
@@ -198,5 +212,5 @@
       "declaration": "eliot-blob-api.workspace = true"
     }
   ],
-  "denominator_digest": "9851ae3919afbcca34255309b23e498868b33e5700a136104110580aa2d8f78a"
+  "denominator_digest": "947e2dd4399ad2fbc90b8531d1438d90625d4cf0c376decba42ef1df687215a0"
 }

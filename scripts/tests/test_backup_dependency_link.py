@@ -42,10 +42,31 @@ since the frozen base, because other admitted issues added their own edges in
 the same files; the claim this work unit actually has to support is narrower
 and is proven per edge instead. Each of the ten frozen edge declarations is
 byte-identical in the base blob and in the working tree and appears exactly
-once in each, and the parsed dependency table at the base is equal to the
-current one. That is what "existing dependency lines are verified no-ops, not
-rewritten" means here; whole-file equality would be both false and stronger
-than the work unit is entitled to claim.
+once in each, and every frozen edge's dependency is present in the parsed
+manifest at the base as well as in the working tree. That is what "existing
+dependency lines are verified no-ops, not rewritten" means here; whole-file or
+whole-table equality would be both false -- root ``Cargo.toml`` gained six
+workspace aliases and two members and lost one member between the base and
+the working tree, all through other admitted issues -- and stronger than the
+work unit is entitled to claim. The per-fact claims are stated per case: case
+7 pins the versions and the six aliases it reads, case 8 pins the storage
+members, the five aliases the admitted edges consume, and ``default-members``,
+``exclude`` and ``resolver``.
+
+``affected_manifests`` is the affected-MANIFEST denominator: every manifest
+that declares one of the ten admitted edges, not only the manifests this work
+unit happens to edit. Three of those ten edges live in
+``crates/storage/eliot-backup/Cargo.toml`` and
+``crates/storage/eliot-blob/Cargo.toml``, so both manifests are inside the
+denominator and both carry measured ``manifest_identities``. They are recorded
+as affected instead of being moved out of the frozen edge set and left to the
+edge-symbols and lock fixtures alone, because those two manifests are the
+subject of cases 2, 4 and 5, and narrowing the denominator would have deleted
+exactly the dependency evidence this gate exists to hold while satisfying the
+case 1 completeness check -- "every frozen edge's manifest is in the
+denominator" -- only by deleting the edges that check was written to police.
+The completeness check is the point of case 1, so the denominator covers the
+edges instead of the edges being dropped to fit the denominator.
 
 Source anchors bind to declaration text, not to line numbers. A line number
 is not a stable identity for a source location, and this repository's own
@@ -123,15 +144,21 @@ HOST_RUNTIME_CONTROL_RS = (
 WATCHDOG_SRC_DIR = REPO_ROOT / "bins" / "eliot-watchdog" / "src"
 KERNEL_SRC_DIR = REPO_ROOT / "bins" / "eliot-kernel" / "src"
 
-# The issue's exclusive mutable scope for this work unit. This is an
-# independent expected set: case 1 requires the frozen denominator to cover
-# exactly these paths, so the fixture can neither omit one nor quietly grow
-# the denominator past the granted scope.
+# The issue's affected-MANIFEST denominator: every manifest that declares one
+# of the ten admitted edges below, whether or not this work unit edits it.
+# This is an independent expected set: case 1 requires the frozen denominator
+# to cover exactly these paths, so the fixture can neither omit one nor
+# quietly grow the denominator, and -- just as load-bearing -- every frozen
+# edge's manifest has to appear here. The two storage manifests are in this
+# set because three admitted edges are declared in them; see the module
+# docstring for why the denominator grew rather than the edge set shrinking.
 EXPECTED_AFFECTED_MANIFESTS = (
     "bins/eliot-kernel/Cargo.toml",
     "bins/eliot-watchdog/Cargo.toml",
     "crates/kernel/eliot-host-control-endpoint/Cargo.toml",
     "crates/kernel/eliot-host-service/Cargo.toml",
+    "crates/storage/eliot-backup/Cargo.toml",
+    "crates/storage/eliot-blob/Cargo.toml",
     "Cargo.toml",
     "Cargo.lock",
 )
@@ -150,6 +177,19 @@ EXPECTED_FROZEN_EDGES = (
     ("crates/storage/eliot-backup/Cargo.toml", "eliot-blob-api"),
     ("crates/storage/eliot-backup/Cargo.toml", "eliot-store-api"),
     ("crates/storage/eliot-blob/Cargo.toml", "eliot-blob-api"),
+)
+
+# The `[workspace.dependencies]` aliases the ten admitted edges consume. Each
+# edge above that is declared as `X.workspace = true` resolves through one of
+# these; `eliot-backup` is absent because its kernel edge is an explicit path
+# and version pin, not an alias. Case 8 compares exactly these across the two
+# ends, because they are the aliasing facts this work unit freezes.
+FROZEN_WORKSPACE_ALIASES = (
+    "eliot-blob-api",
+    "eliot-host-service",
+    "eliot-ipc",
+    "eliot-protocol",
+    "eliot-store-api",
 )
 
 EXPECTED_FROZEN_LOCK_EDGES = (
@@ -546,6 +586,43 @@ def manifest_dependencies(manifest_path: Path) -> dict:
     return dependencies
 
 
+def unidentified_manifests(affected: object, identities: object) -> list[str]:
+    """Return the affected manifests that carry no measured manifest identity.
+
+    ``manifest_identities`` is what carries the base and working-tree digests,
+    so an affected manifest with no identity entry is a path the denominator
+    claims while nothing measures it. Used once for the verdict and once for the
+    negative probe below.
+    """
+    if not isinstance(affected, list) or not isinstance(identities, list):
+        return ["affected_manifests or manifest_identities is not a list"]
+    measured = {
+        str(entry.get("manifest", "")) for entry in identities if isinstance(entry, dict)
+    }
+    return sorted({str(path) for path in affected} - measured)
+
+
+def changed_aliases(
+    base_dependencies: dict,
+    current_dependencies: dict,
+    aliases: tuple[str, ...],
+) -> list[str]:
+    """Return the named aliases that are absent at or altered between two ends.
+
+    Used once for the verdict and once for the negative probe, so the check
+    that reports an unchanged alias table is the same check that reports an
+    edited one. A missing alias at either end counts as changed: an alias that
+    was deleted is exactly the alias movement this predicate exists to catch.
+    """
+    return [
+        alias
+        for alias in aliases
+        if base_dependencies.get(alias) is None
+        or current_dependencies.get(alias) is None
+        or base_dependencies[alias] != current_dependencies[alias]
+    ]
+
+
 def uses_crate(rs_text: str, crate_name: str) -> bool:
     """Check for a real ``use`` of a Rust crate (``use x`` or ``x::``)."""
     return f"use {crate_name}" in rs_text or f"{crate_name}::" in rs_text
@@ -789,6 +866,17 @@ class BackupDependencyLinkTests(unittest.TestCase):
                 {str(m) for m in fixture["affected_manifests"]},
                 f"edge {edge['manifest']} lies outside the frozen denominator",
             )
+        # Every affected manifest must carry a measured identity. Without this,
+        # adding a path to `affected_manifests` would opt it straight out of the
+        # base/current digest comparison below while still satisfying the
+        # scope check -- the same hole this case exists to close.
+        self.assertEqual(
+            unidentified_manifests(
+                fixture["affected_manifests"], fixture["manifest_identities"],
+            ),
+            [],
+            "an affected manifest carries no measured base/current identity",
+        )
 
         # The manifests exist and the recorded identity is the real one.
         for entry in fixture["manifest_identities"]:
@@ -858,6 +946,20 @@ class BackupDependencyLinkTests(unittest.TestCase):
         del tampered_shape["unchanged_since_base"]
         self.assertTrue(
             validate_denominator(tampered_shape), "denominator missing a member accepted",
+        )
+        # Negative: dropping one identity entry must be reported by the same
+        # predicate the identity-completeness verdict above uses.
+        dropped = str(fixture["affected_manifests"][0])
+        self.assertEqual(
+            unidentified_manifests(
+                fixture["affected_manifests"],
+                [
+                    entry for entry in fixture["manifest_identities"]
+                    if str(entry["manifest"]) != dropped
+                ],
+            ),
+            [dropped],
+            "an affected manifest with no measured identity is not reported",
         )
 
     # WORK_UNIT_CASE: 974/2
@@ -1165,10 +1267,22 @@ class BackupDependencyLinkTests(unittest.TestCase):
 
     # WORK_UNIT_CASE: 974/8
     def test_08_no_members(self) -> None:
-        """Workspace membership is unchanged; no new member or alias added."""
+        """The workspace facts this work unit freezes are unchanged base..current.
+
+        The claim is per fact, never per table. The root manifest is shared with
+        other admitted issues, so a whole-table equality would be false: root
+        ``Cargo.toml`` gained six workspace aliases and two members and lost
+        one member between BASE_COMMIT and the working tree. What this case
+        freezes is the storage member set, the five workspace aliases the ten
+        admitted edges consume, and the ``default-members``, ``exclude`` and
+        ``resolver`` keys -- each compared at the base and in the working tree.
+        """
+        require_base_ancestor(8)
         root = load_toml(ROOT_MANIFEST)
-        members = root["workspace"]["members"]
-        base_members = load_toml_bytes(git_blob("Cargo.toml"))["workspace"]["members"]
+        workspace = root["workspace"]
+        base_workspace = load_toml_bytes(git_blob("Cargo.toml"))["workspace"]
+        members = workspace["members"]
+        base_members = base_workspace["members"]
         for required in (
             "crates/storage/eliot-backup",
             "crates/storage/eliot-blob-api",
@@ -1176,7 +1290,7 @@ class BackupDependencyLinkTests(unittest.TestCase):
         ):
             self.assertIn(required, members)
             self.assertIn(required, base_members)
-        default_members = root["workspace"].get("default-members", [])
+        default_members = workspace.get("default-members", [])
         self.assertEqual(
             sorted(default_members),
             sorted(
@@ -1220,10 +1334,56 @@ class BackupDependencyLinkTests(unittest.TestCase):
             {m for m in base_storage if m not in storage}, set(),
             "this work unit must not drop a storage workspace member",
         )
+        # These three keys carry no per-edge claim, so each is compared across
+        # the two ends in full rather than sampled.
         self.assertEqual(
             base_workspace.get("default-members", []), default_members,
             "default-members changed since the frozen base",
         )
+        self.assertEqual(
+            base_workspace.get("exclude", []), workspace.get("exclude", []),
+            "the workspace exclude list changed since the frozen base",
+        )
+        self.assertEqual(
+            base_workspace.get("resolver"), workspace.get("resolver"),
+            "the workspace resolver changed since the frozen base",
+        )
+        # The aliases the admitted edges resolve through, compared by value and
+        # not by presence: a bare alias replacing a pinned path+version entry is
+        # a rewrite, and a presence check would call it preserved.
+        self.assertEqual(
+            changed_aliases(
+                base_workspace["dependencies"],
+                workspace["dependencies"],
+                FROZEN_WORKSPACE_ALIASES,
+            ),
+            [],
+            "a workspace alias the admitted edges consume changed since the "
+            "frozen base",
+        )
+        # Negative: the same predicate reports an alias edited at one end, and
+        # an alias dropped at one end, so the verdict above is not vacuous.
+        for label, tampered_aliases_probe in (
+            (
+                "edited",
+                {**workspace["dependencies"], "eliot-blob-api": {"workspace": True}},
+            ),
+            ("dropped", {
+                alias: value
+                for alias, value in workspace["dependencies"].items()
+                if alias != "eliot-store-api"
+            }),
+        ):
+            with self.subTest(tamper=label):
+                self.assertEqual(
+                    changed_aliases(
+                        base_workspace["dependencies"],
+                        tampered_aliases_probe,
+                        FROZEN_WORKSPACE_ALIASES,
+                    ),
+                    ["eliot-blob-api"] if label == "edited" else ["eliot-store-api"],
+                    f"a {label} frozen workspace alias is not reported",
+                )
         # Negative: dropping the backup member breaks admission.
         tampered = [m for m in members if m != "crates/storage/eliot-backup"]
         self.assertNotIn("crates/storage/eliot-backup", tampered)
