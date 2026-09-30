@@ -25,7 +25,10 @@ use crate::reactive_context::{
 use crate::{JournalBackend, JournalError, ReconcileOutcome};
 
 pub const JOURNAL_MAGIC: &[u8] = b"ELIOT-HOST-STATE\n";
-/// Current journal wire revision. Version 1 readiness records did not retain
+/// Current journal wire revision. Version 4 adds Host-owned module
+/// build/source-provenance records; version 3 remains readable so existing
+/// Host epochs can append the first v4 frame without rebasing their journal.
+/// Version 1 readiness records did not retain
 /// the exact supervision predecessor and are therefore never replayed into a
 /// current Host contour. Version 2 carried the retired Host-local
 /// `EpochIdentity { lineage, sequence }` spelling; version 3 carries the
@@ -33,7 +36,8 @@ pub const JOURNAL_MAGIC: &[u8] = b"ELIOT-HOST-STATE\n";
 /// frames are rejected explicitly as `UnknownVersion` and are never silently
 /// rewritten: recovery proceeds through an explicit new-lineage Host epoch,
 /// and rollback to a version 2 reader requires the version 2 journal bytes.
-pub const JOURNAL_VERSION: u16 = 3;
+pub const JOURNAL_VERSION: u16 = 4;
+const PREVIOUS_JOURNAL_VERSION: u16 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AppendDisposition {
@@ -385,7 +389,7 @@ fn scan_frames(bytes: &[u8]) -> Result<Vec<ScannedFrame<'_>>, JournalError> {
             .and_then(|delta| offset.checked_add(delta))
             .ok_or(JournalError::Torn { offset })?;
         let header: FrameHeader = decode(&bytes[offset..header_end])?;
-        if header.version != JOURNAL_VERSION {
+        if header.version != JOURNAL_VERSION && header.version != PREVIOUS_JOURNAL_VERSION {
             return Err(JournalError::UnknownVersion {
                 version: header.version,
             });
@@ -521,6 +525,7 @@ fn apply(
                 state.drain = None;
                 state.drain_commit = None;
                 state.wakes.clear();
+                state.module_build_provenance.clear();
                 if let Some(queue) = state.reactive_context.as_mut() {
                     queue.advance_generation()?;
                 }
@@ -760,6 +765,19 @@ fn apply(
             state.observations.push(next.clone());
             state.clean_marker = None;
         }
+        HostStateRecord::ModuleBuildProvenance(next) => {
+            if state.activation.as_ref().map(|activation| activation.state)
+                != Some(crate::ActivationState::Starting)
+                || state
+                    .module_build_provenance
+                    .iter()
+                    .any(|existing| existing.module_id == next.module_id)
+            {
+                return Err(JournalError::IdempotencyConflict);
+            }
+            state.module_build_provenance.push(next.clone());
+            state.clean_marker = None;
+        }
         HostStateRecord::ReadinessObservation(next) => {
             let active = state.kernel.as_ref().ok_or(JournalError::StaleFence)?;
             let active_checksum = record_checksum(&HostStateRecord::Kernel(active.clone()))?;
@@ -843,7 +861,8 @@ fn apply(
                 .reactive_context
                 .as_ref()
                 .is_none_or(crate::ReactiveContextQueueState::clean_for_drain);
-            if next.manifest.schema_version != JOURNAL_VERSION
+            if (next.manifest.schema_version != JOURNAL_VERSION
+                && next.manifest.schema_version != PREVIOUS_JOURNAL_VERSION)
                 || next.manifest.last_sequence != state.sequence
                 || next.manifest.last_checksum.as_str()
                     != state.last_checksum.as_deref().unwrap_or("GENESIS")

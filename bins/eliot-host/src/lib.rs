@@ -1609,19 +1609,22 @@ type Duration = std::time::Duration;
 #[cfg(windows)]
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use eliot_contracts::{AuthorityEpoch, EpochContractError, EpochId, ResourceGeneration};
 #[cfg(windows)]
-use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence};
+use eliot_contracts::{
+    ArtifactId, ClockReading, ContractId, ProductId, RequestId, RequestMetadata, SourceId,
+    StateFence,
+};
+use eliot_contracts::{AuthorityEpoch, EpochContractError, EpochId, ResourceGeneration};
 #[cfg(windows)]
 use eliot_host_service::{HostDurableJobAdapter, HostWakeIntentAdapter};
 use eliot_host_state::{
     ActivationState, AppendReceipt, DrainRecord, DrainState, EpochIdentity, EpochLineageId,
     EpochTransition, HostInstallationEpoch, HostObservationRecord, HostState,
     HostStateJournalService, HostStateRecord, IdempotencyIdentity, JournalBackend, JournalError,
-    KernelJobBinding, KernelRecord, NonceState, OneTimeNonceState, PriorKernelDisposition,
-    ProductionHostStateJournal, ReconcileOutcome, RecordFence, RecoveryLineageEvidence,
-    RedbJournalBackend, StoreRebindRecord, StoreRebindState, host_owner_epoch_digest,
-    record_checksum,
+    KernelJobBinding, KernelRecord, ModuleBuildProvenanceRecord, NonceState, OneTimeNonceState,
+    PriorKernelDisposition, ProductionHostStateJournal, ReconcileOutcome, RecordFence,
+    RecoveryLineageEvidence, RedbJournalBackend, StoreRebindRecord, StoreRebindState,
+    host_owner_epoch_digest, record_checksum,
 };
 use eliot_installation::{
     ActivationCommitFence, ActivePhaseBRebindIntent, ActivePhaseBRebindReceipt,
@@ -1688,6 +1691,8 @@ use eliot_runtime_contracts::{
     WATCHDOG_PUBLICATION_FILE_NAME, WATCHDOG_PUBLICATION_RETAINED_LIMIT, WatchdogAdmissionTemplate,
     WatchdogPublicationBundle, WatchdogPublicationRetentionPlan,
 };
+#[cfg(windows)]
+use eliot_runtime_contracts::{admit_module_manifest, admitted_manifest_path};
 use sha2::{Digest as _, Sha256};
 
 #[cfg(windows)]
@@ -5442,6 +5447,33 @@ pub struct HostPhaseBMaterialization {
     agent_bridge_final: Option<AgentBridgePhaseBBinding>,
     file_identities: [FileIdentity; 4],
     launch: RuntimeLaunchDescriptor,
+}
+
+#[cfg(windows)]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModuleBuildSourceProof {
+    schema_version: u32,
+    module_id: String,
+    package: String,
+    binary: String,
+    artifact_path: String,
+    artifact_sha256: String,
+    artifact_bytes: u64,
+    manifest_path: String,
+    manifest_sha256: String,
+    manifest_bytes: u64,
+    source_commit: String,
+    source_tree_id: String,
+    builder_script_sha256: String,
+    cargo_manifest_sha256: String,
+    cargo_lock_sha256: String,
+    rust_toolchain_sha256: String,
+    daemon_contract_source_sha256: String,
+    module_manifest_source_sha256: String,
+    cargo_profile: String,
+    build_target: String,
+    build_argv: Vec<String>,
 }
 
 #[cfg(windows)]
@@ -9454,6 +9486,297 @@ impl HostComposition {
     #[cfg(windows)]
     #[allow(
         clippy::too_many_lines,
+        reason = "module source admission and journal readback remain one fenced Host lifecycle transition"
+    )]
+    fn admit_and_record_module_build_provenance(
+        &mut self,
+        launch: &RuntimeLaunchDescriptor,
+        fence: &RecordFence,
+    ) -> Result<(), HostError> {
+        const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+        const MAX_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
+        const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+        const MAX_PROVENANCE_BYTES: u64 = 64 * 1024;
+        let error = |reason: String| HostError::RecoveryRequired(reason);
+        let hash_bytes = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+        let is_lower_digest = |value: &str| {
+            valid_sha256_text(value) && value.bytes().all(|byte| !byte.is_ascii_uppercase())
+        };
+        let make_handle = |value: &str, field: &str| {
+            PlatformHandle::new(value.to_owned()).map_err(|handle_error| {
+                HostError::ProcessContour(format!("{field}: {handle_error}"))
+            })
+        };
+        let artifact_path = Path::new(launch.eliotd_executable_path.as_str());
+        if !artifact_path.is_absolute() {
+            return Err(error(
+                "approved eliotd artifact path is not absolute".to_owned(),
+            ));
+        }
+        let artifact_lease = open_launch_lease(
+            launch.profile,
+            self.jobs.portable_root.as_ref(),
+            artifact_path,
+        )?;
+        if artifact_lease.path() != artifact_path {
+            return Err(error(
+                "eliotd artifact lease differs from the active launch descriptor".to_owned(),
+            ));
+        }
+        artifact_lease.verify().map_err(HostError::ProcessContour)?;
+        verify_launch_digest(
+            &artifact_lease,
+            &launch.eliotd_artifact_digest,
+            "runtime.eliotd_artifact",
+        )?;
+        let artifact_bytes = artifact_lease
+            .read_bounded(MAX_ARTIFACT_BYTES)
+            .map_err(HostError::ProcessContour)?;
+        artifact_lease.verify().map_err(HostError::ProcessContour)?;
+        let artifact_sha256 = hash_bytes(&artifact_bytes);
+        if artifact_sha256 != launch.eliotd_artifact_digest.as_str() {
+            return Err(error(
+                "retained eliotd artifact bytes differ from the active launch digest".to_owned(),
+            ));
+        }
+        let artifact_bytes_len = u64::try_from(artifact_bytes.len())
+            .map_err(|_| error("eliotd artifact size exceeds its bound".to_owned()))?;
+        let artifact_id = ArtifactId::new(&artifact_sha256)
+            .map_err(|contract_error| error(contract_error.to_string()))?;
+        let module_id = ContractId::new("eliotd")
+            .map_err(|contract_error| error(contract_error.to_string()))?;
+
+        let manifest_path = admitted_manifest_path(artifact_lease.path(), &module_id)
+            .map_err(|contract_error| error(contract_error.to_string()))?;
+        let manifest_lease = open_launch_lease(
+            launch.profile,
+            self.jobs.portable_root.as_ref(),
+            &manifest_path,
+        )?;
+        let manifest_bytes = manifest_lease
+            .read_bounded(MAX_MANIFEST_BYTES)
+            .map_err(HostError::ProcessContour)?;
+        manifest_lease.verify().map_err(HostError::ProcessContour)?;
+        let admitted = admit_module_manifest(&artifact_id, &manifest_bytes)
+            .map_err(|contract_error| error(contract_error.to_string()))?;
+        if admitted.module_id != module_id || admitted.artifact_id != artifact_id {
+            return Err(error(
+                "admitted module manifest differs from the approved eliotd identity".to_owned(),
+            ));
+        }
+        let manifest_bytes_len = u64::try_from(manifest_bytes.len())
+            .map_err(|_| error("module manifest size exceeds its bound".to_owned()))?;
+
+        let provenance_path = manifest_path.with_file_name("module.eliotd.provenance.json");
+        let provenance_lease = open_launch_lease(
+            launch.profile,
+            self.jobs.portable_root.as_ref(),
+            &provenance_path,
+        )?;
+        let provenance_bytes = provenance_lease
+            .read_bounded(MAX_PROVENANCE_BYTES)
+            .map_err(HostError::ProcessContour)?;
+        provenance_lease
+            .verify()
+            .map_err(HostError::ProcessContour)?;
+        let source: ModuleBuildSourceProof =
+            serde_json::from_slice(&provenance_bytes).map_err(|parse_error| {
+                error(format!("module source proof is malformed: {parse_error}"))
+            })?;
+        let provenance_sha256 = hash_bytes(&provenance_bytes);
+        let provenance_bytes_len = u64::try_from(provenance_bytes.len())
+            .map_err(|_| error("module provenance size exceeds its bound".to_owned()))?;
+        let expected_build_arguments = [
+            "build",
+            "--frozen",
+            "--locked",
+            "--offline",
+            "--release",
+            "-p",
+            "eliotd",
+            "--bin",
+            "eliotd",
+        ];
+        let source_identity_valid = [
+            source.source_commit.as_str(),
+            source.source_tree_id.as_str(),
+        ]
+        .into_iter()
+        .all(|value| {
+            (40..=64).contains(&value.len())
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        });
+        let source_hashes_valid = [
+            source.builder_script_sha256.as_str(),
+            source.cargo_manifest_sha256.as_str(),
+            source.cargo_lock_sha256.as_str(),
+            source.rust_toolchain_sha256.as_str(),
+            source.daemon_contract_source_sha256.as_str(),
+            source.module_manifest_source_sha256.as_str(),
+        ]
+        .into_iter()
+        .all(is_lower_digest);
+        if source.schema_version != 1
+            || source.module_id != "eliotd"
+            || source.package != "eliotd"
+            || source.binary != "eliotd"
+            || source.artifact_path != "runtime/eliotd.exe"
+            || source.artifact_sha256 != artifact_sha256
+            || source.artifact_bytes != artifact_bytes_len
+            || source.manifest_path != "runtime/module.eliotd.toml"
+            || source.manifest_sha256 != admitted.manifest_digest
+            || source.manifest_bytes != manifest_bytes_len
+            || !source_identity_valid
+            || !source_hashes_valid
+            || source.cargo_profile != "release"
+            || source.build_target != "x86_64-pc-windows-msvc"
+            || source
+                .build_argv
+                .iter()
+                .map(String::as_str)
+                .ne(expected_build_arguments)
+            || !is_lower_digest(&source.artifact_sha256)
+            || !is_lower_digest(&source.manifest_sha256)
+            || provenance_bytes.is_empty()
+        {
+            return Err(error(
+                "module-specific source/build proof does not bind the exact active eliotd artifact and manifest".to_owned(),
+            ));
+        }
+        let config_lease =
+            self.jobs.eliotd_config_lease.as_ref().ok_or_else(|| {
+                error("active eliotd Governor config lease is missing".to_owned())
+            })?;
+        if config_lease.path() != Path::new(launch.eliotd_config_path.as_str()) {
+            return Err(error(
+                "eliotd config lease differs from the active launch descriptor".to_owned(),
+            ));
+        }
+        config_lease.verify().map_err(HostError::ProcessContour)?;
+        verify_launch_digest(
+            config_lease,
+            &launch.eliotd_config_digest,
+            "runtime.eliotd_config",
+        )?;
+        let config_bytes = config_lease
+            .read_bounded(MAX_CONFIG_BYTES)
+            .map_err(HostError::ProcessContour)?;
+        config_lease.verify().map_err(HostError::ProcessContour)?;
+        if hash_bytes(&config_bytes) != launch.eliotd_config_digest.as_str() {
+            return Err(error(
+                "retained eliotd config bytes differ from the active launch digest".to_owned(),
+            ));
+        }
+        let profile = match launch.profile {
+            InstallationProfile::SystemService => "system_service",
+            InstallationProfile::UserMode => "user_mode",
+            InstallationProfile::PortableDev => "portable_dev",
+        };
+        let operation = IdempotencyIdentity {
+            operation_id: make_handle("module-build-provenance:eliotd", "module operation")?,
+            idempotency_key: make_handle(
+                &format!(
+                    "activation:{}:{}:{}",
+                    fence.activation_id,
+                    fence.activation_generation.current.lineage_id.as_str(),
+                    fence.activation_generation.current.sequence.get()
+                ),
+                "module idempotency key",
+            )?,
+        };
+        let record = ModuleBuildProvenanceRecord {
+            fence: fence.clone(),
+            operation,
+            module_id: make_handle(&source.module_id, "module id")?,
+            artifact_path: make_handle(&source.artifact_path, "artifact path")?,
+            artifact_digest: make_handle(&source.artifact_sha256, "artifact digest")?,
+            artifact_bytes: source.artifact_bytes,
+            config_digest: launch.eliotd_config_digest.clone(),
+            state_fence_digest: make_handle(
+                &sha256_json(&launch.authority_state_fence)?,
+                "state fence digest",
+            )?,
+            installation_profile: make_handle(profile, "installation profile")?,
+            manifest_path: make_handle(&source.manifest_path, "manifest path")?,
+            manifest_digest: make_handle(&admitted.manifest_digest, "manifest digest")?,
+            manifest_bytes: source.manifest_bytes,
+            contract_digest: make_handle(&admitted.contract_digest, "contract digest")?,
+            protocol_set_digest: make_handle(
+                &sha256_json(&admitted.contract.protocols)?,
+                "protocol set digest",
+            )?,
+            provenance_path: make_handle(
+                "runtime/module.eliotd.provenance.json",
+                "provenance path",
+            )?,
+            provenance_digest: make_handle(&provenance_sha256, "provenance digest")?,
+            provenance_bytes: provenance_bytes_len,
+            source_commit: make_handle(&source.source_commit, "source commit")?,
+            source_tree_id: make_handle(&source.source_tree_id, "source tree")?,
+            builder_script_digest: make_handle(
+                &source.builder_script_sha256,
+                "builder script digest",
+            )?,
+            cargo_manifest_digest: make_handle(
+                &source.cargo_manifest_sha256,
+                "Cargo manifest digest",
+            )?,
+            cargo_lock_digest: make_handle(&source.cargo_lock_sha256, "Cargo lock digest")?,
+            rust_toolchain_digest: make_handle(
+                &source.rust_toolchain_sha256,
+                "Rust toolchain digest",
+            )?,
+            daemon_contract_source_digest: make_handle(
+                &source.daemon_contract_source_sha256,
+                "daemon contract source digest",
+            )?,
+            module_manifest_source_digest: make_handle(
+                &source.module_manifest_source_sha256,
+                "module manifest source digest",
+            )?,
+            cargo_profile: make_handle(&source.cargo_profile, "Cargo profile")?,
+            build_target: make_handle(&source.build_target, "build target")?,
+            build_arguments: source
+                .build_argv
+                .iter()
+                .map(|argument| make_handle(argument, "Cargo build argument"))
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        let journal_record = HostStateRecord::ModuleBuildProvenance(record.clone());
+        let expected_checksum = record_checksum(&journal_record)?;
+        self.append_record(journal_record)?;
+        let readback = self.journal.snapshot()?;
+        let matching_records = readback
+            .module_build_provenance
+            .iter()
+            .filter(|existing| existing.module_id == record.module_id)
+            .collect::<Vec<_>>();
+        let matching_operation = readback
+            .applied_operations
+            .iter()
+            .find(|applied| applied.identity == record.operation);
+        if readback
+            .activation
+            .as_ref()
+            .is_none_or(|activation| activation.fence != *fence)
+            || matching_records.len() != 1
+            || matching_records
+                .first()
+                .is_none_or(|existing| *existing != &record)
+            || matching_operation.is_none_or(|applied| applied.checksum != expected_checksum)
+        {
+            return Err(error(
+                "Host module source proof append did not pass exact journal readback".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
         reason = "ordered Phase-B receipt admission, sibling start, and child readiness remain one fenced lifecycle boundary"
     )]
     fn start_manifest_contour(
@@ -9517,6 +9840,17 @@ impl HostComposition {
         next.trigger_evidence
             .push(phase_b_activation_binding(&phase_b)?);
         self.append_record(HostStateRecord::Activation(next))?;
+        let starting_activation = self.journal.snapshot()?.activation.ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "Host activation disappeared after the Starting append".to_owned(),
+            )
+        })?;
+        if starting_activation.state != ActivationState::Starting {
+            return Err(HostError::RecoveryRequired(
+                "Host activation readback is not in the Starting state".to_owned(),
+            ));
+        }
+        self.admit_and_record_module_build_provenance(&phase_b.launch, &starting_activation.fence)?;
         // I1.5 "start only the remaining capabilities required by the admitted
         // request". The set that may gate this contour is the one the
         // activation generation itself durably carries, read back from the

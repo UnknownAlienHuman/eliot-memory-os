@@ -1328,8 +1328,8 @@ pub struct DrainRecord {
     /// continues the current attempt and carries `None`.
     ///
     /// `default` is mandatory, not stylistic: `DrainRecord` and
-    /// `HostStateRecord` both deny unknown fields and `JOURNAL_VERSION` is 3,
-    /// so a required field would make every installed v3 frame fail
+    /// `HostStateRecord` both deny unknown fields and the journal wire revision
+    /// advanced to 4, so a required field would make every installed v3 frame fail
     /// `decode_record_for_replay` and render the whole epoch unloadable.
     ///
     /// `skip_serializing_if` is equally mandatory, for the same reason
@@ -2041,8 +2041,8 @@ pub struct EpochRetirementRecord {
     /// retirement (#2868).
     ///
     /// `default` is mandatory, not stylistic: `EpochRetirementRecord` and
-    /// `HostStateRecord` both deny unknown fields and `JOURNAL_VERSION` is 3,
-    /// so a required field would make every already-installed v3 frame fail
+    /// `HostStateRecord` both deny unknown fields and the journal wire revision
+    /// advanced to 4, so a required field would make every already-installed v3 frame fail
     /// `decode_record_for_replay` and render the whole epoch unloadable.
     ///
     /// `None` is a legacy record written before the relation existed. It stays
@@ -2698,6 +2698,201 @@ pub(crate) fn store_rebind_transition(
     }
 }
 
+/// Host-owned, per-activation readback of one release builder's module-specific
+/// artifact/source proof joined to the exact admitted module contract and
+/// launch inputs. This row proves the bytes Host observed under its active
+/// fence; it does not grant process, semantic, or generation authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleBuildProvenanceRecord {
+    pub fence: RecordFence,
+    pub operation: IdempotencyIdentity,
+    pub module_id: PlatformHandle,
+    pub artifact_path: PlatformHandle,
+    pub artifact_digest: PlatformHandle,
+    pub artifact_bytes: u64,
+    pub config_digest: PlatformHandle,
+    pub state_fence_digest: PlatformHandle,
+    pub installation_profile: PlatformHandle,
+    pub manifest_path: PlatformHandle,
+    pub manifest_digest: PlatformHandle,
+    pub manifest_bytes: u64,
+    pub contract_digest: PlatformHandle,
+    pub protocol_set_digest: PlatformHandle,
+    pub provenance_path: PlatformHandle,
+    pub provenance_digest: PlatformHandle,
+    pub provenance_bytes: u64,
+    pub source_commit: PlatformHandle,
+    pub source_tree_id: PlatformHandle,
+    pub builder_script_digest: PlatformHandle,
+    pub cargo_manifest_digest: PlatformHandle,
+    pub cargo_lock_digest: PlatformHandle,
+    pub rust_toolchain_digest: PlatformHandle,
+    pub daemon_contract_source_digest: PlatformHandle,
+    pub module_manifest_source_digest: PlatformHandle,
+    pub cargo_profile: PlatformHandle,
+    pub build_target: PlatformHandle,
+    pub build_arguments: Vec<PlatformHandle>,
+}
+
+impl ModuleBuildProvenanceRecord {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the closed provenance record validates its field shapes, pinned build, and activation binding as one invariant"
+    )]
+    fn validate(&self) -> Result<(), JournalError> {
+        self.fence.validate()?;
+        self.operation.validate()?;
+        for (value, field) in [
+            (&self.module_id, "module_build_provenance.module_id"),
+            (&self.artifact_path, "module_build_provenance.artifact_path"),
+            (
+                &self.installation_profile,
+                "module_build_provenance.installation_profile",
+            ),
+            (&self.manifest_path, "module_build_provenance.manifest_path"),
+            (
+                &self.provenance_path,
+                "module_build_provenance.provenance_path",
+            ),
+            (&self.cargo_profile, "module_build_provenance.cargo_profile"),
+            (&self.build_target, "module_build_provenance.build_target"),
+        ] {
+            handle(value, field)?;
+        }
+        for (value, field) in [
+            (
+                &self.artifact_digest,
+                "module_build_provenance.artifact_digest",
+            ),
+            (&self.config_digest, "module_build_provenance.config_digest"),
+            (
+                &self.state_fence_digest,
+                "module_build_provenance.state_fence_digest",
+            ),
+            (
+                &self.manifest_digest,
+                "module_build_provenance.manifest_digest",
+            ),
+            (
+                &self.contract_digest,
+                "module_build_provenance.contract_digest",
+            ),
+            (
+                &self.protocol_set_digest,
+                "module_build_provenance.protocol_set_digest",
+            ),
+            (
+                &self.provenance_digest,
+                "module_build_provenance.provenance_digest",
+            ),
+            (
+                &self.builder_script_digest,
+                "module_build_provenance.builder_script_digest",
+            ),
+            (
+                &self.cargo_manifest_digest,
+                "module_build_provenance.cargo_manifest_digest",
+            ),
+            (
+                &self.cargo_lock_digest,
+                "module_build_provenance.cargo_lock_digest",
+            ),
+            (
+                &self.rust_toolchain_digest,
+                "module_build_provenance.rust_toolchain_digest",
+            ),
+            (
+                &self.daemon_contract_source_digest,
+                "module_build_provenance.daemon_contract_source_digest",
+            ),
+            (
+                &self.module_manifest_source_digest,
+                "module_build_provenance.module_manifest_source_digest",
+            ),
+        ] {
+            digest(value, field)?;
+            if value.as_str().bytes().any(|byte| byte.is_ascii_uppercase()) {
+                return Err(JournalError::Invalid(format!(
+                    "{field} must use lowercase hexadecimal"
+                )));
+            }
+        }
+        for (value, field) in [
+            (&self.source_commit, "module_build_provenance.source_commit"),
+            (
+                &self.source_tree_id,
+                "module_build_provenance.source_tree_id",
+            ),
+        ] {
+            let text = value.as_str();
+            if !(40..=64).contains(&text.len())
+                || !text
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            {
+                return Err(JournalError::Invalid(format!(
+                    "{field} must be a lowercase source identity"
+                )));
+            }
+        }
+        if self.module_id.as_str() != "eliotd"
+            || self.artifact_path.as_str() != "runtime/eliotd.exe"
+            || self.manifest_path.as_str() != "runtime/module.eliotd.toml"
+            || self.provenance_path.as_str() != "runtime/module.eliotd.provenance.json"
+            || self.cargo_profile.as_str() != "release"
+            || self.build_target.as_str() != "x86_64-pc-windows-msvc"
+            || self.artifact_bytes == 0
+            || self.manifest_bytes == 0
+            || self.provenance_bytes == 0
+        {
+            return Err(JournalError::Invalid(
+                "module build provenance has non-canonical role or build identity".into(),
+            ));
+        }
+        let expected_arguments = [
+            "build",
+            "--frozen",
+            "--locked",
+            "--offline",
+            "--release",
+            "-p",
+            "eliotd",
+            "--bin",
+            "eliotd",
+        ];
+        if self.build_arguments.len() != expected_arguments.len()
+            || self
+                .build_arguments
+                .iter()
+                .zip(expected_arguments)
+                .any(|(actual, expected)| actual.as_str() != expected)
+        {
+            return Err(JournalError::Invalid(
+                "module build provenance invocation is not the pinned eliotd release command"
+                    .into(),
+            ));
+        }
+        let expected_operation_id = format!("module-build-provenance:{}", self.module_id);
+        let current_activation = &self.fence.activation_generation.current;
+        let expected_idempotency_key = format!(
+            "activation:{}:{}:{}",
+            self.fence.activation_id,
+            current_activation.lineage_id.as_str(),
+            current_activation.sequence.get()
+        );
+        if self.operation.operation_id.as_str() != expected_operation_id
+            || self.operation.idempotency_key.as_str() != expected_idempotency_key
+        {
+            return Err(JournalError::Invalid(
+                "module build provenance operation identity is not deterministic for its activation"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)]
@@ -2715,6 +2910,8 @@ pub enum HostStateRecord {
     EpochRetirement(EpochRetirementRecord),
     StoreRebind(StoreRebindRecord),
     ReactiveContext(ReactiveContextRecord),
+    /// Readback-bound per-module release source/build proof (#22 W1).
+    ModuleBuildProvenance(ModuleBuildProvenanceRecord),
     /// Durable cutover intent/terminal record (#961).
     CutoverIntent(CutoverIntentRecord),
     /// Durable isolated backup destination preparation admission/result.
@@ -2740,6 +2937,7 @@ impl HostStateRecord {
             Self::EpochRetirement(value) => value.validate(),
             Self::StoreRebind(value) => value.validate(),
             Self::ReactiveContext(value) => validate_record_for_journal(value),
+            Self::ModuleBuildProvenance(value) => value.validate(),
             Self::CutoverIntent(value) => value.validate(),
             Self::BackupPreparation(value) => value.validate(),
         }
@@ -2768,6 +2966,7 @@ impl HostStateRecord {
             Self::EpochRetirement(value) => &value.fence,
             Self::StoreRebind(value) => &value.fence,
             Self::ReactiveContext(value) => &value.fence,
+            Self::ModuleBuildProvenance(value) => &value.fence,
             Self::CutoverIntent(value) => &value.fence,
             Self::BackupPreparation(value) => &value.fence,
         }
@@ -2788,6 +2987,7 @@ impl HostStateRecord {
             Self::EpochRetirement(value) => &value.operation,
             Self::StoreRebind(value) => &value.operation,
             Self::ReactiveContext(value) => &value.operation,
+            Self::ModuleBuildProvenance(value) => &value.operation,
             Self::CutoverIntent(value) => &value.operation,
             Self::BackupPreparation(value) => &value.operation,
         }
@@ -2863,6 +3063,11 @@ pub struct HostState {
     /// the operation was admitted and its outcome was never recorded.
     #[serde(default)]
     pub backup_preparations: Vec<BackupPreparationRecord>,
+    /// Current-generation module build/source rows, keyed by module id.
+    /// Generation advance clears this projection before a new provenance row
+    /// can be admitted.
+    #[serde(default)]
+    pub module_build_provenance: Vec<ModuleBuildProvenanceRecord>,
     pub clean_marker: Option<CleanMarker>,
     pub retained_epochs: Vec<EpochEvidence>,
     pub retired_epochs: Vec<HostInstallationEpoch>,
@@ -2914,6 +3119,7 @@ impl HostState {
             reactive_context: Some(ReactiveContextQueueState::default()),
             pending_cutover: None,
             backup_preparations: Vec::new(),
+            module_build_provenance: Vec::new(),
             clean_marker: None,
             retained_epochs,
             retired_epochs: Vec::new(),

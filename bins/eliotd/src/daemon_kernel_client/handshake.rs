@@ -202,7 +202,8 @@ pub(super) fn client_hello(
         .map_err(|error| KernelClientError::Contract(error.to_string()))?;
     let artifact_id = ArtifactId::new(binding.daemon_artifact_sha256.as_str())
         .map_err(|error| KernelClientError::Contract(error.to_string()))?;
-    let contract = declared_module_contract(module_id.clone(), artifact_id.clone());
+    let contract = admitted_daemon_module_contract(binding.daemon_artifact_sha256.as_str())
+        .map_err(|error| KernelClientError::Contract(error.to_string()))?;
     let generation = ModuleGeneration {
         module_id,
         generation: binding.module_generation,

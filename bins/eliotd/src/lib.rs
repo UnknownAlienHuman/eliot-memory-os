@@ -210,8 +210,6 @@ pub use controlboard_adapters::{
     is_controlboard_read_tool, serve_controlboard_view,
 };
 pub use daemon_config::{DaemonConfig, admit_daemon_module_manifest};
-#[cfg(windows)]
-pub use daemon_kernel_client::admitted_daemon_module_contract;
 pub(crate) use daemon_kernel_client::kernel_port_error;
 pub use daemon_kernel_client::{
     ActivationSubmitError, DaemonKernelClient, LocalReadSubmitOutcome, ObserveDeferOutcome,
@@ -219,6 +217,8 @@ pub use daemon_kernel_client::{
 };
 #[cfg(test)]
 pub(crate) use daemon_kernel_client::{KernelClientError, WireOutcome, operation_payload};
+#[cfg(windows)]
+pub use daemon_kernel_client::{admitted_daemon_module_contract, render_build_module_manifest};
 #[cfg(all(test, windows))]
 pub(crate) use daemon_kernel_client::{
     is_pre_admission_pending_rejection, retry_pre_admission, validate_server_hello,

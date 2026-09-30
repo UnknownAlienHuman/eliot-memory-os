@@ -24,7 +24,10 @@ use super::canary_removal::{
     CANARY_REMOVAL_WIRE_VERSION, CanaryRemovalOperation, CanaryRemovalOperationVersion,
     canary_removal_operation_id,
 };
-use super::package_planner::REQUIRED_PACKAGE_ROLES as SOURCE_BUNDLE_REQUIRED_ROLES;
+use super::package_planner::{
+    MODULE_BUILD_PROVENANCE_ROLES as SOURCE_BUNDLE_MODULE_PROVENANCE_ROLES,
+    REQUIRED_PACKAGE_ROLES as SOURCE_BUNDLE_REQUIRED_ROLES, package_inventory_roles,
+};
 use super::{
     ActivationCommitReceipt, GenerationPackagePlanner, INSTALLATION_TRANSACTION_WIRE_VERSION,
     InstallationError, InstallationStage, InstallationStepOutcome, InstallationTransaction,
@@ -2673,16 +2676,26 @@ fn validate_publication_journal(
                 reason: "destination leaf is invalid".to_owned(),
             })?,
     )?;
-    if journal.precommit_files.len() != SOURCE_BUNDLE_REQUIRED_ROLES.len() {
-        return Err(InstallationError::InvalidField {
-            field: "publication.precommit_files".to_owned(),
-            reason: "publication journal must retain the exact twelve-role inventory".to_owned(),
-        });
-    }
-    for (role, (expected_path, expected_executable)) in journal
+    let has_module_manifest = journal
         .precommit_files
         .iter()
-        .zip(SOURCE_BUNDLE_REQUIRED_ROLES)
+        .any(|role| role.relative_path == SOURCE_BUNDLE_MODULE_PROVENANCE_ROLES[0].0);
+    let has_module_provenance = journal
+        .precommit_files
+        .iter()
+        .any(|role| role.relative_path == SOURCE_BUNDLE_MODULE_PROVENANCE_ROLES[1].0);
+    if has_module_manifest != has_module_provenance {
+        return Err(InstallationError::IdentityConflict);
+    }
+    let expected_roles = package_inventory_roles(has_module_manifest);
+    if journal.precommit_files.len() != expected_roles.len() {
+        return Err(InstallationError::InvalidField {
+            field: "publication.precommit_files".to_owned(),
+            reason: "publication journal must retain a complete approved role inventory".to_owned(),
+        });
+    }
+    for (role, (expected_path, expected_executable)) in
+        journal.precommit_files.iter().zip(expected_roles)
     {
         validate_package_relative_path(Path::new(&role.relative_path)).map_err(|error| {
             InstallationError::InvalidField {
@@ -2904,7 +2917,7 @@ fn verify_publication_bundle(
     let observation = bundle
         .observe()
         .map_err(|error| InstallationError::Platform(error.to_string()))?;
-    if observation.files.len() != SOURCE_BUNDLE_REQUIRED_ROLES.len() {
+    if observation.files.len() != journal.precommit_files.len() {
         return Err(InstallationError::IdentityConflict);
     }
     for role in &journal.precommit_files {
