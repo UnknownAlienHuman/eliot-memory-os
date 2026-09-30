@@ -39,14 +39,14 @@ pub(crate) const USER_BROKER_FENCE_OPERATION: &str = "eliot.user-broker.fence";
 pub(crate) const USER_BROKER_VALIDATE_NATIVE_RESOURCE_SELECTION_CURRENT_OPERATION: &str =
     "eliot.user-broker.validate-native-resource-selection-current";
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct UserBrokerHeartbeatPayload {
     registration: RegistrationReceipt,
     observed_at: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct UserBrokerResourceSelectionCurrentPayload {
     registration: RegistrationReceipt,
