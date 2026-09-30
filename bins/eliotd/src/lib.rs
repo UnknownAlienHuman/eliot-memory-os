@@ -4267,18 +4267,18 @@ impl DaemonComposition {
     /// - it is **circular** — `GovernorComposition::admit_observed_scope_attach`
     ///   fails closed unless a `WorkScope` owner is already retained, and this
     ///   method is the only daemon path that installs one;
-    /// - the daemon holds no `WorkScopeDescriptor`, no `GoverningSourceSet`, and
-    ///   no authenticated authorization reference, so three of the nine
-    ///   `ScopeAttachIngress` fields would have to be fabricated;
+    /// - no production transport supplies the retained descriptor, admitted
+    ///   governing-source closure, authorization reference, or privacy
+    ///   boundary required by `ScopeAttachIngress`;
     /// - the daemon knows only its own config and state directories, which are
     ///   not a user `WorkScope`. Attaching one of them as a scope would create
     ///   a `WorkScope` binding the user never declared.
     ///
     /// The legitimate owner is the attach-transport ingress
     /// `eliot_governor::GovernorComposition` already documents as blocked
-    /// ("attach-transport: `bins/eliotd` `ScopeAttachIngress` carries no
-    /// discovery or onboarding lease"). A startup attach was deliberately not
-    /// added to manufacture a caller.
+    /// (`ScopeAttachIngress` carries no discovery/onboarding lease, and no
+    /// current transport provides its owner-issued privacy boundary). A
+    /// startup attach was deliberately not added to manufacture a caller.
     pub fn admit_scope_attach(
         &mut self,
         ingress: &task_binding_admission::ScopeAttachIngress,
@@ -4307,6 +4307,7 @@ impl DaemonComposition {
             ingress.governing_source_generation,
             &ingress.sources,
             &ingress.privacy,
+            &ingress.privacy_boundary,
             ingress.owner_revision,
         )?;
         let snapshot = self

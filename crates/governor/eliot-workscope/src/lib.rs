@@ -454,11 +454,25 @@ pub struct ScopeBindingGuardReceipt {
     pub source_generation: u64,
 }
 
+/// Exact privacy and governing-source authority admitted with one binding.
+///
+/// This value is retained from the admission arguments. It is never rebuilt
+/// from a binding, scan name, ticket, or legacy snapshot.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkScopeAdmissionAuthority {
+    pub privacy_profile: PrivacyProfile,
+    pub privacy_boundary: PrivacyBoundary,
+    pub governing_sources: GoverningSourceSet,
+}
+
 /// The persisted, exact current `WorkScope` binding owned by the governor.
 ///
 /// This is a closed snapshot: it carries no task, plan, session, principal or
 /// kernel-generation authority.  Admission and recovery validate the guard
-/// receipt against the retained binding before exposing the snapshot.
+/// receipt against the retained binding before exposing the snapshot. A
+/// missing `admission_authority` is a legacy row and never grants default
+/// privacy or governing-source authority.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkScopeBindingSnapshot {
@@ -466,6 +480,8 @@ pub struct WorkScopeBindingSnapshot {
     pub owner_revision: u64,
     pub binding: ScopeBinding,
     pub guard_receipt: ScopeBindingGuardReceipt,
+    #[serde(default)]
+    pub admission_authority: Option<WorkScopeAdmissionAuthority>,
 }
 
 /// The canonical owner for one current `WorkScope` binding.
@@ -515,6 +531,10 @@ pub enum WorkScopeError {
     BindingReceiptNotMatched,
     #[error("scope binding guard receipt does not match the retained binding")]
     BindingReceiptMismatch,
+    #[error("retained WorkScope admission authority is unavailable")]
+    AdmissionAuthorityUnavailable,
+    #[error("retained WorkScope admission authority does not match its binding")]
+    AdmissionAuthorityMismatch,
     #[error("scan disclosure storage contour is not admitted by the installation owner")]
     ScanContourNotAdmitted,
     #[error("scan disclosure identity conflicts with the retained owner record")]
@@ -3130,8 +3150,58 @@ impl ScopeBinding {
     }
 }
 
+impl WorkScopeAdmissionAuthority {
+    fn validate_for(
+        &self,
+        state_fence: &StateFence,
+        binding: &ScopeBinding,
+    ) -> Result<(), WorkScopeError> {
+        self.privacy_profile.validate()?;
+        self.privacy_boundary.validate()?;
+        if !self.privacy_profile.admits(binding.privacy_class)
+            || !self.privacy_boundary.admits(binding.privacy_class)
+        {
+            return Err(WorkScopeError::PrivacyDenied);
+        }
+        let boundary_lineage = self
+            .privacy_boundary
+            .lineage
+            .as_ref()
+            .map(|lineage| lineage.lineage_ref.as_str());
+        if boundary_lineage != binding.scope.lineage_ref.as_deref() {
+            return Err(WorkScopeError::AdmissionAuthorityMismatch);
+        }
+        if self.governing_sources.generation != binding.governing_source_generation {
+            return Err(WorkScopeError::SourceSetMismatch);
+        }
+        self.governing_sources
+            .validate_for(&binding.scope, &self.privacy_profile)?;
+        if self
+            .governing_sources
+            .sources
+            .iter()
+            .any(|source| source.assurance.state_fence != *state_fence)
+        {
+            return Err(WorkScopeError::InvalidSourceEvidence);
+        }
+        if self
+            .governing_sources
+            .sources
+            .iter()
+            .any(|source| !self.privacy_boundary.admits(source.assurance.privacy_class))
+        {
+            return Err(WorkScopeError::PrivacyDenied);
+        }
+        Ok(())
+    }
+}
+
 impl WorkScopeBindingSnapshot {
     /// Constructs a persisted current binding only after full receipt closure.
+    ///
+    /// This constructor preserves legacy snapshots that have no retained
+    /// admission authority. Consumers requiring that authority must use
+    /// [`WorkScopeBindingOwner::read_admission_authority`] and fail closed.
     pub fn new(
         state_fence: StateFence,
         owner_revision: u64,
@@ -3143,6 +3213,26 @@ impl WorkScopeBindingSnapshot {
             owner_revision,
             binding,
             guard_receipt,
+            admission_authority: None,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    /// Constructs a snapshot with the exact authority retained at admission.
+    pub fn new_with_authority(
+        state_fence: StateFence,
+        owner_revision: u64,
+        binding: ScopeBinding,
+        guard_receipt: ScopeBindingGuardReceipt,
+        admission_authority: WorkScopeAdmissionAuthority,
+    ) -> Result<Self, WorkScopeError> {
+        let snapshot = Self {
+            state_fence,
+            owner_revision,
+            binding,
+            guard_receipt,
+            admission_authority: Some(admission_authority),
         };
         snapshot.validate()?;
         Ok(snapshot)
@@ -3181,6 +3271,18 @@ impl WorkScopeBindingSnapshot {
         {
             return Err(WorkScopeError::BindingReceiptMismatch);
         }
+        if let Some(authority) = &self.admission_authority {
+            authority.validate_for(&self.state_fence, &self.binding)?;
+            let current_receipt = ScopeBindingGuard.check(
+                &self.binding,
+                &self.binding,
+                &authority.governing_sources,
+                &authority.privacy_profile,
+            );
+            if current_receipt != self.guard_receipt {
+                return Err(WorkScopeError::AdmissionAuthorityMismatch);
+            }
+        }
         Ok(())
     }
 }
@@ -3192,6 +3294,8 @@ struct WorkScopeBindingSnapshotWire {
     owner_revision: u64,
     binding: ScopeBinding,
     guard_receipt: ScopeBindingGuardReceipt,
+    #[serde(default)]
+    admission_authority: Option<WorkScopeAdmissionAuthority>,
 }
 
 impl<'de> Deserialize<'de> for WorkScopeBindingSnapshot {
@@ -3200,13 +3304,15 @@ impl<'de> Deserialize<'de> for WorkScopeBindingSnapshot {
         D: serde::Deserializer<'de>,
     {
         let wire = WorkScopeBindingSnapshotWire::deserialize(deserializer)?;
-        Self::new(
-            wire.state_fence,
-            wire.owner_revision,
-            wire.binding,
-            wire.guard_receipt,
-        )
-        .map_err(serde::de::Error::custom)
+        let snapshot = Self {
+            state_fence: wire.state_fence,
+            owner_revision: wire.owner_revision,
+            binding: wire.binding,
+            guard_receipt: wire.guard_receipt,
+            admission_authority: wire.admission_authority,
+        };
+        snapshot.validate().map_err(serde::de::Error::custom)?;
+        Ok(snapshot)
     }
 }
 
@@ -3235,6 +3341,20 @@ impl WorkScopeBindingOwner {
             return Err(WorkScopeError::StateFenceMismatch);
         }
         Ok(self.snapshot.clone())
+    }
+
+    /// Reads the retained admission authority only at its exact state fence.
+    ///
+    /// Legacy snapshots return [`WorkScopeError::AdmissionAuthorityUnavailable`];
+    /// the binding, ticket, and caller claims are never used to reconstruct it.
+    pub fn read_admission_authority(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<WorkScopeAdmissionAuthority, WorkScopeError> {
+        let snapshot = self.read_current(state_fence)?;
+        snapshot
+            .admission_authority
+            .ok_or(WorkScopeError::AdmissionAuthorityUnavailable)
     }
 }
 
@@ -3341,6 +3461,30 @@ mod tests {
             binding,
             receipt,
         )
+    }
+
+    fn admission_authority_fixture(
+        state_fence: &StateFence,
+        binding: &ScopeBinding,
+    ) -> WorkScopeAdmissionAuthority {
+        let scope = candidate(&binding.scope.instance_ref);
+        let mut governing_sources = source_set(&scope);
+        governing_sources.sources[0].authority_basis =
+            Some(AuthorityBasis::ProjectContract {
+                contract_ref: "contract:architecture".into(),
+            });
+        governing_sources.sources[0].assurance.state_fence = state_fence.clone();
+        WorkScopeAdmissionAuthority {
+            privacy_profile: PrivacyProfile {
+                admitted_classes: vec![binding.privacy_class],
+            },
+            privacy_boundary: PrivacyBoundary {
+                boundary_ref: "privacy-boundary:one".into(),
+                admitted_classes: vec![binding.privacy_class],
+                lineage: scope.lineage,
+            },
+            governing_sources,
+        }
     }
 
     fn source_set(scope: &WorkScopeCandidate) -> GoverningSourceSet {
@@ -3541,6 +3685,127 @@ mod tests {
             Err(error) => panic!("binding owner recovery failed: {error}"),
         };
         assert_eq!(recovered_owner.read_current(&state_fence), Ok(snapshot));
+    }
+
+    #[test]
+    fn admission_authority_is_retained_and_read_at_its_exact_fence() {
+        let (_, binding, _) = binding_fixture();
+        let state_fence = StateFence::new(
+            test_epoch(TEST_LINEAGE_A, 1),
+            ResourceGeneration::new(binding.scope.generation)
+                .unwrap_or(ResourceGeneration::genesis()),
+        );
+        let authority = admission_authority_fixture(&state_fence, &binding);
+        let receipt = ScopeBindingGuard.check(
+            &binding,
+            &binding,
+            &authority.governing_sources,
+            &authority.privacy_profile,
+        );
+        let snapshot = match WorkScopeBindingSnapshot::new_with_authority(
+            state_fence.clone(),
+            7,
+            binding,
+            receipt,
+            authority.clone(),
+        ) {
+            Ok(value) => value,
+            Err(error) => panic!("authority snapshot fixture is invalid: {error}"),
+        };
+        let owner = match WorkScopeBindingOwner::new(snapshot) {
+            Ok(value) => value,
+            Err(error) => panic!("authority owner fixture is invalid: {error}"),
+        };
+        assert_eq!(owner.read_admission_authority(&state_fence), Ok(authority));
+
+        let stale_fence = StateFence::new(
+            test_epoch(TEST_LINEAGE_A, 2),
+            state_fence.resource_generation.clone(),
+        );
+        assert_eq!(
+            owner.read_admission_authority(&stale_fence),
+            Err(WorkScopeError::StateFenceMismatch)
+        );
+    }
+
+    #[test]
+    fn legacy_binding_snapshot_does_not_gain_admission_authority() {
+        let (state_fence, binding, receipt) = binding_fixture();
+        let snapshot =
+            match WorkScopeBindingSnapshot::new(state_fence.clone(), 7, binding, receipt) {
+                Ok(value) => value,
+                Err(error) => panic!("legacy binding snapshot fixture is invalid: {error}"),
+            };
+        let mut legacy = match serde_json::to_value(&snapshot) {
+            Ok(value) => value,
+            Err(error) => panic!("binding snapshot serialization failed: {error}"),
+        };
+        if let Some(fields) = legacy.as_object_mut() {
+            fields.remove("admission_authority");
+        } else {
+            panic!("serialized binding snapshot is not an object");
+        }
+        let recovered: WorkScopeBindingSnapshot = from_json(legacy);
+        assert_eq!(recovered.admission_authority, None);
+        let owner = match WorkScopeBindingOwner::from_snapshot(recovered) {
+            Ok(value) => value,
+            Err(error) => panic!("legacy binding owner recovery failed: {error}"),
+        };
+        assert_eq!(
+            owner.read_admission_authority(&state_fence),
+            Err(WorkScopeError::AdmissionAuthorityUnavailable)
+        );
+    }
+
+    #[test]
+    fn retained_admission_authority_rejects_fence_and_lineage_drift() {
+        let (_, binding, _) = binding_fixture();
+        let state_fence = StateFence::new(
+            test_epoch(TEST_LINEAGE_A, 1),
+            ResourceGeneration::new(binding.scope.generation)
+                .unwrap_or(ResourceGeneration::genesis()),
+        );
+        let mut authority = admission_authority_fixture(&state_fence, &binding);
+        let receipt = ScopeBindingGuard.check(
+            &binding,
+            &binding,
+            &authority.governing_sources,
+            &authority.privacy_profile,
+        );
+        authority.governing_sources.sources[0].assurance.state_fence = StateFence::new(
+            test_epoch(TEST_LINEAGE_A, 2),
+            ResourceGeneration::new(binding.scope.generation)
+                .unwrap_or(ResourceGeneration::genesis()),
+        );
+        assert_eq!(
+            WorkScopeBindingSnapshot::new_with_authority(
+                state_fence.clone(),
+                7,
+                binding.clone(),
+                receipt,
+                authority,
+            ),
+            Err(WorkScopeError::InvalidSourceEvidence)
+        );
+
+        let mut authority = admission_authority_fixture(&state_fence, &binding);
+        authority.privacy_boundary.lineage = None;
+        let receipt = ScopeBindingGuard.check(
+            &binding,
+            &binding,
+            &authority.governing_sources,
+            &authority.privacy_profile,
+        );
+        assert_eq!(
+            WorkScopeBindingSnapshot::new_with_authority(
+                state_fence,
+                7,
+                binding,
+                receipt,
+                authority,
+            ),
+            Err(WorkScopeError::AdmissionAuthorityMismatch)
+        );
     }
 
     #[test]

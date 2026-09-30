@@ -249,8 +249,8 @@ use eliot_workscope::{
     BootstrapDiscoveryInputs, BootstrapScanEvidence, DiscoveryLeaseKey, DiscoveryLeaseRequest,
     DiscoveryRead, DiscoveryReadLease, GoverningSourceCandidateEvidence, GoverningSourceRole,
     ManifestEvidence, ObservedScopeResources, OnboardingLease, OnboardingReadinessReceipt,
-    ReadinessLifecycle, ScopeBindingDisposition, ScopeResolutionState, TaskBindingState,
-    issue_discovery_lease, task_selection_required,
+    PrivacyBoundary, ReadinessLifecycle, ScopeBindingDisposition, ScopeResolutionState,
+    TaskBindingState, issue_discovery_lease, task_selection_required,
 };
 
 /// Authenticated activation's bounded filesystem/VCS observation and its
@@ -3385,8 +3385,10 @@ pub struct ScopeAttachIngress {
     pub governing_source_generation: u64,
     /// Onboarding-retained governing sources for the observed instance.
     pub sources: GoverningSourceSet,
-    /// Privacy boundary the new binding must satisfy.
+    /// Privacy profile used to admit the governing-source closure.
     pub privacy: PrivacyProfile,
+    /// Exact boundary and lineage admitted by the caller for this binding.
+    pub privacy_boundary: PrivacyBoundary,
     /// Caller-sequenced durable revision for the admitted owner.
     pub owner_revision: u64,
 }
@@ -3397,7 +3399,9 @@ impl ScopeAttachIngress {
     /// Malformed caller fields (blank references, zero counters) fail as
     /// `TASK_SELECTION_REQUIRED`; scope-identity disagreements (a descriptor
     /// that does not validate, a privacy class outside the admitted
-    /// boundary) fail as `TASK_SCOPE_INCOMPATIBLE`. A non-absolute root
+    /// profile or privacy boundary) fail as `TASK_SCOPE_INCOMPATIBLE`. A
+    /// boundary whose exact lineage differs from the descriptor also fails
+    /// as incompatible. A non-absolute root
     /// fails as incompatible: only an explicit absolute path may be
     /// observed. The governing source set itself is checked at admission
     /// against the observed scope, never here.
@@ -3439,9 +3443,21 @@ impl ScopeAttachIngress {
                 "attach ingress privacy boundary invalid: {error}"
             ))
         })?;
-        if !self.privacy.admits(self.privacy_class) {
+        self.privacy_boundary.validate().map_err(|error| {
+            TaskBindingError::scope_incompatible(format!(
+                "attach ingress privacy boundary invalid: {error}"
+            ))
+        })?;
+        if !self.privacy.admits(self.privacy_class)
+            || !self.privacy_boundary.admits(self.privacy_class)
+        {
             return Err(TaskBindingError::scope_incompatible(
                 "attach ingress privacy class is outside the admitted boundary",
+            ));
+        }
+        if self.privacy_boundary.lineage != self.descriptor.lineage {
+            return Err(TaskBindingError::scope_incompatible(
+                "attach ingress privacy boundary lineage differs from the descriptor",
             ));
         }
         Ok(())
