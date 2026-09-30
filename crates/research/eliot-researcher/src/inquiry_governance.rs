@@ -4206,7 +4206,7 @@ impl EvidenceFreeze {
         // it does not prove that `supersedes` names a freeze or that
         // `expected_revision` names a revision, and a record whose predecessor is
         // a blank string would otherwise re-present as a successor of nothing.
-        for (value, field) in [
+        for (field, value) in [
             ("freeze.supersedes", self.supersedes.as_deref()),
             (
                 "freeze.expected_revision",
