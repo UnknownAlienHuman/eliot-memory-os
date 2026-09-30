@@ -21,6 +21,7 @@
 //! its public API while the control-plane lifecycle gateway has a bounded home.
 
 use super::*;
+use tracing::Instrument;
 
 /// F-LOG-KERNEL-4 (#903): control-plane boundary observations.
 ///
@@ -28,11 +29,16 @@ use super::*;
 /// plus a bounded stable outcome. Never carries request payloads, digests,
 /// peer identities, pipe names, or owner error strings (I15.4, I07.20).
 fn observe_control(event: &'static str, outcome: &'static str) {
+    observe_control_in_context(event, outcome, &tracing::Span::current());
+}
+
+fn observe_control_in_context(event: &'static str, outcome: &'static str, context: &tracing::Span) {
     use super::kernel_diagnostics::{KERNEL_DIAGNOSTICS_TARGET, bound_field};
     let event_bound = bound_field(event);
     let outcome_bound = bound_field(outcome);
     tracing::info!(
         target: KERNEL_DIAGNOSTICS_TARGET,
+        parent: context,
         event = event_bound.text(),
         outcome = outcome_bound.text(),
         "control plane observation"
@@ -93,6 +99,8 @@ fn control_request_terminal_code(error: &TransportError) -> &'static str {
 enum ControlRequestFailure {
     Transport(TransportError),
     Transition(KernelServiceError),
+    /// A nested operation already owns the failed operation terminal.
+    TerminalOwned(TransportError),
 }
 
 impl From<TransportError> for ControlRequestFailure {
@@ -168,25 +176,32 @@ impl KernelComposition {
         &self,
         command: KernelControlCommand,
     ) -> Result<KernelServiceState, KernelServiceError> {
-        self.apply_control_with_terminal(command, true)
+        let context = super::kernel_diagnostics::operation_context(None, None, None, None);
+        self.apply_control_with_terminal(command, true, &context)
     }
 
     fn apply_control_with_terminal(
         &self,
         command: KernelControlCommand,
         emit_terminal: bool,
+        context: &tracing::Span,
     ) -> Result<KernelServiceState, KernelServiceError> {
-        observe_control("kernel.control.transition_requested", "attempt");
+        observe_control_in_context("kernel.control.transition_requested", "attempt", context);
         match self.apply_control_inner(command) {
             Ok(state) => {
-                observe_control("kernel.control.transition_committed", "success");
+                observe_control_in_context(
+                    "kernel.control.transition_committed",
+                    "success",
+                    context,
+                );
                 Ok(state)
             }
             Err(error) => {
-                observe_control("kernel.control.transition_failed", "rejected");
+                observe_control_in_context("kernel.control.transition_failed", "rejected", context);
                 if emit_terminal {
-                    super::kernel_diagnostics::observe_terminal_error(
+                    super::kernel_diagnostics::observe_terminal_error_in_context(
                         control_transition_terminal_code(&error),
+                        context,
                     );
                 }
                 Err(error)
@@ -230,24 +245,55 @@ impl KernelComposition {
         peer: &PeerIdentity,
         expected_sequence: u64,
     ) -> Result<KernelControlResponse, TransportError> {
-        observe_control("kernel.control.request_received", "attempt");
-        match Box::pin(self.apply_control_request_inner(request, peer, expected_sequence)).await {
+        let validated = request.validate().is_ok();
+        let generation = validated.then(|| request.generation.value().to_string());
+        let epoch = validated
+            .then(|| StateFence::canonical_epoch_digest(&request.candidate.kernel_epoch).ok())
+            .flatten();
+        let context = super::kernel_diagnostics::operation_context(
+            validated.then_some(request.message_id.as_str()),
+            generation.as_deref(),
+            None,
+            epoch.as_ref().map(|value| value.as_str()),
+        );
+        if validated {
+            let request_id = super::kernel_diagnostics::bound_field(request.message_id.as_str());
+            context.record("request_id", request_id.text());
+            context.record(
+                "request_id_redaction",
+                request_id.redaction_status().unwrap_or("none"),
+            );
+        }
+        observe_control_in_context("kernel.control.request_received", "attempt", &context);
+        match Box::pin(self.apply_control_request_inner(request, peer, expected_sequence, &context))
+            .instrument(context.clone())
+            .await
+        {
             Ok(response) => {
-                observe_control("kernel.control.request_admitted", "success");
+                observe_control_in_context("kernel.control.request_admitted", "success", &context);
                 Ok(response)
             }
             Err(error) => {
-                observe_control("kernel.control.request_denied", "rejected");
-                let (terminal_code, transport_error) = match error {
+                observe_control_in_context("kernel.control.request_denied", "rejected", &context);
+                let (terminal_code, transport_error, emit_terminal) = match error {
                     ControlRequestFailure::Transport(error) => {
-                        (control_request_terminal_code(&error), error)
+                        (control_request_terminal_code(&error), error, true)
                     }
                     ControlRequestFailure::Transition(error) => (
                         control_transition_terminal_code(&error),
                         TransportError::SessionFenced,
+                        true,
                     ),
+                    ControlRequestFailure::TerminalOwned(error) => {
+                        (control_request_terminal_code(&error), error, false)
+                    }
                 };
-                super::kernel_diagnostics::observe_terminal_error(terminal_code);
+                if emit_terminal {
+                    super::kernel_diagnostics::observe_terminal_error_in_context(
+                        terminal_code,
+                        &context,
+                    );
+                }
                 Err(transport_error)
             }
         }
@@ -265,6 +311,7 @@ impl KernelComposition {
         request: KernelControlRequest,
         peer: &PeerIdentity,
         expected_sequence: u64,
+        context: &tracing::Span,
     ) -> Result<KernelControlResponse, ControlRequestFailure> {
         request
             .validate()
@@ -617,9 +664,20 @@ impl KernelComposition {
         let is_probe = matches!(&request.command, KernelControlCommand::ProbeReady);
         #[cfg(windows)]
         let supervision_publication = if is_probe {
+            let mut terminal_owned = false;
             Some(
-                self.renew_daemon_supervision_for_probe(&request)
-                    .map_err(|_| TransportError::SessionFenced)?,
+                self.renew_daemon_supervision_for_probe_in_context(
+                    &request,
+                    context,
+                    &mut terminal_owned,
+                )
+                .map_err(|_| {
+                    if terminal_owned {
+                        ControlRequestFailure::TerminalOwned(TransportError::SessionFenced)
+                    } else {
+                        ControlRequestFailure::Transport(TransportError::SessionFenced)
+                    }
+                })?,
             )
         } else {
             None
@@ -697,10 +755,22 @@ impl KernelComposition {
         let receipt = if is_probe {
             #[cfg(windows)]
             {
+                let mut terminal_owned = false;
                 Some(
-                    self.self_authored_ready_receipt(&request, peer)
-                        .await
-                        .map_err(|_| TransportError::SessionFenced)?,
+                    self.self_authored_ready_receipt_in_context(
+                        &request,
+                        peer,
+                        context,
+                        &mut terminal_owned,
+                    )
+                    .await
+                    .map_err(|_| {
+                        if terminal_owned {
+                            ControlRequestFailure::TerminalOwned(TransportError::SessionFenced)
+                        } else {
+                            ControlRequestFailure::Transport(TransportError::SessionFenced)
+                        }
+                    })?,
                 )
             }
             #[cfg(not(windows))]
@@ -842,10 +912,10 @@ impl KernelComposition {
                 .is_some()
         {
             let launched = self
-                .launch_eliotd()
+                .launch_eliotd_in_context(context)
                 .await
-                .map_err(|_| TransportError::SessionFenced)?;
-            self.await_daemon_ready(&launched, self.ipc_limits().operation_timeout)
+                .map_err(|_| ControlRequestFailure::TerminalOwned(TransportError::SessionFenced))?;
+            self.await_daemon_ready(&launched, self.ipc_limits().operation_timeout, context)
                 .await
                 .map_err(|_| TransportError::SessionFenced)?;
         }
@@ -900,7 +970,7 @@ impl KernelComposition {
                     self.revoke_runtime_lease(&query.state_fence, &query.lease_id)?;
                 }
                 command => {
-                    self.apply_control_with_terminal(command.clone(), false)
+                    self.apply_control_with_terminal(command.clone(), false, context)
                         .map_err(ControlRequestFailure::Transition)?;
                 }
             }

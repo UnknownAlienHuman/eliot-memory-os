@@ -565,7 +565,9 @@ impl SupervisionLeaseCommitTicket {
         )
     }
 
-    pub(crate) fn validate(&self) -> Result<(), OrsError> {
+    /// Validates this original ticket before an external owner uses its fields.
+    /// This preserves the existing ticket/payload checks and grants no authority.
+    pub fn validate(&self) -> Result<(), OrsError> {
         self.expected_payload()?;
         Ok(())
     }
