@@ -41,6 +41,17 @@ use eliot_kernel_service::{
     IrreversibleStorageEffect, StorageReplacement, StorageReplacementCutoverReceipt,
     StorageReplacementStage, StorageReplacementTransfer, StorageRollbackDisposition,
 };
+// Issue #1872: the durable owner read/write of the storage-replacement cutover
+// receipt. The coordinator's own `StorageReplacementCutoverReceipt` is an
+// in-process value; the ORS `StorageReplacementCutoverReceiptRecord` is the
+// owner's durable proof of a committed `canonical_store` route cutover, keyed by
+// the real `cutover_id`. The ingress writes it through the owner's own store
+// adapter and proves a post-cutover operation from it, so a caller-presented
+// receipt is never the evidence.
+use eliot_ors::{
+    IrreversibleStorageEffectKind, StorageReplacementCutoverReceiptRecord,
+    StorageReplacementTransferRecord,
+};
 use eliot_process::{
     OperationId, OriginChallengeRequest, OriginControlGrant, OriginControlOperation,
     OriginControlPresentation, ProcessExecutionView, ProcessLifecycle,
@@ -248,12 +259,10 @@ pub(crate) const USER_AUTOMATION_OPERATOR_OPERATION: &str = "eliot_user_automati
 /// Reaching the arm is not the same as a cutover being available. The arm admits
 /// the exact session fence and generation and then drives the coordinator, which
 /// re-derives the route scope and cutover state from the committed ORS
-/// cutover-ownership record rather than the payload — and the durable
-/// `StorageReplacementCutoverReceiptRecord` is **not yet** in `eliot-ors`, so
-/// after a crash the operator must still hold the receipt. The operation is
-/// honestly *reachable and admitted*,
-/// not *durably recoverable*; the missing record is named in the issue's
-/// remaining work.
+/// cutover-ownership record rather than the payload. The receipt the coordinator
+/// constructs is then handed to the ORS owner, which records it durably under
+/// the same real `cutover_id` before any reply exists, so a committed cutover
+/// and its proof are written in the same admitted operation and cannot diverge.
 pub(crate) const STORAGE_REPLACEMENT_OPERATION: &str = "daemon_storage_replacement";
 
 /// Authenticated daemon operation that reconstructs an I5.11 replacement whose
@@ -261,9 +270,10 @@ pub(crate) const STORAGE_REPLACEMENT_OPERATION: &str = "daemon_storage_replaceme
 ///
 /// This is the path a retry of a committed cutover reaches, and the only one:
 /// [`STORAGE_REPLACEMENT_OPERATION`] itself refuses a candidate generation that
-/// already owns the pinned route through a committed cutover. It carries the same
-/// availability caveat as that operation — it is recognized here and unreachable
-/// from the front door until `frame_dispatch::is_daemon_operation` lists it.
+/// already owns the pinned route through a committed cutover. The presented
+/// receipt is only a claim here: the cutover is proven from the ORS owner's
+/// durable receipt record, so after a crash the operator does not have to still
+/// be holding the receipt.
 pub(crate) const STORAGE_REPLACEMENT_RESUME_OPERATION: &str = "daemon_storage_replacement_resume";
 
 /// Authenticated daemon operation that answers one I5.14 rollback request for a
@@ -273,10 +283,26 @@ pub(crate) const STORAGE_REPLACEMENT_RESUME_OPERATION: &str = "daemon_storage_re
 /// reaches [`StorageReplacement::request_rollback`], which reloads the
 /// ORS-committed cut ownership row its receipt names and refuses the request as
 /// a generation rollback once an irreversible migration or external effect is
-/// recorded. It carries the same availability caveat as
-/// [`STORAGE_REPLACEMENT_OPERATION`].
+/// recorded. The `I5.14` decision is reached only after the presented receipt
+/// has been reconciled against the owner's durable receipt record, so a caller
+/// cannot obtain a permitted generation rollback by presenting a receipt the
+/// owner does not hold.
 pub(crate) const STORAGE_REPLACEMENT_ROLLBACK_OPERATION: &str =
     "daemon_storage_replacement_rollback";
+
+/// Terminal code for a request whose committed cutover the ORS owner does not
+/// prove with a durable receipt record.
+///
+/// This is deliberately neither [`storage_replacement_terminal_code`]'s
+/// "committed" answer nor a cutover failure. The `canonical_store` route cutover
+/// is already committed in the `CUTOVER_OWNERSHIP` row by the time this can be
+/// emitted, so the route is switched and nothing here says it is not; what is
+/// missing is the owner's durable proof of it. Absence of that record leaves
+/// the outcome unestablished — a cutover whose proof exists only in one process's
+/// memory is an effect nobody can reconcile — so it is reported as its own class
+/// instead of collapsing into "the cutover failed" or into a success.
+const STORAGE_REPLACEMENT_RECEIPT_UNESTABLISHED: &str =
+    "REPLACEMENT_RECEIPT_UNESTABLISHED";
 
 const STARTUP_EVIDENCE_FIELDS: [&str; 8] = [
     "transport_binding",
@@ -2263,6 +2289,96 @@ fn record_storage_replacement_stage(
     Ok(())
 }
 
+/// Projects the ORS owner's irreversible-effect vocabulary onto the
+/// coordinator's.
+///
+/// Both spellings are the same closed `I5.11` set, and the owner's record is the
+/// proof, so every value that reaches the coordinator's `I5.14` decision is read
+/// through this one projection from the durable record rather than from the
+/// caller's copy.
+fn owned_irreversible_effects(
+    owned: &BTreeSet<IrreversibleStorageEffectKind>,
+) -> BTreeSet<IrreversibleStorageEffect> {
+    let mut effects = BTreeSet::new();
+    for effect in owned {
+        effects.insert(match effect {
+            IrreversibleStorageEffectKind::IrreversibleMigration => {
+                IrreversibleStorageEffect::IrreversibleMigration
+            }
+            IrreversibleStorageEffectKind::ExternalEffectIssued => {
+                IrreversibleStorageEffect::ExternalEffectIssued
+            }
+        });
+    }
+    effects
+}
+
+/// Projects the coordinator's in-process cutover receipt onto the ORS owner's
+/// durable receipt record and writes it through the owner's own store adapter.
+///
+/// Every field is copied from the coordinator's receipt, which the coordinator
+/// itself re-derived from the committed `CUTOVER_OWNERSHIP` row, and the record
+/// is keyed by that same `cutover_id`. Nothing is recomputed and nothing is
+/// supplied by the caller. The write is two owner steps — stage, then commit —
+/// mirroring the existing cutover-ownership staging, and the commit copies the
+/// committed cutover row's own linearization identity rather than minting one,
+/// so the proof cannot claim a linearization point the cutover does not have.
+fn record_storage_replacement_receipt(
+    ors: &RedbRecoveryStore,
+    receipt: &StorageReplacementCutoverReceipt,
+) -> Result<(), KernelServiceError> {
+    let cutover_id = receipt.committed_cutover.cutover_id.as_str();
+    let mut irreversible_effects = BTreeSet::new();
+    for effect in &receipt.irreversible_effects {
+        irreversible_effects.insert(match effect {
+            IrreversibleStorageEffect::IrreversibleMigration => {
+                IrreversibleStorageEffectKind::IrreversibleMigration
+            }
+            IrreversibleStorageEffect::ExternalEffectIssued => {
+                IrreversibleStorageEffectKind::ExternalEffectIssued
+            }
+        });
+    }
+    let record = StorageReplacementCutoverReceiptRecord {
+        cutover_id: cutover_id.to_owned(),
+        replacement_id: receipt.replacement_id.clone(),
+        incumbent_generation: receipt.incumbent_generation,
+        candidate_generation: receipt.candidate_generation,
+        transfer: StorageReplacementTransferRecord {
+            format: receipt.transfer.format.clone(),
+            payload_digest: receipt.transfer.payload_digest.clone(),
+            export_fence_digest: receipt.transfer.export_fence_digest.clone(),
+        },
+        irreversible_effects,
+        linearization_record_id: None,
+    };
+    ors.stage_storage_replacement_receipt(record)
+        .and_then(|_| ors.commit_storage_replacement_receipt(cutover_id))
+        .map(|_| ())
+        .map_err(|error| KernelServiceError::Platform(error.to_string()))
+}
+
+/// Whether a caller-presented receipt agrees with the ORS owner's durable
+/// record of the same cutover, field for field.
+///
+/// The owner's record is the proof and the presented receipt is only a claim, so
+/// this compares rather than adopts: the identity, the two store generations,
+/// the `I5.10` transfer and the irreversible-effect set must all be the ones the
+/// owner recorded. A disagreement is a caller presenting a receipt the owner does
+/// not hold, and nothing here derives a missing value from the other side.
+fn storage_replacement_receipt_matches_owned_record(
+    presented: &StorageReplacementCutoverReceipt,
+    owned: &StorageReplacementCutoverReceiptRecord,
+) -> bool {
+    presented.replacement_id == owned.replacement_id
+        && presented.incumbent_generation == owned.incumbent_generation
+        && presented.candidate_generation == owned.candidate_generation
+        && presented.transfer.format == owned.transfer.format
+        && presented.transfer.payload_digest == owned.transfer.payload_digest
+        && presented.transfer.export_fence_digest == owned.transfer.export_fence_digest
+        && presented.irreversible_effects == owned_irreversible_effects(&owned.irreversible_effects)
+}
+
 impl KernelComposition {
     /// Drives one admitted I5.11 storage replacement from the first stage through
     /// the committed `canonical_store` route cutover.
@@ -2331,22 +2447,41 @@ impl KernelComposition {
         }
         // Stage 8. The coordinator loads the ORS-committed cut ownership record
         // and refuses anything that is not committed, so the receipt below is
-        // constructed only from a durable linearization point. A refusal here
-        // still reports the recorded stages and no receipt, because none was
-        // constructed.
-        let terminal_code = match replacement.commit_canonical_store_route_cutover(
+        // constructed only from a durable linearization point. The coordinator's
+        // receipt is an in-process value, so it is handed straight to the ORS
+        // owner to record durably, keyed by the same real `cutover_id`, in this
+        // same operation and before any reply exists. The reply that reports a
+        // committed cutover is produced only after that write returned, so a
+        // committed cutover and its proof cannot diverge: if the owner refuses
+        // the record, the outcome is unestablished and no receipt is projected,
+        // because a receipt only one process ever held is an effect nobody can
+        // reconcile.
+        let outcome = match replacement.commit_canonical_store_route_cutover(
             ors,
             &request.cutover_id,
             &request.cutover_evidence,
         ) {
-            Ok(_) => None,
-            Err(error) => Some(storage_replacement_terminal_code(&error)),
+            Ok(receipt) => match record_storage_replacement_receipt(ors, &receipt) {
+                Ok(()) => storage_replacement_outcome(&replacement, None, None),
+                Err(_error) => {
+                    let mut unestablished = storage_replacement_outcome(
+                        &replacement,
+                        Some(STORAGE_REPLACEMENT_RECEIPT_UNESTABLISHED),
+                        None,
+                    );
+                    unestablished.cutover_receipt = None;
+                    unestablished
+                }
+            },
+            // A refusal here still reports the recorded stages and no receipt,
+            // because none was constructed.
+            Err(error) => storage_replacement_outcome(
+                &replacement,
+                Some(storage_replacement_terminal_code(&error)),
+                None,
+            ),
         };
-        Ok(storage_replacement_response(&storage_replacement_outcome(
-            &replacement,
-            terminal_code,
-            None,
-        )))
+        Ok(storage_replacement_response(&outcome))
     }
 
     /// Reconstructs an already-committed I5.11 replacement after a restart.
@@ -2505,6 +2640,25 @@ impl KernelComposition {
 
     /// Shared reconstruction for the two post-cutover operations.
     ///
+    /// **The durable owner, not the caller, proves the cutover.** Before either
+    /// post-cutover action touches the coordinator, the presented receipt is
+    /// reconciled against the ORS owner's own
+    /// `StorageReplacementCutoverReceiptRecord` for the same `cutover_id`:
+    ///
+    /// - The record is loaded by the presented receipt's `cutover_id` and
+    ///   validated by the record's own `validate()` — the original recorded
+    ///   value, never a recomputed digest and never a re-derivation from the
+    ///   presented copy.
+    /// - A caller that presents a receipt the owner does not hold is refused,
+    ///   and so is one that disagrees with the record in any field. The
+    ///   coordinator is then handed the **owner's** irreversible-effect set
+    ///   rather than the presented one, so a presented field can never stand in
+    ///   for the owner's.
+    /// - When the record is absent the answer is
+    ///   [`STORAGE_REPLACEMENT_RECEIPT_UNESTABLISHED`], not a success and not a
+    ///   refusal that reads as "the cutover failed": the route cutover is
+    ///   already committed, and what is missing is the owner's proof of it.
+    ///
     /// A refused reconstruction is reported with the coordinator's own stable
     /// code rather than fenced, so the operator learns *why* a receipt did not
     /// re-derive against the durable row instead of only learning that the
@@ -2517,12 +2671,29 @@ impl KernelComposition {
         resumption: StorageReplacementResumption,
     ) -> Result<StorageReplacement, &'static str> {
         observe_daemon_operation(operation, "replacement_committed_requested");
+        let ors = self.p07_ors.as_ref();
+        let Some(owned) = ors
+            .load_storage_replacement_receipt(&resumption.receipt.committed_cutover.cutover_id)
+            .map_err(|_| STORAGE_REPLACEMENT_RECEIPT_UNESTABLISHED)?
+        else {
+            return Err(STORAGE_REPLACEMENT_RECEIPT_UNESTABLISHED);
+        };
+        let mut receipt = resumption.receipt;
+        if !storage_replacement_receipt_matches_owned_record(&receipt, &owned) {
+            return Err(STORAGE_REPLACEMENT_RECEIPT_UNESTABLISHED);
+        }
+        // The coordinator's rollback classifier reads the irreversible-effect
+        // set out of the receipt it is given, so it is handed the owner's set.
+        // The presented set has just been proven equal to it; assigning the
+        // owner's copy keeps the value that reaches the `I5.14` decision the
+        // durable one even if that proof is ever weakened.
+        receipt.irreversible_effects = owned_irreversible_effects(&owned.irreversible_effects);
         StorageReplacement::resume_after_committed_cutover(
-            self.p07_ors.as_ref(),
+            ors,
             resumption.replacement_id,
             resumption.incumbent_generation,
             resumption.candidate_generation,
-            &resumption.receipt,
+            &receipt,
         )
         .map_err(|error| storage_replacement_terminal_code(&error))
     }

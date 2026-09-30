@@ -575,6 +575,119 @@ impl GenerationCutoverOwnershipReceipt {
     }
 }
 
+/// One `I5.10` exchange into the candidate store, in the durable owner's shape.
+///
+/// ORS never holds the exported bytes: this is the same binding the Kernel
+/// coordinator records, kept in the owner's own vocabulary because ORS is below
+/// that crate and must not gain a dependency edge to reach its type. The two
+/// bound digests are the exact exported bytes and the `I5.10` `ExportFence` they
+/// were taken at, and the format identity is stored opaquely: ORS stores what the
+/// coordinator recorded and never interprets a transfer format, so the `ECXF/1`
+/// identity stays pinned where the coordinator validates it, on the path that
+/// stages this row.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageReplacementTransferRecord {
+    /// The recorded logical transfer format identity.
+    pub format: String,
+    /// Lowercase SHA-256 digest of the exact exported transfer bytes.
+    pub payload_digest: String,
+    /// Lowercase SHA-256 digest over the `I5.10` export fence the bytes were
+    /// taken at.
+    pub export_fence_digest: String,
+}
+
+impl StorageReplacementTransferRecord {
+    /// Validates the recorded format identity text and both bound digests.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_text(&self.format, "storage_replacement_receipt_transfer_format")?;
+        validate_digest(&self.payload_digest, "storage_replacement_receipt_payload_digest")?;
+        validate_digest(
+            &self.export_fence_digest,
+            "storage_replacement_receipt_export_fence_digest",
+        )
+    }
+}
+
+/// One irreversible occurrence that closes the generation-rollback path for a
+/// storage replacement, in the durable owner's own closed vocabulary.
+///
+/// `I5.11` allows switching generation back only when no irreversible
+/// migration/effect occurred. The set only grows: an observed irreversible
+/// effect cannot be un-observed, so a rollback decision that reads this row can
+/// never see a smaller set than the one the cutover was committed with.
+#[derive(
+    Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize, PartialOrd, Ord,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum IrreversibleStorageEffectKind {
+    /// The candidate's imported state cannot be reconciled back into the
+    /// incumbent store, so a generation switch back would lose canonical data.
+    IrreversibleMigration,
+    /// A canonical or external effect was already issued through the candidate
+    /// route, so the effect must be reconciled forward rather than undone.
+    ExternalEffectIssued,
+}
+
+/// The durable record of one committed governed storage-replacement cutover
+/// (issue #1872, `I5.11` stage 8, `I5.14` durable effect ledger).
+///
+/// It is keyed by the **real** `cutover_id` of the `CUTOVER_OWNERSHIP` row it
+/// proves, so a caller cannot present a receipt for a cutover the owner does not
+/// hold, and it carries exactly what that proof needs: the replacement identity,
+/// the two store generations the `canonical_store` route switched between, the
+/// `I5.10` transfer the cutover is proven against, and the irreversible effects
+/// fixed at the commit. Its `linearization_record_id` is the committed cutover
+/// row's own ORS linearization identity, copied by the owner at the same commit
+/// and never recomputed here, so the proof and the cutover it proves cannot
+/// diverge: a receipt that is not committed carries no linearization identity and
+/// therefore reads as absent.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageReplacementCutoverReceiptRecord {
+    /// The cutover identity whose committed `CUTOVER_OWNERSHIP` row this record
+    /// proves. It is the table key.
+    pub cutover_id: String,
+    /// The storage-replacement identity the cutover belonged to.
+    pub replacement_id: String,
+    /// The store generation that owned the route before the cutover.
+    pub incumbent_generation: Option<ResourceGeneration>,
+    /// The store generation that owns the route after the cutover.
+    pub candidate_generation: ResourceGeneration,
+    /// The `I5.10` transfer the cutover is proven against.
+    pub transfer: StorageReplacementTransferRecord,
+    /// The irreversible effects recorded when the cutover was committed.
+    pub irreversible_effects: BTreeSet<IrreversibleStorageEffectKind>,
+    /// The committed cutover row's own ORS linearization identity; `None` while
+    /// staged, so a staged row is never a proof.
+    pub linearization_record_id: Option<String>,
+}
+
+impl StorageReplacementCutoverReceiptRecord {
+    /// Validates the record's own recorded values.
+    ///
+    /// This is the single gate the durable read runs, so a restart validates the
+    /// owner's own bytes rather than anything a caller presented. It deliberately
+    /// does not recompute a digest and does not consult a caller: the transfer
+    /// digests are validated as the recorded lowercase SHA-256 values and the
+    /// generations as the two distinct ones the cutover switched between.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_text(&self.cutover_id, "storage_replacement_receipt_cutover_id")?;
+        validate_text(&self.replacement_id, "storage_replacement_receipt_replacement_id")?;
+        if self.incumbent_generation == Some(self.candidate_generation) {
+            return Err(OrsError::InvalidField {
+                field: "storage_replacement_receipt_store_generations",
+                reason: "a storage replacement cutover receipt must name two distinct store generations",
+            });
+        }
+        self.transfer.validate()?;
+        if let Some(linearization) = &self.linearization_record_id {
+            validate_text(linearization, "storage_replacement_receipt_linearization")?;
+        }
+        Ok(())
+    }
+}
+
 /// The boundary after which an unstaged old-daemon proposal is stale
 /// (I14.15).
 ///

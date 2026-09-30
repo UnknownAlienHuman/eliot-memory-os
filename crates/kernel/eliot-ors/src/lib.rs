@@ -55,8 +55,10 @@ pub use cutover_ownership::{
     CapabilityRouteScope, CutoverAdmission, CutoverRouteEntry, CutoverRouteSnapshot,
     CutoverRouteTable, DaemonCutoverOwnership, GenerationCutoverOwnership,
     GenerationCutoverOwnershipReceipt, InFlightDisposition, InFlightDispositionKind,
-    MAX_CUTOVER_IN_FLIGHT, MAX_CUTOVER_UNRESOLVED_SCOPES, ModuleArtifactIdentity,
-    OldDaemonProposalFence, OperationContinuationPermit, StateMigrationDecision,
+    IrreversibleStorageEffectKind, MAX_CUTOVER_IN_FLIGHT, MAX_CUTOVER_UNRESOLVED_SCOPES,
+    ModuleArtifactIdentity, OldDaemonProposalFence, OperationContinuationPermit,
+    StateMigrationDecision, StorageReplacementCutoverReceiptRecord,
+    StorageReplacementTransferRecord,
 };
 pub use doctor::*;
 pub use effect_operation_lease::{

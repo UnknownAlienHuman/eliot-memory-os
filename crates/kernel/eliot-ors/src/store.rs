@@ -54,7 +54,8 @@ mod backup_snapshot;
 mod recovery_projection;
 
 use crate::cutover_ownership::{
-    GenerationCutoverOwnership, GenerationCutoverOwnershipReceipt, StoredCutoverOwnership,
+    GenerationCutoverOwnership, GenerationCutoverOwnershipReceipt, StateMigrationDecision,
+    StorageReplacementCutoverReceiptRecord, StoredCutoverOwnership,
 };
 use crate::{
     AcceptedPending, ActivationLifecycleRecord, ActivationLifecycleState,
@@ -440,6 +441,20 @@ impl OrsStoreIdentity {
 }
 const CUTOVER_OWNERSHIP: TableDefinition<&str, &str> =
     TableDefinition::new("ors_cutover_ownership_v1");
+/// Durable storage-replacement cutover receipt records (issue #1872, `I5.11`
+/// stage 8, `I5.14`): one row per committed `canonical_store` route cutover a
+/// governed storage replacement produced, keyed by the real `cutover_id` of the
+/// `CUTOVER_OWNERSHIP` row it proves.
+///
+/// It is one more table in the existing ORS family, owned by the same
+/// [`RedbRecoveryStore`] and written through the same `persistence_codec`; it is
+/// not a second cutover owner and it never writes a `CUTOVER_OWNERSHIP` row. The
+/// row is durable before it is a proof: `stage_storage_replacement_receipt`
+/// writes it with no linearization identity, and the single commit that makes it
+/// proof also copies the committed cutover row's own linearization identity, so
+/// the two cannot diverge.
+const STORAGE_REPLACEMENT_RECEIPTS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_storage_replacement_receipts_v1");
 const HOST_REQUESTS: TableDefinition<&str, &str> = TableDefinition::new("ors_host_requests_v1");
 /// Durable versioned-artifact registry rows (issue #1971; I1.6, I1.12, I14.14).
 ///
@@ -26073,6 +26088,12 @@ impl RedbRecoveryStore {
         // reads authoritatively empty instead of failing on a missing table.
         // No row is backfilled or inferred here.
         drop(write.open_table(VERSIONED_ARTIFACTS).map_err(storage)?);
+        // #1872: the durable storage-replacement cutover receipt family is part
+        // of the base ORS table family, materialized empty on every open exactly
+        // like every other base table, so a load on a store that never committed
+        // a replacement cutover reads authoritatively empty instead of failing
+        // on a missing table. No row is ever backfilled or inferred here.
+        drop(write.open_table(STORAGE_REPLACEMENT_RECEIPTS).map_err(storage)?);
         drop(write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?);
         drop(
             write
@@ -29514,6 +29535,195 @@ impl RedbRecoveryStore {
         }
         write.commit().map_err(storage)?;
         Ok(fenced)
+    }
+
+    /// Stages the durable receipt record of one committed storage-replacement
+    /// cutover (issue #1872, `I5.11` stage 8).
+    ///
+    /// The record is durable before it is a proof, exactly as a staged cutover
+    /// candidate is: `load_storage_replacement_receipt` refuses to answer from a
+    /// staged row, so an interrupted stage leaves the outcome unestablished
+    /// rather than reading as a committed cutover.
+    ///
+    /// The owner, not the caller, decides whether the cutover this record
+    /// claims is real. The staged row must name a `CUTOVER_OWNERSHIP` row that is
+    /// already `Committed`, its two generations must be that row's own two
+    /// generations, and the row's `migration` decision must name forward repair
+    /// exactly when the record carries an irreversible effect. So a receipt can
+    /// be staged only against a cutover the owner itself linearized, and the
+    /// proof and the cutover it proves cannot diverge.
+    pub fn stage_storage_replacement_receipt(
+        &self,
+        record: StorageReplacementCutoverReceiptRecord,
+    ) -> Result<StorageReplacementCutoverReceiptRecord, OrsError> {
+        record.validate()?;
+        if record.linearization_record_id.is_some() {
+            return Err(OrsError::InvalidField {
+                field: "storage_replacement_receipt_linearization",
+                reason: "a staged receipt has no linearization identity",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        {
+            let cutover = Self::committed_cutover_for_receipt(&write, &record.cutover_id)?;
+            Self::require_receipt_binds_committed_cutover(&record, &cutover)?;
+            let current = write.open_table(STORAGE_REPLACEMENT_RECEIPTS).map_err(storage)?;
+            if let Some(existing) = current.get(record.cutover_id.as_str()).map_err(storage)? {
+                let staged: StorageReplacementCutoverReceiptRecord =
+                    decode_named(existing.value(), "storage_replacement_cutover_receipt")?;
+                if staged == record {
+                    return Ok(staged);
+                }
+                return Err(OrsError::DuplicateConflict);
+            }
+        }
+        {
+            let mut current = write.open_table(STORAGE_REPLACEMENT_RECEIPTS).map_err(storage)?;
+            current
+                .insert(record.cutover_id.as_str(), encode(&record)?.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(record)
+    }
+
+    /// Commits one staged storage-replacement receipt in a single write
+    /// transaction.
+    ///
+    /// This is the durable step that makes the proof real, and it is the same
+    /// step the ingress reaches in the operation that commits the
+    /// `canonical_store` route cutover: the reply that reports a committed
+    /// cutover is only produced after it returns. The linearization identity is
+    /// **copied from the committed `CUTOVER_OWNERSHIP` row** this record names
+    /// and is never recomputed here, so the proof carries the cutover's own
+    /// linearization point and not a second one that could disagree with it.
+    ///
+    /// Idempotent for one already-committed record, and refusing a second
+    /// different record for the same cutover.
+    pub fn commit_storage_replacement_receipt(
+        &self,
+        cutover_id: &str,
+    ) -> Result<StorageReplacementCutoverReceiptRecord, OrsError> {
+        let write = self.database.begin_write().map_err(storage)?;
+        let cutover = Self::committed_cutover_for_receipt(&write, cutover_id)?;
+        let Some(linearization_record_id) = cutover.linearization_record_id.clone() else {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "cutover_ownership",
+                reason: "committed cutover has no linearization identity".to_owned(),
+            });
+        };
+        let staged: StorageReplacementCutoverReceiptRecord = {
+            let current = write.open_table(STORAGE_REPLACEMENT_RECEIPTS).map_err(storage)?;
+            let Some(existing) = current.get(cutover_id).map_err(storage)? else {
+                return Err(OrsError::ReservationNotFound);
+            };
+            decode_named(existing.value(), "storage_replacement_cutover_receipt")?
+        };
+        Self::require_receipt_binds_committed_cutover(&staged, &cutover)?;
+        let committed = StorageReplacementCutoverReceiptRecord {
+            linearization_record_id: Some(linearization_record_id),
+            ..staged.clone()
+        };
+        committed.validate()?;
+        if staged == committed {
+            // Idempotent: the stored row already carries the cutover's own
+            // linearization point, so a second commit rewrites nothing.
+            return Ok(staged);
+        }
+        if staged.linearization_record_id.is_some() {
+            // A stored proof carrying a different linearization point would be a
+            // second claim on the same cutover, so it is refused rather than
+            // overwritten.
+            return Err(OrsError::IntegrityProblem {
+                record_type: "storage_replacement_cutover_receipt",
+                reason: "committed receipt claims a different linearization point".to_owned(),
+            });
+        }
+        {
+            let mut current = write.open_table(STORAGE_REPLACEMENT_RECEIPTS).map_err(storage)?;
+            current
+                .insert(cutover_id, encode(&committed)?.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(committed)
+    }
+
+    /// Loads the committed receipt record of one storage-replacement cutover.
+    ///
+    /// This is the owner read the Kernel ingress proves a committed cutover
+    /// from. It answers from a committed row only: a staged row with no
+    /// linearization identity is reported as absent, so a caller that presents
+    /// a receipt the owner has not committed learns that the outcome is
+    /// unestablished rather than reading a claim back as proof.
+    pub fn load_storage_replacement_receipt(
+        &self,
+        cutover_id: &str,
+    ) -> Result<Option<StorageReplacementCutoverReceiptRecord>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let current = read.open_table(STORAGE_REPLACEMENT_RECEIPTS).map_err(storage)?;
+        let Some(existing) = current.get(cutover_id).map_err(storage)? else {
+            return Ok(None);
+        };
+        let record: StorageReplacementCutoverReceiptRecord =
+            decode_named(existing.value(), "storage_replacement_cutover_receipt")?;
+        if record.linearization_record_id.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(record))
+    }
+
+    /// Reads the cutover ownership row a receipt record names and refuses
+    /// anything that is not already a committed cutover.
+    ///
+    /// A staged (`Armed`) or fenced row is evidence of an interrupted attempt,
+    /// never a cutover a receipt can prove, so it is refused here rather than
+    /// answered with an absence that would read as "the cutover failed".
+    fn committed_cutover_for_receipt(
+        write: &redb::WriteTransaction,
+        cutover_id: &str,
+    ) -> Result<GenerationCutoverOwnership, OrsError> {
+        let current = write.open_table(CUTOVER_OWNERSHIP).map_err(storage)?;
+        let Some(existing) = current.get(cutover_id).map_err(storage)? else {
+            return Err(OrsError::ReservationNotFound);
+        };
+        let stored: StoredCutoverOwnership = decode_named(existing.value(), "cutover_ownership")?;
+        if stored.record.state != GenerationCutoverState::Committed {
+            return Err(OrsError::InvalidTransition);
+        }
+        Ok(stored.record)
+    }
+
+    /// Refuses a receipt record that does not bind the committed cutover it
+    /// names.
+    ///
+    /// Every binding here is the owner's, not the caller's: the two store
+    /// generations must be the committed row's own two generations, and the
+    /// irreversible-effect set must agree with that row's `migration` decision
+    /// in the one direction `I5.11` fixes — forward repair exactly when an
+    /// irreversible effect is recorded. A record that disagrees is not a proof
+    /// of that cutover and is never made one.
+    fn require_receipt_binds_committed_cutover(
+        record: &StorageReplacementCutoverReceiptRecord,
+        cutover: &GenerationCutoverOwnership,
+    ) -> Result<(), OrsError> {
+        if record.candidate_generation != cutover.new_generation
+            || record.incumbent_generation != cutover.old_generation
+        {
+            return Err(OrsError::InvalidField {
+                field: "storage_replacement_receipt_store_generations",
+                reason: "the receipt must name the committed cutover's own store generations",
+            });
+        }
+        if (cutover.migration == StateMigrationDecision::ForwardRepairRequired)
+            == record.irreversible_effects.is_empty()
+        {
+            return Err(OrsError::InvalidField {
+                field: "storage_replacement_receipt_irreversible_effects",
+                reason: "the receipt must record an irreversible effect exactly when the committed state migration names forward repair",
+            });
+        }
+        Ok(())
     }
 
     /// Publishes the whole versioned-artifact registry to durable ORS state

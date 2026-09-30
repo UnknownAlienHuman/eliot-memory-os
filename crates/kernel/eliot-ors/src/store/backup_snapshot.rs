@@ -934,7 +934,7 @@ struct DispositionedTable {
 /// in this issue. Until it exists, a table added to `store.rs` is on the author.
 ///
 /// Split in four so no half can grow past the point where a reader stops
-/// checking it: 45 table-backed tables and 28 source-bound exclusions.
+/// checking it: 46 table-backed tables and 28 source-bound exclusions.
 fn dispositioned_tables() -> Vec<DispositionedTable> {
     let mut tables = family_backed_tables();
     tables.extend(source_bound_exclusions());
@@ -969,7 +969,7 @@ fn excluded(
     }
 }
 
-/// The 45 tables that back a dispositioned row family.
+/// The 46 tables that back a dispositioned row family.
 fn family_backed_tables() -> Vec<DispositionedTable> {
     let mut tables = canonical_family_tables();
     tables.extend(supervision_and_replay_family_tables());
@@ -1031,6 +1031,14 @@ fn canonical_family_tables() -> Vec<DispositionedTable> {
             RowFamilyKind::BackupVerificationResults,
         ),
         family(super::CUTOVER_OWNERSHIP, RowFamilyKind::CutoverOwnership),
+        // #1872: the durable storage-replacement cutover receipt is the proof
+        // that one committed `canonical_store` route cutover happened, so it
+        // belongs to the `CutoverOwnership` family and inherits exactly that
+        // family's disposition. It is deliberately NOT given its own
+        // `RowFamilyKind`: the row is cutover-ownership state, and a restored
+        // installation must not read a prior installation's committed-cutover
+        // proof back as its own any more than it may re-own the route.
+        family(super::STORAGE_REPLACEMENT_RECEIPTS, RowFamilyKind::CutoverOwnership),
         family(super::HOST_REQUESTS, RowFamilyKind::HostRequests),
         family(
             super::VERSIONED_ARTIFACTS,

@@ -40,7 +40,7 @@ use crate::SupervisionLeaseSnapshot;
 use crate::SupervisionLeaseStageReceipt;
 use crate::SupervisionLeaseStageResolution;
 use crate::UnknownCommitRecord;
-use crate::cutover_ownership::StoredCutoverOwnership;
+use crate::cutover_ownership::{StorageReplacementCutoverReceiptRecord, StoredCutoverOwnership};
 use eliot_runtime_contracts::GenerationCutoverState;
 use eliot_runtime_contracts::RuntimeLease;
 use eliot_store_api::{
@@ -865,6 +865,14 @@ impl PersistedValue for StoredCutoverOwnership {
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate_persisted()
+    }
+}
+
+impl PersistedValue for StorageReplacementCutoverReceiptRecord {
+    const RECORD_TYPE: &'static str = "storage_replacement_cutover_receipt";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
     }
 }
 
