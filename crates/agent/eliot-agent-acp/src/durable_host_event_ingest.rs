@@ -1277,6 +1277,74 @@ impl DurableHostEventJournal {
         )
     }
 
+    /// Measured per-stream expected cursor ranges for one coverage manifest:
+    /// every committed stream binds `1..=last_durable` (commits are
+    /// contiguous from one, and cursor facts are never evicted). No committed
+    /// stream is an invalid plan.
+    fn measured_cursor_ranges(&self) -> Result<Vec<StreamCursorRange>, IngestError> {
+        let mut ranges = Vec::new();
+        for (stream_id, progress) in &self.progress {
+            if progress.last_durable_sequence == 0 {
+                continue;
+            }
+            ranges.push(StreamCursorRange {
+                stream: stream_id.clone(),
+                first_expected_cursor: 1,
+                last_expected_cursor: progress.last_durable_sequence,
+            });
+        }
+        if ranges.is_empty() {
+            return Err(IngestError::InvalidInput("coverage_manifest.streams"));
+        }
+        Ok(ranges)
+    }
+
+    /// Measured received/applied counts over the committed records:
+    /// rejections stay typed [`IngestError`] returns, never records, so one
+    /// stored record yields exactly one counted event.
+    fn measured_event_counts(&self) -> (u64, u64) {
+        let mut received = 0u64;
+        let mut applied = 0u64;
+        for record in self.records.values() {
+            received += 1;
+            if record.disposition.applied_count > 0 {
+                applied += 1;
+            }
+        }
+        (received, applied)
+    }
+
+    /// Measured blind intervals from the retained best-effort drop gaps: one
+    /// localized blind interval per dropped sequence, plus the raw gap count
+    /// for the sequence-fault facts.
+    fn measured_blind_intervals(&self) -> (Vec<CoverageBlindInterval>, u64) {
+        let mut blind_cursors: Vec<(String, u64, &'static str)> = self
+            .dropped_gaps
+            .iter()
+            .map(|gap| {
+                let reason = match gap.reason {
+                    BestEffortDropReason::ConflictingDuplicate => {
+                        "best-effort-drop:CONFLICTING_DUPLICATE"
+                    }
+                    BestEffortDropReason::StaleSequence => "best-effort-drop:STALE_SEQUENCE",
+                };
+                (gap.stream_id.clone(), gap.sequence, reason)
+            })
+            .collect();
+        blind_cursors.sort();
+        blind_cursors.dedup_by(|first, second| first.0 == second.0 && first.1 == second.1);
+        let intervals = blind_cursors
+            .into_iter()
+            .map(|(stream, sequence, reason)| CoverageBlindInterval {
+                stream,
+                first_missing_cursor: sequence,
+                last_missing_cursor: sequence,
+                reason: reason.to_owned(),
+            })
+            .collect();
+        (intervals, self.dropped_gaps.len() as u64)
+    }
+
     /// Constructs and retains the coverage denominator for one
     /// product/session/attempt/route fingerprint (issue #1936 W1, I7.23).
     ///
@@ -1320,52 +1388,9 @@ impl DurableHostEventJournal {
         {
             return Err(IngestError::NotCommitted);
         }
-        let mut ranges = Vec::new();
-        for (stream_id, progress) in &self.progress {
-            if progress.last_durable_sequence == 0 {
-                continue;
-            }
-            ranges.push(StreamCursorRange {
-                stream: stream_id.clone(),
-                first_expected_cursor: 1,
-                last_expected_cursor: progress.last_durable_sequence,
-            });
-        }
-        if ranges.is_empty() {
-            return Err(IngestError::InvalidInput("coverage_manifest.streams"));
-        }
-        let mut received = 0u64;
-        let mut applied = 0u64;
-        for record in self.records.values() {
-            received += 1;
-            if record.disposition.applied_count > 0 {
-                applied += 1;
-            }
-        }
-        let mut blind_cursors: Vec<(String, u64, &'static str)> = self
-            .dropped_gaps
-            .iter()
-            .map(|gap| {
-                let reason = match gap.reason {
-                    BestEffortDropReason::ConflictingDuplicate => {
-                        "best-effort-drop:CONFLICTING_DUPLICATE"
-                    }
-                    BestEffortDropReason::StaleSequence => "best-effort-drop:STALE_SEQUENCE",
-                };
-                (gap.stream_id.clone(), gap.sequence, reason)
-            })
-            .collect();
-        blind_cursors.sort();
-        blind_cursors.dedup_by(|first, second| first.0 == second.0 && first.1 == second.1);
-        let blind_intervals_and_missing_source_reasons = blind_cursors
-            .into_iter()
-            .map(|(stream, sequence, reason)| CoverageBlindInterval {
-                stream,
-                first_missing_cursor: sequence,
-                last_missing_cursor: sequence,
-                reason: reason.to_owned(),
-            })
-            .collect();
+        let ranges = self.measured_cursor_ranges()?;
+        let (received, applied) = self.measured_event_counts();
+        let (blind_intervals, gaps) = self.measured_blind_intervals();
         let manifest = ObservationCoverageManifest {
             fingerprint: plan.fingerprint.clone(),
             allowed_manifest_digest: plan.allowed_manifest_digest.to_owned(),
@@ -1382,12 +1407,12 @@ impl DurableHostEventJournal {
                 unknown: received - applied,
             },
             sequence_faults: SequenceFaults {
-                gaps: self.dropped_gaps.len() as u64,
+                gaps,
                 duplicates: 0,
                 reorders: 0,
                 payload_mutations: 0,
             },
-            blind_intervals_and_missing_source_reasons,
+            blind_intervals_and_missing_source_reasons: blind_intervals,
             missing_source_reasons: plan.missing_source_reasons.to_vec(),
             coverage_by_material_action_and_effect_route: plan
                 .coverage_by_material_action_and_effect_route
@@ -1850,37 +1875,25 @@ impl DurableHostEventJournal {
         let route_evidence =
             Self::retained_route_evidence(&envelope, binding, admission, physical_observation)?;
         Self::check_envelope_linkage(&envelope, sequence, &stored)?;
-        let envelope_digest = envelope
-            .compute_digest()
-            .map_err(|_| IngestError::DigestEncoding)?;
-        if envelope_digest != envelope.normalization.output_digest {
-            return Err(IngestError::EnvelopeMismatch("output_digest"));
-        }
+        let envelope_digest = Self::sealed_envelope_digest(&envelope)?;
         let hash_hex = transport_hash.as_str().to_owned();
         let key = EventKey {
             stream_id: stream_id.to_owned(),
             sequence,
         };
-        if let Some(existing) = self.records.get(&(stream_id.to_owned(), sequence)) {
-            if Self::staged_replay_identical(
-                existing,
-                &hash_hex,
-                &envelope_digest,
-                requested_route_digest.as_ref(),
-                actual_route_digest.as_ref(),
-                route_evidence.as_ref(),
-            ) {
-                return Ok(StageOutcome { key, fresh: false });
-            }
-            self.record_best_effort_drop(
-                stream_id,
-                sequence,
-                &transport_hash,
-                &envelope_digest,
-                envelope.delivery,
-                BestEffortDropReason::ConflictingDuplicate,
-            );
-            return Err(IngestError::ConflictingDuplicate);
+        if let Some(outcome) = self.replay_if_identical(
+            stream_id,
+            sequence,
+            &transport_hash,
+            &hash_hex,
+            &envelope_digest,
+            &envelope,
+            requested_route_digest.as_ref(),
+            actual_route_digest.as_ref(),
+            route_evidence.as_ref(),
+            key,
+        )? {
+            return Ok(outcome);
         }
         self.insert_staged_record(
             stream_id,
@@ -1895,8 +1908,71 @@ impl DurableHostEventJournal {
             predecessors,
             warnings,
             transformation_version,
-            key,
+            EventKey {
+                stream_id: stream_id.to_owned(),
+                sequence,
+            },
         )
+    }
+
+    /// Computes the canonical digest of a staged envelope and binds it to
+    /// the declared normalization output digest: a sealed envelope whose
+    /// recomputed digest drifts from its receipt fails closed here, before
+    /// any cursor moves.
+    fn sealed_envelope_digest(
+        envelope: &NormalizedHostEventEnvelope,
+    ) -> Result<LowercaseSha256, IngestError> {
+        let envelope_digest = envelope
+            .compute_digest()
+            .map_err(|_| IngestError::DigestEncoding)?;
+        if envelope_digest != envelope.normalization.output_digest {
+            return Err(IngestError::EnvelopeMismatch("output_digest"));
+        }
+        Ok(envelope_digest)
+    }
+
+    /// Idempotent-replay branch of the shared staging core: an identical
+    /// redelivery under one cursor returns the existing key without storing;
+    /// changed bytes or changed route metadata under one cursor quarantines
+    /// [`IngestError::ConflictingDuplicate`] (with best-effort gap evidence
+    /// only for best-effort deliveries). Returns `None` when no record
+    /// exists under the cursor and fresh insertion must proceed.
+    #[allow(clippy::too_many_arguments)]
+    fn replay_if_identical(
+        &mut self,
+        stream_id: &str,
+        sequence: u64,
+        transport_hash: &LowercaseSha256,
+        hash_hex: &str,
+        envelope_digest: &LowercaseSha256,
+        envelope: &NormalizedHostEventEnvelope,
+        requested_route_digest: Option<&LowercaseSha256>,
+        actual_route_digest: Option<&LowercaseSha256>,
+        route_evidence: Option<&CommittedRouteEvidenceRelation>,
+        key: EventKey,
+    ) -> Result<Option<StageOutcome>, IngestError> {
+        let Some(existing) = self.records.get(&(stream_id.to_owned(), sequence)) else {
+            return Ok(None);
+        };
+        if Self::staged_replay_identical(
+            existing,
+            hash_hex,
+            envelope_digest,
+            requested_route_digest,
+            actual_route_digest,
+            route_evidence,
+        ) {
+            return Ok(Some(StageOutcome { key, fresh: false }));
+        }
+        self.record_best_effort_drop(
+            stream_id,
+            sequence,
+            transport_hash,
+            envelope_digest,
+            envelope.delivery,
+            BestEffortDropReason::ConflictingDuplicate,
+        );
+        Err(IngestError::ConflictingDuplicate)
     }
 
     /// Exact-replay identity for one stored record (issue #2645 W4): an
