@@ -113,6 +113,25 @@ pub const CAPABILITY_CANONICAL_STORE: &str = "canonical-store";
 /// Watchdog service to keep sensing.
 pub const CAPABILITY_INDEPENDENT_SUPERVISION: &str = "independent-supervision";
 
+/// Bounded start window for a queued next-generation wake, in milliseconds.
+///
+/// I1.5 fixes no wake timing; the single time constant it does fix is the
+/// five-minute idle-grace Config Default, and a queued next-generation
+/// trigger already waited through drain. ASSUMPTION: a next generation that
+/// has not started within one further grace window is stale, so the wake
+/// stops being startable then. Past this deadline the wake is still
+/// deliverable until expiry, but reported past-deadline so the demand-start
+/// owner starts it ahead of merely due work.
+pub const NEXT_GENERATION_WAKE_START_DEADLINE_MS: u64 = 5 * 60 * 1000;
+/// Terminal bound for a queued next-generation wake, in milliseconds.
+///
+/// I1.5: "Stale/resolved intents are cancelled rather than executed because
+/// they were once queued." ASSUMPTION: past twice the start window with no
+/// next generation started, the intent is stale and must expire instead of
+/// firing into an unreconciled installation; the obligation then surfaces as
+/// the deduplicated manual entrypoint the background-wake rule requires.
+pub const NEXT_GENERATION_WAKE_EXPIRY_MS: u64 = 2 * NEXT_GENERATION_WAKE_START_DEADLINE_MS;
+
 /// One I1.5 observable-use trigger class.
 ///
 /// The vocabulary is closed and frozen: it is the durable `trigger_class`
@@ -218,6 +237,62 @@ impl DrainWakeOutcome {
             Self::ReplayAlreadyConsumed => "replay-already-consumed",
         }
     }
+}
+
+/// Due next-generation wake handed to the stopped-installation
+/// demand-start owner.
+///
+/// Every field is durable journal content: the owner starts exactly this
+/// wake inside its deadline and honors its capability set, maintenance
+/// family and budget. STITCH (installer scope): the Task Scheduler wake
+/// registration that fires this handoff does not exist in-repo yet; see
+/// [`HostComposition::publish_pending_next_generation_wake`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NextGenerationDueWake {
+    /// Durable identity of the queued `WakeIntent`.
+    pub wake_id: PlatformHandle,
+    /// Millisecond timestamp from the durable `earliest_start` marker.
+    pub earliest_start_ms: u64,
+    /// Millisecond timestamp from the durable `deadline` marker.
+    pub deadline_ms: u64,
+    /// Millisecond timestamp from the durable `expiry` marker.
+    pub expiry_ms: u64,
+    /// Capability set the next generation must start.
+    pub required_capabilities: Vec<PlatformHandle>,
+    /// Maintenance family the wake serves.
+    pub maintenance_family: PlatformHandle,
+    /// Budget the bounded wake job runs under.
+    pub budget_ref: PlatformHandle,
+}
+
+/// Verdict of publishing the durable pending next-generation wake.
+///
+/// The verdict consumes the three durable schedule markers
+/// (`earliest_start`, `deadline`, `expiry`), so each marker steers delivery
+/// instead of decorating one timestamp.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NextGenerationWakePublication {
+    /// No pending next-generation wake is durable; there is nothing to start.
+    Absent,
+    /// The wake is durable but its `earliest_start` is in the future: the
+    /// demand-start owner fires it then, not now.
+    NotYetDue {
+        /// Millisecond timestamp from the durable `earliest_start` marker.
+        earliest_start_ms: u64,
+    },
+    /// The wake is inside its start window: the demand-start owner starts
+    /// the next generation now.
+    Due(NextGenerationDueWake),
+    /// The wake is past its start deadline but inside expiry: still owed,
+    /// reported distinctly so the owner starts it ahead of merely due work.
+    PastDeadline(NextGenerationDueWake),
+    /// The wake is past its terminal bound and was durably transitioned to
+    /// `Expired`: it must never fire. The obligation surfaces as the manual
+    /// entrypoint, never as a start.
+    Expired {
+        /// Durable identity of the expired `WakeIntent`.
+        wake_id: PlatformHandle,
+    },
 }
 
 /// Durable facts one re-armed pre-commit drain attempt binds both of its
@@ -1045,6 +1120,95 @@ impl HostComposition {
         }))
     }
 
+    /// Returns the full durable pending next-generation wake record, if one
+    /// is queued.
+    ///
+    /// The publication policy consumes the whole record — schedule markers,
+    /// capability set, maintenance family and budget — never the bare wake
+    /// identity, so delivery carries what the demand-start owner must honor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the durable Host state cannot be read.
+    pub fn pending_next_generation_wake_record(
+        &self,
+    ) -> Result<Option<WakeRecord>, HostError> {
+        let state = self.snapshot()?;
+        Ok(state
+            .wakes
+            .iter()
+            .find(|wake| wake.intent.state == WakeIntentState::Pending)
+            .cloned())
+    }
+
+    /// Publishes the durable pending next-generation wake through the I1.5
+    /// schedule/expiry policy to the stopped-installation demand-start owner.
+    ///
+    /// I1.5: a `WakeIntent` schedules work but never grants authority, and
+    /// stale intents are cancelled rather than executed. The verdict consumes
+    /// all three durable schedule markers: before `earliest_start` the wake
+    /// is not due; inside the start window it is due; past the start
+    /// deadline but inside expiry it is still owed yet reported distinctly;
+    /// past the terminal bound it is durably transitioned to `Expired`
+    /// through the existing owner `Pending -> Expired` edge
+    /// (`wake_transition`), so a later start can never claim it.
+    ///
+    /// STITCH (Task Scheduler wake registration, installer scope): the
+    /// `Due` / `PastDeadline` handoff carries every field an installer-owned
+    /// Task Scheduler wake registration consumes — wake identity, start
+    /// boundary, deadline, expiry, required capabilities, maintenance family
+    /// and budget. The nearest in-repo owner precedent is the
+    /// installer-owned task surface
+    /// (`eliot_platform_windows::profile_supervision::{register_current_user_task,
+    /// run_current_user_task}`), but no wake-task registration owner exists:
+    /// that lane must bind this handoff to a one-shot wake entry. This
+    /// function performs the policy verdict and the durable expiry, never a
+    /// second scheduler.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the durable Host state cannot be read, a
+    /// schedule marker is not a millisecond timestamp, or the journal
+    /// rejects the expiry transition.
+    pub fn publish_pending_next_generation_wake(
+        &mut self,
+    ) -> Result<NextGenerationWakePublication, HostError> {
+        let now_ms = unix_millis()?;
+        let Some(wake) = self.pending_next_generation_wake_record()? else {
+            return Ok(NextGenerationWakePublication::Absent);
+        };
+        let earliest_ms = wake_schedule_marker_ms(&wake.earliest_start, "wake-earliest:")?;
+        let deadline_ms = wake_schedule_marker_ms(&wake.deadline, "wake-deadline:")?;
+        let expiry_ms = wake_schedule_marker_ms(&wake.expiry, "wake-expiry:")?;
+        if now_ms < earliest_ms {
+            return Ok(NextGenerationWakePublication::NotYetDue {
+                earliest_start_ms: earliest_ms,
+            });
+        }
+        if now_ms <= expiry_ms {
+            let due = NextGenerationDueWake {
+                wake_id: wake.wake_id.clone(),
+                earliest_start_ms: earliest_ms,
+                deadline_ms,
+                expiry_ms,
+                required_capabilities: wake.required_capabilities.clone(),
+                maintenance_family: wake.maintenance_family.clone(),
+                budget_ref: wake.budget_ref.clone(),
+            };
+            if now_ms <= deadline_ms {
+                return Ok(NextGenerationWakePublication::Due(due));
+            }
+            return Ok(NextGenerationWakePublication::PastDeadline(due));
+        }
+        let mut expired = wake.clone();
+        expired.operation = operation("host-next-generation-wake-expired")?;
+        expired.intent.state = WakeIntentState::Expired;
+        self.append_record(HostStateRecord::Wake(expired))?;
+        Ok(NextGenerationWakePublication::Expired {
+            wake_id: wake.wake_id,
+        })
+    }
+
     /// Returns the capability set this activation generation durably requires.
     ///
     /// I1.5 "start only the remaining capabilities required by the admitted
@@ -1199,6 +1363,17 @@ impl HostComposition {
             .validate()
             .map_err(|error| HostError::Platform(error.to_string()))?;
         let now_ms = unix_millis()?;
+        // I1.5 background wake: the job has budget, deadline and
+        // revalidation, and stale intents are cancelled rather than executed.
+        // The three schedule markers are therefore three distinct policy
+        // points, never one now marker: the next generation may start
+        // immediately (Host is exiting under a committed drain), it must
+        // start within one bounded window, and past the terminal bound the
+        // intent is stale. The demand-start owner consumes all three through
+        // `HostComposition::publish_pending_next_generation_wake`.
+        let earliest_ms = now_ms;
+        let deadline_ms = now_ms.saturating_add(NEXT_GENERATION_WAKE_START_DEADLINE_MS);
+        let expiry_ms = now_ms.saturating_add(NEXT_GENERATION_WAKE_EXPIRY_MS);
         let mut required_capabilities = Vec::with_capacity(trigger.requested_capabilities().len());
         for capability in trigger.requested_capabilities() {
             required_capabilities.push(
@@ -1222,11 +1397,11 @@ impl HostComposition {
             wake_id: wake_id.clone(),
             intent,
             reason_evidence_refs: vec![evidence.clone(), trigger_class],
-            earliest_start: PlatformHandle::new(format!("wake-earliest:{now_ms}"))
+            earliest_start: PlatformHandle::new(format!("wake-earliest:{earliest_ms}"))
                 .map_err(|error| HostError::Platform(error.to_string()))?,
-            deadline: PlatformHandle::new(format!("wake-deadline:{now_ms}"))
+            deadline: PlatformHandle::new(format!("wake-deadline:{deadline_ms}"))
                 .map_err(|error| HostError::Platform(error.to_string()))?,
-            expiry: PlatformHandle::new(format!("wake-expiry:{now_ms}"))
+            expiry: PlatformHandle::new(format!("wake-expiry:{expiry_ms}"))
                 .map_err(|error| HostError::Platform(error.to_string()))?,
             required_capabilities,
             maintenance_family: PlatformHandle::new("demand-start-reconciliation")
@@ -1467,5 +1642,24 @@ fn unix_millis() -> Result<u64, HostError> {
         .and_then(|elapsed| {
             u64::try_from(elapsed.as_millis())
                 .map_err(|error| HostError::Platform(error.to_string()))
+        })
+}
+
+/// Decodes one durable wake schedule marker into its millisecond timestamp.
+///
+/// The markers are this file's own spellings (`wake-earliest:`,
+/// `wake-deadline:`, `wake-expiry:` followed by Unix milliseconds); a marker
+/// that does not decode is durable-state corruption, reported typed rather
+/// than defaulted, so a corrupt schedule can never silently become due.
+fn wake_schedule_marker_ms(handle: &PlatformHandle, prefix: &str) -> Result<u64, HostError> {
+    handle
+        .as_str()
+        .strip_prefix(prefix)
+        .and_then(|digits| digits.parse::<u64>().ok())
+        .ok_or_else(|| {
+            HostError::OwnerLeaseRecovery(
+                "next-generation WakeIntent schedule marker is not a durable millisecond timestamp"
+                    .to_owned(),
+            )
         })
 }

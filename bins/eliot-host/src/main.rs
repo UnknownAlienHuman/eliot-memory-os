@@ -8,7 +8,9 @@ use std::io::{self, BufRead, Write};
 use std::sync::OnceLock;
 
 #[cfg(windows)]
-use eliot_host::activation_lifecycle::{ActivationTriggerClass, DrainWakeOutcome, IdleLeaseCensus};
+use eliot_host::activation_lifecycle::{
+    ActivationTriggerClass, DrainWakeOutcome, IdleLeaseCensus, NextGenerationWakePublication,
+};
 use eliot_host::host_diagnostics::{
     HostConsoleRequest, HostRequestProjection, observe_host_request,
 };
@@ -27,6 +29,10 @@ use eliot_host_state::HostState;
 use eliot_host_state::WakeDisposition;
 #[cfg(windows)]
 use eliot_installation::InstallationProfile;
+#[cfg(windows)]
+use eliot_kernel_core::{UserAutomationTrigger, UserAutomationTriggerOrigin};
+#[cfg(windows)]
+use eliot_kernel_service::UserAutomationHostExecutionOperation;
 #[cfg(windows)]
 use eliot_platform::PlatformHandle;
 #[cfg(windows)]
@@ -758,6 +764,7 @@ fn run_profile_supervisor(
             let drain_tick = idle_drain.evaluate(&mut host, std::time::Instant::now());
             report_activation_diagnostics(&host, &idle_drain.last_census);
             if drain_tick == IdleDrainTick::CommitDue {
+                publish_next_generation_wake(&mut host);
                 break;
             }
         }
@@ -1457,6 +1464,7 @@ extern "system" fn service_main(service_arg_count: u32, service_arg_vector: *mut
                 io::stderr().lock(),
                 "eliot-host: idle grace elapsed with no runtime or supervision lease; running the ordered idle-drain sequence"
             );
+            publish_next_generation_wake(&mut host);
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
@@ -1771,20 +1779,78 @@ fn process_backup_dispatch_requests(host: &HostComposition) {
 ///   that still requires supervision".
 /// * `DeliverReactiveContext` hands owner-produced Context to an attached
 ///   agent/session. I1.5 "MCP/agent bridge attach or tool call".
-/// * `AdmitUserAutomationOccurrence` / `CancelUserAutomationPendingWakes`
-///   admit or cancel an occurrence of one ELIOT-launched automation attempt.
-///   I1.5 "ELIOT-launched `AgentAttempt` or external-agent reconciliation"; the
-///   two share a class because both are the same attempt on the automation
-///   plane, one admitting its occurrence and one withdrawing its pending wakes.
+/// * `AdmitUserAutomationOccurrence` carrying an owner-attested scheduler
+///   wake is that wake reaching the lifecycle. I1.5 "Task Scheduler wake
+///   created by an admitted `WakeIntent`", which requests the runtime and
+///   independent supervision branches but never the store branch. Any other
+///   occurrence admission, and every wake cancellation, is the attempt it
+///   serves: I1.5 "ELIOT-launched `AgentAttempt` or external-agent
+///   reconciliation".
+///
+/// STITCH (far sides outside this file — never fabricated at this dispatch
+/// site):
+/// * `CliRequest` / `UiRequest`: the endpoint observes the authenticated
+///   peer (`server.peer_identity()` in
+///   `crates/kernel/eliot-host-control-endpoint/src/lib.rs`, bound into the
+///   UserAutomation execution session), but `HostRuntimeControlEnvelope`
+///   carries no peer identity and `HostRuntimeControlRequest` carries no
+///   caller/principal field, and no ControlBoard/Operator contract exists in
+///   Host. Mapping an operation to `cli-request` / `ui-request` here would
+///   fabricate the caller, so the endpoint owner must propagate the
+///   authenticated peer identity onto the runtime-control envelope first.
+/// * `WatchdogRegisteredActivity`: `ReactiveContextDeliveryRequest`
+///   (`crates/kernel/eliot-host-service/src/reactive_context_delivery.rs`)
+///   carries no bridge-vs-Watchdog producer discriminator, and Watchdog
+///   observations otherwise reach Host through the heartbeat/spool tick
+///   reconcile, not as an attributable trigger; moreover `bins/eliot-watchdog`
+///   neither produces a `WakeIntent` nor demand-starts Host today. The
+///   carrier owner or a real Watchdog demand-start caller must attest the
+///   watchdog origin first.
 #[cfg(windows)]
 fn runtime_control_trigger_class(
-    operation: &HostRuntimeControlOperation,
+    request: &eliot_host::HostRuntimeControlRequest,
 ) -> ActivationTriggerClass {
-    match runtime_control_dispatch(operation) {
+    if request.operation == HostRuntimeControlOperation::AdmitUserAutomationOccurrence
+        && user_automation_proves_scheduled_wake(request)
+    {
+        return ActivationTriggerClass::ScheduledWake;
+    }
+    match runtime_control_dispatch(&request.operation) {
         RuntimeControlDispatch::Kernel => ActivationTriggerClass::ApprovedMaintenanceJob,
         RuntimeControlDispatch::Store => ActivationTriggerClass::ProtectedExternalEffect,
         RuntimeControlDispatch::ReactiveContext => ActivationTriggerClass::AgentBridgeAttach,
         RuntimeControlDispatch::UserAutomation => ActivationTriggerClass::AgentAttempt,
+    }
+}
+
+/// Whether the request carries an owner-attested scheduler wake.
+///
+/// A Task Scheduler wake reaches Host as an admitted user-automation
+/// occurrence whose validated carrier proves the scheduler-wake origin: the
+/// Kernel due-wake owner (`resolve_due_wake` in
+/// `crates/kernel/eliot-kernel-service/src/user_automation_execution.rs`)
+/// refuses any wake that did not arrive as a `ScheduledWake` calendar
+/// occurrence, so this predicate reuses exactly that two-part shape — a
+/// `ScheduledWake` origin plus a `Scheduled` calendar trigger — instead of
+/// inventing one. A Human run-now, an admitted child, a wake cancellation,
+/// or a missing carrier proves no scheduler wake and stays the attempt.
+#[cfg(windows)]
+fn user_automation_proves_scheduled_wake(
+    request: &eliot_host::HostRuntimeControlRequest,
+) -> bool {
+    let Some(carrier) = request.user_automation.as_ref() else {
+        return false;
+    };
+    if let UserAutomationHostExecutionOperation::AdmitOccurrence { request } =
+        &carrier.execution.operation
+    {
+        request.invocation.trigger_origin == UserAutomationTriggerOrigin::ScheduledWake
+            && matches!(
+                request.invocation.trigger,
+                UserAutomationTrigger::Scheduled { .. }
+            )
+    } else {
+        false
     }
 }
 
@@ -1820,7 +1886,7 @@ fn process_runtime_control_requests(
             Err(_) => None,
         };
         let Some(envelope) = request else { break };
-        let trigger = runtime_control_trigger_class(&envelope.request().operation);
+        let trigger = runtime_control_trigger_class(envelope.request());
         let response = match runtime_control_dispatch(&envelope.request().operation) {
             RuntimeControlDispatch::Kernel => {
                 host.handle_kernel_restart_request(envelope.request())
@@ -1945,6 +2011,59 @@ fn report_scm_tick(outcome: ScmContourTickOutcome) {
         io::stderr().lock(),
         "eliot-host: independent contour disposition: {disposition:?}"
     );
+}
+
+/// Publishes the durable pending next-generation wake to the
+/// stopped-installation demand-start owner on the ordered-stop path.
+///
+/// The ordered idle-drain sequence commits `DrainCommitRecord` before Host
+/// exits, and a trigger queued after that point waits in the journal as a
+/// `Pending` next-generation `WakeIntent`. Resolving it through the
+/// schedule/expiry policy here — after the commit decision, before the stop
+/// sequence runs — means a due wake reaches its owner instead of sitting
+/// unread, a not-yet-due wake keeps its start boundary, and a stale one
+/// expires durably instead of firing into an unreconciled installation.
+/// The installer-owned Task Scheduler wake registration consumes the due
+/// handoff (STITCH: `eliot_platform_windows::profile_supervision` task
+/// owner); this loop performs the policy verdict and the observable record,
+/// never a second scheduler.
+#[cfg(windows)]
+fn publish_next_generation_wake(host: &mut HostComposition) {
+    match host.publish_pending_next_generation_wake() {
+        Ok(NextGenerationWakePublication::Absent) => {}
+        Ok(NextGenerationWakePublication::NotYetDue { earliest_start_ms }) => {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "eliot-host: next-generation wake is durable but not yet due; the demand-start owner fires it at earliest_start_ms={earliest_start_ms}"
+            );
+        }
+        Ok(NextGenerationWakePublication::Due(due)) => {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "eliot-host: next-generation wake is due; the demand-start owner starts the next activation generation inside deadline_ms={} (expiry_ms={})",
+                due.deadline_ms, due.expiry_ms
+            );
+        }
+        Ok(NextGenerationWakePublication::PastDeadline(due)) => {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "eliot-host: next-generation wake is past its start deadline but inside expiry_ms={}; the demand-start owner starts it ahead of merely due work",
+                due.expiry_ms
+            );
+        }
+        Ok(NextGenerationWakePublication::Expired { .. }) => {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "eliot-host: next-generation wake expired past its terminal bound and was durably expired; the obligation surfaces as the manual entrypoint"
+            );
+        }
+        Err(error) => {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "eliot-host: next-generation wake publication failed: {error}"
+            );
+        }
+    }
 }
 
 /// I1.5 Config Default: the default idle grace is five minutes. This is a
