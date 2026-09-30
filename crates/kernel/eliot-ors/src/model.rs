@@ -44,13 +44,6 @@ pub const HOST_REQUEST_EXECUTABLE_INPUT_CONTRACT_VERSION: u16 = 1;
 /// Shared schema identity for the canonical ToolRequest byte stream.
 pub const HOST_REQUEST_TOOL_REQUEST_SCHEMA_ID: &str = "eliot.mcp.tool-request.v1";
 
-/// Hard ceiling for one complete retained executable ToolRequest.
-pub const MAX_HOST_REQUEST_EXECUTABLE_INPUT_BYTES: u64 = 64 * 1024;
-
-/// Maximum canonical owner-binding bytes retained beside one executable host
-/// request. Payload bytes are separately protected and use their own cap.
-pub const MAX_HOST_REQUEST_APPLICATION_BINDING_BYTES: usize = 256 * 1024;
-
 /// This issue allows one original send attempt plus one proven-not-sent retry.
 pub const MAX_HOST_REQUEST_SEND_ATTEMPTS: usize = 2;
 
@@ -7800,11 +7793,6 @@ impl HostRequestApplicationBinding {
         if self.wire_version != HOST_REQUEST_EXECUTABLE_INPUT_CONTRACT_VERSION {
             return Err(OrsError::UnsupportedContractVersion(self.wire_version));
         }
-        let binding_bytes =
-            canonical_json_bytes(self).map_err(|error| OrsError::Encoding(error.to_string()))?;
-        if binding_bytes.len() > MAX_HOST_REQUEST_APPLICATION_BINDING_BYTES {
-            return Err(OrsError::PayloadTooLarge);
-        }
         self.validate_owner_projections()?;
         self.validate_resolved_binding_fields()?;
         self.validate_clock_and_revisions()?;
@@ -8417,7 +8405,7 @@ impl HostRequestExecutableInput {
         if self.schema_id.as_str() != HOST_REQUEST_TOOL_REQUEST_SCHEMA_ID
             || self.encoding != HostRequestExecutableInputEncoding::CanonicalJsonV1
             || self.payload_length == 0
-            || self.payload_length > MAX_HOST_REQUEST_EXECUTABLE_INPUT_BYTES
+            || self.payload_length > MAX_INLINE_RECOVERY_BYTES
             || self.payload_sha256 != record.payload_digest
             || self.schema_id.as_str()
                 != record
