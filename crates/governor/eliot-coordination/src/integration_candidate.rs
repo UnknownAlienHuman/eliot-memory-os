@@ -298,9 +298,7 @@ impl CoordinationOwner {
         let mut lease_ids: Vec<String> = self
             .integration_lease_by_request
             .values()
-            .filter(|lease| {
-                lease.candidate_id.as_deref() == Some(candidate.candidate_id.as_str())
-            })
+            .filter(|lease| lease.candidate_id.as_deref() == Some(candidate.candidate_id.as_str()))
             .map(|lease| lease.lease_id.clone())
             .collect();
         lease_ids.sort();
@@ -326,14 +324,10 @@ impl CoordinationOwner {
             .collect();
         let mut gaps = Vec::new();
         if submission_event_sequence.is_none() {
-            gaps.push(
-                "submission event absent from the retained event stream".to_owned(),
-            );
+            gaps.push("submission event absent from the retained event stream".to_owned());
         }
         if lease_ids.is_empty() {
-            gaps.push(
-                "no integration lease decision recorded against this candidate".to_owned(),
-            );
+            gaps.push("no integration lease decision recorded against this candidate".to_owned());
         }
         if correlated_reviews.is_empty() {
             gaps.push(
@@ -422,15 +416,14 @@ impl CoordinationOwner {
         if retained_revisions.is_empty() {
             gaps.push("no retained revision digests for this artifact identity".to_owned());
         }
-        if let Some(requested) = revision {
-            if !retained_revisions
+        if revision.is_some_and(|requested| {
+            !retained_revisions
                 .iter()
                 .any(|entry| entry.revision == requested)
-            {
-                gaps.push(
-                    "requested revision is not retained for this artifact identity".to_owned(),
-                );
-            }
+        }) {
+            gaps.push(
+                "requested revision is not retained for this artifact identity".to_owned(),
+            );
         }
         if reviews.is_empty() {
             gaps.push("no retained reviews for this artifact identity".to_owned());
