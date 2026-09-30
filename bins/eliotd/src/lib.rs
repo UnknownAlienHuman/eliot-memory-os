@@ -252,7 +252,7 @@ impl eliot_lsp_bridge::LspProcessOwnerPort for DaemonCurrentSourceLspProcessOwne
 
     fn reconcile(
         &self,
-        operation_id: eliot_contracts::OperationId,
+        operation_id: eliot_process::OperationId,
     ) -> eliot_lsp_bridge::LspProcessOwnerFuture<'_, eliot_process::ProcessEvidence> {
         Box::pin(async move {
             let response = self
@@ -2323,7 +2323,7 @@ impl DaemonComposition {
         let process_owner = DaemonCurrentSourceLspProcessOwner {
             kernel,
             identity: identity.clone(),
-            task_id,
+            task_id: task_id.clone(),
         };
         let bridge = eliot_lsp_bridge::LspCurrentBridge::new(Arc::new(process_owner), git_owner);
         let profile = self
