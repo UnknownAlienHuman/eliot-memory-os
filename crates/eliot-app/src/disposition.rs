@@ -133,16 +133,6 @@ const TRUSTED_CLI_LIVE_SIGNING_TEST: &str =
 /// cannot silently fall behind the declared consumer set.
 pub const CONSUMER_SURFACES: &[ConsumerSurface] = &[
     ConsumerSurface {
-        path: "plugin/eliot-governor/hooks/hooks.json",
-        live_reference: "${PLUGIN_ROOT}\\\\bin\\\\eliot-governor.exe",
-        body: CODEX_PLUGIN_HOOKS,
-    },
-    ConsumerSurface {
-        path: "integrations/claude/eliot/hooks/hooks.json",
-        live_reference: "\"command\": \"${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe\"",
-        body: CLAUDE_PLUGIN_HOOKS,
-    },
-    ConsumerSurface {
         path: "integrations/opencode/opencode.json",
         live_reference: "\"{env:ELIOT_GOVERNOR_EXE}\"",
         body: OPENCODE_CONFIG,
@@ -1134,20 +1124,6 @@ const INVENTORY_REVISION: &str = "2026-09-25";
 pub fn current_consumer_inventory() -> &'static [ConsumerEntry] {
     &[
         ConsumerEntry {
-            consumer: "Codex plugin lifecycle hooks",
-            proof: "plugin/eliot-governor/hooks/hooks.json",
-            live_reference: "${PLUGIN_ROOT}\\\\bin\\\\eliot-governor.exe",
-            disposition: Disposition::ExtractToCurrentOwner,
-            expiry: "remove when hooks route through bins/eliot-agent-bridge and crates/surfaces/* under #13",
-        },
-        ConsumerEntry {
-            consumer: "Claude Code plugin lifecycle hooks",
-            proof: "integrations/claude/eliot/hooks/hooks.json",
-            live_reference: "\"command\": \"${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe\"",
-            disposition: Disposition::ExtractToCurrentOwner,
-            expiry: "remove when hooks route through bins/eliot-agent-bridge and crates/surfaces/* under #13",
-        },
-        ConsumerEntry {
             consumer: "OpenCode MCP server registration",
             proof: "integrations/opencode/opencode.json",
             live_reference: "\"{env:ELIOT_GOVERNOR_EXE}\"",
@@ -1379,6 +1355,22 @@ pub const MIGRATED_CONSUMER_EDGES: &[MigratedConsumerEdge] = &[
         current_owner: "bins/eliot-agent-bridge (SPINE_FUNCTIONAL contour)",
         evidence: "bridge argv mcp --profile SPINE_FUNCTIONAL --transport stdio --client-declaration <installation-owned agent-bridge/client-declaration-v2.json>; the admitted contour the facade's unconditional Bridge redirect already serves for the claude host (crates/eliot-app/src/main.rs::delegate_host_mcp_to_agent_bridge); served through the Kernel front door with no Governor, Store, WAL, or writer construction",
     },
+    MigratedConsumerEdge {
+        consumer: "Codex plugin lifecycle hooks",
+        proof: "plugin/eliot-governor/hooks/hooks.json",
+        legacy_reference: "${PLUGIN_ROOT}\\\\bin\\\\eliot-governor.exe",
+        current_owner_reference: "${PLUGIN_ROOT}\\\\bin\\\\eliot-agent-bridge.exe\\\" hook",
+        current_owner: "bins/eliot-agent-bridge hook intake (evaluation in crates/eliot-engine EliotHookService)",
+        evidence: "bridge argv hook <event> (bins/eliot-agent-bridge/src/hook_intake.rs::run_hook_intake): per-event argv preserved (session-start, pre-tool-use, post-tool-use, pre-compact, post-compact, stop); host hook JSON stdin incl. empty-input {}, ELIOT_TASK_ID attach, and decision.stdout evaluated through eliot_engine::EliotHookService::for_session().process, the existing owner (crates/eliot-engine/src/plugin.rs), under the retired run_hook contract (crates/eliot-app/src/commands/execution.rs:305); no profile/transport/declaration flags; MCP front door untouched",
+    },
+    MigratedConsumerEdge {
+        consumer: "Claude Code plugin lifecycle hooks",
+        proof: "integrations/claude/eliot/hooks/hooks.json",
+        legacy_reference: "\"command\": \"${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe\"",
+        current_owner_reference: "\"command\": \"${CLAUDE_PLUGIN_ROOT}/bin/eliot-agent-bridge.exe\"",
+        current_owner: "bins/eliot-agent-bridge hook intake (evaluation in crates/eliot-engine EliotHookService)",
+        evidence: "bridge argv hook <event> (bins/eliot-agent-bridge/src/hook_intake.rs::run_hook_intake): per-event argv preserved (session-start, pre-tool-use, post-tool-use, subagent-start, subagent-stop, pre-compact, stop); host hook JSON stdin incl. empty-input {}, ELIOT_TASK_ID attach, and decision.stdout evaluated through eliot_engine::EliotHookService::for_session().process, the existing owner (crates/eliot-engine/src/plugin.rs), under the retired run_hook contract (crates/eliot-app/src/commands/execution.rs:305); the two host event --host claude --event rows (PostToolUseFailure, SessionEnd) are removed from this edge because record_event lease-gating plus reports/host-events writes are host-runtime behavior owned by the #77 host-request protocol migration and are not servable by the hook intake; host-observable output is unchanged (continue/suppress ack either way) and no current reader consumes reports/host-events",
+    },
 ];
 
 /// Baked bytes of a migrated edge proof.
@@ -1387,6 +1379,8 @@ fn migrated_proof_body(path: &str) -> Option<&'static str> {
         "plugin/eliot-governor/.mcp.json" => Some(CODEX_PLUGIN_MCP),
         "integrations/claude/claude-desktop/mcpb/manifest.json" => Some(CLAUDE_DESKTOP_MCPB),
         "integrations/claude/eliot/.mcp.json" => Some(CLAUDE_PLUGIN_MCP),
+        "plugin/eliot-governor/hooks/hooks.json" => Some(CODEX_PLUGIN_HOOKS),
+        "integrations/claude/eliot/hooks/hooks.json" => Some(CLAUDE_PLUGIN_HOOKS),
         _ => None,
     }
 }

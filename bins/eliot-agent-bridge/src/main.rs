@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod hook_intake;
 mod request_input;
 
 use eliot_agent_bridge::{
@@ -736,9 +737,32 @@ fn main() {
     // byte-for-byte. No protocol sniffing: the mode is named by argv, never
     // inferred from payload bytes.
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
+    // Lifecycle hook intake (issue #18 W11): a leading `hook` token selects
+    // the `hook <event>` serving path for host plugin bridges. It is stripped
+    // before dispatch like the `mcp` token, takes no
+    // `--profile/--transport/--client-declaration` flags, and never falls
+    // through to the MCP front door or the private `op` loop below.
+    let hook_mode = argv
+        .first()
+        .is_some_and(|first| first == hook_intake::HOOK_MODE_TOKEN);
     let mcp_mode = argv.first().is_some_and(|first| first == MCP_MODE_TOKEN);
+    if hook_mode {
+        argv.remove(0);
+    }
     if mcp_mode {
         argv.remove(0);
+    }
+    if hook_mode {
+        // The hook intake owns its stdio exchange from here: host hook JSON
+        // on stdin, the host decision schema on stdout.
+        let code = match hook_intake::run_hook_intake(&argv) {
+            Ok(()) => 0,
+            Err(error) => {
+                emit_error(error.code(), &error.detail());
+                error.exit_code()
+            }
+        };
+        std::process::exit(code);
     }
     let config = match parse_args(argv) {
         Ok(config) => config,
