@@ -157,10 +157,6 @@ pub struct TaskControllerOrientationOutputSchemaRecipe {
 pub struct TaskControllerOrientationInput {
     /// Original K0 request identity, admission reference and semantic bytes.
     pub request: DurableJobRequest,
-    /// Original Kernel-native claim ID from `prepare_native_worker_launch`; it
-    /// is compared with the claim-channel value and never reconstructed from
-    /// task/job/attempt labels.
-    pub native_worker_claim_id: String,
     /// Exact owner-authenticated result of the original `ContextReconstruction`
     /// query. Its response retains the selector-complete owner publication,
     /// including the original `evidence_subject` and named-read receipts.
@@ -246,7 +242,6 @@ impl TaskControllerOrientationInput {
             "task_controller_invocation.orientation.classification_source_readback",
         )?;
         if runtime_input.semantic_source != self.semantic_source
-            || runtime_input.native_worker_claim_id != self.native_worker_claim_id
             || runtime_input.output_contract != submission.output_contract
             || runtime_input.context_reconstruction_result
                 != self.context_reconstruction_result
