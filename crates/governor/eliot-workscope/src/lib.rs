@@ -3298,10 +3298,9 @@ mod tests {
     ) -> WorkScopeAdmissionAuthority {
         let scope = candidate(&binding.scope.instance_ref);
         let mut governing_sources = source_set(&scope);
-        governing_sources.sources[0].authority_basis =
-            Some(AuthorityBasis::ProjectContract {
-                contract_ref: "contract:architecture".into(),
-            });
+        governing_sources.sources[0].authority_basis = Some(AuthorityBasis::ProjectContract {
+            contract_ref: "contract:architecture".into(),
+        });
         governing_sources.sources[0].assurance.state_fence = state_fence.clone();
         WorkScopeAdmissionAuthority {
             privacy_profile: PrivacyProfile {
@@ -3560,11 +3559,11 @@ mod tests {
     #[test]
     fn legacy_binding_snapshot_does_not_gain_admission_authority() {
         let (state_fence, binding, receipt) = binding_fixture();
-        let snapshot =
-            match WorkScopeBindingSnapshot::new(state_fence.clone(), 7, binding, receipt) {
-                Ok(value) => value,
-                Err(error) => panic!("legacy binding snapshot fixture is invalid: {error}"),
-            };
+        let snapshot = match WorkScopeBindingSnapshot::new(state_fence.clone(), 7, binding, receipt)
+        {
+            Ok(value) => value,
+            Err(error) => panic!("legacy binding snapshot fixture is invalid: {error}"),
+        };
         let mut legacy = match serde_json::to_value(&snapshot) {
             Ok(value) => value,
             Err(error) => panic!("binding snapshot serialization failed: {error}"),
