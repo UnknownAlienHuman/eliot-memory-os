@@ -754,7 +754,9 @@ impl GrantClosureCanonicalLinkPort for Arc<dyn OperationalRecoveryStore> {
         // cannot express, so the constraint is enforced rather than dropped; an
         // unusable identity is a determinate contract refusal, not a link.
         let operation_id = OperationIdentity::new(operation_id).map_err(|error| {
-            KernelPortError::Contract(format!("unusable grant closure operation identity: {error}"))
+            KernelPortError::Contract(format!(
+                "unusable grant closure operation identity: {error}"
+            ))
         })?;
         let projection = OperationalRecoveryStore::link_grant_closure_canonical_receipt(
             self.as_ref(),

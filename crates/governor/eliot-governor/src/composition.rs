@@ -8246,10 +8246,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         // an adapter that needs a typed ORS operation identity rebuilds it from
         // these same bytes at the boundary that actually calls the store.
         let closure_projection = durable_link
-            .link_grant_closure_canonical_receipt(
-                closure.operation_id.as_str(),
-                &receipt_identity,
-            )
+            .link_grant_closure_canonical_receipt(closure.operation_id.as_str(), &receipt_identity)
             .map_err(|error| PendingCanonicalHandoff {
                 phase: CanonicalRevocationPhase::SecondPhaseLink,
                 error: CompositionError::Owner(error.to_string()),
