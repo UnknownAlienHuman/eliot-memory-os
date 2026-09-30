@@ -489,6 +489,23 @@ impl StoredSignalEpisode {
                 "watchdog signal episode schema is unsupported".to_owned(),
             ));
         }
+        // The three checks below run in this fixed order and each one fails
+        // closed on the same conditions it always did. They read only this row,
+        // so splitting them moves no durable write and no transaction boundary:
+        // a caller that validated a row before its commit still validates the
+        // identical row the same way afterwards.
+        self.validate_stored_identity()?;
+        self.validate_accepted_evidence()?;
+        self.validate_reopen_history()
+    }
+
+    /// Fails closed when the stored identity is unusable or disagrees with the
+    /// episode key this row recorded for it.
+    ///
+    /// The key is re-derived from the identity fields the row independently
+    /// stores, so neither can be substituted for the other, and the stored class
+    /// and reopen condition are read back under their exact codes.
+    fn validate_stored_identity(&self) -> Result<(), SpoolError> {
         check_identity_text(&self.episode_key, "episode key")?;
         check_identity_text(&self.rule_id, "rule identity")?;
         check_identity_text(&self.subject_id, "subject identity")?;
@@ -527,6 +544,16 @@ impl StoredSignalEpisode {
                 "watchdog signal episode key does not match its own stored identity".to_owned(),
             ));
         }
+        Ok(())
+    }
+
+    /// Fails closed when the accepted evidence disagrees with itself.
+    ///
+    /// The accepted event list is bounded and free of repeated identities, the
+    /// occurrence count is exactly one per accepted identity, a record reference
+    /// exists exactly when the episode accepted something, and the retained
+    /// record is itself canonical.
+    fn validate_accepted_evidence(&self) -> Result<(), SpoolError> {
         if self.accepted_revision > self.highest_revision {
             return Err(SpoolError::Corrupt(
                 "watchdog signal episode revision is above its own highest revision".to_owned(),
@@ -573,6 +600,14 @@ impl StoredSignalEpisode {
             }
             check_digest(&record.record_digest, "accepted record digest")?;
         }
+        Ok(())
+    }
+
+    /// Fails closed when the reopen history is over its bound or out of order.
+    ///
+    /// Ordering is what keeps an earlier episode instance represented beside the
+    /// newer one, so a reopened episode cannot rewrite the history behind it.
+    fn validate_reopen_history(&self) -> Result<(), SpoolError> {
         if self.reopen_history.len() > MAX_SIGNAL_EPISODE_REOPENS {
             return Err(SpoolError::Corrupt(
                 "watchdog signal episode reopen history exceeds its bound".to_owned(),
@@ -654,6 +689,11 @@ impl StoredSignalEpisode {
     ///
     /// Returns whether this acceptance reopened a previously closed episode.
     ///
+    /// Takes the three facts of the accepted observation this method reads
+    /// rather than the observation itself: the source event identity, its
+    /// owner-recorded time, and the producer that issued it. Nothing else in an
+    /// observation can influence the resulting row.
+    ///
     /// # Errors
     ///
     /// Returns [`SpoolError::Corrupt`] when the row is not canonical, the
@@ -663,7 +703,9 @@ impl StoredSignalEpisode {
     /// resulting row is not canonical.
     pub(crate) fn accept(
         &mut self,
-        observation: &SignalEpisodeObservation,
+        source_event: &AcceptedSourceEvent,
+        observed_at_ms: u64,
+        producer_generation: u64,
         admission: &SourceEventAdmission,
         record: StoredSignalRecordRef,
     ) -> Result<bool, SpoolError> {
@@ -673,7 +715,7 @@ impl StoredSignalEpisode {
                 "watchdog signal episode accepted an admission that is not new evidence".to_owned(),
             ));
         }
-        if observation.observed_at_ms == 0 || observation.producer_generation == 0 {
+        if observed_at_ms == 0 || producer_generation == 0 {
             return Err(SpoolError::Corrupt(
                 "watchdog signal episode observation carries an uninitialized time or producer"
                     .to_owned(),
@@ -724,7 +766,7 @@ impl StoredSignalEpisode {
             }
         };
         self.accepted_source_events
-            .push(StoredSourceEvent::from_core(&observation.source_event));
+            .push(StoredSourceEvent::from_core(source_event));
         self.independent_occurrences =
             self.independent_occurrences.checked_add(1).ok_or_else(|| {
                 SpoolError::Corrupt(
@@ -734,7 +776,7 @@ impl StoredSignalEpisode {
         // A genuinely new event is the only thing that may move the episode's
         // evidence time, and it moves it to this observation's own recorded
         // time, never to a later reading of the clock.
-        self.evidence_observed_at_ms = observation.observed_at_ms;
+        self.evidence_observed_at_ms = observed_at_ms;
         self.accepted_revision = self.accepted_revision.saturating_add(1);
         self.highest_revision = self.highest_revision.saturating_add(1);
         self.accepted_record = Some(record);

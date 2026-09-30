@@ -16,7 +16,7 @@ use eliot_watchdog_core::{
     acknowledgement_advances_cursor, is_duplicate_ack, validate_acknowledgement, validate_batch,
     validate_batch_freshness, validate_cursor,
 };
-use redb::{Database, ReadableTable, TableDefinition, WriteTransaction};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
 
 use crate::{
     AdmittedIsolatedDestination, SERVICE_NAME, SpoolError, WatchdogRuntimeBinding, current_unix_ms,
@@ -1651,7 +1651,21 @@ impl WatchdogSpool {
         &self,
         observation: episode::SignalEpisodeObservation,
     ) -> Result<episode::SignalEpisodeOutcome, SpoolError> {
-        let episode_key = eliot_watchdog_core::FailureEpisodeKey::derive(&observation.identity)
+        // The observation is owned exactly once and decomposed here, so each
+        // owner-supplied fact below is read from the value this function
+        // received rather than from a borrow of a caller's copy. The source
+        // event is taken over by value: it is the identity this function
+        // classifies against and later reconciles against, and keeping one
+        // owner of it means the reconciliation can never name a second event.
+        let episode::SignalEpisodeObservation {
+            identity,
+            source_event,
+            reopen_condition,
+            observed_at_ms,
+            producer_generation,
+            record_reason,
+        } = observation;
+        let episode_key = eliot_watchdog_core::FailureEpisodeKey::derive(&identity)
             .map_err(|error| {
                 SpoolError::Corrupt(format!(
                     "watchdog signal episode identity is not derivable: {error:?}"
@@ -1669,30 +1683,25 @@ impl WatchdogSpool {
             let table = write
                 .open_table(episode::SIGNAL_EPISODE_TABLE)
                 .map_err(|error| SpoolError::Database(error.to_string()))?;
-            match episode::read_episode(&table, ledger_key.as_str())? {
-                Some(state) => state,
-                None => {
-                    // A new episode takes one table slot, and the table is
-                    // bounded. The check is against the real retained row count
-                    // rather than a caller's number, so an over-full table
-                    // refuses the new episode instead of the closer later walking
-                    // past it.
-                    let stored = episode::stored_episode_keys(&table)?.len();
-                    if stored >= episode::MAX_SIGNAL_EPISODES {
-                        return Err(SpoolError::Corrupt(
-                            "watchdog signal episode table is at its bound; refusing to open another episode rather than dropping an existing one"
-                                .to_owned(),
-                        ));
-                    }
-                    episode::StoredSignalEpisode::fresh(
-                        &observation.identity,
-                        &episode_key,
-                        &observation.reopen_condition,
-                    )
+            if let Some(state) = episode::read_episode(&table, ledger_key.as_str())? {
+                state
+            } else {
+                // A new episode takes one table slot, and the table is
+                // bounded. The check is against the real retained row count
+                // rather than a caller's number, so an over-full table
+                // refuses the new episode instead of the closer later walking
+                // past it.
+                let stored = episode::stored_episode_keys(&table)?.len();
+                if stored >= episode::MAX_SIGNAL_EPISODES {
+                    return Err(SpoolError::Corrupt(
+                        "watchdog signal episode table is at its bound; refusing to open another episode rather than dropping an existing one"
+                            .to_owned(),
+                    ));
                 }
+                episode::StoredSignalEpisode::fresh(&identity, &episode_key, &reopen_condition)
             }
         };
-        let admission = state.classify(&observation.source_event)?;
+        let admission = state.classify(&source_event)?;
         let (outcome, emission) = match admission {
             eliot_watchdog_core::SourceEventAdmission::Retransmission { .. } => {
                 // Already accepted under the same identity and digest: reuse
@@ -1715,7 +1724,7 @@ impl WatchdogSpool {
             } => (
                 episode::SignalEpisodeOutcome::Refused(
                     episode::SignalEpisodeRefusal::ConflictingSourceEventPayload {
-                        event_id: observation.source_event.event_id.clone(),
+                        event_id: source_event.event_id.clone(),
                         recorded_payload_digest,
                     },
                 ),
@@ -1727,11 +1736,11 @@ impl WatchdogSpool {
                 } else {
                     let payload = WatchdogSpoolPayload::Gap {
                         service: SERVICE_NAME.to_owned(),
-                        reason: observation.record_reason,
+                        reason: record_reason,
                         coverage_claimed: false,
                     };
                     let (_appended, created) =
-                        Self::append_in_transaction(&write, observation.observed_at_ms, payload)?;
+                        Self::append_in_transaction(&write, observed_at_ms, payload)?;
                     // The identity of the record this transaction just created,
                     // bound the way an export batch binds it. A
                     // retention-pressure gap record written ahead of it can
@@ -1744,7 +1753,13 @@ impl WatchdogSpool {
                         record_digest,
                         observed_at_ms: created.observed_at_ms,
                     };
-                    let reopened = state.accept(&observation, &admission, record.clone())?;
+                    let reopened = state.accept(
+                        &source_event,
+                        observed_at_ms,
+                        producer_generation,
+                        &admission,
+                        record.clone(),
+                    )?;
                     let progress = state.progress();
                     (
                         episode::SignalEpisodeOutcome::Accepted {
@@ -1774,7 +1789,7 @@ impl WatchdogSpool {
                 // never handed a second record for an event that already has
                 // one.
                 match self
-                    .reconcile_accepted_signal_event(ledger_key.as_str(), &observation.source_event)
+                    .reconcile_accepted_signal_event(ledger_key.as_str(), &source_event)
                 {
                     Some(reconciled) => Ok(reconciled),
                     None => Err(SpoolError::Database(error.to_string())),
