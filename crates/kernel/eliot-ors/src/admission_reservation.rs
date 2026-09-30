@@ -259,6 +259,11 @@ impl AdmissionReservationRecord {
                             || transition.authority_epoch != self.authority_epoch
                             || transition.state_fence != self.state_fence
                             || transition.now_ms != self.updated_at_ms
+                            // An activation is not a disposition: it carries no
+                            // reason and no disposition evidence, only the pair
+                            // of owner receipts that authorized it.
+                            || transition.reason.is_some()
+                            || transition.evidence.is_some()
                             || transition
                                 .activation
                                 .as_ref()
@@ -288,8 +293,9 @@ impl AdmissionReservationRecord {
                             || transition.authority_epoch != self.authority_epoch
                             || transition.state_fence != self.state_fence
                             || transition.now_ms != self.updated_at_ms
-                            || self.disposition_reason.as_ref() != Some(&transition.reason)
-                            || self.disposition_evidence.as_ref() != Some(&transition.evidence)
+                            || transition.activation.is_some()
+                            || self.disposition_reason.as_ref() != transition.reason.as_ref()
+                            || self.disposition_evidence.as_ref() != transition.evidence.as_ref()
                     })
                 {
                     return Err(OrsError::InvalidTransition);
@@ -304,8 +310,9 @@ impl AdmissionReservationRecord {
                             || transition.authority_epoch != self.authority_epoch
                             || transition.state_fence != self.state_fence
                             || transition.now_ms != self.updated_at_ms
-                            || self.disposition_reason.as_ref() != Some(&transition.reason)
-                            || self.disposition_evidence.as_ref() != Some(&transition.evidence)
+                            || transition.activation.is_some()
+                            || self.disposition_reason.as_ref() != transition.reason.as_ref()
+                            || self.disposition_evidence.as_ref() != transition.evidence.as_ref()
                     })
                 {
                     return Err(OrsError::InvalidTransition);
@@ -397,10 +404,17 @@ pub struct AdmissionReservationTransitionRequest {
     pub operation_id: OperationIdentity,
     /// Requested lifecycle target.
     pub target_state: AdmissionReservationState,
-    /// Receipt-backed disposition reason.
-    pub reason: OpaqueLabel,
-    /// Exact evidence supporting the disposition.
-    pub evidence: AdmissionReservationClaimRef,
+    /// Receipt-backed disposition reason. `Some` for exactly the transitions
+    /// that dispose of the reservation, `None` for an activation, which has a
+    /// disposition reason of its own nowhere: it is not released and not
+    /// expired.
+    #[serde(default)]
+    pub reason: Option<OpaqueLabel>,
+    /// Exact evidence supporting the disposition. `Some` for exactly the
+    /// transitions that dispose of the reservation, `None` for an activation,
+    /// whose evidence is the pair of owner receipts in [`Self::activation`].
+    #[serde(default)]
+    pub evidence: Option<AdmissionReservationClaimRef>,
     /// Exact current receipt against which this request was issued.
     pub expected_current_receipt: OperationalMutationReceipt,
     /// Expected immutable authority epoch.
