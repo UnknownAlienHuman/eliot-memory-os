@@ -15,8 +15,9 @@ use eliot_store_api::{
     PAYLOAD_AUTHORITY_VERSION, PayloadEncoding, PayloadSource, PreparedTransition, ProjectionMode,
     ProjectionPublicationId, ProjectionPublicationRecord, ProjectionStatus, RequestMeta,
     Resubmission, RevisionDelta, RevisionHead, RevisionHeadExpectation, RevisionKey, SplitView,
-    StoreError, WriteReceipt, WriteReceiptStatus, canonical_json_bytes, canonical_request_hash,
-    issue_store_receipt_envelope, sha256_hex, validate_store_receipt_envelope,
+    CausalBinding, StoreError, WriteReceipt, WriteReceiptStatus, canonical_json_bytes,
+    canonical_request_hash, issue_store_receipt_envelope, issue_store_receipt_envelope_with_causal,
+    sha256_hex, validate_store_receipt_envelope, validate_store_receipt_envelope_with_causal,
     verify_canonical_request_hash, verify_ordering_scope_binding,
 };
 use serde::Serialize;
@@ -976,6 +977,67 @@ pub(crate) fn build_receipt_with_expected_heads(
     Ok(receipt)
 }
 
+/// Builds a planned Store receipt with causal facts read from the canonical
+/// database owner for this exact allocation attempt.
+pub(crate) fn build_receipt_with_expected_heads_and_causal(
+    ctx: &RequestMeta,
+    transition: &PreparedTransition,
+    plan: &ApplyPlan,
+    expected_revision_heads: &[RevisionHeadExpectation],
+    expected_ordering_heads: &[OrderingHeadExpectation],
+    causal: &CausalBinding,
+) -> Result<WriteReceipt, StoreError> {
+    let recomputed = verify_apply_canonical_hash(
+        ctx,
+        transition,
+        expected_revision_heads,
+        expected_ordering_heads,
+    )?;
+    let mut receipt = WriteReceipt {
+        operation_id: transition.identity.operation_id.clone(),
+        idempotency_key: transition.identity.idempotency_key.clone(),
+        canonical_request_hash: recomputed,
+        transition_class: transition.transition_class,
+        status: WriteReceiptStatus::Committed,
+        commit_id: Some(plan.commit_id.clone()),
+        state_fence: transition.state_fence.clone(),
+        ordering_sequences: plan.next_ordering_heads.clone(),
+        revision_before_after: plan.revision_before_after.clone(),
+        applied_command_ids: plan.command_ids.clone(),
+        emitted_event_ids: plan.event_ids.clone(),
+        projection_refs: plan
+            .projection_records
+            .iter()
+            .map(|record| record.publication_id.clone())
+            .collect(),
+        outbox_refs: plan
+            .outbox_records
+            .iter()
+            .map(|record| record.outbox_id.clone())
+            .collect(),
+        operation_manifest_digest: transition.operation_manifest_digest.clone(),
+        admission_digest: transition.admission_digest.clone(),
+        mutation_plan_digest: transition.mutation_plan_digest.clone(),
+        semantic_source_revisions: transition.semantic_source_revisions.clone(),
+        policy_config_schema_versions: eliot_store_api::PolicyConfigSchemaVersions::bound_to(
+            transition,
+        ),
+        error_code: None,
+        resubmission: Resubmission::None,
+        committed_at: Some(plan.committed_at.clone()),
+        envelope: None,
+    };
+    receipt.envelope = Some(issue_store_receipt_envelope_with_causal(
+        ctx,
+        transition,
+        &receipt,
+        plan.commit_sequence,
+        causal,
+    )?);
+    receipt.validate()?;
+    Ok(receipt)
+}
+
 /// Validates receipt identity plus the recomputed digest (issue #63).
 ///
 /// Checks supplied == recomputed (typed mismatch otherwise), receipt ==
@@ -1000,6 +1062,49 @@ pub(crate) fn validate_receipt_identity_with_expected_heads(
         return Err(AdapterError::Store(StoreError::InvalidReceipt));
     }
     validate_receipt_identity(receipt, ctx, transition)
+}
+
+/// Validates an apply receipt against its independently read canonical
+/// causal projection as well as the recomputed request identity.
+pub(crate) fn validate_receipt_identity_with_expected_heads_and_causal(
+    receipt: &WriteReceipt,
+    ctx: &RequestMeta,
+    transition: &PreparedTransition,
+    expected_revision_heads: &[RevisionHeadExpectation],
+    expected_ordering_heads: &[OrderingHeadExpectation],
+    causal: &CausalBinding,
+) -> Result<(), AdapterError> {
+    let recomputed = verify_apply_canonical_hash(
+        ctx,
+        transition,
+        expected_revision_heads,
+        expected_ordering_heads,
+    )
+    .map_err(AdapterError::Store)?;
+    if receipt.canonical_request_hash != recomputed {
+        return Err(AdapterError::Store(StoreError::InvalidReceipt));
+    }
+    validate_receipt_identity_with_causal(receipt, ctx, transition, causal)
+}
+
+pub(crate) fn validate_receipt_identity_with_causal(
+    receipt: &WriteReceipt,
+    ctx: &RequestMeta,
+    transition: &PreparedTransition,
+    causal: &CausalBinding,
+) -> Result<(), AdapterError> {
+    receipt.validate()?;
+    if receipt.operation_id != transition.identity.operation_id
+        || receipt.idempotency_key != transition.identity.idempotency_key
+        || receipt.canonical_request_hash != transition.identity.canonical_request_hash
+        || receipt.transition_class != transition.transition_class
+        || receipt.operation_manifest_digest != transition.operation_manifest_digest
+        || receipt.state_fence != ctx.state_fence
+    {
+        return Err(AdapterError::Store(StoreError::InvalidReceipt));
+    }
+    validate_store_receipt_envelope_with_causal(ctx, transition, receipt, causal)?;
+    Ok(())
 }
 
 /// Validates a deduplicated revision-head result set.
