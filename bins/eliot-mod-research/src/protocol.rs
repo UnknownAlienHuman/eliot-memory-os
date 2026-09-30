@@ -38,8 +38,28 @@
 //! non-circular: the binding digest is computed before the process request
 //! exists, and the process request's own digest is what the envelope then
 //! records. A single self-referential digest would be uncomputable.
+//!
+//! ## Admitted identity coverage (issue #24, W2)
+//!
+//! [`SubmitBinding`] carries the eight identities the issue requires the
+//! provider to be bound to — exact artifact/config/protocol digest, the
+//! Module/Capability Registry evidence references, process generation, Authority
+//! Epoch, State Fence, privacy/data class, budget/deadline and cancellation
+//! identity — beside its correlation fields. They belong to the
+//! [`crate::admission::ProviderAdmission`] alone; this module never derives
+//! them, and [`ProviderAdmission::validate_submit_binding`](crate::admission::ProviderAdmission::validate_submit_binding)
+//! is what compares them back by value at mint time. Carrying them here is
+//! necessary but not sufficient: the canonical digest is what the provider is
+//! actually given, and it is compared twice — once by the minting port and once
+//! by the bridge before the executor is contacted.
+//!
+//! The wire version is deliberately **not** bumped for this. The provider never
+//! receives these bytes: it receives only the canonical binding digest through
+//! the admitted argv, and the envelope bytes stay in this process as the
+//! reconciliation record. [`RESEARCH_PROVIDER_WIRE_VERSION`] governs the frames
+//! the provider sends back, and those are unchanged.
 
-use eliot_contracts::ContractVersion;
+use eliot_contracts::{ContractVersion, EpochId, StateFence};
 use serde::{Deserialize, Serialize};
 
 use crate::evidence::sha256_hex;
@@ -94,6 +114,16 @@ impl ProtocolRefusal {
 /// canonical digest is the value handed over, and the field values are the
 /// exact correlation the answer must be attributed to. It deliberately omits
 /// the process-request digest, which cannot exist before the argv is sealed.
+///
+/// The admitted-identity block below is what issue #24's "bind the provider to
+/// exact artifact/config/protocol hash, Module/Capability Registry evidence,
+/// process generation, Authority Epoch, State Fence, privacy/data class,
+/// budget/deadline, and cancellation identity" requires. Every one of those
+/// values is read from a [`ProviderAdmission`](crate::admission::ProviderAdmission)
+/// accessor and re-proved against the same record at mint time by
+/// [`ProviderAdmission::validate_submit_binding`](crate::admission::ProviderAdmission::validate_submit_binding);
+/// nothing here is a second identity authority, and no value is derived,
+/// defaulted or widened in this module.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubmitBinding {
@@ -111,6 +141,30 @@ pub struct SubmitBinding {
     pub required_schema: String,
     /// SHA-256 of the canonical request JSON this binding was built from.
     pub request_sha256: String,
+    /// Exact admitted executable content digest (the artifact identity).
+    pub executable_sha256: String,
+    /// Exact admitted provider configuration digest.
+    pub config_digest: String,
+    /// Exact admitted provider protocol digest.
+    pub protocol_digest: String,
+    /// Module/Capability Registry evidence reference for the provider.
+    pub module_id: String,
+    /// Module generation evidence reference for the provider.
+    pub module_generation_id: String,
+    /// Admitted process generation.
+    pub process_generation: u64,
+    /// Admitted Authority Epoch (exact lineage/sequence tuple).
+    pub authority_epoch: EpochId,
+    /// Admitted State Fence.
+    pub state_fence: StateFence,
+    /// Admitted privacy/data-class wire name.
+    pub disclosure: String,
+    /// Admitted budget ceiling in provider units.
+    pub budget_units: u64,
+    /// Admitted deadline ceiling in milliseconds.
+    pub deadline_ms: i64,
+    /// Cancellation identity for this operation's lifecycle.
+    pub cancellation_id: String,
 }
 
 impl SubmitBinding {
@@ -141,11 +195,17 @@ impl SubmitBinding {
 
 /// Canonical submit envelope retained as the exact reconciliation record.
 ///
-/// The envelope binds operation, route, exact request content, and the sealed
-/// process-request digest the execution ran under. Its bytes never reach the
-/// child as a stream (see the module docs); they are retained so an unknown
-/// outcome or a replay can be reconciled byte-for-byte against the binding
-/// digest the provider was actually given.
+/// The envelope binds operation, route, exact request content, the full
+/// admitted-identity block, and the sealed process-request digest the execution
+/// ran under. Its bytes never reach the child as a stream (see the module
+/// docs); they are retained so an unknown outcome or a replay can be reconciled
+/// byte-for-byte against the binding digest the provider was actually given.
+///
+/// It is exactly its [`SubmitBinding`] plus `invocation_digest`, so
+/// [`SubmitEnvelope::binding`] is total: every admitted identity the provider was
+/// bound to is still readable from the retained reconciliation record after the
+/// run, and a round-trip comparison of `binding().digest()` against the
+/// delivered digest re-proves all of them at once.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubmitEnvelope {
@@ -165,9 +225,71 @@ pub struct SubmitEnvelope {
     pub required_schema: String,
     /// SHA-256 of the canonical request JSON this envelope was built from.
     pub request_sha256: String,
+    /// Exact admitted executable content digest (the artifact identity).
+    pub executable_sha256: String,
+    /// Exact admitted provider configuration digest.
+    pub config_digest: String,
+    /// Exact admitted provider protocol digest.
+    pub protocol_digest: String,
+    /// Module/Capability Registry evidence reference for the provider.
+    pub module_id: String,
+    /// Module generation evidence reference for the provider.
+    pub module_generation_id: String,
+    /// Admitted process generation.
+    pub process_generation: u64,
+    /// Admitted Authority Epoch (exact lineage/sequence tuple).
+    pub authority_epoch: EpochId,
+    /// Admitted State Fence.
+    pub state_fence: StateFence,
+    /// Admitted privacy/data-class wire name.
+    pub disclosure: String,
+    /// Admitted budget ceiling in provider units.
+    pub budget_units: u64,
+    /// Admitted deadline ceiling in milliseconds.
+    pub deadline_ms: i64,
+    /// Cancellation identity for this operation's lifecycle.
+    pub cancellation_id: String,
 }
 
 impl SubmitEnvelope {
+    /// Builds the retained reconciliation record from the delivered binding and
+    /// the sealed process-request digest the execution ran under.
+    ///
+    /// The two records differ by exactly that one field, so this is the
+    /// INVERSE of [`Self::binding`] and the pair is total in both directions:
+    /// `SubmitEnvelope::from_binding(&b, d).binding() == b` for every binding
+    /// `b`, and no admitted identity the provider was bound to can be dropped
+    /// on the way into the retained record.
+    ///
+    /// The `invocation_digest` cannot exist while the binding is being built —
+    /// the binding's own digest is projected into the argv that the process
+    /// request seals, so the envelope is strictly later — which is why this is
+    /// a separate constructor and not a field on [`SubmitBinding`].
+    pub fn from_binding(binding: &SubmitBinding, invocation_digest: &str) -> Self {
+        Self {
+            wire_version: binding.wire_version,
+            operation_id: binding.operation_id.clone(),
+            exchange_id: binding.exchange_id.clone(),
+            idempotency_key: binding.idempotency_key.clone(),
+            invocation_digest: invocation_digest.to_owned(),
+            protocol_revision: binding.protocol_revision,
+            required_schema: binding.required_schema.clone(),
+            request_sha256: binding.request_sha256.clone(),
+            executable_sha256: binding.executable_sha256.clone(),
+            config_digest: binding.config_digest.clone(),
+            protocol_digest: binding.protocol_digest.clone(),
+            module_id: binding.module_id.clone(),
+            module_generation_id: binding.module_generation_id.clone(),
+            process_generation: binding.process_generation,
+            authority_epoch: binding.authority_epoch.clone(),
+            state_fence: binding.state_fence.clone(),
+            disclosure: binding.disclosure.clone(),
+            budget_units: binding.budget_units,
+            deadline_ms: binding.deadline_ms,
+            cancellation_id: binding.cancellation_id.clone(),
+        }
+    }
+
     /// Returns the bounded submit projection of this envelope.
     ///
     /// # Errors
@@ -183,6 +305,18 @@ impl SubmitEnvelope {
             protocol_revision: self.protocol_revision,
             required_schema: self.required_schema.clone(),
             request_sha256: self.request_sha256.clone(),
+            executable_sha256: self.executable_sha256.clone(),
+            config_digest: self.config_digest.clone(),
+            protocol_digest: self.protocol_digest.clone(),
+            module_id: self.module_id.clone(),
+            module_generation_id: self.module_generation_id.clone(),
+            process_generation: self.process_generation,
+            authority_epoch: self.authority_epoch.clone(),
+            state_fence: self.state_fence.clone(),
+            disclosure: self.disclosure.clone(),
+            budget_units: self.budget_units,
+            deadline_ms: self.deadline_ms,
+            cancellation_id: self.cancellation_id.clone(),
         }
     }
 
@@ -205,11 +339,34 @@ impl SubmitEnvelope {
         if envelope.wire_version != RESEARCH_PROVIDER_WIRE_VERSION {
             return Err(ProtocolRefusal::StaleWire);
         }
+        // Every admitted identity is shape-checked here as well as compared by
+        // value in `admission`: `deny_unknown_fields` refuses an *extra* field,
+        // and the checks below refuse a missing, blank or out-of-range one, so a
+        // stripped envelope cannot decode into a record that looks admitted.
+        // Blank text is `BlankCorrelation`; a zero generation or non-positive
+        // ceiling is `MalformedWire`, because the Kernel never admits one and
+        // naming it as blank correlation would misdescribe the refusal.
         if envelope.operation_id.trim().is_empty()
             || envelope.invocation_digest.trim().is_empty()
             || envelope.request_sha256.trim().is_empty()
+            || envelope.exchange_id.trim().is_empty()
+            || envelope.idempotency_key.trim().is_empty()
+            || envelope.required_schema.trim().is_empty()
+            || envelope.executable_sha256.trim().is_empty()
+            || envelope.config_digest.trim().is_empty()
+            || envelope.protocol_digest.trim().is_empty()
+            || envelope.module_id.trim().is_empty()
+            || envelope.module_generation_id.trim().is_empty()
+            || envelope.disclosure.trim().is_empty()
+            || envelope.cancellation_id.trim().is_empty()
         {
             return Err(ProtocolRefusal::BlankCorrelation);
+        }
+        if envelope.process_generation == 0
+            || envelope.budget_units == 0
+            || envelope.deadline_ms <= 0
+        {
+            return Err(ProtocolRefusal::MalformedWire);
         }
         Ok(envelope)
     }
@@ -320,7 +477,7 @@ mod tests {
 
     use eliot_contracts::ContractVersion;
 
-    use crate::support::DIGEST_A;
+    use crate::support::{DIGEST_A, DIGEST_B, DIGEST_C, test_epoch, test_fence};
 
     use super::*;
 
@@ -334,6 +491,18 @@ mod tests {
             protocol_revision: ContractVersion::new(1, 0, 0),
             required_schema: "research-evidence-bundle/v1".to_owned(),
             request_sha256: DIGEST_A.to_owned(),
+            executable_sha256: DIGEST_A.to_owned(),
+            config_digest: DIGEST_B.to_owned(),
+            protocol_digest: DIGEST_C.to_owned(),
+            module_id: "mod-research-provider".to_owned(),
+            module_generation_id: "gen-mod-24-a".to_owned(),
+            process_generation: 3,
+            authority_epoch: test_epoch(),
+            state_fence: test_fence(),
+            disclosure: "ProjectBound".to_owned(),
+            budget_units: 10,
+            deadline_ms: 1_800_000_000_000,
+            cancellation_id: "cancel-24-slice-a".to_owned(),
         }
     }
 

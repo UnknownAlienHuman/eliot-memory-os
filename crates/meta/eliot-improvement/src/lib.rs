@@ -3,6 +3,334 @@
 //! This crate deliberately stops at the promotion boundary.  It records a
 //! replayable proposal and produces an outcome-linked input for an external
 //! governor decision; no API in this crate can make a candidate active.
+//!
+//! # Inventory (#1145 W1)
+//!
+//! This is the measured reverse-consumer, state, effect, experiment-path and
+//! test inventory of the whole package. Every count and every consumer below
+//! was read off the source at `main@7eb86a841`; where a claim is "no consumer",
+//! the exact `git grep` that established it is named. Nothing here is a
+//! projection of intent: a name listed as consumed carries its call site, and a
+//! name listed as unconsumed was searched for by `use eliot_improvement` path
+//! form, by bare path form and by method-call form.
+//!
+//! ## Public surface
+//!
+//! 192 top-level `pub` items and 80 `pub` methods across twelve source files.
+//! The crate root declares 11 `pub mod`s, 10 `pub use` groups that flatten to
+//! 91 crate-root names, and 8 crate-root types (`ImprovementSurface`,
+//! `CandidateState`, `ImprovementLifecycle`, `ReplayPlan`,
+//! `ImprovementCandidate`, `OutcomeEvidence`, `PromotionInput`,
+//! `ImprovementError`). Seven `learning_closure` names are deliberately not
+//! re-exported at the root; the block comment further down records which.
+//!
+//! ## Reverse consumers
+//!
+//! Only ONE consumer leg in this repository reaches a production entry point.
+//! It is `bins/eliotd`, and every crate-level item on that leg is listed below
+//! with its call site. One further crate, `crates/meta/eliot-self-quality`,
+//! reaches this crate from inside that same leg. Every other in-workspace
+//! consumer is a second dead end.
+//!
+//! The live leg, verified by following each hop:
+//!
+//! ```text
+//! bins/eliotd/src/main.rs:30                       daemon_runtime::run()
+//! -> daemon_runtime.rs:895                         runtime.block_on(run_loop(..))
+//! -> daemon_runtime.rs:1573                        run_loop
+//! -> daemon_runtime.rs:1795                        maybe_start_improvement_intake
+//! -> daemon_runtime.rs:5487                        run_improvement_intake(..).await
+//! -> daemon_runtime.rs:5150/5157                   improvement_intake_artifact
+//! -> daemon_runtime.rs:5025/5047                   assemble_improvement_artifact
+//! -> improvement_intake_dispatch.rs:379            pub fn assemble_improvement_artifact
+//! ```
+//!
+//! From that entry point the crate is entered through exactly these items:
+//!
+//! | Crate item | Call site on the live leg |
+//! |---|---|
+//! | `evidence_sources::sourced_evidence` | `improvement_intake_dispatch.rs:416` |
+//! | `evidence_sources::candidate_from_evidence` | `improvement_intake_dispatch.rs:430` |
+//! | `ImprovementCandidate::new` | `evidence_sources.rs:89` |
+//! | `ImprovementCandidate::transition_lifecycle` | `improvement_intake_dispatch.rs:447` |
+//! | `ImprovementCandidate::validate` | `improvement_dedup_read.rs:555` (and internally at `evidence_sources.rs:114`, `brief.rs:279`) |
+//! | `brief::SafeBoundary::from_observed_closure` | `improvement_intake_dispatch.rs:491` |
+//! | `brief::brief_at_safe_boundary` | `improvement_intake_dispatch.rs:538` |
+//! | `brief::record_owner_decision` | `improvement_intake.rs:34` (from `improvement_intake_dispatch.rs:585`) |
+//! | `application_class::classify` | `improvement_intake_dispatch.rs:804` |
+//! | `application_class::check_class_gate` | `improvement_intake_dispatch.rs:805` |
+//! | `application_class::ChangeDescriptor::from_recorded_surface` | `improvement_intake_dispatch.rs:803` |
+//! | `candidate_bounds::BoundedBacklog::restored` | `improvement_dedup_read.rs:483` |
+//! | `candidate_bounds::BoundedBacklog::admit_reporting_pressure` | `improvement_intake_dispatch.rs:1239` |
+//! | `candidate_bounds::BoundedBacklog::entry_for` | `improvement_intake_dispatch.rs:1286` |
+//! | `candidate_bounds::canonical_evidence_lineage` | `improvement_dedup_read.rs:540`, `candidate_dispatch.rs:591` |
+//! | `candidate_bounds::evidence_lineage_digest` | `improvement_dedup_read.rs:546`, `candidate_dispatch.rs:591` |
+//! | `candidate_bounds::CandidateBoundPolicy` | `improvement_intake_dispatch.rs:1060,1085` |
+//! | `ImprovementSurface::closed_name` | `improvement_candidate_dispatch.rs:497` |
+//! | `ImprovementLifecycle::is_terminal` | `improvement_dedup_read.rs:626` |
+//! | `ImprovementCandidate`, `ImprovementSurface`, `ImprovementLifecycle`, `ReplayPlan`, `SourcedEvidence`, `EvidenceSource`, `OwnerDecision`, `OwnerDecisionKind`, `ImprovementBrief`, `SafeBoundary`, `ImprovementError`, `AdmitOutcome`, `AdmitReport`, `TrackedCandidate`, `ArchivedCandidate`, `DurableCandidateRecord`, `BoundsError` | type positions in `improvement_intake.rs`, `improvement_intake_dispatch.rs`, `improvement_dedup_read.rs`, `improvement_candidate_dispatch.rs`, `daemon_runtime.rs:58,5106` |
+//!
+//! The consumer half of the same pass — the leg that reads a candidate back —
+//! rides the same observation at `daemon_runtime.rs:5263`
+//! (`dispatch_improvement_candidate_route` ->
+//! `improvement_candidate_dispatch.rs:260 route_improvement_candidate` ->
+//! `improvement_candidate_route.rs:100`). The path that consumes a candidate
+//! is the path that constructs it.
+//!
+//! One crate reaches in from inside that leg. `crates/meta/eliot-self-quality`
+//! calls `evidence_sources::sourced_evidence` at `improvement_handoff.rs:69`
+//! and returns `SourcedEvidence` at `conformance_evidence.rs:98`;
+//! `git grep -n "sourced_evidence_from_conformance_diagnosis"` shows its
+//! production call at `improvement_intake_dispatch.rs:1003`, so the
+//! conformance-diagnosis arm of the live leg reaches this crate through
+//! `eliot_self_quality::conformance_evidence.rs:111`. `eliotd` depends on
+//! `eliot-self-quality` (`bins/eliotd/Cargo.toml:94`), so this is one consumer
+//! leg, not two.
+//!
+//! ### Named elsewhere, but not on a live path
+//!
+//! These have an in-workspace caller in non-test source, and that caller is
+//! itself unreachable from any production entry point. Each was traced:
+//!
+//! - `producer::produce_learning_candidate` and `producer::LearningProduction`.
+//!   `git grep -n "produce_learning_candidate(" -- '*.rs'` returns two
+//!   non-definition hits: `bins/eliot-wasm-host/src/governed_admission.rs:197`
+//!   inside `admit_governed_host`, and
+//!   `crates/smart/eliot-context-compiler-wasm/src/governed_compose.rs:149`.
+//!   `git grep -n "admit_governed_host" -- '*.rs'` returns only its definition,
+//!   the `pub use` in `bins/eliot-wasm-host/src/lib.rs:78`, and one prose
+//!   mention in `eliot-context-admission/src/lib.rs:271` — zero callers.
+//!   `compose_governed_compilation` is likewise only its definition and the
+//!   `lib.rs:55` re-export of a crate that is not in the root `Cargo.toml`
+//!   members list at all. **Open disposition: live contract, bounded reference
+//!   fixture, or delete.**
+//! - `governed_screen::{check_governed_carriage, CarriageMark,
+//!   PresentedLearning, bounds_to_context_error, datetime_from_unix}` and
+//!   `candidate_bounds::{retrieve_governed, GovernedRetrieval,
+//!   RetrievalDecision, ReusableCandidateRef, CrossTaskCarryover,
+//!   bound_compilation_task}`. Their only workspace callers are
+//!   `crates/smart/eliot-context-admission/src/learning_gate.rs:209` (inside
+//!   `admit_context_with_learning`) and
+//!   `crates/smart/eliot-context-assembly/src/learning_gate.rs:81` (inside
+//!   `assemble_active_view_with_learning`). `git grep` for those two functions
+//!   returns, outside their own definitions and tests, only
+//!   `bins/eliot-wasm-host/src/governed_admission.rs` (inside the callerless
+//!   `admit_governed_host`) and the non-member wasm crate. `eliotd` itself
+//!   reaches those crates only through the NON-learning `admit_context_traced`
+//!   (`daemon_runtime`-side `kernel_context_read_client.rs:74`) and
+//!   `assemble_active_view` (`:76`), neither of which touches this crate. That
+//!   crate's own
+//!   `crates/smart/eliot-context-admission/src/lib.rs:258-274` already records
+//!   this as a measured absence.
+//!
+//! ### No consumer outside this crate, at all
+//!
+//! Searched by `git grep -n "<name>(" -- '*.rs'` and by `git grep -n
+//! "eliot_improvement::<name>" -- '*.rs'`, both excluding
+//! `crates/meta/eliot-improvement/**`:
+//!
+//! - `intake_from_evidence` — zero call sites. The three `eliotd` hits at
+//!   `improvement_intake_dispatch.rs:95,100,452` are prose explaining why the
+//!   daemon deliberately does NOT call it.
+//! - `require_matched_budget_for_promotion` — zero external call sites. The two
+//!   `eliotd` hits (`improvement_intake_dispatch.rs:88,96`) are prose. Its only
+//!   callers are internal: `intake.rs:284` and `lib.rs:933`.
+//! - `intake_from_evidence_governed`, `IntakeRequest`, `IntakeOutcome`,
+//!   `GovernedIntakeOutcome`, `GovernedIntakeError`,
+//!   `RetainedCampaignLearning`, `RetainedReusableClosure` — no `.rs` hit
+//!   outside the crate except the generated
+//!   `crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml`
+//!   projection.
+//! - `stamp_outcome_budget` — exactly one external caller,
+//!   `bins/eliotd/src/improvement_intake.rs:46`, inside
+//!   `stamp_promotion_budget`. `git grep -n "stamp_promotion_budget"` returns
+//!   only that definition. So the one budget-stamping bridge is itself
+//!   uncalled, and `BudgetProof` and `OutcomeEvidence` are named in
+//!   `improvement_intake.rs` but never reached from the daemon.
+//! - `ImprovementCandidate::promotion_input` and `PromotionInput` — no `.rs`
+//!   consumer outside the crate. `PromotionInput::validate` is unreached;
+//!   `ImprovementCandidate::promotion_input` has no caller at all.
+//! - `promote_lifecycle` — zero external call sites. The only gate that can
+//!   reach a promoting disposition has no production caller; the live leg uses
+//!   `transition_lifecycle(Triaged)`.
+//! - `ImprovementCandidate::transition` (the advisory `CandidateState` machine)
+//!   — zero external call sites; grepped `candidate.transition(`.
+//! - `ImprovementLifecycle::is_promoting_disposition`,
+//!   `CandidateState::is_experimental` — zero external call sites.
+//! - `route_rejected_surface`, `ImprovementCandidateDraft`,
+//!   `route_overlay_task_policy_change` — the whole
+//!   `overlay_policy_routing` module has no production consumer.
+//! - `sourced_evidence_from_repeated_verifier_failure` — zero external hits.
+//! - `brief::is_non_mutating`, `budget_proof::{ComplexityEconomicsDelta,
+//!   is_conclusive, supports_promotion}` — zero external hits.
+//! - The entire `promotion_input` module (45 top-level items, including
+//!   `prepare_promotion_input`, `promotion_evidence_digest`,
+//!   `PriorPromotionHistory`, `PromotionRequest`, `PromotionCandidate`,
+//!   `ClosureBinding`, `PromotionGateEvidence`, `PromotionInputError`,
+//!   `PromotionInputPolicy`, `PromotionPreparation`, `AGENT_ORDER`,
+//!   `PROOF_CEILING`, `PRIVACY_CEILING`, `REQUESTED_EFFECT`,
+//!   `SUPPORTED_SCHEMA_VERSIONS`, `SCOPED_UPDATE_PROMOTED`) — every `.rs`
+//!   hit outside the crate is a hit in this crate's own `tests/`.
+//!   `MODULE_ID`, `RUNTIME_LAYER`, `SOURCE_LAYER` and `CAUSAL_PROPERTY` are
+//!   re-exported at the crate root; `PRODUCT_PULSE`,
+//!   `SUPPORTED_SCHEMA_VERSIONS`, `PROOF_CEILING`, `PRIVACY_CEILING` and
+//!   `REQUESTED_EFFECT` are reachable only as
+//!   `eliot_improvement::promotion_input::<NAME>`, which is where this crate's
+//!   own `tests/candidate_admission_edge.rs:271,334-336,365-369` read them.
+//! - The entire `learning_closure` module (50 top-level items, including
+//!   `assemble_campaign_learning_closure`,
+//!   `assemble_campaign_learning_closure_with_evidence`, `ClosurePolicy`,
+//!   `CampaignLearningClosure`, `LearningDebt`, `trigger_closure_due`,
+//!   `allowed_disposition`, `supported_episode_disposition`) — every `.rs`
+//!   hit outside the crate is a hit in this crate's own `tests/`. That is
+//!   consistent with I12.24:289, which puts closure assembly on "existing Meta,
+//!   Memory OS and Governor paths" and says its disposition "records, but
+//!   never performs, a promotion" — this crate holds the record shape and no
+//!   assembly owner.
+//! - `candidate_bounds::{BoundedBacklog::new, BoundedBacklog::admit,
+//!   BoundedBacklog::admit_governed, BoundedBacklog::archive,
+//!   BoundedBacklog::active_for, BoundedBacklog::active_reusable,
+//!   BoundedBacklog::policy_for, bind_local_overlay, live_local_overlay,
+//!   bind_reusable_candidate, retrieve_for_attempt, reverify_live,
+//!   governed_assemble_campaign_learning_closure,
+//!   governed_assemble_at_lifecycle_event,
+//!   governed_closure_assembly_admission, closure_candidate_usable_by_task,
+//!   GovernedOverlay::is_live_local_admitted(_at_unix)}` — no production
+//!   consumer; the hits are in this crate's `tests/`, in other crates'
+//!   `tests/`, or doc prose. The live daemon reaches the backlog only through
+//!   `restored`, `admit_reporting_pressure` and `entry_for`.
+//! - `CrossTaskCarryover::verify` is reached from
+//!   `improvement_intake_dispatch.rs:1486` inside
+//!   `verify_cross_task_carryover`, and `git grep -n
+//!   "verify_cross_task_carryover"` returns only that definition plus its own
+//!   doc comments — so the cross-task revalidation seam is present and typed
+//!   but uncalled.
+//!
+//! ### Names that are NOT this crate's
+//!
+//! `crates/governor/eliot-maintenance/src/improvement_pipeline.rs` declares its
+//! OWN `ExperimentPlan` (`:429`), `MechanismDeclaration` (`:366`),
+//! `ActivationEvidence` (`:491`), `RollbackContract` (`:524`) and
+//! `ImprovementProposal` (`:544`). Those five names have ZERO occurrences
+//! anywhere in `crates/meta/eliot-improvement`, verified by `Select-String`
+//! over `src/*.rs` and `tests/*.rs`. Reading a #1145 claim about "the six exact
+//! identities" as a claim about this crate substitutes one crate for another;
+//! this crate's own contribution is the advisory `ImprovementCandidate`, the
+//! `ReplayPlan`, the `ImprovementBrief` and the lifecycle/budget gates.
+//!
+//! ## Mutable state and effects
+//!
+//! The crate is stateless in the sense ARCH-MOD-03 requires it to declare.
+//! Measured:
+//!
+//! - **No global or static state.** `Select-String` for `static `,
+//!   `OnceLock`, `LazyLock` and `lazy_static` over `src/*.rs` returns no
+//!   declaration; every `'static` hit is a `&'static str` type in an error
+//!   enum or a returned name.
+//! - **No interior mutability.** No `Mutex`, `RwLock`, `RefCell`, `Cell`,
+//!   `UnsafeCell` or `Atomic*` anywhere in `src/`. The only `&mut self`
+//!   receivers are `ImprovementCandidate::{set_details, transition,
+//!   transition_lifecycle, promote_lifecycle}` and
+//!   `BoundedBacklog::{admit, admit_governed, admit_reporting_pressure,
+//!   archive, bind_local_overlay, bind_reusable_candidate}`. `BoundedBacklog`
+//!   is the crate's one stateful aggregate and it is a plain value the CALLER
+//!   owns; `eliotd` constructs one per pass at `daemon_runtime.rs:5106` and
+//!   drops it at the end of that pass.
+//! - **No filesystem, process, network, thread, env or async effect.**
+//!   `grep` for `std::fs`, `std::net`, `std::process`, `std::thread`,
+//!   `std::env`, `Command::new`, `tokio`, `async `, `await` and `unsafe`
+//!   over `src/*.rs` returns ZERO source hits. The textual matches for those
+//!   strings live in `tests/promotion_input.rs:1199-1221` and
+//!   `tests/learning_closure.rs:1928-1941`, where they are the FORBIDDEN list
+//!   of a source-bound test that asserts the module's own source contains none
+//!   of them. `unsafe_code = "forbid"` is inherited from the workspace
+//!   `[workspace.lints.rust]`, and `overlay_policy_routing.rs:19` repeats it
+//!   at module scope.
+//! - **Clock.** Ten clock reads in total, all in construction or bookkeeping
+//!   paths, none in a gate: `OffsetDateTime::now_utc()` at `lib.rs:646` (`new`),
+//!   `lib.rs:724,863,946` (`set_details`, `transition`,
+//!   `apply_lifecycle_edge`), `lib.rs:969` (`promotion_input`),
+//!   `brief.rs:299,322` (`brief_at_safe_boundary`, `record_owner_decision`) and
+//!   `candidate_bounds.rs:1122` (a lineage merge), plus `Uuid::now_v7()` at
+//!   `lib.rs:961` and `brief.rs:288`. `datetime_from_unix` converts a
+//!   caller-supplied timestamp and reads no clock. No expiry, admission or
+//!   promotion decision in this crate consults the clock on its own behalf;
+//!   `now` is always a parameter (`candidate_bounds.rs:1370,1877,1897,2237,2355`
+//!   and `governed_screen.rs:83,152,190`). The two modules that own the inner
+//!   learning loop are clock-free outright: `Select-String` for
+//!   `OffsetDateTime` over `learning_closure.rs` and `promotion_input.rs`
+//!   returns nothing, so neither module can read a clock even by accident.
+//! - **One owner-held read.** `brief.rs:200` calls
+//!   `CanonicalLearningDeltaStore::load()`, a read of already-committed
+//!   IN-PROCESS state the caller passes in. It opens no transport, no store
+//!   client and no durability path; `brief.rs:176-181` states the caller's
+//!   mutex obligation.
+//!
+//! Per acceptance item A9 — "cannot edit source/config/policy, install
+//! artifacts, activate generations, issue authority, promote support/truth or
+//! produce `VERIFIED_COMPLETE`" — the per-item evidence is:
+//! source/config/policy edit: no filesystem or process effect at all, above;
+//! artifact installation: no process spawn; generation activation: the crate
+//! has no generation API and reads no generation store; authority issuance:
+//! every boundary is a refusal (`SelfPromotionForbidden`,
+//! `ApplicationClassViolation`, `UnsafeBoundary`, `BudgetGateViolation`,
+//! `MissingBudgetProof`), and `validate_base` at `lib.rs:805` refuses
+//!   `advisory_only: false` at `lib.rs:820` outright; support/truth promotion
+//!   and `VERIFIED_COMPLETE`: no name in this crate's source spells either, and
+//!   the only transition into a promoting disposition, `promote_lifecycle`
+//! (`lib.rs:916`), is unreachable from production because it has no caller
+//! and `require_matched_budget_for_promotion` is itself uncalled externally.
+//!
+//! ## Experiment path
+//!
+//! Nothing in this crate RUNS an experiment. What it holds is record and
+//! validation only:
+//!
+//! - `ReplayPlan` (`lib.rs:570`) names the fixed-replay, holdout, transfer and
+//!   counter-metric references. `ReplayPlan::validate` (`lib.rs:579`) refuses
+//!   empty reference groups and an empty `transfer_refs`. It matches
+//!   I12.24:67, "fixed replay as diagnostic evidence only".
+//! - `canary_plan`, `rollback` and `stop_condition` are `String` REFERENCES on
+//!   the candidate (`lib.rs:617-621`); `validate` (`lib.rs:744-746`) requires
+//!   them to be non-empty and never resolves them.
+//! - `BudgetProof` / `ComplexityEconomicsDelta` /
+//!   `require_matched_budget_for_promotion` are the I12.24:76 matched-budget
+//!   gate. `OutcomeEvidence::validate_for` (`lib.rs:1008`) refuses a
+//!   promotion-bound outcome that lacks a budget ledger, a conclusive
+//!   economics delta, affected checks, live shadow/canary evidence or
+//!   delayed-harm visibility. That is I12.24:76's "An unmatched ledger or
+//!   inconclusive complexity delta cannot promote the candidate merely because
+//!   replay or a local metric improved."
+//! - The lifecycle enums carry the experiment states and enforce the edge
+//!   table: `AcceptedForExperiment` and `Running` exist only as transitions
+//!   `lifecycle_edge_allowed` (`lib.rs:517`) permits, and the promoting step
+//!   "promote, narrow, rollback or archive" (I12.24:70) is gated so that
+//!   `transition_lifecycle` refuses `Supported`/`Narrowed` outright
+//!   (`lib.rs:892`) and only `promote_lifecycle` admits them, and only with a
+//!   budget proof.
+//! - `promotion_input::prepare_promotion_input` (`promotion_input.rs:551`) is a
+//!   pure gate over already-supplied evidence, and it has no production caller.
+//!
+//! ## Tests
+//!
+//! 106 `#[test]` functions, all in `crates/meta/eliot-improvement/tests/`, one
+//! file per cell, none inline in `src/` (measured: zero `#[test]`, zero
+//! `mod tests`, zero `cfg(test)` under `src/`):
+//!
+//! | File | `#[test]` |
+//! |---|---|
+//! | `tests/learning_closure.rs` | 58 |
+//! | `tests/promotion_input.rs` | 28 |
+//! | `tests/candidate_bounds_1869.rs` | 10 |
+//! | `tests/candidate_admission_edge.rs` | 5 |
+//! | `tests/producer_1869.rs` | 5 |
+//!
+//! Counted by matching the `#[test]` attribute in each file's source, not by a
+//! test run. Two of them are source-bound negatives rather than behavioural
+//! proofs and are the direct evidence for the effect claims above:
+//! `tests/promotion_input.rs:1197` and `tests/learning_closure.rs:1926` read
+//! their own module's source with `include_str!` and assert the forbidden
+//! effect vocabulary is absent.
 
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};

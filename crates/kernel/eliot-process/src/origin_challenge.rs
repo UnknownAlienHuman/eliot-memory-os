@@ -494,6 +494,9 @@ pub struct OriginControlGrant {
     operation: OriginControlOperation,
     physical: PhysicalProcessBinding,
     generation: Generation,
+    installation_id: String,
+    state_fence: StateFence,
+    expires_at_unix_ms: u64,
     decided_at_unix_ms: u64,
     grant_digest: String,
 }
@@ -514,6 +517,21 @@ impl OriginControlGrant {
         self.decided_at_unix_ms
     }
 
+    /// Returns the installation identity the decided challenge bound.
+    pub fn installation_id(&self) -> &str {
+        &self.installation_id
+    }
+
+    /// Returns the admitted fence the decided challenge bound.
+    pub const fn state_fence(&self) -> &StateFence {
+        &self.state_fence
+    }
+
+    /// Returns the challenge expiry time (inclusive) this grant inherits.
+    pub const fn expires_at_unix_ms(&self) -> u64 {
+        self.expires_at_unix_ms
+    }
+
     /// Returns the secret-bound decision tag.
     pub fn grant_digest(&self) -> &str {
         &self.grant_digest
@@ -525,8 +543,11 @@ impl OriginControlGrant {
     /// The effect boundary calls this with the identity the authoritative
     /// owner still holds for the same operation, so a grant minted for one
     /// child, one image, one start time, or one generation cannot authorize a
-    /// different or substituted target. A grant is not transferable between
-    /// operations, so this never needs the operation identity to match.
+    /// different or substituted target. This checks identity and generation
+    /// only: a caller about to perform one specific operation class must also
+    /// bind the grant to that class with
+    /// [`Self::binds_target_for_operation`], so a grant minted for one
+    /// operation cannot authorize another.
     pub fn binds_target(
         &self,
         physical: &PhysicalProcessBinding,
@@ -537,6 +558,62 @@ impl OriginControlGrant {
         }
         if self.generation != generation {
             return Err(ContractError::FenceMismatch);
+        }
+        Ok(())
+    }
+
+    /// Checks that this grant authorizes exactly the intended operation class
+    /// on exactly the target the caller is about to act on.
+    ///
+    /// The effect boundary calls this with the operation it is about to
+    /// perform and the identity the authoritative owner still holds for the
+    /// same target object, so a grant minted for one operation class (for
+    /// example kill) cannot authorize a different one (for example adoption
+    /// or credential attachment), and a grant minted for one child, one
+    /// image, one start time, or one generation cannot authorize a different
+    /// or substituted target. Uses the same `origin_operation` typed failure
+    /// the authority decision uses for a wrong operation class.
+    pub fn binds_target_for_operation(
+        &self,
+        physical: &PhysicalProcessBinding,
+        generation: Generation,
+        expected_operation: OriginControlOperation,
+    ) -> Result<(), ContractError> {
+        if self.operation != expected_operation {
+            return Err(ContractError::InvalidValue {
+                field: "origin_operation",
+                reason: "grant does not allow this operation class",
+            });
+        }
+        self.binds_target(physical, generation)
+    }
+
+    /// Checks that this grant is still current for the effect about to run.
+    ///
+    /// The effect boundary calls this with the live authority contour and
+    /// clock after [`Self::binds_target_for_operation`], so a grant decided
+    /// under an older authority epoch, a moved fence, or an expired
+    /// challenge window cannot authorize a later privileged effect even
+    /// when it still names the right operation and target. The installation
+    /// identity rides in the proof and its secret-bound digest as admitted
+    /// intent evidence; its authoritative binding was already proven against
+    /// the durable issuance record by [`OriginChallengeAuthority::decide`],
+    /// and the target side is proven against the retained start receipt by
+    /// [`Self::binds_target_for_operation`]. Uses the existing typed
+    /// currency failures, never a new proof token or second authority.
+    pub fn binds_effect_currency(
+        &self,
+        live_lineage_id: &str,
+        live_authority_sequence: u64,
+        now_unix_ms: u64,
+    ) -> Result<(), ContractError> {
+        if now_unix_ms > self.expires_at_unix_ms {
+            return Err(ContractError::ExpiredDispatchPermit);
+        }
+        if self.state_fence.authority_epoch.sequence.get() != live_authority_sequence
+            || self.state_fence.authority_epoch.lineage_id.as_str() != live_lineage_id
+        {
+            return Err(ContractError::StaleStateFence);
         }
         Ok(())
     }
@@ -555,6 +632,9 @@ impl OriginControlGrant {
             operation: OriginControlOperation,
             physical: &'a PhysicalProcessBinding,
             generation: Generation,
+            installation_id: &'a str,
+            state_fence: &'a StateFence,
+            expires_at_unix_ms: u64,
             decided_at_unix_ms: u64,
         }
         let bytes = serde_json::to_vec(&GrantMaterial {
@@ -563,6 +643,9 @@ impl OriginControlGrant {
             operation: challenge.operation,
             physical,
             generation,
+            installation_id: &challenge.installation_id,
+            state_fence: &challenge.state_fence,
+            expires_at_unix_ms: challenge.expires_at_unix_ms,
             decided_at_unix_ms: now_unix_ms,
         })
         .map_err(|error| ContractError::Serialization(error.to_string()))?;
@@ -572,6 +655,9 @@ impl OriginControlGrant {
             operation: challenge.operation,
             physical: physical.clone(),
             generation,
+            installation_id: challenge.installation_id.clone(),
+            state_fence: challenge.state_fence.clone(),
+            expires_at_unix_ms: challenge.expires_at_unix_ms,
             decided_at_unix_ms: now_unix_ms,
             grant_digest,
         })
@@ -916,6 +1002,10 @@ impl OriginChallengeAuthority {
             || entry.physical_digest != challenge.physical_digest
             || entry.installation_id != challenge.installation_id
             || entry.generation != challenge.generation
+            // The fence is compared against the live issuance record, not
+            // only the caller-serialized request binding checked below, so a
+            // serialized fence alone never suffices.
+            || !fences_match_exact(&entry.state_fence, &challenge.state_fence)
             || entry.operation != challenge.operation
             || entry.issued_at_unix_ms != challenge.issued_at_unix_ms
             || entry.expires_at_unix_ms != challenge.expires_at_unix_ms
@@ -976,6 +1066,9 @@ impl OriginChallengeAuthority {
         // generation equal the challenge's, so the grant carries those exact
         // values: the effect boundary can then recheck the still-running
         // target against the proof instead of trusting the caller's routing.
+        // The admitted installation, fence, and challenge window ride along
+        // in the same proof, so the boundary can also recheck currency
+        // against its live contour and clock.
         OriginControlGrant::mint(
             &self.key,
             &presentation.challenge,

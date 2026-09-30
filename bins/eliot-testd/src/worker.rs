@@ -71,9 +71,9 @@ use eliot_process::{
 };
 use eliot_testd_core::{
     EvidenceCollector, JobState, KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider,
-    Lease, NormalizedEvidence, RawArtifactStream, TestJob, TestdError, TestdSourceObservation,
-    TestdSourceObservationRange, TestdStore, TestdToolObservation, evaluate_testd_verification,
-    issue_process_admission,
+    Lease, NormalizedEvidence, RawArtifactStream, SourceObservationGitPort, TestJob, TestdError,
+    TestdSourceObservation, TestdSourceObservationRange, TestdStore, TestdToolObservation,
+    evaluate_testd_verification, issue_process_admission,
 };
 
 use crate::kernel_client::{
@@ -109,6 +109,42 @@ const MAX_REASON_CHARS: usize = 512;
 /// recorded artifact keeps exactly one normalized reference either way.
 const INLINE_STREAM_HANDLE_PREFIX: &str = "testd-inline-stream";
 
+/// The governed physical-process contour for one admitted shot.
+///
+/// The tool child and the terminal source observation are launched by the SAME
+/// admitted `ProcessExecutor`, and the observation's Git port is that executor
+/// itself. They are bound together here so they cannot be passed apart: a shot
+/// that launched the tool under the Job Object contour but took its source
+/// observation from somewhere else is exactly the bypass issue #1140 AC3
+/// removes (issue #1140, AC3).
+///
+/// `git` is `None` only when no Git observation is available at all; every
+/// productive profile then fails closed rather than falling back to an
+/// ungoverned source observation.
+pub struct GovernedContour<'a, E: ?Sized> {
+    /// The admitted executor that owns the Job Object contour.
+    executor: &'a E,
+    /// The same executor, presented as the physical Git port.
+    git: Option<&'a dyn SourceObservationGitPort>,
+}
+
+impl<'a, E: ?Sized> GovernedContour<'a, E> {
+    /// Binds one executor as both the launch contour and the Git port.
+    pub const fn new(executor: &'a E, git: Option<&'a dyn SourceObservationGitPort>) -> Self {
+        Self { executor, git }
+    }
+
+    /// The admitted executor that owns the Job Object contour.
+    pub const fn executor(&self) -> &'a E {
+        self.executor
+    }
+
+    /// The same executor presented as the physical Git port.
+    pub const fn git(&self) -> Option<&'a dyn SourceObservationGitPort> {
+        self.git
+    }
+}
+
 /// Drives exactly one admitted one-shot claim to a deterministic disposition.
 ///
 /// `presented` is the session-bound admission: envelope, parsed typed
@@ -121,16 +157,21 @@ const INLINE_STREAM_HANDLE_PREFIX: &str = "testd-inline-stream";
 /// canonical). Every post-claim path finishes or cancels through the durable
 /// store, so the lease is always released. Errors are fail-closed and carry
 /// no raw output.
+///
+/// `contour` is the governed process contour used for BOTH the tool child and
+/// the terminal source observation (issue #1140, AC3). Without its Git port
+/// the finish path fails closed rather than falling back to an ungoverned
+/// source observation.
 pub fn drive_admitted_one_shot<E: ProcessExecutor + 'static>(
     _composition: &TestdComposition,
     store: &TestdStore,
     presented: PresentedAdmission,
-    executor: &E,
+    contour: &GovernedContour<'_, E>,
     owner: &str,
     lease_ms: u64,
     now: u64,
 ) -> Result<TestReceipt, TestdError> {
-    drive_admitted_one_shot_from_store(store, presented, executor, owner, lease_ms, now)
+    drive_admitted_one_shot_from_store(store, presented, contour, owner, lease_ms, now)
 }
 
 /// Drives one admitted shot against the already-open canonical TestD store.
@@ -141,7 +182,7 @@ pub fn drive_admitted_one_shot<E: ProcessExecutor + 'static>(
 pub(crate) fn drive_admitted_one_shot_from_store<E: ProcessExecutor + 'static>(
     store: &TestdStore,
     presented: PresentedAdmission,
-    executor: &E,
+    contour: &GovernedContour<'_, E>,
     owner: &str,
     lease_ms: u64,
     now: u64,
@@ -203,24 +244,18 @@ pub(crate) fn drive_admitted_one_shot_from_store<E: ProcessExecutor + 'static>(
         .lease
         .clone()
         .ok_or_else(|| TestdError::Corrupt("claimed job carries no lease".to_owned()))?;
-    drive_claimed(
-        store, &job, &mut lease, presented, executor, owner, lease_ms,
-    )
+    drive_claimed(store, &job, &mut lease, presented, contour, owner, lease_ms)
 }
 
 /// Drives one claimed job against the presented admission to a deterministic
 /// disposition. The job is already leased to this shot; every path below ends
 /// in `finish` or `cancel` so the lease is always released.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "DISPATCH-LIVE residual: one admitted-shot context (composition, store, job, lease, presented material, executor, owner, now); a params-struct refactor is deferred until the dispatch-launch seam fixes the call shape, never a bare allow"
-)]
 fn drive_claimed<E: ProcessExecutor + 'static>(
     store: &TestdStore,
     job: &TestJob,
     lease: &mut Lease,
     presented: PresentedAdmission,
-    executor: &E,
+    contour: &GovernedContour<'_, E>,
     owner: &str,
     lease_ms: u64,
 ) -> Result<TestReceipt, TestdError> {
@@ -315,7 +350,7 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
         lease,
         current_clock_ms(),
         permit,
-        executor,
+        contour.executor(),
         sink,
     ));
     let started_at = start_result
@@ -331,12 +366,10 @@ fn drive_claimed<E: ProcessExecutor + 'static>(
         store,
         job,
         lease,
-        executor,
+        contour,
         &collector,
-        operation_id,
-        start_note,
+        SupervisionInput::for_start(operation_id, start_note, lease_ms),
         started_at,
-        lease_ms,
     )?;
     Ok(crate::receipt(&store.get(&job.job_id)?.ok_or_else(
         || TestdError::Corrupt("job disappeared after finish".to_owned()),
@@ -410,35 +443,28 @@ fn observe_tool_identity(request: &ProcessRequest) -> Result<TestdToolObservatio
 /// deadline (or after a durable cancellation), and reconciles the exact
 /// operation before accepting an unproven outcome. There is no second claim
 /// or scheduler in this loop.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "DISPATCH-LIVE residual: one observation context (store, job, lease, executor, collector, operation, start note, lease duration); a params-struct refactor is deferred until the dispatch-launch seam fixes the call shape, never a bare allow"
-)]
 fn observe_and_finish<E: ProcessExecutor + 'static>(
     store: &TestdStore,
     job: &TestJob,
     lease: &mut Lease,
-    executor: &E,
+    contour: &GovernedContour<'_, E>,
     collector: &EvidenceCollector,
-    operation_id: OperationId,
-    start_note: Option<String>,
+    supervision: SupervisionInput,
     started_at: ClockReading,
-    lease_ms: u64,
 ) -> Result<(), TestdError> {
     let started_at_ms = clock_ms(&started_at).unwrap_or_else(current_clock_ms);
+    let lease_ms = supervision.lease_ms;
     let deadline_ms =
         started_at_ms.saturating_add(profile_wall_timeout_ms(job.invocation.profile.as_str())?);
     let outcome = supervise_operation(
         store,
         job,
         lease,
-        executor,
+        contour.executor(),
         collector,
         SupervisionInput {
-            operation_id,
-            start_note,
             deadline_ms,
-            lease_ms,
+            ..supervision
         },
     )?;
 
@@ -462,14 +488,44 @@ fn observe_and_finish<E: ProcessExecutor + 'static>(
     if lease.expires_at_ms <= finish_now.saturating_add(SUPERVISION_POLL_INTERVAL_MS) {
         *lease = store.renew_lease(&job.job_id, &*lease, finish_now, lease_ms)?;
     }
-    finish_observed_attempt(store, job, lease, collector, &current, outcome, started_at)
+    finish_observed_attempt(
+        store,
+        lease,
+        contour,
+        collector,
+        &FinishInputs {
+            claimed: job,
+            observed: &current,
+        },
+        outcome,
+        started_at,
+    )
 }
 
 struct SupervisionInput {
     operation_id: OperationId,
     start_note: Option<String>,
+    /// Unused by `observe_and_finish`, which derives the deadline from the
+    /// claimed job's own profile; carried so one struct serves both callers.
     deadline_ms: u64,
     lease_ms: u64,
+}
+
+impl SupervisionInput {
+    /// The supervision inputs a starting caller knows; the deadline is filled
+    /// in by `observe_and_finish` from the job's admitted wall timeout.
+    const fn for_start(
+        operation_id: OperationId,
+        start_note: Option<String>,
+        lease_ms: u64,
+    ) -> Self {
+        Self {
+            operation_id,
+            start_note,
+            deadline_ms: 0,
+            lease_ms,
+        }
+    }
 }
 
 struct SupervisionOutcome {
@@ -585,16 +641,93 @@ fn supervise_operation<E: ProcessExecutor + 'static>(
     })
 }
 
+/// Takes the terminal source observation through the governed Git port.
+///
+/// Returns the observed range when one was taken, plus the typed fault that made
+/// the attempt `Unknown` when it was not. A productive profile is never observed
+/// by an ungoverned fallback: with no Git port, or with no persisted
+/// pre-dispatch observation to compare against, the attempt is `Unknown` with
+/// the reason recorded rather than silently unobserved (issue #1140, AC3).
+fn observe_terminal_source<E: ProcessExecutor + 'static>(
+    observed: &TestJob,
+    contour: &GovernedContour<'_, E>,
+    execution: &mut ExecutionStatus,
+) -> (Option<TestdSourceObservationRange>, Option<String>) {
+    if !eliot_testd_core::is_productive_testd_profile(&observed.invocation.profile) {
+        return (None, None);
+    }
+    let Some(before) = observed.source_observation_before.as_ref() else {
+        *execution = ExecutionStatus::Unknown;
+        return (
+            None,
+            Some("productive verifier has no persisted pre-dispatch source observation".to_owned()),
+        );
+    };
+    let Some(git) = contour.git() else {
+        *execution = ExecutionStatus::Unknown;
+        return (
+            None,
+            Some(
+                "productive verifier has no governed Git port for its terminal source observation"
+                    .to_owned(),
+            ),
+        );
+    };
+    match TestdSourceObservation::capture(&observed.target_roots.source_root, git) {
+        Ok(after) => (
+            Some(TestdSourceObservationRange {
+                before: before.clone(),
+                after,
+            }),
+            None,
+        ),
+        Err(error) => {
+            *execution = ExecutionStatus::Unknown;
+            (
+                None,
+                Some(format!(
+                    "terminal source state was not observed after verifier execution: {error}"
+                )),
+            )
+        }
+    }
+}
+
 /// Captures terminal evidence and finishes the already-revalidated attempt.
-fn finish_observed_attempt(
+///
+/// The terminal source observation is taken through `contour`'s physical Git
+/// port, the same admitted `ProcessExecutor`/Job Object contour that launched
+/// the tool child (issue #1140, AC3).
+///
+/// The claimed job and the durable view re-read from the store beside it.
+///
+/// They are kept as two values on purpose: `claimed` is the job this worker
+/// leased and presented, and `observed` is the store's current durable state.
+/// The finish path compares them (state, lease, source observation) rather than
+/// assuming the durable view still matches what was claimed.
+struct FinishInputs<'a> {
+    claimed: &'a TestJob,
+    observed: &'a TestJob,
+}
+
+/// Finishes one observed attempt through the same governed contour that
+/// launched the tool child.
+///
+/// The terminal source observation is taken through `contour`'s physical Git
+/// port, which is the same admitted `ProcessExecutor`/Job Object contour
+/// (issue #1140, AC3). A productive profile without that port is never
+/// observed by an ungoverned fallback: the attempt finishes as `Unknown` with
+/// the reason recorded.
+fn finish_observed_attempt<E: ProcessExecutor + 'static>(
     store: &TestdStore,
-    job: &TestJob,
     lease: &mut Lease,
+    contour: &GovernedContour<'_, E>,
     collector: &EvidenceCollector,
-    current: &TestJob,
+    inputs: &FinishInputs<'_>,
     outcome: SupervisionOutcome,
     started_at: ClockReading,
 ) -> Result<(), TestdError> {
+    let FinishInputs { claimed, observed } = *inputs;
     let SupervisionOutcome {
         mut execution,
         mut reason,
@@ -605,7 +738,7 @@ fn finish_observed_attempt(
     let records = collector.snapshot();
     let synthetic = match capture_inline_previews(
         collector,
-        &job.invocation.profile,
+        &claimed.invocation.profile,
         &records,
         finished_at,
     ) {
@@ -613,7 +746,7 @@ fn finish_observed_attempt(
         Err(error) => {
             finish_unknown(
                 store,
-                job,
+                claimed,
                 lease,
                 collector,
                 format!(
@@ -623,36 +756,13 @@ fn finish_observed_attempt(
             return Ok(());
         }
     };
-    let source_observation = if eliot_testd_core::is_productive_testd_profile(
-        &current.invocation.profile,
-    ) {
-        match current.source_observation_before.as_ref() {
-            Some(before) => {
-                match TestdSourceObservation::capture(&current.target_roots.source_root) {
-                    Ok(after) => Some(TestdSourceObservationRange {
-                        before: before.clone(),
-                        after,
-                    }),
-                    Err(error) => {
-                        execution = ExecutionStatus::Unknown;
-                        reason = format!(
-                            "terminal source state was not observed after verifier execution: {error}"
-                        );
-                        None
-                    }
-                }
-            }
-            None => {
-                execution = ExecutionStatus::Unknown;
-                reason = "productive verifier has no persisted pre-dispatch source observation"
-                    .to_owned();
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let mut receipt = collector.verification_receipt_at(job, execution, started_at, finished_at);
+    let (source_observation, observation_fault) =
+        observe_terminal_source(observed, contour, &mut execution);
+    if let Some(message) = observation_fault {
+        reason = message;
+    }
+    let mut receipt =
+        collector.verification_receipt_at(claimed, execution, started_at, finished_at);
     receipt.source_observation = source_observation;
     for handle in &synthetic {
         receipt.normalized.push(NormalizedEvidence {
@@ -662,10 +772,10 @@ fn finish_observed_attempt(
             execution,
         });
     }
-    if receipt.validate(job).is_err() {
+    if receipt.validate(claimed).is_err() {
         finish_unknown(
             store,
-            job,
+            claimed,
             lease,
             &EvidenceCollector::default(),
             "enriched receipt failed validation; outcome rescheduled as unknown without evidence promotion"
@@ -674,7 +784,7 @@ fn finish_observed_attempt(
         return Ok(());
     }
     let finish_now = current_clock_ms();
-    let verification = match evaluate_testd_verification(job, &receipt, finish_now) {
+    let verification = match evaluate_testd_verification(claimed, &receipt, finish_now) {
         Ok(run) => Some(run),
         Err(error) => {
             // A receipt without the raw evidence required by the verifier
@@ -689,7 +799,7 @@ fn finish_observed_attempt(
         None => reason,
     };
     store.finish(
-        &job.job_id,
+        &claimed.job_id,
         lease,
         execution,
         verification,
@@ -1003,7 +1113,12 @@ impl KernelProcessAdmissionProvider for PresentedProcessProvider {
 /// Test doubles resolve on the first poll; the production dispatch launch
 /// seam owns the runtime decision before the admitted drive goes live, so
 /// this never spins on reactor-backed work today.
-fn block_on_one_shot<F: Future>(future: F) -> F::Output {
+///
+/// Shared with the composition root so the governed Git source-observation
+/// port drives the same executor futures on the same driver as the
+/// productive tool start; there is exactly one noop-waker driver in this
+/// binary.
+pub(crate) fn block_on_one_shot<F: Future>(future: F) -> F::Output {
     let waker = Waker::noop();
     let mut context = Context::from_waker(waker);
     let mut pinned = Box::pin(future);

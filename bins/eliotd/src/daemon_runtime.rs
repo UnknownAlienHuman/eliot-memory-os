@@ -225,6 +225,13 @@ enum ActivationCompletion {
 struct ActivationResolvedTicket {
     ticket: AgentActivationResolutionTicket,
     result: AgentActivationResolutionResult,
+    /// Shared composition retained for the post-acceptance readiness-owner
+    /// bind. It is not held across any Kernel await or blocking scanner call.
+    composition: SharedComposition,
+    /// The exact Host-observed bounded discovery lease/key/evidence created
+    /// while resolving this ticket. The accepted-result trigger consumes this
+    /// value; it never re-observes the workspace or recreates the lease.
+    cold_start_discovery: Option<eliotd::task_binding_admission::ColdStartDiscoveryInput>,
     /// Issue #1115: the semantic Governor binding combined with the P-07
     /// revision/digest, both captured before this flight was published. The
     /// submit path reuses this pair verbatim and never performs a second
@@ -338,7 +345,13 @@ fn start_activation_resolve(
             Ok(now) => now,
             Err(error) => return ActivationCompletion::Resolve(Err(error)),
         };
-        ActivationCompletion::Resolve(resolve_valid_ticket(&guard, kernel_owner, ticket, now))
+        ActivationCompletion::Resolve(resolve_valid_ticket(
+            &guard,
+            Arc::clone(&composition),
+            kernel_owner,
+            ticket,
+            now,
+        ))
     })
 }
 
@@ -722,13 +735,29 @@ pub(super) fn run() -> Result<(), String> {
     // and submits any unavailable-family decision through the canonical
     // notification path using only the composition's admitted fence.
     let startup_maintenance_observations = [
+        // The startup reconciliation observation carries the seven declared
+        // startup slot dispositions themselves (`ledger_report`), so its family
+        // is the one that observation concerns: a declared slot that is not
+        // bound, or bound but unusable, is the daemon's own declared-capability
+        // conformance gap. See `conformance_observed_family`; the family is
+        // derived from this same projection the report was rendered from, never
+        // from a literal.
         maintenance_observation(
             MaintenanceTriggerOrigin::StartupReconciliation,
+            conformance_observed_family(&startup_readiness),
             &[startup_readiness.ledger_report()],
             false,
         ),
+        // Same declared-capability denominator, read as the cold-start
+        // completion verdict: `startup_bindings_complete` is the strict
+        // expected-versus-supplied boolean over the same seven slots and
+        // `report` is the bounded readiness record carrying the core verdict
+        // and the degraded set. Same family for the same observed gap; the
+        // trigger identity still separates the two, because the catalog's
+        // deduplication key includes the origin.
         maintenance_observation(
             MaintenanceTriggerOrigin::ColdStartCompletion,
+            conformance_observed_family(&startup_readiness),
             &[
                 format!(
                     "startup_bindings_complete={}",
@@ -1638,7 +1667,7 @@ async fn run_loop(
     // Governor `RecordLearningRecord` seam. Its lock wait stays in this
     // independently polled flight so a cadence handler never suspends polling
     // of the owner-feed lock holder.
-    let mut improvement_intake_flight = ImprovementIntakeFlight::Idle;
+    let mut improvement_intake_flight = ImprovementIntakeFlight::Idle { retained: None };
     // Issue #2559: one cadence observation may wait for the composition lock,
     // but its wait remains in this independently polled flight. A later tick
     // cannot replace the observation already retained here.
@@ -1756,11 +1785,18 @@ async fn run_loop(
                     &mut maintenance_flight,
                     &mut maintenance_failure_guard,
                 );
-                // Issue #1867 W1: the improvement-intake dispatch rides the same
-                // cadence and the same real idle observation, on its own single-
-                // owner flight. It never shares the notification completion
-                // branch, so a blocked durable commit cannot delay the
-                // maintenance notification.
+                // Issue #1867 W2/A1: the improvement-intake dispatch rides the
+                // same cadence, on its own single-owner flight. It never shares
+                // the notification completion branch, so a blocked durable
+                // commit cannot delay the maintenance notification.
+                //
+                // It also makes its OWN observation rather than borrowing the
+                // idle maintenance one, because it is the step that feeds the
+                // improvement funnel and it holds the declared-capability
+                // readiness projection the idle site does not. That is what
+                // lets a real observed conformance gap name the conformance
+                // family and reach the Self-Quality conformance-diagnosis
+                // contract; see `improvement_intake_observation`.
                 //
                 // #1867 W3: the step also reads the deduplication registry back
                 // from the durable candidate records over the retained Kernel
@@ -1769,6 +1805,7 @@ async fn run_loop(
                     &kernel,
                     &composition,
                     &flight,
+                    &readiness_projection,
                     &mut improvement_intake_flight,
                 );
             }
@@ -2083,14 +2120,32 @@ fn note_supervision_applied(
 
 /// Builds the sanitized maintenance observation for one wired trigger site.
 ///
-/// Shared by every trigger arm so each one names the same self-observed family
-/// and passes its evidence identities through the shared diagnostics sanitizer:
-/// a trigger can never carry control characters, secrets, or unbounded detail
-/// into the evaluator's own field validation. The family is the one
-/// self-observed family this daemon can honestly name today; the registered
-/// per-observation family catalog is #1693's to supply.
+/// Shared by every trigger arm so each one passes its evidence identities
+/// through the shared diagnostics sanitizer: a trigger can never carry control
+/// characters, secrets, or unbounded detail into the evaluator's own field
+/// validation.
+///
+/// # The family is a parameter, because it is the caller's real observation
+///
+/// It used to be hardcoded here as [`SELF_OBSERVED_FAMILY`] for every site,
+/// which made two registered families structurally unreachable: no live
+/// observation could ever carry `MaintenanceFamily::DonorConformance` or
+/// `MaintenanceFamily::SecurityDependencyScan`, so every live candidate was
+/// labelled [`eliot_improvement::EvidenceSource::Attempt`] and the
+/// Self-Quality conformance-diagnosis projection in
+/// `improvement_intake_dispatch::conformance_diagnosis_evidence` could not be
+/// reached by any production call (issue #1867 W2/A1).
+///
+/// Each call site therefore names the family its OWN evidence supports — see
+/// [`conformance_observed_family`] for the sites that observe a
+/// declared-capability conformance gap, and the comment at each remaining site
+/// for the family that observation concerns. The registered per-family catalog
+/// (#1693) still decides the mode, the conditions, the deduplication scope and
+/// the route; it does not and cannot invent which family an observed signal
+/// concerns, and neither does this constructor.
 fn maintenance_observation(
     origin: MaintenanceTriggerOrigin,
+    family: eliot_maintenance::MaintenanceFamily,
     evidence_refs: &[String],
     activation_in_flight: bool,
 ) -> MaintenanceObservation {
@@ -2100,10 +2155,80 @@ fn maintenance_observation(
         .collect();
     MaintenanceObservation {
         origin,
-        family: SELF_OBSERVED_FAMILY,
+        family,
         evidence_refs,
         activation_in_flight,
     }
+}
+
+/// The family an observation of the daemon's own declared-capability
+/// conformance gap concerns (issue #1867 W2/A1, I12.24:50).
+///
+/// # What is observed here
+///
+/// [`StartupReadinessProjection`] is the daemon's own expected-versus-supplied
+/// record over its declared integration contract, and both reads below are
+/// that record and nothing else:
+///
+/// - [`every_declared_capability_bound`] is true only when EVERY declared
+///   slot is bound with its own proof, so a `false` is a slot the daemon
+///   declared and cannot use;
+/// - [`degraded_capabilities`] is the exact set of declared OPTIONAL
+///   capabilities currently unavailable. Its own documentation excludes
+///   mandatory capabilities because their unavailability is already a withheld
+///   core verdict.
+///
+/// [`every_declared_capability_bound`]:
+/// `StartupReadinessProjection::every_declared_capability_bound`
+/// [`degraded_capabilities`]: `StartupReadinessProjection::degraded_capabilities`
+///
+/// Both are pure reads of state the daemon produced: the startup attach sites
+/// filled the ledger, and `observe_owner` re-derives it under the composition
+/// lock on every health heartbeat. Neither performs IO, opens a client, or
+/// starts anything.
+///
+/// # Why `DonorConformance` is the family a gap names
+///
+/// `MaintenanceFamily::DonorConformance` is the registered family whose own
+/// obligation is "Donor or conformance audit"
+/// (`crates/governor/eliot-maintenance/src/lib.rs:115-116`), and I12.24:50
+/// names `Architecture/Implementation/runtime conformance gap` as an
+/// improvement trigger. A declared capability that is not bound, or bound but
+/// unusable, is exactly that gap between what the Architecture declares and
+/// what the running composition is. Its registered entry also accepts both
+/// origins these sites raise: `Policy` (which `IdleTransition` maps to) and
+/// `Onboarding`/`Installation` (which `ColdStartCompletion` maps to), so the
+/// named family is eligible at the sites that can observe the gap rather than
+/// ineligible by construction.
+///
+/// # What this does NOT claim
+///
+/// Naming the family does NOT claim that a conformance audit ran. The
+/// registered entry records that no conformance audit runner is admitted —
+/// "no donor or conformance audit runner is admitted:
+/// `crates/foundation/eliot-conformance-contracts` is a stateless effect-free
+/// contract crate that explicitly does not discover evidence or promote
+/// support" (`maintenance_family_catalog.rs:1514`) — so the owner's decision
+/// for it is the real `Block`/`AutomationOff` a family with no route receives.
+/// That is the honest signal, and it is the one the improvement brief is
+/// about: the daemon observed a conformance gap, and no admitted owner can
+/// resolve it.
+///
+/// # When nothing is degraded
+///
+/// If every declared capability is bound and none is degraded, the same
+/// observation concerns the daemon's own health and maintenance debt and names
+/// [`SELF_OBSERVED_FAMILY`], exactly as the idle and store-health sites do. A
+/// healthy daemon therefore never claims a conformance gap it did not observe.
+fn conformance_observed_family(
+    startup_readiness: &StartupReadinessProjection,
+) -> eliot_maintenance::MaintenanceFamily {
+    if startup_readiness.every_declared_capability_bound()
+        && startup_readiness.degraded_capabilities().is_empty()
+    {
+        return SELF_OBSERVED_FAMILY;
+    }
+    eliot_maintenance::MaintenanceFamily::DonorConformance
 }
 
 /// Evaluates one real maintenance observation and captures the exact admitted
@@ -2162,6 +2287,329 @@ async fn evaluate_and_emit_maintenance_notification(
     if let Some((fence, decision, evidence)) = candidate {
         note_blocked_automation_notification(kernel, fence, &decision, &evidence, failure_guard)
             .await;
+        publish_maintenance_source_results(composition, &decision, failure_guard).await;
+    }
+}
+
+/// Publishes every applicable source result of one evaluated maintenance
+/// decision into the canonical observation path, then records what that
+/// publication actually established.
+///
+/// This is the production binding of publication to the maintenance decision
+/// owner. It runs for **every** decision the owner produced, not only the
+/// success branch: a deferral, a block, a suggestion, an escalation and a
+/// duplicate suppression each owe a bound observation, and a decision that
+/// names an existing job also publishes that job's own retained results
+/// (completions, partials, failures, cancellations and unresolved outcomes)
+/// through the same route. A failed or unknown result is therefore never dropped
+/// for not being a success, and no result is reported through a diagnostic
+/// logger alone.
+///
+/// Work performed, observation durably recorded and actual improvement are
+/// three different facts, and this function establishes only the first two. A
+/// published result is admitted onto the retained job revision under the exact
+/// committed store receipt the canonical route returned; a result that could
+/// not be published is left as an explicit outstanding observation obligation
+/// with a visible owner and a named resolution condition. Nothing here
+/// reconciles such an obligation, back-fills a plausible outcome for it, or
+/// concludes that the maintained subsystem improved — a completed job is work
+/// performed, not utility.
+///
+/// The exchange is awaited inside the retained maintenance flight with the
+/// composition lock released, exactly as the notification leg beside it is, so no
+/// Kernel exchange crosses the composition mutex. A refusal is an explicit typed
+/// gap through the stream's own failure guard: the obligation stays durable on
+/// its own store and is retried, so a publication outage degrades the
+/// self-observation surface without becoming a daemon-killing error and without
+/// disappearing behind exit code zero.
+#[allow(
+    clippy::too_many_lines,
+    reason = "publication, durable receipt settlement and independent coverage evaluation stay in one explicit order so an admitted observation is never reported as an outstanding obligation, or the reverse"
+)]
+async fn publish_maintenance_source_results(
+    composition: &SharedComposition,
+    decision: &eliot_maintenance::AutomationTriggerDecision,
+    failure_guard: &mut RepeatedFailureGuard,
+) {
+    // The decision's own no-attempt result, plus the retained results of the job
+    // this decision names. Both come from the maintenance owner's own records:
+    // nothing here constructs an outcome class, and the job read is the existing
+    // durable-job route rather than a local map.
+    //
+    // A job the decision names is the owner of the work, so its completions,
+    // partials, failures, cancellations and unresolved outcomes publish through
+    // the same route as the decision. A suppressed duplicate therefore still
+    // makes the existing job's failures and unknown outcomes visible, rather than
+    // only the suppression itself.
+    let mut obligations = Vec::new();
+    // The independent expected set. It is declared from the decision's own
+    // durable-job reference, never rebuilt from the obligation list this pass is
+    // iterating, so a completeness claim is measured against what the owner
+    // declared is owed rather than against the list being checked.
+    let mut expected: Vec<eliot_maintenance::ExpectedOutcomeObservation> = Vec::new();
+    let mut jobs: Vec<eliot_maintenance::MaintenanceJob> = Vec::new();
+    {
+        let guard = composition.lock().await;
+        let live_fence = guard.governor_kernel_fence();
+        obligations.push(eliot_maintenance::decision_result_obligation(
+            decision,
+            &live_fence,
+        ));
+        if let Some(job_ref) = &decision.durable_job_ref {
+            expected.push(eliot_maintenance::ExpectedOutcomeObservation {
+                job_id: job_ref.clone(),
+            });
+            match guard.retained_maintenance_job(job_ref) {
+                Ok(Some(job)) => {
+                    obligations.extend(job.result_obligations.iter().cloned());
+                    jobs.push(job);
+                }
+                // No retained job is unavailable, not resolved. The decision's
+                // own result still publishes, and the expected set keeps naming
+                // this job so its owed observation is reported as outstanding
+                // rather than quietly dropping out of coverage.
+                Ok(None) => {}
+                Err(error) => {
+                    if failure_guard.should_emit() {
+                        let _ = eliotd::diagnostics::ErrorRecord::of(
+                            eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                            "maintenance-result-publication",
+                            &error.to_string(),
+                        )
+                        .emit();
+                    }
+                }
+            }
+        }
+    }
+    // The admitted set is built only from committed store receipts the canonical
+    // route actually returned. A publication identity, the job's own
+    // `outcome_ref`, and the fact that a job completed settle nothing here.
+    let mut admitted: Vec<eliot_maintenance::AdmittedObservationReceipt> = Vec::new();
+    for obligation in &obligations {
+        let publication = {
+            let guard = composition.lock().await;
+            guard
+                .publish_maintenance_result(&obligation.publication_id, obligation)
+                .await
+        };
+        match publication {
+            Ok(
+                eliotd::maintenance_trigger_evaluator::MaintenanceResultPublication::Reconciled {
+                    receipt,
+                },
+            ) => {
+                // Only a job-side obligation can be settled durably. The
+                // decision's own non-execution result has no retained job
+                // revision to admit onto, and inventing one would be a second
+                // store rather than a receipt.
+                if let Some(job_ref) = &obligation.job_ref
+                    && jobs.iter().any(|job| job.job_id == job_ref.as_str())
+                {
+                    let admitted_receipt = eliot_maintenance::AdmittedObservationReceipt {
+                        publication_id: obligation.publication_id.clone(),
+                        observation_receipt_ref: receipt.operation_id.as_str().to_owned(),
+                    };
+                    let settlement = {
+                        let mut guard = composition.lock().await;
+                        guard.admit_maintenance_observation_receipt(
+                            job_ref,
+                            &admitted_receipt.publication_id,
+                            &admitted_receipt.observation_receipt_ref,
+                        )
+                    };
+                    match settlement {
+                        Ok(_) => admitted.push(admitted_receipt),
+                        Err(error) => {
+                            // The observation is admitted but the job revision
+                            // could not record it. The obligation stays owed, so
+                            // a later pass re-presents the same identity and
+                            // reconciles rather than publishing a second record.
+                            if failure_guard.should_emit() {
+                                let _ = eliotd::diagnostics::ErrorRecord::of(
+                                    eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                                    "maintenance-result-obligation",
+                                    &error.to_string(),
+                                )
+                                .emit();
+                            }
+                        }
+                    }
+                }
+                tracing::info!(
+                    target: "eliotd::diagnostics",
+                    event = "eliotd.maintenance_result_published",
+                    publication_id = %obligation.publication_id,
+                    execution_outcome = ?obligation.execution_outcome,
+                    operation_id = %receipt.operation_id,
+                );
+            }
+            Err(error) => {
+                // Two refusals, two dispositions, and the difference is the
+                // store's own receipt.
+                //
+                // A terminal non-committed receipt means the store decided this
+                // exact publication: the writeback is unavailable, and the gap
+                // is recorded on the retained job revision through its own
+                // store. Leaving it `Pending` would report a rejection as an
+                // attempt that was never made, and the daemon has no other
+                // durable place to say so.
+                //
+                // Every other refusal — an unready composition, a transport
+                // failure, a refused identity — produced no receipt at all. The
+                // obligation stays `Pending` and is re-presented on a later
+                // pass; recording a gap for an outage would invent a refusal the
+                // store never issued.
+                if let eliotd::maintenance_trigger_evaluator::MaintenanceResultPublishError::NotAdmitted {
+                    operation_id,
+                    status,
+                    ..
+                } = &error
+                    && let Some(refused_status) = refused_receipt_status(*status)
+                    && let Some(job_ref) = &obligation.job_ref
+                    && let Some(index) =
+                        jobs.iter().position(|job| job.job_id == job_ref.as_str())
+                {
+                    let publication_id = obligation.publication_id.clone();
+                    let recorded = {
+                        let mut guard = composition.lock().await;
+                        guard.record_maintenance_observation_gap(
+                            job_ref,
+                            &publication_id,
+                            operation_id.as_str(),
+                            refused_status,
+                        )
+                    };
+                    match recorded {
+                        // The retained revision in hand is replaced so the
+                        // coverage pass below reports this refusal as the
+                        // durable gap it is, not as an unstarted attempt.
+                        Ok(job) => jobs[index] = job,
+                        Err(gap_error) => {
+                            if failure_guard.should_emit() {
+                                let _ = eliotd::diagnostics::ErrorRecord::of(
+                                    eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                                    "maintenance-result-observation-gap",
+                                    &gap_error.to_string(),
+                                )
+                                .emit();
+                            }
+                        }
+                    }
+                }
+                if failure_guard.should_emit() {
+                    let _ = eliotd::diagnostics::ErrorRecord::of(
+                        eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                        "maintenance-result-publication",
+                        &error.to_string(),
+                    )
+                    .emit();
+                }
+            }
+        }
+    }
+    // Completeness against the independent expected set. Anything outstanding
+    // here is work performed whose observation is not durably recorded. It is
+    // reported as such and left owed: never reconciled, never back-filled with
+    // an outcome written after the fact, and never read as improvement.
+    match eliot_maintenance::outcome_observation_coverage(&expected, &jobs, &admitted) {
+        Ok(coverage) => {
+            // The summary states only what coverage is, never what utility is: a
+            // fully covered set means every declared result observation is
+            // admitted, not that the maintained subsystem improved.
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.maintenance_outcome_observation_coverage",
+                declared = expected.len(),
+                observed = coverage.observed.len(),
+                outstanding = coverage.outstanding.len(),
+                complete = coverage.is_complete(),
+            );
+            for outstanding in coverage.outstanding {
+                let (job_ref, publication_id, detail) = match outstanding {
+                    eliot_maintenance::OutstandingOutcome::ObservationOwed(obligation) => (
+                        obligation.job_ref,
+                        obligation.publication_id,
+                        // A recorded coverage gap is stated as such. It is the
+                        // writeback's availability, not the work: the work that
+                        // was performed is unaffected by whether its observation
+                        // could be written back, and a gap is never reconciled
+                        // into a result.
+                        match obligation.coverage_gap_ref {
+                            Some(gap_ref) => format!(
+                                "work performed ({:?}) has no admitted observation; owner={}; resolves when {}; writeback recorded unavailable under gap {} (profile {}, reason {})",
+                                obligation.work_performed,
+                                obligation.obligation_owner,
+                                obligation.resolution_condition,
+                                gap_ref,
+                                eliot_maintenance::OBSERVATION_GAP_PROFILE,
+                                eliot_maintenance::OBSERVATION_GAP_REASON,
+                            ),
+                            None => format!(
+                                "work performed ({:?}) has no admitted observation; owner={}; resolves when {}",
+                                obligation.work_performed,
+                                obligation.obligation_owner,
+                                obligation.resolution_condition,
+                            ),
+                        },
+                    ),
+                    eliot_maintenance::OutstandingOutcome::RevisionUnavailable { job_ref } => (
+                        job_ref,
+                        String::new(),
+                        "the retained durable job revision is unavailable, so its owed observation is unverified"
+                            .to_owned(),
+                    ),
+                    eliot_maintenance::OutstandingOutcome::NoResultDeclared { job_ref } => (
+                        job_ref,
+                        String::new(),
+                        "the declared job has reached no result-bearing state, so it owes no outcome observation yet"
+                            .to_owned(),
+                    ),
+                };
+                tracing::warn!(
+                    target: "eliotd::diagnostics",
+                    event = "eliotd.maintenance_outcome_observation_outstanding",
+                    job = %eliotd::diagnostics::sanitize_identity(&job_ref),
+                    publication_id = %eliotd::diagnostics::sanitize_identity(&publication_id),
+                    detail = %detail,
+                );
+            }
+        }
+        Err(error) => {
+            if failure_guard.should_emit() {
+                let _ = eliotd::diagnostics::ErrorRecord::of(
+                    eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                    "maintenance-outcome-coverage",
+                    &error.to_string(),
+                )
+                .emit();
+            }
+        }
+    }
+}
+
+/// Maps one terminal store receipt status onto the maintenance owner's refusal
+/// vocabulary, or `None` when the receipt is not a refusal at all.
+///
+/// Total over [`eliot_store_api::WriteReceiptStatus`], so a newly added status
+/// cannot silently fall through. `Committed` maps to `None` and that is the rule
+/// rather than an oversight: a committed receipt is an admission, and the
+/// maintenance owner records admissions through its own receipt transition.
+/// Mapping it to a refusal here would give one store receipt two dispositions.
+fn refused_receipt_status(
+    status: eliot_store_api::WriteReceiptStatus,
+) -> Option<eliot_maintenance::RefusedReceiptStatus> {
+    match status {
+        eliot_store_api::WriteReceiptStatus::Committed => None,
+        eliot_store_api::WriteReceiptStatus::Rejected => {
+            Some(eliot_maintenance::RefusedReceiptStatus::Rejected)
+        }
+        eliot_store_api::WriteReceiptStatus::DeadLetter => {
+            Some(eliot_maintenance::RefusedReceiptStatus::DeadLettered)
+        }
+        eliot_store_api::WriteReceiptStatus::Cancelled => {
+            Some(eliot_maintenance::RefusedReceiptStatus::Cancelled)
+        }
     }
 }
 
@@ -2204,10 +2652,19 @@ fn maybe_start_startup_maintenance_triggers(
 /// idle *observation*, not a busy-to-idle edge detector: the loop retains no
 /// previous-idle flag, and inventing one to manufacture a transition edge
 /// would be a fabricated event source.
+///
+/// The family is [`SELF_OBSERVED_FAMILY`]: the only thing this site observes
+/// is whether admitted interactive work is in flight, which is the daemon's
+/// own health and maintenance-debt review and nothing more. It is NOT named
+/// [`conformance_observed_family`]'s conformance family, because this site
+/// holds no declared-capability evidence at all; the improvement intake, which
+/// does hold that projection, takes its own observation
+/// ([`improvement_intake_observation`]) rather than borrowing this one.
 fn idle_maintenance_observation(flight: &ActivationFlight) -> MaintenanceObservation {
     let activation_in_flight = matches!(flight, ActivationFlight::InFlight(_));
     maintenance_observation(
         MaintenanceTriggerOrigin::IdleTransition,
+        SELF_OBSERVED_FAMILY,
         &[format!("activation_in_flight={activation_in_flight}")],
         activation_in_flight,
     )
@@ -2478,8 +2935,38 @@ async fn run_health_heartbeat_tick(
         // rejected evaluation is an explicit typed gap, never a daemon-killing
         // error, and the trigger stays durable for the next eligible pass.
         let blocked_automation = match guard.evaluate_maintenance_trigger_with_evidence(
+            // The family is [`SELF_OBSERVED_FAMILY`]: the observed evidence is
+            // the durable store's own health status and its canonical operation
+            // manifest identity, which is the daemon's admitted health and
+            // maintenance debt.
+            //
+            // It is deliberately NOT `MaintenanceFamily::SecurityDependencyScan`,
+            // and the reason is measured, not stylistic. That family's
+            // registered observation is "scripts/verify-dependency-policy.py
+            // pinned-scanner canonical receipt" and its registered execution
+            // owner is recorded as unavailable with the reason "no runtime scan
+            // owner is admitted: `docs/DEPENDENCY_POLICY.md` pins the scanner to
+            // cargo-deny 0.20.2 plus a verified executable digest ... and no
+            // eliotd Kernel operation or Rust owner exposes a scan result to the
+            // daemon" (`maintenance_family_catalog.rs:1441-1457`). The digest
+            // this site observes is `StoreHealth::manifest_digest` — the store
+            // API's own operation-manifest identity returned by the health
+            // poll — not a scanner receipt, advisory-set digest or policy
+            // finding set, so naming that family here would claim a scan
+            // result nobody produced. It is also ineligible by origin: this
+            // site's `AdmittedObservation` maps to `MaintenanceTrigger::
+            // WatchdogProblem`, which is not among that entry's registered
+            // origins (`Human`, `Policy`, `Installation`).
+            //
+            // Consequence, stated so it is not read as covered:
+            // `improvement_intake_dispatch::maintenance_evidence_source`'s
+            // `SecurityDependencyScan => EvidenceSource::SecurityIncident` arm
+            // remains unreachable, because reaching it needs a real pinned-
+            // scanner receipt surfaced to this daemon, and no admitted owner
+            // surfaces one.
             maintenance_observation(
                 MaintenanceTriggerOrigin::AdmittedObservation,
+                SELF_OBSERVED_FAMILY,
                 &[
                     format!("store_health={:?}", health.status),
                     health.manifest_digest.as_str().to_owned(),
@@ -2514,6 +3001,7 @@ async fn run_health_heartbeat_tick(
     if let Some((fence, decision, evidence)) = blocked_automation {
         note_blocked_automation_notification(kernel, fence, &decision, &evidence, failure_guard)
             .await;
+        publish_maintenance_source_results(composition, &decision, failure_guard).await;
     }
     // #2560: the same readiness evaluation that produced the startup record
     // reaches diagnostics here, so an operator sees exactly when a core
@@ -2613,6 +3101,7 @@ async fn submit_supervision_heartbeat(
 /// surfaced only once a `Resolved` result actually needs the pair.
 fn resolve_valid_ticket(
     composition: &DaemonComposition,
+    readiness_composition: SharedComposition,
     kernel_owner: Result<Option<AgentActivationKernelOwnerReadback>, String>,
     ticket: AgentActivationResolutionTicket,
     now: u64,
@@ -2643,6 +3132,34 @@ fn resolve_valid_ticket(
                 ticket.ticket_id
             )
         })?;
+    let mut cold_start_discovery =
+        if result.resolved_binding().is_some() && ticket.workspace_selector.is_some() {
+            Some(
+                eliotd::task_binding_admission::observe_cold_start_discovery(
+                    &ticket,
+                    &ticket.state_fence,
+                    now.max(1),
+                )
+                .map_err(|error| {
+                    format!(
+                        "daemon activation discovery ticket {}: {error}",
+                        ticket.ticket_id
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
+    let result = if let Some(observed) = cold_start_discovery.as_mut() {
+        DaemonComposition::attach_cold_start_question(result, observed, None).map_err(|error| {
+            format!(
+                "daemon activation cold-start question ticket {}: {error}",
+                ticket.ticket_id
+            )
+        })?
+    } else {
+        result
+    };
     let semantic_owner = if matches!(
         &result.disposition,
         AgentActivationResolutionDisposition::Resolved { .. }
@@ -2700,6 +3217,8 @@ fn resolve_valid_ticket(
     Ok(Some(Box::new(ActivationResolvedTicket {
         ticket,
         result,
+        composition: readiness_composition,
+        cold_start_discovery,
         owner_readback,
     })))
 }
@@ -2722,10 +3241,12 @@ fn start_activation_dispatch(
     let future: Pin<Box<dyn std::future::Future<Output = ActivationCompletion>>> =
         Box::pin(async move {
             let outcome = dispatch_agent_activation_result(
-                &kernel_clone,
+                kernel_clone,
+                resolved.composition,
                 &resolved.ticket,
                 resolved.result,
                 resolved.owner_readback,
+                resolved.cold_start_discovery,
             )
             .await;
             ActivationCompletion::Dispatch(outcome)
@@ -2799,7 +3320,10 @@ async fn drain_flights_on_shutdown(
             && matches!(owner_feed_flight, OwnerFeedFlight::Idle)
             && matches!(governor_authority_flight, GovernorAuthorityFlight::Idle)
             && matches!(maintenance_flight, MaintenanceFlight::Idle)
-            && matches!(improvement_intake_flight, ImprovementIntakeFlight::Idle)
+            && matches!(
+                improvement_intake_flight,
+                ImprovementIntakeFlight::Idle { .. }
+            )
             && matches!(health_heartbeat_flight, HealthHeartbeatFlight::Idle)
             && matches!(solo_poll_flight, SoloPollFlight::Idle)
         {
@@ -2933,7 +3457,12 @@ async fn drain_flights_on_shutdown(
                 *owner_feed_flight = OwnerFeedFlight::Idle;
                 *governor_authority_flight = GovernorAuthorityFlight::Idle;
                 *maintenance_flight = MaintenanceFlight::Idle;
-                *improvement_intake_flight = ImprovementIntakeFlight::Idle;
+                // The in-flight step is dropped here, so this process holds no
+                // record it could honestly retain: the record a dropped step was
+                // carrying died with the future, and inventing one would be a
+                // fabricated prior. `None` is the denying direction the pipeline
+                // already reads as "no retained record".
+                *improvement_intake_flight = ImprovementIntakeFlight::Idle { retained: None };
                 *health_heartbeat_flight = HealthHeartbeatFlight::Idle;
                 *solo_poll_flight = SoloPollFlight::Idle;
                 *supervision_progress = None;
@@ -3139,7 +3668,71 @@ async fn run_owner_feed_sync(
             }
         }
     }
+    report_authority_revocation_ingress(kernel, composition, failure_guard).await;
     trigger
+}
+
+/// Reports the durable grant-closure second phases that are still pending
+/// (#686).
+///
+/// This is the production driver for
+/// [`eliotd::authority_revocation_ingress`]. It is deliberately separate from
+/// the owner-feed restore above and runs after it, so the closure read can
+/// never delay, reorder, or fail a restore that is already proven correct: a
+/// degraded ingress pass only emits a bounded diagnostic on this stream's
+/// existing failure guard and the next tick retries it, exactly like the
+/// owner-feed pass itself. The ingress never gates readiness and never fails
+/// the daemon.
+///
+/// Pending second phases are a real durable obligation that nothing in the
+/// shipped daemon can currently finish, so they are reported with the exact
+/// missing owner named rather than left implied by an absence.
+async fn report_authority_revocation_ingress(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: SharedComposition,
+    failure_guard: &mut RepeatedFailureGuard,
+) {
+    let plan = {
+        let guard = composition.lock().await;
+        eliotd::capture_authority_revocation_ingress_plan(&guard)
+    };
+    let report = match plan {
+        Ok(plan) => eliotd::scan_authority_revocation_ingress(plan, kernel).await,
+        Err(error) => Err(error),
+    };
+    match report {
+        Ok(report) => {
+            for pending in report.pending_second_phase() {
+                tracing::warn!(
+                    target: "eliotd::diagnostics",
+                    event = "eliotd.authority_revocation_second_phase_pending",
+                    grant_id = %eliotd::diagnostics::sanitize_identity(&pending.grant_id),
+                    closure_operation_id = %eliotd::diagnostics::sanitize_identity(
+                        &pending.closure_operation_id
+                    ),
+                    authority_receipt_id = %eliotd::diagnostics::sanitize_identity(
+                        &pending.authority_receipt_id
+                    ),
+                    snapshot_id = %eliotd::diagnostics::sanitize_identity(&pending.snapshot_id),
+                    recovered_status = ?pending.recovered_status,
+                    grant_graph_revision = report.revision(),
+                    candidates_examined = report.candidates_examined(),
+                    committed_closures = report.committed_closures(),
+                    resume_blocked = pending.resume_blocked,
+                );
+            }
+        }
+        Err(error) => {
+            if failure_guard.should_emit() {
+                let _ = eliotd::diagnostics::ErrorRecord::of(
+                    eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                    "authority-revocation-ingress",
+                    &error.to_string(),
+                )
+                .emit();
+            }
+        }
+    }
 }
 
 /// The governor-authority driver travels with its in-flight drive step and
@@ -4549,7 +5142,11 @@ enum TestdOwnerFlight {
 
 /// Completion of one in-flight improvement-intake step.
 enum ImprovementIntakeCompletion {
-    Settled(Result<(), String>),
+    /// The pipeline-checked current record the route admitted, which the NEXT
+    /// pass compares against for its own repeat assessment. `None` on any pass
+    /// that was not admitted, so an unadmitted pass never accumulates a record to
+    /// compare against.
+    Settled(Option<eliot_maintenance::RetainedImprovementProposal>),
 }
 
 struct ImprovementIntakeFlightState {
@@ -4565,8 +5162,25 @@ struct ImprovementIntakeFlightState {
 /// unreachable. `Idle` means no dispatch is outstanding; `InFlight` holds
 /// the one pending bounded step. No second owner and no second concurrent
 /// dispatch exist.
+///
+/// `Idle` carries the pipeline's own checked current record from the last
+/// ADMITTED pass, which the next pass presents as its retained prior record so
+/// `assess_improvement_repeat` compares checked content instead of a recomputed
+/// digest. It is process-local and is lost on restart, which is stated rather
+/// than papered over: no durable owner of a `RetainedImprovementProposal` exists
+/// in this workspace, so an absent record is passed to the pipeline as no record
+/// at all and it disposes of that as its own `NoRetainedPrior` case.
 enum ImprovementIntakeFlight {
-    Idle,
+    Idle {
+        /// Boxed for the same storage reason the operation is boxed on the
+        /// `UserAutomationOperation` boundary: the retained record is far
+        /// larger than the in-flight handle, and leaving it inline made this
+        /// enum's `Idle` and `InFlight` arms differ by more than three times
+        /// their own size. It is a storage detail only — the record is read
+        /// through a reference on the next pass exactly as before, and no
+        /// value is copied to make it fit.
+        retained: Option<Box<eliot_maintenance::RetainedImprovementProposal>>,
+    },
     InFlight(ImprovementIntakeFlightState),
 }
 
@@ -4699,11 +5313,12 @@ fn admit_over_restored_registry(
 
 /// Runs one improvement-intake step: evaluate and assemble the artifact over a
 /// real observation, read the deduplication registry back from the durable
-/// candidate records, admit into it through the governed path, and commit the
+/// candidate records, admit into it through the governed path, commit the
 /// artifact — and every archive receipt the admission produced — durably
-/// through the Governor `RecordLearningRecord` seam.
+/// through the Governor `RecordLearningRecord` seam, and route the committed
+/// artifact through the Governor improvement pipeline.
 ///
-/// Four phases, and the lock is held for three of them:
+/// Six phases, and the lock is held for three of them:
 ///
 /// 1. guarded: evaluate the observation, capture the admitted fence, assemble
 ///    the artifact, read the `G-19` admission policy;
@@ -4713,12 +5328,22 @@ fn admit_over_restored_registry(
 ///    acceptance and evidence reads are run;
 /// 3. guarded: re-check the fence, rebuild the bounded backlog from those
 ///    records, and run the governed admission against it;
-/// 4. guarded: commit.
+/// 4. guarded: commit;
+/// 5. UNGUARDED and pure: route the committed artifact through the Governor
+///    improvement pipeline (`improvement_candidate_dispatch`), which is where
+///    `ImprovementRouteRequest` is constructed and `route_improvement_candidate`
+///    is called;
+/// 6. guarded: read the routed disposition's external-effect state back from
+///    the effect owner and, when the disposition names an UNRESOLVED effect,
+///    make that named obligation durable through the same
+///    `commit_learning_record` seam phase 4 used
+///    (`record_unknown_effect_obligation`).
 ///
-/// A refused or unexhausted phase-2 read is a typed error and the pass STOPS.
-/// It is never treated as an empty registry: admitting against "nothing was
-/// there" is precisely the failure this read exists to prevent, because it
-/// makes a repeat of the same evidence lineage look like a first observation.
+/// A refused or unexhausted phase-2 read is this phase's own diagnostic and the
+/// pass STOPS. It is never treated as an empty registry: admitting against
+/// "nothing was there" is precisely the failure this read exists to prevent,
+/// because it makes a repeat of the same evidence lineage look like a first
+/// observation.
 ///
 /// The durable write is owned entirely by
 /// [`eliotd::DaemonComposition::commit_learning_record`], the one
@@ -4728,11 +5353,18 @@ fn admit_over_restored_registry(
 /// a typed diagnostic rather than a loop failure — exactly the discipline
 /// [`evaluate_and_emit_maintenance_notification`] already uses for the
 /// notification leg.
+///
+/// The return value is the pipeline-checked record the NEXT pass retains for its
+/// own repeat assessment, or `None` when this pass was not admitted. Every
+/// refusal above returns the record it was handed rather than clearing it: a
+/// refused pass produced no new record, and that is not evidence the last
+/// admitted one stopped existing.
 async fn run_improvement_intake(
     kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
     observation: MaintenanceObservation,
-) -> Result<(), String> {
+    retained: Option<&eliot_maintenance::RetainedImprovementProposal>,
+) -> Option<eliot_maintenance::RetainedImprovementProposal> {
     let prepared = {
         let guard = composition.lock().await;
         improvement_intake_artifact(&guard, observation)
@@ -4746,16 +5378,34 @@ async fn run_improvement_intake(
                 &error,
             )
             .emit();
-            return Ok(());
+            // A pass that never assembled a candidate reached no route, so it
+            // retains nothing new; the prior admitted record stays.
+            return retained.cloned();
         }
     };
     // The deduplication registry, read back from the records this daemon
     // committed, at the fence this pass admitted under. Unguarded: the read is
     // an authenticated Kernel exchange and the composition guard is not held
     // across it.
-    let rows = eliotd::improvement_dedup_read::read_candidate_scope(kernel, &fence)
-        .await
-        .map_err(|error| error.to_string())?;
+    //
+    // A refused or unexhausted read is this phase's own diagnostic, exactly as
+    // the three phases below treat their refusals, so every phase of this step
+    // reports at its own site rather than one of them reporting as another's. The
+    // pass STOPS here: it is never treated as an empty registry, because
+    // admitting against "nothing was there" is precisely the failure this read
+    // exists to prevent.
+    let rows = match eliotd::improvement_dedup_read::read_candidate_scope(kernel, &fence).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            let _ = eliotd::diagnostics::ErrorRecord::of(
+                eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                "improvement-dedup-read",
+                &error.to_string(),
+            )
+            .emit();
+            return retained.cloned();
+        }
+    };
     let restored = rows.len();
     let admitted = {
         let guard = composition.lock().await;
@@ -4770,7 +5420,10 @@ async fn run_improvement_intake(
                 &error,
             )
             .emit();
-            return Ok(());
+            // The route step is not attempted: it routes the artifact this pass
+            // was about to admit, and nothing was admitted. The prior admitted
+            // record stays.
+            return retained.cloned();
         }
     };
     let committed = {
@@ -4829,37 +5482,246 @@ async fn run_improvement_intake(
             .emit();
         }
     }
-    // Phase 5: run the Governor improvement-candidate ROUTE over the same
+    // Phases 5 and 6: run the Governor improvement-candidate ROUTE over the same
     // observation, the same `G-19` policy and the same admitted fence this pass
-    // already holds. This is the leg that makes
-    // `route_improvement_candidate` reachable at all: `ImprovementRouteRequest`
-    // borrows seven Governor-owned records, so until this call nothing in the
-    // repository constructed one.
-    //
-    // It is pure with respect to the Kernel — no exchange, no write — so it
-    // needs no guard and adds no fifth phase of durability. A typed
-    // `PipelineError` is a diagnostic under the same discipline as the three
-    // refusals above, never a loop failure: the Governor pipeline refusing this
-    // candidate is the advisory outcome I12.24:76 requires, because this daemon
-    // holds no independent executed evaluation and sets
-    // `ImprovementEvidenceExecution::NotExecuted` rather than claiming one.
-    // Nothing on this path promotes, activates, installs, completes, or issues
-    // authority.
+    // already holds, then route the disposition's external effect to the owner
+    // that owes it. Phase 5 is the leg that makes `route_improvement_candidate`
+    // reachable at all: `ImprovementRouteRequest` borrows seven Governor-owned
+    // records, so until this call nothing in the repository constructed one. It
+    // is pure with respect to the Kernel — no exchange, no write — so it needs no
+    // guard. The outcome is read and recorded by
+    // [`report_improvement_candidate_route`], which is where a canary handoff is
+    // checked against this build's identity, where an unresolved external effect
+    // is named instead of dropped, and where the record the NEXT pass compares
+    // against is settled.
+    route_and_reconcile_improvement_candidate(composition, &artifact, &policy, &fence, retained)
+        .await
+}
+
+/// Routes the committed artifact through the Governor pipeline, then routes the
+/// disposition's external effect to the owner that owes it.
+///
+/// The two route phases of one improvement-intake step, split out of
+/// [`run_improvement_intake`] so each reads on its own.
+///
+/// # Phase 5 — the Governor route
+///
+/// This is the leg that makes `route_improvement_candidate` reachable at all:
+/// `ImprovementRouteRequest` borrows seven Governor-owned records, so until this
+/// call nothing in the repository constructed one. It is pure with respect to
+/// the Kernel — no exchange, no write — so it needs no guard.
+///
+/// A typed `PipelineError` is a diagnostic under the same discipline as the
+/// refusal phases of the step that called this, never a loop failure: the
+/// Governor pipeline refusing this candidate is the advisory outcome I12.24:76
+/// requires, because this daemon holds no independent executed evaluation and
+/// sets `ImprovementEvidenceExecution::NotExecuted` rather than claiming one.
+/// Reading what the disposition decided stays with
+/// [`report_improvement_candidate_route`], which this function hands the outcome
+/// to unchanged.
+///
+/// # Phase 6 — the external effect
+///
+/// The disposition's effect state has already been read from the effect owner
+/// through the Governor pipeline's own accessors, so this phase only makes a
+/// NAMED unresolved effect durable, and only when the disposition carries one.
+/// See [`record_unknown_effect_obligation`].
+///
+/// # The returned record
+///
+/// The record the NEXT pass retains for its own repeat assessment, or the one
+/// this pass was handed when the route was refused. A refusal produced no
+/// checked record, so it retains nothing new, and the previously retained record
+/// stays in the flight: a refused pass is not evidence that the last admitted
+/// record stopped existing.
+async fn route_and_reconcile_improvement_candidate(
+    composition: &SharedComposition,
+    artifact: &eliotd::improvement_intake_dispatch::ImprovementArtifact,
+    policy: &eliot_maintenance::ImprovementAdmissionPolicy,
+    fence: &eliot_contracts::StateFence,
+    retained: Option<&eliot_maintenance::RetainedImprovementProposal>,
+) -> Option<eliot_maintenance::RetainedImprovementProposal> {
     let routed = eliotd::improvement_candidate_dispatch::dispatch_improvement_candidate_route(
-        &artifact, &policy, &fence,
+        eliotd::improvement_candidate_dispatch::ImprovementRouteDispatch {
+            artifact,
+            policy,
+            state_fence: fence,
+            retained,
+        },
     );
+    // Phase 6 — the external effect this disposition names, read from the effect
+    // owner and, when the disposition actually carries an unresolved effect,
+    // routed to that owner's durable surface. It runs before the disposition is
+    // read so a named debt outlives the pass that observed it even if the reading
+    // below is the part a reader looks at first. Nothing here attaches an effect
+    // outcome, and nothing on this path promotes, activates, installs,
+    // completes, or issues authority.
+    if let Ok(outcome) = &routed {
+        record_unknown_effect_obligation(composition, artifact, &outcome.effect, fence).await;
+    }
+    report_improvement_candidate_route(&artifact.candidate.candidate_id, routed, retained)
+}
+
+/// Reads one improvement-candidate route outcome and records what it actually
+/// decided.
+///
+/// Split out of [`run_improvement_intake`] so the reading of a disposition is
+/// auditable on its own rather than buried at the end of a long pass. It is
+/// where the daemon stops treating the Governor pipeline's answer as an opaque
+/// `Debug` line:
+///
+/// - A `CanaryAdmitted` handoff is the one disposition that CARRIES a record, so
+///   it is the one disposition that has to be READ. The handoff is checked
+///   against this build's own checked identity — the wire revision it was written
+///   under, then the content identity of the commitment, discriminator
+///   projection and material-equality key it records — through the
+///   Governor-owned checks, before any of it is named as more than what the
+///   pipeline wrote. A refusal crosses as the typed `PipelineError` those checks
+///   produced; nothing here recomputes a digest, and no empty, substituted, or
+///   legacy value stands in for one.
+///
+///   Checked is not authorized. `execution_authorized` is false in every handoff
+///   the pipeline builds, and the Kernel owner (#11) must still authorize and
+///   execute activation independently; this leg names what was admitted and
+///   proves nothing beyond that.
+/// - An `UnknownRequiresReconciliation` obligation is a named debt, not a weaker
+///   success and not an absent result. It is named here with its exact identity
+///   and the retry gate read from the effect owner's own stored value, so the
+///   debt is inspectable instead of dropped with the match arm. It is made
+///   durable one step earlier by phase 6
+///   ([`record_unknown_effect_obligation`]), through the same
+///   `commit_learning_record` seam the rest of the improvement record family
+///   uses and in the same closed `Candidate` kind and Governor scope;
+///   `improvement_candidate_dispatch` records why that shape and no other, with
+///   the measurement — the closed learning-record kind set has no kind for an
+///   unresolved effect, and the one kind that fits is re-proved exhaustively by
+///   `improvement_dedup_read::classify_row`, which refuses any document shape it
+///   has not been taught. The record carries the debt and the owner's DENYING
+///   answer only: no outcome, no receipt, and no authority, because the effect
+///   owner is the half that does not exist yet.
+/// - The `CanaryAdmitted` arm also names the repeat assessment the pipeline
+///   derived against the retained prior record, so an absent assessment is
+///   visibly the denial it is rather than a silent omission.
+/// - Every other terminal disposition keeps the verbatim record it always had.
+///
+/// The return value is the pipeline-checked current record the NEXT pass
+/// compares against, or the record this call was handed when the pass was not
+/// admitted. A refusal is not evidence that the last admitted record stopped
+/// existing, so the `Err` arm settles on the record the flight already held.
+///
+/// A typed `PipelineError` from the route or from the identity check is a
+/// diagnostic under the same discipline as the other refusals in the pass, never
+/// a loop failure: the Governor pipeline refusing this candidate is the advisory
+/// outcome I12.24:76 requires, because this daemon holds no independent executed
+/// evaluation and sets `ImprovementEvidenceExecution::NotExecuted` rather than
+/// claiming one. Nothing on this path promotes, activates, installs, completes,
+/// or issues authority.
+fn report_improvement_candidate_route(
+    candidate_id: &str,
+    routed: Result<
+        eliotd::improvement_candidate_dispatch::ImprovementRouteOutcome,
+        eliot_maintenance::PipelineError,
+    >,
+    retained: Option<&eliot_maintenance::RetainedImprovementProposal>,
+) -> Option<eliot_maintenance::RetainedImprovementProposal> {
     match routed {
-        Ok(disposition) => {
-            tracing::info!(
-                target: "eliotd::diagnostics",
-                event = "eliotd.improvement_candidate_routed",
-                candidate_id = %artifact.candidate.candidate_id,
-                // The pipeline's own advisory-only terminal disposition, recorded
-                // verbatim. A `CanaryAdmitted` disposition here would still be a
-                // non-authorizing handoff the Kernel owner (#11) must
-                // independently authorize, never an activation.
-                disposition = ?disposition,
-            );
+        Ok(outcome) => {
+            match outcome.disposition {
+                // The identity check is NOT repeated here. `dispatch_improvement_candidate_route`
+                // already ran `check_handoff_consumable`, which applies both
+                // Governor-owned checks against the handoff's OWN recorded wire
+                // revision, commitment, discriminator and material-equality key, bound
+                // to the exact experiment plan this run passed to the pipeline. A
+                // `CanaryAdmitted` disposition therefore arrives here only if that
+                // record passed, and a refusal crossed as the typed `PipelineError`
+                // in the `Err` arm below with no disposition returned at all. Running
+                // the same check twice would be a second opinion about one record.
+                eliot_maintenance::ImprovementTerminalDisposition::CanaryAdmitted { handoff } => {
+                    tracing::info!(
+                        target: "eliotd::diagnostics",
+                        event = "eliotd.improvement_canary_handoff_checked",
+                        candidate_id = %handoff.candidate_id,
+                        proposal_id = %handoff.proposal_id,
+                        experiment_id = %handoff.experiment_id,
+                        operation_ref = %handoff.operation_ref,
+                        idempotency_key = %handoff.idempotency_key,
+                        // The identity this build checked and read, named so the
+                        // record's version is visible next to the disposition
+                        // rather than buried in an opaque projection string.
+                        wire_revision = handoff.wire_revision,
+                        commitment_domain = %handoff.proposal_commitment.domain,
+                        commitment_encoding_version = %handoff.proposal_commitment.encoding_version,
+                        commitment_algorithm = %handoff.proposal_commitment.algorithm,
+                        // The recorded digest, read as recorded. This is the
+                        // value the pipeline committed, not one derived here.
+                        proposal_commitment = %handoff.proposal_commitment.digest,
+                        discriminator_domain = %handoff.proposal_discriminator.domain,
+                        material_equality_domain = %handoff.proposal_material_equality.domain,
+                        // Always false: a handoff is a request for the Kernel
+                        // owner to authorize, never an authorization.
+                        execution_authorized = handoff.execution_authorized,
+                        activation_owner_id = %handoff.activation_owner_id,
+                        // The repeat assessment the pipeline derived against the
+                        // retained prior record, when both records existed. `None`
+                        // on every pass that was not admitted, which is every pass on
+                        // this workspace: the execution gate refuses first, so no
+                        // current record is ever published. Recorded so an absent
+                        // assessment is visibly the denial it is rather than a silent
+                        // omission.
+                        repeat = ?outcome.repeat,
+                    );
+                }
+                eliot_maintenance::ImprovementTerminalDisposition::UnknownRequiresReconciliation {
+                    obligation,
+                } => tracing::warn!(
+                    target: "eliotd::diagnostics",
+                    event = "eliotd.improvement_unknown_effect_outstanding",
+                    // Read first, from the effect owner's own stored value and never
+                    // asserted here: the gate denies until that owner settles the
+                    // effect. The identity fields below are then named verbatim.
+                    retry_permitted = obligation.retry_permitted(),
+                    candidate_id = %obligation.candidate_id,
+                    experiment_id = %obligation.experiment_id,
+                    commitment_domain = %obligation.commitment.domain,
+                    commitment_encoding_version = %obligation.commitment.encoding_version,
+                    commitment_algorithm = %obligation.commitment.algorithm,
+                    proposal_commitment = %obligation.commitment.digest,
+                    owner_id = %obligation.owner_id,
+                    forward_repair_ref = %obligation.forward_repair_ref,
+                    invalidation_targets = ?obligation.invalidation_set,
+                    // The debt is made durable by phase 6
+                    // (`record_unknown_effect_obligation`) through the same
+                    // `commit_learning_record` seam the rest of the improvement
+                    // record family uses; this line names what was READ, and that
+                    // phase reports whether the commit landed. What the record
+                    // carries is the debt plus the owner's DENYING answer: no
+                    // outcome, no receipt and no authority.
+                    effect = ?outcome.effect,
+                ),
+                disposition => {
+                    tracing::info!(
+                        target: "eliotd::diagnostics",
+                        event = "eliotd.improvement_candidate_routed",
+                        candidate_id,
+                        // The pipeline's own advisory-only terminal disposition,
+                        // recorded verbatim.
+                        disposition = ?disposition,
+                        // The repeat assessment, when one was derived, and the
+                        // external-effect state the owner gave for it. Recorded so
+                        // "nobody settled this effect" and "no prior record was
+                        // compared" are visible facts on the live pass instead of
+                        // unexamined omissions: on this workspace the execution
+                        // gate refuses first, so both are absent.
+                        repeat = ?outcome.repeat,
+                        effect = ?outcome.effect,
+                    );
+                }
+            }
+            // Only an ADMITTED pass publishes a checked current record, so only
+            // an admitted pass replaces what the next pass compares against.
+            // Every other outcome — including the refusal below — settles on the
+            // record the flight already held.
+            outcome.retained_next
         }
         Err(error) => {
             let _ = eliotd::diagnostics::ErrorRecord::of(
@@ -4868,36 +5730,195 @@ async fn run_improvement_intake(
                 &error.to_string(),
             )
             .emit();
+            // A refusal produced no checked record, so the pass retains nothing
+            // NEW. The previously retained record stays in the flight: a refused
+            // pass is not evidence that the prior admitted record stopped
+            // existing.
+            retained.cloned()
         }
     }
-    Ok(())
+}
+
+/// The improvement intake's OWN observation, and the family its evidence
+/// concerns (issue #1867 W2/A1, I12.24:50).
+///
+/// # Why the intake does not reuse the idle maintenance observation
+///
+/// It used to call [`idle_maintenance_observation`], whose only evidence is
+/// `activation_in_flight={bool}`. That observation cannot name a conformance
+/// family honestly, so the whole Self-Quality conformance-diagnosis leg (the
+/// `conformance_diagnosis_evidence` projection in `improvement_intake_dispatch`,
+/// reached from `assemble_improvement_artifact` when
+/// `maintenance_evidence_source` returns `ConformanceDiagnosis`) had no live
+/// producer: every candidate was labelled an attempt. The intake step is the
+/// one that feeds the improvement funnel, so it now makes its own observation
+/// at the same cadence, from the readiness projection the tick already holds.
+///
+/// # What this site observes
+///
+/// Two real records, and nothing spelled:
+///
+/// - `declared_capabilities_bound` is
+///   [`every_declared_capability_bound`] over the declared slot denominator —
+///   the expected-versus-supplied comparison the daemon's own startup attach
+///   sites and `observe_owner` produce;
+/// - the bounded readiness record [`report`], which carries the core verdict,
+///   the owner generation and epoch the verdict was derived from, the degraded
+///   optional set, and every slot's mandatory flag, availability and prior
+///   failure.
+///
+/// [`every_declared_capability_bound`]:
+/// `StartupReadinessProjection::every_declared_capability_bound`
+/// [`report`]: `StartupReadinessProjection::report`
+///
+/// The `activation_in_flight` evidence and the gate it feeds are unchanged: the
+/// intake is still gated on the real admitted activation state captured before
+/// its future is created, exactly as the idle maintenance trigger is.
+///
+/// The family is [`conformance_observed_family`], so an observed declared-
+/// capability gap is raised as the conformance family and reaches the funnel
+/// through the Self-Quality conformance-diagnosis contract, while a daemon
+/// whose declared set is fully bound and undegraded keeps naming
+/// [`SELF_OBSERVED_FAMILY`] and its attempt lineage. This is a pure read of
+/// retained state: no IO, no client, no clock, and it happens on the
+/// single-threaded loop before the flight future is created, so the borrowed
+/// projection never crosses the future.
+fn improvement_intake_observation(
+    activation_flight: &ActivationFlight,
+    startup_readiness: &StartupReadinessProjection,
+) -> MaintenanceObservation {
+    let activation_in_flight = matches!(activation_flight, ActivationFlight::InFlight(_));
+    maintenance_observation(
+        MaintenanceTriggerOrigin::IdleTransition,
+        conformance_observed_family(startup_readiness),
+        &[
+            format!("activation_in_flight={activation_in_flight}"),
+            format!(
+                "declared_capabilities_bound={}",
+                startup_readiness.every_declared_capability_bound()
+            ),
+            startup_readiness.report(),
+        ],
+        activation_in_flight,
+    )
+}
+
+/// Records one routed disposition's unresolved external effect for its owner.
+///
+/// # What this step is
+///
+/// The improvement pipeline's `UnknownRequiresReconciliation` disposition
+/// carries a named debt: a candidate, an experiment, a committed operation and
+/// idempotency namespace, a forward-repair reference, an invalidation set, and
+/// the external owner that owes the reconciliation. `ImprovementRouteOutcome`
+/// has already read all of that back from the effect owner through the
+/// Governor pipeline's own accessors, so this step only makes it DURABLE —
+/// otherwise the debt would exist for exactly as long as the pass that observed
+/// it, and a named external debt that vanishes with a process is the failure
+/// I14.24 records.
+///
+/// Durability goes through the same single seam phase 4 used:
+/// `improvement_candidate_dispatch::commit_unknown_effect_obligation` reaches
+/// [`eliotd::DaemonComposition::commit_learning_record`] in the same Governor
+/// scope and the same closed `candidate` record kind as the candidate artifact,
+/// the archive receipts and the lineage-merge receipts. No store client is
+/// opened, no operation is invented, and the lock is taken only for the commit
+/// itself.
+///
+/// # What this step is NOT
+///
+/// It does not settle the effect, and it cannot. The owner outcome lives behind
+/// a private field whose only writer re-checks that the outcome is terminal,
+/// carries a canonical receipt, and names this obligation's exact operation id
+/// and idempotency key — and this repository has no producer of a SETTLED
+/// `eliot_authority::EffectReceipt` to offer it. So the committed record names
+/// the debt and the denying answer, and a refusal to commit it is this phase's
+/// own diagnostic under the same discipline as phases 1 to 4, never a loop
+/// failure. Nothing here promotes, activates, installs, completes, or issues
+/// authority, and nothing here retries anything: a retry is the Governor gate's
+/// answer to read, never one this step decides.
+async fn record_unknown_effect_obligation(
+    composition: &SharedComposition,
+    artifact: &eliotd::improvement_intake_dispatch::ImprovementArtifact,
+    effect: &eliotd::improvement_candidate_route::ImprovementEffectState,
+    fence: &eliot_contracts::StateFence,
+) {
+    if effect.obligation.is_none() {
+        // No unresolved effect is named, so there is no debt to record. A record
+        // written for a disposition that carries no obligation would be an
+        // invented one.
+        return;
+    }
+    let committed = {
+        let mut guard = composition.lock().await;
+        eliotd::improvement_candidate_dispatch::commit_unknown_effect_obligation(
+            &mut guard, artifact, effect, fence,
+        )
+        .await
+    };
+    match committed {
+        Ok(Some(receipt)) => {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.improvement_effect_reconciliation_recorded",
+                candidate_id = %artifact.candidate.candidate_id,
+                operation_id = %receipt.operation_id,
+                // The owner's own two answers, recorded verbatim so the record
+                // and the daemon's own view cannot drift apart silently.
+                retry_permitted = effect.retry_permitted,
+                completion_retained = effect.completion_retained,
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let _ = eliotd::diagnostics::ErrorRecord::of(
+                eliotd::diagnostics::OwningComponent::DaemonRuntime,
+                "improvement-reconciliation-commit",
+                &error.to_string(),
+            )
+            .emit();
+        }
+    }
 }
 
 /// Starts one improvement-intake step when its flight is idle. The
-/// observation is captured from the activation state before the future is
-/// created, so the decision and its evidence are the same observation; a busy
-/// flight is left untouched.
+/// observation is captured from the activation state and the readiness
+/// projection before the future is created, so the decision and its evidence
+/// are the same observation; a busy flight is left untouched.
 ///
 /// The retained Kernel client is cloned into the future because the step now
 /// performs an authenticated named read — the deduplication-registry read-back
 /// — as well as the durable write. It is the same retained transport every
 /// other read in this loop uses, not a second client.
+///
+/// The retained prior record is CLONED into the future rather than moved, because
+/// the flight keeps holding it until this very step settles: a step that fails
+/// or refuses still leaves the last admitted record in place for the pass after
+/// it. Only settlement replaces it, and only with a record the pipeline itself
+/// committed on an admitted pass.
 fn maybe_start_improvement_intake(
     kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
     activation_flight: &ActivationFlight,
+    startup_readiness: &StartupReadinessProjection,
     flight: &mut ImprovementIntakeFlight,
 ) {
-    if !matches!(flight, ImprovementIntakeFlight::Idle) {
-        return;
-    }
-    let observation = idle_maintenance_observation(activation_flight);
+    let retained = match flight {
+        // The clone is a pointer copy: the flight's record is already boxed, so
+        // the future carries the reference-sized handle rather than a second
+        // inline copy of the record. The record the step reads is the same one.
+        ImprovementIntakeFlight::Idle { retained } => retained.clone(),
+        ImprovementIntakeFlight::InFlight(_) => return,
+    };
+    let observation = improvement_intake_observation(activation_flight, startup_readiness);
     let kernel = Arc::clone(kernel);
     let composition = Arc::clone(composition);
     *flight = ImprovementIntakeFlight::InFlight(ImprovementIntakeFlightState {
         future: Box::pin(async move {
-            let result = run_improvement_intake(&kernel, &composition, observation).await;
-            ImprovementIntakeCompletion::Settled(result)
+            let retained_next =
+                run_improvement_intake(&kernel, &composition, observation, retained.as_deref())
+                    .await;
+            ImprovementIntakeCompletion::Settled(retained_next)
         }),
     });
 }
@@ -4908,29 +5929,30 @@ async fn next_improvement_intake_completion(
     flight: &mut ImprovementIntakeFlight,
 ) -> ImprovementIntakeCompletion {
     match flight {
-        ImprovementIntakeFlight::Idle => std::future::pending().await,
+        ImprovementIntakeFlight::Idle { .. } => std::future::pending().await,
         ImprovementIntakeFlight::InFlight(state) => (&mut state.future).await,
     }
 }
 
 /// Releases a completed improvement-intake flight so a later cadence
 /// observation can start. Settlement itself is synchronous and cannot block
-/// the run loop; the step never fails the loop, so every outcome idles. The
-/// settled result is consumed here so a step that did not complete is still
-/// recorded as a diagnostic rather than dropped.
+/// the run loop; the step never fails the loop, so every outcome idles.
+///
+/// The record the step retained goes back into `Idle` and is the input to the
+/// NEXT pass's repeat assessment. It is the pipeline's own checked record, not a
+/// recomputation; see [`ImprovementIntakeFlight`].
 fn settle_improvement_intake_completion(
     flight: &mut ImprovementIntakeFlight,
     completion: ImprovementIntakeCompletion,
 ) {
-    if let ImprovementIntakeCompletion::Settled(Err(error)) = completion {
-        let _ = eliotd::diagnostics::ErrorRecord::of(
-            eliotd::diagnostics::OwningComponent::DaemonRuntime,
-            "improvement-intake-settle",
-            &error,
-        )
-        .emit();
-    }
-    *flight = ImprovementIntakeFlight::Idle;
+    let ImprovementIntakeCompletion::Settled(retained) = completion;
+    *flight = ImprovementIntakeFlight::Idle {
+        // Boxed for the enum's arm-size balance only; the stored value and the
+        // value the step returns are the same record, and boxing moves no
+        // boundary — `run_improvement_intake` and the next pass's repeat
+        // assessment both read it through a plain reference.
+        retained: retained.map(Box::new),
+    };
 }
 
 /// Pure tick gate: the `TestD` owner timer starts work only when the flight
@@ -5125,10 +6147,12 @@ async fn testd_owner_drain_admitted(composition: &SharedComposition) -> bool {
 /// creates no Session, authority, or Finish; only bounded ticket identity is
 /// carried in diagnostics.
 async fn dispatch_agent_activation_result(
-    kernel: &DaemonKernelClient,
+    kernel: Arc<DaemonKernelClient>,
+    composition: SharedComposition,
     ticket: &AgentActivationResolutionTicket,
     result: AgentActivationResolutionResult,
     owner_readback: Option<eliot_protocol::AgentActivationOwnerReadback>,
+    cold_start_discovery: Option<eliotd::task_binding_admission::ColdStartDiscoveryInput>,
 ) -> Result<(), ActivationDispatchError> {
     // #740: dispatch span over the submit-then-reconcile path. The retained
     // result is reused verbatim; only bounded ticket identity is carried.
@@ -5145,7 +6169,17 @@ async fn dispatch_agent_activation_result(
         .submit_agent_activation_result(&result, owner_readback)
         .await
     {
-        Ok(ack) => classify_submit_ack(ticket, &result, &ack),
+        Ok(ack) => {
+            classify_submit_ack(ticket, &result, &ack)?;
+            trigger_accepted_cold_start(
+                &kernel,
+                Arc::clone(&composition),
+                ticket,
+                cold_start_discovery,
+            )
+            .await;
+            Ok(())
+        }
         // #839 (W14/A3): the submit failure's own provenance now decides the
         // path. A failure that provably never reached the transport, and a
         // definitive non-acceptance, hold nothing for Kernel to reconcile and
@@ -5177,9 +6211,220 @@ async fn dispatch_agent_activation_result(
                         ticket.ticket_id
                     ))
                 })?;
-            classify_reconcile_ack(ticket, &result, &ack, &submit_detail)
+            classify_reconcile_ack(ticket, &result, &ack, &submit_detail)?;
+            trigger_accepted_cold_start(
+                &kernel,
+                Arc::clone(&composition),
+                ticket,
+                cold_start_discovery,
+            )
+            .await;
+            Ok(())
         }
     }
+}
+
+/// Runs the I4.4.1 trigger after either direct acceptance or an accepted
+/// reconciliation of a possibly-lost result acknowledgement. The exact Host
+/// lease/key/evidence stays attached to this resolved dispatch across both
+/// paths.
+async fn trigger_accepted_cold_start(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: SharedComposition,
+    ticket: &AgentActivationResolutionTicket,
+    discovery: Option<eliotd::task_binding_admission::ColdStartDiscoveryInput>,
+) {
+    if let Some(discovery) = discovery {
+        let kernel = Arc::clone(kernel);
+        let ticket_id = ticket.ticket_id.clone();
+        let worker_ticket = ticket.clone();
+        let route_kernel = Arc::clone(&kernel);
+        let route_connection_id = ticket.connection_id.clone();
+        let route_ticket_id = ticket.ticket_id.clone();
+        let contour_result = tokio::task::spawn_blocking(move || {
+            eliotd::task_binding_admission::request_scan_disclosure_contour(
+                &route_kernel,
+                &route_connection_id,
+                &route_ticket_id,
+            )
+        })
+        .await
+        .unwrap_or_else(|error| {
+            Err(format!(
+                "accepted activation readiness contour worker failed closed: {error}"
+            ))
+        });
+        if let Ok(contour) = &contour_result {
+            let owner = Arc::new(
+                eliotd::task_binding_admission::KernelColdStartReadinessRecordOwner::new(
+                    Arc::clone(&kernel),
+                    ticket.connection_id.clone(),
+                    ticket.ticket_id.clone(),
+                ),
+            );
+            let bind_result = composition
+                .lock()
+                .await
+                .bind_cold_start_readiness_owner(contour, owner);
+            if let Err(error) = bind_result {
+                tracing::warn!(
+                    ticket = %eliotd::diagnostics::sanitize_identity(&ticket_id),
+                    error = %error,
+                    "accepted activation readiness owner bind refused"
+                );
+            }
+        } else if let Err(error) = &contour_result {
+            tracing::warn!(
+                ticket = %eliotd::diagnostics::sanitize_identity(&ticket_id),
+                error = %error,
+                "accepted activation readiness contour unavailable"
+            );
+        }
+        tokio::task::spawn_blocking(move || {
+            trigger_cold_start_controller(&kernel, &worker_ticket, discovery, contour_result)
+        })
+        .await
+        .map_or_else(
+            |error| {
+                tracing::warn!(
+                    ticket = %eliotd::diagnostics::sanitize_identity(&ticket_id),
+                    error = %error,
+                    "accepted activation's I4.4.1 scanner trigger worker failed closed"
+                );
+            },
+            |trigger_result| match trigger_result {
+                Err(refusal) => {
+                    tracing::warn!(
+                        ticket = %eliotd::diagnostics::sanitize_identity(&ticket_id),
+                        refusal = %refusal,
+                        "accepted activation's I4.4.1 scanner trigger refused"
+                    );
+                }
+                Ok(eliot_workscope::BootstrapScanOutcome::PrivacyBoundaryRequired {
+                    code, ..
+                }) => {
+                    tracing::info!(
+                        ticket = %eliotd::diagnostics::sanitize_identity(&ticket_id),
+                        question_code = %code,
+                        "accepted activation's I4.4.1 scanner retained its privacy question"
+                    );
+                }
+                Ok(eliot_workscope::BootstrapScanOutcome::Completed { persisted, .. }) => {
+                    tracing::info!(
+                        ticket = %eliotd::diagnostics::sanitize_identity(&ticket_id),
+                        scan_receipt = %persisted.receipt_ref,
+                        "accepted activation's I4.4.1 scanner retained its owner receipt"
+                    );
+                }
+            },
+        );
+    }
+}
+
+/// Fires the I4.4.1 `AttachOrLaunch` trigger only after Kernel accepted the
+/// exact typed activation result. The same retained Host lease/evidence is
+/// passed to `ColdStartController`; no second filesystem observation or new
+/// lease is created. The accepted ticket now binds the authenticated readiness
+/// transport adapter to the installation contour. The current Host discovery
+/// still lacks admitted privacy-boundary and governing-source digest evidence,
+/// so it can deliver its typed smallest-question result but cannot construct a
+/// durable readiness claim, join a lease, or compile a terminal receipt.
+fn trigger_cold_start_controller(
+    kernel: &Arc<DaemonKernelClient>,
+    ticket: &AgentActivationResolutionTicket,
+    mut discovery: eliotd::task_binding_admission::ColdStartDiscoveryInput,
+    contour_result: Result<eliot_governor::InstallationScanContour, String>,
+) -> Result<eliot_workscope::BootstrapScanOutcome, String> {
+    let now = unix_ms(SystemTime::now())?;
+    let trigger = eliot_workscope::ColdStartTrigger::AttachOrLaunch;
+    let controller_result = eliot_workscope::ColdStartController::check_discovery_with_scan(
+        trigger,
+        &discovery.lease,
+        &discovery.discovery.evidence,
+        now,
+    );
+    // Every accepted explicit attach reaches the authenticated installation
+    // owner routes. The contour and binding are derived there; this caller
+    // supplies no authority-bearing storage or binding fields.
+    let binding_result = eliotd::task_binding_admission::request_scan_disclosure_binding(
+        kernel,
+        &ticket.connection_id,
+        &ticket.ticket_id,
+    );
+    let contour_status = contour_result
+        .as_ref()
+        .err()
+        .map_or("available", String::as_str);
+    let binding_status = binding_result
+        .as_ref()
+        .err()
+        .map_or("available", String::as_str);
+
+    if let Err(controller) = controller_result {
+        let missing_reads = trigger
+            .required_discovery_reads()
+            .iter()
+            .filter(|read| {
+                !discovery.lease.allowed_reads.contains(read)
+                    || !discovery.discovery.evidence.attested_reads.contains(read)
+            })
+            .map(|read| format!("{read:?}"))
+            .collect::<Vec<_>>();
+        return Err(format!(
+            "I4.4.1 AttachOrLaunch refused before scanner: trigger discovery lease/evidence rejected by ColdStartController ({controller:?}); required reads missing from the lease or evidence: {missing_reads:?}; Kernel contour owner: {contour_status}; Kernel binding owner: {binding_status}",
+        ));
+    }
+
+    let (Some(candidate_privacy), Some(privacy_boundary), Some(policy)) = (
+        discovery.discovery.candidate_privacy,
+        discovery.discovery.privacy_boundary.as_ref(),
+        discovery.discovery.policy.as_ref(),
+    ) else {
+        // The privacy-bounded scanner's question path validates this exact
+        // retained lease/key/evidence and performs no charge or persistence.
+        return eliot_workscope::run_bootstrap_discovery(
+            None,
+            None,
+            &mut discovery.lease,
+            &discovery.key,
+            &discovery.discovery,
+        )
+        .map_err(|error| format!("privacy-bounded attach scanner refused: {error}"));
+    };
+
+    let contour = contour_result?;
+    let binding = binding_result?;
+    let owner = Arc::new(
+        eliotd::task_binding_admission::KernelScanDisclosureRecordOwner::new(
+            Arc::clone(kernel),
+            ticket.connection_id.clone(),
+            ticket.ticket_id.clone(),
+            binding.clone(),
+        ),
+    );
+    let mut store = eliot_governor::GovernorComposition::<dyn eliot_governor::KernelGenerationPort>::bind_installation_scan_store(
+        contour.installation_id(),
+        contour.ors_object_ref(),
+        contour.ors_generation(),
+        owner,
+    )
+    .map_err(|error| format!("installation scan owner bind refused: {error}"))?;
+    eliot_governor::GovernorComposition::<dyn eliot_governor::KernelGenerationPort>::run_cold_start_trigger_scan(
+        trigger,
+        &mut discovery.lease,
+        &discovery.key,
+        &mut store,
+        &binding,
+        candidate_privacy,
+        Some(privacy_boundary),
+        &discovery.discovery.evidence,
+        discovery.discovery.proposed_kind,
+        &discovery.discovery.identity_fingerprint,
+        &policy.verifier_refs,
+        discovery.discovery.governing_source_refs.clone(),
+        now,
+    )
+    .map_err(|error| format!("I4.4.1 AttachOrLaunch scanner failed closed: {error}"))
 }
 
 /// Builds the lost-acknowledgement reconcile query from the single retained

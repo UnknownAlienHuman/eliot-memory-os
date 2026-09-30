@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 using System.IO.Pipes;
 using System.Text;
@@ -7,11 +8,10 @@ using Eliot.Operator.Protocol;
 namespace Eliot.Operator.Services;
 
 /// Redeems the inherited one-shot handoff with the User Broker before the
-/// Governor connection is opened. The client has one fixed pipe, one
+/// Governor connection is opened. The client has one owner-issued pipe, one
 /// challenge/redeem exchange and no cached authority or retry path.
 internal static class BrokerPipeClient
 {
-    private const string PipeName = @"eliot\user-broker\operator";
     private const string Preface = "ELIOT-BROKER-1\n";
 
     private static readonly string[] ChallengeProperties =
@@ -75,7 +75,7 @@ internal static class BrokerPipeClient
 
         using var pipe = new NamedPipeClientStream(
             ".",
-            PipeName,
+            OwnerIssuedPipeName(endpoint),
             PipeDirection.InOut,
             PipeOptions.Asynchronous);
         await pipe.ConnectAsync(cancellationToken).ConfigureAwait(false);
@@ -187,6 +187,44 @@ internal static class BrokerPipeClient
         }
     }
 
+    /// The endpoint is the only owner-issued statement of WHICH broker
+    /// instance this handoff may authenticate against, so that name is used
+    /// verbatim with the same normalisation the Governor client applies to its
+    /// own endpoint. A name literal in this client would contradict the owner
+    /// (the broker serves exactly the name it minted into this handoff) and
+    /// would let a stale or forged endpoint be redeemed against an arbitrary
+    /// pipe. An unusable owner-issued name is therefore the same typed refusal
+    /// as any other invalid endpoint: no default, no cached name, no second
+    /// attempt, and the name itself never reaches a message or diagnostic.
+    private static string OwnerIssuedPipeName(OperatorEndpoint endpoint)
+    {
+        var pipeName = endpoint.PipeName is { } issued
+            ? issued.Replace(@"\\.\pipe\", string.Empty, StringComparison.OrdinalIgnoreCase)
+            : string.Empty;
+        if (string.IsNullOrWhiteSpace(pipeName))
+        {
+            throw new OperatorRestartRequiredException(OperatorFaultReason.EndpointInvalid);
+        }
+
+        return pipeName;
+    }
+
+    /// The generation's tick field is an OS creation instant, not an opaque
+    /// marker: OperatorProcessIdentityProvider.Observe minted it from
+    /// process.StartTime.ToUniversalTime().Ticks of the very process this
+    /// generation names. Range-checking that field only proves the token is
+    /// well shaped, so a forged "{pid}:1" would satisfy a shape check and be
+    /// accepted as the same process generation, while a replacement process
+    /// inheriting a recycled PID has a different creation instant. The instant
+    /// is therefore read live here, at comparison time, from the process that
+    /// holds this PID now - a fresh observation, never a remembered or cached
+    /// start time, so nothing can go stale between production and comparison.
+    ///
+    /// A start time that cannot be observed is a refusal, never a match: an
+    /// exited or replaced process, an invalid id and an unavailable API are all
+    /// conditions in which no continuity may be claimed. The PID equality above
+    /// is kept, and the shape parse keeps its NumberStyles.None /
+    /// CultureInfo.InvariantCulture discipline.
     private static bool ProcessGenerationMatches(string processGeneration, int processId)
     {
         var separator = processGeneration.IndexOf(':');
@@ -202,7 +240,26 @@ internal static class BrokerPipeClient
                 NumberStyles.None,
                 CultureInfo.InvariantCulture,
                 out var processStartTicks)
-            && processStartTicks > 0;
+            && processStartTicks > 0
+            && LiveStartTicksEqual(processId, processStartTicks);
+    }
+
+    /// Compares the generation's tick field against the live creation instant
+    /// of the process that currently owns the PID. Every way this observation
+    /// can fail is a fail-closed refusal, so a generation can never be honoured
+    /// on the strength of its shape alone.
+    private static bool LiveStartTicksEqual(int processId, long expectedStartTicks)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(processId);
+            return process.StartTime.ToUniversalTime().Ticks == expectedStartTicks;
+        }
+        catch (Exception error) when (error is ArgumentException or InvalidOperationException
+            or NotSupportedException or System.ComponentModel.Win32Exception)
+        {
+            return false;
+        }
     }
 
     private static async Task WriteRequestAsync(

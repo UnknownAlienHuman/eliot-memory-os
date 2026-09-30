@@ -19,6 +19,9 @@ use eliot_receipts::ProofCeiling;
 use serde::Serialize;
 
 use crate::SNAPSHOT_SCHEMA_VERSION;
+use crate::fair_pull_loop::{
+    FAIR_PULL_LOOP_PROOF_CEILING, FairPullLoop, FairPullOutcome, FairPullStart,
+};
 use crate::model::{
     AdmissionId, AttemptRecord, CancelCommand, CancellationFinalReceipt, CancellationReceipt,
     CancellationReconciliationId, CandidateId, CandidateResultReceipt, CapacityDeferral,
@@ -434,6 +437,7 @@ fn class_report(
 ) -> WorkClassSelectionReport {
     WorkClassSelectionReport {
         work_class,
+        capacity_partition: work_class.capacity_class(),
         ready_items: view.ready.len(),
         in_flight_items: view.in_flight.len(),
         in_flight_bytes: view.in_flight_bytes,
@@ -654,6 +658,10 @@ fn item_block(
 
 /// Smooth weighted round robin over the classes that offered a head.
 ///
+/// The protected control partition is settled first and separately, and this
+/// rotation then runs over the normal classes only. See
+/// [`choose_protected_head`] for why the protected class does not take part.
+///
 /// The lowest virtual time among the participating classes wins, an exact tie
 /// goes to the lower scheduler rank (so equal weights keep the I14.1 class
 /// order), and **only the winner** then advances by
@@ -662,9 +670,16 @@ fn item_block(
 /// minimum unchanged between pulls, so the same class would win every pull.
 ///
 /// Service bound, as implemented and checked: over any complete round of
-/// `W = sum(weight)` pulls, class `i` is selected exactly `weight_i` times. In
-/// a shorter window the observed share deviates from `weight_i / W` by at most
-/// one round, so `weight / W` is the round share and not a per-pull guarantee.
+/// `W = sum(weight)` pulls **among the classes this rotation runs over**, class
+/// `i` is selected exactly `weight_i` times. In a shorter window the observed
+/// share deviates from `weight_i / W` by at most one round, so `weight / W` is
+/// the round share and not a per-pull guarantee.
+///
+/// The sum runs over the eight **normal** classes only. The protected control
+/// class is not a rotation participant (issue #1683 W4), so it contributes no
+/// weight to `W` and receives no round share; it is selected ahead of the
+/// rotation whenever it offers a head. `W` is therefore the sum of the eight
+/// normal weights, and a round is eight-normal-participants wide, not nine.
 ///
 /// Credit bound. A class's credit is its virtual time minus the winner's, so it
 /// is non-negative. For a class served at global time `T`, its virtual time is
@@ -692,7 +707,24 @@ fn choose_fair_head<'a, 'profile>(
 ) -> (Option<&'a AttemptRecord>, [u64; 9], [Option<u64>; 9]) {
     let mut virtual_time = *current;
     let mut credits: [Option<u64>; 9] = [None; 9];
+
+    // Issue #1683 W4: the protected control partition is settled before the
+    // rotation, and it does not participate in it. See `choose_protected_head`.
+    if let Some(attempt) = choose_protected_head(views, &mut credits) {
+        return (Some(attempt), virtual_time, credits);
+    }
+
+    // The normal rotation, over the eight normal classes only. The protected
+    // class is excluded by the same `is_protected_partition` predicate that
+    // `choose_protected_head` used to admit it, so the partition split is
+    // derived from one function and the two filters cannot drift apart. The
+    // exclusion is redundant for the winner — a protected head reaching this
+    // point would already have returned above — and is kept so the rotation is
+    // correct as a standalone statement of "over the normal classes", which is
+    // what the round-share bound below is stated for.
+    let is_normal = |index: &usize| !WorkClass::ALL[*index].is_protected_partition();
     let winner = (0..WorkClass::ALL.len())
+        .filter(is_normal)
         .filter(|index| views[*index].head.is_some())
         .min_by_key(|index| (virtual_time[*index], *index));
     let Some(winner) = winner else {
@@ -700,13 +732,69 @@ fn choose_fair_head<'a, 'profile>(
     };
     let base = virtual_time[winner];
     for index in 0..WorkClass::ALL.len() {
-        if views[index].head.is_some() {
+        if is_normal(&index) && views[index].head.is_some() {
             credits[index] = Some(virtual_time[index] - base);
         }
     }
     let weight = resolve(WorkClass::ALL[winner]).map_or(1, |profile| u64::from(profile.weight));
     virtual_time[winner] = virtual_time[winner].saturating_add(FAIRNESS_QUANTUM / weight);
     (views[winner].head, virtual_time, credits)
+}
+
+/// The reserved protected-control head for one pull, or `None` when the
+/// protected partition offers nothing this pull (issue #1683 W4).
+///
+/// Why the protected class is settled outside the rotation rather than weighted
+/// inside it. I14.3 states "Normal workload cannot consume it", and I14.8
+/// requires a "strong reviewer/arbitration reserve protected from bulk
+/// workers". A weight is a *share*: a `control` item holding weight `w` out of
+/// a total `W` is served `w / W` of the pulls, so under saturated
+/// `normal_background` / `model_jobs` / `swarm` traffic it would wait for a
+/// fraction of the rotation, and its service bound would be a preference rather
+/// than a reservation. That is the exact defect W4 names: reserved capacity that
+/// bulk workers can delay is not reserved. Selecting the protected head first
+/// makes the reserve a bound — a ready control item is served by the next pull
+/// regardless of what the eight normal classes are doing — while the normal
+/// rotation is unchanged for the eight classes that actually rotate.
+///
+/// What the reserve does **not** do, stated so this is not overclaimed:
+///
+/// - It does not let control exceed its own bound. The protected class is gated
+///   by the same per-class ceilings as every other class inside
+///   [`offer_class_head`], including `max_concurrency`, so a protected class
+///   already at its concurrency ceiling offers no head and this returns `None`.
+///   The reserve therefore cannot be over-consumed; the ceiling refuses first.
+/// - It does not let control borrow normal capacity. The partition is decided by
+///   [`WorkClass::capacity_class`], and the Kernel enforces the same split
+///   physically in `eliot_kernel_core::ControlReserve`. This function adds no
+///   new capacity notion; it only stops the *rotation* from spending control's
+///   service opportunities.
+/// - It does not starve the normal classes. Control takes at most one pull per
+///   ready control item, and its own `max_concurrency` ceiling bounds how many
+///   such items can be in flight, so a permanently-ready control class still
+///   lets the normal rotation run whenever the protected partition is closed.
+///
+/// The credit array is filled for the protected class alone (as `Some(0)`, the
+/// winner's own credit, matching the rotation's convention that the winner's
+/// credit is zero) so a caller publishing per-class credit sees the protected
+/// class accounted for rather than silently absent.
+///
+/// Ordering *within* the protected partition needs no rotation: `control` is
+/// currently its only member, and within the class the order is already
+/// oldest-canonical-enqueue-first via `offer_class_head`. If a second class ever
+/// joins the protected partition, it would need an intra-partition rotation here
+/// and this function would stop being a single lookup; the closed nine-class
+/// `WorkClass::ALL` denominator is what makes the current shape total.
+fn choose_protected_head<'a>(
+    views: &'a [ClassPullView<'a>],
+    credits: &mut [Option<u64>; 9],
+) -> Option<&'a AttemptRecord> {
+    let index = WorkClass::ALL
+        .iter()
+        .position(|work_class| work_class.is_protected_partition())?;
+    let attempt = views[index].head?;
+    credits[index] = Some(0);
+    Some(attempt)
 }
 
 /// Published claim state of every deliverable that currently has a live writer.
@@ -786,6 +874,13 @@ pub struct AgentCoordinator {
     /// this state cannot grow without bound. It is in-memory scheduler state,
     /// not canonical work state: a restore starts it from zero.
     fair_virtual_time: [u64; 9],
+    /// I14.8 pull-based scheduler wake state (issue #1683 W1). Armed by the
+    /// transitions that change what is queued or release a slot, and consumed
+    /// by [`Self::drive_fair_pull`]. In-memory like `fair_virtual_time`, and
+    /// like it the durable part is the event log: `cursor` is `events.len()` at
+    /// the newest armed transition, so replay re-derives it and a restart
+    /// cannot strand eligible work.
+    fair_pull_loop: FairPullLoop,
     events: Vec<CoordinatorEvent>,
 }
 
@@ -914,6 +1009,7 @@ impl AgentCoordinator {
             enqueue_sequence: BTreeMap::new(),
             next_enqueue_sequence: 0,
             fair_virtual_time: [0; 9],
+            fair_pull_loop: FairPullLoop::default(),
             events: Vec::new(),
         })
     }
@@ -1350,6 +1446,9 @@ impl AgentCoordinator {
         self.events.push(CoordinatorEvent::PlanAdmitted {
             receipt: Box::new(receipt.clone()),
         });
+        // Issue #1683 W1: new admitted work is exactly what a pull can now
+        // serve, so this arms the I14.8 pull loop at the event that created it.
+        self.note_selection_inputs_changed();
         Ok(receipt)
     }
 
@@ -1360,10 +1459,17 @@ impl AgentCoordinator {
     /// [`SchedulingProfile`]: every class then carries equal weight and **no
     /// per-class item, byte, concurrency, deadline or WIP limit is applied** —
     /// the ceilings it publishes are `None`, not unlimited ones. Only the
-    /// canonical enqueue age order inside a class and the cross-class rank
-    /// tie-break on an exact virtual-time tie apply. The call is a read: it
+    /// canonical enqueue age order inside a class and the cross-class scheduler
+    /// rank tie-break on an exact virtual-time tie apply. The call is a read: it
     /// consumes no fairness credit, so two peeks over unchanged state return the
     /// same item and a peek never changes what a later pull selects.
+    ///
+    /// Because no limit applies here, the protected control reservation also has
+    /// no ceiling to be refused by on this path: a ready `control` item is
+    /// returned by this peek whenever one exists, with nothing to bound how many
+    /// may be in flight. That is inherent to the profile-free peek and is the
+    /// reason the reserve is a bound only on the profile-bound
+    /// [`Self::pull_next`].
     ///
     /// The coordinator's global limits are **not** applied here. `max_ready_items`,
     /// `max_admitted_attempts` and `max_active_per_route` are admission-time
@@ -1406,11 +1512,20 @@ impl AgentCoordinator {
     /// Service bounds, each stated for what this code does (see
     /// [`choose_fair_head`] for the derivation):
     ///
-    /// - **round share**: over any complete round of `W = sum(weight)` pulls,
-    ///   class `i` is selected exactly `weight_i` times, so `weight / W` is the
-    ///   share it receives in a round. In a window shorter than a round the
-    ///   observed share deviates from it by at most one round; it is not a
-    ///   per-pull guarantee.
+    /// - **reserved protected partition** (issue #1683 W4): `control` is not a
+    ///   rotation participant. It draws only [`WorkClass::capacity_class`]'s
+    ///   `ProtectedControl` partition, and a ready control item is selected by
+    ///   the next pull regardless of what the eight normal classes are doing, so
+    ///   its service bound is a reservation rather than the `weight / W` share
+    ///   below. `W` in the round-share bound is therefore the sum of the eight
+    ///   **normal** weights. Control's own per-class ceilings still apply and
+    ///   still refuse first; the reserve changes which partition a pull draws
+    ///   from, not whether a ceiling can be exceeded.
+    /// - **round share**: over any complete round of `W = sum(weight)` pulls
+    ///   among the normal classes, class `i` is selected exactly `weight_i`
+    ///   times, so `weight / W` is the share it receives in a round. In a window
+    ///   shorter than a round the observed share deviates from it by at most one
+    ///   round; it is not a per-pull guarantee.
     /// - **returning class**: a class that becomes eligible again keeps the
     ///   virtual time it had, so it is not charged for the pulls it missed. It
     ///   wins again as soon as its frozen time is the lowest among the eligible
@@ -1484,6 +1599,137 @@ impl AgentCoordinator {
     ) -> Result<ReadySelectionOutcome, CoordinatorError> {
         profile.validate()?;
         Ok(self.select_ready(Some(profile), true))
+    }
+
+    /// One bounded, release-driven pull-based drive (issue #1683 W1, I14.8).
+    ///
+    /// I14.8: "Scheduler is pull-based: terminal/deferred/blocked attempt
+    /// releases its slot, then the next currently admissible Ready Work Item is
+    /// selected." This is that sentence as an operation. It pulls through the
+    /// same [`Self::pull_next`] selector under the same profile, and each
+    /// selection becomes a `Running` attempt through the existing
+    /// [`Self::start_attempt`] transition, so released capacity advances work
+    /// without another agent command and without a notification this method
+    /// could miss.
+    ///
+    /// The `ExecutionContext` each started attempt receives is derived through
+    /// `ExecutionContext::from` from the coordinator's **own stored admission
+    /// receipt** — the same sealed-verifier-admitted evidence `start_attempt`
+    /// requires a caller to present — and from the attempt's own stored record
+    /// and enqueue ordinal. No provider, admission, lease or route evidence is
+    /// minted, synthesized or re-derived, so a drive can never admit work.
+    ///
+    /// Bounded, and the bound is derived rather than chosen here: the drive
+    /// starts at most one attempt per currently non-terminal admitted attempt,
+    /// and `admit`/`reassign` refuse to push the projection past the validated
+    /// `CoordinatorConfig::max_admitted_attempts`, so the loop is finite. It
+    /// also stops at the first pull that selects nothing, so re-polling an
+    /// unchanged projection costs exactly one pull instead of spinning.
+    ///
+    /// A missed wake cannot strand work, and a restart cannot renew an age.
+    /// [`Self::note_selection_inputs_changed`] arms the loop from the seven
+    /// transitions that change the projection, and the published cursor is the
+    /// durable `events.len()` at the newest of them, which
+    /// `replay_snapshot_events` re-derives. `consumed_wake` reports the
+    /// coalesced count when a wake was pending, and the drive runs either way:
+    /// it is evidence for the caller, not a gate on correctness.
+    ///
+    /// What it publishes is the exact disposition I14.8 W7 requires: for every
+    /// class that held ready work and was closed, `last_selection.deferrals`
+    /// names the limiting dimension, the observed value, the limit reached and
+    /// the profile revision whose change re-opens it. The pull-versus-retry
+    /// directive itself stays with the admission owner; a pull declining to
+    /// start one item is not a durable `DEFERRED_CAPACITY` transition, so this
+    /// method does not restate that vocabulary.
+    ///
+    /// Production residual, unchanged by this method and not worked around here:
+    /// no issuer of the provider-verified [`ProviderAdmissionReceipt`] that
+    /// [`Self::admit`] requires exists in this tree, so in production `attempts`
+    /// is empty, a drive performs one pull, selects nothing, and stops. That is
+    /// the correct bounded behaviour of an empty projection, and the drive goes
+    /// live when that owner lands (issue #1678). It is called from production
+    /// by `AgentFabric::drive_fair_pull` in `bins/eliotd/src/agent_fabric.rs`.
+    ///
+    /// Proof ceiling: [`FAIR_PULL_LOOP_PROOF_CEILING`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the profile's own validation failure when it is not a valid
+    /// versioned nine-class set — the drive is then refused whole rather than
+    /// run without per-class partitions — and any owner rejection from
+    /// [`Self::start_attempt`], which is the same rejection a caller driving
+    /// the pull by hand would receive.
+    pub fn drive_fair_pull(
+        &mut self,
+        profile: &SchedulingProfile,
+    ) -> Result<FairPullOutcome, CoordinatorError> {
+        profile.validate()?;
+        let consumed_wake = self.fair_pull_loop.take_wake();
+        let cursor = self.fair_pull_loop.cursor();
+        let poll_bound = self.active_attempt_count();
+        let mut started = Vec::new();
+        let mut pulls_performed = 0usize;
+        let mut last_selection = self.select_ready(Some(profile), true);
+        pulls_performed += 1;
+        while let Some(attempt_id) = last_selection.selected_attempt_id.clone() {
+            if started.len() >= poll_bound {
+                break;
+            }
+            // The selected attempt is `Admitted`, so it carries a stored
+            // record, a canonical enqueue ordinal and the admission receipt
+            // that admitted it. All three are read; none is constructed.
+            let record = self
+                .attempts
+                .get(&attempt_id)
+                .cloned()
+                .ok_or(CoordinatorError::UnknownAttempt)?;
+            let enqueue_sequence = self
+                .enqueue_sequence
+                .get(&attempt_id)
+                .copied()
+                .ok_or(CoordinatorError::UnknownAttempt)?;
+            let receipt = self
+                .admissions
+                .get(&record.admission_id)
+                .ok_or(CoordinatorError::UnknownAdmission)?
+                .receipt
+                .clone();
+            let work_class = record.work_class;
+            let admission_id = record.admission_id.clone();
+            self.start_attempt(ExecutionContext::from(&receipt), attempt_id.clone())?;
+            started.push(FairPullStart {
+                attempt_id,
+                admission_id,
+                work_class,
+                enqueue_sequence,
+            });
+            pulls_performed += 1;
+            last_selection = self.select_ready(Some(profile), true);
+        }
+        Ok(FairPullOutcome {
+            algorithm: FAIR_PULL_ALGORITHM,
+            proof_ceiling: FAIR_PULL_LOOP_PROOF_CEILING,
+            profile_revision: profile.profile_revision.clone(),
+            capacity_identity: last_selection.capacity_identity.clone(),
+            capacity_revision: last_selection.capacity_revision.clone(),
+            cursor_event_sequence: cursor,
+            consumed_wake,
+            poll_bound,
+            pulls_performed,
+            started,
+            last_selection,
+        })
+    }
+
+    /// Arms the I14.8 pull loop after a transition that changed what is queued
+    /// or released a slot.
+    ///
+    /// Every such transition calls this exactly once, after its own event is
+    /// recorded, so the durable cursor is the event-log length at that change
+    /// and duplicate notifications coalesce into one pending wake. Replay runs
+    /// the same transitions, so a restore re-derives the same cursor.
+    fn note_selection_inputs_changed(&mut self) {
+        self.fair_pull_loop.arm(count_as_u64(self.events.len()));
     }
 
     /// The bounded deterministic selector behind [`Self::next_ready`] and
@@ -1595,6 +1841,9 @@ impl AgentCoordinator {
             context,
             attempt_id,
         });
+        // Issue #1683 W1: a start moves one item out of the ready queue, so it
+        // changes what the next pull can select.
+        self.note_selection_inputs_changed();
         Ok(record)
     }
 
@@ -1888,6 +2137,9 @@ impl AgentCoordinator {
             context,
             receipt: Box::new(receipt),
         });
+        // Issue #1683 W1 / I14.8: a terminal attempt releases its slot, which
+        // is the pull-based scheduler's wake.
+        self.note_selection_inputs_changed();
         Ok(final_receipt)
     }
 
@@ -1942,6 +2194,9 @@ impl AgentCoordinator {
             context,
             receipt: Box::new(receipt),
         });
+        // Issue #1683 W1 / I14.8: a terminal attempt releases its slot, which
+        // is the pull-based scheduler's wake.
+        self.note_selection_inputs_changed();
         Ok(result)
     }
 
@@ -2082,6 +2337,9 @@ impl AgentCoordinator {
             context,
             receipt: Box::new(receipt),
         });
+        // Issue #1683 W1: a reassigned attempt re-enters the ready queue as new
+        // work under a new canonical enqueue ordinal.
+        self.note_selection_inputs_changed();
         Ok(result)
     }
 
@@ -2204,6 +2462,9 @@ impl AgentCoordinator {
             context,
             submission: Box::new(submission),
         });
+        // Issue #1683 W1 / I14.8: a terminal attempt releases its slot, which
+        // is the pull-based scheduler's wake.
+        self.note_selection_inputs_changed();
         Ok(receipt)
     }
 
@@ -2530,6 +2791,9 @@ impl AgentCoordinator {
                 context,
                 receipt: Box::new(receipt),
             });
+        // Issue #1683 W1 / I14.8: a reconciled attempt is the release of the
+        // exclusion an unknown outcome had been holding, so it is the wake.
+        self.note_selection_inputs_changed();
         Ok(final_receipt)
     }
 

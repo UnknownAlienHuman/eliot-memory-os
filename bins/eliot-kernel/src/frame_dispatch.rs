@@ -15,6 +15,10 @@ use super::daemon_request_dispatch::{
     NOTIFICATION_STATE_READ_OPERATION, USER_AUTOMATION_OPERATOR_OPERATION,
     USER_AUTOMATION_RUNTIME_OPERATION,
 };
+use super::daemon_request_dispatch::{
+    STORAGE_REPLACEMENT_OPERATION, STORAGE_REPLACEMENT_RESUME_OPERATION,
+    STORAGE_REPLACEMENT_ROLLBACK_OPERATION,
+};
 use super::dreamer_job_dispatch::is_dreamer_operation;
 use super::front_door_session::{DOCTOR_MODULE_ID, TESTD_MODULE_ID};
 use super::generation_control::{
@@ -22,6 +26,7 @@ use super::generation_control::{
 };
 use super::native_worker_lifecycle_route::is_native_worker_operation;
 use super::request_dispatch::is_backup_operation;
+use super::user_broker_registration_route::USER_BROKER_MODULE_ID;
 use super::wasm_runtime_port_grant::{
     HandlerSession, HostBinaryFacts, KernelObservedGrantFacts, WASM_GRANT_REQUEST_WIRE_ID,
     WASM_GRANT_REQUEST_WIRE_VERSION, WASM_PORT_GRANT_OPERATION, WasmGrantRequest,
@@ -847,6 +852,13 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
 
+        // User Broker Sessions have a dedicated, operation-scoped matrix.
+        // They cannot fall through to health, daemon, process, or generic
+        // control routes even when a peer presents a valid frame envelope.
+        if session.module_generation.module_id.as_str() == USER_BROKER_MODULE_ID {
+            return self.dispatch_user_broker_frame(session, frame);
+        }
+
         if frame.kind == FrameKind::Heartbeat && frame.message_type == MessageType::Health {
             let payload = self.runtime_health_payload(session)?;
             return Ok(KernelFrameAction::Reply(status_frame(
@@ -1414,6 +1426,20 @@ fn is_daemon_operation(operation: &str) -> bool {
             // epoch, route scope, and cutover state still come from the owner's
             // committed ORS cutover-ownership record rather than the payload.
             | GENERATION_CUTOVER_OPERATION
+        // Issue #1872: the I5.11 storage-replacement ingress. Same mirror
+        // obligation as `GENERATION_CUTOVER_OPERATION` above, and the same
+        // consequence if omitted: the drive, resume and rollback arms are
+        // dispatched by `daemon_request_dispatch.rs`, but without these
+        // markers a frame naming one falls through every predicate here, fails
+        // the `ProcessExecutionRequest` decode, and fences before the arm is
+        // entered. The three markers only let the frame reach the arm; the arm
+        // still proves the module binding, the peer principal, the exact
+        // session StateFence and generation, and the route scope, and the
+        // cutover state still comes from the committed ORS cutover-ownership
+        // record rather than the payload.
+        | STORAGE_REPLACEMENT_OPERATION
+        | STORAGE_REPLACEMENT_RESUME_OPERATION
+        | STORAGE_REPLACEMENT_ROLLBACK_OPERATION
             | DAEMON_STARTUP_EVIDENCE_OPERATION
             // Issue #1779: the authenticated `UserAutomation` runtime route.
             // The marker is the closed daemon operation name the retained
@@ -1442,6 +1468,22 @@ fn is_daemon_operation(operation: &str) -> bool {
             // `ProcessExecutionRequest` decode, and fenced the session
             // before the arm was ever entered.
             | super::daemon_request_dispatch::QUERY_GRANT_CLOSURE_LINKS_OPERATION
+            // Issue #686: the two canonical second-phase legs the projection
+            // read above cannot perform itself. The markers are the one strings
+            // the admitted dispatch arms already serve
+            // (`GRANT_CLOSURE_RECEIPT_OPERATION`,
+            // `LINK_GRANT_CLOSURE_RECEIPT_OPERATION`); without these entries
+            // the frame would fall through every predicate, fail the
+            // `ProcessExecutionRequest` decode, and fence the session before
+            // either arm was ever entered — which is exactly how a first-phase
+            // receipt read and a pending second-phase link stayed unreachable
+            // from the daemon. The entries only let the frame reach the arms:
+            // each arm still proves the module binding, the peer principal, and
+            // the exact session State Fence, and the closure still comes from
+            // the retained P-07 owner and the retained ORS rather than from the
+            // payload.
+            | super::daemon_request_dispatch::GRANT_CLOSURE_RECEIPT_OPERATION
+            | super::daemon_request_dispatch::LINK_GRANT_CLOSURE_RECEIPT_OPERATION
             | "store_recovery"
             | "store_initialize_genesis"
             | "apply_prepared"

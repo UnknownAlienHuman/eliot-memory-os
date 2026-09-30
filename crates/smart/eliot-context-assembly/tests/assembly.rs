@@ -55,6 +55,10 @@ fn candidate(context: &ContextBinding) -> ContextCandidate {
         binding: context.clone(),
         atom_id: id("atom"),
         provider_role: role(),
+        // This fixture asserts about assembly membership and boundary
+        // preservation, not about a measured position inside the snapshot, so
+        // the range stays a typed unknown.
+        source_range: None,
         source: SourceSnapshot {
             source_id: eliot_contracts::SourceId::new("source").expect("fixture source"),
             owner: ProviderId::new("fixture-provider").expect("fixture owner"),

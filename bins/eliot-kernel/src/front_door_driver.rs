@@ -261,11 +261,10 @@ async fn serve_connection(
     let limits = kernel.ipc_limits();
     let peer = front_door.peer_identity().clone();
     if selection.kind() == NamedPipePeerKind::UserBroker {
-        // The transport role is pinned to the installed image and live
-        // interactive token, but the Kernel has no owner-issued Broker launch
-        // nonce/session record yet. Close before reading any frame so a
-        // Broker cannot enter the generic control or client-hello route.
-        return Ok(());
+        return Box::pin(serve_user_broker_connection(
+            kernel, front_door, shutdown, selection, peer,
+        ))
+        .await;
     }
     if selection.kind() == NamedPipePeerKind::AgentBridge {
         return Box::pin(serve_agent_bridge_connection(
@@ -326,6 +325,13 @@ async fn serve_connection(
             session.fence();
             return Ok(());
         };
+        if let Err(error) = kernel
+            .await_native_worker_registration_start(&session, &frame)
+            .await
+        {
+            session.fence();
+            return Err(error);
+        }
         let action = match kernel.dispatch_frame(&session, &frame) {
             Ok(action) => action,
             Err(error) => {
@@ -511,6 +517,93 @@ async fn serve_connection(
     }
 }
 
+/// Serves the dedicated User Broker EBP session until the transport is lost.
+/// The handshake binder admits only the installer-pinned OS-selected role,
+/// and every dispatched frame stays on the registration-specific route.
+#[cfg(windows)]
+async fn serve_user_broker_connection(
+    kernel: Arc<KernelComposition>,
+    mut front_door: NamedPipeServer,
+    mut shutdown: watch::Receiver<bool>,
+    selection: NamedPipePeerSelection,
+    peer: eliot_ipc::PeerIdentity,
+) -> Result<(), TransportError> {
+    let limits = kernel.ipc_limits();
+    let Some(client_frame) =
+        receive_frame_or_shutdown(&mut front_door, limits, &mut shutdown).await?
+    else {
+        return Ok(());
+    };
+    let connection_id = client_frame.connection_id.clone();
+    let client = match decode_client_hello_frame_unbound(&client_frame) {
+        Ok(client) => client,
+        Err(error) => {
+            if !connection_id.trim().is_empty() {
+                let rejection = handshake_rejection_frame(&connection_id, error.to_string())?;
+                send_checked(&mut front_door, &rejection, limits).await?;
+            }
+            return Ok(());
+        }
+    };
+    let handshake =
+        match kernel.bind_user_broker_session(connection_id.clone(), peer, &selection, &client) {
+            Ok(handshake) => handshake,
+            Err(error) => {
+                let rejection = handshake_rejection_frame(&connection_id, error.to_string())?;
+                send_checked(&mut front_door, &rejection, limits).await?;
+                return Ok(());
+            }
+        };
+    let mut session = handshake.session;
+    let server_frame = match server_hello_frame(&connection_id, &handshake.server_hello) {
+        Ok(frame) => frame,
+        Err(error) => {
+            session.fence();
+            kernel.fence_user_broker_session(&session);
+            return Err(error);
+        }
+    };
+    if let Err(error) = send_checked(&mut front_door, &server_frame, limits).await {
+        session.fence();
+        kernel.fence_user_broker_session(&session);
+        return Err(error);
+    }
+
+    let result = loop {
+        let received = match receive_frame_or_shutdown(&mut front_door, limits, &mut shutdown).await
+        {
+            Ok(received) => received,
+            Err(error) => break Err(error),
+        };
+        let Some(frame) = received else {
+            break Ok(());
+        };
+        let action = match kernel.dispatch_frame(&session, &frame) {
+            Ok(action) => action,
+            Err(error) => break Err(error),
+        };
+        match action {
+            KernelFrameAction::Reply(reply) => {
+                if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
+                    break Err(error);
+                }
+            }
+            KernelFrameAction::Fence(rejection) => {
+                break send_checked(&mut front_door, &rejection, limits).await;
+            }
+            KernelFrameAction::Process { .. }
+            | KernelFrameAction::Daemon { .. }
+            | KernelFrameAction::Doctor { .. }
+            | KernelFrameAction::Testd { .. }
+            | KernelFrameAction::Dreamer { .. }
+            | KernelFrameAction::Research { .. } => break Err(TransportError::SessionFenced),
+        }
+    };
+    session.fence();
+    kernel.fence_user_broker_session(&session);
+    result
+}
+
 #[cfg(windows)]
 async fn serve_agent_bridge_connection(
     kernel: Arc<KernelComposition>,
@@ -641,6 +734,13 @@ async fn serve_admitted_bridge_host_requests(
                 return Err(error);
             }
         };
+        if let Err(error) = kernel
+            .await_native_worker_registration_start(&session, &frame)
+            .await
+        {
+            kernel.revoke_agent_bridge(&connection_id);
+            return Err(error);
+        }
         let action = match kernel.dispatch_frame(&session, &frame) {
             Ok(action) => action,
             Err(
@@ -664,6 +764,30 @@ async fn serve_admitted_bridge_host_requests(
                 let signal = error
                     .backpressure_signal()
                     .unwrap_or(eliot_ipc::BACKPRESSURE_BRIDGE_DISPATCH);
+                // STITCH (reserve owner): the whole-or-null versioned I14
+                // backpressure response for this shed frame. The dispatch
+                // seam carries only the triple-string `BackpressureSignal`
+                // — no disposition, no bottleneck observation, no profile
+                // revision, no operation identity — and
+                // `KernelComposition::dispatch_frame`
+                // (bins/eliot-kernel/src/frame_dispatch.rs::dispatch_frame)
+                // returns exactly that error shape, so mapping the three
+                // strings to a disposition here would fabricate a
+                // directive. The only leg that may supply the whole
+                // `eliot_runtime_contracts::I14BackpressureResponseV1`
+                // (contract version, closed disposition, complete recovery
+                // directive) is the reserve owner that reads the live
+                // partition (`FrontDoor::normal_saturation_response`,
+                // `FrontDoor::protected_exhaustion_response`,
+                // `FrontDoor::guarantee_lost_response` in
+                // crates/kernel/eliot-kernel-core/src/control_reserve_rejection.rs),
+                // threaded through the dispatch error channel. Until that
+                // leg lands, the slot stays null — never partial. The key
+                // sits beside `value`, never inside it: `value` still
+                // decodes whole into `BridgeTransportBackpressure` (which
+                // denies unknown fields), so the existing triple-string
+                // signal parses exactly as before.
+                let directive: Option<eliot_runtime_contracts::I14BackpressureResponseV1> = None;
                 let reply = eliot_protocol::Frame {
                     protocol_version: session.protocol_version,
                     encoding_profile: eliot_protocol::EncodingProfile::JsonV1,
@@ -681,6 +805,7 @@ async fn serve_admitted_bridge_host_requests(
                             "shed_work": signal.shed_work,
                             "outcome": "unknown",
                         },
+                        "directive": directive,
                     })),
                     trace_context: std::collections::BTreeMap::new(),
                 };

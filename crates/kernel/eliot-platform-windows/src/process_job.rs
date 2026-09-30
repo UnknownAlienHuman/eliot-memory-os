@@ -1050,6 +1050,9 @@ impl RecoverableJobObject {
         &self,
         spec: SuspendedLaunchSpec,
     ) -> Result<SuspendedExistingJobChild<'_>, WindowsAdapterError> {
+        if spec.retain_stdin_writer {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
         if !self
             .live_processes()?
             .iter()
@@ -1188,6 +1191,7 @@ pub struct SuspendedLaunchSpec {
     working_directory: PathBuf,
     environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     stdin_payload: Option<Vec<u8>>,
+    retain_stdin_writer: bool,
 }
 
 #[cfg(windows)]
@@ -1223,6 +1227,7 @@ impl SuspendedLaunchSpec {
             working_directory,
             environment,
             stdin_payload: None,
+            retain_stdin_writer: false,
         })
     }
 
@@ -1245,10 +1250,33 @@ impl SuspendedLaunchSpec {
     /// accepts one the suspended child could not drain before the parent
     /// closed its writer.
     pub fn with_stdin(mut self, payload: Vec<u8>) -> Result<Self, WindowsAdapterError> {
-        if payload.is_empty() || payload.len() > SUSPENDED_LAUNCH_STDIN_LIMIT {
+        if self.retain_stdin_writer
+            || payload.is_empty()
+            || payload.len() > SUSPENDED_LAUNCH_STDIN_LIMIT
+        {
             return Err(WindowsAdapterError::InvalidInput);
         }
         self.stdin_payload = Some(payload);
+        Ok(self)
+    }
+
+    /// Retains the parent's standard-input writer for frames sent after the
+    /// child resumes. The writer is transferred with the running child and
+    /// remains open until its owner closes the child lifecycle.
+    ///
+    /// This mode carries no launch or protocol authority. Callers provide
+    /// already-framed bytes through their admitted operation owner. It cannot
+    /// be combined with [`Self::with_stdin`], whose bytes are delivered before
+    /// resume and followed by EOF.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` if one-shot input is already attached or this
+    /// live-writer mode was already selected.
+    pub fn with_live_stdin(mut self) -> Result<Self, WindowsAdapterError> {
+        if self.retain_stdin_writer || self.stdin_payload.is_some() {
+            return Err(WindowsAdapterError::InvalidInput);
+        }
+        self.retain_stdin_writer = true;
         Ok(self)
     }
 
@@ -1896,6 +1924,7 @@ struct JobChildHandles {
     executable: PinnedExecutable,
     spec: SuspendedLaunchSpec,
     command_line_utf16: Vec<u16>,
+    stdin: Option<std::fs::File>,
     stdout: Option<std::fs::File>,
     stderr: Option<std::fs::File>,
     observer: JobProcessObserver,
@@ -2943,15 +2972,27 @@ impl SuspendedJobChild {
                 WindowsAdapterError::Timeout
             });
         }
-        // Parent keeps only the read sides. When the admitted launch carried a
-        // one-shot request line it is written to the child's stdin first;
-        // closing the sole parent stdin writer then gives the child that exact
-        // line followed by deterministic EOF instead of inherited input. The
+        // A one-shot request is delivered before resume and followed by EOF.
+        // Live mode keeps the sole parent writer attached to this exact child
+        // lifecycle; it is transferred only after the child resumes. The
         // delivery outcome is surfaced only after the kill-on-reap guard below
-        // is armed, so a failed write can never leave an unresumed child.
-        let stdin_delivery = deliver_stdin_payload(&stdin_write, spec.stdin_payload.as_deref());
+        // is armed, so a failed one-shot write cannot leave an unresumed child.
+        let stdin_delivery = if spec.retain_stdin_writer {
+            if spec.stdin_payload.is_some() {
+                Err(WindowsAdapterError::InvalidInput)
+            } else {
+                Ok(())
+            }
+        } else {
+            deliver_stdin_payload(&stdin_write, spec.stdin_payload.as_deref())
+        };
         drop(stdin_read);
-        drop(stdin_write);
+        let stdin = if spec.retain_stdin_writer && stdin_delivery.is_ok() {
+            Some(stdin_write.into_file())
+        } else {
+            drop(stdin_write);
+            None
+        };
         drop(stdout_write);
         drop(stderr_write);
         let mut cleanup = SuspendedProcessCleanup {
@@ -2985,6 +3026,7 @@ impl SuspendedJobChild {
             executable,
             spec,
             command_line_utf16,
+            stdin,
             stdout: Some(stdout_read.into_file()),
             stderr: Some(stderr_read.into_file()),
             observer,
@@ -3153,6 +3195,13 @@ impl<V> RunningJobChild<V> {
     #[must_use]
     pub fn take_stderr(&mut self) -> Option<std::fs::File> {
         self.inner.stderr.take()
+    }
+
+    /// Transfers the live standard-input writer exactly once when this child
+    /// was launched with [`SuspendedLaunchSpec::with_live_stdin`].
+    #[must_use]
+    pub fn take_stdin_writer(&mut self) -> Option<std::fs::File> {
+        self.inner.stdin.take()
     }
 
     /// Returns an idempotent observation without changing typestate.

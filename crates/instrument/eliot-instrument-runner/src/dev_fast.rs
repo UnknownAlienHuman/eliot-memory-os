@@ -24,8 +24,8 @@ use thiserror::Error;
 
 use crate::InstrumentRunner;
 use crate::profile::{
-    InstrumentProfile, InstrumentRegistry, ProfileCompiler, ProfileError, ProfileScopeClasses,
-    StageEnvironment, TargetLayout, WorkScope, admitted_profile_for_alias,
+    InstrumentProfile, InstrumentRegistry, ProfileCompiler, ProfileError, StageEnvironment,
+    TargetLayout, WorkScope, admitted_profile_for_alias,
 };
 use crate::profile_run::{
     AggregateStatus, InstrumentRun, ProfileAggregate, RetainedExitOutcome, RetainedToolIdentity,
@@ -961,10 +961,11 @@ pub fn dev_fast_caller_plan(
 /// closed here instead of producing a receipt that defaults to an identity.
 /// There is no path from this function to a receipt whose identity is missing.
 ///
-/// The exact admitted revision, the profile digest, the stage DAG digest, and
-/// the resolution digest are all read back from the same
-/// [`ProfileCompiler::resolve_full`] result, so local and CI cannot report
-/// different revisions for one route.
+/// The exact admitted revision, the profile digest, the stage DAG digest, the
+/// resolution digest, and the admitted scope classes are all read back from the
+/// same [`ProfileCompiler::resolve_full`] result, so local and CI cannot report
+/// different revisions, or receipt one route under different declared classes,
+/// for one route name.
 ///
 /// `request.route` is a profile ALIAS, not a profile name, a command, or a
 /// stage list: it must appear in the closed
@@ -1007,7 +1008,6 @@ pub fn resolve_verification_route(
     generation: u64,
     request: VerificationRouteRequest,
     aggregate: &ProfileAggregate,
-    classes: &ProfileScopeClasses,
     environment_dependencies: &[DeclaredEnvironmentDependency],
 ) -> Result<VerificationProfileReceipt, DevFastError> {
     let VerificationRouteRequest {
@@ -1044,9 +1044,16 @@ pub fn resolve_verification_route(
         .map_err(|error| {
             DevFastError::Admission(format!("resolved route did not compile: {error}"))
         })?;
+    // The scope classes the receipt validates the declared environment
+    // dependencies against are the ones the resolution above admitted, read
+    // back from the registry's own profile revision. Taking them from the
+    // resolution instead of a caller argument is what keeps local and CI on
+    // one identity: a caller cannot receipt a route under classes the
+    // registry never admitted, so the same route always validates its
+    // environment dependencies against the same admitted class text.
     build_verification_profile_receipt(
         &admitted,
-        classes,
+        &resolved.classes,
         aggregate,
         &environment_identity,
         environment_dependencies,
@@ -1221,7 +1228,9 @@ pub fn finalize_dev_fast_stage(
 /// Returns [`DevFastError::Admission`] when the registry, the compilation,
 /// or the candidate binding fails. Launch, admission, and invocation
 /// failures of individual stages never surface here: they become explicit
-/// missing runs inside the returned aggregate.
+/// missing runs inside the returned aggregate. New admission is checked
+/// against the live registry, so a replaced spec, parser, receipt, or route
+/// becomes a missing run instead of a launch.
 pub async fn run_dev_fast_profile<E: ProcessExecutor + 'static>(
     runner: &InstrumentRunner<E>,
     generation: u64,
@@ -1231,7 +1240,7 @@ pub async fn run_dev_fast_profile<E: ProcessExecutor + 'static>(
 ) -> Result<ProfileAggregate, DevFastError> {
     let registry = dev_fast_registry(generation, receipts)?;
     let plan = dev_fast_caller_plan(&registry, candidate)?;
-    let runs = StageOrchestrator::launch_plan(runner, &plan, launcher).await;
+    let runs = StageOrchestrator::launch_plan_live(runner, &registry, &plan, launcher).await;
     Ok(ProfileAggregate::assemble(&plan, runs))
 }
 

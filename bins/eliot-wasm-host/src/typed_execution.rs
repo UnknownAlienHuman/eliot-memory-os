@@ -33,7 +33,9 @@ use eliot_wasm_runtime::{
 use crate::artifact_preflight::{PreflightError, preflight_bytes};
 use crate::contour::CAPABILITY_INTRODUCTION_REQUIRED;
 use crate::typed_bindings::{TypedWorld, typed_wit_digest};
-use crate::wasmtime_provider::is_instance_limit_error;
+use crate::wasmtime_provider::{
+    WasmtimeBuildError, WasmtimeComponentEngine, is_instance_limit_error,
+};
 
 const ENGINE_VERSION: &str = "47.0.4";
 const PROVIDER_STACK_SIZE: u64 = 8 * 1024;
@@ -486,6 +488,15 @@ fn validate_limits(
     // no-host-call component states zero instead of carrying a nonzero
     // budget that implies a hidden capability. Usage enforcement still
     // denies any actual host call above the budget.
+    //
+    // Item 10 (#758): the artifact-digest allow-list is admission identity,
+    // not a tuning ceiling, so a buffer that hashes outside it is the owned
+    // typed `ADMISSION_MISMATCH`, never a limit denial.
+    if !limits.artifact_access.allowed_digests.contains(digest) {
+        return Err(TypedExecutionError::AdmissionMismatch(
+            "cache-artifact".to_owned(),
+        ));
+    }
     if [
         limits.max_input_bytes,
         limits.max_output_bytes,
@@ -497,7 +508,6 @@ fn validate_limits(
         || limits.max_table_elements == 0
         || limits.max_instances == 0
         || limits.artifact_access.max_reads == 0
-        || !limits.artifact_access.allowed_digests.contains(digest)
     {
         return Err(TypedExecutionError::LimitDenied("envelope".to_owned()));
     }
@@ -685,18 +695,27 @@ fn typed_cache_identity(
 
 /// Revalidates the cache identity before compile (no bypass): the same
 /// bounded buffer is re-hashed independently of preflight — mirroring the
-/// pool owner's key-versus-bytes revalidation — and the fresh hash must be
-/// allow-listed by the admitted artifact policy. Both typed lanes call this
-/// after limit validation and before any engine is built; the capsule lane
-/// reaches it through its delegation to the domain lane. A buffer that does
-/// not hash to an allow-listed digest is denied with the owned typed
-/// `ADMISSION_MISMATCH`, never served from a stale entry.
+/// pool owner's key-versus-bytes revalidation — and the fresh hash must equal
+/// the preflight digest the caller bound AND be allow-listed by the admitted
+/// artifact policy. Item 10 (#758): hash and compile use the same buffer, not
+/// a reread path, so a digest agreed by two independent hashes that still
+/// disagrees is the owned typed `ADMISSION_MISMATCH`, never a stale entry.
+/// Both typed lanes call this after limit validation and before any engine is
+/// built; the capsule lane reaches it through its delegation to the domain
+/// lane. A buffer that does not hash to an allow-listed digest is denied with
+/// the owned typed `ADMISSION_MISMATCH`, never served from a stale entry.
 fn check_cache_identity(
     world: TypedWorld,
     artifact: &[u8],
+    expected: &Sha256Digest,
     limits: &InvocationLimits,
 ) -> Result<TypedCacheIdentity, TypedExecutionError> {
     let digest = Sha256Digest::of_bytes(artifact);
+    if digest != *expected {
+        return Err(TypedExecutionError::AdmissionMismatch(
+            "artifact-digest".to_owned(),
+        ));
+    }
     if !limits.artifact_access.allowed_digests.contains(&digest) {
         return Err(TypedExecutionError::AdmissionMismatch(
             "cache-artifact".to_owned(),
@@ -823,6 +842,17 @@ impl TypedBound {
         Ok(())
     }
 
+    /// Bounds one list of strings: the item ceiling applies to the list
+    /// itself, then every element is bounded as text. Item 9 (#758): a
+    /// `list<string>` leaf is never counted without measuring its elements.
+    fn texts(&mut self, values: &[String]) -> Result<(), TypedExecutionError> {
+        self.list(values)?;
+        for value in values {
+            self.text(value)?;
+        }
+        Ok(())
+    }
+
     /// Final total check against the admitted output ceiling.
     fn finish(self, max_output_bytes: u64) -> Result<u64, TypedExecutionError> {
         if self.bytes > max_output_bytes {
@@ -875,6 +905,74 @@ fn check_ceiling(
     Ok(())
 }
 
+/// Builds the typed lane's dispatch provider for the exact bounded buffer
+/// (item 26 seam, #758): the buffer is compiled through the configured
+/// provider (`WasmtimeComponentEngine::new_for_admitted_limits`) instead of a
+/// locally-configured engine, and the caller dispatches via
+/// `provider.dispatch_leg(limits)` — the same leg the provider itself invokes
+/// under for the admitted cancellation policy. Both typed lanes (describe and
+/// domain) build through this one seam so the typed provider construction
+/// exists exactly once. `guest_exec` is untouched: the shared provider
+/// constructor is reused, never modified, here.
+///
+/// The provider legs carry the exact typed settings the retired local seam
+/// enforced: component model on, epoch interruption on, fuel accounting only
+/// on the fuel leg (selected exactly when the admitted policy meters fuel),
+/// and the provider stack ceiling. The legs additionally use the
+/// provider-owned pooling allocator (a provider performance Default, not a
+/// typed ceiling); Store/resource ceilings stay lane-owned in [`new_store`].
+///
+/// Failure vocabulary is unchanged: engine construction failure is the typed
+/// `ENGINE:config:invalid`, compilation failure keeps the staged `Compile`
+/// mapping of [`map_compile_error`], and binding/digest variants unreachable
+/// through this constructor (every digest is recomputed from the presented
+/// bytes; no caller binding is taken) map to the closest owned typed denial.
+fn build_typed_dispatch_provider(
+    world: TypedWorld,
+    limits: &InvocationLimits,
+    artifact: &[u8],
+) -> Result<WasmtimeComponentEngine, TypedExecutionError> {
+    WasmtimeComponentEngine::new_for_admitted_limits(
+        artifact,
+        &typed_component_configuration(world),
+        limits,
+    )
+    .map_err(map_provider_build_error)
+}
+
+/// Component-configuration bytes bound into the typed dispatch provider
+/// build. Computed per world from the lane's own generated selection — lane,
+/// world, describe plus domain exports, closed imports — never pasted, never
+/// a name/path/URL, and never the legacy guest descriptor.
+fn typed_component_configuration(world: TypedWorld) -> Vec<u8> {
+    format!(
+        "component=typed-dispatch;world={};exports=describe+{};imports=closed",
+        world.world_name(),
+        world.domain_func(),
+    )
+    .into_bytes()
+}
+
+/// Maps a dispatch-provider build failure to the exact owned typed denial.
+/// Typed failures stay typed: there is no stringly catch-all.
+fn map_provider_build_error(error: WasmtimeBuildError) -> TypedExecutionError {
+    match error {
+        WasmtimeBuildError::Config(_) => TypedExecutionError::Engine("config:invalid".to_owned()),
+        WasmtimeBuildError::Compile(error) => {
+            staged(TypedStage::Compile, map_compile_error(&error))
+        }
+        WasmtimeBuildError::ArtifactDigestMismatch => {
+            TypedExecutionError::AdmissionMismatch("artifact-digest".to_owned())
+        }
+        WasmtimeBuildError::VersionMismatch
+        | WasmtimeBuildError::WitDigestMismatch
+        | WasmtimeBuildError::ConfigurationDigestMismatch
+        | WasmtimeBuildError::ComponentConfigurationDigestMismatch => {
+            TypedExecutionError::AdmissionMismatch("engine-binding".to_owned())
+        }
+    }
+}
+
 /// Executes the typed `describe` descriptor for one world through the real
 /// Wasmtime component engine under deny-by-default sandbox policy.
 ///
@@ -899,25 +997,18 @@ pub fn execute_describe_experimental(
     let preflight = preflight_bytes(artifact)?;
     validate_limits(limits, &preflight.digest)?;
     // Cache identity revalidation before any engine is built: no bypass.
-    let cache_identity = check_cache_identity(world, artifact, limits)?;
+    let cache_identity = check_cache_identity(world, artifact, &preflight.digest, limits)?;
 
-    let mut config = wasmtime::Config::new();
-    config.wasm_component_model(true);
-    config.consume_fuel(typed_fuel_budget(limits).is_some());
-    config.epoch_interruption(true);
-    config.max_wasm_stack(usize::try_from(PROVIDER_STACK_SIZE).unwrap_or(8192));
-    let engine = wasmtime::Engine::new(&config)
-        .map_err(|_| TypedExecutionError::Engine("config:invalid".to_owned()))?;
-    let component = wasmtime::component::Component::new(&engine, artifact)
-        .map_err(|error| staged(TypedStage::Compile, map_compile_error(&error)))?;
+    let provider = build_typed_dispatch_provider(world, limits, artifact)?;
+    let (engine, component) = provider.dispatch_leg(limits);
 
     // Inspect the exact component type before any instance is created or any
     // guest function is called. Generated bindings provide the expected WIT
     // function signatures; the Wasmtime ComponentFunc type checker compares
     // them against the compiled component metadata.
-    let (imports, exports) = preflight_component_type(world, &engine, &component)?;
+    let (imports, exports) = preflight_component_type(world, engine, component)?;
 
-    let (descriptor, usage) = dispatch_describe(world, &engine, &component, limits)?;
+    let (descriptor, usage) = dispatch_describe(world, engine, component, limits)?;
     let (output_digest, output_bytes) =
         validate_descriptor(world, &descriptor, limits.max_output_bytes)
             .map_err(|error| staged(TypedStage::Output, error))?;
@@ -959,6 +1050,10 @@ pub fn execute_describe_experimental(
         semantic_digest: Sha256Digest::of_bytes(b"typed-semantic-pending"),
     };
     receipt.semantic_digest = semantic_digest(&receipt);
+    // STITCH(#758-P10.1): the describe-only lane is kit-less — no governing
+    // kit binds this call, so no honest `kit_digest` source exists here.
+    // This site stays on the host receipt and must not call the shared
+    // projection until a kit owner binds one.
     Ok((receipt, descriptor))
 }
 
@@ -1904,21 +1999,14 @@ pub fn execute_domain_experimental(
     let preflight = preflight_bytes(artifact)?;
     validate_limits(limits, &preflight.digest)?;
     // Cache identity revalidation before any engine is built: no bypass.
-    let cache_identity = check_cache_identity(world, artifact, limits)?;
+    let cache_identity = check_cache_identity(world, artifact, &preflight.digest, limits)?;
 
-    let mut config = wasmtime::Config::new();
-    config.wasm_component_model(true);
-    config.consume_fuel(typed_fuel_budget(limits).is_some());
-    config.epoch_interruption(true);
-    config.max_wasm_stack(usize::try_from(PROVIDER_STACK_SIZE).unwrap_or(8192));
-    let engine = wasmtime::Engine::new(&config)
-        .map_err(|_| TypedExecutionError::Engine("config:invalid".to_owned()))?;
-    let component = wasmtime::component::Component::new(&engine, artifact)
-        .map_err(|error| staged(TypedStage::Compile, map_compile_error(&error)))?;
+    let provider = build_typed_dispatch_provider(world, limits, artifact)?;
+    let (engine, component) = provider.dispatch_leg(limits);
 
-    let (imports, exports) = preflight_component_type(world, &engine, &component)?;
+    let (imports, exports) = preflight_component_type(world, engine, component)?;
 
-    let (descriptor, result, usage) = dispatch_domain(world, &engine, &component, limits, request)?;
+    let (descriptor, result, usage) = dispatch_domain(world, engine, component, limits, request)?;
 
     let (descriptor_digest, descriptor_bytes) =
         validate_descriptor(world, &descriptor, limits.max_output_bytes)
@@ -1929,10 +2017,15 @@ pub fn execute_domain_experimental(
     let mut output_bound = TypedBound::default();
     check_result(&result, admitted, &mut output_bound)
         .map_err(|error| staged(TypedStage::Output, error))?;
-    let output_bytes = descriptor_bytes
-        + output_bound
-            .finish(limits.max_output_bytes)
-            .map_err(|error| staged(TypedStage::Output, error))?;
+    // The result bound is still enforced fail-closed against the admitted
+    // ceiling, but the receipt counts exactly what `output_digest` covers:
+    // the validated descriptor fields from `validate_descriptor`. Folding
+    // result bytes into this counter would pair a descriptor-only digest
+    // with descriptor+result bytes.
+    output_bound
+        .finish(limits.max_output_bytes)
+        .map_err(|error| staged(TypedStage::Output, error))?;
+    let output_bytes = descriptor_bytes;
 
     let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     let terminal = result.terminal().to_owned();
@@ -1968,6 +2061,11 @@ pub fn execute_domain_experimental(
         semantic_digest: Sha256Digest::of_bytes(b"typed-semantic-pending"),
     };
     receipt.semantic_digest = semantic_digest(&receipt);
+    // STITCH(#758-P10.1): the unbound domain lane is kit-less — `provenance`
+    // is `None` at this shared constructor, so no honest `kit_digest` source
+    // exists here. The kit-bound capsule lane projects after return in
+    // `execute_capsule_domain_experimental`; this site stays on the host
+    // receipt and never synthesizes a digest.
     Ok((receipt, result))
 }
 
@@ -2100,8 +2198,23 @@ pub fn execute_capsule_domain_experimental(
             "capsule-output".to_owned(),
         ));
     }
+    // P10.1 (#758) receipt assembly inputs, bound at this kit-owned call
+    // site only: the governing kit digest and the admitted ceiling come
+    // from the validated `kit` above; nothing is synthesized. Bound before
+    // delegation so a kit-digest failure denies before any engine work.
+    let kit_digest = kit.digest().map_err(map_contract_error)?;
     // Delegation re-enters the direct lane: capsule provenance is consumed.
-    execute_domain_experimental(world, artifact, limits, request, admitted, None)
+    let (receipt, result) =
+        execute_domain_experimental(world, artifact, limits, request, admitted, None)?;
+    // Resolve the emitted host receipt through #760's shared contract. The
+    // host receipt stays the source of truth: the projection is additive
+    // fail-closed evidence, never a replacement. A projection denial fails
+    // the call instead of emitting a receipt the shared contract rejects.
+    // STITCH(#758-P10.1): the projected shared receipt is validated but not
+    // yet carried outward; returning or emitting it is follow-up outside
+    // this receipt-assembly slice.
+    crate::receipt_bridge::project_shared_receipt(&receipt, &kit_digest, kit.proof_ceiling)?;
+    Ok((receipt, result))
 }
 
 /// Digest of the admitted operation envelope plus the measured request bound.
@@ -2125,6 +2238,446 @@ fn input_digest(
     Sha256Digest::of_bytes(canonical.as_bytes())
 }
 
+/// Item-9 (#758) nested walkers for the raw typed input. One small function
+/// per WIT record below the six request roots: every string leaf is bounded
+/// with [`TypedBound::text`], every list (records, strings, or enums) with
+/// [`TypedBound::list`], every `list<string>` with [`TypedBound::texts`].
+/// Scalar, enum, and boolean fields are fixed-size and skipped. A field the
+/// WIT shape does not carry cannot be observed and is not invented.
+fn bound_provider_role(
+    value: &crate::typed_bindings::context_admission::exports::eliot::current::admission::ProviderRole,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.provider)?;
+    bound.text(&value.role)?;
+    Ok(())
+}
+
+fn bound_measurement_ref(
+    value: &crate::typed_bindings::context_admission::exports::eliot::current::admission::MeasurementRef,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.serializer)?;
+    bound.text(&value.schema_revision)?;
+    bound.text(&value.route)?;
+    bound.text(&value.model)?;
+    bound.text(&value.tokenizer)?;
+    bound.text(&value.input_digest)?;
+    Ok(())
+}
+
+fn bound_atom_representation(
+    value: &crate::typed_bindings::context_admission::exports::eliot::current::admission::AtomRepresentation,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.content)?;
+    bound.texts(&value.manifest)?;
+    bound.text(&value.source_digest)?;
+    bound.text(&value.handle)?;
+    Ok(())
+}
+
+fn bound_context_candidate(
+    value: &crate::typed_bindings::context_admission::exports::eliot::current::admission::ContextCandidate,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.atom_id)?;
+    bound.text(&value.source_digest)?;
+    bound.text(&value.source_revision)?;
+    bound.text(&value.semantic_role)?;
+    bound_provider_role(&value.provider_role, bound)?;
+    bound_atom_representation(&value.representation, bound)?;
+    bound_measurement_ref(&value.measurement, bound)?;
+    Ok(())
+}
+
+fn bound_admitted_atom_ref(
+    value: &crate::typed_bindings::context_assembly::exports::eliot::current::assembly::AdmittedAtomRef,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.atom_id)?;
+    bound.text(&value.representation_digest)?;
+    bound.text(&value.source_digest)?;
+    Ok(())
+}
+
+fn bound_serialized_measurement(
+    value: &crate::typed_bindings::context_assembly::exports::eliot::current::assembly::SerializedMeasurement,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.serializer)?;
+    bound.text(&value.schema_revision)?;
+    bound.text(&value.input_digest)?;
+    bound.text(&value.output_digest)?;
+    Ok(())
+}
+
+fn bound_seed_cue(
+    value: &crate::typed_bindings::cue_activation::exports::eliot::current::activation::SeedCue,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.cue_id)?;
+    bound.text(&value.comparison_key)?;
+    bound.text(&value.normalization_profile)?;
+    Ok(())
+}
+
+fn bound_relation_edge(
+    value: &crate::typed_bindings::cue_activation::exports::eliot::current::activation::RelationEdge,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.edge_id)?;
+    bound.text(&value.from_handle)?;
+    bound.text(&value.to_handle)?;
+    Ok(())
+}
+
+fn bound_dimension_verdict(
+    value: &crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::DimensionVerdict,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.note)?;
+    Ok(())
+}
+
+fn bound_handler_subtype(
+    value: &crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::HandlerSubtype,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    use crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::HandlerSubtype as S;
+    match value {
+        S::Orientation(payload) => bound_orientation_payload(payload, bound),
+        S::ResearchSynthesis(payload) => bound_research_payload(payload, bound),
+        S::Curation(payload) => bound_curation_request_ref(payload, bound),
+        S::Unsupported(payload) => bound_unsupported_subtype(payload, bound),
+    }
+}
+
+fn bound_orientation_payload(
+    value: &crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::OrientationPayload,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.summary)?;
+    bound.texts(&value.findings)?;
+    bound.texts(&value.unknowns)?;
+    Ok(())
+}
+
+fn bound_research_payload(
+    value: &crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::ResearchPayload,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound_research_pack_ref(&value.pack, bound)?;
+    bound_research_brief(&value.brief, bound)?;
+    Ok(())
+}
+
+fn bound_source_card(
+    value: &crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::SourceCard,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.handle)?;
+    bound.text(&value.competence)?;
+    bound.text(&value.privacy_class)?;
+    bound.text(&value.allowed_use)?;
+    bound.text(&value.lineage_group)?;
+    Ok(())
+}
+
+fn bound_omitted_source(
+    value: &crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::OmittedSource,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.handle)?;
+    bound.text(&value.reason)?;
+    Ok(())
+}
+
+fn bound_research_pack_ref(
+    value: &crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::ResearchPackRef,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.pack_digest)?;
+    bound.text(&value.question)?;
+    bound.text(&value.task_id)?;
+    bound.text(&value.scope_id)?;
+    bound.text(&value.fence_epoch)?;
+    bound.text(&value.bundle_digest)?;
+    bound.text(&value.manifest_digest)?;
+    bound.list(&value.sources)?;
+    for source in &value.sources {
+        bound_source_card(source, bound)?;
+    }
+    bound.texts(&value.source_denominator)?;
+    bound.texts(&value.missing_source_classes)?;
+    bound.list(&value.omitted_sources)?;
+    for omitted in &value.omitted_sources {
+        bound_omitted_source(omitted, bound)?;
+    }
+    bound.texts(&value.authorized_sources)?;
+    Ok(())
+}
+
+fn bound_research_claim(
+    value: &crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::ResearchClaim,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.claim_id)?;
+    bound.texts(&value.support)?;
+    bound.texts(&value.counter_evidence)?;
+    bound.texts(&value.citations)?;
+    bound.texts(&value.lineage_groups)?;
+    bound.texts(&value.precision_notes)?;
+    bound.text(&value.absence_basis)?;
+    Ok(())
+}
+
+fn bound_rival_position(
+    value: &crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::RivalPosition,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.rival_id)?;
+    bound.text(&value.position)?;
+    bound.text(&value.target_claim)?;
+    bound.texts(&value.evidence)?;
+    Ok(())
+}
+
+fn bound_recommended_probe(
+    value: &crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::RecommendedProbe,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.probe_id)?;
+    bound.texts(&value.discriminates)?;
+    bound.texts(&value.outcomes)?;
+    bound.text(&value.verifier)?;
+    bound.text(&value.owner)?;
+    bound.text(&value.cost_class)?;
+    bound.text(&value.applicability)?;
+    Ok(())
+}
+
+fn bound_probe_residue(
+    value: &crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::ProbeResidue,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.probe_id)?;
+    bound.text(&value.detail)?;
+    Ok(())
+}
+
+fn bound_dependence_group(
+    value: &crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::DependenceGroup,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.lineage_group)?;
+    bound.texts(&value.members)?;
+    Ok(())
+}
+
+fn bound_concilium_recommendation(
+    value: &crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::ConciliumRecommendation,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.owner)?;
+    bound.texts(&value.evidence_refs)?;
+    bound.texts(&value.positions)?;
+    bound.text(&value.review_objective)?;
+    Ok(())
+}
+
+fn bound_coverage_report(
+    value: &crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::CoverageReport,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.texts(&value.missing_classes)?;
+    bound.list(&value.omitted_sources)?;
+    for omitted in &value.omitted_sources {
+        bound_omitted_source(omitted, bound)?;
+    }
+    bound.texts(&value.represented_sources)?;
+    bound.texts(&value.cited_sources)?;
+    Ok(())
+}
+
+fn bound_brief_omission(
+    value: &crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::BriefOmission,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.detail)?;
+    Ok(())
+}
+
+fn bound_preservation_verdict(
+    value: &crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::PreservationVerdict,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.note)?;
+    Ok(())
+}
+
+fn bound_research_brief(
+    value: &crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::ResearchBrief,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.brief_id)?;
+    bound_research_pack_ref(&value.pack, bound)?;
+    bound.text(&value.pack_digest)?;
+    bound.text(&value.question)?;
+    bound.list(&value.claims)?;
+    for claim in &value.claims {
+        bound_research_claim(claim, bound)?;
+    }
+    bound.list(&value.rivals)?;
+    for rival in &value.rivals {
+        bound_rival_position(rival, bound)?;
+    }
+    bound.texts(&value.unknowns)?;
+    bound.list(&value.probes)?;
+    for probe in &value.probes {
+        bound_recommended_probe(probe, bound)?;
+    }
+    bound.list(&value.probe_residue)?;
+    for residue in &value.probe_residue {
+        bound_probe_residue(residue, bound)?;
+    }
+    bound_concilium_recommendation(&value.concilium, bound)?;
+    bound_coverage_report(&value.coverage, bound)?;
+    bound.list(&value.dependence)?;
+    for group in &value.dependence {
+        bound_dependence_group(group, bound)?;
+    }
+    bound.list(&value.preservation)?;
+    for verdict in &value.preservation {
+        bound_preservation_verdict(verdict, bound)?;
+    }
+    bound.list(&value.omitted)?;
+    for omission in &value.omitted {
+        bound_brief_omission(omission, bound)?;
+    }
+    bound.text(&value.raw_digest)?;
+    bound.text(&value.semantic_digest)?;
+    Ok(())
+}
+
+fn bound_classification_payload(
+    value: &crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::ClassificationPayload,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.label)?;
+    bound.texts(&value.targets)?;
+    bound.texts(&value.evidence_refs)?;
+    Ok(())
+}
+
+fn bound_relation_payload(
+    value: &crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::RelationPayload,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.from_handle)?;
+    bound.text(&value.to_handle)?;
+    bound.text(&value.predicate)?;
+    bound.texts(&value.evidence_refs)?;
+    Ok(())
+}
+
+fn bound_generic_curation_payload(
+    value: &crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::GenericCurationPayload,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.texts(&value.targets)?;
+    bound.texts(&value.evidence_refs)?;
+    bound.text(&value.note)?;
+    Ok(())
+}
+
+fn bound_curation_payload(
+    value: &crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::CurationPayload,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    use crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::CurationPayload as P;
+    match value {
+        P::Classification(payload) => bound_classification_payload(payload, bound),
+        P::Relation(payload) => bound_relation_payload(payload, bound),
+        P::Generic(payload) => bound_generic_curation_payload(payload, bound),
+    }
+}
+
+fn bound_curation_request_ref(
+    value: &crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::CurationRequestRef,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.list(&value.kinds)?;
+    bound.text(&value.handler_id)?;
+    bound.text(&value.registry_digest)?;
+    bound_curation_payload(&value.payload, bound)?;
+    Ok(())
+}
+
+fn bound_unsupported_subtype(
+    value: &crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::UnsupportedSubtype,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.want_kind)?;
+    bound.text(&value.human_detail)?;
+    Ok(())
+}
+
+fn bound_source_member(
+    value: &crate::typed_bindings::memory_curation_screen::exports::eliot::current::screen::SourceMember,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.member_id)?;
+    bound.texts(&value.provenance)?;
+    bound.texts(&value.conflict)?;
+    Ok(())
+}
+
+fn bound_pending_request(
+    value: &crate::typed_bindings::dreamer_cycle::exports::eliot::current::cycle::PendingRequest,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.request_id)?;
+    bound.text(&value.operation_id)?;
+    bound.text(&value.idempotency_key)?;
+    Ok(())
+}
+
+fn bound_observed_outcome(
+    value: &crate::typed_bindings::dreamer_cycle::exports::eliot::current::cycle::ObservedOutcome,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.request_id)?;
+    bound.text(&value.operation_id)?;
+    bound.text(&value.evidence_digest)?;
+    Ok(())
+}
+
+fn bound_dreamer_state(
+    value: &crate::typed_bindings::dreamer_cycle::exports::eliot::current::cycle::DreamerState,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.state_digest)?;
+    bound.text(&value.fence_epoch)?;
+    bound.list(&value.pending)?;
+    for pending in &value.pending {
+        bound_pending_request(pending, bound)?;
+    }
+    bound.list(&value.observed)?;
+    for observed in &value.observed {
+        bound_observed_outcome(observed, bound)?;
+    }
+    Ok(())
+}
+
+/// Pre-lift bound of the raw typed input. The request arrives as generated
+/// WIT types: the CLI takes no serialized fixture on this path, so there is
+/// no outer JSON/string/tree format to mistake for an opaque WIT ABI escape
+/// (P3.4, #758). Every string/list leaf below — top-level fields, nested
+/// records, list elements, and optional strings — is measured here, before
+/// the host lowers any of it into guest memory; the total is then checked
+/// against the admitted input ceiling by the caller (item 9, #758). Scalar,
+/// enum, and boolean leaves carry no heap allocation and need no bound.
 fn bound_request(
     world: TypedWorld,
     request: &TypedDomainRequest,
@@ -2133,98 +2686,22 @@ fn bound_request(
 ) -> Result<(), TypedExecutionError> {
     match (world, request) {
         (TypedWorld::ContextAdmission, TypedDomainRequest::Admission(value)) => {
-            check_echo(&value.operation_id, &admitted.operation_id, "operation-id")?;
-            check_echo(&value.task_id, &admitted.task_id, "task-id")?;
-            check_echo(&value.scope_id, &admitted.scope_id, "scope-id")?;
-            check_echo(&value.fence_epoch, &admitted.fence_epoch, "fence-epoch")?;
-            bound.text(&value.operation_id)?;
-            bound.text(&value.task_id)?;
-            bound.text(&value.attempt_id)?;
-            bound.text(&value.scope_id)?;
-            bound.text(&value.fence_epoch)?;
-            bound.text(&value.recipe_digest)?;
-            bound.text(&value.recipe_revision)?;
-            bound.list(&value.candidates)?;
-            bound.list(&value.provider_denominator)?;
-            bound.list(&value.measurements)?;
-            Ok(())
+            bound_admission_request(value, admitted, bound)
         }
         (TypedWorld::ContextAssembly, TypedDomainRequest::Assembly(value)) => {
-            check_echo(&value.operation_id, &admitted.operation_id, "operation-id")?;
-            check_echo(&value.task_id, &admitted.task_id, "task-id")?;
-            check_echo(&value.scope_id, &admitted.scope_id, "scope-id")?;
-            check_echo(&value.fence_epoch, &admitted.fence_epoch, "fence-epoch")?;
-            bound.text(&value.operation_id)?;
-            bound.text(&value.task_id)?;
-            bound.text(&value.scope_id)?;
-            bound.text(&value.fence_epoch)?;
-            bound.text(&value.admitted_digest)?;
-            bound.text(&value.recipe_digest)?;
-            bound.list(&value.admitted)?;
-            Ok(())
+            bound_assembly_request(value, admitted, bound)
         }
         (TypedWorld::CueActivation, TypedDomainRequest::CueActivation(value)) => {
-            // The activation world carries no task/scope field; its echoed
-            // operation identity is the WIT `request-id`.
-            check_echo(&value.request_id, &admitted.operation_id, "operation-id")?;
-            check_echo(&value.fence_epoch, &admitted.fence_epoch, "fence-epoch")?;
-            bound.text(&value.request_id)?;
-            bound.text(&value.snapshot_id)?;
-            bound.text(&value.fence_epoch)?;
-            bound.text(&value.normalization_profile)?;
-            bound.list(&value.seeds)?;
-            bound.list(&value.relation_edges)?;
-            Ok(())
+            bound_cue_activation_request(value, admitted, bound)
         }
         (TypedWorld::DreamerHandler, TypedDomainRequest::DreamerHandler(value)) => {
-            check_echo(&value.operation_id, &admitted.operation_id, "operation-id")?;
-            check_echo(&value.task_id, &admitted.task_id, "task-id")?;
-            check_echo(&value.scope_id, &admitted.scope_id, "scope-id")?;
-            check_echo(&value.fence_epoch, &admitted.fence_epoch, "fence-epoch")?;
-            bound.text(&value.operation_id)?;
-            bound.text(&value.task_id)?;
-            bound.text(&value.attempt_id)?;
-            bound.text(&value.scope_id)?;
-            bound.text(&value.fence_epoch)?;
-            bound.text(&value.bundle_digest)?;
-            bound.text(&value.manifest_digest)?;
-            bound.text(&value.grounding_digest)?;
-            bound.text(&value.validation_receipt)?;
-            bound.text(&value.requester.principal)?;
-            bound.text(&value.requester.session)?;
-            Ok(())
+            bound_dreamer_handler_request(value, admitted, bound)
         }
         (TypedWorld::MemoryCurationScreen, TypedDomainRequest::MemoryCurationScreen(value)) => {
-            check_echo(&value.operation_id, &admitted.operation_id, "operation-id")?;
-            check_echo(&value.task_id, &admitted.task_id, "task-id")?;
-            check_echo(&value.scope_id, &admitted.scope_id, "scope-id")?;
-            check_echo(&value.fence_epoch, &admitted.fence_epoch, "fence-epoch")?;
-            bound.text(&value.operation_id)?;
-            bound.text(&value.task_id)?;
-            bound.text(&value.scope_id)?;
-            bound.text(&value.fence_epoch)?;
-            bound.text(&value.source_id)?;
-            bound.text(&value.snapshot_revision)?;
-            bound.text(&value.profile_id)?;
-            bound.list(&value.members)?;
-            bound.list(&value.rule_ids)?;
-            Ok(())
+            bound_memory_curation_screen_request(value, admitted, bound)
         }
         (TypedWorld::DreamerCycle, TypedDomainRequest::DreamerCycle(value)) => {
-            check_echo(&value.operation_id, &admitted.operation_id, "operation-id")?;
-            check_echo(&value.task_id, &admitted.task_id, "task-id")?;
-            check_echo(&value.scope_id, &admitted.scope_id, "scope-id")?;
-            check_echo(&value.fence_epoch, &admitted.fence_epoch, "fence-epoch")?;
-            bound.text(&value.operation_id)?;
-            bound.text(&value.task_id)?;
-            bound.text(&value.scope_id)?;
-            bound.text(&value.fence_epoch)?;
-            bound.text(&value.state.state_digest)?;
-            bound.text(&value.state.fence_epoch)?;
-            bound.text(&value.policy.policy_revision)?;
-            bound.list(&value.state.pending)?;
-            bound.list(&value.state.observed)?;
-            Ok(())
+            bound_dreamer_cycle_request(value, admitted, bound)
         }
         // `TypedDomainRequest::world()` was compared with the selection above,
         // so no unhandled pairing reaches this point.
@@ -2232,6 +2709,169 @@ fn bound_request(
             reason: "request-world".to_owned(),
         }),
     }
+}
+
+fn bound_admission_request(
+    value: &crate::typed_bindings::context_admission::exports::eliot::current::admission::AdmissionRequest,
+    admitted: &TypedDomainAdmission,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    check_echo(&value.operation_id, &admitted.operation_id, "operation-id")?;
+    check_echo(&value.task_id, &admitted.task_id, "task-id")?;
+    check_echo(&value.scope_id, &admitted.scope_id, "scope-id")?;
+    check_echo(&value.fence_epoch, &admitted.fence_epoch, "fence-epoch")?;
+    bound.text(&value.operation_id)?;
+    bound.text(&value.task_id)?;
+    bound.text(&value.attempt_id)?;
+    bound.text(&value.scope_id)?;
+    bound.text(&value.fence_epoch)?;
+    bound.text(&value.recipe_digest)?;
+    bound.text(&value.recipe_revision)?;
+    if let Some(digest) = value.predecessor_digest.as_ref() {
+        bound.text(digest)?;
+    }
+    if let Some(note) = value.invalidation.as_ref() {
+        bound.text(note)?;
+    }
+    bound.list(&value.candidates)?;
+    for candidate in &value.candidates {
+        bound_context_candidate(candidate, bound)?;
+    }
+    bound.list(&value.provider_denominator)?;
+    for slot in &value.provider_denominator {
+        bound_provider_role(slot, bound)?;
+    }
+    bound.list(&value.measurements)?;
+    for measurement in &value.measurements {
+        bound_measurement_ref(measurement, bound)?;
+    }
+    Ok(())
+}
+
+fn bound_assembly_request(
+    value: &crate::typed_bindings::context_assembly::exports::eliot::current::assembly::AssemblyRequest,
+    admitted: &TypedDomainAdmission,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    check_echo(&value.operation_id, &admitted.operation_id, "operation-id")?;
+    check_echo(&value.task_id, &admitted.task_id, "task-id")?;
+    check_echo(&value.scope_id, &admitted.scope_id, "scope-id")?;
+    check_echo(&value.fence_epoch, &admitted.fence_epoch, "fence-epoch")?;
+    bound.text(&value.operation_id)?;
+    bound.text(&value.task_id)?;
+    bound.text(&value.scope_id)?;
+    bound.text(&value.fence_epoch)?;
+    bound.text(&value.admitted_digest)?;
+    bound.text(&value.recipe_digest)?;
+    bound.list(&value.admitted)?;
+    for atom in &value.admitted {
+        bound_admitted_atom_ref(atom, bound)?;
+    }
+    bound_serialized_measurement(&value.measurement, bound)?;
+    if let Some(digest) = value.predecessor_digest.as_ref() {
+        bound.text(digest)?;
+    }
+    Ok(())
+}
+
+fn bound_cue_activation_request(
+    value: &crate::typed_bindings::cue_activation::exports::eliot::current::activation::ActivationRequest,
+    admitted: &TypedDomainAdmission,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    // The activation world carries no task/scope field; its echoed
+    // operation identity is the WIT `request-id`.
+    check_echo(&value.request_id, &admitted.operation_id, "operation-id")?;
+    check_echo(&value.fence_epoch, &admitted.fence_epoch, "fence-epoch")?;
+    bound.text(&value.request_id)?;
+    bound.text(&value.snapshot_id)?;
+    bound.text(&value.fence_epoch)?;
+    bound.text(&value.normalization_profile)?;
+    bound.list(&value.seeds)?;
+    for seed in &value.seeds {
+        bound_seed_cue(seed, bound)?;
+    }
+    bound.list(&value.relation_edges)?;
+    for edge in &value.relation_edges {
+        bound_relation_edge(edge, bound)?;
+    }
+    Ok(())
+}
+
+fn bound_dreamer_handler_request(
+    value: &crate::typed_bindings::dreamer_handler::exports::eliot::current::handler::ValidatedCandidate,
+    admitted: &TypedDomainAdmission,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    check_echo(&value.operation_id, &admitted.operation_id, "operation-id")?;
+    check_echo(&value.task_id, &admitted.task_id, "task-id")?;
+    check_echo(&value.scope_id, &admitted.scope_id, "scope-id")?;
+    check_echo(&value.fence_epoch, &admitted.fence_epoch, "fence-epoch")?;
+    bound.text(&value.operation_id)?;
+    bound.text(&value.task_id)?;
+    bound.text(&value.attempt_id)?;
+    bound.text(&value.scope_id)?;
+    bound.text(&value.fence_epoch)?;
+    bound.text(&value.bundle_digest)?;
+    bound.text(&value.manifest_digest)?;
+    bound.text(&value.grounding_digest)?;
+    bound.text(&value.validation_receipt)?;
+    bound.text(&value.requester.principal)?;
+    bound.text(&value.requester.session)?;
+    bound.list(&value.preservation.verdicts)?;
+    for verdict in &value.preservation.verdicts {
+        bound_dimension_verdict(verdict, bound)?;
+    }
+    bound_handler_subtype(&value.subtype, bound)?;
+    Ok(())
+}
+
+fn bound_memory_curation_screen_request(
+    value: &crate::typed_bindings::memory_curation_screen::exports::eliot::current::screen::ScreenRequest,
+    admitted: &TypedDomainAdmission,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    check_echo(&value.operation_id, &admitted.operation_id, "operation-id")?;
+    check_echo(&value.task_id, &admitted.task_id, "task-id")?;
+    check_echo(&value.scope_id, &admitted.scope_id, "scope-id")?;
+    check_echo(&value.fence_epoch, &admitted.fence_epoch, "fence-epoch")?;
+    bound.text(&value.operation_id)?;
+    bound.text(&value.task_id)?;
+    bound.text(&value.scope_id)?;
+    bound.text(&value.fence_epoch)?;
+    bound.text(&value.source_id)?;
+    bound.text(&value.snapshot_revision)?;
+    bound.text(&value.profile_id)?;
+    bound.list(&value.members)?;
+    for member in &value.members {
+        bound_source_member(member, bound)?;
+    }
+    bound.texts(&value.rule_ids)?;
+    if let Some(digest) = value.predecessor_digest.as_ref() {
+        bound.text(digest)?;
+    }
+    Ok(())
+}
+
+fn bound_dreamer_cycle_request(
+    value: &crate::typed_bindings::dreamer_cycle::exports::eliot::current::cycle::CycleStepInput,
+    admitted: &TypedDomainAdmission,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    check_echo(&value.operation_id, &admitted.operation_id, "operation-id")?;
+    check_echo(&value.task_id, &admitted.task_id, "task-id")?;
+    check_echo(&value.scope_id, &admitted.scope_id, "scope-id")?;
+    check_echo(&value.fence_epoch, &admitted.fence_epoch, "fence-epoch")?;
+    bound.text(&value.operation_id)?;
+    bound.text(&value.task_id)?;
+    bound.text(&value.scope_id)?;
+    bound.text(&value.fence_epoch)?;
+    bound.text(&value.policy.policy_revision)?;
+    bound_dreamer_state(&value.state, bound)?;
+    if let Some(digest) = value.predecessor_digest.as_ref() {
+        bound.text(digest)?;
+    }
+    Ok(())
 }
 
 const fn ceiling_admission(
@@ -2626,6 +3266,15 @@ fn call_admission(
             native_revision: raw.native_revision,
             abi_digest: raw.abi_digest,
         };
+        // P5.5 (#758): deny a lying descriptor before the domain export runs.
+        validate_descriptor(
+            TypedWorld::ContextAdmission,
+            &descriptor,
+            limits.max_output_bytes,
+        )
+        .map_err(|error| staged(TypedStage::Descriptor, error))?;
+        validate_descriptor_abi_digest(&descriptor)
+            .map_err(|error| staged(TypedStage::Descriptor, error))?;
         let called = interface
             .call_admit(&mut *store, request)
             .map_err(|error| {
@@ -2677,6 +3326,15 @@ fn call_assembly(
             native_revision: raw.native_revision,
             abi_digest: raw.abi_digest,
         };
+        // P5.5 (#758): deny a lying descriptor before the domain export runs.
+        validate_descriptor(
+            TypedWorld::ContextAssembly,
+            &descriptor,
+            limits.max_output_bytes,
+        )
+        .map_err(|error| staged(TypedStage::Descriptor, error))?;
+        validate_descriptor_abi_digest(&descriptor)
+            .map_err(|error| staged(TypedStage::Descriptor, error))?;
         let called = interface
             .call_assemble(&mut *store, request)
             .map_err(|error| {
@@ -2728,6 +3386,15 @@ fn call_cue_activation(
             native_revision: raw.native_revision,
             abi_digest: raw.abi_digest,
         };
+        // P5.5 (#758): deny a lying descriptor before the domain export runs.
+        validate_descriptor(
+            TypedWorld::CueActivation,
+            &descriptor,
+            limits.max_output_bytes,
+        )
+        .map_err(|error| staged(TypedStage::Descriptor, error))?;
+        validate_descriptor_abi_digest(&descriptor)
+            .map_err(|error| staged(TypedStage::Descriptor, error))?;
         let called = interface
             .call_activate(&mut *store, request)
             .map_err(|error| {
@@ -2779,6 +3446,15 @@ fn call_dreamer_handler(
             native_revision: raw.native_revision,
             abi_digest: raw.abi_digest,
         };
+        // P5.5 (#758): deny a lying descriptor before the domain export runs.
+        validate_descriptor(
+            TypedWorld::DreamerHandler,
+            &descriptor,
+            limits.max_output_bytes,
+        )
+        .map_err(|error| staged(TypedStage::Descriptor, error))?;
+        validate_descriptor_abi_digest(&descriptor)
+            .map_err(|error| staged(TypedStage::Descriptor, error))?;
         let called = interface
             .call_handle(&mut *store, request)
             .map_err(|error| {
@@ -2831,6 +3507,15 @@ fn call_memory_curation_screen(
             native_revision: raw.native_revision,
             abi_digest: raw.abi_digest,
         };
+        // P5.5 (#758): deny a lying descriptor before the domain export runs.
+        validate_descriptor(
+            TypedWorld::MemoryCurationScreen,
+            &descriptor,
+            limits.max_output_bytes,
+        )
+        .map_err(|error| staged(TypedStage::Descriptor, error))?;
+        validate_descriptor_abi_digest(&descriptor)
+            .map_err(|error| staged(TypedStage::Descriptor, error))?;
         let called = interface
             .call_screen(&mut *store, request)
             .map_err(|error| {
@@ -2882,6 +3567,15 @@ fn call_dreamer_cycle(
             native_revision: raw.native_revision,
             abi_digest: raw.abi_digest,
         };
+        // P5.5 (#758): deny a lying descriptor before the domain export runs.
+        validate_descriptor(
+            TypedWorld::DreamerCycle,
+            &descriptor,
+            limits.max_output_bytes,
+        )
+        .map_err(|error| staged(TypedStage::Descriptor, error))?;
+        validate_descriptor_abi_digest(&descriptor)
+            .map_err(|error| staged(TypedStage::Descriptor, error))?;
         let called = interface.call_step(&mut *store, request).map_err(|error| {
             staged(
                 TypedStage::Invoke,

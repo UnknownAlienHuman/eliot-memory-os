@@ -77,8 +77,11 @@ FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 # (`- uses:` followed by an indented value). The key accepts every YAML spelling
 # GitHub accepts (optionally single- or double-quoted, any spacing before the
 # `:`), mirroring the `on:`-key handling in _on_block_child_key, so the pin,
-# owner and one-pin rules see all of them.
-USES_KEY_RE = re.compile(r"""(?:^|[{,\s\[])(?:-)?\s*(?:"uses"|'uses'|uses)\s*:(?!:)""")
+# owner and one-pin rules see all of them. A double-quoted key may also carry
+# backslash escapes (`"us\u0065s"` parses as `uses`); the quoted text is
+# captured so the caller decodes it before comparing (single-quoted and plain
+# keys have no escapes, so they stay literal).
+USES_KEY_RE = re.compile(r"""(?:^|[{,\s\[])(?:-)?\s*(?:"(?P<dqkey>(?:[^"\\]|\\.)*)"|'uses'|uses)\s*:(?!:)""")
 # A `uses` VALUE: a single-quoted or double-quoted scalar, or a plain scalar,
 # terminated at a comment (`# ...` release annotation) or at a flow mapping
 # separator. The value is never taken across a comment, so a release
@@ -209,6 +212,70 @@ def _strip_quotes(text: str) -> str:
     return text.strip().strip("'\"")
 
 
+# YAML double-quoted scalar escapes (YAML 1.2 section 5.7): the single-character
+# escapes plus the hexadecimal `\xXX`, `\uXXXX` and `\UXXXXXXXX` forms. A
+# backslash followed by a line break is a continuation and contributes nothing.
+_YAML_DQ_SIMPLE_ESCAPES = {
+    "0": "\0",
+    "a": "\a",
+    "b": "\b",
+    "t": "\t",
+    "n": "\n",
+    "v": "\v",
+    "f": "\f",
+    "r": "\r",
+    "e": "\x1b",
+    " ": " ",
+    '"': '"',
+    "\\": "\\",
+    "N": chr(0x85),
+    "_": chr(0xA0),
+    "L": chr(0x2028),
+    "P": chr(0x2029),
+}
+
+
+def _unescape_yaml_double_quoted(text: str) -> str:
+    """Decode backslash escapes in a double-quoted YAML scalar.
+
+    GitHub parses `"i\u0066"` as the key `if`, so a raw-text comparison never
+    sees it. Unknown escapes are left as written rather than dropped, so an
+    unrecognized spelling can never silently become a governed key.
+    """
+    def replace(match: re.Match[str]) -> str:
+        seq = match.group(1)
+        if len(seq) == 1:
+            if seq in ("\n", "\r"):
+                return ""
+            return _YAML_DQ_SIMPLE_ESCAPES.get(seq, match.group(0))
+        if seq[0] in ("x", "u", "U"):
+            try:
+                return chr(int(seq[1:], 16))
+            except ValueError:
+                return match.group(0)
+        return match.group(0)
+    return re.sub(
+        r"\\(x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|.)",
+        replace,
+        text,
+        flags=re.DOTALL,
+    )
+
+
+def _action_identity_line(line: str) -> str:
+    """A workflow line with YAML quote delimiters removed but content kept.
+
+    `workflow_code_line` deletes quoted spans because quoted prose is not code;
+    that also deletes a quoted `uses: "actions/cache@..."` value before the
+    `"<action>@" in code` step-recognition tests, so the step escapes every
+    rule that depends on it. Step recognition only asks whether the line names
+    the action, so it keeps the span content and drops just the delimiters
+    (plus a trailing `#` comment), judging quoted spellings exactly like
+    unquoted ones.
+    """
+    return _strip_comment(line).replace('"', "").replace("'", "")
+
+
 def workflow_code_line(line: str) -> str:
     """A workflow line without quoted prose or a trailing comment.
 
@@ -270,7 +337,9 @@ def _yaml_key(line: str) -> str | None:
     match = re.match(r"^\s*(?:-\s+)?(?:\"([^\"]*)\"|'([^']*)'|([^\s#:][^:]*?))\s*:(?:\s|$)", line)
     if match is None:
         return None
-    for group in (match.group(1), match.group(2), match.group(3)):
+    if match.group(1) is not None:
+        return _unescape_yaml_double_quoted(match.group(1)).strip()
+    for group in (match.group(2), match.group(3)):
         if group is not None:
             return group.strip()
     return None
@@ -670,6 +739,9 @@ def iter_action_references_in_text(content: str) -> list[tuple[int, str]]:
     references: list[tuple[int, str]] = []
     for index, line in enumerate(lines):
         for key_match in USES_KEY_RE.finditer(line):
+            dqkey = key_match.group("dqkey")
+            if dqkey is not None and _unescape_yaml_double_quoted(dqkey) != "uses":
+                continue
             value_match = USES_VALUE_RE.match(line, key_match.end())
             if value_match is not None:
                 references.append(
@@ -1035,7 +1107,7 @@ def check_cache_key_fingerprints(root: Path) -> list[Finding]:
         # search for the next key stops at the next step entry, which is what
         # keeps a sibling job's key from being read as this step's key.
         for cache_line, line in enumerate(lines):
-            if "actions/cache@" not in workflow_code_line(line):
+            if "actions/cache@" not in _action_identity_line(line):
                 continue
             seen_cache_step = True
             step_indent = len(line) - len(line.lstrip(" "))
@@ -1214,7 +1286,7 @@ def check_cache_key_manifest_coverage(root: Path) -> list[Finding]:
             continue
         lines = content.splitlines()
         for cache_line, line in enumerate(lines):
-            if "actions/cache@" not in workflow_code_line(line):
+            if "actions/cache@" not in _action_identity_line(line):
                 continue
             step_indent = len(line) - len(line.lstrip(" "))
             key_line = next(
@@ -1812,7 +1884,7 @@ def check_fail_closed_privilege(root: Path) -> list[Finding]:
                     )
                 )
         for index, line in enumerate(lines):
-            if "actions/checkout@" not in workflow_code_line(line):
+            if "actions/checkout@" not in _action_identity_line(line):
                 continue
             item = _nearest_list_item(lines, index)
             block = _own_block(lines, item) if item is not None else [index]

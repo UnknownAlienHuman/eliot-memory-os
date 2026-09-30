@@ -47,8 +47,8 @@ use eliot_kernel_core::user_automation::{
 };
 use eliot_receipts::{
     ArtifactBinding, AuthorityBinding, CausalBinding, EffectClass, OperationBinding, ProofCeiling,
-    ReceiptCore, ReceiptDisposition, ReceiptKind, RequestBinding, SessionBinding, TaskBinding,
-    WorkScopeBinding, WorkScopeId,
+    ReceiptCore, ReceiptDisposition, ReceiptEnvelope, ReceiptKind, RequestBinding, SessionBinding,
+    TaskBinding, WorkScopeBinding, WorkScopeId,
 };
 use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, NamedReadOperation, NamedReadRequest,
@@ -59,6 +59,7 @@ use eliot_store_api::{
     automation_revision_read_request, automation_run_now_params,
     automation_state_transition_params, canonical_json_bytes, canonical_request_hash,
     generated_operation_manifests, operation_manifest_set_digest, sha256_hex,
+    with_automation_normalization_receipt,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -177,6 +178,16 @@ pub struct UserAutomationOwnerSnapshot {
         eliot_kernel_core::user_automation::UserAutomationConfigurationState,
     /// Principal that the revision was checked against.
     pub authenticated_principal: String,
+    /// Owner-issued schedule normalization envelope the Store retained on this
+    /// immutable revision row, when the row carries one.
+    ///
+    /// This is the RETAINED envelope, read back verbatim from the row the
+    /// revision leg wrote, not a value derived here: preflight requires the
+    /// declared receipt id to be the content-derived identity of a real
+    /// `ReceiptEnvelope`, so only the owner's own stored bytes can satisfy it.
+    /// `None` means the row retained none, which stays a named missing owner
+    /// rather than an empty or synthesized envelope.
+    pub normalization_receipt: Option<ReceiptEnvelope>,
     /// Fence under which both named reads were observed.
     pub state_fence: StateFence,
     /// Exact named-read evidence for the snapshot.
@@ -371,20 +382,7 @@ impl<C> CanonicalUserAutomationStore<C> {
                 field: "automation.revision",
                 reason: "requested immutable revision is not retained",
             })?;
-        let document =
-            entry
-                .get("revision_json")
-                .and_then(Value::as_str)
-                .ok_or(StoreError::InvalidField {
-                    field: "automation.revision_json",
-                    reason: "stored owner revision document is malformed",
-                })?;
-        let revision: UserAutomationRevision = serde_json::from_str(document)
-            .map_err(|error| StoreError::Serialization(error.to_string()))?;
-        revision.validate().map_err(|_| StoreError::InvalidField {
-            field: "automation.revision",
-            reason: "stored owner revision failed domain validation",
-        })?;
+        let revision = retained_owner_revision(entry)?;
         if revision.automation_id != lookup.automation_id
             || revision.revision != lookup.requested_revision
             || revision.owner_principal != lookup.authenticated_principal
@@ -396,6 +394,9 @@ impl<C> CanonicalUserAutomationStore<C> {
             revision,
             current_configuration_state: current_state,
             authenticated_principal: lookup.authenticated_principal.clone(),
+            // The owner-issued envelope as the Store retained it beside this
+            // revision, decoded from the ORIGINAL stored bytes.
+            normalization_receipt: decode_retained_normalization_envelope(entry)?,
             state_fence: lookup.state_fence.clone(),
             provenance: UserAutomationOwnerReadProvenance {
                 current_before: owner_read_provenance(current_request, &current_response),
@@ -413,6 +414,76 @@ impl<C> CanonicalUserAutomationStore<C> {
     pub(crate) fn client(&self) -> &C {
         &self.client
     }
+}
+
+/// Decodes the immutable owner revision the Store retained on one row.
+///
+/// The stored document is read back as bytes and run through the revision's own
+/// `validate()`, so a row is accepted because the domain says it is well-formed
+/// rather than because it parsed. Nothing here is derived from the request.
+fn retained_owner_revision(entry: &Value) -> Result<UserAutomationRevision, StoreError> {
+    let document =
+        entry
+            .get("revision_json")
+            .and_then(Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "automation.revision_json",
+                reason: "stored owner revision document is malformed",
+            })?;
+    let revision: UserAutomationRevision = serde_json::from_str(document)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    revision.validate().map_err(|_| StoreError::InvalidField {
+        field: "automation.revision",
+        reason: "stored owner revision failed domain validation",
+    })?;
+    Ok(revision)
+}
+
+/// Decodes the owner-issued schedule normalization envelope the Store retained
+/// beside one immutable revision row.
+///
+/// This reads the ORIGINAL stored bytes the revision leg wrote and checks them
+/// with the envelope's own `validate()` — the same two steps
+/// `ApplyNotificationState` applies to a retained `source_receipt_json`. It
+/// derives nothing and re-issues nothing: an absent column reads as `None`,
+/// which the preflight reader reports as a named missing owner instead of
+/// substituting a receipt, and a present-but-invalid envelope fails closed
+/// rather than being silently dropped.
+///
+/// # Production caller
+///
+/// The one call site is
+/// [`CanonicalUserAutomationStore::project_owner_snapshot`] in this file,
+/// which fills `UserAutomationOwnerSnapshot::normalization_receipt` from the
+/// decoded envelope. That projection is not a library-internal helper: it is
+/// reached only through
+/// `crates/kernel/eliot-kernel-service/src/store_gateway.rs::KernelStoreGateway::read_user_automation_owner`
+/// (the `pub` method that performs the Store IO and calls
+/// `project_owner_snapshot`), which in turn is called from the authenticated
+/// operator surface
+/// `bins/eliot-kernel/src/daemon_request_dispatch.rs::KernelComposition::user_automation_operator_operation`.
+///
+/// The envelope this decodes is written by the production mutation leg in
+/// this same file — `mutation_parameters` calls
+/// `revision_with_owner_normalization_receipt` to seal it beside the
+/// revision — and the Surreal adapter persists it under
+/// [`eliot_store_api::AUTOMATION_PARAM_NORMALIZATION_RECEIPT_JSON`]. Its
+/// consumer is
+/// `store_gateway.rs::KernelStoreGateway::assemble_run_now_preflight_projection`
+/// via `select_retained_normalization_receipts`.
+fn decode_retained_normalization_envelope(
+    entry: &Value,
+) -> Result<Option<ReceiptEnvelope>, StoreError> {
+    let Some(stored) = entry
+        .get(eliot_store_api::AUTOMATION_PARAM_NORMALIZATION_RECEIPT_JSON)
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(None);
+    };
+    let envelope: ReceiptEnvelope = serde_json::from_value(stored.clone())
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    envelope.validate().map_err(StoreError::Receipt)?;
+    Ok(Some(envelope))
 }
 
 fn validate_owner_named_response(
@@ -936,6 +1007,24 @@ impl<C: CanonicalStoreClient> UserAutomationStorePort for CanonicalUserAutomatio
             | UserAutomationOperation::Resume { .. }
             | UserAutomationOperation::Remove { .. }
             | UserAutomationOperation::RunNow { .. } => self.execute_mutation(&request).await,
+            // I12.24:65's decision-owner selection records one disposition
+            // against one improvement brief. It is not a read, and it is not a
+            // mutation of an automation row either: the automation Store owns
+            // revisions, invocations, wakes and failures, and a brief lives in
+            // the improvement owner's own canonical record, not in this
+            // schema. I12.24:3 states that ELIOT "never silently rewrites code,
+            // policy or memory authority", and I12.24:82 makes the advisory
+            // class "default; changes nothing until owner acts", so admitting
+            // this as an automation mutation here would mint a second write
+            // path for improvement state. The closed refusal this file already
+            // models for an operation it does not own
+            // (`StoreError::UnknownOperation`, the same answer
+            // `mutation_parameters` and `project_mutation_result` give) is
+            // the honest classification, and it fails closed before any Store
+            // I/O.
+            UserAutomationOperation::DecideImprovementBrief { .. } => {
+                Err(StoreError::UnknownOperation)
+            }
         }
     }
 
@@ -1707,7 +1796,7 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
             &canonical_json_bytes(&admission_view)
                 .map_err(|error| StoreError::Serialization(error.to_string()))?,
         );
-        let automation_id = automation_scope(&request.intent.operation);
+        let automation_id = automation_scope(&request.intent.operation)?;
         let mut transition = PreparedTransition {
             contract_version: eliot_store_api::CONTRACT_VERSION,
             identity: request.identity.clone(),
@@ -1750,16 +1839,23 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
                 // persisted, and the owner-issued normalization binding is
                 // attached here, before the document is serialized. The stored
                 // revision therefore never names a receipt the owner did not
-                // mint over this exact occurrence set.
+                // mint over this exact occurrence set, and the same mint hands
+                // its canonical envelope to the Store to retain on the row, so
+                // the id the revision names is later readable as a real
+                // envelope instead of a digest.
                 let revision = &**revision;
-                let normalized = revision_with_owner_normalization_receipt(request, revision)?;
+                let (normalized, envelope) =
+                    revision_with_owner_normalization_receipt(request, revision)?;
                 let document = serde_json::to_string(&normalized)
                     .map_err(|error| StoreError::Serialization(error.to_string()))?;
-                Ok(automation_create_params(
-                    revision.automation_id.clone(),
-                    revision.revision.clone(),
-                    state_wire(revision.configuration_state),
-                    document,
+                Ok(with_automation_normalization_receipt(
+                    automation_create_params(
+                        revision.automation_id.clone(),
+                        revision.revision.clone(),
+                        state_wire(revision.configuration_state),
+                        document,
+                    ),
+                    retained_normalization_envelope(&envelope)?,
                 ))
             }
             UserAutomationOperation::Edit {
@@ -1767,15 +1863,19 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
                 revision,
             } => {
                 let revision = &**revision;
-                let normalized = revision_with_owner_normalization_receipt(request, revision)?;
+                let (normalized, envelope) =
+                    revision_with_owner_normalization_receipt(request, revision)?;
                 let document = serde_json::to_string(&normalized)
                     .map_err(|error| StoreError::Serialization(error.to_string()))?;
-                Ok(automation_edit_params(
-                    revision.automation_id.clone(),
-                    previous_revision.revision.clone(),
-                    revision.revision.clone(),
-                    state_wire(revision.configuration_state),
-                    document,
+                Ok(with_automation_normalization_receipt(
+                    automation_edit_params(
+                        revision.automation_id.clone(),
+                        previous_revision.revision.clone(),
+                        revision.revision.clone(),
+                        state_wire(revision.configuration_state),
+                        document,
+                    ),
+                    retained_normalization_envelope(&envelope)?,
                 ))
             }
             UserAutomationOperation::Pause {
@@ -2098,9 +2198,48 @@ const AUTOMATION_NORMALIZATION_OPERATION_KIND: &str = "user-automation.schedule.
 /// Stable authority identity of the schedule normalizer on this leg.
 const AUTOMATION_NORMALIZATION_AUTHORITY_ID: &str = "eliot-user-automation:schedule-normalizer";
 
+/// Owner-issued task and session bindings for the normalization envelope.
+///
+/// The task/session bindings mirror the canonical Store receipt owner: a
+/// request that carries a task without the fence revision that task is pinned
+/// at cannot be bound honestly, so it is refused here instead of being
+/// committed with the binding dropped. The refusal stays ahead of any receipt
+/// construction, exactly where it stood inline, so a request carrying a task
+/// without its fence revision is still rejected before any envelope identity is
+/// derived.
+fn owner_normalization_bindings(
+    request: &UserAutomationStoreRequest,
+    state_fence: &StateFence,
+) -> Result<(Option<TaskBinding>, Option<SessionBinding>), StoreError> {
+    let task = match (request.context.task_id.clone(), state_fence.task_revision) {
+        (Some(task_id), Some(task_revision)) => Some(TaskBinding {
+            task_id,
+            task_revision,
+            state_fence: state_fence.clone(),
+        }),
+        (None, _) => None,
+        (Some(_), None) => {
+            return Err(StoreError::InvalidField {
+                field: "automation.context.task_id",
+                reason: "normalization receipt requires the fenced task revision",
+            });
+        }
+    };
+    let session = request
+        .context
+        .session_id
+        .clone()
+        .map(|session_id| SessionBinding {
+            session_id,
+            authority_epoch: state_fence.authority_epoch.clone(),
+            state_fence: state_fence.clone(),
+        });
+    Ok((task, session))
+}
+
 /// Returns the immutable revision with the owner-issued schedule normalization
 /// receipt this Store leg mints over exactly that revision's compiled occurrence
-/// set.
+/// set, together with the canonical envelope that receipt projects out of.
 ///
 /// I11.12:31 makes the normalized schedule the trigger contract and forbids
 /// silently guessing an ambiguous calendar phrase, and I05.19:96 says a new
@@ -2128,52 +2267,40 @@ const AUTOMATION_NORMALIZATION_AUTHORITY_ID: &str = "eliot-user-automation:sched
 /// production dependency of this crate; the issuing authority is therefore
 /// named as that principal rather than as an adapter that does not exist here.
 /// The receipt still proves nothing Kernel does not re-derive: the envelope
-/// identity is content-derived, and the run-now readback must supply that exact
-/// envelope to `UserAutomationPreflightProjection::assemble`, which validates it
-/// and requires its canonical bytes to carry the stored set's compiled digest.
+/// identity is content-derived, and the two envelopes minted here from one core
+/// are required to carry that identical identity, so the retained bytes and the
+/// id the revision names cannot come apart.
 ///
-/// Minting is not retention, and this leg does not claim to be both. The set
-/// `read_run_now_normalization_receipts` selects from is the canonical Store's
-/// own retained `WriteReceipt` history, one envelope per committed operation,
-/// issued by the Store receipt owner from the committed plan; a Kernel caller
-/// cannot append a second envelope to it, and a Store-issued envelope for this
-/// transition binds the committed plan rather than the compiled occurrence set,
-/// so it can never carry the digest `assemble` requires. This leg therefore
-/// mints the identity the revision names and leaves its retention to the Store
-/// receipt owner, and a run-now occurrence whose envelope that owner has not
-/// retained stays unadmitted by name instead of being admitted on a digest.
+/// ## Retention rides the revision row, because it cannot ride the Store's own
+///
+/// Minting is not retention, and this leg now does both — because the
+/// measurement that split them is closed. The retained set a run-now read
+/// selects from cannot be the canonical Store's `WriteReceipt` history:
+/// `receipt_artifacts` emits exactly two artifacts, `store-transition:{op}`
+/// (the digest of the committed `PreparedTransition`) and
+/// `store-plan:{commit_id}`, so a Store-issued envelope never carries
+/// `compiled_occurrences_digest` as an artifact `sha256`. Nor can it be made
+/// to: that envelope's identity is content-derived from a core built over the
+/// committed transition and the adapter-assigned `commit_id` /
+/// `commit_sequence`, and the transition digest already covers the very
+/// `revision_json` that names the envelope id — so binding an occurrence digest
+/// there would be circular, and the id is not computable before the commit
+/// anyway. A Kernel caller cannot append a second envelope to the Store's
+/// history either, without becoming exactly the second writer I05.19:96
+/// forbids.
+///
+/// So the envelope is retained where the subsystem that issued it already
+/// writes: on the immutable revision row, through the same closed parameter
+/// and the same shared validator `ApplyNotificationState` uses for
+/// `source_receipt_json`. One envelope, one issuing subsystem, one writer, one
+/// lifecycle root — the Store persists the ORIGINAL bytes and re-derives
+/// nothing, and `check_normalization_receipt_binding` is untouched.
 fn revision_with_owner_normalization_receipt(
     request: &UserAutomationStoreRequest,
     revision: &UserAutomationRevision,
-) -> Result<UserAutomationRevision, StoreError> {
+) -> Result<(UserAutomationRevision, ReceiptEnvelope), StoreError> {
     let state_fence = request.context.state_fence.clone();
-    // The owner-issued task/session bindings mirror the canonical Store
-    // receipt owner: a request that carries a task without the fence revision
-    // that task is pinned at cannot be bound honestly, so it is refused here
-    // instead of being committed with the binding dropped.
-    let task = match (request.context.task_id.clone(), state_fence.task_revision) {
-        (Some(task_id), Some(task_revision)) => Some(TaskBinding {
-            task_id,
-            task_revision,
-            state_fence: state_fence.clone(),
-        }),
-        (None, _) => None,
-        (Some(_), None) => {
-            return Err(StoreError::InvalidField {
-                field: "automation.context.task_id",
-                reason: "normalization receipt requires the fenced task revision",
-            });
-        }
-    };
-    let session = request
-        .context
-        .session_id
-        .clone()
-        .map(|session_id| SessionBinding {
-            session_id,
-            authority_epoch: state_fence.authority_epoch.clone(),
-            state_fence: state_fence.clone(),
-        });
+    let (task, session) = owner_normalization_bindings(request, &state_fence)?;
     let core = ReceiptCore {
         contract: eliot_receipts::contract_identity().map_err(StoreError::Receipt)?,
         kind: ReceiptKind::Verification,
@@ -2241,6 +2368,14 @@ fn revision_with_owner_normalization_receipt(
             proof: ProofCeiling::ScopedVerification,
         },
     };
+    // One core, one identity, two consumers: the declared receipt projects the
+    // schedule's evidence fields out of the envelope minted over this core, and
+    // the retained envelope is that whole canonical object, which a later
+    // owner read must hand preflight assembly. Because both are derived from
+    // the SAME `ReceiptEnvelope::issue` over the SAME core bytes, their
+    // content-derived identities are equal by construction, and the equality
+    // is checked rather than assumed so the two can never come apart.
+    let retained = ReceiptEnvelope::issue(core.clone()).map_err(StoreError::Receipt)?;
     let receipt = revision
         .schedule
         .issue_normalization_receipt(core, &request.authenticated_principal)
@@ -2248,24 +2383,64 @@ fn revision_with_owner_normalization_receipt(
             field: "automation.schedule.normalization_receipt",
             reason: "owner-issued normalization receipt was refused",
         })?;
+    if retained.identity.receipt_id.as_str() != receipt.receipt_id.as_str() {
+        return Err(StoreError::InvalidField {
+            field: "automation.schedule.normalization_receipt",
+            reason: "retained normalization envelope is not the identity the revision names",
+        });
+    }
     let mut owned = revision.clone();
     owned.schedule.normalization_receipt = receipt;
-    Ok(owned)
+    Ok((owned, retained))
+}
+
+/// Renders the owner-issued normalization envelope for the Store to retain.
+///
+/// The envelope is validated HERE, at the owner edge that issued it, with its
+/// own `validate()` — the same edge `notification_state.rs` applies to a
+/// notification `source_receipt` — so a structurally invalid envelope is
+/// refused before it can reach a durable row instead of after. The bytes handed
+/// on are the canonical envelope itself; no digest is computed, replaced or
+/// re-derived anywhere on this path.
+fn retained_normalization_envelope(envelope: &ReceiptEnvelope) -> Result<Value, StoreError> {
+    envelope.validate().map_err(StoreError::Receipt)?;
+    serde_json::to_value(envelope).map_err(|error| StoreError::Serialization(error.to_string()))
 }
 
 /// Returns the automation identity scoping one intent's ordering stream.
-fn automation_scope(operation: &UserAutomationOperation) -> String {
+///
+/// The scope is the `automation:` ordering namespace, so every arm must name
+/// a real automation identity: the stream exists to serialize canonical
+/// transitions that touch one automation's rows, and a scope identity that
+/// names no automation would place a transition in a stream it does not
+/// belong to.
+///
+/// I12.24:65's decision-owner selection therefore has no honest arm. It
+/// carries `brief_id` and no `automation_id`, and it mutates no automation
+/// revision, invocation, wake or failure, so there is no automation whose
+/// ordering it could join. `brief_id` is not a substitute: reusing it as the
+/// scope would silently map one improvement brief onto the automation
+/// ordering namespace, colliding with an unrelated automation that happens to
+/// share the string and fabricating an ordering relationship I12.24:3 does not
+/// permit ("never silently rewrites code, policy or memory authority"). This
+/// is the same closed refusal `execute_user_automation` returns for the
+/// operation, carried by [`StoreError::UnknownOperation`], so the transition
+/// is never admitted with a fabricated scope.
+fn automation_scope(operation: &UserAutomationOperation) -> Result<String, StoreError> {
     match operation {
         UserAutomationOperation::Create { revision }
-        | UserAutomationOperation::Edit { revision, .. } => revision.automation_id.clone(),
-        UserAutomationOperation::List { .. } => "list".to_owned(),
+        | UserAutomationOperation::Edit { revision, .. } => Ok(revision.automation_id.clone()),
+        UserAutomationOperation::List { .. } => Ok("list".to_owned()),
         UserAutomationOperation::Status { automation_id }
         | UserAutomationOperation::History { automation_id }
         | UserAutomationOperation::Pause { automation_id, .. }
         | UserAutomationOperation::Resume { automation_id, .. }
         | UserAutomationOperation::Remove { automation_id, .. }
         | UserAutomationOperation::RunNow { automation_id, .. }
-        | UserAutomationOperation::InspectLastFailure { automation_id } => automation_id.clone(),
+        | UserAutomationOperation::InspectLastFailure { automation_id } => {
+            Ok(automation_id.clone())
+        }
+        UserAutomationOperation::DecideImprovementBrief { .. } => Err(StoreError::UnknownOperation),
     }
 }
 

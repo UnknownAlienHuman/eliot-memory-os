@@ -427,10 +427,14 @@ impl CanaryRemovalBuildBinding {
 
 /// Read-only, versioned plan for removing one exact installed canary.
 ///
-/// The plan is the complete finite denominator of the removal: every closed
-/// resource category the accepted registry or the original transaction can
-/// describe is present exactly once, and every category that is not removed is
-/// present with an explicit `RETAINED` or `UNSUPPORTED` action.
+/// The plan is the complete finite denominator of the removal: every exact
+/// resource identity the accepted registry or the original transaction can
+/// describe has one row, so a closed resource category spans one row per
+/// roster effect that names it, and every row that is not removed carries an
+/// explicit `RETAINED` or `UNSUPPORTED` action. Owner-derived rows
+/// (`CanaryEvidenceRoot`, `StoreObjects`, `GenerationRegistryRecord`) appear
+/// exactly once per `require_quiesced_owner_effects`, which runs at the
+/// destructive gates rather than inside plan validation.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CanaryRemovalPlan {
@@ -545,8 +549,12 @@ impl CanaryRemovalPlan {
         {
             return Err(InstallationError::IdentityConflict);
         }
+        // The removal identity is a pure function of the original installed
+        // transaction and the target generation, so a plan whose identity was
+        // derived from different inputs is a conflict; the matching identity
+        // is the honest one by construction.
         if self.removal_transaction_id
-            == canary_removal_operation_id(&self.install_transaction_id, &self.generation)?
+            != canary_removal_operation_id(&self.install_transaction_id, &self.generation)?
         {
             return Err(InstallationError::IdentityConflict);
         }
@@ -578,12 +586,16 @@ impl CanaryRemovalPlan {
                     identity: effect.effect_id.as_str().to_owned(),
                 });
             }
-            if !categories.insert(effect.category) {
-                return Err(InstallationError::Duplicate {
-                    kind: "canary removal resource category".to_owned(),
-                    identity: format!("{:?}", effect.category),
-                });
-            }
+            // One row names one exact resource identity, not one category: the
+            // frozen graph carries one row per installer effect, so a category
+            // spans as many rows as the roster holds effects for it (one
+            // `CreateRoot`/`ApplyAcl` per hierarchy root, one
+            // `RegisterService`/`StartService` per service role). Roster-row
+            // exactness is carried by the identity uniqueness above and by
+            // `require_complete_effect_coverage`; owner-derived rows carry
+            // theirs via `require_quiesced_owner_effects` at the destructive
+            // gates. Never by category uniqueness.
+            categories.insert(effect.category);
         }
         for effect in &self.effects {
             if effect
@@ -1172,17 +1184,23 @@ where
     if install.candidate_manifest.generation != *generation {
         return Err(InstallationError::IdentityConflict);
     }
-    if install.stage() != InstallationStage::Completed {
-        return Err(InstallationError::IncompleteObservation(format!(
-            "canary removal requires a completed installation transaction, observed {:?}",
-            install.stage()
-        )));
-    }
+    // The pending-activation refusal runs before the stage gate on purpose: a
+    // pre-activation install with a held intent and no receipt yet passes
+    // `install.validate()` (the intent is legal while activating) and must
+    // meet this precise refusal instead of the generic stage message. Once
+    // the receipt exists the check evaluates false and planning falls
+    // through to the stage gate below.
     if install.has_pending_activation_projection_intent() {
         return Err(InstallationError::IncompleteObservation(
             "the activation owner still holds this transaction's pending activation intent"
                 .to_owned(),
         ));
+    }
+    if install.stage() != InstallationStage::ActiveVerified {
+        return Err(InstallationError::IncompleteObservation(format!(
+            "canary removal requires an active-verified installation transaction, observed {:?}",
+            install.stage()
+        )));
     }
     // A held intent together with the committed activation receipt is retained
     // historical provenance, not a pending projection: the install history
@@ -2067,7 +2085,7 @@ where
 }
 
 /// Revalidates the durable fence before any destructive action: the exact
-/// installed transaction and its completed stage, the re-observed drain
+/// installed transaction and its active-verified finished stage, the re-observed drain
 /// evidence (applied effects, no pending external change, no held activation
 /// intent), the current registry revision, the target's still-retired
 /// position, any pending activation, and the required re-observed
@@ -2107,7 +2125,7 @@ where
     {
         return Err(InstallationError::IdentityConflict);
     }
-    if install.stage() != InstallationStage::Completed {
+    if install.stage() != InstallationStage::ActiveVerified {
         return Err(InstallationError::IdentityConflict);
     }
     // Quiesce is re-observed at fence time, not just at plan time: the drain

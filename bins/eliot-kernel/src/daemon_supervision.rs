@@ -7,12 +7,21 @@
 #![forbid(unsafe_code)]
 
 use eliot_contracts::StateFence;
+#[cfg(windows)]
+use eliot_kernel_service::KernelServiceState;
 use eliot_kernel_service::{KernelActivationReceipt, KernelServiceError};
 use eliot_ors::{SupervisionLeaseOperation, SupervisionLeaseSnapshot};
-use eliot_process::{EliotdLiveReadyEvidence, EliotdLiveReceipt, ProcessStartReceipt};
+#[cfg(not(windows))]
+use eliot_process::ProcessStartReceipt;
+#[cfg(windows)]
+use eliot_process::{
+    EliotdLiveReadyEvidence, EliotdLiveReceipt, ExitDisposition, ProcessExecutionView,
+    ProcessStartReceipt,
+};
 #[cfg(windows)]
 use eliot_runtime_contracts::{
     DaemonChannelCursor, DaemonProgressObservation, DaemonSupervisionRenewalPolicy,
+    RestartOwnerLifecycle,
 };
 use eliot_runtime_contracts::{
     LeaseState, SupervisionGenerationBinding, SupervisionLeaseIncarnationBinding,
@@ -50,6 +59,107 @@ fn observe_supervision(event: &'static str, outcome: &'static str) {
 
 pub(crate) const fn daemon_status_proves_ready(status: &DaemonRuntimeStatus) -> bool {
     matches!(status, DaemonRuntimeStatus::Ready)
+}
+
+// ============================================================================
+// Automatic-restart refusals for the Kernel-supervised child (I14.10, #1682 W3).
+//
+// The class rule itself - permanent, transient, temporary - lives in
+// `eliot_runtime_contracts::restart_policy::decide_automatic_restart`, and it is
+// not restated here. Calling it needs a whole `RestartPolicyV1`, and no
+// admitted configuration in this workspace carries the eight
+// `RestartIntensityPolicy` values such a declaration requires:
+// `bins/eliot-kernel/src/kernel_config.rs:28-119` is the Kernel's complete
+// admitted configuration and has no restart-intensity field, and
+// `RestartIntensityPolicy` is never constructed anywhere in the repository
+// (`crates/foundation/eliot-runtime-contracts/src/restart_policy.rs:85` is its
+// only declaration). I08-12 keeps those numbers in config and fault profiles,
+// so inventing them here is forbidden and reading them from `main` is not
+// possible. The class-permission half of W3 therefore stays unwired until that
+// profile exists, and is named rather than faked.
+//
+// What is bound here is the half that is about *refusing* rather than about
+// budgets: the two preconditions that `decide_automatic_restart` consults
+// before any class is read, and which no class may bypass. Both are refusals.
+// Neither can admit a replacement, so binding them can only ever remove an
+// automatic restart that would otherwise have happened; neither widens what
+// restarts, and neither is a second copy of the class rule.
+
+/// Why the Kernel refuses an automatic replacement before any declared restart
+/// class is consulted.
+#[cfg(windows)]
+pub(crate) enum DaemonRestartRefusal {
+    /// The owner is draining, stopping, retiring or not yet admitted, so a
+    /// deliberate going-away is not a failure to retry.
+    OwnerLifecycle,
+    /// The process owner recorded no exit, or recorded one it could not
+    /// classify. That is not a proved normal exit and not a proved abnormal
+    /// one, so it may not buy a replacement under any class.
+    ExitIdentityNotProved,
+}
+
+/// Maps the owner's own lifecycle onto the value the class rule reads, so a
+/// deliberate going-away is never mistaken for a failure to retry.
+///
+/// Draining and stopping are planned shutdown; `ManualRecovery` is retirement;
+/// the pre-activation states and a closed-admission failure are quiescing.
+/// Only an admitted, control-open state is `Running`, so a planned shutdown,
+/// a cancellation and a retirement cannot provoke an automatic-restart loop.
+#[cfg(windows)]
+const fn daemon_owner_restart_lifecycle(state: KernelServiceState) -> RestartOwnerLifecycle {
+    match state {
+        KernelServiceState::Activating
+        | KernelServiceState::Ready
+        | KernelServiceState::Degraded => RestartOwnerLifecycle::Running,
+        KernelServiceState::Draining | KernelServiceState::Stopped => {
+            RestartOwnerLifecycle::PlannedShutdown
+        }
+        KernelServiceState::ManualRecovery => RestartOwnerLifecycle::Retiring,
+        KernelServiceState::Cold
+        | KernelServiceState::Reconciling
+        | KernelServiceState::ShadowNoAuthority
+        | KernelServiceState::HandoffPrepared
+        | KernelServiceState::Failed => RestartOwnerLifecycle::Quiescing,
+    }
+}
+
+/// Returns the refusal that applies to one observed previous generation, or
+/// `None` when neither precondition blocks a replacement.
+///
+/// `view` is the process owner's exact observation of the generation being
+/// replaced, not liveness and not a PID. The physical `ExitDisposition` it
+/// records is the only exit identity that exists: a clean exit code, a signal
+/// or resource-limit stop, and a deliberate cancel are all classifiable, and
+/// which of them may buy a replacement is the class rule's decision, not this
+/// function's. Only the unclassifiable case is refused here.
+#[cfg(windows)]
+pub(crate) fn daemon_refuses_replacement(
+    owner_state: KernelServiceState,
+    view: &ProcessExecutionView,
+) -> Option<DaemonRestartRefusal> {
+    if daemon_owner_restart_lifecycle(owner_state) != RestartOwnerLifecycle::Running {
+        return Some(DaemonRestartRefusal::OwnerLifecycle);
+    }
+    match view.exit() {
+        None => Some(DaemonRestartRefusal::ExitIdentityNotProved),
+        Some(exit) => match exit.disposition() {
+            ExitDisposition::Unknown => Some(DaemonRestartRefusal::ExitIdentityNotProved),
+            ExitDisposition::Completed
+            | ExitDisposition::Signalled
+            | ExitDisposition::ResourceLimit
+            | ExitDisposition::Cancelled => None,
+        },
+    }
+}
+
+/// Bounded reason for a refusal, for the diagnostics facade. It is a fixed
+/// vocabulary, so no owner payload can reach an observation.
+#[cfg(windows)]
+pub(crate) const fn daemon_restart_refusal_reason(refusal: &DaemonRestartRefusal) -> &'static str {
+    match refusal {
+        DaemonRestartRefusal::OwnerLifecycle => "owner_lifecycle_suppressed",
+        DaemonRestartRefusal::ExitIdentityNotProved => "exit_identity_not_proved",
+    }
 }
 
 pub(crate) struct DaemonRuntimeState {

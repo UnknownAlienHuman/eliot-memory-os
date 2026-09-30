@@ -31,7 +31,8 @@
 //! - [`HandoffRecoveryFinish`] binds the observed outcome to the existing
 //!   [`HandoffCausalLink`](crate::HandoffCausalLink) and the attempt-bound
 //!   intent only after the required checks, reconciling repeats instead of
-//!   launching another worker;
+//!   launching another worker, and advances the intent to executed only when
+//!   the bound worker actually executes;
 //! - [`recover_handoff`] runs these owners in order so every helper has a
 //!   real caller: registry permit, evidence, gate, dispatcher, effect
 //!   reconciliation, rebuild request, and finish.
@@ -189,6 +190,18 @@ impl HandoffCaptureRegistry {
         }
     }
 
+    /// Returns the registered capture operation for one checkpoint, if any.
+    ///
+    /// The canonical persistence caller reads the registration before
+    /// committing, so a second capture of the same checkpoint replays the
+    /// same operation instead of registering over durable acceptance.
+    pub fn operation(
+        &self,
+        checkpoint_id: &HandoffCheckpointId,
+    ) -> Option<&HandoffCaptureOperation> {
+        self.operations.get(checkpoint_id.as_str())
+    }
+
     /// Reconciles a lost commit response against the registered operation.
     ///
     /// The operation keeps its identity: reconciling never mints a second
@@ -243,6 +256,35 @@ impl HandoffCaptureRegistry {
 pub struct HandoffProviderHook;
 
 impl HandoffProviderHook {
+    /// Records an honestly observed internal provider compaction as a gap.
+    ///
+    /// The gap carries the provider and the observed cause only: no private
+    /// native reasoning or transcript is serialized, and no checkpoint is
+    /// claimed to have preceded the compaction. Continuation under the
+    /// returned gap stays restricted to the explicitly partial/rehydrated
+    /// path through [`Self::admit_continuation`], and every other continuity
+    /// is refused with the dependent action.
+    ///
+    /// STITCH: adapter/fabric entrypoints that observe an internal
+    /// compaction without a controllable pre-hook record here. No provider
+    /// adapter on main offers such a pre-hook (the claude/codex/opencode
+    /// adapters launch sidecars and only measure compaction as probe
+    /// telemetry), so every observed provider compaction records a gap
+    /// rather than claiming a preceding capture.
+    pub fn record_internal_compaction(
+        provider_ref: PublicReference,
+        cause: String,
+    ) -> Result<HandoffProviderGap, HandoffRecoveryError> {
+        validate_text(&cause, "provider_gap.cause")?;
+        let gap = HandoffProviderGap {
+            provider_ref,
+            capability: HandoffProviderCompactionCapability::InternalCompactionWithoutPreHook,
+            cause,
+        };
+        gap.validate()?;
+        Ok(gap)
+    }
+
     /// Admits or refuses continuation for one provider observation.
     pub fn admit_continuation(
         capability: HandoffProviderCompactionCapability,
@@ -474,6 +516,26 @@ pub enum HandoffResumeAdmission {
     },
 }
 
+/// Requires the resume intent to name the handoff and target attempt the
+/// retained link binds.
+///
+/// A crossed intent — the right target under the wrong handoff, or a stale
+/// target — is refused as a stale resume request before any authority,
+/// dispatch, or binding step can act on it, so it can never launch another
+/// worker.
+fn require_intent_for_link(
+    intent: &HandoffResumeIntent,
+    link: &HandoffCausalLink,
+) -> Result<(), HandoffRecoveryError> {
+    if intent.handoff_id != link.handoff_id || intent.target_attempt_id != link.target_attempt_id {
+        return Err(HandoffCheckpointError::StaleResumeRequest {
+            handoff_id: intent.handoff_id.as_str().to_owned(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 /// Resume/revalidation owner (I12.17, I7.15).
 ///
 /// The gate consumes the complete retained payload with its carried
@@ -496,6 +558,7 @@ impl HandoffResumeGate {
         intent.validate()?;
         let retained = evidence.retained()?;
         retained.validate()?;
+        require_intent_for_link(intent, &retained.link)?;
         if !observations.authority_readback_available {
             return Err(HandoffRecoveryError::AuthorityReadbackUnavailable);
         }
@@ -837,6 +900,9 @@ pub struct HandoffRebuildRequest {
     pub recipe_ref: PublicReference,
     /// Changed generation or fence members, named explicitly.
     pub changed_members: Vec<String>,
+    /// Resume-time revalidation the rebuild derives from, carried together
+    /// with the checkpoint, recipe and fence for the external caller.
+    pub revalidation: HandoffResumeRevalidation,
     /// Derived summaries admitted against this request so far.
     pub summaries: Vec<HandoffDerivedSummary>,
 }
@@ -867,6 +933,7 @@ impl HandoffRebuildRequest {
             delta,
             recipe_ref,
             changed_members: changed_generation_members(&retained.revalidation),
+            revalidation: retained.revalidation.clone(),
             summaries: Vec::new(),
         })
     }
@@ -911,6 +978,7 @@ impl HandoffRecoveryFinish {
     ) -> Result<Option<HandoffCausalLink>, HandoffRecoveryError> {
         retained.validate()?;
         intent.reconcile(request)?;
+        require_intent_for_link(intent, &retained.link)?;
         if !matches!(
             observed,
             HandoffResumeStatus::ResumeAdmitted | HandoffResumeStatus::ResumedExecution
@@ -939,6 +1007,28 @@ impl HandoffRecoveryFinish {
                 Ok(Some(bound))
             }
         }
+    }
+
+    /// Advances an admitted intent to executed when the bound worker actually
+    /// executes.
+    ///
+    /// The transition reconciles the same target intent, so a repeated
+    /// execution report observes the recorded stage instead of launching
+    /// again, and a stale request naming another target is refused. Only an
+    /// admitted intent advances: every earlier state has no launched worker
+    /// to report, and an already-executing intent admits no second launch.
+    pub fn mark_executed(
+        intent: &mut HandoffResumeIntent,
+        request: &HandoffResumeIntent,
+    ) -> Result<(), HandoffRecoveryError> {
+        intent.reconcile(request)?;
+        if !intent.admits_execution() {
+            return Err(HandoffRecoveryError::OutcomeNotAdmissible {
+                status: intent.status,
+            });
+        }
+        intent.advance(HandoffResumeStatus::ResumedExecution)?;
+        Ok(())
     }
 }
 
@@ -1038,9 +1128,15 @@ fn advance_floor(
 /// complete retained payload, admits the resume under fresh authority,
 /// dispatches the continuity branch, reconciles every in-flight operation
 /// without duplicating launch or tools, derives the rebuild request when a
-/// changed generation fences the retained authority, and binds the outcome
-/// to the causal link and intent. A blocked dependent action returns a
-/// diagnostic admission with no dispatch, no rebuild, and no bound link.
+/// changed generation fences the retained authority, and binds the admitted
+/// outcome to the causal link and intent. The bound status is
+/// [`HandoffResumeStatus::ResumeAdmitted`]: the bound worker may be launched,
+/// and the resume owner advances the intent to
+/// [`HandoffResumeStatus::ResumedExecution`] through
+/// [`HandoffRecoveryFinish::mark_executed`] only when the worker actually
+/// executes, so admitted and executed resumes stay distinct. A blocked
+/// dependent action returns a diagnostic admission with no dispatch, no
+/// rebuild, and no bound link.
 pub fn recover_handoff(
     inputs: &HandoffRecoveryInputs<'_>,
     intent: &mut HandoffResumeIntent,
@@ -1094,7 +1190,7 @@ pub fn recover_handoff(
         intent,
         inputs.resume_request,
         inputs.link,
-        HandoffResumeStatus::ResumedExecution,
+        HandoffResumeStatus::ResumeAdmitted,
     )?;
     Ok(HandoffRecoveryOutput {
         admission,

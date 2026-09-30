@@ -17,6 +17,13 @@
 //! dispatch presentation and its sealed receipt
 //! ([`ProviderAdmission::bind_admitted_dispatch`]); carrying them is not the
 //! same as being bound to this operation.
+//!
+//! The same reasoning applies to the bounded submit projection the provider is
+//! actually given: it is a third record, not a restatement of the admission, so
+//! [`ProviderAdmission::validate_submit_binding`] re-proves the eight bound
+//! identities by value against this record before the executor is contacted.
+//! Without it the delivered digest would be identical for two operations that
+//! differ in exactly those identities.
 
 use eliot_contracts::{ContractVersion, EpochId, StateFence, fences_match_exact};
 use eliot_kernel_service::{ResearchProviderDispatch, ResearchProviderDispatchReceipt};
@@ -63,7 +70,11 @@ impl AdmissionRefusal {
 /// - `module_id` / `module_generation_id` are Module/Capability Registry
 ///   evidence *references* (cf. `EliotdLiveSupervisionEvidence`): they
 ///   correlate the operation with a catalogued generation without granting
-///   authority or re-issuing admission.
+///   authority or re-issuing admission. They are compared by value against the
+///   Kernel's own attested dispatch content, which is what makes them
+///   trustworthy as references; they are **not** yet resolved through a
+///   `CapabilityCellRegistry` record, because none naming the research-provider
+///   cell exists. See the ASSUMPTION note on [`ProviderAdmission::module_id`].
 /// - `inquiry_digest` / `denominator_digest` bind the frozen Researcher
 ///   inquiry and its exact source-role portfolio / coverage denominator. A
 ///   coverage or absence claim must name its scope, revision, and the method
@@ -204,12 +215,36 @@ impl ProviderAdmission {
     }
 
     /// Returns the Module Registry evidence reference.
+    ///
+    /// ASSUMPTION (named gap, W2): this is a Kernel-issued **reference** whose
+    /// content is re-proved against the live authority, but it is not yet
+    /// resolved through a Module/Capability Registry. The `CapabilityCellRegistry`
+    /// type and its fail-closed validator exist in `eliot-contracts`, and
+    /// `eliot-runtime-status` has the `resolve_generation_via_registry`
+    /// readback, but **no generated registry record names the research-provider
+    /// cell**: the only registry record compiled into the tree is the generated
+    /// native-worker cell in `bins/eliot-kernel/src/composition_bootstrap.rs`,
+    /// and `workstreams/core-daemons/capability-cell-registry.contract.toml`
+    /// lists `research_provider` only as an `[[inventory_family]]` (a process
+    /// name and its source paths) while the same file's `[confirmed_gap]`
+    /// states the executable registry is still missing. `git grep
+    /// capability_cell -- bins/eliot-mod-research` returns nothing.
+    ///
+    /// The owner that must supply it is #13 (the generated current-pair
+    /// `CapabilityCellRegistry` and its research-provider cell record). Binding
+    /// this field to a registry that does not exist would mean inventing the
+    /// authority it is supposed to prove, so the reference stays exactly as
+    /// strong as the evidence behind it and no stronger.
     #[must_use]
     pub fn module_id(&self) -> &str {
         &self.module_id
     }
 
     /// Returns the Module generation evidence reference.
+    ///
+    /// Carries the same named gap as [`ProviderAdmission::module_id`]: bound by
+    /// value against the Kernel's own attested dispatch content, not yet
+    /// resolved through a Module/Capability Registry record.
     #[must_use]
     pub fn module_generation_id(&self) -> &str {
         &self.module_generation_id
@@ -324,6 +359,69 @@ impl ProviderAdmission {
             || request.protocol_revision != self.protocol_revision
             || request.required_schema != self.required_schema
             || request.coverage_goal != self.coverage_goal
+        {
+            return Err(AdmissionRefusal::RequestMismatch);
+        }
+        Ok(())
+    }
+
+    /// Re-proves that a delivered submit binding carries exactly this admitted
+    /// operation's eight bound identities.
+    ///
+    /// [`ProviderAdmission::bind_admitted_dispatch`] proves this record against
+    /// the Kernel, and [`ProviderAdmission::validate_request`] proves an
+    /// exchange request against this record. Neither covers the third record in
+    /// the chain: the bounded submit projection whose canonical digest is the
+    /// value actually handed to the provider through the admitted argv. Before
+    /// this method the projection carried correlation and route only, so the
+    /// digest the provider was given was — arithmetically — the same digest for
+    /// two operations differing in artifact, config, protocol, Module Registry
+    /// evidence, generation, epoch, fence, privacy class, ceilings or
+    /// cancellation identity.
+    ///
+    /// Every field is therefore read from this record's own accessors and
+    /// compared by value, with the same comparison strength the Kernel-facing
+    /// proof uses: [`EpochId::is_same_authority`] for the exact lineage/sequence
+    /// tuple, [`fences_match_exact`] for the fence (both directions, no
+    /// one-directional `None` wildcard), and the crate's `admitted_disclosure_wire`
+    /// projection so the comparison reads the Kernel's own privacy vocabulary
+    /// rather than a second one. The two digests and the artifact digest are
+    /// compared as exact strings; no value is re-derived, defaulted or widened.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdmissionRefusal::RequestMismatch`] when any bound identity
+    /// disagrees with this record, and [`AdmissionRefusal::EpochFenceConflict`]
+    /// when the carried epoch disagrees with the carried fence authority epoch
+    /// (a binding whose own two fields contradict each other is refused before
+    /// either is compared to this record). There is no partial acceptance and no
+    /// second reason code.
+    pub fn validate_submit_binding(
+        &self,
+        binding: &crate::protocol::SubmitBinding,
+    ) -> Result<(), AdmissionRefusal> {
+        // The binding's own epoch/fence pair must be self-consistent before it
+        // is compared to this record, otherwise a binding could name one epoch
+        // and a fence admitted under another and still match on the epoch.
+        if !binding
+            .authority_epoch
+            .is_same_authority(&binding.state_fence.authority_epoch)
+        {
+            return Err(AdmissionRefusal::EpochFenceConflict);
+        }
+        if binding.operation_id != self.operation_id.as_str()
+            || binding.executable_sha256 != self.bridge.executable_sha256()
+            || binding.config_digest != self.config_digest
+            || binding.protocol_digest != self.protocol_digest
+            || binding.module_id != self.module_id
+            || binding.module_generation_id != self.module_generation_id
+            || binding.process_generation != self.process_generation.get()
+            || !binding.authority_epoch.is_same_authority(&self.epoch)
+            || !fences_match_exact(&binding.state_fence, &self.fence)
+            || binding.disclosure != admitted_disclosure_wire(self.disclosure)
+            || binding.budget_units != self.budget_units
+            || binding.deadline_ms != self.deadline_ms
+            || binding.cancellation_id != self.cancellation_id
         {
             return Err(AdmissionRefusal::RequestMismatch);
         }

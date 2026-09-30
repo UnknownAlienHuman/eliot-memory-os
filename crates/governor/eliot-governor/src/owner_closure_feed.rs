@@ -20,11 +20,13 @@
 //!
 //! // On provider-revision advance and on recovery, with the canonical
 //! // read client, the Kernel publish port, the owner snapshot, the live
-//! // fence, the origin selector, the record bound, and the exact expected
-//! // graph revision:
+//! // fence, the origin selector, the record bound, the exact expected
+//! // graph revision, and the admitted revocation operation identity this
+//! // restore runs under:
 //! let bound = synchronize_owner_feed(
 //!     &reads, &kernel_publish_port,
 //!     snapshot, state_fence, origin_ref, max_records, expected_revision,
+//!     operation,
 //! ).await?;
 //! ```
 //!
@@ -36,7 +38,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_authority::{CrossRootQuarantineEvidence, RevocationHistoryEvidence};
+use eliot_authority::{
+    CrossRootQuarantineEvidence, RevocationHistoryEvidence, RevocationOperationIdentity,
+};
 use eliot_contracts::{StateFence, canonical_json_bytes};
 use eliot_kernel_core::{GovernorClosureRestore, owner_bundle_digest};
 use eliot_receipts::ReceiptIdentity;
@@ -137,6 +141,17 @@ pub async fn publish_owner_feed<P: OwnerPublishPort + ?Sized>(
 /// trigger is stale and the call refuses before any publish. Unavailable
 /// history, fence disagreement, stale evidence, and readback mismatch
 /// all refuse before any owner state is installed or claimed.
+///
+/// `operation` is the admitted revocation operation identity this
+/// feed's restore runs under, supplied by the durable boundary and
+/// forwarded verbatim. It is required, never defaulted: the snapshot,
+/// the history evidence, and the receipt maps carry none of its five
+/// coordinates, so deriving one here would fabricate the very identity
+/// the closure recheck is meant to be audited against.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the durable feed boundary keeps read, publish, fence, roots, history, revision, and the admitted operation identity explicit"
+)]
 pub async fn synchronize_owner_feed<
     R: CanonicalReadClient + ?Sized,
     P: OwnerPublishPort + ?Sized,
@@ -148,6 +163,7 @@ pub async fn synchronize_owner_feed<
     origin_refs: &[String],
     max_records: u32,
     expected_revision: u64,
+    operation: RevocationOperationIdentity,
 ) -> Result<u64, CompositionError> {
     synchronize_owner_feed_with_canonical_receipts(
         reads,
@@ -158,6 +174,7 @@ pub async fn synchronize_owner_feed<
         max_records,
         expected_revision,
         BTreeMap::new(),
+        operation,
     )
     .await
 }
@@ -165,9 +182,12 @@ pub async fn synchronize_owner_feed<
 /// Runs the owner feed with canonical second-phase links read from the
 /// durable ORS boundary. The map is never reconstructed from process-local
 /// state; an absent link remains explicitly pending.
+///
+/// `operation` carries the same admitted identity
+/// [`synchronize_owner_feed`] requires, forwarded verbatim.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the durable feed boundary keeps read, publish, fence, roots, history, revision, and canonical receipt evidence explicit"
+    reason = "the durable feed boundary keeps read, publish, fence, roots, history, revision, canonical receipt evidence, and the admitted operation identity explicit"
 )]
 pub async fn synchronize_owner_feed_with_canonical_receipts<
     R: CanonicalReadClient + ?Sized,
@@ -181,6 +201,7 @@ pub async fn synchronize_owner_feed_with_canonical_receipts<
     max_records: u32,
     expected_revision: u64,
     canonical_receipts: BTreeMap<String, ReceiptIdentity>,
+    operation: RevocationOperationIdentity,
 ) -> Result<u64, CompositionError> {
     synchronize_owner_feed_with_quarantine_evidence(
         reads,
@@ -192,6 +213,7 @@ pub async fn synchronize_owner_feed_with_canonical_receipts<
         expected_revision,
         canonical_receipts,
         BTreeMap::new(),
+        operation,
     )
     .await
 }
@@ -200,9 +222,26 @@ pub async fn synchronize_owner_feed_with_canonical_receipts<
 /// quarantine evidence records read from the durable boundary. Neither map
 /// is reconstructed from process-local state; absent evidence leaves the
 /// affected omissions explicitly unresolved.
+///
+/// `operation` is the admitted principal, task, work scope, observing
+/// receipt, and causal transaction position the restored provider's
+/// origin-bound recheck and every served closure verdict run under. It is
+/// required, not defaulted, because nothing reachable from this boundary
+/// holds it: the owner snapshot is a grant/effect payload, the decoded
+/// history is a fence, a durable source revision, and per-closure owner
+/// namespace/digest/bounds records, and the two evidence maps are
+/// per-root link and quarantine records. The graph is a pure authority
+/// evaluator with no plan, no scope binding, and no Store readback, so
+/// no coordinate is derivable here. Reusing `origin_ref` as the principal
+/// or work scope, or mapping `source_revision` into a transaction
+/// sequence, would restate the operation's own subject as its identity
+/// and break the audit the recheck exists to provide. The durable
+/// boundary that admitted this operation supplies it, already refused by
+/// `RevocationOperationIdentity::admit` if any coordinate is blank,
+/// control-bearing, or carries no `transaction_sequence`.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the durable feed boundary keeps read, publish, fence, roots, history, revision, canonical receipt evidence, and quarantine evidence explicit"
+    reason = "the durable feed boundary keeps read, publish, fence, roots, history, revision, canonical receipt evidence, quarantine evidence, and the admitted operation identity explicit"
 )]
 pub async fn synchronize_owner_feed_with_quarantine_evidence<
     R: CanonicalReadClient + ?Sized,
@@ -217,6 +256,7 @@ pub async fn synchronize_owner_feed_with_quarantine_evidence<
     expected_revision: u64,
     canonical_receipts: BTreeMap<String, ReceiptIdentity>,
     quarantine_evidence: BTreeMap<String, CrossRootQuarantineEvidence>,
+    operation: RevocationOperationIdentity,
 ) -> Result<u64, CompositionError> {
     if expected_revision == 0 {
         return Err(CompositionError::Owner(
@@ -304,6 +344,7 @@ pub async fn synchronize_owner_feed_with_quarantine_evidence<
         state_fence,
         canonical_receipts,
         quarantine_evidence,
+        operation,
     )?;
     if let Some(expected_registry) = durable_registry {
         let actual_registry = provider.export_registry()?;

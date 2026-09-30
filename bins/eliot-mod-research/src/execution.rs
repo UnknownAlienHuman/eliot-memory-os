@@ -28,6 +28,7 @@ use thiserror::Error;
 
 use crate::BridgeError;
 use crate::admission::ProviderAdmission;
+use crate::admitted_disclosure_wire;
 use crate::evidence::{CancellationEvidence, RawProviderEvidence, exit_code_of, sha256_hex};
 use crate::protocol::{
     RESEARCH_PROVIDER_WIRE_VERSION, ResultFrame, SubmitAck, SubmitEnvelope, scan_result_frame,
@@ -69,8 +70,13 @@ pub enum RequestPortError {
 /// canonical request digest the minted request must execute for; the second is
 /// the digest of the bounded submit projection that the minted request's argv
 /// must carry, so the provider can verify exactly which request it answers.
-/// The bridge re-validates the returned request against both before the
-/// executor is contacted.
+/// That projection now covers the eight admitted identities (artifact/config/
+/// protocol digest, Module/Capability Registry evidence, process generation,
+/// Authority Epoch, State Fence, privacy/data class, budget/deadline and
+/// cancellation identity), so the digest is a commitment to all of them rather
+/// than to correlation alone. The bridge re-validates the returned request
+/// against both before the executor is contacted, and re-proves the
+/// projection's own content against the admission.
 pub trait ResearchRequestPort: Send + Sync {
     /// Binds one admitted operation to exactly one authorized process request.
     ///
@@ -301,10 +307,11 @@ impl ProviderBridge {
     /// Order (all fail-closed): request/admission binding, submit-binding
     /// projection, port minting, minted-request re-validation (artifact,
     /// operation, generation, epoch, no ambient environment inheritance,
-    /// delivered submit binding), executor start with receipt checks, terminal
-    /// wait with deadline, stream readback with immutable evidence
-    /// materialization, typed ack decode. A provider terminal state that
-    /// cannot be classified returns [`ProviderOutcome::Unknown`] with the
+    /// delivered submit binding, and the delivered binding's own admitted
+    /// identities re-proved against the admission), executor start with receipt
+    /// checks, terminal wait with deadline, stream readback with immutable
+    /// evidence materialization, typed ack decode. A provider terminal state
+    /// that cannot be classified returns [`ProviderOutcome::Unknown`] with the
     /// evidence preserved, and must be reconciled by operation identity before
     /// any retry.
     pub fn execute(
@@ -312,14 +319,43 @@ impl ProviderBridge {
         admission: &ProviderAdmission,
         request: &ResearchQueryRequest,
     ) -> Result<ProviderExecution, BridgeError> {
-        let binding = build_submit_binding_digests(admission, request)?;
+        let (request_sha256, submit_binding, submit_binding_sha256) =
+            build_submit_binding_digests(admission, request)?;
         let process_request = self
             .port
-            .bind(admission, &binding)
+            .bind(admission, &(request_sha256, submit_binding_sha256.clone()))
             .map_err(|_| BridgeError::ProviderUnavailable)?;
-        let bound = self.bind_operation(admission, request, &binding, process_request)?;
-        let view = self.await_terminal(&bound)?;
+        let bound = self.bind_operation(
+            admission,
+            &submit_binding,
+            &submit_binding_sha256,
+            process_request,
+        )?;
+        let view = self.await_terminal(&bound, self.admitted_wait_bound(admission))?;
         self.finish_terminal(bound, &view)
+    }
+
+    /// Resolves the terminal-lifecycle wait bound for one admitted operation.
+    ///
+    /// The wait used to be [`BOUND_RUN_DEADLINE`] alone, and
+    /// [`ProviderBridge::with_deadline`] was the only way to change it — a
+    /// builder with no production caller, so every real run waited a fixed
+    /// thirty seconds whatever the Kernel admitted. The admitted deadline was
+    /// compared and receipted but governed nothing this process actually
+    /// enforced, which is a carried value, not a bound one.
+    ///
+    /// The bound is now the **lesser** of the two, so it is a strict tightening
+    /// of the existing horizon rather than a replacement of it: a run can never
+    /// wait past the ceiling the Kernel admitted, and it can never wait longer
+    /// than it did before. A deadline already in the past leaves no remaining
+    /// budget at all, which is reported as zero rather than extended, so an
+    /// expired ceiling ends the wait immediately instead of being ignored.
+    fn admitted_wait_bound(&self, admission: &ProviderAdmission) -> Duration {
+        let remaining = crate::dispatch_authority::remaining_admitted_ms(
+            admission,
+            crate::dispatch_authority::unix_ms(),
+        );
+        Duration::from_millis(remaining).min(self.deadline)
     }
 
     /// Re-validates the minted binding, seals the canonical submit envelope,
@@ -328,25 +364,23 @@ impl ProviderBridge {
     fn bind_operation(
         &self,
         admission: &ProviderAdmission,
-        request: &ResearchQueryRequest,
-        binding: &(String, String),
+        submit_binding: &crate::protocol::SubmitBinding,
+        submit_binding_sha256: &str,
         process_request: ProcessRequest,
     ) -> Result<BoundOperation, BridgeError> {
-        let (request_sha256, submit_binding_sha256) = binding;
-        check_minted_request(admission, &process_request, submit_binding_sha256)?;
+        check_minted_request(
+            admission,
+            &process_request,
+            submit_binding,
+            submit_binding_sha256,
+        )?;
         let operation = process_request.operation_id().clone();
         let digest = process_request.invocation_digest().to_owned();
         let generation = process_request.generation();
-        let envelope = SubmitEnvelope {
-            wire_version: RESEARCH_PROVIDER_WIRE_VERSION,
-            operation_id: operation.as_str().to_owned(),
-            exchange_id: request.exchange_id.clone(),
-            idempotency_key: request.idempotency_key.clone(),
-            invocation_digest: digest.clone(),
-            protocol_revision: request.protocol_revision,
-            required_schema: request.required_schema.clone(),
-            request_sha256: request_sha256.clone(),
-        };
+        // The envelope is the delivered binding plus the sealed process-request
+        // digest, so the retained reconciliation record keeps every admitted
+        // identity the provider was bound to instead of only its correlation.
+        let envelope = SubmitEnvelope::from_binding(submit_binding, &digest);
         // These three refusals happen before the executor is contacted, so no
         // provider output exists to retain: `NotAttempted` says exactly that,
         // and is deliberately not the digest of an empty stream.
@@ -359,7 +393,10 @@ impl ProviderBridge {
             })?;
         // Fail-closed serializer check: the retained reconciliation record must
         // decode back to the same operation, and its delivered projection must
-        // be the exact binding the port put in argv.
+        // be the exact binding the port put in argv. Because the projection now
+        // carries the full admitted-identity block, comparing that one digest
+        // re-proves every bound identity survived serialization — a stripped or
+        // altered envelope cannot reproduce the delivered digest.
         let round_trip = SubmitEnvelope::decode(&wire_bytes).map_err(|refusal| {
             BridgeError::ProtocolViolation {
                 reason: refusal.reason(),
@@ -370,7 +407,8 @@ impl ProviderBridge {
         if round_trip.operation_id != envelope.operation_id
             || round_trip.invocation_digest != envelope.invocation_digest
             || round_trip.request_sha256 != envelope.request_sha256
-            || round_trip.binding().digest().ok().as_deref() != Some(submit_binding_sha256.as_str())
+            || round_trip.binding().digest().ok().as_deref() != Some(submit_binding_sha256)
+            || round_trip.binding() != *submit_binding
         {
             return Err(BridgeError::ProtocolViolation {
                 reason: "submit envelope failed its round-trip binding check",
@@ -387,7 +425,7 @@ impl ProviderBridge {
             invocation_digest: digest.clone(),
             process_generation: generation.get(),
             submission: SubmissionRecord {
-                submit_binding_sha256: submit_binding_sha256.clone(),
+                submit_binding_sha256: submit_binding_sha256.to_owned(),
                 envelope_sha256: sha256_hex(&wire_bytes),
                 envelope_bytes: wire_bytes.clone(),
             },
@@ -429,7 +467,7 @@ impl ProviderBridge {
             operation,
             digest,
             wire_bytes,
-            submit_binding_sha256: submit_binding_sha256.clone(),
+            submit_binding_sha256: submit_binding_sha256.to_owned(),
         })
     }
 
@@ -439,6 +477,11 @@ impl ProviderBridge {
     /// captured streams back so the provider's real stdout/stderr survive as
     /// evidence, and stays explicit: the outcome is unconfirmed and
     /// reconciliation by operation identity is required before any retry.
+    ///
+    /// `wait_bound` is the already-resolved admitted ceiling from
+    /// [`ProviderBridge::admitted_wait_bound`]; it is passed in rather than
+    /// read from `self` so this arm can only ever overrun by a value the
+    /// admission actually carried.
     ///
     /// The deadline observation is captured FIRST, because it is the primary
     /// cause of this failure. Cancellation and stream readback are then two
@@ -451,6 +494,7 @@ impl ProviderBridge {
     fn await_terminal(
         &self,
         bound: &BoundOperation,
+        wait_bound: Duration,
     ) -> Result<eliot_process::ProcessExecutionView, BridgeError> {
         let started = Instant::now();
         loop {
@@ -464,7 +508,7 @@ impl ProviderBridge {
             if view.lifecycle().is_terminal() {
                 return Ok(view);
             }
-            if started.elapsed() >= self.deadline {
+            if started.elapsed() >= wait_bound {
                 // Cancellation and stream readback are independent: each is
                 // attempted and each keeps its own typed outcome. Neither may
                 // erase the deadline, and neither may erase a receipt the other
@@ -688,6 +732,18 @@ impl ProviderBridge {
 /// argv carries the digest it computed itself, so a port that projected a
 /// different binding is refused before the executor is contacted.
 ///
+/// The projection carries the eight identities issue #24 requires the provider
+/// to be bound to — exact artifact/config/protocol digest, Module/Capability
+/// Registry evidence, process generation, Authority Epoch, State Fence,
+/// privacy/data class, budget/deadline and cancellation identity. Every one is
+/// read from a [`ProviderAdmission`] accessor; none is derived, defaulted or
+/// widened here, and the assembled projection is immediately re-proved against
+/// the same record by [`ProviderAdmission::validate_submit_binding`] before it
+/// is returned, so this function cannot hand out a binding that merely *looks*
+/// admitted. That self-check is what makes the digest comparison on the
+/// mint-time side meaningful: both sides compare against a projection already
+/// proven equal to the admission.
+///
 /// A coverage or absence claim must name its scope, revision, and the method
 /// by which the denominator can be checked independently (A05.07). The frozen
 /// inquiry's exact source-role portfolio / coverage denominator digest is bound
@@ -697,9 +753,10 @@ impl ProviderBridge {
 /// # Errors
 ///
 /// Returns [`BridgeError::NotAdmitted`] when the request or the admission fails
-/// validation, the coverage denominator digest is malformed, or the two
-/// disagree on a bound dimension; and [`BridgeError::ProtocolViolation`] when
-/// the request or the projection cannot be encoded.
+/// validation, the coverage denominator digest is malformed, the two disagree on
+/// a bound dimension, or the assembled projection does not re-prove against the
+/// admission; and [`BridgeError::ProtocolViolation`] when the request or the
+/// projection cannot be encoded.
 pub fn build_submit_binding(
     admission: &ProviderAdmission,
     request: &ResearchQueryRequest,
@@ -734,17 +791,39 @@ pub fn build_submit_binding(
         protocol_revision: request.protocol_revision,
         required_schema: request.required_schema.clone(),
         request_sha256: request_sha256.clone(),
+        executable_sha256: admission.bridge().executable_sha256().to_owned(),
+        config_digest: admission.config_digest().to_owned(),
+        protocol_digest: admission.protocol_digest().to_owned(),
+        module_id: admission.module_id().to_owned(),
+        module_generation_id: admission.module_generation_id().to_owned(),
+        process_generation: admission.process_generation().get(),
+        authority_epoch: admission.epoch().clone(),
+        state_fence: admission.fence().clone(),
+        disclosure: admitted_disclosure_wire(admission.disclosure()).to_owned(),
+        budget_units: admission.budget_units(),
+        deadline_ms: admission.deadline_ms(),
+        cancellation_id: admission.cancellation_id().to_owned(),
     };
+    // Fail-closed: the projection is proven against the record it was read from
+    // before its digest is projected into the admitted argv. A binding whose
+    // digest the provider is given must never be one this record does not own.
+    admission
+        .validate_submit_binding(&binding)
+        .map_err(|refusal| BridgeError::NotAdmitted {
+            reason: refusal.reason(),
+        })?;
     Ok((request_sha256, binding))
 }
 
-/// Returns the exact request digest and delivered submit-binding digest for one
-/// admitted operation.
+/// Returns the exact request digest, the delivered submit binding, and that
+/// binding's canonical digest for one admitted operation.
 ///
 /// This runs before the process request exists, which is exactly why the
 /// delivered projection is the envelope *minus* the process-request digest (see
-/// `protocol`). The pair is the exact material the request-minting port embeds
-/// and the bridge re-checks.
+/// `protocol`). The triple is the exact material the request-minting port
+/// embeds and the bridge re-checks; the binding itself is returned so the
+/// mint-time check can compare its **content** against the admission instead of
+/// only its digest.
 ///
 /// # Errors
 ///
@@ -753,7 +832,7 @@ pub fn build_submit_binding(
 pub fn build_submit_binding_digests(
     admission: &ProviderAdmission,
     request: &ResearchQueryRequest,
-) -> Result<(String, String), BridgeError> {
+) -> Result<(String, crate::protocol::SubmitBinding, String), BridgeError> {
     let (request_sha256, binding) = build_submit_binding(admission, request)?;
     let binding_sha256 = binding
         .digest()
@@ -762,7 +841,7 @@ pub fn build_submit_binding_digests(
             evidence: None,
             disposition: None,
         })?;
-    Ok((request_sha256, binding_sha256))
+    Ok((request_sha256, binding, binding_sha256))
 }
 
 /// Re-validates a port-minted request against the admission before the
@@ -771,9 +850,20 @@ pub fn build_submit_binding_digests(
 /// delivered submit binding in argv, and no ambient environment inheritance
 /// (the child receives only explicit values, so credentials, proxy
 /// configuration, and user resources cannot leak in).
+///
+/// The delivered submit binding is re-proved here by **content**, not only by
+/// digest. The digest in argv proves the port projected the same bytes the
+/// bridge computed; comparing the binding's own fields against the admission
+/// proves those bytes are this operation's admitted identities — exact
+/// artifact/config/protocol digest, Module/Capability Registry evidence,
+/// process generation, Authority Epoch, State Fence, privacy/data class,
+/// budget/deadline and cancellation identity. Without that second comparison a
+/// binding that is self-consistent but foreign would satisfy the digest check
+/// on its own, and the provider would be handed an identity nobody admitted.
 fn check_minted_request(
     admission: &ProviderAdmission,
     request: &ProcessRequest,
+    binding: &crate::protocol::SubmitBinding,
     submit_binding_sha256: &str,
 ) -> Result<(), BridgeError> {
     request.validate().map_err(|_| BridgeError::NotAdmitted {
@@ -815,6 +905,11 @@ fn check_minted_request(
             reason: "minted process request does not carry the delivered submit binding",
         });
     }
+    admission
+        .validate_submit_binding(binding)
+        .map_err(|refusal| BridgeError::NotAdmitted {
+            reason: refusal.reason(),
+        })?;
     Ok(())
 }
 

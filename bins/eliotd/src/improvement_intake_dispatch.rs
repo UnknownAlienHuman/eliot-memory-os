@@ -28,6 +28,39 @@
 //! evidence was. The derivation — and why no `Watchdog` label survives it —
 //! are documented on that function.
 //!
+//! Since #1867 W2/A1 that derivation is LIVE for the conformance source rather
+//! than only declared: the daemon names the observed family at each trigger
+//! site instead of hardcoding one (`daemon_runtime::maintenance_observation`
+//! takes the family as a parameter), so a real declared-capability conformance
+//! gap observed at the startup or improvement-intake sites reaches
+//! [`conformance_diagnosis_evidence`] below and enters the funnel through the
+//! Self-Quality conformance-diagnosis contract.
+//!
+//! # What is still NOT connected, measured rather than asserted
+//!
+//! W2 also names attempts/evaluators, campaign closure, security incidents,
+//! accepted implementation deviations, complaints, Watchdog, Dreamer and
+//! Concilium suggestions. On this tree only the first and the conformance
+//! diagnosis are reachable, and the reasons are recorded per-arm on
+//! [`maintenance_evidence_source`]: a family census shows the only families any
+//! production trigger site can name are [`crate::SELF_OBSERVED_FAMILY`] and
+//! `MaintenanceFamily::DonorConformance`, so every other source needs a
+//! producer that does not exist yet rather than a match arm that is missing
+//! here. The security-incident arm is annotated at the arm itself with the
+//! receipt and trigger site that would make it live; Watchdog, Dreamer and
+//! Concilium have no arm and are annotated as such. None is filled from a
+//! substitute value.
+//!
+//! The decision now also carries its origin —
+//! [`eliot_maintenance::AutomationTriggerDecision::trigger`] is copied verbatim
+//! from the evaluated trigger — so the three suggestion sources are no longer
+//! blocked by a missing field. They remain unselected because the ONE
+//! observation this intake is handed is built from
+//! `MaintenanceTriggerOrigin::IdleTransition`, which maps to
+//! `MaintenanceTrigger::Policy` and can never read `WatchdogProblem`,
+//! `Dreamer` or `Concilium`. The per-source remaining step, which now differs
+//! sharply between them, is recorded on [`maintenance_evidence_source`].
+//!
 //! # The durable port is the existing Governor/Kernel named mutation
 //!
 //! The owner-actionable artifact (candidate revision + brief + owner decision)
@@ -44,12 +77,39 @@
 //!
 //! # What deduplication is and is NOT guaranteed here
 //!
-//! The candidate identity is content-derived
+//! The candidate identity IS content-derived
 //! ([`eliot_improvement::ImprovementCandidate::new`]), so a repeat of the same
-//! observation produces the same `candidate_id`, and therefore the same
-//! `improvement-candidate:<id>` commit key: the store converges on one row
-//! instead of appending a new candidate per cadence tick. That is the durable
-//! half of I12.24's "deduplicated by target surface and evidence lineage".
+//! observation produces the same `candidate_id` and therefore the same
+//! `improvement-candidate:<id>` HANDLE. The IN-MEMORY registry converges on one
+//! entry per candidate for that reason, and
+//! [`crate::improvement_dedup_read::restored_registry`] re-establishes it on
+//! every pass from the committed rows.
+//!
+//! It did NOT previously converge to one STORE row, and this claim used to say
+//! it did. It does not, and the reason is the brief: the committed document
+//! carries `artifact.brief` verbatim ([`commit_improvement_artifact`]), and
+//! [`eliot_improvement::brief_at_safe_boundary`] mints `brief_id` as a fresh
+//! `Uuid::now_v7()` and stamps `created_at` with `OffsetDateTime::now_utc()` on
+//! every call (`crates/meta/eliot-improvement/src/brief.rs:326,337`). The store
+//! keys a learning row by `(record_kind, handle, record_digest)`
+//! (`surreal_learning.rs::learning_row_key`), and the presented
+//! `record_digest` is the digest of those exact document bytes
+//! ([`commit_improvement_artifact`]). A fresh `brief_id` is therefore a fresh
+//! digest, a fresh row id, and a `CREATE` rather than the compare-and-set the
+//! adapter performs on an existing one
+//! (`surreal_learning.rs:189`). One cadence tick over one unchanged occurrence
+//! appends one new row under one unchanged handle. The improvement owner's own
+//! crate records this as the expected behaviour rather than a defect — "a
+//! re-commit under a new digest legitimately produces a second row for the same
+//! candidate" (`candidate_bounds.rs:640-646`) — and the read side tolerates it
+//! by keeping the highest `candidate.revision` per `candidate_id`
+//! (`restored_registry`, `improvement_dedup_read.rs:652-663`).
+//!
+//! Stated plainly because the previous claim was the opposite and would have
+//! been believed: the durable rows accumulate per tick; the convergence is
+//! real only in the registry rebuilt from them. This is also the precondition
+//! publication cannot yet meet — see "The brief reaches no owner, and the
+//! contour that would carry it is absent" below.
 //!
 //! The registry is REBUILT from this daemon's own committed rows, through the
 //! existing authenticated read route
@@ -143,6 +203,128 @@
 //! existing G-19 admission policy record, read through the existing
 //! maintenance owner.
 //!
+//! # The recorded disposition is the DAEMON's own, and no owner ingress exists
+//!
+//! I12.24:65 places "decision owner selects reject / investigate / work item /
+//! experiment" AFTER the brief reaches one, and this module records a
+//! disposition on every pass. What it records is the DAEMON's own
+//! non-authoritative triage of its own observation, under the daemon's own
+//! harness-established identity ([`SERVICE_NAME`]) — never an owner's selection,
+//! because no owner's selection can reach this process. Measured on this tree
+//! rather than assumed:
+//!
+//! | candidate ingress surface | measured result |
+//! |---|---|
+//! | listener / socket / stdin in `bins/eliotd` | ZERO. `TcpListener`, `UnixListener`, `UnixStream`, `read_line`, `accept(` and `stdin()` match nothing under `bins/eliotd` |
+//! | the daemon's only transport | OUTBOUND. `daemon_kernel_client.rs:1885 connect_authenticated_kernel_front_door` is the authenticated named-pipe CLIENT. `eliotd` dials the Kernel; nothing dials `eliotd` |
+//! | the daemon's pull queues | REAL, but wrong-typed. `local_read_claim` (`frame_dispatch.rs:1451`), `task_controller_claim` (`:1498`), `campaign_packet_claim` (`:1500`) and `finish_claim` (`:1506`) are genuine Kernel→daemon routes, and each carries one fixed attempt type. None carries a brief decision, and adding one is a Kernel operation plus a store record kind |
+//! | `eliot_user_automation` / `UserAutomationOperation` | never reaches `eliotd`: `git grep -c user_automation -- bins/eliotd` is 0. Served inside the Kernel, which dispatches a wake to the Host |
+//! | the `DecideImprovementBrief` operation itself | the vocabulary entry is closed, authenticated and live — `daemon_request_dispatch.rs:4214` binds `intent.principal_ref` from `authenticated_user_automation_principal(session)` — and it is REFUSED at both ends: the automation Store answers `StoreError::UnknownOperation` (`user_automation_store.rs:954`) and the operator route answers `TransportError::SessionFenced` (`daemon_request_dispatch.rs:4208-4213`) |
+//! | a durable decision an owner could write for the daemon to read | none. The daemon's read client admits a closed set of named reads (`kernel_context_read_client.rs:190-249`) and `GetUserAutomationState` is not among them; and the only row the daemon re-reads is its OWN `Candidate` artifact, written by this same pass under the same record key, so an owner cannot pre-empt it |
+//!
+//! Two consequences follow, and both are stated rather than worked around:
+//!
+//! 1. **The disposition recorded here is the daemon's own.** `Reject` and
+//!    `Investigate` are both non-mutating, so recording one authorizes nothing
+//!    (I12.24:82: "advisory … default; changes nothing until owner acts"), and
+//!    the artifact is truthful about WHO chose it. What is not true of it is that
+//!    an owner chose it.
+//! 2. **`OwnerDecisionKind::Reject` remains unreachable from a real,
+//!    non-constant source**, and so do `WorkItem` and `Experiment`. That is not
+//!    repaired here, because every available substitute is a fabrication: the
+//!    maintenance owner's own `AutomationDecision` (`eliot-maintenance/src/lib.rs:184`)
+//!    decides whether to run a maintenance JOB and never saw this brief; the
+//!    observed closure's `actor_id` is the principal that EXECUTED the
+//!    consequential attempt and selected nothing; and the `G-19` admission
+//!    authority issues learning-admission PERMITS, which is a different act from
+//!    selecting a disposition over a brief. Mapping any of them onto this
+//!    vocabulary would record an owner's decision that owner never made — the
+//!    misattribution [`maintenance_evidence_source`] exists to remove, reached
+//!    from the other direction.
+//!
+//! # The exact missing route, named
+//!
+//! Reaching I12.24:65 needs three artifacts in three other owners' files:
+//!
+//! 1. a Kernel dispatch arm that COMMITS the authenticated decision as a durable
+//!    row, beside `dispatch_user_automation_operator_transition`
+//!    (`bins/eliot-kernel/src/daemon_request_dispatch.rs:4242`), replacing the
+//!    `SessionFenced` refusal at `:4208-4213` for this one operation. It is
+//!    refused today because the automation Store owns no ordering scope a brief
+//!    can join, which is correct; the commit belongs to the improvement owner's
+//!    own canonical record, not to the automation Store.
+//! 2. a Kernel queue the daemon can claim, beside the existing pull legs in
+//!    `DaemonKernelClient` (`daemon_kernel_client.rs:2130` is the first,
+//!    `claim_local_read_pair_async`; `claim_finish_pair_async` at `:2395` is the
+//!    last), carrying the committed decision's `brief_id`, its closed decision
+//!    string, and the principal the Session authenticated.
+//! 3. the daemon-side poll, in `daemon_runtime::run_improvement_intake`
+//!    (`bins/eliotd/src/daemon_runtime.rs:4791` is the guarded phase it would
+//!    have to precede) — outside this change's two files — which maps the closed
+//!    decision string onto [`OwnerDecisionKind`] FAILING CLOSED on an unmapped
+//!    value, and calls this module with the claimed principal as the owner.
+//!
+//! Until (1) and (2) exist, no code in this repository can make an owner's
+//! selection reach `record_owner_decision`, and this module will not pretend
+//! otherwise.
+//!
+//! # The brief reaches no owner, and the contour that would carry it is absent
+//!
+//! The three artifacts above are the DECISION half of I12.24:65. The BRIEF half
+//! — the arrow that has to arrive first, "concise Improvement Brief to active
+//! Main Agent or Human at a safe boundary", whose load-bearing sentence is
+//! I12.24:74: "The named decision owner does not search raw metrics" — is
+//! missing in a way that is measured here rather than assumed, because it is not
+//! the same gap and it is upstream of the three above.
+//!
+//! ## What the brief is today: a field of this daemon's own row
+//!
+//! [`commit_improvement_artifact`] already writes the brief verbatim into the
+//! `Candidate` learning record's canonical JSON document, as
+//! `{"candidate", "brief", "owner_decision", "enforced_bound",
+//! "governed_admission_digest"}`. So all eight I12.24:74 fields plus
+//! `brief_id` ARE durable, byte-for-byte, through the one governed seam. What
+//! is absent is any route by which a decision OWNER reaches that row. Measured
+//! on this tree:
+//!
+//! | candidate owner-facing surface | measured result |
+//! |---|---|
+//! | `LearningRecordKind` vocabulary | CLOSED at six variants — `Delta`, `Overlay`, `Closure`, `ActivationReceipt`, `Candidate`, `ViewRef` (`learning_store.rs:100-113`). There is NO `Brief` kind, so the brief cannot become a first-class durable record without a store-contract change this file does not own |
+//! | who reads `GetLearningRecordRange` for `Candidate` | the DAEMON ONLY. Three production call sites exist and every one filters a different kind: `improvement_dedup_read.rs:379` asks for `Candidate` and re-proves the daemon's own committed row (its `:849` check is a self-consistency proof of that row, not an owner reading it); `skill_evidence_read.rs:171` and `negative_memory_action_gate.rs:419` both ask for `ActivationReceipt`. `git grep -l GetLearningRecordRange -- "*.cs" -- bins/eliot/src` returns nothing: no Operator surface and no CLI reads any learning record |
+//! | ControlBoard | the `items` vector is a LITERAL `Vec::new()` (`controlboard_adapters.rs:987`), and the comment above it states why: the Governor owners carry no ControlBoard visibility/privacy/epistemic facts and inventing rows "would be a privacy expansion" (`controlboard_projection.rs:23-29`). A brief has no `BoardItem` to land in, and `BoardItem` itself carries no field for benefit, risk, cost, unknowns, or `brief_id` (`eliot-controlboard/src/lib.rs:467-478`) |
+//! | the ControlBoard read edge | not reachable either. `controlboard.read` is admitted by no host request: `daemon_runtime.rs:4144` records that "nothing in this repository presents a host request naming this capability" |
+//! | the canonical notification record | REAL, durable, and Human-read — it is the one owner-facing surface that genuinely exists, and it is the honest candidate. But its closed shape ([`eliot_kernel_core::Notification`], `notification_state.rs:317-337`) has `subject`, `summary`, `evidence_handles`, `affected_scope`, `owner`, `required_action` and no slot for likely benefit, risk, cost, next reversible step, unknowns, or `brief_id`. The brief would have to be re-spelled into `summary` prose, which is the "re-spelled into a log string" failure I12.24:74 exists to prevent, and the record's own `dedup_key` is derived from the maintenance decision (`automation_failure_key`), not from the brief — so two briefs over one trigger would collide onto one record or churn `IdentityConflict` |
+//! | the notification emitter's reachability | it is a free function in another file, `emit_blocked_automation_notification` (`notification_state_emit.rs:582`), reached from the health-heartbeat arm `note_blocked_automation_notification` (`daemon_runtime.rs:2641`). It is not reachable from this module and its signature takes an `AutomationTriggerDecision`, not a brief |
+//! | Host / operator console | `host_console_protocol.rs` serves exactly `Status` and `Stop`; `apps/Eliot.Operator` reads `controlboard.read` and the runtime-status contract only. Neither names a learning record, a brief, or `DecideImprovementBrief` |
+//!
+//! ## The two artifacts a publication would need, in two other owners
+//!
+//! 1. a durable WRITE the brief's own fields can occupy without re-spelling.
+//!    The existing `Candidate` document already carries them, so this half is
+//!    nearly free — but the record's KEY is the candidate id
+//!    (`improvement-candidate:<candidate_id>`), so an owner addressing a BRIEF
+//!    has no handle to name. Naming one needs either a `Brief` variant in the
+//!    closed [`eliot_store_api::LearningRecordKind`] set (`learning_store.rs`,
+//!    `eliot-store-api`) or a stable brief-keyed handle, and the second is
+//!    blocked by the digest churn measured above: with a fresh `brief_id` per
+//!    pass there is no stable brief identity to key on.
+//! 2. an owner-facing READ that projects that record to a Human or an active
+//!    Main Agent. The one contour that could carry it without a new owner is
+//!    the ControlBoard `items` projection, and that is exactly the projection
+//!    the Governor deliberately refuses to populate (the privacy-expansion note
+//!    cited above). Filling it is the ControlBoard/privacy owner's decision,
+//!    not this dispatch layer's.
+//!
+//! Neither is in this file, and neither can be honestly faked here. A
+//! `tracing` span field carrying `brief_id` (`daemon_runtime.rs:5340`) is a
+//! diagnostic, not a publication: nothing outside this process reads it, and no
+//! owner can act on it. So this module states the gap and stops.
+//!
+//! What I12.24:82 already guarantees keeps this honest in the meantime: the
+//! recorded disposition is `Investigate`, one of the kinds `is_non_mutating`
+//! admits, so nothing here changes a surface while the publication contour is
+//! absent.
+//!
 //! # Archive receipts are durable dispositions, not diagnostics (W3)
 //!
 //! The governed admission returns the [`ArchivedCandidate`] receipts the
@@ -231,6 +413,11 @@ const IMPROVEMENT_SURFACE_NAME: ImprovementTargetSurface = ImprovementTargetSurf
 /// sole admission owner for `meta.learning.closure` and
 /// `meta.improvement.promotion_input` candidates
 /// (`crates/governor/eliot-maintenance/src/improvement_admission.rs:3-4`).
+/// It names an ADMISSION authority and nothing else, and is deliberately not
+/// the `owner` of the recorded decision below: that value names the principal
+/// that SELECTED the disposition, and no admission authority has selected one.
+/// See "The recorded disposition is the DAEMON's own, and no owner ingress
+/// exists" in the module documentation.
 const IMPROVEMENT_OWNER: &str = IMPROVEMENT_ADMISSION_AUTHORITY;
 
 /// Closed store scope for durable improvement-candidate learning records.
@@ -326,11 +513,19 @@ pub enum ImprovementDispatchError {
 /// One assembled, owner-actionable improvement artifact over a real
 /// observation, ready to be made durable.
 ///
-/// Every field is a function of the observed maintenance decision; the
-/// `ImprovementBrief` is the exact artifact I12.24:74 requires the decision
+/// Every field is a function of the observed maintenance decision, and the
+/// `ImprovementBrief` carries the exact content I12.24:74 requires a decision
 /// owner to read (problem, evidence, likely benefit, risk, proposed owner,
-/// cost, next reversible step, unknowns) so the owner never searches raw
-/// metrics.
+/// cost, next reversible step, unknowns) — so that content needs no raw-metric
+/// search once it REACHES an owner.
+///
+/// Stated precisely, because the previous wording of this field claimed the
+/// owner does not search raw metrics, and that is not yet true: no
+/// owner-facing contour reads this artifact. It is committed verbatim into the
+/// `Candidate` record and read back only by this daemon's own deduplication
+/// read. The CONTENT is complete; the DELIVERY is absent, and the missing
+/// contour is measured and named under "The brief reaches no owner, and the
+/// contour that would carry it is absent" in the module documentation.
 #[derive(Clone, Debug)]
 pub struct ImprovementArtifact {
     /// The evidence-bound candidate admitted to the deduplication registry.
@@ -457,18 +652,15 @@ pub fn assemble_improvement_artifact(
     enforce_advisory_class_gate(&candidate)?;
 
     // The safe boundary is READ, not spelled. It used to be two formatted
-    // strings (`owner:{IMPROVEMENT_OWNER}` and `boundary:{scope_ref}`), which
+    // strings (a constant owner and a constant `boundary:{scope_ref}`), which
     // satisfied `SafeBoundary::validate` while observing nothing at all: the
-    // owner was a constant and the boundary was the scope this very pass is
-    // about to write, so the check proved nothing about the operation it claims
-    // to gate. `SafeBoundary` now has private fields and one constructor,
-    // `SafeBoundary::from_observed_closure`, which takes both values from a
-    // record the Governor's learning-closure owner actually committed from
-    // owner-recorded lifecycle activities
-    // (`crates/governor/eliot-governor/src/learning_closure.rs:483`). That
-    // boundary is derived by `derive_boundaries`, which refuses an ordinary
-    // read and an empty activity set before anything is committed, per
-    // I12.24:181.
+    // check proved nothing about the operation it claims to gate.
+    // `SafeBoundary::from_observed_closure` takes both values from a record the
+    // Governor's learning-closure owner actually committed from owner-recorded
+    // lifecycle activities (`crates/governor/eliot-governor/src/
+    // learning_closure.rs:483`), and that boundary is derived by
+    // `derive_boundaries`, which refuses an ordinary read and an empty activity
+    // set before anything is committed, per I12.24:181.
     //
     // STATED PLAINLY, because it changes what this pass does: `store` is read
     // from already-committed in-process state and performs no exchange, but an
@@ -510,11 +702,7 @@ pub fn assemble_improvement_artifact(
     );
     // What the observed closure actually concluded about behaviour, read
     // through the record's own predicates rather than re-spelled here.
-    let observed_effect = if observed.carries_behavioural_proposal {
-        "and proposes a next-behaviour change for the next attempt"
-    } else {
-        "and closed with no next-behaviour change proposed"
-    };
+    let observed_effect = observed_behaviour_effect(&observed);
     // The two values below are the boundary's OWN observed strings, so the
     // boundary this brief describes and the boundary it is gated on are
     // literally the same value.
@@ -559,24 +747,69 @@ pub fn assemble_improvement_artifact(
         &boundary,
     )?;
 
-    // The daemon's owner records a non-mutating `Investigate` disposition: the
-    // artifact is real and actionable, and recording it changes nothing. This
-    // is the production caller of the bridge's
-    // `record_brief_decision`, which previously had none.
+    // The disposition recorded here is the DAEMON'S OWN, and is named that way.
     //
-    // The `owner` here is the maintenance (`G-19`) admission authority and is
-    // deliberately NOT the brief's `proposed_owner`: this field names the
-    // principal that RECORDED this disposition, which the maintenance owner is
-    // (it issued the permit this candidate was assembled under), whereas the
-    // brief's `proposed_owner` names the principal proposed to decide. Naming
-    // the same constant in both would be the incoherence this region exists to
-    // remove; naming them differently, with the difference stated here, is what
-    // makes each field mean one thing.
+    // It is still the production caller of the bridge's `record_brief_decision`,
+    // which previously had none, and it is still non-mutating: `Investigate` is
+    // one of the two kinds `is_non_mutating` admits, and recording it changes
+    // no surface, which is I12.24:82's "advisory … default; changes nothing
+    // until owner acts" observed rather than asserted.
+    //
+    // What changed is the `owner`. It used to be [`IMPROVEMENT_OWNER`], the
+    // maintenance (`G-19`) admission authority, on the reasoning that this field
+    // names the principal that RECORDED the disposition and the maintenance owner
+    // is that principal because it issued the permit this candidate was assembled
+    // under. That reasoning was wrong, and it is the same error this issue
+    // exists to remove, read from the other side. Issuing a learning-admission
+    // permit is a different act from selecting a disposition over a brief: the
+    // `G-19` owner admitted the CANDIDATE to the bounded backlog, and it never
+    // saw this brief, never read it, and chose nothing about it. Recording its
+    // name against a disposition it did not select is precisely the false
+    // attribution A12.02:3 forbids — "Identity is not a model's self-declared
+    // string" — with the failure running the other way: not a model inventing an
+    // identity, but a real principal's name attached to a decision that principal
+    // never made. A later reader of `improvement_dedup_read` takes that field at
+    // its word, so the false attribution is not harmless; it is a durable claim
+    // about a real owner.
+    //
+    // The owner recorded now is the only principal that genuinely selected this
+    // disposition: the daemon itself, under its own service identity
+    // ([`SERVICE_NAME`]). That identity is not self-declared — A12.02:3 is
+    // "Identity is not a model's self-declared string" — it is the installed
+    // service's own, named by the composition and carried on every request
+    // identity this daemon commits (`improvement_commit_identity` below binds it
+    // as both `product_id` and `source_id`), and the exchange it makes over is
+    // authenticated in the other direction too: the Kernel front door proves
+    // this daemon's peer SID, session identity and artifact digest before the
+    // connection is used (`daemon_kernel_client.rs:1878-1908`). It grants nothing
+    // either way — `is_non_mutating` is what makes the record advisory. A note
+    // that says "the daemon triaged this and no owner has ruled on it" is a
+    // smaller claim than the one it replaces, and it is a TRUE one.
+    //
+    // It is deliberately NOT the brief's `proposed_owner` either. That field
+    // names the principal proposed to DECIDE (the observed boundary's
+    // `actor_id`, read from a committed closure record); this field names the
+    // principal that DID record a disposition. The daemon is not proposed to
+    // decide its own brief, so conflating the two would overwrite the one route
+    // an owner's decision has a named place to arrive through.
+    //
+    // The four dispositions remain unreachable from an owner's selection, and
+    // `OwnerDecisionKind::Reject` in particular is not produced anywhere in
+    // `bins/`. The measurement of every candidate ingress surface, and the exact
+    // route that is missing and where it would attach, are recorded in the
+    // module documentation above under "The recorded disposition is the DAEMON's
+    // own, and no owner ingress exists". Nothing here substitutes a fabricated
+    // caller for it.
     let decision_record = crate::improvement_intake::record_brief_decision(
         &brief,
-        IMPROVEMENT_OWNER,
+        SERVICE_NAME,
         OwnerDecisionKind::Investigate,
-        &format!("triage blocked maintenance family {}", decision.family),
+        &format!(
+            "the daemon triaged blocked maintenance family {} at its own initiative; this \
+             disposition selects nothing and no owner has ruled on this brief, because no \
+             owner-issued ingress reaches this process",
+            decision.family
+        ),
     )
     .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))?;
 
@@ -691,6 +924,21 @@ fn newest_observed_closure(
         carries_behavioural_proposal: observed.carries_behavioural_proposal(),
         has_retry_lineage: observed.lineage_for_retry().is_some(),
     })
+}
+
+/// What the observed closure actually concluded about behaviour.
+///
+/// Read through the record's own predicate (`carries_behavioural_proposal`)
+/// rather than re-spelled at the call site, so the brief reports what the
+/// closure committed rather than what this dispatch layer would have chosen.
+/// Both arms are equally truthful statements about the record; neither is a
+/// prediction.
+fn observed_behaviour_effect(observed: &ObservedClosure) -> &'static str {
+    if observed.carries_behavioural_proposal {
+        "and proposes a next-behaviour change for the next attempt"
+    } else {
+        "and closed with no next-behaviour change proposed"
+    }
 }
 
 /// The unknowns the observed closure could not resolve, plus the one it cannot
@@ -812,33 +1060,75 @@ fn enforce_advisory_class_gate(
 ///
 /// - `MaintenanceFamily::SecurityDependencyScan` is the daemon's
 ///   security/dependency incident family, and I12.24:49 names "security
-///   incident".
+///   incident". It is still UNREACHABLE from this daemon, and the reason is
+///   measured rather than assumed: the only site that observes anything close
+///   to a dependency or manifest identity is the store-health poll
+///   (`daemon_runtime.rs`, the `AdmittedObservation` trigger), and what it
+///   observes is `StoreHealth::manifest_digest` — the store API's own
+///   operation-manifest identity — while that family's registered observation
+///   is the pinned-scanner canonical receipt from
+///   `scripts/verify-dependency-policy.py` and its registered execution owner
+///   is recorded as unavailable because "no eliotd Kernel operation or Rust
+///   owner exposes a scan result to the daemon"
+///   (`maintenance_family_catalog.rs:1441-1457`). That site's origin also maps
+///   to `MaintenanceTrigger::WatchdogProblem`, which is not one of that
+///   entry's registered origins (`Human`, `Policy`, `Installation`). Naming
+///   the family there would claim a scan nobody ran, so this arm stays
+///   unreachable until a real scan receipt is surfaced to the daemon.
 /// - `MaintenanceFamily::DonorConformance` is the conformance-audit family,
 ///   and I12.24:50 names "Architecture/Implementation/runtime conformance gap",
-///   which the closed set spells [`EvidenceSource::ConformanceDiagnosis`].
-/// - every other family, at every decision the evaluator can return, is the
-///   attempt itself: `AutomationDecision::Start` admits the job, `Suggest`
-///   preserves a recommendation instead, `Defer` holds it for a later eligible
-///   window, `Block` and `Escalate` deny or escalate it, and
-///   `SuppressDuplicate` records that equivalent work is already active. Each
-///   of those is an outcome this daemon itself produced, and none of them is a
-///   Watchdog suggestion.
+///   which the closed set spells [`EvidenceSource::ConformanceDiagnosis`]. It
+///   is REACHABLE: the daemon names it at the sites whose own evidence is a
+///   declared-capability conformance gap — the two startup trigger sites and
+///   the improvement-intake observation, through
+///   `daemon_runtime::conformance_observed_family` (issue #1867 W2/A1). That
+///   is what makes [`conformance_diagnosis_evidence`] a live projection rather
+///   than an unreachable one.
+/// - every other family is the attempt itself, and the set of families that can
+///   reach this function is EXACTLY [`crate::SELF_OBSERVED_FAMILY`] and
+///   `MaintenanceFamily::DonorConformance`. That is measured, not assumed: the
+///   sole caller of `assemble_improvement_artifact` is
+///   `daemon_runtime::improvement_intake_artifact` (`daemon_runtime.rs:4813`),
+///   it is the only caller of `run_improvement_intake`, and the one observation
+///   that function is ever handed is built by
+///   `daemon_runtime::improvement_intake_observation` — whose family is
+///   `daemon_runtime::conformance_observed_family` (issue #1867 W2/A1) and
+///   whose origin is `MaintenanceTriggerOrigin::IdleTransition`. So the
+///   residual resolves to `SelfQualityDebt` and to nothing else, which is the
+///   measured reason the remaining I12.24 sources have no arm here rather than
+///   a judgement about them. What the residual covers is the DECISION, not the
+///   family: `AutomationDecision::Start` admits the job, `Suggest` preserves a
+///   recommendation instead, `Defer` holds it for a later eligible window,
+///   `Block` and `Escalate` deny or escalate it, and `SuppressDuplicate`
+///   records that equivalent work is already active. Each of those is an
+///   outcome this daemon itself produced, and none of them is a Watchdog
+///   suggestion.
 ///
 /// # Why no decision reaching this function is a `Watchdog` observation
 ///
 /// [`EvidenceSource::Watchdog`] is I12.24:54's "Dreamer/Watchdog/Concilium
-/// suggestion". [`eliot_maintenance::AutomationTriggerDecision`]
-/// (`crates/governor/eliot-maintenance/src/lib.rs:288-306`) carries
-/// `trigger_id`, `family`, `scope_ref`, `decision`, `reason`, `admits_job` and
-/// `durable_job_ref` — and no trigger-origin field, so no part of the decision
-/// establishes which kind of occurrence proposed the trigger. The origin that
-/// maps to `MaintenanceTrigger::WatchdogProblem` is
-/// `MaintenanceTriggerOrigin::AdmittedObservation`
-/// (`maintenance_trigger_evaluator.rs:125`), while the observation this dispatch
-/// records is built from `MaintenanceTriggerOrigin::IdleTransition`
-/// (`daemon_runtime.rs:2169`), which maps to `MaintenanceTrigger::Policy`
-/// (`maintenance_trigger_evaluator.rs:123`). A policy-driven occurrence is not
-/// a Watchdog suggestion, and nothing in the decision could make it one.
+/// suggestion", and this function still cannot select it. The reason is NOT the
+/// one this file previously gave, and the previous reason is now false.
+///
+/// What used to be true, and is not any more: the decision carried no
+/// origin at all. [`eliot_maintenance::AutomationTriggerDecision`]
+/// (`crates/governor/eliot-maintenance/src/lib.rs:304-336`) now carries
+/// `trigger: MaintenanceTrigger` (`:323`), copied verbatim from
+/// `MaintenanceTriggerInput::trigger` at both construction sites
+/// (`lib.rs:762` and `lib.rs:1123`) and never selected, widened or defaulted
+/// there. The origin is therefore READABLE on the decision this function
+/// receives, and the arm is missing a producer rather than a field.
+///
+/// What is still true, and is what blocks the arm: the observation this
+/// dispatch records is built from `MaintenanceTriggerOrigin::IdleTransition`
+/// (`daemon_runtime::improvement_intake_observation`, `daemon_runtime.rs:5690`),
+/// and the origin→trigger map is exhaustive over the four-member origin enum
+/// (`maintenance_trigger_evaluator.rs:122-128`), so that origin maps to
+/// `MaintenanceTrigger::Policy` — never `WatchdogProblem`. A policy-driven
+/// occurrence is not a Watchdog suggestion, and the decision's own
+/// `trigger` field now says so out loud instead of being silent about it.
+/// That is the whole of the remaining gap, and it is a one-line change in
+/// another owner's file; see "The exact remaining step" below.
 ///
 /// The residual this function used to carry claimed
 /// [`EvidenceSource::Watchdog`] for every decision that was neither of the two
@@ -852,19 +1142,152 @@ fn enforce_advisory_class_gate(
 /// support is the misattribution this issue exists to remove, so the residual
 /// is dropped rather than renamed.
 ///
-/// `ASSUMPTION:` I12.24:40-55 names no separate "maintenance" variant, and no
-/// field of the maintenance decision carries a Watchdog, Dreamer or Concilium
-/// attribution — those three sources therefore stay unreachable from this
-/// daemon rather than being mislabelled here. Reaching any of them needs the
-/// maintenance trigger ORIGIN to travel with the decision, which is an
-/// `eliot-maintenance` contract change this issue does not own; the honest
-/// outcome here is the `Attempt` label above plus that stated ceiling, not a
-/// refusal to classify a live observation.
+/// `ASSUMPTION:` I12.24:40-55 names no separate "maintenance" variant, and the
+/// decision's `trigger` field carries an I14.22 job origin
+/// (`MaintenanceTrigger`), not an I12.24 evidence source — so the three
+/// I12.24 sources stay unreachable from this daemon rather than being
+/// mislabelled here.
+///
+/// The contract half of that ceiling is now CLOSED and no longer part of the
+/// reason. `AutomationTriggerDecision::trigger` exists and travels verbatim
+/// (`lib.rs:323`, copied at `lib.rs:762` and `lib.rs:1123`), so "the origin does
+/// not travel with the decision" is no longer true of any of the three. What
+/// remains is per-source, and each remaining step is recorded at the source
+/// below: an observation whose origin is not `IdleTransition` reaching this
+/// intake. The honest outcome here is the `Attempt` label above plus that
+/// stated ceiling, not a refusal to classify a live observation.
+///
+/// # The three sources with NO arm, and the producer each waits for
+///
+/// [`EvidenceSource::Watchdog`], [`EvidenceSource::Dreamer`] and
+/// [`EvidenceSource::Concilium`] are the W2 sources that are not merely an
+/// unreachable arm but an ABSENT one: the match below has no pattern that could
+/// produce them, while the closed vocabulary does carry all three honestly
+/// (`evidence_sources.rs:29-31`). They no longer share the reason the
+/// `ASSUMPTION` above used to give them, because that reason is discharged.
+/// What each still lacks is its own producer, and the remaining step differs
+/// per source:
+///
+/// - `Watchdog` is the CLOSEST of the three, and its remaining step is now a
+///   single origin at a single site rather than a missing contract field.
+///   Measured on this tree, not assumed:
+///
+///   1. The origin that denotes a Watchdog/Doctor occurrence,
+///      `MaintenanceTriggerOrigin::AdmittedObservation`, is live and has exactly
+///      ONE construction site in this daemon
+///      (`daemon_runtime.rs:2868`, the store-health poll). The origin→trigger
+///      map is exhaustive over the four-member origin enum
+///      (`maintenance_trigger_evaluator.rs:122-128`), and only
+///      `AdmittedObservation` maps to `MaintenanceTrigger::WatchdogProblem`, so
+///      that one site is the only producer of a `WatchdogProblem` decision.
+///   2. That decision does not reach this function. It is consumed at
+///      `daemon_runtime.rs:2902-2906` by
+///      `note_blocked_automation_notification` and
+///      `publish_maintenance_source_results`; it is never handed to
+///      `run_improvement_intake` (`:5260`), whose only call site is
+///      `maybe_start_improvement_intake` (`:5797`).
+///   3. The one observation that DOES reach this function is built at
+///      `daemon_runtime::improvement_intake_observation` (`:5684`), which names
+///      `MaintenanceTriggerOrigin::IdleTransition` unconditionally (`:5690`).
+///      The intake is therefore the sole consumer of that one origin, and the
+///      decision it assembles over carries `MaintenanceTrigger::Policy`.
+///
+///   **The exact remaining step**, now that the origin travels on the decision:
+///   a trigger site that hands this intake an observation built from
+///   `MaintenanceTriggerOrigin::AdmittedObservation`. The site already exists
+///   and already builds exactly such an observation
+///   (`daemon_runtime.rs:2868`); what is absent is a route carrying it from
+///   there into `improvement_intake_observation`. Once that route exists, this
+///   function can select [`EvidenceSource::Watchdog`] by comparing
+///   `decision.trigger` against [`MaintenanceTrigger::WatchdogProblem`] — a
+///   value it now holds, and the one value in the closed origin map that means
+///   "Watchdog/Doctor problem recipe"
+///   (`maintenance_trigger_evaluator.rs:118-119`). Until then the arm would be
+///   dead on a value the live path provably cannot carry, so it is not wired.
+/// - `Dreamer` needs a Dreamer that SUGGESTS work, and its gap is LARGER than
+///   the Watchdog one in a way the origin map settles. `MaintenanceTrigger` has
+///   a `Dreamer` member (`lib.rs:184-185`), but NO origin maps to it: the
+///   exhaustive map at `maintenance_trigger_evaluator.rs:122-128` names only
+///   `Policy`, `Onboarding` and `WatchdogProblem`. So unlike `Watchdog`, a
+///   `Dreamer` decision cannot be produced by re-routing an existing origin —
+///   it needs a NEW `MaintenanceTriggerOrigin` member, which is a vocabulary
+///   this issue does not own. Independently, no Dreamer instance proposes
+///   anything to this daemon: the route is owner-declared and unassigned on
+///   this base, an omitted Dreamer route resolving to `RouteState::Unassigned`
+///   with no paid route (`eliot_config::first_run::decide_first_run`).
+/// - `Concilium` needs a deliberation verdict with a route into this intake,
+///   and its gap is largest of the three: `MaintenanceTrigger` has NO
+///   `Concilium` member at all, so a Concilium verdict could not be carried on
+///   the decision even if the field were consulted. A vocabulary claim with no
+///   producer behind it is the mirror of the misattribution this function
+///   exists to remove, so none is added here. The funnel's request source is
+///   also absent (see this module's header on `ImprovementRouteRequest` having
+///   no production request source), so a verdict has no path into
+///   `assemble_improvement_artifact` at all.
+///
+/// None is filled here because none has a producer this file could read without
+/// inventing the observation it claims. Filling any of them from a decision
+/// would reinstate exactly the misattribution the removed residual was — and
+/// with `trigger` now readable, that misattribution would be materially easier
+/// to commit by accident, which is the reason the `Watchdog` arm waits for a
+/// route rather than being wired speculatively against a field that exists but
+/// can only ever read `Policy` here.
 pub fn maintenance_evidence_source(
     decision: &eliot_maintenance::AutomationTriggerDecision,
 ) -> EvidenceSource {
     use eliot_maintenance::MaintenanceFamily;
     match decision.family {
+        // DEAD ARM — kept, not wired. Measured unreachable on this tree, and
+        // the precise missing producer is recorded here so the next owner does
+        // not re-derive it. Reaching it needs a decision whose `family` is
+        // `SecurityDependencyScan`, and the family is the CALLER's real
+        // observation, so the producer this arm waits for is a trigger site
+        // that observes a security/dependency scan receipt and names the
+        // family. No such site exists:
+        //
+        // 1. No scan is performed for this daemon. The family's registered
+        //    observation is the "scripts/verify-dependency-policy.py
+        //    pinned-scanner canonical receipt" and its registered execution
+        //    owner is recorded unavailable because "no eliotd Kernel operation
+        //    or Rust owner exposes a scan result to the daemon"
+        //    (`maintenance_family_catalog.rs:1448-1449`). Producing the receipt
+        //    is a `scripts/` and dependency-policy owner's job, not this
+        //    dispatch layer's.
+        // 2. The one daemon site whose trigger origin IS the Watchdog/Doctor
+        //    problem origin (`MaintenanceTriggerOrigin::AdmittedObservation`,
+        //    `maintenance_trigger_evaluator.rs:126`) is the store-health poll
+        //    (`daemon_runtime.rs:2868-2876`), and it observes
+        //    `StoreHealth::manifest_digest` — the store API's own
+        //    operation-manifest identity — naming `SELF_OBSERVED_FAMILY`. That
+        //    is not a scanner receipt, and it is ineligible for this family
+        //    twice over: the observed value is the wrong kind of fact, and the
+        //    origin is not among this entry's registered origins (`Human`,
+        //    `Policy`, `Installation`; `maintenance_family_catalog.rs:1444`).
+        //    The decision that site produces now carries
+        //    `MaintenanceTrigger::WatchdogProblem` on its own `trigger` field,
+        //    which makes the ineligibility CHECKABLE rather than assumed: the
+        //    origin reads back as a Watchdog/Doctor problem, and that is
+        //    precisely not a scanner receipt. Naming the family there would
+        //    claim a scan nobody ran.
+        // 3. The exhaustive family census confirms the gap is total, not a
+        //    missing match arm: the only `MaintenanceFamily` values any
+        //    production trigger site names are `SELF_OBSERVED_FAMILY`
+        //    (`SelfQualityDebt`) and `MaintenanceFamily::DonorConformance`
+        //    (`maintenance_trigger_evaluator.rs:372`, and
+        //    `daemon_runtime::conformance_observed_family`).
+        //
+        // What would make it reachable, concretely: an admitted owner that
+        // surfaces the pinned-scanner receipt (advisory set digest, policy
+        // finding set digest, scanner identity and executable digest) to this
+        // daemon as a `MaintenanceObservation` evidence set, AND a trigger site
+        // that names `SecurityDependencyScan` at an origin its catalog entry
+        // registers. Either half alone still leaves the arm dead: a receipt
+        // with no family-naming site reaches nothing, and a family-naming site
+        // with no receipt claims a scan nobody ran. The arm is not deleted
+        // because `EvidenceSource::SecurityIncident` is a real I12.24:49
+        // source and the family's registered observation is exactly a scan
+        // receipt — the vocabulary and the catalog both already name it; only
+        // the producer is missing.
         MaintenanceFamily::SecurityDependencyScan => EvidenceSource::SecurityIncident,
         MaintenanceFamily::DonorConformance => EvidenceSource::ConformanceDiagnosis,
         _ => EvidenceSource::Attempt,
@@ -915,10 +1338,44 @@ fn conformance_diagnosis_evidence(
         // The routing table's own default owner for a conformance-dimension
         // finding with no counterevidence and no special family
         // (`routing.rs::route_owner`, rules 1-9 miss, rule 10 default), i.e.
-        // the owner a real conformance finding reaches. `route_owner` itself is
-        // not called here because it takes a `SelfQualityObservation` and this
-        // daemon holds no frozen #820 observation snapshot; the same default is
-        // named rather than re-derived.
+        // the owner a real conformance finding reaches.
+        //
+        // `route_owner` itself is NOT called here, and the reason is measured
+        // on this tree rather than assumed. It takes a
+        // `SelfQualityObservation`, whose every variant wraps an
+        // `ObservationCore`
+        // (`crates/foundation/eliot-conformance-contracts/src/self_quality.rs:362-376`),
+        // and that core has ten required fields. Most of them are owner-binding,
+        // window and measurement facts this daemon does not hold and cannot
+        // honestly produce at any trigger site: `OwnerBinding`
+        // (`owner_ref`, `schema_ref`, `revision_ref`, `content_digest`),
+        // `ObservationWindow` (`observed_from_ms`, `observed_to_ms`,
+        // `environment_ref`, `platform_ref`, `toolchain_ref`), the `metric`
+        // measurement (`value`, `unit_ref`, `normalization_ref`,
+        // `population_ref`, `presence`) and the declared `completeness`
+        // denominators. The daemon's real observation is a maintenance
+        // decision: a `trigger_id`, a `family`, a `scope_ref` and the observed
+        // evidence identities. Manufacturing a window, a platform, a toolchain
+        // or a metric normalization to satisfy the constructor would fabricate
+        // precisely the observation the owner routing is supposed to read, so
+        // the default is named instead and the routing table is not
+        // circumvented by re-deriving a different one.
+        //
+        // `ASSUMPTION:` the named default is the owner `route_owner` would
+        // return for the finding recorded here, and the precedence table makes
+        // that checkable without holding the observation: rule 1 needs
+        // non-empty counterevidence (this handoff carries none), rules 2-8 key
+        // on the six family names `RECOVERY`, `ERASURE_INFLUENCE`,
+        // `SECURITY_PRIVACY`, `HUMAN_ATTENTION`, `COST_QUOTA`, `PRODUCT`,
+        // `PERFORMANCE_RESOURCES`, `MEMORY_PROVENANCE`,
+        // `RECOVERY_COMPATIBILITY` and `SOURCE_BUILD` (this finding's family
+        // is a maintenance `DONOR_CONFORMANCE`, which is none of them), and
+        // rule 9 needs a `LearningQuality`/`ContextQuality` dimension or an
+        // `Inconclusive`/`Missing` status (this is a conformance-dimension
+        // finding reached through a blocking maintenance decision). Rules 1-9
+        // therefore miss and rule 10 is the default. If a future change makes
+        // this finding a `SECURITY_PRIVACY` or `COST_QUOTA` one, the owner
+        // must be routed, not defaulted.
         owner: SelfQualityHandoffOwner::DevelopmentDiagnosis675,
         priority: conformance_priority(decision),
         symptom_refs: vec![format!("maintenance-trigger:{}", decision.trigger_id)],

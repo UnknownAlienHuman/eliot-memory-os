@@ -31,14 +31,24 @@
 //!   index. Both answer with durable evidence or a typed
 //!   [`KernelPortError`]; neither synthesizes a receipt.
 //!
+//!   Both ports are transport-neutral: every type in their signatures is
+//!   reachable from a daemon-side dependency set that holds no in-process ORS.
+//!   The link arm therefore stays completable from the process that owns the
+//!   revocation decision — over the authenticated transport to the Kernel,
+//!   which owns ORS in its own process — instead of being nameable only by a
+//!   Kernel-process type.
+//!
 //! Validation order (fail-closed): admitted [`RequestIdentity`] shape and
 //! exact fence agreement first, then non-blank revocation binding fields
-//! with nonzero revision/count, then the closed typed parameters. Failure
-//! mapping reuses the existing [`CompositionError`] variants (no new
-//! variant is introduced so the closed matches elsewhere in this crate keep
-//! compiling): identity/fence/response-binding mismatches are
-//! [`CompositionError::Provider`]; every other deterministic admission
-//! refusal is [`CompositionError::Owner`].
+//! with nonzero revision/count, then the closed typed parameters. On the
+//! return path [`canonical_receipt_identity`] issues a receipt identity only
+//! from a write receipt that is itself `Committed` and whose receipt core
+//! reports `Success`, so a possible, partial or unknown commit never becomes
+//! the recorded revocation. Failure mapping reuses the existing
+//! [`CompositionError`] variants (no new variant is introduced so the closed
+//! matches elsewhere in this crate keep compiling):
+//! identity/fence/response-binding mismatches are [`CompositionError::Provider`];
+//! every other deterministic admission refusal is [`CompositionError::Owner`].
 //!
 //! Honest gaps: `RecordAuthorityRevocation` and
 //! `GetAuthorityRevocationHistory` are known-but-unsupported at the store
@@ -56,20 +66,23 @@ use std::sync::Arc;
 use eliot_canonical::CanonicalWriteEnvelope;
 use eliot_contracts::{OperationId, canonical_json_bytes, sha256_hex};
 use eliot_kernel_core::GrantActivationPort;
-use eliot_ors::{GrantClosureProjection, OperationIdentity, OperationalRecoveryStore, OrsError};
+use eliot_ors::{OperationIdentity, OperationalRecoveryStore, OrsError};
 use eliot_protocol::RequestIdentity;
-use eliot_receipts::{GrantClosureReceipt, GrantClosureState, ReceiptIdentity};
+use eliot_receipts::{
+    GrantClosureReceipt, GrantClosureState, ReceiptDispositionKind, ReceiptIdentity,
+};
 use eliot_store_api::{
     EffectClass, EventProjectionRelationIntents, InfluenceDependencyClosure, InfluenceState,
     NamedMutationOperation, NamedMutationRequest, NamedReadOperation, NamedReadRequest,
     NamedReadResponse, OperationManifestDigest, OrderingHeadExpectation, OrderingScopeId,
     ReadConsistency, RecordedRevocationDisposition, RevocationReason, ScopeId, SecurityContext,
-    TransitionClass, WriteReceipt, generated_operation_manifests, operation_manifest_set_digest,
-    parse_revocation_history_payload,
+    TransitionClass, WriteReceipt, WriteReceiptStatus, generated_operation_manifests,
+    operation_manifest_set_digest, parse_revocation_history_payload,
 };
 
 use crate::{
-    CompositionError, GrantClosureCanonicalLinkPort, GrantClosureReceiptPort, KernelPortError,
+    CompositionError, GrantClosureCanonicalLinkPort, GrantClosureReceiptPort,
+    GrantClosureSecondPhaseLink, KernelPortError,
 };
 use eliot_authority::{
     AuthorityRevocationClosureEvidence, GrantRevocationRequest,
@@ -239,12 +252,48 @@ pub fn authority_revocation_envelope(
 /// Returns the immutable canonical receipt identity produced by the Store
 /// receipt envelope. A transport receipt without its reconciliation envelope
 /// is not a source for a second-phase link.
+///
+/// The receipt is only evidence of a recorded revocation when the write it
+/// describes actually committed. Two terminal dispositions are therefore
+/// compared here, both against the ORIGINAL recorded values, before any
+/// [`ReceiptIdentity`] exists:
+///
+/// * the transport status must be [`WriteReceiptStatus::Committed`]. That is
+///   the one disposition the crate's own commit gate already requires
+///   (`capability_evidence_commit`, `experience_commit`,
+///   `learning_record_commit`) and the rule the Kernel's unknown-commit
+///   classifier states: only `Committed` reconciles as committed, every other
+///   terminal status is a known non-commit. `WriteReceipt::validate()` places
+///   no such invariant — it accepts a reconciliation envelope on a `Rejected`,
+///   `DeadLetter` or `Cancelled` receipt — so nothing downstream of this
+///   function would refuse a write that never recorded the revocation.
+/// * the receipt core's own disposition must be
+///   [`ReceiptDispositionKind::Success`]. That is the exact disposition the
+///   one store-owned issuer of a committed write's envelope
+///   (`eliot_store_api::issue_store_receipt_envelope`) stamps, and the same
+///   success-only rule `eliot_authority::effects` applies to a committed
+///   effect. `ReceiptEnvelope::validate()` accepts `Partial`, `Failure`,
+///   `Unknown` and `Cancelled` as internally well-formed, so a partial or
+///   unknown canonical outcome would otherwise be linked to the durable
+///   closure row and reported as a completed reconciliation.
+///
+/// A refusal here leaves the revocation saga's second phase unestablished, so
+/// the caller retains the pending canonical handoff and the record stays
+/// blocked. A possible commit can therefore never become a no-write, and a
+/// non-commit is never re-presented as this operation's recorded result.
 pub fn canonical_receipt_identity(
     receipt: &WriteReceipt,
 ) -> Result<ReceiptIdentity, CompositionError> {
     receipt.validate().map_err(|error| {
         identity_refused(format!("canonical write receipt is invalid: {error}"))
     })?;
+    if receipt.status != WriteReceiptStatus::Committed {
+        return Err(identity_refused(format!(
+            "canonical write receipt is not committed ({:?}); nothing was recorded under this \
+             operation identity",
+            receipt.status
+        )));
+    }
     let envelope = receipt.require_reconciliation_envelope().map_err(|error| {
         identity_refused(format!(
             "canonical write receipt has no exact reconciliation envelope: {error}"
@@ -257,6 +306,13 @@ pub fn canonical_receipt_identity(
         return Err(identity_refused(
             "canonical receipt envelope does not bind the durable write receipt".to_owned(),
         ));
+    }
+    if envelope.core.disposition.kind() != ReceiptDispositionKind::Success {
+        return Err(identity_refused(format!(
+            "canonical receipt envelope reports {:?}, not a committed outcome; a partial or \
+             unknown result is not a recorded revocation",
+            envelope.core.disposition.kind()
+        )));
     }
     Ok(envelope.identity.clone())
 }
@@ -676,15 +732,35 @@ fn closure_link_error(error: OrsError) -> KernelPortError {
 /// agree with the presented identity. A store that answers with a different
 /// identity or an absent link is a typed [`KernelPortError`], never a success
 /// and never a rewritten first phase.
+///
+/// It returns the neutral [`GrantClosureSecondPhaseLink`] rather than the
+/// in-process `eliot_ors::GrantClosureProjection`: the ORS projection's
+/// lifecycle phase, operation order and store receipt are operational evidence
+/// no Governor proof or caller reads, while the three facts the saga actually
+/// proves — the committed `GrantClosureReceipt` and the linked
+/// `ReceiptIdentity` — are store-neutral and are copied out verbatim. That is
+/// what lets a transport client with no in-process ORS implement the same port
+/// from the far side of the authenticated transport.
 impl GrantClosureCanonicalLinkPort for Arc<dyn OperationalRecoveryStore> {
     fn link_grant_closure_canonical_receipt(
         &self,
-        operation_id: &OperationIdentity,
+        operation_id: &str,
         canonical_receipt: &ReceiptIdentity,
-    ) -> Result<GrantClosureProjection, KernelPortError> {
+    ) -> Result<GrantClosureSecondPhaseLink, KernelPortError> {
+        // The typed ORS operation identity is rebuilt here, from the ORIGINAL
+        // recorded first-phase bytes the caller presents, because this is the
+        // boundary that calls the store. `OperationIdentity::new` applies the
+        // bounded non-blank/control-character check the neutral port signature
+        // cannot express, so the constraint is enforced rather than dropped; an
+        // unusable identity is a determinate contract refusal, not a link.
+        let operation_id = OperationIdentity::new(operation_id).map_err(|error| {
+            KernelPortError::Contract(format!(
+                "unusable grant closure operation identity: {error}"
+            ))
+        })?;
         let projection = OperationalRecoveryStore::link_grant_closure_canonical_receipt(
             self.as_ref(),
-            operation_id,
+            &operation_id,
             canonical_receipt,
         )
         .map_err(closure_link_error)?;
@@ -700,7 +776,13 @@ impl GrantClosureCanonicalLinkPort for Arc<dyn OperationalRecoveryStore> {
                 "canonical closure receipt link read-back disagrees".to_owned(),
             ));
         }
-        Ok(projection)
+        // The ORIGINAL committed first-phase bytes, copied verbatim out of the
+        // owner's own read-back. The first-phase row is not edited here; only
+        // the second-phase link was added, above, by the store itself.
+        Ok(GrantClosureSecondPhaseLink::new(
+            commit.clone(),
+            canonical_receipt.clone(),
+        ))
     }
 }
 
@@ -754,11 +836,12 @@ mod authority_revocation_tests {
     use super::*;
     use eliot_authority::{
         AuthoritySet, CapabilityGrant, EffectAuthorizer, GrantGraph, GrantId, GrantStatus,
-        LogicalTime, PrincipalRef,
+        LogicalTime, PrincipalRef, RevocationOperationIdentity,
     };
     use eliot_contracts::{
-        ClockReading, ContractId, EpochId, EpochLineageId, ProductId, RequestId, RequestMetadata,
-        ResourceGeneration, SessionId, SourceId, StateFence,
+        ClockReading, ContractId, EpochId, EpochLineageId, ProductId, ReceiptId, RequestId,
+        RequestMetadata, ResourceGeneration, SessionId, SourceId, StateFence, TaskId,
+        TransactionSequence,
     };
     use eliot_receipts::RequestBinding;
     use eliot_receipts::{AuthorityBinding, EffectClass, ProofCeiling};
@@ -777,6 +860,30 @@ mod authority_revocation_tests {
         )
         .expect("epoch");
         StateFence::new(epoch, ResourceGeneration::new(1).expect("generation"))
+    }
+
+    /// The admitted revocation operation identity the history-bound restore is
+    /// handed alongside its evidence. `AuthorityOwner` holds no plan, scope
+    /// binding or Store readback of its own, so it derives none of these five
+    /// coordinates; a fixture must hand it one that survives
+    /// [`RevocationOperationIdentity::admit`] — every text coordinate non-blank
+    /// and a causal `transaction_sequence` present. It reuses this module's own
+    /// principal, scope and naming family, and no test asserts anything about
+    /// this value.
+    fn operation() -> RevocationOperationIdentity {
+        RevocationOperationIdentity::admit(
+            "principal:root",
+            TaskId::new("task:governor-revocation-1").expect("task id"),
+            GOVERNOR_ORDERING_SCOPE,
+            ReceiptId::new("receipt-revoke-1").expect("receipt id"),
+            ClockReading {
+                valid_time_ms: Some(1_000),
+                known_time_ms: Some(1_000),
+                transaction_sequence: Some(TransactionSequence::genesis()),
+                monotonic_ns: None,
+            },
+        )
+        .expect("fixture revocation operation identity is admitted")
     }
 
     fn identity(fence: &StateFence) -> RequestIdentity {
@@ -1012,18 +1119,149 @@ mod authority_revocation_tests {
         );
     }
 
+    /// One recorded closure as the durable history owner would have written
+    /// it.
+    ///
+    /// `RecordedRevocation` carries the full producer-declared coordinate set
+    /// (owner namespace, bounds, disposition, omissions, influence state,
+    /// affected count/digest and canonical request digest), and recovery
+    /// RECOMPUTES and compares the content-addressed ones. A fixture that
+    /// omits or stubs them would refuse at decode for a reason unrelated to
+    /// the case under test, so this declares every coordinate over the same
+    /// membership it reports.
+    fn recorded_revocation(root_ref: &str) -> RecordedRevocation {
+        let dependent_refs = vec!["grant:child".to_owned(), "grant:origin".to_owned()];
+        let affected = eliot_authority::AuthorityRevocationClosureEvidence::members_of(
+            root_ref,
+            &dependent_refs,
+        );
+        let affected_member_digest =
+            eliot_authority::AuthorityRevocationClosureEvidence::affected_members_digest(&affected)
+                .expect("recorded affected membership is addressable");
+        let bounds = eliot_influence::RevocationBounds::default_bounds();
+        let invalidation_reason = eliot_store_api::RevocationReason::SourceRevoked;
+        let disposition = eliot_store_api::RecordedRevocationDisposition::Complete;
+        let omissions: Vec<String> = Vec::new();
+        let affected_member_count = affected.len() as u64;
+        let recorded_bounds = recorded_bounds(&bounds);
+        let canonical_request_digest =
+            eliot_store_api::canonical_json_bytes(&recorded_revocation_preimage(
+                root_ref,
+                &dependent_refs,
+                invalidation_reason,
+                &recorded_bounds,
+                disposition,
+                &omissions,
+                affected_member_count,
+                &affected_member_digest,
+            ))
+            .map(|bytes| eliot_store_api::sha256_hex(&bytes))
+            .expect("recorded revocation is addressable");
+        RecordedRevocation {
+            closure_id: "revocation-686-01".to_owned(),
+            root_ref: root_ref.to_owned(),
+            dependent_refs,
+            invalidation_reason,
+            revision: 9,
+            owner_namespace: root_ref.to_owned(),
+            bounds: recorded_bounds,
+            disposition,
+            omissions,
+            current_influence: eliot_security_contracts::InfluenceState::Revoked,
+            affected_member_count,
+            affected_member_digest,
+            canonical_request_digest,
+        }
+    }
+
+    /// The recorded wire form of the engine's one standing bounds set.
+    fn recorded_bounds(
+        bounds: &eliot_influence::RevocationBounds,
+    ) -> eliot_store_api::RecordedRevocationBounds {
+        eliot_store_api::RecordedRevocationBounds {
+            max_nodes: bounds.max_nodes,
+            max_edges: bounds.max_edges,
+            max_depth: bounds.max_depth,
+            max_result: bounds.max_result,
+            max_work: bounds.max_work,
+            max_frontier: bounds.max_frontier,
+            max_time: bounds.max_time,
+        }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the recorded closure preimage is exactly the producer-declared coordinate set the durable owner hashes"
+    )]
+    fn recorded_revocation_preimage<'a>(
+        root_ref: &'a str,
+        dependent_refs: &'a [String],
+        invalidation_reason: eliot_store_api::RevocationReason,
+        recorded_bounds: &'a eliot_store_api::RecordedRevocationBounds,
+        disposition: eliot_store_api::RecordedRevocationDisposition,
+        omissions: &'a [String],
+        affected_member_count: u64,
+        affected_member_digest: &'a str,
+    ) -> impl serde::Serialize + 'a {
+        #[derive(serde::Serialize)]
+        struct Preimage<'a> {
+            evidence_version: u16,
+            closure_id: &'a str,
+            owner_namespace: &'a str,
+            root_ref: &'a str,
+            dependent_refs: &'a [String],
+            invalidation_reason: eliot_store_api::RevocationReason,
+            current_influence: eliot_security_contracts::InfluenceState,
+            state_fence: eliot_contracts::StateFence,
+            revision: u64,
+            bounds: eliot_store_api::RecordedRevocationBounds,
+            disposition: &'a str,
+            omissions: &'a [String],
+            affected_member_count: u64,
+            affected_member_digest: &'a str,
+        }
+        Preimage {
+            evidence_version: REVOCATION_HISTORY_EVIDENCE_VERSION as u16,
+            closure_id: "revocation-686-01",
+            owner_namespace: root_ref,
+            root_ref,
+            dependent_refs,
+            invalidation_reason,
+            current_influence: eliot_security_contracts::InfluenceState::Revoked,
+            state_fence: fence(),
+            revision: 9,
+            bounds: eliot_store_api::RecordedRevocationBounds {
+                max_nodes: recorded_bounds.max_nodes,
+                max_edges: recorded_bounds.max_edges,
+                max_depth: recorded_bounds.max_depth,
+                max_result: recorded_bounds.max_result,
+                max_work: recorded_bounds.max_work,
+                max_frontier: recorded_bounds.max_frontier,
+                max_time: recorded_bounds.max_time,
+            },
+            disposition: match disposition {
+                eliot_store_api::RecordedRevocationDisposition::Complete => {
+                    eliot_security_contracts::REVOCATION_DISPOSITION_COMPLETE
+                }
+                eliot_store_api::RecordedRevocationDisposition::Partial => {
+                    eliot_security_contracts::REVOCATION_DISPOSITION_PARTIAL
+                }
+                eliot_store_api::RecordedRevocationDisposition::Unknown => {
+                    eliot_security_contracts::REVOCATION_DISPOSITION_UNKNOWN
+                }
+            },
+            omissions,
+            affected_member_count,
+            affected_member_digest,
+        }
+    }
+
     fn history_response(fence: &StateFence) -> NamedReadResponse {
         let payload = RevocationHistoryPayload {
             version: REVOCATION_HISTORY_PAYLOAD_VERSION,
             origin_ref: "root:alpha".to_owned(),
             source_revision: 9,
-            closures: vec![RecordedRevocation {
-                closure_id: "revocation-686-01".to_owned(),
-                root_ref: "root:alpha".to_owned(),
-                dependent_refs: vec!["grant:child".to_owned(), "grant:origin".to_owned()],
-                invalidation_reason: eliot_store_api::RevocationReason::SourceRevoked,
-                revision: 9,
-            }],
+            closures: vec![recorded_revocation("root:alpha")],
         };
         NamedReadResponse {
             operation: NamedReadOperation::GetAuthorityRevocationHistory,
@@ -1045,6 +1283,7 @@ mod authority_revocation_tests {
             &snapshot,
             &fence,
             Some(&evidence),
+            &operation(),
         )
         .expect("current evidence restores");
         let suppressed: Vec<&str> = outcome
@@ -1087,7 +1326,13 @@ mod authority_revocation_tests {
         let fence = fence();
         let snapshot = owner_snapshot(&fence);
         assert!(
-            AuthorityOwner::from_snapshot_with_revocation_history(&snapshot, &fence, None).is_err(),
+            AuthorityOwner::from_snapshot_with_revocation_history(
+                &snapshot,
+                &fence,
+                None,
+                &operation()
+            )
+            .is_err(),
             "missing history blocks restoration"
         );
         let evidence =
@@ -1104,7 +1349,8 @@ mod authority_revocation_tests {
             AuthorityOwner::from_snapshot_with_revocation_history(
                 &snapshot,
                 &other_fence,
-                Some(&evidence)
+                Some(&evidence),
+                &operation()
             )
             .is_err(),
             "stale fence blocks restoration"

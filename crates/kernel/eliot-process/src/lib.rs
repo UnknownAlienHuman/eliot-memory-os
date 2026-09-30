@@ -1176,6 +1176,27 @@ impl PermitIssuance {
         issuance.validation_revision = Some(validation_revision);
         Ok(issuance)
     }
+
+    /// Returns the State Fence this issuance is bound to.
+    ///
+    /// An authority composition reads the fence back so the stored
+    /// [`DispatchValidationContext`] can be built exactly in lockstep with
+    /// the permit it will later consume. The fence is public input to the
+    /// authority, not a capability: [`DispatchPermitAuthority::issue`] and
+    /// its `validate_and_consume` still prove it against the intent and the
+    /// live context.
+    pub const fn state_fence(&self) -> &FencingToken {
+        &self.state_fence
+    }
+
+    /// Returns the revision heads this issuance binds into its permit.
+    ///
+    /// The authority composition reads them back to build the matching
+    /// validation context; `validate_and_consume` still refuses any permit
+    /// whose expected heads differ from the live context.
+    pub const fn expected_revision_heads(&self) -> &BTreeMap<String, String> {
+        &self.expected_revision_heads
+    }
 }
 
 /// Immutable process request consumed by [`ProcessExecutor::start`].

@@ -296,6 +296,11 @@ enum Response {
         host_request_port: &'static str,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kernel_binding_failure: Option<PortFailure>,
+        /// The activation owner's bounded cold-start question, retained from
+        /// the authenticated attach and shown only while the live Kernel
+        /// binding probe succeeds. This does not claim terminal readiness.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cold_start_question: Option<eliot_protocol::AgentActivationColdStartQuestion>,
         observation_forwarding_port: &'static str,
         recovery: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -317,6 +322,8 @@ enum Response {
         session_id: String,
         activation_generation: u64,
         authority_epoch: EpochId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cold_start_question: Option<eliot_protocol::AgentActivationColdStartQuestion>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bootstrap: Option<UnderstandingBootstrap>,
     },
@@ -377,10 +384,20 @@ enum Response {
     /// Typed refusal to allocate a bridge-event slot. The exact exhausted
     /// resource, permitted reconciliation path, and ORS-local acceptance
     /// phase remain structured through the host response.
+    ///
+    /// Issue #1679: bridge-local pressure only — no I14 disposition and no
+    /// versioned recovery directive. This arm never claims I14.4/5
+    /// conformance as-is; the versioned directive is whole-or-null and null
+    /// at this projection (see `bridge_error`), with STITCH placement for a
+    /// later slice to thread the reserve owner's live measurement.
     Backpressure {
         pressure: BridgeEventCapacityPressure,
     },
     /// Typed transport refusal from the kernel; local durable phase is unknown.
+    ///
+    /// Issue #1679: same whole-or-null seam as [`Response::Backpressure`] —
+    /// bridge-local pressure only, no I14 disposition, no versioned
+    /// directive, never an I14.4/5 conformance claim as-is.
     TransportBackpressure {
         pressure: BridgeTransportBackpressure,
     },
@@ -2155,6 +2172,7 @@ fn handle_reconnect(
             session_id: view.binding().session_id().as_str().to_owned(),
             activation_generation: view.binding().activation_generation().get(),
             authority_epoch: view.binding().state_fence().authority_epoch().clone(),
+            cold_start_question: view.cold_start_question().cloned(),
             bootstrap: None,
         },
         Err(BridgeError::StaleAuthority) => Response::Error {
@@ -2337,6 +2355,7 @@ fn status_response(
             activation_port: "not-attached",
             host_request_port: "no-session: attach and activate before host-request dispatch",
             kernel_binding_failure: None,
+            cold_start_question: None,
             observation_forwarding_port: "unavailable: attach and activate before forwarding coverage gaps",
             recovery: "attach and activate before host requests; attached Status and reconnect probe the live Kernel binding; a replacement connection requires a new admission".to_owned(),
             reactive: None,
@@ -2373,6 +2392,11 @@ fn status_response(
                     "degraded: live Kernel binding could not be confirmed; forwarding availability is unknown",
                 ),
             };
+            let cold_start_question = if kernel_binding_failure.is_none() {
+                view.cold_start_question().cloned()
+            } else {
+                None
+            };
             Response::Status {
                 profile: Profile::as_str(profile),
                 control_capacity: runner.control_capacity(),
@@ -2385,6 +2409,7 @@ fn status_response(
                 activation_port: "attached",
                 host_request_port,
                 kernel_binding_failure,
+                cold_start_question,
                 observation_forwarding_port,
                 recovery,
                 reactive: Some(reactive_status_view(runner)),
@@ -2448,10 +2473,32 @@ fn bridge_error(error: &BridgeError) -> Response {
             code: "KERNEL_ACTIVATION_PORT_REJECTED",
             detail: "Kernel-owned HostActivationPort rejected or fenced the request".to_owned(),
         }
+    // Issue #1679 bridge backpressure (caller STITCH): the versioned I14
+    // backpressure directive for these arms is whole-or-null, and at this
+    // projection it is honestly null. This path holds only the bridge-local
+    // pressure the owner typed on the wire — a dimension, a recovery route,
+    // and a local phase — with no I14 disposition, no operation identity, no
+    // profile revision, no state fence, and no authority epoch, so naming a
+    // bottleneck observation or a revision here would fabricate capacity
+    // evidence this projection never observed (cf. the owner-side
+    // `control_reserve_rejection` builders, which refuse to emit unless the
+    // live partition actually reads saturated). The typed bridge pressure
+    // below is unchanged. A later slice threads the reserve owner's live
+    // `I14BackpressureResponseV1` measurement into this response; until that
+    // owner call site exists the answer keeps this pressure with a null
+    // versioned directive rather than a partial one.
     } else if let BridgeError::Backpressure(pressure) = error {
         Response::Backpressure {
             pressure: *pressure,
         }
+    // Issue #1679 bridge backpressure (caller STITCH): same whole-or-null
+    // seam as the event-capacity arm above. The transport refusal carries no
+    // owner-measured observation at this projection — no disposition, no
+    // operation identity, no profile revision, no state fence — so the
+    // versioned directive is honestly null here rather than a fabricated
+    // transport record. Placement is this same response, fed later by the
+    // reserve owner's live measurement; the typed bridge pressure below is
+    // unchanged.
     } else if let BridgeError::TransportBackpressure(pressure) = error {
         Response::TransportBackpressure {
             pressure: *pressure,
@@ -4078,11 +4125,7 @@ mod tests {
             "client_capabilities":{"tasks":false},
             "tool":{"name":"eliot.query","arguments":{
                 "intent":{
-                    "mode":"verification",
-                    "time_scope":"session-window",
-                    "branch_environment_scope":"branch",
-                    "freshness_policy":"exact-fence",
-                    "required_assurance":"evidence-provenance"
+                    "mode":"verification"
                 },
                 "query":"subject:evidence-alpha",
                 "exact_resource_uri": null

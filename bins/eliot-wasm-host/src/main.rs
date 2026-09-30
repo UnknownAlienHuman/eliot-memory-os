@@ -7,7 +7,7 @@ use eliot_wasm_host::{
     CliError, ContourGateError, PrototypeContourDecision, TypedWorld, admit_generation,
     admit_prototype, check_governed_admission, default_experimental_limits,
     execute_describe_experimental, experimental_manifest, parse_args, read_bounded_artifact,
-    run_guest_exec, run_ordinary_request_loop, typed_wit_digest,
+    require_absolute_artifact_path, run_guest_exec, run_ordinary_request_loop, typed_wit_digest,
 };
 
 const INVALID_ARGUMENT_EXIT: i32 = 2;
@@ -16,16 +16,38 @@ const ADMISSION_REQUIRED_EXIT: i32 = 1;
 /// Bounded receipt-stream budget: one terminal line never exceeds it.
 const RECEIPT_MAX_BYTES: usize = 64 * 1024;
 
+/// Per-field detail ceiling: the line budget above bounds framing; this
+/// ceiling keeps one diagnostic line emittable even when a caller passes a
+/// hostile unbounded detail (for example a component-controlled export
+/// name), instead of dropping the line silently. Truncation is on a char
+/// boundary and never alters the machine-readable code.
+const ERROR_DETAIL_MAX_BYTES: usize = 1024;
+
+/// Truncates a detail string to [`ERROR_DETAIL_MAX_BYTES`] on a char
+/// boundary. Codes stay exact; only free-form detail is shortened, and no
+/// raw payload, path, secret, or backtrace is ever added here.
+fn truncate_detail(detail: &str) -> &str {
+    if detail.len() <= ERROR_DETAIL_MAX_BYTES {
+        return detail;
+    }
+    let mut end = ERROR_DETAIL_MAX_BYTES;
+    while !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    &detail[..end]
+}
+
 /// Emits one bounded JSON terminal line on `stderr`.
 ///
 /// Proper bounded serialization, not string interpolation: every value is
-/// escaped by the serializer and the whole line is refused when it would
-/// exceed the receipt budget, so an untrusted field can never break the
-/// framing or smuggle a newline into it.
+/// escaped by the serializer, the free-form detail is truncated to its own
+/// ceiling first, and the whole line is refused when it would still exceed
+/// the receipt budget, so an untrusted field can never break the framing
+/// or smuggle a newline into it.
 fn emit_error(code: &str, detail: &str) {
     let line = serde_json::to_vec(&serde_json::json!({
         "error": code,
-        "detail": detail,
+        "detail": truncate_detail(detail),
     }));
     let Ok(bytes) = line else {
         return;
@@ -226,6 +248,13 @@ fn run_experimental_describe(component_path: &Path, world_name: &str) -> ! {
         emit_error("UNKNOWN_WORLD", "world is unknown");
         std::process::exit(INVALID_ARGUMENT_EXIT);
     };
+    // The experimental lane takes only an explicit absolute local artifact:
+    // a relative spelling is denied here so acquisition never resolves it
+    // against the process working directory.
+    if let Err(error) = require_absolute_artifact_path(component_path) {
+        emit_error("PREFLIGHT_DENIED", &error.to_string());
+        std::process::exit(ADMISSION_REQUIRED_EXIT);
+    }
     let (artifact, preflight) = match read_bounded_artifact(component_path) {
         Ok(pair) => pair,
         Err(error) => {

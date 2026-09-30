@@ -158,7 +158,8 @@ pub use user_automation_state::{
     AUTOMATION_PAGE_REVISION, AUTOMATION_PAGE_REVISIONS, AUTOMATION_PAGE_STATE_FENCE,
     AUTOMATION_PARAM_AUTOMATION_ID, AUTOMATION_PARAM_CONFIGURATION_STATE, AUTOMATION_PARAM_CURSOR,
     AUTOMATION_PARAM_FAILURE_JSON, AUTOMATION_PARAM_INCLUDE_RETIRED,
-    AUTOMATION_PARAM_INVOCATION_JSON, AUTOMATION_PARAM_MAX_RECORDS, AUTOMATION_PARAM_OCCURRENCE_ID,
+    AUTOMATION_PARAM_INVOCATION_JSON, AUTOMATION_PARAM_MAX_RECORDS,
+    AUTOMATION_PARAM_NORMALIZATION_RECEIPT_JSON, AUTOMATION_PARAM_OCCURRENCE_ID,
     AUTOMATION_PARAM_OPERATION, AUTOMATION_PARAM_PREVIOUS_REVISION, AUTOMATION_PARAM_QUERY,
     AUTOMATION_PARAM_REVISION, AUTOMATION_PARAM_REVISION_JSON, AUTOMATION_QUERY_CURRENT,
     AUTOMATION_QUERY_FAILURE, AUTOMATION_QUERY_HISTORY, AUTOMATION_QUERY_INVOCATIONS,
@@ -179,6 +180,7 @@ pub use user_automation_state::{
     is_configuration_state_wire, parse_automation_failure_document, validate_automation_doc,
     validate_automation_failure_document, validate_automation_mutation_params,
     validate_automation_read_params, verify_automation_continuation,
+    with_automation_normalization_receipt,
 };
 
 pub use request_hash::{
@@ -3783,6 +3785,11 @@ pub enum NamedMutationOperation {
     /// through the same fenced `RecoverySchema` transition. The store treats
     /// the snapshot as opaque bytes and only arbitrates `owner/canonical`.
     RecordFinishEvidence,
+    /// Persists the Governor-owned Module Catalog snapshot through the
+    /// fenced `RecoverySchema` transition. The store treats the snapshot as
+    /// opaque bytes and only arbitrates the fixed `owner/module_registry`
+    /// revision. Admission currentness remains a Governor readback decision.
+    RecordModuleCatalogSnapshot,
     AppendAuditEvent,
     /// Durable authority-revocation record (issue #686). Known-but-
     /// unsupported until a store-owned slice activates its catalogue row
@@ -3903,6 +3910,7 @@ impl NamedMutationOperation {
             Self::ReconcileRecovery
             | Self::RecordFinishDecision
             | Self::RecordFinishEvidence
+            | Self::RecordModuleCatalogSnapshot
             | Self::RecordAuthorityRevocation => TransitionClass::RecoverySchema,
             Self::ApplyErasure => TransitionClass::Erasure,
             Self::ApplyNotificationState => TransitionClass::NotificationState,

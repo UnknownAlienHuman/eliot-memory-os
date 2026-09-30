@@ -6,6 +6,8 @@
 //! Forbidden authority: must not self-author readiness without authenticated evidence, semantic oracle, or alternate authority; this module remains evidence-gated, renewal-gated, and supervision-checked.
 
 #[cfg(windows)]
+use super::canonical_store_runtime::StoreTruthEvidence;
+#[cfg(windows)]
 use super::kernel_audit::AuditEventDraft;
 use super::{
     DaemonRuntimeStatus, DaemonSupervisionContour, EliotdLaunchDescriptor, Generation,
@@ -18,8 +20,9 @@ use super::{
 use super::{
     EliotdLiveReadyEvidence, EliotdLiveReceipt, EliotdLiveReceiptDisposition, HealthVector,
     ProcessObservation, ProtectedRootLease, ProtectedRuntimePathLease, PublicationOutcome,
-    PublicationPrecondition, SupervisionLeaseSnapshot, classify_eliotd_live_receipt_transition,
-    publish_atomic_owned_runtime_receipt, windows_paths_equal,
+    PublicationPrecondition, StateFence, SupervisionLeaseSnapshot,
+    classify_eliotd_live_receipt_transition, publish_atomic_owned_runtime_receipt,
+    windows_paths_equal,
 };
 use sha2::{Digest as _, Sha256};
 use std::path::Path;
@@ -660,6 +663,26 @@ impl KernelComposition {
                 if lineage_zeros > 1 {
                     return Err(KernelServiceError::ReadinessNotProven);
                 }
+                // #1681 / I14.21 / I14.11 item 7: an unresolved rebind effect
+                // blocks capability restoration. A `Pending` ORS replay record
+                // for this exact generation and authority epoch is a possible
+                // Store effect whose outcome is still unknown, and readiness
+                // and attachment alone cannot clear it. The effect stays
+                // unknown here: it is not retried, is not given a fresh
+                // identity to repeat, and is not resolved by assuming it did
+                // not happen.
+                let unresolved_same_lineage = ors_records.iter().any(|r| {
+                    r.state == eliot_ors::StoreRebindReplayState::Pending
+                        && r.generation == receipt.generation.value()
+                        && r.authority_epoch == receipt.authority_epoch.sequence.get()
+                });
+                if unresolved_same_lineage {
+                    observe_live_receipt(
+                        "kernel.live_receipt.store_availability_refused",
+                        "store_rebind_effect_unresolved",
+                    );
+                    return Err(KernelServiceError::ReadinessNotProven);
+                }
                 let latest = committed.into_iter().max_by_key(|r| {
                     (
                         r.commit_order,
@@ -701,33 +724,44 @@ impl KernelComposition {
                 }
             }
         }
-        let gateway = self
-            .canonical_store_gateway
-            .lock()
-            .map_err(|_| KernelServiceError::Platform("store gateway lock poisoned".to_owned()))?
-            .clone()
-            .ok_or(KernelServiceError::ReadinessNotProven)?;
-        let health = gateway
-            .health()
+        // #1681 / I14.11: the three Store facts are observed separately and
+        // canonical-sensitive authority is refused unless all three hold.
+        //
+        // The previous form collapsed them: a poisoned owner lock, an absent
+        // gateway, a Store that declined to answer, a Store that answered
+        // "not ready" and a Store whose semantic truth belongs to another
+        // fence all reached the caller as the same untyped refusal. A caller
+        // cannot act on that. The observation now names which owner is
+        // missing, and an unreadable owner DEFERS with that name instead of
+        // reporting clean absence.
+        //
+        // The presented candidate fence is the fence freshness is judged
+        // against, so a Store still serving an older fence is stale truth
+        // rather than a healthy Store.
+        let availability_fence =
+            StateFence::new(candidate.kernel_epoch.clone(), request.generation);
+        // `observe_canonical_store_availability` fails closed: it yields the
+        // evidence only when all three facts hold, and otherwise returns the
+        // refusal naming the owner that is missing. The caller therefore
+        // cannot reach the evidence below on stale truth, an unattached
+        // transport, or an owner it could not read.
+        let evidence = self
+            .observe_canonical_store_availability(&availability_fence)
             .await
-            .map_err(KernelServiceError::Platform)?;
-        if health.status != eliot_store_api::StoreHealthStatus::Ready {
-            return Err(KernelServiceError::ReadinessNotProven);
-        }
-        let snapshot = gateway
-            .validation_snapshot()
-            .await
-            .map_err(KernelServiceError::Platform)?;
-        snapshot
-            .validate()
-            .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
-        if snapshot.state_fence.authority_epoch != candidate.kernel_epoch
-            || snapshot.state_fence.resource_generation != request.generation
-        {
-            return Err(KernelServiceError::HandshakeMismatch {
-                field: "store_state_fence",
-            });
-        }
+            .map_err(|refusal| {
+                observe_live_receipt(
+                    "kernel.live_receipt.store_availability_refused",
+                    refusal.owner().as_str(),
+                );
+                refusal.kernel_service_error()
+            })?;
+        // The facts are proven. The two owner-issued values the receipt cites
+        // come from the SAME bounded round trips the observation just made, so
+        // proving the three facts costs no additional Store IO.
+        let StoreTruthEvidence {
+            manifest_digest,
+            validation_revision,
+        } = evidence;
         self.record_startup_evidence(5)?;
         let daemon_evidence = if self.active_daemon_launch()?.is_some() {
             let daemon_receipt = self.ensure_daemon_ready_for_probe().await?;
@@ -775,13 +809,12 @@ impl KernelComposition {
         let mut evidence_refs = KernelReadyReceipt::probe_binding_evidence(request)?;
         evidence_refs.extend([
             eliot_platform::PlatformHandle::new(format!(
-                "kernel-store-validation:{}",
-                snapshot.validation_revision
+                "kernel-store-validation:{validation_revision}"
             ))
             .map_err(|error| KernelServiceError::Platform(error.to_string()))?,
             eliot_platform::PlatformHandle::new(format!(
                 "kernel-store-health:{}",
-                health.manifest_digest.as_str()
+                manifest_digest.as_str()
             ))
             .map_err(|error| KernelServiceError::Platform(error.to_string()))?,
         ]);

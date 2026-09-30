@@ -74,6 +74,10 @@ fn candidate(
         binding: context.clone(),
         atom_id: id(atom_id),
         provider_role,
+        // This fixture asserts about binding, representation and admission, not
+        // about a measured position inside the snapshot, so the range stays a
+        // typed unknown.
+        source_range: None,
         source: SourceSnapshot {
             source_id: SourceId::new(format!("source-{atom_id}")).expect("source"),
             owner: ProviderId::new(format!("owner-{atom_id}")).expect("owner"),

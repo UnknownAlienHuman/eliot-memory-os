@@ -9,7 +9,11 @@ use eliot_process::{
     CancellationStatus, OperationId, ProcessLifecycle, ProcessStartReceipt, ResourceLimits,
     SecretRef,
 };
-use eliot_protocol::{AckPhase, EncodingProfile};
+use eliot_protocol::{
+    AckPhase, EncodingProfile, Frame, NATIVE_WORKER_FRAME_V1_WIRE_VERSION,
+    NATIVE_WORKER_PROTOCOL_VERSION, NativeWorkerFramePayloadV1, NativeWorkerOperationV1,
+    ProtocolPayload, ProtocolVersion,
+};
 use eliot_receipts::ReceiptDisposition;
 use eliot_runtime_contracts::ServiceProcessState;
 use schemars::JsonSchema;
@@ -19,7 +23,7 @@ use crate::WorkerError;
 pub use crate::generated::{NativeWorkerExecuteEbpCallV1, WorkerRequest};
 
 /// Stable version of A-13's language-neutral native-worker protocol.
-pub const PROTOCOL_VERSION: &str = "eliot-native-worker/v2";
+pub const PROTOCOL_VERSION: &str = NATIVE_WORKER_PROTOCOL_VERSION;
 /// The only encoding profile admitted by the first native-worker contract.
 pub const JSON_ENCODING_PROFILE: &str = "json-v1";
 
@@ -211,7 +215,9 @@ pub struct EventAckReceipt {
     pub acknowledged_at_unix_ms: u64,
 }
 
-/// Native worker frame. Every request carries the complete EBP correlation/fence context.
+/// Native worker frame. The shared EBP envelope carries correlation, encoding,
+/// and trace context; the native-worker payload preserves this contour's exact
+/// lease, deadline, authority fence, admission revision, and generation.
 ///
 /// `request_id` is the shared ELIOT-owned [`RequestId`] (same identity type
 /// as EBP `Frame.request_id`, I7.2); `connection_id` is the transport-owner
@@ -269,6 +275,102 @@ impl WorkerFrame {
             return Err(WorkerError::InvalidFrame("epoch_fence"));
         }
         Ok(())
+    }
+
+    /// Projects a validated native-worker frame into the shared EBP envelope.
+    ///
+    /// The generated Execute body is serialized without changing its schema
+    /// identity and is validated again by `WorkerCore` at dispatch.
+    pub fn to_ebp_frame(&self) -> Result<Frame, WorkerError> {
+        self.validate_shape()?;
+        let operation = native_worker_operation(&self.body);
+        let body = serde_json::to_value(&self.body)
+            .map_err(|_| WorkerError::InvalidFrame("body_serialization"))?;
+        let frame = Frame {
+            protocol_version: ProtocolVersion::CURRENT,
+            encoding_profile: EncodingProfile::JsonV1,
+            connection_id: self.connection_id.clone(),
+            request_id: Some(self.request_id.clone()),
+            kind: operation.frame_kind(),
+            message_type: operation.message_type(),
+            request_identity: None,
+            payload: ProtocolPayload::NativeWorkerFrameV1(NativeWorkerFramePayloadV1 {
+                wire_version: NATIVE_WORKER_FRAME_V1_WIRE_VERSION,
+                native_protocol_version: self.protocol_version.clone(),
+                operation,
+                deadline_unix_ms: self.deadline_unix_ms,
+                authority_epoch: self.authority_epoch.clone(),
+                state_fence: self.state_fence.clone(),
+                lease_id: self.lease_id.clone(),
+                admission_revision: self.admission_revision.clone(),
+                producer_generation: self.producer_generation,
+                body,
+            }),
+            trace_context: self.trace_context.clone(),
+        };
+        frame
+            .validate()
+            .map_err(|_| WorkerError::InvalidFrame("ebp_frame"))?;
+        Ok(frame)
+    }
+
+    /// Reconstitutes a native-worker frame from a validated shared EBP frame.
+    pub fn from_ebp_frame(frame: Frame) -> Result<Self, WorkerError> {
+        frame
+            .validate()
+            .map_err(|_| WorkerError::InvalidFrame("ebp_frame"))?;
+        let Frame {
+            encoding_profile,
+            connection_id,
+            request_id,
+            request_identity: _,
+            payload,
+            trace_context,
+            ..
+        } = frame;
+        if encoding_profile != EncodingProfile::JsonV1 {
+            return Err(WorkerError::UnsupportedEncoding);
+        }
+        let ProtocolPayload::NativeWorkerFrameV1(native) = payload else {
+            return Err(WorkerError::InvalidFrame("native_worker_payload"));
+        };
+        let request_id = request_id.ok_or(WorkerError::InvalidFrame("request_id"))?;
+        let body: WorkerFrameBody = serde_json::from_value(native.body)
+            .map_err(|_| WorkerError::InvalidFrame("body_deserialization"))?;
+        if native_worker_operation(&body) != native.operation {
+            return Err(WorkerError::InvalidFrame("operation_body_mismatch"));
+        }
+        let frame = Self {
+            protocol_version: native.native_protocol_version,
+            encoding_profile: JSON_ENCODING_PROFILE.to_owned(),
+            connection_id,
+            request_id,
+            trace_context,
+            deadline_unix_ms: native.deadline_unix_ms,
+            authority_epoch: native.authority_epoch,
+            state_fence: native.state_fence,
+            lease_id: native.lease_id,
+            admission_revision: native.admission_revision,
+            producer_generation: native.producer_generation,
+            body,
+        };
+        frame.validate_shape()?;
+        Ok(frame)
+    }
+}
+
+fn native_worker_operation(body: &WorkerFrameBody) -> NativeWorkerOperationV1 {
+    match body {
+        WorkerFrameBody::Execute(_) => NativeWorkerOperationV1::Execute,
+        WorkerFrameBody::Cancel(_) => NativeWorkerOperationV1::Cancel,
+        WorkerFrameBody::Heartbeat => NativeWorkerOperationV1::Heartbeat,
+        WorkerFrameBody::Health => NativeWorkerOperationV1::Health,
+        WorkerFrameBody::Checkpoint(_) => NativeWorkerOperationV1::Checkpoint,
+        WorkerFrameBody::Quiesce => NativeWorkerOperationV1::Quiesce,
+        WorkerFrameBody::Reconnect(_) => NativeWorkerOperationV1::Reconnect,
+        WorkerFrameBody::Reconcile => NativeWorkerOperationV1::Reconcile,
+        WorkerFrameBody::Acknowledge(_) => NativeWorkerOperationV1::Acknowledge,
+        WorkerFrameBody::Shutdown => NativeWorkerOperationV1::Shutdown,
     }
 }
 

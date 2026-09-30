@@ -332,13 +332,15 @@ impl AuthenticatedHostSession {
             return Err("max_records must be within the catalogue bound".to_owned());
         }
         let input = QueryInput {
-            intent: QueryIntent {
-                mode,
-                time_scope: "governor local evidence window".to_owned(),
-                branch_environment_scope: "governor local branch and environment".to_owned(),
-                freshness_policy: "exact captured records only".to_owned(),
-                required_assurance: "verifier evidence read".to_owned(),
-            },
+            // Only `mode` is a selector on this surface: it is the dimension
+            // `plan_evidence_pack_query` reads, and it is the one both query
+            // plans fail closed on. The four prose strings this call site
+            // used to supply were validated as non-blank and then discarded by
+            // the plan, so they promised a time scope, a branch scope, a
+            // freshness policy and an assurance level that nothing selected.
+            // Their canonical typed forms are the Governor read facade's closed
+            // enums, resolved there against the request fence (#1144 W4).
+            intent: QueryIntent { mode },
             query: format!("subject:{subject}"),
             exact_resource_uri: None,
         };
@@ -1462,11 +1464,7 @@ mod local_read_result_tests {
         "client_capabilities":{"tasks":false},
         "tool":{"name":"eliot.query","arguments":{
             "intent":{
-                "mode":"verification",
-                "time_scope":"session-window",
-                "branch_environment_scope":"branch",
-                "freshness_policy":"exact-fence",
-                "required_assurance":"evidence-provenance"
+                "mode":"verification"
             },
             "query":"subject:evidence-alpha",
             "exact_resource_uri":null
@@ -1702,11 +1700,7 @@ mod local_read_build_tests {
         "client_capabilities":{"tasks":false},
         "tool":{"name":"eliot.query","arguments":{
             "intent":{
-                "mode":"verification",
-                "time_scope":"session-window",
-                "branch_environment_scope":"branch",
-                "freshness_policy":"exact-fence",
-                "required_assurance":"evidence-provenance"
+                "mode":"verification"
             },
             "query":"subject:evidence-alpha",
             "exact_resource_uri":null

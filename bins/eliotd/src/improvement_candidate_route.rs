@@ -21,36 +21,54 @@
 //!
 //! # One checked commitment, never a second one
 //!
-//! Both consumers here read the record the Governor pipeline committed.
+//! Every consumer here reads the record the Governor pipeline committed.
 //! [`route_improvement_candidate`] returns the disposition whose canary handoff
-//! carries that exact commitment and its discriminator projection, and
+//! carries that exact commitment and its discriminator projection,
+//! [`check_improvement_handoff_identity`] reads a returned handoff against this
+//! build's checked wire revision and content identity, and
 //! [`assess_improvement_repeat`] compares a retained prior record against that
-//! same checked record. Neither computes a digest, substitutes a fallback, empty,
-//! or legacy value, or swallows a failure: a hashing or serialization failure is
-//! produced once by the pipeline and crosses into the daemon as the typed
-//! `PipelineError` it is.
+//! same checked record. None of them computes a digest, substitutes a fallback,
+//! empty, or legacy value, or swallows a failure: a hashing or serialization
+//! failure is produced once by the pipeline and crosses into the daemon as the
+//! typed `PipelineError` it is.
 //!
 //! # The consumer checks the producer's version or refuses the record
 //!
 //! Every consumer of a committed record here verifies that the record carries
-//! the identity this daemon's build checks, so a record written under another
-//! domain, encoding revision, or algorithm is a typed refusal
-//! ([`eliot_maintenance::UncheckedRecordIdentity`]) and never a tolerated
-//! value. The recorded digest is validated against the value the producer
-//! recorded; it is never recomputed over local state, and no digest,
-//! placeholder, or empty string stands in for a record this build cannot
-//! read.
+//! the identity this daemon's build checks — its wire revision, and its domain,
+//! encoding revision, or algorithm — so a record written under another identity
+//! is a typed refusal ([`eliot_maintenance::UncheckedWireRevision`] or
+//! [`eliot_maintenance::UncheckedRecordIdentity`]) and never a tolerated value.
+//! The recorded digest is validated against the value the producer recorded; it
+//! is never recomputed over local state, and no digest, placeholder, or empty
+//! string stands in for a record this build cannot read.
+//!
+//! # The external effect is read from its owner, never settled here
+//!
+//! [`read_improvement_effect_state`] is the one place this route answers "what
+//! happened to the external effect this candidate names", and it answers it by
+//! forwarding to the Governor owner: the retry gate from
+//! [`improvement_candidate_retry_permitted`] and the owner's retained result
+//! from [`retained_improvement_candidate_completion`]. It attaches nothing. The
+//! owner's outcome field is private to the Governor module, its only writer
+//! re-checks the receipt's binding to the obligation's exact operation identity,
+//! and no producer of such a receipt exists in this workspace — so every answer
+//! this route produces is the denying one, which is stated on
+//! [`ImprovementEffectState`] rather than papered over with a receipt this daemon
+//! would have had to invent.
 
 use eliot_maintenance::improvement_pipeline::{
     ImprovementCurrentProposal, RetainedImprovementProposal, compare_improvement_commitments,
 };
 use eliot_maintenance::{
     ActivationEvidence, ExperimentPlan, IMPROVEMENT_PIPELINE_OWNER, ImprovementAdmissionDecision,
-    ImprovementAdmissionPolicy, ImprovementCandidateView, ImprovementEvidenceView,
-    ImprovementOperation, ImprovementPipelineInputs, ImprovementProposal, RollbackContract,
-    improvement_retry_permitted, reconcile_unknown_activation, retained_improvement_completion,
-    run_improvement_candidate_pipeline,
+    ImprovementAdmissionPolicy, ImprovementCanaryHandoff, ImprovementCandidateView,
+    ImprovementEvidenceView, ImprovementOperation, ImprovementPipelineInputs, ImprovementProposal,
+    ImprovementTerminalDisposition, RollbackContract, check_checked_record_identity,
+    check_handoff_wire_revision, improvement_retry_permitted, reconcile_unknown_activation,
+    retained_improvement_completion, run_improvement_candidate_pipeline,
 };
+use serde::Serialize;
 
 /// Borrowed inputs for one production improvement-candidate route call.
 ///
@@ -108,18 +126,124 @@ pub fn route_improvement_candidate(
     })
 }
 
-/// Returns the owning identity for each of the eight distinct pipeline operations.
+/// Reads one `CanaryAdmitted` handoff against this build's checked identity.
 ///
-/// Production caller of [`ImprovementOperation::owner`]: Propose/Admit/Promote
-/// resolve to Governor maintenance, Execute/Measure to Testd, Evaluate to the
+/// The daemon-side read of a handoff the pipeline committed. A handoff is a
+/// RECORD — the exact commitment, discriminator projection and
+/// material-equality key the pipeline derived from one normalized proposal —
+/// and this is the point at which the daemon checks that record against the
+/// same constants this build commits with, before the handoff is named as
+/// anything other than an opaque log line.
+///
+/// Two existing owner checks are applied, in the order their two questions
+/// differ:
+///
+/// 1. [`eliot_maintenance::check_handoff_wire_revision`] — WHICH serialized
+///    shape the record was written under. The recorded `wire_revision` is
+///    compared against the constant the producer stamps; it is never rounded,
+///    padded, or read as though the current shape had produced it.
+/// 2. [`eliot_maintenance::check_checked_record_identity`] — WHICH content
+///    identity the record carries: the domain, encoding revision and algorithm
+///    of the handoff's own `proposal_commitment`, `proposal_discriminator` and
+///    `proposal_material_equality`.
+///
+/// Nothing is recomputed. The commitment is validated as the ORIGINAL recorded
+/// value against the producer's own constants: no digest is re-derived over
+/// local state and called a match, and no substitute, empty, or legacy digest
+/// stands in for a record this build cannot read. A refusal crosses this
+/// boundary as the typed [`eliot_maintenance::PipelineError`] the owner check
+/// produced — [`eliot_maintenance::UncheckedWireRevision`] or
+/// [`eliot_maintenance::UncheckedRecordIdentity`], each through its own `From`
+/// arm — and never as a tolerated handoff or a log string standing in for one.
+///
+/// # Why an `ImprovementCurrentProposal` view is assembled here
+///
+/// The content-identity check is typed over [`ImprovementCurrentProposal`], and
+/// that is the shape it is compared on everywhere else in the owner crate. The
+/// view below carries the handoff's OWN three identity objects — its recorded
+/// commitment, discriminator and material-equality key, copied, never derived —
+/// together with the candidate identity the handoff itself records and the
+/// exact experiment plan this same route call passed to the pipeline. No field
+/// is invented and no value is derived: the check reads only the three identity
+/// objects, so the view exists solely to reach the existing owner check rather
+/// than to restate it. This is a read view, never a committed record, never a
+/// stored record, and never an input to a progress assessment — a retained
+/// record and a real comparison stay with
+/// [`assess_improvement_repeat`], which is the only function here that compares
+/// records.
+///
+/// A `CanaryAdmitted` handoff is still NOT an activation: nothing here
+/// promotes, activates, installs, completes, or issues authority, and
+/// `execution_authorized` stays false in every construction the pipeline makes.
+pub fn check_improvement_handoff_identity(
+    handoff: &ImprovementCanaryHandoff,
+    experiment: &ExperimentPlan,
+) -> Result<(), eliot_maintenance::PipelineError> {
+    check_handoff_wire_revision(handoff)?;
+    // `From<UncheckedRecordIdentity>` and `From<UncheckedWireRevision>` are
+    // separate arms of `PipelineError`, so each owner refusal keeps its own
+    // type across this boundary instead of collapsing into one reason string.
+    check_checked_record_identity(&ImprovementCurrentProposal {
+        candidate_id: handoff.candidate_id.clone(),
+        commitment: handoff.proposal_commitment.clone(),
+        discriminator: handoff.proposal_discriminator.clone(),
+        material_equality: handoff.proposal_material_equality.clone(),
+        experiment_plan: experiment.clone(),
+    })?;
+    Ok(())
+}
+
+/// Returns the owning identity for each of the nine distinct pipeline operations.
+///
+/// Production caller of [`ImprovementOperation::owner`]:
+/// Propose/IngestCandidate/Admit/Promote resolve to Governor maintenance,
+/// Execute/Measure to Testd, Evaluate to the
 /// independent Instrument verifier, `CanaryActivate` to Kernel (handoff only),
 /// and Rollback to the bound rollback-contract owner.
+///
+/// # This map is READ on the live route, not merely published
+///
+/// The daemon consults this map at the ONE point where it decides the routing of
+/// its own records:
+/// `improvement_candidate_dispatch::dispatch_improvement_candidate_route` reads
+/// it before it builds anything, and the owner identities it then writes into
+/// its `ExperimentPlan`, `ActivationEvidence`, `ImprovementEvidenceView` and
+/// `RollbackContract` come from here rather than from a constant re-spelled at
+/// the field. The Governor crate then re-checks those very fields independently —
+/// `check_experiment_owner_routing` refuses an executor that is not the Testd
+/// owner, `check_evaluator_independence` refuses an evidence verifier that is not
+/// the planned one or that is the executor, the admission owner or the rollback
+/// owner (A14.6, A5.5), and `check_rollback_join` refuses a rollback owner that
+/// disagrees with the admission policy — so a map entry that ever resolved
+/// elsewhere would REFUSE the route rather than be recorded and discarded.
+///
+/// `rollback_owner_id` is the map's only input because Rollback is the one
+/// operation with no fixed pipeline owner. On the live path the value passed is
+/// the same `G-19` admission policy record's own
+/// [`eliot_maintenance::ImprovementAdmissionPolicy::rollback_owner_id`] the
+/// request already carries, so the owner the map names and the owner the
+/// pipeline compares against are one value read once, never a literal.
+///
+/// The map projects all nine operations and the daemon reads three of them
+/// (`ExecuteExperiment`, `Evaluate`, `Rollback`), because those are the three
+/// whose owner the daemon has to state in a record it builds. The remaining six
+/// are stamped or decided inside the Governor crate this route calls — including
+/// the `CanaryActivate` owner the pipeline writes into the handoff's
+/// `activation_owner_id` and the daemon only reads — so there is no daemon-side
+/// field for them to appear in, and the map is left complete rather than trimmed
+/// to what one caller happens to read.
 #[must_use]
-pub fn improvement_operation_owners(rollback_owner_id: &str) -> [(&'static str, String); 8] {
+pub fn improvement_operation_owners(rollback_owner_id: &str) -> [(&'static str, String); 9] {
     [
         (
             ImprovementOperation::Propose.as_str(),
             ImprovementOperation::Propose
+                .owner(rollback_owner_id)
+                .to_string(),
+        ),
+        (
+            ImprovementOperation::IngestCandidate.as_str(),
+            ImprovementOperation::IngestCandidate
                 .owner(rollback_owner_id)
                 .to_string(),
         ),
@@ -242,9 +366,7 @@ pub fn reconcile_improvement_unknown(
 /// a bound advisory handoff each leave the gate open because each carries its
 /// own owner and remedy, and a fresh attempt is that owner's to make.
 #[must_use]
-pub fn improvement_candidate_retry_permitted(
-    disposition: &eliot_maintenance::ImprovementTerminalDisposition,
-) -> bool {
+pub fn improvement_candidate_retry_permitted(disposition: &ImprovementTerminalDisposition) -> bool {
     improvement_retry_permitted(disposition)
 }
 
@@ -263,19 +385,140 @@ pub fn improvement_candidate_retry_permitted(
 ///
 /// # What the daemon does not do yet
 ///
-/// This is the route's forwarder, and the honest limit is that it has no live
-/// caller: the daemon does not yet produce a request for this route, so nothing
-/// in `eliotd` invokes this function on a live path today (open item A1/W3).
-/// Reading this forwarder as a running reconciliation would overstate the
-/// daemon. What exists today is the mechanism — the Governor-owned entry point
-/// and this forwarder to it — plus the effect owner's obligation to attach its
-/// own receipt, which nothing in this workspace performs, so in practice the
-/// result is `None` for every disposition the pipeline produces today.
+/// The daemon DOES produce a request for this route now
+/// (`improvement_candidate_dispatch::dispatch_improvement_candidate_route`
+/// builds one per maintenance observation), and it does read the disposition
+/// that comes back. This forwarder is read through
+/// [`read_improvement_effect_state`], which every dispatched route step calls,
+/// so it is no longer an uncalled mechanism. What it still does not do is
+/// discharge an effect: nothing in this workspace produces an owner-settled
+/// [`eliot_authority::EffectReceipt`] for an improvement operation, so the
+/// receipt this forwarder would return does not exist yet, and the Governor
+/// entry point therefore returns `None` for every disposition the pipeline
+/// produces today. Reading it as a running reconciliation would overstate the
+/// daemon. The owner that could attach one is named in the report rather than
+/// simulated: see [`UnknownEffectObligation::owner_id`].
 #[must_use]
 pub fn retained_improvement_candidate_completion(
-    disposition: &eliot_maintenance::ImprovementTerminalDisposition,
+    disposition: &ImprovementTerminalDisposition,
 ) -> Option<&eliot_receipts::ReceiptEnvelope> {
     retained_improvement_completion(disposition)
+}
+
+/// The exact identity of one unresolved external effect, as its owner must see
+/// it.
+///
+/// Every field is copied from the Governor pipeline's own
+/// [`eliot_maintenance::ImprovementUnknownEffect`], which its single
+/// construction site builds from checked records only: the candidate and
+/// experiment from the committed record, the operation and idempotency namespace
+/// from that record's proposal commitment, and the forward-repair reference and
+/// invalidation targets from the gap-free rollback contract. Nothing here is
+/// derived, defaulted, or supplied by this daemon, so a durable copy of this
+/// value can name no debt the Governor owner did not check.
+///
+/// The operation and idempotency pair is what the Governor owner re-checks when
+/// a receipt is offered to the obligation, so it is carried verbatim rather than
+/// restated: a receipt that names another operation is refused at that seam, and
+/// this projection must not appear to relax it by spelling a different identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct UnknownEffectObligation {
+    /// Owner that holds the unresolved reconciliation debt.
+    pub owner_id: String,
+    /// Candidate whose external activation or effect outcome is unresolved.
+    pub candidate_id: String,
+    /// Exact bounded experiment the unresolved effect belongs to.
+    pub experiment_id: String,
+    /// Committed logical operation an owner receipt must name.
+    pub operation_ref: String,
+    /// Committed idempotency namespace the same receipt must name.
+    pub idempotency_key: String,
+    /// Forward-repair reference the checked rollback contract names for an
+    /// incomplete rollback effect.
+    pub forward_repair_ref: String,
+    /// Invalidation targets the checked rollback contract covers, in the
+    /// contract's own committed order.
+    pub invalidation_set: Vec<String>,
+}
+
+/// What one terminal disposition says about the external effect it names.
+///
+/// Both answers are read from the Governor owner and re-decided by nothing here:
+/// the retry gate from [`improvement_candidate_retry_permitted`] and the owner's
+/// retained result from [`retained_improvement_candidate_completion`]. An
+/// unsettled, foreign, still-unknown, or merely non-success outcome therefore
+/// denies the retry gate and retains no result, and a completed effect denies
+/// the gate while its retained result is what the owner reads back — this
+/// projection reports those two answers verbatim and never turns one into the
+/// other.
+///
+/// # The absent owner, named rather than simulated
+///
+/// The effect owner's outcome is private to the Governor module and reachable
+/// only through `ImprovementUnknownEffect::with_settled_owner_outcome`, whose
+/// four re-checks this route cannot and does not bypass. No producer for such a
+/// receipt exists in this workspace, so every `ImprovementEffectState` this
+/// daemon builds today is the denying one: no obligation settled, no retry
+/// permitted, no completion retained. That is the honest live report. Supplying a
+/// receipt to discharge the debt is [`UnknownEffectObligation::owner_id`]'s
+/// work, over [`ImprovementTerminalDisposition::UnknownRequiresReconciliation`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ImprovementEffectState {
+    /// The Governor gate's own answer for this disposition.
+    pub retry_permitted: bool,
+    /// Whether the effect owner has retained a result for a COMPLETED effect.
+    pub completion_retained: bool,
+    /// The unresolved obligation to route to its named owner, present only when
+    /// the disposition carries one.
+    pub obligation: Option<UnknownEffectObligation>,
+}
+
+/// Reads one terminal disposition's external-effect state from its owner.
+///
+/// Production caller of both effect forwarders above, in one place, so a consumer
+/// never re-derives either answer. Every disposition is answered, and the
+/// obligation projection names every variant explicitly rather than behind a
+/// wildcard: adding a disposition stays a compile error here until its
+/// obligation answer is decided, so a future variant cannot silently inherit "no
+/// unresolved effect" from an unexamined default.
+#[must_use]
+pub fn read_improvement_effect_state(
+    disposition: &ImprovementTerminalDisposition,
+) -> ImprovementEffectState {
+    ImprovementEffectState {
+        retry_permitted: improvement_candidate_retry_permitted(disposition),
+        completion_retained: retained_improvement_candidate_completion(disposition).is_some(),
+        obligation: obligation_of(disposition),
+    }
+}
+
+/// Projects the owner-facing identity of a disposition's unresolved effect.
+///
+/// `None` for every disposition that names no external effect. `RolledBack` is
+/// named here for the same reason the Governor entry points name it: a bare
+/// `contract_ref` is a contract reference, not a named unresolved effect, and
+/// reading it as one would invent debt the checked records do not carry.
+fn obligation_of(disposition: &ImprovementTerminalDisposition) -> Option<UnknownEffectObligation> {
+    match disposition {
+        ImprovementTerminalDisposition::UnknownRequiresReconciliation { obligation } => {
+            Some(UnknownEffectObligation {
+                owner_id: obligation.owner_id.clone(),
+                candidate_id: obligation.candidate_id.clone(),
+                experiment_id: obligation.experiment_id.clone(),
+                operation_ref: obligation.commitment.operation_ref.clone(),
+                idempotency_key: obligation.commitment.idempotency_key.clone(),
+                forward_repair_ref: obligation.forward_repair_ref.clone(),
+                invalidation_set: obligation.invalidation_set.clone(),
+            })
+        }
+        ImprovementTerminalDisposition::RolledBack { .. }
+        | ImprovementTerminalDisposition::Rejected { .. }
+        | ImprovementTerminalDisposition::Inconclusive { .. }
+        | ImprovementTerminalDisposition::RegressionRejected { .. }
+        | ImprovementTerminalDisposition::NoProgress { .. }
+        | ImprovementTerminalDisposition::Blocked { .. }
+        | ImprovementTerminalDisposition::CanaryAdmitted { .. } => None,
+    }
 }
 
 /// Returns the Governor maintenance owner identity for the improvement route.

@@ -6,9 +6,20 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CONTEXT_CONTRACT_VERSION, ContextBinding, ContextError, DecisionRevision, ProofBinding,
-    ProviderRole, SemanticRole, SourceSnapshot, validate_digest, validate_text,
+    CONTEXT_CONTRACT_VERSION, ContextBinding, ContextError, DecisionRevision, ExactSourceRange,
+    ProofBinding, ProviderRole, SemanticRole, SourceSnapshot, validate_digest, validate_text,
 };
+
+/// Largest source span, in the declared coordinate system's own units, that one
+/// atom may claim as exact.
+///
+/// `1_048_576` is the ceiling `validate_content` already applies to one atom's
+/// representation content, so a wider claimed span was not measured against a
+/// payload this crate will hold. A producer whose original is wider states no
+/// range at all rather than an unbounded one. The span is bounded, never the
+/// absolute offset: a ten-megabyte snapshot may still contain a small atom at
+/// any offset within it.
+pub const MAX_ATOM_SOURCE_RANGE_UNITS: u64 = 1_048_576;
 
 fn validate_content(value: &str, field: &'static str) -> Result<(), ContextError> {
     if value.trim().is_empty()
@@ -531,6 +542,29 @@ pub struct ContextCandidate {
     pub provider_role: ProviderRole,
     /// Immutable source snapshot.
     pub source: SourceSnapshot,
+    /// Exact half-open range of this atom inside `source`, when the provider
+    /// measured one.
+    ///
+    /// The value reuses the boundary owner's own `ExactSourceRange` verbatim, so
+    /// a range is never a second, weaker spelling: it names its coordinate
+    /// system and the exact immutable source revision it was measured against,
+    /// and `ContextCandidate::validate` re-checks both against `source` instead
+    /// of inferring either. Its claimed span is bounded by
+    /// `MAX_ATOM_SOURCE_RANGE_UNITS`.
+    ///
+    /// `None` is a typed unknown, not an exact whole-unit claim: a provider that
+    /// cannot say where its material came from says nothing, and an absent range
+    /// is never defaulted, inferred or widened into a range that reads as exact
+    /// (I12.13, "unknown source boundaries remain unknown"). It is also the shape
+    /// a boundary envelope already accepts for a source member it cannot pin, so
+    /// a producer that has no measurement carries the same explicit absence on
+    /// both sides rather than inventing an endpoint.
+    ///
+    /// The field is covered by the candidate canonical digest and by
+    /// `AdmittedContextSet::canonical_payload`, so removing or altering a range
+    /// changes the admitted atom identity instead of being invisible to it.
+    #[serde(default)]
+    pub source_range: Option<ExactSourceRange>,
     /// Intrinsic learning provenance. `None` means ordinary evidence with no
     /// learning treatment; `Some` marks learning-derived material that the
     /// retrieval and delivery screens must verify against an owner-verified
@@ -588,6 +622,19 @@ impl ContextCandidate {
         self.binding.validate()?;
         self.provider_role.validate()?;
         self.source.validate()?;
+        if let Some(range) = &self.source_range {
+            // The range carries the coordinate system and the exact immutable
+            // source revision; reusing the boundary owner's own check is what
+            // makes that binding verifiable instead of asserted. A snapshot the
+            // range does not name, or endpoints the snapshot cannot order, is
+            // refused here rather than carried into the admitted set.
+            range.validate(&self.source)?;
+            if range.length > MAX_ATOM_SOURCE_RANGE_UNITS {
+                return Err(ContextError::Bounds {
+                    field: "candidate.source_range.length",
+                });
+            }
+        }
         if let Some(provenance) = &self.learning {
             provenance.validate()?;
         }

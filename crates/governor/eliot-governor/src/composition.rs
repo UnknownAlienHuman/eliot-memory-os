@@ -44,8 +44,9 @@ use crate::{
 use eliot_authority::{
     CrossRootQuarantineEvidence, GrantActivationRequest, GrantId, GrantRevocationRequest,
     GrantStatus, IntroductionActivationRequest, IntroductionId, IntroductionRevocationRequest,
-    IntroductionStatus, P07AuthorityPort, P07PortError, RootTransitionActivationReceipt,
-    RootTransitionActivationRequest,
+    IntroductionStatus, P07AuthorityPort, P07PortError, RevocationOperationIdentity,
+    RevocationOrigin, RevocationTransitionDisposition, RevocationTransitionRequest,
+    RootTransitionActivationReceipt, RootTransitionActivationRequest,
 };
 use eliot_budget::{BudgetLedger, BudgetLedgerRecoverySnapshot};
 use eliot_canonical::{
@@ -70,6 +71,7 @@ use eliot_evaluation_contracts::{TerminalVerifierBinding, VerifierEvidenceRef};
 use eliot_finish::{
     DescendantClosure, FinishDecisionReceipt, FinishLifecycleAction, FinishService,
 };
+use eliot_influence::RevocationBounds;
 use eliot_instrument_api::{
     CaptureProvenance, EvidenceAxes, EvidenceCoverage, EvidenceFreshness, ExecutionStatus,
     InstrumentInvocation, InstrumentKind, NormalizedEvidence, RawEvidence, RawEvidenceSource,
@@ -81,17 +83,22 @@ use eliot_instrument_nextest::{
 use eliot_maintenance::{
     AutomationDecision, AutomationTriggerDecision, MaintenanceController, MaintenanceError,
     MaintenanceFamily, MaintenanceJob, MaintenanceJobState, MaintenanceStateStore,
+    RefusedReceiptStatus, maintenance_decision_ref,
 };
 use eliot_module_registry::ModuleCatalog;
 use eliot_module_registry::ModuleCatalogSnapshot;
 use eliot_observation::{ObservationJournal, ObservationJournalEntry};
-use eliot_ors::ScanDisclosureRecordOwner;
+use eliot_ors::{
+    ColdStartReadinessClaim, ColdStartReadinessOrsRecord, ColdStartReadinessOwnerKey,
+    ColdStartReadinessRecordOwner, ColdStartReadinessStageOutcome,
+    ColdStartReadinessTerminalDisposition, ScanDisclosureRecordOwner,
+};
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::{GrantClosureReceipt, ReceiptIdentity};
 use eliot_runtime_contracts::{
     AuthorityActivationReceipt, AuthorityRevocationReceipt, AuthorityState, RuntimeLease,
 };
-use eliot_security_contracts::PrivacyClass;
+use eliot_security_contracts::{PrivacyClass, RevocationReason};
 use eliot_session::{SessionLifecycleOwner, SessionLifecycleSnapshot, SessionState};
 use eliot_skill::{SkillLifecycleView, SkillRegistry};
 use eliot_store_api::{
@@ -109,10 +116,10 @@ use eliot_workscope::{
     GenerationEvidence, GoverningSourceAdmission, GoverningSourceSet, GuardTrigger, GuardVerdict,
     IdentityEvidence, IdentityLegOutcome, LeaseJoin, LooseScanQuarantine, MaterialAdmission,
     MaterialReadinessDirective, MaterialReadinessInputs, ObservedScopeResources, OnboardingLease,
-    OnboardingSingleFlight, PrivacyBoundary, PrivacyProfile, QuarantinedScopeRecord,
-    ReadinessLifecycle, RepositoryLineageIdentity, RequestedEffect, ResolutionAuthentication,
-    ResolutionRequest, ScanDisclosureOwnerBinding, ScanReceiptHandle, ScannerResolverInputs,
-    ScopeBinding, ScopeBindingDisposition, ScopeBindingGuard, ScopeIdentity, ScopeKind,
+    PrivacyBoundary, PrivacyProfile, QuarantinedScopeRecord, ReadinessLifecycle,
+    RepositoryLineageIdentity, RequestedEffect, ResolutionAuthentication, ResolutionRequest,
+    ScanDisclosureOwnerBinding, ScanReceiptHandle, ScannerResolverInputs, ScopeBinding,
+    ScopeBindingDisposition, ScopeBindingGuard, ScopeIdentity, ScopeKind,
     ScopeRelocationOrAttachReceipt, ScopeResolution, SourceAdmissionRequest, TaskBindingInput,
     TaskBindingState, TaskIntakeCandidate, TaskSelectionRequired, TriggerAdmission, TriggerReport,
     WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeCandidate, WorkScopeCandidateSet,
@@ -264,18 +271,87 @@ pub enum KernelPortError {
     NotAdmitted(String),
 }
 
+/// The proved canonical second phase of one grant closure, carried across the
+/// process boundary in transport-neutral types.
+///
+/// The daemon composition root does not depend on `eliot-ors` and must never
+/// gain it (the Kernel owns ORS inside the Kernel process, so the daemon has
+/// to reach the link through the authenticated transport). This record is
+/// therefore the port's return type instead of an in-process ORS projection:
+/// it names exactly the two facts the reconciliation proof reads — the
+/// ORIGINAL committed first-phase closure row and the exact Store-issued
+/// canonical receipt identity durably linked to it — and both are re-served
+/// verbatim from the owner's own committed bytes. No digest is recomputed and
+/// no field is re-derived here or by any implementor.
+///
+/// The link is mandatory, not optional: the durable second phase either exists
+/// and is returned, or the implementor answers `Err`. An absent link is an
+/// unestablished outcome, so a type that could carry "no link" as a success
+/// value would be a fabricated receipt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GrantClosureSecondPhaseLink {
+    /// The ORIGINAL committed first-phase closure row, served verbatim. The
+    /// first-phase bytes are never rewritten by the second phase.
+    closure: GrantClosureReceipt,
+    /// The exact Store-issued canonical receipt identity durably linked to
+    /// `closure` by this call.
+    canonical_receipt: ReceiptIdentity,
+}
+
+impl GrantClosureSecondPhaseLink {
+    /// Binds the ORIGINAL committed first-phase closure to the exact durable
+    /// canonical receipt linked against it.
+    ///
+    /// An implementor MUST pass the owner's verbatim committed closure and the
+    /// owner's verbatim linked receipt identity. It is not a constructor for an
+    /// unrecorded link: a first phase that did not commit, or a link the owner
+    /// does not hold, is a typed [`KernelPortError`], never a value here.
+    pub fn new(closure: GrantClosureReceipt, canonical_receipt: ReceiptIdentity) -> Self {
+        Self {
+            closure,
+            canonical_receipt,
+        }
+    }
+
+    /// Returns the ORIGINAL committed first-phase closure the link was recorded
+    /// against. The caller compares its `operation_id` and `declaration` by
+    /// content against the closure it read back, never by shape.
+    pub const fn closure(&self) -> &GrantClosureReceipt {
+        &self.closure
+    }
+
+    /// Returns the exact durable canonical second-phase receipt link.
+    pub const fn canonical_receipt(&self) -> &ReceiptIdentity {
+        &self.canonical_receipt
+    }
+}
+
 /// Narrow durable boundary for the canonical second phase of a grant
 /// closure. The Kernel-side adapter must delegate this call to
 /// `eliot_ors::OperationalRecoveryStore::link_grant_closure_canonical_receipt`;
 /// Governor never edits the first-phase closure row.
+///
+/// Like [`GrantClosureReceiptPort`], this port is transport-neutral: every type
+/// in its signature is reachable from a daemon-side dependency set that holds
+/// no in-process ORS, so the saga arm that records the canonical second phase
+/// is implementable by the process that owns the decision. `operation_id` is
+/// the ORIGINAL closure operation identity string already recorded in the
+/// first-phase [`GrantClosureReceipt`]; an adapter that needs a typed ORS
+/// operation identity constructs it from these exact bytes at the boundary
+/// that calls the store, which is where that validation belongs.
 pub trait GrantClosureCanonicalLinkPort: Send + Sync {
     /// Links the exact Store-issued `ReceiptIdentity` to the immutable
-    /// first-phase closure operation.
+    /// first-phase closure operation, and returns the proved read-back so the
+    /// caller re-checks it instead of taking the owner's word for it.
+    ///
+    /// Returns a typed [`KernelPortError`] when the first phase has not
+    /// committed for `operation_id`, when the link conflicts with an existing
+    /// one, or when the owner's read-back does not bind the presented receipt.
     fn link_grant_closure_canonical_receipt(
         &self,
-        operation_id: &eliot_ors::OperationIdentity,
+        operation_id: &str,
         canonical_receipt: &ReceiptIdentity,
-    ) -> Result<eliot_ors::GrantClosureProjection, KernelPortError>;
+    ) -> Result<GrantClosureSecondPhaseLink, KernelPortError>;
 }
 
 /// Readback boundary for the durable closure committed by the first P-07
@@ -332,6 +408,20 @@ pub struct PendingCanonicalRevocation {
     pub revocation_id: String,
     /// The canonical phase that has not completed.
     pub phase: CanonicalRevocationPhase,
+}
+
+/// The admitted canonical identity one grant-revocation saga commits under.
+///
+/// The operation identity, the canonical operation id and the canonical
+/// request identity are one indivisible admission: they are composed together
+/// by the caller from admitted ingress and are never derived from the durable
+/// closure. They travel as one value so the prepare step cannot be handed a
+/// mixture of two different operations.
+#[derive(Clone, Copy, Debug)]
+struct CanonicalRevocationCommit<'a> {
+    canonical_operation_id: &'a OperationId,
+    canonical_request_identity: &'a RequestIdentity,
+    operation: &'a RevocationOperationIdentity,
 }
 
 /// Internal carrier for a canonical-phase refusal: which phase failed and the
@@ -3708,8 +3798,17 @@ impl<P: KernelDurableJobPort + ?Sized> GovernorOwners<P> {
         }
         let skill = SkillRegistry::from_snapshot(skill_views)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let module_registry_read = recovery.owner_read(RecoveryOwner::ModuleRegistry)?;
         let module_snapshot: ModuleCatalogSnapshot =
             decode_owner_snapshot(recovery, RecoveryOwner::ModuleRegistry)?;
+        if module_snapshot.catalog_revision != module_registry_read.revision
+            || module_snapshot.state_fence != *state_fence
+        {
+            return Err(CompositionError::Recovery(
+                "module catalog snapshot revision or fence does not match its Kernel named-read owner"
+                    .to_owned(),
+            ));
+        }
         let module_registry = ModuleCatalog::from_snapshot(module_snapshot)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         let change_snapshot: eliot_change_monitor::ChangeMonitorSnapshot =
@@ -3840,15 +3939,11 @@ pub struct GovernorComposition<P: ?Sized> {
     /// stale presentation still shows. An entry is removed only when the
     /// second-phase link commits; a failed retry never clears it.
     pending_canonical_revocations: BTreeMap<String, PendingCanonicalRevocation>,
-    /// Governor-owned cold-start single-flight registry (issue #1790, I4.4.1).
-    ///
-    /// Compatible concurrent attaches join the same [`OnboardingSingleFlight`]
-    /// lease here instead of keeping caller-owned registries: the registry
-    /// holds no filesystem, process, credential or store state, only lease
-    /// keys with their terminal receipts, so every trigger that reaches the
-    /// cold-start legs below coalesces on exact workspace identity, privacy
-    /// boundary and governing-source generation.
-    cold_start: OnboardingSingleFlight,
+    /// Installation-bound durable owner for exact cold-start lease and terminal
+    /// receipt records. Compatible callers join through this owner.
+    cold_start_readiness_owner: Option<Arc<dyn ColdStartReadinessRecordOwner>>,
+    cold_start_readiness_contour: Option<InstallationScanContour>,
+    cold_start_readiness_claims: BTreeMap<String, ColdStartReadinessOwnerClaim>,
     /// Bounded in-process diagnostic projection of scope-identity mismatches
     /// (issue #1787, W6 partial projection). Newest record is last; a later
     /// mismatch appends instead of overwriting, up to
@@ -4349,9 +4444,10 @@ pub enum AuthorityActionReceipt {
     /// The three durable phases of one reconciled grant revocation. A grant
     /// revocation never reports a single-phase receipt: either the whole saga
     /// committed and proved its read-backs, or it returns `Err`. The record is
-    /// boxed because it carries the whole committed ORS closure projection,
-    /// which is far larger than the other two terminal receipts; the box is a
-    /// representation choice only and changes no field or proof.
+    /// boxed because it carries the whole committed first-phase closure
+    /// together with its second-phase link, which is far larger than the other
+    /// two terminal receipts; the box is a representation choice only and
+    /// changes no field or proof.
     ReconciledGrantRevocation(Box<AuthorityRevocationReconciliation>),
 }
 
@@ -4362,8 +4458,10 @@ pub struct AuthorityRevocationReconciliation {
     pub authority_receipt: AuthorityRevocationReceipt,
     /// Canonical write receipt proving the second phase committed.
     pub canonical_receipt: WriteReceipt,
-    /// ORS projection carrying the exact second-phase link.
-    pub closure_projection: eliot_ors::GrantClosureProjection,
+    /// Proved canonical second phase: the ORIGINAL committed first-phase
+    /// closure together with the exact Store-issued receipt durably linked to
+    /// it, as the neutral [`GrantClosureSecondPhaseLink`] carries it.
+    pub closure_projection: GrantClosureSecondPhaseLink,
 }
 
 /// Agent- and Human-facing projection of one retained terminal cold-start
@@ -4383,7 +4481,7 @@ pub struct AuthorityRevocationReconciliation {
 /// `OnboardingReadinessReceipt::validate` checks structure and internal
 /// consistency but does not verify a stored payload digest, and `receipt_ref`
 /// is not such a digest. Correct origin and freshness therefore depend on the
-/// retained `OnboardingSingleFlight` owner and #8's authenticated live
+/// durable ORS readiness owner and #8's authenticated live
 /// producer. This projection has no clock input, so it cannot independently
 /// establish that the lease has not expired or been revoked; the live #8
 /// caller must revalidate those facts before using readiness. `readiness` is
@@ -4431,6 +4529,15 @@ pub struct ColdStartSurfaceView {
     pub workspace_instance_ref: String,
     pub projection_source_ref: String,
     pub projection_generation: u64,
+}
+
+/// Ephemeral capability held only by the composition invocation that won the
+/// durable ORS claim. Restart recovery uses ORS readback and never restores
+/// this process-local compile capability from serialized data.
+#[derive(Clone)]
+struct ColdStartReadinessOwnerClaim {
+    claim: ColdStartReadinessClaim,
+    record_key: String,
 }
 
 /// Maps one compiled readiness lifecycle to its canonical transport token.
@@ -4481,6 +4588,10 @@ pub struct PreparedMaintenanceAdmission {
     /// loads this key through its own Durable Job store handle outside any
     /// composition borrow.
     pub job_id: String,
+    /// Stable identity of the exact source decision this admission is prepared
+    /// from, so the adopted job attributes its later source results to the
+    /// decision that admitted the work.
+    pub decision_ref: String,
 }
 
 impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
@@ -4553,7 +4664,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             readiness: CompositionReadiness::Ready,
             authority_presentations: BTreeMap::new(),
             pending_canonical_revocations: BTreeMap::new(),
-            cold_start: OnboardingSingleFlight::new(),
+            cold_start_readiness_owner: None,
+            cold_start_readiness_contour: None,
+            cold_start_readiness_claims: BTreeMap::new(),
             scope_quarantine: Vec::new(),
         })
     }
@@ -4646,6 +4759,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             scope_ref: decision.scope_ref.clone(),
             trigger_id: decision.trigger_id.clone(),
             job_id,
+            // The owner's own decision reference, derived from the decision's
+            // stable identity rather than chosen here, so the adopted job and an
+            // owner-admitted job attribute their results identically.
+            decision_ref: maintenance_decision_ref(decision),
         })
     }
 
@@ -4731,6 +4848,12 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let job = MaintenanceJob {
             job_id: prepared.job_id.clone(),
             trigger_id: prepared.trigger_id.clone(),
+            // The adoption names the same decision reference the owner's own
+            // `admit` would, derived from that decision's stable identity, so
+            // every later source result on this job is attributed to the
+            // decision that admitted the work rather than to a reference the
+            // adoption chose.
+            decision_ref: prepared.decision_ref.clone(),
             family: prepared.family,
             scope_ref: prepared.scope_ref.clone(),
             state_fence: prepared.state_fence.clone(),
@@ -4742,10 +4865,157 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             budget_ref,
             outcome_ref: None,
             user_session_required,
+            result_obligations: Vec::new(),
         };
         job.validate().map_err(|error| {
             CompositionError::Recovery(format!("adopted maintenance job is invalid: {error}"))
         })?;
+        Ok(job)
+    }
+
+    /// Records on the retained job revision that the canonical observation
+    /// route admitted one result this job owed an observation for.
+    ///
+    /// This is the narrow durable half of the result-to-observation path, and
+    /// the reason it lives beside [`Self::retained_durable_job`] rather than in
+    /// a new owner: the receipt is settled onto the same Kernel durable-job
+    /// ledger the transitions already write through, so the job state and the
+    /// observation it owes stay in one store with one atomic boundary. Nothing
+    /// here claims improvement, reconciles an outstanding obligation, or
+    /// writes an outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError::NotReady`] when the composition is not
+    /// ready, and [`CompositionError::Recovery`] when the maintenance owner
+    /// refuses the receipt — an unknown publication identity, a conflicting
+    /// second receipt under one identity, an already-unavailable delivery, a
+    /// job that is not retained, or a stale fence. The owner's own
+    /// [`MaintenanceError`] is preserved in the detail so a dangling
+    /// publication identity stays distinguishable from a transport failure.
+    pub fn admit_maintenance_observation_receipt(
+        &mut self,
+        job_id: &str,
+        publication_id: &str,
+        observation_receipt_ref: &str,
+    ) -> Result<MaintenanceJob, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        // The maintenance owner performs the read, the settlement and the
+        // single durable write through the same Kernel durable-job ledger its
+        // lifecycle transitions already use. This seam exists only because the
+        // owner set is otherwise immutable to `eliotd` callers.
+        let fence = self.snapshot.state_fence();
+        self.owners
+            .maintenance
+            .admit_observation_receipt(job_id, &fence, publication_id, observation_receipt_ref)
+            .map_err(|error| {
+                CompositionError::Recovery(format!(
+                    "maintenance observation receipt was not admitted: {error}"
+                ))
+            })
+    }
+
+    /// Records the explicit coverage gap for one refused maintenance result
+    /// writeback, on the same Kernel durable-job ledger the transitions and
+    /// receipt admissions already write through.
+    ///
+    /// `refused_operation_id` and `refused_status` are the exact facts the
+    /// canonical route returned: a gap may only be recorded against a terminal
+    /// non-committed store receipt, because a readiness or transport refusal
+    /// produced no receipt and must leave the obligation `Pending` for a later
+    /// retry. `RefusedReceiptStatus` has no `Committed` member, so an admission
+    /// cannot be recorded here at all. The gap identity is derived by the owner
+    /// from those values together with the publication identity, so a caller
+    /// cannot name a gap it did not earn and a repeated refusal of the same
+    /// result reconciles onto the same gap instead of appending another.
+    ///
+    /// This records a coverage consequence; it never admits an observation,
+    /// never reconciles an outstanding obligation and never writes an outcome.
+    /// An already-admitted receipt under that identity is refused rather than
+    /// downgraded to a gap.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError::NotReady`] when the composition is not ready,
+    /// and [`CompositionError::Recovery`] when the maintenance owner refuses the
+    /// gap — an unknown publication identity, a conflicting recorded gap, or an
+    /// already-admitted observation. The owner's own [`MaintenanceError`] is
+    /// preserved in the detail so a dangling publication identity stays
+    /// distinguishable from a transport failure.
+    pub fn record_maintenance_observation_gap(
+        &mut self,
+        job_id: &str,
+        publication_id: &str,
+        refused_operation_id: &str,
+        refused_status: RefusedReceiptStatus,
+    ) -> Result<MaintenanceJob, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        let fence = self.snapshot.state_fence();
+        self.owners
+            .maintenance
+            .record_observation_gap(
+                job_id,
+                &fence,
+                publication_id,
+                refused_operation_id,
+                refused_status,
+            )
+            .map_err(|error| {
+                CompositionError::Recovery(format!(
+                    "maintenance observation gap was not recorded: {error}"
+                ))
+            })
+    }
+
+    /// Returns the retained durable maintenance job for one exact job identity.
+    ///
+    /// The read goes through the same authenticated Kernel durable-job route the
+    /// maintenance owner writes through, so the returned revision and the
+    /// result-to-observation obligations its transitions appended are the ones the
+    /// owner actually persisted in that single atomic write. Nothing is
+    /// reconstructed here: an absent job is `Ok(None)`, which is unavailable
+    /// rather than resolved, and the read fails closed when the job is not
+    /// retained under this fence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError::NotReady`] when the composition is not ready
+    /// and [`CompositionError::Kernel`] with the transport's own
+    /// [`KernelPortError`] when the durable-job read or the retained revision's
+    /// validation is refused.
+    pub fn retained_durable_job(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<MaintenanceJob>, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        // The retained snapshot's own fence, owned here because the projection
+        // builds a fresh `StateFence`. The read borrows it, and the binding
+        // check below compares against the same owned value, so neither use
+        // moves it.
+        let fence = self.snapshot.state_fence();
+        let job = self
+            .kernel
+            .load_durable_job(job_id, &fence)
+            .map_err(CompositionError::Kernel)?;
+        if let Some(job) = &job {
+            job.validate().map_err(|error| {
+                CompositionError::Recovery(format!(
+                    "retained durable maintenance job is invalid: {error}"
+                ))
+            })?;
+            if job.job_id != job_id || job.state_fence != fence {
+                return Err(CompositionError::Recovery(
+                    "retained durable maintenance job is not bound to this fence and identity"
+                        .to_owned(),
+                ));
+            }
+        }
         Ok(job)
     }
 
@@ -6055,10 +6325,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     pub fn current_task_selection(
         &self,
         now: u64,
-        lineage_candidate_ref: &str,
-        workspace_instance_candidate_ref: &str,
-        privacy_class: PrivacyClass,
-        governing_source_generation: u64,
+        _lineage_candidate_ref: &str,
+        _workspace_instance_candidate_ref: &str,
+        _privacy_class: PrivacyClass,
+        _governing_source_generation: u64,
     ) -> Result<
         (
             Option<GovernorActivationSnapshot>,
@@ -6066,54 +6336,28 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         ),
         CompositionError,
     > {
-        if self.readiness != CompositionReadiness::Ready {
-            return Err(CompositionError::NotReady);
-        }
+        let _ = now;
+        Err(CompositionError::Recovery(
+            "partial cold-start identity cannot authorize durable task selection; supply the full readiness claim"
+                .to_owned(),
+        ))
+    }
+
+    /// Resolves task selection only from the exact durable terminal receipt
+    /// named by a full ORS readiness claim.
+    pub fn current_task_selection_for_claim(
+        &self,
+        now: u64,
+        claim: &ColdStartReadinessClaim,
+    ) -> Result<
+        (
+            Option<GovernorActivationSnapshot>,
+            eliot_workscope::OnboardingReadinessReceipt,
+        ),
+        CompositionError,
+    > {
+        let (_, receipt) = self.cold_start_readiness_terminal_for_claim(claim, now)?;
         let live_fence = self.snapshot.state_fence();
-        let (lease, receipt) = self
-            .cold_start
-            .terminal_for_key(
-                lineage_candidate_ref,
-                workspace_instance_candidate_ref,
-                privacy_class,
-                governing_source_generation,
-            )
-            .ok_or_else(|| {
-                CompositionError::Recovery(
-                    "no terminal cold-start receipt for lease key".to_owned(),
-                )
-            })?;
-        receipt
-            .validate()
-            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        lease
-            .validate()
-            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        let scope = self
-            .owners
-            .work_scope
-            .as_ref()
-            .ok_or(CompositionError::ActivationScopeSelectionRequired)?
-            .read_current(&live_fence)
-            .map_err(map_activation_scope_error)?;
-        ensure_snapshot_fresh(&scope, "task selection WorkScope is not freshly matched")?;
-        if receipt.lease_ref != lease.lease_ref
-            || lease.lineage_candidate_ref != lineage_candidate_ref
-            || lease.workspace_instance_candidate_ref != workspace_instance_candidate_ref
-            || lease.privacy_class != privacy_class
-            || lease.governing_source_generation != governing_source_generation
-            || receipt.governing_source_generation != governing_source_generation
-            || receipt.expiry_tick < now
-            || receipt.expiry_tick != lease.deadline
-            || !fences_match_exact(&receipt.state_fence, &live_fence)
-            || receipt.scope != scope.binding.scope
-            || receipt.instance.instance_ref != scope.binding.scope.instance_ref
-            || receipt.instance.root_identity != scope.binding.scope.root_identity
-            || receipt.instance.generation != scope.binding.scope.generation
-            || receipt.governing_source_generation != scope.binding.governing_source_generation
-        {
-            return Err(CompositionError::ActivationStaleFence);
-        }
         match receipt.task_binding.clone() {
             TaskBindingState::CurrentTaskContract {
                 task_ref,
@@ -6434,10 +6678,219 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .map_err(CompositionError::ScanDisclosure)
     }
 
-    /// Joins one I4.4.1 trigger to the retained cold-start single-flight
+    /// Binds the separate durable readiness table to the admitted installation
+    /// contour. Rebinding is allowed only for the exact same contour; the
+    /// transport owner may be refreshed without changing storage authority.
+    pub fn bind_cold_start_readiness_owner(
+        &mut self,
+        contour: &InstallationScanContour,
+        owner: Arc<dyn ColdStartReadinessRecordOwner>,
+    ) -> Result<(), CompositionError> {
+        if let Some(bound) = self.cold_start_readiness_contour.as_ref()
+            && bound != contour
+        {
+            return Err(CompositionError::Recovery(
+                "cold-start readiness owner cannot change its installation contour".to_owned(),
+            ));
+        }
+        let owner = contour
+            .bind_cold_start_readiness_owner(owner)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        self.cold_start_readiness_contour = Some(contour.clone());
+        self.cold_start_readiness_owner = Some(owner);
+        Ok(())
+    }
+
+    /// Builds the exact durable readiness key from the admitted lease,
+    /// candidate, governing sources, scanner evidence, owner binding, and
+    /// retained installation contour. Candidate source names alone cannot
+    /// construct this claim: the source set must validate against the
+    /// admitted privacy profile and the scan receipt must read back through
+    /// its installation-bound owner.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the claim validates one complete lease, source set, scanner receipt, and installation contour before constructing its durable key"
+    )]
+    pub fn build_cold_start_readiness_claim(
+        &self,
+        proposed: &OnboardingLease,
+        candidate: &WorkScopeCandidate,
+        sources: &GoverningSourceSet,
+        privacy: &PrivacyProfile,
+        scan: &BootstrapScanEvidence,
+        scan_store: &InstallationScanDisclosureStore,
+        scan_binding: &ScanDisclosureOwnerBinding,
+        scan_receipt: &ScanReceiptHandle,
+    ) -> Result<ColdStartReadinessClaim, CompositionError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CompositionError::NotReady);
+        }
+        proposed
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        candidate
+            .scope
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        candidate
+            .instance
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        scan.validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        scan_binding
+            .admit()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        privacy
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        sources
+            .validate_for(&candidate.scope, privacy)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+
+        let contour = self.cold_start_readiness_contour.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "cold-start readiness owner has no admitted installation contour".to_owned(),
+            )
+        })?;
+        if contour != scan_store.contour()
+            || scan_binding.installation_id != contour.installation_id()
+            || candidate.scope.lineage_ref.as_deref()
+                != Some(proposed.lineage_candidate_ref.as_str())
+            || candidate.scope.instance_ref != proposed.workspace_instance_candidate_ref
+            || candidate.instance.instance_ref != proposed.workspace_instance_candidate_ref
+            || candidate.instance.root_identity != candidate.scope.root_identity
+            || candidate.privacy_class != proposed.privacy_class
+            || !privacy.admits(candidate.privacy_class)
+            || sources.scope_ref != candidate.scope.scope_ref
+            || sources.generation != proposed.governing_source_generation
+            || scan.canonical_root_ref != candidate.scope.root_identity
+            || scan.filesystem_identity_ref != candidate.instance.root_identity
+            || scan_binding.candidate_root_ref != candidate.scope.root_identity
+        {
+            return Err(CompositionError::Recovery(
+                "cold-start readiness evidence does not match its exact candidate and owner binding"
+                    .to_owned(),
+            ));
+        }
+
+        let live_fence = self.snapshot.state_fence();
+        live_fence
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let fence_bytes = canonical_json_bytes(&live_fence)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if scan_binding.state_fence_ref.as_deref() != Some(sha256_hex(&fence_bytes).as_str()) {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+
+        let replayed =
+            eliot_workscope::ScanDisclosureStore::readback(scan_store, scan_receipt, scan_binding)
+                .map_err(CompositionError::ScanDisclosure)?;
+        if replayed.scan_ref != scan_receipt.receipt_ref {
+            return Err(CompositionError::ScanDisclosure(
+                WorkScopeError::ScanReceiptReplaced,
+            ));
+        }
+
+        let mut governing_source_digests: Vec<String> = sources
+            .sources
+            .iter()
+            .map(|source| source.digest.clone())
+            .collect();
+        governing_source_digests.sort();
+        governing_source_digests.dedup();
+        let key = ColdStartReadinessOwnerKey {
+            installation_id: contour.installation_id().to_owned(),
+            lineage_candidate_ref: proposed.lineage_candidate_ref.clone(),
+            workspace_instance_candidate_ref: proposed.workspace_instance_candidate_ref.clone(),
+            filesystem_identity_ref: candidate.instance.root_identity.clone(),
+            vcs_identity_ref: candidate.instance.vcs_identity_ref.clone(),
+            privacy_boundary_ref: scan_binding.privacy_boundary_ref.clone(),
+            privacy_class: candidate.privacy_class,
+            governing_source_set_ref: format!(
+                "governing-source-set:{}:{}",
+                sources.scope_ref, sources.generation
+            ),
+            governing_source_generation: sources.generation,
+            governing_source_digests,
+            dirty_summary_ref: scan.vcs_dirty_summary_ref.clone(),
+            state_fence: live_fence,
+        };
+        let lease_bytes = canonical_json_bytes(proposed)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let lease_bytes = String::from_utf8(lease_bytes)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        ColdStartReadinessClaim::new(
+            key,
+            proposed.lease_ref.clone(),
+            proposed.deadline,
+            lease_bytes,
+        )
+        .map_err(|error| CompositionError::Recovery(error.to_string()))
+    }
+
+    fn readiness_join_from_record(
+        record: &ColdStartReadinessOrsRecord,
+        now: u64,
+        created: bool,
+    ) -> Result<LeaseJoin, CompositionError> {
+        record
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let lease: OnboardingLease = serde_json::from_str(&record.claim.lease_bytes)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        lease
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if lease.lease_ref != record.claim.lease_ref
+            || lease.deadline != record.claim.lease_deadline
+            || lease.lineage_candidate_ref != record.claim.key.lineage_candidate_ref
+            || lease.workspace_instance_candidate_ref
+                != record.claim.key.workspace_instance_candidate_ref
+            || lease.privacy_class != record.claim.key.privacy_class
+            || lease.governing_source_generation != record.claim.key.governing_source_generation
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        if let Some(terminal) = record.terminal.as_ref() {
+            if now > record.claim.lease_deadline {
+                return Err(CompositionError::ActivationStaleFence);
+            }
+            let receipt: eliot_workscope::OnboardingReadinessReceipt =
+                serde_json::from_str(&terminal.receipt_bytes)
+                    .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+            receipt
+                .validate()
+                .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+            let surface = receipt
+                .surface(&lease)
+                .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+            return Ok(LeaseJoin::JoinedTerminal {
+                lease_ref: lease.lease_ref,
+                surface,
+                receipt: Box::new(receipt),
+            });
+        }
+        if now > record.claim.lease_deadline {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        if created {
+            Ok(LeaseJoin::Created {
+                lease_ref: lease.lease_ref,
+            })
+        } else {
+            Ok(LeaseJoin::Joined {
+                lease_ref: lease.lease_ref,
+            })
+        }
+    }
+
+    /// Joins one I4.4.1 trigger to the durable cold-start single-flight
     /// lease (issue #1790, single-flight join production caller).
     ///
-    /// The join runs against the retained [`OnboardingSingleFlight`] registry,
+    /// The join runs against the installation-bound ORS readiness owner,
     /// so compatible concurrent attaches coalesce on exact workspace
     /// filesystem/VCS identity plus privacy boundary plus governing-source
     /// generation, and a changed governing-source digest or dirty-base summary
@@ -6461,28 +6914,62 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         &mut self,
         trigger: ColdStartTrigger,
         discovery_lease: &DiscoveryReadLease,
-        proposed: OnboardingLease,
+        proposed: &OnboardingLease,
         candidate: &WorkScopeCandidate,
         sources: &GoverningSourceSet,
+        privacy: &PrivacyProfile,
         scan: &BootstrapScanEvidence,
+        scan_store: &InstallationScanDisclosureStore,
+        scan_binding: &ScanDisclosureOwnerBinding,
+        scan_receipt: &ScanReceiptHandle,
         now: u64,
     ) -> Result<LeaseJoin, CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
         }
-        self.cold_start
-            .join_with_evidence(
-                trigger,
-                discovery_lease,
-                proposed,
-                candidate,
-                sources,
-                scan,
-                now,
-            )
+        ColdStartController::check_discovery_with_scan(trigger, discovery_lease, scan, now)
             .map_err(|error| {
                 CompositionError::Recovery(format!("cold-start lease join refused: {error:?}"))
-            })
+            })?;
+        let claim = self.build_cold_start_readiness_claim(
+            proposed,
+            candidate,
+            sources,
+            privacy,
+            scan,
+            scan_store,
+            scan_binding,
+            scan_receipt,
+        )?;
+        let owner = self.cold_start_readiness_owner.as_ref().ok_or_else(|| {
+            CompositionError::Recovery("cold-start readiness ORS owner is not bound".to_owned())
+        })?;
+        let outcome = owner
+            .claim_cold_start_readiness(&claim, now)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let (record, created) = match outcome {
+            ColdStartReadinessStageOutcome::Stored { record } => (*record, true),
+            ColdStartReadinessStageOutcome::AlreadyBound { record } => (*record, false),
+        };
+        record
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if record.claim.key != claim.key
+            || record.claim.binding_digest != claim.binding_digest
+            || record.claim.base_identity_digest != claim.base_identity_digest
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        if created && record.terminal.is_none() {
+            self.cold_start_readiness_claims.insert(
+                record.claim.binding_digest.clone(),
+                ColdStartReadinessOwnerClaim {
+                    claim,
+                    record_key: record.record_key.clone(),
+                },
+            );
+        }
+        Self::readiness_join_from_record(&record, now, created)
     }
 
     /// Drives one I4.4.1 trigger end to end — join, compile, publish — against
@@ -6515,13 +7002,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// discovery or onboarding lease). Caller: STITCH.
     #[allow(
         clippy::too_many_arguments,
-        reason = "cold-start compilation joins every frozen receipt field in one owner-checked entry"
+        clippy::too_many_lines,
+        reason = "cold-start compilation joins every frozen receipt field and the durable terminal in one owner-checked entry"
     )]
     pub fn compile_cold_start_at_trigger(
         &mut self,
         trigger: ColdStartTrigger,
         discovery_lease: &DiscoveryReadLease,
-        proposed: OnboardingLease,
+        proposed: &OnboardingLease,
         receipt_ref: &str,
         principal_ref: &str,
         session_ref: &str,
@@ -6544,6 +7032,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         projection_generation: u64,
         privacy: &PrivacyProfile,
         task: TaskBindingInput,
+        scan: &BootstrapScanEvidence,
         scan_store: &InstallationScanDisclosureStore,
         scan_binding: &ScanDisclosureOwnerBinding,
         scan_receipt: Option<&ScanReceiptHandle>,
@@ -6555,6 +7044,71 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let scan_handle = scan_receipt.ok_or(CompositionError::ScanDisclosure(
             WorkScopeError::ScanReceiptMissing,
         ))?;
+        ColdStartController::check_discovery_with_scan(trigger, discovery_lease, scan, now)
+            .map_err(|error| {
+                CompositionError::Recovery(format!("cold-start lease join refused: {error:?}"))
+            })?;
+        let claim = self.build_cold_start_readiness_claim(
+            proposed,
+            candidate,
+            sources,
+            privacy,
+            scan,
+            scan_store,
+            scan_binding,
+            scan_handle,
+        )?;
+        if !fences_match_exact(&claim.key.state_fence, state_fence) {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        let retained_claim = self
+            .cold_start_readiness_claims
+            .get(&claim.binding_digest)
+            .cloned()
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "this composition did not win the durable cold-start lease claim".to_owned(),
+                )
+            })?;
+        if retained_claim.claim.key != claim.key
+            || retained_claim.claim.binding_digest != claim.binding_digest
+            || retained_claim.claim.lease_ref != claim.lease_ref
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        let owner = self.cold_start_readiness_owner.as_ref().ok_or_else(|| {
+            CompositionError::Recovery("cold-start readiness ORS owner is not bound".to_owned())
+        })?;
+        let record = owner
+            .load_cold_start_readiness(&retained_claim.record_key)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "durable cold-start lease disappeared before compilation".to_owned(),
+                )
+            })?;
+        record
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if record.record_key != retained_claim.record_key
+            || record.claim.key != claim.key
+            || record.claim.binding_digest != claim.binding_digest
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        if record.terminal.is_some() {
+            let joined = Self::readiness_join_from_record(&record, now, false)?;
+            self.cold_start_readiness_claims
+                .remove(&claim.binding_digest);
+            return Ok(joined);
+        }
+        if now > record.claim.lease_deadline {
+            self.cold_start_readiness_claims
+                .remove(&claim.binding_digest);
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        let lease: OnboardingLease = serde_json::from_str(&record.claim.lease_bytes)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         let replayed =
             eliot_workscope::ScanDisclosureStore::readback(scan_store, scan_handle, scan_binding)
                 .map_err(CompositionError::ScanDisclosure)?;
@@ -6563,12 +7117,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 WorkScopeError::ScanReceiptReplaced,
             ));
         }
-        self.cold_start
-            .compile_and_publish(
-                trigger,
-                discovery_lease,
-                proposed,
+        let mut receipt = ColdStartController
+            .compile(
                 receipt_ref,
+                &lease,
                 principal_ref,
                 session_ref,
                 scope,
@@ -6593,7 +7145,47 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 Some(scan_handle),
                 now,
             )
-            .map_err(Self::cold_start_driver_error)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        receipt.receipt_revision = record.record_revision;
+        receipt
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let receipt_bytes = canonical_json_bytes(&receipt)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let receipt_bytes = String::from_utf8(receipt_bytes)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let disposition = match receipt.readiness {
+            ReadinessLifecycle::ReadyMaterial | ReadinessLifecycle::ReadyReadOnly => {
+                ColdStartReadinessTerminalDisposition::Ready
+            }
+            ReadinessLifecycle::NeedsTask
+                if matches!(receipt.task_binding, TaskBindingState::Ambiguous { .. }) =>
+            {
+                ColdStartReadinessTerminalDisposition::Ambiguous
+            }
+            _ => ColdStartReadinessTerminalDisposition::Failed,
+        };
+        let terminal_record = owner
+            .publish_cold_start_readiness(
+                &record.record_key,
+                &claim.binding_digest,
+                &record.claim.lease_ref,
+                disposition,
+                &receipt.receipt_ref,
+                &receipt_bytes,
+            )
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "durable cold-start terminal publication had no readback".to_owned(),
+                )
+            })?;
+        terminal_record
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        self.cold_start_readiness_claims
+            .remove(&claim.binding_digest);
+        Self::readiness_join_from_record(&terminal_record, now, false)
     }
 
     /// Projects the retained terminal cold-start surface for one exact lease
@@ -6627,56 +7219,103 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         .map(|(_, surface)| surface)
     }
 
-    /// Returns the exact retained lease and terminal surface from one
-    /// Governor-owned lookup (issue #1746 W5; #8 W1).
-    ///
-    /// Unlike the surface-only projection, this readback retains the lease's
-    /// compiler epoch and terminal state so an attach boundary can compare the
-    /// complete owner lease, not only the fields projected into
-    /// `ColdStartSurfaceView`. The lookup is read-only and preserves the same
-    /// current-fence, `WorkScope`, receipt and key checks as
-    /// [`Self::cold_start_surface_for_lease`].
-    pub fn cold_start_owner_readback_for_lease(
+    /// Projects the exact durable cold-start terminal named by a full owner
+    /// claim. Reads revalidate the stored lease, terminal revision, current
+    /// `StateFence`, and freshly matched `WorkScope` before returning a surface.
+    pub fn cold_start_surface_for_claim(
         &self,
-        lineage_candidate_ref: &str,
-        workspace_instance_candidate_ref: &str,
-        privacy_class: PrivacyClass,
-        governing_source_generation: u64,
-    ) -> Result<(eliot_workscope::OnboardingLease, ColdStartSurfaceView), CompositionError> {
+        claim: &ColdStartReadinessClaim,
+        now: u64,
+    ) -> Result<ColdStartSurfaceView, CompositionError> {
+        self.cold_start_owner_readback_for_claim(claim, now)
+            .map(|(_, surface)| surface)
+    }
+
+    /// Reads the exact retained terminal lease and surface from ORS after
+    /// restart. A partial identity cannot name the full binding digest, and
+    /// the process-local claim map is never a fallback.
+    pub fn cold_start_owner_readback_for_claim(
+        &self,
+        claim: &ColdStartReadinessClaim,
+        now: u64,
+    ) -> Result<(OnboardingLease, ColdStartSurfaceView), CompositionError> {
+        let (lease, receipt) = self.cold_start_readiness_terminal_for_claim(claim, now)?;
+        let surface = Self::cold_start_surface_view(&lease, &receipt)?;
+        Ok((lease, surface))
+    }
+
+    fn cold_start_readiness_terminal_for_claim(
+        &self,
+        claim: &ColdStartReadinessClaim,
+        now: u64,
+    ) -> Result<(OnboardingLease, eliot_workscope::OnboardingReadinessReceipt), CompositionError>
+    {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
         }
-        let (lease, receipt) = self
-            .cold_start
-            .terminal_for_key(
-                lineage_candidate_ref,
-                workspace_instance_candidate_ref,
-                privacy_class,
-                governing_source_generation,
+        claim
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let contour = self.cold_start_readiness_contour.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "cold-start readiness owner has no admitted installation contour".to_owned(),
             )
-            .ok_or_else(|| {
-                CompositionError::Recovery(
-                    "no terminal cold-start receipt for lease key".to_owned(),
-                )
-            })?;
-        receipt
-            .validate()
-            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        lease
-            .validate()
-            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        if lease.lineage_candidate_ref != lineage_candidate_ref
-            || lease.workspace_instance_candidate_ref != workspace_instance_candidate_ref
-            || lease.privacy_class != privacy_class
-            || lease.governing_source_generation != governing_source_generation
-            || receipt.lease_ref != lease.lease_ref
-            || receipt.governing_source_generation != lease.governing_source_generation
-            || receipt.expiry_tick != lease.deadline
-        {
+        })?;
+        if claim.key.installation_id != contour.installation_id() {
             return Err(CompositionError::ActivationStaleFence);
         }
         let live_fence = self.snapshot.state_fence();
-        if !fences_match_exact(&receipt.state_fence, &live_fence) {
+        if !fences_match_exact(&claim.key.state_fence, &live_fence) {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        let owner = self.cold_start_readiness_owner.as_ref().ok_or_else(|| {
+            CompositionError::Recovery("cold-start readiness ORS owner is not bound".to_owned())
+        })?;
+        let record = owner
+            .load_cold_start_readiness_for_binding(&claim.binding_digest)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "no durable cold-start lease for the complete readiness key".to_owned(),
+                )
+            })?;
+        record
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if record.claim.key != claim.key
+            || record.claim.binding_digest != claim.binding_digest
+            || now > record.claim.lease_deadline
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        let terminal = record.terminal.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "durable cold-start lease has no terminal readiness receipt".to_owned(),
+            )
+        })?;
+        let lease: OnboardingLease = serde_json::from_str(&record.claim.lease_bytes)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let receipt: eliot_workscope::OnboardingReadinessReceipt =
+            serde_json::from_str(&terminal.receipt_bytes)
+                .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        lease
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        receipt
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if lease.lease_ref != record.claim.lease_ref
+            || lease.deadline != record.claim.lease_deadline
+            || lease.lineage_candidate_ref != claim.key.lineage_candidate_ref
+            || lease.workspace_instance_candidate_ref != claim.key.workspace_instance_candidate_ref
+            || lease.privacy_class != claim.key.privacy_class
+            || lease.governing_source_generation != claim.key.governing_source_generation
+            || receipt.lease_ref != lease.lease_ref
+            || receipt.governing_source_generation != lease.governing_source_generation
+            || receipt.expiry_tick != lease.deadline
+            || receipt.expiry_tick < now
+            || !fences_match_exact(&receipt.state_fence, &live_fence)
+        {
             return Err(CompositionError::ActivationStaleFence);
         }
         if let Some(owner) = self.owners.work_scope.as_ref() {
@@ -6695,53 +7334,73 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             {
                 return Err(CompositionError::ActivationStaleFence);
             }
-        } else if receipt.readiness == eliot_workscope::ReadinessLifecycle::ReadyMaterial {
+        } else if receipt.readiness == ReadinessLifecycle::ReadyMaterial {
             return Err(CompositionError::ActivationScopeSelectionRequired);
         }
+        Ok((lease, receipt))
+    }
+
+    fn cold_start_surface_view(
+        lease: &OnboardingLease,
+        receipt: &eliot_workscope::OnboardingReadinessReceipt,
+    ) -> Result<ColdStartSurfaceView, CompositionError> {
         let surface = receipt
-            .surface(&lease)
+            .surface(lease)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        Ok((
-            lease.clone(),
-            ColdStartSurfaceView {
-                receipt_ref: surface.receipt_ref,
-                lease_ref: receipt.lease_ref.clone(),
-                principal_ref: receipt.principal_ref.clone(),
-                session_ref: receipt.session_ref.clone(),
-                scope: receipt.scope.clone(),
-                scope_descriptor_revision: receipt.scope_descriptor_revision,
-                instance: receipt.instance.clone(),
-                lineage: receipt.lineage.clone(),
-                scope_resolution: receipt.scope_resolution,
-                task_binding: receipt.task_binding.clone(),
-                state_fence: receipt.state_fence.clone(),
-                governing_source_set_ref: receipt.governing_source_set_ref.clone(),
-                governing_source_generation: receipt.governing_source_generation,
-                governance_profile_ref: receipt.governance_profile_ref.clone(),
-                limiting_integration_evidence: receipt.limiting_integration_evidence.clone(),
-                route_profile_ref: receipt.route_profile_ref.clone(),
-                serializer_id: receipt.serializer_id.clone(),
-                serializer_version: receipt.serializer_version.clone(),
-                serializer_options_digest: receipt.serializer_options_digest.clone(),
-                tokenizer_id: receipt.tokenizer_id.clone(),
-                tokenizer_version: receipt.tokenizer_version.clone(),
-                tokenizer_hash: receipt.tokenizer_hash.clone(),
-                readiness: cold_start_readiness_token(surface.readiness).to_owned(),
-                smallest_missing_question: surface.smallest_missing_question,
-                lease_deadline: surface.lease_deadline,
-                receipt_revision: receipt.receipt_revision,
-                proof_readiness: receipt.proof_readiness,
-                missing_inputs: receipt.missing_inputs.clone(),
-                next_safe_action: receipt.next_safe_action.clone(),
-                discovered_source_refs: receipt.discovered_source_refs.clone(),
-                admitted_source_refs: receipt.admitted_source_refs.clone(),
-                conflicting_source_refs: receipt.conflicting_source_refs.clone(),
-                unavailable_source_refs: receipt.unavailable_source_refs.clone(),
-                scan_receipt_ref: receipt.scan_receipt_ref.clone(),
-                workspace_instance_ref: receipt.instance.instance_ref.clone(),
-                projection_source_ref: receipt.projection_source_ref.clone(),
-                projection_generation: receipt.projection_generation,
-            },
+        Ok(ColdStartSurfaceView {
+            receipt_ref: surface.receipt_ref,
+            lease_ref: receipt.lease_ref.clone(),
+            principal_ref: receipt.principal_ref.clone(),
+            session_ref: receipt.session_ref.clone(),
+            scope: receipt.scope.clone(),
+            scope_descriptor_revision: receipt.scope_descriptor_revision,
+            instance: receipt.instance.clone(),
+            lineage: receipt.lineage.clone(),
+            scope_resolution: receipt.scope_resolution,
+            task_binding: receipt.task_binding.clone(),
+            state_fence: receipt.state_fence.clone(),
+            governing_source_set_ref: receipt.governing_source_set_ref.clone(),
+            governing_source_generation: receipt.governing_source_generation,
+            governance_profile_ref: receipt.governance_profile_ref.clone(),
+            limiting_integration_evidence: receipt.limiting_integration_evidence.clone(),
+            route_profile_ref: receipt.route_profile_ref.clone(),
+            serializer_id: receipt.serializer_id.clone(),
+            serializer_version: receipt.serializer_version.clone(),
+            serializer_options_digest: receipt.serializer_options_digest.clone(),
+            tokenizer_id: receipt.tokenizer_id.clone(),
+            tokenizer_version: receipt.tokenizer_version.clone(),
+            tokenizer_hash: receipt.tokenizer_hash.clone(),
+            readiness: cold_start_readiness_token(surface.readiness).to_owned(),
+            smallest_missing_question: surface.smallest_missing_question,
+            lease_deadline: surface.lease_deadline,
+            receipt_revision: receipt.receipt_revision,
+            proof_readiness: receipt.proof_readiness,
+            missing_inputs: receipt.missing_inputs.clone(),
+            next_safe_action: receipt.next_safe_action.clone(),
+            discovered_source_refs: receipt.discovered_source_refs.clone(),
+            admitted_source_refs: receipt.admitted_source_refs.clone(),
+            conflicting_source_refs: receipt.conflicting_source_refs.clone(),
+            unavailable_source_refs: receipt.unavailable_source_refs.clone(),
+            scan_receipt_ref: receipt.scan_receipt_ref.clone(),
+            workspace_instance_ref: receipt.instance.instance_ref.clone(),
+            projection_source_ref: receipt.projection_source_ref.clone(),
+            projection_generation: receipt.projection_generation,
+        })
+    }
+
+    /// Compatibility entry for callers holding only a partial lease identity.
+    /// Such fields cannot reproduce the ORS binding digest, so this method
+    /// deliberately fails closed. Use [`Self::cold_start_owner_readback_for_claim`].
+    pub fn cold_start_owner_readback_for_lease(
+        &self,
+        _lineage_candidate_ref: &str,
+        _workspace_instance_candidate_ref: &str,
+        _privacy_class: PrivacyClass,
+        _governing_source_generation: u64,
+    ) -> Result<(eliot_workscope::OnboardingLease, ColdStartSurfaceView), CompositionError> {
+        Err(CompositionError::Recovery(
+            "partial cold-start identity cannot authorize durable readback; supply the full readiness claim"
+                .to_owned(),
         ))
     }
 
@@ -7557,23 +8216,40 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     ///
     /// A grant revocation is the only arm with a canonical second phase, so it
     /// is the only arm that reads `canonical_operation_id`,
-    /// `canonical_request_identity`, `durable_link`, and `closure_source`:
-    /// they are forwarded verbatim to [`Self::revoke_grant_and_reconcile`] in
-    /// the order that method mandates — Kernel/ORS fences the exact graph
-    /// revision first, then the durable closure read-back, then the canonical
-    /// envelope commit, then the ORS second-phase link. The other three arms
-    /// never touch them.
+    /// `canonical_request_identity`, `operation`, `durable_link`, and
+    /// `closure_source`: they are forwarded verbatim to
+    /// [`Self::revoke_grant_and_reconcile`] in the order that method mandates
+    /// — Kernel/ORS fences the exact graph revision first, then the durable
+    /// closure read-back and the prepared authority-revocation transition,
+    /// then the canonical envelope commit, then the ORS second-phase link. The
+    /// other three arms never touch them.
+    ///
+    /// `operation` is the admitted revocation operation identity the bounded
+    /// closure and the prepared canonical revocation transition are computed
+    /// under. It is required and never defaulted: the durable closure receipt
+    /// carries a fence, a membership and a digest but none of the identity's
+    /// five coordinates, so preparing under a synthesized identity would make
+    /// the authority graph's own recheck certify itself.
     ///
     /// The canonical operation identity and admitted request identity are
     /// composed by the caller from admitted ingress and are never derived
     /// from the durable closure, so an exact replay of one operation resolves
     /// to the same receipt while the same operation under a changed payload
     /// conflicts at the store instead of reconciling to a different closure.
+    ///
+    /// The grant-revocation arm runs through
+    /// [`Self::apply_admitted_authority_revocation`], which admits the
+    /// presented operation against the live composition generation before
+    /// the saga starts. Live status: production seam for all four authority
+    /// families; the daemon composition root's authority pass is its one
+    /// production caller (BLOCKED-BY authority-transport: that pass does not
+    /// yet build one of these requests from an admitted canonical source).
     pub async fn apply_authority_request<L, C>(
         &mut self,
         request: PresentedAuthorityRequest,
         canonical_operation_id: &OperationId,
         canonical_request_identity: &RequestIdentity,
+        operation: &RevocationOperationIdentity,
         durable_link: &L,
         closure_source: &C,
     ) -> Result<AuthorityActionReceipt, CompositionError>
@@ -7586,10 +8262,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 .activate_grant(&request)
                 .map(AuthorityActionReceipt::Activation),
             PresentedAuthorityRequest::GrantRevocation(request) => self
-                .revoke_grant_and_reconcile(
+                .apply_admitted_authority_revocation(
                     &request,
                     canonical_operation_id,
                     canonical_request_identity,
+                    operation,
                     durable_link,
                     closure_source,
                 )
@@ -7607,6 +8284,119 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 .activate_root_transition(&request)
                 .map(|receipt| AuthorityActionReceipt::RootTransitionActivation(Box::new(receipt))),
         }
+    }
+
+    /// Applies one admitted grant revocation through the complete
+    /// Kernel-first saga under the live composition generation (#686).
+    ///
+    /// This is the production ingress for the revocation half of
+    /// [`Self::apply_authority_request`], and the only entry that reaches
+    /// [`Self::revoke_grant_and_reconcile`] and through it
+    /// [`Self::revoke_grant`], the `GrantGraph` closure revoke, and the
+    /// `RetainedAuthorityRequest` unknown-outcome surface. It admits nothing
+    /// itself: the daemon composition root still builds the
+    /// [`GrantRevocationRequest`] and both canonical identities from its own
+    /// admitted ingress, and both durable boundary ports are still the
+    /// existing owners that hold the ORS first-phase row and the
+    /// Kernel-issued receipt. No second graph, ledger, authority machine or
+    /// Store client is introduced here.
+    ///
+    /// Fail-closed order, all of it ahead of any transport:
+    /// - The composition must be `Ready` and must still retain a live P-07
+    ///   port. A degraded composition issues no right and starts no saga.
+    /// - The presented binding State Fence must equal the live composition
+    ///   State Fence, and the admitted canonical request identity must carry
+    ///   that same fence. An operation compiled against a superseded
+    ///   generation refuses here instead of being presented to the current
+    ///   Kernel owner and retained against a different owner snapshot
+    ///   (A00-03: restoration of revoked influence after recovery is a hard
+    ///   boundary; I6.15 keeps the Governor the owner of the semantic gating
+    ///   around the receipts this port returns).
+    /// - A retained presentation for the same grant must carry the exact
+    ///   same bytes. Changed content under a retained operation identity
+    ///   returns `IdentityConflict` and performs no transition (I5.27), so a
+    ///   lost acknowledgement can never become a second, differently shaped
+    ///   revocation, and a replay of the exact bytes still resolves to the
+    ///   retained receipt rather than minting a new identity.
+    /// - A pending stricter canonical revocation for the same grant must
+    ///   name the same snapshot. Re-presenting that exact operation resumes
+    ///   its unfinished second phase under the same canonical operation
+    ///   identity; presenting different content under an already fenced
+    ///   grant returns `IdentityConflict` instead of a fresh blind retry, and
+    ///   the retained record is never cleared by a refusal.
+    ///
+    /// Everything past admission is the existing saga, unchanged: Kernel
+    /// fences the exact graph revision first, the durable closure is read
+    /// back and validated against this request's snapshot and fence, the
+    /// authority graph's own origin-bound re-derivation is proven to bind
+    /// that closure, the canonical envelope is compiled from that closure and
+    /// committed, and the Store-issued receipt identity is linked to the
+    /// immutable first-phase row and read back. The returned record is only
+    /// ever the evidence those owners supplied.
+    ///
+    /// `operation` is the admitted revocation operation identity the bounded
+    /// closure and the prepared canonical revocation transition are computed
+    /// under, forwarded verbatim to [`Self::revoke_grant_and_reconcile`]. It
+    /// is required, never defaulted.
+    ///
+    /// Live status: production ingress for the revocation half; the daemon
+    /// composition root's polled authority pass is its one production caller
+    /// (BLOCKED-BY authority-revocation-transport: that pass builds no
+    /// revocation request and holds no `GrantClosureReceiptPort` /
+    /// `GrantClosureCanonicalLinkPort` adapter yet).
+    pub async fn apply_admitted_authority_revocation<L, C>(
+        &mut self,
+        request: &GrantRevocationRequest,
+        canonical_operation_id: &OperationId,
+        canonical_request_identity: &RequestIdentity,
+        operation: &RevocationOperationIdentity,
+        durable_link: &L,
+        closure_source: &C,
+    ) -> Result<AuthorityRevocationReconciliation, CompositionError>
+    where
+        L: GrantClosureCanonicalLinkPort + ?Sized,
+        C: GrantClosureReceiptPort + ?Sized,
+    {
+        self.require_ready_for_authority()?;
+        // Resolve the retained port here as well: a diagnosed degradation must
+        // refuse before the saga starts, never half-way through it.
+        self.authority_port()?;
+        let live_fence = self.snapshot.state_fence();
+        if request.binding.state_fence != live_fence {
+            return Err(CompositionError::Recovery(
+                "admitted grant revocation is not bound to the live composition State Fence"
+                    .to_owned(),
+            ));
+        }
+        if canonical_request_identity.request.metadata.state_fence != live_fence {
+            return Err(CompositionError::Provider(
+                "admitted canonical request identity is not bound to the live composition State Fence"
+                    .to_owned(),
+            ));
+        }
+        let presented = PresentedAuthorityRequest::GrantRevocation(request.clone());
+        let ledger_key = presented.ledger_key();
+        if let Some(retained) = self.authority_presentations.get(ledger_key.as_str())
+            && retained.request() != &presented
+        {
+            return Err(CompositionError::Authority(P07PortError::IdentityConflict));
+        }
+        if let Some(pending) = self
+            .pending_canonical_revocations
+            .get(request.grant_id.as_str())
+            && pending.snapshot_id != request.snapshot_id.as_str()
+        {
+            return Err(CompositionError::Authority(P07PortError::IdentityConflict));
+        }
+        self.revoke_grant_and_reconcile(
+            request,
+            canonical_operation_id,
+            canonical_request_identity,
+            operation,
+            durable_link,
+            closure_source,
+        )
+        .await
     }
 
     /// Presents one canonical grant activation to the retained P-07 port and
@@ -7780,9 +8570,16 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// The retained P-07 port first requests the exact graph revision and
     /// durable descendant closure from Kernel/ORS. Only after that receipt is
     /// validated does Governor fence the declared closure in its own
-    /// projection, compile the canonical declaration from the durable
-    /// [`GrantClosureReceipt`] and commit it. The Store-issued canonical
-    /// receipt identity is finally linked to the immutable ORS first-phase row.
+    /// projection, prove that the authority graph's own origin-bound
+    /// re-derivation binds that exact durable closure, compile the canonical
+    /// declaration from the durable [`GrantClosureReceipt`] and commit it. The
+    /// Store-issued canonical receipt identity is finally linked to the
+    /// immutable ORS first-phase row.
+    ///
+    /// `operation` is the admitted revocation operation identity both the
+    /// bounded closure and the prepared canonical revocation transition are
+    /// computed under. It is required, never defaulted, and is forwarded
+    /// verbatim to [`Self::reconcile_canonical_revocation`].
     ///
     /// Every failure after the Kernel first phase retains a
     /// [`PendingCanonicalRevocation`] before returning. The mechanical fence
@@ -7791,6 +8588,12 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// a later activation is refused, and a failed retry never clears it. The
     /// record is removed only when the second-phase link commits, which is the
     /// one outcome that proves canonical reconciliation completed.
+    ///
+    /// Its one production ingress is [`Self::apply_admitted_authority_revocation`],
+    /// which admits the presented operation against the live composition
+    /// generation before the Kernel first phase is struck;
+    /// [`Self::apply_authority_request`] reaches it through the
+    /// `GrantRevocation` arm.
     pub async fn revoke_grant_and_reconcile<
         L: GrantClosureCanonicalLinkPort + ?Sized,
         C: GrantClosureReceiptPort + ?Sized,
@@ -7799,6 +8602,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         request: &GrantRevocationRequest,
         canonical_operation_id: &OperationId,
         canonical_request_identity: &RequestIdentity,
+        operation: &RevocationOperationIdentity,
         durable_link: &L,
         closure_source: &C,
     ) -> Result<AuthorityRevocationReconciliation, CompositionError> {
@@ -7810,8 +8614,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .reconcile_canonical_revocation(
                 request,
                 &authority_receipt,
-                canonical_operation_id,
-                canonical_request_identity,
+                &CanonicalRevocationCommit {
+                    canonical_operation_id,
+                    canonical_request_identity,
+                    operation,
+                },
                 durable_link,
                 closure_source,
             )
@@ -7844,6 +8651,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// This method is reached only after [`Self::revoke_grant`] returned a
     /// validated Kernel revocation receipt, so every refusal here is a refusal
     /// to finish a handoff whose mechanical fence already took effect.
+    ///
+    /// The prepared canonical revocation transition is computed here, before
+    /// this projection fences the declared closure, because it is the
+    /// authority graph's own origin-bound re-derivation at the CURRENT graph
+    /// revision that the durable declaration is then held against.
     async fn reconcile_canonical_revocation<
         L: GrantClosureCanonicalLinkPort + ?Sized,
         C: GrantClosureReceiptPort + ?Sized,
@@ -7851,8 +8663,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         &mut self,
         request: &GrantRevocationRequest,
         authority_receipt: &AuthorityRevocationReceipt,
-        canonical_operation_id: &OperationId,
-        canonical_request_identity: &RequestIdentity,
+        commit: &CanonicalRevocationCommit<'_>,
         durable_link: &L,
         closure_source: &C,
     ) -> Result<AuthorityRevocationReconciliation, PendingCanonicalHandoff> {
@@ -7872,7 +8683,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             || closure.declaration.target_grant_id != request.grant_id.as_str()
             || closure.authority_receipt.snapshot_id != request.snapshot_id.as_str()
             || closure.authority.state_fence != request.binding.state_fence
-            || canonical_request_identity.request.metadata.state_fence
+            || commit
+                .canonical_request_identity
+                .request
+                .metadata
+                .state_fence
                 != closure.authority.state_fence
         {
             return Err(PendingCanonicalHandoff {
@@ -7895,6 +8710,16 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 error: CompositionError::Authority(P07PortError::InvalidBinding),
             });
         }
+        // The declared closure is admitted; before this projection fences it
+        // and advances its own graph revision, the authority graph prepares
+        // the canonical revocation transition over the SAME target and
+        // closure and proves that its own origin-bound re-derivation binds
+        // the durable declaration this saga is about to commit.
+        self.prepare_revocation_transition_for_commit(request, &closure, commit)
+            .map_err(|error| PendingCanonicalHandoff {
+                phase: CanonicalRevocationPhase::ClosureReadback,
+                error,
+            })?;
         // The Kernel already fenced the complete declared closure. Fence the
         // exact same declared members in this projection so an already-issued
         // narrower descendant cannot keep reading an effective right out of the
@@ -7911,8 +8736,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             })?;
         self.owners.authority.invalidate_owner_hydrations();
         let envelope = authority_revocation_envelope_from_closure(
-            canonical_request_identity,
-            canonical_operation_id,
+            commit.canonical_request_identity,
+            commit.canonical_operation_id,
             &closure,
         )
         .map_err(|error| PendingCanonicalHandoff {
@@ -7920,7 +8745,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             error,
         })?;
         let canonical_receipt = self
-            .commit_canonical(canonical_request_identity, envelope)
+            .commit_canonical(commit.canonical_request_identity, envelope)
             .await
             .map_err(|error| PendingCanonicalHandoff {
                 phase: CanonicalRevocationPhase::CanonicalCommit,
@@ -7932,20 +8757,44 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 error,
             }
         })?;
-        let closure_operation_id = eliot_ors::OperationIdentity::new(closure.operation_id.as_str())
-            .map_err(|error| PendingCanonicalHandoff {
-                phase: CanonicalRevocationPhase::SecondPhaseLink,
-                error: CompositionError::Recovery(error.to_string()),
-            })?;
+        // The ORIGINAL recorded first-phase operation identity, not a
+        // re-derived or freshly minted one. `closure.validate()` above already
+        // revalidated this exact field under the closure receipt contract, and
+        // an adapter that needs a typed ORS operation identity rebuilds it from
+        // these same bytes at the boundary that actually calls the store.
+        let closure_projection =
+            Self::link_closure_second_phase(durable_link, &closure, &receipt_identity)?;
+        Ok(AuthorityRevocationReconciliation {
+            authority_receipt: authority_receipt.clone(),
+            canonical_receipt,
+            closure_projection,
+        })
+    }
+
+    /// Links the canonical second phase of one grant revocation through the
+    /// durable boundary and proves the read-back.
+    ///
+    /// The owner-side link is keyed by the ORIGINAL recorded first-phase
+    /// operation identity, never a re-derived or freshly minted one. The
+    /// read-back is compared by CONTENT on the owner's committed bytes, never
+    /// by existence and never by shape: the linked operation identity, the
+    /// whole declared closure membership, and the exact linked canonical
+    /// receipt. A disagreement is the second-phase refusal the saga retains a
+    /// pending stricter revocation for.
+    fn link_closure_second_phase<L: GrantClosureCanonicalLinkPort + ?Sized>(
+        durable_link: &L,
+        closure: &GrantClosureReceipt,
+        receipt_identity: &ReceiptIdentity,
+    ) -> Result<GrantClosureSecondPhaseLink, PendingCanonicalHandoff> {
         let closure_projection = durable_link
-            .link_grant_closure_canonical_receipt(&closure_operation_id, &receipt_identity)
+            .link_grant_closure_canonical_receipt(closure.operation_id.as_str(), receipt_identity)
             .map_err(|error| PendingCanonicalHandoff {
                 phase: CanonicalRevocationPhase::SecondPhaseLink,
                 error: CompositionError::Owner(error.to_string()),
             })?;
-        if closure_projection.commit().operation_id != closure.operation_id
-            || closure_projection.commit().declaration != closure.declaration
-            || closure_projection.second_phase() != Some(&receipt_identity)
+        if closure_projection.closure().operation_id != closure.operation_id
+            || closure_projection.closure().declaration != closure.declaration
+            || closure_projection.canonical_receipt() != receipt_identity
         {
             return Err(PendingCanonicalHandoff {
                 phase: CanonicalRevocationPhase::SecondPhaseLink,
@@ -7955,11 +8804,107 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 ),
             });
         }
-        Ok(AuthorityRevocationReconciliation {
-            authority_receipt: authority_receipt.clone(),
-            canonical_receipt,
-            closure_projection,
-        })
+        Ok(closure_projection)
+    }
+
+    /// Prepares the authority crate's canonical revocation transition over
+    /// THIS composition's own grant graph and proves it binds the exact
+    /// durable closure the Kernel/ORS first phase committed.
+    ///
+    /// [`authority_revocation_envelope_from_closure`] compiles the canonical
+    /// record from the durable `GrantClosureReceipt`: it revalidates that
+    /// receipt with its own `validate()` and digests the membership, revision
+    /// and fence the declaration itself carries. The membership it records is
+    /// therefore the declaration's own word about itself. This step adds the
+    /// independent half the declaration cannot supply: the authority graph
+    /// re-derives the origin-bound affected set itself, at the CURRENT live
+    /// graph revision and under the same State Fence, from the admitted
+    /// operation identity, and the saga refuses unless those two derivations
+    /// agree. `A00-03` names "restoration of revoked influence after recovery"
+    /// a fail-closed boundary, and a declaration whose membership the shipped
+    /// graph cannot reproduce is exactly the case that must not be written.
+    ///
+    /// The comparison is by CONTENT, never by existence or shape: the whole
+    /// re-derived affected set, and the authority epoch every re-derived
+    /// member was proven under. Nothing is recomputed, defaulted or
+    /// manufactured here. The prepared transition's own `graph_revision` is
+    /// deliberately NOT compared with `closure.declaration.grant_graph_revision`:
+    /// those are two owners' counters — the Kernel's enumeration revision and
+    /// this projection's own revision, which `GrantGraph::revoke` and
+    /// `GrantGraph::revoke_declared_closure` have each already advanced past
+    /// that point — so no equality between them would mean anything.
+    ///
+    /// A declaration the authority graph cannot reproduce is refused here
+    /// rather than written. That is the intended direction: the closure's
+    /// `validate()` already refuses a cross-root member, so a durable
+    /// membership this graph re-derives as larger is evidence the recorded
+    /// closure is narrower than the authority's own denominator, and the
+    /// canonical revocation record must not be minted from it.
+    ///
+    /// What is presented is the owner's own material, never a synthesized
+    /// coordinate: the operation identity and idempotency key are the admitted
+    /// canonical ones, the snapshot and State Fence are the ones the durable
+    /// closure records, the bounds are the same default bounds the canonical
+    /// record is committed under, and the reason is the terminal
+    /// `SourceRevoked` state the durable influence closure records. The
+    /// disposition is [`RevocationTransitionDisposition::Prepared`] and no
+    /// write receipt is presented, because at this point nothing has been
+    /// written: the canonical commit is the NEXT step, and no durable receipt
+    /// exists yet to present. A committed presentation is never synthesized
+    /// from a receipt this step has not been given.
+    ///
+    /// `prior` is `None` because this composition retains no prepared
+    /// transition between calls: its durable second-phase progress is the
+    /// [`PendingCanonicalRevocation`] record, and the I5.27 same-operation /
+    /// changed-payload conflict is already enforced on the retained
+    /// presentation bytes at
+    /// [`Self::apply_admitted_authority_revocation`]. The prepared
+    /// transition's own replay gate therefore has nothing to read here, and
+    /// claiming a prior it does not hold would be a fabricated one.
+    fn prepare_revocation_transition_for_commit(
+        &self,
+        request: &GrantRevocationRequest,
+        closure: &GrantClosureReceipt,
+        commit: &CanonicalRevocationCommit<'_>,
+    ) -> Result<(), CompositionError> {
+        let origin = RevocationOrigin::Grant(request.grant_id.clone());
+        let prepared = self
+            .owners
+            .authority
+            .grants
+            .prepare_revocation_transition(
+                &origin,
+                &RevocationTransitionRequest {
+                    operation_id: commit.canonical_operation_id.as_str().to_owned(),
+                    idempotency_key: commit.canonical_request_identity.idempotency_key.clone(),
+                    snapshot_id: request.snapshot_id.clone(),
+                    state_fence: closure.authority.state_fence.clone(),
+                    bounds: RevocationBounds::default_bounds(),
+                    reason: RevocationReason::SourceRevoked,
+                    disposition: RevocationTransitionDisposition::Prepared,
+                    write_receipt: None,
+                    operation: commit.operation.clone(),
+                },
+                None,
+            )
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        // The whole re-derived membership and the authority epoch every member
+        // was proven under. Any disagreement is a reconciliation refusal, not a
+        // widening and not a silent repair.
+        let declared_affected: BTreeSet<String> =
+            closure.declaration.affected_grants().into_iter().collect();
+        if prepared.affected() != &declared_affected
+            || !prepared
+                .authority_epoch()
+                .is_same_authority(&closure.authority_receipt.authority_epoch)
+        {
+            return Err(CompositionError::Recovery(
+                "prepared authority revocation transition does not bind the durable closure \
+                 membership and authority epoch"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Presents one canonical introduction activation to the retained P-07
@@ -8223,12 +9168,22 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// an absent history, or a stale/invalid view refuses before any owner
     /// state is installed: unavailable history is never absence of
     /// revocation.
+    ///
+    /// `operation` is the admitted revocation operation identity this
+    /// restore runs under, supplied by the durable boundary that admitted
+    /// it and forwarded verbatim. It is required, never defaulted: the
+    /// snapshot is a grant/effect payload and the decoded history carries
+    /// only a fence, a durable source revision, and per-closure owner
+    /// namespace/digest/bounds records, so none of the identity's five
+    /// coordinates is derivable here. Restoring under a synthesized
+    /// identity would make the origin-bound recheck certify itself.
     pub async fn restore_authority_with_live_history<R: CanonicalReadClient + ?Sized>(
         reads: &R,
         snapshot: &AuthorityOwnerSnapshot,
         state_fence: &StateFence,
         origin_ref: &str,
         max_records: u32,
+        operation: &RevocationOperationIdentity,
     ) -> Result<AuthorityRestoreOutcome, CompositionError> {
         let request = revocation_history_read_request(state_fence, origin_ref, max_records)?;
         let response = reads
@@ -8240,6 +9195,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             snapshot,
             state_fence,
             Some(&evidence),
+            operation,
         )
     }
 
@@ -8253,6 +9209,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// on provider-revision advance and on recovery; a stale trigger
     /// refuses before any publish, and no owner state installs until
     /// the Kernel readback proves the exact published bytes.
+    ///
+    /// `operation` is the admitted revocation operation identity the
+    /// underlying feed restores under; it is forwarded verbatim to
+    /// [`synchronize_owner_feed`] and is required, never defaulted.
     pub async fn synchronize_kernel_owner<
         R: CanonicalReadClient + ?Sized,
         K: OwnerPublishPort + ?Sized,
@@ -8263,6 +9223,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         origin_refs: &[String],
         max_records: u32,
         expected_revision: u64,
+        operation: RevocationOperationIdentity,
     ) -> Result<u64, CompositionError> {
         let snapshot = self.owners.authority.snapshot()?;
         let state_fence = self.snapshot.state_fence();
@@ -8274,6 +9235,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             origin_refs,
             max_records,
             expected_revision,
+            operation,
         )
         .await
     }
@@ -8282,6 +9244,15 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// read from the durable ORS boundary. The legacy method above remains the
     /// fail-closed empty-link entry point; a production caller that has read
     /// completed links must use this method.
+    ///
+    /// `operation` is the admitted revocation operation identity the
+    /// underlying feed restores under; it is forwarded verbatim to
+    /// [`synchronize_owner_feed_with_canonical_receipts`] and is
+    /// required, never defaulted.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the durable feed boundary keeps read, publish, roots, history, revision, canonical receipt evidence, and the admitted operation identity explicit"
+    )]
     pub async fn synchronize_kernel_owner_with_canonical_receipts<
         R: CanonicalReadClient + ?Sized,
         K: OwnerPublishPort + ?Sized,
@@ -8293,6 +9264,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         max_records: u32,
         expected_revision: u64,
         canonical_receipts: BTreeMap<String, ReceiptIdentity>,
+        operation: RevocationOperationIdentity,
     ) -> Result<u64, CompositionError> {
         let snapshot = self.owners.authority.snapshot()?;
         let state_fence = self.snapshot.state_fence();
@@ -8305,6 +9277,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             max_records,
             expected_revision,
             canonical_receipts,
+            operation,
         )
         .await
     }
@@ -8313,9 +9286,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// plus owner quarantine evidence records read from the durable
     /// boundary. Absent evidence leaves the affected omissions explicitly
     /// unresolved; it is never reconstructed here.
+    ///
+    /// `operation` is the admitted revocation operation identity the
+    /// underlying feed restores under; it is forwarded verbatim to
+    /// [`synchronize_owner_feed_with_quarantine_evidence`] and is
+    /// required, never defaulted.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the durable feed boundary keeps read, publish, roots, history, revision, canonical receipt evidence, and quarantine evidence explicit"
+        reason = "the durable feed boundary keeps read, publish, roots, history, revision, canonical receipt evidence, quarantine evidence, and the admitted operation identity explicit"
     )]
     pub async fn synchronize_kernel_owner_with_quarantine_evidence<
         R: CanonicalReadClient + ?Sized,
@@ -8329,6 +9307,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         expected_revision: u64,
         canonical_receipts: BTreeMap<String, ReceiptIdentity>,
         quarantine_evidence: BTreeMap<String, CrossRootQuarantineEvidence>,
+        operation: RevocationOperationIdentity,
     ) -> Result<u64, CompositionError> {
         let snapshot = self.owners.authority.snapshot()?;
         let state_fence = self.snapshot.state_fence();
@@ -8342,6 +9321,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             expected_revision,
             canonical_receipts,
             quarantine_evidence,
+            operation,
         )
         .await
     }

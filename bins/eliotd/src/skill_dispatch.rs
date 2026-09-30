@@ -7,7 +7,7 @@
 //! Intake pairs decode to the wire intake, resolve canonical procedure
 //! acceptance over the authenticated Kernel route, and drive install→receipt
 //! only for owner-accepted material (issue #1191); display pairs decode to
-//! the wire display request and drive ack→display; activation pairs decode to
+//! the wire display request and drive sweep→ack→display; activation pairs decode to
 //! the wire harness receipt and fold it into the per-attempt stage summary
 //! (issue #1191); execution pairs decode to the wire evidence ingest, retain
 //! the bounded page through the existing evidence owner, and publish an
@@ -953,6 +953,18 @@ fn commit_activation_candidate(
         // admission's own receipt check — an unvalidated receipt cannot
         // reach the fence/route/retained-row legs on a stored-status pass.
         Some(SkillResultEnvelope::refused(&error))
+    } else if let Some(error) = candidate
+        .bound_subject
+        .as_deref()
+        .and_then(|bound| bound.validate().err())
+    {
+        // Owner-row validation leg (issue #1882 W2, I7.13): the published
+        // stages are folded from the BOUND owner row, never from the
+        // presented receipt's self-declared stages, so the row is re-proved
+        // here under the commit's fresh borrow like every other load-bearing
+        // binding — an unvalidated owner row cannot reach Material use
+        // through a plan-time pass.
+        Some(SkillResultEnvelope::refused(&error))
     } else if candidate.ingest_attempt_id.trim().is_empty() {
         Some(SkillResultEnvelope::refused(
             &eliot_skill::SkillError::InvalidField {
@@ -1039,7 +1051,13 @@ fn commit_activation_candidate(
     // admission re-checks live dep staleness even when the catalogue entry
     // itself has not been remarked yet; only revalidation or explicit
     // scoped/provisional admission through the governed lifecycle path
-    // lifts the standing. The owner admits the same
+    // lifts the standing. STITCH (issue #1882 W2/A2): the full-world sweep
+    // — live dependency-set feed, host/profile versions, admitted
+    // definition version, tool-owner view
+    // (`gate_material_use_against` over `LiveSkillWorld`) — has no producer
+    // at this commit and is never synthesized here; the designated driver is
+    // the owning crate's per-caller gate once a live-world feed reaches the
+    // bridge. The owner admits the same
     // standing again at admission time; this leg keeps the commit's fence,
     // route and retained-receipt legs consistent on one observation instead
     // of trusting fields of an unvalidated or stale record.
@@ -1210,13 +1228,33 @@ pub fn commit_skill_pair(
             PlannedSkillPair::Resolved(outcome) => outcome,
             PlannedSkillPair::Display(payload) => {
                 if composition.kernel_snapshot().state_fence() == plan.admitted_fence {
-                    match composition.skill_carry_receipt_to_display(
-                        &payload.skill_id,
-                        payload.receipt,
-                        payload.ack,
-                    ) {
-                        Ok(display) => SkillResultEnvelope::display(display),
-                        Err(error) => SkillResultEnvelope::refused(&error),
+                    // Full-world tool/definition staleness sweep ahead of display
+                    // (issue #1882 A4, I7.13): the versioned acknowledge entry
+                    // below enforces the tool-basis and definition drift legs
+                    // per call for the subject Skill, while this refresh sweep
+                    // marks every OTHER drifted entry world-wide under the same
+                    // live tool-owner source, so a Skill whose declared tool
+                    // basis or admitted Tool Definition version changed is
+                    // marked stale and not representable as generally
+                    // delivered even when no display call ever reaches it. A
+                    // mark rotates the catalogue digest, so Hotset receipts
+                    // issued before the sweep fail closed at activation instead
+                    // of displaying a drifted body. The dependency-set and
+                    // host/profile legs still await their live producer (STITCH
+                    // on `activation_display_against`): no live dependency
+                    // registry or live host reporter feeds the bridge on main,
+                    // and this drive never synthesizes those terms.
+                    if let Err(error) = composition.skill_reconcile_tool_basis() {
+                        SkillResultEnvelope::refused(&error)
+                    } else {
+                        match composition.skill_carry_receipt_to_display(
+                            &payload.skill_id,
+                            payload.receipt,
+                            payload.ack,
+                        ) {
+                            Ok(display) => SkillResultEnvelope::display(display),
+                            Err(error) => SkillResultEnvelope::refused(&error),
+                        }
                     }
                 } else {
                     SkillResultEnvelope::refused(&eliot_skill::SkillError::FenceMismatch)

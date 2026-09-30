@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use eliot_host_service::runtime_control::BackupRuntimeControlRequest;
+use eliot_host_service::runtime_control::{BackupOwnerOutcome, BackupRuntimeControlRequest};
 
 /// The closed backup operation vocabulary, consumed from its canonical
 /// `#954` owner (`eliot-protocol/src/backup.rs`).
@@ -150,12 +150,22 @@ pub const fn authority_matches(
 // effect. An absent owner is a fail-closed refusal, never a no-op success.
 // ---------------------------------------------------------------------------
 
-/// Bounded, redacted refusal of one admitted backup control request.
+/// Bounded, redacted **pre-effect** refusal of one admitted backup control
+/// request.
 ///
 /// The refusal names the operation it applies to and a stable reason class.
 /// It carries no payload text, no owner internals and no secret, and it is
-/// produced before any owner effect, so a refused request can never be
-/// answered with a success frame.
+/// produced *before any owner effect*, so a refused request can never be
+/// answered with a success frame and never leaves an unresolved effect
+/// behind.
+///
+/// This type is therefore not a general failure channel for the owner
+/// callback. An owner that has already crossed an effect boundary and cannot
+/// say whether the effect committed must return
+/// [`BackupOwnerOutcome::PossibleEffect`] instead of a refusal: I14.21 keeps
+/// such an operation reconciling, and a refusal would falsely report that no
+/// effect happened. The endpoint's own admission gates, which all run before
+/// the owner is called, keep returning this type unchanged.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BackupDispatchRefusal {
     /// The operation whose request was refused.
@@ -187,24 +197,43 @@ impl std::error::Error for BackupDispatchRefusal {}
 /// The registered Host backup owner for the canonical Host runtime-control
 /// pipe.
 ///
-/// One admitted request routes to exactly one owner operation. `Ok(())` is
-/// returned only after that exact operation has been performed, so the
-/// endpoint never reports a transport acknowledgement as backup semantic
-/// success; every other outcome is a [`BackupDispatchRefusal`] carrying no
-/// effect.
+/// One admitted request routes to exactly one owner operation, and the owner
+/// answers with the outcome that operation actually reached. The four states
+/// stay distinct across the seam and are never collapsed into one:
+///
+/// - **pre-effect rejection** — [`BackupDispatchRefusal`], produced before
+///   the owner did anything, so no effect is outstanding;
+/// - **admitted / pending** — [`BackupOwnerOutcome::Admitted`], the exact
+///   operation is retained and still running, with no stage claimed and no
+///   receipt issued;
+/// - **completed owner result** — [`BackupOwnerOutcome::Completed`], the
+///   owner performed the operation and issued its own phase attestation,
+///   optionally with the prepared destination as a bounded immutable handle;
+/// - **possible-effect / unknown** — [`BackupOwnerOutcome::PossibleEffect`],
+///   the operation is retained but the effect may or may not have committed,
+///   so the original operation is reconciled instead of retried.
+///
+/// The endpoint never reports a transport acknowledgement as backup semantic
+/// success: only the owner's own outcome reaches the wire, and it is
+/// re-validated against the admitted request before delivery.
 pub trait HostBackupOwner: Send + Sync {
     /// Performs the one owner operation the closed accepted table and the
-    /// registered dispatch resolved for `request`.
+    /// registered dispatch resolved for `request`, and reports the outcome
+    /// that operation reached.
     ///
     /// # Errors
     ///
-    /// Returns [`BackupDispatchRefusal`] when this owner has no operation
-    /// for the request, when the request lacks the separate admission its
-    /// operation requires, or when the owner effect itself fails closed.
+    /// Returns [`BackupDispatchRefusal`] only when the request was refused
+    /// **before** any owner effect: this owner has no operation for it, the
+    /// request lacks the separate admission its operation requires, or
+    /// admission of the exact operation failed closed. Once an effect may
+    /// have happened, the owner must return
+    /// [`BackupOwnerOutcome::PossibleEffect`] with the retained operation
+    /// instead, so the outcome remains reconciling.
     fn dispatch_backup_operation(
         &self,
         request: &BackupRuntimeControlRequest,
-    ) -> Result<(), BackupDispatchRefusal>;
+    ) -> Result<BackupOwnerOutcome, BackupDispatchRefusal>;
 }
 
 /// The registered backup owner together with the exact closed dispatch table
@@ -251,14 +280,17 @@ impl HostBackupOwnerRegistration {
 
     /// Routes one already-admitted request to the registered owner.
     ///
+    /// The owner's outcome is returned unchanged. It is not flattened into a
+    /// success, and a pre-effect refusal is not confused with an outcome
+    /// whose effect is merely unknown.
+    ///
     /// # Errors
     ///
-    /// Returns the owner's [`BackupDispatchRefusal`] unchanged; the typed
-    /// failure is never collapsed into a success.
+    /// Returns the owner's pre-effect [`BackupDispatchRefusal`] unchanged.
     pub fn dispatch(
         &self,
         request: &BackupRuntimeControlRequest,
-    ) -> Result<(), BackupDispatchRefusal> {
+    ) -> Result<BackupOwnerOutcome, BackupDispatchRefusal> {
         self.owner.dispatch_backup_operation(request)
     }
 }

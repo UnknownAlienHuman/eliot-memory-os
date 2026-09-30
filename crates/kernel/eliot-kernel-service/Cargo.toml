@@ -27,6 +27,7 @@ eliot-doctor-core.workspace = true
 # lifecycle/action admission.
 eliot-epistemic = { path = "../../smart/eliot-epistemic", version = "0.1.0" }
 eliot-evidence.workspace = true
+eliot-host-state.workspace = true
 # Issue #2966 step 2: the history projector declares the traversal bounds
 # the committed closures were proven under. Narrow use of one type plus
 # `default_bounds`; same layer-family edge `eliot-kernel-core` already holds.

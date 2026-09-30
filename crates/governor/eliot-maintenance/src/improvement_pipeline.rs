@@ -34,6 +34,16 @@
 //! refusals with a typed relation identity, so an experiment cannot be executed
 //! by a self-chosen principal or evaluated by the party proposing it.
 //!
+//! The independent admission review is held to the same principal relation
+//! through the same shared predicate. The two records may name different
+//! verifiers, and their identities are never compared with each other, but
+//! neither reviewer may be the experiment executor, the admitting Governor
+//! owner, or the rollback owner. The admission review is the record the decision
+//! leans on hardest — it carries the pulse outcome, the harm observation, and the
+//! pass verdict — so a review written by the party that executed the experiment
+//! is the party grading its own work, and both records' own `independent` flag is
+//! a caller-set boolean that establishes nothing by itself.
+//!
 //! Activation evidence carries the I0.5 `EvidenceExecutionStatus` dimension
 //! rather than a boolean. Only `EXECUTED` may support admission:
 //! `NOT_EXECUTED` and `SIMULATED` can never become accepted improvement, and
@@ -137,7 +147,63 @@
 //! build's constant at the handoff boundary, so a handoff assembled under
 //! another wire revision is a typed [`UncheckedWireRevision`] rather than a
 //! tolerated record. The constant was never compared before revision `8`; it is
-//! now read at the boundary whose shape it describes.
+//! now read at the boundary whose shape it describes. Revision `9` puts the
+//! staleness discriminator where the claim already said it was. The receipt
+//! owner's `validate_terminal_receipt` binds a terminal outcome to its effect on
+//! three things — operation id, idempotency key, and state fence — and this
+//! module re-established only the first two. The third is now compared too, on
+//! two values that are both recorded and both owned elsewhere: the `state_fence`
+//! on the authorized effect's `OperationBinding` and the `state_fence` on the
+//! operation binding inside the retained `ReceiptEnvelope` (see
+//! `ImprovementUnknownEffect::binds_effect_fence`). Both carry an authority
+//! epoch — an exact `(lineage_id, sequence)` tuple — and a resource generation,
+//! and they are compared with `fences_match_exact`, so a receipt whose outcome
+//! was recorded under a superseded epoch or an earlier generation than the
+//! effect it claims to settle is refused as a typed
+//! [`UnboundOwnerOutcome::DivergentStateFence`] at the attaching seam and denied
+//! by [`improvement_retry_permitted`]. Nothing was invented to make that
+//! comparison possible: no clock, no nonce, no epoch of this module's own, and
+//! no constant that would let it pass. It is not a wire-revision change either —
+//! the owner outcome is skipped on serialize, so the bytes of an already-written
+//! obligation are unchanged, which is why
+//! [`IMPROVEMENT_PIPELINE_WIRE_REVISION`] stays at `8`.
+//!
+//! ## The staleness check this module can and cannot make
+//!
+//! Stated here rather than left to be discovered, because the difference is the
+//! whole of what a reader may rely on.
+//!
+//! What it makes: an outcome whose two recorded fences disagree is refused, so
+//! a receipt cannot pair an effect admitted under one authority epoch or
+//! resource generation with a settlement observed under another and pass as that
+//! operation's outcome. `EffectReceipt` is an open all-`pub` struct, so a value
+//! reaching the seam need not have passed `EffectReceipt::terminal`, and this is
+//! a live comparison rather than a restatement of a constructor's guarantee.
+//!
+//! What it cannot make, because the value does not exist here: a comparison
+//! against a *current* fence. This module records no current authority epoch and
+//! no current resource generation, and it holds no fence of its own on
+//! [`ImprovementUnknownEffect`], on [`ProposalCommitment`], on
+//! [`ImprovementProposal`], or on [`ImprovementCandidateView`]. The one
+//! generation-shaped field on the proposal, `target_generation`, is a
+//! `String` documented as observation-only and never activated here, so it is
+//! not a [`StateFence`] value and comparing it against a `ResourceGeneration`
+//! would assert an identity nobody defines. The candidate's
+//! `validity_scope` in `eliot-improvement` is likewise a `String` and does not
+//! reach this crate at all. So a receipt that is *internally* consistent but was
+//! settled under a fence that has since been superseded still reaches the gate.
+//!
+//! Closing that would require the daemon to supply one value this crate does not
+//! currently receive: the admitted `StateFence` — at minimum the authority epoch
+//! and resource generation — that the candidate was admitted under, carried on
+//! the intake path beside the candidate identity, and bound to the obligation at
+//! the module's single `unknown_effect_of` construction site the way
+//! [`RollbackContract::forward_repair_ref`] is. The comparison would then be
+//! three-sided: this receipt's fence, the fence the effect was authorized under,
+//! and the fence the run was admitted under. Until that value exists, inventing
+//! a stand-in for it — a clock read, a locally held epoch, a constant — would
+//! produce a check that looks present and can only ever pass, which is worse than
+//! the recorded gap.
 //!
 //! That is precisely what the gate establishes, and the module claims no more.
 //! A `FAILURE` or `CANCELLED` disposition records what the owner observed about
@@ -170,7 +236,7 @@
 use std::collections::BTreeSet;
 
 use eliot_authority::{EffectOutcome, EffectReceipt};
-use eliot_contracts::{canonical_json_bytes, sha256_hex};
+use eliot_contracts::{StateFence, canonical_json_bytes, fences_match_exact, sha256_hex};
 use eliot_receipts::{OperationBinding, ReceiptEnvelope};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -1039,7 +1105,7 @@ impl ImprovementUnknownEffect {
     /// outside this module, and a checked seam rather than an assignment: the
     /// binding is re-verified here even though the field starts empty and
     /// nothing else can write it, because a receipt is an untrusted input at this
-    /// boundary. Four conditions must hold together, and each refusal is a typed
+    /// boundary. Five conditions must hold together, and each refusal is a typed
     /// [`UnboundOwnerOutcome`] rather than a silently dropped value:
     ///
     /// 1. the outcome is terminal — an `UnknownOutcome` is a still-unsettled
@@ -1051,7 +1117,11 @@ impl ImprovementUnknownEffect {
     ///    id and idempotency key;
     /// 4. the canonical receipt itself names that same operation id and
     ///    idempotency key, so a receipt bound elsewhere cannot ride in on an
-    ///    authorized effect that happens to match.
+    ///    authorized effect that happens to match; and
+    /// 5. the canonical receipt was recorded under the *same* state fence as the
+    ///    authorized effect it settles, so an outcome observed under a superseded
+    ///    authority epoch or an earlier resource generation cannot be replayed as
+    ///    this operation's settlement (see `Self::binds_effect_fence`).
     ///
     /// It borrows `&mut self` rather than consuming `self`. The obligation is
     /// held by its owning disposition behind a `Box` and its owner updates it in
@@ -1077,12 +1147,10 @@ impl ImprovementUnknownEffect {
         if matches!(&receipt.outcome, EffectOutcome::UnknownOutcome { .. }) {
             return Err(UnboundOwnerOutcome::StillUnsettled);
         }
-        let observed = &receipt
-            .canonical_receipt
-            .as_ref()
-            .ok_or(UnboundOwnerOutcome::UnsettledEffect)?
-            .core
-            .operation;
+        let Some(canonical) = receipt.canonical_receipt.as_ref() else {
+            return Err(UnboundOwnerOutcome::UnsettledEffect);
+        };
+        let observed = &canonical.core.operation;
         let authorized = &receipt.authorized_effect.proposal.operation;
         if !self.binds_operation(authorized) {
             return Err(UnboundOwnerOutcome::ForeignOperation {
@@ -1098,6 +1166,12 @@ impl ImprovementUnknownEffect {
                 idempotency_key: observed.idempotency_key.as_str().to_owned(),
             });
         }
+        if !Self::binds_effect_fence(authorized, observed) {
+            return Err(UnboundOwnerOutcome::DivergentStateFence {
+                authorized: Box::new(authorized.state_fence.clone()),
+                observed: Box::new(observed.state_fence.clone()),
+            });
+        }
         self.owner_outcome = Some(Box::new(receipt));
         Ok(())
     }
@@ -1107,11 +1181,13 @@ impl ImprovementUnknownEffect {
     /// The answer is read from the effect owner's stored validated outcome and
     /// from nothing else — never from a constant, a reason string, or the mere
     /// presence of a lookup reference. An outcome the owner has not settled yet,
-    /// a stored outcome whose bound operation is foreign to this obligation, and
-    /// a still-unknown outcome all deny. A completed effect denies as well: a
-    /// committed or compensated outcome is reconciled from the result its owner
-    /// already retained through [`retained_improvement_completion`], never
-    /// authorized a second time.
+    /// a stored outcome whose bound operation is foreign to this obligation, a
+    /// stored outcome whose canonical receipt was recorded under a different
+    /// state fence than the authorized effect it settles, and a still-unknown
+    /// outcome all deny. A completed effect denies as well: a committed or
+    /// compensated outcome is reconciled from the result its owner already
+    /// retained through [`retained_improvement_completion`], never authorized a
+    /// second time.
     ///
     /// Opening the gate requires positive owner evidence, not a bare
     /// discriminant: the outcome must be `Rejected` *and* the owner must have
@@ -1120,6 +1196,17 @@ impl ImprovementUnknownEffect {
     /// merely-present-and-never-validated case, and it denies. A settled
     /// `Rejected` outcome is an owner-validated terminal outcome whose canonical
     /// receipt disposition is `FAILURE` or `CANCELLED`.
+    ///
+    /// The fence condition is the stale-outcome refusal, and it is a real
+    /// comparison of two recorded values rather than a test that can only pass:
+    /// `Self::binds_effect_fence` reads the state fence the authorized effect
+    /// was admitted under and the state fence the canonical receipt was recorded
+    /// under, and denies when they are not the same fence — which also keeps the
+    /// "a canonical receipt must be present" requirement stated in one place
+    /// rather than as a separate flag. What it cannot do is compare either of
+    /// them against a *current* fence, because this module records none; the
+    /// honest limit is stated in this module's header and is not papered over
+    /// here.
     ///
     /// That is the whole of the guarantee, and it is stated rather than
     /// overstated: a non-success disposition is not by itself proof that nothing
@@ -1133,7 +1220,12 @@ impl ImprovementUnknownEffect {
     pub fn retry_permitted(&self) -> bool {
         self.owning_outcome().is_some_and(|receipt| {
             matches!(&receipt.outcome, EffectOutcome::Rejected)
-                && receipt.canonical_receipt.is_some()
+                && receipt.canonical_receipt.as_ref().is_some_and(|canonical| {
+                    Self::binds_effect_fence(
+                        &receipt.authorized_effect.proposal.operation,
+                        &canonical.core.operation,
+                    )
+                })
         })
     }
 
@@ -1175,6 +1267,53 @@ impl ImprovementUnknownEffect {
             && operation.idempotency_key.as_str() == self.commitment.idempotency_key.as_str()
     }
 
+    /// Returns whether one owner-side operation binding was recorded under the
+    /// same state fence as the other.
+    ///
+    /// The staleness discriminator of this type, and the second half of the
+    /// receipt owner's own terminal binding: the effect owner's
+    /// `validate_terminal_receipt` relates the retained canonical receipt's
+    /// `OperationBinding` to the authorized effect's on the operation id, the
+    /// idempotency key **and** the state fence, and this module re-establishes
+    /// the third of those three the same way it re-establishes the first two.
+    ///
+    /// The two values compared are both recorded and both owned elsewhere. They
+    /// are the `state_fence` on the authorized effect's own `OperationBinding`
+    /// and the `state_fence` on the operation binding inside the retained
+    /// `ReceiptEnvelope`, reached only through `eliot_authority::EffectReceipt`.
+    /// Each carries an authority epoch — an exact `(lineage_id, sequence)` tuple
+    /// — and a resource generation, so a receipt settled under a superseded
+    /// epoch or an earlier generation is a *different recorded value* from one
+    /// settled under the fence the effect was authorized in, not a matter of
+    /// wording. They are compared with `fences_match_exact`, the repository's own
+    /// both-directions exact fence comparison, so a `None` revision on one side
+    /// never satisfies a `Some` revision on the other and an equal sequence from
+    /// a different lineage never matches. Nothing here is derived, defaulted,
+    /// sampled or invented: no clock, no counter invented for this module, no
+    /// nonce, and no constant that would make the comparison vacuous.
+    ///
+    /// `EffectReceipt` is an open struct whose three fields are all public, so a
+    /// value arriving at this seam need not have passed
+    /// `EffectReceipt::terminal`, and a receipt is treated here as the untrusted
+    /// input it is. That is what makes this comparison load-bearing rather than
+    /// decorative: a hand-built receipt can pair an authorized effect with a
+    /// canonical receipt recorded under a different fence, and the operation
+    /// identity alone would accept it.
+    ///
+    /// WHAT THIS DOES NOT ESTABLISH, stated rather than implied: the comparison
+    /// is between two recorded fences inside one receipt, so it establishes that
+    /// the outcome was settled under the fence of the effect it claims to settle.
+    /// It does **not** establish that either fence is *current*. This module
+    /// records no current fence, so a receipt that is internally consistent but
+    /// was settled under a fence that has since been superseded still passes
+    /// here. The value that would detect that is the admitted fence the candidate
+    /// was proposed under, and it does not reach this crate: see the staleness
+    /// note in this module's header for the exact missing input and the owner
+    /// that has to supply it.
+    fn binds_effect_fence(authorized: &OperationBinding, observed: &OperationBinding) -> bool {
+        fences_match_exact(&authorized.state_fence, &observed.state_fence)
+    }
+
     /// Returns the stored owner outcome only when the operation it was bound to
     /// is this obligation's own, so a receipt for another operation can answer
     /// neither the retry question nor the retained-result question here.
@@ -1199,6 +1338,17 @@ impl ImprovementUnknownEffect {
     /// it digests the effect payload, while [`ProposalCommitment::digest`] digests
     /// the whole normalized proposal envelope, so the two are not the same
     /// preimage and matching them would assert an identity neither owner defines.
+    ///
+    /// The fence relation is different in kind from the operation identity above,
+    /// and is not folded into this filter for that reason. The operation pair
+    /// relates an owner-side value to this obligation's commitment and no owner
+    /// defines that correspondence yet. The fence relation relates two values
+    /// *inside* the same receipt, and the receipt owner defines it exactly —
+    /// `validate_terminal_receipt` requires the retained canonical receipt's
+    /// state fence to equal the authorized effect's. Filtering it in here would
+    /// change what [`Self::settled_completion_result`] hands back, so it is
+    /// applied where the unknown-outcome debt is discharged instead: at the
+    /// attaching seam and at [`Self::retry_permitted`].
     fn owning_outcome(&self) -> Option<&EffectReceipt> {
         self.owner_outcome
             .as_deref()
@@ -1211,9 +1361,10 @@ impl ImprovementUnknownEffect {
 /// Every variant is a refusal to *believe* something, so none of them discharges
 /// the obligation: the debt stays owed and the retry gate stays closed. They are
 /// distinct because they are distinct facts about the receipt — a still-unknown
-/// effect, an effect the owner never settled against a receipt, and a receipt
-/// that belongs to a different operation are three different things a caller has
-/// to go and fix.
+/// effect, an effect the owner never settled against a receipt, a receipt that
+/// belongs to a different operation, and an outcome recorded under a state fence
+/// other than the one its effect was authorized under are four different things a
+/// caller has to go and fix.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum UnboundOwnerOutcome {
     /// The outcome is still `UnknownOutcome`, so the effect is not settled at
@@ -1239,6 +1390,34 @@ pub enum UnboundOwnerOutcome {
         operation_id: String,
         /// Idempotency key that side of the receipt is bound to.
         idempotency_key: String,
+    },
+    /// The two halves of the receipt were recorded under different state
+    /// fences, so the outcome is not a settlement of the effect it rides on.
+    ///
+    /// `authorized` is the fence the owner admitted the effect under and
+    /// `observed` is the fence the retained canonical receipt was recorded
+    /// under. They are the two recorded values the staleness refusal actually
+    /// compares, carried whole so the owner can see which epoch or generation
+    /// disagrees rather than being told only that something did. This is the
+    /// refusal the effect owner itself issues as `ReceiptMismatch` when it
+    /// builds a terminal receipt; a hand-built `EffectReceipt` reaches this
+    /// module without passing that constructor, so the relation is re-checked
+    /// here.
+    #[error(
+        "improvement owner outcome was recorded under a different state fence than the effect it settles: authorized {authorized:?} vs canonical receipt {observed:?}"
+    )]
+    DivergentStateFence {
+        /// Fence the authorized effect was admitted under.
+        ///
+        /// Boxed for the same storage reason `owner_outcome` is: two whole
+        /// fences inline made this error enum larger than every other value on
+        /// the reconciliation seam, and the two are only ever read together
+        /// through a reference. This is a storage detail — the comparison that
+        /// produces them is unchanged and both recorded values are still
+        /// carried whole.
+        authorized: Box<StateFence>,
+        /// Fence the retained canonical receipt was recorded under.
+        observed: Box<StateFence>,
     },
 }
 
@@ -2416,6 +2595,7 @@ fn join_improvement_inputs(
         inputs.evidence,
         inputs.proposal,
         inputs.experiment,
+        inputs.policy,
     )?;
     check_rollback_join(
         inputs.rollback,
@@ -2575,22 +2755,46 @@ fn check_evaluator_independence(
             relation: "experiment-evaluation: evaluator-is-not-the-instrument-verifier-family",
         });
     }
-    for (relation, evaluator, principal) in [
-        (
+    check_evaluator_distinct_from_owners(
+        evidence.verifier_id.as_str(),
+        experiment,
+        policy,
+        [
             "experiment-evaluation: evaluator-is-the-experiment-executor",
-            evidence.verifier_id.as_str(),
-            experiment.testd_owner_id.as_str(),
-        ),
-        (
             "experiment-evaluation: evaluator-is-the-governor-admission-owner",
-            evidence.verifier_id.as_str(),
-            policy.external_owner_id.as_str(),
-        ),
-        (
             "experiment-evaluation: evaluator-is-the-rollback-owner",
-            evidence.verifier_id.as_str(),
-            policy.rollback_owner_id.as_str(),
-        ),
+        ],
+    )
+}
+
+/// Requires one named evaluator to be a principal distinct from the experiment
+/// executor, the admitting Governor owner, and the rollback owner.
+///
+/// The one distinctness comparison this module makes about an evaluator, shared
+/// by the experiment evaluation ([`check_evaluator_independence`]) and the
+/// independent admission review (`check_admission_evidence_join`). Sharing it is
+/// the point: the two evaluators are different records that may legitimately be
+/// different people, but neither may be a principal whose interest the evidence
+/// serves, and a second hand-written copy of these three relations is a place
+/// where the two could drift apart and quietly disagree about who may evaluate.
+///
+/// The three principals are read from the records that already carry them — the
+/// experiment's declared Testd executor, the policy's admission owner, and the
+/// policy's rollback owner — never from a caller-set independence boolean.
+/// `relations` supplies the three refusal identities, in the fixed order
+/// executor, admission owner, rollback owner, so each caller reports under its
+/// own relation namespace instead of sharing one another's wording.
+fn check_evaluator_distinct_from_owners(
+    evaluator: &str,
+    experiment: &ExperimentPlan,
+    policy: &ImprovementAdmissionPolicy,
+    relations: [&'static str; 3],
+) -> Result<(), PipelineError> {
+    let [executor, admission_owner, rollback_owner] = relations;
+    for (relation, principal) in [
+        (executor, experiment.testd_owner_id.as_str()),
+        (admission_owner, policy.external_owner_id.as_str()),
+        (rollback_owner, policy.rollback_owner_id.as_str()),
     ] {
         if evaluator == principal {
             return Err(PipelineError::UnboundRelation { relation });
@@ -2801,17 +3005,30 @@ fn check_experiment_evaluation_join(
 }
 
 /// Requires the admission-review evidence to name the same candidate, the same
-/// experiment, and the same content revision the experiment evaluation did.
+/// experiment, and the same content revision the experiment evaluation did, and
+/// to have been produced by a principal distinct from the experiment executor,
+/// the admitting Governor owner, and the rollback owner.
 ///
 /// A later independent admission review may legitimately carry a different
 /// verifier identity, so verifier identities are never compared with each
 /// other. The typed relationship to the same candidate, experiment, and content
-/// revision is what is required.
+/// revision is what is required of the two records together.
+///
+/// The reviewer itself is a different matter, and it is the record this gate
+/// leans on hardest: the admission review is what carries the pulse outcome, the
+/// harm observation, and the pass verdict the decision is made from, so a review
+/// written by the party that executed the experiment, by the owner that admits
+/// it, or by the rollback owner is the party grading its own work. That is the
+/// same relation [`check_evaluator_independence`] already refuses for the
+/// experiment evaluation, and it is refused here through the same shared
+/// predicate rather than through the review's own `independent` flag, which is
+/// a caller-set boolean and establishes nothing on its own.
 fn check_admission_evidence_join(
     admission: &ImprovementEvidenceView,
     evaluation: &ActivationEvidence,
     proposal: &ImprovementProposal,
     experiment: &ExperimentPlan,
+    policy: &ImprovementAdmissionPolicy,
 ) -> Result<(), PipelineError> {
     if admission.bound_candidate_id != proposal.candidate_id {
         return Err(PipelineError::UnboundRelation {
@@ -2828,6 +3045,16 @@ fn check_admission_evidence_join(
             relation: "admission-evidence: content-revision-mismatch",
         });
     }
+    check_evaluator_distinct_from_owners(
+        admission.verifier_id.as_str(),
+        experiment,
+        policy,
+        [
+            "admission-evidence: reviewer-is-the-experiment-executor",
+            "admission-evidence: reviewer-is-the-governor-admission-owner",
+            "admission-evidence: reviewer-is-the-rollback-owner",
+        ],
+    )?;
     bounded_text(
         &admission.run_ref,
         "admission_evidence.run_ref",

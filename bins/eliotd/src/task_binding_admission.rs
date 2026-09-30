@@ -41,10 +41,12 @@
 //!   and `TaskContract` compatibility when the command is task-relative".
 //! - [`admit_named_mutation_capture`] — the transport edge
 //!   (`DaemonKernelClient::apply_prepared`). No typed selection exists there, so
-//!   this entry only decides the capture leg: a `CaptureObservation` naming no
-//!   task is a cold unbound candidate and is never treated here as task-bound.
-//!   It deliberately does not restate the store bridge's presence/agreement
-//!   rule for task-bearing writes; that rule belongs to
+//!   a task-free `CaptureObservation` is admitted here as a cold unbound
+//!   candidate and is never treated as task-bound, while any transition naming
+//!   a task — with or without a capture — is reported as task-relative for the
+//!   selection-owning ingress and the store gate. It deliberately does not
+//!   restate the store bridge's presence/agreement rule for task-bearing
+//!   writes; that rule belongs to
 //!   `eliot-store-surreal::task_binding_gate`, which re-derives it from the
 //!   opaque proof handles before provider I/O. Neither replaces the other.
 //! - [`observe_explicit_workspace`] — the daemon half of the `WorkScope`
@@ -143,8 +145,12 @@
 #![forbid(unsafe_code)]
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use eliot_bootstrap::capture::{WorkspaceInstanceFacts, observe_workspace_instance};
+use eliot_bootstrap::capture::{
+    WorkspaceInstanceFacts, WorkspaceSourceDocumentKind, observe_workspace_instance,
+    observe_workspace_source_candidates,
+};
 use eliot_contracts::sha256_hex;
 use eliot_contracts::{RequestMetadata, StateFence, TaskId};
 use eliot_governor::{
@@ -153,6 +159,11 @@ use eliot_governor::{
 };
 use eliot_integration_coverage::{GovernanceProfile, IntegrationCoverageProfile};
 use eliot_observation::TaskSelectionEvidence;
+use eliot_ors::{
+    ColdStartReadinessClaim, ColdStartReadinessOrsRecord, ColdStartReadinessRecordOwner,
+    ColdStartReadinessStageOutcome, ColdStartReadinessTerminalDisposition, OrsError,
+    ScanDisclosureOrsRecord, ScanDisclosureRecordOwner, ScanDisclosureStageOutcome,
+};
 use eliot_protocol::{
     AgentActivationCandidateCoverage, AgentActivationResolutionDisposition,
     AgentActivationResolutionResult, AgentActivationResolutionTicket,
@@ -161,9 +172,10 @@ use eliot_security_contracts::PrivacyClass;
 use eliot_store_api::{NamedMutationOperation, PreparedTransition};
 use eliot_workscope::{
     BootstrapDiscoveryInputs, BootstrapScanEvidence, DiscoveryLeaseKey, DiscoveryLeaseRequest,
-    DiscoveryRead, DiscoveryReadLease, ManifestEvidence, ObservedScopeResources, OnboardingLease,
-    OnboardingReadinessReceipt, ReadinessLifecycle, ScopeBindingDisposition, ScopeResolutionState,
-    TaskBindingState, issue_discovery_lease, task_selection_required,
+    DiscoveryRead, DiscoveryReadLease, GoverningSourceCandidateEvidence, GoverningSourceRole,
+    ManifestEvidence, ObservedScopeResources, OnboardingLease, OnboardingReadinessReceipt,
+    ReadinessLifecycle, ScopeBindingDisposition, ScopeResolutionState, TaskBindingState,
+    issue_discovery_lease, task_selection_required,
 };
 
 /// Authenticated activation's bounded filesystem/VCS observation and its
@@ -175,6 +187,507 @@ pub struct ColdStartDiscoveryInput {
     pub lease: DiscoveryReadLease,
     pub key: DiscoveryLeaseKey,
     pub discovery: BootstrapDiscoveryInputs,
+}
+
+const SCAN_DISCLOSURE_OWNER_OPERATION: &str = "scan_disclosure_owner";
+const SCAN_DISCLOSURE_OWNER_WIRE_VERSION: u16 = 1;
+
+#[derive(serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ScanDisclosureOwnerRpcRequest<'a> {
+    wire_version: u16,
+    application_connection_id: &'a str,
+    activation_ticket_id: &'a str,
+    #[serde(flatten)]
+    action: ScanDisclosureOwnerRpcAction<'a>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+enum ScanDisclosureOwnerRpcAction<'a> {
+    IssueContour,
+    IssueBinding,
+    Stage {
+        binding: &'a eliot_workscope::ScanDisclosureOwnerBinding,
+        record: &'a ScanDisclosureOrsRecord,
+    },
+    Commit {
+        binding: &'a eliot_workscope::ScanDisclosureOwnerBinding,
+        operation_key: &'a str,
+        request_hash: &'a str,
+        writer_receipt: &'a str,
+    },
+    Load {
+        binding: &'a eliot_workscope::ScanDisclosureOwnerBinding,
+        operation_key: &'a str,
+    },
+    Retire {
+        binding: &'a eliot_workscope::ScanDisclosureOwnerBinding,
+        operation_key: &'a str,
+        request_hash: &'a str,
+        policy_revision: u64,
+        successor_ref: Option<&'a str>,
+    },
+    List {
+        binding: &'a eliot_workscope::ScanDisclosureOwnerBinding,
+        limit: u16,
+    },
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScanDisclosureOwnerRpcResponse {
+    wire_version: u16,
+    #[serde(flatten)]
+    result: ScanDisclosureOwnerRpcResult,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
+enum ScanDisclosureOwnerRpcResult {
+    Contour {
+        contour: KernelScanDisclosureContour,
+    },
+    Binding {
+        binding: eliot_workscope::ScanDisclosureOwnerBinding,
+    },
+    Staged {
+        stored: bool,
+        record: Option<ScanDisclosureOrsRecord>,
+    },
+    Record {
+        record: Option<ScanDisclosureOrsRecord>,
+    },
+    Records {
+        records: Vec<ScanDisclosureOrsRecord>,
+    },
+}
+
+#[derive(serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ColdStartReadinessOwnerRpcRequest<'a> {
+    wire_version: u16,
+    application_connection_id: &'a str,
+    activation_ticket_id: &'a str,
+    #[serde(flatten)]
+    action: ColdStartReadinessOwnerRpcAction<'a>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(
+    clippy::enum_variant_names,
+    reason = "wire action names must match the authenticated Kernel readiness route"
+)]
+enum ColdStartReadinessOwnerRpcAction<'a> {
+    ReadinessClaim {
+        claim: &'a ColdStartReadinessClaim,
+    },
+    ReadinessPublish {
+        record_key: &'a str,
+        binding_digest: &'a str,
+        lease_ref: &'a str,
+        disposition: ColdStartReadinessTerminalDisposition,
+        receipt_ref: &'a str,
+        receipt_bytes: &'a str,
+    },
+    ReadinessLoad {
+        record_key: &'a str,
+    },
+    ReadinessLoadForBinding {
+        binding_digest: &'a str,
+    },
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ColdStartReadinessOwnerRpcResponse {
+    wire_version: u16,
+    #[serde(flatten)]
+    result: ColdStartReadinessOwnerRpcResult,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
+enum ColdStartReadinessOwnerRpcResult {
+    ReadinessClaimed {
+        outcome: ColdStartReadinessStageOutcome,
+    },
+    ReadinessRecord {
+        record: Option<Box<ColdStartReadinessOrsRecord>>,
+    },
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KernelScanDisclosureContour {
+    installation_id: String,
+    ors_object_ref: String,
+    ors_generation: u64,
+}
+
+/// Daemon-side `ScanDisclosureRecordOwner` adapter. Every method crosses the
+/// existing authenticated Kernel client; no ORS object or in-process trait
+/// handle is passed into eliotd.
+pub struct KernelScanDisclosureRecordOwner {
+    kernel: Arc<super::DaemonKernelClient>,
+    application_connection_id: String,
+    activation_ticket_id: String,
+    binding: eliot_workscope::ScanDisclosureOwnerBinding,
+}
+
+impl KernelScanDisclosureRecordOwner {
+    pub fn new(
+        kernel: Arc<super::DaemonKernelClient>,
+        application_connection_id: String,
+        activation_ticket_id: String,
+        binding: eliot_workscope::ScanDisclosureOwnerBinding,
+    ) -> Self {
+        Self {
+            kernel,
+            application_connection_id,
+            activation_ticket_id,
+            binding,
+        }
+    }
+
+    fn request(
+        &self,
+        action: ScanDisclosureOwnerRpcAction<'_>,
+    ) -> Result<ScanDisclosureOwnerRpcResult, OrsError> {
+        let payload = serde_json::to_value(ScanDisclosureOwnerRpcRequest {
+            wire_version: SCAN_DISCLOSURE_OWNER_WIRE_VERSION,
+            application_connection_id: &self.application_connection_id,
+            activation_ticket_id: &self.activation_ticket_id,
+            action,
+        })
+        .map_err(|error| OrsError::Contract(error.to_string()))?;
+        let value = self
+            .kernel
+            .request_blocking(SCAN_DISCLOSURE_OWNER_OPERATION, payload)
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        let response: ScanDisclosureOwnerRpcResponse =
+            serde_json::from_value(value).map_err(|error| OrsError::Contract(error.to_string()))?;
+        if response.wire_version != SCAN_DISCLOSURE_OWNER_WIRE_VERSION {
+            return Err(OrsError::Contract(
+                "unsupported scan-disclosure owner response version".to_owned(),
+            ));
+        }
+        Ok(response.result)
+    }
+
+    /// Obtains the installation contour through the authenticated Kernel
+    /// route. ORS generation is never supplied by this daemon call.
+    pub(crate) fn issue_contour(
+        kernel: &super::DaemonKernelClient,
+        application_connection_id: &str,
+        activation_ticket_id: &str,
+    ) -> Result<eliot_governor::InstallationScanContour, String> {
+        let payload = serde_json::to_value(ScanDisclosureOwnerRpcRequest {
+            wire_version: SCAN_DISCLOSURE_OWNER_WIRE_VERSION,
+            application_connection_id,
+            activation_ticket_id,
+            action: ScanDisclosureOwnerRpcAction::IssueContour,
+        })
+        .map_err(|error| error.to_string())?;
+        let value = kernel
+            .request_blocking(SCAN_DISCLOSURE_OWNER_OPERATION, payload)
+            .map_err(|error| error.to_string())?;
+        let response: ScanDisclosureOwnerRpcResponse =
+            serde_json::from_value(value).map_err(|error| error.to_string())?;
+        if response.wire_version != SCAN_DISCLOSURE_OWNER_WIRE_VERSION {
+            return Err("unsupported scan-disclosure owner response version".to_owned());
+        }
+        match response.result {
+            ScanDisclosureOwnerRpcResult::Contour { contour } => {
+                eliot_governor::InstallationScanContour::bind(
+                    contour.installation_id,
+                    contour.ors_object_ref,
+                    contour.ors_generation,
+                )
+                .map_err(|error| error.to_string())
+            }
+            _ => Err("Kernel returned the wrong scan-disclosure owner result".to_owned()),
+        }
+    }
+
+    /// Requests a Kernel-issued scan binding. The caller supplies no binding
+    /// fields; the authenticated Kernel route must derive them from current
+    /// retained owners or return its typed missing-owner refusal.
+    pub(crate) fn issue_binding(
+        kernel: &super::DaemonKernelClient,
+        application_connection_id: &str,
+        activation_ticket_id: &str,
+    ) -> Result<eliot_workscope::ScanDisclosureOwnerBinding, String> {
+        let payload = serde_json::to_value(ScanDisclosureOwnerRpcRequest {
+            wire_version: SCAN_DISCLOSURE_OWNER_WIRE_VERSION,
+            application_connection_id,
+            activation_ticket_id,
+            action: ScanDisclosureOwnerRpcAction::IssueBinding,
+        })
+        .map_err(|error| error.to_string())?;
+        let value = kernel
+            .request_blocking(SCAN_DISCLOSURE_OWNER_OPERATION, payload)
+            .map_err(|error| error.to_string())?;
+        let response: ScanDisclosureOwnerRpcResponse =
+            serde_json::from_value(value).map_err(|error| error.to_string())?;
+        if response.wire_version != SCAN_DISCLOSURE_OWNER_WIRE_VERSION {
+            return Err("unsupported scan-disclosure owner response version".to_owned());
+        }
+        match response.result {
+            ScanDisclosureOwnerRpcResult::Binding { binding } => Ok(binding),
+            _ => Err("Kernel returned the wrong scan-disclosure owner result".to_owned()),
+        }
+    }
+}
+
+impl ScanDisclosureRecordOwner for KernelScanDisclosureRecordOwner {
+    fn stage_scan_disclosure(
+        &self,
+        record: &ScanDisclosureOrsRecord,
+    ) -> Result<ScanDisclosureStageOutcome, OrsError> {
+        match self.request(ScanDisclosureOwnerRpcAction::Stage {
+            binding: &self.binding,
+            record,
+        })? {
+            ScanDisclosureOwnerRpcResult::Staged {
+                stored: true,
+                record: None,
+            } => Ok(ScanDisclosureStageOutcome::Stored),
+            ScanDisclosureOwnerRpcResult::Staged {
+                stored: false,
+                record: Some(record),
+            } => Ok(ScanDisclosureStageOutcome::AlreadyBound(Box::new(record))),
+            _ => Err(OrsError::Contract(
+                "Kernel returned an invalid scan-disclosure stage result".to_owned(),
+            )),
+        }
+    }
+
+    fn commit_scan_disclosure(
+        &self,
+        operation_key: &str,
+        request_hash: &str,
+        writer_receipt: &str,
+    ) -> Result<Option<ScanDisclosureOrsRecord>, OrsError> {
+        match self.request(ScanDisclosureOwnerRpcAction::Commit {
+            binding: &self.binding,
+            operation_key,
+            request_hash,
+            writer_receipt,
+        })? {
+            ScanDisclosureOwnerRpcResult::Record { record } => Ok(record),
+            _ => Err(OrsError::Contract(
+                "Kernel returned an invalid scan-disclosure commit result".to_owned(),
+            )),
+        }
+    }
+
+    fn load_scan_disclosure(
+        &self,
+        operation_key: &str,
+    ) -> Result<Option<ScanDisclosureOrsRecord>, OrsError> {
+        match self.request(ScanDisclosureOwnerRpcAction::Load {
+            binding: &self.binding,
+            operation_key,
+        })? {
+            ScanDisclosureOwnerRpcResult::Record { record } => Ok(record),
+            _ => Err(OrsError::Contract(
+                "Kernel returned an invalid scan-disclosure load result".to_owned(),
+            )),
+        }
+    }
+
+    fn retire_scan_disclosure(
+        &self,
+        operation_key: &str,
+        request_hash: &str,
+        policy_revision: u64,
+        successor_ref: Option<&str>,
+    ) -> Result<Option<ScanDisclosureOrsRecord>, OrsError> {
+        match self.request(ScanDisclosureOwnerRpcAction::Retire {
+            binding: &self.binding,
+            operation_key,
+            request_hash,
+            policy_revision,
+            successor_ref,
+        })? {
+            ScanDisclosureOwnerRpcResult::Record { record } => Ok(record),
+            _ => Err(OrsError::Contract(
+                "Kernel returned an invalid scan-disclosure retire result".to_owned(),
+            )),
+        }
+    }
+
+    fn list_scan_disclosures(
+        &self,
+        installation_id: &str,
+        limit: u16,
+    ) -> Result<Vec<ScanDisclosureOrsRecord>, OrsError> {
+        if installation_id != self.binding.installation_id {
+            return Err(OrsError::Contract(
+                "scan-disclosure list installation conflicts with its owner binding".to_owned(),
+            ));
+        }
+        match self.request(ScanDisclosureOwnerRpcAction::List {
+            binding: &self.binding,
+            limit,
+        })? {
+            ScanDisclosureOwnerRpcResult::Records { records } => Ok(records),
+            _ => Err(OrsError::Contract(
+                "Kernel returned an invalid scan-disclosure list result".to_owned(),
+            )),
+        }
+    }
+}
+
+/// Daemon-side adapter for the authenticated Kernel route that owns durable
+/// cold-start readiness leases and terminal receipts. This deliberately has
+/// no scan-disclosure binding: readiness rows have a separate ORS lifecycle,
+/// while the route authenticates the application connection and activation
+/// ticket and checks the full claim against its retained activation.
+pub struct KernelColdStartReadinessRecordOwner {
+    kernel: Arc<super::DaemonKernelClient>,
+    application_connection_id: String,
+    activation_ticket_id: String,
+}
+
+impl KernelColdStartReadinessRecordOwner {
+    pub fn new(
+        kernel: Arc<super::DaemonKernelClient>,
+        application_connection_id: String,
+        activation_ticket_id: String,
+    ) -> Self {
+        Self {
+            kernel,
+            application_connection_id,
+            activation_ticket_id,
+        }
+    }
+
+    fn request(
+        &self,
+        action: ColdStartReadinessOwnerRpcAction<'_>,
+    ) -> Result<ColdStartReadinessOwnerRpcResult, OrsError> {
+        let payload = serde_json::to_value(ColdStartReadinessOwnerRpcRequest {
+            wire_version: SCAN_DISCLOSURE_OWNER_WIRE_VERSION,
+            application_connection_id: &self.application_connection_id,
+            activation_ticket_id: &self.activation_ticket_id,
+            action,
+        })
+        .map_err(|error| OrsError::Contract(error.to_string()))?;
+        let value = self
+            .kernel
+            .request_blocking(SCAN_DISCLOSURE_OWNER_OPERATION, payload)
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        let response: ColdStartReadinessOwnerRpcResponse =
+            serde_json::from_value(value).map_err(|error| OrsError::Contract(error.to_string()))?;
+        if response.wire_version != SCAN_DISCLOSURE_OWNER_WIRE_VERSION {
+            return Err(OrsError::Contract(
+                "unsupported cold-start readiness owner response version".to_owned(),
+            ));
+        }
+        Ok(response.result)
+    }
+}
+
+impl ColdStartReadinessRecordOwner for KernelColdStartReadinessRecordOwner {
+    fn claim_cold_start_readiness(
+        &self,
+        claim: &ColdStartReadinessClaim,
+        _now: u64,
+    ) -> Result<ColdStartReadinessStageOutcome, OrsError> {
+        match self.request(ColdStartReadinessOwnerRpcAction::ReadinessClaim { claim })? {
+            ColdStartReadinessOwnerRpcResult::ReadinessClaimed { outcome } => Ok(outcome),
+            ColdStartReadinessOwnerRpcResult::ReadinessRecord { .. } => Err(OrsError::Contract(
+                "Kernel returned an invalid cold-start readiness claim result".to_owned(),
+            )),
+        }
+    }
+
+    fn publish_cold_start_readiness(
+        &self,
+        record_key: &str,
+        binding_digest: &str,
+        lease_ref: &str,
+        disposition: ColdStartReadinessTerminalDisposition,
+        receipt_ref: &str,
+        receipt_bytes: &str,
+    ) -> Result<Option<ColdStartReadinessOrsRecord>, OrsError> {
+        match self.request(ColdStartReadinessOwnerRpcAction::ReadinessPublish {
+            record_key,
+            binding_digest,
+            lease_ref,
+            disposition,
+            receipt_ref,
+            receipt_bytes,
+        })? {
+            ColdStartReadinessOwnerRpcResult::ReadinessRecord { record } => {
+                Ok(record.map(|value| *value))
+            }
+            ColdStartReadinessOwnerRpcResult::ReadinessClaimed { .. } => Err(OrsError::Contract(
+                "Kernel returned an invalid cold-start readiness publish result".to_owned(),
+            )),
+        }
+    }
+
+    fn load_cold_start_readiness(
+        &self,
+        record_key: &str,
+    ) -> Result<Option<ColdStartReadinessOrsRecord>, OrsError> {
+        match self.request(ColdStartReadinessOwnerRpcAction::ReadinessLoad { record_key })? {
+            ColdStartReadinessOwnerRpcResult::ReadinessRecord { record } => {
+                Ok(record.map(|value| *value))
+            }
+            ColdStartReadinessOwnerRpcResult::ReadinessClaimed { .. } => Err(OrsError::Contract(
+                "Kernel returned an invalid cold-start readiness load result".to_owned(),
+            )),
+        }
+    }
+
+    fn load_cold_start_readiness_for_binding(
+        &self,
+        binding_digest: &str,
+    ) -> Result<Option<ColdStartReadinessOrsRecord>, OrsError> {
+        match self
+            .request(ColdStartReadinessOwnerRpcAction::ReadinessLoadForBinding { binding_digest })?
+        {
+            ColdStartReadinessOwnerRpcResult::ReadinessRecord { record } => {
+                Ok(record.map(|value| *value))
+            }
+            ColdStartReadinessOwnerRpcResult::ReadinessClaimed { .. } => Err(OrsError::Contract(
+                "Kernel returned an invalid cold-start readiness binding read result".to_owned(),
+            )),
+        }
+    }
+}
+
+/// Requests a current contour through the same authenticated Kernel owner
+/// route used by the durable record adapter.
+pub fn request_scan_disclosure_contour(
+    kernel: &super::DaemonKernelClient,
+    application_connection_id: &str,
+    activation_ticket_id: &str,
+) -> Result<eliot_governor::InstallationScanContour, String> {
+    KernelScanDisclosureRecordOwner::issue_contour(
+        kernel,
+        application_connection_id,
+        activation_ticket_id,
+    )
+}
+
+/// Requests the authenticated Kernel owner to derive the scan binding from
+/// retained session, workspace, privacy, lease and task-selection evidence.
+pub fn request_scan_disclosure_binding(
+    kernel: &super::DaemonKernelClient,
+    application_connection_id: &str,
+    activation_ticket_id: &str,
+) -> Result<eliot_workscope::ScanDisclosureOwnerBinding, String> {
+    KernelScanDisclosureRecordOwner::issue_binding(
+        kernel,
+        application_connection_id,
+        activation_ticket_id,
+    )
 }
 
 /// Stable rejection code when task-bound promotion lacks current evidence.
@@ -222,6 +735,13 @@ pub enum CanonicalOperationRequirement {
 /// the name is not a canonical operation and is refused upstream, never
 /// defaulted to a weaker class.
 ///
+/// Frozen against the shared MCP contract (`crates/surfaces/eliot-mcp`
+/// `ADMITTED_TOOL_NAMES` / `ToolRequest::canonical_name` carry exactly these
+/// eight hot tools; the `eliot_user_automation`, `skill.inject`, and
+/// `skill.display` non-hot carriers are not canonical operations and stay
+/// `None`). Re-verify against that contract before changing this table; a
+/// renamed tool never smuggles a weaker class past the gate.
+///
 /// Designated caller (STITCH, surfaces lane): the agent-bridge MCP dispatcher
 /// maps tool names through this table before submitting; the daemon write path
 /// re-derives its own requirement from the typed [`NamedMutationOperation`]
@@ -248,6 +768,10 @@ pub fn classify_canonical_operation(operation: &str) -> Option<CanonicalOperatio
 /// capture becomes task-bound is decided by the exact selection evidence in
 /// [`admit_capture`], never by the suboperation name.
 ///
+/// Frozen against the exact five `ObserveInput` kinds in the shared MCP
+/// contract (`tag = "kind"`, `snake_case`); an unknown suboperation stays
+/// `None` and is refused upstream, never defaulted.
+///
 /// Designated caller (STITCH, surfaces lane): the agent-bridge MCP dispatcher,
 ///
 /// together with [`classify_canonical_operation`].
@@ -267,6 +791,10 @@ pub fn classify_observe_suboperation(suboperation: &str) -> Option<CanonicalOper
 /// `inspect`/`wait` are read-only orientation over run lineage and durable
 /// state; `delegate`/`audit`/`compare`/`cancel`/`send` create or reconcile
 /// execution effects and are task-relative.
+///
+/// Frozen against the exact `CoordinateInput` discriminators in the shared
+/// MCP contract (`snake_case` `operation` tag); an unknown discriminator stays
+/// `None` and is refused upstream, never defaulted.
 ///
 /// Designated caller (STITCH, surfaces lane): the agent-bridge MCP dispatcher,
 /// together with [`classify_canonical_operation`].
@@ -938,6 +1466,15 @@ pub fn refuse_ready_string_without_evidence(
 /// capture route ([`admit_capture`] `ColdUnbound`, conflicting lineage
 /// preserved).
 ///
+/// Reference (read-only, Governor-owned; issue #1746, W3): the retained-data
+/// leg is `GovernorComposition::require_scope_guard_for_observed` /
+/// `require_fresh_matched_binding`, and the canonical-write trigger is
+/// `GovernorComposition::check_canonical_write_work_scope` (already joined in
+/// `DaemonComposition::commit_canonical_and_refresh` after
+/// [`admit_canonical_write`]). This entry is the daemon's observation-derived
+/// legs over the same owner primitives — it mints no receipt and installs no
+/// binding.
+///
 /// Called by [`admit_task_bound_with_observed_scope`].
 pub fn scope_guard_disposition(
     expected: &ScopeBinding,
@@ -1064,7 +1601,10 @@ pub fn admit_task_bound_with_observed_scope(
 ///
 /// There is deliberately no latest-task, open-task, or resolver-guess leg here:
 /// ambiguity is reported, never resolved. The task-intake owner producer is
-/// absent pending issue #8.
+/// present (`eliot_workscope::task_selection_required`, consumed by
+/// [`selection_response_for_receipt`]); what is still absent is owner-proven
+/// selection source/evidence on `CurrentTaskContract` receipts, so the current
+/// arm keeps refusing (see [`bind_current_task_selection`]).
 pub fn resolve_task_selection(
     receipt: &OnboardingReadinessReceipt,
 ) -> Result<TaskSelectionDisposition, TaskBindingError> {
@@ -1305,11 +1845,15 @@ pub struct MaterialBootstrap {
 /// `DaemonComposition::read_cold_start_surface_for_attach` supplies the exact
 /// retained surface for the lease, and
 /// [`DaemonComposition::commit_canonical_and_refresh`](super::DaemonComposition)
-/// carries the admitted bootstrap toward the #1742 Material gate. This entry
+/// carries the admitted bootstrap toward the #1742 Material gate. `now` is the
+/// caller's unix-millisecond observation clock (the same clock
+/// [`observe_cold_start_discovery`] takes): the join honors #8's bounded
+/// freshness instead of re-deriving it, so an expired receipt or lease fails
+/// closed here before any owner field is compared. This entry
 /// mints no profile, receipt, or lease of its own.
 #[allow(
     clippy::too_many_arguments,
-    reason = "bootstrap joins the receipt, surface, both profiles, and the live fence in one edge"
+    reason = "bootstrap joins the receipt, surface, both profiles, the live fence, and the freshness clock in one edge"
 )]
 #[expect(
     clippy::too_many_lines,
@@ -1321,6 +1865,7 @@ pub fn admit_bootstrap_context(
     coverage: Option<&IntegrationCoverageProfile>,
     governance: Option<&GovernanceProfile>,
     live_fence: &StateFence,
+    now: u64,
 ) -> Result<BootstrapAdmission, TaskBindingError> {
     receipt.validate().map_err(|error| {
         TaskBindingError::scope_incompatible(format!(
@@ -1330,6 +1875,24 @@ pub fn admit_bootstrap_context(
     if !eliot_contracts::fences_match_exact(&receipt.state_fence, live_fence) {
         return Err(TaskBindingError::scope_incompatible(
             "compiled readiness receipt was compiled at another fence",
+        ));
+    }
+    // #8 bounds every bootstrap by receipt expiry and lease deadline. The join
+    // reuses that bound as stated: an expired receipt or lease re-resolves
+    // through the owner route instead of admitting a stale bootstrap.
+    if now == 0 {
+        return Err(TaskBindingError::selection_required(
+            "bootstrap freshness clock is not available",
+        ));
+    }
+    if receipt.expiry_tick < now {
+        return Err(TaskBindingError::scope_incompatible(
+            "compiled readiness receipt expired before bootstrap; re-resolve through the owner route",
+        ));
+    }
+    if surface.lease_deadline < now {
+        return Err(TaskBindingError::scope_incompatible(
+            "bootstrap lease expired before dispatch; re-resolve through the owner route",
         ));
     }
     // Same session/scope/selection-state and source revisions on both sides.
@@ -1816,6 +2379,42 @@ pub fn seal_dispatched_binding(
     })
 }
 
+/// Renders one non-matched `MaterialEffect` guard report as a stable typed
+/// detail (issue #1746, W3).
+///
+/// Preserves the exact owner disposition — stale, different-instance,
+/// ambiguous, provisional, or conflicted — instead of reducing every refusal
+/// to one prose reason, so the effect gate answers conflict/rebind with the
+/// discriminating identity instead of a guess. Called only by
+/// [`revalidate_dispatched_binding`].
+fn material_effect_guard_detail(report: &eliot_workscope::TriggerReport) -> String {
+    let identity = match report.identity {
+        eliot_workscope::IdentityLegOutcome::DifferentInstance => "DIFFERENT_INSTANCE",
+        eliot_workscope::IdentityLegOutcome::Ambiguous => "AMBIGUOUS",
+        eliot_workscope::IdentityLegOutcome::StaleBinding => "STALE_BINDING",
+        eliot_workscope::IdentityLegOutcome::IdentityClear => "IDENTITY_CLEAR",
+    };
+    let verdict = match report.verdict {
+        eliot_workscope::GuardVerdict::Allow => "ALLOW",
+        eliot_workscope::GuardVerdict::Withhold => "WITHHOLD",
+        eliot_workscope::GuardVerdict::Quarantine => "QUARANTINE",
+    };
+    let receipt = report
+        .receipt
+        .as_ref()
+        .map_or("", |receipt| match receipt.disposition {
+            ScopeBindingDisposition::Matched => ", receipt MATCHED",
+            ScopeBindingDisposition::DifferentInstance => ", receipt DIFFERENT_INSTANCE",
+            ScopeBindingDisposition::Ambiguous => ", receipt AMBIGUOUS",
+            ScopeBindingDisposition::StaleBinding => ", receipt STALE_BINDING",
+            ScopeBindingDisposition::ProvisionalRebind => ", receipt PROVISIONAL_REBIND",
+            ScopeBindingDisposition::Conflicted => ", receipt CONFLICTED",
+        });
+    format!(
+        "scope guard at material effect is not MATCHED: identity {identity}, verdict {verdict}{receipt}; rebind under a new operation, no rewrite"
+    )
+}
+
 /// Revalidates one sealed dispatch identity at the effect gate against the
 /// live owners (issue #1746, W6/A5).
 ///
@@ -1831,13 +2430,30 @@ pub fn seal_dispatched_binding(
 /// Shared safe status/recovery remains available under its own authority and
 /// never passes through this entry.
 ///
+/// The scope-identity legs run here as well (issue #1746, W3; I4.2.1): the
+/// retained binding the gate read at the live fence, the live observation,
+/// and the governing-source closure run through the existing owner
+/// (`eliot_workscope::check_at_trigger`) at the `MaterialEffect` trigger.
+/// `Allow` requires identity-clear `MATCHED`; stale, different-instance,
+/// ambiguous, provisional, or conflicted observations conflict for rebind with
+/// the exact disposition (see [`material_effect_guard_detail`]). Scope
+/// uncertainty never admits a task-bound effect here — only the quarantined
+/// capture route ([`admit_capture`] `ColdUnbound`) may retain bytes. This entry
+/// runs only the pure owner legs over gate-supplied bindings; the Governor's
+/// retained-data legs (`require_scope_guard_for_observed`,
+/// `check_canonical_write_work_scope`) remain the authority for the
+/// retained binding itself. This entry mints no receipt and installs no
+/// binding.
+///
 /// Designated caller (STITCH, daemon composition lane): the pre-commit effect
 /// gate in `DaemonComposition::commit_canonical_and_refresh`
 /// (`bins/eliotd/src/lib.rs`), between the `ColdUnbound` admission projection
-/// and the scope-sensitive trigger, passing the live Governor task/scope,
-/// principal/session, task revision, acceptance digest, receipt revision,
-/// governance profile reference, projection generation (the live receipt's own
-/// `projection_generation`, alongside its revision), and kernel-snapshot fence.
+/// and the scope-sensitive trigger, passing the live Governor task/scope, the
+/// retained binding read at the live fence, the live observed binding, the
+/// governing-source closure, principal/session, task revision, acceptance digest,
+/// receipt revision, governance profile reference, projection generation (the
+/// live receipt's own `projection_generation`, alongside its revision), and
+/// kernel-snapshot fence.
 #[allow(
     clippy::too_many_arguments,
     reason = "revalidation joins the sealed identity against every live owner value that can invalidate it in one fail-closed edge"
@@ -1846,6 +2462,9 @@ pub fn revalidate_dispatched_binding(
     binding: &DispatchedBinding,
     live_task_ref: Option<&str>,
     live_scope_ref: &str,
+    retained: &ScopeBinding,
+    observed: &ScopeBinding,
+    source_closure: Option<(&GoverningSourceSet, &PrivacyProfile)>,
     live_principal_ref: &str,
     live_session_ref: &str,
     live_task_revision: u64,
@@ -1868,6 +2487,29 @@ pub fn revalidate_dispatched_binding(
     if live_scope_ref != binding.scope_ref {
         return Err(TaskBindingError::scope_incompatible(
             "dispatched WorkScope is not the admitted WorkScope; rebind, no rewrite",
+        ));
+    }
+    // Issue #1746, W3: the MaterialEffect scope-identity legs run at this
+    // effect gate, not only at the canonical-write trigger. The gate passes
+    // the retained binding it read at the live fence, the live observation,
+    // and the governing-source closure; the existing owner legs decide.
+    // `Allow` requires identity-clear `MATCHED`. Anything else conflicts for
+    // rebind with the exact disposition — never a silent move, never a task
+    // or memory transfer.
+    if retained.scope.scope_ref != binding.scope_ref {
+        return Err(TaskBindingError::scope_incompatible(
+            "effect gate retained binding is not the admitted WorkScope; rebind, no rewrite",
+        ));
+    }
+    let guard = eliot_workscope::check_at_trigger(
+        retained,
+        observed,
+        source_closure,
+        eliot_workscope::GuardTrigger::MaterialEffect,
+    );
+    if !guard.is_matched() {
+        return Err(TaskBindingError::scope_incompatible(
+            material_effect_guard_detail(&guard),
         ));
     }
     // An intervening logout or rebind moved the live principal/session. The
@@ -1999,10 +2641,12 @@ pub fn revalidate_task_bound_for_effect(
 /// This is the production entry for `DaemonKernelClient::apply_prepared`'s
 /// pre-transport admission: the last point inside the daemon where a
 /// `CaptureObservation` can still be classified before it reaches Kernel and
-/// the store. Its only decision is the capture leg:
+/// the store. It decides the capture leg and reports task-relative work it
+/// cannot admit:
 ///
 /// - a `CaptureObservation` naming no task on either the admitted context or
-///   the transition has no unique task selection, so it is admitted through
+///   the transition, and with no task-relative/effectful operation in the
+///   typed catalogue, has no unique task selection, so it is admitted through
 ///   [`admit_capture`] as [`TaskBindingAdmission::ColdUnbound`] with no task
 ///   activation, support/influence promotion, or finish relevance;
 /// - a `CaptureObservation` that names a task is task-relative, and this edge
@@ -2011,7 +2655,16 @@ pub fn revalidate_task_bound_for_effect(
 ///   ([`admit_canonical_write`]) and is re-derived at the store gate from the
 ///   proof handles the transition actually carries. A typed selection is never
 ///   manufactured here, and an absent one is never treated as compatible;
-/// - a transition with no capture at all is
+/// - a transition with no capture that still names a task on either the
+///   admitted context or the transition — or whose typed operation is
+///   task-relative/effectful under the frozen requirement table
+///   ([`requirement_for_named_mutation`]) even when no task handle is named —
+///   is equally task-relative work passing a capture-only edge (issue #1746,
+///   A6): it is reported as [`TaskBindingAdmission::TaskRelative`] — never
+///   admitted here and never labelled [`TaskBindingAdmission::NotTaskRelative`],
+///   which would claim no binding is required. Its binding belongs to the same
+///   selection-owning ingress and store gate as the capture-naming-task arm;
+/// - a transition with no capture and no task on either side is
 ///   [`TaskBindingAdmission::NotTaskRelative`].
 ///
 /// It never selects the most recent or open task and never falls back to
@@ -2037,20 +2690,27 @@ pub fn admit_named_mutation_capture(
     context: &RequestMetadata,
     transition: &PreparedTransition,
 ) -> Result<TaskBindingAdmission, TaskBindingError> {
-    let captures = transition
-        .named_operations
-        .iter()
-        .any(|named| named.operation == NamedMutationOperation::CaptureObservation);
-    if !captures {
-        return Ok(TaskBindingAdmission::NotTaskRelative);
-    }
+    // Issue #1746, W1: the capture/task-relative split is derived from the
+    // frozen requirement table, never from an operation-name comparison on
+    // this edge, so a renamed or newly catalogued effectful operation cannot
+    // slip through as needing no binding. This is the same table
+    // [`admit_canonical_write`] derives its split from.
+    let carries_requirement = |requirement: CanonicalOperationRequirement| {
+        transition
+            .named_operations
+            .iter()
+            .any(|named| requirement_for_named_mutation(named.operation) == requirement)
+    };
     let names_a_task = transition.task_id.is_some() || context.task_id.is_some();
-    if names_a_task {
+    if names_a_task || carries_requirement(CanonicalOperationRequirement::TaskRelativeEffectful) {
         // Issue #1746, A6: the bridge transport edge enforces the same binding
-        // rule as the direct internal intake — a task-relative effect needs
-        // owner evidence, so its binding decision belongs to the ingress that
-        // owns the exact selection. The terminal arm is unreachable
-        // fail-closed if the frozen table ever stops requiring it.
+        // rule as the direct internal intake — task-relative work needs owner
+        // evidence, so its binding decision belongs to the ingress that owns
+        // the exact selection, whether or not this transition carries a
+        // capture. A task-bearing non-capture transition is reported here,
+        // never admitted and never labelled as needing no binding. The
+        // terminal arm is unreachable fail-closed if the frozen table ever
+        // stops requiring it.
         if entrypoint_requires_binding(
             DispatchEntrypoint::BridgeTransport,
             CanonicalOperationRequirement::TaskRelativeEffectful,
@@ -2060,6 +2720,9 @@ pub fn admit_named_mutation_capture(
         return Err(TaskBindingError::selection_required(
             "bridge transport edge cannot admit a task-relative effect without owner evidence",
         ));
+    }
+    if !carries_requirement(CanonicalOperationRequirement::SafeRawCapture) {
+        return Ok(TaskBindingAdmission::NotTaskRelative);
     }
     match admit_capture(
         transition.identity.operation_id.as_str().to_owned(),
@@ -2160,13 +2823,17 @@ pub fn observe_and_admit_task(
 ///
 /// The producer remains the authenticated attach/onboarding owner. The type
 /// itself does not authenticate these values; a caller must pass the exact
-/// owner-issued lease/surface pair and the fence it observed at the same
-/// boundary. Without that producer, there is deliberately no live daemon
+/// owner-issued lease/surface/claim tuple and the fence it observed at the
+/// same boundary. Without that producer, there is deliberately no live daemon
 /// caller.
 #[derive(Clone, Debug)]
 pub struct ColdStartAttachInput {
     /// The exact single-flight lease whose terminal is being attached.
     pub lease: OnboardingLease,
+    /// Full Governor-built ORS claim for the exact lease identity and fence.
+    /// Partial lease fields are never sufficient for a durable readiness
+    /// readback.
+    pub readiness_claim: ColdStartReadinessClaim,
     /// The complete prior projection returned by the Governor for this lease.
     pub expected_surface: ColdStartSurfaceView,
     /// Fence observed by the authenticated attach boundary.
@@ -2188,6 +2855,19 @@ impl ColdStartAttachInput {
                 == self.lease.workspace_instance_candidate_ref
             && self.expected_surface.governing_source_generation
                 == self.lease.governing_source_generation
+            && self.readiness_claim.lease_ref == self.lease.lease_ref
+            && self.readiness_claim.lease_deadline == self.lease.deadline
+            && self.readiness_claim.key.lineage_candidate_ref == self.lease.lineage_candidate_ref
+            && self.readiness_claim.key.workspace_instance_candidate_ref
+                == self.lease.workspace_instance_candidate_ref
+            && self.readiness_claim.key.privacy_class == self.lease.privacy_class
+            && self.readiness_claim.key.governing_source_generation
+                == self.lease.governing_source_generation
+            && self.expected_surface.governing_source_set_ref
+                == self.readiness_claim.key.governing_source_set_ref
+            && self.expected_surface.governing_source_generation
+                == self.readiness_claim.key.governing_source_generation
+            && self.readiness_claim.key.state_fence == self.state_fence
     }
 }
 
@@ -2348,11 +3028,13 @@ fn observe_explicit_workspace_facts(
 /// Observes one authenticated activation selector and creates the exact
 /// discovery lease/evidence inputs admitted by the privacy-bounded scanner.
 ///
-/// Only Host-observed filesystem, VCS and root-manifest name facts are
-/// populated. Known-format inspection and governing-source discovery remain
-/// explicitly unresolved. No privacy class, boundary, source closure, or
-/// task is inferred here; the scanner returns its smallest privacy question
-/// until the applicable owner supplies those inputs.
+/// Host observes filesystem/VCS/manifests and a fixed set of root-relative
+/// governing-source filenames only; no document contents are opened. The
+/// authenticated ticket and observed root bind a short discovery lease that
+/// explicitly admits the source-candidate read. Known-format inspection stays
+/// unresolved. No privacy class, boundary, source closure, or task is inferred
+/// here; the scanner returns its smallest privacy question until the
+/// applicable owner supplies those inputs.
 #[allow(
     clippy::too_many_lines,
     reason = "bounded Host observations and the matching discovery lease are assembled in one auditable path"
@@ -2385,13 +3067,21 @@ pub fn observe_cold_start_discovery(
     let instance_ref = instance.instance_ref.clone();
     let root_identity = instance.root_identity.clone();
     let proposed_kind = observed.kind;
-    let mut allowed_reads = vec![DiscoveryRead::FilesystemIdentity];
+    let mut allowed_reads = vec![
+        DiscoveryRead::FilesystemIdentity,
+        DiscoveryRead::GoverningSourceCandidates,
+    ];
     if facts.has_git {
         allowed_reads.push(DiscoveryRead::VcsIdentity);
     }
     if !facts.manifest_names.is_empty() {
         allowed_reads.push(DiscoveryRead::ManifestNamesAndHashes);
     }
+    let consumption_limit = u32::try_from(allowed_reads.len()).map_err(|_| {
+        TaskBindingError::scope_incompatible(
+            "Host discovery read count exceeds the lease consumption limit",
+        )
+    })?;
     let request = DiscoveryLeaseRequest {
         proposer_ref: ticket.activation_request_id.as_str().to_owned(),
         session_ref: ticket.connection_id.clone(),
@@ -2399,7 +3089,7 @@ pub fn observe_cold_start_discovery(
         candidate_root_ref: root_identity.clone(),
         root_filesystem_identity_ref: root_identity.clone(),
         allowed_reads,
-        consumption_limit: 3,
+        consumption_limit,
         deadline: ticket.kernel_deadline_unix_ms,
     };
     let key = DiscoveryLeaseKey {
@@ -2413,7 +3103,41 @@ pub fn observe_cold_start_discovery(
             "Host-observed discovery lease refused: {error}"
         ))
     })?;
+    lease
+        .authorize(DiscoveryRead::GoverningSourceCandidates, now)
+        .map_err(|error| {
+            TaskBindingError::scope_incompatible(format!(
+                "Host source-candidate read is outside its discovery lease: {error:?}"
+            ))
+        })?;
+    let source_candidates = observe_workspace_source_candidates(Path::new(&facts.canonical_root))
+        .map_err(|error| {
+            TaskBindingError::scope_incompatible(format!(
+                "Host source-candidate observation failed: {error}"
+            ))
+        })?
+        .into_iter()
+        .map(|candidate| GoverningSourceCandidateEvidence {
+            source_ref: candidate.relative_path,
+            role: match candidate.kind {
+                WorkspaceSourceDocumentKind::UserTask => GoverningSourceRole::UserTask,
+                WorkspaceSourceDocumentKind::Architecture => GoverningSourceRole::Architecture,
+                WorkspaceSourceDocumentKind::Implementation => GoverningSourceRole::Implementation,
+                WorkspaceSourceDocumentKind::AgentInstruction => {
+                    GoverningSourceRole::AgentInstruction
+                }
+                WorkspaceSourceDocumentKind::BuildTestContract => {
+                    GoverningSourceRole::BuildTestContract
+                }
+                WorkspaceSourceDocumentKind::DomainPolicy => GoverningSourceRole::DomainPolicy,
+                WorkspaceSourceDocumentKind::SupportingReference => {
+                    GoverningSourceRole::SupportingReference
+                }
+            },
+        })
+        .collect::<Vec<_>>();
     let mut attested_reads = vec![DiscoveryRead::FilesystemIdentity];
+    attested_reads.push(DiscoveryRead::GoverningSourceCandidates);
     if facts.has_git {
         attested_reads.push(DiscoveryRead::VcsIdentity);
     }
@@ -2445,17 +3169,22 @@ pub fn observe_cold_start_discovery(
         editor_workspaces: Vec::new(),
         existing_records: Vec::new(),
         adapters: Vec::new(),
+        governing_source_candidates: Some(source_candidates),
         recent_changes: Vec::new(),
         artifact_dirs: Vec::new(),
         execution_identity: None,
         broker_attached: None,
         redacted_literal_identities: Vec::new(),
-        unresolved_fields: vec![
-            DiscoveryRead::KnownFormatHeaders,
-            DiscoveryRead::GoverningSourceCandidates,
-        ],
+        unresolved_fields: vec![DiscoveryRead::KnownFormatHeaders],
         attested_reads,
     };
+    let governing_source_refs = evidence
+        .governing_source_candidates
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|candidate| candidate.source_ref.clone())
+        .collect();
     let discovery = BootstrapDiscoveryInputs {
         scan_ref: format!("scan:{}", ticket.ticket_id),
         candidate_privacy: None,
@@ -2465,7 +3194,7 @@ pub fn observe_cold_start_discovery(
         proposed_kind,
         identity_fingerprint: instance_ref,
         evidence,
-        governing_source_refs: Vec::new(),
+        governing_source_refs,
         now,
     };
     Ok(ColdStartDiscoveryInput {

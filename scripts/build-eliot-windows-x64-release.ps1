@@ -59,6 +59,14 @@ $repo = Split-Path -Parent $PSScriptRoot
 # seam, and offline trust admission. It is dot-sourced beside this builder and
 # beside the finalizer; it is never part of the retiring facade package.
 . (Join-Path $PSScriptRoot 'lib/governor-retirement-approval.ps1')
+# Issue #1858 inventory/manifest slice: the exact-bytes entrypoint
+# inventory and the installed invocation+readback mechanism
+# (Get-LegacyEntrypointDispositions, Invoke-InstalledEntrypointReadback).
+# Dot-sourced beside this builder; it is product code, not part of any
+# staged payload. The slice implements the accepted unconditional cutover:
+# no retained launch config may name the Bridge binary directly or select
+# the cutover flag; either shape drift throws fail-closed.
+. (Join-Path $PSScriptRoot 'lib/entrypoint-inventory.ps1')
 $surrealCatalogRelativePath = 'docs/release/SURREALDB_WINDOWS_X64.lock.json'
 $runtimeArtifactDefinitions = @(
     [pscustomobject]@{
@@ -120,6 +128,12 @@ $runtimeArtifactDefinitions = @(
         binary = 'eliot-wasm-host'
         role = 'wasm_host'
         relative_path = 'runtime/eliot-wasm-host.exe'
+    }
+    [pscustomobject]@{
+        package = 'eliot-user-broker'
+        binary = 'eliot-user-broker'
+        role = 'user_broker'
+        relative_path = 'runtime/eliot-user-broker.exe'
     }
     [pscustomobject]@{
         package = 'eliot-notify'
@@ -1659,6 +1673,21 @@ function Get-FilteredFileHash([string]$Repo, [string]$RelativePath, [string]$Fil
     return $hash
 }
 
+function Get-PinnedSourceSha256([string]$Repo, [string]$SourceCommit, [string]$RelativePath) {
+    $normalized = Assert-SafeRelativePath $RelativePath 'module build source'
+    $path = Join-Path $Repo $normalized.Replace('/', '\')
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw "module build source is missing: $normalized"
+    }
+    $file = Get-Item -LiteralPath $path -ErrorAction Stop
+    Assert-TrackedSourceFile $file $normalized
+    $expected = Get-GitBlobHash $Repo $SourceCommit $normalized
+    if ((Get-FilteredFileHash $Repo $normalized $file.FullName) -cne $expected) {
+        throw "module build source differs from the pinned source commit: $normalized"
+    }
+    return (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
 function Assert-TrackedSourceFile([System.IO.FileSystemInfo]$File, [string]$RelativePath) {
     if (-not ($File -is [System.IO.FileInfo])) {
         throw "tracked release source is not a regular file: $RelativePath"
@@ -2970,120 +2999,14 @@ function Assert-ClosedCodeBearingPayload([string]$BundlePath, [object[]]$Signing
     }
 }
 
-function Get-LegacyEntrypointDispositions {
-    $notObserved = [ordered]@{
-        status = 'NOT_PERFORMED'
-        detail = 'No installed Windows runtime invocation was performed by the release builder.'
-    }
-    $consumers = @(
-        [ordered]@{
-            entrypoint = 'Claude Code MCP stdio --host claude'
-            source_config = 'integrations/claude/eliot/.mcp.json'
-            inventory_basis = 'Manually recorded source-config declaration; not checked against installed or staged consumer bytes.'
-            packaged_config = $null
-            command = '${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe'
-            args = @('mcp', 'stdio', '--host', 'claude', '--instance', 'default')
-            configured_environment = 'No env member; ELIOT_CLAUDE_FRONT_DOOR is not declared.'
-            effective_cutover_value = 'NOT_OBSERVED (may be inherited by the process)'
-            behavior = 'Unconditionally emit the stderr REDIRECT receipt and delegate this Claude edge (default profile) to the approved Bridge with no ambient operator flag; success exits with the child status, and resolution/launch failure emits structured ERROR with no legacy fallback. No Governor, Store, WAL, or writer object is constructed on this path.'
-            canonical_route = 'Claude Code agent-bridge declaration and Kernel canonical configuration route.'
-        },
-        [ordered]@{
-            entrypoint = 'Claude Desktop MCP stdio --host claude-desktop'
-            source_config = 'integrations/claude/claude-desktop/mcpb/manifest.json'
-            inventory_basis = 'Manually recorded source-config declaration; not checked against installed or staged consumer bytes.'
-            packaged_config = $null
-            command = '${__dirname}/server/eliot-governor.exe'
-            args = @('mcp', 'stdio', '--host', 'claude-desktop', '--instance', 'default')
-            configured_environment = [ordered]@{}
-            effective_cutover_value = 'NOT_OBSERVED (ELIOT_CLAUDE_FRONT_DOOR is not in env)'
-            behavior = 'Unconditionally emit the stderr REDIRECT receipt and delegate this Claude Desktop edge (default profile) to the approved Bridge with no ambient operator flag; success exits with the child status, and resolution/launch failure emits structured ERROR with no legacy fallback. No Governor, Store, WAL, or writer object is constructed on this path.'
-            canonical_route = 'Claude Desktop agent-bridge declaration and Kernel canonical configuration route.'
-        },
-        [ordered]@{
-            entrypoint = 'OpenCode MCP stdio --host opencode'
-            source_config = 'integrations/opencode/opencode.json'
-            inventory_basis = 'Manually recorded source-config declaration; not checked against installed or staged consumer bytes.'
-            packaged_config = $null
-            command = @('{env:ELIOT_GOVERNOR_EXE}', 'mcp', 'stdio', '--host', 'opencode', '--instance', 'default')
-            configured_environment = 'No MCP env member; command resolves the executable through ELIOT_GOVERNOR_EXE.'
-            effective_cutover_value = 'NOT_OBSERVED (ELIOT_CLAUDE_FRONT_DOOR is not declared)'
-            behavior = 'Unconditionally emit the stderr REDIRECT receipt and delegate this OpenCode edge (default profile) to the approved Bridge with no ambient operator flag; success exits with the child status, and resolution/launch failure emits structured ERROR with no legacy fallback. No Governor, Store, WAL, or writer object is constructed on this path.'
-            canonical_route = 'OpenCode agent-bridge declaration and Kernel canonical configuration route.'
-        },
-        [ordered]@{
-            entrypoint = 'Codex MCP stdio profile codex_controller'
-            source_config = 'plugin/eliot-governor/.mcp.json'
-            inventory_basis = 'Manually recorded source-config declaration; not checked against installed or staged consumer bytes.'
-            packaged_config = 'integrations/codex/plugins/eliot-governor/.mcp.json'
-            command = 'bin/eliot-governor.exe'
-            cwd = '.'
-            args = @('mcp', 'stdio', '--profile', 'codex_controller', '--instance', 'default')
-            configured_environment = 'No env member; ELIOT_CLAUDE_FRONT_DOOR is not declared.'
-            effective_cutover_value = 'NOT_OBSERVED (may be inherited by the process)'
-            behavior = 'Unconditionally return structured ERROR with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER before legacy mcp stdio with no ambient operator flag; the codex_controller profile has no Bridge contour (behavior home is the eliot-mcp track per canon) and is never delegated. No legacy serving path remains.'
-            canonical_route = $null
-        }
-    )
-    $dispositions = @(
-        foreach ($consumer in $consumers) {
-            [ordered]@{
-                entrypoint = $consumer.entrypoint
-                behavior = $consumer.behavior
-                canonical_route = $consumer.canonical_route
-                launch_configuration = $consumer
-                source_behavior_status = 'SOURCE_DECLARED'
-                observed_behavior = $notObserved
-            }
-        }
-        [ordered]@{
-            entrypoint = 'eliot-governor.exe daemon run'
-            behavior = 'Unconditionally refuse with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER at the dispatch entry gate before DbClientSet/CanonicalStore start or ControlWal/WriterActor construction, with no ambient operator flag; no legacy serving path remains.'
-            canonical_route = 'Kernel canonical configuration route; installed route NOT_OBSERVED.'
-            launch_configuration = [ordered]@{ command = 'eliot-governor.exe'; args = @('daemon', 'run'); environment = 'Caller-provided; effective value NOT_OBSERVED.' }
-            source_behavior_status = 'SOURCE_DECLARED'
-            observed_behavior = $notObserved
-        }
-        [ordered]@{
-            entrypoint = 'eliot-governor.exe service run'
-            behavior = 'Unconditionally refuse with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER at the dispatch entry gate before legacy service handling, with no ambient operator flag; no legacy serving path remains.'
-            canonical_route = 'Kernel canonical configuration route; installed route NOT_OBSERVED.'
-            launch_configuration = [ordered]@{ command = 'eliot-governor.exe'; args = @('service', 'run'); environment = 'Caller-provided; effective value NOT_OBSERVED.' }
-            source_behavior_status = 'SOURCE_DECLARED'
-            observed_behavior = $notObserved
-        }
-        [ordered]@{
-            entrypoint = 'eliot-governor.exe hook <event>'
-            behavior = 'Unconditionally refuse with LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER at the dispatch entry gate before hook handling, with no ambient operator flag; the Bridge implements no hook/host-event argv, so hooks are refused, never served. No legacy serving path remains.'
-            canonical_route = 'Kernel canonical configuration route; installed route NOT_OBSERVED.'
-            launch_configuration = [ordered]@{
-                source_config = 'plugin/eliot-governor/hooks/hooks.json'
-                commands = @(
-                    '"${PLUGIN_ROOT}\bin\eliot-governor.exe" hook session-start',
-                    '"${PLUGIN_ROOT}\bin\eliot-governor.exe" hook pre-tool-use',
-                    '"${PLUGIN_ROOT}\bin\eliot-governor.exe" hook post-tool-use',
-                    '"${PLUGIN_ROOT}\bin\eliot-governor.exe" hook pre-compact',
-                    '"${PLUGIN_ROOT}\bin\eliot-governor.exe" hook post-compact',
-                    '"${PLUGIN_ROOT}\bin\eliot-governor.exe" hook stop'
-                )
-                environment = 'No cutover flag declared; effective value NOT_OBSERVED.'
-            }
-            source_behavior_status = 'SOURCE_DECLARED'
-            observed_behavior = $notObserved
-        }
-        [ordered]@{
-            entrypoint = 'eliot.exe setup/canary legacy-owner checks'
-            behavior = 'When governor.toml exists, the Governor process is running, or the OS observation is unknown, fail closed with the corresponding legacy cutover code and canonical-route receipt.'
-            canonical_route = 'Kernel canonical configuration route; installed route NOT_OBSERVED.'
-            launch_configuration = [ordered]@{ command = 'eliot.exe'; args = @('setup'); environment = 'Legacy-owner check; installed invocation NOT_OBSERVED.' }
-            source_behavior_status = 'SOURCE_DECLARED'
-            observed_behavior = $notObserved
-        }
-    )
-    return $dispositions
-}
+# Issue #1858: Get-LegacyEntrypointDispositions lives in
+# scripts/lib/entrypoint-inventory.ps1 (dot-sourced above). It enumerates the
+# retained legacy entrypoints from exact pinned/staged bytes (fail closed on
+# drift) under the accepted unconditional cutover; both manifest call sites
+# below invoke that slice with the repository root, pinned source commit,
+# staged bundle root, and staged Bridge record.
 
-function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [object]$RuntimePlan, [string]$CodexPluginBaseVersion, [object]$SurrealArtifact, [object]$SelectedPolicyReceipt, [object]$FrontDoorBridge, [bool]$LegacyGovernorPresent, [string]$GovernorDisposition, [object]$GovernorEvidence, [object]$GovernorApproval, [object[]]$SigningInventory) {
+function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [object]$RuntimePlan, [string]$CodexPluginBaseVersion, [object]$SurrealArtifact, [object]$SelectedPolicyReceipt, [object]$FrontDoorBridge, [object]$ModuleBuildProvenance, [bool]$LegacyGovernorPresent, [string]$GovernorDisposition, [object]$GovernorEvidence, [object]$GovernorApproval, [object[]]$SigningInventory, [string]$RepoRoot, [string]$BundleRoot) {
     $entries = @()
     foreach ($artifact in @($RuntimePlan)) {
         $entries += [ordered]@{
@@ -3145,6 +3068,20 @@ function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [obj
         proof_ceiling = 'unsigned-build-evidence'
         gate = $null
     }
+    foreach ($moduleProof in @(
+            @{ path = [string]$ModuleBuildProvenance.manifest_path; selection = 'canonical `eliotd` ModuleManifest exported from the live handshake contract constructor'; owner = 'eliot-runtime-contracts ModuleManifest + eliotd build-only exporter'; proof = 'exact contract bytes bound to the built eliotd artifact' },
+            @{ path = [string]$ModuleBuildProvenance.provenance_path; selection = 'module-specific source/build proof generated from the pinned release source and exact artifact bytes'; owner = 'scripts/build-eliot-windows-x64-release.ps1'; proof = 'source commit/tree, build inputs, invocation, artifact and manifest digests' }
+        )) {
+        $entries += [ordered]@{
+            path = $moduleProof.path
+            selection = $moduleProof.selection
+            owner = $moduleProof.owner
+            install_destination = 'runtime/'
+            generation = $SourceCommit
+            proof_ceiling = $moduleProof.proof
+            gate = $null
+        }
+    }
     if ($LegacyGovernorPresent) {
         $entries += [ordered]@{
             path = 'eliot-governor.exe'
@@ -3156,7 +3093,7 @@ function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [obj
             gate = '#1189-legacy-retirement (GATED: retained explicitly by #1719, never by repository presence; full retire/re-home BLOCKED-BY #18)'
             entrypoint_disposition = 'retained-legacy-entrypoints; unconditional cutover owned by #1858: Claude, Claude Desktop and OpenCode MCP stdio (default profile) always redirect to the approved Bridge, every other MCP stdio host/profile and every non-stdio arm always returns structured ERROR; no ambient operator flag, no legacy serving path remains'
             cutover_behavior = 'source-declared unconditional behavior owned by #1858; ELIOT_CLAUDE_FRONT_DOOR survives only as refusal evidence and never gates, source launch configs do not select it, and effective inherited selection is NOT_OBSERVED'
-            entrypoint_behaviors = @(Get-LegacyEntrypointDispositions)
+            entrypoint_behaviors = @(Get-LegacyEntrypointDispositions $RepoRoot $SourceCommit $BundleRoot $FrontDoorBridge)
         }
     }
     if ($FrontDoorBridge) {
@@ -3324,6 +3261,7 @@ function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [obj
         architecture = 'windows-x64'
         denominator_policy = 'registry-selected-only-no-wholesale'
         codex_plugin_base_version = $CodexPluginBaseVersion
+        module_build_provenance = $ModuleBuildProvenance
         governor_disposition = $GovernorDisposition
         governor_evidence = $GovernorEvidence
         governor_approval = $GovernorApproval
@@ -3392,8 +3330,11 @@ function Test-ReleaseBundle([string]$Path, [string]$GovernorRetirementApproval) 
         'runtime/eliot-testd.exe',
         'runtime/eliot-native-worker.exe',
         'runtime/eliot-wasm-host.exe',
+        'runtime/eliot-user-broker.exe',
         'runtime/eliot-notify.exe',
         'runtime/surreal.exe',
+        'runtime/module.eliotd.toml',
+        'runtime/module.eliotd.provenance.json',
         'runtime/RUNTIME_ARTIFACTS.json',
         'operator/Eliot.Operator.exe',
         'operator/OPERATOR_BUILD_RECEIPT.json',
@@ -3642,6 +3583,96 @@ function Test-ReleaseBundle([string]$Path, [string]$GovernorRetirementApproval) 
         [string]$runtimeManifest.architecture -ne 'windows-x64' -or
         [string]$runtimeManifest.catalog_path -ne $surrealCatalogRelativePath) {
         throw 'runtime artifact manifest does not match RELEASE.json'
+    }
+    $moduleBinding = $release.module_build_provenance
+    $moduleManifestPath = Join-Path $resolved 'runtime/module.eliotd.toml'
+    $moduleProvenancePath = Join-Path $resolved 'runtime/module.eliotd.provenance.json'
+    $moduleManifestEvidence = Read-VerifiedResidentFile $moduleManifestPath 'canonical eliotd module manifest'
+    $moduleProvenanceEvidence = Read-VerifiedResidentFile $moduleProvenancePath 'eliotd source/build provenance'
+    $moduleSourceProof = [System.Text.Encoding]::UTF8.GetString($moduleProvenanceEvidence.bytes).TrimStart([char]0xFEFF) | ConvertFrom-Json
+    $expectedModuleProofFields = @(
+        'schema_version', 'module_id', 'package', 'binary', 'artifact_path', 'artifact_sha256',
+        'artifact_bytes', 'manifest_path', 'manifest_sha256', 'manifest_bytes', 'source_commit',
+        'source_tree_id', 'builder_script_sha256', 'cargo_manifest_sha256', 'cargo_lock_sha256',
+        'rust_toolchain_sha256', 'daemon_contract_source_sha256', 'module_manifest_source_sha256',
+        'cargo_profile', 'build_target', 'build_argv'
+    )
+    $observedModuleProofFields = @($moduleSourceProof.PSObject.Properties.Name | Sort-Object)
+    $expectedModuleProofFields = @($expectedModuleProofFields | Sort-Object)
+    $sourceTreeId = (& git -C $repo rev-parse ("{0}^{{tree}}" -f [string]$release.source_commit) 2>$null | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or
+        ($observedModuleProofFields -join "`n") -cne ($expectedModuleProofFields -join "`n") -or
+        -not $moduleBinding -or
+        [string]$moduleBinding.module_id -cne 'eliotd' -or
+        [string]$moduleBinding.artifact_path -cne 'runtime/eliotd.exe' -or
+        [string]$moduleBinding.manifest_path -cne 'runtime/module.eliotd.toml' -or
+        [string]$moduleBinding.provenance_path -cne 'runtime/module.eliotd.provenance.json' -or
+        [string]$moduleBinding.source_commit -cne [string]$release.source_commit -or
+        [string]$moduleBinding.source_tree_id -cne $sourceTreeId -or
+        [string]$moduleBinding.manifest_sha256 -cne $moduleManifestEvidence.sha256 -or
+        [int64]$moduleBinding.manifest_bytes -ne [int64]$moduleManifestEvidence.length -or
+        [string]$moduleBinding.provenance_sha256 -cne $moduleProvenanceEvidence.sha256 -or
+        [int64]$moduleBinding.provenance_bytes -ne [int64]$moduleProvenanceEvidence.length -or
+        [int]$moduleSourceProof.schema_version -ne 1 -or
+        [string]$moduleSourceProof.module_id -cne 'eliotd' -or
+        [string]$moduleSourceProof.package -cne 'eliotd' -or
+        [string]$moduleSourceProof.binary -cne 'eliotd' -or
+        [string]$moduleSourceProof.artifact_path -cne 'runtime/eliotd.exe' -or
+        [string]$moduleSourceProof.manifest_path -cne 'runtime/module.eliotd.toml' -or
+        [string]$moduleSourceProof.manifest_sha256 -cne $moduleManifestEvidence.sha256 -or
+        [int64]$moduleSourceProof.manifest_bytes -ne [int64]$moduleManifestEvidence.length -or
+        [string]$moduleSourceProof.source_commit -cne [string]$release.source_commit -or
+        [string]$moduleSourceProof.source_tree_id -cne $sourceTreeId -or
+        [string]$moduleSourceProof.cargo_profile -cne 'release' -or
+        [string]$moduleSourceProof.build_target -cne 'x86_64-pc-windows-msvc' -or
+        (@($moduleSourceProof.build_argv) -join "`n") -cne (@('build', '--frozen', '--locked', '--offline', '--release', '-p', 'eliotd', '--bin', 'eliotd') -join "`n") -or
+        [string]$moduleSourceProof.artifact_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$moduleSourceProof.manifest_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$moduleSourceProof.builder_script_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$moduleSourceProof.cargo_manifest_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$moduleSourceProof.cargo_lock_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$moduleSourceProof.rust_toolchain_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$moduleSourceProof.daemon_contract_source_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$moduleSourceProof.module_manifest_source_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        [int64]$moduleSourceProof.artifact_bytes -le 0 -or
+        [string]$moduleBinding.artifact_sha256 -cne [string]$moduleSourceProof.artifact_sha256 -or
+        [int64]$moduleBinding.artifact_bytes -ne [int64]$moduleSourceProof.artifact_bytes) {
+        throw 'RELEASE.json and module-specific source/build provenance do not form one exact module binding'
+    }
+    $daemonArtifactPath = Join-Path $resolved 'runtime/eliotd.exe'
+    $daemonArtifactEvidence = Read-VerifiedResidentFile $daemonArtifactPath 'provenance-bound eliotd executable'
+    if ($daemonArtifactEvidence.sha256 -cne [string]$moduleSourceProof.artifact_sha256 -or
+        $daemonArtifactEvidence.length -ne [int64]$moduleSourceProof.artifact_bytes) {
+        throw 'module source/build provenance does not bind the exact staged eliotd executable'
+    }
+    foreach ($sourceBinding in @(
+            @{ field = 'builder_script_sha256'; path = 'scripts/build-eliot-windows-x64-release.ps1' },
+            @{ field = 'cargo_manifest_sha256'; path = 'bins/eliotd/Cargo.toml' },
+            @{ field = 'cargo_lock_sha256'; path = 'Cargo.lock' },
+            @{ field = 'rust_toolchain_sha256'; path = 'rust-toolchain.toml' },
+            @{ field = 'daemon_contract_source_sha256'; path = 'bins/eliotd/src/daemon_kernel_client/handshake.rs' },
+            @{ field = 'module_manifest_source_sha256'; path = 'crates/foundation/eliot-runtime-contracts/src/module_manifest.rs' }
+        )) {
+        $expectedSourceSha256 = Get-PinnedSourceSha256 $repo ([string]$release.source_commit) $sourceBinding.path
+        $sourceField = [string]$sourceBinding.field
+        if ([string]$moduleSourceProof.$sourceField -cne $expectedSourceSha256) {
+            throw "eliotd provenance differs from the pinned build source: $($sourceBinding.path)"
+        }
+    }
+    $runtimeModuleBinding = $runtimeManifest.module_build_provenance
+    if ([string]$runtimeModuleBinding.module_id -cne [string]$moduleBinding.module_id -or
+        [string]$runtimeModuleBinding.artifact_path -cne [string]$moduleBinding.artifact_path -or
+        [string]$runtimeModuleBinding.artifact_sha256 -cne [string]$moduleBinding.artifact_sha256 -or
+        [int64]$runtimeModuleBinding.artifact_bytes -ne [int64]$moduleBinding.artifact_bytes -or
+        [string]$runtimeModuleBinding.manifest_path -cne [string]$moduleBinding.manifest_path -or
+        [string]$runtimeModuleBinding.manifest_sha256 -cne [string]$moduleBinding.manifest_sha256 -or
+        [int64]$runtimeModuleBinding.manifest_bytes -ne [int64]$moduleBinding.manifest_bytes -or
+        [string]$runtimeModuleBinding.provenance_path -cne [string]$moduleBinding.provenance_path -or
+        [string]$runtimeModuleBinding.provenance_sha256 -cne [string]$moduleBinding.provenance_sha256 -or
+        [int64]$runtimeModuleBinding.provenance_bytes -ne [int64]$moduleBinding.provenance_bytes -or
+        [string]$runtimeModuleBinding.source_commit -cne [string]$moduleBinding.source_commit -or
+        [string]$runtimeModuleBinding.source_tree_id -cne [string]$moduleBinding.source_tree_id) {
+        throw 'runtime artifact manifest module binding differs from RELEASE.json'
     }
     $expectedRuntime = @(Get-RuntimeArtifactDefinitions)
     $declaredRuntime = @($runtimeManifest.artifacts)
@@ -4506,6 +4537,95 @@ try {
     foreach ($artifact in $runtimeArtifactPlan) {
         Copy-Item -LiteralPath $artifact.path -Destination (Join-Path $bundle $artifact.relative_path)
     }
+    # Issue #22 W1: the module contract bytes come from the exact constructor
+    # the live daemon handshake uses. The exported manifest is bound to the
+    # staged eliotd.exe digest, and this separate record binds its bytes to the
+    # pinned source tree, toolchain inputs, release-builder source and exact
+    # cargo invocation. Host later validates and durably records these values
+    # under its active RecordFence; this build artifact alone grants no runtime
+    # or generation authority.
+    $daemonArtifactPath = Join-Path $runtimeRoot 'eliotd.exe'
+    if (-not (Test-Path -LiteralPath $daemonArtifactPath -PathType Leaf)) {
+        throw 'module provenance export requires the staged runtime/eliotd.exe artifact'
+    }
+    $daemonArtifactFile = Get-Item -LiteralPath $daemonArtifactPath -ErrorAction Stop
+    Assert-NoSecretFile $daemonArtifactFile 'runtime/eliotd.exe'
+    [void](Assert-WindowsX64Pe $daemonArtifactFile.FullName 'runtime/eliotd.exe')
+    $daemonArtifactSha256 = (Get-FileHash -LiteralPath $daemonArtifactPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $moduleManifestPath = Join-Path $runtimeRoot 'module.eliotd.toml'
+    $manifestExport = Invoke-JobContainedNativeProcess $daemonArtifactPath @(
+        '--emit-build-module-manifest', $daemonArtifactSha256
+    ) $runtimeRoot 'eliotd-module-manifest-export'
+    if ([int]$manifestExport.exit_code -ne 0) {
+        throw "canonical eliotd module manifest export failed with exit code $($manifestExport.exit_code)"
+    }
+    $daemonArtifactReadback = Get-Item -LiteralPath $daemonArtifactPath -ErrorAction Stop
+    $daemonArtifactReadbackSha256 = (Get-FileHash -LiteralPath $daemonArtifactPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($daemonArtifactReadbackSha256 -cne $daemonArtifactSha256 -or
+        [int64]$daemonArtifactReadback.Length -ne [int64]$daemonArtifactFile.Length) {
+        throw 'staged eliotd.exe changed while its canonical module manifest was exported'
+    }
+    if (-not (Test-Path -LiteralPath $moduleManifestPath -PathType Leaf)) {
+        throw 'canonical eliotd module manifest export did not create runtime/module.eliotd.toml'
+    }
+    $moduleManifestFile = Get-Item -LiteralPath $moduleManifestPath -ErrorAction Stop
+    Assert-NoSecretFile $moduleManifestFile 'runtime/module.eliotd.toml'
+    $moduleManifestSha256 = (Get-FileHash -LiteralPath $moduleManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($moduleManifestFile.Length -le 0) {
+        throw 'canonical eliotd module manifest export produced empty bytes'
+    }
+    $sourceTreeId = (& git -C $repo rev-parse ("{0}^{{tree}}" -f $sourceCommit) 2>$null | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $sourceTreeId -notmatch '^[0-9a-f]{40,64}$') {
+        throw 'failed to resolve the exact release source tree identity for module provenance'
+    }
+    $moduleBuildArguments = @(
+        'build', '--frozen', '--locked', '--offline', '--release', '-p', 'eliotd', '--bin', 'eliotd'
+    )
+    $moduleSourceProof = [ordered]@{
+        schema_version = 1
+        module_id = 'eliotd'
+        package = 'eliotd'
+        binary = 'eliotd'
+        artifact_path = 'runtime/eliotd.exe'
+        artifact_sha256 = $daemonArtifactSha256
+        artifact_bytes = [int64]$daemonArtifactFile.Length
+        manifest_path = 'runtime/module.eliotd.toml'
+        manifest_sha256 = $moduleManifestSha256
+        manifest_bytes = [int64]$moduleManifestFile.Length
+        source_commit = $sourceCommit
+        source_tree_id = $sourceTreeId
+        builder_script_sha256 = Get-PinnedSourceSha256 $repo $sourceCommit 'scripts/build-eliot-windows-x64-release.ps1'
+        cargo_manifest_sha256 = Get-PinnedSourceSha256 $repo $sourceCommit 'bins/eliotd/Cargo.toml'
+        cargo_lock_sha256 = Get-PinnedSourceSha256 $repo $sourceCommit 'Cargo.lock'
+        rust_toolchain_sha256 = Get-PinnedSourceSha256 $repo $sourceCommit 'rust-toolchain.toml'
+        daemon_contract_source_sha256 = Get-PinnedSourceSha256 $repo $sourceCommit 'bins/eliotd/src/daemon_kernel_client/handshake.rs'
+        module_manifest_source_sha256 = Get-PinnedSourceSha256 $repo $sourceCommit 'crates/foundation/eliot-runtime-contracts/src/module_manifest.rs'
+        cargo_profile = 'release'
+        build_target = 'x86_64-pc-windows-msvc'
+        build_argv = $moduleBuildArguments
+    }
+    $moduleProvenancePath = Join-Path $runtimeRoot 'module.eliotd.provenance.json'
+    [System.IO.File]::WriteAllText(
+        $moduleProvenancePath,
+        ($moduleSourceProof | ConvertTo-Json -Depth 6),
+        [System.Text.UTF8Encoding]::new($false))
+    $moduleProvenanceFile = Get-Item -LiteralPath $moduleProvenancePath -ErrorAction Stop
+    Assert-NoSecretFile $moduleProvenanceFile 'runtime/module.eliotd.provenance.json'
+    $moduleProvenanceSha256 = (Get-FileHash -LiteralPath $moduleProvenancePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $moduleBuildProvenance = [ordered]@{
+        module_id = 'eliotd'
+        artifact_path = 'runtime/eliotd.exe'
+        artifact_sha256 = $daemonArtifactSha256
+        artifact_bytes = [int64]$daemonArtifactFile.Length
+        manifest_path = 'runtime/module.eliotd.toml'
+        manifest_sha256 = $moduleManifestSha256
+        manifest_bytes = [int64]$moduleManifestFile.Length
+        provenance_path = 'runtime/module.eliotd.provenance.json'
+        provenance_sha256 = $moduleProvenanceSha256
+        provenance_bytes = [int64]$moduleProvenanceFile.Length
+        source_commit = $sourceCommit
+        source_tree_id = $sourceTreeId
+    }
     $surrealBundleEvidence = Read-VerifiedResidentFile $resolvedSurrealExe 'project-local SurrealDB artifact for staging'
     $stagedSurrealPath = Join-Path $bundle 'runtime/surreal.exe'
     $writtenSurreal = Write-VerifiedResidentFile $stagedSurrealPath $surrealBundleEvidence.bytes 'staged SurrealDB artifact'
@@ -4614,6 +4734,7 @@ try {
             features_policy = [string]$stageToolchain.build.features_policy
         }
         surreal_version = $verifiedPinnedSurreal.version
+        module_build_provenance = $moduleBuildProvenance
         artifacts = @($verifiedRuntimeArtifacts + $verifiedPinnedSurreal)
         bundle_signing_artifacts = @($bundleSigningArtifacts)
     } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $runtimeRoot 'RUNTIME_ARTIFACTS.json') -Encoding utf8
@@ -4687,9 +4808,20 @@ try {
             $bundle $runtimeManifest $runtimeReceiptSha256 $operatorReceipt $operatorReceiptSha256 `
             $legacyGovernorPresent ([bool]$frontDoorBridgeStaged) $expectedBridgeSha256 $expectedBridgeBytes)
     Assert-ClosedCodeBearingPayload $bundle $signingInventory
-    $stagedPayloadManifest = Get-StagedPayloadManifest $sourceCommit $Version $runtimeArtifactPlan $codexPluginBaseVersion $verifiedPinnedSurreal $selectedSurrealPolicyReceipt $frontDoorBridgeStaged $legacyGovernorPresent ([string]$plan.governor_disposition) $governorEvidence $governorApprovalReference $signingInventory
+    $stagedPayloadManifest = Get-StagedPayloadManifest $sourceCommit $Version $runtimeArtifactPlan $codexPluginBaseVersion $verifiedPinnedSurreal $selectedSurrealPolicyReceipt $frontDoorBridgeStaged $moduleBuildProvenance $legacyGovernorPresent ([string]$plan.governor_disposition) $governorEvidence $governorApprovalReference $signingInventory $repo $bundle
     $stagedPayloadManifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $bundle 'STAGED_PAYLOAD_MANIFEST.json') -Encoding utf8
     $stagedPayloadManifestHash = (Get-FileHash -LiteralPath (Join-Path $bundle 'STAGED_PAYLOAD_MANIFEST.json') -Algorithm SHA256).Hash.ToLowerInvariant()
+    # Issue #1858 AUD6/W6: stage the installed-entrypoint readback PLAN beside
+    # the manifest. -WhatIf plans every retained entrypoint invocation without
+    # launching a process; the operator reruns
+    # Invoke-InstalledEntrypointReadback without -WhatIf on the installed
+    # release (TEST-PHASE) and matches the cutover code plus canonical-route
+    # receipt per entrypoint.
+    $entrypointReadbackPlanPath = Join-Path $bundle 'INSTALLED_ENTRYPOINT_READBACK_PLAN.json'
+    if ($legacyGovernorPresent) {
+        Invoke-InstalledEntrypointReadback -InstallRoot $bundle -SnapshotPath $entrypointReadbackPlanPath -WhatIf | Out-Null
+    }
+    $entrypointReadbackPlanHash = if ((Test-Path -LiteralPath $entrypointReadbackPlanPath -PathType Leaf)) { (Get-FileHash -LiteralPath $entrypointReadbackPlanPath -Algorithm SHA256).Hash.ToLowerInvariant() } else { $null }
     $release = [ordered]@{
         component = 'eliot_windows_x64_release'
         version = $Version
@@ -4708,7 +4840,7 @@ try {
             bridge_provisioned = [bool]$frontDoorBridgeStaged
             bridge_sha256 = if ($frontDoorBridgeStaged) { [string]$frontDoorBridgeStaged.sha256 } else { $null }
             bridge_bytes = if ($frontDoorBridgeStaged) { [int64]$frontDoorBridgeStaged.bytes } else { $null }
-            legacy_entrypoint_disposition = if ($legacyGovernorPresent) { @(Get-LegacyEntrypointDispositions) }
+            legacy_entrypoint_disposition = if ($legacyGovernorPresent) { @(Get-LegacyEntrypointDispositions $repo $sourceCommit $bundle $frontDoorBridgeStaged) }
             else {
                 @(
                     [ordered]@{
@@ -4728,11 +4860,12 @@ try {
                 source = 'crates/eliot-app/src/main.rs::dispatch_command'
                 runtime_execution = 'NOT_PERFORMED'
             }
-            observed_behavior = 'Installed runtime observation was NOT_PERFORMED by the release builder; see source_declared_behavior for source behavior.'
+            observed_behavior = 'Installed runtime observation was NOT_PERFORMED by the release builder; see source_declared_behavior for source behavior and installed_entrypoint_readback_plan for the staged TEST-PHASE invocation plan.'
             installed_runtime_observation = [ordered]@{
                 status = 'NOT_PERFORMED'
-                detail = 'No installed Windows release invocation was performed by the release builder.'
+                detail = 'No installed Windows release invocation was performed by the release builder. Rerun scripts/lib/entrypoint-inventory.ps1::Invoke-InstalledEntrypointReadback without -WhatIf against the installed release and match LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER plus the canonical-route receipt per retained entrypoint.'
             }
+            installed_entrypoint_readback_plan = if ($legacyGovernorPresent) { [ordered]@{ path = 'INSTALLED_ENTRYPOINT_READBACK_PLAN.json'; sha256 = [string]$entrypointReadbackPlanHash } } else { $null }
         }
         operator_schema_version = $verifiedOperator.schema_version
         operator_protocol_version = $verifiedOperator.protocol_version
@@ -4743,6 +4876,7 @@ try {
         runtime_artifact_catalog_sha256 = $surrealCatalog.sha256
         runtime_artifact_catalog_source_commit = $surrealCatalog.source_commit
         runtime_artifact_count = $runtimeArtifactPlan.Count + 1
+        module_build_provenance = $moduleBuildProvenance
         runtime_artifacts = @($verifiedRuntimeArtifacts + $verifiedPinnedSurreal | ForEach-Object {
                 [ordered]@{
                     package = $_.package

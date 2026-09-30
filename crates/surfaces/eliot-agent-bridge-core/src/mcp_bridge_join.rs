@@ -24,12 +24,21 @@
 //! No expected set is ever taken from the joining caller. Event identity,
 //! position, and content are compared against the retained owner journal;
 //! the live generation and the expected route fingerprint are read from the
-//! owner's own attach binding and the owner's own observed route; the
-//! nominated correlation is compared against the digest this correlation
-//! recorded; and a later event is compared against the evidence read back out
-//! of the correlation's own retained revisions. Comparing two values the
-//! caller supplied, or recomputing a fresh digest over what the join already
-//! holds, could only prove that the caller agrees with itself.
+//! owner's own attach binding and the owner's own observed route; and a later
+//! event is compared against the evidence read back out of the correlation's
+//! own retained revisions. Comparing two values the caller supplied, or
+//! recomputing a fresh digest over what the join already holds, could only
+//! prove that the caller agrees with itself.
+//!
+//! The correlation identity is deliberately NOT an input to this join. A
+//! correlation's recorded digest names the correlation; it says nothing about
+//! which host event belongs to it, so requiring the caller to echo that digest
+//! back would compare a record against itself and pass for every candidate. The
+//! only thing that can attribute an event to one exact invocation is the
+//! event's own owner-validated observation, and that is what
+//! [`normalize_terminal_observation`] requires. An event that carries no
+//! invocation scope is refused, so no event can close a correlation merely
+//! because that correlation was the one still pending.
 //!
 //! Contiguity is a property of the *owner journal*, not of any one
 //! invocation, so a proven interval is never coverage until it is bounded to
@@ -256,15 +265,6 @@ pub enum ReconcileError {
         /// Conflicting event identity.
         event_id: String,
     },
-    /// The nominated correlation digest is not the digest this correlation
-    /// recorded, so the event joins a different logical correlation and closes
-    /// nothing here.
-    CorrelationMismatch {
-        /// Correlation digest the joining caller named.
-        claimed: String,
-        /// Correlation digest this correlation actually recorded.
-        recorded: String,
-    },
     /// The candidate failed host-observation normalization.
     HostRejected(HostObservationReject),
 }
@@ -294,10 +294,6 @@ impl std::fmt::Display for ReconcileError {
                 "host event {event_id} was already accepted for this correlation with \
                  different content"
             ),
-            Self::CorrelationMismatch { claimed, recorded } => write!(
-                formatter,
-                "nominated correlation {claimed} is not this correlation {recorded}"
-            ),
             Self::HostRejected(reason) => {
                 write!(formatter, "host event rejected for correlation: {reason}")
             }
@@ -314,8 +310,7 @@ impl std::error::Error for ReconcileError {
             | Self::NominatedEventNotJournaled { .. }
             | Self::OutOfDeclaredOrder { .. }
             | Self::JournalContentConflict { .. }
-            | Self::PriorEvidenceConflict { .. }
-            | Self::CorrelationMismatch { .. } => None,
+            | Self::PriorEvidenceConflict { .. } => None,
         }
     }
 }
@@ -348,33 +343,37 @@ pub struct TerminalReconcileRequest<'a> {
 
 /// Reconciles one nominated terminal host event against an emission.
 ///
-/// The candidate is joined on exact correlation identity first, then exact event
-/// identity, then exact generation, then exact content, then against the
-/// evidence this correlation already accepted:
+/// The candidate is joined on exact event identity first, then exact content,
+/// then exact generation, then against the evidence this correlation already
+/// accepted:
 ///
-/// 0. **exact correlation** — the nominated correlation digest must be the
-///    digest this correlation recorded, so an event named against a different
-///    logical correlation closes nothing here;
-/// 1. **exact identity** — the event identity must be present in the live
+/// 0. **exact identity** — the event identity must be present in the live
 ///    owner journal, and that identity must be bound to exactly the sequence
 ///    and cursor the candidate claims. An event that is absent, or that sits at
 ///    a different position than it claims, closes nothing;
+/// 1. **exact content** — every journaled entry under that identity must equal
+///    the candidate field for field. One differing entry is a same-identity
+///    content conflict and is refused, never overwritten; byte-equal repeats
+///    are an exact replay and stay idempotent;
 /// 2. **exact generation** — the candidate's own owner-validated lineage must
 ///    name the session in the owner's own live attach binding, and its route
 ///    fingerprint must be the one the owner itself observed, so a restart or
 ///    session rotation cannot relabel an old observation as current;
-/// 3. **exact content** — every journaled entry under that identity must equal
-///    the candidate field for field. One differing entry is a same-identity
-///    content conflict and is refused, never overwritten; byte-equal repeats
-///    are an exact replay and stay idempotent;
+/// 3. **attribution** — the candidate's own owner-validated observation must
+///    name one exact invocation. This is the only step that can establish that
+///    the event is about *this* correlation: the recorded digest identifies the
+///    correlation but proves nothing about the event, and route, session, and
+///    generation are shared by every correlation on the route. A terminal
+///    payload carries no invocation scope, so it is refused here and the
+///    correlation stays pending;
 /// 4. **prior accepted evidence** — the same event identity may not reappear
 ///    for this correlation with any changed content, compared against the
 ///    evidence read back out of this correlation's own retained revisions.
 ///
 /// Only then is the event assessed, with the owner's live coverage
 /// denominator bounded to the candidate's own journaled sequence. Stale,
-/// foreign, duplicated, reordered, and out-of-order host events each close
-/// nothing current.
+/// foreign, unattributable, duplicated, reordered, and out-of-order host events
+/// each close nothing current.
 pub fn reconcile_terminal_event(
     bridge: &AgentBridgeCore,
     request: &TerminalReconcileRequest<'_>,
@@ -383,15 +382,16 @@ pub fn reconcile_terminal_event(
         return Err(ReconcileError::OwnerUnattached);
     };
     let recorded_digest = request.emission.identity.identity_digest.as_str();
-    if request.keys.correlation_digest != recorded_digest {
-        return Err(ReconcileError::CorrelationMismatch {
-            claimed: request.keys.correlation_digest.clone(),
-            recorded: recorded_digest.to_owned(),
-        });
-    }
     let journaled = journal_binding(inputs.history(), request.candidate)?;
     let owner = owner_binding(bridge, inputs.fingerprint())?;
-    let host = normalize_terminal_observation(journaled, request.keys, &owner)
+    // The recorded digest is passed down, never re-derived and never restated
+    // by the joining caller: the evidence must name the correlation this join
+    // actually holds, and the only claim it can make is that this event belongs
+    // to it. That claim is established by the candidate's own invocation scope
+    // inside `normalize_terminal_observation`, which refuses an event that
+    // names no invocation. Route, session, and generation are shared by every
+    // correlation on the route and can never establish it.
+    let host = normalize_terminal_observation(journaled, request.keys, &owner, recorded_digest)
         .map_err(ReconcileError::HostRejected)?;
     // An exact replay is idempotent: identical evidence re-derives the
     // identical assessment, so the correlation still closes exactly once, and a

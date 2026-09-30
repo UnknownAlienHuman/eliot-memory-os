@@ -1556,9 +1556,9 @@ fn host_lifecycle_frozen_event(boundary: &'static HostLifecycleBoundary) -> &'st
 
 pub use credential_control::{HostCredentialControl, HostPhaseBRequest, HostPhaseBRequestQueue};
 pub use eliot_host_control_endpoint::{
-    AcceptedOwnerMethod, BackupDispatchRefusal, HOST_RUNTIME_CONTROL_PIPE, HostBackupOwner,
-    HostBackupOwnerRegistration, HostRuntimeControl, HostRuntimeControlQueue,
-    HostUserAutomationExecutionEnvelope, HostUserAutomationExecutionQueue,
+    AcceptedOwnerMethod, BackupDispatchRefusal, BackupOwnerOutcome, BackupRetainedOperation,
+    HOST_RUNTIME_CONTROL_PIPE, HostBackupOwner, HostBackupOwnerRegistration, HostRuntimeControl,
+    HostRuntimeControlQueue, HostUserAutomationExecutionEnvelope, HostUserAutomationExecutionQueue,
     UserAutomationHostExecutionEndpoint, UserAutomationHostExecutionRequest,
     UserAutomationHostExecutionResponse, UserAutomationRuntimeError, pop_user_automation_execution,
     process_user_automation_execution_queue, reject_unbound_user_automation_execution,
@@ -1609,19 +1609,22 @@ type Duration = std::time::Duration;
 #[cfg(windows)]
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use eliot_contracts::{AuthorityEpoch, EpochContractError, EpochId, ResourceGeneration};
 #[cfg(windows)]
-use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence};
+use eliot_contracts::{
+    ArtifactId, ClockReading, ContractId, ProductId, RequestId, RequestMetadata, SourceId,
+    StateFence,
+};
+use eliot_contracts::{AuthorityEpoch, EpochContractError, EpochId, ResourceGeneration};
 #[cfg(windows)]
 use eliot_host_service::{HostDurableJobAdapter, HostWakeIntentAdapter};
 use eliot_host_state::{
     ActivationState, AppendReceipt, DrainRecord, DrainState, EpochIdentity, EpochLineageId,
     EpochTransition, HostInstallationEpoch, HostObservationRecord, HostState,
     HostStateJournalService, HostStateRecord, IdempotencyIdentity, JournalBackend, JournalError,
-    KernelJobBinding, KernelRecord, NonceState, OneTimeNonceState, PriorKernelDisposition,
-    ProductionHostStateJournal, ReconcileOutcome, RecordFence, RecoveryLineageEvidence,
-    RedbJournalBackend, StoreRebindRecord, StoreRebindState, host_owner_epoch_digest,
-    record_checksum,
+    KernelJobBinding, KernelRecord, ModuleBuildProvenanceRecord, NonceState, OneTimeNonceState,
+    PriorKernelDisposition, ProductionHostStateJournal, ReconcileOutcome, RecordFence,
+    RecoveryLineageEvidence, RedbJournalBackend, StoreRebindRecord, StoreRebindState,
+    host_owner_epoch_digest, record_checksum,
 };
 use eliot_installation::{
     ActivationCommitFence, ActivePhaseBRebindIntent, ActivePhaseBRebindReceipt,
@@ -1646,9 +1649,9 @@ use eliot_kernel_core::KernelRuntimeHealthEvidence;
 use eliot_kernel_service::KERNEL_CONTROL_PIPE;
 use eliot_kernel_service::{
     EliotdLaunchDescriptor, HostJobBinding, HostKernelCandidateBinding, HostProcessBinding,
-    HostStartupEvidence, HostStoreBootstrapRequirement, KernelActivationPermit,
-    KernelActivationQuery, KernelActivationReceipt, KernelControlCommand, KernelControlRequest,
-    KernelControlResponse, KernelReadyReceipt, KernelServiceState,
+    HostStartupEvidence, HostStartupEvidenceReport, HostStoreBootstrapRequirement,
+    KernelActivationPermit, KernelActivationQuery, KernelActivationReceipt, KernelControlCommand,
+    KernelControlRequest, KernelControlResponse, KernelReadyReceipt, KernelServiceState,
     ProcessAuthorityHandoffDescriptor, RestartBudget, StoreBootstrapHandoff, StoreProcessBinding,
     StoreRebindHandoff, StoreRebindQuery, StoreRebindReceipt, control_request_frame,
     decode_control_response_frame, semantic_store_config_hash_from_json,
@@ -1688,6 +1691,8 @@ use eliot_runtime_contracts::{
     WATCHDOG_PUBLICATION_FILE_NAME, WATCHDOG_PUBLICATION_RETAINED_LIMIT, WatchdogAdmissionTemplate,
     WatchdogPublicationBundle, WatchdogPublicationRetentionPlan,
 };
+#[cfg(windows)]
+use eliot_runtime_contracts::{admit_module_manifest, admitted_manifest_path};
 use sha2::{Digest as _, Sha256};
 
 #[cfg(windows)]
@@ -2777,9 +2782,12 @@ impl HostJobBranches {
             host_state_root,
             store_data_root,
         )?;
+        let module_build_provenance =
+            Self::readback_module_build_provenance_for_startup(journal, &evidence, candidate)?;
         Self::send_bound_host_startup_evidence(
             transport,
             &evidence,
+            Some(module_build_provenance),
             candidate,
             generation_handle,
             sequence,
@@ -2804,6 +2812,7 @@ impl HostJobBranches {
     async fn send_bound_host_startup_evidence(
         transport: &mut NamedPipeTransport,
         evidence: &HostStartupEvidence,
+        module_build_provenance: Option<Vec<ModuleBuildProvenanceRecord>>,
         candidate: &HostKernelCandidateBinding,
         generation_handle: &PlatformHandle,
         sequence: u64,
@@ -2811,7 +2820,10 @@ impl HostJobBranches {
         let request = kernel_control_request(
             candidate,
             evidence.state_fence.resource_generation,
-            KernelControlCommand::ReportHostStartupEvidence(evidence.clone()),
+            KernelControlCommand::ReportHostStartupEvidence(HostStartupEvidenceReport {
+                startup_evidence: evidence.clone(),
+                module_build_provenance,
+            }),
             sequence,
         )?;
         let frame = control_request_frame(
@@ -2850,6 +2862,95 @@ impl HostJobBranches {
             ));
         }
         Ok(())
+    }
+
+    /// Returns the exact current-activation module rows Host journaled and read
+    /// back before it sends candidate startup evidence. The journal head must
+    /// still equal the head observed by the evidence producer so a stale row
+    /// set cannot be paired with a later or earlier checksum.
+    #[cfg(windows)]
+    fn readback_module_build_provenance_for_startup<B: JournalBackend>(
+        journal: &HostStateJournalService<B>,
+        evidence: &HostStartupEvidence,
+        candidate: &HostKernelCandidateBinding,
+    ) -> Result<Vec<ModuleBuildProvenanceRecord>, HostError> {
+        let state = journal
+            .snapshot()
+            .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        if state.last_checksum.as_deref() != Some(evidence.host_record_checksum.as_str()) {
+            return Err(HostError::RecoveryRequired(
+                "Host provenance readback no longer matches the startup-evidence journal head"
+                    .to_owned(),
+            ));
+        }
+        let activation = state.activation.as_ref().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "Host activation is missing during module provenance readback".to_owned(),
+            )
+        })?;
+        let fence = &activation.fence;
+        if fence.host != state.host
+            || fence.host.installation != candidate.installation_id
+            || fence.host.epoch.current.lineage_id.as_str()
+                != candidate
+                    .supervision_incarnation
+                    .host_epoch
+                    .lineage_id
+                    .as_str()
+            || fence.host.epoch.current.sequence.get() != candidate.host_epoch.value()
+            || fence.activation_id != candidate.activation_id
+            || fence.activation_generation.current.lineage_id.as_str()
+                != candidate
+                    .supervision_incarnation
+                    .activation_generation
+                    .lineage_id
+                    .as_str()
+            || fence.activation_generation.current.sequence.get()
+                != candidate
+                    .supervision_incarnation
+                    .activation_generation
+                    .sequence
+        {
+            return Err(HostError::RecoveryRequired(
+                "Host provenance fence differs from the current candidate activation".to_owned(),
+            ));
+        }
+        let records = state.module_build_provenance;
+        if records.is_empty() {
+            return Err(HostError::RecoveryRequired(
+                "Host journal has no module provenance rows for candidate startup".to_owned(),
+            ));
+        }
+        for record in &records {
+            if record.fence != *fence {
+                return Err(HostError::RecoveryRequired(
+                    "Host journal contains a module provenance row from another activation fence"
+                        .to_owned(),
+                ));
+            }
+            record
+                .validate()
+                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+            let journal_record = HostStateRecord::ModuleBuildProvenance(record.clone());
+            let expected_checksum = record_checksum(&journal_record)
+                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+            let matching_operations = state
+                .applied_operations
+                .iter()
+                .filter(|applied| applied.identity == record.operation)
+                .collect::<Vec<_>>();
+            if matching_operations.len() != 1
+                || matching_operations
+                    .first()
+                    .is_none_or(|applied| applied.checksum != expected_checksum)
+            {
+                return Err(HostError::RecoveryRequired(
+                    "Host module provenance row lacks its exact journal operation readback"
+                        .to_owned(),
+                ));
+            }
+        }
+        Ok(records)
     }
 
     /// Completes the authenticated Host↔Kernel lifecycle before Host
@@ -4277,6 +4378,7 @@ impl HostJobBranches {
             HostJobBranches::send_bound_host_startup_evidence(
                 &mut transport,
                 supervision_evidence,
+                None,
                 candidate,
                 approved_generation,
                 1,
@@ -5445,6 +5547,33 @@ pub struct HostPhaseBMaterialization {
 }
 
 #[cfg(windows)]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModuleBuildSourceProof {
+    schema_version: u32,
+    module_id: String,
+    package: String,
+    binary: String,
+    artifact_path: String,
+    artifact_sha256: String,
+    artifact_bytes: u64,
+    manifest_path: String,
+    manifest_sha256: String,
+    manifest_bytes: u64,
+    source_commit: String,
+    source_tree_id: String,
+    builder_script_sha256: String,
+    cargo_manifest_sha256: String,
+    cargo_lock_sha256: String,
+    rust_toolchain_sha256: String,
+    daemon_contract_source_sha256: String,
+    module_manifest_source_sha256: String,
+    cargo_profile: String,
+    build_target: String,
+    build_argv: Vec<String>,
+}
+
+#[cfg(windows)]
 impl HostPhaseBMaterialization {
     /// Returns the immutable candidate manifest digest bound by this receipt.
     #[must_use]
@@ -5703,12 +5832,44 @@ const BACKUP_DISPATCH_ANSWER_DEADLINE: std::time::Duration = std::time::Duration
 /// One admitted backup operation handed from the registered owner to the live
 /// Host composition, with the single-slot answer channel the pipe server thread
 /// is blocked on.
+///
+/// The answer carries the owner's typed outcome, not a bare success. A channel
+/// typed `Result<(), BackupDispatchRefusal>` forces every owner result to
+/// collapse into `Ok(())` or into a refusal that claims no effect existed,
+/// which is exactly the distinction this carrier exists to preserve (#962).
 #[cfg(windows)]
 struct BackupDispatchWork {
     /// The exact admitted request the endpoint already gated and validated.
     request: eliot_host_control_endpoint::BackupRuntimeControlRequest,
     /// Answers this one operation back to the blocked owner call.
-    answer: std::sync::mpsc::SyncSender<Result<(), BackupDispatchRefusal>>,
+    answer: std::sync::mpsc::SyncSender<Result<BackupOwnerOutcome, BackupDispatchRefusal>>,
+}
+
+/// Names the operation this Host still retains for one admitted request.
+///
+/// This is the owner's own retained-operation reference, not a requester retry
+/// token: the operation, the canonical `#954` request-identity digest of the
+/// admitted body, and the admitted owner are read back from the request the
+/// endpoint already gated, never from a value the composition selects here. An
+/// operation whose retained identity cannot be named from the admitted request
+/// is refused, because a reference the owner cannot name is evidence about no
+/// operation at all.
+#[cfg(windows)]
+fn retained_backup_operation(
+    request: &eliot_host_control_endpoint::BackupRuntimeControlRequest,
+) -> Result<BackupRetainedOperation, BackupDispatchRefusal> {
+    let identity_digest = PlatformHandle::new(request.body.identity().identity_digest.clone())
+        .map_err(|_| {
+            BackupDispatchRefusal::new(
+                request.operation,
+                "the admitted backup request carries no nameable retained operation identity",
+            )
+        })?;
+    Ok(BackupRetainedOperation {
+        operation: request.operation,
+        identity_digest,
+        owner: request.owner.clone(),
+    })
 }
 
 /// The bounded handoff state shared by the registered owner and the composition.
@@ -5764,15 +5925,23 @@ impl HostBackupDispatchQueue {
     /// Hands one admitted request to the live composition and blocks for the
     /// owner's answer within the bounded deadline.
     ///
-    /// `Ok(())` is returned only after the composition ran the exact owner
-    /// operation that request resolved to, so a transport acknowledgement is
-    /// never reported as backup semantic success. A full handoff, a closed
-    /// handoff, and an unanswered operation are three distinct typed refusals,
-    /// the first two produced before the composition is entered at all.
+    /// The returned value is the owner's typed outcome, so a transport
+    /// acknowledgement is never reported as backup semantic success and an
+    /// operation whose effect is unestablished is never reported as an
+    /// effect-free refusal. The two failures of this handoff are deliberately
+    /// different in kind and stay that way:
+    ///
+    /// - a full or closed handoff refuses **before** the composition is
+    ///   entered, so no effect can exist and a pre-effect
+    ///   [`BackupDispatchRefusal`] is exact;
+    /// - an operation that was handed over and then went unanswered may or may
+    ///   not have run, so it is reported as
+    ///   [`BackupOwnerOutcome::PossibleEffect`] over the retained operation,
+    ///   never as a refusal.
     fn submit(
         &self,
         request: &eliot_host_control_endpoint::BackupRuntimeControlRequest,
-    ) -> Result<(), BackupDispatchRefusal> {
+    ) -> Result<BackupOwnerOutcome, BackupDispatchRefusal> {
         let operation = request.operation;
         let (answer, answered) = std::sync::mpsc::sync_channel(1);
         self.handoff
@@ -5789,13 +5958,14 @@ impl HostBackupDispatchQueue {
             })?;
         match answered.recv_timeout(BACKUP_DISPATCH_ANSWER_DEADLINE) {
             Ok(outcome) => outcome,
-            // A disconnected requester and an unanswered operation are the
-            // same honest answer here: the operation stays admitted at the
-            // owner, and this refusal is not a claim that no effect exists.
-            Err(_) => Err(BackupDispatchRefusal::new(
-                operation,
-                "the live Host composition did not answer this admitted backup operation within its bounded deadline",
-            )),
+            // The work was handed to the live composition before this deadline,
+            // so it may already have run and only its answer was lost. That is
+            // precisely the possible-effect state: the operation is preserved
+            // and reconciled by identity, and a refusal here would falsely
+            // claim that no effect exists.
+            Err(_) => Ok(BackupOwnerOutcome::PossibleEffect {
+                retained: retained_backup_operation(request)?,
+            }),
         }
     }
 
@@ -5833,9 +6003,11 @@ impl HostBackupDispatchQueue {
 /// [`HostComposition::backup_dispatch_prepare`] and
 /// [`HostComposition::backup_dispatch_cutover`], still refuse — and each names
 /// the exact owner obligation that is absent rather than being a blanket
-/// error: the closed `#954` [`BackupRuntimeControlRequest`] envelope carries no
-/// admitted preparation body, and retained Host state carries no owner-issued
-/// isolated-restore staging parent for a prepare to write into.
+/// error: retained Host state carries no owner-issued isolated-restore staging
+/// parent for a prepare to write into, and the Host cutover-intent owner has
+/// issued no separately admitted cutover body. Both refusals are pre-effect:
+/// each is decided before its arm is entered, so neither leaves an unresolved
+/// effect that would have to be reconciled.
 #[cfg(windows)]
 pub struct HostBackupDispatchOwner {
     /// The live composition's bounded handoff. This is the owner's real state,
@@ -5858,7 +6030,7 @@ impl eliot_host_control_endpoint::HostBackupOwner for HostBackupDispatchOwner {
     fn dispatch_backup_operation(
         &self,
         request: &eliot_host_control_endpoint::BackupRuntimeControlRequest,
-    ) -> Result<(), eliot_host_control_endpoint::BackupDispatchRefusal> {
+    ) -> Result<BackupOwnerOutcome, BackupDispatchRefusal> {
         use eliot_host_control_endpoint::BackupDispatchRefusal;
         let operation = request.operation;
         let refusal = |reason: &'static str| BackupDispatchRefusal::new(operation, reason);
@@ -6125,10 +6297,21 @@ impl HostComposition {
     /// Runs the one owner operation an admitted backup request resolved to,
     /// against this composition's real retained owner state (#962).
     ///
-    /// `Ok(())` means the owner operation really ran and reached its own
-    /// success case; every other outcome is the typed
-    /// [`BackupDispatchRefusal`] naming the owner obligation that is missing,
-    /// and is produced before any effect.
+    /// The answer is this owner's own retained evidence, and the four states
+    /// stay distinct because they are four different facts about the admitted
+    /// operation, not four spellings of one:
+    ///
+    /// - [`BackupOwnerOutcome::Admitted`] — the owner still retains this exact
+    ///   operation and it is in flight: nothing is claimed as done;
+    /// - [`BackupOwnerOutcome::Completed`] — the owner re-proved the retained
+    ///   record against the live root and issues its own attestation;
+    /// - [`BackupOwnerOutcome::PossibleEffect`] — the operation is retained but
+    ///   its effect may or may not have committed, so the original operation
+    ///   must be reconciled rather than retried;
+    /// - [`BackupDispatchRefusal`] — refused **before** any effect.
+    ///
+    /// An owner result is never a refusal. A refusal is only ever produced by
+    /// a gate that ran before this composition entered its operation.
     ///
     /// # Terminal ownership (F-LOG-HOST-8, #983 W4)
     ///
@@ -6169,11 +6352,12 @@ impl HostComposition {
     fn dispatch_backup_owner_operation(
         &self,
         request: &eliot_host_control_endpoint::BackupRuntimeControlRequest,
-    ) -> Result<(), BackupDispatchRefusal> {
-        // Armed on entry, disarmed on the operation's own `Ok` return below, so
-        // every other outcome — the closed-table miss, the reconciliation read's
-        // typed refusals, and the two named owner refusals for the prepare and
-        // cutover arms — emits exactly one terminal record for this operation.
+    ) -> Result<BackupOwnerOutcome, BackupDispatchRefusal> {
+        // Armed on entry, disarmed only where this composition reached a real
+        // owner success, so every other outcome — the closed-table miss, the
+        // reconciliation read's possible-effect and refusal arms, and the two
+        // named owner refusals for the prepare and cutover arms — emits exactly
+        // one terminal record for this operation.
         let mut host_terminal = HostTerminalGuard::armed(BOUNDARY_BACKUP_DISPATCH_TERMINAL);
         let operation = request.operation;
         let Some(target) = HostComposition::backup_dispatch_target(operation) else {
@@ -6191,61 +6375,131 @@ impl HostComposition {
             BackupDispatchTarget::Reconcile => {
                 match self.backup_dispatch_reconcile(request.request_id.as_str()) {
                     // The owner re-verified this operation's recorded result
-                    // against the live root. That is the owner's own success,
-                    // not a transport acknowledgement.
-                    Ok(crate::backup_preparation::ReconcileDisposition::Current(_)) => Ok(()),
+                    // against the live root. This is the owner's own read
+                    // result, so it is reported as the owner retained the
+                    // operation and nothing further is claimed: the retained
+                    // preparation is the evidence, and the requester reads that
+                    // same retained operation rather than resubmitting.
+                    //
+                    // It is deliberately NOT `Completed`. A `Completed` outcome
+                    // carries a `#954` `BackupPhaseAttestation`, and this Host
+                    // holds none of what one requires: it is no attested backup
+                    // role for the reconciled stage, issues no backup
+                    // `ReceiptId`, and retains no archive identity or `#954`
+                    // `StateFence` for it. Minting one here would be exactly the
+                    // fabricated owner receipt the audit forbids, and the
+                    // endpoint would refuse it at re-validation anyway.
+                    Ok(crate::backup_preparation::ReconcileDisposition::Current(_)) => {
+                        Ok(BackupOwnerOutcome::Admitted {
+                            retained: retained_backup_operation(request)?,
+                        })
+                    }
+                    // No record at all: nothing was ever admitted for this
+                    // operation, so no effect can be outstanding and a
+                    // pre-effect refusal is exact.
                     Ok(crate::backup_preparation::ReconcileDisposition::Absent) => {
                         Err(BackupDispatchRefusal::new(
                             operation,
                             "this Host retains no isolated-restore preparation for the admitted operation",
                         ))
                     }
+                    // The reclamation finished: the recorded destination was
+                    // removed and its absence was observed, so the operation is
+                    // terminal. It is answered as a refusal in the same shape as
+                    // the `Absent` arm above — this Host will take no effect for
+                    // this operation, and nothing is left to do — rather than as
+                    // `PossibleEffect`.
+                    //
+                    // It must NOT be `PossibleEffect`: that disposition tells the
+                    // requester the effect may or may not have committed and the
+                    // operation must be preserved and waited on, which is exactly
+                    // wrong for an operation whose root is already gone. It is
+                    // not `Admitted` either, which claims the operation is still
+                    // executing, and it is not `Completed`, which this Host must
+                    // not mint without a `#954` `BackupPhaseAttestation` (see the
+                    // `Current` arm above).
+                    Ok(crate::backup_preparation::ReconcileDisposition::Reclaimed) => {
+                        Err(BackupDispatchRefusal::new(
+                            operation,
+                            "this Host already reclaimed the admitted operation's isolated-restore destination and observed its absence: the operation is finished, its root is gone, and there is nothing to preserve and nothing to retry",
+                        ))
+                    }
+                    // Two dispositions, one answer, because they are the same
+                    // fact about authority.
+                    //
+                    // `AdmittedWithoutResult`: intent is durable, no result was
+                    // ever recorded, and the derived root is not observable. The
+                    // owner's own record calls the outcome UNKNOWN and says the
+                    // effect "may or may not have happened before the process
+                    // stopped". That is the possible-effect state, NOT an
+                    // in-flight admitted one: reporting it as `Admitted` would
+                    // tell the requester the operation is still running and
+                    // invite a second preparation under the same operation id.
+                    //
+                    // `Uncertain`: a recorded result that cannot be re-proved
+                    // against the live root, or a cleanup transition whose
+                    // removal effect nobody observed. Either way the effects are
+                    // unestablished, so the retained operation is preserved and
+                    // reconciled, never deleted and never retried blindly. A
+                    // record whose reclamation COMPLETED is not here: the owner
+                    // observed that absence, and the `Reclaimed` arm above says
+                    // so instead of sending a finished operation into a
+                    // preserve-and-wait loop.
+                    //
+                    // They are one arm because they carry the same obligation -
+                    // reconcile the original operation - and splitting them would
+                    // assert a distinction the owner does not make.
+                    //
+                    // The journal's own read failure joins them: it is a real
+                    // read failure, not a claim that no preparation ran, so it
+                    // carries the same obligation - reconcile the original
+                    // operation - and the same answer. A single arm keeps the
+                    // claim honest: the owner cannot distinguish these, and
+                    // neither can this projection.
                     Ok(
                         crate::backup_preparation::ReconcileDisposition::AdmittedWithoutResult {
                             ..
-                        },
-                    ) => Err(BackupDispatchRefusal::new(
-                        operation,
-                        "the admitted preparation is durable without a recorded result and must be reconciled, never re-prepared",
-                    )),
-                    Ok(crate::backup_preparation::ReconcileDisposition::Uncertain { .. }) => {
-                        Err(BackupDispatchRefusal::new(
-                            operation,
-                            "the retained preparation outcome is unestablished and is preserved, never re-prepared",
-                        ))
-                    }
-                    Err(_) => Err(BackupDispatchRefusal::new(
-                        operation,
-                        "the Host preparation journal refused to reconcile this admitted operation",
-                    )),
+                        }
+                        | crate::backup_preparation::ReconcileDisposition::Uncertain { .. },
+                    )
+                    | Err(_) => Ok(BackupOwnerOutcome::PossibleEffect {
+                        retained: retained_backup_operation(request)?,
+                    }),
                 }
             }
-            // Named owner refusal, not a blanket error. Preparing needs an
-            // owner-issued isolated-restore staging parent, and retained Host
-            // state has none: every root `RuntimeStateRoots` derives
-            // (host/kernel/store/watchdog) lives under the installation root,
-            // which IS the preparation source, and `admit_staging_parent`
-            // refuses any staging parent nested under the source. The missing
-            // owner is the installation root contract, which must derive a
-            // destination parent outside the source installation root.
+            // Named owner refusal, not a blanket error, and PRE-EFFECT: this
+            // arm refuses before `prepare_backup_destination` is entered.
+            // Preparing needs an owner-issued isolated-restore staging parent,
+            // and retained Host state has none: every root `RuntimeStateRoots`
+            // derives (host/kernel/store/watchdog) lives under the installation
+            // root, which IS the preparation source, and
+            // `admit_staging_parent` refuses any staging parent nested under
+            // the source. The missing owner is the installation root contract,
+            // which must derive a destination parent outside the source
+            // installation root. No destination is created, so a refusal here
+            // still means no effect.
             BackupDispatchTarget::Prepare => Err(BackupDispatchRefusal::new(
                 operation,
                 "no owner-issued isolated-restore staging parent exists in retained Host state: every derived runtime root is the preparation source, and a staging parent nested under the source is refused",
             )),
-            // Named owner refusal. A cutover needs a separately admitted
-            // `CutoverRequest` body that the closed `#954` envelope does not
-            // carry and that the Host cutover-intent owner has issued no record
-            // of, so no body can be constructed here without fabricating one.
+            // Named owner refusal, also PRE-EFFECT: it refuses before
+            // `backup_dispatch_cutover` is entered. A cutover needs a separately
+            // admitted `CutoverRequest` body that the closed `#954` envelope does
+            // not carry and that the Host cutover-intent owner has issued no
+            // record of, so no body can be constructed here without fabricating
+            // one. Nothing is activated, so a refusal here still means no
+            // effect.
             BackupDispatchTarget::Cutover => Err(BackupDispatchRefusal::new(
                 operation,
                 "no separately admitted cutover body is retained by the Host cutover-intent owner for this operation",
             )),
         };
-        // The operation reached its own success case, so it owns no terminal
-        // record. This is the only disarm on the path: every `Err` arm above
-        // drops armed and emits exactly one, and the returned refusal is the
-        // owner's own value, unchanged.
-        if outcome.is_ok() {
+        // Only a real owner success releases the terminal record. An
+        // `Admitted` read and a `PossibleEffect` answer are both genuine
+        // answers this owner reached, so neither is an operation failure; every
+        // `Err` arm above drops armed and emits exactly one, and the returned
+        // value is the owner's own, unchanged.
+        if matches!(&outcome, Ok(BackupOwnerOutcome::Admitted { .. })) {
             host_terminal.disarm();
         }
         outcome
@@ -6782,8 +7036,9 @@ impl HostComposition {
     /// [`crate::backup_cutover::CutoverOutcome::residual`] names whatever
     /// uncertainty the owners left behind. No caller assertion is accepted: this
     /// port takes no `validated` flag, so the pure mapper cannot certify
-    /// qualification from a caller's word, and an unqualified read answers
-    /// `Requested`. The optional `retirement_receipt`
+    /// qualification from a caller's word, and a COHERENT unqualified read
+    /// answers `Requested` while a torn journal/registry pair answers
+    /// `Unknown` with `ConcurrentOwnerMovement`. The optional `retirement_receipt`
     /// is a lookup HINT, never the proof: it is believed only when it names the
     /// transaction identity the journal owner computed for the record it
     /// resolved, so an unrelated genuine `AppendReceipt` cannot produce
@@ -9354,6 +9609,297 @@ impl HostComposition {
     #[cfg(windows)]
     #[allow(
         clippy::too_many_lines,
+        reason = "module source admission and journal readback remain one fenced Host lifecycle transition"
+    )]
+    fn admit_and_record_module_build_provenance(
+        &mut self,
+        launch: &RuntimeLaunchDescriptor,
+        fence: &RecordFence,
+    ) -> Result<(), HostError> {
+        const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+        const MAX_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
+        const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+        const MAX_PROVENANCE_BYTES: u64 = 64 * 1024;
+        let error = |reason: String| HostError::RecoveryRequired(reason);
+        let hash_bytes = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+        let is_lower_digest = |value: &str| {
+            valid_sha256_text(value) && value.bytes().all(|byte| !byte.is_ascii_uppercase())
+        };
+        let make_handle = |value: &str, field: &str| {
+            PlatformHandle::new(value.to_owned()).map_err(|handle_error| {
+                HostError::ProcessContour(format!("{field}: {handle_error}"))
+            })
+        };
+        let artifact_path = Path::new(launch.eliotd_executable_path.as_str());
+        if !artifact_path.is_absolute() {
+            return Err(error(
+                "approved eliotd artifact path is not absolute".to_owned(),
+            ));
+        }
+        let artifact_lease = open_launch_lease(
+            launch.profile,
+            self.jobs.portable_root.as_ref(),
+            artifact_path,
+        )?;
+        if artifact_lease.path() != artifact_path {
+            return Err(error(
+                "eliotd artifact lease differs from the active launch descriptor".to_owned(),
+            ));
+        }
+        artifact_lease.verify().map_err(HostError::ProcessContour)?;
+        verify_launch_digest(
+            &artifact_lease,
+            &launch.eliotd_artifact_digest,
+            "runtime.eliotd_artifact",
+        )?;
+        let artifact_bytes = artifact_lease
+            .read_bounded(MAX_ARTIFACT_BYTES)
+            .map_err(HostError::ProcessContour)?;
+        artifact_lease.verify().map_err(HostError::ProcessContour)?;
+        let artifact_sha256 = hash_bytes(&artifact_bytes);
+        if artifact_sha256 != launch.eliotd_artifact_digest.as_str() {
+            return Err(error(
+                "retained eliotd artifact bytes differ from the active launch digest".to_owned(),
+            ));
+        }
+        let artifact_bytes_len = u64::try_from(artifact_bytes.len())
+            .map_err(|_| error("eliotd artifact size exceeds its bound".to_owned()))?;
+        let artifact_id = ArtifactId::new(&artifact_sha256)
+            .map_err(|contract_error| error(contract_error.to_string()))?;
+        let module_id = ContractId::new("eliotd")
+            .map_err(|contract_error| error(contract_error.to_string()))?;
+
+        let manifest_path = admitted_manifest_path(artifact_lease.path(), &module_id)
+            .map_err(|contract_error| error(contract_error.to_string()))?;
+        let manifest_lease = open_launch_lease(
+            launch.profile,
+            self.jobs.portable_root.as_ref(),
+            &manifest_path,
+        )?;
+        let manifest_bytes = manifest_lease
+            .read_bounded(MAX_MANIFEST_BYTES)
+            .map_err(HostError::ProcessContour)?;
+        manifest_lease.verify().map_err(HostError::ProcessContour)?;
+        let admitted = admit_module_manifest(&artifact_id, &manifest_bytes)
+            .map_err(|contract_error| error(contract_error.to_string()))?;
+        if admitted.module_id != module_id || admitted.artifact_id != artifact_id {
+            return Err(error(
+                "admitted module manifest differs from the approved eliotd identity".to_owned(),
+            ));
+        }
+        let manifest_bytes_len = u64::try_from(manifest_bytes.len())
+            .map_err(|_| error("module manifest size exceeds its bound".to_owned()))?;
+
+        let provenance_path = manifest_path.with_file_name("module.eliotd.provenance.json");
+        let provenance_lease = open_launch_lease(
+            launch.profile,
+            self.jobs.portable_root.as_ref(),
+            &provenance_path,
+        )?;
+        let provenance_bytes = provenance_lease
+            .read_bounded(MAX_PROVENANCE_BYTES)
+            .map_err(HostError::ProcessContour)?;
+        provenance_lease
+            .verify()
+            .map_err(HostError::ProcessContour)?;
+        let source: ModuleBuildSourceProof =
+            serde_json::from_slice(&provenance_bytes).map_err(|parse_error| {
+                error(format!("module source proof is malformed: {parse_error}"))
+            })?;
+        let provenance_sha256 = hash_bytes(&provenance_bytes);
+        let provenance_bytes_len = u64::try_from(provenance_bytes.len())
+            .map_err(|_| error("module provenance size exceeds its bound".to_owned()))?;
+        let expected_build_arguments = [
+            "build",
+            "--frozen",
+            "--locked",
+            "--offline",
+            "--release",
+            "-p",
+            "eliotd",
+            "--bin",
+            "eliotd",
+        ];
+        let source_identity_valid = [
+            source.source_commit.as_str(),
+            source.source_tree_id.as_str(),
+        ]
+        .into_iter()
+        .all(|value| {
+            (40..=64).contains(&value.len())
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        });
+        let source_hashes_valid = [
+            source.builder_script_sha256.as_str(),
+            source.cargo_manifest_sha256.as_str(),
+            source.cargo_lock_sha256.as_str(),
+            source.rust_toolchain_sha256.as_str(),
+            source.daemon_contract_source_sha256.as_str(),
+            source.module_manifest_source_sha256.as_str(),
+        ]
+        .into_iter()
+        .all(is_lower_digest);
+        if source.schema_version != 1
+            || source.module_id != "eliotd"
+            || source.package != "eliotd"
+            || source.binary != "eliotd"
+            || source.artifact_path != "runtime/eliotd.exe"
+            || source.artifact_sha256 != artifact_sha256
+            || source.artifact_bytes != artifact_bytes_len
+            || source.manifest_path != "runtime/module.eliotd.toml"
+            || source.manifest_sha256 != admitted.manifest_digest
+            || source.manifest_bytes != manifest_bytes_len
+            || !source_identity_valid
+            || !source_hashes_valid
+            || source.cargo_profile != "release"
+            || source.build_target != "x86_64-pc-windows-msvc"
+            || source
+                .build_argv
+                .iter()
+                .map(String::as_str)
+                .ne(expected_build_arguments)
+            || !is_lower_digest(&source.artifact_sha256)
+            || !is_lower_digest(&source.manifest_sha256)
+            || provenance_bytes.is_empty()
+        {
+            return Err(error(
+                "module-specific source/build proof does not bind the exact active eliotd artifact and manifest".to_owned(),
+            ));
+        }
+        let config_lease =
+            self.jobs.eliotd_config_lease.as_ref().ok_or_else(|| {
+                error("active eliotd Governor config lease is missing".to_owned())
+            })?;
+        if config_lease.path() != Path::new(launch.eliotd_config_path.as_str()) {
+            return Err(error(
+                "eliotd config lease differs from the active launch descriptor".to_owned(),
+            ));
+        }
+        config_lease.verify().map_err(HostError::ProcessContour)?;
+        verify_launch_digest(
+            config_lease,
+            &launch.eliotd_config_digest,
+            "runtime.eliotd_config",
+        )?;
+        let config_bytes = config_lease
+            .read_bounded(MAX_CONFIG_BYTES)
+            .map_err(HostError::ProcessContour)?;
+        config_lease.verify().map_err(HostError::ProcessContour)?;
+        if hash_bytes(&config_bytes) != launch.eliotd_config_digest.as_str() {
+            return Err(error(
+                "retained eliotd config bytes differ from the active launch digest".to_owned(),
+            ));
+        }
+        let profile = match launch.profile {
+            InstallationProfile::SystemService => "system_service",
+            InstallationProfile::UserMode => "user_mode",
+            InstallationProfile::PortableDev => "portable_dev",
+        };
+        let operation = IdempotencyIdentity {
+            operation_id: make_handle("module-build-provenance:eliotd", "module operation")?,
+            idempotency_key: make_handle(
+                &format!(
+                    "activation:{}:{}:{}",
+                    fence.activation_id,
+                    fence.activation_generation.current.lineage_id.as_str(),
+                    fence.activation_generation.current.sequence.get()
+                ),
+                "module idempotency key",
+            )?,
+        };
+        let record = ModuleBuildProvenanceRecord {
+            fence: fence.clone(),
+            operation,
+            module_id: make_handle(&source.module_id, "module id")?,
+            artifact_path: make_handle(&source.artifact_path, "artifact path")?,
+            artifact_digest: make_handle(&source.artifact_sha256, "artifact digest")?,
+            artifact_bytes: source.artifact_bytes,
+            config_digest: launch.eliotd_config_digest.clone(),
+            state_fence_digest: make_handle(
+                &sha256_json(&launch.authority_state_fence)?,
+                "state fence digest",
+            )?,
+            installation_profile: make_handle(profile, "installation profile")?,
+            manifest_path: make_handle(&source.manifest_path, "manifest path")?,
+            manifest_digest: make_handle(&admitted.manifest_digest, "manifest digest")?,
+            manifest_bytes: source.manifest_bytes,
+            contract_digest: make_handle(&admitted.contract_digest, "contract digest")?,
+            protocol_set_digest: make_handle(
+                &sha256_json(&admitted.contract.protocols)?,
+                "protocol set digest",
+            )?,
+            provenance_path: make_handle(
+                "runtime/module.eliotd.provenance.json",
+                "provenance path",
+            )?,
+            provenance_digest: make_handle(&provenance_sha256, "provenance digest")?,
+            provenance_bytes: provenance_bytes_len,
+            source_commit: make_handle(&source.source_commit, "source commit")?,
+            source_tree_id: make_handle(&source.source_tree_id, "source tree")?,
+            builder_script_digest: make_handle(
+                &source.builder_script_sha256,
+                "builder script digest",
+            )?,
+            cargo_manifest_digest: make_handle(
+                &source.cargo_manifest_sha256,
+                "Cargo manifest digest",
+            )?,
+            cargo_lock_digest: make_handle(&source.cargo_lock_sha256, "Cargo lock digest")?,
+            rust_toolchain_digest: make_handle(
+                &source.rust_toolchain_sha256,
+                "Rust toolchain digest",
+            )?,
+            daemon_contract_source_digest: make_handle(
+                &source.daemon_contract_source_sha256,
+                "daemon contract source digest",
+            )?,
+            module_manifest_source_digest: make_handle(
+                &source.module_manifest_source_sha256,
+                "module manifest source digest",
+            )?,
+            cargo_profile: make_handle(&source.cargo_profile, "Cargo profile")?,
+            build_target: make_handle(&source.build_target, "build target")?,
+            build_arguments: source
+                .build_argv
+                .iter()
+                .map(|argument| make_handle(argument, "Cargo build argument"))
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        let journal_record = HostStateRecord::ModuleBuildProvenance(record.clone());
+        let expected_checksum = record_checksum(&journal_record)?;
+        self.append_record(journal_record)?;
+        let readback = self.journal.snapshot()?;
+        let matching_records = readback
+            .module_build_provenance
+            .iter()
+            .filter(|existing| existing.module_id == record.module_id)
+            .collect::<Vec<_>>();
+        let matching_operation = readback
+            .applied_operations
+            .iter()
+            .find(|applied| applied.identity == record.operation);
+        if readback
+            .activation
+            .as_ref()
+            .is_none_or(|activation| activation.fence != *fence)
+            || matching_records.len() != 1
+            || matching_records
+                .first()
+                .is_none_or(|existing| *existing != &record)
+            || matching_operation.is_none_or(|applied| applied.checksum != expected_checksum)
+        {
+            return Err(error(
+                "Host module source proof append did not pass exact journal readback".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
         reason = "ordered Phase-B receipt admission, sibling start, and child readiness remain one fenced lifecycle boundary"
     )]
     fn start_manifest_contour(
@@ -9417,6 +9963,17 @@ impl HostComposition {
         next.trigger_evidence
             .push(phase_b_activation_binding(&phase_b)?);
         self.append_record(HostStateRecord::Activation(next))?;
+        let starting_activation = self.journal.snapshot()?.activation.ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "Host activation disappeared after the Starting append".to_owned(),
+            )
+        })?;
+        if starting_activation.state != ActivationState::Starting {
+            return Err(HostError::RecoveryRequired(
+                "Host activation readback is not in the Starting state".to_owned(),
+            ));
+        }
+        self.admit_and_record_module_build_provenance(&phase_b.launch, &starting_activation.fence)?;
         // I1.5 "start only the remaining capabilities required by the admitted
         // request". The set that may gate this contour is the one the
         // activation generation itself durably carries, read back from the

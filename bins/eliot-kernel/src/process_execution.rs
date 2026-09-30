@@ -278,12 +278,13 @@ pub(crate) struct GovernedProcessEffectSource {
 /// from a real file open: two opens at capture (which must agree, or the
 /// operation runs unobserved) and two opens at readback (which the ledger
 /// itself compares, with disagreement refused as `UnstableReadback`). The
-/// admission-pinned digest is the independent authority a capture is
-/// compared against: a transition the new admission explains (re-pinned
-/// image) is adopted, while a transition no admission explains is ingested
-/// as a `FilesystemNotification` hint and confirmed Material on the spot,
-/// so an external uncorrelated mutation emits an unknown-origin change and
-/// blocks governed acceptance until reconciled. Per-artifact last-observed
+/// admission-pinned digest is only the lease authority the capture
+/// validates against: any transition between the retained previous digest
+/// and two fresh agreeing reads is ingested as a
+/// `FilesystemNotification` hint and confirmed Material on the spot, so an
+/// external uncorrelated mutation emits an unknown-origin change and blocks
+/// governed acceptance until a recorded governed change reconciles it.
+/// Per-artifact last-observed
 /// digests are retained here under one mutex (atomic publish); the ledger
 /// itself stays the only acceptance gate.
 pub(crate) struct KernelGovernedProcessEffectPort {
@@ -317,11 +318,11 @@ impl KernelGovernedProcessEffectPort {
         hint_id: &str,
         hint: change_monitor::KernelChangeHint,
         verification: &change_monitor::HintVerification,
-    ) {
+    ) -> bool {
         if change_monitor::ingest_hint(hint).is_err() {
-            return;
+            return false;
         }
-        let _ = change_monitor::confirm_hint(hint_id, verification);
+        change_monitor::confirm_hint(hint_id, verification).is_ok()
     }
 }
 
@@ -375,14 +376,17 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
             .lock()
             .ok()
             .and_then(|last| last.get(&resource).cloned());
+        let mut transition_unrecorded = false;
         if let Some(previous) = previous
             && previous != first_digest
-            && first_digest != source.expected_sha256
         {
-            // The image moved between independent observations and the new
-            // admission still pins the old bytes: no governed operation
-            // explains the transition, so it is external and uncorrelated.
-            // Both agreeing capture reads become the confirmation evidence.
+            // The image moved between independent observations: the retained
+            // previous digest against two fresh agreeing reads is evidence
+            // no admission explains by itself (a re-pinned admission digest
+            // only proves the lease scope, not who wrote the bytes), so the
+            // transition is external and uncorrelated until a recorded
+            // governed change reconciles it. Both agreeing capture reads
+            // become the confirmation evidence.
             let hint_id = change_monitor::filesystem_hint_id(&artifact, &previous);
             let hint = change_monitor::KernelChangeHint {
                 hint_id: hint_id.clone(),
@@ -401,9 +405,10 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
                 },
                 git: None,
             };
-            Self::confirm_external_transition(&hint_id, hint, &verification);
+            transition_unrecorded =
+                !Self::confirm_external_transition(&hint_id, hint, &verification);
         }
-        if let Ok(mut last) = self.last_observed.lock() {
+        if !transition_unrecorded && let Ok(mut last) = self.last_observed.lock() {
             last.insert(resource.clone(), first_digest.clone());
         }
         Ok(GovernedProcessEffectBaseline {
@@ -1991,7 +1996,12 @@ impl ProcessExecutionGateway {
                 eliot_process::ContractError::DispatchBindingMismatch,
             ));
         }
-        if let Err(error) = self.authorize_effect_with_grant(owner, &operation_id, grant) {
+        if let Err(error) = self.authorize_effect_with_grant(
+            owner,
+            &operation_id,
+            grant,
+            OriginControlOperation::Kill,
+        ) {
             observe_process("kernel.process.cancel_rejected", "fenced");
             super::kernel_diagnostics::observe_terminal_error(process_terminal_code(&error));
             return Err(error);
@@ -2159,21 +2169,30 @@ impl ProcessExecutionGateway {
 
     /// Authorizes the owner for the exact operation and, when an origin
     /// control grant funds the effect, proves that grant still names the
-    /// identity the authoritative durable record retains for that same
-    /// operation (issue #1775 W4; I3.4).
+    /// admitted operation class and the identity the authoritative durable
+    /// record retains for that same operation (issue #1775 W3/W4; I3.4).
     ///
     /// The comparison is against the retained start receipt — the object the
     /// Kernel itself created and persisted — never a PID reopened by number
     /// and never the caller's serialized binding. A grant minted for one
     /// child, one image, one start time, or one managed generation therefore
-    /// cannot authorize a substituted or different target, and an operation
-    /// with no proven retained identity has nothing to compare against and
-    /// fails closed.
+    /// cannot authorize a substituted or different target, and a grant minted
+    /// for one operation class (for example adoption) cannot authorize the
+    /// effect named by `expected_operation`. An operation with no proven
+    /// retained identity has nothing to compare against and fails closed.
+    ///
+    /// Currency is rechecked here too, against the live authority contour
+    /// and clock rather than the decide-time observation: a grant whose
+    /// challenge window has expired, or whose admitted fence no longer
+    /// matches the live epoch lineage and sequence, fails before the
+    /// privileged effect even when it still names the right operation and
+    /// target.
     fn authorize_effect_with_grant(
         &self,
         owner: &ProcessOwnerBinding,
         operation_id: &eliot_process::OperationId,
         grant: Option<&OriginControlGrant>,
+        expected_operation: OriginControlOperation,
     ) -> Result<(), ProcessExecutionError> {
         let record = self
             .replay_store
@@ -2190,7 +2209,19 @@ impl ProcessExecutionGateway {
             .ok_or(ProcessExecutionError::UnknownOutcome)?
             .identity();
         grant
-            .binds_target(identity.physical(), identity.generation())
+            .binds_target_for_operation(
+                identity.physical(),
+                identity.generation(),
+                expected_operation,
+            )
+            .map_err(ProcessExecutionError::Contract)?;
+        let live_epoch = &self.snapshot_binding.authority_epoch().current;
+        grant
+            .binds_effect_currency(
+                live_epoch.lineage_id.as_str(),
+                live_epoch.epoch,
+                super::unix_ms(),
+            )
             .map_err(ProcessExecutionError::Contract)
     }
 }

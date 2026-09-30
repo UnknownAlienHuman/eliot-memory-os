@@ -28,11 +28,14 @@
 //!
 //! The record is the owner's (#961, `c8b6bf64`), not a second registry and not a
 //! reuse of an unrelated record: `Pending` is written before the root is created
-//! and proves only that the operation was admitted, and `Prepared` is written
-//! after the root exists and its identity was pinned and is the sole proof that
-//! this operation created that exact directory. Nothing here reads a `Pending`
-//! record as proof that a root does or does not exist, and nothing treats it as
-//! permission to prepare a second destination.
+//! and proves only that the operation was admitted, `Prepared` is written after
+//! the root exists and its identity was pinned and is the sole proof that this
+//! operation created that exact directory, and the reclamation's own
+//! `CleanupPending` / `Reclaimed` dispositions are written only on top of a
+//! `Prepared` record and only against that same pinned identity. Nothing here
+//! reads a `Pending` record as proof that a root does or does not exist, nothing
+//! treats it as permission to prepare a second destination, and nothing treats a
+//! predictable path as ownership.
 //!
 //! The created directory is **not** an installation allocated through the
 //! installation authority: `ApprovedGenerationRegistry` exposes no public
@@ -179,7 +182,14 @@
 //!   authorized the reclamation, so the root is preserved. An operation whose
 //!   `Reclaimed` retention is refused is reported as preserved rather than
 //!   removed, so [`CleanupReport`] never claims a durable lifecycle state this
-//!   module could not write.
+//!   module could not write. Both dispositions are the Host journal owner's
+//!   ([`BackupPreparationState::CleanupPending`] and
+//!   [`BackupPreparationState::Reclaimed`]), so on the durable sink the
+//!   reclamation is recorded rather than refused: the record keeps the exact
+//!   pinned identity it was authorized against, never re-pins another one, and a
+//!   crash between the two dispositions leaves a durable "may have been
+//!   reclaimed" record instead of a `Prepared` record asserting that a root
+//!   still exists when nobody looked.
 //!
 //! # Staging parent, generation and sweep bounds
 //!
@@ -455,12 +465,15 @@ pub enum PreparationError {
 // `conflict_field`/`admission_digest`/`derive_*`/`hash_path`/`capture_identity`
 // /`reject_reparse`/`reverify_recorded_destination`/`protected_path_to_preparation`
 // /`projection_to_preparation`/`intent_json`/`result_json`/`cleanup_transition_json`
-// /`destination_from_result`/`owner_identity_evidence`/`reject_audit_note`
+// /`destination_from_result`/`recorded_outcome`/`projected_disposition`
+// /`owner_identity_evidence`
+// /`reject_audit_note`
 // (private steps whose outcome surfaces with its exact category at the owning
 // boundary). The durable sink adds only the same shape of step:
 // `HostStatePreparationJournal::{snapshot, record_fence, retained, append,
 // destination_custody}` and
-// `preparation_handle`/`preparation_mutation`/`preparation_state_spelling` are
+// `preparation_handle`/`preparation_mutation`/`preparation_state_spelling`/
+// `CleanupTransitionState::{spelling, from_spelling, record_state}` are
 // private steps whose outcome surfaces with its exact category at the owning
 // boundary; `HostStatePreparationJournal::{record_intent, record_result, load,
 // list_operations}` are the `PreparationJournal` port itself, whose refusals
@@ -798,12 +811,17 @@ pub enum ReconcileDisposition {
     /// This is deliberately distinct from both [`Self::Absent`] and
     /// [`Self::Uncertain`]. It is not absent because the intent proves the
     /// operation was admitted; it is not `Uncertain` because no receipt exists to
-    /// be uncertain *about* — there is no recorded outcome at all, only a
+    /// be uncertain *about* - there is no recorded outcome at all, only a
     /// recorded admission whose effect may or may not have happened before the
     /// process stopped. I14.21 requires an unknown to pause the Ordering Scope
     /// and preserve the operation; reporting it as absent would let a second
     /// preparation run under the same operation id and overwrite the recorded
     /// intent, destroying the only evidence that the first one was admitted.
+    ///
+    /// A record that DID reach an outcome is never this. A record that only
+    /// *authorized* a reclamation is [`Self::Uncertain`], and a record whose
+    /// reclamation completed is [`Self::Reclaimed`]; neither is a result that
+    /// was never written.
     AdmittedWithoutResult {
         /// The admission digest the durable intent binds, carried so the recorded
         /// operation identity survives reconciliation instead of being discarded
@@ -812,7 +830,40 @@ pub enum ReconcileDisposition {
         /// a destination from it.
         admission_digest: String,
     },
-    /// State cannot be established: preserved as-is, never deleted, never retried blindly.
+    /// The recorded destination was removed and its absence was OBSERVED: the
+    /// reclamation finished and the operation is terminal (case 958/15).
+    ///
+    /// This is the disposition of a durable, observed fact, and it is
+    /// deliberately distinct from every other arm. It is not
+    /// [`Self::Uncertain`] because nothing here is unestablished: the owner's
+    /// [`BackupPreparationState::Reclaimed`] disposition is retained only AFTER
+    /// the absence was observed, so the record proves the exact root this
+    /// operation created is gone rather than that its fate is unknown. Reporting
+    /// a finished operation as `Uncertain` would tell a caller to preserve and
+    /// wait on work that is already done, and every later sweep would list the
+    /// finished operation as a preserved unknown. It is not
+    /// [`Self::AdmittedWithoutResult`] because an outcome WAS recorded here: the
+    /// whole reclamation protocol completed.
+    ///
+    /// It is not stronger than the record proves either. The pinned identity is
+    /// retained by the owner rather than cleared, so this arm says exactly that
+    /// the directory this operation created was removed; it names no
+    /// destination to reuse, claims no restoration, activation or retirement,
+    /// and authorizes no further effect.
+    ///
+    /// A record that only authorized the reclamation is never this: an
+    /// authorization retained before an irreversible effect whose absence nobody
+    /// observed is genuinely unestablished, and stays [`Self::Uncertain`].
+    Reclaimed,
+    /// State cannot be established, or an owner-authorized cleanup transition is
+    /// retained whose effect nobody observed: preserved as-is, never deleted,
+    /// never retried blindly.
+    ///
+    /// A retained reclamation authorization arrives here rather than as a
+    /// destination: it names no live prepared root, and re-attempting an effect
+    /// whose absence nobody observed is exactly the blind retry I14.21 forbids.
+    /// A *completed* reclamation is not unestablished and is
+    /// [`Self::Reclaimed`], not this.
     Uncertain { reason: String },
 }
 
@@ -826,11 +877,24 @@ pub struct CleanupReport {
     /// transition, the bounded empty-root removal AND the retained `Reclaimed`
     /// transition. A root that was removed but whose `Reclaimed` retention was
     /// refused is reported under [`Self::preserved`] instead, so `removed` is
-    /// never a claim about a durable state this module could not write.
+    /// never a claim about a durable state this module could not write. On the
+    /// durable sink both transitions are the Host journal owner's reclamation
+    /// dispositions, so an entry here names a record that says the root is
+    /// gone.
+    ///
+    /// The entry states that the root is gone, not that THIS call removed it: an
+    /// operation whose record was already `Reclaimed` before the sweep started
+    /// is reported here from that record's own durable state, and no second
+    /// removal is attempted for it. That is the same fact `removed` already
+    /// names, so a later sweep must not report a finished reclamation as a
+    /// preserved unknown.
     pub removed: Vec<String>,
     /// Operation ids preserved with reasons (unknown/foreign/mismatch/populated/
     /// unauthorized). An operation the sweep stopped before is preserved here
-    /// too, so a partial sweep is always visible in the returned report.
+    /// too, so a partial sweep is always visible in the returned report. An
+    /// operation whose reclamation is only authorized is preserved here, because
+    /// its effect is unestablished; one whose reclamation completed is in
+    /// [`Self::removed`] instead.
     pub preserved: Vec<(String, String)>,
 }
 
@@ -879,7 +943,7 @@ pub enum DestinationCustody {
 /// `Observation` record), and the installation registry is not used as a
 /// substitute: an unactivated destination is not an approved generation.
 ///
-/// # What `Pending` and `Prepared` mean here
+/// # What `Pending`, `Prepared` and the reclamation dispositions mean here
 ///
 /// The sink writes `Pending` **before** the destination root is created and
 /// `Prepared` **after** the root exists and its OS identity was pinned. A
@@ -890,18 +954,25 @@ pub enum DestinationCustody {
 /// not try, and is never treated as permission to prepare a second destination
 /// under the same operation identity. `Prepared` is the sole proof that this
 /// operation — and no other — created that exact directory, and it is the only
-/// state [`cleanup_preparations`] will remove; a `Pending` root is reconciled
-/// and preserved, never deleted by path name.
+/// state a reclamation may start from; a `Pending` root is reconciled and
+/// preserved, never deleted by path name.
+///
+/// The owner's reclamation dispositions (`CleanupPending` retained before the
+/// removal effect, `Reclaimed` only after the absence was observed) are
+/// reachable only from `Prepared` and only while that record still pins the same
+/// identity, so a cleanup write is a successor of the exact proof it acts on
+/// rather than a fresh claim.
 ///
 /// # Cancellation
 ///
-/// `Prepared` is terminal in the owner's transition law, so a durable
-/// preparation cannot be moved back to a cancelled state. [`cancel_preparation`]
+/// Cancellation is a third, separate transition, and it is not a disposition of
+/// this record: a durable preparation has no cancelled state, so the cancel
+/// envelope reaches this port with no state to move to. [`cancel_preparation`]
 /// over this sink therefore refuses with a typed [`PreparationError`] naming
 /// that boundary, and preserves the prepared root for the owner-governed
-/// [`cleanup_preparations`] sweep. The cancel envelope's in-memory evidence
-/// shape is unchanged; what is refused is writing a second terminal outcome for
-/// an operation the owner has already settled.
+/// [`cleanup_preparations`] sweep — the only path that can retire the
+/// destination, because it is the only one that proves emptiness and custody.
+/// The cancel envelope's in-memory evidence shape is unchanged.
 ///
 /// Synchronous narrow port: record intent before effects, result after;
 /// load-before-act for idempotency.
@@ -1095,12 +1166,19 @@ fn preparation_handle(
 }
 
 /// Stable wire spelling of one preparation state, used to derive the per-outcome
-/// journal mutation identity. Kept in lockstep with
-/// [`BackupPreparationState`]'s `SCREAMING_SNAKE_CASE` serde.
+/// journal mutation identity and the durable state a projected intent reports.
+///
+/// The two reclamation states take their spelling from
+/// [`CleanupTransitionState::spelling`] - the vocabulary the cleanup frames
+/// already write - so the durable disposition and the cleanup transition this
+/// module sends are one spelling, and the two can never drift into a frame that
+/// claims a state the journal would read as a different one.
 const fn preparation_state_spelling(state: BackupPreparationState) -> &'static str {
     match state {
         BackupPreparationState::Pending => "pending",
         BackupPreparationState::Prepared => "prepared",
+        BackupPreparationState::CleanupPending => CleanupTransitionState::CleanupPending.spelling(),
+        BackupPreparationState::Reclaimed => CleanupTransitionState::Reclaimed.spelling(),
     }
 }
 
@@ -1219,17 +1297,26 @@ impl PreparationJournal for HostStatePreparationJournal<'_> {
         self.append(record)
     }
 
-    /// Writes the durable `Prepared` result, after the root exists and is pinned.
+    /// Writes the durable outcome one result frame asks this owner to record:
+    /// the `Prepared` result, or an owner-authorized cleanup transition.
     ///
-    /// The frame is built by carrying the **retained** `Pending` record's own
-    /// binding forward and changing only the state and the pinned identity. That
-    /// is what makes the result a successor of the exact admission rather than a
-    /// fresh claim: the owner-issued authority generation and the rest of the
-    /// binding are read from the durable record, and the owner's
-    /// `backup_preparation_transition` re-checks the agreement. A result whose
-    /// own values disagree with the retained frame is refused here as a typed
-    /// conflict before any append, so a mismatched result never reaches the
-    /// journal as a re-scoped preparation.
+    /// The frame is built by carrying the **retained** record's own binding
+    /// forward and changing only the state and, for the prepared result, the
+    /// pinned identity. That is what makes the successor a successor of the
+    /// exact durable frame rather than a fresh claim: the owner-issued authority
+    /// generation and the rest of the binding are read from the durable record,
+    /// and the owner's `backup_preparation_transition` re-checks the agreement.
+    /// An outcome whose own values disagree with the retained frame is refused
+    /// here as a typed conflict before any append, so a mismatched frame never
+    /// reaches the journal as a re-scoped preparation.
+    ///
+    /// The pinned identity is never recomputed, defaulted, or taken from the
+    /// frame once the record already holds one: a reclamation is authorized
+    /// against the exact directory this operation proved it created, so a
+    /// cleanup frame naming a different `root_identity` is a changed input under
+    /// one operation identity, and the successor carries the RETAINED value
+    /// forward. Only the `Prepared` result establishes the identity, because
+    /// that is the one moment it is captured.
     ///
     /// The receipt is read back through `destination_from_result`, the same
     /// reader the in-memory path reconciles through, rather than decoded
@@ -1250,15 +1337,19 @@ impl PreparationJournal for HostStatePreparationJournal<'_> {
                     .to_owned(),
             });
         };
-        if retained.state == BackupPreparationState::Prepared {
-            // `Prepared` is terminal in the owner's transition law. The cancel
-            // envelope reaches this port too, and a durable preparation has no
-            // cancelled state to move to, so the outcome is refused and the
-            // prepared root stays durable for the owner-governed cleanup sweep.
+        let outcome = recorded_outcome(result)?;
+        // The owner's law holds this edge. Refusing it here too is what keeps the
+        // refusal typed at the port instead of surfacing as a stringly journal
+        // fault, and it names the boundary a caller has to cross: a
+        // cancellation envelope reaches this port as well, and a durable
+        // preparation has no cancelled disposition, so the only forward moves
+        // are the owner-authorized reclamation steps.
+        if !retained.state.admits(outcome) {
             return Err(PreparationError::UnknownState {
                 operation: operation_id.to_owned(),
-                reason: "the durable preparation result is already terminal; cancellation is not \
-                         a state of this record and the prepared destination is preserved"
+                reason: "the durable preparation has no admissible move to this outcome; \
+                         cancellation is not a state of this record and the destination is \
+                         preserved for the owner-governed cleanup transition"
                     .to_owned(),
             });
         }
@@ -1269,8 +1360,8 @@ impl PreparationJournal for HostStatePreparationJournal<'_> {
             });
         };
         let pinned = destination.root_identity.identity.as_str();
-        // The result must describe the very root and identity the durable
-        // admission proposed, or it is not this operation's result. Every
+        // The outcome must describe the very root and identity the durable
+        // admission proposed, or it is not this operation's outcome. Every
         // comparison is against the RETAINED value, never a recomputation.
         if destination.root.to_string_lossy() != retained.destination_root.as_str()
             || destination.destination_id != retained.destination_id.as_str()
@@ -1282,11 +1373,28 @@ impl PreparationJournal for HostStatePreparationJournal<'_> {
                 field: "destination",
             });
         }
+        let identity = match retained.destination_root_identity.as_ref() {
+            // The result that establishes the exclusive-creation proof: the
+            // captured value is the only source at this point, and the owner's
+            // own record validation admits it as a handle.
+            None => preparation_handle(pinned, "destination_root_identity")?,
+            // Every later disposition is authorized against the identity this
+            // operation already pinned, so the retained value - never the
+            // presented one - is what the successor records.
+            Some(retained_identity) => {
+                if retained_identity.as_str() != pinned {
+                    return Err(PreparationError::ConflictField {
+                        field: "root_identity",
+                    });
+                }
+                retained_identity.clone()
+            }
+        };
         let record = BackupPreparationRecord {
             fence: retained.fence.clone(),
             operation: preparation_mutation(
                 operation_id,
-                BackupPreparationState::Prepared,
+                outcome,
                 retained.admission_digest.as_str(),
             )?,
             preparation_operation: retained.preparation_operation.clone(),
@@ -1299,11 +1407,8 @@ impl PreparationJournal for HostStatePreparationJournal<'_> {
             config_projection_digest: retained.config_projection_digest.clone(),
             authority_generation: retained.authority_generation,
             destination_epoch: retained.destination_epoch,
-            destination_root_identity: Some(preparation_handle(
-                pinned,
-                "destination_root_identity",
-            )?),
-            // A `Prepared` result necessarily carries evidence a `Pending`
+            destination_root_identity: Some(identity.clone()),
+            // A result and a reclamation necessarily carry evidence a `Pending`
             // cannot: that this operation created the root and pinned its
             // identity. The list is digests and handles only, and the owner's
             // transition law deliberately does not require it to equal the
@@ -1311,9 +1416,9 @@ impl PreparationJournal for HostStatePreparationJournal<'_> {
             retained_evidence_refs: vec![
                 retained.admission_digest.clone(),
                 retained.destination_id.clone(),
-                preparation_handle(pinned, "destination_root_identity")?,
+                identity,
             ],
-            state: BackupPreparationState::Prepared,
+            state: outcome,
         };
         self.append(record)
     }
@@ -1322,9 +1427,16 @@ impl PreparationJournal for HostStatePreparationJournal<'_> {
     /// the preparation lifecycle reads.
     ///
     /// The intent is reconstructed from exactly the admission fields the
-    /// durable record retains. The result exists only for a `Prepared` record,
-    /// because a `Pending` record has no recorded outcome and reporting one would
-    /// be the fabrication this module exists to prevent.
+    /// durable record retains, and it names the record's own durable disposition
+    /// so a reader can tell a settled result from a reclamation.
+    ///
+    /// The result exists only for a `Prepared` record. A `Pending` record has no
+    /// recorded outcome, and reporting one would be the fabrication this module
+    /// exists to prevent. A reclamation record is not a usable prepared
+    /// destination either, in the opposite direction: `CleanupPending` means
+    /// reclamation was authorized and the root's fate is unobserved, and
+    /// `Reclaimed` means the root is gone, so neither may be projected as a live
+    /// destination that a caller could reuse or delete by name.
     fn load(
         &self,
         operation_id: &str,
@@ -1349,6 +1461,7 @@ impl PreparationJournal for HostStatePreparationJournal<'_> {
             "root": record.destination_root,
             "destination_id": record.destination_id,
             "destination_epoch": record.destination_epoch,
+            "disposition": preparation_state_spelling(record.state),
         });
         let result = match (record.state, &record.destination_root_identity) {
             (BackupPreparationState::Prepared, Some(identity)) => Some(serde_json::json!({
@@ -1362,10 +1475,24 @@ impl PreparationJournal for HostStatePreparationJournal<'_> {
                 "config_projection_digest": record.config_projection_digest,
                 "audit_fence_note": serde_json::Value::Null,
             })),
-            // Unreachable: the owner's record validation makes these two states
-            // impossible together. Treated as no recorded result rather than
-            // trusted, so a corrupted projection cannot invent a receipt.
-            (BackupPreparationState::Prepared, None) | (BackupPreparationState::Pending, _) => None,
+            // No recorded result, for two distinct reasons that must not
+            // produce a receipt either way.
+            //
+            // An admission with no outcome, and a reclamation record whose root
+            // is no longer a usable destination, are the same projection: there
+            // is nothing to hand back. The third case,
+            // `(Prepared, None)`, is unreachable — the owner's record
+            // validation requires the pinned identity in every state at or
+            // after `Prepared` — and is refused here as no recorded result
+            // rather than trusted, so a corrupted projection cannot invent a
+            // receipt.
+            (
+                BackupPreparationState::Pending
+                | BackupPreparationState::CleanupPending
+                | BackupPreparationState::Reclaimed,
+                _,
+            )
+            | (BackupPreparationState::Prepared, None) => None,
         };
         Ok(Some((intent, result)))
     }
@@ -2041,11 +2168,14 @@ pub const CLEANUP_TRANSITION_VERSION: u32 = 1;
 /// them leaves a durable "may have been reclaimed" record rather than a
 /// receipt that claims a root is gone when nobody looked.
 ///
-/// This is deliberately not a second preparation lifecycle. The preparation
-/// lifecycle is the Host journal owner's (`BackupPreparationState`), and
-/// cancellation is a third, separate transition: none of them is proof that a
-/// populated root is safe to destroy, and a `Cancelled` record in particular
-/// says only that the operation was withdrawn, not that its root is empty.
+/// These are not a second preparation lifecycle. Each one names the durable
+/// disposition its transition is recorded under, and that disposition is the
+/// Host journal owner's ([`BackupPreparationState::CleanupPending`] and
+/// [`BackupPreparationState::Reclaimed`]): this type is the wire vocabulary the
+/// cleanup frames are written in, and the owner holds the state machine. No
+/// transition here is proof that a populated root is safe to destroy - the
+/// bounded empty-root effect and the custody disposition decide that
+/// separately.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CleanupTransitionState {
     /// Reclamation is authorized and about to be attempted.
@@ -2062,6 +2192,32 @@ impl CleanupTransitionState {
             Self::Reclaimed => "reclaimed",
         }
     }
+
+    /// Reads one wire spelling back, or `None` when the frame names a
+    /// disposition this module never writes.
+    ///
+    /// Derived from [`Self::spelling`] rather than a second set of literals, so
+    /// the accepted spellings and the emitted ones cannot drift apart. A frame
+    /// naming anything else is refused instead of being read as some default
+    /// disposition, because guessing here would write a durable state the caller
+    /// never asked for.
+    fn from_spelling(spelling: &str) -> Option<Self> {
+        if spelling == Self::CleanupPending.spelling() {
+            Some(Self::CleanupPending)
+        } else if spelling == Self::Reclaimed.spelling() {
+            Some(Self::Reclaimed)
+        } else {
+            None
+        }
+    }
+
+    /// The durable owner disposition this cleanup transition is recorded under.
+    const fn record_state(self) -> BackupPreparationState {
+        match self {
+            Self::CleanupPending => BackupPreparationState::CleanupPending,
+            Self::Reclaimed => BackupPreparationState::Reclaimed,
+        }
+    }
 }
 
 /// Renders the durable frame for one owner-authorized cleanup transition.
@@ -2076,10 +2232,11 @@ impl CleanupTransitionState {
 ///
 /// The frame is a superset of [`result_json`]: a reader that only understands
 /// preparation receipts still decodes it. That is a transitional property, not
-/// a design goal — the typed lifecycle decoder this issue's first fix requires
-/// is what makes the state a decoded value rather than a field this writer
-/// happens to add, and until it lands nothing may read a cleanup frame as a
-/// usable prepared destination.
+/// a design goal. The durable sink does not read the superset as a usable
+/// prepared destination: [`HostStatePreparationJournal::record_result`] decodes
+/// the `transition` block into the owner's reclamation state and writes that
+/// disposition, and [`HostStatePreparationJournal::load`] reports a reclamation
+/// record as carrying no live prepared destination at all.
 fn cleanup_transition_json(
     destination: &PreparedDestination,
     state: CleanupTransitionState,
@@ -2096,6 +2253,65 @@ fn cleanup_transition_json(
     });
     frame["prior_receipt"] = result_json(destination);
     frame
+}
+
+/// The durable disposition one result frame asks the owner port to record.
+///
+/// A frame either carries the owner-authorized cleanup `transition` block or it
+/// does not, and the absence of one is the prepared result itself. A transition
+/// block that is not a versioned cleanup transition of this module, or that
+/// names a disposition this module never writes, is refused rather than read as
+/// some default: guessing here would write a durable state no caller asked for,
+/// and a cleanup request silently downgraded to a prepared result is exactly
+/// the dishonest write the owner's lifecycle exists to prevent.
+fn recorded_outcome(
+    result: &serde_json::Value,
+) -> Result<BackupPreparationState, PreparationError> {
+    let Some(transition) = result.get("transition") else {
+        return Ok(BackupPreparationState::Prepared);
+    };
+    let version = transition
+        .get("version")
+        .and_then(serde_json::Value::as_u64);
+    if version != Some(u64::from(CLEANUP_TRANSITION_VERSION)) {
+        return Err(PreparationError::InvalidRequest {
+            field: "transition",
+            reason: "cleanup transition does not carry the cleanup transition version this \
+                     module writes"
+                .to_owned(),
+        });
+    }
+    let spelling = transition
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(PreparationError::InvalidRequest {
+            field: "transition",
+            reason: "cleanup transition names no disposition".to_owned(),
+        })?;
+    CleanupTransitionState::from_spelling(spelling)
+        .map(CleanupTransitionState::record_state)
+        .ok_or(PreparationError::InvalidRequest {
+            field: "transition",
+            reason: "cleanup transition names a disposition this module never writes".to_owned(),
+        })
+}
+
+/// The durable disposition a projected intent frame names, or `None` when it
+/// names none this module writes.
+///
+/// Read through the same [`preparation_state_spelling`] vocabulary the journal
+/// mutation identity and the cleanup transition block use, so a projected
+/// disposition and the frame that wrote it can never be read as two different
+/// states.
+fn projected_disposition(intent: &serde_json::Value) -> Option<BackupPreparationState> {
+    let disposition = intent.get("disposition")?.as_str()?;
+    if disposition == preparation_state_spelling(BackupPreparationState::CleanupPending) {
+        Some(BackupPreparationState::CleanupPending)
+    } else if disposition == preparation_state_spelling(BackupPreparationState::Reclaimed) {
+        Some(BackupPreparationState::Reclaimed)
+    } else {
+        None
+    }
 }
 
 fn destination_from_result(
@@ -2319,6 +2535,15 @@ pub fn prepare_isolated_destination<J: PreparationJournal>(
 /// and which A4's own repeated-request rule forbids ("the same verified
 /// destination or a conflict, not another installation"). Reconciliation never
 /// deletes.
+///
+/// A record whose reclamation is only *authorized* carries no live prepared
+/// destination and no established outcome, so it is `Uncertain`: a reclamation
+/// whose absence nobody observed is never attempted a second time. A record
+/// whose reclamation *completed* is `Reclaimed`, because the absence was
+/// observed and the record proves it: reporting that finished operation as
+/// uncertain would understate the evidence and send the caller into a reconcile
+/// loop for work that is already done. Neither is `Current`, so a reclaimed root
+/// is never offered for reuse or re-reclamation.
 pub fn reconcile_preparation<J: PreparationJournal>(
     journal: &J,
     operation_id: &str,
@@ -2334,6 +2559,32 @@ pub fn reconcile_preparation<J: PreparationJournal>(
         return Ok(ReconcileDisposition::Absent);
     };
     let Some(result) = result else {
+        // A reclamation disposition is not an outcome that can be re-derived by
+        // looking at the root, so each one is reported as what the durable
+        // record itself already says, read from the record's own disposition
+        // rather than inferred from the root.
+        //
+        // The two are deliberately NOT one answer. `Reclaimed` is retained only
+        // after the absence was observed, so it is an established, finished
+        // fact and reports as such; `CleanupPending` is an authorization whose
+        // effect nobody observed, which is genuinely unestablished and reports as
+        // uncertain. Neither is ever re-prepared or reclaimed again: re-attempting
+        // an effect whose absence nobody observed is the blind retry I14.21
+        // forbids, and a terminal disposition is not re-attemptable at all.
+        let disposition = projected_disposition(&intent);
+        if matches!(disposition, Some(BackupPreparationState::Reclaimed)) {
+            observe_prepare_progress(OP_RECONCILE, "outcome", "reclaimed", 0, 0);
+            return Ok(ReconcileDisposition::Reclaimed);
+        }
+        if matches!(disposition, Some(BackupPreparationState::CleanupPending)) {
+            observe_prepare_progress(OP_RECONCILE, "outcome", "uncertain", 0, 0);
+            return Ok(ReconcileDisposition::Uncertain {
+                reason: "reclamation of this exact destination is authorized but its absence \
+                         was never observed; the root is preserved and the effect is never \
+                         retried blindly"
+                    .to_owned(),
+            });
+        }
         // Intent without result: a crash between intent recording and effect
         // completion. The operation WAS admitted — the durable intent is the
         // proof — so it is never reported as absent, whatever the root shows.
@@ -2400,7 +2651,9 @@ pub fn reconcile_preparation<J: PreparationJournal>(
 /// embeds the prior receipt so no evidence is destroyed. Absent operations
 /// cannot be cancelled; uncertain ones must reconcile first, and so must
 /// admitted-but-unrecorded ones, which have no receipt to embed and are
-/// preserved rather than released.
+/// preserved rather than released. A `Reclaimed` operation is finished: its
+/// destination is already gone, so there is nothing to cancel and nothing that
+/// reconciling first could change.
 pub fn cancel_preparation<J: PreparationJournal>(
     journal: &mut J,
     operation_id: &str,
@@ -2434,6 +2687,18 @@ pub fn cancel_preparation<J: PreparationJournal>(
                 operation: operation_id.to_owned(),
                 reason: "admitted without a recorded result; there is no receipt to embed, so the \
                           operation is preserved for inspection"
+                    .to_owned(),
+            },
+            0,
+        )),
+        ReconcileDisposition::Reclaimed => Err(note_prepare_error(
+            OP_CANCEL,
+            "outcome",
+            PreparationError::UnknownState {
+                operation: operation_id.to_owned(),
+                reason: "this operation already reclaimed its destination and the absence was \
+                          observed; it is finished, so there is nothing to cancel, nothing to \
+                          preserve and nothing to retry"
                     .to_owned(),
             },
             0,
@@ -2502,7 +2767,11 @@ pub fn cancel_preparation<J: PreparationJournal>(
 /// [`CleanupTransitionState::Reclaimed`] is retained only after the absence has
 /// actually been observed, and an operation whose `Reclaimed` retention is
 /// refused is reported as preserved rather than removed, so [`CleanupReport`]
-/// never claims a durable state this module could not write.
+/// never claims a durable state this module could not write. A record that
+/// already carries `Reclaimed` when the sweep reaches it reports as
+/// [`CleanupReport::removed`] from that record's own state, never as a
+/// preserved unknown: the root is gone, and no proof is re-verified and no
+/// effect re-attempted for a terminal disposition.
 pub fn cleanup_preparations<J: PreparationJournal>(
     journal: &mut J,
     operation_ids: &[String],
@@ -2601,6 +2870,18 @@ pub fn cleanup_preparations<J: PreparationJournal>(
                          (admission digest {admission_digest})"
                     ),
                 ));
+            }
+            Ok(ReconcileDisposition::Reclaimed) => {
+                // The record's own durable state says this operation's root was
+                // removed and its absence observed, so this sweep reports it as
+                // removed rather than as a preserved unknown: listing a correctly
+                // reclaimed root under `preserved` is a false statement about a
+                // directory that is gone. The disposition is read from the
+                // record, never inferred from the root, and nothing is deleted
+                // here - `Reclaimed` is terminal, so there is no proof to
+                // re-verify and no effect left to attempt.
+                observe_prepare_progress(OP_CLEANUP, "sweep", "reclaimed", 0, 0);
+                report.removed.push(operation_id.to_owned());
             }
             Ok(ReconcileDisposition::Uncertain { reason }) => {
                 observe_prepare_progress(OP_CLEANUP, "sweep", "preserved", 0, 0);
@@ -2773,7 +3054,7 @@ fn remove_reverified_destination<J: PreparationJournal>(
 /// [`PreparationError::ArbitraryPath`], and an unresolvable root yields
 /// [`PreparationError::FilesystemEffect`]. Owner error internals are never
 /// echoed. Staging admission and generation authority stay with
-/// [`prepare_isolated_destination`] and HostComposition delegation, and the
+/// [`prepare_isolated_destination`] and `HostComposition` delegation, and the
 /// owner lease reference a caller may present is a claim checked against
 /// [`OwnerEvidence::owner_lease_ref`] by the configuration projection rather
 /// than bound from the request.
@@ -2924,7 +3205,7 @@ pub struct PresentedPreparationRequest {
 /// HostComposition-side delegation handle for isolated destination
 /// preparation (issue #958).
 ///
-/// This is the exact sink interface the HostComposition owner binds: it owns
+/// This is the exact sink interface the `HostComposition` owner binds: it owns
 /// the installation/Host journal sink (`J`), takes inspected owner evidence
 /// ([`OwnerEvidence`]) plus one presented request, and runs the full
 /// owner-bound preparation lifecycle. [`OwnerEvidence`] has all-private fields

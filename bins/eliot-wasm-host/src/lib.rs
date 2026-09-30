@@ -35,6 +35,7 @@ mod installed_binary;
 mod parent_authority;
 mod parent_dispatch;
 mod parent_runtime;
+mod receipt_bridge;
 mod request_loop;
 mod shadow;
 mod typed_bindings;
@@ -46,6 +47,7 @@ mod pool;
 pub use admission::{LiveAuthority, PortGrantError, ResolvedPortGrant, resolve_kernel_port_grant};
 pub use artifact_preflight::{
     MAX_ARTIFACT_BYTES, Preflight, PreflightError, preflight_bytes, read_bounded_artifact,
+    require_absolute_artifact_path,
 };
 pub use child_engine::{ISOLATED_CHILD_IMPLEMENTATION_ID, IsolatedChildEngine};
 pub use cli_contract::{CliConfig, CliError, GuestExecArgs, Profile, Transport, parse_args};
@@ -86,6 +88,7 @@ pub use installed_binary::{
 pub use parent_authority::{ParentDispatchAuthority, edge_now_ms};
 pub use parent_dispatch::drive_parent_dispatch;
 pub use parent_runtime::{AdmittedRuntime, build_admitted_runtime, drive_parent_runtime};
+pub use receipt_bridge::project_shared_receipt;
 pub use request_loop::{
     ACK_PHASE_ENQUEUED, AdmittedBinding, ControlDeliveryAcknowledgement, DeliverySetChannel,
     KernelControlReader, LoopCompletion, LoopError, MAX_RESULT_FRAME_BYTES, MAX_RESULT_SEQUENCE,

@@ -11,7 +11,7 @@ use eliot_agent_contracts::{
 };
 use eliot_contracts::{ContractIdentity, LowercaseSha256};
 use eliot_evaluation_contracts::BudgetEvidence;
-use eliot_kernel_core::NormalWorkClass;
+use eliot_kernel_core::{CapacityClass, NormalWorkClass};
 use eliot_receipts::ProofCeiling;
 use eliot_security_contracts::PrivacyClass;
 use serde::{Deserialize, Serialize};
@@ -1123,6 +1123,68 @@ impl WorkClass {
             Self::Normal(NormalWorkClass::Maintenance) => 8,
         }
     }
+
+    /// The Kernel capacity partition this class is structurally able to draw
+    /// from (issue #1683 W4).
+    ///
+    /// I14.3 states "Normal workload cannot consume it", and the Kernel already
+    /// enforces that as a physical partition in
+    /// `eliot_kernel_core::ControlReserve` (`try_acquire_normal` and
+    /// `try_acquire_protected` increment disjoint counters). What was missing
+    /// was the *selection-side* half: the fair pull ranked the nine classes by
+    /// weight alone, so a `control` item was merely a weighted competitor in the
+    /// same rotation as `normal_background`, and nothing stopped saturated bulk
+    /// work from occupying the pulls a control item needed. `WorkClass::Control`
+    /// claimed the protected partition in its own doc comment but no code read
+    /// that claim.
+    ///
+    /// This method is the one place that claim becomes checkable. It reuses the
+    /// existing `eliot_kernel_core::CapacityClass` (re-exported from
+    /// `eliot_runtime_contracts`, the frozen vocabulary the front door already
+    /// switches on) rather than introducing a coordinator-local partition type,
+    /// so there is exactly one capacity vocabulary in the tree.
+    ///
+    /// The mapping is total and has no invalid arm: `Control` names the
+    /// protected partition and every `Normal` class names the normal partition,
+    /// so a class can never be admitted by a path that lets it draw from the
+    /// other one.
+    ///
+    /// Which exhaustiveness is load-bearing, precisely: the **outer** `match` on
+    /// `WorkClass` is the compile-time gate, and it must stay a no-wildcard
+    /// match. A new work class is a new partition decision, so a new
+    /// `WorkClass` variant has to fail to compile here until someone says which
+    /// partition it draws from. The `Self::Normal(_)` arm is the second variant
+    /// of that same gate, not a wildcard on the type: because `WorkClass` has
+    /// exactly two top-level shapes today, naming the second one exhaustively
+    /// over the outer enum is what makes the match total. The *inner*
+    /// `NormalWorkClass` taxonomy is deliberately not enumerated, because there
+    /// is no per-variant decision here to fail on — a new `NormalWorkClass`
+    /// inherits `NormalWorkload`, which is the correct answer for anything named
+    /// `Normal`, so enumerating the eight would guard nothing and only invite
+    /// eight identical arms to drift. Should a future variant need a partition
+    /// other than `NormalWorkload`, the type must gain a third `WorkClass` shape
+    /// for it, and the outer match here will not compile until that shape is
+    /// given a partition explicitly.
+    #[must_use]
+    pub const fn capacity_class(self) -> CapacityClass {
+        match self {
+            Self::Control => CapacityClass::ProtectedControl,
+            Self::Normal(_) => CapacityClass::NormalWorkload,
+        }
+    }
+
+    /// Returns whether this class draws only the protected control partition.
+    ///
+    /// A member of the protected partition is a reservation, not a preference:
+    /// I14.8 requires "strong reviewer/arbitration reserve protected from bulk
+    /// workers", and I14.3 requires that normal workload cannot consume it. A
+    /// protected class therefore takes no part in the weighted rotation and
+    /// cannot be crowded out by it; see
+    /// [`crate::AgentCoordinator::pull_next`].
+    #[must_use]
+    pub const fn is_protected_partition(self) -> bool {
+        matches!(self.capacity_class(), CapacityClass::ProtectedControl)
+    }
 }
 
 impl std::str::FromStr for WorkClass {
@@ -1581,6 +1643,17 @@ impl CapacityDeferral {
 #[serde(deny_unknown_fields)]
 pub struct WorkClassSelectionReport {
     pub work_class: WorkClass,
+    /// The Kernel capacity partition this class draws from
+    /// ([`WorkClass::capacity_class`]), published so a caller can see which
+    /// partition a selected item is charged against without re-deriving the
+    /// class-to-partition mapping, and so a report of the protected partition
+    /// is distinguishable from a report of normal work.
+    ///
+    /// It is published state, not a second authority: the front door still
+    /// decides the partition at acquisition from the same `CapacityClass`
+    /// vocabulary. This field exists so the selector's decision is auditable,
+    /// not so a caller can bypass the front door.
+    pub capacity_partition: CapacityClass,
     /// Admitted items of this class.
     pub ready_items: usize,
     /// Non-terminal items of this class that are not queued: `Running`,

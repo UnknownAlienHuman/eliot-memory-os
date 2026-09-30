@@ -382,6 +382,21 @@ static RECORD_FINISH_EVIDENCE_PARAMETERS: [ParameterDeclaration; 2] = [
         required: true,
     },
 ];
+/// The Governor's complete catalog image is opaque here. The store only
+/// arbitrates the fixed owner address and outer revision; the Governor proves
+/// source-policy agreement and independently reads the committed image back.
+static RECORD_MODULE_CATALOG_SNAPSHOT_PARAMETERS: [ParameterDeclaration; 2] = [
+    ParameterDeclaration {
+        name: "expected_module_registry_revision",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "snapshot_json",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+];
 static NO_PARAMETERS: [ParameterDeclaration; 0] = [];
 static EPISTEMIC_REVISION_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
     name: "revision",
@@ -758,7 +773,18 @@ static APPLY_INSTRUMENT_REGISTRY_PARAMETERS: [ParameterDeclaration; 1] = [Parame
 /// each leg requires) is enforced by the automation-state contract; every
 /// name here is optional at the declaration level so one closed table
 /// serves all six legs.
-static APPLY_USER_AUTOMATION_PARAMETERS: [ParameterDeclaration; 9] = [
+///
+/// `normalization_receipt_json` is the owner-issued schedule normalization
+/// envelope a create/edit leg retains beside its own immutable revision, and
+/// it is DECLARED here rather than smuggled through as an undeclared name:
+/// membership in this table is exact, so an undeclared parameter is refused
+/// pre-dispatch. It stays optional at this level for the same reason every
+/// other leg payload is — the closed table serves all six legs — and the
+/// automation-state contract plus the backends decide its shape and its
+/// retention. Absence is never a synthesized receipt: a revision that
+/// retained no envelope leaves its compiled occurrence set unadmitted by name
+/// downstream.
+static APPLY_USER_AUTOMATION_PARAMETERS: [ParameterDeclaration; 10] = [
     ParameterDeclaration {
         name: "operation",
         shape: ParameterShape::Subject,
@@ -786,6 +812,11 @@ static APPLY_USER_AUTOMATION_PARAMETERS: [ParameterDeclaration; 9] = [
     },
     ParameterDeclaration {
         name: "configuration_state",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "normalization_receipt_json",
         shape: ParameterShape::Subject,
         required: false,
     },
@@ -1232,6 +1263,7 @@ pub const fn named_mutation_operation_name(operation: NamedMutationOperation) ->
         NamedMutationOperation::ReconcileRecovery => "ReconcileRecovery",
         NamedMutationOperation::RecordFinishDecision => "RecordFinishDecision",
         NamedMutationOperation::RecordFinishEvidence => "RecordFinishEvidence",
+        NamedMutationOperation::RecordModuleCatalogSnapshot => "RecordModuleCatalogSnapshot",
         NamedMutationOperation::AppendAuditEvent => "AppendAuditEvent",
         NamedMutationOperation::RecordAuthorityRevocation => "RecordAuthorityRevocation",
         NamedMutationOperation::ApplyErasure => "ApplyErasure",
@@ -1260,6 +1292,7 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
         b"ReconcileRecovery" => Some(NamedMutationOperation::ReconcileRecovery),
         b"RecordFinishDecision" => Some(NamedMutationOperation::RecordFinishDecision),
         b"RecordFinishEvidence" => Some(NamedMutationOperation::RecordFinishEvidence),
+        b"RecordModuleCatalogSnapshot" => Some(NamedMutationOperation::RecordModuleCatalogSnapshot),
         b"AppendAuditEvent" => Some(NamedMutationOperation::AppendAuditEvent),
         b"RecordAuthorityRevocation" => Some(NamedMutationOperation::RecordAuthorityRevocation),
         b"ApplyErasure" => Some(NamedMutationOperation::ApplyErasure),
@@ -1396,8 +1429,9 @@ pub const fn declared_read_parameters(
 /// `ApplyUserAutomationState` declares the leg discriminator, the
 /// always-present `automation_id`, and the conditionally-required leg
 /// payloads (`revision`, `revision_json`, `previous_revision`,
-/// `configuration_state`, `occurrence_id`, `invocation_json`; leg
-/// completeness is enforced by the automation-state contract);
+/// `configuration_state`, `normalization_receipt_json`, `occurrence_id`,
+/// `invocation_json`; leg completeness is enforced by the
+/// automation-state contract);
 /// `CommitExperienceBank` and `CommitAgentFeedback` declare the six
 /// required commit fields (`record_json`, `record_digest`,
 /// `record_revision` as its decimal string, `scope_digest`,
@@ -1426,6 +1460,9 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::ReconcileRecovery => &RECONCILE_RECOVERY_PARAMETERS,
         NamedMutationOperation::RecordFinishDecision => &RECORD_FINISH_DECISION_PARAMETERS,
         NamedMutationOperation::RecordFinishEvidence => &RECORD_FINISH_EVIDENCE_PARAMETERS,
+        NamedMutationOperation::RecordModuleCatalogSnapshot => {
+            &RECORD_MODULE_CATALOG_SNAPSHOT_PARAMETERS
+        }
         NamedMutationOperation::UpdateTaskState => &UPDATE_TASK_STATE_PARAMETERS,
         NamedMutationOperation::ApplySwarmOwnerRevisions => &APPLY_SWARM_OWNER_REVISION_PARAMETERS,
         NamedMutationOperation::ApplyBlackboardItem => &APPLY_BLACKBOARD_ITEM_PARAMETERS,

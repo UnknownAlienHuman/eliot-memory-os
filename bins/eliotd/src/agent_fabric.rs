@@ -65,9 +65,9 @@ use eliot_agent_contracts::{
 };
 use eliot_agent_coordinator::{
     AdmissionId, AdmittedProviderCapability, AgentCoordinator, CandidateId, CoordinatorConfig,
-    CoordinatorError, CoordinatorSnapshot, PlanGap, ProviderBindingSnapshot, ProviderIdentity,
-    ProviderSelectionHealth, StaffingPlanCandidate, StaffingPlanRequest,
-    SwarmDefinitionAdmissionPrep, WorkClass,
+    CoordinatorError, CoordinatorSnapshot, FairPullOutcome, PlanGap, ProviderBindingSnapshot,
+    ProviderIdentity, ProviderSelectionHealth, SchedulingProfile, StaffingPlanCandidate,
+    StaffingPlanRequest, SwarmDefinitionAdmissionPrep, WorkClass,
 };
 #[cfg(test)]
 use eliot_agent_coordinator::{OwnerCurrentness, PresentedClaimMaterial};
@@ -2165,7 +2165,7 @@ impl AgentFabric {
                 let _ = crate::diagnostics::AdmissionRecord::of(
                     crate::diagnostics::disposition_of_admission(admission),
                     &admission.reservation_id,
-                    admission.admission_id.as_str(),
+                    admission.definition_digest.as_str(),
                 )
                 .emit();
             }
@@ -3159,6 +3159,47 @@ impl AgentFabric {
             .insert(key.clone(), AttemptLifecycle::UnknownOutcome);
         self.record("outcome_unknown", &key);
         Ok(())
+    }
+
+    /// Drives the coordinator's bounded fair pull over its admitted projection
+    /// (issue #1683 W1, I14.8 "Scheduler is pull-based").
+    ///
+    /// This is the daemon composition root's join to the coordinator's
+    /// pull-based scheduler, and it is a real effect rather than a probe: every
+    /// entry in the returned `started` is an attempt the coordinator actually
+    /// transitioned to `Running` through its own admission, so capacity freed
+    /// by a terminal attempt advances work without another agent command.
+    /// Nothing here admits, launches a process, binds a provider execution or
+    /// grants Finish authority; the coordinator drive's own proof ceiling
+    /// bounds it.
+    ///
+    /// `profile` is the Kernel-owned nine-class scheduling policy compiled by
+    /// `eliot_agent_coordinator::load_runtime_scheduling_profile`. The fabric
+    /// resolves no file, environment variable or working directory of its own,
+    /// so the configuration location stays the composition root's decision, and
+    /// an absent document is the loader's own typed refusal rather than a
+    /// defaulted profile.
+    ///
+    /// Production residual, unchanged here and not worked around: no issuer of
+    /// the provider-verified `ProviderAdmissionReceipt` that
+    /// `AgentCoordinator::admit` requires exists in the tree today (issue
+    /// #1678), so in production the coordinator's `attempts` map is empty and
+    /// the drive reports that no work is currently admissible. This method is
+    /// the caller that makes the drive live the moment that owner lands.
+    ///
+    /// # Errors
+    ///
+    /// Returns the coordinator owner rejection unchanged, including the
+    /// profile's own validation failure when it is not a valid versioned
+    /// nine-class set.
+    pub fn drive_fair_pull(
+        &mut self,
+        profile: &SchedulingProfile,
+    ) -> Result<FairPullOutcome, FabricError> {
+        // #1683: bounded fair-pull span over the release path. The recorded
+        // decision is the coordinator's; the fabric never re-decides it.
+        let _span = tracing::info_span!("eliotd.fabric_fair_pull").entered();
+        Ok(self.coordinator.drive_fair_pull(profile)?)
     }
 
     /// Asserts that an unknown outcome cannot satisfy Finish.

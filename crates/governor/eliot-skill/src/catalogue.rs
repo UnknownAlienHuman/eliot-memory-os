@@ -139,6 +139,45 @@ fn canonical_digest<T: Serialize>(value: &T, field: &'static str) -> Result<Stri
     Ok(sha256_hex(&bytes))
 }
 
+/// Binds one activation receipt chain from its records (`I7.13`, issue
+/// #1882 A3): the persisted structural-validation digest, the catalogue
+/// digest the receipt bound (entry statuses included, so staleness is
+/// observable), the exact receipt identity, the receiver ack binding, and
+/// the Current/provisional delivery ceiling the entry displayed under.
+///
+/// Single recipe shared by minting (`activation_display`) and resolution
+/// (`resolve_activation_chain`): the chain is recomputed from records at
+/// both ends, never re-stated, so a substituted chain fails closed.
+fn receipt_chain_digest(
+    validation_digest: &str,
+    catalogue_digest: &str,
+    receipt: &HotsetDeliveryReceipt,
+    ack: &HotsetDeliveryAck,
+    status: SkillStatus,
+) -> Result<String, SkillError> {
+    canonical_digest(
+        &(
+            validation_digest,
+            catalogue_digest,
+            &receipt.receipt_digest,
+            &receipt.hotset_id,
+            &ack.receiver_id,
+            &ack.hotset_id,
+            match ack.disposition {
+                HotsetAckDisposition::Applied => "applied",
+                HotsetAckDisposition::Rejected { .. } => "rejected",
+            },
+            // The chain commits to the delivery ceiling: a provisional
+            // activation never shares a chain with a current-grade one.
+            match status {
+                SkillStatus::Current => "current",
+                _ => "provisional",
+            },
+        ),
+        "activation.receipt_chain",
+    )
+}
+
 /// Read-only view over the tool owner's registry, implemented by the tool
 /// owner and passed at installation and activation boundaries. This crate
 /// mints no registry and ships no default set: an unknown name fails closed
@@ -1365,26 +1404,12 @@ impl SkillCatalogue {
             .as_ref()
             .map(PromotionEvidence::evidence_digest)
             .transpose()?;
-        let receipt_chain_digest = canonical_digest(
-            &(
-                &validation_digest,
-                &catalogue_digest,
-                &receipt.receipt_digest,
-                &receipt.hotset_id,
-                &ack.receiver_id,
-                &ack.hotset_id,
-                match ack.disposition {
-                    HotsetAckDisposition::Applied => "applied",
-                    HotsetAckDisposition::Rejected { .. } => "rejected",
-                },
-                // The chain commits to the delivery ceiling: a provisional
-                // activation never shares a chain with a current-grade one.
-                match entry.status {
-                    SkillStatus::Current => "current",
-                    _ => "provisional",
-                },
-            ),
-            "activation.receipt_chain",
+        let receipt_chain_digest = receipt_chain_digest(
+            &validation_digest,
+            &catalogue_digest,
+            receipt,
+            ack,
+            entry.status,
         )?;
         Ok(ActivatedSkillDisplay {
             skill_id: entry.index.skill_id.clone(),
@@ -1465,6 +1490,140 @@ impl SkillCatalogue {
         entry.validate()?;
         super::activation::gate_material_use_against(entry, world)?;
         self.activation_display(skill_id, receipt, ack, world.tools)
+    }
+
+    /// Resolves one presented activation display back to its bound records
+    /// (`I7.13`, issue #1882 A3/A4).
+    ///
+    /// The positive acceptance: an activated Skill's receipt chain resolves
+    /// to the `eliot-skill` validation, staleness, and delivery-ack records.
+    /// Every leg is re-compared against the exact content this call observes
+    /// — the persisted structural-validation report, the live catalogue
+    /// state (entry statuses included, so staleness is observable), the full
+    /// displayed content (trigger, budgets, dependency versions, eligibility,
+    /// host/profile versions, scope, status, and the promotion record), and
+    /// the exact receipt/ack pair — never re-stated from the presented
+    /// display. Digests alone do not bind the human-readable content, so a
+    /// substituted display that keeps every digest yet widens the admitted
+    /// scope, forges dependency versions, or claims unearned promotion fails
+    /// with `IdentityMismatch` on the content legs below.
+    /// A Skill whose dependency changed is not representable as generally
+    /// delivered: the drift mark rotates the catalogue digest, so a display
+    /// bound before the mark fails closed here exactly as it does at
+    /// `activation_display`, and a stale entry or an unvalidated `Current`
+    /// stays refused through the existing use gate. The receipt chain is
+    /// recomputed from the records with the single chain recipe and compared
+    /// to the presented chain, so a substituted chain fails with
+    /// `IdentityMismatch`. Failure reasons reuse the display path's typed
+    /// fields; no second refusal vocabulary is introduced.
+    ///
+    /// # STITCH: designated chain-resolution caller
+    ///
+    /// `caller: STITCH`. The designated caller is a receiver holding a
+    /// presented or retained display past serve time (a receipt-chain audit
+    /// or a display/ack round trip that outlives the serving call); today
+    /// every display is derived fresh at serve time through
+    /// `activation_display`, where the same legs already bind, so no second
+    /// resolution path is manufactured here.
+    pub fn resolve_activation_chain(
+        &self,
+        skill_id: &str,
+        display: &ActivatedSkillDisplay,
+        receipt: &HotsetDeliveryReceipt,
+        ack: &HotsetDeliveryAck,
+        tools: &dyn KnownTools,
+    ) -> Result<(), SkillError> {
+        display.validate()?;
+        if display.skill_id != skill_id {
+            return Err(SkillError::IdentityMismatch);
+        }
+        let entry = self.entries.get(skill_id).ok_or(SkillError::NotFound)?;
+        entry.validate()?;
+        if !entry.is_usable() {
+            return Err(SkillError::InvalidField {
+                field: "entry.status",
+                reason: "stale or retired Skills are blocked from use",
+            });
+        }
+        if display.validation_digest != entry.validation.report_digest
+            || display.body_digest != entry.body.body_digest
+            || display.body_version != entry.body.body_version
+        {
+            return Err(SkillError::IdentityMismatch);
+        }
+        // Displayed content binding (issue #1882 A3/A4): the digests above
+        // do not bind the human-readable content, so every descriptive field
+        // is compared against the live entry. A substituted display that
+        // keeps every digest yet widens the admitted scope, forges dependency
+        // versions, or claims unearned promotion is not the record and fails
+        // here; only the served content resolves.
+        if display.trigger != entry.index.trigger || display.status != entry.status {
+            return Err(SkillError::IdentityMismatch);
+        }
+        if display.index_tokens != entry.runtime.index_tokens
+            || display.body_tokens != entry.runtime.body_tokens
+            || display.runtime_tokens != entry.runtime.runtime_tokens
+            || display.index_budget_tokens != entry.runtime.index_budget_tokens
+            || display.body_budget_tokens != entry.runtime.body_budget_tokens
+            || display.runtime_budget_tokens != entry.runtime.runtime_budget_tokens
+        {
+            return Err(SkillError::IdentityMismatch);
+        }
+        if display.dependency_versions != entry.dependencies
+            || display.eligible_routes != entry.index.eligible_routes
+            || display.eligible_profiles != entry.index.eligible_profiles
+            || display.eligible_policies != entry.index.eligible_policies
+            || display.host_version != entry.host_version
+            || display.profile_version != entry.profile_version
+            || display.scope != entry.scope
+        {
+            return Err(SkillError::IdentityMismatch);
+        }
+        let expected_promotion = entry
+            .promotion_evidence
+            .as_ref()
+            .map(PromotionEvidence::evidence_digest)
+            .transpose()?;
+        if display.promotion_digest != expected_promotion {
+            return Err(SkillError::IdentityMismatch);
+        }
+        receipt.validate()?;
+        if display.catalogue_digest != receipt.catalogue_digest
+            || display.delivery_receipt_digest != receipt.receipt_digest
+        {
+            return Err(SkillError::IdentityMismatch);
+        }
+        if receipt.catalogue_digest != self.catalogue_digest()? {
+            return Err(SkillError::IdentityMismatch);
+        }
+        ack.validate()?;
+        if ack.hotset_id != receipt.hotset_id || ack.receipt_digest != receipt.receipt_digest {
+            return Err(SkillError::IdentityMismatch);
+        }
+        if ack.disposition != HotsetAckDisposition::Applied {
+            return Err(SkillError::InvalidField {
+                field: "delivery.ack",
+                reason: "activation requires an applied receiver ack for this receipt",
+            });
+        }
+        if !receipt.confirms_delivery(skill_id) {
+            return Err(SkillError::InvalidField {
+                field: "delivery.receipt",
+                reason: "activation requires a delivery receipt for this Skill",
+            });
+        }
+        entry.body.validate_tools(tools)?;
+        let resolved = receipt_chain_digest(
+            &entry.validation.report_digest,
+            &receipt.catalogue_digest,
+            receipt,
+            ack,
+            entry.status,
+        )?;
+        if resolved != display.receipt_chain_digest {
+            return Err(SkillError::IdentityMismatch);
+        }
+        Ok(())
     }
 }
 

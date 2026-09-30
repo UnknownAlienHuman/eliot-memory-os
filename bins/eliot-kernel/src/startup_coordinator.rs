@@ -179,14 +179,21 @@ pub enum GovernanceSupervision {
 
 /// Minimal Governance Profile (A7.7 vector). The ceiling is the weakest
 /// relevant axis: no single strong axis promotes authority by itself.
+///
+/// The three axes are module-local (I7.16, #1935 AUD1): no struct-literal
+/// minting outside this module, so the Governor-fed
+/// [`governor_authorization_axes_to_profile`] ladder is the only production
+/// minter, and it mints only from the recorded Governor-issued
+/// revision/fingerprint/axes. Production gates admit only the recorded
+/// projection, never a caller-minted profile.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Serialize)]
 pub struct GovernanceProfile {
     /// Observation axis.
-    pub observation: GovernanceObservation,
+    observation: GovernanceObservation,
     /// Enforcement axis.
-    pub enforcement: GovernanceEnforcement,
+    enforcement: GovernanceEnforcement,
     /// Supervision axis.
-    pub supervision: GovernanceSupervision,
+    supervision: GovernanceSupervision,
 }
 
 impl GovernanceProfile {
@@ -245,7 +252,7 @@ impl GovernanceProfile {
     /// separately by [`StartupCoordinator::authority_ceiling`].
     #[must_use]
     pub const fn ceiling(self) -> AuthorityCeiling {
-        match (self.observation, self.enforcement, self.supervision) {
+        match (self.observation(), self.enforcement(), self.supervision()) {
             (
                 GovernanceObservation::IndependentlyObserved,
                 GovernanceEnforcement::Enforced,
@@ -259,6 +266,27 @@ impl GovernanceProfile {
             ) => AuthorityCeiling::Material,
             _ => AuthorityCeiling::LowImpact,
         }
+    }
+
+    /// Observation axis of this profile, in the existing A7.7 vocabulary.
+    /// Readback only: axes are minted solely by the Governor-fed ladder.
+    #[must_use]
+    pub const fn observation(self) -> GovernanceObservation {
+        self.observation
+    }
+
+    /// Enforcement axis of this profile, in the existing A7.7 vocabulary.
+    /// Readback only: axes are minted solely by the Governor-fed ladder.
+    #[must_use]
+    pub const fn enforcement(self) -> GovernanceEnforcement {
+        self.enforcement
+    }
+
+    /// Supervision axis of this profile, in the existing A7.7 vocabulary.
+    /// Readback only: axes are minted solely by the Governor-fed ladder.
+    #[must_use]
+    pub const fn supervision(self) -> GovernanceSupervision {
+        self.supervision
     }
 }
 

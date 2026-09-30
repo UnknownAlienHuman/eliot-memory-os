@@ -126,6 +126,13 @@ pub enum ReconcileFailure {
     /// The event joined a correlation but the owner's own log refused the
     /// resulting revision, so no current assessment exists.
     RevisionRefused(String),
+    /// More than one retained correlation accepted the same candidate event.
+    ///
+    /// Attribution is decided by the host event's own invocation scope, so this
+    /// cannot happen while that scope is exact. It is refused rather than
+    /// resolved by retention order: picking the first record would attribute a
+    /// host terminal fact to whichever request happened to still be pending.
+    AmbiguousAttribution(String),
 }
 
 impl std::fmt::Display for ReconcileFailure {
@@ -137,6 +144,10 @@ impl std::fmt::Display for ReconcileFailure {
             Self::RevisionRefused(detail) => {
                 write!(formatter, "owner's log refused the revision: {detail}")
             }
+            Self::AmbiguousAttribution(event_id) => write!(
+                formatter,
+                "host event {event_id} matched more than one correlation; it closes none"
+            ),
         }
     }
 }
@@ -466,10 +477,19 @@ impl BridgeRunner {
     ///
     /// Each retained correlation is offered the candidate exactly once, in
     /// retention order, so one event cannot close one correlation twice and
-    /// one correlation cannot close once per event. A later exact
-    /// host-completion event therefore resolves the SAME correlation as
-    /// completed and appends a linked revision, so no false degradation stays
-    /// current beside a healthy completion.
+    /// one correlation cannot close once per event. Retention order decides
+    /// nothing: an acceptance means the host event's own invocation scope named
+    /// that correlation, and if the event were ever to match more than one, the
+    /// join refuses as [`ReconcileFailure::AmbiguousAttribution`] rather than
+    /// taking the first. A later exact host-completion event therefore resolves
+    /// the SAME correlation as completed and appends a linked revision, so no
+    /// false degradation stays current beside a healthy completion.
+    ///
+    /// Nothing here nominates a correlation on the caller's behalf. The join
+    /// keys carry no correlation digest, because a digest the correlation
+    /// recorded says nothing about which event belongs to it; comparing it back
+    /// would pass for every retained record and let a turn-level terminal fact
+    /// close whichever request was still pending.
     pub fn reconcile_terminal_host_event(
         &mut self,
         event: &HostEventEnvelope,
@@ -486,6 +506,15 @@ impl BridgeRunner {
             return Err(ReconcileFailure::OwnerUnavailable);
         }
         let candidate_count = self.correlations.records().len();
+        // Every retained correlation is offered the candidate and the join
+        // decides; a refusal means the event is not attributable to that
+        // correlation, which is the ordinary outcome for all of them. The loop
+        // never takes the first acceptance: it counts them, so a candidate that
+        // somehow matched more than one correlation is an explicit ambiguity
+        // refusal rather than a silent attribution to whichever record happened
+        // to be retained first. Correct attribution is the join's job — the
+        // host event's own invocation scope, or nothing.
+        let mut accepted: Option<(usize, Assessment)> = None;
         for index in 0..candidate_count {
             let request = {
                 let record = &self.correlations.records()[index];
@@ -494,7 +523,6 @@ impl BridgeRunner {
                     candidate: event,
                     keys: &HostEventJoinKeys {
                         integration_id: integration_id.to_owned(),
-                        correlation_digest: record.emission.identity.identity_digest.clone(),
                         deadline_unix_ms: record.deadline_unix_ms,
                     },
                     assessments: &record.assessments,
@@ -504,45 +532,49 @@ impl BridgeRunner {
                     now_unix_ms: Some(now_unix_ms),
                 }
             };
-            let assessment: Assessment = match reconcile_terminal_event(&self.core, &request) {
-                Ok(assessment) => assessment,
-                // A refused join means this correlation is not the one the
-                // event names. That is the ordinary outcome for every other
-                // retained correlation, not an error.
-                Err(_) => continue,
+            let Ok(assessment) = reconcile_terminal_event(&self.core, &request) else {
+                continue;
             };
-            // Read before the mutable borrow: `owner_sequence` needs
-            // `&self.correlations` and `&self.core`, and neither can be read
-            // while a `&mut` into `self.correlations` is live.
-            let sequence = self.correlations.owner_sequence(&self.core);
-            let record = &mut self.correlations.records_mut()[index];
-            let digest = record.emission.identity.identity_digest.clone();
-            let state = assessment.state;
-            record
-                .assessments
-                .append(&digest, assessment)
-                .map_err(|error| ReconcileFailure::RevisionRefused(error.to_string()))?;
-            // The appended revision is cloned out of the correlations store
-            // before the bridge core is borrowed mutably: the two fields are
-            // disjoint, but a live `&mut` into `self.correlations` across
-            // `&mut self.core` is a borrow error, not a race.
-            let latest = record.assessments.latest().cloned();
-            let edge_filed = match latest {
-                Some(revision) => {
-                    matches!(
-                        submit_derived_fault(&mut self.core, &revision, sequence),
-                        FaultEdgeSubmission::Submitted
-                    )
-                }
-                None => false,
-            };
-            return Ok(HostEventReconciliation::Resolved {
-                correlation_digest: digest,
-                state,
-                edge_filed,
-            });
+            if accepted.is_some() {
+                return Err(ReconcileFailure::AmbiguousAttribution(
+                    event.event_id.as_str().to_owned(),
+                ));
+            }
+            accepted = Some((index, assessment));
         }
-        Ok(HostEventReconciliation::NoTrackedCorrelation)
+        let Some((index, assessment)) = accepted else {
+            return Ok(HostEventReconciliation::NoTrackedCorrelation);
+        };
+        // Read before the mutable borrow: `owner_sequence` needs
+        // `&self.correlations` and `&self.core`, and neither can be read while a
+        // `&mut` into `self.correlations` is live.
+        let sequence = self.correlations.owner_sequence(&self.core);
+        let record = &mut self.correlations.records_mut()[index];
+        let digest = record.emission.identity.identity_digest.clone();
+        let state = assessment.state;
+        record
+            .assessments
+            .append(&digest, assessment)
+            .map_err(|error| ReconcileFailure::RevisionRefused(error.to_string()))?;
+        // The appended revision is cloned out of the correlations store before
+        // the bridge core is borrowed mutably: the two fields are disjoint, but a
+        // live `&mut` into `self.correlations` across `&mut self.core` is a
+        // borrow error, not a race.
+        let latest = record.assessments.latest().cloned();
+        let edge_filed = match latest {
+            Some(revision) => {
+                matches!(
+                    submit_derived_fault(&mut self.core, &revision, sequence),
+                    FaultEdgeSubmission::Submitted
+                )
+            }
+            None => false,
+        };
+        Ok(HostEventReconciliation::Resolved {
+            correlation_digest: digest,
+            state,
+            edge_filed,
+        })
     }
 
     /// Assesses every tracked correlation against its admitted deadline from

@@ -50,7 +50,7 @@ use eliot_contracts::{
 };
 use eliot_platform_windows::ProtectedPathLease;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicBool, AtomicU64},
@@ -274,23 +274,38 @@ impl KernelComposition {
             observe_terminal_error(kernel_build_error_code(error));
         })?;
         let ors = Arc::new(
-            RedbRecoveryStore::open(&ors_path)
-                .map_err(|error| KernelBuildError::Ors(error.to_string()))
-                .inspect_err(|error| {
-                    observe_entrypoint_with_detail(
-                        EntrypointStage::Composition,
-                        "kernel.composition.build_failed",
-                    );
-                    observe_terminal_error(kernel_build_error_code(error));
-                })?,
+            Self::open_ors_for_config(&config, &ors_path).inspect_err(|error| {
+                observe_entrypoint_with_detail(
+                    EntrypointStage::Composition,
+                    "kernel.composition.build_failed",
+                );
+                observe_terminal_error(kernel_build_error_code(error));
+            })?,
         );
-        Self::assemble(config, ors, None, platform).inspect_err(|error| {
+        Self::assemble(config, ors, ors_path, None, platform).inspect_err(|error| {
             observe_entrypoint_with_detail(
                 EntrypointStage::Composition,
                 "kernel.composition.build_failed",
             );
             observe_terminal_error(kernel_build_error_code(error));
         })
+    }
+
+    /// Opens the production ORS at the exact configured object path and binds
+    /// it to the Host installation identity when the authenticated Host
+    /// launch binding is present. Unbound development compositions retain
+    /// their existing open path, but cannot issue an installation contour.
+    fn open_ors_for_config(
+        config: &KernelConfig,
+        ors_path: &Path,
+    ) -> Result<RedbRecoveryStore, KernelBuildError> {
+        let result = if let Some(binding) = config.eliotd_receipt_binding.as_ref() {
+            RedbRecoveryStore::open_for_installation(ors_path, binding.installation_id())
+                .map(|(store, _identity)| store)
+        } else {
+            RedbRecoveryStore::open(ors_path)
+        };
+        result.map_err(|error| KernelBuildError::Ors(error.to_string()))
     }
 
     /// Consumes the Host-approved protected authority descriptor before
@@ -323,11 +338,7 @@ impl KernelComposition {
                 .map_err(&terminal)?,
         );
         let ors_path = Self::ors_path_for_config(&config).map_err(&terminal)?;
-        let ors = Arc::new(
-            RedbRecoveryStore::open(&ors_path)
-                .map_err(|error| KernelBuildError::Ors(error.to_string()))
-                .map_err(&terminal)?,
-        );
+        let ors = Arc::new(Self::open_ors_for_config(&config, &ors_path).map_err(&terminal)?);
         let prepared = Self::prepare_authority_descriptor_material(
             &platform,
             &ors,
@@ -384,10 +395,9 @@ impl KernelComposition {
             Arc::clone(&platform),
             prepared.descriptor.dispatch_key.clone(),
         ));
-        let authority_id = prepared.descriptor.authority_id.clone();
         let handoff = prepared.handoff.clone();
         let controller = Self::prepare_descriptor_controller(
-            authority_id.clone(),
+            prepared.descriptor.authority_id.clone(),
             prepared.key,
             Arc::clone(&ors) as Arc<dyn OperationalRecoveryStore>,
             Arc::clone(&codec),
@@ -400,8 +410,15 @@ impl KernelComposition {
         Self::consume_authority_handoff(&ors, &handoff)
             .map_err(|error| KernelBuildError::Service(error.to_string()))
             .map_err(&terminal)?;
-        Self::assemble_with_process_controller(config, controller, snapshot_binding, ors, platform)
-            .map_err(&terminal)
+        Self::assemble_with_process_controller(
+            config,
+            controller,
+            snapshot_binding,
+            ors,
+            ors_path,
+            platform,
+        )
+        .map_err(&terminal)
     }
 
     /// Builds a production composition with an externally supplied process
@@ -431,12 +448,8 @@ impl KernelComposition {
                 .map_err(&terminal)?,
         );
         let ors_path = Self::ors_path_for_config(&config).map_err(&terminal)?;
-        let ors = Arc::new(
-            RedbRecoveryStore::open(&ors_path)
-                .map_err(|error| KernelBuildError::Ors(error.to_string()))
-                .map_err(&terminal)?,
-        );
-        Self::assemble_with_process_authority(config, authority_config, ors, platform)
+        let ors = Arc::new(Self::open_ors_for_config(&config, &ors_path).map_err(&terminal)?);
+        Self::assemble_with_process_authority(config, authority_config, ors, ors_path, platform)
             .map_err(&terminal)
     }
 
@@ -690,6 +703,7 @@ impl KernelComposition {
         config: KernelConfig,
         authority_config: ProcessExecutionAuthorityConfig,
         ors: Arc<RedbRecoveryStore>,
+        ors_object_path: PathBuf,
         platform: Arc<WindowsPlatform>,
     ) -> Result<Self, KernelBuildError> {
         let authority_store: Arc<dyn OperationalRecoveryStore> = ors.clone();
@@ -708,6 +722,7 @@ impl KernelComposition {
             controller,
             authority_config.snapshot_binding,
             ors,
+            ors_object_path,
             platform,
         )
     }
@@ -717,6 +732,7 @@ impl KernelComposition {
         controller: Arc<Mutex<ProcessDispatchAuthorityController>>,
         snapshot_binding: AuthoritySnapshotBinding,
         ors: Arc<RedbRecoveryStore>,
+        ors_object_path: PathBuf,
         platform: Arc<WindowsPlatform>,
     ) -> Result<Self, KernelBuildError> {
         let path_admission = Arc::new(KernelPathAdmission::new(Arc::clone(&platform)));
@@ -726,7 +742,7 @@ impl KernelComposition {
             snapshot_binding,
             path_admission,
         ));
-        Self::assemble(config, ors, Some(gateway), platform)
+        Self::assemble(config, ors, ors_object_path, Some(gateway), platform)
     }
 
     /// Reconciles the durable activation intent and replay snapshot before a
@@ -1087,7 +1103,7 @@ impl KernelComposition {
             RedbRecoveryStore::open_with_evidence(&ors_path, evidence)
                 .map_err(|error| KernelBuildError::Ors(error.to_string()))?,
         );
-        Self::assemble(config, ors, None, platform)
+        Self::assemble(config, ors, ors_path, None, platform)
     }
 
     /// Keeps ordered generation, authority, and handoff construction in one
@@ -1097,6 +1113,7 @@ impl KernelComposition {
     fn assemble(
         config: KernelConfig,
         ors: Arc<RedbRecoveryStore>,
+        ors_object_path: PathBuf,
         process_gateway: Option<Arc<ProcessExecutionGateway>>,
         platform: Arc<WindowsPlatform>,
     ) -> Result<Self, KernelBuildError> {
@@ -1131,6 +1148,16 @@ impl KernelComposition {
                 );
                 KernelBuildError::Service(error)
             })?;
+        }
+        #[cfg(windows)]
+        if let Some(binding) = &eliotd_receipt_binding {
+            let expected_ors_path = binding.kernel_ors_root().join("kernel-ors.redb");
+            if !super::windows_paths_equal(&ors_object_path, &expected_ors_path) {
+                return Err(KernelBuildError::Service(
+                    "opened Kernel ORS object path does not match the Host installation binding"
+                        .to_owned(),
+                ));
+            }
         }
         observe_entrypoint_with_detail(
             EntrypointStage::Composition,
@@ -1587,6 +1614,12 @@ impl KernelComposition {
             audit_fallback: Mutex::new(audit_fallback),
             diagnostic_brief: Mutex::new(None),
             store_rebind_boundary: KernelStoreRebindProductionBoundary,
+            // This is the canonical path passed to the same open that
+            // produced `p07_ors`. It is a contour locator only: requests read
+            // identity/generation from the retained handle and never reopen
+            // this path, so later path substitution cannot change that
+            // handle's ORS identity or generation.
+            ors_object_path,
             work_root,
             runtime,
             platform,
@@ -1607,6 +1640,9 @@ impl KernelComposition {
             wasm_host_artifact_sha256,
             user_broker_executable_path,
             user_broker_artifact_sha256,
+            user_broker_registration_authority:
+                super::user_broker_registration_authority::UserBrokerRegistrationAuthority::default(
+                ),
             wasm_join_table: Mutex::new(eliot_kernel_service::WasmJoinTable::default()),
             pre_stage_identity_cache: Mutex::new(
                 eliot_kernel_service::PreStageIdentityCache::default(),

@@ -26,7 +26,24 @@ use thiserror::Error;
 mod end_of_activity;
 mod improvement_admission;
 pub mod improvement_pipeline;
+mod outcome_observation;
+pub mod result_obligation;
 mod trigger_intake;
+
+pub use outcome_observation::{
+    AdmittedObservationReceipt, ExpectedOutcomeObservation, MaintenanceOutcomeDisposition,
+    OBSERVATION_GAP_PROFILE, OBSERVATION_GAP_REASON, OUTCOME_OBSERVATION_OWNER,
+    OUTCOME_OBSERVATION_RESOLUTION, ObservedOutcomeObservation, OutcomeObservationCoverage,
+    OutstandingOutcome, OutstandingOutcomeObligation, RefusedReceiptStatus,
+    admit_observation_delivery, outcome_observation_coverage, outcome_observation_disposition,
+    record_observation_gap,
+};
+
+pub use result_obligation::{
+    FOLLOW_UP_PENDING_REASON, MAINTENANCE_OBLIGATION_CONTRACT_VERSION, MAX_RESULT_OBLIGATIONS,
+    MaintenanceResultObligation, NOT_APPLICABLE_REASON, SOURCE_EVALUATION_METHOD,
+    SOURCE_EVALUATION_METHOD_REVISION, maintenance_observation_record,
+};
 
 pub use end_of_activity::{
     ActivationScopeReference, AssessmentRecordReference, AssessmentSourceCoverage,
@@ -292,6 +309,20 @@ impl MaintenanceTriggerInput {
 pub struct AutomationTriggerDecision {
     /// Trigger identity.
     pub trigger_id: String,
+    /// Origin of the observation that produced this trigger.
+    ///
+    /// Carried verbatim from [`MaintenanceTriggerInput::trigger`], which is the
+    /// caller-observed origin of that trigger: this evaluator copies the
+    /// observed value and never selects, widens, or defaults one, so a decision
+    /// cannot claim an origin the evaluated trigger did not carry.
+    ///
+    /// The field exists because I12.24:54 closes the trigger set with
+    /// "Dreamer/Watchdog/Concilium suggestion": a downstream classifier has to
+    /// read which kind of observation produced a decision, and the family alone
+    /// cannot say that. `MaintenanceTrigger` names the origins this contract
+    /// expresses today — a Concilium suggestion is not one of them yet, so this
+    /// field widens no vocabulary and asserts none.
+    pub trigger: MaintenanceTrigger,
     /// Selected family and scope.
     pub family: MaintenanceFamily,
     /// Affected scope.
@@ -388,6 +419,13 @@ pub struct MaintenanceJob {
     pub job_id: String,
     /// Trigger identity that admitted this job.
     pub trigger_id: String,
+    /// Identity of the exact source decision that admitted this job.
+    ///
+    /// Carried on the job because every later source result names the decision
+    /// that produced it. Derived from the decision's own stable identity, so the
+    /// decision a result is attributed to is the decision that admitted the
+    /// work rather than a reference restated by the transition.
+    pub decision_ref: String,
     /// Registered maintenance family.
     pub family: MaintenanceFamily,
     /// Narrow affected scope.
@@ -410,6 +448,15 @@ pub struct MaintenanceJob {
     pub outcome_ref: Option<String>,
     /// Whether execution requires an authenticated user session.
     pub user_session_required: bool,
+    /// Append-only result-to-observation obligations this job has produced.
+    ///
+    /// Persisted in the same `save` as the lifecycle revision that produced
+    /// them, so the job state and the canonical observation it owes become
+    /// durable together or in neither. The list is append-only: a reconciliation
+    /// adds a linked entry and never rewrites or removes the earlier one, so the
+    /// original uncertainty stays visible next to its resolution.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub result_obligations: Vec<MaintenanceResultObligation>,
 }
 
 impl MaintenanceJob {
@@ -417,8 +464,39 @@ impl MaintenanceJob {
     pub fn validate(&self) -> Result<(), MaintenanceError> {
         text(&self.job_id, "job_id")?;
         text(&self.trigger_id, "trigger_id")?;
+        text(&self.decision_ref, "decision_ref")?;
         text(&self.scope_ref, "scope_ref")?;
         text(&self.budget_ref, "budget_ref")?;
+        if self.result_obligations.len() > result_obligation::MAX_RESULT_OBLIGATIONS {
+            return Err(MaintenanceError::InvalidField("job.result_obligations"));
+        }
+        // The append chain is checked as a chain, not as a set: an obligation's
+        // predecessor must be the entry before it, so a dropped or reordered
+        // obligation is refused instead of silently orphaning the uncertainty it
+        // was resolving.
+        for (index, obligation) in self.result_obligations.iter().enumerate() {
+            obligation.validate()?;
+            let expected_predecessor = index
+                .checked_sub(1)
+                .and_then(|prior| self.result_obligations.get(prior))
+                .map(|prior| prior.publication_id.as_str());
+            if obligation.predecessor_obligation_ref.as_deref() != expected_predecessor {
+                return Err(MaintenanceError::InvalidField(
+                    "job.result_obligations.predecessor_obligation_ref",
+                ));
+            }
+            // Every obligation must name the job, trigger, decision, family and
+            // scope this revision actually has. An obligation that disagrees with
+            // its own job would publish a result under another job's identity.
+            if obligation.job_ref.as_deref() != Some(self.job_id.as_str())
+                || obligation.source_trigger_ref != self.trigger_id
+                || obligation.decision_ref != self.decision_ref
+                || obligation.family != self.family
+                || obligation.scope_ref != self.scope_ref
+            {
+                return Err(MaintenanceError::InvalidField("job.result_obligations"));
+            }
+        }
         self.state_fence
             .validate()
             .map_err(|_| MaintenanceError::FenceMismatch)?;
@@ -485,6 +563,92 @@ impl MaintenanceJob {
             state: next,
             ..self.clone()
         })
+    }
+}
+
+/// The stable identity of the source decision that produced one maintenance
+/// result.
+///
+/// Derived from the decision's own stable identity — its trigger, family, scope,
+/// action and reason — rather than assigned by a caller, so the decision a
+/// result is attributed to is the decision that was actually evaluated. It is a
+/// pure function of that decision, so re-evaluating the same decision yields the
+/// same reference and a changed decision yields a different one.
+#[must_use]
+pub fn maintenance_decision_ref(decision: &AutomationTriggerDecision) -> String {
+    format!(
+        "maintenance-decision:{}:{}:{}:{}:{}",
+        decision.family,
+        decision.trigger_id,
+        decision.scope_ref,
+        match decision.decision {
+            AutomationDecision::Start => "START",
+            AutomationDecision::Suggest => "SUGGEST",
+            AutomationDecision::Defer => "DEFER",
+            AutomationDecision::SuppressDuplicate => "SUPPRESS_DUPLICATE",
+            AutomationDecision::Block => "BLOCK",
+            AutomationDecision::Escalate => "ESCALATE",
+        },
+        match decision.reason {
+            DecisionReason::Eligible => "ELIGIBLE",
+            DecisionReason::AutomationOff => "AUTOMATION_OFF",
+            DecisionReason::SuggestOnly => "SUGGEST_ONLY",
+            DecisionReason::ExplicitRequestRequired => "EXPLICIT_REQUEST_REQUIRED",
+            DecisionReason::NotIdle => "NOT_IDLE",
+            DecisionReason::OutsideSchedule => "OUTSIDE_SCHEDULE",
+            DecisionReason::RouteUnavailable => "ROUTE_UNAVAILABLE",
+            DecisionReason::BudgetUnavailable => "BUDGET_UNAVAILABLE",
+            DecisionReason::UserSessionRequired => "USER_SESSION_REQUIRED",
+            DecisionReason::DuplicateActiveJob => "DUPLICATE_ACTIVE_JOB",
+            DecisionReason::Expired => "EXPIRED",
+            DecisionReason::SafetyRecovery => "SAFETY_RECOVERY",
+        }
+    )
+}
+
+/// The result-to-observation obligation a non-execution decision owes.
+///
+/// A decision that starts no execution attempt is still a source result: it is
+/// the answer the maintenance owner gave, and it is in coverage. This records the
+/// real decision reference and the absent execution evidence, so a deferral, a
+/// block, a suggestion, an escalation and a duplicate suppression each publish a
+/// bound observation instead of a fabricated failed job — and instead of being
+/// reported only through a diagnostic logger.
+///
+/// The durable job identity is carried when the decision names one (a
+/// suppressed duplicate's existing job), because that job is the real owner of
+/// the work the decision declined to duplicate. The execution outcome is
+/// [`NotAttempted`](eliot_observation_contracts::MaintenanceExecutionOutcome::NotAttempted):
+/// this decision began no attempt, so it carries no attempt, receipt, effect,
+/// checkpoint or reconciliation reference.
+#[must_use]
+pub fn decision_result_obligation(
+    decision: &AutomationTriggerDecision,
+    state_fence: &StateFence,
+) -> MaintenanceResultObligation {
+    let decision_ref = maintenance_decision_ref(decision);
+    let publication_id = format!("maintenance-result:{decision_ref}:not-attempted");
+    MaintenanceResultObligation {
+        contract_version: result_obligation::MAINTENANCE_OBLIGATION_CONTRACT_VERSION,
+        publication_id: publication_id.clone(),
+        source_trigger_ref: decision.trigger_id.clone(),
+        decision_ref,
+        family: decision.family,
+        scope_ref: decision.scope_ref.clone(),
+        job_ref: decision.durable_job_ref.clone(),
+        attempt_ref: None,
+        execution_receipt_ref: None,
+        state_fence: state_fence.clone(),
+        source_outcome_revision: "NOT_ATTEMPTED:0".to_owned(),
+        actual_effect_refs: Vec::new(),
+        checkpoint_refs: Vec::new(),
+        reconciliation_refs: Vec::new(),
+        execution_outcome: eliot_observation_contracts::MaintenanceExecutionOutcome::NotAttempted,
+        delivery: eliot_observation_contracts::MaintenanceDeliveryState::Pending {
+            obligation_ref: publication_id,
+        },
+        evaluation_revision: 1,
+        predecessor_obligation_ref: None,
     }
 }
 
@@ -594,6 +758,10 @@ impl<S: MaintenanceStateStore> MaintenanceController<S> {
         if let Some(active) = &input.active_job_id {
             return Ok(AutomationTriggerDecision {
                 trigger_id: input.trigger_id.clone(),
+                // The observed origin travels with the suppressed decision too:
+                // duplicate suppression says an equivalent request already owns
+                // this work, it does not change where the trigger came from.
+                trigger: input.trigger,
                 family: input.family,
                 scope_ref: input.scope_ref.clone(),
                 decision: AutomationDecision::SuppressDuplicate,
@@ -670,6 +838,10 @@ impl<S: MaintenanceStateStore> MaintenanceController<S> {
         let job = MaintenanceJob {
             job_id,
             trigger_id: decision.trigger_id.clone(),
+            // The admission names the exact decision that produced it, so every
+            // later source result on this job is attributed to the decision that
+            // actually admitted the work.
+            decision_ref: maintenance_decision_ref(decision),
             family: decision.family,
             scope_ref: decision.scope_ref.clone(),
             state_fence,
@@ -681,6 +853,7 @@ impl<S: MaintenanceStateStore> MaintenanceController<S> {
             budget_ref,
             outcome_ref: None,
             user_session_required,
+            result_obligations: Vec::new(),
         };
         job.validate()?;
         self.store.save(&job)?;
@@ -726,6 +899,10 @@ impl<S: MaintenanceStateStore> MaintenanceController<S> {
         }
         let mut next = job.transition(MaintenanceJobState::Checkpointed)?;
         next.checkpoint = Some(checkpoint);
+        // A bounded partial result is a source result in its own right: it owes
+        // an observation like any other outcome, and it is recorded in the same
+        // write as the checkpoint that produced it.
+        result_obligation::append_result_obligation(&mut next, None)?;
         self.store.save(&next)?;
         Ok(next)
     }
@@ -763,6 +940,7 @@ impl<S: MaintenanceStateStore> MaintenanceController<S> {
         let job = self.load_checked(job_id, fence)?;
         let mut next = job.transition(MaintenanceJobState::Completed)?;
         next.outcome_ref = Some(outcome_ref);
+        result_obligation::append_result_obligation(&mut next, None)?;
         self.store.save(&next)?;
         Ok(next)
     }
@@ -778,6 +956,7 @@ impl<S: MaintenanceStateStore> MaintenanceController<S> {
         let job = self.load_checked(job_id, fence)?;
         let mut next = job.transition(MaintenanceJobState::UnknownOutcome)?;
         next.outcome_ref = Some(evidence_ref);
+        result_obligation::append_result_obligation(&mut next, None)?;
         self.store.save(&next)?;
         Ok(next)
     }
@@ -793,6 +972,7 @@ impl<S: MaintenanceStateStore> MaintenanceController<S> {
         let job = self.load_checked(job_id, fence)?;
         let mut next = job.transition(MaintenanceJobState::Failed)?;
         next.outcome_ref = Some(evidence_ref);
+        result_obligation::append_result_obligation(&mut next, None)?;
         self.store.save(&next)?;
         Ok(next)
     }
@@ -809,8 +989,13 @@ impl<S: MaintenanceStateStore> MaintenanceController<S> {
         if job.state != MaintenanceJobState::UnknownOutcome {
             return Err(MaintenanceError::UnknownRequiresReconciliation);
         }
+        // The unknown result is this job's current source result, so a
+        // quarantine that follows it is an appended obligation naming it, not a
+        // replacement of it. The uncertainty stays in the history.
+        let predecessor = result_obligation::latest_obligation(&job).cloned();
         let mut next = job.transition(MaintenanceJobState::RollbackRequired)?;
         next.outcome_ref = Some(evidence_ref);
+        result_obligation::append_result_obligation(&mut next, predecessor.as_ref())?;
         self.store.save(&next)?;
         Ok(next)
     }
@@ -828,6 +1013,12 @@ impl<S: MaintenanceStateStore> MaintenanceController<S> {
         if job.state != MaintenanceJobState::UnknownOutcome {
             return Err(MaintenanceError::UnknownRequiresReconciliation);
         }
+        // The unknown result being reconciled is the predecessor of whatever this
+        // resolves to. It is named, not replaced: the appended record adds linked
+        // evidence and the original uncertainty remains in the job's history.
+        let predecessor = result_obligation::latest_obligation(&job)
+            .cloned()
+            .ok_or(MaintenanceError::UnknownRequiresReconciliation)?;
         let target = match disposition {
             ReconciliationDisposition::ProvenNoEffect => MaintenanceJobState::Deferred,
             ReconciliationDisposition::ProvenApplied => MaintenanceJobState::Completed,
@@ -837,6 +1028,7 @@ impl<S: MaintenanceStateStore> MaintenanceController<S> {
         };
         let mut next = job.transition(target)?;
         next.outcome_ref = Some(evidence_ref);
+        result_obligation::append_reconciliation_obligation(&mut next, &predecessor)?;
         self.store.save(&next)?;
         Ok(next)
     }
@@ -848,7 +1040,105 @@ impl<S: MaintenanceStateStore> MaintenanceController<S> {
         fence: &StateFence,
     ) -> Result<MaintenanceJob, MaintenanceError> {
         let job = self.load_checked(job_id, fence)?;
-        let next = job.transition(MaintenanceJobState::Cancelled)?;
+        let mut next = job.transition(MaintenanceJobState::Cancelled)?;
+        // A cancellation is a source result too. It records no outcome evidence
+        // because none was produced, and it still owes an observation.
+        result_obligation::append_result_obligation(&mut next, None)?;
+        self.store.save(&next)?;
+        Ok(next)
+    }
+
+    /// Records that the canonical observation route admitted one result this
+    /// job owed an observation for, and persists that fact on the job revision.
+    ///
+    /// This is the only transition that makes the second of the three states
+    /// durable. Before it the retained obligation is `Pending` — the work
+    /// happened and the observation does not exist yet. After it the retained
+    /// obligation carries the exact store receipt, so a later read can tell an
+    /// admitted observation from a merely referenced one.
+    ///
+    /// It writes through the same [`MaintenanceStateStore::save`] every
+    /// lifecycle transition uses, so the receipt and the revision it settles
+    /// become durable together or in neither. It never touches the lifecycle
+    /// state, the outcome reference or any earlier obligation, so admitting an
+    /// observation cannot rewrite the execution history it observes, and it
+    /// never writes an outcome: the only value it can add is a receipt the
+    /// caller already holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaintenanceError::InvalidField`] when an identity is empty,
+    /// when this job owes no result observation under `publication_id`, or
+    /// when that obligation's delivery is already recorded as unavailable;
+    /// [`MaintenanceError::IdentityConflict`] when a different receipt is
+    /// already admitted under that identity; [`MaintenanceError::FenceMismatch`]
+    /// for a stale or mismatched fence; and [`MaintenanceError::Store`] when
+    /// the port refuses the write. Replaying the same receipt is a
+    /// reconciliation and persists nothing.
+    pub fn admit_observation_receipt(
+        &mut self,
+        job_id: &str,
+        fence: &StateFence,
+        publication_id: &str,
+        observation_receipt_ref: &str,
+    ) -> Result<MaintenanceJob, MaintenanceError> {
+        let job = self.load_checked(job_id, fence)?;
+        let next = outcome_observation::admit_observation_delivery(
+            &job,
+            publication_id,
+            observation_receipt_ref,
+        )?;
+        if next == job {
+            return Ok(job);
+        }
+        self.store.save(&next)?;
+        Ok(next)
+    }
+
+    /// Records that the canonical observation route returned a terminal
+    /// non-committed receipt for one result this job owed an observation for,
+    /// and persists that disposition on the job revision.
+    ///
+    /// This is W5's gap disposition: the store issued a receipt and that receipt
+    /// did not commit, so the writeback is unavailable rather than pending.
+    /// Leaving it `Pending` would report a rejection or an outage as though the
+    /// observation had merely not been attempted yet, and would keep
+    /// re-presenting it with no visible consequence.
+    ///
+    /// It writes through the same [`MaintenanceStateStore::save`] every
+    /// lifecycle transition and every receipt admission uses, so the gap and
+    /// the revision it covers stay in one store with one atomic boundary. It
+    /// appends no obligation and enters no producer, so recording a gap cannot
+    /// recursively create another maintenance result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaintenanceError::InvalidField`] when an identity is empty,
+    /// when this job owes no result observation under `publication_id`, or when
+    /// a different gap is already recorded there;
+    /// [`MaintenanceError::IdentityConflict`] when a store receipt is already
+    /// admitted under that identity; [`MaintenanceError::FenceMismatch`] for a
+    /// stale or mismatched fence; and [`MaintenanceError::Store`] when the port
+    /// refuses the write. Re-recording the same gap is a reconciliation and
+    /// persists nothing.
+    pub fn record_observation_gap(
+        &mut self,
+        job_id: &str,
+        fence: &StateFence,
+        publication_id: &str,
+        refused_operation_id: &str,
+        status: RefusedReceiptStatus,
+    ) -> Result<MaintenanceJob, MaintenanceError> {
+        let job = self.load_checked(job_id, fence)?;
+        let next = outcome_observation::record_observation_gap(
+            &job,
+            publication_id,
+            refused_operation_id,
+            status,
+        )?;
+        if next == job {
+            return Ok(job);
+        }
         self.store.save(&next)?;
         Ok(next)
     }
@@ -880,6 +1170,7 @@ impl<S: MaintenanceStateStore> MaintenanceController<S> {
     ) -> AutomationTriggerDecision {
         AutomationTriggerDecision {
             trigger_id: input.trigger_id.clone(),
+            trigger: input.trigger,
             family: input.family,
             scope_ref: input.scope_ref.clone(),
             decision,

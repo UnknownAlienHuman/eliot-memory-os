@@ -61,6 +61,7 @@ pub use finish_attempt::{
     PreparedKernelExchange,
 };
 pub use governor_authority_projection::{GovernorAuthorityProjection, LiveGovernorAuthority};
+pub use module_registry_admission::{ModuleCatalogOwnerReadback, ModuleRegistryAdmissionError};
 pub use negative_memory_activation::{
     NegativeMemoryActivationDocument, NegativeMemoryActivationEvidence,
     NegativeMemoryActivationReceipt, NegativeMemoryActivationRefusal,
@@ -100,6 +101,7 @@ mod learning_delta_integration;
 mod learning_promotion;
 mod learning_record_commit;
 mod migration_inventory;
+mod module_registry_admission;
 mod negative_memory_activation;
 mod negative_memory_context;
 mod negative_memory_gate;

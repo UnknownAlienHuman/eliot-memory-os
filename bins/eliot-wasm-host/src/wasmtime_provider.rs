@@ -27,6 +27,18 @@ const RUN_EXPORT: &str = "run";
 /// claimed by carrying it.
 const ENGINE_FIXTURE_IDENTITY: &[u8] = b"wasmtime-component/47.0.4";
 pub(crate) const PROVIDER_STACK_SIZE: usize = 8 * 1024;
+/// Fixed memory-COUNT ceiling for the provider Store. `InvocationLimits`
+/// bounds memory bytes and instance count but carries no memory count, so
+/// the provider fixes it here. Forwarded through
+/// `ResourceLimiter::memories` so `Store::limiter` snapshots it as the hard
+/// store limit; caller-supplied counts are never accepted, so an
+/// unknown/invalid count cannot become unlimited.
+pub(crate) const PROVIDER_MAX_MEMORIES: usize = 1;
+/// Fixed table-COUNT ceiling for the provider Store. `InvocationLimits`
+/// bounds table elements and instance count but carries no table count, so
+/// the provider fixes it here. Forwarded through `ResourceLimiter::tables`
+/// for the same snapshot reason as [`PROVIDER_MAX_MEMORIES`].
+pub(crate) const PROVIDER_MAX_TABLES: usize = 1;
 const EPOCH_DRIVER_THREAD_PREFIX: &str = "eliot-wasm-epoch";
 #[cfg(test)]
 const COMPONENT_CONFIGURATION: &[u8] =
@@ -117,6 +129,14 @@ impl ResourceLimiter for StoreState {
 
     fn instances(&self) -> usize {
         self.limits.instances()
+    }
+
+    fn tables(&self) -> usize {
+        self.limits.tables()
+    }
+
+    fn memories(&self) -> usize {
+        self.limits.memories()
     }
 }
 
@@ -233,6 +253,27 @@ impl std::fmt::Debug for WasmtimeComponentEngine {
     }
 }
 
+/// Actual import/export identities the compiled component bytes declare,
+/// observed from Wasmtime component-type metadata before instantiation
+/// (P10.1 engine evidence).
+///
+/// No instance is created and no guest function is invoked to discover the
+/// type. Both engine legs compile the same digest-bound artifact bytes under
+/// the same component-model configuration, so the observation holds for
+/// either leg; the epoch leg is the canonical observation point. Names are
+/// exact (no truncation or `Value` repair): total size is transitively
+/// bounded by the already-bounded artifact, and receipt-line bounding stays
+/// with the receipt-map assembly that consumes this evidence. Carries no
+/// digest, path, secret, timing, or backtrace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComponentIoEvidence {
+    /// Import names the component bytes actually declare. The closed-world
+    /// expectation is empty; the empty linker enforces it at instantiation.
+    pub imports: Vec<String>,
+    /// Export names the component bytes actually declare.
+    pub exports: Vec<String>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum WasmtimeBuildError {
     #[error("wasmtime configuration failed: {0}")]
@@ -318,7 +359,7 @@ impl WasmtimeComponentEngine {
             engine_configuration: crate::pool::pooled_configuration_digest(&pool_config),
         };
         let (epoch_component, fuel_component) = pool
-            .compile(&key, artifact)
+            .compile(&key, artifact, component_configuration)
             .map_err(WasmtimeBuildError::Compile)?;
         let (epoch_engine, fuel_engine) = pool.into_engines();
         Ok(Self {
@@ -337,6 +378,50 @@ impl WasmtimeComponentEngine {
             component_configuration_digest: key.component_configuration,
             artifact_bytes: artifact.len() as u64,
         })
+    }
+
+    /// Observes the actual import/export identities the compiled component
+    /// declares, for the bounded engine/run receipt (P10.1).
+    ///
+    /// Reads Wasmtime component-type metadata only: no instantiation, no
+    /// descriptor or domain invocation, no ambient import granted. The
+    /// receipt-map assembly binds these observed identities (instead of
+    /// manifest claims) to the receipt's actual-imports/exports fields.
+    #[must_use]
+    pub fn observed_component_io(&self) -> ComponentIoEvidence {
+        let component_type = self.epoch_component.component_type();
+        ComponentIoEvidence {
+            imports: component_type
+                .imports(&self.epoch_engine)
+                .map(|(name, _)| name.to_owned())
+                .collect(),
+            exports: component_type
+                .exports(&self.epoch_engine)
+                .map(|(name, _)| name.to_owned())
+                .collect(),
+        }
+    }
+
+    /// Lends the provider-built dispatch leg for the admitted cancellation
+    /// policy (issue #758, W1): the `(&Engine, &Component)` pair the
+    /// provider itself invokes under (`invoke_component_with_epoch_driver`
+    /// selects the same leg), so typed dispatch can instantiate from
+    /// provider-built engine legs instead of a locally-configured engine.
+    ///
+    /// Borrow-only: no new engine or linker owner, no compilation, no
+    /// configuration, and no behavior change to the legacy `run` path. Both
+    /// legs compile the same digest-bound artifact bytes under the same
+    /// provider settings; the admitted policy selects which leg runs.
+    #[must_use]
+    pub fn dispatch_leg(&self, limits: &InvocationLimits) -> (&Engine, &Component) {
+        match limits.epoch.cancellation {
+            eliot_wasm_runtime::CancellationPolicy::EpochInterruption => {
+                (&self.epoch_engine, &self.epoch_component)
+            }
+            eliot_wasm_runtime::CancellationPolicy::EpochAndFuel => {
+                (&self.fuel_engine, &self.fuel_component)
+            }
+        }
     }
 
     /// Executes raw input through the admitted component without the port
@@ -403,9 +488,11 @@ impl WasmtimeComponentEngine {
             StoreState {
                 limits: StoreLimitsBuilder::new()
                     .memory_size(usize::try_from(limits.max_memory_bytes).unwrap_or(usize::MAX))
+                    .memories(PROVIDER_MAX_MEMORIES)
                     .table_elements(
                         usize::try_from(limits.max_table_elements).unwrap_or(usize::MAX),
                     )
+                    .tables(PROVIDER_MAX_TABLES)
                     .instances(usize::try_from(limits.max_instances).unwrap_or(usize::MAX))
                     .build(),
                 peak_memory_bytes: None,
@@ -695,10 +782,17 @@ pub fn provider_configuration_digest() -> Sha256Digest {
 }
 
 fn canonical_configuration_descriptor() -> &'static [u8] {
-    b"wasmtime=47.0.4;component_model=true;typed_abi=guest.run;max_wasm_stack=8192;max_epoch_deadline_ticks=1024;epoch_only.consume_fuel=false;epoch_only.epoch_interruption=true;epoch_and_fuel.consume_fuel=true;epoch_and_fuel.epoch_interruption=true"
+    b"wasmtime=47.0.4;component_model=true;typed_abi=guest.run;max_wasm_stack=8192;max_memories=1;max_tables=1;max_epoch_deadline_ticks=1024;epoch_only.consume_fuel=false;epoch_only.epoch_interruption=true;epoch_and_fuel.consume_fuel=true;epoch_and_fuel.epoch_interruption=true"
 }
 
 fn configured_engine(consume_fuel: bool) -> Result<Engine, WasmtimeBuildError> {
+    // Exact enforced settings: component model on, epoch interruption on,
+    // and the fixed provider stack ceiling. Fuel accounting is enabled only
+    // on the fuel engine; the epoch-only engine still interrupts infinite
+    // loops via epoch — including component initialization, which executes
+    // under the invoking Store's epoch deadline set before instantiation —
+    // never via fuel. Fuel bounds invocation, never compilation: both
+    // engines compile the same bytes outside any Store.
     let mut config = Config::new();
     config.wasm_component_model(true);
     config.consume_fuel(consume_fuel);

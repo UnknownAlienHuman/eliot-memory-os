@@ -6,13 +6,39 @@
 //! I2.23 (typed contract payloads).
 //! This module owns only the EBP transport/session proof; Kernel remains the
 //! sole process, Store, and canonical authority owner.
+//!
+//! Issue #1742 W4/W6 (caller STITCH, no fake consumer): this client owns one
+//! live claim/submit pair per lane — agent-activation, local-read,
+//! campaign-packet, task-controller, observe, finish — and there is no act
+//! claim pair and no retained-checkpoint resume pair, so neither gate below
+//! has a daemon-side call site yet:
+//!
+//! - W4: the daemon-side `eliot-context-admission::admit_material_decision`
+//!   invocation over Governor owner-resolved inputs, with the dispatch
+//!   binding (`bind_material_dispatch`) and dispatch-time revalidation
+//!   (`revalidate_material_dispatch`) through a live act claim/flight, runs
+//!   at the Governor owner's future live act claim, never here. The Kernel
+//!   submit arm owns only the mechanical binding
+//!   (`bins/eliot-kernel/src/host_request_route.rs::check_act_submit_binding`)
+//!   and the bridge owns only linkage revalidation
+//!   (`bins/eliot-agent-bridge/src/kernel_host_request_client.rs::revalidate_act_dispatch`);
+//!   both live in sibling-writer files and are not touched here. Refusals
+//!   stay typed (`DECISION_CONTEXT_INCOMPLETE` / `MaterialDecisionRefusal`).
+//! - W6: the resume-dispatch `admit_material_resume` invocation over #1730's
+//!   retained checkpoint runs at the resume owner's join, never here: no
+//!   `RetainedHandoffCheckpoint` consumer exists under `bins/`, so there is
+//!   no resume path to weaken — unavailable/erased originals stay explicit
+//!   and derived summaries never replace originals by construction. That
+//!   call site is the resume owner's to write, and is named here rather than
+//!   faked with a consumer in this crate.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+#[cfg(windows)]
+use eliot_contracts::{ArtifactId, ContractId};
 use eliot_contracts::{
     ClockReading, OperationId, ProductId, RequestId, RequestMetadata, SessionId, SourceId,
     StateFence,
@@ -31,6 +57,8 @@ use eliot_protocol::{
     TaskControllerInvocation, TaskControllerResultBody, host_request_operation_id,
 };
 use eliot_receipts::RequestBinding;
+#[cfg(windows)]
+use eliot_runtime_contracts::{MODULE_MANIFEST_SCHEMA_VERSION, ModuleManifest};
 use eliot_store_api::{NamedReadRequest, NamedReadResponse, WriteReceipt};
 use eliot_testd_core::{
     TestdPendingVerifierDispatch, TestdTerminalCompletionEvidence, TestdVerifierDispatchBinding,
@@ -59,6 +87,28 @@ use super::{
 };
 
 const PROVIDER_CAPABILITY_VERIFY_OPERATION: &str = "native_worker.provider_capability.verify";
+
+/// Renders the release builder's `eliotd` manifest from the exact contract
+/// constructor used by the live Kernel handshake.
+///
+/// This is a build-only export seam. It creates no admission or runtime
+/// authority; the caller supplies the artifact digest produced by the release
+/// build, and the running daemon later re-admits the retained sibling bytes
+/// against that same digest before publishing its contract.
+#[cfg(windows)]
+pub fn render_build_module_manifest(artifact_sha256: &str) -> Result<String, crate::DaemonError> {
+    let artifact_id = ArtifactId::new(artifact_sha256)
+        .map_err(|error| crate::DaemonError::LaunchConfig(error.to_string()))?;
+    let module_id = ContractId::new(SERVICE_NAME)
+        .map_err(|error| crate::DaemonError::LaunchConfig(error.to_string()))?;
+    let contract = handshake::declared_module_contract(module_id, artifact_id);
+    ModuleManifest {
+        schema_version: MODULE_MANIFEST_SCHEMA_VERSION,
+        contract,
+    }
+    .render_toml()
+    .map_err(|error| crate::DaemonError::LaunchConfig(error.to_string()))
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -207,7 +257,6 @@ pub struct DaemonKernelClient {
     pub(super) kernel_binding: KernelLaunchBinding,
     pub(super) connection_id: String,
     pub(super) snapshot: KernelGenerationSnapshot,
-    request_counter: Arc<AtomicU64>,
     /// Literal Kernel-issued `sid=..;session=..` binding string retained only
     /// after a successful [`validate_server_hello`](handshake::validate_server_hello)
     /// in this process (AUD-C02-B, Implements #1187). Never the whole
@@ -346,6 +395,74 @@ pub enum TaskControllerSubmitOutcome {
     Expired,
     /// The attempt was replaced, revoked or otherwise stale.
     StaleAttempt,
+}
+
+/// Version of the canonical Kernel request identity encoding this module
+/// mints. I5.27 requires the canonical encoding to be deterministic AND
+/// versioned; the version is bound into the digest input so a future encoding
+/// change cannot silently re-key a receipt already admitted under this one.
+const KERNEL_REQUEST_IDENTITY_ENCODING_VERSION: u16 = 1;
+
+/// Domain separator for the canonical Kernel request identity digest. Keeps
+/// this digest disjoint from every other digest in the system, so a request
+/// identity can never be reproduced from an unrelated material.
+const KERNEL_REQUEST_IDENTITY_DOMAIN: &str = "eliot.kernel_request_identity";
+
+/// The caller-admitted inputs one Kernel request identity is derived from.
+///
+/// I5.27's `CanonicalOperationIdentity`: the semantic command kind, the
+/// principal and operation scope, and the canonical request bytes. Every field
+/// here is supplied by the caller as operation content or as the admitted
+/// scope; none of them is an attempt counter, nonce, clock or ambient state.
+/// Two byte-identical presentations of one operation therefore bind to the
+/// same identity, and a changed payload binds to a different one.
+///
+/// This is the ONLY place the operation name and the scope are declared for a
+/// transport identity, so the digest input and the emitted key labels cannot
+/// be given different values.
+struct CanonicalKernelRequest<'a> {
+    /// The semantic command kind. Not caller spelling of a retry: it is the
+    /// closed operation this request actually executes.
+    operation: &'a str,
+    /// The admitted principal and operation scope: the installation,
+    /// generation and authority epoch this connection is bound to. A different
+    /// installation or generation really is a different operation scope, so
+    /// this belongs in the identity; it is not an attempt discriminator.
+    scope: &'a str,
+    /// The exact canonical request bytes this transport is about to send.
+    request: &'a serde_json::Value,
+}
+
+/// Computes the canonical request digest for one Kernel request.
+///
+/// Reuses the repository's single canonicalization and digest owner
+/// (`eliot_contracts::canonical_json_bytes`, which sorts every object key
+/// recursively, and `eliot_contracts::sha256_hex`). This introduces no second
+/// hash or canonicalization scheme, and the domain separator plus encoding
+/// version follow the same shape as the existing `testd_owner_*_request_digest`
+/// helpers in this module.
+fn canonical_kernel_request_digest(
+    request: &CanonicalKernelRequest<'_>,
+) -> Result<String, serde_json::Error> {
+    // Named `DigestInput` rather than `Canonical` so the field names below can
+    // keep I5.27's exact canonical spelling: those names ARE the declared
+    // identity shape, so they are not renamed to satisfy a lint.
+    #[derive(Serialize)]
+    struct DigestInput<'a> {
+        domain_separator: &'a str,
+        canonical_encoding_version: u16,
+        semantic_command_kind: &'a str,
+        principal_and_scope: &'a str,
+        canonical_request: &'a serde_json::Value,
+    }
+    let bytes = canonical_json_bytes(&DigestInput {
+        domain_separator: KERNEL_REQUEST_IDENTITY_DOMAIN,
+        canonical_encoding_version: KERNEL_REQUEST_IDENTITY_ENCODING_VERSION,
+        semantic_command_kind: request.operation,
+        principal_and_scope: request.scope,
+        canonical_request: request.request,
+    })?;
+    Ok(sha256_hex(&bytes))
 }
 
 fn derive_task_controller_request_identity(
@@ -1293,7 +1410,6 @@ impl DaemonKernelClient {
             ),
             snapshot: expected_snapshot(&config.launch)?,
             kernel_binding: config.kernel_binding.clone(),
-            request_counter: Arc::new(AtomicU64::new(1)),
             validated_session_binding: Mutex::new(None),
             shutdown_tx,
             shutdown_rx,
@@ -1558,7 +1674,7 @@ impl DaemonKernelClient {
 
     /// Clones the retained validated binding string, if any. A poisoned slot
     /// reads as absent (fail-closed to "no live session"), never invented.
-    fn validated_session_binding(&self) -> Option<String> {
+    pub(super) fn validated_session_binding(&self) -> Option<String> {
         self.validated_session_binding
             .lock()
             .ok()
@@ -1578,9 +1694,42 @@ impl DaemonKernelClient {
     /// for this exact publish (same contour as `daemon_ready`) and
     /// correlated by [`Self::send_startup_evidence`]; the producer never
     /// mints identities.
-    pub fn mint_startup_evidence_identity(&self) -> Result<RequestIdentity, super::DaemonError> {
-        self.next_identity(super::startup_evidence_producer::DAEMON_STARTUP_EVIDENCE_OPERATION)
-            .map_err(|error| super::DaemonError::Kernel(error.to_string()))
+    ///
+    /// I5.27: "fields affecting authority, scope, ordering, privacy or
+    /// effect cannot be omitted/defaulted silently". The digest input is
+    /// therefore `content` — the evaluated
+    /// [`StartupEvidenceContent`](super::startup_evidence_producer::StartupEvidenceContent),
+    /// which is the published payload minus exactly one field. Two
+    /// publishes under the same generation that differ in any
+    /// `config_mirror_digest`, `policy_mirror_digest`, capability
+    /// evaluation, evidence ref or bound fence now derive different
+    /// `request_id`, `idempotency_key` and `cancellation_id` values, so the
+    /// Kernel can no longer resolve a second, different publish to the first
+    /// one's receipt.
+    ///
+    /// `content` deliberately excludes `transport_binding`: the payload
+    /// carries this very identity, so a digest over the full payload would
+    /// be a fixed point nobody can compute. That is the one field the
+    /// digest cannot cover, and it is covered by construction instead — the
+    /// caller binds the identity to the same `content` value it was
+    /// derived from (`bind_startup_evidence`), so the identity determines
+    /// every other byte of the payload and a different payload cannot be
+    /// presented under it. The bound `state_fence` is inside `content`, so
+    /// a different generation or authority epoch is still a different
+    /// publish, and `principal_and_scope` still carries this connection.
+    /// No counter, nonce, salt, clock or hidden state participates.
+    pub fn mint_startup_evidence_identity(
+        &self,
+        content: &super::startup_evidence_producer::StartupEvidenceContent,
+    ) -> Result<RequestIdentity, super::DaemonError> {
+        let canonical_content = serde_json::to_value(content)
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        self.next_identity(&CanonicalKernelRequest {
+            operation: super::startup_evidence_producer::DAEMON_STARTUP_EVIDENCE_OPERATION,
+            scope: &self.connection_id,
+            request: &canonical_content,
+        })
+        .map_err(|error| super::DaemonError::Kernel(error.to_string()))
     }
 
     /// Publishes one validated Governor startup evidence payload on the
@@ -1779,7 +1928,11 @@ impl DaemonKernelClient {
         operation: &str,
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, KernelClientError> {
-        let identity = self.next_identity(operation)?;
+        let identity = self.next_identity(&CanonicalKernelRequest {
+            operation,
+            scope: &self.connection_id,
+            request: &payload,
+        })?;
         self.transact_async_with_identity(operation, payload, identity)
             .await
     }
@@ -1938,11 +2091,31 @@ impl DaemonKernelClient {
         Ok((transport, limits))
     }
 
-    fn next_identity(&self, operation: &str) -> Result<RequestIdentity, KernelClientError> {
-        let sequence = self.request_counter.fetch_add(1, Ordering::Relaxed);
-        let request_id =
-            RequestId::new(format!("{}:{}:{}", self.connection_id, operation, sequence))
-                .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+    /// Mints the transport operation binding for one Kernel request from the
+    /// canonical request bytes plus the caller-admitted identity inputs.
+    ///
+    /// I5.27 requires idempotency to be defined over canonical bytes, never
+    /// over a per-attempt discriminator. The binding below is therefore a
+    /// pure function of `canonical_request` and `scope`: two byte-identical
+    /// presentations of one operation derive the same `request_id`, the same
+    /// `idempotency_key` and the same `cancellation_id`, so the Kernel binds
+    /// both attempts to the one admitted operation and a retry resolves to the
+    /// first attempt's receipt instead of opening a second operation. A
+    /// changed payload derives a different binding, so it is never mistaken
+    /// for a replay of the original.
+    ///
+    /// The operation name and scope are read from `canonical_request` alone,
+    /// so the digest input and the emitted key labels can never disagree. No
+    /// counter, nonce, salt, clock or hidden state participates.
+    fn next_identity(
+        &self,
+        canonical_request: &CanonicalKernelRequest<'_>,
+    ) -> Result<RequestIdentity, KernelClientError> {
+        let operation = canonical_request.operation;
+        let digest = canonical_kernel_request_digest(canonical_request)
+            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+        let request_id = RequestId::new(format!("{}:{}:{}", self.connection_id, operation, digest))
+            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
         let fence = self.snapshot.state_fence();
         let metadata = RequestMetadata {
             request_id: request_id.clone(),
@@ -1965,9 +2138,14 @@ impl DaemonKernelClient {
                 metadata,
                 state_fence: fence,
             },
-            idempotency_key: format!("{SERVICE_NAME}:{operation}:{sequence}"),
+            idempotency_key: format!("{SERVICE_NAME}:{operation}:{digest}"),
             deadline_unix_ms: unix_ms().saturating_add(30_000),
-            cancellation_id: format!("{SERVICE_NAME}:{operation}:{sequence}:cancel"),
+            // A cancellation handle addresses the admitted operation, not one
+            // transport attempt, so it is derived from the same canonical
+            // bytes. Deriving it from a counter would make a cancelled attempt
+            // unreachable by the next attempt's cancel, which is exactly the
+            // per-attempt identity I5.27 forbids.
+            cancellation_id: format!("{SERVICE_NAME}:{operation}:{digest}:cancel"),
         })
     }
 
@@ -2664,7 +2842,6 @@ impl DaemonKernelClient {
             kernel_binding: self.kernel_binding.clone(),
             connection_id: self.connection_id.clone(),
             snapshot: self.snapshot.clone(),
-            request_counter: Arc::clone(&self.request_counter),
             validated_session_binding: Mutex::new(self.validated_session_binding()),
             // #791 (W4/W17): the clone shares the same shutdown broadcast, so
             // a request published on the owning client is observed by a
@@ -3024,11 +3201,7 @@ mod tests {
     fn query_tool() -> Value {
         json!({"name":"eliot.query","arguments":{
             "intent":{
-                "mode":"verification",
-                "time_scope":"session-window",
-                "branch_environment_scope":"branch",
-                "freshness_policy":"exact-fence",
-                "required_assurance":"evidence-provenance"
+                "mode":"verification"
             },
             "query":"subject:evidence-alpha",
             "exact_resource_uri": null
@@ -3141,7 +3314,6 @@ mod tests {
                 protected_snapshot_digest: "b".repeat(64),
                 principal: "test-principal".to_owned(),
             },
-            request_counter: Arc::new(AtomicU64::new(1)),
             validated_session_binding: Mutex::new(None),
             shutdown_tx: shutdown_tx.clone(),
             shutdown_rx: shutdown_rx.clone(),

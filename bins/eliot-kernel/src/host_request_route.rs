@@ -1130,7 +1130,19 @@ impl KernelComposition {
                     self.enqueue_local_read_pair_under_transition(envelope, tool)?;
                     Some("skill")
                 }
-                Ok(LocalReadAdmission::CampaignPacket { .. }) => {
+                Ok(admission @ LocalReadAdmission::CampaignPacket { .. }) => {
+                    // A2: the effect-capable (Material) lane re-joins the live
+                    // Governor-issued material authority before dispatch. A
+                    // missing derivation or a revocation that landed after
+                    // envelope admission fails this lane closed; read-only
+                    // lanes stay exempt. Routing carries no visibility input,
+                    // so a hidden packet method invoked by name faces the
+                    // identical gate.
+                    super::tool_exposure::authorize_material_lane(
+                        self,
+                        &admission,
+                        &envelope.state_fence,
+                    )?;
                     self.enqueue_campaign_packet_pair_under_transition(envelope, tool)?;
                     Some("campaign-packet")
                 }
@@ -4578,6 +4590,17 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
+        if stored.capability_ref.as_str() != OBSERVE_CAPABILITY {
+            // Issue #1739 W3: the observe result leg serves only the
+            // admitted `eliot.observe` lane — the same lane join the shared
+            // submit leg enforces. A stored capability outside the serving
+            // lane is a requested-versus-actual route divergence, never a
+            // silent fence.
+            self.audit_observe(AuditEventDraft::route_mismatch_submit(
+                session, &stored, lane,
+            ));
+            return Err(TransportError::SessionFenced);
+        }
         // Exact replay is idempotent even across deadline expiry: a retained
         // terminal result never takes the expiry path, and serving it is
         // canonical readback rather than a second completion.
@@ -4593,6 +4616,12 @@ impl KernelComposition {
         self.audit_observe(AuditEventDraft::result_native_raw_appended(
             session, body, &stored, None, lane,
         ));
+        // Issue #1739 W3: a submission must carry the current wire version
+        // and the governed attempt — the same submission join the shared
+        // submit leg enforces. Legacy readback versions stay readable
+        // through the replay path above but can never complete an operation.
+        body.validate_for_submission()
+            .map_err(|_| TransportError::SessionFenced)?;
         if activation_deadline_expired(unix_ms(), stored.deadline_unix_ms) {
             return self.expired_claim_timeout(ExpiredClaimObservation {
                 session: Some(session),
@@ -7410,10 +7439,44 @@ fn host_request_failure_response(
         .validate()
         .map_err(|_| TransportError::SessionFenced)?;
     let failure = serde_json::to_value(failure).map_err(|_| TransportError::SessionFenced)?;
-    Ok(Some(serde_json::json!({
+    let mut response = serde_json::json!({
         "status": "failure",
         "failure": failure,
-    })))
+    });
+    if matches!(error, TransportError::Backpressure) {
+        // Migration seam (issue #1679): the versioned BUSY directive rides
+        // alongside the legacy failure, never duplicating it. The legacy
+        // `RecoveryDirective` above is untouched until W6 retires the shape;
+        // the versioned observation is whole-or-null — `null` while the shed
+        // carries no owner-measured dimension to report.
+        response["recovery"] = serde_json::json!({
+            "backpressure_directive": host_request_busy_backpressure_directive()
+                .unwrap_or(serde_json::Value::Null),
+        });
+    }
+    Ok(Some(response))
+}
+
+/// Builds the versioned I14 BUSY directive for one shed host request, or
+/// `None` when the shedding owner produced no complete one (issue #1679).
+///
+/// Whole-or-null seam mirroring `store_read_unavailable_directive` in
+/// `daemon_request_dispatch.rs`: the BUSY arm attaches the returned value
+/// alongside the legacy failure and reports its absence as `null` instead of
+/// shipping a partial directive.
+///
+/// A `BUSY` response validates only with a claimed, observed exhausted
+/// bottleneck dimension plus the owner-produced compiled profile revision.
+/// The plain `TransportError::Backpressure` shed carries no owner-measured
+/// dimension — its shed sites span heterogeneous owners (local-read queue
+/// fullness, reservation-counter overflow, ORS projection limits) — and this
+/// edge owns no capacity-profile revision or state fence. Naming one
+/// denominator dimension or a revision here would fabricate capacity evidence
+/// the shed path never observed, so the arm reports the absence honestly. A
+/// later slice threads the shedding owner's measurement; until then this
+/// returns `None`.
+fn host_request_busy_backpressure_directive() -> Option<serde_json::Value> {
+    None
 }
 
 /// Stored phase persisted by the bridge-event stage entry. The route answers
@@ -8763,11 +8826,7 @@ mod invoke_read_tool_tests {
     fn query_tool() -> serde_json::Value {
         serde_json::json!({"name":"eliot.query","arguments":{
             "intent":{
-                "mode":"verification",
-                "time_scope":"session-window",
-                "branch_environment_scope":"branch",
-                "freshness_policy":"exact-fence",
-                "required_assurance":"evidence-provenance"
+                "mode":"verification"
             },
             "query":"subject:evidence-alpha",
             "exact_resource_uri": null

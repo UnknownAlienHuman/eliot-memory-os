@@ -181,7 +181,7 @@ pub struct ObserveDeferral {
 /// Re-proves the admitted linkage (capability echoes the tool name,
 /// canonical tool bytes digest to the admitted payload digest), the admitted
 /// envelope shape, and the attempt binding (operation handle plus validated
-/// capability) before any defer touches the pair. Returns the honest
+/// capability admitted for this facet) before any defer touches the pair. Returns the honest
 /// deferral with its exact owner and resume condition. Pure: no IO, no
 /// semantic interpretation, no invented receipt.
 pub fn serve_admitted_observe(
@@ -202,6 +202,16 @@ pub fn serve_admitted_observe(
         .map_err(|error| format!("daemon observe pair attempt is not bound shape: {error}"))?;
     if attempt.operation_id != host_request_operation_id(envelope) {
         return Err("daemon observe pair attempt does not bind the envelope".to_owned());
+    }
+    // Issue #1739 W3: the claim joins the Governor dispatch only through
+    // the attempt minted for this admitted operation. A capability minted
+    // for another facet never dispatches here, even when its shape
+    // validates — the defer leg would quarantine it, but the dispatch
+    // refuses it before any suboperation decodes.
+    if attempt.facet_method != OBSERVE_CAPABILITY {
+        return Err(
+            "daemon observe pair attempt is not admitted for the observe operation".to_owned(),
+        );
     }
     let object = tool
         .as_object()

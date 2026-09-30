@@ -437,8 +437,9 @@ struct ActivatedMutationDescriptor {
 /// `CaptureObservation` and `AppendAuditEvent` persist the lowest ceiling
 /// (`Candidate`) through the `CaptureCandidate` family; `ApplyLifecyclePolicy`
 /// persists `ReversibleMutation` through the `LifecyclePolicy` family;
-/// `ReconcileRecovery`, `RecordFinishEvidence`, and `RecordFinishDecision` persist
-/// `ReversibleMutation` through the `RecoverySchema` family;
+/// `ReconcileRecovery`, `RecordFinishEvidence`, `RecordFinishDecision`, and
+/// `RecordModuleCatalogSnapshot` persist `ReversibleMutation` through the
+/// `RecoverySchema` family;
 /// `UpdateTaskState` persists `ReversibleMutation`
 /// through the `TaskControl` family; `ApplyEpistemicRevision` persists
 /// `ReversibleMutation` through the `Epistemic` family; `ApplyErasure`
@@ -467,10 +468,10 @@ struct ActivatedMutationDescriptor {
 /// contract; the store issues the fenced row revision the Governor orders
 /// same-key evidence by, and the write itself grants no admission, support,
 /// influence, or lifecycle change). All
-/// eighteen address no store scope, mirroring the scope-free read
+/// activated mutation rows address no store scope, mirroring the scope-free read
 /// descriptors. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 18] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 19] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],
@@ -512,6 +513,15 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 18] = [
         transition_classes: &[TransitionClass::RecoverySchema],
         maximum_effect: EffectClass::ReversibleMutation,
         max_input_bytes: READ_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::RecordModuleCatalogSnapshot,
+        transition_classes: &[TransitionClass::RecoverySchema],
+        maximum_effect: EffectClass::ReversibleMutation,
+        // Owner snapshots are bounded at 512 KiB. The existing 2 MiB bulk
+        // parameter bound covers canonical JSON string escaping and the
+        // remaining fixed parameters without broadening the payload bound.
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
     },
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::UpdateTaskState,
@@ -642,8 +652,8 @@ fn genesis_entry_spec() -> OperationManifestSpec {
 
 /// Generates the per-operation manifest descriptors from the declaration table.
 ///
-/// Declaration order is the canonical order: the eighteen activated reads, the
-/// sixteen activated mutations, then the genesis bootstrap entry. Generation is
+/// Declaration order is the canonical order: the activated reads, the
+/// activated mutations, then the genesis bootstrap entry. Generation is
 /// pure over crate constants, so the same source always yields byte-identical
 /// entries.
 pub fn generated_operation_manifests() -> Result<Vec<NamedOperationManifest>, StoreError> {
@@ -805,7 +815,8 @@ pub fn validate_read_against_catalogue(
 /// `ApplyEpistemicRevision`, `ApplyErasure`, `ApplyNotificationState`,
 /// `ApplyReactiveInjectionState`, `ApplyResourceSnapshot`,
 /// `CommitExperienceBank`, `CommitAgentFeedback`,
-/// `RecordLearningRecord`, and `RecordCapabilityEvidenceRecord` have activated
+/// `RecordLearningRecord`, `RecordCapabilityEvidenceRecord`, and
+/// `RecordModuleCatalogSnapshot` have activated
 /// mutation entries; any other named
 /// command fails closed here until a later slice proves its handler, schema,
 /// consumer triple, and semantic owner-authority gate. `ApplySwarmOwnerRevisions`
@@ -843,26 +854,7 @@ pub fn validate_transition_against_catalogue(
         }
         return Ok(());
     }
-    let set_digest = operation_manifest_set_digest(entries)?;
-    if transition.operation_manifest_digest != set_digest {
-        return Err(StoreError::ManifestMismatch);
-    }
-    // `ERASURE_STATE_IRREVERSIBLE` execution direction (issue #1712): an
-    // `Erasure`-class plan executes only the named `ApplyErasure` operation.
-    // `PreparedTransition::validate` already aligns each command's family with
-    // the plan class, so this arm is defense in depth today: it stays
-    // mechanically evaluated on every erasure plan and refuses if a future
-    // operation ever maps to the `Erasure` family without travelling the
-    // named erasure transaction. No generic reversible-effect executor admits
-    // the erasure class through this gate.
-    if transition.transition_class == TransitionClass::Erasure
-        && transition
-            .named_operations
-            .iter()
-            .any(|command| command.operation != NamedMutationOperation::ApplyErasure)
-    {
-        return Err(StoreError::TransitionClassExceeded);
-    }
+    validate_named_plan_manifest_and_erasure(transition, entries)?;
     for command in &transition.named_operations {
         let entry = find_entry(entries, named_mutation_operation_name(command.operation))?;
         if entry.operation_kind != OperationKind::Mutation {
@@ -881,6 +873,7 @@ pub fn validate_transition_against_catalogue(
             | NamedMutationOperation::ReconcileRecovery
             | NamedMutationOperation::RecordFinishDecision
             | NamedMutationOperation::RecordFinishEvidence
+            | NamedMutationOperation::RecordModuleCatalogSnapshot
             | NamedMutationOperation::UpdateTaskState
             | NamedMutationOperation::ApplyEpistemicRevision
             | NamedMutationOperation::ApplyErasure
@@ -924,6 +917,33 @@ pub fn validate_transition_against_catalogue(
             }
         }
         validate_parameter_size(&command.parameters, entry.max_input_bytes)?;
+    }
+    Ok(())
+}
+
+fn validate_named_plan_manifest_and_erasure(
+    transition: &PreparedTransition,
+    entries: &[NamedOperationManifest],
+) -> Result<(), StoreError> {
+    let set_digest = operation_manifest_set_digest(entries)?;
+    if transition.operation_manifest_digest != set_digest {
+        return Err(StoreError::ManifestMismatch);
+    }
+    // `ERASURE_STATE_IRREVERSIBLE` execution direction (issue #1712): an
+    // `Erasure`-class plan executes only the named `ApplyErasure` operation.
+    // `PreparedTransition::validate` already aligns each command's family with
+    // the plan class, so this arm is defense in depth today: it stays
+    // mechanically evaluated on every erasure plan and refuses if a future
+    // operation ever maps to the `Erasure` family without travelling the
+    // named erasure transaction. No generic reversible-effect executor admits
+    // the erasure class through this gate.
+    if transition.transition_class == TransitionClass::Erasure
+        && transition
+            .named_operations
+            .iter()
+            .any(|command| command.operation != NamedMutationOperation::ApplyErasure)
+    {
+        return Err(StoreError::TransitionClassExceeded);
     }
     Ok(())
 }

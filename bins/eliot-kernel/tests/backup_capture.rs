@@ -456,6 +456,7 @@ fn to_request(input: &BackupInput, suspended: u64) -> CaptureRequest {
         receipts: input.receipts.clone(),
         blobs: input.blobs.clone(),
         purge_ledger: input.purge_ledger.clone(),
+        purge_ledger_revision: input.purge_ledger_revision,
         ors_snapshot: input.ors_snapshot.clone(),
         suspended_count: suspended,
         artifacts: input.artifacts.clone(),
@@ -470,7 +471,13 @@ fn coordinator() -> KernelBackupCapture {
 
 /// Mirrors the coordinator's `assemble_input` binding for independent digest
 /// recomputation: archive identity from the export fence, class/source/schema
-/// from the frozen plan, purge revision from the carried ledger length.
+/// from the frozen plan, and the purge revision the PRODUCER declared.
+///
+/// The revision crosses the request unchanged, exactly as `assemble_input`
+/// copies it. This fixture previously recomputed it as the carried ledger
+/// length, which is the count-of-the-caller's-own-list binding #960 A14
+/// removes: it could never be cross-checked against the purge owner that
+/// applies the ledger.
 fn coordinator_input(request: &CaptureRequest) -> BackupInput {
     BackupInput {
         backup_id: request.export_fence.export_id.clone(),
@@ -488,11 +495,7 @@ fn coordinator_input(request: &CaptureRequest) -> BackupInput {
         watchdog_spool: request.watchdog_spool.clone(),
         host_audit: request.host_audit.clone(),
         missing_features: Vec::new(),
-        purge_ledger_revision: if request.purge_ledger.is_empty() {
-            0
-        } else {
-            request.purge_ledger.len() as u64
-        },
+        purge_ledger_revision: request.purge_ledger_revision,
     }
 }
 
@@ -1164,10 +1167,14 @@ fn config_purge_build_and_forensic_audit_ceilings_retained() {
     for kept in &bundle.artifacts {
         kept.validate().expect("artifact digest binds bytes");
     }
-    // The purge revision binds the carried ledger length: the coordinator
-    // rebinds it from evidence instead of trusting caller arithmetic.
+    // The purge revision is the purge OWNER's declared value, carried across
+    // the request verbatim: the coordinator neither counts the carried ledger
+    // nor derives the value, so a restore can cross-check this archive against
+    // the owner that applies the ledger. The fixture declares 7 against a
+    // single carried entry precisely so the manifest is not the entry count
+    // (#960 A14).
     assert_eq!(bundle.purge_ledger.len(), 1);
-    assert_eq!(bundle.manifest.purge_ledger_revision, 1);
+    assert_eq!(bundle.manifest.purge_ledger_revision, 7);
     assert!(!bundle.purge_ledger.is_empty(), "purge ledger retained");
     // Host audit is present but forensic: never active authority, never part
     // of the recovery denominator, and the class stays FullRecovery.

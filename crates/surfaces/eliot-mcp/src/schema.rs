@@ -78,6 +78,13 @@ pub fn canonical_tool_schemas() -> Result<Vec<ToolSchema>, SchemaError> {
     ])
 }
 
+/// Pinned generator configuration identity recorded in the advertised catalogue.
+///
+/// The canonical catalogue is generated with this exact schemars
+/// configuration; served schemas prove it by declaring
+/// [`CANONICAL_SCHEMA_DIALECT`].
+pub const CANONICAL_SCHEMA_GENERATOR: &str = "schemars::generate::SchemaSettings::draft2020_12";
+
 /// Generates canonical JSON Schema from the same type used for Serde decoding.
 ///
 /// The generator configuration is pinned to the recorded
@@ -92,6 +99,29 @@ pub fn canonical_schema<T: JsonSchema>() -> Result<Value, SchemaError> {
         return Err(SchemaError::UnsupportedDialect);
     }
     Ok(value)
+}
+
+/// Verdict that one generated descriptor stays inside the supported host
+/// compatibility band.
+///
+/// The supported band is verbatim Draft 2020-12 full fidelity: both served
+/// schemas must declare [`CANONICAL_SCHEMA_DIALECT`], which carries the
+/// referenced definitions, nested discriminators, and semantic constraints
+/// untouched from generation. A descriptor outside the band is withheld
+/// ([`SchemaError::UnsupportedDialect`]); it is never advertised with
+/// silently removed constraints.
+///
+/// # Errors
+///
+/// Returns [`SchemaError::UnsupportedDialect`] when either served schema
+/// leaves the supported band.
+pub fn check_advertised_schema_compatibility(descriptor: &ToolSchema) -> Result<(), SchemaError> {
+    for schema in [&descriptor.input_schema, &descriptor.output_schema] {
+        if schema.get("$schema").and_then(Value::as_str) != Some(CANONICAL_SCHEMA_DIALECT) {
+            return Err(SchemaError::UnsupportedDialect);
+        }
+    }
+    Ok(())
 }
 
 fn descriptor<T: JsonSchema>(name: &str, description: &str) -> Result<ToolSchema, SchemaError> {

@@ -38,6 +38,7 @@ use std::sync::atomic::Ordering;
 
 mod activation_projection;
 pub mod agent_fabric;
+pub mod authority_revocation_ingress;
 pub mod campaign_context_owner;
 pub mod campaign_evaluation_owner;
 pub mod campaign_owner_matrix;
@@ -115,7 +116,12 @@ mod kernel_recovery_client;
 mod kernel_transition_client;
 pub mod maintenance_dispatch;
 pub mod maintenance_family_catalog;
-mod maintenance_trigger_evaluator;
+// Public because `daemon_runtime` lives in the `eliotd` binary crate and
+// reaches the maintenance publication owner through it, exactly as it reaches
+// `maintenance_dispatch` and `maintenance_family_catalog` beside it. The
+// previous private declaration made that reach a compile error the Governor
+// failure had masked.
+pub mod maintenance_trigger_evaluator;
 mod negative_memory_action_gate;
 pub mod notification_acknowledge_emit;
 pub mod notification_board_attach;
@@ -164,6 +170,12 @@ pub use agent_fabric::{
 };
 use agent_fabric::{FabricOperation, FabricPortId, MissingPortResidual, PortBindingState};
 
+pub use authority_revocation_ingress::{
+    AUTHORITY_REVOCATION_RESUME_BLOCKED, AuthorityRevocationIngressPlan,
+    AuthorityRevocationIngressReport, PendingCanonicalSecondPhase,
+    capture_authority_revocation_ingress_plan, scan_authority_revocation_ingress,
+};
+
 use controlboard_adapters::SharedOperatorReplay;
 
 pub use canonical_config_precedence::{
@@ -198,8 +210,6 @@ pub use controlboard_adapters::{
     is_controlboard_read_tool, serve_controlboard_view,
 };
 pub use daemon_config::{DaemonConfig, admit_daemon_module_manifest};
-#[cfg(windows)]
-pub use daemon_kernel_client::admitted_daemon_module_contract;
 pub(crate) use daemon_kernel_client::kernel_port_error;
 pub use daemon_kernel_client::{
     ActivationSubmitError, DaemonKernelClient, LocalReadSubmitOutcome, ObserveDeferOutcome,
@@ -207,6 +217,8 @@ pub use daemon_kernel_client::{
 };
 #[cfg(test)]
 pub(crate) use daemon_kernel_client::{KernelClientError, WireOutcome, operation_payload};
+#[cfg(windows)]
+pub use daemon_kernel_client::{admitted_daemon_module_contract, render_build_module_manifest};
 #[cfg(all(test, windows))]
 pub(crate) use daemon_kernel_client::{
     is_pre_admission_pending_rejection, retry_pre_admission, validate_server_hello,
@@ -273,11 +285,15 @@ pub use governor_observe_serve::{
     ObserveDeferral, ObserveOwnerRoute, ObserveSuboperation, decode_observe_suboperation,
     observe_suboperation_owner, serve_admitted_observe,
 };
-pub use improvement_candidate_dispatch::dispatch_improvement_candidate_route;
+pub use improvement_candidate_dispatch::{
+    ImprovementRouteDispatch, ImprovementRouteOutcome, commit_unknown_effect_obligation,
+    dispatch_improvement_candidate_route,
+};
 pub use improvement_candidate_route::{
-    ImprovementRouteRequest, assess_improvement_repeat, improvement_candidate_retry_permitted,
-    improvement_operation_owners, improvement_route_owner, reconcile_improvement_unknown,
-    route_improvement_candidate,
+    ImprovementEffectState, ImprovementRouteRequest, UnknownEffectObligation,
+    assess_improvement_repeat, check_improvement_handoff_identity,
+    improvement_candidate_retry_permitted, improvement_operation_owners, improvement_route_owner,
+    read_improvement_effect_state, reconcile_improvement_unknown, route_improvement_candidate,
 };
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
@@ -1620,6 +1636,56 @@ impl DaemonComposition {
             .improvement_admission_policy(operation_ref, idempotency_key, SERVICE_NAME))
     }
 
+    /// The live admitted State Fence this composition's owners stand on.
+    ///
+    /// Read from the retained Governor snapshot, never from a caller claim, so a
+    /// transported or cached fence cannot substitute for the one a maintenance
+    /// result is published under. Pure with respect to the Kernel: no exchange
+    /// happens here.
+    ///
+    /// # Errors
+    ///
+    /// [`DaemonError::Composition`] with [`CompositionError::NotReady`] when the
+    /// Governor is not ready; the fence itself is the retained snapshot's own
+    /// value and cannot fail.
+    pub fn governor_kernel_fence(&self) -> eliot_contracts::StateFence {
+        self.governor.kernel_snapshot().state_fence().clone()
+    }
+
+    /// The retained durable maintenance job for one exact job identity.
+    ///
+    /// This is the existing durable-job read route, not a local map: the job
+    /// revision and the result-to-observation obligations its transitions
+    /// appended come from the same atomic write the owner persisted, so a
+    /// publication reads the obligation the source transition actually recorded
+    /// rather than a value recomputed here.
+    ///
+    /// `Ok(None)` means no such job is retained; that is unavailable, not
+    /// resolved. The read happens under the composition lock, so a caller must
+    /// release it before any Kernel exchange.
+    ///
+    /// # Errors
+    ///
+    /// [`DaemonError::Composition`] with [`CompositionError::NotReady`] when the
+    /// Governor is not ready, [`CompositionError::Kernel`] carrying the
+    /// transport's own [`eliot_governor::KernelPortError`] when the durable-job
+    /// read is refused, and the composition's own `Recovery` variant when the
+    /// retained revision fails validation or is not bound to this fence and
+    /// identity. The Governor route refuses with a [`CompositionError`], so the
+    /// refusal keeps that type instead of being restated as a maintenance-owner
+    /// refusal the read never produced.
+    pub fn retained_maintenance_job(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<eliot_maintenance::MaintenanceJob>, DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        self.governor
+            .retained_durable_job(job_id)
+            .map_err(DaemonError::Composition)
+    }
+
     /// Commits the durable learning-closure edge for one consequential attempt.
     ///
     /// This is the production caller of
@@ -1882,73 +1948,31 @@ impl DaemonComposition {
             ));
         }
         let outcome = self.map_activation_outcome(ticket, now, successor_observation.as_ref());
-        let outcome = match outcome {
-            Ok(result)
-                if result.resolved_binding().is_some() && ticket.workspace_selector.is_some() =>
-            {
-                // Issue #2900 W12/B2: the installation-bound owner supply is
-                // STITCH — no live `eliotd` thread holds the canonical
-                // `Arc<dyn ScanDisclosureRecordOwner>` (Kernel
-                // `RedbRecoveryStore` lives in the separate kernel process;
-                // `eliotd` owns no store client and takes no new store
-                // dependency) and no installation/session owner issues the
-                // per-operation `ScanDisclosureOwnerBinding` yet — so the
-                // port stays disconnected and the question leg runs
-                // storeless with typed fail-closed completion.
-                Self::attach_cold_start_question(ticket, now, result, None)
-            }
-            other => other,
-        };
         emit_activation_admission_diagnostics(ticket, &outcome);
         outcome
     }
 
-    /// Runs the reachable, non-ready attach discovery leg for an explicit
-    /// workspace selector. The Host observer supplies filesystem/VCS facts;
-    /// the scanner may return only its smallest privacy-boundary question
-    /// until an installation-backed disclosure owner is supplied.
+    /// Attaches the bounded pre-owner question using the exact Host observation
+    /// retained by the activation dispatch. The lease/key/evidence are carried
+    /// forward unchanged for the post-acceptance trigger owner route.
     ///
     /// Issue #2900 W12: this is the live attach/cold-start ingress that
-    /// reaches the scan port. When the installation-bound durable owner is
-    /// supplied, it is connected before `BootstrapScanner::scan` through
-    /// [`Self::attach_cold_start_owner_receipt`]: the scan charges the
-    /// observed lease once, persists through the owner, replays the handle
-    /// back under the same binding, and the completed activation stands on
-    /// that durable receipt — no in-memory-only or loose-file fallback
-    /// exists anywhere on this route. An owner refusal of
-    /// `ScanContourNotAdmitted` (no persistable inputs) falls through to
-    /// the storeless question projection below, which charges nothing and
-    /// persists nothing; any other owner refusal fails closed with its
-    /// typed cause. Without the owner the pre-owner question leg below
-    /// runs without a store (no lease charge, no persistence), and a
-    /// completed scan fails closed with the typed inaccessible cause.
-    /// Caller: live `DaemonComposition::resolve_agent_activation_v2`; the
-    /// owner supply behind the owner arm is STITCH (see call site).
-    fn attach_cold_start_question(
-        ticket: &AgentActivationResolutionTicket,
-        now: u64,
+    /// reaches the scan port. An installation-bound durable owner, when
+    /// available, is connected before `BootstrapScanner::scan`; its exact
+    /// receipt is read back under the same binding. Without that owner, only
+    /// the storeless smallest-question leg may run and completion fails closed.
+    /// Caller: `daemon_runtime::resolve_valid_ticket`, which retains this
+    /// Host observation for the accepted-result trigger after Kernel ACK.
+    pub fn attach_cold_start_question(
         result: AgentActivationResolutionResult,
+        observed: &mut crate::task_binding_admission::ColdStartDiscoveryInput,
         owner: Option<(
             &mut eliot_governor::InstallationScanDisclosureStore,
             &eliot_workscope::ScanDisclosureOwnerBinding,
         )>,
     ) -> Result<AgentActivationResolutionResult, DaemonError> {
-        let mut observed = crate::task_binding_admission::observe_cold_start_discovery(
-            ticket,
-            &ticket.state_fence,
-            now.max(1),
-        )
-        .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
         if let Some((store, binding)) = owner {
-            match Self::attach_cold_start_owner_receipt(store, binding, &mut observed) {
-                // The durable owner receipt stays retained in the
-                // installation-bound owner under its operation key with
-                // exact-replay semantics; the activation stands as
-                // resolved. The trigger-driven terminal compilation takes
-                // its own trigger-scan handle through
-                // `GovernorComposition::compile_cold_start_at_trigger`,
-                // which reads it back through the same store and binding
-                // before compiling.
+            match Self::attach_cold_start_owner_receipt(store, binding, observed) {
                 Ok(_handle) => return Ok(result),
                 Err(eliot_workscope::WorkScopeError::ScanContourNotAdmitted) => {}
                 Err(error) => {
@@ -1967,6 +1991,24 @@ impl DaemonComposition {
         )
         .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
         Self::project_cold_start_question(result, scan)
+    }
+
+    /// Binds the accepted activation's authenticated Kernel readiness owner
+    /// to the exact installation contour. The adapter carries only the
+    /// retained connection/ticket envelope; claim construction and durable
+    /// lease decisions remain in Governor after complete evidence is
+    /// available.
+    pub fn bind_cold_start_readiness_owner(
+        &mut self,
+        contour: &eliot_governor::InstallationScanContour,
+        owner: Arc<dyn eliot_ors::ColdStartReadinessRecordOwner>,
+    ) -> Result<(), DaemonError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        self.governor
+            .bind_cold_start_readiness_owner(contour, owner)
+            .map_err(DaemonError::Composition)
     }
 
     /// Projects one storeless scan outcome onto the resolved activation.
@@ -3714,10 +3756,12 @@ impl DaemonComposition {
     /// boundary (issue #1746 W5; #8 W1).
     ///
     /// This is an owner readback adapter, not a second cold-start compiler:
-    /// the input must carry the Governor-issued lease and its complete prior
-    /// surface. The method checks the full lease key/epoch/deadline/terminal
-    /// state, compares the supplied fence to the Governor's current snapshot, then
-    /// asks the Governor for the exact terminal under that key. It returns the
+    /// the input must carry the Governor-issued lease, its complete prior
+    /// surface, and the full Governor-built ORS claim. Partial lease fields
+    /// cannot identify a durable readiness row. The method checks the claim,
+    /// full lease key/epoch/deadline/terminal state, compares the supplied
+    /// fence to the Governor's current snapshot, then asks the Governor for
+    /// the exact terminal under that claim. It returns the
     /// surface only if every projected frozen field is equal to the expected
     /// owner projection. Expiry uses the daemon's internal Unix-millisecond
     /// clock, so the caller cannot extend a lease by supplying an older tick. A moved fence, changed receipt,
@@ -3726,9 +3770,10 @@ impl DaemonComposition {
     /// correlation identity.
     ///
     /// `caller: STITCH`. The authenticated Kernel/attach producer must supply
-    /// the actual lease/surface pair and observed fence; the current activation
-    /// route does not carry those semantic owner values. This method never
-    /// derives them from host fields or creates a replacement receipt.
+    /// the actual lease/surface/full-claim tuple and observed fence; the
+    /// current activation route does not carry those semantic owner values.
+    /// This method never derives them from host fields or creates a replacement
+    /// receipt.
     pub fn read_cold_start_surface_for_attach(
         &self,
         input: &task_binding_admission::ColdStartAttachInput,
@@ -3753,22 +3798,26 @@ impl DaemonComposition {
             ));
         }
 
+        input.readiness_claim.validate().map_err(|error| {
+            DaemonError::Composition(CompositionError::Recovery(format!(
+                "cold-start attach readiness claim is invalid: {error}"
+            )))
+        })?;
+        let now = unix_ms();
         let live_fence = self.governor.kernel_snapshot().state_fence();
         if input.state_fence != live_fence
             || input.expected_surface.state_fence != live_fence
-            || input.expected_surface.lease_deadline < unix_ms()
+            || input.expected_surface.lease_deadline < now
+            || !input.matches_lease()
         {
             return Err(DaemonError::Composition(
                 CompositionError::ActivationStaleFence,
             ));
         }
 
-        let (current_lease, current_surface) = self.governor.cold_start_owner_readback_for_lease(
-            &input.lease.lineage_candidate_ref,
-            &input.lease.workspace_instance_candidate_ref,
-            input.lease.privacy_class,
-            input.lease.governing_source_generation,
-        )?;
+        let (current_lease, current_surface) = self
+            .governor
+            .cold_start_owner_readback_for_claim(&input.readiness_claim, now)?;
         if current_lease != input.lease || current_surface != input.expected_surface {
             return Err(DaemonError::Composition(
                 CompositionError::ActivationStaleFence,
@@ -3871,7 +3920,7 @@ impl DaemonComposition {
     ///
     /// The daemon adds no resolver of its own: it asks the Governor for the
     /// activation snapshot and the owner-compiled readiness receipt through
-    /// [`eliot_governor::GovernorComposition::current_task_selection`] — the
+    /// [`eliot_governor::GovernorComposition::current_task_selection_for_claim`] — the
     /// unique live work lease, the live owner session, the durable
     /// `TaskContract` revision, the installed `MATCHED` `WorkScope`, and the
     /// receipt whose `task_binding` carries the acceptance digest and the
@@ -3893,33 +3942,23 @@ impl DaemonComposition {
     ///
     /// # Live status
     ///
-    /// `caller: STITCH`. The dispatch ingresses that would supply the lease
-    /// key terms are owned by the attach-transport and operation-wiring issues
-    /// (`GovernorComposition::current_task_selection` is reached from no live
-    /// path because the retained cold-start lease itself has no producer yet).
-    /// No synthetic caller was added.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "selection resolution joins the activation route, the compiled receipt, and the live fence in one fail-closed entry"
-    )]
+    /// The exact full claim is required so durable readiness readback binds
+    /// the complete identity, source-digest set, and fence. A caller with only
+    /// partial lease key terms cannot reach Governor task selection.
     pub fn resolve_current_task_selection(
         &self,
         now: u64,
-        lineage_candidate_ref: &str,
-        workspace_instance_candidate_ref: &str,
-        privacy_class: eliot_security_contracts::PrivacyClass,
-        governing_source_generation: u64,
+        claim: &eliot_ors::ColdStartReadinessClaim,
     ) -> Result<task_binding_admission::TaskSelectionResponse, DaemonError> {
         if self.readiness() != CompositionReadiness::Ready {
             return Err(DaemonError::Composition(CompositionError::NotReady));
         }
-        let (activation, receipt) = self.governor.current_task_selection(
-            now,
-            lineage_candidate_ref,
-            workspace_instance_candidate_ref,
-            privacy_class,
-            governing_source_generation,
-        )?;
+        claim.validate().map_err(|error| {
+            DaemonError::Composition(CompositionError::Recovery(format!(
+                "current-task readiness claim is invalid: {error}"
+            )))
+        })?;
+        let (activation, receipt) = self.governor.current_task_selection_for_claim(now, claim)?;
         let live_fence = self.governor.kernel_snapshot().state_fence();
         match task_binding_admission::bind_current_task_selection(
             activation.as_ref(),

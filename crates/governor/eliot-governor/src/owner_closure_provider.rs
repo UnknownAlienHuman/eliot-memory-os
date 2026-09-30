@@ -39,7 +39,7 @@ use eliot_authority::{
     GrantClosureDelegation, GrantGraphRecoverySnapshot, GrantId, GrantRecoveryRecord, GrantStatus,
     MechanicalAuthoritySubset, MechanicalSubsetConstraints, QuarantineEnforcementRef,
     QuarantineEvidenceStatus, RevocationClosureState, RevocationClosureVerdict,
-    RevocationHistoryEvidence, VerifiedQuarantineBinding,
+    RevocationHistoryEvidence, RevocationOperationIdentity, VerifiedQuarantineBinding,
 };
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_influence::RevocationBounds;
@@ -99,6 +99,22 @@ pub struct OwnerClosureProvider {
     /// ORS reference must resolve here before any receipt readback can
     /// satisfy a fenced disposition.
     retained_quarantine_enforcements: BTreeMap<String, QuarantineEnforcementRef>,
+    /// The admitted revocation operation identity this provider's bounded
+    /// closure rechecks run under: principal, task, work scope, observing
+    /// receipt, and causal `transaction_sequence`.
+    ///
+    /// It is required, never optional and never defaulted. The provider holds
+    /// no plan, no task binding, no scope binding, and no Store readback of
+    /// its own — a grant carries a holder and a root, a history record carries
+    /// a fence, a revision and a digest, and neither is an admitted task or a
+    /// causal position — so it can derive no coordinate of this identity and
+    /// does not try. The durable boundary that observed this state supplies
+    /// it at restore, already refused by
+    /// [`RevocationOperationIdentity::admit`] if any coordinate is blank,
+    /// control-bearing, or carries no `transaction_sequence`. Rotation
+    /// retains it: refreshing to newer durable state is the SAME owner
+    /// operation observed later, not a second operation.
+    admitted_operation: RevocationOperationIdentity,
 }
 
 /// Governor-side admitted-hydration registry.
@@ -291,6 +307,10 @@ impl OwnerClosureProvider {
     /// revocation. A stale fence, a revision disagreement, or an invalid
     /// snapshot refuses likewise, before any owner state is installed.
     ///
+    /// `operation` is the admitted revocation operation identity supplied by
+    /// the durable boundary; see
+    /// [`Self::restore_with_retained_quarantine_decisions`].
+    ///
     /// # Errors
     ///
     /// Returns [`CompositionError::Recovery`] for an invalid snapshot, an
@@ -299,8 +319,15 @@ impl OwnerClosureProvider {
         snapshot: AuthorityOwnerSnapshot,
         history: Option<RevocationHistoryEvidence>,
         expected_fence: &StateFence,
+        operation: RevocationOperationIdentity,
     ) -> Result<Self, CompositionError> {
-        Self::restore_with_canonical_receipts(snapshot, history, expected_fence, BTreeMap::new())
+        Self::restore_with_canonical_receipts(
+            snapshot,
+            history,
+            expected_fence,
+            BTreeMap::new(),
+            operation,
+        )
     }
 
     /// Restores the provider with canonical second-phase links read from the
@@ -311,6 +338,7 @@ impl OwnerClosureProvider {
         history: Option<RevocationHistoryEvidence>,
         expected_fence: &StateFence,
         canonical_receipts: BTreeMap<String, ReceiptIdentity>,
+        operation: RevocationOperationIdentity,
     ) -> Result<Self, CompositionError> {
         Self::restore_with_quarantine_evidence(
             snapshot,
@@ -318,6 +346,7 @@ impl OwnerClosureProvider {
             expected_fence,
             canonical_receipts,
             BTreeMap::new(),
+            operation,
         )
     }
 
@@ -334,6 +363,7 @@ impl OwnerClosureProvider {
         expected_fence: &StateFence,
         canonical_receipts: BTreeMap<String, ReceiptIdentity>,
         quarantine_evidence: BTreeMap<String, CrossRootQuarantineEvidence>,
+        operation: RevocationOperationIdentity,
     ) -> Result<Self, CompositionError> {
         Self::restore_with_retained_quarantine_decisions(
             snapshot,
@@ -343,6 +373,7 @@ impl OwnerClosureProvider {
             quarantine_evidence,
             BTreeMap::new(),
             BTreeMap::new(),
+            operation,
         )
     }
 
@@ -352,6 +383,19 @@ impl OwnerClosureProvider {
     /// Evidence shape and map identity are proven here; CURRENT
     /// qualification happens per verdict and per explicit admission,
     /// never at restore.
+    ///
+    /// `operation` is the admitted revocation operation identity the origin-
+    /// bound closure recheck and every served closure verdict run under. It
+    /// is required, not defaulted: the provider derives none of its five
+    /// coordinates, so a caller that has none cannot restore a provider whose
+    /// verdicts could otherwise be computed under an invented operation.
+    /// The three overloads above are the same construction with less retained
+    /// evidence, and they carry the same required identity — evidence may be
+    /// sparse, identity may not be absent.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the retained restore carries the snapshot, history, fence, canonical second-phase links, quarantine evidence, retained semantic decisions and the admitted operation identity as one fail-closed construction"
+    )]
     pub fn restore_with_retained_quarantine_decisions(
         snapshot: AuthorityOwnerSnapshot,
         history: Option<RevocationHistoryEvidence>,
@@ -360,6 +404,7 @@ impl OwnerClosureProvider {
         quarantine_evidence: BTreeMap<String, CrossRootQuarantineEvidence>,
         retained_quarantine_decisions: BTreeMap<String, CrossRootQuarantineEvidence>,
         retained_quarantine_enforcements: BTreeMap<String, QuarantineEnforcementRef>,
+        operation: RevocationOperationIdentity,
     ) -> Result<Self, CompositionError> {
         validate_canonical_receipt_links(&canonical_receipts)?;
         validate_quarantine_evidence_links(&quarantine_evidence)?;
@@ -381,6 +426,7 @@ impl OwnerClosureProvider {
             &snapshot,
             expected_fence,
             Some(&history),
+            &operation,
         )?;
         let hydrations = outcome.owner.owner_hydrations.clone();
         if outcome.owner.grants.revision() != snapshot.grant_graph.revision {
@@ -421,6 +467,7 @@ impl OwnerClosureProvider {
             quarantine_evidence,
             retained_quarantine_decisions,
             retained_quarantine_enforcements,
+            admitted_operation: operation,
         };
         if let Some(hydrations) = hydrations.as_ref() {
             let durable_bytes = canonical_json_bytes(hydrations).map_err(recovery)?;
@@ -497,6 +544,12 @@ impl OwnerClosureProvider {
     /// [`Self::complete_closure_verdict`]): completeness requires every
     /// omission bound to a CURRENT verified quarantine binding.
     ///
+    /// The traversal runs under the provider's admitted
+    /// [`RevocationOperationIdentity`], retained from restore. The provider
+    /// derives no principal, task, work scope, observing receipt, or causal
+    /// position of its own, so this is the only honest identity available
+    /// here: the one the durable boundary admitted for this owner operation.
+    ///
     /// # Errors
     ///
     /// Returns [`CompositionError::Recovery`] for an unknown grant identity
@@ -516,6 +569,7 @@ impl OwnerClosureProvider {
                 &self.state_fence,
                 &bounds,
                 &bindings,
+                &self.admitted_operation,
             )
             .map_err(|error| CompositionError::Recovery(error.to_string()))
     }
@@ -527,6 +581,11 @@ impl OwnerClosureProvider {
     /// cannot account for, so the fencing sites refuse instead of
     /// presenting an incomplete closure as complete. The exact frontier
     /// stays available through [`Self::revocation_closure_verdict`].
+    ///
+    /// The bounded traversal runs under the provider's admitted
+    /// [`RevocationOperationIdentity`], the same identity
+    /// [`Self::revocation_closure_verdict`] serves: a fencing gate must not
+    /// recheck under a different operation than the one the recheck names.
     fn complete_closure_verdict(
         &self,
         target: &GrantId,
@@ -541,6 +600,7 @@ impl OwnerClosureProvider {
                 &self.state_fence,
                 &bounds,
                 &bindings,
+                &self.admitted_operation,
             )
             .map_err(|error| CompositionError::Owner(error.to_string()))?;
         if !matches!(verdict.state, RevocationClosureState::Complete { .. }) {
@@ -682,6 +742,13 @@ impl OwnerClosureProvider {
     /// Returns [`CompositionError::Recovery`] for a fence change, a stale
     /// revision, an invalid snapshot or history, or admitted material that
     /// disagrees with the new state.
+    ///
+    /// The retained [`RevocationOperationIdentity`] is carried across the
+    /// rotation rather than re-supplied: a refresh observes the SAME owner
+    /// operation at a newer durable revision, so its closure rechecks belong
+    /// to the operation already admitted. Minting a second identity here
+    /// would make rotation look like a new causal position that nothing
+    /// observed.
     pub fn refresh(
         &mut self,
         snapshot: AuthorityOwnerSnapshot,
@@ -694,8 +761,13 @@ impl OwnerClosureProvider {
             ));
         }
         let fence = self.state_fence.clone();
-        let candidate =
-            Self::restore_with_canonical_receipts(snapshot, history, &fence, BTreeMap::new())?;
+        let candidate = Self::restore_with_canonical_receipts(
+            snapshot,
+            history,
+            &fence,
+            BTreeMap::new(),
+            self.admitted_operation.clone(),
+        )?;
         if candidate.revision() != expected_revision {
             return Err(CompositionError::Recovery(
                 "restored owner revision disagrees with the expected revision".to_owned(),
@@ -2315,7 +2387,31 @@ mod owner_closure_provider_tests {
         AuthoritySet, CapabilityGrant, EffectAuthorizer, GrantGraph, GrantId, GrantStatus,
         LogicalTime, PrincipalRef,
     };
-    use eliot_contracts::{ContractId, EpochId, EpochLineageId, ResourceGeneration};
+    use eliot_contracts::{
+        ClockReading, ContractId, EpochId, EpochLineageId, ReceiptId, ResourceGeneration, TaskId,
+        TransactionSequence,
+    };
+
+    /// The admitted revocation operation identity every fixture restores
+    /// under. It is a fixture, like the fence and the snapshot: the provider
+    /// derives no coordinate of it, so the restore boundary must be handed
+    /// one that survives [`RevocationOperationIdentity::admit`] — every
+    /// coordinate non-blank and a causal `transaction_sequence` present.
+    fn operation() -> RevocationOperationIdentity {
+        RevocationOperationIdentity::admit(
+            "principal:operator",
+            TaskId::new("task-1").expect("task id"),
+            "scope-1",
+            ReceiptId::new("receipt-1").expect("receipt id"),
+            ClockReading {
+                valid_time_ms: Some(1_000),
+                known_time_ms: Some(1_000),
+                transaction_sequence: Some(TransactionSequence::genesis()),
+                monotonic_ns: None,
+            },
+        )
+        .expect("admitted revocation operation identity")
+    }
 
     const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
 
@@ -2405,7 +2501,12 @@ mod owner_closure_provider_tests {
 
     fn provider() -> Result<OwnerClosureProvider, CompositionError> {
         let fence = test_fence();
-        OwnerClosureProvider::restore(owner_snapshot(&fence), Some(history(&fence)), &fence)
+        OwnerClosureProvider::restore(
+            owner_snapshot(&fence),
+            Some(history(&fence)),
+            &fence,
+            operation(),
+        )
     }
 
     /// The one revision token these fixtures declare. No fixture models a
@@ -2481,7 +2582,10 @@ mod owner_closure_provider_tests {
     #[test]
     fn restore_refuses_absent_history() {
         let fence = test_fence();
-        assert!(OwnerClosureProvider::restore(owner_snapshot(&fence), None, &fence).is_err());
+        assert!(
+            OwnerClosureProvider::restore(owner_snapshot(&fence), None, &fence, operation())
+                .is_err()
+        );
     }
 
     #[test]
@@ -2615,6 +2719,7 @@ mod owner_closure_provider_tests {
             owner_snapshot(&fence2),
             Some(history(&fence2)),
             &fence2,
+            operation(),
         )?;
         assert!(fresh.serve_restore().is_err());
         fresh.import_registry(&bytes)?;

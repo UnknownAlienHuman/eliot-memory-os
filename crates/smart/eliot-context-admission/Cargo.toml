@@ -40,6 +40,13 @@ eliot-improvement = { path = "../../meta/eliot-improvement", version = "0.1.0" }
 # binds the authority owner's own class rather than a renamed local enum. The
 # edge stays in the non-wasm section to keep the guest contour unchanged.
 eliot-authority = { path = "../../governor/eliot-authority", version = "0.1.0" }
+# Issue #1742 W4: the dispatch binding carries the authority owner's effect
+# ceiling (`eliot-security-contracts::EffectCeiling`) and W6 consumes #1730's
+# retained checkpoint (`eliot-agent-contracts::RetainedHandoffCheckpoint`).
+# Both are owner types reused verbatim, never redefined locally. The edges stay
+# in the non-wasm section to keep the guest contour unchanged.
+eliot-agent-contracts.workspace = true
+eliot-security-contracts.workspace = true
 
 [dev-dependencies]
 eliot-agent-contracts = { path = "../../agent/eliot-agent-contracts", version = "0.1.0" }

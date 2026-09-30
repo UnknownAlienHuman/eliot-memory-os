@@ -84,6 +84,10 @@ fn candidate() -> ContextCandidate {
         binding: context_binding(),
         atom_id: id("atom"),
         provider_role: provider_role(),
+        // This fixture asserts about reactive planning inputs, not about a
+        // measured position inside the snapshot, so the range stays a typed
+        // unknown.
+        source_range: None,
         source: SourceSnapshot {
             source_id: eliot_contracts::SourceId::new("fixture-source").expect("fixture source"),
             owner: ProviderId::new("fixture-provider").expect("fixture owner"),

@@ -32,10 +32,10 @@
 //!                              fence gate, observed evidence);
 //! purge .................... purge owner (`apply_purge_ledger`: every ledger
 //!                              entry is applied through the ORS purge-ledger
-//!                              owner, which issues the revision; the
-//!                              owner-issued revision is cross-checked against
-//!                              the revision the archive declares before the
-//!                              phase stages anything, and the entries with the
+//!                              owner, which issues the revision; the archive's
+//!                              declared revision is cross-checked against the
+//!                              owner's own durable counter before the phase
+//!                              stages anything, and the entries with the
 //!                              revisions they consumed are staged as this
 //!                              phase's evidence, purge-first before any
 //!                              import);
@@ -54,14 +54,36 @@
 //!
 //! Effects whose bindings are absent refuse fail-closed with the exact
 //! responsible capability; reconciliation answers from persisted identity
-//! receipts (`Applied` on exact transaction/phase/input match, `NotApplied`
-//! otherwise, `Unknown` only for undecidable bytes so the engine takes its
-//! explicit rollback-required disposition). All effects here are synchronous
-//! and local with a persisted identity receipt per phase, so no ambiguous
-//! external commit exists in this target and no `Unknown` outcome is
-//! manufactured: async owner-channel unknowns belong to the #962 wire layer,
-//! which must upgrade reconciliation there, never downgrade readback to a
-//! blind re-apply here.
+//! receipts AND from the material those receipts attest (`Applied` only on
+//! exact transaction/phase/input match with that material still present and
+//! still the digested bytes; `NotApplied` only where the phase's own material
+//! is proven absent, which is the only phase-specific positive no-effect
+//! evidence this target holds; `Unknown` for undecidable bytes — a missing
+//! receipt over material that IS published among them — so the engine takes
+//! its explicit rollback-required disposition). A receipt file that cannot be
+//! read is never an absence: `Path::exists()` collapses missing, inaccessible
+//! and broken paths into one silent `false`, so the two absence tests on the
+//! RECONCILIATION path — the receipt read in `load_applied` and the member
+//! probe in `phase_material_published` — are fallible reads that distinguish
+//! them, and an inaccessible one refuses rather than reading as absent. The
+//! staged-output CLEANUP path is a separate concern and is not covered by that
+//! claim: `is_attested_phase_material` and `count_dir` still answer presence
+//! with `Path::exists()`. All effects here are synchronous and local with a
+//! persisted identity receipt per phase, so no ambiguous external commit
+//! exists in this target; the `Unknown` outcomes above are therefore all
+//! LOCAL to a phase whose own material is undecidable, never a manufactured
+//! effect ambiguity. Async owner-channel unknowns belong to the #962 wire
+//! layer, which must upgrade reconciliation there, never downgrade readback to
+//! a blind re-apply here.
+//!
+//! Every staged byte is made durable BEFORE the phase receipt that names it is
+//! written, in the order the same module's ORS journal already applies to its
+//! own sealed bodies: reserve bounded output capacity, write the
+//! operation-owned temporary file, flush it, publish it at the admitted
+//! destination, establish publication durability, then flush the phase receipt
+//! and let the existing ORS CAS record `ReceiptPersisted`. A failed body flush
+//! is a refusal, never a silent success, so a recovered row can never point at
+//! material a target power loss could remove (A13.7 ARCH-RES-03, I5.19).
 //!
 //! The durable journal is injected as `J: RestoreJournalPort` with
 //! owner-issued [`RestoreJournalAdmission`](eliot_backup::RestoreJournalAdmission):
@@ -110,6 +132,7 @@ use super::backup_restore_ports::{
     PinnedDestinationAdmission, RESTORE_EVIDENCE_FILE, RESTORE_ISOLATED_AREA,
     RESTORE_JOURNAL_IDENTITY, RESTORE_JOURNAL_PAYLOAD_AREA, RestorePorts, StagedCleanupRefusal,
     backup_to_kernel, check_kernel_effect_fence, ors_to_backup, require_production_admitted,
+    sync_file, sync_parent_directory,
 };
 
 /// Maps one accepted restore step to its responsible owner.
@@ -1510,6 +1533,28 @@ enum ObservedEffect {
     Undecidable,
 }
 
+/// The exact material one restore phase published under the destination.
+///
+/// Every phase stages its bytes through [`KernelRestoreTarget::write_file`] and
+/// hands evidence to [`KernelRestoreTarget::effect_receipt`], which digests
+/// those bytes into [`RestoreEffectReceipt::evidence_sha256`]. For eight of the
+/// ten phases the evidence bytes ARE the published member's bytes — the phase
+/// either wrote that same buffer or read it back through
+/// [`KernelRestoreTarget::staged_bytes`] — so the receipt's digest is a claim
+/// about material on disk and can be compared against it. The two exceptions
+/// are stated in [`KernelRestoreTarget::phase_material`] rather than papered
+/// over: their evidence is a separate observation document that is never
+/// persisted, so only the presence of what they published is re-provable.
+struct PhaseMaterial {
+    /// The member this phase published, when it publishes one, resolved
+    /// through the same contained-member guard
+    /// [`KernelRestoreTarget::write_file`] uses.
+    member: Option<PathBuf>,
+    /// Whether [`RestoreEffectReceipt::evidence_sha256`] is the digest of
+    /// `member`'s exact bytes.
+    receipt_digests_member: bool,
+}
+
 /// Bounded removal disposition for the output one restore execution staged.
 ///
 /// A disposition, not an error: the primary engine failure is returned either
@@ -1521,6 +1566,14 @@ enum StagedCleanup {
     NothingStaged,
     /// Every removable file this execution staged was removed.
     Removed,
+    /// Published phase material a still-present phase receipt attests was
+    /// preserved instead of unlinked, so something this execution staged
+    /// SURVIVED. This is deliberately not [`Self::Removed`] and not
+    /// [`Self::NothingStaged`]: "the destination is empty" and "the
+    /// destination still holds restored canonical history this cleanup chose
+    /// not to destroy" are different facts about the same run, and a caller
+    /// that cannot tell them apart is told a loss where there was none.
+    AttestedPhaseMaterialPreserved,
     /// Cleanup preserved what it could not attribute to this execution, for
     /// the exact typed reason.
     Refused(StagedCleanupRefusal),
@@ -1530,9 +1583,11 @@ enum StagedCleanup {
 ///
 /// Every applicable phase re-checks the Kernel effect fence before touching
 /// state, executes the genuine responsible-owner operation with the exact
-/// bindings the coordinator supplies, persists exact bytes, and returns an
-/// observed receipt. Reconciliation answers from persisted identity receipts
-/// only.
+/// bindings the coordinator supplies, persists exact bytes — flushed before
+/// they are published, so a phase receipt is never journalled over bytes a
+/// power loss could remove — and returns an observed receipt. Reconciliation
+/// answers from persisted identity receipts AND the material they attest, never
+/// from a receipt alone.
 ///
 /// It also owns the two bounds the target is responsible for: every staged
 /// write is admitted against [`StagedOutputBudget`] BEFORE it happens, and the
@@ -1566,18 +1621,18 @@ struct KernelRestoreTarget<'a> {
     ors: Option<std::sync::Arc<RedbRecoveryStore>>,
     /// Revisions the purge phase actually consumed from the ORS purge-ledger
     /// owner, in ledger order. Observable on the SUCCESS path only:
-    /// [`KernelRestoreTarget::apply_purge_ledger`] first cross-checks them
-    /// against the archive's declared revision through
-    /// [`check_purge_revision_closure`], then projects them into the staged
-    /// phase evidence, and that staging is what the phase receipt digests. If a
-    /// later step of the same phase fails, the target is dropped with this
-    /// field — no reader observes it on that path, and this comment does not
-    /// claim one does.
+    /// [`KernelRestoreTarget::apply_purge_ledger`] first cross-checks the
+    /// archive's declared revision against the owner's own durable counter
+    /// through [`check_purge_revision_closure`], then projects these
+    /// revisions into the staged phase evidence, and that staging is what the
+    /// phase receipt digests. If a later step of the same phase fails, the
+    /// target is dropped with this field — no reader observes it on that path,
+    /// and this comment does not claim one does.
     applied_purge_revisions: Vec<AppliedPurgeRevision>,
     /// The ARCHIVE's own declared purge-ledger revision,
     /// `bundle.manifest.purge_ledger_revision`, copied once when this target
     /// was built so the purge phase can cross-check it against what the owner
-    /// issued without reaching back into the bundle.
+    /// itself reports without reaching back into the bundle.
     ///
     /// Stored, never recomputed: nothing here increments, derives or counts to
     /// produce it.
@@ -1632,7 +1687,9 @@ impl<'a> KernelRestoreTarget<'a> {
     }
 
     /// Applies every archive purge entry through the ORS purge-ledger owner
-    /// and returns the revision that owner issued for each one.
+    /// and returns the owner's own durable purge-ledger counter as it stood
+    /// BEFORE this call, together with the revision that owner issued for each
+    /// entry.
     ///
     /// This is the live route to
     /// [`RedbRecoveryStore::apply_purge_ledger_entry`], the only writer of the
@@ -1703,17 +1760,23 @@ impl<'a> KernelRestoreTarget<'a> {
     ///
     /// ## Ordering against the revision cross-check
     ///
-    /// The revisions returned here are cross-checked against the archive's
-    /// declared revision by [`check_purge_revision_closure`], which
-    /// [`KernelRestoreTarget::apply_purge_ledger`] calls on the result of THIS
-    /// function and only after this function returned. A rehearsal carrying a
-    /// purge entry therefore still refuses at the guard above, before any owner
-    /// call, and never reaches the cross-check: adding it does not move the live
-    /// owner one step closer to a rehearsal.
+    /// The owner counter read here is the owner's own
+    /// [`RedbRecoveryStore::purge_ledger_revision`] — read AFTER this function
+    /// applies the archive's ledger, so the value cross-checked by
+    /// [`check_purge_revision_closure`] is the ledger position this owner has
+    /// now reached, which is the same kind of quantity the archive's
+    /// `manifest.purge_ledger_revision` declares. Reading it BEFORE would
+    /// compare the position the destination started from against the position
+    /// the source finished at, which is not a closure check at all.
+    /// [`KernelRestoreTarget::apply_purge_ledger`] passes it
+    /// to that check on the result of THIS function, so a rehearsal carrying a
+    /// purge entry still refuses at the guard above, before any owner call, and
+    /// never reaches the cross-check: adding it does not move the live owner one
+    /// step closer to a rehearsal.
     fn apply_purge_entries(
         &self,
         entries: &[PurgeLedgerEntry],
-    ) -> Result<Vec<AppliedPurgeRevision>, BackupError> {
+    ) -> Result<(Option<u64>, Vec<AppliedPurgeRevision>), BackupError> {
         // A rehearsal reaches the LIVE owner: this is the only phase in the
         // restore body that writes to the live `p07_ors` store, every other
         // phase writes solely into the isolated destination. Refuse before
@@ -1726,12 +1789,28 @@ impl<'a> KernelRestoreTarget<'a> {
         }
         let Some(ors) = self.ors.as_ref() else {
             if entries.is_empty() {
-                return Ok(Vec::new());
+                return Ok((None, Vec::new()));
             }
             return Err(BackupError::RestoreCapabilityUnsupported {
                 capability: owners::PURGE_LEDGER_OWNER,
             });
         };
+        // The owner's own durable counter, read through the owner's own
+        // accessor AFTER this phase has applied the archive's ledger. This is
+        // the only value that answers "which purge-ledger revision has this
+        // owner reached", and it is read from the same durable counter the
+        // applying transactions commit with each ledger row — never counted
+        // over `entries`, never read out of the archive under check.
+        //
+        // The read is AFTER, not before, and the position matters: the
+        // archive's `manifest.purge_ledger_revision` is the ledger position the
+        // SOURCE observed once it had applied its own ledger, so it is a
+        // POST-apply position. Comparing a pre-apply counter against it
+        // compares two different quantities — on a rebuilt destination whose
+        // counter starts at 0, applying 7 entries correctly leaves the owner at
+        // 7, and a pre-apply read of 0 would refuse a restore that did exactly
+        // the right thing, AFTER having committed the whole ledger (issue #960,
+        // A14).
         let mut applied = Vec::with_capacity(entries.len());
         for entry in entries {
             let revision = ors.apply_purge_ledger_entry(entry).map_err(ors_to_backup)?;
@@ -1740,7 +1819,8 @@ impl<'a> KernelRestoreTarget<'a> {
                 revision,
             });
         }
-        Ok(applied)
+        let owner_revision = ors.purge_ledger_revision().map_err(ors_to_backup)?;
+        Ok((Some(owner_revision), applied))
     }
 
     /// Stages one file, refusing BEFORE the write when the bounded output
@@ -1752,6 +1832,45 @@ impl<'a> KernelRestoreTarget<'a> {
     /// [`BackupError::LimitExceeded`] naming the exact ceiling, not a
     /// formatted message, and it propagates through the phase and the engine
     /// unchanged.
+    ///
+    /// ## Order: reserved capacity, durable bytes, published name
+    ///
+    /// The two bounds above are the "reserve bounded output capacity" step and
+    /// run BEFORE any I/O, so a refused write never creates a directory, a
+    /// temporary file or a byte. The rest is the same admitted durable-file
+    /// staging convention this restore lane's ORS journal already applies to
+    /// its own sealed bodies
+    /// ([`sync_file`](super::backup_restore_ports::sync_file) /
+    /// [`sync_parent_directory`](super::backup_restore_ports::sync_parent_directory),
+    /// called from `OrsRestoreJournal::seal`), in the order the durable claim
+    /// requires:
+    ///
+    /// ```text
+    /// reserve bounded output capacity                    (the two LimitExceeded checks)
+    /// -> create/write the operation-owned temporary file  (std::fs::write)
+    /// -> flush the written file                          (sync_file, before publishing)
+    /// -> publish it at the admitted destination          (std::fs::rename)
+    /// -> establish publication durability                (sync_parent_directory)
+    /// -> publish/flush the phase receipt                 (persist_applied's own call)
+    /// -> allow the existing ORS CAS to record ReceiptPersisted
+    /// ```
+    ///
+    /// Atomic naming is not durability. A rename only makes the NAME atomic,
+    /// while the engine CASes `ReceiptPersisted` into a store that does fsync
+    /// afterwards, so without the two flushes the journal would be told
+    /// `ReceiptPersisted` over bytes a power loss could still remove. That is
+    /// exactly the invariant the same module already states for its journal
+    /// bodies at `backup_restore_ports.rs:1567-1570`: a recovered row must
+    /// never point at material a target power loss could remove. The readback
+    /// half of that claim is [`Self::check_attested_material`].
+    ///
+    /// A failed body flush is a REFUSAL, not a silent success: the error
+    /// propagates as this phase's own `BackupError`, which the engine
+    /// reconciles against that same phase. No ORS transaction is held across
+    /// any of this I/O, and no cross-store atomicity is claimed — the two
+    /// flushes bound the window, they do not close it. The staged counters and
+    /// [`Self::staged`] are committed only after both flushes, so a refusal
+    /// never accounts for a file that was never published.
     fn write_file(&mut self, relative: &str, bytes: &[u8]) -> Result<(), BackupError> {
         let members = self
             .staged_members
@@ -1789,7 +1908,20 @@ impl<'a> KernelRestoreTarget<'a> {
         }
         let tmp = path.with_extension("tmp-restore");
         std::fs::write(&tmp, bytes).map_err(|error| BackupError::Target(error.to_string()))?;
+        // Flush the operation-owned temporary file BEFORE it is published.
+        // Publishing first and flushing after would leave a name pointing at
+        // bytes the target never made stable, which is the same defect the
+        // write order above exists to prevent.
+        sync_file(&tmp)?;
         std::fs::rename(&tmp, &path).map_err(|error| BackupError::Target(error.to_string()))?;
+        // Flush the directory entry that now names the published file, so the
+        // name itself survives the power loss the bytes must survive.
+        // `contained_member_path` admits only one or more plain relative
+        // segments, so the joined path always has a parent; it is resolved
+        // rather than assumed anyway, because a member that named none would
+        // leave the publication above unflushable, and that must be a refusal
+        // rather than a silent skip of the durability step.
+        sync_parent_directory(path.parent().ok_or(BackupError::RestoreJournalCorrupt)?)?;
         self.staged_members = members;
         self.staged_bytes = staged_bytes;
         self.staged.push(path);
@@ -1889,10 +2021,17 @@ impl<'a> KernelRestoreTarget<'a> {
     ///
     /// The engine's typed failure is the cause and is never replaced. When the
     /// cleanup removed everything, or had nothing removable to remove, the
-    /// refusal stays plain [`KernelRestoreError::TargetFailed`] — there is no
-    /// second fact to report. When the cleanup preserved what it could not
-    /// attribute, that exact typed reason travels with the SAME primary
-    /// failure, so nothing is lost and nothing is stringified.
+    /// refusal stays plain [`KernelRestoreError::TargetFailed`] — in both of
+    /// those cases the bounded cleanup did exactly what it exists to do, so
+    /// there is no second fact to report and nothing about the primary cause is
+    /// lost. When the cleanup preserved something — either what it could not
+    /// attribute, or published phase material a still-present phase receipt
+    /// attests — that exact typed reason travels with the SAME primary failure,
+    /// so nothing is lost and nothing is stringified. The two preservation
+    /// causes are distinct typed reasons and never collapse into one, because
+    /// "we could not prove this was ours to remove" and "these bytes are
+    /// applied history the journal still accounts for" are different facts a
+    /// caller needs separately (#960 W13/A18).
     fn refuse_with_staged_cleanup(
         &self,
         destination: &KernelIsolatedDestination,
@@ -1903,6 +2042,12 @@ impl<'a> KernelRestoreTarget<'a> {
         match self.cleanup_staged_output(destination, transaction_id, target_id) {
             StagedCleanup::NothingStaged | StagedCleanup::Removed => {
                 KernelRestoreError::TargetFailed(primary)
+            }
+            StagedCleanup::AttestedPhaseMaterialPreserved => {
+                KernelRestoreError::StagedCleanupIncomplete {
+                    primary,
+                    cleanup: StagedCleanupRefusal::AttestedPhaseMaterialPreserved,
+                }
             }
             StagedCleanup::Refused(cleanup) => {
                 KernelRestoreError::StagedCleanupIncomplete { primary, cleanup }
@@ -1918,38 +2063,57 @@ impl<'a> KernelRestoreTarget<'a> {
     ///    ([`Self::staged`]) minus the preserved observation classes, so a
     ///    prior execution's staging, a pinned admission, and the reconcileable
     ///    phase receipts are never candidates at all;
-    /// 2. a destination that was resumed rather than constructed fresh is
+    /// 2. a staged path whose publishing phase still has its phase receipt on
+    ///    disk is not a candidate either
+    ///    ([`Self::is_attested_phase_material`]): that receipt is the durable
+    ///    observation the ORS restore journal committed `ReceiptPersisted`
+    ///    against, so the bytes it digests are applied history a resume will
+    ///    reconcile and never re-run. Unlinking them is a loss, not a
+    ///    cleanup — `ARCH-RES-03` (A13.7) and the item's own "cleanup
+    ///    preserved" clause;
+    /// 3. a destination that was resumed rather than constructed fresh is
     ///    refused outright, because its contents are not provably ours;
-    /// 3. the pinned destination admission is re-read through the same
+    /// 4. the pinned destination admission is re-read through the same
     ///    [`KernelBackupRestore::refuse_foreign_destination`] gate that
     ///    admitted it, so a destination pinned to another transaction or
     ///    target is refused rather than emptied;
-    /// 4. the destination root and the isolated area are resolved again HERE,
+    /// 5. the destination root and the isolated area are resolved again HERE,
     ///    not reused from open time, and the root must still sit inside
     ///    `<work_root>/.eliot/restore-isolated/<label>`, so a swapped or
     ///    re-pointed destination cannot redirect a removal.
     ///
-    /// Bounded work, in three dimensions: the walk is over a known path set,
+    /// Bounded work, in four dimensions: the walk is over a known path set,
     /// so there is no unbounded directory recursion; the set is at most
     /// [`StagedOutputBudget::members`] because those are the same writes the
-    /// budget admitted; and the aggregate unlinked bytes stop at
-    /// [`StagedOutputBudget::bytes`], the same ceiling that admitted them.
-    /// Empty directories left behind are reclaimed with
-    /// [`std::fs::remove_dir`], which cannot remove a non-empty directory, so
-    /// a directory this pass did not empty always survives.
+    /// budget admitted; the aggregate unlinked bytes stop at
+    /// [`StagedOutputBudget::bytes`], the same ceiling that admitted them; and
+    /// the attestation probe is one bounded `Path::exists` per staged path
+    /// over the same set, never a directory walk. Empty directories left behind
+    /// are reclaimed with [`std::fs::remove_dir`], which cannot remove a
+    /// non-empty directory, so a directory this pass did not empty always
+    /// survives — and now a directory whose attested material this pass
+    /// deliberately kept can never be emptied at all.
     fn cleanup_staged_output(
         &self,
         destination: &KernelIsolatedDestination,
         transaction_id: &str,
         target_id: &str,
     ) -> StagedCleanup {
-        let candidates: Vec<&PathBuf> = self
-            .staged
-            .iter()
-            .filter(|path| !Self::is_preserved_observation(path, &self.root))
-            .collect();
+        let mut preserved_attested = false;
+        let mut candidates: Vec<&PathBuf> = Vec::with_capacity(self.staged.len());
+        for path in &self.staged {
+            if self.is_attested_phase_material(path) {
+                preserved_attested = true;
+            } else if !Self::is_preserved_observation(path, &self.root) {
+                candidates.push(path);
+            }
+        }
         if candidates.is_empty() {
-            return StagedCleanup::NothingStaged;
+            return if preserved_attested {
+                StagedCleanup::AttestedPhaseMaterialPreserved
+            } else {
+                StagedCleanup::NothingStaged
+            };
         }
         if destination.is_resumed() {
             return StagedCleanup::Refused(StagedCleanupRefusal::AdmittedResume);
@@ -2029,6 +2193,10 @@ impl<'a> KernelRestoreTarget<'a> {
         Self::reclaim_empty_directories(&parents, &self.root);
         match refusal {
             Some(refusal) => StagedCleanup::Refused(refusal),
+            // `Removed` would be a false claim here: it says every removable
+            // file this execution staged is gone, and the attested material
+            // this pass declined to unlink is still on disk.
+            None if preserved_attested => StagedCleanup::AttestedPhaseMaterialPreserved,
             None => StagedCleanup::Removed,
         }
     }
@@ -2064,6 +2232,83 @@ impl<'a> KernelRestoreTarget<'a> {
             || first == RESTORE_EVIDENCE_FILE
     }
 
+    /// Whether a staged path is published phase material whose phase receipt
+    /// is STILL on disk, and is therefore attested applied history rather than
+    /// abandoned staging.
+    ///
+    /// Each phase publishes its material first and persists
+    /// `phase-receipts/<phase-digest>.json` second, whose `evidence_sha256` is
+    /// the digest of the material it just read back; only then does the engine
+    /// compare-and-swap `ReceiptPersisted` into the durable ORS journal. A
+    /// receipt that is still present therefore names material the journal
+    /// already accounts for, and the engine resumes at `record.phase` — it
+    /// never re-runs the phases behind the journal head, because the only
+    /// destination verifier (`apply_rebuild`'s `count_dir`) is itself a phase
+    /// behind that head.
+    ///
+    /// Unlinking such bytes leaves a durable journal and retained receipts
+    /// attesting restored canonical history that does not exist, which
+    /// `ARCH-RES-03` (A13.7) forbids. So they are not cleanup candidates at
+    /// all: they are preserved, and the disposition reports that something
+    /// survived rather than claiming the destination was emptied.
+    ///
+    /// A path that is not recognised as a phase's published material is left to
+    /// the ordinary candidate rules, so a file this execution staged whose
+    /// phase never reached its receipt is still removable.
+    fn is_attested_phase_material(&self, path: &Path) -> bool {
+        let Ok(relative) = path.strip_prefix(&self.root) else {
+            return false;
+        };
+        let Some(phase) = Self::publishing_phase(relative) else {
+            return false;
+        };
+        self.phase_receipt_path(&phase)
+            .is_ok_and(|receipt| receipt.exists())
+    }
+
+    /// Maps one staged path back to the single phase that publishes it.
+    ///
+    /// The mapping is the inverse of the `write_file` relative path each phase
+    /// uses, so the receipt named here is the very receipt that phase
+    /// persisted for exactly these bytes. A path no phase publishes — or a
+    /// path whose shape does not match one of these phases — has no phase to
+    /// attest it and is `None`.
+    fn publishing_phase(relative: &Path) -> Option<RestorePhase> {
+        let staged = relative.to_str()?;
+        let phase = match staged {
+            "purge_ledger.json" => RestorePhase::ApplyPurgeLedger,
+            "suspended_ors.json" => RestorePhase::SuspendOrsOperations,
+            "rebuild.json" => RestorePhase::RebuildProjections,
+            "verify.json" => RestorePhase::VerifyReceiptEventChain,
+            _ => {
+                let (directory, member) = staged.split_once('/')?;
+                // A member is one path segment: a nested staged path belongs to
+                // no phase and is never attested.
+                if member.is_empty() || member.contains('/') {
+                    return None;
+                }
+                match directory {
+                    // A blob is staged under its own content hash, with no
+                    // extension; every other member is staged as `<id>.json`.
+                    "blobs" => RestorePhase::ImportSealedBlob {
+                        hash: member.to_owned(),
+                    },
+                    "events" => RestorePhase::ImportCanonicalEvent {
+                        record_id: member.strip_suffix(".json")?.to_owned(),
+                    },
+                    "receipts" => RestorePhase::ImportReceipt {
+                        operation_id: member.strip_suffix(".json")?.to_owned(),
+                    },
+                    "projections" => RestorePhase::ImportProjection {
+                        record_id: member.strip_suffix(".json")?.to_owned(),
+                    },
+                    _ => return None,
+                }
+            }
+        };
+        Some(phase)
+    }
+
     /// Reclaims the directories this pass emptied, deepest first.
     ///
     /// Only plain [`std::fs::remove_dir`] is used, and only on directories
@@ -2079,12 +2324,184 @@ impl<'a> KernelRestoreTarget<'a> {
         }
     }
 
+    /// The exact material one restore phase published, and whether the phase
+    /// receipt digests those bytes.
+    ///
+    /// The mapping is the mirror of the `apply_*` methods: every arm names the
+    /// same member that method stages. Nothing here is derived from the
+    /// receipt, from a count, or from a name the phase did not write, so a
+    /// resumed receipt is checked against the same member the phase produced
+    /// rather than against a weaker echo of itself.
+    fn phase_material(&self, phase: &RestorePhase) -> Result<PhaseMaterial, BackupError> {
+        match phase {
+            RestorePhase::Pending => Err(BackupError::RestorePhaseMismatch),
+            RestorePhase::PrepareIsolatedRoot => Ok(PhaseMaterial {
+                // The pinned destination admission is the one durable byte
+                // prepare publishes, and only when this execution carries Host
+                // admission to pin; a rehearsal without it publishes no member.
+                member: self
+                    .manifest_evidence
+                    .as_ref()
+                    .map(|_| self.contained_member_path(DESTINATION_ADMISSION_FILE))
+                    .transpose()?,
+                // `apply_prepare` digests `ObservedPrepare`, an observation
+                // assembled in memory and never persisted, so the admission's
+                // own bytes carry no digest this receipt attests.
+                receipt_digests_member: false,
+            }),
+            RestorePhase::ApplyPurgeLedger => self.digested_member("purge_ledger.json"),
+            RestorePhase::ImportSealedBlob { hash } => Ok(PhaseMaterial {
+                member: Some(self.contained_member_path(&format!("blobs/{hash}"))?),
+                // `apply_blob` digests `ObservedBlobRestore` — the observed
+                // re-seal, whose `resealed_sha256` is a destination-encrypted
+                // digest no archive member carries. That document is never
+                // persisted, so the receipt attests no digest of the re-sealed
+                // bytes and only their presence is re-provable. The content
+                // binding this phase does own is `BlobOwnerClient::restore_blob`,
+                // which re-verifies the plaintext digest and the restoration
+                // receipt before it stages anything.
+                receipt_digests_member: false,
+            }),
+            RestorePhase::ImportCanonicalEvent { record_id } => {
+                self.digested_member(&format!("events/{record_id}.json"))
+            }
+            RestorePhase::ImportReceipt { operation_id } => {
+                self.digested_member(&format!("receipts/{operation_id}.json"))
+            }
+            RestorePhase::ImportProjection { record_id } => {
+                self.digested_member(&format!("projections/{record_id}.json"))
+            }
+            RestorePhase::SuspendOrsOperations => self.digested_member("suspended_ors.json"),
+            RestorePhase::RebuildProjections => self.digested_member("rebuild.json"),
+            RestorePhase::VerifyReceiptEventChain => self.digested_member("verify.json"),
+            RestorePhase::FinalizeIsolatedRoot => self.digested_member(RESTORE_EVIDENCE_FILE),
+        }
+    }
+
+    /// Whether a phase's own material is present under the destination.
+    ///
+    /// This is the readback of [`Self::phase_material`] for the one case where
+    /// the receipt that would have carried the digest is itself gone, so
+    /// presence of the phase-owned member is the only phase-specific evidence
+    /// still available. Exactly that member is consulted — never a directory
+    /// listing, a count, or a name the phase did not write — and the probe is a
+    /// fallible read, so an inaccessible member refuses
+    /// ([`BackupError::Target`]) rather than reading as an absence.
+    fn phase_material_published(&self, phase: &RestorePhase) -> Result<bool, BackupError> {
+        let Some(member) = self.phase_material(phase)?.member else {
+            // The phase publishes no member at all under this execution's
+            // authority (a rehearsal prepare carries no Host admission to
+            // pin), so there is nothing of its own that could exist.
+            return Ok(false);
+        };
+        match std::fs::metadata(&member) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(BackupError::Target(error.to_string())),
+        }
+    }
+
+    /// Material for a phase whose receipt digest IS the digest of the bytes it
+    /// published, because the `apply_*` method either staged that same buffer
+    /// or read it back through [`Self::staged_bytes`] and handed it to
+    /// [`Self::effect_receipt`].
+    fn digested_member(&self, relative: &str) -> Result<PhaseMaterial, BackupError> {
+        Ok(PhaseMaterial {
+            member: Some(self.contained_member_path(relative)?),
+            receipt_digests_member: true,
+        })
+    }
+
+    /// Re-reads the material a recovered phase receipt attests.
+    ///
+    /// This is the readback half of the durability order
+    /// [`Self::write_file`] establishes on the write half. A receipt is an
+    /// observation of an effect; it is not the effect. Without this, a receipt
+    /// whose material a power loss removed — or that now names bytes other than
+    /// the ones on disk — still reports `Applied` and the engine advances to
+    /// the next phase over material that was never durably produced.
+    ///
+    /// Refusals reuse this file's existing vocabulary rather than a new error
+    /// kind: [`BackupError::RestoreJournalCorrupt`] is what a journaled effect
+    /// without its observation already is here ([`Self::group_ref`],
+    /// [`Self::check_destination_admission`]), and
+    /// [`BackupError::RestoreJournalMismatch`] is what a receipt that disagrees
+    /// with what it names already is. An unreadable path is a
+    /// [`BackupError::Target`], never an absence.
+    fn check_attested_material(
+        material: &PhaseMaterial,
+        evidence_sha256: &str,
+    ) -> Result<(), BackupError> {
+        let Some(member) = material.member.as_deref() else {
+            return Ok(());
+        };
+        let bytes = match std::fs::read(member) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(BackupError::RestoreJournalCorrupt);
+            }
+            Err(error) => return Err(BackupError::Target(error.to_string())),
+        };
+        if material.receipt_digests_member && sha256_hex(&bytes) != evidence_sha256 {
+            return Err(BackupError::RestoreJournalMismatch);
+        }
+        Ok(())
+    }
+
+    /// Reads one phase's recovered observation back off the destination.
+    ///
+    /// A present receipt bound to this transaction, phase and input digest is
+    /// only `Applied` when the material it attests is STILL THERE and, where
+    /// the receipt's `evidence_sha256` is that material's digest, is still the
+    /// same bytes ([`Self::check_attested_material`]). Validating a receipt's
+    /// own digests against themselves is not a weaker form of this check, it is
+    /// the substitution being fixed: a receipt is a description, and a
+    /// description is not its own evidence.
+    ///
+    /// A MISSING receipt is not the same fact, and it is not a proven no-effect
+    /// verdict. The engine reaches `IntentPersisted` before the phase executes
+    /// and calls this reconciliation first, so a crash inside the phase leaves
+    /// the receipt absent while the phase's own material may already be
+    /// published and, since [`Self::write_file`], already durable. The
+    /// phase-specific question is therefore asked of the material
+    /// ([`Self::phase_material_published`]), never of the receipt's absence:
+    ///
+    /// - material PRESENT means the phase DID publish. That is positive
+    ///   evidence of an effect and never of no-effect, and the receipt that
+    ///   would have described it is gone, so the observation cannot be
+    ///   reconstructed. The state is [`ObservedEffect::Undecidable`], so the
+    ///   engine pauses this Ordering Scope, keeps the intent and opens a
+    ///   Problem State rather than duplicating a published effect (I14.21).
+    /// - material ABSENT means the phase produced nothing durable. Every phase
+    ///   here publishes exactly the member [`Self::phase_material`] names and
+    ///   nothing else, and that member is flushed to stable storage before the
+    ///   receipt is written, so a phase that had completed would have left it
+    ///   behind. That is the phase-specific positive no-effect evidence this
+    ///   target holds, and only it returns [`ObservedEffect::NotAttempted`].
+    ///
+    /// The receipt test itself is a FALLIBLE READ, not an existence probe:
+    /// `Path::exists()` collapses a missing file, a permission denial and a
+    /// broken path into one silent `false`, so inaccessible evidence would be
+    /// reported as evidence of absence and the phase would be re-applied over
+    /// it. Only `NotFound` means "no receipt" here; every other error refuses,
+    /// because a refusal is a fact the coordinator can act on and a false
+    /// absence is not. Unparseable bytes remain [`ObservedEffect::Undecidable`]
+    /// so the coordinator takes its explicit rollback-required disposition
+    /// (I14.21).
     fn load_applied(&self, intent: &RestoreIntent) -> Result<ObservedEffect, BackupError> {
         let path = self.phase_receipt_path(&intent.phase)?;
-        if !path.exists() {
-            return Ok(ObservedEffect::NotAttempted);
-        }
-        let bytes = std::fs::read(&path).map_err(|error| BackupError::Target(error.to_string()))?;
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return if self.phase_material_published(&intent.phase)? {
+                    Ok(ObservedEffect::Undecidable)
+                } else {
+                    Ok(ObservedEffect::NotAttempted)
+                };
+            }
+            // Inaccessible receipt state is not absence: it is a refusal.
+            Err(error) => return Err(BackupError::Target(error.to_string())),
+        };
         let applied: RestoreAppliedEffect = match serde_json::from_slice(&bytes) {
             Ok(applied) => applied,
             // Torn or foreign bytes: the effect state cannot be established
@@ -2099,6 +2516,12 @@ impl<'a> KernelRestoreTarget<'a> {
         {
             return Err(BackupError::RestoreJournalCorrupt);
         }
+        // A receipt is a description of an effect, not the effect: it is only
+        // evidence of a phase that ran if the material it names is still there.
+        Self::check_attested_material(
+            &self.phase_material(&intent.phase)?,
+            &applied.receipt.evidence_sha256,
+        )?;
         Ok(ObservedEffect::Applied(Box::new(applied)))
     }
 
@@ -2660,14 +3083,20 @@ impl RestoreTarget for KernelRestoreTarget<'_> {
 
     fn apply_purge_ledger(&mut self, entries: &[PurgeLedgerEntry]) -> Result<(), BackupError> {
         PurgeOwnerClient::bind(entries).validate_entries()?;
-        let applied = self.apply_purge_entries(entries)?;
-        // The archive's declared revision and the revisions the owner issued
-        // for THESE entries are two readings of one quantity, so they are
-        // compared here — after the owner answered, and BEFORE this phase
-        // stages the evidence document that carries the answer. A disagreement
-        // therefore never becomes a staged phase receipt, and it is never
-        // published as the restore's `provenance.purge_ledger_revision`.
-        check_purge_revision_closure(self.declared_purge_ledger_revision, entries, &applied)?;
+        let (owner_revision, applied) = self.apply_purge_entries(entries)?;
+        // The archive's declared revision and the ledger position the OWNER
+        // itself reports for its own applied ledger are two readings of one
+        // quantity, so they are compared here — after the owner answered, and
+        // BEFORE this phase stages the evidence document that carries the
+        // answer. A disagreement therefore never becomes a staged phase
+        // receipt, and it is never published as the restore's
+        // `provenance.purge_ledger_revision`.
+        check_purge_revision_closure(
+            self.declared_purge_ledger_revision,
+            owner_revision,
+            entries,
+            &applied,
+        )?;
         self.applied_purge_revisions = applied;
         // The staged document is this phase's evidence, so the owner-issued
         // revisions ride the SAME effect evidence every other phase already
@@ -2784,16 +3213,32 @@ impl RestoreTarget for KernelRestoreTarget<'_> {
     ) -> Result<RestoreReconciliation, BackupError> {
         // Every effect in this target is synchronous and local with one
         // persisted identity receipt per phase, so reconciliation reads the
-        // observation back by exact identity: a present receipt bound to this
-        // transaction, phase, and input digest is Applied; its absence is
-        // NotApplied and the coordinator re-applies idempotently (byte
-        // staging overwrites, re-sealing mints fresh bytes with a fresh
-        // receipt — no prior receipt exists to contradict). Bytes that parse
-        // as nothing are Undecidable and propagate as Unknown: the
-        // coordinator takes the explicit rollback-required disposition
-        // (I14.21) with no new identity and no blind retry. Async
-        // owner-channel unknowns belong to the #962 wire layer, which must
-        // upgrade reconciliation there, never downgrade readback here.
+        // observation back by exact identity AND re-reads the material that
+        // receipt attests (`load_applied` / `check_attested_material`). A
+        // present receipt bound to this transaction, phase and input digest,
+        // and still describing material that is still there, is Applied. A
+        // receipt is a description of an effect, not the effect, so a receipt
+        // whose material was removed — or that now names bytes other than the
+        // ones on disk — refuses rather than advancing the journal over a phase
+        // that never produced what the journal and the finalize obligations say
+        // it produced (A13.7 ARCH-RES-03).
+        //
+        // Its ABSENCE is never a proven no-effect by itself. Only the absence
+        // of the phase's own material is, because that member is the phase's
+        // entire durable effect and `write_file` flushes it to stable storage
+        // before any receipt that could describe it is written; there the
+        // coordinator re-applies idempotently (byte staging overwrites,
+        // re-sealing mints fresh bytes with a fresh receipt — no prior receipt
+        // exists to contradict). A missing receipt over material that IS
+        // published is evidence of an effect whose observation was lost, so it
+        // is Undecidable, not NotApplied, and both the receipt test and the
+        // material test are fallible reads — a permission denial is a refusal,
+        // never a fabricated no-effect. Bytes that parse as nothing are
+        // likewise Undecidable and propagate as Unknown: the coordinator takes
+        // the explicit rollback-required disposition (I14.21) with no new
+        // identity and no blind duplicate effect. Async owner-channel unknowns
+        // belong to the #962 wire layer, which must upgrade reconciliation
+        // there, never downgrade readback here.
         match &intent.phase {
             RestorePhase::Pending => Err(BackupError::RestorePhaseMismatch),
             _ => match self.load_applied(intent)? {
@@ -2936,10 +3381,9 @@ fn check_ors_journal_budget(bundle: &BackupBundle) -> Result<(), KernelRestoreEr
     Ok(())
 }
 
-/// Cross-checks the archive's declared purge-ledger revision against the
-/// revisions the ORS purge-ledger owner actually issued for the entries this
-/// phase applied (issue #960, A14: "current purge/residency/reference closure
-/// preserved").
+/// Cross-checks the archive's declared purge-ledger revision against the ORS
+/// purge-ledger OWNER's own durable counter (issue #960, A14: "current
+/// purge/residency/reference closure preserved").
 ///
 /// The restore evidence publishes
 /// `provenance.purge_ledger_revision`, and `eliot_backup` REQUIRES that
@@ -2949,24 +3393,45 @@ fn check_ors_journal_budget(bundle: &BackupBundle) -> Result<(), KernelRestoreEr
 /// That field is therefore copied from the manifest, and until this check the
 /// owner's answer for the same quantity was never compared against it: two
 /// independent numbers, one copied out of the archive under check and one
-/// issued by the owner that applied the ledger. `A13.7` requires a restore to
+/// issued by the owner that applies the ledger. `A13.7` requires a restore to
 /// verify privacy purge closure against the CURRENT owner, and
 /// `I5.13:44` requires the manifest to bind the purge-ledger revision, so the
 /// two must be cross-checked rather than one of them published unchecked.
 ///
-/// The compared values are only ever the two legitimate ones: the archive's
-/// declared `manifest.purge_ledger_revision`, and the revision the owner
-/// returned from [`RedbRecoveryStore::apply_purge_ledger_entry`]. Nothing here
-/// computes, increments, counts or derives a revision: there is no `+ 1`, no
-/// `wrapping_add`, no counter and no use of an entry count as a revision. The
-/// only selection performed is choosing which owner-issued value represents
-/// the ledger position reached by the whole archive ledger (the highest one),
-/// because entries are handed to the owner in ledger order.
+/// `owner_revision` is that owner answer, and it is the ONLY owner answer this
+/// check may use: the durable counter
+/// [`RedbRecoveryStore::purge_ledger_revision`] reports, read through the
+/// owner itself AFTER this phase applied the archive's ledger.
+///
+/// It is deliberately NOT the highest revision
+/// [`RedbRecoveryStore::apply_purge_ledger_entry`] returned while applying the
+/// entries. Those are the positions THIS restore allocated, in a ledger that was
+/// already at some other position: on a destination that had applied purges
+/// before, that maximum disagreed with the archive's declaration by exactly the
+/// destination's prior count, so the phase refused for every archive carrying a
+/// non-empty ledger and passed only where a virgin store's arithmetic happened
+/// to agree. Comparing an archive's declaration against a copy of the caller's
+/// own entry list is a completeness check with no owner behind it (`A14`), and
+/// a coincidence is not evidence.
+///
+/// Nor is it the counter read BEFORE this phase applied anything. The archive's
+/// declared revision is the position the SOURCE reached once it had applied its
+/// own ledger, so it is a post-apply position; a pre-apply read is the position
+/// the DESTINATION started from, and the two are different quantities. On a
+/// rebuilt destination starting at 0, applying 7 entries correctly leaves the
+/// owner at the declared 7, and a pre-apply read of 0 refuses a restore that did
+/// exactly the right thing — after having already committed the whole ledger.
+///
+/// The compared values are therefore only ever the two legitimate ones: the
+/// archive's declared `manifest.purge_ledger_revision`, and the revision the
+/// owner reports for its own applied ledger. Nothing here computes, increments,
+/// counts or derives a revision: there is no `+ 1`, no `wrapping_add`, no
+/// counter and no use of an entry count as a revision.
 ///
 /// The archive side is whatever its producer declared for that manifest field —
 /// `elipt_backup` leaves the value to the producer and only refuses the
 /// incoherent pairs — and it is never re-derived here. An archive whose
-/// declared revision is not a revision the applying owner issues is therefore
+/// declared revision is not the revision the applying owner holds is therefore
 /// refused at this check rather than published as a closure: this module does
 /// not reconcile two producers' conventions and never rewrites either number
 /// to make them agree.
@@ -2975,20 +3440,23 @@ fn check_ors_journal_budget(bundle: &BackupBundle) -> Result<(), KernelRestoreEr
 ///
 /// * a count disagreement — the owner did not issue one revision for every
 ///   carried entry — refuses, so a phase that applied less than the archive
-///   declares cannot pass as closure;
+///   carries cannot pass as closure;
 /// * an owner-issued revision of zero refuses, because the owner's own record
 ///   contract states an applied purge always consumes a NON-ZERO ledger
 ///   revision (`PurgeLedgerRecord::validate`); a zero is the owner's "nothing
 ///   was ever applied" answer, not an issued revision, and treating it as one
 ///   would be absence of proof read as proof;
-/// * an issued revision that disagrees with the archive's declared revision
-///   refuses. This is the same shape as the archive-side binding
+/// * a declared revision that differs from the owner's own counter refuses —
+///   both when the owner's ledger is AHEAD of the archive's declaration and
+///   when it is BEHIND it. This is the same shape as the archive-side binding
 ///   `elipt_backup::BackupBundle::validate_class_requirements` already
 ///   enforces for this field, and as the owner-side answer comparison in
-///   `eliot-host`'s `project_owner_bound`, and it is deliberately strict in
-///   BOTH directions: a declared revision the owner's ledger never reached is
-///   as much a closure failure as an applied revision the archive never
-///   declared.
+///   `eliot-host`'s `project_owner_bound`: a destination that does not hold
+///   exactly the ledger position the archive declares is not a closed purge
+///   position, and re-applying the archive's ledger into it would publish a
+///   closure this restore never established;
+/// * an owner that reported NO revision at all refuses, because `None` is not
+///   a revision and must not stand in for agreement.
 ///
 /// The refusal is the seam's existing typed
 /// [`BackupError::FenceMismatch`] naming `purge ledger revision` — the same
@@ -3014,6 +3482,7 @@ fn check_ors_journal_budget(bundle: &BackupBundle) -> Result<(), KernelRestoreEr
 /// binds the phase receipt of the phase that actually ran.
 fn check_purge_revision_closure(
     declared: u64,
+    owner_revision: Option<u64>,
     entries: &[PurgeLedgerEntry],
     applied: &[AppliedPurgeRevision],
 ) -> Result<(), BackupError> {
@@ -3027,13 +3496,11 @@ fn check_purge_revision_closure(
             subject: PURGE_LEDGER_REVISION_SUBJECT.to_owned(),
         });
     }
-    // The highest revision the owner issued is the ledger position this
-    // restore's whole ledger reached: a SELECTION among values the owner
-    // returned, never a value computed here. `None` — the owner issued no
-    // revision at all — is compared as itself, so it refuses rather than
-    // standing in for agreement.
-    let owner_issued = applied.iter().map(|record| record.revision).max();
-    if owner_issued != Some(declared) {
+    // The owner's own durable counter, read through the owner before this phase
+    // moved it, against the archive's declaration. `None` — the owner answered
+    // with no revision at all — is compared as itself, so it refuses rather
+    // than standing in for agreement.
+    if owner_revision != Some(declared) {
         return Err(BackupError::FenceMismatch {
             subject: PURGE_LEDGER_REVISION_SUBJECT.to_owned(),
         });

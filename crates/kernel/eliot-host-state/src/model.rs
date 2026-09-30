@@ -9,6 +9,7 @@ use eliot_runtime_contracts::{
     HealthDimension, KernelActivationState, ServiceProcessRecord, ServiceProcessState,
     SupervisionLeasePredecessorIdentity, WakeIntent, WakeIntentState,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -129,7 +130,9 @@ pub(crate) fn epoch_transition_is_direct_child_of(
 }
 
 /// Reasons that require a fresh Host lineage instead of continuing a counter.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RecoveryLineageReason {
     Corruption,
@@ -139,7 +142,9 @@ pub enum RecoveryLineageReason {
 }
 
 /// External evidence for an explicitly recovered, globally distinct Host lineage.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryLineageEvidence {
     pub reason: RecoveryLineageReason,
@@ -161,7 +166,7 @@ impl RecoveryLineageEvidence {
 /// The epoch is the canonical [`EpochTransition`]: equality (not ordering)
 /// is the authority rule, so this type keeps `Eq` but deliberately has no
 /// `Ord` and no `Hash` over the transition.
-#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostInstallationEpoch {
     pub installation: PlatformHandle,
@@ -235,7 +240,9 @@ pub fn host_owner_epoch_digest(
 }
 
 /// Stable mutation identity used for replay and conflict detection.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(deny_unknown_fields)]
 pub struct IdempotencyIdentity {
     pub operation_id: PlatformHandle,
@@ -250,7 +257,7 @@ impl IdempotencyIdentity {
 }
 
 /// Every record carries the current Host and activation fence.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecordFence {
     pub host: HostInstallationEpoch,
@@ -1328,8 +1335,8 @@ pub struct DrainRecord {
     /// continues the current attempt and carries `None`.
     ///
     /// `default` is mandatory, not stylistic: `DrainRecord` and
-    /// `HostStateRecord` both deny unknown fields and `JOURNAL_VERSION` is 3,
-    /// so a required field would make every installed v3 frame fail
+    /// `HostStateRecord` both deny unknown fields and the journal wire revision
+    /// advanced to 4, so a required field would make every installed v3 frame fail
     /// `decode_record_for_replay` and render the whole epoch unloadable.
     ///
     /// `skip_serializing_if` is equally mandatory, for the same reason
@@ -2041,8 +2048,8 @@ pub struct EpochRetirementRecord {
     /// retirement (#2868).
     ///
     /// `default` is mandatory, not stylistic: `EpochRetirementRecord` and
-    /// `HostStateRecord` both deny unknown fields and `JOURNAL_VERSION` is 3,
-    /// so a required field would make every already-installed v3 frame fail
+    /// `HostStateRecord` both deny unknown fields and the journal wire revision
+    /// advanced to 4, so a required field would make every already-installed v3 frame fail
     /// `decode_record_for_replay` and render the whole epoch unloadable.
     ///
     /// `None` is a legacy record written before the relation existed. It stays
@@ -2214,11 +2221,20 @@ pub enum CutoverIntentState {
 
 /// Closed outcome of one durable backup destination preparation.
 ///
-/// `Pending` is the pre-effect state and the only non-terminal one: the
-/// destination root may be created only after the admission is durable.
-/// `Prepared` is terminal and is written only after the root exists and its OS
-/// identity was pinned, so it is the sole proof that this operation - and no
-/// other - created that exact directory.
+/// `Pending` is the pre-effect state: the destination root may be created only
+/// after the admission is durable. `Prepared` is written only after the root
+/// exists and its OS identity was pinned, so it is the sole proof that this
+/// operation - and no other - created that exact directory, and it is the
+/// state a reclamation is authorized against.
+///
+/// `CleanupPending` and `Reclaimed` are the reclamation's own two
+/// dispositions, and both are reachable only from a record that already pins
+/// the identity. `CleanupPending` is the authorization retained BEFORE the
+/// removal effect and `Reclaimed` only AFTER the absence has been observed, so
+/// a crash between them leaves a durable "may have been reclaimed" record
+/// rather than a receipt claiming a root is gone when nobody looked. Neither is
+/// reachable from `Pending`: an admission that pins no identity authorizes
+/// nothing, and a predictable path is not ownership.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum BackupPreparationState {
@@ -2232,11 +2248,50 @@ pub enum BackupPreparationState {
     /// absence, not a failure, and never permission to prepare a second
     /// destination under this operation identity. A root observed under this
     /// state is a partial destination: owned by nothing until a `Prepared`
-    /// record pins it, and therefore preserved rather than deleted.
+    /// record pins it, and therefore preserved rather than deleted, and it can
+    /// never move to a reclamation state because it carries no proof of what it
+    /// would be reclaiming.
     Pending,
     /// The result is durable: this operation exclusively created the recorded
     /// destination and pinned its OS identity.
+    ///
+    /// Not a fixed point: the owner-authorized reclamation moves out of it, and
+    /// only that. Nothing here re-opens a prepared root for a second
+    /// preparation.
     Prepared,
+    /// The owner has authorized reclamation of the recorded destination and the
+    /// removal effect has not been observed yet.
+    ///
+    /// This is the durable intent of the irreversible effect, retained before
+    /// it, and it still carries the pinned identity that authorizes it. A crash
+    /// after this frame leaves the outcome unobserved rather than absent, so a
+    /// later reader preserves the root and re-observes instead of retrying an
+    /// effect whose outcome nobody established.
+    CleanupPending,
+    /// The recorded destination was removed and its absence was observed.
+    ///
+    /// Terminal. The pinned identity is retained, not cleared: the reclamation
+    /// is only attributable to the exact directory this operation created, and
+    /// dropping the proof would erase that attribution.
+    Reclaimed,
+}
+
+impl BackupPreparationState {
+    /// Whether the transition law of one preparation operation admits `self`
+    /// as the successor of `retained`.
+    ///
+    /// This is the law [`backup_preparation_transition`] applies, named as a
+    /// predicate so the Host preparation owner - which must refuse an illegal
+    /// envelope with its own typed error before it appends anything - reads the
+    /// owner's own rule instead of restating it. There is one law, not two.
+    pub const fn admits(self, retained: Self) -> bool {
+        matches!(
+            (retained, self),
+            (Self::Pending, Self::Prepared)
+                | (Self::Prepared, Self::CleanupPending)
+                | (Self::CleanupPending, Self::Reclaimed)
+        )
+    }
 }
 
 /// Durable admission, binding and outcome of one separately authorized isolated
@@ -2276,9 +2331,11 @@ pub enum BackupPreparationState {
 /// `destination_root` is the PROPOSED destination, recorded before any effect.
 /// It is a name, not ownership: on its own it never authorises deleting
 /// anything at that path. `destination_root_identity` is the exclusive-creation
-/// proof, and it is present in exactly one state (`Prepared`) - which is why
-/// cleanup can remove a destination this operation created while a `Pending`
-/// root is preserved as unknown rather than removed by path name.
+/// proof, and it is present in exactly the states at or after `Prepared` -
+/// which is why cleanup can remove a destination this operation created while
+/// a `Pending` root is preserved as unknown rather than removed by path name.
+/// The reclamation states keep carrying it rather than clearing it, so the
+/// record of *which* directory was removed never loses its proof.
 ///
 /// Scope, stated as for every other Host journal record: the record lives in
 /// the log of the Host epoch that wrote it, and a restart re-bases the journal
@@ -2339,8 +2396,8 @@ pub struct BackupPreparationRecord {
     /// Authority Epoch, and the derivation floors the value at 1, so zero is
     /// likewise refused.
     pub destination_epoch: u64,
-    /// OS identity pinned at exclusive creation. Present in exactly one state;
-    /// see [`Self::validate`].
+    /// OS identity pinned at exclusive creation. Present in exactly the states
+    /// at or after `Prepared`; see [`Self::validate`].
     pub destination_root_identity: Option<PlatformHandle>,
     /// Bounded retained evidence for this outcome. Digests/handles only.
     ///
@@ -2389,25 +2446,31 @@ impl BackupPreparationRecord {
             ));
         }
         // The pinned identity is the exclusive-creation proof, so it exists in
-        // exactly one state. A `Prepared` result without it would assert
-        // ownership of a root whose identity was never captured, and a `Pending`
-        // admission carrying one would claim an effect the record says has not
-        // been recorded.
+        // exactly the states at or after `Prepared`. A result without it would
+        // assert ownership of a root whose identity was never captured, a
+        // reclamation without it would remove a root this operation never
+        // proved it created, and a `Pending` admission carrying one would claim
+        // an effect the record says has not been recorded. A reclamation state
+        // is therefore refused outright unless the proof is still attached,
+        // which is what keeps a `Pending` record from ever authorizing a
+        // deletion.
         match (&self.destination_root_identity, self.state) {
             (None, BackupPreparationState::Pending) => {}
-            (Some(identity), BackupPreparationState::Prepared) => {
-                handle(identity, "backup_preparation.destination_root_identity")?;
-            }
             (Some(_), BackupPreparationState::Pending) => {
                 return Err(JournalError::Invalid(
                     "pending backup preparation must not carry a pinned destination identity"
                         .into(),
                 ));
             }
-            (None, BackupPreparationState::Prepared) => {
+            (None, _) => {
                 return Err(JournalError::Invalid(
-                    "prepared backup preparation requires the pinned destination identity".into(),
+                    "every backup preparation state at or after prepared requires the pinned \
+                     destination identity"
+                        .into(),
                 ));
+            }
+            (Some(identity), _) => {
+                handle(identity, "backup_preparation.destination_root_identity")?;
             }
         }
         handles(
@@ -2424,8 +2487,22 @@ impl BackupPreparationRecord {
 /// retained record on the operation identity, the admitted source/archive/class
 /// binding, the admission digest, the proposed destination and every
 /// owner-issued identity, so a changed binding under one operation identity is
-/// an idempotency conflict rather than a re-scoped preparation. `Prepared` is
-/// the only terminal state and nothing moves out of it.
+/// an idempotency conflict rather than a re-scoped preparation. Once the
+/// retained record pins a destination identity, the successor must pin that
+/// SAME identity: the reclamation is authorized against the exact directory
+/// this operation proved it created, and re-pinning a different one would
+/// authorize deleting a root this operation never created.
+///
+/// The legal moves are `Pending -> Prepared -> CleanupPending -> Reclaimed`.
+/// Each is a single forward step in the one lifecycle, so a state is reached
+/// only from the state that actually precedes it, and `Reclaimed` is terminal:
+/// nothing re-opens a reclaimed root. There is deliberately no move out of
+/// `Pending` to a reclamation state, because a `Pending` record carries no
+/// pinned identity and therefore authorizes no deletion - a predictable path is
+/// not ownership. Replaying the SAME outcome is not a move at all: the journal
+/// keys `applied_operations` on the per-outcome mutation identity, so a
+/// byte-identical replay of one disposition is resolved before this law is
+/// consulted.
 ///
 /// `retained_evidence_refs` is deliberately NOT part of the comparison, for the
 /// same reason the cutover intent's evidence list is not: a `Prepared` result
@@ -2439,7 +2516,8 @@ pub(crate) fn backup_preparation_transition(
 ) -> Result<(), JournalError> {
     let Some(current) = current else {
         // The root may be created only after the admission is durable, so a
-        // result with no durable intent is refused here rather than trusted.
+        // result - and any reclamation of it - with no durable intent is
+        // refused here rather than trusted.
         return if next.state == BackupPreparationState::Pending {
             Ok(())
         } else {
@@ -2460,7 +2538,19 @@ pub(crate) fn backup_preparation_transition(
     {
         return Err(JournalError::IdempotencyConflict);
     }
-    if current.state == BackupPreparationState::Prepared {
+    // The ownership rule, enforced on every move: once this operation has
+    // pinned the identity of the directory it created, no successor may pin a
+    // different one. A reclamation therefore removes only what the `Prepared`
+    // frame proved, and a `Pending` frame - which pins nothing - is refused by
+    // `BackupPreparationRecord::validate` before it can reach a reclamation
+    // state at all.
+    if current.destination_root_identity.is_some()
+        && current.destination_root_identity != next.destination_root_identity
+    {
+        return Err(JournalError::IdempotencyConflict);
+    }
+    let legal = next.state.admits(current.state);
+    if !legal {
         return Err(illegal("backup_preparation", current.state, next.state));
     }
     Ok(())
@@ -2615,6 +2705,205 @@ pub(crate) fn store_rebind_transition(
     }
 }
 
+/// Host-owned, per-activation readback of one release builder's module-specific
+/// artifact/source proof joined to the exact admitted module contract and
+/// launch inputs. This row proves the bytes Host observed under its active
+/// fence; it does not grant process, semantic, or generation authority.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleBuildProvenanceRecord {
+    pub fence: RecordFence,
+    pub operation: IdempotencyIdentity,
+    pub module_id: PlatformHandle,
+    pub artifact_path: PlatformHandle,
+    pub artifact_digest: PlatformHandle,
+    pub artifact_bytes: u64,
+    pub config_digest: PlatformHandle,
+    pub state_fence_digest: PlatformHandle,
+    pub installation_profile: PlatformHandle,
+    pub manifest_path: PlatformHandle,
+    pub manifest_digest: PlatformHandle,
+    pub manifest_bytes: u64,
+    pub contract_digest: PlatformHandle,
+    pub protocol_set_digest: PlatformHandle,
+    pub provenance_path: PlatformHandle,
+    pub provenance_digest: PlatformHandle,
+    pub provenance_bytes: u64,
+    pub source_commit: PlatformHandle,
+    pub source_tree_id: PlatformHandle,
+    pub builder_script_digest: PlatformHandle,
+    pub cargo_manifest_digest: PlatformHandle,
+    pub cargo_lock_digest: PlatformHandle,
+    pub rust_toolchain_digest: PlatformHandle,
+    pub daemon_contract_source_digest: PlatformHandle,
+    pub module_manifest_source_digest: PlatformHandle,
+    pub cargo_profile: PlatformHandle,
+    pub build_target: PlatformHandle,
+    pub build_arguments: Vec<PlatformHandle>,
+}
+
+impl ModuleBuildProvenanceRecord {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the closed provenance record validates its field shapes, pinned build, and activation binding as one invariant"
+    )]
+    /// Validates this complete canonical row before it crosses a protocol boundary.
+    ///
+    /// The row is still evidence only: successful validation does not grant
+    /// generation, process, or semantic authority.
+    pub fn validate(&self) -> Result<(), JournalError> {
+        self.fence.validate()?;
+        self.operation.validate()?;
+        for (value, field) in [
+            (&self.module_id, "module_build_provenance.module_id"),
+            (&self.artifact_path, "module_build_provenance.artifact_path"),
+            (
+                &self.installation_profile,
+                "module_build_provenance.installation_profile",
+            ),
+            (&self.manifest_path, "module_build_provenance.manifest_path"),
+            (
+                &self.provenance_path,
+                "module_build_provenance.provenance_path",
+            ),
+            (&self.cargo_profile, "module_build_provenance.cargo_profile"),
+            (&self.build_target, "module_build_provenance.build_target"),
+        ] {
+            handle(value, field)?;
+        }
+        for (value, field) in [
+            (
+                &self.artifact_digest,
+                "module_build_provenance.artifact_digest",
+            ),
+            (&self.config_digest, "module_build_provenance.config_digest"),
+            (
+                &self.state_fence_digest,
+                "module_build_provenance.state_fence_digest",
+            ),
+            (
+                &self.manifest_digest,
+                "module_build_provenance.manifest_digest",
+            ),
+            (
+                &self.contract_digest,
+                "module_build_provenance.contract_digest",
+            ),
+            (
+                &self.protocol_set_digest,
+                "module_build_provenance.protocol_set_digest",
+            ),
+            (
+                &self.provenance_digest,
+                "module_build_provenance.provenance_digest",
+            ),
+            (
+                &self.builder_script_digest,
+                "module_build_provenance.builder_script_digest",
+            ),
+            (
+                &self.cargo_manifest_digest,
+                "module_build_provenance.cargo_manifest_digest",
+            ),
+            (
+                &self.cargo_lock_digest,
+                "module_build_provenance.cargo_lock_digest",
+            ),
+            (
+                &self.rust_toolchain_digest,
+                "module_build_provenance.rust_toolchain_digest",
+            ),
+            (
+                &self.daemon_contract_source_digest,
+                "module_build_provenance.daemon_contract_source_digest",
+            ),
+            (
+                &self.module_manifest_source_digest,
+                "module_build_provenance.module_manifest_source_digest",
+            ),
+        ] {
+            digest(value, field)?;
+            if value.as_str().bytes().any(|byte| byte.is_ascii_uppercase()) {
+                return Err(JournalError::Invalid(format!(
+                    "{field} must use lowercase hexadecimal"
+                )));
+            }
+        }
+        for (value, field) in [
+            (&self.source_commit, "module_build_provenance.source_commit"),
+            (
+                &self.source_tree_id,
+                "module_build_provenance.source_tree_id",
+            ),
+        ] {
+            let text = value.as_str();
+            if !(40..=64).contains(&text.len())
+                || !text
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            {
+                return Err(JournalError::Invalid(format!(
+                    "{field} must be a lowercase source identity"
+                )));
+            }
+        }
+        if self.module_id.as_str() != "eliotd"
+            || self.artifact_path.as_str() != "runtime/eliotd.exe"
+            || self.manifest_path.as_str() != "runtime/module.eliotd.toml"
+            || self.provenance_path.as_str() != "runtime/module.eliotd.provenance.json"
+            || self.cargo_profile.as_str() != "release"
+            || self.build_target.as_str() != "x86_64-pc-windows-msvc"
+            || self.artifact_bytes == 0
+            || self.manifest_bytes == 0
+            || self.provenance_bytes == 0
+        {
+            return Err(JournalError::Invalid(
+                "module build provenance has non-canonical role or build identity".into(),
+            ));
+        }
+        let expected_arguments = [
+            "build",
+            "--frozen",
+            "--locked",
+            "--offline",
+            "--release",
+            "-p",
+            "eliotd",
+            "--bin",
+            "eliotd",
+        ];
+        if self.build_arguments.len() != expected_arguments.len()
+            || self
+                .build_arguments
+                .iter()
+                .zip(expected_arguments)
+                .any(|(actual, expected)| actual.as_str() != expected)
+        {
+            return Err(JournalError::Invalid(
+                "module build provenance invocation is not the pinned eliotd release command"
+                    .into(),
+            ));
+        }
+        let expected_operation_id = format!("module-build-provenance:{}", self.module_id);
+        let current_activation = &self.fence.activation_generation.current;
+        let expected_idempotency_key = format!(
+            "activation:{}:{}:{}",
+            self.fence.activation_id,
+            current_activation.lineage_id.as_str(),
+            current_activation.sequence.get()
+        );
+        if self.operation.operation_id.as_str() != expected_operation_id
+            || self.operation.idempotency_key.as_str() != expected_idempotency_key
+        {
+            return Err(JournalError::Invalid(
+                "module build provenance operation identity is not deterministic for its activation"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)]
@@ -2632,6 +2921,8 @@ pub enum HostStateRecord {
     EpochRetirement(EpochRetirementRecord),
     StoreRebind(StoreRebindRecord),
     ReactiveContext(ReactiveContextRecord),
+    /// Readback-bound per-module release source/build proof (#22 W1).
+    ModuleBuildProvenance(ModuleBuildProvenanceRecord),
     /// Durable cutover intent/terminal record (#961).
     CutoverIntent(CutoverIntentRecord),
     /// Durable isolated backup destination preparation admission/result.
@@ -2657,6 +2948,7 @@ impl HostStateRecord {
             Self::EpochRetirement(value) => value.validate(),
             Self::StoreRebind(value) => value.validate(),
             Self::ReactiveContext(value) => validate_record_for_journal(value),
+            Self::ModuleBuildProvenance(value) => value.validate(),
             Self::CutoverIntent(value) => value.validate(),
             Self::BackupPreparation(value) => value.validate(),
         }
@@ -2685,6 +2977,7 @@ impl HostStateRecord {
             Self::EpochRetirement(value) => &value.fence,
             Self::StoreRebind(value) => &value.fence,
             Self::ReactiveContext(value) => &value.fence,
+            Self::ModuleBuildProvenance(value) => &value.fence,
             Self::CutoverIntent(value) => &value.fence,
             Self::BackupPreparation(value) => &value.fence,
         }
@@ -2705,6 +2998,7 @@ impl HostStateRecord {
             Self::EpochRetirement(value) => &value.operation,
             Self::StoreRebind(value) => &value.operation,
             Self::ReactiveContext(value) => &value.operation,
+            Self::ModuleBuildProvenance(value) => &value.operation,
             Self::CutoverIntent(value) => &value.operation,
             Self::BackupPreparation(value) => &value.operation,
         }
@@ -2780,6 +3074,11 @@ pub struct HostState {
     /// the operation was admitted and its outcome was never recorded.
     #[serde(default)]
     pub backup_preparations: Vec<BackupPreparationRecord>,
+    /// Current-generation module build/source rows, keyed by module id.
+    /// Generation advance clears this projection before a new provenance row
+    /// can be admitted.
+    #[serde(default)]
+    pub module_build_provenance: Vec<ModuleBuildProvenanceRecord>,
     pub clean_marker: Option<CleanMarker>,
     pub retained_epochs: Vec<EpochEvidence>,
     pub retired_epochs: Vec<HostInstallationEpoch>,
@@ -2831,6 +3130,7 @@ impl HostState {
             reactive_context: Some(ReactiveContextQueueState::default()),
             pending_cutover: None,
             backup_preparations: Vec::new(),
+            module_build_provenance: Vec::new(),
             clean_marker: None,
             retained_epochs,
             retired_epochs: Vec::new(),

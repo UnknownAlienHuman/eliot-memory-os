@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     EpochIdentity, OpaqueLabel, OperationalPhase, OperationalRecordInput, RecoveryInboxDisposition,
     RecoveryInboxItem, SupervisionLeaseCommitTicket, SupervisionLeaseSnapshot,
+    UserBrokerResourceSelection,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -41,6 +42,7 @@ pub(super) enum OperationalKind {
     GenerationCutover,
     SessionBinding,
     UserBroker,
+    UserBrokerResourceSelection,
     AuthoritySnapshot,
     AuthorityRevocation,
     CapabilityGrant,
@@ -60,6 +62,7 @@ impl OperationalKind {
             Self::GenerationCutover => "generation_cutover",
             Self::SessionBinding => "session_binding",
             Self::UserBroker => "user_broker",
+            Self::UserBrokerResourceSelection => "user_broker_resource_selection",
             Self::AuthoritySnapshot => "authority_snapshot",
             Self::AuthorityRevocation => "authority_revocation",
             Self::CapabilityGrant => "capability_grant",
@@ -88,6 +91,11 @@ pub(super) struct DurableOperationalRecord {
     /// retired generation tables any authority.
     #[serde(default)]
     pub(super) generation_cutover: Option<RuntimeGenerationCutoverRecord>,
+    /// Exact owner-issued native resource selection attached to its dedicated
+    /// operational kind. Absent on all other records; omission preserves the
+    /// serialized bytes and receipt hashes of pre-existing operational rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) user_broker_resource_selection: Option<UserBrokerResourceSelection>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

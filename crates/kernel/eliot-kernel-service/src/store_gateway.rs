@@ -38,7 +38,13 @@ use eliot_ors::{
     RedbRecoveryStore, ReservationRecord, UnknownCommitOutcome, UnknownCommitRecord,
     WriterReservationToken,
 };
+use eliot_ors::{OrsError, prove_maintenance_trigger_staging};
 use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse, JobOperation};
+use eliot_protocol::{
+    MaintenanceTriggerAck, MaintenanceTriggerClaim, MaintenanceTriggerDecisionReceipt,
+    MaintenanceTriggerGapKind, MaintenanceTriggerIntakeReceipt, MaintenanceTriggerPage,
+    MaintenanceTriggerRecord, MaintenanceTriggerRevocation, ProtocolError,
+};
 use eliot_runtime_contracts::{
     AffectedOperationClass, BackpressureDisposition, BottleneckAvailability,
     BottleneckCoverageState, BottleneckObservationV1, CapacityBottleneck,
@@ -93,15 +99,24 @@ use crate::user_automation_orchestration::{
     runtime_obligation_payload_digest,
 };
 use crate::{
-    CanonicalUserAutomationStore, EbpCanonicalStoreClient, EbpStoreTransport, KernelService,
-    StoreClientFault, StoreClientFaultHarness, UserAutomationConfigurationPhase,
-    UserAutomationExecutionPhase, UserAutomationHorizonOutcome, UserAutomationHorizonPhase,
-    UserAutomationHorizonTrigger, UserAutomationMutationResult, UserAutomationOperatorTransition,
-    UserAutomationOwnerLookup, UserAutomationOwnerSnapshot, UserAutomationReadResult,
-    UserAutomationRuntimeError, UserAutomationRuntimePort, UserAutomationService,
-    UserAutomationServiceRequest, UserAutomationStoreOutcome, UserAutomationStoreRequest,
-    UserAutomationWakeHorizonPublication, UserAutomationWakePhase, UserAutomationWakePort,
-    committed_configuration_state, compile_wake_horizon, run_now_wake_read_request,
+    AuthenticatedMaintenanceTriggerSession, CanonicalUserAutomationStore, EbpCanonicalStoreClient,
+    EbpStoreTransport, KernelService, KernelServiceError, MaintenanceTriggerClaimRequest,
+    MaintenanceTriggerDeliveryError, MaintenanceTriggerDeliveryLedger,
+    MaintenanceTriggerDeliveryRow, StoreClientFault, StoreClientFaultHarness,
+    UserAutomationConfigurationPhase, UserAutomationExecutionPhase, UserAutomationHorizonOutcome,
+    UserAutomationHorizonPhase, UserAutomationHorizonTrigger, UserAutomationMutationResult,
+    UserAutomationOperatorTransition, UserAutomationOwnerLookup, UserAutomationOwnerSnapshot,
+    UserAutomationReadResult, UserAutomationRuntimeError, UserAutomationRuntimePort,
+    UserAutomationService, UserAutomationServiceRequest, UserAutomationStoreOutcome,
+    UserAutomationStoreRequest, UserAutomationWakeHorizonPublication, UserAutomationWakePhase,
+    UserAutomationWakePort, committed_configuration_state, compile_wake_horizon,
+    handle_maintenance_trigger_ack, handle_maintenance_trigger_claim,
+    handle_maintenance_trigger_decision, handle_maintenance_trigger_expiry,
+    handle_maintenance_trigger_gap, handle_maintenance_trigger_mark_ambiguous,
+    handle_maintenance_trigger_pending_page, handle_maintenance_trigger_release_expired,
+    handle_maintenance_trigger_replacement_pending_set, handle_maintenance_trigger_revocation,
+    handle_maintenance_trigger_supersession, recover_maintenance_trigger_commit,
+    replay_maintenance_trigger_after_crash, run_now_wake_read_request,
 };
 use eliot_kernel_core::user_automation::UserAutomationExecutionProjection;
 
@@ -520,6 +535,50 @@ fn retained_terminal_evidence(
     }
 }
 
+/// Selects the schedule normalization receipt envelopes the canonical Store
+/// retains beside one immutable owner revision, under the request fence.
+///
+/// The normalization receipt is owner evidence over the compiled occurrence set,
+/// so it is read from the owner that retained it and is never assembled, derived
+/// or defaulted here. Retention lives on the revision row the revision leg wrote
+/// — the `normalization_receipt_json` mechanism `ApplyNotificationState` already
+/// uses for `source_receipt_json` — and NOT in the canonical Store's own
+/// `WriteReceipt` history, which provably cannot carry this digest:
+/// `receipt_artifacts` emits exactly `store-transition:{op}` (the committed
+/// transition digest) and `store-plan:{commit_id}`, and that envelope's
+/// content-derived identity depends on the committed transition plus the
+/// adapter-assigned `commit_id`/`commit_sequence`. It is therefore not
+/// computable before the commit, and re-pointing it at a compiled occurrence set
+/// would be circular, because the transition digest already covers the very
+/// `revision_json` that names the envelope id.
+///
+/// Selection is by the envelope's own content-derived identity — exactly the id
+/// the immutable revision names — and the binding is then closed by
+/// `UserAutomationPreflightProjection::assemble`, which validates the envelope
+/// through its own `validate()` and requires its canonical bytes to carry the
+/// revision's compiled-occurrence digest. `check_normalization_receipt_binding`
+/// is unchanged by where the envelope is read from. A revision that retained no
+/// such envelope yields none, and the caller reports the missing owner instead
+/// of substituting a receipt.
+fn select_retained_normalization_receipts(
+    state_fence: &StateFence,
+    owner: &UserAutomationOwnerSnapshot,
+) -> Result<Vec<eliot_receipts::ReceiptEnvelope>, RunNowPreflightAssembly> {
+    if owner.state_fence != *state_fence {
+        return Err(RunNowPreflightAssembly::Unknown(
+            "the retained UserAutomation owner revision does not bind to the request fence"
+                .to_owned(),
+        ));
+    }
+    let declared = &owner.revision.schedule.normalization_receipt;
+    Ok(owner
+        .normalization_receipt
+        .iter()
+        .filter(|envelope| envelope.identity.receipt_id.as_str() == declared.receipt_id.as_str())
+        .cloned()
+        .collect())
+}
+
 /// Projects one already-resolved durable record into its typed answer,
 /// preserving the outcome it actually recorded.
 ///
@@ -748,6 +807,16 @@ pub struct KernelStoreGateway {
     /// observation and never answers on its own. Its initial state is
     /// uninitialized evidence, not an observed clear ledger.
     paused_scopes: PausedScopeMirror,
+    /// The one Kernel-owned retained maintenance-trigger delivery ledger
+    /// (issue #1694). Every ledger transition is performed through this
+    /// owner: the intake/claim/decision/ack and recovery seams below lock it
+    /// together with the service guard (service-first, ledger-second) and
+    /// snapshot its durable rows on every transition. There is no second
+    /// ledger, database, or poller; row durability rides the ORS staging
+    /// proof (intake) and the committed named Store transaction the decision
+    /// receipt binds (decision), and startup restores through
+    /// [`Self::restore_maintenance_trigger_ledger`].
+    maintenance_triggers: Mutex<MaintenanceTriggerDeliveryLedger>,
 }
 
 impl std::fmt::Debug for KernelStoreGateway {
@@ -926,6 +995,10 @@ impl KernelStoreGateway {
             // observation, and until one succeeds a negative mirror answer
             // is unavailable rather than clear.
             paused_scopes: PausedScopeMirror::new(),
+            // One delivery ledger per gateway: the owner of every retained
+            // maintenance trigger row. It starts empty; the startup path
+            // restores it before any claim is served.
+            maintenance_triggers: Mutex::new(MaintenanceTriggerDeliveryLedger::new()),
         }
     }
 
@@ -1591,6 +1664,491 @@ impl KernelStoreGateway {
         )
         .await
         .map_err(|error| error.to_string())
+    }
+
+    /// Locks the Kernel service for one maintenance-trigger owner step.
+    ///
+    /// Guards are always taken service-first, ledger-second, and no guard is
+    /// ever held across ORS or Store IO: IO runs guard-free before the
+    /// transition, then the transition runs under both guards.
+    fn lock_maintenance_service(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, KernelService>, MaintenanceTriggerDeliveryError> {
+        self.service.lock().map_err(|_| {
+            MaintenanceTriggerDeliveryError::OwnerUnavailable(
+                "Kernel service lock poisoned".to_owned(),
+            )
+        })
+    }
+
+    /// Locks the owned delivery ledger; always after the service guard.
+    fn lock_maintenance_ledger(
+        &self,
+    ) -> Result<
+        std::sync::MutexGuard<'_, MaintenanceTriggerDeliveryLedger>,
+        MaintenanceTriggerDeliveryError,
+    > {
+        self.maintenance_triggers.lock().map_err(|_| {
+            MaintenanceTriggerDeliveryError::OwnerUnavailable(
+                "maintenance trigger ledger lock poisoned".to_owned(),
+            )
+        })
+    }
+
+    /// Binds one maintenance-trigger session from live Kernel authority.
+    ///
+    /// The principal reference comes from the authenticated composition
+    /// boundary, never from a request DTO. The guard is released before any
+    /// IO the caller performs afterwards; the transition re-proves liveness
+    /// under a fresh guard.
+    fn bind_maintenance_session(
+        &self,
+        principal_ref: &str,
+    ) -> Result<AuthenticatedMaintenanceTriggerSession, MaintenanceTriggerDeliveryError> {
+        let service = self.lock_maintenance_service()?;
+        AuthenticatedMaintenanceTriggerSession::bind(&service, principal_ref)
+            .map_err(MaintenanceTriggerDeliveryError::Service)
+    }
+
+    /// Admits one retained maintenance trigger into the owned delivery ledger
+    /// (issue #1694).
+    ///
+    /// The complete opaque input must already be staged through the ORS
+    /// owner: staging is proven with no owner guard held (the service lock
+    /// is never held across ORS work anywhere in this module), then the
+    /// session is bound, liveness re-proved, and the row admitted under both
+    /// guards. The returned rows are the ledger's durable snapshot after
+    /// this transition. `handle_maintenance_trigger_intake` stays the seam
+    /// for guard-free front-door callers (STITCH): this owner entry proves
+    /// staging first so no guard is ever held across the ORS read.
+    pub fn admit_maintenance_trigger(
+        &self,
+        principal_ref: &str,
+        record: MaintenanceTriggerRecord,
+    ) -> Result<
+        (
+            MaintenanceTriggerIntakeReceipt,
+            Vec<MaintenanceTriggerDeliveryRow>,
+        ),
+        MaintenanceTriggerDeliveryError,
+    > {
+        let session = self.bind_maintenance_session(principal_ref)?;
+        let commit_ors = self.commit_ors.clone().ok_or_else(|| {
+            MaintenanceTriggerDeliveryError::StagingProof(OrsError::IntegrityProblem {
+                record_type: "maintenance_trigger_delivery",
+                reason: "maintenance trigger intake requires the composition-bound ORS".to_owned(),
+            })
+        })?;
+        prove_maintenance_trigger_staging(
+            &*commit_ors,
+            &record.payload.envelope_reference,
+            &record.payload.payload_hash,
+        )
+        .map_err(MaintenanceTriggerDeliveryError::StagingProof)?;
+        let service = self.lock_maintenance_service()?;
+        session
+            .service_context(&service)
+            .map_err(MaintenanceTriggerDeliveryError::Service)?;
+        let mut ledger = self.lock_maintenance_ledger()?;
+        let receipt = ledger.admit_intake(record)?;
+        Ok((receipt, ledger.durable_rows()))
+    }
+
+    /// Issues one finite fenced claim from the owned delivery ledger (issue
+    /// #1694).
+    ///
+    /// Binds the session from live authority, then issues the claim bound to
+    /// the current compatible daemon generation/session, trigger revision,
+    /// and delivery identity through the existing ledger seam. The returned
+    /// rows are the durable snapshot after this transition.
+    pub fn claim_maintenance_trigger(
+        &self,
+        principal_ref: &str,
+        request: MaintenanceTriggerClaimRequest,
+    ) -> Result<
+        (MaintenanceTriggerClaim, Vec<MaintenanceTriggerDeliveryRow>),
+        MaintenanceTriggerDeliveryError,
+    > {
+        let session = self.bind_maintenance_session(principal_ref)?;
+        let service = self.lock_maintenance_service()?;
+        let mut ledger = self.lock_maintenance_ledger()?;
+        let claim = handle_maintenance_trigger_claim(&service, &session, &mut ledger, request)?;
+        Ok((claim, ledger.durable_rows()))
+    }
+
+    /// Releases one expired claim back under the same trigger identity
+    /// (issue #1694).
+    ///
+    /// A timed-out `Claimed` row returns to `Pending`; a `DecisionRecorded`
+    /// row with a lapsed claim moves to `Reconciling` with its committed
+    /// receipt preserved. Redelivery always needs a fresh finite claim,
+    /// never a new trigger ID. The returned rows are the durable snapshot
+    /// after this transition.
+    pub fn release_expired_maintenance_trigger_claim(
+        &self,
+        principal_ref: &str,
+        trigger_id: &str,
+        now_unix_ms: u64,
+    ) -> Result<Vec<MaintenanceTriggerDeliveryRow>, MaintenanceTriggerDeliveryError> {
+        let session = self.bind_maintenance_session(principal_ref)?;
+        let service = self.lock_maintenance_service()?;
+        let mut ledger = self.lock_maintenance_ledger()?;
+        handle_maintenance_trigger_release_expired(
+            &service,
+            &session,
+            &mut ledger,
+            trigger_id,
+            now_unix_ms,
+        )?;
+        Ok(ledger.durable_rows())
+    }
+
+    /// Enumerates one bounded pending page from the owned delivery ledger
+    /// (issue #1694).
+    ///
+    /// A read: no ledger transition, so no rows snapshot. A reconnect
+    /// resumes from its cursor and never resets progress to a guessed
+    /// complete-empty set.
+    pub fn maintenance_trigger_pending_page(
+        &self,
+        principal_ref: &str,
+        continuation: Option<&str>,
+        now_unix_ms: u64,
+    ) -> Result<MaintenanceTriggerPage, MaintenanceTriggerDeliveryError> {
+        let session = self.bind_maintenance_session(principal_ref)?;
+        let service = self.lock_maintenance_service()?;
+        let ledger = self.lock_maintenance_ledger()?;
+        handle_maintenance_trigger_pending_page(
+            &service,
+            &session,
+            &ledger,
+            continuation,
+            now_unix_ms,
+        )
+    }
+
+    /// Records one daemon decision into the owned delivery ledger against
+    /// its committed named Store transaction (issue #1694).
+    ///
+    /// The authenticated daemon submits its decision through the Governor
+    /// `PreparedTransition` → Kernel → named Store transaction; that
+    /// transaction's committed [`WriteReceipt`] is the durability the
+    /// ledger row rides on. This owner entry re-reads the exact receipt
+    /// through the existing Store client, requires `Committed` status,
+    /// re-proves the canonical-bytes digest the decision receipt binds, and
+    /// requires the receipt fence to match live service authority — an
+    /// arbitrary receipt ID or transport `Ok(())` can never complete this
+    /// transition. Only then is the decision recorded; the returned rows
+    /// are the durable snapshot after the transition. A lost or ambiguous
+    /// commit stays pending/reconciling through
+    /// [`Self::mark_maintenance_trigger_commit_ambiguous`]: receipt absence
+    /// here is never reported as proof of non-commit.
+    pub async fn record_maintenance_trigger_decision(
+        &self,
+        principal_ref: &str,
+        trigger_id: &str,
+        receipt: MaintenanceTriggerDecisionReceipt,
+    ) -> Result<Vec<MaintenanceTriggerDeliveryRow>, MaintenanceTriggerDeliveryError> {
+        let _flight = self
+            .flight
+            .enter()
+            .map_err(MaintenanceTriggerDeliveryError::OwnerUnavailable)?;
+        receipt.validate()?;
+        let session = self.bind_maintenance_session(principal_ref)?;
+        let operation_id =
+            OperationId::new(receipt.canonical_receipt_ref.clone()).map_err(|_| {
+                MaintenanceTriggerDeliveryError::Protocol(ProtocolError::InvalidField {
+                    field: "maintenance_trigger_decision_receipt.canonical_receipt_ref",
+                    reason: "decision receipt names no well-formed canonical receipt",
+                })
+            })?;
+        let stored = self.store.receipt(operation_id).await?;
+        let stored = stored.ok_or(MaintenanceTriggerDeliveryError::Protocol(
+            ProtocolError::InvalidField {
+                field: "maintenance_trigger_decision_receipt.canonical_receipt_ref",
+                reason: "no committed Store receipt answers this decision",
+            },
+        ))?;
+        stored.validate()?;
+        if stored.status != WriteReceiptStatus::Committed {
+            return Err(MaintenanceTriggerDeliveryError::Protocol(
+                ProtocolError::InvalidField {
+                    field: "maintenance_trigger_decision_receipt.canonical_receipt_ref",
+                    reason: "the bound Store transaction was not committed",
+                },
+            ));
+        }
+        let receipt_bytes = canonical_json_bytes(&stored)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        if sha256_hex(&receipt_bytes) != receipt.receipt_digest {
+            return Err(MaintenanceTriggerDeliveryError::Protocol(
+                ProtocolError::InvalidField {
+                    field: "maintenance_trigger_decision_receipt.receipt_digest",
+                    reason: "the receipt digest does not bind this operation",
+                },
+            ));
+        }
+        let service = self.lock_maintenance_service()?;
+        let context = session
+            .service_context(&service)
+            .map_err(MaintenanceTriggerDeliveryError::Service)?;
+        if !stored
+            .state_fence
+            .authority_epoch
+            .is_same_authority(&context.authority_epoch)
+            || stored.state_fence.resource_generation.value() != context.generation
+        {
+            return Err(MaintenanceTriggerDeliveryError::Service(
+                KernelServiceError::HandshakeMismatch {
+                    field: "maintenance_trigger.fence",
+                },
+            ));
+        }
+        let mut ledger = self.lock_maintenance_ledger()?;
+        handle_maintenance_trigger_decision(&service, &session, &mut ledger, trigger_id, receipt)?;
+        Ok(ledger.durable_rows())
+    }
+
+    /// Acknowledges one delivery against the exact committed decision
+    /// receipt (issue #1694).
+    ///
+    /// The ack must echo the live claim exactly and embed the committed
+    /// receipt byte for byte; a stale consumer cannot ack after revocation.
+    /// The returned rows are the durable snapshot after this transition.
+    pub fn acknowledge_maintenance_trigger(
+        &self,
+        principal_ref: &str,
+        ack: &MaintenanceTriggerAck,
+        current_fence: &StateFence,
+        now_unix_ms: u64,
+    ) -> Result<Vec<MaintenanceTriggerDeliveryRow>, MaintenanceTriggerDeliveryError> {
+        let session = self.bind_maintenance_session(principal_ref)?;
+        let service = self.lock_maintenance_service()?;
+        let mut ledger = self.lock_maintenance_ledger()?;
+        handle_maintenance_trigger_ack(
+            &service,
+            &session,
+            &mut ledger,
+            ack,
+            current_fence,
+            now_unix_ms,
+        )?;
+        Ok(ledger.durable_rows())
+    }
+
+    /// Replays one retained trigger after a pre-commit crash, without
+    /// minting new state (issue #1694).
+    ///
+    /// A read: the caller re-presents the exact retained record to the
+    /// evaluator under the same identity.
+    pub fn replay_maintenance_trigger_after_crash(
+        &self,
+        principal_ref: &str,
+        trigger_id: &str,
+    ) -> Result<MaintenanceTriggerRecord, MaintenanceTriggerDeliveryError> {
+        let session = self.bind_maintenance_session(principal_ref)?;
+        let service = self.lock_maintenance_service()?;
+        let ledger = self.lock_maintenance_ledger()?;
+        replay_maintenance_trigger_after_crash(&service, &session, &ledger, trigger_id)
+    }
+
+    /// Recovers one committed decision receipt after a post-commit crash
+    /// (issue #1694).
+    ///
+    /// A read: the caller acknowledges this exact receipt without a new
+    /// job, recommendation, or wake.
+    pub fn recover_maintenance_trigger_commit(
+        &self,
+        principal_ref: &str,
+        trigger_id: &str,
+    ) -> Result<MaintenanceTriggerDecisionReceipt, MaintenanceTriggerDeliveryError> {
+        let session = self.bind_maintenance_session(principal_ref)?;
+        let service = self.lock_maintenance_service()?;
+        let ledger = self.lock_maintenance_ledger()?;
+        recover_maintenance_trigger_commit(&service, &session, &ledger, trigger_id)
+    }
+
+    /// Marks one lost or ambiguous commit as reconciling (issue #1694).
+    ///
+    /// Receipt absence during an outage is not proof of non-commit: the
+    /// trigger stays open, gains an `AmbiguousCommit` gap record, and must
+    /// be reconciled by receipt lookup before any further effect. The
+    /// returned rows are the durable snapshot after this transition.
+    pub fn mark_maintenance_trigger_commit_ambiguous(
+        &self,
+        principal_ref: &str,
+        trigger_id: &str,
+        now_unix_ms: u64,
+    ) -> Result<Vec<MaintenanceTriggerDeliveryRow>, MaintenanceTriggerDeliveryError> {
+        let session = self.bind_maintenance_session(principal_ref)?;
+        let service = self.lock_maintenance_service()?;
+        let mut ledger = self.lock_maintenance_ledger()?;
+        handle_maintenance_trigger_mark_ambiguous(
+            &service,
+            &session,
+            &mut ledger,
+            trigger_id,
+            now_unix_ms,
+        )?;
+        Ok(ledger.durable_rows())
+    }
+
+    /// Revokes one daemon generation/session's trigger-consumer authority
+    /// (issue #1694).
+    ///
+    /// Pending claims return under the same identity for the replacement
+    /// generation, committed rows move to `Reconciling` with receipts
+    /// preserved, and every later old-generation claim or ack fails. The
+    /// returned rows are the durable snapshot after this transition.
+    pub fn revoke_maintenance_trigger_consumer(
+        &self,
+        principal_ref: &str,
+        revocation: MaintenanceTriggerRevocation,
+    ) -> Result<Vec<MaintenanceTriggerDeliveryRow>, MaintenanceTriggerDeliveryError> {
+        let session = self.bind_maintenance_session(principal_ref)?;
+        let service = self.lock_maintenance_service()?;
+        let mut ledger = self.lock_maintenance_ledger()?;
+        handle_maintenance_trigger_revocation(&service, &session, &mut ledger, revocation)?;
+        Ok(ledger.durable_rows())
+    }
+
+    /// Surfaces the bounded pending set to a replacement generation (issue
+    /// #1694).
+    ///
+    /// A read: after replacement authentication plus the required mirror
+    /// recovery, the replacement sees the bounded pending set before
+    /// reconciliation may be claimed complete. Ordinary pending debt
+    /// acquires no runtime lease here.
+    pub fn maintenance_trigger_replacement_pending_set(
+        &self,
+        principal_ref: &str,
+        continuation: Option<&str>,
+        mirror_recovered: bool,
+        now_unix_ms: u64,
+    ) -> Result<MaintenanceTriggerPage, MaintenanceTriggerDeliveryError> {
+        let session = self.bind_maintenance_session(principal_ref)?;
+        let service = self.lock_maintenance_service()?;
+        let ledger = self.lock_maintenance_ledger()?;
+        handle_maintenance_trigger_replacement_pending_set(
+            &service,
+            &session,
+            &ledger,
+            continuation,
+            mirror_recovered,
+            now_unix_ms,
+        )
+    }
+
+    /// Records terminal expiry for a past-window trigger (issue #1694).
+    ///
+    /// Expired eligibility blocks stale execution but never deletes the row,
+    /// its record, or its evidence locators. The returned rows are the
+    /// durable snapshot after this transition.
+    pub fn expire_maintenance_trigger(
+        &self,
+        principal_ref: &str,
+        trigger_id: &str,
+        reason: &str,
+        now_unix_ms: u64,
+    ) -> Result<Vec<MaintenanceTriggerDeliveryRow>, MaintenanceTriggerDeliveryError> {
+        let session = self.bind_maintenance_session(principal_ref)?;
+        let service = self.lock_maintenance_service()?;
+        let mut ledger = self.lock_maintenance_ledger()?;
+        handle_maintenance_trigger_expiry(
+            &service,
+            &session,
+            &mut ledger,
+            trigger_id,
+            reason,
+            now_unix_ms,
+        )?;
+        Ok(ledger.durable_rows())
+    }
+
+    /// Records supersession by an explicitly linked successor trigger
+    /// (issue #1694).
+    ///
+    /// The successor is named, both rows stay readable, and materially new
+    /// evidence arrives as a new trigger rather than an overwrite. The
+    /// returned rows are the durable snapshot after this transition.
+    pub fn supersede_maintenance_trigger(
+        &self,
+        principal_ref: &str,
+        trigger_id: &str,
+        successor_trigger_id: &str,
+        reason: &str,
+        now_unix_ms: u64,
+    ) -> Result<Vec<MaintenanceTriggerDeliveryRow>, MaintenanceTriggerDeliveryError> {
+        let session = self.bind_maintenance_session(principal_ref)?;
+        let service = self.lock_maintenance_service()?;
+        let mut ledger = self.lock_maintenance_ledger()?;
+        handle_maintenance_trigger_supersession(
+            &service,
+            &session,
+            &mut ledger,
+            trigger_id,
+            successor_trigger_id,
+            reason,
+            now_unix_ms,
+        )?;
+        Ok(ledger.durable_rows())
+    }
+
+    /// Records a visible recovery gap for unrepairable damage (issue #1694).
+    ///
+    /// Missing keys, corrupt payloads, inaccessible sources, and incomplete
+    /// enumeration produce this record — never a plaintext fallback and
+    /// never silent deletion. The returned rows are the durable snapshot
+    /// after this transition.
+    pub fn record_maintenance_trigger_gap(
+        &self,
+        principal_ref: &str,
+        trigger_id: &str,
+        kind: MaintenanceTriggerGapKind,
+        detail: &str,
+        now_unix_ms: u64,
+    ) -> Result<Vec<MaintenanceTriggerDeliveryRow>, MaintenanceTriggerDeliveryError> {
+        let session = self.bind_maintenance_session(principal_ref)?;
+        let service = self.lock_maintenance_service()?;
+        let mut ledger = self.lock_maintenance_ledger()?;
+        handle_maintenance_trigger_gap(
+            &service,
+            &session,
+            &mut ledger,
+            trigger_id,
+            kind,
+            detail,
+            now_unix_ms,
+        )?;
+        Ok(ledger.durable_rows())
+    }
+
+    /// Restores the owned delivery ledger from previously persisted durable
+    /// rows (issue #1694).
+    ///
+    /// Runs once at startup before any claim is served: refuses when the
+    /// owner already holds rows, then every row is revalidated through the
+    /// existing validators before entering the ledger — a damaged row fails
+    /// the restore instead of entering as a guessed-complete entry. The
+    /// rows source is the startup composition's read-back of the persisted
+    /// rows through the Store-lane rows backend (STITCH): this entry owns
+    /// the restore, not the read-back. The returned rows are the restored
+    /// durable snapshot.
+    pub fn restore_maintenance_trigger_ledger(
+        &self,
+        rows: Vec<MaintenanceTriggerDeliveryRow>,
+    ) -> Result<Vec<MaintenanceTriggerDeliveryRow>, MaintenanceTriggerDeliveryError> {
+        let mut ledger = self.lock_maintenance_ledger()?;
+        if !ledger.durable_rows().is_empty() {
+            return Err(MaintenanceTriggerDeliveryError::Protocol(
+                ProtocolError::InvalidField {
+                    field: "maintenance_trigger_delivery.ledger",
+                    reason: "restore runs once at startup before any claim is served",
+                },
+            ));
+        }
+        ledger.restore_rows(rows)?;
+        Ok(ledger.durable_rows())
     }
 
     /// Reads one bounded, opaque Store recovery snapshot through the active
@@ -2378,6 +2936,88 @@ impl KernelStoreGateway {
         }
     }
 
+    /// Durably records that one wake-horizon publication MAY ALREADY have been
+    /// handed to the schedule owner, and does so BEFORE the transport await that
+    /// could commit it (issue #2970).
+    ///
+    /// `Admitted` alone cannot carry that meaning on this contour: it is the very
+    /// same durable state the horizon path leaves behind when no schedule owner
+    /// was reachable, so a restart cannot distinguish a horizon the owner never
+    /// received from one it already retained. This advance therefore walks the
+    /// outbox's own mechanical progression to `Routed`, the state
+    /// `classify_retained_obligation` already reads as "the owner may already
+    /// have acted". Nothing here is ever moved backward out of that contour.
+    ///
+    /// The write lands before the first await, so a process death inside the
+    /// await window reloads as reconciling work rather than re-issuable
+    /// `Retained` work, and the later attempt must answer "did this possibly
+    /// happen?" from the owner itself under the ORIGINAL owner operation
+    /// identity instead of publishing the slice again.
+    fn mark_wake_horizon_obligation_possible_effect(
+        &self,
+        obligation: &UserAutomationRuntimeObligation,
+    ) -> Result<(), String> {
+        let Some(ors) = self.commit_ors.as_deref() else {
+            return Err(unretained_obligation_reason(
+                obligation,
+                "this Kernel composition bound no durable operational outbox handle, so the wake \
+                 horizon publication cannot be recorded as a possible owner effect"
+                    .to_owned(),
+            ));
+        };
+        let operation_id = user_automation_obligation_operation_id(obligation)?;
+        let Some(existing) = ors
+            .load_host_request(&operation_id, &obligation.request_digest)
+            .map_err(|error| {
+                unretained_obligation_reason(
+                    obligation,
+                    format!("the retained horizon obligation could not be read: {error}"),
+                )
+            })?
+        else {
+            return Err(unretained_obligation_reason(
+                obligation,
+                "the retained horizon obligation record disappeared before its possible owner effect \
+                 could be recorded"
+                    .to_owned(),
+            ));
+        };
+        // Only the edges this row has not already taken are walked. A record
+        // that already reached `Routed` proves the possible effect durably, and
+        // this contour never moves a row backward out of it.
+        let missing = match existing.state {
+            HostRequestState::Requested => {
+                vec![HostRequestState::Admitted, HostRequestState::Routed]
+            }
+            HostRequestState::Admitted => vec![HostRequestState::Routed],
+            _ => Vec::new(),
+        };
+        for target in missing {
+            match ors.advance_host_request(&operation_id, &obligation.request_digest, target, None)
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Err(unretained_obligation_reason(
+                        obligation,
+                        "the retained horizon obligation record disappeared before its possible \
+                         owner effect could be recorded"
+                            .to_owned(),
+                    ));
+                }
+                Err(error) => {
+                    return Err(unretained_obligation_reason(
+                        obligation,
+                        format!(
+                            "the wake horizon publication could not be advanced to {target:?} \
+                             before the schedule owner handoff: {error}"
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Prepares one retained wake cancellation for its single owner handoff,
     /// and reports the unresolved phases to return when it cannot.
     ///
@@ -3106,50 +3746,6 @@ impl KernelStoreGateway {
         Ok(())
     }
 
-    /// Reads the schedule normalization receipt envelopes this fence retains in
-    /// the canonical Store receipt history.
-    ///
-    /// The normalization receipt is owner evidence over the compiled occurrence
-    /// set, so it is read from the owner that retained it and is never assembled,
-    /// derived or defaulted here. Selection is by the envelope's own
-    /// content-derived identity — exactly the id the immutable revision names —
-    /// and the binding is then closed by
-    /// [`UserAutomationPreflightProjection::assemble`], which validates the
-    /// envelope through its own `validate()` and requires its canonical bytes to
-    /// carry the revision's compiled-occurrence digest. An owner that retained no
-    /// such envelope simply yields none, and the caller reports the missing
-    /// owner instead of substituting a receipt.
-    async fn read_run_now_normalization_receipts(
-        &self,
-        state_fence: &StateFence,
-        declared: &eliot_kernel_core::user_automation::ScheduleNormalizationReceipt,
-    ) -> Result<Vec<eliot_receipts::ReceiptEnvelope>, RunNowPreflightAssembly> {
-        let recovery = self
-            .recovery(StoreRecoveryRequest {
-                contract_version: eliot_store_api::CONTRACT_VERSION,
-                state_fence: state_fence.clone(),
-                records: Vec::new(),
-                include_receipts: true,
-                include_jobs: false,
-            })
-            .await
-            .map_err(RunNowPreflightAssembly::Unavailable)?;
-        if recovery.state_fence != *state_fence {
-            return Err(RunNowPreflightAssembly::Unknown(
-                "retained UserAutomation receipt history does not bind to the request fence"
-                    .to_owned(),
-            ));
-        }
-        Ok(recovery
-            .receipts
-            .into_iter()
-            .filter_map(|receipt| receipt.envelope)
-            .filter(|envelope| {
-                envelope.identity.receipt_id.as_str() == declared.receipt_id.as_str()
-            })
-            .collect())
-    }
-
     /// Assembles the complete preflight projection for one committed `RunNow`
     /// occurrence from its owner members.
     ///
@@ -3232,17 +3828,13 @@ impl KernelStoreGateway {
         }
         // The schedule normalization envelope the revision names is owner
         // evidence over the compiled occurrence set, so it is read from the
-        // canonical Store receipt history rather than assembled here. The read
-        // selects the envelope by its own content-derived identity; assembly then
-        // re-checks that envelope's canonical bytes name the compiled occurrence
-        // digest, so a self-asserted digest cannot satisfy the binding. An owner
-        // that has retained no such envelope leaves the occurrence unadmitted by
-        // name instead of substituting a receipt.
-        let normalization_receipts = Box::pin(self.read_run_now_normalization_receipts(
-            state_fence,
-            &owner.revision.schedule.normalization_receipt,
-        ))
-        .await?;
+        // owner that retained it beside the revision row rather than assembled
+        // here. The read selects the envelope by its own content-derived
+        // identity; assembly then re-checks that envelope's canonical bytes name
+        // the compiled occurrence digest, so a self-asserted digest cannot
+        // satisfy the binding. An owner that has retained no such envelope leaves
+        // the occurrence unadmitted by name instead of substituting a receipt.
+        let normalization_receipts = select_retained_normalization_receipts(state_fence, owner)?;
         if normalization_receipts.is_empty() {
             return Err(RunNowPreflightAssembly::Unavailable(
                 "no owner-issued schedule normalization receipt envelope is retained under this \
@@ -4843,25 +5435,46 @@ impl KernelStoreGateway {
         ) {
             Ok(obligation) => obligation,
             Err(error) => {
-                let reason =
-                    unretained_horizon_reason(&publication.automation_revision, error.to_string());
-                return Ok(Some(unreached_horizon_phase(
+                return Ok(Some(unretained_wake_horizon_phase(
                     &publication,
                     &requested_occurrence_ids,
-                    retry_handle,
-                    UnreachedHorizonKind::Unavailable,
-                    &reason,
+                    &retry_handle,
+                    error.to_string(),
                 )));
             }
         };
         // The retained record is consulted first, so an answered or reconciling
         // obligation is reported under its original owner operation identity
-        // without publishing the slice a second time.
-        let retained = classify_retained_horizon_publication(
-            &obligation,
-            &publication,
-            self.retain_user_automation_obligation(sealed, &obligation),
-        );
+        // without publishing the slice a second time. A row the durable owner
+        // classifies as possible-effect is first put to the schedule owner, which
+        // is the only party that can say whether the effect landed; a row it
+        // answers for settles here and any other answer keeps it reconciling.
+        //
+        // The gate is the durable `Reconciling` classification and nothing else.
+        // Two neighbouring outcomes deliberately do NOT reach the owner, because a
+        // readback would destroy the only evidence each of them carries: a row
+        // whose retained answer no longer decodes stays unresolved so the
+        // corruption remains visible instead of being overwritten with a fresh
+        // answer, and a row holding a wake-cancellation retry claim is not a
+        // horizon obligation at all.
+        let retained = self.retain_user_automation_obligation(sealed, &obligation);
+        if matches!(
+            &retained,
+            RetainedObligationLookup::Held(RetainedUserAutomationObligation::Reconciling { .. })
+        ) && let Some(phase) = self
+            .reconcile_wake_horizon_possible_effect(
+                runtime,
+                &mut obligation,
+                &publication,
+                &requested_occurrence_ids,
+                &retry_handle,
+            )
+            .await?
+        {
+            obligations.push(obligation);
+            return Ok(Some(phase));
+        }
+        let retained = classify_retained_horizon_publication(&obligation, &publication, retained);
         if let Some(phase) = retained_horizon_phase(
             retained,
             &mut obligation,
@@ -4885,18 +5498,174 @@ impl KernelStoreGateway {
         Ok(Some(phase.1))
     }
 
+    /// Makes one schedule owner's own acknowledgement the durable retained body
+    /// of the horizon obligation it answers.
+    ///
+    /// The acknowledgement is tied to the exact request twice before it is
+    /// retained: once as this owner's answer to this publication, and once as an
+    /// answer shape this obligation may durably hold. Either refusal returns its
+    /// typed reason and writes nothing, leaving the record reconciling rather
+    /// than retaining a horizon that cannot be tied to the request that asked
+    /// for it. Retaining the answer is the last step, and it is the only step
+    /// that changes the durable record: a failure to retain it is reported as a
+    /// reason, never as a partial acknowledgement.
+    fn settle_wake_horizon_acknowledgement(
+        &self,
+        obligation: &UserAutomationRuntimeObligation,
+        publication: &UserAutomationWakeHorizonPublication,
+        acknowledgement: &UserAutomationWakePublication,
+    ) -> Result<UserAutomationRuntimeObligationDisposition, String> {
+        acknowledgement
+            .validate_for(publication)
+            .map_err(|error| error.to_string())?;
+        let answer = UserAutomationRuntimeObligationAnswer::WakeHorizonPublication {
+            publication_request: Some(Box::new(publication.clone())),
+            acknowledgement: Box::new(acknowledgement.clone()),
+        };
+        answer
+            .validate_horizon_for(publication)
+            .map_err(|error| error.to_string())?;
+        self.retain_user_automation_obligation_answer(obligation, &answer)?;
+        Ok(UserAutomationRuntimeObligationDisposition::Answered {
+            answer: Box::new(answer),
+        })
+    }
+
+    /// Asks the schedule owner whether one possible-effect horizon obligation was
+    /// already applied, and settles the retained row out of the owner's own
+    /// answer.
+    ///
+    /// A row that reached the monotonic `Routed` state is reconciling until
+    /// something asks the owner the only question that can close it, so this is
+    /// that ask. It runs ahead of the ordinary classification and only for the
+    /// one durable classification that means "the owner may already have acted";
+    /// an absent, issued, answered, or unreadable row is left to
+    /// `classify_retained_horizon_publication` exactly as before.
+    ///
+    /// The discriminator is the SHAPE of the owner's answer, and it introduces
+    /// no new state, digest, nonce, cap, or timeout. `Ok` is the owner's own
+    /// retained acknowledgement for THIS exact publication, so it settles the row
+    /// to `Answered` through the same `settle_wake_horizon_acknowledgement` the
+    /// issue path uses: one retained body, one pair of validators, one ORS
+    /// writer, no second settlement path. The next attempt of this parent
+    /// operation then reads the row back as answered and serves that body
+    /// verbatim instead of publishing the slice again.
+    ///
+    /// EVERY other answer DEFERS, and the row stays reconciling. That set is
+    /// deliberately large, and `NotRetained` is the member that has to be argued
+    /// rather than assumed. It is a genuine complete negative, and it is still
+    /// not proof that the effect was never issued: it answers a question about
+    /// the owner's CURRENT activation generation, because the Host journal
+    /// clears its whole wake projection at an activation cutover
+    /// (`eliot_host_state::journal`), so a horizon published and fired under an
+    /// earlier generation reads as absent under this one. Settling that to
+    /// `Retained` would republish occurrences whose effect already happened,
+    /// which is the exact double-publish issue #2970 exists to close, and the
+    /// port's own contract forbids the inference: "an absent or inconclusive
+    /// lookup is an error, never proof that publication did not occur."
+    /// `Unavailable` proves less still, because `map_journal_error` collapses an
+    /// explicitly indeterminate `BackendError::Unknown` into it. Every deferred
+    /// answer keeps its typed detail in the reconciling reason, so the row
+    /// records that reconciliation was attempted and what the owner said.
+    ///
+    /// `None` means this obligation is not in the classification this reconciles
+    /// and the caller must run the ordinary path.
+    async fn reconcile_wake_horizon_possible_effect<R>(
+        &self,
+        runtime: Option<&R>,
+        obligation: &mut UserAutomationRuntimeObligation,
+        publication: &UserAutomationWakeHorizonPublication,
+        requested_occurrence_ids: &[String],
+        retry_handle: &str,
+    ) -> Result<Option<UserAutomationHorizonPhase>, String>
+    where
+        R: UserAutomationRuntimePort + UserAutomationWakePort + ?Sized,
+    {
+        let Some(runtime) = runtime else {
+            // The intent is durably retained and this transition composed no
+            // schedule owner at all, so there is nothing to ask and nothing to
+            // settle. The ordinary classification reports it as unresolved.
+            return Ok(None);
+        };
+        let acknowledgement = match UserAutomationWakePort::read_wake_horizon_publication(
+            runtime,
+            publication.clone(),
+        )
+        .await
+        {
+            Ok(acknowledgement) => acknowledgement,
+            Err(refusal) => {
+                // No answer this boundary may close the question on. The row
+                // keeps its `Reconciling` disposition and its possible-effect
+                // state, and the reported reason now names the typed owner
+                // answer that refused to settle it.
+                let detail = unretained_horizon_outcome_reason(
+                    &publication.automation_revision,
+                    &obligation.owner_operation_id,
+                    &refusal.to_string(),
+                );
+                obligation.disposition = UserAutomationRuntimeObligationDisposition::Reconciling {
+                    reason: detail.clone(),
+                };
+                return Ok(Some(unreached_horizon_phase(
+                    publication,
+                    requested_occurrence_ids,
+                    retry_handle.to_owned(),
+                    UnreachedHorizonKind::UnknownOutcome,
+                    &detail,
+                )));
+            }
+        };
+        // The owner's retained acknowledgement becomes this obligation's durable
+        // body through the existing settle seam. A refusal here — a foreign
+        // identity, a failed horizon accounting, a row that could not be
+        // retained — writes nothing and keeps the record reconciling, so a wrong
+        // answer can never become a settled horizon.
+        let disposition = match self.settle_wake_horizon_acknowledgement(
+            obligation,
+            publication,
+            &acknowledgement,
+        ) {
+            Ok(disposition) => disposition,
+            Err(reason) => {
+                obligation.disposition = UserAutomationRuntimeObligationDisposition::Reconciling {
+                    reason: reason.clone(),
+                };
+                return Ok(Some(unreached_horizon_phase(
+                    publication,
+                    requested_occurrence_ids,
+                    retry_handle.to_owned(),
+                    UnreachedHorizonKind::UnknownOutcome,
+                    &reason,
+                )));
+            }
+        };
+        obligation.disposition = disposition;
+        Ok(Some(acknowledged_horizon_phase(
+            publication,
+            requested_occurrence_ids,
+            &acknowledgement,
+        )?))
+    }
+
     /// Issues one bounded wake horizon under a durably routed obligation and
     /// returns the obligation's final disposition beside the horizon phase the
     /// schedule owner produced.
     ///
-    /// The retained record is admitted durably before the request leaves this
-    /// boundary, so a lost response arms the anti-blind-retry fence on the
-    /// original owner operation identity instead of leaving an untracked possible
-    /// effect. The exact owner answer becomes the durable record's retained body,
+    /// The retained record is advanced to the monotonic `Routed` state BEFORE the
+    /// request leaves this boundary, so that state answers "may the schedule
+    /// owner already have retained this slice?" durably and from durable state
+    /// alone. The exact owner answer becomes the durable record's retained body,
     /// so a replay of this same parent operation serves it instead of publishing
-    /// the slice a second time. An owner that was never reachable leaves the
-    /// record admitted, because nothing was published and the effect may still be
-    /// issued under the same retained identity.
+    /// the slice a second time. Once the record is `Routed` no reported answer
+    /// makes it re-issuable: an owner that answers `Unavailable`, a typed refusal,
+    /// and a lost response all leave an obligation that must be reconciled under
+    /// its original owner operation identity, because a later read of the
+    /// committed configuration is empty of the effect either way.
+    ///
+    /// The `Unavailable` arm is the one that pays for that rule with real
+    /// availability, and it documents its own lumped producers rather than
+    /// leaving a reader to assume a clean no-send.
     async fn issue_wake_horizon<R>(
         &self,
         obligation: &UserAutomationRuntimeObligation,
@@ -4936,7 +5705,13 @@ impl KernelStoreGateway {
                 ),
             ));
         };
-        if let Err(reason) = self.mark_user_automation_obligation_admitted(obligation) {
+        // Issue #2970: the durable possible-effect state is persisted BEFORE the
+        // awaited owner call, not after it. `Admitted` on its own cannot say the
+        // owner was never handed this slice, so the record is advanced to
+        // `Routed` first: a process death inside the await window then reloads
+        // as reconciling under this original owner operation identity rather than
+        // as work a later attempt would publish a second time.
+        if let Err(reason) = self.mark_wake_horizon_obligation_possible_effect(obligation) {
             reconcile(&reason);
             return Ok((
                 settled,
@@ -4945,29 +5720,20 @@ impl KernelStoreGateway {
         }
         match UserAutomationWakePort::publish_wake_horizon(runtime, publication.clone()).await {
             Ok(acknowledgement) => {
-                acknowledgement
-                    .validate_for(publication)
-                    .map_err(|error| error.to_string())?;
-                let answer = UserAutomationRuntimeObligationAnswer::WakeHorizonPublication {
-                    publication_request: Some(Box::new(publication.clone())),
-                    acknowledgement: Box::new(acknowledgement.clone()),
+                settled.disposition = match self.settle_wake_horizon_acknowledgement(
+                    obligation,
+                    publication,
+                    &acknowledgement,
+                ) {
+                    Ok(disposition) => disposition,
+                    Err(reason) => {
+                        reconcile(&reason);
+                        return Ok((
+                            settled,
+                            unreached(UnreachedHorizonKind::UnknownOutcome, &reason),
+                        ));
+                    }
                 };
-                answer
-                    .validate_horizon_for(publication)
-                    .map_err(|error| error.to_string())?;
-                settled.disposition =
-                    match self.retain_user_automation_obligation_answer(obligation, &answer) {
-                        Ok(()) => UserAutomationRuntimeObligationDisposition::Answered {
-                            answer: Box::new(answer),
-                        },
-                        Err(reason) => {
-                            reconcile(&reason);
-                            return Ok((
-                                settled,
-                                unreached(UnreachedHorizonKind::UnknownOutcome, &reason),
-                            ));
-                        }
-                    };
                 Ok((
                     settled,
                     acknowledged_horizon_phase(
@@ -4977,14 +5743,45 @@ impl KernelStoreGateway {
                     )?,
                 ))
             }
-            // No schedule owner was reachable, so nothing was published. The
-            // intent stays durably retained under its owner operation identity
-            // and the effect may still be issued under it.
+            // `Unavailable` is a LUMPED owner answer, NOT a "nothing was sent"
+            // proof, and this branch must not read it as one. It is produced
+            // both by a contour that never engaged a transport at all (the
+            // `UserAutomationWakePort::publish_wake_horizon` trait default in
+            // `user_automation_execution.rs`) and, on the composed Host route,
+            // from inside an ALREADY-ISSUED publication. The Host wake adapter's
+            // `map_journal_error` collapses `JournalError::Synchronization`,
+            // `BackendError::Unavailable`, `BackendError::PlanGap` and the
+            // explicitly indeterminate `BackendError::Unknown` into
+            // `Unavailable`, and that one mapping fires both on the
+            // per-occurrence journal append and on the post-append
+            // acknowledgement readback, so a horizon whose every occurrence was
+            // already retained can still answer `Unavailable`. Those answers
+            // return as `UserAutomationHostExecutionFailure::Unavailable` and are
+            // mapped back by `UserAutomationHostExecutionClient`, i.e. after a
+            // complete authenticated round trip.
+            //
+            // The lump therefore cannot be split here. Reading it as clean
+            // absence would re-open exactly the double-publish window issue
+            // #2970 closes, and the record is already durably `Routed`, so the
+            // obligation is reported unresolved under its original identity.
+            //
+            // The availability cost is real and is not hidden: an answer from
+            // the never-engaged default IS provably never-sent, yet it is not
+            // retryable from this contour. `UserAutomationRuntimeError` has no
+            // value that separates "owner absent" from "owner's own state
+            // unreadable or its write indeterminate", so the honest resolution
+            // is to split that vocabulary on the owner's error contract, not to
+            // infer a narrower meaning here. Tracked as a named follow-up.
             Err(UserAutomationRuntimeError::Unavailable(reason)) => {
-                settled.disposition = UserAutomationRuntimeObligationDisposition::Retained;
+                let detail = unretained_horizon_outcome_reason(
+                    &publication.automation_revision,
+                    &obligation.owner_operation_id,
+                    &reason,
+                );
+                reconcile(&detail);
                 Ok((
                     settled,
-                    unreached(UnreachedHorizonKind::Unavailable, &reason),
+                    unreached(UnreachedHorizonKind::UnknownOutcome, &detail),
                 ))
             }
             // The owner may have retained the slice and the answer was lost, so
@@ -7169,7 +7966,16 @@ fn schedule_horizon_trigger(
         | UserAutomationOperation::Pause { .. }
         | UserAutomationOperation::RunNow { .. }
         | UserAutomationOperation::Remove { .. }
-        | UserAutomationOperation::InspectLastFailure { .. } => None,
+        | UserAutomationOperation::InspectLastFailure { .. }
+        // A committed recurring wake horizon belongs to a committed AUTOMATION
+        // configuration revision, and the closed reason above names the
+        // revision transition that produced it. I12.24:65's decision-owner
+        // selection names no revision and schedules nothing: it records one
+        // disposition against one brief, and I12.24:82 makes the advisory class
+        // "default; changes nothing until owner acts", so there is no recurring
+        // schedule for it to own. `None` is the honest answer, and naming it
+        // here keeps the exclusion exhaustive rather than silent.
+        | UserAutomationOperation::DecideImprovementBrief { .. } => None,
     }
 }
 
@@ -7187,6 +7993,30 @@ const UNREACHED_WAKE_OWNER_REASON: &str = "no authenticated UserAutomation runti
 
 /// Projects a horizon that the schedule owner did not fully acknowledge.
 ///
+/// Builds the phase a wake-horizon publication reports when its owner effect
+/// could not be retained at all.
+///
+/// The horizon keeps its exact requested and remaining sets and the replay
+/// handle, so a caller that retained nothing still learns which occurrences were
+/// outstanding and under which identity it may ask again. Nothing is issued and
+/// no receipt is substituted for the missing record: the obligation is a
+/// precondition of the owner effect, not a receipt for it.
+fn unretained_wake_horizon_phase(
+    publication: &UserAutomationWakeHorizonPublication,
+    requested_occurrence_ids: &[String],
+    retry_handle: &str,
+    error: String,
+) -> UserAutomationHorizonPhase {
+    let reason = unretained_horizon_reason(&publication.automation_revision, error);
+    unreached_horizon_phase(
+        publication,
+        requested_occurrence_ids,
+        retry_handle.to_owned(),
+        UnreachedHorizonKind::Unavailable,
+        &reason,
+    )
+}
+
 /// The exact requested and remaining occurrence sets and the replay handle are
 /// always retained. A failure answer never reports an empty remainder: an empty
 /// set would claim that nothing is outstanding, which is exactly the answer this

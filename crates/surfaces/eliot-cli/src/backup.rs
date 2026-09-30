@@ -71,6 +71,24 @@
 //! naming the exact missing owner evidence, never as a verified archive and
 //! never silently dropped.
 //!
+//! The create path is bounded the same way and reports strictly less. Its
+//! Kernel route admits the bounded descriptors and then admits the CALLER
+//! through the transport's own proved peer identity and front-door capability —
+//! the same admission the capture owner itself consumes — before naming the
+//! absent capture-owner behaviour. So an unadmitted session is fenced rather
+//! than answered, and an admitted one receives a typed refusal. That refusal is
+//! a statement about the REQUEST's next step, never about an ARCHIVE: a handler
+//! that read its own arguments back has validated the request, not the
+//! archive, and `archive_id`, `verification_level`, `class_ceiling`,
+//! `capture_receipt`, `archive_fence_relation`, `archive_fence_proof`,
+//! `target_compatibility` and `result_identity` therefore all stay explicitly
+//! absent. Only `requested_class` and `requested_scope` are reported, and they
+//! are echoes of the operator's own request. Because the create route refuses
+//! BEFORE any effect, `next_reconciliation` says there is nothing to reconcile
+//! and the same operation may be re-run once the owner exists; reporting an
+//! uncertain effect that provably never happened would be the I14.21 error in
+//! its mirror image.
+//!
 //! A proof is only as good as the request it answers, so the verify path binds
 //! the NESTED result identity rather than trusting the envelope echo.
 //! [`BackupResultIdentity`] carries the operation that produced the answer, the
@@ -508,18 +526,20 @@ impl ArchiveFenceProof {
     }
 }
 
-/// The capture owner a create refusal names while admitted capture is missing.
+/// The capture owner a create refusal names while the capture owner cannot be
+/// reached.
 ///
-/// A create is refused with `plan_gap` while admitted capture is owned by
-/// #959, and the Kernel's create route writes that owner into the refusal
-/// verbatim. This constant mirrors that literal so the create reply's one
-/// domain identity is checkable instead of merely readable: a refusal naming
-/// any other owner is a domain-identity mismatch, not this operation's answer.
+/// A create is refused with `plan_gap` while the capture owner's capture entry
+/// is unreachable, and the Kernel's create route writes that owner into the
+/// refusal verbatim. This constant mirrors that literal so the create reply's
+/// one domain identity is checkable instead of merely readable: a refusal
+/// naming any other owner is a domain-identity mismatch, not this operation's
+/// answer.
 ///
 /// The two literals are separate owners of the same spelling, not a shared
 /// contract: the Kernel route states it in its refusal and this surface
-/// states it here. When #959 lands and the create reply becomes a real
-/// capture answer, both sides must change together; until then a drift
+/// states it here. When the capture owner lands and the create reply becomes a
+/// real capture answer, both sides must change together; until then a drift
 /// between them is refused here rather than silently accepted. This surface
 /// must not mint an owner, a receipt or a class to keep the check passing.
 pub const BACKUP_CREATE_MISSING_OWNER: &str = "backup-capture-owner (#959)";
@@ -1391,7 +1411,27 @@ fn respond(
     Ok(response)
 }
 
+/// The one safe next action for a given outcome.
+///
+/// A refused CREATE is separated out before the state match, and the reason is
+/// effect ordering (I14.21), not wording. The create route's refusal is
+/// pre-effect by construction: nothing was published, nothing was mutated, and
+/// the reply answers with the caller's own operation identity, so there is NO
+/// effect whose outcome could be uncertain and therefore nothing to reconcile.
+/// Telling an operator to "reconcile the same operation" here would report an
+/// effect that provably never happened, and would make them look for a
+/// half-finished archive that was never started. The honest next action is that
+/// the operation may be re-run once the named owner exists — the same operation
+/// identity, not a second capture of a different scope.
+///
+/// Every other state keeps the existing shared wording, so verify and
+/// restore-test are unchanged.
 fn next_action(state: &str, operation: &str, operation_id: &str) -> String {
+    if state == BACKUP_STATE_REFUSED && operation == BACKUP_CREATE_OPERATION {
+        return format!(
+            "no capture was started for operation {operation_id}, so there is nothing to reconcile; the refusal names the absent capture-owner behaviour, and the same operation may be re-run only after that owner exists"
+        );
+    }
     match state {
         BACKUP_STATE_INVALID => format!(
             "correct the refused field and resubmit operation {operation_id} once; no {operation} was started"
@@ -1473,11 +1513,28 @@ fn restore_test_params(
 /// capture-owner refusal, decoded strictly: a reply that claims a capture
 /// happened, that names a different command, correlation, or status, that
 /// carries a field this operation never answers, or that names a different
-/// missing owner, is a typed result mismatch rather than a success. The
-/// create reply carries no domain receipt, class, source or destination, so
-/// those identities stay explicitly absent here instead of being read from the
-/// reply. The requested class and scope this outcome does report are echoes of
-/// what the operator asked for, never an identity the owner proved.
+/// missing owner, is a typed result mismatch rather than a success.
+///
+/// # WHAT THIS PROJECTION MAY AND MAY NOT REPORT
+///
+/// The create reply is a refusal carrying `code`, `missing_owner` and `reason`
+/// only, and this surface reports exactly that much. `archive_id`,
+/// `verification_level`, `class_ceiling`, `capture_receipt`,
+/// `archive_fence_relation`, `archive_fence_proof`, `target_compatibility`,
+/// `cancellation_reason_code`, `owner_cleanup_state` and `result_identity` all
+/// stay `None`, because no owner issued any of them. That is the whole point of
+/// this projection: a handler that read its own arguments back and reported
+/// success would have validated the REQUEST, not the ARCHIVE, and putting a
+/// descriptor into any of those fields is exactly the substitution this path
+/// refuses to make. `requested_class` and `requested_scope` ARE reported, and
+/// they are echoes of what the operator asked for, never identities the owner
+/// proved.
+///
+/// `missing_obligations` carries the owner the refusal names AND the reason the
+/// route gave for naming it, so an operator reads WHICH behaviour is absent
+/// rather than only which issue owns it. The proven level never leaves
+/// [`BackupStage::Requested`]: an admitted-shape request that no owner acted on
+/// has proved nothing about an archive.
 pub fn backup_create(
     client: &mut KernelClient,
     request: &CommandRequest,
@@ -1533,9 +1590,10 @@ pub fn backup_create(
         return Err(BackupClientError::Client(CliError::ResultMismatch));
     }
     let reason = envelope_text(&response, "reason")?.to_owned();
-    // Admitted capture is not implemented: the request proved its shape and
-    // nothing else, so the proven level never leaves `Requested` and the
-    // effect/proof pair reports the requested mutation, not a read.
+    // The route admitted the request and then named the absent capture-owner
+    // behaviour: it reached no owner, published nothing and mutated nothing. The
+    // proven level therefore never leaves `Requested` and the effect/proof pair
+    // reports the requested mutation, not a read.
     let state = BACKUP_STATE_REFUSED;
     let outcome = BackupOperationOutcome {
         operation: BACKUP_CREATE_OPERATION.to_owned(),
@@ -1572,7 +1630,11 @@ pub fn backup_create(
         cancellation_reason_code: None,
         owner_cleanup_state: None,
         gates_passed: Vec::new(),
-        missing_obligations: vec![missing_owner],
+        // Both the owner and the route's own reason for naming it. The owner
+        // alone is a bare issue number; the reason is what tells an operator
+        // which behaviour has to exist, and the refusal reason is bounded
+        // owner-route text echoed verbatim, never prose invented here.
+        missing_obligations: vec![missing_owner, reason.clone()],
         next_reconciliation: next_action(state, BACKUP_CREATE_OPERATION, &operation_id),
         reason,
     };

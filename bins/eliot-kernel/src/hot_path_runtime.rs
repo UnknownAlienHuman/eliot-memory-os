@@ -28,6 +28,11 @@
 //!    recorded at that pair's own admission, never a recomputed one, so the
 //!    ledger cannot drift away from the index it bounds.
 //!
+//!    That ledger is built from the identity `bind_hot_path_manifest_set`
+//!    returned, not from a second spelling of the queue identity written here.
+//!    One queue identity per enforced ledger is the point: a queue the bind
+//!    never certified cannot be the queue this process bounds.
+//!
 //! The request-byte bound is checked here, at admission, from the exact bytes
 //! the owner received — before the expensive decode of the retained tool payload
 //! happens — and a refusal never partially acquires, so the owner is never
@@ -59,6 +64,13 @@ const KERNEL_HOT_SPINE_SERVICE: &str = "eliot-kernel";
 
 /// The bounded queue identity the Kernel's local-read pairs are admitted against.
 const LOCAL_READ_QUEUE_ID: &str = "local_read_claim";
+
+/// The declared operation whose registered queue this process bounds.
+///
+/// This is the operation identity, not a second spelling of the queue
+/// identity: the queue identity is read back off the bind result, so the two
+/// cannot drift into checking one thing and enforcing another.
+const LOCAL_READ_OPERATION: &str = "local_read_claim";
 
 /// Observed hot-spine outcomes. Closed, bounded control codes — never prose,
 /// never a claim about a bound this process did not actually hit.
@@ -153,6 +165,16 @@ impl KernelHotSpine {
     /// local-read queue is bounded by — and never from the declaration itself,
     /// so a declaration that claims a looser or tighter bound than the build
     /// really uses is refused instead of being taken at its word.
+    ///
+    /// The queue identity the ledger is later built from is read back off the
+    /// binder's own result rather than off the constant this file registers
+    /// with. Those two spellings can only agree after `bind_hot_path_manifest_set`
+    /// has compared every declared `queue_id` against this build's registered
+    /// queue, so the identity this process enforces is the identity that bind
+    /// certified. A declaration carrying a foreign queue identity under the same
+    /// operation and the same numbers — or an extra such row alongside the
+    /// genuine one — has nowhere left to attach: the binder refuses it, and a
+    /// refused bind refuses composition assembly outright.
     pub(crate) fn bind() -> Result<Self, HotSpineError> {
         let path = hot_path_manifest_path(std::path::Path::new(env!("CARGO_MANIFEST_DIR")))
             .map_err(|_| HotSpineError::DeclarationRefused)?;
@@ -162,13 +184,26 @@ impl KernelHotSpine {
         let bound = bind_hot_path_manifest_set(&admitted.set, &registration)
             .map_err(|_| HotSpineError::DeclarationRefused)?;
         let bound_operations = bound
-            .into_iter()
-            .map(|identity| identity.operation)
+            .iter()
+            .map(|identity| identity.operation.clone())
             .collect::<Vec<_>>();
+        // I12.14 step 4/5: the enforced ledger exists only over a queue the bind
+        // above certified by exact identity. `LOCAL_READ_OPERATION` names the
+        // declared operation this process bounds; a bind result without it, or
+        // with a different registered queue identity, is a refusal rather than a
+        // fallback onto whatever the running-build constant happens to spell.
+        let bound_queue = bound
+            .iter()
+            .find(|identity| identity.operation == LOCAL_READ_OPERATION)
+            .map(|identity| &identity.registered_queue)
+            .ok_or(HotSpineError::DeclarationRefused)?;
+        if bound_queue.queue_id != LOCAL_READ_QUEUE_ID {
+            return Err(HotSpineError::DeclarationRefused);
+        }
         let local_read = Mutex::new(HotPathQueueCapacity::new(
-            LOCAL_READ_QUEUE_ID,
-            super::host_request_route::MAX_QUEUED_LOCAL_READS as u64,
-            IpcImplementation::registered_queue_bytes() as u64,
+            &bound_queue.queue_id,
+            bound_queue.max_items,
+            bound_queue.max_bytes,
         ));
         Ok(Self {
             admitted,
@@ -269,7 +304,7 @@ fn kernel_running_registration() -> RunningBuildRegistration {
         service: KERNEL_HOT_SPINE_SERVICE.to_owned(),
         operations: vec![
             RegisteredOperation {
-                operation: "local_read_claim".to_owned(),
+                operation: LOCAL_READ_OPERATION.to_owned(),
                 queue: RegisteredQueueSettings {
                     queue_id: LOCAL_READ_QUEUE_ID.to_owned(),
                     max_items: queued_items,

@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use eliot_instrument_api::{ExecutionStatus, InstrumentInvocation};
+use eliot_instrument_api::{ExecutionStatus, InstrumentAdmissionGrant, InstrumentInvocation};
 use eliot_process::{
     CancellationReceipt, ExitDisposition, ExitStatus, OperationId, ProcessEvidence,
     ProcessEvidenceSink, ProcessExecutionError, ProcessExecutionView, ProcessExecutor,
@@ -697,6 +697,40 @@ impl<E: ProcessExecutor + 'static> InstrumentRunner<E> {
             target_root_observed,
             cache_root_observed,
         })
+    }
+
+    /// Launches the exact immutable binding only under a sealed admission grant.
+    ///
+    /// The grant must seal itself and must bind the sealed request's exact
+    /// arguments and executable digest: a grant minted for another object, or
+    /// a request that drifted after admission, fails closed here instead of
+    /// reaching the executor. Observation and revocation stay with the
+    /// admission boundary; this is the at-dispatch revalidation of the same
+    /// object at use.
+    ///
+    /// # Errors
+    /// Returns [`RunnerError::ReceiptMismatch`] when the grant does not seal
+    /// itself, the binding is already consumed, or the sealed request drifts
+    /// from the grant, and the underlying launch error otherwise.
+    pub async fn launch_admitted(
+        &self,
+        binding: &mut InstrumentBinding,
+        grant: &InstrumentAdmissionGrant,
+        sink: Arc<dyn ProcessEvidenceSink>,
+    ) -> Result<InstrumentStartReceipt, RunnerError> {
+        if grant.digest() != grant.grant_digest {
+            return Err(RunnerError::ReceiptMismatch);
+        }
+        let Some(request) = binding.process_request.as_ref() else {
+            return Err(RunnerError::ReceiptMismatch);
+        };
+        if request.argv() != grant.arguments.as_slice() {
+            return Err(RunnerError::ReceiptMismatch);
+        }
+        if request.executable_sha256() != grant.content_digest.as_str() {
+            return Err(RunnerError::ReceiptMismatch);
+        }
+        self.launch(binding, sink).await
     }
 
     /// Inspects an operation and preserves the binding identity.

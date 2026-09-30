@@ -4,6 +4,19 @@
 //! One typed binding module per #756 world, generated from the single
 //! `wit/typed` directory with the pinned Wasmtime component facility.
 //! No hand-copied schema, no second neutral-runtime engine, no WASI.
+//!
+//! Determinism contract (P4.4): each module below is exactly one
+//! `wasmtime::component::bindgen!` expansion over the single `wit/typed`
+//! directory with the workspace-pinned `wasmtime` facility. No expanded
+//! output is checked in: the checked-in bytes are the generation inputs
+//! (the six `world` selections) plus the hand-maintained identity tables
+//! (`TYPED_PACKAGE_ID`, `TYPED_WIT_VERSION`, the `TypedWorld` name maps,
+//! `export_matches_interface`, `typed_wit_digest`). Rebuilding against the
+//! locked workspace regenerates byte-identical bindings from the same WIT
+//! bytes; a WIT change regenerates all six modules on the next build, and
+//! no manual edit to expanded code is possible. Reviewers re-derive this by
+//! comparing each module's `world` against the `world` declarations in
+//! `wit/typed` and `typed_wit_digest` against the checked-in WIT bytes.
 
 use eliot_wasm_runtime::Sha256Digest;
 
@@ -16,6 +29,7 @@ pub const LEGACY_WORLD: &str = "eliot:wasm/guest";
 /// Legacy export that marks a legacy/component mismatch.
 pub const LEGACY_EXPORT: &str = "run";
 
+/// Generated engine bindings for the `context-admission` world (`wit/typed`).
 pub mod context_admission {
     wasmtime::component::bindgen!({
         path: "wit/typed",
@@ -23,6 +37,7 @@ pub mod context_admission {
     });
 }
 
+/// Generated engine bindings for the `context-assembly` world (`wit/typed`).
 pub mod context_assembly {
     wasmtime::component::bindgen!({
         path: "wit/typed",
@@ -30,6 +45,7 @@ pub mod context_assembly {
     });
 }
 
+/// Generated engine bindings for the `cue-activation` world (`wit/typed`).
 pub mod cue_activation {
     wasmtime::component::bindgen!({
         path: "wit/typed",
@@ -37,6 +53,7 @@ pub mod cue_activation {
     });
 }
 
+/// Generated engine bindings for the `dreamer-handler` world (`wit/typed`).
 pub mod dreamer_handler {
     wasmtime::component::bindgen!({
         path: "wit/typed",
@@ -44,6 +61,7 @@ pub mod dreamer_handler {
     });
 }
 
+/// Generated engine bindings for the `memory-curation-screen` world (`wit/typed`).
 pub mod memory_curation_screen {
     wasmtime::component::bindgen!({
         path: "wit/typed",
@@ -51,6 +69,7 @@ pub mod memory_curation_screen {
     });
 }
 
+/// Generated engine bindings for the `dreamer-cycle` world (`wit/typed`).
 pub mod dreamer_cycle {
     wasmtime::component::bindgen!({
         path: "wit/typed",

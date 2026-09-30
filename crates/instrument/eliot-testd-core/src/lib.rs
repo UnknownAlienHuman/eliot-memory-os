@@ -27,7 +27,6 @@ use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
@@ -1465,6 +1464,72 @@ pub struct TestdVerifierDispatchBinding {
     pub canonical_plan_sha256: String,
 }
 
+/// Closed Git subcommand set admitted for one source observation.
+///
+/// The set is closed: [`TestdSourceObservation::capture`] seals exactly
+/// these argument vectors, and the port receives only a value of this
+/// type. No caller text, no shell string, and no arbitrary executable
+/// path can reach the physical process contour through this port.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceObservationGitCommand {
+    /// `git rev-parse --show-toplevel`
+    ShowTopLevel,
+    /// `git rev-parse --abbrev-ref HEAD`
+    AbbreviatedBranch,
+    /// `git rev-parse --verify HEAD^{commit}`
+    VerifiedCommit,
+    /// `git status --porcelain=v2 -z --untracked-files=all`
+    PorcelainV2Status,
+    /// `git diff --binary --no-ext-diff HEAD --`
+    BinaryWorktreeDiff,
+    /// `git ls-files --others --exclude-standard -z`
+    UntrackedListing,
+}
+
+impl SourceObservationGitCommand {
+    /// Returns the exact sealed argv for this closed subcommand.
+    #[must_use]
+    pub const fn argv(self) -> &'static [&'static str] {
+        match self {
+            Self::ShowTopLevel => &["rev-parse", "--show-toplevel"],
+            Self::AbbreviatedBranch => &["rev-parse", "--abbrev-ref", "HEAD"],
+            Self::VerifiedCommit => &["rev-parse", "--verify", "HEAD^{commit}"],
+            Self::PorcelainV2Status => &["status", "--porcelain=v2", "-z", "--untracked-files=all"],
+            Self::BinaryWorktreeDiff => &["diff", "--binary", "--no-ext-diff", "HEAD", "--"],
+            Self::UntrackedListing => &["ls-files", "--others", "--exclude-standard", "-z"],
+        }
+    }
+}
+
+/// Physical Git execution port for one source observation.
+///
+/// `eliot-testd-core` owns durable scheduling state and never owns
+/// physical process mechanics: the governing `ProcessExecutor`/Job
+/// Object contour (#100) launches every child. This crate contributes
+/// only the closed subcommand vocabulary and the digest contract; the
+/// composition root owns the bound implementation that resolves the
+/// installed `git` executable, seals a `ProcessIntent` plus dispatch
+/// permit, and reads the executor's bounded captured streams.
+///
+/// The port carries no authority of its own. A successful return proves
+/// only that one admitted Git invocation exited successfully with
+/// complete, bounded, untruncated stdout.
+pub trait SourceObservationGitPort: Send + Sync {
+    /// Runs one closed Git subcommand in `repository_root` and returns its
+    /// exact complete stdout.
+    ///
+    /// # Errors
+    /// Returns an error when the governed contour refuses the launch,
+    /// the child does not exit successfully, or the bounded capture is
+    /// incomplete or truncated. No partial observation is ever returned
+    /// as success.
+    fn run_git(
+        &self,
+        repository_root: &Path,
+        command: SourceObservationGitCommand,
+    ) -> Result<Vec<u8>, TestdError>;
+}
+
 /// Immutable observation of the source repository used by one verifier run.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1477,9 +1542,18 @@ pub struct TestdSourceObservation {
 
 impl TestdSourceObservation {
     /// Reads the live Git repository identity and a content-bound working-tree
-    /// digest. Any unavailable or oversized observation fails closed.
-    pub fn capture(repository_root: impl AsRef<Path>) -> Result<Self, TestdError> {
+    /// digest through the governed process contour supplied by `git`.
+    ///
+    /// This crate never launches a child itself: every Git invocation is
+    /// dispatched through `git`, whose production implementation is the
+    /// composition root's `ProcessExecutor`. Any unavailable, oversized,
+    /// truncated, or non-success observation fails closed.
+    pub fn capture(
+        repository_root: impl AsRef<Path>,
+        git: &dyn SourceObservationGitPort,
+    ) -> Result<Self, TestdError> {
         const MAX_GIT_OUTPUT: usize = 64 * 1024 * 1024;
+        const MAX_OBSERVED_SOURCE_FILE_BYTES: usize = 64 * 1024 * 1024;
         let repository_root =
             std::fs::canonicalize(repository_root).map_err(|_| TestdError::Invalid {
                 field: "source_observation.repository_root",
@@ -1491,43 +1565,15 @@ impl TestdSourceObservation {
                 reason: "source root is not a directory",
             });
         }
-        let run_git = |arguments: &[&str]| -> Result<Vec<u8>, TestdError> {
-            let mut command = Command::new("git");
-            command.current_dir(&repository_root);
-            for variable in [
-                "GIT_DIR",
-                "GIT_WORK_TREE",
-                "GIT_COMMON_DIR",
-                "GIT_INDEX_FILE",
-                "GIT_OBJECT_DIRECTORY",
-                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-                "GIT_PREFIX",
-                "GIT_CEILING_DIRECTORIES",
-                "GIT_DISCOVERY_ACROSS_FILESYSTEM",
-                "GIT_EXTERNAL_DIFF",
-                "GIT_CONFIG",
-                "GIT_CONFIG_COUNT",
-                "GIT_CONFIG_PARAMETERS",
-                "GIT_CONFIG_SYSTEM",
-                "GIT_CONFIG_GLOBAL",
-                "GIT_CONFIG_NOSYSTEM",
-            ] {
-                command.env_remove(variable);
-            }
-            let output = command
-                .args(arguments)
-                .output()
-                .map_err(|_| TestdError::Invalid {
-                    field: "source_observation.git",
-                    reason: "Git could not be started for source observation",
-                })?;
-            if !output.status.success() || output.stdout.len() > MAX_GIT_OUTPUT {
+        let run_git = |command: SourceObservationGitCommand| -> Result<Vec<u8>, TestdError> {
+            let stdout = git.run_git(&repository_root, command)?;
+            if stdout.len() > MAX_GIT_OUTPUT {
                 return Err(TestdError::Invalid {
                     field: "source_observation.git",
                     reason: "Git source observation failed or exceeded its bound",
                 });
             }
-            Ok(output.stdout)
+            Ok(stdout)
         };
         let decode_text = |bytes: Vec<u8>, field| -> Result<String, TestdError> {
             String::from_utf8(bytes)
@@ -1538,7 +1584,7 @@ impl TestdSourceObservation {
                 })
         };
         let top_level = decode_text(
-            run_git(&["rev-parse", "--show-toplevel"])?,
+            run_git(SourceObservationGitCommand::ShowTopLevel)?,
             "source_observation.repository_root",
         )?;
         let observed_root = std::fs::canonicalize(top_level).map_err(|_| TestdError::Invalid {
@@ -1552,7 +1598,7 @@ impl TestdSourceObservation {
             });
         }
         let branch = decode_text(
-            run_git(&["rev-parse", "--abbrev-ref", "HEAD"])?,
+            run_git(SourceObservationGitCommand::AbbreviatedBranch)?,
             "source_observation.branch",
         )?;
         let branch = if branch == "HEAD" {
@@ -1561,12 +1607,12 @@ impl TestdSourceObservation {
             branch
         };
         let commit = decode_text(
-            run_git(&["rev-parse", "--verify", "HEAD^{commit}"])?,
+            run_git(SourceObservationGitCommand::VerifiedCommit)?,
             "source_observation.commit",
         )?;
-        let status = run_git(&["status", "--porcelain=v2", "-z", "--untracked-files=all"])?;
-        let diff = run_git(&["diff", "--binary", "--no-ext-diff", "HEAD", "--"])?;
-        let untracked = run_git(&["ls-files", "--others", "--exclude-standard", "-z"])?;
+        let status = run_git(SourceObservationGitCommand::PorcelainV2Status)?;
+        let diff = run_git(SourceObservationGitCommand::BinaryWorktreeDiff)?;
+        let untracked = run_git(SourceObservationGitCommand::UntrackedListing)?;
         let mut untracked_paths = untracked
             .split(|byte| *byte == 0)
             .filter(|path| !path.is_empty())
@@ -1616,7 +1662,7 @@ impl TestdSourceObservation {
                     field: "source_observation.untracked_path",
                     reason: "untracked file cannot be read for source observation",
                 })?;
-                if bytes.len() > MAX_GIT_OUTPUT {
+                if bytes.len() > MAX_OBSERVED_SOURCE_FILE_BYTES {
                     return Err(TestdError::Invalid {
                         field: "source_observation.untracked_path",
                         reason: "untracked file exceeds the source-observation bound",

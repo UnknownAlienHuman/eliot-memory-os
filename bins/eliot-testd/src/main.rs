@@ -220,7 +220,7 @@ fn block_on_drive<F: Future>(future: F) -> F::Output {
 fn drive_admitted<E: ProcessExecutor + 'static>(
     composition: &TestdComposition,
     presented: PresentedAdmission,
-    executor: &E,
+    contour: &eliot_testd::worker::GovernedContour<'_, E>,
 ) -> i32 {
     // Closed-profile gate: the admitted drive derives its executable
     // binding from the registry; an unregistered profile, fixed-argv
@@ -244,7 +244,7 @@ fn drive_admitted<E: ProcessExecutor + 'static>(
     match run_admitted_one_shot(
         composition,
         presented,
-        executor,
+        contour,
         SERVICE_NAME,
         ADMITTED_WORKER_LEASE_MS,
         now_ms(),

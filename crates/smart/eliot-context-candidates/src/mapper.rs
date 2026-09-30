@@ -1639,6 +1639,11 @@ fn build_atom(
         atom_id: item.member.member_id.clone(),
         provider_role: slot.clone(),
         source: item.member.source.clone(),
+        // A normalized member carries the whole unit verbatim, not a measured
+        // position inside its snapshot, so this projection has no exact range to
+        // state. The typed unknown is the honest value; it is never widened into
+        // a whole-snapshot range here.
+        source_range: None,
         learning: None,
         representation: eliot_context_contracts::AtomRepresentation::Whole {
             content: item.member.content.clone(),

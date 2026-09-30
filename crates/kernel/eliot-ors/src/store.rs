@@ -102,13 +102,14 @@ use crate::{
     SupervisionLeaseStageResolutionDisposition, SupervisionLeaseTicketReconciliation,
     UnknownCommitOutcome, UnknownCommitRecord, UserBrokerFence, UserBrokerHeartbeat,
     UserBrokerRegistration, UserBrokerRegistrationReceipt, UserBrokerRegistrationSnapshot,
-    VersionedArtifactEntry, VersionedArtifactRegistry, WorkerReplayAck, WorkerReplayAckRecord,
-    WorkerReplayBegin, WorkerReplayCursors, WorkerReplayDraft, WorkerReplayEvent,
-    WorkerReplayRequestDecision, WorkerReplayRequestRecord, WorkerReplayStreamRecord,
-    WriteIdempotencyRecoveryCursor, WriteIdempotencyRecoveryEntry, WriteIdempotencyRecoveryPage,
-    WriteReservationRecoveryCursor, WriteReservationRecoveryPage, WriterReservationToken,
-    is_replay_terminal_phase, parse_replay_stream_id, require_replay_claim_binding,
-    signed_supervision_lease_from_verified, signed_terminal_supervision_lease_from_verified,
+    UserBrokerResourceSelection, UserBrokerResourceSelectionSnapshot, VersionedArtifactEntry,
+    VersionedArtifactRegistry, WorkerReplayAck, WorkerReplayAckRecord, WorkerReplayBegin,
+    WorkerReplayCursors, WorkerReplayDraft, WorkerReplayEvent, WorkerReplayRequestDecision,
+    WorkerReplayRequestRecord, WorkerReplayStreamRecord, WriteIdempotencyRecoveryCursor,
+    WriteIdempotencyRecoveryEntry, WriteIdempotencyRecoveryPage, WriteReservationRecoveryCursor,
+    WriteReservationRecoveryPage, WriterReservationToken, is_replay_terminal_phase,
+    parse_replay_stream_id, require_replay_claim_binding, signed_supervision_lease_from_verified,
+    signed_terminal_supervision_lease_from_verified,
 };
 
 /// The versioned-artifact family rides the same ORS persistence codec as every
@@ -126,6 +127,12 @@ impl persistence_codec::PersistedValue for VersionedArtifactEntry {
 }
 
 const META: TableDefinition<&str, &str> = TableDefinition::new("ors_meta_v1");
+const STORE_OBJECT_IDENTITY_KEY: &str = "store_object_identity_v1";
+const STORE_OBJECT_IDENTITY_SCHEMA_KEY: &str = "store_object_identity_schema";
+const STORE_OBJECT_IDENTITY_SCHEMA_V1: &str = "ors_store_object_identity_v1";
+const STORE_OBJECT_IDENTITY_SCHEMA_VERSION: u16 = 1;
+const MAX_STORE_OBJECT_IDENTITY_BYTES: usize = 1024;
+const MAX_STORE_OBJECT_IDENTITY_SCHEMA_BYTES: usize = 64;
 const ENVELOPES: TableDefinition<&str, &str> = TableDefinition::new("ors_envelopes_v1");
 const RESERVATIONS: TableDefinition<&str, &str> = TableDefinition::new("ors_reservations_v1");
 const RESERVATION_ORDERS: TableDefinition<&str, &str> =
@@ -235,6 +242,18 @@ const UNKNOWN_COMMIT_RECOVERY: TableDefinition<&str, &str> =
 /// canonical ordering write attempt.
 const SCAN_DISCLOSURE_RECORDS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_scan_disclosure_v1");
+/// Durable cold-start lease and terminal readiness rows (issue #1790). These
+/// three tables share one readiness owner: immutable revision rows preserve
+/// terminal receipts, the base-identity head allocates the next revision, and
+/// the full-binding index makes an exact restart readback independent of the
+/// current head. Backup census marks the whole family historical so restore
+/// never revives an old lease or readiness decision.
+const COLD_START_READINESS_RECORDS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_cold_start_readiness_v1");
+const COLD_START_READINESS_HEADS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_cold_start_readiness_heads_v1");
+const COLD_START_READINESS_BINDINGS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_cold_start_readiness_bindings_v1");
 /// Durable owner-backed `backup.verify` results (issue #2802; I5.27, I14.21).
 ///
 /// One row per public request operation identity, so an exact replay of the same
@@ -268,6 +287,157 @@ const PURGE_LEDGER: TableDefinition<&str, &str> = TableDefinition::new("ors_purg
 /// instant and cannot be presented, retried or recomputed by the caller.
 const PURGE_LEDGER_REVISION_BINDINGS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_purge_ledger_revision_bindings_v1");
+
+/// Durable identity and open generation of this ORS database object.
+///
+/// This row lives in `ors_meta_v1`, outside the backup row-family denominator.
+/// The generation advances transactionally on every successful open, and the
+/// installation binding can be established once but never changed.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoreObjectIdentityRecord {
+    schema_version: u16,
+    installation_id: Option<String>,
+    ors_generation: u64,
+}
+
+impl StoreObjectIdentityRecord {
+    fn validate(&self) -> Result<(), OrsError> {
+        if self.schema_version != STORE_OBJECT_IDENTITY_SCHEMA_VERSION {
+            return Err(OrsError::MigrationRequired {
+                reason: "ORS store-object identity schema is unsupported".to_owned(),
+            });
+        }
+        if self.ors_generation == 0 {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "ors_store_object_identity",
+                reason: "store-object generation must be non-zero".to_owned(),
+            });
+        }
+        if let Some(installation_id) = &self.installation_id {
+            if installation_id.len() > crate::MAX_BACKUP_ID_LEN
+                || installation_id.trim() != installation_id
+                || installation_id.chars().any(char::is_control)
+            {
+                return Err(OrsError::InvalidField {
+                    field: "ors_installation_identity",
+                    reason: "installation identity must be exact, bounded text",
+                });
+            }
+            crate::model::validate_text(installation_id, "ors_installation_identity")?;
+        }
+        Ok(())
+    }
+
+    fn installed_identity(&self) -> Result<OrsStoreIdentity, OrsError> {
+        let installation_id =
+            self.installation_id
+                .clone()
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "ors_store_object_identity",
+                    reason: "ORS database is not bound to an installed identity".to_owned(),
+                })?;
+        Ok(OrsStoreIdentity {
+            installation_id,
+            ors_generation: self.ors_generation,
+        })
+    }
+}
+
+impl persistence_codec::PersistedValue for StoreObjectIdentityRecord {
+    const RECORD_TYPE: &'static str = "ors_store_object_identity";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+fn read_store_object_identity(
+    meta: &impl ReadableTable<&'static str, &'static str>,
+) -> Result<StoreObjectIdentityRecord, OrsError> {
+    let schema = match meta
+        .get(STORE_OBJECT_IDENTITY_SCHEMA_KEY)
+        .map_err(storage)?
+    {
+        Some(value) if value.value().len() > MAX_STORE_OBJECT_IDENTITY_SCHEMA_BYTES => {
+            return Err(OrsError::ProjectionLimitExceeded);
+        }
+        Some(value) => Some(value.value().to_owned()),
+        None => None,
+    };
+    match schema.as_deref() {
+        Some(STORE_OBJECT_IDENTITY_SCHEMA_V1) => {}
+        Some(_) => {
+            return Err(OrsError::MigrationRequired {
+                reason: "ORS store-object identity schema marker is unsupported".to_owned(),
+            });
+        }
+        None => {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "ors_store_object_identity",
+                reason: "store-object identity schema marker is missing".to_owned(),
+            });
+        }
+    }
+    let raw = meta
+        .get(STORE_OBJECT_IDENTITY_KEY)
+        .map_err(storage)?
+        .ok_or_else(|| OrsError::IntegrityProblem {
+            record_type: "ors_store_object_identity",
+            reason: "store-object identity row is missing".to_owned(),
+        })?;
+    if raw.value().len() > MAX_STORE_OBJECT_IDENTITY_BYTES {
+        return Err(OrsError::ProjectionLimitExceeded);
+    }
+    let raw = raw.value().to_owned();
+    let record: StoreObjectIdentityRecord = decode(&raw)?;
+    record.validate()?;
+    if encode(&record)? != raw {
+        return Err(OrsError::IntegrityProblem {
+            record_type: "ors_store_object_identity",
+            reason: "store-object identity row is not canonically encoded".to_owned(),
+        });
+    }
+    Ok(record)
+}
+
+fn validate_scan_disclosure_installation(
+    record: &crate::ScanDisclosureOrsRecord,
+    identity: &OrsStoreIdentity,
+) -> Result<(), OrsError> {
+    if record.installation_id != identity.installation_id {
+        return Err(OrsError::IntegrityProblem {
+            record_type: crate::SCAN_DISCLOSURE_RECORD_TYPE,
+            reason: "scan disclosure installation does not match the durable ORS binding"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// ORS-owned installation binding and durable object generation read back on open.
+///
+/// Fields are intentionally private: callers can carry the identity ORS read
+/// from its durable metadata, but cannot mint or substitute its generation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrsStoreIdentity {
+    installation_id: String,
+    ors_generation: u64,
+}
+
+impl OrsStoreIdentity {
+    /// Exact Host-injected installation identity bound to this ORS database.
+    #[must_use]
+    pub fn installation_id(&self) -> &str {
+        &self.installation_id
+    }
+
+    /// Durable ORS object generation read back after the open transaction.
+    #[must_use]
+    pub const fn ors_generation(&self) -> u64 {
+        self.ors_generation
+    }
+}
 const CUTOVER_OWNERSHIP: TableDefinition<&str, &str> =
     TableDefinition::new("ors_cutover_ownership_v1");
 const HOST_REQUESTS: TableDefinition<&str, &str> = TableDefinition::new("ors_host_requests_v1");
@@ -3359,6 +3529,21 @@ pub trait OperationalRecoveryStore: Send + Sync {
         fence: UserBrokerFence,
         expected: &UserBrokerRegistrationReceipt,
     ) -> Result<UserBrokerRegistrationSnapshot, OrsError>;
+    /// Commits one immutable Kernel-issued native resource selection under its
+    /// exact effect-operation identity. Exact replay returns the original
+    /// readback; changed content under that operation is rejected. ORS records
+    /// no semantic authority and does not mint the selection.
+    fn commit_user_broker_resource_selection(
+        &self,
+        selection: UserBrokerResourceSelection,
+    ) -> Result<UserBrokerResourceSelectionSnapshot, OrsError>;
+    /// Loads one exact owner-issued native resource selection by its effect
+    /// operation identity. The snapshot revalidates the typed selection and
+    /// store-issued receipt from the durable current row.
+    fn load_user_broker_resource_selection(
+        &self,
+        subject_id: &OperationIdentity,
+    ) -> Result<Option<UserBrokerResourceSelectionSnapshot>, OrsError>;
     fn commit_authority_snapshot(
         &self,
         snapshot: KernelAuthoritySnapshot,
@@ -4100,6 +4285,153 @@ pub struct RedbRecoveryStore {
         std::sync::Mutex<Option<Arc<crate::test_support::AuthorityHandoffPersistenceFailpoint>>>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ColdStartReadinessRevisionHead {
+    contract_version: u16,
+    base_identity_digest: String,
+    record_key: String,
+    record_revision: u64,
+}
+
+impl ColdStartReadinessRevisionHead {
+    fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != crate::CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        crate::model::validate_digest(
+            &self.base_identity_digest,
+            "cold_start_head_base_identity_digest",
+        )?;
+        if self.record_revision == 0
+            || self.record_key
+                != format!(
+                    "cold-start-readiness:{}:{:020}",
+                    self.base_identity_digest, self.record_revision
+                )
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                reason: "cold-start revision head has an invalid row address".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ColdStartReadinessBindingIndex {
+    contract_version: u16,
+    base_identity_digest: String,
+    binding_digest: String,
+    record_key: String,
+    record_revision: u64,
+}
+
+impl ColdStartReadinessBindingIndex {
+    fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != crate::CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        crate::model::validate_digest(
+            &self.base_identity_digest,
+            "cold_start_binding_base_identity_digest",
+        )?;
+        crate::model::validate_digest(&self.binding_digest, "cold_start_binding_digest")?;
+        if self.record_revision == 0
+            || self.record_key
+                != format!(
+                    "cold-start-readiness:{}:{:020}",
+                    self.base_identity_digest, self.record_revision
+                )
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                reason: "cold-start binding index has an invalid row address".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl persistence_codec::PersistedValue for crate::ColdStartReadinessOrsRecord {
+    const RECORD_TYPE: &'static str = crate::COLD_START_READINESS_RECORD_TYPE;
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl persistence_codec::PersistedValue for ColdStartReadinessRevisionHead {
+    const RECORD_TYPE: &'static str = "cold_start_readiness_revision_head";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl persistence_codec::PersistedValue for ColdStartReadinessBindingIndex {
+    const RECORD_TYPE: &'static str = "cold_start_readiness_binding_index";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+fn validate_cold_start_installation(
+    claim: &crate::ColdStartReadinessClaim,
+    identity: &OrsStoreIdentity,
+) -> Result<(), OrsError> {
+    if claim.key.installation_id != identity.installation_id {
+        return Err(OrsError::IntegrityProblem {
+            record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+            reason: "cold-start readiness installation does not match the durable ORS binding"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Canonical ORS port for durable cold-start lease and terminal receipt rows.
+///
+/// The claim operation is one atomic single-flight decision. Publication is
+/// absorbing once a terminal receipt is present; every read revalidates the
+/// typed identity key, fence, lease bytes, terminal revision, and receipt
+/// digest. This owner is separate from scan-disclosure lifecycle records.
+pub trait ColdStartReadinessRecordOwner: Send + Sync {
+    /// Claims or joins one exact cold-start key; an expired active lease gets
+    /// a new retained revision, while a terminal winner is immutable.
+    fn claim_cold_start_readiness(
+        &self,
+        claim: &crate::ColdStartReadinessClaim,
+        now: u64,
+    ) -> Result<crate::ColdStartReadinessStageOutcome, OrsError>;
+
+    /// Publishes the one immutable terminal receipt for an owned lease.
+    fn publish_cold_start_readiness(
+        &self,
+        record_key: &str,
+        binding_digest: &str,
+        lease_ref: &str,
+        disposition: crate::ColdStartReadinessTerminalDisposition,
+        receipt_ref: &str,
+        receipt_bytes: &str,
+    ) -> Result<Option<crate::ColdStartReadinessOrsRecord>, OrsError>;
+
+    /// Loads one exact durable revision by its owner-issued row key.
+    fn load_cold_start_readiness(
+        &self,
+        record_key: &str,
+    ) -> Result<Option<crate::ColdStartReadinessOrsRecord>, OrsError>;
+
+    /// Loads the latest durable revision for one exact full identity/fence key.
+    fn load_cold_start_readiness_for_binding(
+        &self,
+        binding_digest: &str,
+    ) -> Result<Option<crate::ColdStartReadinessOrsRecord>, OrsError>;
+}
+
 /// Narrow durable port for scan disclosure records (issue #2900).
 ///
 /// The installation-bound scan-disclosure adapter writes, replays, reads and
@@ -4194,6 +4526,50 @@ impl ScanDisclosureRecordOwner for RedbRecoveryStore {
         limit: u16,
     ) -> Result<Vec<crate::ScanDisclosureOrsRecord>, OrsError> {
         RedbRecoveryStore::list_scan_disclosures(self, installation_id, limit)
+    }
+}
+
+impl ColdStartReadinessRecordOwner for RedbRecoveryStore {
+    fn claim_cold_start_readiness(
+        &self,
+        claim: &crate::ColdStartReadinessClaim,
+        now: u64,
+    ) -> Result<crate::ColdStartReadinessStageOutcome, OrsError> {
+        RedbRecoveryStore::claim_cold_start_readiness(self, claim, now)
+    }
+
+    fn publish_cold_start_readiness(
+        &self,
+        record_key: &str,
+        binding_digest: &str,
+        lease_ref: &str,
+        disposition: crate::ColdStartReadinessTerminalDisposition,
+        receipt_ref: &str,
+        receipt_bytes: &str,
+    ) -> Result<Option<crate::ColdStartReadinessOrsRecord>, OrsError> {
+        RedbRecoveryStore::publish_cold_start_readiness(
+            self,
+            record_key,
+            binding_digest,
+            lease_ref,
+            disposition,
+            receipt_ref,
+            receipt_bytes,
+        )
+    }
+
+    fn load_cold_start_readiness(
+        &self,
+        record_key: &str,
+    ) -> Result<Option<crate::ColdStartReadinessOrsRecord>, OrsError> {
+        RedbRecoveryStore::load_cold_start_readiness(self, record_key)
+    }
+
+    fn load_cold_start_readiness_for_binding(
+        &self,
+        binding_digest: &str,
+    ) -> Result<Option<crate::ColdStartReadinessOrsRecord>, OrsError> {
+        RedbRecoveryStore::load_cold_start_readiness_for_binding(self, binding_digest)
     }
 }
 
@@ -5705,6 +6081,381 @@ impl RedbRecoveryStore {
             })
     }
 
+    /// Atomically claims one exact cold-start single-flight key (issue #1790).
+    ///
+    /// A changed workspace, privacy boundary, governing-source generation,
+    /// source digest set, dirty summary or state fence receives a new
+    /// append-only revision under the same base workspace identity. An exact
+    /// replay joins the retained lease until its deadline; after expiry, the
+    /// next lease gets a new revision even when the earlier row is terminal.
+    /// A terminal receipt is never overwritten.
+    pub fn claim_cold_start_readiness(
+        &self,
+        claim: &crate::ColdStartReadinessClaim,
+        now: u64,
+    ) -> Result<crate::ColdStartReadinessStageOutcome, OrsError> {
+        claim.validate()?;
+        if now == 0 || now > claim.lease_deadline {
+            return Err(OrsError::InvalidField {
+                field: "cold_start_claim_now",
+                reason: "claim time must be non-zero and not past the lease deadline",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let store_identity = {
+            let meta = write.open_table(META).map_err(storage)?;
+            read_store_object_identity(&meta)?.installed_identity()?
+        };
+        validate_cold_start_installation(claim, &store_identity)?;
+
+        if let Some(existing) = Self::load_cold_start_binding(&write, claim, &store_identity)?
+            .filter(|existing| now <= existing.claim.lease_deadline)
+        {
+            write.commit().map_err(storage)?;
+            return Ok(crate::ColdStartReadinessStageOutcome::AlreadyBound {
+                record: Box::new(existing),
+            });
+        }
+
+        let revision = Self::next_cold_start_revision(&write, claim)?;
+        let record = crate::ColdStartReadinessOrsRecord::leased(claim.clone(), revision);
+        Self::persist_cold_start_claim(&write, claim, &record)?;
+        write.commit().map_err(storage)?;
+        Ok(crate::ColdStartReadinessStageOutcome::Stored {
+            record: Box::new(record),
+        })
+    }
+
+    fn load_cold_start_binding(
+        write: &redb::WriteTransaction,
+        claim: &crate::ColdStartReadinessClaim,
+        store_identity: &OrsStoreIdentity,
+    ) -> Result<Option<crate::ColdStartReadinessOrsRecord>, OrsError> {
+        let index = {
+            let indexes = write
+                .open_table(COLD_START_READINESS_BINDINGS)
+                .map_err(storage)?;
+            indexes
+                .get(claim.binding_digest.as_str())
+                .map_err(storage)?
+                .map(|value| decode::<ColdStartReadinessBindingIndex>(value.value()))
+                .transpose()?
+        };
+        let Some(index) = index else {
+            return Ok(None);
+        };
+        index.validate()?;
+        if index.binding_digest != claim.binding_digest
+            || index.base_identity_digest != claim.base_identity_digest
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                reason: "cold-start binding index disagrees with the presented key".to_owned(),
+            });
+        }
+        let existing = {
+            let records = write
+                .open_table(COLD_START_READINESS_RECORDS)
+                .map_err(storage)?;
+            let raw = records
+                .get(index.record_key.as_str())
+                .map_err(storage)?
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                    reason: "cold-start binding index points to a missing revision".to_owned(),
+                })?;
+            decode::<crate::ColdStartReadinessOrsRecord>(raw.value())?
+        };
+        existing.validate()?;
+        validate_cold_start_installation(&existing.claim, store_identity)?;
+        if existing.claim.binding_digest != claim.binding_digest
+            || !existing.claim.same_key(claim)
+            || existing.record_key != index.record_key
+            || existing.record_revision != index.record_revision
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                reason: "cold-start binding index does not identify its exact durable key"
+                    .to_owned(),
+            });
+        }
+        Ok(Some(existing))
+    }
+
+    fn next_cold_start_revision(
+        write: &redb::WriteTransaction,
+        claim: &crate::ColdStartReadinessClaim,
+    ) -> Result<u64, OrsError> {
+        let head = {
+            let heads = write
+                .open_table(COLD_START_READINESS_HEADS)
+                .map_err(storage)?;
+            heads
+                .get(claim.base_identity_digest.as_str())
+                .map_err(storage)?
+                .map(|value| decode::<ColdStartReadinessRevisionHead>(value.value()))
+                .transpose()?
+        };
+        let Some(head) = head else {
+            return Ok(1);
+        };
+        head.validate()?;
+        if head.base_identity_digest != claim.base_identity_digest {
+            return Err(OrsError::IntegrityProblem {
+                record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                reason: "cold-start revision head disagrees with its table key".to_owned(),
+            });
+        }
+        let head_record = {
+            let records = write
+                .open_table(COLD_START_READINESS_RECORDS)
+                .map_err(storage)?;
+            let raw = records
+                .get(head.record_key.as_str())
+                .map_err(storage)?
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                    reason: "cold-start revision head points to a missing row".to_owned(),
+                })?;
+            decode::<crate::ColdStartReadinessOrsRecord>(raw.value())?
+        };
+        head_record.validate()?;
+        if head_record.record_revision != head.record_revision
+            || head_record.claim.base_identity_digest != head.base_identity_digest
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                reason: "cold-start revision head does not match its durable row".to_owned(),
+            });
+        }
+        head.record_revision
+            .checked_add(1)
+            .ok_or(OrsError::ProjectionLimitExceeded)
+    }
+
+    fn persist_cold_start_claim(
+        write: &redb::WriteTransaction,
+        claim: &crate::ColdStartReadinessClaim,
+        record: &crate::ColdStartReadinessOrsRecord,
+    ) -> Result<(), OrsError> {
+        record.validate()?;
+        let head = ColdStartReadinessRevisionHead {
+            contract_version: crate::CONTRACT_VERSION,
+            base_identity_digest: claim.base_identity_digest.clone(),
+            record_key: record.record_key.clone(),
+            record_revision: record.record_revision,
+        };
+        let index = ColdStartReadinessBindingIndex {
+            contract_version: crate::CONTRACT_VERSION,
+            base_identity_digest: claim.base_identity_digest.clone(),
+            binding_digest: claim.binding_digest.clone(),
+            record_key: record.record_key.clone(),
+            record_revision: record.record_revision,
+        };
+        head.validate()?;
+        index.validate()?;
+        let record_bytes = encode(record)?;
+        let head_bytes = encode(&head)?;
+        let index_bytes = encode(&index)?;
+        {
+            let mut records = write
+                .open_table(COLD_START_READINESS_RECORDS)
+                .map_err(storage)?;
+            if records
+                .get(record.record_key.as_str())
+                .map_err(storage)?
+                .is_some()
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                    reason: "cold-start revision row already exists without its binding index"
+                        .to_owned(),
+                });
+            }
+            records
+                .insert(record.record_key.as_str(), record_bytes.as_str())
+                .map_err(storage)?;
+        }
+        {
+            let mut heads = write
+                .open_table(COLD_START_READINESS_HEADS)
+                .map_err(storage)?;
+            heads
+                .insert(claim.base_identity_digest.as_str(), head_bytes.as_str())
+                .map_err(storage)?;
+        }
+        {
+            let mut indexes = write
+                .open_table(COLD_START_READINESS_BINDINGS)
+                .map_err(storage)?;
+            indexes
+                .insert(claim.binding_digest.as_str(), index_bytes.as_str())
+                .map_err(storage)?;
+        }
+        Ok(())
+    }
+
+    /// Publishes one immutable terminal readiness receipt for its claimed row.
+    pub fn publish_cold_start_readiness(
+        &self,
+        record_key: &str,
+        binding_digest: &str,
+        lease_ref: &str,
+        disposition: crate::ColdStartReadinessTerminalDisposition,
+        receipt_ref: &str,
+        receipt_bytes: &str,
+    ) -> Result<Option<crate::ColdStartReadinessOrsRecord>, OrsError> {
+        crate::model::validate_text(record_key, "cold_start_record_key")?;
+        crate::model::validate_digest(binding_digest, "cold_start_binding_digest")?;
+        crate::model::validate_text(lease_ref, "cold_start_lease_ref")?;
+        crate::model::validate_text(receipt_ref, "cold_start_receipt_ref")?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let store_identity = {
+            let meta = write.open_table(META).map_err(storage)?;
+            read_store_object_identity(&meta)?.installed_identity()?
+        };
+        let mut record = {
+            let records = write
+                .open_table(COLD_START_READINESS_RECORDS)
+                .map_err(storage)?;
+            let Some(raw) = records.get(record_key).map_err(storage)? else {
+                drop(records);
+                write.commit().map_err(storage)?;
+                return Ok(None);
+            };
+            decode::<crate::ColdStartReadinessOrsRecord>(raw.value())?
+        };
+        record.validate()?;
+        validate_cold_start_installation(&record.claim, &store_identity)?;
+        if record.claim.binding_digest != binding_digest || record.claim.lease_ref != lease_ref {
+            return Err(OrsError::IntegrityProblem {
+                record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                reason: "terminal readiness publication does not match its lease owner".to_owned(),
+            });
+        }
+        let terminal = crate::ColdStartReadinessTerminalReceipt {
+            disposition,
+            receipt_ref: receipt_ref.to_owned(),
+            receipt_revision: record.record_revision,
+            receipt_digest: crate::model::sha256_hex(receipt_bytes.as_bytes()),
+            receipt_bytes: receipt_bytes.to_owned(),
+        };
+        match record.terminal.as_ref() {
+            Some(existing) if existing == &terminal => {
+                write.commit().map_err(storage)?;
+                Ok(Some(record))
+            }
+            Some(_) => Err(OrsError::IntegrityProblem {
+                record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                reason: "terminal readiness revision is immutable".to_owned(),
+            }),
+            None => {
+                record.terminal = Some(terminal);
+                record.validate()?;
+                let bytes = encode(&record)?;
+                {
+                    let mut records = write
+                        .open_table(COLD_START_READINESS_RECORDS)
+                        .map_err(storage)?;
+                    records
+                        .insert(record_key, bytes.as_str())
+                        .map_err(storage)?;
+                }
+                write.commit().map_err(storage)?;
+                Ok(Some(record))
+            }
+        }
+    }
+
+    /// Loads and validates one exact cold-start revision.
+    pub fn load_cold_start_readiness(
+        &self,
+        record_key: &str,
+    ) -> Result<Option<crate::ColdStartReadinessOrsRecord>, OrsError> {
+        crate::model::validate_text(record_key, "cold_start_record_key")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let store_identity = {
+            let meta = read.open_table(META).map_err(storage)?;
+            read_store_object_identity(&meta)?.installed_identity()?
+        };
+        let records = read
+            .open_table(COLD_START_READINESS_RECORDS)
+            .map_err(storage)?;
+        records
+            .get(record_key)
+            .map_err(storage)?
+            .map(|raw| {
+                let record: crate::ColdStartReadinessOrsRecord = decode(raw.value())?;
+                record.validate()?;
+                validate_cold_start_installation(&record.claim, &store_identity)?;
+                if record.record_key != record_key {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                        reason: "cold-start row key does not match its durable record".to_owned(),
+                    });
+                }
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    /// Loads and validates the exact durable revision for one full key digest.
+    pub fn load_cold_start_readiness_for_binding(
+        &self,
+        binding_digest: &str,
+    ) -> Result<Option<crate::ColdStartReadinessOrsRecord>, OrsError> {
+        crate::model::validate_digest(binding_digest, "cold_start_binding_digest")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let store_identity = {
+            let meta = read.open_table(META).map_err(storage)?;
+            read_store_object_identity(&meta)?.installed_identity()?
+        };
+        let index = {
+            let indexes = read
+                .open_table(COLD_START_READINESS_BINDINGS)
+                .map_err(storage)?;
+            indexes
+                .get(binding_digest)
+                .map_err(storage)?
+                .map(|raw| decode::<ColdStartReadinessBindingIndex>(raw.value()))
+                .transpose()?
+        };
+        let Some(index) = index else {
+            return Ok(None);
+        };
+        index.validate()?;
+        if index.binding_digest != binding_digest {
+            return Err(OrsError::IntegrityProblem {
+                record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                reason: "cold-start binding index key does not match its record".to_owned(),
+            });
+        }
+        let records = read
+            .open_table(COLD_START_READINESS_RECORDS)
+            .map_err(storage)?;
+        let raw = records
+            .get(index.record_key.as_str())
+            .map_err(storage)?
+            .ok_or_else(|| OrsError::IntegrityProblem {
+                record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                reason: "cold-start binding index points to a missing revision".to_owned(),
+            })?;
+        let record: crate::ColdStartReadinessOrsRecord = decode(raw.value())?;
+        record.validate()?;
+        validate_cold_start_installation(&record.claim, &store_identity)?;
+        if record.claim.binding_digest != binding_digest
+            || record.claim.base_identity_digest != index.base_identity_digest
+            || record.record_key != index.record_key
+            || record.record_revision != index.record_revision
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: crate::COLD_START_READINESS_RECORD_TYPE,
+                reason: "cold-start binding index does not match its durable revision".to_owned(),
+            });
+        }
+        Ok(Some(record))
+    }
+
     /// Stages one scan disclosure record as `Prepared` (issue #2900).
     ///
     /// The stage is the atomic durable step: an exact replay of the same
@@ -5725,6 +6476,11 @@ impl RedbRecoveryStore {
             });
         }
         let write = self.database.begin_write().map_err(storage)?;
+        let store_identity = {
+            let meta = write.open_table(META).map_err(storage)?;
+            read_store_object_identity(&meta)?.installed_identity()?
+        };
+        validate_scan_disclosure_installation(record, &store_identity)?;
         let key = record.operation_key.clone();
         let stored = {
             let mut table = write.open_table(SCAN_DISCLOSURE_RECORDS).map_err(storage)?;
@@ -5775,6 +6531,10 @@ impl RedbRecoveryStore {
         crate::model::validate_digest(request_hash, "scan_disclosure_request_hash")?;
         crate::model::validate_text(writer_receipt, "scan_disclosure_writer_receipt")?;
         let write = self.database.begin_write().map_err(storage)?;
+        let store_identity = {
+            let meta = write.open_table(META).map_err(storage)?;
+            read_store_object_identity(&meta)?.installed_identity()?
+        };
         let committed = {
             let mut table = write.open_table(SCAN_DISCLOSURE_RECORDS).map_err(storage)?;
             let staged_bytes = table
@@ -5788,6 +6548,7 @@ impl RedbRecoveryStore {
             };
             let mut next: crate::ScanDisclosureOrsRecord = decode(&bytes)?;
             next.validate()?;
+            validate_scan_disclosure_installation(&next, &store_identity)?;
             if next.request_hash != request_hash {
                 return Err(OrsError::IntegrityProblem {
                     record_type: crate::SCAN_DISCLOSURE_RECORD_TYPE,
@@ -5830,6 +6591,10 @@ impl RedbRecoveryStore {
         operation_key: &str,
     ) -> Result<Option<crate::ScanDisclosureOrsRecord>, OrsError> {
         let read = self.database.begin_read().map_err(storage)?;
+        let store_identity = {
+            let meta = read.open_table(META).map_err(storage)?;
+            read_store_object_identity(&meta)?.installed_identity()?
+        };
         let table = read.open_table(SCAN_DISCLOSURE_RECORDS).map_err(storage)?;
         table
             .get(operation_key)
@@ -5837,6 +6602,7 @@ impl RedbRecoveryStore {
             .map(|value| {
                 let record: crate::ScanDisclosureOrsRecord = decode(value.value())?;
                 record.validate()?;
+                validate_scan_disclosure_installation(&record, &store_identity)?;
                 if record.operation_key != operation_key {
                     return Err(OrsError::IntegrityProblem {
                         record_type: crate::SCAN_DISCLOSURE_RECORD_TYPE,
@@ -5882,6 +6648,10 @@ impl RedbRecoveryStore {
             crate::model::validate_text(successor, "scan_disclosure_supersedes_ref")?;
         }
         let write = self.database.begin_write().map_err(storage)?;
+        let store_identity = {
+            let meta = write.open_table(META).map_err(storage)?;
+            read_store_object_identity(&meta)?.installed_identity()?
+        };
         let retired = {
             let mut table = write.open_table(SCAN_DISCLOSURE_RECORDS).map_err(storage)?;
             let staged_bytes = table
@@ -5895,6 +6665,7 @@ impl RedbRecoveryStore {
             };
             let mut next: crate::ScanDisclosureOrsRecord = decode(&bytes)?;
             next.validate()?;
+            validate_scan_disclosure_installation(&next, &store_identity)?;
             if next.request_hash != request_hash {
                 return Err(OrsError::IntegrityProblem {
                     record_type: crate::SCAN_DISCLOSURE_RECORD_TYPE,
@@ -5955,12 +6726,23 @@ impl RedbRecoveryStore {
             return Err(OrsError::InvalidCursorLimit);
         }
         let read = self.database.begin_read().map_err(storage)?;
+        let store_identity = {
+            let meta = read.open_table(META).map_err(storage)?;
+            read_store_object_identity(&meta)?.installed_identity()?
+        };
+        if installation_id != store_identity.installation_id() {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "ors_store_object_identity",
+                reason: "scan disclosure listing does not match the durable ORS binding".to_owned(),
+            });
+        }
         let table = read.open_table(SCAN_DISCLOSURE_RECORDS).map_err(storage)?;
         let mut records = Vec::new();
         for entry in table.iter().map_err(storage)? {
             let (_, value) = entry.map_err(storage)?;
             let record: crate::ScanDisclosureOrsRecord = decode(value.value())?;
             record.validate()?;
+            validate_scan_disclosure_installation(&record, &store_identity)?;
             if record.installation_id == installation_id {
                 records.push(record);
             }
@@ -24791,22 +25573,30 @@ impl RedbRecoveryStore {
         Ok(())
     }
 
-    /// Opens or creates an ORS database and converts interrupted execution to reconciliation.
+    /// Opens or creates an unbound ORS database and advances its durable object generation.
+    ///
+    /// Production installation-scoped composition should use
+    /// [`Self::open_for_installation`], which also binds the Host-issued
+    /// installation identity before returning the store.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, OrsError> {
-        let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(storage)?;
-        }
-        let database = Database::create(path).map_err(storage)?;
-        let store = Self {
-            database,
-            evidence: Arc::new(RejectUnboundEvidence),
-            #[cfg(feature = "test-support")]
-            authority_handoff_failpoint: std::sync::Mutex::new(None),
-        };
-        store.initialize()?;
-        store.recover_interrupted_execution()?;
+        let (store, _) = Self::open_inner(path, Arc::new(RejectUnboundEvidence), None)?;
         Ok(store)
+    }
+
+    /// Opens ORS for one Host-authenticated installation and returns the
+    /// installation binding and generation read back from durable ORS metadata.
+    ///
+    /// The binding is set once. A later open for a different installation
+    /// fails closed. The object generation is allocated by ORS and increments
+    /// transactionally on every successful open; it is not accepted from the
+    /// caller, backup request, runtime artifact registry or P-07 revision.
+    pub fn open_for_installation(
+        path: impl AsRef<Path>,
+        installation_id: &str,
+    ) -> Result<(Self, OrsStoreIdentity), OrsError> {
+        let (store, record) =
+            Self::open_inner(path, Arc::new(RejectUnboundEvidence), Some(installation_id))?;
+        Ok((store, record.installed_identity()?))
     }
 
     /// Opens ORS with the composition-owned canonical/readback authenticator.
@@ -24814,6 +25604,25 @@ impl RedbRecoveryStore {
         path: impl AsRef<Path>,
         evidence: Arc<dyn CanonicalEvidenceProvider>,
     ) -> Result<Self, OrsError> {
+        let (store, _) = Self::open_inner(path, evidence, None)?;
+        Ok(store)
+    }
+
+    /// Reads the installed identity and object generation from durable ORS metadata.
+    ///
+    /// This is a readback of the store-owned binding, not a cached or caller-
+    /// supplied identity. It fails closed when the database is still unbound.
+    pub fn installed_store_identity(&self) -> Result<OrsStoreIdentity, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let meta = read.open_table(META).map_err(storage)?;
+        read_store_object_identity(&meta)?.installed_identity()
+    }
+
+    fn open_inner(
+        path: impl AsRef<Path>,
+        evidence: Arc<dyn CanonicalEvidenceProvider>,
+        expected_installation_id: Option<&str>,
+    ) -> Result<(Self, StoreObjectIdentityRecord), OrsError> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(storage)?;
@@ -24826,8 +25635,161 @@ impl RedbRecoveryStore {
             authority_handoff_failpoint: std::sync::Mutex::new(None),
         };
         store.initialize()?;
+        store.check_store_object_identity(expected_installation_id)?;
         store.recover_interrupted_execution()?;
-        Ok(store)
+        let identity = store.advance_store_object_generation(expected_installation_id)?;
+        Ok((store, identity))
+    }
+
+    fn check_store_object_identity(
+        &self,
+        expected_installation_id: Option<&str>,
+    ) -> Result<(), OrsError> {
+        if let Some(installation_id) = expected_installation_id {
+            crate::model::validate_text(installation_id, "ors_installation_identity")?;
+            if installation_id.len() > crate::MAX_BACKUP_ID_LEN
+                || installation_id.trim() != installation_id
+                || installation_id.chars().any(char::is_control)
+            {
+                return Err(OrsError::InvalidField {
+                    field: "ors_installation_identity",
+                    reason: "installation identity must be exact, bounded text",
+                });
+            }
+        }
+        let read = self.database.begin_read().map_err(storage)?;
+        let meta = read.open_table(META).map_err(storage)?;
+        let schema_present = meta
+            .get(STORE_OBJECT_IDENTITY_SCHEMA_KEY)
+            .map_err(storage)?
+            .is_some();
+        let identity_present = meta
+            .get(STORE_OBJECT_IDENTITY_KEY)
+            .map_err(storage)?
+            .is_some();
+        let identity = match (schema_present, identity_present) {
+            (false, false) => None,
+            (true, true) => Some(read_store_object_identity(&meta)?),
+            _ => {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "ors_store_object_identity",
+                    reason: "store-object identity row and schema marker disagree".to_owned(),
+                });
+            }
+        };
+        if let (Some(expected), Some(identity)) = (expected_installation_id, identity)
+            && identity
+                .installation_id
+                .as_deref()
+                .is_some_and(|bound| bound != expected)
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "ors_store_object_identity",
+                reason: "ORS database is bound to a different installation identity".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn advance_store_object_generation(
+        &self,
+        expected_installation_id: Option<&str>,
+    ) -> Result<StoreObjectIdentityRecord, OrsError> {
+        let write = self.database.begin_write().map_err(storage)?;
+        let mut meta = write.open_table(META).map_err(storage)?;
+        let schema = match meta
+            .get(STORE_OBJECT_IDENTITY_SCHEMA_KEY)
+            .map_err(storage)?
+        {
+            Some(value) if value.value().len() > MAX_STORE_OBJECT_IDENTITY_SCHEMA_BYTES => {
+                return Err(OrsError::ProjectionLimitExceeded);
+            }
+            Some(value) => Some(value.value().to_owned()),
+            None => None,
+        };
+        let raw_record = match meta.get(STORE_OBJECT_IDENTITY_KEY).map_err(storage)? {
+            Some(value) if value.value().len() > MAX_STORE_OBJECT_IDENTITY_BYTES => {
+                return Err(OrsError::ProjectionLimitExceeded);
+            }
+            Some(value) => Some(value.value().to_owned()),
+            None => None,
+        };
+        let mut record = match (schema.as_deref(), raw_record) {
+            (None, None) => StoreObjectIdentityRecord {
+                schema_version: STORE_OBJECT_IDENTITY_SCHEMA_VERSION,
+                installation_id: expected_installation_id.map(str::to_owned),
+                ors_generation: 1,
+            },
+            (Some(STORE_OBJECT_IDENTITY_SCHEMA_V1), Some(raw)) => {
+                let mut record: StoreObjectIdentityRecord = decode(&raw)?;
+                record.validate()?;
+                if encode(&record)? != raw {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "ors_store_object_identity",
+                        reason: "store-object identity row is not canonically encoded".to_owned(),
+                    });
+                }
+                record.ors_generation = record.ors_generation.checked_add(1).ok_or_else(|| {
+                    OrsError::IntegrityProblem {
+                        record_type: "ors_store_object_identity",
+                        reason: "store-object generation is exhausted".to_owned(),
+                    }
+                })?;
+                record
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "ors_store_object_identity",
+                    reason: "store-object identity row and schema marker disagree".to_owned(),
+                });
+            }
+            (Some(_), Some(_)) => {
+                return Err(OrsError::MigrationRequired {
+                    reason: "ORS store-object identity schema marker is unsupported".to_owned(),
+                });
+            }
+        };
+
+        if let Some(expected) = expected_installation_id {
+            match record.installation_id.as_deref() {
+                Some(bound) if bound != expected => {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "ors_store_object_identity",
+                        reason: "ORS database is bound to a different installation identity"
+                            .to_owned(),
+                    });
+                }
+                Some(_) => {}
+                None => record.installation_id = Some(expected.to_owned()),
+            }
+        }
+        record.validate()?;
+        let encoded = encode(&record)?;
+        meta.insert(STORE_OBJECT_IDENTITY_KEY, encoded.as_str())
+            .map_err(storage)?;
+        meta.insert(
+            STORE_OBJECT_IDENTITY_SCHEMA_KEY,
+            STORE_OBJECT_IDENTITY_SCHEMA_V1,
+        )
+        .map_err(storage)?;
+        drop(meta);
+        write.commit().map_err(storage)?;
+
+        // Return a fresh read of the committed row, not the attempted write or
+        // a caller-provided generation.
+        let read = self.database.begin_read().map_err(storage)?;
+        let meta = read.open_table(META).map_err(storage)?;
+        let readback = read_store_object_identity(&meta)?;
+        if readback.ors_generation != record.ors_generation
+            || readback.installation_id != record.installation_id
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "ors_store_object_identity",
+                reason: "store-object identity readback differs from the committed generation"
+                    .to_owned(),
+            });
+        }
+        Ok(readback)
     }
 
     /// Opens a Kernel-route test store with the structural Kernel-route evidence.
@@ -27441,6 +28403,7 @@ impl RedbRecoveryStore {
             terminal_receipt_sha256: None,
             admission_reservation: None,
             generation_cutover: None,
+            user_broker_resource_selection: None,
         };
         Self::persist_operational_record(&write, &key, &record)?;
         write.commit().map_err(storage)?;
@@ -27458,6 +28421,85 @@ impl RedbRecoveryStore {
         }
         UserBrokerRegistrationSnapshot::from_store(
             record.input.clone(),
+            record.phase,
+            record.operation_order,
+            Self::receipt_for(record)?,
+        )
+    }
+
+    fn user_broker_resource_selection_input(
+        selection: &UserBrokerResourceSelection,
+    ) -> Result<OperationalRecordInput, OrsError> {
+        selection.validate()?;
+        let record_id = selection.record_id()?;
+        let subject_id = selection.subject_id()?;
+        let payload_bytes = encode(selection)?.into_bytes();
+        let payload_length =
+            u64::try_from(payload_bytes.len()).map_err(|_| OrsError::PayloadTooLarge)?;
+        let payload_sha256 = crate::model::sha256_hex(&payload_bytes);
+        let authority_epoch = EpochLineage {
+            current: EpochIdentity {
+                lineage_id: OpaqueLabel::new(
+                    selection.selection.authority_epoch.lineage_id.as_str(),
+                )?,
+                epoch: selection.selection.authority_epoch.sequence.get(),
+            },
+            predecessor: None,
+        };
+        authority_epoch.validate()?;
+        let state_fence = StateFenceSnapshot::capture(
+            &selection.selection.state_fence,
+            authority_epoch.current.epoch,
+        )?;
+        state_fence.validate_against_epoch(&selection.selection.authority_epoch)?;
+        let created_at_ms =
+            i64::try_from(selection.selection.issued_at).map_err(|_| OrsError::InvalidField {
+                field: "user_broker_resource_selection_issued_at",
+                reason: "selection timestamp exceeds the ORS creation-time range",
+            })?;
+        let locator = PlatformHandle::new(format!(
+            "ors:user-broker-resource-selection:{}",
+            subject_id.as_str()
+        ))
+        .map_err(|error| OrsError::Contract(error.to_string()))?;
+        OperationalRecordInput::immutable_locator(
+            OperationalRecordContext {
+                record_id,
+                subject_id,
+                authority_epoch,
+                state_fence,
+                created_at_ms,
+                cleanup_after_ms: None,
+            },
+            locator,
+            payload_sha256,
+            payload_length,
+        )
+    }
+
+    fn user_broker_resource_selection_snapshot(
+        record: &DurableOperationalRecord,
+    ) -> Result<UserBrokerResourceSelectionSnapshot, OrsError> {
+        let selection = record
+            .user_broker_resource_selection
+            .as_ref()
+            .ok_or_else(|| OrsError::IntegrityProblem {
+                record_type: "user_broker_resource_selection",
+                reason: "typed selection sidecar is missing".to_owned(),
+            })?;
+        if record.kind != OperationalKind::UserBrokerResourceSelection
+            || record.admission_reservation.is_some()
+            || record.generation_cutover.is_some()
+            || Self::user_broker_resource_selection_input(selection)? != record.input
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "user_broker_resource_selection",
+                reason: "operational kind, metadata, locator, or typed selection mismatch"
+                    .to_owned(),
+            });
+        }
+        UserBrokerResourceSelectionSnapshot::from_store(
+            selection.clone(),
             record.phase,
             record.operation_order,
             Self::receipt_for(record)?,
@@ -27561,10 +28603,95 @@ impl RedbRecoveryStore {
             terminal_receipt_sha256: None,
             admission_reservation: None,
             generation_cutover: None,
+            user_broker_resource_selection: None,
         };
         Self::persist_operational_record(&write, &key, &record)?;
         write.commit().map_err(storage)?;
         Self::user_broker_snapshot(&record)
+    }
+
+    fn load_user_broker_resource_selection(
+        &self,
+        subject_id: &OperationIdentity,
+    ) -> Result<Option<UserBrokerResourceSelectionSnapshot>, OrsError> {
+        let key = Self::operational_key(OperationalKind::UserBrokerResourceSelection, subject_id);
+        let read = self.database.begin_read().map_err(storage)?;
+        let current = read.open_table(OPERATIONAL_CURRENT).map_err(storage)?;
+        current
+            .get(key.as_str())
+            .map_err(storage)?
+            .map(|value| {
+                let record: DurableOperationalRecord =
+                    decode_named(value.value(), "operational_current")?;
+                record.input.validate()?;
+                if record.kind != OperationalKind::UserBrokerResourceSelection
+                    || record.input.subject_id != *subject_id
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "user_broker_resource_selection",
+                        reason: "current row identity does not match its key".to_owned(),
+                    });
+                }
+                Self::user_broker_resource_selection_snapshot(&record)
+            })
+            .transpose()
+    }
+
+    fn commit_user_broker_resource_selection(
+        &self,
+        selection: UserBrokerResourceSelection,
+    ) -> Result<UserBrokerResourceSelectionSnapshot, OrsError> {
+        selection.validate()?;
+        let input = Self::user_broker_resource_selection_input(&selection)?;
+        let key = Self::operational_key(
+            OperationalKind::UserBrokerResourceSelection,
+            &input.subject_id,
+        );
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing = {
+            let current = write.open_table(OPERATIONAL_CURRENT).map_err(storage)?;
+            current
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| {
+                    decode_named::<DurableOperationalRecord>(value.value(), "operational_current")
+                })
+                .transpose()?
+        };
+        if let Some(existing) = existing {
+            existing.input.validate()?;
+            if existing.kind != OperationalKind::UserBrokerResourceSelection
+                || existing.input.subject_id != input.subject_id
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "user_broker_resource_selection",
+                    reason: "current row identity does not match its key".to_owned(),
+                });
+            }
+            let snapshot = Self::user_broker_resource_selection_snapshot(&existing)?;
+            if existing.phase == OperationalPhase::Active
+                && existing.input == input
+                && existing.user_broker_resource_selection.as_ref() == Some(&selection)
+            {
+                return Ok(snapshot);
+            }
+            return Err(OrsError::DuplicateConflict);
+        }
+
+        let durable = DurableOperationalRecord {
+            kind: OperationalKind::UserBrokerResourceSelection,
+            input,
+            phase: OperationalPhase::Active,
+            operation_order: Self::next_operational_order(&write)?,
+            terminal_receipt_id: None,
+            terminal_receipt_sha256: None,
+            admission_reservation: None,
+            generation_cutover: None,
+            user_broker_resource_selection: Some(selection),
+        };
+        Self::persist_operational_record(&write, &key, &durable)?;
+        write.commit().map_err(storage)?;
+        Self::user_broker_resource_selection_snapshot(&durable)
     }
 
     fn transition_existing_operational(
@@ -27849,6 +28976,7 @@ impl RedbRecoveryStore {
             terminal_receipt_sha256: None,
             admission_reservation: None,
             generation_cutover: Some(record),
+            user_broker_resource_selection: None,
         };
         Self::persist_operational_record(&write, &key, &durable)?;
         write.commit().map_err(storage)?;
@@ -28006,6 +29134,7 @@ impl RedbRecoveryStore {
             terminal_receipt_sha256: None,
             admission_reservation: None,
             generation_cutover: Some(committed),
+            user_broker_resource_selection: None,
         };
         Self::persist_operational_record(&write, &route_key, &durable)?;
         let removed = {
@@ -28588,6 +29717,7 @@ impl RedbRecoveryStore {
             terminal_receipt_sha256: None,
             admission_reservation: None,
             generation_cutover: None,
+            user_broker_resource_selection: None,
         };
         Self::persist_operational_record(&write, &key, &durable)?;
         write.commit().map_err(storage)?;
@@ -29966,6 +31096,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             terminal_receipt_sha256: None,
             admission_reservation: Some(record),
             generation_cutover: None,
+            user_broker_resource_selection: None,
         };
         Self::admission_reservation_snapshot(&durable)?;
         Self::persist_operational_record(&write, &key, &durable)?;
@@ -30123,6 +31254,20 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             false,
             OperationalPhase::Fenced,
         )
+    }
+
+    fn commit_user_broker_resource_selection(
+        &self,
+        selection: UserBrokerResourceSelection,
+    ) -> Result<UserBrokerResourceSelectionSnapshot, OrsError> {
+        RedbRecoveryStore::commit_user_broker_resource_selection(self, selection)
+    }
+
+    fn load_user_broker_resource_selection(
+        &self,
+        subject_id: &OperationIdentity,
+    ) -> Result<Option<UserBrokerResourceSelectionSnapshot>, OrsError> {
+        RedbRecoveryStore::load_user_broker_resource_selection(self, subject_id)
     }
 
     fn commit_authority_snapshot(
@@ -30347,6 +31492,7 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                     terminal_receipt_sha256: None,
                     admission_reservation: None,
                     generation_cutover: None,
+                    user_broker_resource_selection: None,
                 };
                 Self::persist_operational_record(&write, &key, &record)?;
                 write.commit().map_err(storage)?;
