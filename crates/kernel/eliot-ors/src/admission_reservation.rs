@@ -101,6 +101,81 @@ pub enum AdmissionReservationState {
     Reconciling,
 }
 
+/// Exact owner evidence committed by one activation transition.
+///
+/// An `Active` reservation must carry BOTH halves of the #1678 saga join: the
+/// owner-issued canonical admission receipt returned by the canonical
+/// `ADMITTED` readback, and the ORS activation receipt that names this exact
+/// reservation. The canonical half is never inferred in Kernel and never
+/// fabricated from a successful transport response; it is copied verbatim from
+/// the receipt the canonical owner issued. The ORS half names the resulting row.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmissionReservationActivation {
+    /// Owner-issued canonical admission receipt for the exact `ADMITTED` write.
+    pub canonical_admission_receipt: ReceiptIdentity,
+    /// ORS activation receipt committed alongside the resulting active row.
+    pub activation_receipt: ReceiptIdentity,
+}
+
+impl AdmissionReservationActivation {
+    /// Validates both receipt references as well-shaped owner evidence.
+    ///
+    /// The two references are checked with the shape rules the receipts crate
+    /// itself applies to an issued identity — a lowercase SHA-256 canonical
+    /// digest and a `receipt-`-namespaced, non-blank receipt id. Nothing is
+    /// recomputed from the record in order to be trusted: the caller's copy is
+    /// validated, and the caller is the canonical owner that issued it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrsError::InvalidField`] naming the first malformed half.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_receipt_identity(
+            &self.canonical_admission_receipt,
+            "admission_reservation_activation.canonical_admission_receipt",
+        )?;
+        validate_receipt_identity(
+            &self.activation_receipt,
+            "admission_reservation_activation.activation_receipt",
+        )?;
+        if self.canonical_admission_receipt == self.activation_receipt {
+            return Err(OrsError::InvalidField {
+                field: "admission_reservation_activation.activation_receipt",
+                reason: "the ORS activation receipt must be distinct from the canonical admission receipt",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Validates one `ReceiptIdentity` against the shape rules the receipts owner
+/// applies when it issues an identity.
+fn validate_receipt_identity(
+    identity: &ReceiptIdentity,
+    field: &'static str,
+) -> Result<(), OrsError> {
+    let receipt_id = identity.receipt_id.as_str();
+    if receipt_id.trim().is_empty() || receipt_id.chars().any(char::is_control) {
+        return Err(OrsError::InvalidField {
+            field,
+            reason: "receipt identity must be a non-blank control-free label",
+        });
+    }
+    let digest = identity.canonical_sha256.as_str();
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(OrsError::InvalidField {
+            field,
+            reason: "canonical receipt digest must be a lowercase SHA-256 digest",
+        });
+    }
+    Ok(())
+}
+
 /// Typed, durable reservation record. `operation_id` changes for each ORS
 /// transition while `reservation_id` and the original binding remain stable.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -177,8 +252,30 @@ impl AdmissionReservationRecord {
                     || self.activation_receipt.is_none()
                     || self.disposition_reason.is_some()
                     || self.disposition_evidence.is_some()
+                    || self.last_transition.as_ref().is_none_or(|transition| {
+                        transition.target_state != self.state
+                            || transition.operation_id != self.operation_id
+                            || transition.operation_id == self.stage_operation_id
+                            || transition.authority_epoch != self.authority_epoch
+                            || transition.state_fence != self.state_fence
+                            || transition.now_ms != self.updated_at_ms
+                            || transition
+                                .activation
+                                .as_ref()
+                                .is_none_or(|activation| {
+                                    Some(&activation.canonical_admission_receipt)
+                                        != self.canonical_admission_receipt.as_ref()
+                                        || Some(&activation.activation_receipt)
+                                            != self.activation_receipt.as_ref()
+                                })
+                    })
                 {
                     return Err(OrsError::InvalidTransition);
+                }
+                if let Some(transition) = &self.last_transition
+                    && let Some(activation) = &transition.activation
+                {
+                    activation.validate()?;
                 }
             }
             AdmissionReservationState::Released | AdmissionReservationState::Expired => {
@@ -312,6 +409,115 @@ pub struct AdmissionReservationTransitionRequest {
     pub state_fence: StateFenceSnapshot,
     /// Observed transition time in Unix milliseconds.
     pub now_ms: i64,
+    /// Owner evidence committed by an `Active` transition. `None` for every
+    /// disposition transition, and `Some` for exactly the one that activated
+    /// this reservation, so a replay of the same operation identity is
+    /// decidable by comparing this whole request.
+    #[serde(default)]
+    pub activation: Option<AdmissionReservationActivation>,
+}
+
+/// Required owner evidence for one exact `StagedInactive`/`Reconciling` →
+/// `Active` reservation transition (REQ6, A4).
+///
+/// Every field here is a fact that must already hold before the row may be
+/// activated. The request carries no launch authority by itself: it is the
+/// evidence the ORS owner compares against the durable row it is about to
+/// mutate, and it is refused field by field on any disagreement. In
+/// particular:
+///
+/// - `expected_current_receipt` is the CAS precondition. It is compared
+///   against the current stored receipt, not merely recorded.
+/// - `canonical_admission_receipt` is the owner-issued receipt returned by the
+///   canonical `ADMITTED` readback. Kernel never infers it from a transport
+///   response.
+/// - `activation_receipt` is the durable ORS activation receipt that commits
+///   the resulting active row and is the reference #1701 must later verify.
+/// - `claims` must equal the immutable claims the reservation was staged with;
+///   a different claim set under one saga identity is an identity conflict.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdmissionReservationActivationRequest {
+    /// Stable reservation identity being activated.
+    pub reservation_id: OperationIdentity,
+    /// Work item the reservation covers; must match the staged row.
+    pub work_item_id: OperationIdentity,
+    /// Proposed attempt the reservation covers; must match the staged row.
+    pub proposed_attempt_id: OperationIdentity,
+    /// Fresh ORS operation identity for this activation transition.
+    pub operation_id: OperationIdentity,
+    /// Complete immutable claims expected to be exactly the staged claims.
+    pub claims: AdmissionReservationClaims,
+    /// Owner-issued canonical admission receipt for the exact `ADMITTED` write.
+    pub canonical_admission_receipt: ReceiptIdentity,
+    /// Durable ORS activation receipt committed with the resulting row.
+    pub activation_receipt: ReceiptIdentity,
+    /// Exact current ORS receipt observed before this transition.
+    pub expected_current_receipt: OperationalMutationReceipt,
+    /// Immutable authority and fence binding expected by the caller.
+    pub authority_epoch: EpochLineage,
+    /// Exact current State Fence expected by the caller.
+    pub state_fence: StateFenceSnapshot,
+    /// Observed activation time in Unix milliseconds.
+    pub now_ms: i64,
+}
+
+/// The durable result of one activation: the active snapshot plus the two
+/// receipt references that commit it (A4).
+///
+/// Both references are echoed from the row the store actually persisted, not
+/// from the caller's request, so the returned activation receipt is a
+/// readback of committed state. `activation_receipt` is the reference #1701
+/// must later carry into the launch-prerequisite verifier; it is the same
+/// value [`ActiveAdmissionReservation::activation_receipt`] exposes once the
+/// verifier has re-derived the active disposition.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct AdmissionReservationActivatedOutcome {
+    /// Reservation identity that was activated.
+    pub reservation_id: OperationIdentity,
+    /// Durable ORS snapshot read back for that exact identity.
+    pub snapshot: AdmissionReservationSnapshot,
+}
+
+impl AdmissionReservationActivatedOutcome {
+    pub(crate) fn from_store(
+        reservation_id: OperationIdentity,
+        snapshot: AdmissionReservationSnapshot,
+    ) -> Self {
+        Self {
+            reservation_id,
+            snapshot,
+        }
+    }
+
+    /// Owner-issued ORS activation receipt reference committed by this row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrsError::InvalidTransition`] when the durable row carries no
+    /// activation receipt. `AdmissionReservationRecord::validate` already
+    /// refuses that, so this stays a typed refusal rather than a panic.
+    pub fn activation_receipt(&self) -> Result<&ReceiptIdentity, OrsError> {
+        self.snapshot
+            .record()
+            .activation_receipt
+            .as_ref()
+            .ok_or(OrsError::InvalidTransition)
+    }
+
+    /// Owner-issued canonical admission receipt reference committed by this row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrsError::InvalidTransition`] when the durable row carries no
+    /// canonical admission receipt, for the same reason as
+    /// [`Self::activation_receipt`].
+    pub fn canonical_admission_receipt(&self) -> Result<&ReceiptIdentity, OrsError> {
+        self.snapshot
+            .record()
+            .canonical_admission_receipt
+            .as_ref()
+            .ok_or(OrsError::InvalidTransition)
+    }
 }
 
 /// Closed read-only verification result for one launch prerequisite.
