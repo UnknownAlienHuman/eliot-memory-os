@@ -129,6 +129,8 @@ pub mod notification_state_emit;
 mod observation_adapters;
 mod owner_feed;
 mod process_origin;
+mod provider_admission;
+mod provider_capability;
 pub mod provider_transport_policy;
 mod reactive_feed;
 mod route_execution_identity;
@@ -3262,6 +3264,14 @@ impl DaemonComposition {
     /// Readiness gates the construction exactly like
     /// [`Self::agent_fabric_descriptor`].
     ///
+    /// The ports returned here feed only the verifier-gated production path
+    /// [`Self::agent_fabric_new_verified_async`]: that sole production
+    /// consumer resolves the session halves over the live authenticated
+    /// session and verifies the binding through the Kernel
+    /// provider-admission verifier before any admitted capability is built,
+    /// so production ports never reach an effect without owner verification
+    /// (issue #1108 W1/W2).
+    ///
     /// # Errors
     ///
     /// Returns [`DaemonError::Composition`] when the Governor is not ready.
@@ -3321,6 +3331,141 @@ impl DaemonComposition {
         let mut fabric = self.agent_fabric_new_verified(kernel, ports, material)?;
         self.require_admitted_model_route(&mut fabric, requirements, observed_scope, now)?;
         Ok(fabric)
+    }
+
+    /// Builds the sealed admission capability through the closed
+    /// provider-admission port (issue #1108, items A4/A5).
+    ///
+    /// Thin integration over [`crate::provider_admission::ProviderAdmission`]
+    /// (session-half overwrite + owner validation) and
+    /// [`crate::provider_capability::admit_provider_capability`]
+    /// (per-operation content comparison against the driven `claimed`
+    /// halves): the only production path from resolved material to the
+    /// coordinator's closed admission. The `health` half rides input-only
+    /// into the capability and never mints admission (issue #265, W6).
+    ///
+    /// # Errors
+    ///
+    /// Returns the closed-port validation, the per-operation identity
+    /// conflict, or the coordinator owner rejection unchanged, each typed.
+    fn build_production_provider_capability(
+        material: VerifiedProviderMaterial,
+        owner: &crate::daemon_kernel_client::OwnerSessionFacts,
+        live_fence: eliot_contracts::StateFence,
+        claimed: &crate::solo_agent_driver::SoloClaimedHalves,
+    ) -> Result<eliot_agent_coordinator::AdmittedProviderCapability, FabricError> {
+        let admission =
+            crate::provider_admission::ProviderAdmission::new(material, owner, live_fence)?;
+        crate::provider_capability::admit_provider_capability(&admission, claimed)
+    }
+
+    /// Constructs the production fabric on a sealed admitted provider
+    /// capability verified through the Kernel admission verifier (issue #1108
+    /// W5/W2, production caller for A1).
+    ///
+    /// Sole production counterpart of the test-only
+    /// `agent_fabric_new_verified`: readiness plus the exact live
+    /// fence and the validated session binding gate the resolution, and
+    /// caller-supplied session halves are overwritten with the live
+    /// authenticated session values, never trusted (I15.2). The binding is
+    /// then verified through the authenticated Kernel provider-admission
+    /// verifier (`DaemonKernelClient::verify_provider_binding_async`) over
+    /// the exact operation/attempt/provider identity before any admitted
+    /// capability is built. Only a verifier-accepted binding reaches
+    /// `AgentFabric::new_with_admitted_provider`; the coordinator performs
+    /// no I/O and launches nothing. No secret material crosses this seam:
+    /// the session half is the Kernel-issued binding string, revisions and
+    /// digests only (I15.4). The #265 `health` half rides input-only and
+    /// never mints admission. The production ports source is
+    /// [`Self::production_fabric_ports`] (W1).
+    ///
+    /// # Errors
+    ///
+    /// Returns the readiness, session-resolution, Kernel verifier,
+    /// capability construction, or coordinator owner rejection unchanged,
+    /// each typed.
+    pub async fn agent_fabric_new_verified_async(
+        &self,
+        kernel: &Arc<DaemonKernelClient>,
+        ports: FabricPorts,
+        material: VerifiedProviderMaterial,
+        claimed: &crate::solo_agent_driver::SoloClaimedHalves,
+    ) -> Result<AgentFabric, DaemonError> {
+        let _span = tracing::info_span!("eliotd.fabric_new_verified_async").entered();
+        let material = self.resolve_verified_material(kernel, material)?;
+        let owner = kernel.owner_session_facts().ok_or_else(|| {
+            DaemonError::Kernel(
+                "daemon has no validated Kernel owner session; verified provider admission stays plan-only"
+                    .to_owned(),
+            )
+        })?;
+        let live_fence = kernel.kernel_fence();
+        kernel
+            .verify_provider_binding_async(&material)
+            .await
+            .map_err(|error| DaemonError::Kernel(error.to_string()))?;
+        let capability =
+            Self::build_production_provider_capability(material, &owner, live_fence, claimed)?;
+        let config = daemon_coordinator_config()?;
+        Ok(AgentFabric::new_with_admitted_provider(
+            config, ports, capability,
+        )?)
+    }
+
+    /// Restores the production fabric on freshly verified owner material in
+    /// one call (issue #1108 A6/W2, verified restore for A8).
+    ///
+    /// Sole production counterpart of the test-only
+    /// `agent_fabric_restore_verified`: the session halves are
+    /// re-resolved over the live authenticated session and the binding is
+    /// verified through the authenticated Kernel provider-admission verifier
+    /// (`DaemonKernelClient::verify_provider_binding_async`) before the
+    /// capability is rebuilt, so a stored snapshot or a stored `Verified`
+    /// label alone restores nothing. Restores through
+    /// `AgentFabric::restore_with_admitted_provider` over the daemon state
+    /// root store: missing, stale, or revoked evidence stays
+    /// plan-only/blocked instead of silently resuming effecting operations
+    /// (ARCH-RES-01). The #265 `health` half rides input-only and never
+    /// mints admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns the session-resolution rejection (not ready, no live session,
+    /// stale expectation epoch), the Kernel verifier rejection, the
+    /// capability construction rejection, the coordinator owner restore
+    /// rejection, or a stale-config conflict unchanged, each typed.
+    pub async fn agent_fabric_restore_verified_async(
+        &self,
+        kernel: &Arc<DaemonKernelClient>,
+        snapshot: FabricSnapshot,
+        ports: FabricPorts,
+        material: VerifiedProviderMaterial,
+        claimed: &crate::solo_agent_driver::SoloClaimedHalves,
+    ) -> Result<AgentFabric, DaemonError> {
+        let _span = tracing::info_span!("eliotd.fabric_restore_verified_async").entered();
+        let material = self.resolve_verified_material(kernel, material)?;
+        let owner = kernel.owner_session_facts().ok_or_else(|| {
+            DaemonError::Kernel(
+                "daemon has no validated Kernel owner session; verified provider restore stays plan-only"
+                    .to_owned(),
+            )
+        })?;
+        let live_fence = kernel.kernel_fence();
+        kernel
+            .verify_provider_binding_async(&material)
+            .await
+            .map_err(|error| DaemonError::Kernel(error.to_string()))?;
+        let capability =
+            Self::build_production_provider_capability(material, &owner, live_fence, claimed)?;
+        let config = daemon_coordinator_config()?;
+        let store = crate::semantic_revision_store::SemanticRevisionStore::new(self.state_root());
+        Ok(AgentFabric::restore_with_admitted_provider(
+            snapshot,
+            config,
+            ports,
+            Some(&store),
+            capability,
+        )?)
     }
 
     /// Enqueues one validated solo delegate intake for the runtime poll hook
@@ -3493,6 +3638,12 @@ impl DaemonComposition {
     /// Resolves the session-observed owner half of one verified provider
     /// material over the live authenticated session.
     ///
+    /// Shared by the test-only verified seam and the production async
+    /// verified constructors below: readiness plus the exact live fence and
+    /// the validated session binding gate the resolution, so both paths
+    /// overwrite caller-supplied halves with the live authenticated session
+    /// values and fail closed without them.
+    ///
     /// Readiness plus the exact live fence and the validated session binding
     /// gate the resolution: the threaded expectation must be current under
     /// the live session epoch (`is_same_authority`, the same rule the
@@ -3500,7 +3651,6 @@ impl DaemonComposition {
     /// `session_binding` values are replaced with the session-observed
     /// ones. Presented halves and the Governor expectation travel through
     /// untouched for the coherence gates downstream to judge.
-    #[cfg(test)]
     fn resolve_verified_material(
         &self,
         kernel: &Arc<DaemonKernelClient>,
