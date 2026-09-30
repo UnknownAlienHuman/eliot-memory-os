@@ -27,7 +27,8 @@ use eliot_kernel_core::UserAutomationOperatorIntent;
 use eliot_kernel_core::user_automation::{
     ConfigPolicySnapshot, DeliveryChannel, UserAutomationConfigurationState,
     UserAutomationDeferReason, UserAutomationExecutionMode, UserAutomationInvocation,
-    UserAutomationPreflightAssembly, UserAutomationPreflightEvidence,
+    UserAutomationPreflightAssembly, UserAutomationPreflightContext,
+    UserAutomationPreflightDecision, UserAutomationPreflightEvidence,
     UserAutomationPreflightProjection, UserAutomationRevision,
 };
 use eliot_ors::{
@@ -52,7 +53,7 @@ use eliot_runtime_contracts::{
     I14_BACKPRESSURE_RESPONSE_VERSION, I14AlternativeRoute, I14BackpressureCause,
     I14BackpressureResponseV1, I14CurrentnessState, I14EscalationCondition, I14ForbiddenAction,
     I14RecoveryAction, I14RecoveryDirectiveV1, I14RequiredAuthority, I14ResolutionState,
-    I14WorkOutcome, NormalWorkClass, RecoveryCommitStatus, StatePreservationStatus,
+    I14WorkOutcome, NormalWorkClass, RecoveryCommitStatus, StatePreservationStatus, WakeIntent,
 };
 use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, CanonicalValidationSnapshot, NamedReadRequest,
@@ -81,8 +82,8 @@ use crate::store_write_reservation::{
     retain_unsupported_prepared_plan, writer_epoch_for_fence_from_epoch,
 };
 use crate::user_automation_execution::{
-    UserAutomationExecutionError, UserAutomationExecutionOutcome, UserAutomationExecutionRequest,
-    UserAutomationRemovalResult, UserAutomationWakeCancellation,
+    UserAutomationDurableJobMaterial, UserAutomationExecutionError, UserAutomationExecutionOutcome,
+    UserAutomationRemovalResult, UserAutomationRuntimeAdmission, UserAutomationWakeCancellation,
     UserAutomationWakeCancellationTarget, UserAutomationWakeEnumerationReceipt,
     UserAutomationWakePublication, UserAutomationWakeTargetEnumeration,
     read_retirement_wake_targets, retirement_wake_enumeration_request,
@@ -5928,19 +5929,22 @@ impl KernelStoreGateway {
                 .map(|failure| failure.failure_fingerprint.clone()),
             _ => None,
         };
-        let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(self));
-        let outcome = UserAutomationService::new(&store)
-            .execute_occurrence(
-                UserAutomationExecutionRequest {
-                    context: sealed.context.clone(),
-                    authenticated_principal: sealed.authenticated_principal.clone(),
-                    identity: sealed.identity.clone(),
-                    invocation: invocation.clone(),
-                    projection,
-                    wake_intent,
-                },
-                runtime,
-            )
+        // The committed occurrence crosses into the existing `RunNow` execution
+        // join with the complete owner-issued Durable Job material, rather than
+        // through a hand-assembled execution request beside it. The join reads
+        // the canonical run-now answer under the very identity this phase
+        // already committed, so it replays that one operation and can neither
+        // commit the invocation again nor mint a second manual nonce, and it
+        // then runs the same deterministic preflight and Durable Job admission
+        // every other occurrence uses.
+        let durable_job = Self::run_now_durable_job_material(
+            sealed,
+            &invocation,
+            &projection,
+            wake_intent.clone(),
+        );
+        let outcome = self
+            .join_run_now_occurrence(sealed, projection, durable_job, runtime)
             .await;
         Self::project_run_now_execution_outcome(
             wake,
@@ -5949,6 +5953,101 @@ impl KernelStoreGateway {
             blocked_fingerprint,
             &occurrence_id,
         )
+    }
+
+    /// Completes the owner-issued Durable Job submission for one committed
+    /// `RunNow` occurrence, or reports that no such submission exists to hand
+    /// over.
+    ///
+    /// The submission is compiled by the existing
+    /// [`UserAutomationDurableJobMaterial::from_admitted_occurrence`] out of the
+    /// members this occurrence already carries: the accepted revision the
+    /// preflight projection was assembled from, the deterministic preflight
+    /// receipt that authorises the admission, the committed wake intent bound to
+    /// this occurrence under this State Fence, and the authenticated parent
+    /// identity. Nothing is defaulted and no value is asserted on an owner's
+    /// behalf, so the occurrence identity, the certified capability closure and
+    /// the declared cost and runtime ceilings the Durable Job owner is asked to
+    /// admit are the ones the committed revision itself declares.
+    ///
+    /// The deterministic preflight is the owner's own pure decision function, so
+    /// asking it here answers exactly one question: does an admitted occurrence
+    /// exist for which owner-issued material can be completed at all. The
+    /// execution join runs the same function on the same projection immediately
+    /// before it builds the admission it sends, so this read cannot disagree
+    /// with the decision the join makes. A preflight that does not admit, and a
+    /// submission the compiler itself refuses, are both handed to the join
+    /// without one: the join's own owner boundary is where that typed refusal is
+    /// already produced, so the reported disposition stays the join's own answer
+    /// rather than the same refusal restated under another error type.
+    fn run_now_durable_job_material(
+        sealed: &UserAutomationServiceRequest,
+        invocation: &UserAutomationInvocation,
+        projection: &UserAutomationPreflightProjection,
+        wake_intent: WakeIntent,
+    ) -> Option<UserAutomationDurableJobMaterial> {
+        let context = UserAutomationPreflightContext {
+            request_metadata: sealed.context.clone(),
+        };
+        let UserAutomationPreflightDecision::Admitted { receipt } =
+            projection.preflight(invocation, &context).ok()?
+        else {
+            return None;
+        };
+        let admission = UserAutomationRuntimeAdmission {
+            context: sealed.context.clone(),
+            authenticated_principal: sealed.authenticated_principal.clone(),
+            identity: sealed.identity.clone(),
+            revision: projection.revision.clone(),
+            invocation: invocation.clone(),
+            preflight: receipt,
+            wake_intent,
+            durable_job: None,
+        };
+        UserAutomationDurableJobMaterial::from_admitted_occurrence(&admission).ok()
+    }
+
+    /// Hands one committed `RunNow` occurrence to the existing `RunNow` execution
+    /// join over the composed runtime channel.
+    ///
+    /// The join is the same `UserAutomationService` contour every other
+    /// occurrence uses: it dispatches the canonical run-now Store operation
+    /// under the admitted parent identity, reads back the committed invocation
+    /// and its wake intent, runs the deterministic preflight, and reaches the
+    /// Durable Job owner. It adds no channel, no retry and no second admission.
+    ///
+    /// The two joins are different future types, so each arm owns its own
+    /// awaited value. The material arm is polled through one box because
+    /// `from_admitted_occurrence` holds a whole canonical-JSON K0
+    /// `JobSubmission` and its digest inputs on the stack; the transient
+    /// allocation is released as soon as the owner's answer is back, so this
+    /// contour's own future stays bounded.
+    async fn join_run_now_occurrence<R>(
+        &self,
+        sealed: &UserAutomationServiceRequest,
+        projection: UserAutomationPreflightProjection,
+        durable_job: Option<UserAutomationDurableJobMaterial>,
+        runtime: &R,
+    ) -> Result<UserAutomationExecutionOutcome, UserAutomationExecutionError>
+    where
+        R: UserAutomationRuntimePort + ?Sized,
+    {
+        let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(self));
+        let service = UserAutomationService::new(&store);
+        match durable_job {
+            Some(material) => {
+                Box::pin(service.run_now_and_execute_with_durable_job(
+                    sealed.clone(),
+                    projection,
+                    material,
+                    runtime,
+                ))
+                .await
+            }
+            None => {
+                Box::pin(service.run_now_and_execute(sealed.clone(), projection, runtime)).await
+            }
+        }
     }
 
     /// Re-proves one committed `RunNow` occurrence against the live owner.
