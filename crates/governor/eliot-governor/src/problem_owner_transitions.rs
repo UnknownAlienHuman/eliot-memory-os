@@ -10,6 +10,15 @@
 //! envelope, its digests, the revision-head expectations and the receipt
 //! reconciliation are all the existing ones.
 //!
+//! A tenth wire verb, `quarantine`, is prepared by
+//! [`crate::source_quarantine_admission`] — the owner-bound admission of an
+//! external-source restriction (issue #1760 item 5) — and it is deliberately not
+//! a body here: it is authorized by a deterministic rule or an authorized
+//! decision rather than by an ownership lease, and it commits a retained
+//! restriction record. It reaches this module's shared envelope and parameter
+//! assembly, so there is still exactly one preparation of an
+//! `ApplyProblemOwnerState` transition and one commit path for it.
+//!
 //! Each transition binds four things, and each is compared rather than carried:
 //!
 //! 1. **Source Signal.** The admitted [`Signal`] is validated and must be bound
@@ -65,27 +74,28 @@ use eliot_problem::{
 };
 use eliot_store_api::{
     EffectClass, EventId, EventProjectionRelationIntents, OperationManifestDigest,
-    OrderingHeadExpectation, OrderingScopeId, PROBLEM_CLOSURE_SUPERSEDED_BY,
-    PROBLEM_CLOSURE_WAIVED, PROBLEM_PARAM_AUTHORIZATION_DIGEST, PROBLEM_PARAM_CLOSURE_JSON,
-    PROBLEM_PARAM_EXPECTED_REVISION, PROBLEM_PARAM_PROBLEM_ID, PROBLEM_PARAM_RECORD_DIGEST,
-    PROBLEM_PARAM_RECORD_JSON, PROBLEM_PARAM_SOURCE_SIGNAL_ID, PROBLEM_PARAM_TRANSITION,
-    ProblemOwnerTransition, RevisionHeadExpectation, ScopeId, SecurityContext, StateFence,
-    TransitionClass, problem_owner_state_mutation_request, problem_revision_key,
+    OrderingHeadExpectation, OrderingScopeId, PROBLEM_CLOSURE_QUARANTINED_FOR_REBUILD,
+    PROBLEM_CLOSURE_SUPERSEDED_BY, PROBLEM_CLOSURE_WAIVED, PROBLEM_PARAM_AUTHORIZATION_DIGEST,
+    PROBLEM_PARAM_CLOSURE_JSON, PROBLEM_PARAM_EXPECTED_REVISION, PROBLEM_PARAM_PROBLEM_ID,
+    PROBLEM_PARAM_RECORD_DIGEST, PROBLEM_PARAM_RECORD_JSON, PROBLEM_PARAM_SOURCE_SIGNAL_ID,
+    PROBLEM_PARAM_TRANSITION, ProblemOwnerTransition, RevisionHeadExpectation, ScopeId,
+    SecurityContext, StateFence, TransitionClass, problem_owner_state_mutation_request,
+    problem_revision_key,
 };
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::composition::CompositionError;
 
 /// Governor canonical scope addressed by every owner transition.
-const PROBLEM_SCOPE_ID: &str = "governor";
+pub(crate) const PROBLEM_SCOPE_ID: &str = "governor";
 /// Ordering scope carried on every owner transition. The store enforces the live
 /// sequence; the constant mirrors the existing problem/recovery legs so all
 /// canonical writes share one conflict-serialization scope.
-const PROBLEM_ORDERING_SCOPE: &str = "scope:governor";
+pub(crate) const PROBLEM_ORDERING_SCOPE: &str = "scope:governor";
 /// Domain separator for the re-proved current-authorization digest.
 const AUTHORIZATION_DOMAIN: &str = "eliot.problem.owner-transition-authorization.v1";
 
-fn owner_refused(detail: impl Into<String>) -> CompositionError {
+pub(crate) fn owner_refused(detail: impl Into<String>) -> CompositionError {
     CompositionError::Owner(detail.into())
 }
 
@@ -211,6 +221,12 @@ pub enum ProblemOwnerClosure {
     Waived(WaiverRecord),
     /// The accepted replacement obligation a supersession points at.
     SupersededBy(SupersessionRecord),
+    /// The owner-bound source restriction an admitted quarantine commits.
+    ///
+    /// Rendered by the quarantine admission owner, which owns the six bindings,
+    /// so the shared parameter assembler only places it: it is admitted evidence
+    /// read back from the committed transition, never re-derived here.
+    QuarantinedForRebuild(Map<String, Value>),
 }
 
 /// One named owner transition, prepared and ready to commit.
@@ -360,7 +376,7 @@ fn authorization_digest(
 ///
 /// The Signal is the transition's source, so it is compared, not restated: a
 /// Signal from another fence cannot admit a transition under this one.
-fn checked_source_signal<'a>(
+pub(crate) fn checked_source_signal<'a>(
     source: &'a Signal,
     fence: &StateFence,
 ) -> Result<&'a Signal, CompositionError> {
@@ -436,6 +452,10 @@ fn closure_value(closure: &ProblemOwnerClosure) -> Result<Value, CompositionErro
             })?,
             PROBLEM_CLOSURE_SUPERSEDED_BY,
         ),
+        ProblemOwnerClosure::QuarantinedForRebuild(record) => (
+            Value::Object(record.clone()),
+            PROBLEM_CLOSURE_QUARANTINED_FOR_REBUILD,
+        ),
     };
     let object = value.as_object_mut().ok_or_else(|| {
         owner_refused("a retained closure record did not render as a JSON object".to_owned())
@@ -452,7 +472,7 @@ fn closure_value(closure: &ProblemOwnerClosure) -> Result<Value, CompositionErro
 /// retained closure record is conditional on the verb. Naming it says "these are
 /// the bindings, assembled and gated", separately from "this is the envelope
 /// they travel in".
-fn problem_owner_parameters(
+pub(crate) fn problem_owner_parameters(
     candidate: &Problem,
     expected_revision: u64,
     source_signal: &Signal,
@@ -528,7 +548,7 @@ fn problem_owner_parameters(
 /// durable record and the receipt, so a transition can never leave history
 /// without its outbox intent or publish an intent for a transition that did not
 /// commit.
-fn problem_owner_envelope(
+pub(crate) fn problem_owner_envelope(
     identity: &eliot_protocol::RequestIdentity,
     operation_id: &eliot_contracts::OperationId,
     manifest_digest: &OperationManifestDigest,

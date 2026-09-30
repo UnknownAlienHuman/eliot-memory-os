@@ -178,6 +178,9 @@ use eliot_store_api::{
 use crate::problem_owner_transitions::{
     ProblemOwnerTransitionOutcome, ProblemOwnerTransitionRequest, prepare_problem_owner_transition,
 };
+use crate::source_quarantine_admission::{
+    SourceQuarantineAdmissionRequest, SourceQuarantineOutcome, prepare_source_quarantine_admission,
+};
 use crate::{
     CanonicalAdmissionOwner, CompositionError, CompositionReadiness, KernelPortError,
     KernelTransitionPort,
@@ -2214,6 +2217,88 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
             transition: prepared.transition,
             problem: prepared.candidate,
             closure: prepared.closure,
+            receipt: reconciled,
+        })
+    }
+
+    /// Commits one owner-bound external-source quarantine (issue #1760 item 5).
+    ///
+    /// This is the production entry for admitting a source restriction. It adds
+    /// no preparation path and no transaction API: the admission is prepared
+    /// once by [`crate::prepare_source_quarantine_admission`], converted to the
+    /// one `PreparedTransition` by the same envelope builder the nine named
+    /// owner transitions use, and committed through
+    /// [`CanonicalAdmissionOwner::commit`], the same gateway every other
+    /// canonical write on this owner uses.
+    ///
+    /// The division of labour is the one the architecture asks for: the Governor
+    /// prepares the transition and the Kernel/Store validate and receipt it. What
+    /// travels is the named `QUARANTINE` verb on the existing
+    /// `ApplyProblemOwnerState` leg together with the retained restriction, which
+    /// the store decodes and compares against the presented Problem identity and
+    /// expected revision, checks the committed record is actually quarantined,
+    /// arbitrates under the `problem:{id}` revision-head compare-and-set, and
+    /// receipts.
+    ///
+    /// A lost commit response reconciles the original receipt through the
+    /// neutral port instead of committing a second quarantine, and a Store
+    /// outcome that is not `Committed` is reported as such rather than dressed up
+    /// as a restriction having been applied: no fake quarantine success on a
+    /// Store failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError`] when readiness or fence agreement fails, or
+    /// when the admission cannot be prepared, committed, or reconciled.
+    pub async fn commit_source_quarantine_admission(
+        &self,
+        request: &SourceQuarantineAdmissionRequest<'_>,
+    ) -> Result<SourceQuarantineOutcome, CompositionError> {
+        self.validate_capture_identity_fence(request.identity)?;
+        let manifest_digest = production_manifest_digest()?;
+        let prepared = prepare_source_quarantine_admission(&manifest_digest, request)?;
+        let expected_hash = prepared
+            .envelope
+            .canonical_request_hash()
+            .map_err(CompositionError::Canonical)?;
+        // The proactive same-operation receipt check is the lost-acknowledgement
+        // readback: an identical replay returns the original receipt instead of
+        // quarantining twice, and the same operation with different canonical
+        // bytes fails closed here.
+        let reconciled = match self.kernel.receipt(prepared.operation_id.clone()).await? {
+            Some(receipt) => {
+                check_receipt(
+                    &receipt,
+                    &prepared.operation_id,
+                    &prepared.identity,
+                    &expected_hash,
+                    TransitionClass::RecoverySchema,
+                    &manifest_digest,
+                )?;
+                receipt
+            }
+            None => {
+                self.commit_problem_leg(
+                    &prepared.identity,
+                    &prepared.operation_id,
+                    prepared.envelope,
+                    &expected_hash,
+                    &manifest_digest,
+                )
+                .await?
+            }
+        };
+        if reconciled.status != WriteReceiptStatus::Committed {
+            return Err(owner_refused(format!(
+                "source quarantine was not committed: {:?}",
+                reconciled.status
+            )));
+        }
+        Ok(SourceQuarantineOutcome {
+            transition: prepared.transition,
+            problem: prepared.candidate,
+            order: prepared.order,
+            decision: prepared.decision,
             receipt: reconciled,
         })
     }

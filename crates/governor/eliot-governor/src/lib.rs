@@ -123,6 +123,7 @@ mod scan_disclosure_owner;
 mod scope_identity_admission;
 mod selection_chain;
 mod skill_lifecycle;
+mod source_quarantine_admission;
 mod swarm_plan_attachment_composition;
 mod swarm_plan_attachment_ownership;
 mod swarm_plan_attachment_service;
@@ -251,6 +252,10 @@ pub use owner_closure_provider::{
 pub use problem_owner_transitions::{
     PreparedProblemOwnerTransition, ProblemOwnerClosure, ProblemOwnerTransitionBody,
     ProblemOwnerTransitionOutcome, ProblemOwnerTransitionRequest, prepare_problem_owner_transition,
+};
+pub use source_quarantine_admission::{
+    PreparedSourceQuarantineAdmission, SourceQuarantineAdmissionRequest,
+    SourceQuarantineDecision, SourceQuarantineOutcome, prepare_source_quarantine_admission,
 };
 pub use quality_applicability::{
     ACTIVE_DIRECTIVE_OWNER, GOVERNANCE_PROFILE_OWNER, GovernedDecision, IMPACT_OWNER,

@@ -11,6 +11,7 @@ use std::fmt;
 use eliot_contracts::{ArtifactId, ClockReading, StateFence};
 use eliot_evidence::ObservationRecord;
 use eliot_observation_contracts::ObservationError;
+use eliot_security_contracts::{AssessedSourceRevision, EffectCeiling};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -205,6 +206,41 @@ fn same_fence(expected: &StateFence, actual: &StateFence) -> Result<(), ProblemE
 
 fn owner_name(value: &str) -> Result<(), ProblemError> {
     text(value, "owner")
+}
+
+/// Whether a value is a lowercase SHA-256 digest.
+fn digest_text(value: &str, field: &'static str) -> Result<(), ProblemError> {
+    text(value, field)?;
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(ProblemError::InvalidField {
+            field,
+            reason: "must be a lowercase SHA-256 digest",
+        });
+    }
+    Ok(())
+}
+
+/// Validates the exact affected source revision one restriction is bound to.
+///
+/// A quarantine that names a source without its revision and digest would bind
+/// the restriction to "this source in the abstract", so a source that moved
+/// between the diagnosis and the admission would still look affected. The scope
+/// is checked with it: a revision without its declared included set is not a
+/// bounded assessment of anything.
+fn assessed_source_shape(source: &AssessedSourceRevision) -> Result<(), ProblemError> {
+    text(&source.source_ref, "assessed_source.source_ref")?;
+    text(&source.revision, "assessed_source.revision")?;
+    digest_text(&source.digest, "assessed_source.digest")?;
+    text(&source.scope.scope_ref, "assessed_source.scope.scope_ref")?;
+    nonempty(&source.scope.included_refs, "assessed_source.scope.included_refs")?;
+    unique_text(
+        &source.scope.included_refs,
+        "assessed_source.scope.included_refs",
+    )
 }
 
 /// Appends newly observed evidence without disturbing what is already retained.
@@ -478,6 +514,18 @@ impl ProblemState {
 /// The scope set is consumed verbatim: it is never expanded by similarity,
 /// and an empty scope is rejected so a caller cannot launder a whole-memory
 /// purge through this entry.
+///
+/// The remaining members are the six facts an external-influence restriction
+/// must bind before it is admitted (I8.8, I12.20). A candidate assessment may
+/// propose a restriction, but only this request — carrying an exact affected
+/// source revision, an exact dependency closure, a bounded permitted effect, an
+/// expected state revision, a named accountable owner and a release/rebuild
+/// condition, under a [`PromotionAuthority`] that has no model variant — is
+/// something a quarantine can be admitted from. `authority` is what makes a
+/// model judgement unable to reach this entry at all: I13.10's closed pair of
+/// a deterministic policy rule and an authorized Human decision has no
+/// `ModelRecommendation` member, so a high-confidence proposal has no way to
+/// name itself as the admitting decision.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RevocationQuarantine {
@@ -485,10 +533,36 @@ pub struct RevocationQuarantine {
     pub revocation_evidence: Vec<ArtifactId>,
     pub revoked_source_ref: String,
     pub rebuild_condition: String,
+    /// The exact affected source revision, digest and declared scope this
+    /// restriction is bound to, so a source that moved after the diagnosis
+    /// cannot be quarantined by a decision taken against its predecessor.
+    pub assessed_source: AssessedSourceRevision,
+    /// The exact affected dependency closure: every member reachable from
+    /// `revoked_source_ref` over the qualified edges the traversal admitted,
+    /// and nothing else. `impacted_scopes` is checked to be a member of this
+    /// set, so the quarantined scope can never be wider than the closure.
+    pub dependency_closure: Vec<String>,
+    /// The bounded effect a quarantined dependent may still cause. Never
+    /// empty: a restriction that permitted every effect would restrict none.
+    pub permitted_effects: Vec<EffectCeiling>,
+    /// The record revision this admission expects to replace. Compared with
+    /// the committed record rather than restated by the caller.
+    pub expected_state_revision: u64,
+    /// The accountable owner of the restricted scope.
+    pub owner: OwnerRef,
+    /// The deterministic rule or authorized decision that admits this
+    /// restriction.
+    pub authority: PromotionAuthority,
 }
 
 impl RevocationQuarantine {
     /// Validates the bounded scope, revocation evidence and rebuild requirement.
+    ///
+    /// `impacted_scopes` must lie inside `dependency_closure`, and the closure
+    /// must name `revoked_source_ref`: a quarantine whose scope reaches outside
+    /// the verified closure, or whose closure does not contain the source it
+    /// claims to restrict, refuses here rather than silently narrowing or
+    /// widening itself.
     pub fn validate(&self) -> Result<(), ProblemError> {
         nonempty(&self.impacted_scopes, "impacted_scopes")?;
         unique_text(&self.impacted_scopes, "impacted_scopes")?;
@@ -500,7 +574,45 @@ impl RevocationQuarantine {
             .collect::<Vec<_>>();
         unique_text(&evidence, "revocation_evidence")?;
         text(&self.revoked_source_ref, "revoked_source_ref")?;
-        text(&self.rebuild_condition, "rebuild_condition")
+        text(&self.rebuild_condition, "rebuild_condition")?;
+        assessed_source_shape(&self.assessed_source)?;
+        if self.assessed_source.source_ref != self.revoked_source_ref {
+            return Err(ProblemError::InvalidField {
+                field: "assessed_source.source_ref",
+                reason: "must name the same source this quarantine revokes",
+            });
+        }
+        nonempty(&self.dependency_closure, "dependency_closure")?;
+        unique_text(&self.dependency_closure, "dependency_closure")?;
+        if !self
+            .dependency_closure
+            .iter()
+            .any(|member| member == &self.revoked_source_ref)
+        {
+            return Err(ProblemError::InvalidField {
+                field: "dependency_closure",
+                reason: "the affected closure must contain the revoked source itself",
+            });
+        }
+        if self
+            .impacted_scopes
+            .iter()
+            .any(|scope| !self.dependency_closure.contains(scope))
+        {
+            return Err(ProblemError::InvalidField {
+                field: "impacted_scopes",
+                reason: "the quarantined scope must lie inside the verified dependency closure",
+            });
+        }
+        nonempty(&self.permitted_effects, "permitted_effects")?;
+        if self.expected_state_revision == 0 {
+            return Err(ProblemError::InvalidField {
+                field: "expected_state_revision",
+                reason: "must be non-zero",
+            });
+        }
+        self.owner.validate()?;
+        self.authority.validate()
     }
 }
 
@@ -513,6 +625,12 @@ impl RevocationQuarantine {
 /// rebuilt from clean inputs satisfying `rebuild_condition`, never from the
 /// revoked source. `validate` re-checks a reloaded order at the caller
 /// boundary.
+///
+/// The order retains the whole admitted restriction, not only its rebuild
+/// condition, because a release cannot be reasoned about from a condition
+/// alone: which exact source revision, which exact closure, which bounded
+/// effect, which owner and which deterministic rule or authorized decision
+/// admitted it are what a later reader compares against.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RevocationRebuildOrder {
@@ -521,10 +639,23 @@ pub struct RevocationRebuildOrder {
     pub revoked_source_ref: String,
     pub rebuild_condition: String,
     pub revocation_evidence: Vec<ArtifactId>,
+    /// The exact affected source revision this order rebuilds from.
+    pub assessed_source: AssessedSourceRevision,
+    /// The exact affected dependency closure this order rebuilds.
+    pub dependency_closure: Vec<String>,
+    /// The bounded effect the quarantined scope may still cause.
+    pub permitted_effects: Vec<EffectCeiling>,
+    /// The record revision the admitting quarantine replaced.
+    pub expected_state_revision: u64,
+    /// The accountable owner of the restricted scope.
+    pub owner: OwnerRef,
+    /// The deterministic rule or authorized decision that admitted it.
+    pub authority: PromotionAuthority,
 }
 
 impl RevocationRebuildOrder {
-    /// Validates the recorded rebuild requirement.
+    /// Validates the recorded rebuild requirement and the restriction it
+    /// rebuilds.
     pub fn validate(&self) -> Result<(), ProblemError> {
         nonempty(&self.impacted_scopes, "impacted_scopes")?;
         unique_text(&self.impacted_scopes, "impacted_scopes")?;
@@ -536,7 +667,35 @@ impl RevocationRebuildOrder {
             .collect::<Vec<_>>();
         unique_text(&evidence, "revocation_evidence")?;
         text(&self.revoked_source_ref, "revoked_source_ref")?;
-        text(&self.rebuild_condition, "rebuild_condition")
+        text(&self.rebuild_condition, "rebuild_condition")?;
+        assessed_source_shape(&self.assessed_source)?;
+        if self.assessed_source.source_ref != self.revoked_source_ref {
+            return Err(ProblemError::InvalidField {
+                field: "assessed_source.source_ref",
+                reason: "must name the same source this order rebuilds",
+            });
+        }
+        nonempty(&self.dependency_closure, "dependency_closure")?;
+        unique_text(&self.dependency_closure, "dependency_closure")?;
+        if !self
+            .dependency_closure
+            .iter()
+            .any(|member| member == &self.revoked_source_ref)
+        {
+            return Err(ProblemError::InvalidField {
+                field: "dependency_closure",
+                reason: "the affected closure must contain the revoked source itself",
+            });
+        }
+        nonempty(&self.permitted_effects, "permitted_effects")?;
+        if self.expected_state_revision == 0 {
+            return Err(ProblemError::InvalidField {
+                field: "expected_state_revision",
+                reason: "must be non-zero",
+            });
+        }
+        self.owner.validate()?;
+        self.authority.validate()
     }
 }
 
@@ -1385,6 +1544,14 @@ impl Problem {
     /// `transition` and `reopen` are unchanged for non-revocation paths.
     /// The quarantined record is assembled and validated as a candidate, so a
     /// refused entry leaves the live record unchanged.
+    ///
+    /// The request's `expected_state_revision` is compared with this record's
+    /// own revision before anything is assembled, so a decision taken against a
+    /// state that has since moved refuses instead of quarantining the successor
+    /// under a predecessor's admission. The returned order retains the whole
+    /// admitted restriction, not only the rebuild condition, so the committed
+    /// history answers which exact source revision, closure, effect, owner and
+    /// admitting authority this quarantine was.
     pub fn open_for_revocation(
         &mut self,
         expected_fence: &StateFence,
@@ -1392,6 +1559,12 @@ impl Problem {
     ) -> Result<RevocationRebuildOrder, ProblemError> {
         same_fence(expected_fence, &self.state_fence)?;
         request.validate()?;
+        if request.expected_state_revision != self.revision {
+            return Err(ProblemError::InvalidField {
+                field: "expected_state_revision",
+                reason: "the quarantine does not expect this record's current revision",
+            });
+        }
         if !request.impacted_scopes.contains(&self.scope_id) {
             return Err(ProblemError::InvalidField {
                 field: "impacted_scopes",
@@ -1431,6 +1604,12 @@ impl Problem {
             revoked_source_ref: request.revoked_source_ref.clone(),
             rebuild_condition: request.rebuild_condition.clone(),
             revocation_evidence: request.revocation_evidence.clone(),
+            assessed_source: request.assessed_source.clone(),
+            dependency_closure: request.dependency_closure.clone(),
+            permitted_effects: request.permitted_effects.clone(),
+            expected_state_revision: request.expected_state_revision,
+            owner: request.owner.clone(),
+            authority: request.authority.clone(),
         })
     }
 }

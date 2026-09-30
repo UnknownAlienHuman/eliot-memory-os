@@ -2846,6 +2846,7 @@ dependencies = [
  "eliot-contracts",
  "eliot-evidence",
  "eliot-observation-contracts",
+ "eliot-security-contracts",
  "schemars",
  "serde",
  "serde_json",

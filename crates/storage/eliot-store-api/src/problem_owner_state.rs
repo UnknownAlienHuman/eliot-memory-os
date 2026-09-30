@@ -1,8 +1,8 @@
 //! Canonical problem-owner-state wire contract (issue #1759 I2, I13.9/I13.7).
 //!
-//! This module owns the serialization-only wire boundary for the nine named
+//! This module owns the serialization-only wire boundary for the named
 //! owner transitions `create`, `update`, `assign`, `unassign`, `escalate`,
-//! `resolve`, `waive`, `supersede` and `reopen`. It contains no problem
+//! `resolve`, `waive`, `supersede`, `reopen` and `quarantine`. It contains no problem
 //! domain model and no transition logic: the pure state machines
 //! (`eliot_problem::Problem`) own the typed record and its fail-closed
 //! candidate-copy transitions, the Governor prepares the one
@@ -10,7 +10,7 @@
 //! Wire shapes stay serialization-only and never become a second semantic
 //! model.
 //!
-//! The nine verbs are *named* on the wire, not spelled as one generic
+//! The verbs are *named* on the wire, not spelled as one generic
 //! mutation: a caller that can write `REOPEN` cannot write the same change as
 //! `UPDATE`, because the discriminator is part of the canonical request hash and
 //! the recorded record must satisfy the identity, predecessor revision and
@@ -55,13 +55,23 @@ pub const PROBLEM_PARAM_AUTHORIZATION_DIGEST: &str = "authorization_digest";
 pub const PROBLEM_PARAM_RECORD_DIGEST: &str = "record_digest";
 /// The complete canonical candidate Problem record.
 pub const PROBLEM_PARAM_RECORD_JSON: &str = "record_json";
-/// The retained closure record a `WAIVE` or `SUPERSEDE` transition commits.
+/// The retained closure record a `WAIVE`, `SUPERSEDE` or `QUARANTINE`
+/// transition commits.
 ///
-/// `Problem` carries no waiver or supersession field, so the committed
-/// transition is where both closures are durable. It is present for exactly
-/// those two verbs and absent for every other one, so a closure can never be
-/// attached to a transition that did not produce one.
+/// `Problem` carries no waiver, supersession or source-restriction record, so
+/// the committed transition is where all three closures are durable. It is
+/// present for exactly those three verbs and absent for every other one, so a
+/// retained record can never be attached to a transition that did not produce
+/// one.
 pub const PROBLEM_PARAM_CLOSURE_JSON: &str = "closure_json";
+
+/// The retained closure record a `QUARANTINE` transition commits.
+///
+/// `Problem` carries no source-restriction record, so the committed transition
+/// is where an admitted quarantine is durable. It is present for exactly the
+/// three closing verbs and absent for every other one, so a retained
+/// restriction can never be attached to a transition that did not produce one.
+pub const PROBLEM_CLOSURE_QUARANTINED_FOR_REBUILD: &str = "SOURCE_QUARANTINE";
 
 /// `closure_json.kind` for an accepted risk.
 pub const PROBLEM_CLOSURE_WAIVED: &str = "WAIVED";
@@ -86,13 +96,31 @@ pub const PROBLEM_TRANSITION_WAIVE: &str = "WAIVE";
 pub const PROBLEM_TRANSITION_SUPERSEDE: &str = "SUPERSEDE";
 /// Wire value of the `reopen` transition.
 pub const PROBLEM_TRANSITION_REOPEN: &str = "REOPEN";
+/// Wire value of the `quarantine` transition.
+///
+/// A tenth named verb, added with issue #1760 item 5: an external-source
+/// restriction is admitted as its own transition rather than as an ordinary
+/// advance, because it is committed with a retained restriction record and
+/// under a deterministic-rule-or-authorized-decision authority that no other
+/// verb can name.
+pub const PROBLEM_TRANSITION_QUARANTINE: &str = "QUARANTINE";
+
+/// `ProblemState::Quarantined` as the wire spelling the candidate record uses.
+///
+/// Declared here so the verb check compares against a named spelling rather
+/// than an inline literal that could drift from the state machine's own
+/// `snake_case` serialization.
+pub const PROBLEM_STATE_QUARANTINED: &str = "quarantined";
 
 /// The closed I13.9 owner-transition verb set.
 ///
-/// Nine variants, one per named transition. The set is closed: a tenth verb is a
-/// contract change, and an existing verb cannot be reused for another verb's
-/// state change because the candidate record is checked against the bindings
-/// that verb carries.
+/// Ten variants, one per named transition. The set is closed: an eleventh verb
+/// would be a further contract change, and an existing verb cannot be reused for
+/// another verb's state change because the candidate record is checked against
+/// the bindings that verb carries. The tenth verb, `quarantine`, is the
+/// owner-bound admission of an external-source restriction; it is named rather
+/// than folded into `update` because it commits a retained restriction record
+/// and is authorized by a deterministic rule or an authorized decision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProblemOwnerTransition {
     /// Open a new Problem at revision 1 from an admitting Signal.
@@ -113,6 +141,9 @@ pub enum ProblemOwnerTransition {
     Supersede,
     /// Reopen a terminal Problem against actual recurrence evidence.
     Reopen,
+    /// Quarantine the bounded affected scope of an admitted source
+    /// restriction, under a deterministic rule or an authorized decision.
+    Quarantine,
 }
 
 impl ProblemOwnerTransition {
@@ -129,12 +160,13 @@ impl ProblemOwnerTransition {
             Self::Waive => PROBLEM_TRANSITION_WAIVE,
             Self::Supersede => PROBLEM_TRANSITION_SUPERSEDE,
             Self::Reopen => PROBLEM_TRANSITION_REOPEN,
+            Self::Quarantine => PROBLEM_TRANSITION_QUARANTINE,
         }
     }
 
     /// Resolves a wire name to its transition, or refuses an unknown verb.
     ///
-    /// Closed: the nine names below are the whole set, so a tenth verb is a
+    /// Closed: the names below are the whole set, so another verb is a
     /// contract change here and never a value that happens to decode.
     #[must_use]
     pub const fn by_name(name: &str) -> Option<Self> {
@@ -148,6 +180,7 @@ impl ProblemOwnerTransition {
             b"WAIVE" => Some(Self::Waive),
             b"SUPERSEDE" => Some(Self::Supersede),
             b"REOPEN" => Some(Self::Reopen),
+            b"QUARANTINE" => Some(Self::Quarantine),
             _ => None,
         }
     }
@@ -177,8 +210,8 @@ pub struct DecodedProblemOwnerState {
     pub record_digest: String,
     /// The complete canonical candidate Problem record.
     pub record_json: Value,
-    /// The retained closure record, present for exactly `WAIVE` and
-    /// `SUPERSEDE`.
+    /// The retained closure record, present for exactly `WAIVE`, `SUPERSEDE`
+    /// and `QUARANTINE`.
     pub closure_json: Option<Value>,
 }
 
@@ -204,7 +237,8 @@ impl DecodedProblemOwnerState {
             | ProblemOwnerTransition::Resolve
             | ProblemOwnerTransition::Waive
             | ProblemOwnerTransition::Supersede
-            | ProblemOwnerTransition::Reopen => match self.expected_revision.checked_add(1) {
+            | ProblemOwnerTransition::Reopen
+            | ProblemOwnerTransition::Quarantine => match self.expected_revision.checked_add(1) {
                 Some(revision) => Some(revision),
                 None => None,
             },
@@ -253,6 +287,18 @@ impl DecodedProblemOwnerState {
             return Err(StoreError::InvalidField {
                 field: "record_json.signal_refs",
                 reason: "candidate record is not bound to the presented source Signal",
+            });
+        }
+        // A quarantine verb whose candidate is not quarantined would commit a
+        // restriction record against a record the store can read as anything
+        // else, so the verb and the state it means are compared here rather
+        // than trusted from the producer.
+        if self.transition == ProblemOwnerTransition::Quarantine
+            && record.get("state").and_then(Value::as_str) != Some(PROBLEM_STATE_QUARANTINED)
+        {
+            return Err(StoreError::InvalidField {
+                field: "record_json.state",
+                reason: "a quarantine transition must commit a quarantined candidate record",
             });
         }
         Ok(())
@@ -325,6 +371,20 @@ fn closure_members(kind: &str) -> &'static [&'static str] {
             "limits",
             "residual_risk",
         ],
+        b"SOURCE_QUARANTINE" => &[
+            "assessed_source",
+            "authority",
+            "dependency_closure",
+            "expected_problem_revision",
+            "impacted_scopes",
+            "kind",
+            "owner",
+            "permitted_effects",
+            "problem_id",
+            "rebuild_condition",
+            "release_condition",
+            "retained_frontier",
+        ],
         _ => &[
             "evidence",
             "kind",
@@ -338,19 +398,231 @@ fn closure_members(kind: &str) -> &'static [&'static str] {
 fn transition_closes(transition: ProblemOwnerTransition) -> bool {
     matches!(
         transition,
-        ProblemOwnerTransition::Waive | ProblemOwnerTransition::Supersede
+        ProblemOwnerTransition::Waive
+            | ProblemOwnerTransition::Supersede
+            | ProblemOwnerTransition::Quarantine
     )
+}
+
+/// Validates one collection of unique non-blank strings.
+fn validate_unique_strings(
+    value: Option<&Value>,
+    reason: &'static str,
+    allow_empty: bool,
+) -> Result<(), StoreError> {
+    let Some(items) = value.and_then(Value::as_array) else {
+        return Err(StoreError::InvalidField {
+            field: PROBLEM_PARAM_CLOSURE_JSON,
+            reason,
+        });
+    };
+    if !allow_empty && items.is_empty() {
+        return Err(StoreError::InvalidField {
+            field: PROBLEM_PARAM_CLOSURE_JSON,
+            reason,
+        });
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for item in items {
+        let Some(text) = item.as_str() else {
+            return Err(StoreError::InvalidField {
+                field: PROBLEM_PARAM_CLOSURE_JSON,
+                reason,
+            });
+        };
+        if text.trim().is_empty() || !seen.insert(text) {
+            return Err(StoreError::InvalidField {
+                field: PROBLEM_PARAM_CLOSURE_JSON,
+                reason,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Whether a value is a lowercase SHA-256 digest.
+fn is_lowercase_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+/// Validates the closed admitting-authority spelling of a retained source
+/// restriction.
+///
+/// The two member names are I13.10's closed pair, restated at this boundary so
+/// a record carrying any other authority shape — including one that tried to
+/// name a model recommendation — refuses here instead of being stored as an
+/// admitted restriction.
+fn validate_quarantine_authority(value: Option<&Value>) -> Result<(), StoreError> {
+    const REASON: &str = "retained source restriction must name a deterministic rule or an authorized decision";
+    let Some(Value::Object(object)) = value else {
+        return Err(StoreError::InvalidField {
+            field: PROBLEM_PARAM_CLOSURE_JSON,
+            reason: REASON,
+        });
+    };
+    let mut members = object.keys();
+    let name = members.next().ok_or(StoreError::InvalidField {
+        field: PROBLEM_PARAM_CLOSURE_JSON,
+        reason: REASON,
+    })?;
+    if members.next().is_some() {
+        return Err(StoreError::InvalidField {
+            field: PROBLEM_PARAM_CLOSURE_JSON,
+            reason: REASON,
+        });
+    }
+    let reference = match name.as_str() {
+        "deterministic_policy" => "rule_id",
+        "authorized_human" => "decision_ref",
+        _ => {
+            return Err(StoreError::InvalidField {
+                field: PROBLEM_PARAM_CLOSURE_JSON,
+                reason: REASON,
+            });
+        }
+    };
+    let inner = object.get(name).and_then(Value::as_object).ok_or(
+        StoreError::InvalidField {
+            field: PROBLEM_PARAM_CLOSURE_JSON,
+            reason: REASON,
+        },
+    )?;
+    if inner.len() != 1
+        || !inner
+            .get(reference)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Err(StoreError::InvalidField {
+            field: PROBLEM_PARAM_CLOSURE_JSON,
+            reason: REASON,
+        });
+    }
+    Ok(())
+}
+
+/// Validates the nested identities of a retained source restriction: the exact
+/// affected source revision with its digest, the admitting authority and the
+/// accountable owner.
+fn validate_source_quarantine_identities(
+    object: &serde_json::Map<String, Value>,
+) -> Result<(), StoreError> {
+    let members = || StoreError::InvalidField {
+        field: PROBLEM_PARAM_CLOSURE_JSON,
+        reason: "retained source restriction does not carry exactly its admitted members",
+    };
+    let Some(source) = object.get("assessed_source").and_then(Value::as_object) else {
+        return Err(members());
+    };
+    for name in ["source_ref", "revision"] {
+        if !source
+            .get(name)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            return Err(members());
+        }
+    }
+    if !source
+        .get("digest")
+        .and_then(Value::as_str)
+        .is_some_and(is_lowercase_digest)
+    {
+        return Err(members());
+    }
+    validate_quarantine_authority(object.get("authority"))?;
+    let Some(owner) = object.get("owner").and_then(Value::as_object) else {
+        return Err(members());
+    };
+    for name in ["principal", "generation"] {
+        if !owner
+            .get(name)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            return Err(members());
+        }
+    }
+    Ok(())
+}
+
+/// Validates the retained source restriction one `QUARANTINE` verb commits.
+///
+/// The record is the lossless statement of what was admitted, so this compares
+/// it with the presented bindings instead of recording both: the retained
+/// Problem identity and expected revision must equal the ones the transition
+/// itself carries, and every named collection must be non-blank and
+/// duplicate-free. Nothing here is held to a digest the store cannot itself
+/// recompute; the affected closure travels as the exact member list the
+/// Governor re-derived from the traversal's own qualified edges, inside the same
+/// canonical request hash that carries the rest of this record.
+fn validate_source_quarantine_json(
+    object: &serde_json::Map<String, Value>,
+    problem_id: &str,
+    expected_revision: &str,
+) -> Result<(), StoreError> {
+    if object.get("problem_id").and_then(Value::as_str) != Some(problem_id) {
+        return Err(StoreError::InvalidField {
+            field: PROBLEM_PARAM_CLOSURE_JSON,
+            reason: "retained source restriction does not name the presented Problem",
+        });
+    }
+    if object.get("expected_problem_revision").and_then(Value::as_str) != Some(expected_revision) {
+        return Err(StoreError::InvalidField {
+            field: PROBLEM_PARAM_CLOSURE_JSON,
+            reason: "retained source restriction does not name the presented expected revision",
+        });
+    }
+    for name in ["release_condition", "rebuild_condition"] {
+        if !object
+            .get(name)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            return Err(StoreError::InvalidField {
+                field: PROBLEM_PARAM_CLOSURE_JSON,
+                reason: "retained source restriction must state its release/rebuild condition",
+            });
+        }
+    }
+    validate_unique_strings(
+        object.get("dependency_closure"),
+        "retained source restriction must carry the exact affected dependency closure",
+        false,
+    )?;
+    validate_unique_strings(
+        object.get("impacted_scopes"),
+        "retained source restriction must carry the bounded quarantined scope",
+        false,
+    )?;
+    validate_unique_strings(
+        object.get("permitted_effects"),
+        "retained source restriction must carry the bounded permitted effect",
+        false,
+    )?;
+    validate_unique_strings(
+        object.get("retained_frontier"),
+        "retained source restriction must carry its retained frontier",
+        true,
+    )?;
+    validate_source_quarantine_identities(object)
 }
 
 /// Validates the retained closure record for one verb.
 ///
 /// Exact membership per `kind`, so a waiver cannot carry a supersession's
-/// members, a supersession cannot carry a waiver's, and neither can hide a
-/// member the admitted decision did not have. This is what makes the closure
-/// durable *as admitted* rather than as a restatement.
+/// members, a supersession cannot carry a waiver's, neither can hide a
+/// member the admitted decision did not have, and a retained source restriction
+/// cannot be attached to a verb that did not admit one. This is what makes the
+/// closure durable *as admitted* rather than as a restatement.
 fn validate_closure_json(
     transition: ProblemOwnerTransition,
     value: &Value,
+    problem_id: &str,
+    expected_revision: &str,
 ) -> Result<(), StoreError> {
     let Value::Object(object) = value else {
         return Err(StoreError::InvalidField {
@@ -368,10 +640,11 @@ fn validate_closure_json(
     let expected_kind = match transition {
         ProblemOwnerTransition::Waive => PROBLEM_CLOSURE_WAIVED,
         ProblemOwnerTransition::Supersede => PROBLEM_CLOSURE_SUPERSEDED_BY,
+        ProblemOwnerTransition::Quarantine => PROBLEM_CLOSURE_QUARANTINED_FOR_REBUILD,
         _ => {
             return Err(StoreError::InvalidField {
                 field: PROBLEM_PARAM_CLOSURE_JSON,
-                reason: "only a waive or supersede transition commits a closure record",
+                reason: "only a waive, supersede or quarantine transition commits a closure record",
             });
         }
     };
@@ -388,6 +661,9 @@ fn validate_closure_json(
             field: PROBLEM_PARAM_CLOSURE_JSON,
             reason: "retained closure record does not carry exactly its admitted members",
         });
+    }
+    if kind == PROBLEM_CLOSURE_QUARANTINED_FOR_REBUILD {
+        return validate_source_quarantine_json(object, problem_id, expected_revision);
     }
     if kind == PROBLEM_CLOSURE_WAIVED
         && !matches!(object.get("expires_at_ms").and_then(Value::as_u64), Some(expiry) if expiry > 0)
@@ -424,7 +700,7 @@ pub fn validate_problem_owner_state_params(
     let Some(transition) = ProblemOwnerTransition::by_name(verb) else {
         return Err(StoreError::UnknownOperation);
     };
-    required_text(parameters, PROBLEM_PARAM_PROBLEM_ID)?;
+    let problem_id = required_text(parameters, PROBLEM_PARAM_PROBLEM_ID)?;
     required_text(parameters, PROBLEM_PARAM_SOURCE_SIGNAL_ID)?;
     let expected = required_text(parameters, PROBLEM_PARAM_EXPECTED_REVISION)?;
     match expected.parse::<u64>() {
@@ -448,11 +724,11 @@ pub fn validate_problem_owner_state_params(
         });
     }
     match parameters.get(PROBLEM_PARAM_CLOSURE_JSON) {
-        Some(value) => validate_closure_json(transition, value)?,
+        Some(value) => validate_closure_json(transition, value, problem_id, expected)?,
         None if transition_closes(transition) => {
             return Err(StoreError::InvalidField {
                 field: PROBLEM_PARAM_CLOSURE_JSON,
-                reason: "a waive or supersede transition must retain its closure record",
+                reason: "a waive, supersede or quarantine transition must retain its closure record",
             });
         }
         None => {}

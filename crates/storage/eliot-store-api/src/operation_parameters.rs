@@ -362,7 +362,7 @@ static RECONCILE_RECOVERY_PARAMETERS: [ParameterDeclaration; 10] = [
 /// exact and every one of them is required, so a transition cannot be admitted
 /// with a binding missing; `validate_problem_owner_state_params` then closes the
 /// verb set, compares the candidate record against them, and gates the optional
-/// retained closure record to exactly the two verbs that produce one.
+/// retained closure record to exactly the three verbs that produce one.
 static APPLY_PROBLEM_OWNER_STATE_PARAMETERS: [ParameterDeclaration; 8] = [
     ParameterDeclaration {
         name: "transition",
