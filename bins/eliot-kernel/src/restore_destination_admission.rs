@@ -242,7 +242,10 @@ impl std::fmt::Display for RestoreDestinationRefusal {
                 "the installation authority retains no prepared isolated destination for this operation"
             ),
             Self::OwnerRecordInvalid => {
-                write!(formatter, "the owner-issued destination admission is invalid")
+                write!(
+                    formatter,
+                    "the owner-issued destination admission is invalid"
+                )
             }
             Self::ForeignInstallation => write!(
                 formatter,
@@ -430,7 +433,9 @@ impl AdmittedIsolatedDestination {
     /// The owner's class is never discarded: a caller that must decide whether
     /// to re-prepare a destination, escalate to the installation authority, or
     /// treat the record as corrupt needs the owner's reason, not a paraphrase.
-    fn owner_refusal(error: eliot_installation::IsolatedDestinationError) -> RestoreDestinationRefusal {
+    fn owner_refusal(
+        error: eliot_installation::IsolatedDestinationError,
+    ) -> RestoreDestinationRefusal {
         use eliot_installation::{IsolatedDestinationError, IsolatedDestinationRefusal as Owner};
         match error {
             IsolatedDestinationError::Refused(Owner::DestinationNotAbsent) => {
@@ -495,7 +500,10 @@ impl AdmittedIsolatedDestination {
             self.admission.operation_id.as_str(),
             self.admission.archive_id.as_str(),
             self.admission.destination_installation.as_str(),
-            self.admission.isolation.destination_installation_root.as_str(),
+            self.admission
+                .isolation
+                .destination_installation_root
+                .as_str(),
         )
         .ok_or(RestoreDestinationRefusal::OwnerRecordInvalid)?;
         if recomputed != self.binding_digest {
@@ -521,7 +529,10 @@ impl AdmittedIsolatedDestination {
     /// reaches it.
     #[must_use]
     pub fn destination_label(&self) -> &str {
-        self.admission.isolation.destination_installation_key.as_str()
+        self.admission
+            .isolation
+            .destination_installation_key
+            .as_str()
     }
 
     /// The destination installation root the OWNER derived and recorded.
@@ -532,7 +543,10 @@ impl AdmittedIsolatedDestination {
     /// and is never re-derived here.
     #[must_use]
     pub fn destination_root(&self) -> &str {
-        self.admission.isolation.destination_installation_root.as_str()
+        self.admission
+            .isolation
+            .destination_installation_root
+            .as_str()
     }
 
     /// The owner-declared isolated restore area the owner resolved through its
@@ -591,9 +605,7 @@ impl AdmittedIsolatedDestination {
     /// decides what an unpinned destination means for its own phase, and a
     /// durable read never collapses a missing file, a permission denial and a
     /// broken path into one silent answer.
-    pub fn read_pinned(
-        destination_root: &Path,
-    ) -> Result<Self, ReadPinnedDestinationError> {
+    pub fn read_pinned(destination_root: &Path) -> Result<Self, ReadPinnedDestinationError> {
         let path = destination_root.join(RESTORE_DESTINATION_BINDING_FILE);
         let bytes = std::fs::read(&path).map_err(ReadPinnedDestinationError::Io)?;
         let pinned: PinnedDestinationBinding =

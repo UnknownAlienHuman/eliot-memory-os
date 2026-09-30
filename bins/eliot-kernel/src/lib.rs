@@ -287,9 +287,9 @@ pub mod notify_operation_identity;
 mod provider_capability_route;
 mod restore_destination_admission;
 pub use restore_destination_admission::{
-    AdmittedIsolatedDestination, PinnedDestinationBinding,
-    ReadPinnedDestinationError, RESTORE_DESTINATION_BINDING_FILE, RestoreDestinationRefusal,
-    admitted_isolated_destination, require_admitted_destination,
+    AdmittedIsolatedDestination, PinnedDestinationBinding, RESTORE_DESTINATION_BINDING_FILE,
+    ReadPinnedDestinationError, RestoreDestinationRefusal, admitted_isolated_destination,
+    require_admitted_destination,
 };
 pub mod reactive_restore_serve;
 mod request_dispatch;

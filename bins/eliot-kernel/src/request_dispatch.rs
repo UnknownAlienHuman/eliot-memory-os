@@ -218,11 +218,11 @@ use super::backup_restore_ports::{
 use super::backup_verify_provenance::{OwnerProvenanceEvidence, check_provenance_binding};
 use super::composition_bootstrap::DAEMON_FRONT_DOOR_CAPABILITY;
 use super::restore_destination_admission::AdmittedIsolatedDestination;
-use eliot_installation::PreparedDestinationAdmission;
 use super::{
     CaptureCallerAuth, CaptureReport, CaptureState, KernelCaptureError, KernelComposition,
     KernelFrameAction, status_frame,
 };
+use eliot_installation::PreparedDestinationAdmission;
 
 /// Closed backup create operation selector (mirrored by the operator CLI
 /// surface; the string only selects this entry, never authority).
@@ -412,7 +412,6 @@ const RESTORE_TEST_SHAPE_GATES_ADMITTED: [&str; 6] = [
 /// [`BACKUP_RESTORE_TEST_MISSING_OWNER`] names.
 const RESTORE_TEST_GATES_NOT_ADMITTED: [&str; 2] =
     ["destination-manifest-admission", "cutover-qualification"];
-
 
 /// The owner-held gates that are additionally not admitted for a blob-carrying
 /// archive, appended to [`RESTORE_TEST_GATES_NOT_ADMITTED`] for that archive.
@@ -3622,21 +3621,20 @@ fn handle_backup_restore_test(
     // identity read from the authenticated Host startup binding. That is an
     // owner-issued value no frame can supply, so an admission minted for another
     // installation refuses here rather than naming a destination on this one.
-    let destination_admission =
-        match AdmittedIsolatedDestination::bind_owner_admission(
-            &owner_admission,
-            identity.installation_ref(),
-            &bundle,
-        ) {
-            Ok(binding) => binding,
-            Err(_) => {
-                return refuse(
-                    &KernelRestoreError::DestinationNotAdmitted,
-                    &gates_passed,
-                    &gates_not_admitted,
-                );
-            }
-        };
+    let destination_admission = match AdmittedIsolatedDestination::bind_owner_admission(
+        &owner_admission,
+        identity.installation_ref(),
+        &bundle,
+    ) {
+        Ok(binding) => binding,
+        Err(_) => {
+            return refuse(
+                &KernelRestoreError::DestinationNotAdmitted,
+                &gates_passed,
+                &gates_not_admitted,
+            );
+        }
+    };
     gates_passed.push("destination-admission");
     let ports = RestorePorts {
         journal_admission: &journal_admission,

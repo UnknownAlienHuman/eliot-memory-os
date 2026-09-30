@@ -3084,13 +3084,14 @@ impl<'a> KernelRestoreTarget<'a> {
                 subject: "owner-admitted destination".to_owned(),
             });
         };
-        let pinned = AdmittedIsolatedDestination::read_pinned(&self.root)
-            .map_err(|error| match error {
+        let pinned =
+            AdmittedIsolatedDestination::read_pinned(&self.root).map_err(|error| match error {
                 // A pin that cannot be read is not a typed owner refusal and is
                 // never reported as one: an inaccessible record is a refusal to
                 // proceed, not evidence that the owner refused.
-                ReadPinnedDestinationError::Io(_)
-                | ReadPinnedDestinationError::Corrupt => BackupError::RestoreJournalCorrupt,
+                ReadPinnedDestinationError::Io(_) | ReadPinnedDestinationError::Corrupt => {
+                    BackupError::RestoreJournalCorrupt
+                }
                 ReadPinnedDestinationError::Refused(_) => BackupError::FenceMismatch {
                     subject: "owner-admitted destination".to_owned(),
                 },
