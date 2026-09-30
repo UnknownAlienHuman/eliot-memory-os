@@ -21747,9 +21747,13 @@ impl RedbRecoveryStore {
     /// written, and capped by
     /// #2730/#2885 — this view only reads its per-namespace rows into the
     /// denominator so quiet streams cannot hide lifetime occupancy behind
-    /// historical windows, and never writes, deletes, or resets it. Served
-    /// inside the owner recovery inventory, where the receiver sizes
-    /// backpressure against pending versus retained evidence.
+    /// historical windows, and never writes, deletes, or resets it. The
+    /// cursor's retained old-sequence boundary is reported as
+    /// `compacted_boundary` (issue #2885, item 10), so status and backup
+    /// account for the retired prefix without re-reading the cursor; this
+    /// view only reads the boundary and no restart or restore path moves
+    /// it. Served inside the owner recovery inventory, where the receiver
+    /// sizes backpressure against pending versus retained evidence.
     fn bridge_capacity_accounting_for(
         read: &redb::ReadTransaction,
         owner: &BridgeStreamOwnerRow,
@@ -21766,19 +21770,31 @@ impl RedbRecoveryStore {
         let (projections, projection_bytes) =
             Self::bridge_projection_accounting_for(read, owner, read_budget)?;
         let (gaps, gap_bytes) = Self::bridge_gap_accounting_for(read, namespace, read_budget)?;
-        let cursor_bytes = {
+        let (cursor_bytes, compacted_boundary) = {
             let cursors = read.open_table(BRIDGE_EVENT_CURSORS).map_err(storage)?;
             match cursors.get(namespace).map_err(storage)? {
                 Some(value) => {
                     read_budget.charge(namespace.as_bytes(), value.value().as_bytes())?;
                     let (stable_bytes, _) =
                         Self::bridge_cursor_stable_and_scan_bytes(value.value())?;
-                    u64::try_from(namespace.len())
+                    let cursor: BridgeEventCursorRow = decode(value.value())?;
+                    cursor.validate()?;
+                    if cursor.owner_namespace != namespace
+                        || cursor.stream_id != owner.local_stream
+                    {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: "bridge_event_cursor",
+                            reason: "capacity census cursor names a foreign owner namespace"
+                                .to_owned(),
+                        });
+                    }
+                    let bytes = u64::try_from(namespace.len())
                         .ok()
                         .and_then(|key_bytes| key_bytes.checked_add(stable_bytes))
-                        .ok_or(OrsError::PayloadTooLarge)?
+                        .ok_or(OrsError::PayloadTooLarge)?;
+                    (bytes, cursor.last_compacted_sequence)
                 }
-                None => 0,
+                None => (0, 0),
             }
         };
         // Position counts/bytes were gathered with the owner-indexed live
@@ -21815,6 +21831,7 @@ impl RedbRecoveryStore {
             "gaps": gaps,
             "gap_bytes": gap_bytes,
             "cursor_bytes": cursor_bytes,
+            "compacted_boundary": compacted_boundary,
             "owner_bytes": owner_bytes,
             "total_bytes": total_bytes,
         }))
