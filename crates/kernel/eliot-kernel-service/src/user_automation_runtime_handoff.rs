@@ -1584,9 +1584,7 @@ impl UserAutomationOperatorTransition {
 /// normalized occurrence denominator — and not only to its name. A read-only
 /// answer and a `RunNow` answer own no revision, and both answer `None` rather
 /// than naming one that does not exist.
-fn committed_revision(
-    phase: &UserAutomationConfigurationPhase,
-) -> Option<&UserAutomationRevision> {
+fn committed_revision(phase: &UserAutomationConfigurationPhase) -> Option<&UserAutomationRevision> {
     match phase.mutation_result()? {
         UserAutomationMutationResult::Revision { revision, .. } => Some(revision),
         UserAutomationMutationResult::RunNow { .. } => None,
@@ -1753,7 +1751,10 @@ fn validate_horizon_denominator_membership(
     let mut run = Vec::with_capacity(horizon.requested_occurrence_ids.len());
     for occurrence_id in &horizon.requested_occurrence_ids {
         let member = occurrence_id.as_str();
-        let Some(position) = denominator.iter().position(|candidate| *candidate == member) else {
+        let Some(position) = denominator
+            .iter()
+            .position(|candidate| *candidate == member)
+        else {
             return Err(format!(
                 "horizon requested occurrence {occurrence_id} is not a member of the committed \
                  revision's normalized denominator"
