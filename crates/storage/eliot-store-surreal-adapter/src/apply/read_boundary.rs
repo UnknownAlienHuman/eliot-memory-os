@@ -1130,7 +1130,7 @@ fn evidence_pack_payload(
             operation_base.saturating_add(row.named_operation_count.unwrap_or(0) as u64);
     }
     // Exact subject match only — never substring, never a default.
-    let matched: Vec<(u64, &EvidenceRecordRow)> = indexed
+    let matched: Vec<(u64, &EvidenceRecordRow, Option<eliot_store_api::TaskBinding>)> = indexed
         .into_iter()
         .filter(|(_, record, _)| record.subject == subject)
         .collect();
