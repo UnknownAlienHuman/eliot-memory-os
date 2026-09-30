@@ -33,11 +33,11 @@
 //! - [`admit_canonical_write`] — the composition-root named-mutation intake.
 //!   The caller presents its compiled
 //!   [`OnboardingReadinessReceipt`](eliot_workscope::OnboardingReadinessReceipt),
-//!   so this is the only entry that can see its task binding. The receipt
-//!   carries the owner-proven selection source/evidence from the promoting
-//!   task-intake owner, which [`resolve_task_selection`] validates into
-//!   [`TaskSelectionEvidence`]. No source is synthesized from an unrelated
-//!   profile or receipt handle. I5.6 step 4 verbatim — "resolve `TaskSelectionEvidence`
+//!   so this is the only entry that can see its task binding. A
+//!   `CurrentTaskContract` binding is admitted only from the owner-proven
+//!   selection evidence retained on that same receipt. No source is synthesized
+//!   from an unrelated profile or receipt handle. I5.6 step 4 verbatim —
+//!   "resolve `TaskSelectionEvidence`
 //!   and `TaskContract` compatibility when the command is task-relative".
 //! - [`admit_named_mutation_capture`] — the transport edge
 //!   (`DaemonKernelClient::apply_prepared`). No typed selection exists there, so
@@ -56,19 +56,10 @@
 //!   mints no receipt of its own.
 //!
 //! - [`bind_current_task_selection`] — the applicability recheck admission
-//!   needs (issue #1746, W4). It refuses a current task until the readiness
-//!   receipt carries owner-proven selection source/evidence. The owner
-//!   producer is `GovernorComposition::current_task_selection_for_claim`
-//!   (retained terminal plus unique live activation, never request-supplied
-//!   evidence); its full-claim composition caller is
-//!   `DaemonComposition::resolve_current_task_selection` (STITCH: no live
-//!   dispatch ingress holds the full claim yet). The dispatch entry
-//!   (`DaemonComposition::commit_canonical_and_refresh`) instead supplies
-//!   partial lease-key terms to the partial-key
-//!   `GovernorComposition::current_task_selection`, which fail-closes by
-//!   owner decision (#1790), so task-relative admission withholds until the
-//!   full-claim route supplies the snapshot. Structural validation of
-//!   request-supplied `TaskSelectionEvidence` is never sufficient.
+//!   needs (issue #1746, W4). It uses only owner-proven selection evidence
+//!   retained in the readiness receipt and rechecks it against the activation
+//!   snapshot and live fence. Structural validation of request-supplied
+//!   `TaskSelectionEvidence` is never sufficient.
 //! - [`admit_canonical_write_with_activation`] — the W4 join (issue #1746,
 //!   W4/A2): [`admit_canonical_write`] preceded by
 //!   [`bind_current_task_selection`], so a structurally valid receipt that
@@ -1319,11 +1310,11 @@ pub fn correlate_activation_result(
 /// in [`resolve_task_selection`] enforces the owner bound (2..=16) on this
 /// exact receipt before they are returned, so the caller answers with the
 /// eligible set instead of choosing; `Exploratory` stays explicitly read-only; `Stale` preserves the
-/// exact revision for a refresh/rebind answer; `Current` without
-/// owner-proven selection source/evidence is refused with
-/// `TASK_SELECTION_REQUIRED` (structural validation of request-supplied
-/// evidence is never sufficient). No task is ever auto-created to remove an
-/// absence, and no cold capture is retroactively attached here.
+/// exact revision for a refresh/rebind answer; `Current` uses only the
+/// owner-proven selection evidence retained on that receipt (structural
+/// validation of request-supplied evidence is never sufficient). No task is
+/// ever auto-created to remove an absence, and no cold capture is retroactively
+/// attached here.
 ///
 /// Called by [`admit_canonical_write`] to derive its selection legs.
 pub fn selection_response_for_receipt(
@@ -1719,15 +1710,13 @@ pub fn admit_task_bound_with_observed_scope(
 /// owner on this exact receipt), never an unbounded caller set. An invalid
 /// receipt fails closed with `TASK_SCOPE_INCOMPATIBLE` and resolves nothing.
 ///
-/// A current binding resolves only from the owner-proven selection
-/// source/evidence refs the promoting owner admitted into the receipt
-/// (`TaskIntakeCandidate::promote`): the evidence is structurally validated
-/// here, never fabricated, and admission additionally requires the live
-/// applicability recheck in [`bind_current_task_selection`] — a `Current`
-/// receipt with no owner-validated activation snapshot never admits
-/// task-bound work. The governance profile and receipt
-/// handle are unrelated to task selection and are not used as provenance.
-/// Every non-current binding state keeps its typed meaning:
+/// A current binding is admitted only from the original owner-proven
+/// [`TaskSelectionEvidence`] retained in the receipt. The original is
+/// validated and compared with the independently retained task contract,
+/// `WorkScope`, and task revision in the readiness fence before it escapes.
+/// The governance profile and receipt handle are unrelated to task selection
+/// and are not used as provenance. Every non-current binding state keeps its
+/// typed meaning:
 ///
 /// - [`TaskBindingState::None_`] — the caller selected no task;
 /// - `Exploratory` — a task is named but the binding is explicitly
@@ -1739,11 +1728,10 @@ pub fn admit_task_bound_with_observed_scope(
 ///   disposition stays non-material.
 ///
 /// There is deliberately no latest-task, open-task, or resolver-guess leg here:
-/// ambiguity is reported, never resolved. The task-intake owner shape is
-/// produced by `eliot_workscope::task_selection_required` and consumed by
-/// [`selection_response_for_receipt`]; the owner-proven selection
-/// source/evidence refs arrive through the promoting owner above, never
-/// through a request.
+/// ambiguity is reported, never resolved. The task-intake owner producer is
+/// present (`eliot_workscope::task_selection_required`, consumed by
+/// [`selection_response_for_receipt`]); current-task evidence is accepted only
+/// from the retained receipt field and must agree with its original contract.
 pub fn resolve_task_selection(
     receipt: &OnboardingReadinessReceipt,
 ) -> Result<TaskSelectionDisposition, TaskBindingError> {
@@ -1760,21 +1748,35 @@ pub fn resolve_task_selection(
             selection_source_ref,
             evidence_ref,
         } => {
-            let evidence = TaskSelectionEvidence {
-                task_ref: task_ref.clone(),
-                task_revision: *task_revision,
-                acceptance_digest: acceptance_digest.clone(),
-                work_scope_ref: receipt.scope.scope_ref.clone(),
-                selection_source_ref: selection_source_ref.clone(),
-                evidence_ref: evidence_ref.clone(),
-                contamination_flags: Vec::new(),
-            };
+            let evidence = receipt.task_selection_evidence.as_ref().ok_or_else(|| {
+                TaskBindingError::selection_required(
+                    "current task has no retained owner-proven selection evidence",
+                )
+            })?;
             evidence.validate().map_err(|error| {
                 TaskBindingError::selection_required(format!(
-                    "current task selection evidence is invalid: {error}"
+                    "retained task selection evidence invalid: {error}"
                 ))
             })?;
-            Ok(TaskSelectionDisposition::Current(evidence))
+            if evidence.is_contaminated() {
+                return Err(TaskBindingError::selection_required(
+                    "retained task selection evidence is contaminated",
+                ));
+            }
+            if evidence.task_ref != *task_ref
+                || evidence.task_revision != *task_revision
+                || evidence.acceptance_digest != *acceptance_digest
+                || evidence.selection_source_ref != *selection_source_ref
+                || evidence.evidence_ref != *evidence_ref
+                || evidence.work_scope_ref != receipt.scope.scope_ref
+                || receipt.state_fence.task_revision.map(|revision| revision.value())
+                    != Some(evidence.task_revision)
+            {
+                return Err(TaskBindingError::scope_incompatible(
+                    "retained task selection evidence disagrees with its task contract, WorkScope, or State Fence",
+                ));
+            }
+            Ok(TaskSelectionDisposition::Current(evidence.clone()))
         }
         TaskBindingState::Exploratory {
             task_ref,
@@ -1802,10 +1804,9 @@ pub fn resolve_task_selection(
 /// Rechecks one Governor-resolved task selection against the current
 /// applicability and fence before any admission (I5.6 step 4, issue #1746 W4).
 ///
-/// [`resolve_task_selection`] resolves `CurrentTaskContract` from the
-/// receipt's owner-proven selection source/evidence refs; this entry is the
-/// applicability leg required by the issue: the ORIGINAL owner evidence is
-/// validated as compiled
+/// [`resolve_task_selection`] supplies only ORIGINAL owner evidence retained
+/// in the readiness receipt. This entry is the applicability leg required by
+/// the issue: that evidence is validated as compiled
 /// (non-zero `TaskContract` revision, acceptance-digest shape, `WorkScope`,
 /// selection source and evidence handles), then every selection field is
 /// rechecked at this exact fence — revision and `WorkScope` against what the
@@ -2244,9 +2245,9 @@ pub fn admit_bootstrap_context(
             },
         }),
         TaskSelectionResponse::Current(task) => {
-            // `resolve_task_selection` admits `CurrentTaskContract` only from
-            // the owner-proven selection source/evidence the receipt carries —
-            // never through a caller READY flag.
+            // `resolve_task_selection` admits this arm only from owner-proven
+            // selection evidence retained on the readiness receipt — never
+            // through a caller READY flag.
             if receipt.scope_resolution != ScopeResolutionState::Authenticated
                 || receipt.readiness != ReadinessLifecycle::ReadyMaterial
             {
@@ -2420,8 +2421,12 @@ fn compatibility_for(
 /// recency, proximity, or the newest/open task. Its typed evidence is exactly
 /// what the store bridge cannot see: the store gate re-derives presence and
 /// agreement from the opaque proof handles, this gate verifies the
-/// `TaskSelectionEvidence` values against the caller's own receipt. A
-/// `TaskBound` admission carries the sealed [`DispatchedBinding`] forward; the
+/// Original `TaskSelectionEvidence` is first checked against the receipt's
+/// independently retained task contract and fence, then against the admitted
+/// request task and the envelope's scope/fence. The operation terms are always
+/// the expected values; evidence is never compared with itself. A `TaskBound`
+/// admission carries that same original evidence in the sealed
+/// [`DispatchedBinding`] forward; the
 /// dispatch effect gate revalidates it against the live owners through
 /// [`revalidate_dispatched_binding`] (and [`revalidate_task_bound_for_effect`]
 /// for the fence leg) (issue #1746, W6/A5).
