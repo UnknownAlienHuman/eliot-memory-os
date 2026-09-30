@@ -27,7 +27,13 @@
 //! - every stage really starts as a real child through the sole
 //!   [`WindowsProcessExecutor`] under a Kernel-issued dispatch permit, so the
 //!   per-stage evidence the receipt carries came from a process this entry
-//!   executed rather than from a value it was handed;
+//!   executed rather than from a value it was handed. That launch is gated by
+//!   `StageOrchestrator::launch_plan_live`, which refuses to launch a plan
+//!   compiled against a replaced registry generation and admits each stage
+//!   through `AdmittedStage::admit_live` against the live [`InstrumentRegistry`]
+//!   this run assembled from the observed supply-chain receipts, so a spec,
+//!   parser, receipt, or route revoked since compilation fails closed before
+//!   any child exists;
 //! - the receipt itself is issued by the shared
 //!   [`build_verification_profile_receipt`] through
 //!   [`resolve_verification_route`], which refuses a missing executable
@@ -80,10 +86,7 @@ use eliot_instrument_runner::{
     ProfileAggregate, ProfileCompiler, RunnerError, StageEnvironment, StageLauncher,
     StageOrchestrator, SupplyChainReceipt, TargetLayout, VerificationProfileReceipt,
     VerificationRouteRequest, WorkScope, admitted_profile_for_alias,
-    profile::{
-        PROFILE_ALIASES, builtin_specs, bundle_verification_profile, compiler_profile,
-        package_verification_profile, test_profile,
-    },
+    profile::{PROFILE_ALIASES, builtin_specs},
     resolve_verification_route,
 };
 use eliot_process::{
@@ -144,6 +147,14 @@ const STAGE_WALL_TIMEOUT_MS: u64 = 3_600_000;
 
 /// Ceiling on descendant processes for one admitted stage child.
 const STAGE_MAX_DESCENDANTS: u32 = 256;
+
+/// Ceiling on the retained bytes of one observed tool version line.
+///
+/// Bounded so a tool that answers `--version` with an unbounded stream cannot
+/// turn the version read into unbounded retention. It is far above any real
+/// tool's version line, so an ordinary version is recorded in full and only a
+/// runaway read is refused.
+const MAX_TOOL_VERSION_BYTES: usize = 4096;
 
 /// The exact invocation this binary reads.
 struct Request {
@@ -306,20 +317,17 @@ fn resolve_route(request: &Request) -> Result<VerificationProfileReceipt, CliErr
     // the supply-chain receipts this process observed, rather than supplied by
     // the caller, because the registry is what decides which revision an alias
     // admits and a caller-assembled registry could admit a different revision
-    // than the one CI resolves. `builtin_specs` plus the four builtin profiles
-    // is the same definition set `with_verification_route_profiles` assembles,
-    // built through `InstrumentRegistry::build` because the receipts have to be
-    // pinned against the admitted spec digests this run observed.
+    // than the one CI resolves. It is built through the SAME shared owner
+    // `InstrumentRegistry::with_verification_route_profiles` that
+    // `resolve_verification_route` builds for the receipt below, so the
+    // admission this process performs on every stage and the admission the
+    // receipt builder performs are the same definitions at the same generation
+    // — the plan this process compiles therefore carries exactly the
+    // registry generation and digest `launch_plan_live` checks before it
+    // admits anything.
     let specs = builtin_specs()?;
     let receipts = observed_supply_chain(&specs)?;
-    let registry = InstrumentRegistry::build(
-        specs,
-        vec![
-            compiler_profile()?,
-            test_profile()?,
-            package_verification_profile()?,
-            bundle_verification_profile()?,
-        ],
+    let registry = InstrumentRegistry::with_verification_route_profiles(
         VERIFICATION_REGISTRY_GENERATION,
         receipts.clone(),
     )?;
@@ -395,7 +403,30 @@ fn resolve_route(request: &Request) -> Result<VerificationProfileReceipt, CliErr
         layout: layout.clone(),
         port,
     };
-    let aggregate = block_on(runner.run_profile_stages(&admitted, &launcher));
+    // The live registry is REQUIRED here, not optional. `launch_plan_live`
+    // first checks that this plan was compiled against exactly this registry's
+    // generation and digest — and records every stage as an explicit missing
+    // proof if it was not, so a plan from a replaced generation can never
+    // launch under revoked admission. It then admits every stage through
+    // `AdmittedStage::admit_live`, which runs `refuse_if_revoked` against that
+    // live registry before sealing the grant, so a spec, parser, supply-chain
+    // receipt, or route replaced since this run's compilation fails closed here
+    // and the stage becomes a visible missing run rather than a child process.
+    // The registry-free `run_profile_stages` walks the same plan but passes
+    // `None` for the live registry, so it never performs either the
+    // generation/digest binding or the per-stage revocation check. Passing that
+    // registry in — the real one this run built from the observed supply-chain
+    // receipts, at the same generation the receipt builder uses — is what makes
+    // this resolver's stage admission a live admission rather than a walk over a
+    // stale compiled one.
+    let plan = StageOrchestrator::plan(&admitted);
+    let runs = block_on(StageOrchestrator::launch_plan_live(
+        &runner,
+        &registry,
+        &plan,
+        &launcher,
+    ));
+    let aggregate = ProfileAggregate::assemble(&plan, runs);
     require_launched_stage(&admitted, &aggregate)?;
 
     // The same observed receipts travel into the receipt builder. It assembles
@@ -571,6 +602,60 @@ fn file_digest(path: &Path) -> Result<String, CliError> {
         ))
     })?;
     Ok(sha256_hex(&bytes))
+}
+
+/// Observes one tool's reported version by really running that tool.
+///
+/// `ExecutableObservation::is_complete` refuses an identity that carries no
+/// tool version, so the version is a required datum here rather than an
+/// optional decoration: I18.21 requires that "executable/tool identities are
+/// pinned or recorded", and a version nobody read is neither. The text is
+/// whatever the tool itself printed on its own `--version` invocation, bounded
+/// to the first non-empty line and to [`MAX_TOOL_VERSION_BYTES`]; a tool that
+/// exits nonzero, prints nothing, or overruns that bound is refused rather than
+/// receipted under a synthesized value, because a wrong version is a pinned
+/// identity that does not describe the bytes it is bound to.
+///
+/// This runs the tool as a plain child of this process for the sole purpose of
+/// reading its version. It is deliberately NOT the governed stage launch: the
+/// stage's own permit-bound launch is [`seal_stage_request`], and this read
+/// happens before it, so no stage is executed and no verdict is derived here.
+fn observed_tool_version(executable: &Path) -> Result<String, CliError> {
+    let output = std::process::Command::new(executable)
+        .arg("--version")
+        .output()
+        .map_err(|error| {
+            CliError::Contract(format!(
+                "tool {} reported no version ({error})",
+                executable.display()
+            ))
+        })?;
+    if !output.status.success() {
+        return Err(CliError::Contract(format!(
+            "tool {} exited {} while reporting its version",
+            executable.display(),
+            output.status
+        )));
+    }
+    let reported = String::from_utf8_lossy(&output.stdout);
+    let version = reported
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .ok_or_else(|| {
+            CliError::Contract(format!(
+                "tool {} printed no version line",
+                executable.display()
+            ))
+        })?;
+    if version.len() > MAX_TOOL_VERSION_BYTES {
+        return Err(CliError::Contract(format!(
+            "tool {} reported a {} byte version line, over the {MAX_TOOL_VERSION_BYTES} byte bound",
+            executable.display(),
+            version.len()
+        )));
+    }
+    Ok(version.to_owned())
 }
 
 /// Reads the exact invocation text this binary accepts.
@@ -1010,6 +1095,14 @@ fn stage_argv(stage: &PlannedStage) -> Vec<String> {
 /// `ExecutableObservation::observe_from_intent` re-derives at launch. The request
 /// is therefore the one the admitted stage runs, and a tool swapped between
 /// sealing and launch fails the executor's own observation check.
+///
+/// The tool version is observed by really running the tool's own version flag
+/// and keeping the first line it printed. A complete identity requires a
+/// non-empty version (`is_complete` refuses an observation without one), and
+/// this is the same machine observation the `eliot-verifier-selfchange` driver
+/// makes before it launches a child: no version is invented from the file name,
+/// and a tool that cannot report one is refused here rather than receipted with
+/// a placeholder.
 fn seal_stage_request(
     cell: &DispatchCell,
     epoch: &EpochId,
@@ -1024,7 +1117,7 @@ fn seal_stage_request(
         &executable,
         argv.to_vec(),
         environment_projection_digest(&projection),
-        None,
+        Some(observed_tool_version(&executable)?),
     )
     .map_err(|error| CliError::Contract(format!("executable observation refused: {error}")))?;
     if !observed.is_complete() {

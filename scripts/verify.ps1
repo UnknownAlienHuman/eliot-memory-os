@@ -552,12 +552,17 @@ if ($profileReceipt.profile -ne $expectedRoute) {
     exit 1
 }
 # A receipt the shared owner issued is trusted as admission evidence; nothing
-# here recomputes or second-guesses it. The resolver's own exit already
-# reported the route's normalized outcome, and the receipt carries that same
-# outcome, so the two can never disagree about whether the run passed.
-if ($profileReceipt.outcome -ne 'PASS' -and $resolverExit -eq 0) {
-    Write-Host "VERIFY_PROFILE_OUTCOME_DISAGREEMENT: receipt outcome '$($profileReceipt.outcome)' with resolver exit 0; the shared receipt governs and no gate is treated as admitted-pass."
-}
+# here recomputes or second-guesses it. The resolver's exit code and the
+# receipt's normalized outcome are the SAME decision over the SAME receipt
+# value: `eliot-profile-resolver` returns exit 0 if and only if
+# `receipt.outcome.is_pass()` (src/bin/eliot-profile-resolver.rs run()), and it
+# writes that exact receipt to `--receipt-out` before choosing the exit. A
+# non-PASS outcome with a zero exit is therefore impossible by construction, so
+# there is no "disagreement" branch to warn on here: adding one would be a check
+# that can never fire. A genuinely non-PASS outcome arrives as a nonzero
+# resolver exit and is surfaced verbatim in the VERIFY_PROFILE_ALIAS and
+# VERIFY_PROFILE_REVISION lines below, and a route that could not be admitted at
+# all issues no receipt and is refused above.
 Write-Host "VERIFY_PROFILE_REVISION: $($profileReceipt.profile)@$($profileReceipt.profile_revision) schema=$($profileReceipt.schema.schema)@$($profileReceipt.schema.version) outcome=$($profileReceipt.outcome)"
 foreach ($identity in @($profileReceipt.tool_identities)) {
     Write-Host "VERIFY_PROFILE_TOOL: $($identity.stage_id) instrument=$($identity.instrument) executable=$($identity.executable) sha256=$($identity.executable_digest)"
