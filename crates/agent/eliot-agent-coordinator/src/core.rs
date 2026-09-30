@@ -1481,15 +1481,18 @@ impl AgentCoordinator {
     /// Known limitation, stated here so a reader of the code does not need the
     /// delivery report: the per-class partition is reachable only through the
     /// profile-bound path [`Self::pull_next`], and in production this
-    /// coordinator's `attempts` map is **empty** — `AgentFabric` never calls
-    /// [`Self::admit`], because no production issuer of the provider-verified
-    /// [`ProviderAdmissionReceipt`] that `admit` requires exists in this tree.
-    /// So this method returns `None` on every production path today, no caller
-    /// invokes it, and `profile_revision` in any published outcome would be
-    /// `None`. A reader must not conclude from this method that saturated
-    /// low-priority work is prevented from consuming another class's
-    /// partition: nothing on this path does that. The full measurement is on
-    /// [`Self::pull_next`].
+    /// coordinator's `attempts` map is **empty** — `AgentFabric` issues no
+    /// admission of its own, because no production issuer of the
+    /// provider-verified [`ProviderAdmissionReceipt`] that `admit` requires
+    /// exists in this tree. `admit` does have one non-test call site in this
+    /// crate, the snapshot replay inside `restore_with_admitted_provider`
+    /// (`replay_snapshot_events`), and that site re-admits a receipt its caller
+    /// must already hold rather than issuing one. So this method returns `None`
+    /// on every production path today, no caller invokes it, and
+    /// `profile_revision` in any published outcome would be `None`. A reader must
+    /// not conclude from this method that saturated low-priority work is
+    /// prevented from consuming another class's partition: nothing on this path
+    /// does that. The full measurement is on [`Self::pull_next`].
     pub fn next_ready(&mut self) -> Option<AttemptRecord> {
         let selected = self.select_ready(None, false).selected_attempt_id?;
         self.attempts.get(&selected).cloned()
@@ -1565,8 +1568,11 @@ impl AgentCoordinator {
     /// `selected_attempt_id` starts that attempt through the existing
     /// [`Self::start_attempt`], which remains the only state transition.
     ///
-    /// Unreachable in production, and the reason is upstream of the profile.
-    /// Measured on `origin/main` @ `5d691922c`, the whole production gap is:
+    /// Unreachable in production, and the reason is upstream of the profile:
+    /// this method has no caller at all in this tree — not even a test — and
+    /// `drive_fair_pull` reaches the same selector directly rather than through
+    /// it. First measured on `origin/main` @ `5d691922c` and re-checked on the
+    /// current base, the whole production gap is:
     ///
     /// - No caller outside this crate constructs a [`ProviderAdmissionReceipt`].
     ///   Its `expires_at_unix_ms` doc records that "No production issuer exists
@@ -1574,12 +1580,17 @@ impl AgentCoordinator {
     ///   `git grep` finds no `bins/` construction site. The receipt is
     ///   provider-verified on intake, so a pull cannot be fed a synthesized
     ///   one without forging provider evidence.
-    /// - `AgentFabric` (`bins/eliotd/src/agent_fabric.rs`) calls exactly three
-    ///   coordinator methods — `plan` (twice), `snapshot`, and a lease
-    ///   `authorizes` on an unrelated `SwarmCoordinatorLease`. It never calls
-    ///   [`Self::admit`], so this coordinator's `attempts` map is empty in
-    ///   production and every pull over it would select nothing even if a
-    ///   profile were supplied.
+    /// - `AgentFabric` (`bins/eliotd/src/agent_fabric.rs`) admits nothing. The
+    ///   method-call enumeration measured at `5d691922c` is no longer current —
+    ///   the fabric has since gained `prepare_swarm_definition_admission`,
+    ///   `new_with_admitted_provider`, `drive_fair_pull` and
+    ///   `restore_with_admitted_provider` calls on the coordinator — but none of
+    ///   them admits. The single non-test call site of `admit` in this crate is
+    ///   the snapshot replay inside `restore_with_admitted_provider`
+    ///   (`replay_snapshot_events`), and it re-admits a receipt its restoring
+    ///   caller must already hold rather than issuing one. So this coordinator's
+    ///   `attempts` map is empty in production and every pull over it would
+    ///   select nothing even if a profile were supplied.
     ///
     /// So the per-class partition is unexercised in production, and the
     /// blocking join is `AgentFabric` -> [`Self::admit`], not a missing profile.
@@ -1658,9 +1669,38 @@ impl AgentCoordinator {
     /// [`Self::admit`] requires exists in this tree, so in production `attempts`
     /// is empty, a drive performs one pull, selects nothing, and stops. That is
     /// the correct bounded behaviour of an empty projection, and the drive goes
-    /// live when that owner lands (issue #1678). It is called from production
-    /// by `AgentFabric::drive_fair_pull` in `bins/eliotd/src/agent_fabric.rs`,
-    /// from both the release event path and the bounded recovery poll.
+    /// live when that owner lands (issue #1678).
+    ///
+    /// **Which arm is live.** Exactly one of the two arms reaches this method
+    /// in production, and it is the bounded recovery poll:
+    /// `AgentFabric::drive_fair_pull` in `bins/eliotd/src/agent_fabric.rs` is
+    /// called from
+    /// `solo_agent_driver::solo_fair_pull_recovery`, which
+    /// `daemon_runtime::maybe_start_fair_pull_recovery` starts on **every** tick
+    /// of the shared `ACTIVATION_POLL_INTERVAL` cadence — not gated on a pending
+    /// wake, on a prior failure, or on anything else.
+    ///
+    /// The release-event arm is correct, non-`cfg(test)`, compiled-and-callable
+    /// code with **no caller in this tree**: `drive_fair_pull_after_release` is
+    /// reached only from `solo_agent_driver::solo_ingest_result`, whose sole
+    /// remaining reference is the public `DaemonComposition::solo_ingest_result`
+    /// wrapper in `bins/eliotd/src/lib.rs`, and nothing calls that wrapper. No
+    /// caller is invented here to make the arm look wired.
+    ///
+    /// That does not weaken I14.8, which states both a release-then-select
+    /// ordering and the guarantee that "Mechanical queue progress never depends
+    /// on an LLM remembering to start another agent". The always-armed poll is
+    /// what holds that guarantee, because it needs no external prompt: wiring the
+    /// event arm would change *when* eligible work is noticed, never *whether*,
+    /// since the poll selects it on the next tick regardless.
+    ///
+    /// Second, daemon-path residual, stated here rather than hidden: in a
+    /// non-test build `restore_solo_fabric` returns `Err` unconditionally and
+    /// `drive_solo_delegate_async` refuses before any fabric effect, so no
+    /// production run sets a live operation and every poll reports
+    /// `FairPullRecovery::NoLiveProjection` without reaching this drive at all.
+    /// Both residuals close at the same two owners — the Kernel native-worker
+    /// owner and the G-11 admission owner (#1678).
     ///
     /// Proof ceiling: [`FAIR_PULL_LOOP_PROOF_CEILING`].
     ///
