@@ -11222,12 +11222,14 @@ impl RedbRecoveryStore {
             return Ok(Some(existing));
         }
         let payload = encode(receipt)?;
-        let mut table = write
-            .open_table(HOST_REQUEST_TOOL_EXPOSURE_RECEIPTS)
-            .map_err(storage)?;
-        table
-            .insert(key.as_str(), payload.as_str())
-            .map_err(storage)?;
+        {
+            let mut table = write
+                .open_table(HOST_REQUEST_TOOL_EXPOSURE_RECEIPTS)
+                .map_err(storage)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
         write.commit().map_err(storage)?;
         Ok(Some(existing))
     }
