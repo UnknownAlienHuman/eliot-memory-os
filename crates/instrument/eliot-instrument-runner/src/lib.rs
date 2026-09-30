@@ -56,8 +56,8 @@ pub use dev_fast::{
     require_dev_fast_parity, resolve_verification_route, run_dev_fast_profile,
 };
 pub use eliot_build_test_graph::{
-    BUILD_ROOT_DIRECTORY, BuildMode, CARGO_TARGET_DIR_ENV, CandidateIdentity, GovernedWorkEnvelope,
-    LaneIdentity, RuntimeEnvironmentLease, WorkEnvelopeError,
+    BUILD_ROOT_DIRECTORY, BuildMode, CARGO_HOME_ENV, CARGO_TARGET_DIR_ENV, CandidateIdentity,
+    GovernedWorkEnvelope, LaneIdentity, RuntimeEnvironmentLease, WorkEnvelopeError,
 };
 pub use eliot_test_selection::{FrozenSelection, TestSelectionReceipt};
 pub use package_disposition::{

@@ -63,21 +63,26 @@ pub struct ExpiredRunningReconciliation {
 
 /// Decides whether a durable job needs expiry reconciliation.
 ///
-/// Returns `Some` only for a `Running` job whose fence no longer holds at
-/// `now` (expired lease, or a running job with no fence at all, which is
-/// ambiguous durable state). The optional process lifecycle is the
+/// Returns `Some` for a `Running` job whose fence no longer holds at `now`
+/// (expired lease, or a running job with no fence at all, which is ambiguous
+/// durable state), and for a `Cancelled` job whose attempt is still `Running`:
+/// a cancelled running attempt has lost its worker fence but its process may
+/// still be alive, so it keeps holding its runtime-environment leases until it
+/// is reconciled here (issue #1897). The optional process lifecycle is the
 /// process-evidence check: terminal evidence still reconciles to `Unknown`
 /// because only a validated finish receipt may resolve an attempt, and live
 /// evidence still reconciles because the expired fence already revoked the
-/// worker's authority to complete. Evidence only selects the reason string;
-/// it never selects success, and a reconciled job never reruns without a
-/// fresh claim, lease, and permit binding.
+/// worker's authority to complete. Evidence only selects the reason string; it
+/// never selects success, and a reconciled job never reruns without a fresh
+/// claim, lease, and permit binding.
 pub fn reconcile_expired_running(
     job: &TestJob,
     now: u64,
     evidence: Option<ProcessLifecycle>,
 ) -> Option<ExpiredRunningReconciliation> {
-    if !matches!(job.state, JobState::Running) {
+    let cancelled_unresolved =
+        job.state == JobState::Cancelled && job.execution == Some(ExecutionStatus::Running);
+    if !matches!(job.state, JobState::Running) && !cancelled_unresolved {
         return None;
     }
     let expired = match job.lease.as_ref() {
@@ -90,6 +95,7 @@ pub fn reconcile_expired_running(
         return None;
     }
     let reason = match evidence {
+        None if cancelled_unresolved => "cancelled-attempt-process-effect-unobserved",
         None => "lease-expired-without-process-evidence",
         Some(lifecycle) if lifecycle.is_terminal() => {
             "lease-expired-terminal-process-evidence-requires-receipt"

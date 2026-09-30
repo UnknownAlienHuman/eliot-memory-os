@@ -14,21 +14,27 @@
 //!
 //! * the target root, derived exactly as
 //!   `%LOCALAPPDATA%\Eliot\build\<workspace-id>\<worktree-id>\<build-mode>\
-//!   <fingerprint>` and never from the repository `target/`
+//!   <fingerprint>` and never from the repository `target/`, under the caller's
+//!   *actual* resolved local application-data root rather than a literal path
 //!   ([`GovernedWorkEnvelope::derive_target_root`]);
-//! * the fixture namespace and the runtime-environment lease set, both
-//!   derived from the tuple rather than from the worktree, because
-//!   "a worktree does not isolate runtime resources"
-//!   ([`GovernedWorkEnvelope::fixture_namespace`],
-//!   [`GovernedWorkEnvelope::runtime_leases`]);
+//! * the fixture namespace, derived from the tuple rather than from the
+//!   worktree, because "a worktree does not isolate runtime resources"
+//!   ([`GovernedWorkEnvelope::fixture_namespace`]);
 //! * the declared resource claims, without which execution is refused
 //!   ([`GovernedWorkEnvelope::admit`]).
 //!
 //! Two work items in different worktrees therefore receive different target
-//! roots, fixture namespaces, and runtime leases from the tuple alone, and a
-//! worktree by itself cannot reach a shared runtime resource: obtaining one
-//! requires a declared claim plus a lease, and [`GovernedWorkEnvelope::admit`]
-//! fails closed when the claim set is empty.
+//! roots and different fixture namespaces from the tuple alone. Their runtime
+//! leases do **not** come from the tuple: "a worktree does not isolate runtime
+//! resources", so a lease is exclusive only against the live holder set its
+//! allocator owns (`eliot_testd_core::ResourceLeaseAllocator`). The envelope
+//! carries the grant that allocator returned, and the two entry points that can
+//! write that record — [`GovernedWorkEnvelope::allocate`] and
+//! [`GovernedWorkEnvelope::with_granted_leases`] — bind it to this work item,
+//! so two jobs cannot present one another's lease DTO. A worktree by itself
+//! still cannot reach a shared runtime resource: obtaining one requires a
+//! declared claim plus a lease, and [`GovernedWorkEnvelope::admit`] fails
+//! closed when the claim set is empty.
 //!
 //! The envelope allocates and records; it does not launch. Callers attach the
 //! lane identity to emitted results through [`CandidateIdentity`], which
@@ -63,6 +69,13 @@ pub const BUILD_ROOT_DIRECTORY: &str = "build";
 /// because an unset value is exactly how a governed instrument falls back to
 /// the repository `target/` directory.
 pub const CARGO_TARGET_DIR_ENV: &str = "CARGO_TARGET_DIR";
+
+/// Environment variable a governed Cargo invocation's cache root is bound to.
+///
+/// The envelope emits this beside [`CARGO_TARGET_DIR_ENV`] and to the same
+/// directory, because an unset `CARGO_HOME` is how a governed invocation reads
+/// the user-global Cargo cache instead of its own lane's root.
+pub const CARGO_HOME_ENV: &str = "CARGO_HOME";
 
 /// Target and cache mode of one governed work item.
 ///
@@ -106,6 +119,10 @@ impl BuildMode {
 /// decides exclusivity against a live holder set is
 /// `eliot_testd_core::ResourceLeaseAllocator`; the envelope carries the
 /// outcome so a persisted work item keeps the leases it was admitted with.
+/// Equal field values are not a grant: only a caller that received these
+/// leases from that allocator may write them, and
+/// [`WorkEnvelopeError::ForeignLeaseHolder`] refuses any record whose holder is
+/// not this work item.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeEnvironmentLease {
@@ -158,7 +175,13 @@ pub struct GovernedWorkEnvelope {
     pub resource_claims: Vec<ResourceClaim>,
     /// Leases held for the declared claims, allocated independently of the
     /// worktree.
-    pub runtime_leases: Vec<RuntimeEnvironmentLease>,
+    ///
+    /// Private on purpose: a lease record is only ever written by
+    /// [`GovernedWorkEnvelope::allocate`] and
+    /// [`GovernedWorkEnvelope::with_granted_leases`], both of which bind it to
+    /// this work item and cross-check it against the declared claims. A caller
+    /// cannot assemble a competing holder set beside the store's own.
+    runtime_leases: Vec<RuntimeEnvironmentLease>,
     /// The fingerprint's own directory below the local application data root.
     /// Governed instruments never build in the repository `target/`.
     pub local_app_data: PathBuf,
@@ -222,6 +245,46 @@ pub enum WorkEnvelopeError {
     /// The local application data root is not absolute.
     #[error("local_app_data must be an absolute path, not {0}")]
     RelativeLocalAppData(String),
+    /// The local application data root is not an existing canonical directory.
+    ///
+    /// The governed build root is derived below this root, so an unverified
+    /// root places the lane outside the user's actual application-data tree —
+    /// the issue text's literal `C:\Users\kleym` shape is not a product
+    /// requirement, and neither is any other caller-supplied path.
+    #[error("local_app_data must be an existing canonical directory, not {0}")]
+    UnresolvedLocalAppData(String),
+    /// A retained lease record names a holder that is not this work item.
+    ///
+    /// The lease set is written only from an allocator grant, and a grant names
+    /// the job it was made for. A record naming any other holder is a copied
+    /// DTO, not an allocation, and is refused before the tuple can execute: two
+    /// jobs cannot hold one exclusive resource by presenting identical lease
+    /// records, because the record is bound to the holder.
+    #[error(
+        "work item {work_item_id} presents a {kind:?} lease on {name} held by {holder}, not by itself"
+    )]
+    ForeignLeaseHolder {
+        /// The work item presenting the record.
+        work_item_id: String,
+        /// Leased resource class of the foreign record.
+        kind: crate::ResourceKind,
+        /// Leased resource name of the foreign record.
+        name: String,
+        /// Holder the record names instead.
+        holder: String,
+    },
+    /// A lease is bound to a holder while the resource claims are not yet bound
+    /// to any allocation.
+    ///
+    /// I2.22 requires a work item to *declare* what it will touch before it is
+    /// granted anything, so leases are attached to an item that already
+    /// declared them. An empty claim set is legitimate for a parallel-safe
+    /// declaration and is refused by [`GovernedWorkEnvelope::admit`], not here.
+    #[error("work item {work_item_id} holds runtime leases but declared no resource claim")]
+    UnclaimedLease {
+        /// The refused work item.
+        work_item_id: String,
+    },
 }
 
 /// The lane identity every mutating work item is allocated in, before any
@@ -258,11 +321,18 @@ impl GovernedWorkEnvelope {
     /// [`GovernedWorkEnvelope::admit`] is the gate that refuses an item whose
     /// declaration is empty.
     ///
+    /// Leases presented here are already bound: each one must name this work
+    /// item as its holder, and a lease set presented by an item that declared
+    /// no claim is refused. An item that has not been granted anything yet
+    /// passes an empty set, which is the normal state between admission and
+    /// the allocator's grant.
+    ///
     /// # Errors
     ///
     /// Returns [`WorkEnvelopeError`] when any tuple element is not a usable
-    /// path segment, when the fingerprint is invalid, or when the
-    /// fingerprint's workspace contradicts the workspace declared beside it.
+    /// path segment, when the fingerprint is invalid, when the fingerprint's
+    /// workspace contradicts the workspace declared beside it, or when the
+    /// presented leases are not this work item's own.
     pub fn allocate(
         identity: LaneIdentity,
         resource_claims: Vec<ResourceClaim>,
@@ -279,7 +349,85 @@ impl GovernedWorkEnvelope {
             local_app_data: identity.local_app_data,
         };
         envelope.validate()?;
+        envelope.require_own_leases()?;
         Ok(envelope)
+    }
+
+    /// Attaches an allocator's actual grant to this retained envelope.
+    ///
+    /// This is the only other way the retained lease record is written, so the
+    /// persisted tuple is always one `allocate` produced. The caller passes the
+    /// `Vec<ResourceLease>` a live `eliot_testd_core::ResourceLeaseAllocator`
+    /// returned for this job; matching field values supplied by a caller are
+    /// not a grant, and the holder check below refuses any record the allocator
+    /// could not have issued for this work item.
+    ///
+    /// The tuple itself is never rebuilt: the work item, workspace, worktree,
+    /// fingerprint, build mode, local application data root and declared claims
+    /// are read off this envelope, never re-derived from the current ambient
+    /// environment. A replay therefore cannot substitute candidate, root, or
+    /// lease identity for the retained one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkEnvelopeError`] when a granted record names another
+    /// holder, or when leases are attached to an item that declared no claim.
+    pub fn with_granted_leases(
+        mut self,
+        granted: Vec<RuntimeEnvironmentLease>,
+    ) -> Result<Self, WorkEnvelopeError> {
+        self.runtime_leases = granted;
+        self.require_own_leases()?;
+        Ok(self)
+    }
+
+    /// Requalifies a retained tuple before its work item executes again.
+    ///
+    /// This is the receipt and restart gate. A restart re-reads the persisted
+    /// tuple and then asks the allocator what it currently holds, so the
+    /// retained lease record is checked against the item that must own it
+    /// before the item runs once more. Everything the tuple asserts is
+    /// re-derived from the retained value itself; nothing is taken from the
+    /// current ambient environment, so a replay cannot substitute candidate,
+    /// root, or lease identity for the retained one.
+    ///
+    /// Unlike [`GovernedWorkEnvelope::admit`] this does not require a non-empty
+    /// claim set, because a parallel-safe declaration legitimately claims
+    /// nothing. It refuses a malformed tuple, a lease this item was never
+    /// granted, and a lease set with no declaration behind it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first refusal in [`WorkEnvelopeError`].
+    pub fn requalify(&self) -> Result<(), WorkEnvelopeError> {
+        self.validate()?;
+        self.require_own_leases()
+    }
+
+    /// Refuses a lease record this work item was never granted.
+    ///
+    /// A lease is a grant, not a name: the allocator that decides exclusivity
+    /// binds every grant to the job it allocated for. Comparing the record's
+    /// holder against this work item is what stops two jobs from holding one
+    /// exclusive port, service, fixture, or database volume by presenting
+    /// identical lease DTOs. An item that declared no claim may hold nothing.
+    fn require_own_leases(&self) -> Result<(), WorkEnvelopeError> {
+        if !self.runtime_leases.is_empty() && self.resource_claims.is_empty() {
+            return Err(WorkEnvelopeError::UnclaimedLease {
+                work_item_id: self.work_item_id.clone(),
+            });
+        }
+        for lease in &self.runtime_leases {
+            if lease.holder != self.work_item_id {
+                return Err(WorkEnvelopeError::ForeignLeaseHolder {
+                    work_item_id: self.work_item_id.clone(),
+                    kind: lease.kind,
+                    name: lease.resource.clone(),
+                    holder: lease.holder.clone(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Rejects a tuple that cannot execute, without deriving anything.
@@ -297,6 +445,24 @@ impl GovernedWorkEnvelope {
         }
         if !self.local_app_data.is_absolute() {
             return Err(WorkEnvelopeError::RelativeLocalAppData(
+                self.local_app_data.to_string_lossy().into_owned(),
+            ));
+        }
+        // I2.22 names `%LOCALAPPDATA%`; the product requirement is the ACTUAL
+        // admitted local application-data root, not a literal path copied from
+        // documentation. Requiring it to be an existing canonical directory is
+        // what makes "the real root" checkable: a typo, a stale install
+        // mapping, or a hard-coded user name fails closed here instead of
+        // silently deriving every governed build root under a path that does
+        // not exist. Canonicalization also refuses a symlink or reparse hop
+        // between the admitted root and the lane it anchors.
+        let canonical = std::fs::canonicalize(&self.local_app_data).map_err(|_| {
+            WorkEnvelopeError::UnresolvedLocalAppData(
+                self.local_app_data.to_string_lossy().into_owned(),
+            )
+        })?;
+        if canonical != self.local_app_data || !canonical.is_dir() {
+            return Err(WorkEnvelopeError::UnresolvedLocalAppData(
                 self.local_app_data.to_string_lossy().into_owned(),
             ));
         }
@@ -379,18 +545,21 @@ impl GovernedWorkEnvelope {
     /// touch, and returns the identity to attach to its result.
     ///
     /// This is the fail-closed admission gate. It requires a non-empty claim
-    /// set, every claim covered by a held lease, and every held lease backed
-    /// by a claim, so a worktree alone cannot obtain a shared runtime
-    /// resource: the tuple is the only route to one.
+    /// set, every claim covered by a held lease, every held lease backed by a
+    /// claim, and every held lease granted to this work item, so a worktree
+    /// alone cannot obtain a shared runtime resource: the tuple is the only
+    /// route to one, and the tuple carries who the grant was made for.
     ///
     /// # Errors
     ///
     /// Returns [`WorkEnvelopeError::UndeclaredResources`] for an empty claim
     /// set, [`WorkEnvelopeError::UnleasedResource`] for a claim without a
-    /// lease, and [`WorkEnvelopeError::UndeclaredLease`] for a lease without
-    /// a claim.
+    /// lease, [`WorkEnvelopeError::UndeclaredLease`] for a lease without a
+    /// claim, and [`WorkEnvelopeError::ForeignLeaseHolder`] for a lease held by
+    /// another work item.
     pub fn admit(&self) -> Result<CandidateIdentity, WorkEnvelopeError> {
         self.validate()?;
+        self.require_own_leases()?;
         if self.resource_claims.is_empty() {
             return Err(WorkEnvelopeError::UndeclaredResources {
                 work_item_id: self.work_item_id.clone(),
@@ -444,18 +613,31 @@ impl GovernedWorkEnvelope {
     /// The exact environment a governed Cargo invocation of this work item
     /// runs with.
     ///
-    /// The target root is bound explicitly, so the invocation cannot fall back
-    /// to the repository `target/` directory the way it would with the
-    /// variable unset. `CARGO_INCREMENTAL` is set only for the interactive
-    /// mode: I2.22 keeps incremental compilation and cross-worktree reuse
-    /// from being enabled together as a universal optimization.
+    /// Both governed roots are bound explicitly and to the *same* directory:
+    /// `CARGO_TARGET_DIR` so the invocation cannot fall back to the repository
+    /// `target/` directory the way it would with the variable unset, and
+    /// `CARGO_HOME` so it cannot fall back to the user-global Cargo home. The
+    /// equality is the concrete `TestD` `TargetRoots` policy — the
+    /// `cache_root == target_root` rule — and its resolver
+    /// (`TestdProcessToolIntent::validate_for_roots`), which refuses any pair
+    /// that is not the same canonical directory. Emitting one variable without
+    /// the other is what maintained a second, competing cache rule: an
+    /// invocation with `CARGO_HOME` unset reads a cache outside this lane.
+    ///
+    /// `CARGO_INCREMENTAL` is set only for the interactive mode: I2.22 keeps
+    /// incremental compilation and cross-worktree reuse from being enabled
+    /// together as a universal optimization.
     ///
     /// # Errors
     ///
     /// Returns [`WorkEnvelopeError`] when the target root cannot be derived.
     pub fn cargo_environment(&self) -> Result<Vec<(String, String)>, WorkEnvelopeError> {
         let target_root = self.derive_target_root()?;
-        let mut environment = vec![(CARGO_TARGET_DIR_ENV.to_owned(), path_text(&target_root))];
+        let root = path_text(&target_root);
+        let mut environment = vec![
+            (CARGO_TARGET_DIR_ENV.to_owned(), root.clone()),
+            (CARGO_HOME_ENV.to_owned(), root),
+        ];
         if self.build_mode == BuildMode::InteractiveIncremental {
             environment.push(("CARGO_INCREMENTAL".to_owned(), "true".to_owned()));
         }
