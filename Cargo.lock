@@ -2514,6 +2514,7 @@ dependencies = [
  "eliot-platform",
  "eliot-platform-windows",
  "eliot-process",
+ "eliot-process-executor",
  "eliot-types",
  "serde",
  "serde_json",

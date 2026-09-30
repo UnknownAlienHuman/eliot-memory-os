@@ -54,7 +54,6 @@ use eliot_instrument_api::{
     InstrumentContractError, InstrumentKind, RawEvidence, RawEvidenceSource,
 };
 use eliot_instrument_runner::profile::{BUILTIN_PARSER_GENERATION, DIAGNOSTIC_PARSER_CONTRACT};
-use eliot_process_executor::environment_projection_digest;
 pub use eliot_instrument_runner::{
     InstrumentSpec, InstrumentSpecParams, RegistryEntry, ResolvedExecutableIdentity,
 };
@@ -69,6 +68,7 @@ pub use eliot_process::{
     OperationId, ProcessEvidence, ProcessExecutionAdmissionRequest, ProcessExecutionView,
     ProcessLifecycle, ProcessStartReceipt,
 };
+use eliot_process_executor::environment_projection_digest;
 pub use eliot_types::memory::GovernedGitScope;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -2697,11 +2697,7 @@ impl<P: LspProcessOwnerPort, G: GitProcessRunner> LspCurrentBridge<P, G> {
         after_run_source_proof: Option<LspSourceArtifactProof>,
         publisher: &Pub,
     ) -> Result<
-        (
-            RetainedLspObservationV1,
-            LspAdoptionProjection,
-            Pub::Output,
-        ),
+        (RetainedLspObservationV1, LspAdoptionProjection, Pub::Output),
         LspCaptureCompletionError<Pub::Error>,
     > {
         let started = Arc::new(started);
@@ -2758,8 +2754,8 @@ impl<P: LspProcessOwnerPort, G: GitProcessRunner> LspCurrentBridge<P, G> {
         }
         let projection = live_capture_projection(retained, started);
         let record = projection.retained_observation.as_ref();
-        let original_payload = serde_json::to_vec(record)
-            .map_err(BridgeError::CaptureSerialization)?;
+        let original_payload =
+            serde_json::to_vec(record).map_err(BridgeError::CaptureSerialization)?;
         let output = publisher
             .publish(record, &projection, &original_payload)
             .await
