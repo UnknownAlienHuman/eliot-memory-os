@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
@@ -826,6 +827,10 @@ const MAX_BRIDGE_ACK_BATCH: usize = 1024;
 /// receive the retired disposition without learning or comparing this ID.
 /// Only owner-checked rows are indexed; legacy ownerless rows keep their
 /// existing scan-checked invariant and are never inferred into this index.
+/// Rows below the compacted boundary leave only through the certified
+/// position drain (issue #2885, items 6-7) once their record and handoff
+/// rows are gone; the compacted-range row preserves their retired
+/// identity, so replay below the boundary stays retired without them.
 const BRIDGE_EVENT_POSITIONS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_bridge_event_positions_v1");
 /// Retained bridge-event replay commitments (issue #2730): the original
@@ -839,6 +844,20 @@ const BRIDGE_EVENT_POSITIONS: TableDefinition<&str, &str> =
 /// disposition — never a fabricated duplicate and never a fresh insertion.
 const BRIDGE_EVENT_REPLAY_COMMITMENTS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_bridge_event_replay_v1");
+/// Certified compacted position ranges (issue #2885, items 5-6): one
+/// cumulative row per admitted stream namespace replacing deleted per-event
+/// position rows with a bounded versioned retirement identity. Keyed by the
+/// owner namespace; the row binds the namespace, stream incarnation, covered
+/// start/end sequences, predecessor chain, retiring ack frontier,
+/// content/position segment commitment, range schema version, and the
+/// certifying owner (retention admission) revision. The table holds at most
+/// one row per stream owner, so it stays within the existing owner bound.
+/// A same-range re-certification with changed content conflicts instead of
+/// overwriting certified history.
+const BRIDGE_EVENT_COMPACTED_RANGES: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_bridge_event_compacted_ranges_v1");
+/// Version of the bridge compacted-range row carried by every range.
+const BRIDGE_COMPACTED_RANGE_VERSION: u16 = 1;
 /// Maximum contiguous-frontier steps walked by one cursor advance (issue
 /// #2730, item 4). One advance closes at most one page of adjacent
 /// positions; the persisted cursor is the exact resume point, so a longer
@@ -2072,6 +2091,132 @@ impl BridgeEventReplayCommitment {
 
 impl persistence_codec::PersistedValue for BridgeEventReplayCommitment {
     const RECORD_TYPE: &'static str = "bridge_event_replay_commitment";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+/// One certified compacted position range (issue #2885, items 5-6).
+///
+/// A cumulative per-namespace retirement identity covering
+/// `[start_sequence..=end_sequence]`: every position in the interval was
+/// terminal-eligible, contiguous, gap-free, and bound to its exact admitted
+/// identity when certified, and its per-event source rows were removed in
+/// the same transaction (positions follow through the certified drain in
+/// the same entry). Below `end_sequence` the retained boundary answers
+/// retired without consulting per-event bindings; the chained
+/// `segment_commitment` still commits each covered `(sequence, event_id,
+/// envelope digest, handoff reconcile key)` leaf in order, so a same-range
+/// re-certification with changed content conflicts instead of rewriting
+/// history. `acked_sequence` is the producer-receipt acknowledgement
+/// frontier covering the range; the row contract carries no receiving-owner
+/// terminal receipt, so `retention_policy_revision` names the owner revision
+/// whose acknowledgement/retirement admission certified it.
+/// `predecessor_end_sequence`/`predecessor_commitment` chain the previous
+/// cumulative state (genesis `(0, "")`); the start never moves, the frontier
+/// never moves backward, and another incarnation's ranges are never adopted.
+/// Whole-incarnation retirement stays with #2729's authenticated
+/// owner/successor evidence; this row retires positions only, never the
+/// incarnation itself.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BridgeEventCompactedRange {
+    contract_version: u16,
+    range_version: u16,
+    owner_namespace: String,
+    owner_incarnation: u64,
+    retention_policy_revision: u64,
+    stream_id: String,
+    start_sequence: u64,
+    end_sequence: u64,
+    predecessor_end_sequence: u64,
+    predecessor_commitment: String,
+    segment_commitment: String,
+    acked_sequence: u64,
+}
+
+impl BridgeEventCompactedRange {
+    fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != crate::CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        if self.range_version != BRIDGE_COMPACTED_RANGE_VERSION {
+            return Err(OrsError::InvalidField {
+                field: "range_version",
+                reason: "bridge compacted range carries the current range version",
+            });
+        }
+        crate::model::validate_digest(&self.owner_namespace, "owner_namespace")?;
+        if self.owner_incarnation == 0 {
+            return Err(OrsError::InvalidField {
+                field: "owner_incarnation",
+                reason: "bridge compacted range binds a nonzero stream incarnation",
+            });
+        }
+        if self.retention_policy_revision == 0 {
+            return Err(OrsError::InvalidField {
+                field: "retention_policy_revision",
+                reason: "bridge compacted range binds the nonzero owner revision that certified it",
+            });
+        }
+        bridge_identity_text(&self.stream_id, "stream_id")?;
+        if self.start_sequence == 0 {
+            return Err(OrsError::InvalidField {
+                field: "start_sequence",
+                reason: "bridge compacted range start must be nonzero",
+            });
+        }
+        if self.end_sequence < self.start_sequence {
+            return Err(OrsError::InvalidField {
+                field: "end_sequence",
+                reason: "bridge compacted range must not end before it starts",
+            });
+        }
+        if self.predecessor_end_sequence == 0 {
+            if !self.predecessor_commitment.is_empty() {
+                return Err(OrsError::InvalidField {
+                    field: "predecessor_commitment",
+                    reason: "a genesis compacted range carries no predecessor commitment",
+                });
+            }
+        } else {
+            crate::model::validate_digest(&self.predecessor_commitment, "predecessor_commitment")?;
+            let next =
+                self.predecessor_end_sequence
+                    .checked_add(1)
+                    .ok_or(OrsError::IntegrityProblem {
+                        record_type: "bridge_event_compacted_range",
+                        reason: "a compacted range predecessor must leave room for its extension"
+                            .to_owned(),
+                    })?;
+            let chained =
+                next == self.start_sequence && self.predecessor_end_sequence < self.end_sequence;
+            if !chained {
+                return Err(OrsError::InvalidField {
+                    field: "predecessor_end_sequence",
+                    reason: "a compacted range extension must start from its certified predecessor",
+                });
+            }
+        }
+        crate::model::validate_digest(&self.segment_commitment, "segment_commitment")?;
+        if self.acked_sequence < self.end_sequence {
+            return Err(OrsError::InvalidField {
+                field: "acked_sequence",
+                reason: "a compacted range must sit under its retiring acked frontier",
+            });
+        }
+        Ok(())
+    }
+
+    /// Key of this range: the owner namespace (one cumulative row per stream).
+    fn record_key(&self) -> String {
+        self.owner_namespace.clone()
+    }
+}
+
+impl persistence_codec::PersistedValue for BridgeEventCompactedRange {
+    const RECORD_TYPE: &'static str = "bridge_event_compacted_range";
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()
@@ -19587,6 +19732,185 @@ impl RedbRecoveryStore {
             .any(|(start, end)| *start <= sequence && sequence <= *end)
     }
 
+    /// Commits one compacted-range extension over its chained predecessor
+    /// (issue #2885, item 5): the canonical bytes length-prefix every
+    /// field, so `sequence`, `event_id`, the content digest, and the
+    /// handoff reconcile key cannot collide across leaves. The digest binds
+    /// the predecessor commitment plus each covered leaf in sequence order;
+    /// changed content under an already-certified range therefore changes
+    /// the commitment instead of matching it.
+    fn bridge_compacted_segment_commitment(
+        predecessor_commitment: &str,
+        leaves: &[(u64, String, String, String)],
+    ) -> String {
+        let predecessor_len = predecessor_commitment.len();
+        let mut canonical = String::new();
+        let _ = write!(canonical, "{predecessor_len}:{predecessor_commitment};");
+        for (sequence, event_id, envelope_sha256, reconcile_key) in leaves {
+            let event_len = event_id.len();
+            let reconcile_len = reconcile_key.len();
+            let _ = write!(
+                canonical,
+                "{sequence:020}:{event_len}:{event_id}:{envelope_sha256}:{reconcile_len}:{reconcile_key};"
+            );
+        }
+        crate::model::sha256_hex(canonical.as_bytes())
+    }
+
+    /// Validates compacted-range leaves as contiguous from their start,
+    /// returning the covered end sequence (issue #2885, item 5).
+    fn validate_compacted_leaves_contiguous(
+        start_sequence: u64,
+        leaves: &[(u64, String, String, String)],
+    ) -> Result<u64, OrsError> {
+        let mut expected = start_sequence;
+        for (sequence, event_id, envelope_sha256, reconcile_key) in leaves {
+            if *sequence != expected {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_event_compacted_range",
+                    reason: "compacted range leaves must be contiguous from their start".to_owned(),
+                });
+            }
+            bridge_identity_text(event_id, "event_id")?;
+            crate::model::validate_digest(envelope_sha256, "envelope_sha256")?;
+            if !reconcile_key.is_empty() {
+                crate::model::validate_digest(reconcile_key, "reconcile_key")?;
+            }
+            expected = expected.saturating_add(1);
+        }
+        Ok(expected.saturating_sub(1))
+    }
+
+    /// Certifies one cumulative compacted range over a contiguous eligible
+    /// prefix (issue #2885, items 5-6). Each leaf is `(sequence, event_id,
+    /// envelope digest, handoff reconcile key)` in ascending contiguous
+    /// order from `start_sequence`; the stored row binds the owner
+    /// namespace/incarnation, the covered interval, the predecessor chain,
+    /// the ack frontier that retired it, the chained content/position
+    /// segment commitment, the range schema version, and the certifying
+    /// owner (retention admission) revision. The first certification is the
+    /// genesis row; every later call must continue exactly at
+    /// `stored.end_sequence + 1` with the same owner/incarnation/stream, so
+    /// the start never moves and the frontier never moves backward. Any
+    /// overlap with already-certified history fails with
+    /// [`OrsError::DuplicateConflict`] instead of rewriting it, while a
+    /// hole past the certified frontier or another incarnation's history
+    /// fails closed with an integrity error. Performs no cursor or
+    /// position mutation itself; the caller advances the boundary over the
+    /// certified prefix in the same transaction. Activation stays gated
+    /// behind [`BridgeEventHandoffRow::retirement_eligible`]: with no
+    /// receiving-owner terminal evidence in the handoff contract the
+    /// eligible prefix is empty and this function is never reached.
+    /// Whole-incarnation retirement is not performed here; it stays with
+    /// #2729's authenticated owner/successor evidence.
+    fn certify_bridge_compacted_range_in(
+        write: &redb::WriteTransaction,
+        access: &BridgeStreamAccess,
+        owner: &BridgeStreamOwnerRow,
+        start_sequence: u64,
+        leaves: &[(u64, String, String, String)],
+        acked_sequence: u64,
+    ) -> Result<(), OrsError> {
+        access.require(BridgeStreamRight::Acknowledge)?;
+        if leaves.is_empty() {
+            return Err(OrsError::InvalidField {
+                field: "compacted_range",
+                reason: "a compacted range certifies a nonempty contiguous prefix",
+            });
+        }
+        if owner.namespace != access.namespace
+            || owner.kind != BRIDGE_STREAM_OWNER_KIND_STREAM
+            || owner.incarnation == 0
+            || owner.revision == 0
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_event_compacted_range",
+                reason: "compacted range certification needs its admitted stream owner".to_owned(),
+            });
+        }
+        let end_sequence = Self::validate_compacted_leaves_contiguous(start_sequence, leaves)?;
+        let mut ranges = write
+            .open_table(BRIDGE_EVENT_COMPACTED_RANGES)
+            .map_err(storage)?;
+        let stored: Option<BridgeEventCompactedRange> = ranges
+            .get(access.namespace.as_str())
+            .map_err(storage)?
+            .map(|value| decode(value.value()))
+            .transpose()?;
+        let Some(stored) = stored else {
+            let range = BridgeEventCompactedRange {
+                contract_version: crate::CONTRACT_VERSION,
+                range_version: BRIDGE_COMPACTED_RANGE_VERSION,
+                owner_namespace: access.namespace.clone(),
+                owner_incarnation: owner.incarnation,
+                retention_policy_revision: owner.revision,
+                stream_id: owner.local_stream.clone(),
+                start_sequence,
+                end_sequence,
+                predecessor_end_sequence: 0,
+                predecessor_commitment: String::new(),
+                segment_commitment: Self::bridge_compacted_segment_commitment("", leaves),
+                acked_sequence,
+            };
+            range.validate()?;
+            let key = range.record_key();
+            ranges
+                .insert(key.as_str(), encode(&range)?.as_str())
+                .map_err(storage)?;
+            return Ok(());
+        };
+        stored.validate()?;
+        if stored.owner_namespace != access.namespace
+            || stored.stream_id != owner.local_stream
+            || stored.owner_incarnation != owner.incarnation
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_event_compacted_range",
+                reason: "compacted range does not belong to this stream incarnation".to_owned(),
+            });
+        }
+        if start_sequence <= stored.end_sequence {
+            return Err(OrsError::DuplicateConflict);
+        }
+        let next = stored
+            .end_sequence
+            .checked_add(1)
+            .ok_or(OrsError::IntegrityProblem {
+                record_type: "bridge_event_compacted_range",
+                reason: "certified compacted frontier leaves no room for an extension".to_owned(),
+            })?;
+        if start_sequence != next {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "bridge_event_compacted_range",
+                reason: "compacted range extension must continue its certified predecessor"
+                    .to_owned(),
+            });
+        }
+        let range = BridgeEventCompactedRange {
+            contract_version: crate::CONTRACT_VERSION,
+            range_version: BRIDGE_COMPACTED_RANGE_VERSION,
+            owner_namespace: access.namespace.clone(),
+            owner_incarnation: owner.incarnation,
+            retention_policy_revision: owner.revision,
+            stream_id: owner.local_stream.clone(),
+            start_sequence: stored.start_sequence,
+            end_sequence,
+            predecessor_end_sequence: stored.end_sequence,
+            predecessor_commitment: stored.segment_commitment.clone(),
+            segment_commitment: Self::bridge_compacted_segment_commitment(
+                &stored.segment_commitment,
+                leaves,
+            ),
+            acked_sequence,
+        };
+        range.validate()?;
+        let key = range.record_key();
+        ranges
+            .insert(key.as_str(), encode(&range)?.as_str())
+            .map_err(storage)?;
+        Ok(())
+    }
+
     /// Drains one bounded slice of the certified position prefix (issue
     /// #2885, items 6-7): positions at or below the compacted boundary
     /// whose event record and handoff are both gone. Only the contiguous
@@ -19717,7 +20041,12 @@ impl RedbRecoveryStore {
     /// stops the prefix instead of being skipped to free space. The
     /// stored reconcile tuple is producer-presented frontier/owner data,
     /// not a receiving-owner receipt or admitted terminal disposition;
-    /// therefore no current row is eligible. Pending payloads and
+    /// therefore no current row is eligible. A terminalized prefix is
+    /// certified as a cumulative compacted range binding owner
+    /// namespace/incarnation, interval, predecessor, ack frontier,
+    /// segment commitment, schema version, and retention revision (issue
+    /// #2885, item 5) before the boundary moves over it in the same
+    /// transaction. Pending payloads and
     /// handoffs, replay commitments, and cursors remain untouched. In
     /// the result, `retirement_continuation` means additional indexed
     /// positions remain to scan for this owner — behind the page end or
@@ -19801,6 +20130,7 @@ impl RedbRecoveryStore {
         let mut terminalized = 0_u64;
         let mut terminalized_boundary = compacted;
         let mut earliest_terminalized_sequence = None;
+        let mut terminalized_leaves: Vec<(u64, String, String, String)> = Vec::new();
         for (_, key, row) in &eligible {
             let record_key = format!("{}::{}", access.namespace, row.event_id);
             let record: Option<BridgeEventRow> = {
@@ -19851,6 +20181,12 @@ impl RedbRecoveryStore {
                 projections.remove(record_key.as_str()).map_err(storage)?;
             }
             terminalized += 1;
+            terminalized_leaves.push((
+                row.sequence,
+                row.event_id.clone(),
+                row.envelope_sha256.clone(),
+                row.reconcile_key.clone(),
+            ));
             earliest_terminalized_sequence = Some(
                 earliest_terminalized_sequence
                     .map_or(row.sequence, |earliest: u64| earliest.min(row.sequence)),
@@ -19858,6 +20194,30 @@ impl RedbRecoveryStore {
             terminalized_boundary = terminalized_boundary.max(row.sequence);
         }
         if terminalized_boundary > compacted {
+            // The boundary advances only over the certified contiguous
+            // prefix (issue #2885, items 5-6): bind its range identity
+            // before publishing the new frontier, in the same transaction.
+            // The prefix must start exactly at the certified frontier; a
+            // torn scan that resumes past a hole fails closed here instead
+            // of skipping it. The certified positions themselves leave
+            // through the bounded drain later in this same entry, once
+            // their record and handoff rows are gone.
+            let prefix_start = terminalized_leaves.first().map(|leaf| leaf.0);
+            if prefix_start != Some(compacted.saturating_add(1)) {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "bridge_event_compacted_range",
+                    reason: "compacted range must extend contiguously from its certified frontier"
+                        .to_owned(),
+                });
+            }
+            Self::certify_bridge_compacted_range_in(
+                write,
+                &access,
+                &owner,
+                compacted.saturating_add(1),
+                &terminalized_leaves,
+                acked,
+            )?;
             Self::write_bridge_cursors_compacted_in(
                 write,
                 &access,
