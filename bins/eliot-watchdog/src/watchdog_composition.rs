@@ -271,7 +271,11 @@ pub fn request_persistent_drift_analysis(
         persistence,
         signals,
     )?;
-    Ok(request_health_analysis(&brief, route, prior_ineffective_analyses))
+    Ok(request_health_analysis(
+        &brief,
+        route,
+        prior_ineffective_analyses,
+    ))
 }
 
 /// The actual manifest's own interval identity: the declared owner-clock
