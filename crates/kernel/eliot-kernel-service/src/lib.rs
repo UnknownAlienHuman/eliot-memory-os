@@ -266,10 +266,9 @@ pub use store_write_reservation::{
     StartupReconciliationReadiness, StartupStagedEnvelope, StartupUnknownOperation,
     UNKNOWN_OUTCOME_REASON, begin_execute_after_send, cancel_before_send, ensure_eligible,
     finalize_reservation, gateway_seed, gateway_seed_from_protected_original_operation,
-    mark_unknown_outcome, project_reserved_write,
-    reconcile_pending_at_startup, reconcile_receipt, reconcile_staged_writes_at_startup,
-    recovery_page, reserve_for_transition, unresolved_reservations, writer_epoch_for_fence,
-    writer_epoch_for_fence_from_epoch,
+    mark_unknown_outcome, project_reserved_write, reconcile_pending_at_startup, reconcile_receipt,
+    reconcile_staged_writes_at_startup, recovery_page, reserve_for_transition,
+    unresolved_reservations, writer_epoch_for_fence, writer_epoch_for_fence_from_epoch,
 };
 pub use testd_front_door::{
     AuthenticatedTestdSession, TESTD_ADMISSION_ADVERTISED, TESTD_ADMISSION_WIRE_ID,

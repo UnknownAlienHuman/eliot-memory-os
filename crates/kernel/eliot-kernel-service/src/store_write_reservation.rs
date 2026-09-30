@@ -143,11 +143,11 @@ use eliot_contracts::{EpochId, RequestMetadata, StateFence};
 use eliot_ors::{
     AcceptedPending, CanonicalDisposition, CanonicalReconciliation, CanonicalScopeObservation,
     EpochIdentity, EpochLineage, ExpectedOrderingHead, OpaqueLabel,
-    OperationIdentity as OrsOperationIdentity,
-    OperationalRecoveryStore, RecoveryAccessClass, RecoveryCursor, RecoveryEnvelopeContext,
-    RecoveryOwner, RecoveryPage, RecoveryPayload, RecoveryPayloadEnvelope, RecoveryWriteBinding,
-    RedbRecoveryStore, ReservationRecord, ReservationRequest, ReservationState,
-    ScopeReservationRequest, StateFenceSnapshot, WriterReservationToken,
+    OperationIdentity as OrsOperationIdentity, OperationalRecoveryStore, RecoveryAccessClass,
+    RecoveryCursor, RecoveryEnvelopeContext, RecoveryOwner, RecoveryPage, RecoveryPayload,
+    RecoveryPayloadEnvelope, RecoveryWriteBinding, RedbRecoveryStore, ReservationRecord,
+    ReservationRequest, ReservationState, ScopeReservationRequest, StateFenceSnapshot,
+    WriterReservationToken,
 };
 use eliot_platform::SecretReference;
 use eliot_receipts::ReceiptDispositionKind;
@@ -941,21 +941,19 @@ fn reserve_for_transition_inner(
     };
     let (token, accepted) = if accept_after_stage {
         let accepted = owner.ors.accept_after_stage(request)?;
-        let token = reservation_token_by_order(
-            owner,
-            accepted.reservation_order,
-            &accepted.operation_id,
-        )?;
+        let token =
+            reservation_token_by_order(owner, accepted.reservation_order, &accepted.operation_id)?;
         if accepted.reservation_id != token.reservation_id
             || accepted.operation_id != token.operation_id
             || accepted.reservation_order != token.reservation_order
             || accepted.prepared_transition_sha256 != token.prepared_transition_sha256
-            || accepted.write_binding != token.write_binding.as_ref().cloned().ok_or_else(|| {
-                ReservationWriteError::Binding {
-                    operation_id: operation_id.clone(),
-                    detail: "accepted ORS record has no original write binding".to_owned(),
-                }
-            })?
+            || accepted.write_binding
+                != token.write_binding.as_ref().cloned().ok_or_else(|| {
+                    ReservationWriteError::Binding {
+                        operation_id: operation_id.clone(),
+                        detail: "accepted ORS record has no original write binding".to_owned(),
+                    }
+                })?
         {
             return Err(ReservationWriteError::Binding {
                 operation_id,
@@ -998,23 +996,22 @@ pub(crate) fn reservation_record_by_order(
     reservation_order: u64,
     operation_id: &OrsOperationIdentity,
 ) -> Result<ReservationRecord, ReservationWriteError> {
-    let after_order = reservation_order.checked_sub(1).ok_or_else(|| {
-        ReservationWriteError::Binding {
-            operation_id: operation_id.as_str().to_owned(),
-            detail: "accepted ORS reservation order must be non-zero".to_owned(),
-        }
-    })?;
+    let after_order =
+        reservation_order
+            .checked_sub(1)
+            .ok_or_else(|| ReservationWriteError::Binding {
+                operation_id: operation_id.as_str().to_owned(),
+                detail: "accepted ORS reservation order must be non-zero".to_owned(),
+            })?;
     let cursor = RecoveryCursor::new(after_order, 1).map_err(ReservationWriteError::Ors)?;
     let page = owner.ors.recover_page(cursor)?;
     let mut exact = page.records.into_iter().filter(|record| {
         record.token.reservation_order == reservation_order
             && record.token.operation_id == *operation_id
     });
-    let record = exact.next().ok_or_else(|| {
-        ReservationWriteError::Binding {
-            operation_id: operation_id.as_str().to_owned(),
-            detail: "durable ORS readback omitted the accepted reservation token".to_owned(),
-        }
+    let record = exact.next().ok_or_else(|| ReservationWriteError::Binding {
+        operation_id: operation_id.as_str().to_owned(),
+        detail: "durable ORS readback omitted the accepted reservation token".to_owned(),
     })?;
     if exact.next().is_some() {
         return Err(ReservationWriteError::Binding {
