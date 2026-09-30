@@ -3359,7 +3359,12 @@ async fn drain_flights_on_shutdown(
                 // record it could honestly retain: the record a dropped step was
                 // carrying died with the future, and inventing one would be a
                 // fabricated prior. `None` is the denying direction the pipeline
-                // already reads as "no retained record".
+                // already reads as "no retained record". This is not the third
+                // way a pass loses its record: the loop is returning
+                // `RunLoopExit::Shutdown` on the next line, so no later pass
+                // exists to compare against anything. The record dies with the
+                // process, which is the same absence a restart produces and the
+                // one this flight's own documentation names.
                 *improvement_intake_flight = ImprovementIntakeFlight::Idle { retained: None };
                 *health_heartbeat_flight = HealthHeartbeatFlight::Idle;
                 *solo_poll_flight = SoloPollFlight::Idle;
@@ -5040,10 +5045,16 @@ enum TestdOwnerFlight {
 
 /// Completion of one in-flight improvement-intake step.
 enum ImprovementIntakeCompletion {
-    /// The pipeline-checked current record the route admitted, which the NEXT
-    /// pass compares against for its own repeat assessment. `None` on any pass
-    /// that was not admitted, so an unadmitted pass never accumulates a record to
-    /// compare against.
+    /// The record the NEXT pass compares against for its own repeat assessment:
+    /// the one this pass's route admitted, or — when this pass admitted nothing,
+    /// and equally when it refused outright — the one the flight already held.
+    ///
+    /// An unadmitted pass therefore settles on the last ADMITTED record rather
+    /// than on `None`, and `None` means the honest absence: no pass has admitted
+    /// anything yet in this process. That absence is what the first pass and a
+    /// restart produce, and it is the only thing they produce: a pass that
+    /// admitted nothing is not evidence the last admitted record stopped
+    /// existing, so it must not read as that absence.
     Settled(Option<eliot_maintenance::RetainedImprovementProposal>),
 }
 
@@ -5068,6 +5079,17 @@ struct ImprovementIntakeFlightState {
 /// than papered over: no durable owner of a `RetainedImprovementProposal` exists
 /// in this workspace, so an absent record is passed to the pipeline as no record
 /// at all and it disposes of that as its own `NoRetainedPrior` case.
+///
+/// Exactly TWO things clear this record, and both are honest absences rather
+/// than evidence: a restart, which ends the process that held it, and the first
+/// pass, which precedes any admission. A pass that admits nothing — because the
+/// disposition is `Rejected`, `NoProgress`, `Inconclusive`, `Blocked`,
+/// `RolledBack`, `RegressionRejected` or `UnknownRequiresReconciliation`, or
+/// because the route refused outright — leaves it in place, because a repeated
+/// failed experiment is a named trigger (I12.24:43) and a replay of a fixed
+/// experiment is the evidence that recognises it (I12.24:67). Clearing the
+/// record between two attempts of the same candidate would make the second
+/// attempt read as a first one.
 enum ImprovementIntakeFlight {
     Idle {
         /// Boxed for the same storage reason the operation is boxed on the
@@ -5253,10 +5275,14 @@ fn admit_over_restored_registry(
 /// notification leg.
 ///
 /// The return value is the pipeline-checked record the NEXT pass retains for its
-/// own repeat assessment, or `None` when this pass was not admitted. Every
-/// refusal above returns the record it was handed rather than clearing it: a
-/// refused pass produced no new record, and that is not evidence the last
-/// admitted one stopped existing.
+/// own repeat assessment. It is the record THIS pass admitted; when this pass
+/// admitted nothing, it is the record the step was handed rather than `None`.
+/// `None` therefore means only "nothing has been admitted in this process yet",
+/// which is the first pass and the pass after a restart — the same two absences
+/// [`ImprovementIntakeFlight`] names. Every refusal above returns the record it
+/// was handed rather than clearing it, and so does every terminal disposition
+/// that published no current record: a pass that produced no new record is not
+/// evidence the last admitted one stopped existing.
 async fn run_improvement_intake(
     kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
@@ -5277,7 +5303,8 @@ async fn run_improvement_intake(
             )
             .emit();
             // A pass that never assembled a candidate reached no route, so it
-            // retains nothing new; the prior admitted record stays.
+            // retains nothing new; the prior admitted record stays, exactly as on
+            // a refused or non-admitted route.
             return retained.cloned();
         }
     };
@@ -5320,7 +5347,7 @@ async fn run_improvement_intake(
             .emit();
             // The route step is not attempted: it routes the artifact this pass
             // was about to admit, and nothing was admitted. The prior admitted
-            // record stays.
+            // record stays, exactly as on a refused or non-admitted route.
             return retained.cloned();
         }
     };
@@ -5427,11 +5454,13 @@ async fn run_improvement_intake(
 ///
 /// # The returned record
 ///
-/// The record the NEXT pass retains for its own repeat assessment, or the one
-/// this pass was handed when the route was refused. A refusal produced no
-/// checked record, so it retains nothing new, and the previously retained record
-/// stays in the flight: a refused pass is not evidence that the last admitted
-/// record stopped existing.
+/// The record the NEXT pass retains for its own repeat assessment: the one this
+/// pass admitted, or the one this pass was handed when the route refused OR
+/// returned a disposition that published no checked current record. A refusal
+/// produced no checked record, so it retains nothing new, and a non-admitted
+/// disposition produced none either; in both cases the previously retained
+/// record stays in the flight, because neither is evidence that the last
+/// admitted record stopped existing.
 async fn route_and_reconcile_improvement_candidate(
     composition: &SharedComposition,
     artifact: &eliotd::improvement_intake_dispatch::ImprovementArtifact,
@@ -5503,9 +5532,18 @@ async fn route_and_reconcile_improvement_candidate(
 /// - Every other terminal disposition keeps the verbatim record it always had.
 ///
 /// The return value is the pipeline-checked current record the NEXT pass
-/// compares against, or the record this call was handed when the pass was not
-/// admitted. A refusal is not evidence that the last admitted record stopped
-/// existing, so the `Err` arm settles on the record the flight already held.
+/// compares against, or the record this call was handed when the pass published
+/// no such record. Publishing one and not publishing one are the two halves of
+/// the same rule, applied identically by both arms: only an ADMITTED pass
+/// publishes a checked current record, so only an admitted pass replaces what
+/// the next pass compares against, and every other outcome settles on the record
+/// the flight already held. A non-admitted pass is not evidence that the last
+/// admitted record stopped existing, so neither arm returns `None` in its place.
+///
+/// That `None` is reachable only as the honest absence — no pass in this process
+/// has admitted anything yet — which is the first pass and the pass after a
+/// restart, and it is exactly what the pipeline disposes as `NoRetainedPrior`
+/// rather than reading as novelty (I12.24:43, I12.24:67).
 ///
 /// A typed `PipelineError` from the route or from the identity check is a
 /// diagnostic under the same discipline as the other refusals in the pass, never
@@ -5619,7 +5657,19 @@ fn report_improvement_candidate_route(
             // an admitted pass replaces what the next pass compares against.
             // Every other outcome — including the refusal below — settles on the
             // record the flight already held.
-            outcome.retained_next
+            //
+            // The fallback is what makes that sentence true of the code.
+            // `retained_next` is populated on the admitted branch ALONE —
+            // `checked_current_record` reads the current record out of the
+            // `CanaryAdmitted` handoff and returns `None` for every other
+            // disposition — so returning it bare would store `None` back into the
+            // flight and erase a record an earlier pass had legitimately
+            // committed. The retained record has to outlive a pass that admitted
+            // nothing for the REPEAT to be recognisable at all: a repeated failed
+            // experiment is a named trigger (I12.24:43) and a fixed replay is the
+            // evidence that recognises it (I12.24:67), and a record dropped
+            // between two attempts makes the second one look like a first.
+            outcome.retained_next.or_else(|| retained.cloned())
         }
         Err(error) => {
             let _ = eliotd::diagnostics::ErrorRecord::of(
@@ -5631,7 +5681,9 @@ fn report_improvement_candidate_route(
             // A refusal produced no checked record, so the pass retains nothing
             // NEW. The previously retained record stays in the flight: a refused
             // pass is not evidence that the prior admitted record stopped
-            // existing.
+            // existing. This is the SAME rule the `Ok` arm applies to every
+            // disposition that published no current record, which is why both
+            // arms return the record this call was handed.
             retained.cloned()
         }
     }
@@ -5793,7 +5845,9 @@ async fn record_unknown_effect_obligation(
 /// the flight keeps holding it until this very step settles: a step that fails
 /// or refuses still leaves the last admitted record in place for the pass after
 /// it. Only settlement replaces it, and only with a record the pipeline itself
-/// committed on an admitted pass.
+/// committed on an admitted pass — a step that admitted nothing settles on the
+/// record it was handed, so "replace" here can only ever change the record from
+/// one admitted pass to a later one.
 fn maybe_start_improvement_intake(
     kernel: &Arc<DaemonKernelClient>,
     composition: &SharedComposition,
@@ -5838,7 +5892,10 @@ async fn next_improvement_intake_completion(
 ///
 /// The record the step retained goes back into `Idle` and is the input to the
 /// NEXT pass's repeat assessment. It is the pipeline's own checked record, not a
-/// recomputation; see [`ImprovementIntakeFlight`].
+/// recomputation, and settlement is the only writer that can change which record
+/// that is: the step returns the record an admitted pass committed, or the one it
+/// was handed, so a step that admitted nothing writes back the very record the
+/// flight already held. See [`ImprovementIntakeFlight`].
 fn settle_improvement_intake_completion(
     flight: &mut ImprovementIntakeFlight,
     completion: ImprovementIntakeCompletion,
