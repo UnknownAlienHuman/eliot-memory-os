@@ -1393,7 +1393,9 @@ pub struct Incident {
     pub incident_id: IncidentId,
     pub title: String,
     pub scope_id: String,
-    pub owner: OwnerRef,
+    /// Lease-bound owner with an explicit unassigned state, so losing an
+    /// Incident owner leaves a visible obligation rather than a silent gap.
+    pub ownership: Ownership,
     pub state: IncidentState,
     pub evidence_refs: Vec<ArtifactId>,
     /// The Problem this Incident was promoted from, once promotion is decided.
@@ -1405,6 +1407,10 @@ pub struct Incident {
     /// Retained review requests; a request is evidence that review was asked
     /// for, and it is never a decision.
     pub review_requests: Vec<IncidentReviewRequest>,
+    /// The independently expected observables a resolution must cover.
+    pub expected_resolution: Vec<ArtifactId>,
+    /// The outstanding reassignment/escalation obligation while unassigned.
+    pub obligation: Option<OwnershipObligation>,
     pub acknowledged_by: Option<String>,
     pub state_fence: StateFence,
     pub revision: u64,
@@ -1439,7 +1445,7 @@ impl Incident {
     pub fn validate(&self) -> Result<(), ProblemError> {
         text(&self.title, "title")?;
         text(&self.scope_id, "scope_id")?;
-        self.owner.validate()?;
+        self.ownership.validate()?;
         fence(&self.state_fence)?;
         nonempty(&self.evidence_refs, "evidence_refs")?;
         if self.revision == 0 {
@@ -1448,6 +1454,39 @@ impl Incident {
                 reason: "must be non-zero",
             });
         }
+        if let Ok(identity) = &self.promotion {
+            if self.expected_resolution.is_empty() {
+                return Err(ProblemError::InvalidField {
+                    field: "expected_resolution",
+                    reason: "a promoted incident must retain its expected closure set",
+                });
+            }
+            if identity.reason == IncidentReason::StructuralCorruption
+                && !self.review_requests.is_empty()
+            {
+                // I13.9 separates semantic contamination from structural
+                // corruption. A review request that observed a wrong
+                // interpretation is not a corruption finding, so a
+                // corruption promotion may not be carried on one.
+                let contamination = self.review_requests.iter().all(|request| {
+                    request.reason != IncidentReason::StructuralCorruption
+                });
+                if contamination && self.review_requests.iter().any(|request| {
+                    request.reason == IncidentReason::UnknownMaterialOrCriticalExternalEffect
+                }) {
+                    return Err(ProblemError::InvalidField {
+                        field: "promotion.reason",
+                        reason: "an unknown-effect finding does not by itself establish structural corruption",
+                    });
+                }
+            }
+        }
+        let expected = self
+            .expected_resolution
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        unique_text(&expected, "expected_resolution")?;
         match (&self.promotion, &self.source_problem) {
             (None, None) => {}
             (Some(promotion), Some(problem_id)) => {
@@ -1482,7 +1521,28 @@ impl Incident {
         for request in &self.review_requests {
             nonempty(&request.evidence_refs, "review_requests.evidence_refs")?;
         }
-        Ok(())
+        // An unassigned Incident keeps a visible obligation, exactly as an
+        // unassigned Problem or attention does; loss is never silent.
+        match (&self.ownership, &self.obligation) {
+            (Ownership::Unassigned(unassigned), Some(obligation)) => {
+                if *obligation != unassigned.obligation {
+                    return Err(ProblemError::InvalidField {
+                        field: "obligation",
+                        reason: "must be the obligation raised by the retained owner loss",
+                    });
+                }
+                Ok(())
+            }
+            (Ownership::Unassigned(_), None) => Err(ProblemError::InvalidField {
+                field: "obligation",
+                reason: "an unassigned incident must retain its outstanding obligation",
+            }),
+            (Ownership::Assigned(_), Some(_)) => Err(ProblemError::InvalidField {
+                field: "obligation",
+                reason: "an assigned incident retains no outstanding obligation",
+            }),
+            (Ownership::Assigned(_), None) => Ok(()),
+        }
     }
 
     /// Records that review was requested, without deciding anything.
@@ -1577,17 +1637,169 @@ impl Incident {
     }
 
     /// Records acknowledgement without resolving the incident.
+    ///
+    /// The caller must present the live [`AuthenticatedOwnerLease`], so a lost
+    /// owner cannot come back and write: the record is unassigned, so there is
+    /// no principal to satisfy. Acknowledgement is receipt only and never
+    /// changes `state` or the promotion.
     pub fn acknowledge(
         &mut self,
         expected_fence: &StateFence,
-        principal: &str,
+        lease: &AuthenticatedOwnerLease,
     ) -> Result<(), ProblemError> {
         same_fence(expected_fence, &self.state_fence)?;
-        owner_name(principal)?;
-        if principal != self.owner.principal {
-            return Err(ProblemError::OwnerMismatch);
+        let owner = self.ownership.assigned()?;
+        if !lease.is_exactly(&owner.lease) || lease.holder().principal != owner.holder.principal {
+            return Err(ProblemError::OwnerLeaseMismatch);
         }
-        self.acknowledged_by = Some(principal.to_owned());
+        self.acknowledged_by = Some(owner.holder.principal.clone());
+        Ok(())
+    }
+
+    /// Assigns an eligible successor under a newly issued ownership lease.
+    ///
+    /// Same lease-epoch rule as the Problem and attention records: the successor
+    /// is named by the lease owner, and the grant's ownership epoch must exceed
+    /// the epoch currently held, so a renewal is a new epoch rather than a reuse.
+    pub fn assign_owner(
+        &mut self,
+        expected_fence: &StateFence,
+        lease: &AuthenticatedOwnerLease,
+    ) -> Result<(), ProblemError> {
+        same_fence(expected_fence, &self.state_fence)?;
+        let grant = lease.grant();
+        if !lease.is_bound_to(&self.state_fence) {
+            return Err(ProblemError::FenceMismatch);
+        }
+        let current_epoch = self.ownership.assigned()?.ownership_epoch;
+        if grant.ownership_epoch <= current_epoch {
+            return Err(ProblemError::InvalidField {
+                field: "lease.ownership_epoch",
+                reason: "must be a new epoch greater than the epoch this record holds",
+            });
+        }
+        if matches!(
+            self.state,
+            IncidentState::Resolved | IncidentState::AcceptedRisk | IncidentState::Superseded
+        ) {
+            return Err(ProblemError::ImmutableState);
+        }
+        let revision = next_revision(self.revision)?;
+        let mut candidate = self.clone();
+        candidate.ownership = Ownership::Assigned(AssignedOwnership {
+            holder: grant.holder.clone(),
+            lease: lease.identity().clone(),
+            ownership_epoch: grant.ownership_epoch,
+        });
+        candidate.obligation = None;
+        candidate.acknowledged_by = None;
+        candidate.revision = revision;
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    /// Records a fenced owner loss and leaves the obligation visible.
+    ///
+    /// The promotion, its reason, its admitting authority, the source Problem
+    /// link and the retained review requests all survive: losing the owner of
+    /// an Incident does not soften what the Incident is. Only the assignment is
+    /// cleared, and one obligation is raised. A loss naming a lease identity
+    /// this record no longer holds is stale and cannot unassign the current
+    /// successor.
+    pub fn record_owner_loss(
+        &mut self,
+        expected_fence: &StateFence,
+        loss: &OwnerLeaseLoss,
+    ) -> Result<OwnershipObligation, ProblemError> {
+        same_fence(expected_fence, &self.state_fence)?;
+        loss.validate()?;
+        let owner = self.ownership.assigned()?;
+        if !loss.observed_lease.is_exactly(&owner.lease) {
+            return Err(ProblemError::StaleOwnerLoss);
+        }
+        if matches!(
+            self.state,
+            IncidentState::Resolved | IncidentState::AcceptedRisk | IncidentState::Superseded
+        ) {
+            return Err(ProblemError::ImmutableState);
+        }
+        let revision = next_revision(self.revision)?;
+        // An open Incident is a security/integrity-class obligation, so the
+        // I13.8 default route is the System Owner/Recovery Principal rather
+        // than a role the caller raising the loss picked.
+        let route = OwnerRoute::SystemOwnerRecoveryPrincipal;
+        let obligation = OwnershipObligation {
+            obligation_id: obligation_id(
+                self.incident_id.as_str(),
+                route,
+                owner.ownership_epoch,
+            )?,
+            route,
+            lost_lease: Some(owner.lease.clone()),
+            ownership_epoch: owner.ownership_epoch,
+            raised_at_revision: revision,
+        };
+        let mut candidate = self.clone();
+        candidate.ownership = Ownership::Unassigned(UnassignedOwnership {
+            last_holder: owner.holder.clone(),
+            reason: loss.reason,
+            lost_lease: Some(owner.lease.clone()),
+            ownership_epoch: owner.ownership_epoch,
+            loss_evidence: loss.evidence.clone(),
+            obligation: obligation.clone(),
+        });
+        candidate.obligation = Some(obligation.clone());
+        candidate.acknowledged_by = None;
+        candidate.revision = revision;
+        candidate.validate()?;
+        *self = candidate;
+        Ok(obligation)
+    }
+
+    /// Resolves the Incident only against the independently expected set.
+    ///
+    /// The expected observables were fixed when the Incident was promoted, and
+    /// the verifier must be independent of the current owner under the
+    /// record's current fence. Repair success, a notification, or a score are
+    /// not observables this can be given, so none of them closes an Incident.
+    pub fn resolve(
+        &mut self,
+        expected_fence: &StateFence,
+        closure: &ClosureEvidence,
+    ) -> Result<(), ProblemError> {
+        same_fence(expected_fence, &self.state_fence)?;
+        if self.state != IncidentState::Verifying {
+            return Err(ProblemError::IllegalTransition {
+                from: format!("{:?}", self.state),
+                to: "RESOLVED".to_owned(),
+            });
+        }
+        closure.validate()?;
+        let owner = self.ownership.assigned()?;
+        if closure.verifier.principal == owner.holder.principal {
+            return Err(ProblemError::IndependentVerifierRequired);
+        }
+        if closure.verifier_fence != self.state_fence {
+            return Err(ProblemError::FenceMismatch);
+        }
+        for expected in &self.expected_resolution {
+            if !closure.verified_observables.contains(expected) {
+                return Err(ProblemError::UnresolvedExpectation {
+                    value: expected.to_string(),
+                });
+            }
+        }
+        let revision = next_revision(self.revision)?;
+        let mut candidate = self.clone();
+        candidate.evidence_refs = merge_evidence(
+            &candidate.evidence_refs,
+            &closure.verified_observables,
+        );
+        candidate.state = IncidentState::Resolved;
+        candidate.revision = revision;
+        candidate.validate()?;
+        *self = candidate;
         Ok(())
     }
 
@@ -1881,69 +2093,232 @@ pub enum AttentionState {
 }
 
 /// Persistent attention obligation.
+///
+/// Every I13.7 field is present and separately named. Delivery,
+/// acknowledgement and influence are independent axes from resolution, so a
+/// delivered or acknowledged record still blocks; `expected_resolution` is the
+/// independently expected closure set fixed when the obligation was raised, and
+/// `waiver_authority` is a principal distinct from the owner, so the owner
+/// cannot waive its own obligation.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CriticalAttention {
     pub attention_id: AttentionId,
     pub obligation: String,
+    /// I13.7 `scope/task` the obligation applies to.
+    pub scope: String,
+    /// I13.7 `affected_action_classes`, the actions this blocks.
     pub affected_scope_actions: Vec<String>,
+    /// I13.7 `source/evidence`.
     pub evidence_refs: Vec<ArtifactId>,
-    pub owner: OwnerRef,
+    /// I13.7 `owner`, lease-bound with an explicit unassigned state.
+    pub ownership: Ownership,
+    /// I13.7 `delivery_state`.
     pub delivery_state: DeliveryState,
+    /// I13.7 `acknowledgement_state`.
+    pub acknowledged_by: Option<String>,
+    /// I13.7 `influence_state`: what the obligation is currently allowed to
+    /// influence, tracked separately from whether it is resolved.
+    pub influence_state: AttentionInfluence,
+    /// I13.7 `resolution_state`.
     pub state: AttentionState,
+    /// I13.7 `deadline_or_review`.
     pub review_condition: String,
-    pub escalation_route: String,
+    /// I13.7 `escalation_target`, as the closed I13.8 route.
+    pub escalation_target: OwnerRoute,
+    /// I13.7 `resolution_condition`, stated by the record.
+    pub resolution_condition: String,
+    /// The independently expected observables a resolution must cover.
+    pub expected_resolution: Vec<ArtifactId>,
+    /// I13.7 `waiver_authority`, a principal distinct from the owner.
+    pub waiver_authority: OwnerRef,
+    /// The applied waiver, retained when one exists.
+    pub waiver: Option<WaiverRecord>,
+    /// The accepted replacement obligation a supersession points at.
+    ///
+    /// Supersession must name a real accepted replacement, so blocking cannot
+    /// disappear into a cycle or a nonexistent identity.
+    pub superseded_by: Option<AttentionId>,
+    /// The outstanding reassignment/escalation obligation while unassigned.
+    pub obligation: Option<OwnershipObligation>,
     pub state_fence: StateFence,
     pub revision: u64,
+}
+
+/// I13.7 `influence_state`: what an attention is currently allowed to affect.
+///
+/// It is a separate axis from resolution on purpose. An unresolved obligation
+/// keeps its influence (and therefore its blocking) even after delivery and
+/// acknowledgement; only a committed terminal transition removes it.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AttentionInfluence {
+    /// The obligation still blocks its affected action classes.
+    Blocking,
+    /// The obligation no longer influences anything, because it reached a
+    /// committed terminal state.
+    Released,
+}
+
+impl AttentionState {
+    /// Whether this is a committed terminal state.
+    ///
+    /// A terminal obligation is closed; nothing reopens it, including a late
+    /// acknowledgement or a reassignment.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Resolved | Self::Waived | Self::Superseded
+        )
+    }
 }
 
 impl CriticalAttention {
     /// Validates that an attention is durable obligation state, not a toast.
     pub fn validate(&self) -> Result<(), ProblemError> {
         text(&self.obligation, "obligation")?;
+        text(&self.scope, "scope")?;
         text(&self.review_condition, "review_condition")?;
-        text(&self.escalation_route, "escalation_route")?;
-        self.owner.validate()?;
+        text(&self.resolution_condition, "resolution_condition")?;
+        self.ownership.validate()?;
+        self.waiver_authority.validate()?;
         fence(&self.state_fence)?;
         nonempty(&self.affected_scope_actions, "affected_scope_actions")?;
         nonempty(&self.evidence_refs, "evidence_refs")?;
+        nonempty(&self.expected_resolution, "expected_resolution")?;
         unique_text(&self.affected_scope_actions, "affected_scope_actions")?;
-        if self.revision == 0 {
+        let evidence = self
+            .evidence_refs
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        unique_text(&evidence, "evidence_refs")?;
+        let expected = self
+            .expected_resolution
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        unique_text(&expected, "expected_resolution")?;
+        if let Some(principal) = &self.acknowledged_by {
+            owner_name(principal)?;
+        }
+        // The waiver authority must be a principal distinct from the owner. An
+        // unassigned record has no owner to be distinct from, so the check
+        // applies exactly when an owner exists.
+        if let Ok(owner) = self.ownership.assigned()
+            && self.waiver_authority.principal == owner.holder.principal
+        {
+            return Err(ProblemError::WaiverAuthorityRequired);
+        }
+        if let Some(waiver) = &self.waiver {
+            if self.state != AttentionState::Waived {
+                return Err(ProblemError::InvalidField {
+                    field: "waiver",
+                    reason: "a waiver is retained only on a waived obligation",
+                });
+            }
+            waiver.validate()?;
+        }
+        if let Some(replacement) = &self.superseded_by {
+            if self.state != AttentionState::Superseded {
+                return Err(ProblemError::InvalidField {
+                    field: "superseded_by",
+                    reason: "a replacement is retained only on a superseded obligation",
+                });
+            }
+            if *replacement == self.attention_id {
+                return Err(ProblemError::InvalidField {
+                    field: "superseded_by",
+                    reason: "a supersession must name a different accepted obligation",
+                });
+            }
+        }
+        // Influence follows resolution, not delivery: an unresolved obligation
+        // keeps blocking, and only a committed terminal state releases it.
+        let expected_influence = if self.state.is_terminal() {
+            AttentionInfluence::Released
+        } else {
+            AttentionInfluence::Blocking
+        };
+        if self.influence_state != expected_influence {
             return Err(ProblemError::InvalidField {
-                field: "revision",
-                reason: "must be non-zero",
+                field: "influence_state",
+                reason: "must be Released exactly when the obligation is terminal",
             });
         }
-        Ok(())
+        if self.state == AttentionState::Waived && self.waiver.is_none() {
+            return Err(ProblemError::WaiverAuthorityRequired);
+        }
+        if self.state == AttentionState::Superseded && self.superseded_by.is_none() {
+            return Err(ProblemError::InvalidField {
+                field: "superseded_by",
+                reason: "supersession must name the accepted replacement obligation",
+            });
+        }
+        match (&self.ownership, &self.obligation) {
+            (Ownership::Unassigned(unassigned), Some(obligation)) => {
+                if *obligation != unassigned.obligation {
+                    return Err(ProblemError::InvalidField {
+                        field: "obligation",
+                        reason: "must be the obligation raised by the retained owner loss",
+                    });
+                }
+                Ok(())
+            }
+            (Ownership::Unassigned(_), None) => Err(ProblemError::InvalidField {
+                field: "obligation",
+                reason: "an unassigned attention must retain its outstanding obligation",
+            }),
+            (Ownership::Assigned(_), Some(_)) => Err(ProblemError::InvalidField {
+                field: "obligation",
+                reason: "an assigned attention retains no outstanding obligation",
+            }),
+            (Ownership::Assigned(_), None) => Ok(()),
+        }
     }
 
     /// Creates a durable obligation in `Active` state with pending delivery.
     ///
     /// Creation is the first append-only transition: the record starts at
-    /// revision 1 carrying the caller's owner, scope, evidence, review
-    /// condition, escalation route and State Fence. No later transition
-    /// erases the obligation or its evidence.
+    /// revision 1 carrying the lease-backed owner, scope, evidence, review
+    /// condition, escalation route, waiver authority, the independently
+    /// expected closure set and the State Fence. No later transition erases the
+    /// obligation or its evidence.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         attention_id: AttentionId,
         obligation: String,
+        scope: String,
         affected_scope_actions: Vec<String>,
         evidence_refs: Vec<ArtifactId>,
-        owner: OwnerRef,
+        ownership: Ownership,
         review_condition: String,
-        escalation_route: String,
+        escalation_target: OwnerRoute,
+        resolution_condition: String,
+        expected_resolution: Vec<ArtifactId>,
+        waiver_authority: OwnerRef,
         state_fence: StateFence,
     ) -> Result<Self, ProblemError> {
         let value = Self {
             attention_id,
             obligation,
+            scope,
             affected_scope_actions,
             evidence_refs,
-            owner,
+            ownership,
             delivery_state: DeliveryState::Pending,
+            acknowledged_by: None,
+            influence_state: AttentionInfluence::Blocking,
             state: AttentionState::Active,
             review_condition,
-            escalation_route,
+            escalation_target,
+            resolution_condition,
+            expected_resolution,
+            waiver_authority,
+            waiver: None,
+            superseded_by: None,
+            obligation: None,
             state_fence,
             revision: 1,
         };
@@ -1952,28 +2327,37 @@ impl CriticalAttention {
     }
 
     /// Acknowledges receipt while retaining an active obligation.
+    ///
+    /// The caller must present the live [`AuthenticatedOwnerLease`], so
+    /// acknowledgement is receipt by the lease-backed owner and nothing more.
+    /// Acknowledgement never changes `state` or `influence_state`: a delivered
+    /// or acknowledged notification does not close a blocking obligation.
     pub fn acknowledge(
         &mut self,
         expected_fence: &StateFence,
-        principal: &str,
+        lease: &AuthenticatedOwnerLease,
     ) -> Result<(), ProblemError> {
         same_fence(expected_fence, &self.state_fence)?;
-        owner_name(principal)?;
-        if principal != self.owner.principal {
-            return Err(ProblemError::OwnerMismatch);
+        // A record whose owner was lost refuses every owner-scoped update, which
+        // is how the lost owner stays fenced.
+        let owner = self.ownership.assigned()?;
+        if !lease.is_exactly(&owner.lease) || lease.holder().principal != owner.holder.principal {
+            return Err(ProblemError::OwnerLeaseMismatch);
         }
-        match self.state {
-            AttentionState::Resolved | AttentionState::Waived | AttentionState::Superseded => {
-                return Err(ProblemError::ImmutableState);
-            }
-            AttentionState::Active | AttentionState::Acknowledged | AttentionState::Escalated => {}
+        if self.state.is_terminal() {
+            // A late acknowledgement cannot revive a terminal obligation.
+            return Err(ProblemError::ImmutableState);
         }
         if self.delivery_state == DeliveryState::Acknowledged {
             return Ok(());
         }
         let revision = next_revision(self.revision)?;
-        self.delivery_state = DeliveryState::Acknowledged;
-        self.revision = revision;
+        let mut candidate = self.clone();
+        candidate.delivery_state = DeliveryState::Acknowledged;
+        candidate.acknowledged_by = Some(owner.holder.principal.clone());
+        candidate.revision = revision;
+        candidate.validate()?;
+        *self = candidate;
         Ok(())
     }
 
@@ -1984,135 +2368,277 @@ impl CriticalAttention {
         expected_fence: &StateFence,
     ) -> Result<(), ProblemError> {
         same_fence(expected_fence, &self.state_fence)?;
-        match self.state {
-            AttentionState::Resolved | AttentionState::Waived | AttentionState::Superseded => {
-                return Err(ProblemError::ImmutableState);
-            }
-            AttentionState::Active | AttentionState::Acknowledged | AttentionState::Escalated => {}
+        if self.state.is_terminal() {
+            return Err(ProblemError::ImmutableState);
         }
         if self.delivery_state == DeliveryState::NextBoundaryPending {
             return Ok(());
         }
         let revision = next_revision(self.revision)?;
-        self.delivery_state = DeliveryState::NextBoundaryPending;
-        self.revision = revision;
+        let mut candidate = self.clone();
+        candidate.delivery_state = DeliveryState::NextBoundaryPending;
+        candidate.revision = revision;
+        candidate.validate()?;
+        *self = candidate;
         Ok(())
     }
 
-    /// Resolves only with explicit evidence and a matching fence.
+    /// Resolves only against the independently expected observable set.
+    ///
+    /// I13.7: "Blocking ends only on verified resolution, authorized waiver or
+    /// supersession. Delivery/acknowledgement alone do not close." The evidence
+    /// is checked against `expected_resolution`, which was fixed when the
+    /// obligation was raised, and the verifier must be independent of the
+    /// current owner under the record's current fence. This is the one exact
+    /// line where a resolution requires evidence the closer did not choose
+    /// alone: a non-empty but unrelated evidence list is refused with
+    /// [`ProblemError::UnresolvedExpectation`], and the owner's own readback is
+    /// refused with [`ProblemError::IndependentVerifierRequired`].
     pub fn resolve(
         &mut self,
         expected_fence: &StateFence,
-        evidence_refs: Vec<ArtifactId>,
+        closure: &ClosureEvidence,
     ) -> Result<(), ProblemError> {
         same_fence(expected_fence, &self.state_fence)?;
-        nonempty(&evidence_refs, "resolution_evidence")?;
-        let revision = next_revision(self.revision)?;
-        self.evidence_refs.extend(evidence_refs);
-        self.state = AttentionState::Resolved;
-        self.revision = revision;
-        Ok(())
-    }
-
-    /// Reassigns delivery ownership without deleting the obligation.
-    pub fn reassign_owner(
-        &mut self,
-        expected_fence: &StateFence,
-        owner: OwnerRef,
-        new_fence: StateFence,
-    ) -> Result<(), ProblemError> {
-        same_fence(expected_fence, &self.state_fence)?;
-        owner.validate()?;
-        fence(&new_fence)?;
-        let revision = next_revision(self.revision)?;
-        match self.state {
-            AttentionState::Resolved | AttentionState::Waived | AttentionState::Superseded => {
-                return Err(ProblemError::ImmutableState);
-            }
-            AttentionState::Escalated => {}
-            AttentionState::Active | AttentionState::Acknowledged => {
-                self.state = AttentionState::Active;
+        if self.state.is_terminal() {
+            return Err(ProblemError::ImmutableState);
+        }
+        closure.validate()?;
+        let owner = self.ownership.assigned()?;
+        if closure.verifier.principal == owner.holder.principal {
+            return Err(ProblemError::IndependentVerifierRequired);
+        }
+        if closure.verifier_fence != self.state_fence {
+            return Err(ProblemError::FenceMismatch);
+        }
+        for expected in &self.expected_resolution {
+            if !closure.verified_observables.contains(expected) {
+                return Err(ProblemError::UnresolvedExpectation {
+                    value: expected.to_string(),
+                });
             }
         }
-        self.owner = owner;
-        self.state_fence = new_fence;
-        self.delivery_state = DeliveryState::Pending;
-        self.revision = revision;
+        let revision = next_revision(self.revision)?;
+        let mut candidate = self.clone();
+        candidate.evidence_refs = merge_evidence(
+            &candidate.evidence_refs,
+            &closure.verified_observables,
+        );
+        candidate.state = AttentionState::Resolved;
+        candidate.influence_state = AttentionInfluence::Released;
+        candidate.revision = revision;
+        candidate.validate()?;
+        *self = candidate;
         Ok(())
     }
 
-    /// Records an authorized waiver: only the current owner principal may
-    /// waive, and the obligation with its evidence is retained as terminal.
+    /// Waives the obligation under a named authority distinct from the owner.
+    ///
+    /// The waiver records its authority, limits, expiry and residual risk, and
+    /// all four are retained as a [`WaiverRecord`]. The owner cannot waive its
+    /// own obligation: only the record's `waiver_authority` may, which is why
+    /// `validate` refuses a record whose waiver authority is the owner.
     pub fn waive(
         &mut self,
         expected_fence: &StateFence,
-        principal: &str,
-    ) -> Result<(), ProblemError> {
+        waiver: &AuthorizedWaiver,
+    ) -> Result<WaiverRecord, ProblemError> {
         same_fence(expected_fence, &self.state_fence)?;
-        owner_name(principal)?;
-        if principal != self.owner.principal {
-            return Err(ProblemError::OwnerMismatch);
+        if self.state.is_terminal() {
+            return Err(ProblemError::ImmutableState);
         }
-        match self.state {
-            AttentionState::Resolved | AttentionState::Waived | AttentionState::Superseded => {
-                return Err(ProblemError::ImmutableState);
-            }
-            AttentionState::Active | AttentionState::Acknowledged | AttentionState::Escalated => {}
+        waiver.validate()?;
+        if waiver.authority.principal != self.waiver_authority.principal {
+            return Err(ProblemError::WaiverAuthorityRequired);
+        }
+        let owner = self.ownership.assigned()?;
+        if waiver.authority.principal == owner.holder.principal {
+            return Err(ProblemError::WaiverAuthorityRequired);
         }
         let revision = next_revision(self.revision)?;
-        self.state = AttentionState::Waived;
-        self.revision = revision;
-        Ok(())
+        let record = WaiverRecord {
+            authority: waiver.authority.clone(),
+            decision_ref: waiver.decision_ref.clone(),
+            limits: waiver.limits.clone(),
+            expires_at_ms: waiver.expires_at_ms,
+            residual_risk: waiver.residual_risk.clone(),
+            evidence: waiver.evidence.clone(),
+        };
+        let mut candidate = self.clone();
+        candidate.evidence_refs = merge_evidence(&candidate.evidence_refs, &waiver.evidence);
+        candidate.waiver = Some(record.clone());
+        candidate.state = AttentionState::Waived;
+        candidate.influence_state = AttentionInfluence::Released;
+        candidate.revision = revision;
+        candidate.validate()?;
+        *self = candidate;
+        Ok(record)
     }
 
-    /// Records supersession: the obligation is retained with its evidence and
-    /// marked as recorded supersession rather than erased.
+    /// Supersedes the obligation onto an accepted replacement.
+    ///
+    /// The replacement must be a different attention that is itself still live,
+    /// so blocking cannot disappear into a cycle or a nonexistent identity: the
+    /// blocking action set moves to a real, inspectable record rather than
+    /// evaporating. A terminal record is never reopened by supersession.
     pub fn supersede(
         &mut self,
         expected_fence: &StateFence,
-        principal: &str,
+        replacement: &CriticalAttention,
     ) -> Result<(), ProblemError> {
         same_fence(expected_fence, &self.state_fence)?;
-        owner_name(principal)?;
-        if principal != self.owner.principal {
-            return Err(ProblemError::OwnerMismatch);
+        if self.state.is_terminal() {
+            return Err(ProblemError::ImmutableState);
         }
-        match self.state {
-            AttentionState::Resolved | AttentionState::Waived | AttentionState::Superseded => {
-                return Err(ProblemError::ImmutableState);
-            }
-            AttentionState::Active | AttentionState::Acknowledged | AttentionState::Escalated => {}
+        replacement.validate()?;
+        if replacement.attention_id == self.attention_id {
+            return Err(ProblemError::InvalidField {
+                field: "superseded_by",
+                reason: "a supersession must name a different accepted obligation",
+            });
+        }
+        if replacement.state.is_terminal() {
+            return Err(ProblemError::InvalidField {
+                field: "superseded_by",
+                reason: "the replacement obligation must still be live",
+            });
+        }
+        if replacement.superseded_by.as_ref() == Some(&self.attention_id) {
+            return Err(ProblemError::InvalidField {
+                field: "superseded_by",
+                reason: "the replacement already supersedes this obligation",
+            });
         }
         let revision = next_revision(self.revision)?;
-        self.state = AttentionState::Superseded;
-        self.revision = revision;
+        let mut candidate = self.clone();
+        candidate.state = AttentionState::Superseded;
+        candidate.influence_state = AttentionInfluence::Released;
+        candidate.superseded_by = Some(replacement.attention_id.clone());
+        candidate.revision = revision;
+        candidate.validate()?;
+        *self = candidate;
         Ok(())
+    }
+
+    /// Assigns an eligible successor under a newly issued ownership lease.
+    ///
+    /// The successor is named by the lease owner, not by the caller: a caller
+    /// holding only a principal string cannot reach this entry. The grant's
+    /// ownership epoch must exceed the epoch currently held, and the grant must
+    /// be bound to the record's live fence, so a renewal is a new epoch rather
+    /// than a reuse. The blocking action set is retained in full.
+    pub fn assign_owner(
+        &mut self,
+        expected_fence: &StateFence,
+        lease: &AuthenticatedOwnerLease,
+    ) -> Result<(), ProblemError> {
+        same_fence(expected_fence, &self.state_fence)?;
+        if self.state.is_terminal() {
+            return Err(ProblemError::ImmutableState);
+        }
+        let grant = lease.grant();
+        if !lease.is_bound_to(&self.state_fence) {
+            return Err(ProblemError::FenceMismatch);
+        }
+        let current_epoch = self.ownership.assigned()?.ownership_epoch;
+        if grant.ownership_epoch <= current_epoch {
+            return Err(ProblemError::InvalidField {
+                field: "lease.ownership_epoch",
+                reason: "must be a new epoch greater than the epoch this record holds",
+            });
+        }
+        let revision = next_revision(self.revision)?;
+        let mut candidate = self.clone();
+        candidate.ownership = Ownership::Assigned(AssignedOwnership {
+            holder: grant.holder.clone(),
+            lease: lease.identity().clone(),
+            ownership_epoch: grant.ownership_epoch,
+        });
+        candidate.obligation = None;
+        candidate.acknowledged_by = None;
+        candidate.delivery_state = DeliveryState::Pending;
+        candidate.revision = revision;
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    /// Records a fenced owner loss and leaves the obligation visible.
+    ///
+    /// Only the assignment is cleared: the blocking action set, the obligation
+    /// text, the evidence, the review condition and the expected closure set all
+    /// survive, and the obligation escalates through the record's own recorded
+    /// [`OwnerRoute`]. A loss naming a lease identity this record no longer
+    /// holds is stale and cannot unassign the current successor. A terminal
+    /// record is preserved rather than reopened.
+    pub fn record_owner_loss(
+        &mut self,
+        expected_fence: &StateFence,
+        loss: &OwnerLeaseLoss,
+    ) -> Result<OwnershipObligation, ProblemError> {
+        same_fence(expected_fence, &self.state_fence)?;
+        loss.validate()?;
+        let owner = self.ownership.assigned()?;
+        if !loss.observed_lease.is_exactly(&owner.lease) {
+            return Err(ProblemError::StaleOwnerLoss);
+        }
+        if self.state.is_terminal() {
+            return Err(ProblemError::ImmutableState);
+        }
+        let revision = next_revision(self.revision)?;
+        let obligation = OwnershipObligation {
+            obligation_id: obligation_id(
+                self.attention_id.as_str(),
+                self.escalation_target,
+                owner.ownership_epoch,
+            )?,
+            route: self.escalation_target,
+            lost_lease: Some(owner.lease.clone()),
+            ownership_epoch: owner.ownership_epoch,
+            raised_at_revision: revision,
+        };
+        // The one exact line where owner loss produces a visible obligation and
+        // fences that owner: the assignment is replaced by an unassigned state
+        // naming the fenced holder, the retained loss evidence and this
+        // obligation, while the blocking action set is kept intact.
+        let mut candidate = self.clone();
+        candidate.ownership = Ownership::Unassigned(UnassignedOwnership {
+            last_holder: owner.holder.clone(),
+            reason: loss.reason,
+            lost_lease: Some(owner.lease.clone()),
+            ownership_epoch: owner.ownership_epoch,
+            loss_evidence: loss.evidence.clone(),
+            obligation: obligation.clone(),
+        });
+        candidate.obligation = Some(obligation.clone());
+        candidate.acknowledged_by = None;
+        candidate.state = AttentionState::Escalated;
+        candidate.revision = revision;
+        candidate.validate()?;
+        *self = candidate;
+        Ok(obligation)
     }
 
     /// Applies review-condition expiry: the obligation escalates via the
     /// recorded route to a new owner and fence, retaining the prior obligation
     /// and evidence. The record remains inspectable; expiry never deletes it.
+    ///
+    /// The new owner is still an [`AuthenticatedOwnerLease`], so escalation
+    /// cannot hand the obligation to a name the caller supplied.
     pub fn expire(
         &mut self,
         expected_fence: &StateFence,
-        owner: OwnerRef,
-        new_fence: StateFence,
+        lease: &AuthenticatedOwnerLease,
     ) -> Result<(), ProblemError> {
-        same_fence(expected_fence, &self.state_fence)?;
-        owner.validate()?;
-        fence(&new_fence)?;
-        let revision = next_revision(self.revision)?;
-        match self.state {
-            AttentionState::Resolved | AttentionState::Waived | AttentionState::Superseded => {
-                return Err(ProblemError::ImmutableState);
-            }
-            AttentionState::Active | AttentionState::Acknowledged | AttentionState::Escalated => {}
+        self.assign_owner(expected_fence, lease)?;
+        if self.state != AttentionState::Escalated {
+            let revision = next_revision(self.revision)?;
+            let mut candidate = self.clone();
+            candidate.state = AttentionState::Escalated;
+            candidate.revision = revision;
+            candidate.validate()?;
+            *self = candidate;
         }
-        self.owner = owner;
-        self.state_fence = new_fence;
-        self.delivery_state = DeliveryState::Pending;
-        self.state = AttentionState::Escalated;
-        self.revision = revision;
         Ok(())
     }
 }
