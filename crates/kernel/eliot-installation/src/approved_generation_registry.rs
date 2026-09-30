@@ -2835,7 +2835,7 @@ impl UserModeTaskRunHostAck {
     /// # Errors
     /// Returns `IdentityConflict` or a typed invalid-field error when the
     /// acknowledgement does not bind to the embedded intent.
-    pub fn validate(&self) -> Result<(), InstallationError> {
+    pub(crate) fn validate(&self) -> Result<(), InstallationError> {
         self.intent.validate()?;
         self.evidence.validate()?;
         if self.evidence.launch_transaction_id != self.intent.transaction_id()
