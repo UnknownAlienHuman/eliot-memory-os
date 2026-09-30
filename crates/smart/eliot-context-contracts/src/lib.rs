@@ -27,6 +27,7 @@ mod reactive_input;
 mod reactive_session;
 mod readback;
 mod recipe;
+mod serializer;
 mod view;
 
 pub use admission::{
@@ -131,6 +132,11 @@ pub use recipe::{
     RecipeQualificationState, RecipeRejectionReason, RecipeResolutionRefusal,
     RecipeRevocationRecord, RecipeRolePosition, RecipeStage, RecipeSupersession,
     ResolvedContextRecipe,
+};
+pub use serializer::{
+    CANONICAL_JSON_SERIALIZER_ID, CANONICAL_JSON_SERIALIZER_OPTIONS,
+    CANONICAL_JSON_SERIALIZER_VERSION, ContextSerializerIdentity,
+    canonical_json_serializer_identity,
 };
 pub use view::{ActiveUnderstandingView, RenderedAtom, SelectionIntegrityProof};
 
