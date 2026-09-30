@@ -924,11 +924,13 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             observed_evidence_refs(&fact)?.into_iter().collect();
         if let Some(verifier) = repeated_verifier_failure_verifier(job, &fact) {
             observed_refs.insert(
-                eliot_learning_delta::repeated_verifier_failure_ref(&verifier).map_err(|error| {
-                    LearningClosureError::Canonical(format!(
-                        "repeated verifier failure marker is not a valid handle: {error}"
-                    ))
-                })?,
+                eliot_learning_delta::repeated_verifier_failure_ref(&verifier).map_err(
+                    |error| {
+                        LearningClosureError::Canonical(format!(
+                            "repeated verifier failure marker is not a valid handle: {error}"
+                        ))
+                    },
+                )?,
             );
         }
         let evidence_refs: Vec<ArtifactId> = observed_refs.into_iter().collect();
