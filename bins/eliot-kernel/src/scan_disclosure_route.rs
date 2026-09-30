@@ -439,23 +439,20 @@ impl KernelComposition {
         let _transition = self.agent_bridge_transition_read()?;
         let (local_result, pending_entry) =
             self.retained_scan_disclosure_activation_result(ticket_id)?;
-        let (ticket, result) = self.load_scan_disclosure_activation_payloads(
-            connection_id,
-            ticket_id,
-            &local_result,
-        )?;
+        let (ticket, result) =
+            self.load_scan_disclosure_activation_payloads(connection_id, ticket_id, &local_result)?;
         let binding = (*result
             .resolved_binding()
             .ok_or(TransportError::SessionFenced)?)
         .clone();
-        let (session_epoch, activated_binding) =
-            self.validate_scan_disclosure_accepted_connection(
+        let (session_epoch, activated_binding) = self
+            .validate_scan_disclosure_accepted_connection(
                 connection_id,
                 &ticket,
                 pending_entry.as_ref(),
             )?;
-        let (kernel_owner_revision, kernel_owner_bundle_sha256) =
-            self.current_scan_disclosure_owner_revision(
+        let (kernel_owner_revision, kernel_owner_bundle_sha256) = self
+            .current_scan_disclosure_owner_revision(
                 &ticket,
                 &result,
                 &binding,
@@ -590,13 +587,7 @@ impl KernelComposition {
         connection_id: &str,
         ticket: &eliot_protocol::AgentActivationResolutionTicket,
         pending_entry: Option<&super::AgentActivationPending>,
-    ) -> Result<
-        (
-            Option<u64>,
-            Option<super::ActivatedApplicationBinding>,
-        ),
-        TransportError,
-    > {
+    ) -> Result<(Option<u64>, Option<super::ActivatedApplicationBinding>), TransportError> {
         let (accepted, session_epoch, activated_binding) = {
             let connections = self
                 .agent_bridge_connections
@@ -681,34 +672,35 @@ impl KernelComposition {
                 return Err(TransportError::IdentityConflict);
             }
         }
-        let (kernel_owner_revision, kernel_owner_bundle_sha256) =
-            if let Some(readback) = owner_readback {
-                let kernel_owner = readback
-                    .kernel_owner
-                    .as_ref()
-                    .ok_or(TransportError::SessionFenced)?;
-                kernel_owner
-                    .validate()
-                    .map_err(|_| TransportError::SessionFenced)?;
-                (kernel_owner.revision, kernel_owner.bundle_sha256.clone())
-            } else if let Some(active) = activated_binding {
-                if active.activation_ticket_id != ticket.ticket_id
-                    || active.activation_ticket_sha256 != ticket.ticket_sha256
-                    || active.resolution_result_sha256 != result.result_sha256
-                    || active.resolved_binding != *binding
-                {
-                    return Err(TransportError::IdentityConflict);
-                }
-                (
-                    active.kernel_owner_revision,
-                    active.kernel_owner_bundle_sha256.clone(),
-                )
-            } else {
-                return Err(TransportError::PlanGap {
-                    dependency: "kernel.activation_owner_readback_retention",
-                    reason: "the accepted connection no longer retains the exact P-07 revision and digest",
-                });
-            };
+        let (kernel_owner_revision, kernel_owner_bundle_sha256) = if let Some(readback) =
+            owner_readback
+        {
+            let kernel_owner = readback
+                .kernel_owner
+                .as_ref()
+                .ok_or(TransportError::SessionFenced)?;
+            kernel_owner
+                .validate()
+                .map_err(|_| TransportError::SessionFenced)?;
+            (kernel_owner.revision, kernel_owner.bundle_sha256.clone())
+        } else if let Some(active) = activated_binding {
+            if active.activation_ticket_id != ticket.ticket_id
+                || active.activation_ticket_sha256 != ticket.ticket_sha256
+                || active.resolution_result_sha256 != result.result_sha256
+                || active.resolved_binding != *binding
+            {
+                return Err(TransportError::IdentityConflict);
+            }
+            (
+                active.kernel_owner_revision,
+                active.kernel_owner_bundle_sha256.clone(),
+            )
+        } else {
+            return Err(TransportError::PlanGap {
+                dependency: "kernel.activation_owner_readback_retention",
+                reason: "the accepted connection no longer retains the exact P-07 revision and digest",
+            });
+        };
         if let Some(active) = activated_binding
             && (active.kernel_owner_revision != kernel_owner_revision
                 || active.kernel_owner_bundle_sha256 != kernel_owner_bundle_sha256)

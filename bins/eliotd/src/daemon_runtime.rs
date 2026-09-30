@@ -2666,14 +2666,12 @@ fn resolve_valid_ticket(
             None
         };
     let result = if let Some(observed) = cold_start_discovery.as_mut() {
-        DaemonComposition::attach_cold_start_question(result, observed, None).map_err(
-            |error| {
-                format!(
-                    "daemon activation cold-start question ticket {}: {error}",
-                    ticket.ticket_id
-                )
-            },
-        )?
+        DaemonComposition::attach_cold_start_question(result, observed, None).map_err(|error| {
+            format!(
+                "daemon activation cold-start question ticket {}: {error}",
+                ticket.ticket_id
+            )
+        })?
     } else {
         result
     };
