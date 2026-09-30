@@ -309,10 +309,12 @@ pub use learning_store::{
 };
 
 pub use write_admission::{
-    MAX_WRITE_ADMISSION_LABEL_BYTES, MAX_WRITE_ADMISSION_SCOPES, MAX_WRITE_SUBMISSION_REASON_CODES,
+    MAX_WRITE_ADMISSION_LABEL_BYTES, MAX_WRITE_ADMISSION_SCOPES,
+    MAX_WRITE_SUBMISSION_REASON_CODES,
     NOT_ACCEPTED_RETRY_IDENTITY_RULE, RESOLVED_EXISTING_NEXT_ALLOWED_ACTION,
     RESOLVED_EXISTING_RETRY_IDENTITY_RULE, ReservationEnvelopeState, ReservedScopeBinding,
-    OriginalWriteSubmission, ReservedWriteOutcome, ReservedWriteReconciliation, ReservedWriteRequest,
+    OriginalWriteSubmission, PreparedWriteOutcome, ReservedWriteOutcome,
+    ReservedWriteReconciliation, ReservedWriteRequest,
     ReservedWriteUnsupported, STAGED_NEXT_ALLOWED_ACTION, STAGED_RETRY_IDENTITY_RULE,
     SplitDimension, SplitDirective, WRITE_ADMISSION_CONTRACT_VERSION, WriteAdmissionParams,
     WriteAdmissionProjection, WriteSubmission, WriteSubmissionState, WriterEpochBinding,
