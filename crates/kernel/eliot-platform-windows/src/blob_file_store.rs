@@ -1148,7 +1148,7 @@ struct BlobNativeDirectoryInformation {
     _allocation_size: i64,
     file_attributes: u32,
     file_name_length: u32,
-    file_name: [u16; 1],
+    file_name: [u16; 0],
 }
 
 #[cfg(windows)]
@@ -1248,15 +1248,19 @@ fn decode_regular_file_records(
     output: &mut Vec<WorkScopePath>,
 ) -> Result<(), BlobFileStoreError> {
     let available = bytes.len();
+    let header = std::mem::size_of::<BlobNativeDirectoryInformation>();
+    if std::mem::offset_of!(BlobNativeDirectoryInformation, file_name) != header {
+        return Err(BlobFileStoreError::InvalidPath);
+    }
     let mut offset = 0_usize;
     while offset < available {
-        let header = std::mem::offset_of!(BlobNativeDirectoryInformation, file_name);
         if available - offset < header {
             return Err(BlobFileStoreError::InvalidPath);
         }
         let information = unsafe {
-            // SAFETY: the checked record header lies within initialized native
-            // output. Reads are unaligned because records are byte-packed.
+            // SAFETY: `header` is the exact struct size and the bound above
+            // proves that many initialized native bytes remain. Reads are
+            // unaligned because records are byte-packed.
             std::ptr::read_unaligned(
                 bytes
                     .as_ptr()
