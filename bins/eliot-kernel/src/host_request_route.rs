@@ -88,10 +88,11 @@ use std::collections::BTreeMap;
 mod daemon_claim_queue;
 
 /// Kernel-owned ChangeMonitor ledger (issue #1824, I10.21): hint ingest,
-/// Git/content checksum/re-read confirmation, governed-tool records, and
+/// content checksum/re-read confirmation, governed-tool records, and
 /// the unknown-origin acceptance block. The canonical file lives beside
 /// this route at `src/change_monitor.rs`; it is nested here because the
-/// only in-tree consumer of its gate is the finish-acceptance leg below.
+/// in-tree producer is the Kernel process-effect lane and the gate
+/// consumer is the finish-acceptance leg below.
 #[path = "change_monitor.rs"]
 pub(crate) mod change_monitor;
 
@@ -795,56 +796,7 @@ impl KernelComposition {
 
         self.note_host_request_operation_under_transition(envelope)?;
         self.audit_host_request_admission(envelope, &admission_receipt, &admitted);
-        Self::observe_change_monitor_host_hint(envelope, &admitted);
         Ok((admission_receipt, admitted))
-    }
-
-    /// Observes one admitted host-request envelope in the Kernel-owned
-    /// `ChangeMonitor` ledger (issue #1824, I10.21 W2).
-    ///
-    /// The admitted envelope arrival is the host event: its operation handle
-    /// maps to the idempotent hint identity, the stored capability names the
-    /// resource, the presenting connection is the origin reference, and the
-    /// admitted envelope and descriptor digests are both the baseline and
-    /// the two agreeing content reads. Admission therefore observes a
-    /// verified-immaterial hint and never wedges governed acceptance.
-    /// Best-effort: ledger contention or a shape refusal never fails
-    /// admission.
-    fn observe_change_monitor_host_hint(
-        envelope: &HostRequestEnvelope,
-        admitted: &HostRequestRecord,
-    ) {
-        let operation_id = host_request_operation_id(envelope);
-        let hint_id = change_monitor::host_hint_id(&operation_id);
-        let hint = change_monitor::KernelChangeHint {
-            hint_id: hint_id.clone(),
-            resource: admitted.capability_ref.as_str().to_owned(),
-            path: change_monitor::HOST_HINT_PATH.to_owned(),
-            origin: change_monitor::HintOrigin::HostEvent,
-            origin_ref: Some(envelope.connection_id.clone()),
-        };
-        if change_monitor::ingest_hint(hint).is_err() {
-            return;
-        }
-        let digest = envelope.envelope_sha256.clone();
-        let verification = change_monitor::HintVerification {
-            before_digest: Some(digest.clone()),
-            first_read: change_monitor::ContentRead::Present {
-                sha256: digest.clone(),
-            },
-            reread: change_monitor::ContentRead::Present { sha256: digest },
-            git: change_monitor::GitReadback {
-                repository: admitted.connection_ref.as_str().to_owned(),
-                head_before: envelope.descriptor_sha256.clone(),
-                head_after: envelope.descriptor_sha256.clone(),
-                status_ref: operation_id,
-                status_sha256: envelope.envelope_sha256.clone(),
-                before_revision: None,
-                after_revision: None,
-                diff_handle: None,
-            },
-        };
-        let _ = change_monitor::confirm_hint(&hint_id, &verification);
     }
 
     /// Appends durable audit evidence for one admitted envelope (issue #1837).
