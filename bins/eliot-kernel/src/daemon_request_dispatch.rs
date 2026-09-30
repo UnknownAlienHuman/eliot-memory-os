@@ -4210,10 +4210,13 @@ impl KernelComposition {
     /// principal, and no second canonical writer.
     ///
     /// The closed vocabulary is not the same set as `UserAutomationOperation`:
-    /// the I12.24:65 owner decision appears in the latter and is refused at this
-    /// boundary, because the automation Store has no automation identity to
-    /// commit it under and this route will not report a durable outcome for a
-    /// decision it cannot record.
+    /// the I12.24:65 owner decision appears in the latter and is refused by this
+    /// route with its own typed `rejected` answer, because the automation Store
+    /// has no automation identity to commit it under and no other owner of a
+    /// brief decision is reachable from here. The refusal is deliberately NOT a
+    /// session fence: a session fence states that the request does not belong to
+    /// this Session and tears the front-door connection down, and neither is
+    /// true of an authenticated owner selecting a disposition.
     ///
     /// The answer is one post-commit orchestration transition. The canonical
     /// Store commit, the wake publication/cancellation handoff over the
@@ -4247,6 +4250,9 @@ impl KernelComposition {
                     ),
                 );
             }
+        }
+        if let Some(refusal) = Self::improvement_brief_decision_refusal(&request) {
+            return Self::bind_user_automation_operator_response(&request, &refusal);
         }
         let transition = match self
             .dispatch_user_automation_operator_transition(session, &request)
@@ -4324,37 +4330,6 @@ impl KernelComposition {
             return Err(TransportError::SessionFenced);
         }
         validate_user_automation_trigger_text(&route.payload.idempotency_key, "idempotency_key")?;
-        // I12.24:65's "decision owner selects reject / investigate / work item /
-        // experiment" is a closed operation on this boundary, and this route is
-        // not the seam that can record one. The operation carries `brief_id`
-        // and no `automation_id`, while every row, ordering scope and mutation
-        // projection the canonical Store below owns is keyed by an automation
-        // identity. Admitting it here would force one of two fabrications:
-        // hang the decision on an invented automation so it could reach a
-        // writer that cannot interpret it, or let it fall through to a Store
-        // refusal after this route had already reported a reconcilable outcome
-        // that no Store call ever backed. The second is the worse one, because
-        // the recoverable answer this route hands back asserts "prior_attempt_
-        // may_have_committed" about a Store that was never entered.
-        //
-        // Refusing here changes nothing about the brief, the candidate or
-        // their authority: I12.24:82 makes the advisory class "default;
-        // changes nothing until owner acts" and I12.24:3 states that ELIOT
-        // "never silently rewrites code, policy or memory authority". What is
-        // refused is only this route's claim to own a decision it cannot
-        // durably record. The improvement owner is the single writer of that
-        // record, and it must take the deciding principal from an
-        // authenticated Session of its own — A12.02:3's "Identity is not a
-        // model's self-declared string" is why the decision cannot be
-        // forwarded over a payload and re-attributed there, and why an ingress
-        // that could not bind the session principal has no honest way to
-        // complete the selection at all.
-        if matches!(
-            route.payload.operation,
-            eliot_kernel_core::UserAutomationOperation::DecideImprovementBrief { .. }
-        ) {
-            return Err(TransportError::SessionFenced);
-        }
         let principal = authenticated_user_automation_principal(session)?;
         let operation_id = eliot_contracts::OperationId::new(format!(
             "user-automation-operation:{}",
@@ -4432,6 +4407,15 @@ impl KernelComposition {
         }
     }
 
+    /// Projects one contract-level refusal of an operation's SHAPE.
+    ///
+    /// The `recovery.unknown_outcome / prior_attempt_may_have_committed` this
+    /// carries is correct here and only here: a request this refused is refused
+    /// on shape, so a prior attempt under the same retry-stable idempotency key
+    /// may already have reached the Store, and this attempt cannot prove it did
+    /// not. An operation refused for a reason no attempt can satisfy must not
+    /// reuse it — see `improvement_brief_decision_refusal` below, which is
+    /// answered `rejected` with `recovery: null` for exactly that reason.
     #[cfg(windows)]
     fn user_automation_precommit_refusal_response(
         request: &eliot_kernel_service::UserAutomationServiceRequest,
@@ -4521,6 +4505,90 @@ impl KernelComposition {
                 "reason": "prior_attempt_may_have_committed",
             },
         })
+    }
+
+    #[cfg(windows)]
+    /// Answers I12.24:65's "decision owner selects reject / investigate / work
+    /// item / experiment" for the one operation no reachable owner can record.
+    ///
+    /// Returns `None` for every other operation, so the closed I11.12 vocabulary
+    /// is untouched. For `UserAutomationOperation::DecideImprovementBrief` it
+    /// returns the route's own typed `rejected` answer.
+    ///
+    /// # Why `rejected` and not the `user_automation_refusal` above
+    ///
+    /// The two answers differ in what they assert, and the difference is the
+    /// whole point. `user_automation_precommit_refusal_response` is the answer
+    /// for a request whose shape the contract refused: it pairs
+    /// `"attempt_state": "store_not_called"` with
+    /// `recovery.unknown_outcome / prior_attempt_may_have_committed`, because a
+    /// prior attempt under the same retry-stable idempotency key may already
+    /// have reached the Store and this one cannot prove it did not.
+    ///
+    /// Here there is no prior attempt to reconcile, and the reason is
+    /// structural rather than a race: the operation names a `brief_id` and no
+    /// `automation_id`, while every row, ordering scope and mutation projection
+    /// the canonical automation Store owns is keyed by an automation identity
+    /// (`user_automation_store.rs::automation_scope` refuses the operation with
+    /// `StoreError::UnknownOperation` for exactly this reason). So this request
+    /// is refused on EVERY attempt, and asserting `prior_attempt_may_have_
+    /// committed` about a Store that is never entered would leave the operator
+    /// reconciling an outcome that provably cannot exist.
+    ///
+    /// # Why not a session fence
+    ///
+    /// `TransportError::SessionFenced` means "this request does not belong to
+    /// this Session" and its caller (`front_door_driver::serve_connection`)
+    /// drops the whole front-door connection. Neither is true here: the request
+    /// arrived on an authenticated peer whose principal
+    /// (`authenticated_user_automation_principal`) is already bound into
+    /// `request.intent.principal_ref`, and A12.2:3's "Identity is not a model's
+    /// self-declared string" is exactly why an authenticated owner's selection
+    /// must be answered rather than mistaken for a foreign one. `rejected` is
+    /// the existing closed variant that says "the owner read its own state and
+    /// definitively refuses this", it carries `recovery: null` so nothing is
+    /// left to reconcile, and it binds through
+    /// `UserAutomationOperatorResultEnvelope::bind_internal_response` like
+    /// every other answer on this route.
+    ///
+    /// # What this does and does not claim
+    ///
+    /// It does NOT close A2. It records nothing and authorizes nothing: I12.24:3
+    /// states that ELIOT "never silently rewrites code, policy or memory
+    /// authority" and I12.24:82 makes the advisory class "default; changes
+    /// nothing until owner acts", and `reject`/`investigate` are the two
+    /// dispositions `is_non_mutating` admits precisely because selecting one
+    /// changes nothing. The selection is still unreachable, and the reason is
+    /// the same structural one on the other side of this boundary: no durable
+    /// owner of a brief disposition exists. The closed
+    /// `LearningRecordKind` set carries no brief or decision variant, the
+    /// canonical `Candidate` document shape is the daemon's own and its intake
+    /// reader `improvement_dedup_read::classify_row` refuses any other shape
+    /// while propagating the failure over the whole read, and the record's own
+    /// `brief_id` is minted fresh per pass by `brief_at_safe_boundary` and
+    /// reaches no owner surface at all. Until that owner exists, this is the
+    /// honest answer: a typed, non-reconcilable refusal naming the operation as
+    /// unroutable here, instead of a reconcilable outcome no Store call backs
+    /// or a fence that misreports an authenticated owner as a foreign one.
+    fn improvement_brief_decision_refusal(
+        request: &eliot_kernel_service::UserAutomationServiceRequest,
+    ) -> Option<serde_json::Value> {
+        if !matches!(
+            request.intent.operation,
+            eliot_kernel_core::UserAutomationOperation::DecideImprovementBrief { .. }
+        ) {
+            return None;
+        }
+        Some(Self::user_automation_runtime_error_response(
+            UserAutomationRuntimeError::Rejected(
+                "the improvement brief decision is not routable through the UserAutomation \
+                 Store: it carries a brief_id and no automation_id, the automation Store owns \
+                 no ordering scope or record a brief disposition can join, and no other \
+                 durable owner of that decision is reachable from this route, so no Store call \
+                 is made and nothing is left to reconcile"
+                    .to_owned(),
+            ),
+        ))
     }
 
     /// Composes the existing authenticated Host execution channel for the
