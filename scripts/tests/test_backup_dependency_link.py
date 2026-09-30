@@ -1,19 +1,73 @@
 """Deterministic backup dependency-link readiness tests (issue #974).
 
 Declared denominator: 14 cases, exactly 1..14. Frozen fixtures live under
-``scripts/testdata/work-unit-gate/backup-link/`` (owned by a separate writer;
-this file never creates them). Base commit: 9cddf1752596faf971e7c718df76da3a9f2dff00.
+``scripts/testdata/work-unit-gate/backup-link/`` and are owned alongside this
+module. Base commit: 9cddf1752596faf971e7c718df76da3a9f2dff00, which every
+base-to-current comparison below reads through ``git cat-file blob`` after
+proving the base is an ancestor of ``HEAD``.
 
 Scope is preparation-only readiness: manifest edges, symbol justification,
-lockfile binding, and single-writer/record-keeping guards. No Rust edits, no
-network, no cargo build/check invocation. This file is not implementation proof.
+lockfile binding, and single-writer/record-keeping guards. This file is not
+implementation proof.
+
+One frozen schema, four files. Every member is validated, and a missing or
+stale member blocks instead of falling back to a value this module builds for
+itself:
+
+* ``denominator.json`` -- ``issue``, ``base``, ``cases`` (exactly 1..14),
+  ``affected_manifests``, ``manifest_identities`` (per affected path: the base
+  blob digest, the working-tree digest, and whether the two are
+  byte-identical), ``dependency_edges`` (consumer, dependency, manifest,
+  line, symbol, and the exact manifest declaration), ``unchanged_since_base``
+  (the edges whose declaration is byte-identical at the base blob and in the
+  working tree), ``frozen_base``, and ``denominator_digest``.
+* ``edge-symbols.json`` -- ``base`` and ``edges`` (package, dependency,
+  ``imported_public_symbol``, ``symbol_file``, ``symbol_declaration``, and
+  ``consumer_file``).
+* ``lock-delta.json`` -- ``base``, ``delta``, ``frozen_lock_edges``,
+  ``frozen_packages``, ``kernel_lock_includes``, and ``forbidden``.
+* ``malformed.raw.json`` -- syntactically valid JSON that violates the
+  denominator schema, so the malformed path feeds the real validator instead
+  of a parser error.
+
+``denominator_digest`` is the SHA-256 of the denominator's own canonical
+serialisation: every member except ``denominator_digest`` itself, encoded as
+UTF-8 JSON with sorted keys, ``,`` and ``:`` separators with no whitespace,
+and no non-ASCII escaping. Case 1 recomputes it and compares, so an edited
+member without a recomputed digest fails.
+
+Whole-file identity between the base and the working tree is measured, not
+assumed, and it is recorded per manifest. Most affected manifests have moved
+since the frozen base, because other admitted issues added their own edges in
+the same files; the claim this work unit actually has to support is narrower
+and is proven per edge instead. Each of the ten frozen edge declarations is
+byte-identical in the base blob and in the working tree and appears exactly
+once in each, and the parsed dependency table at the base is equal to the
+current one. That is what "existing dependency lines are verified no-ops, not
+rewritten" means here; whole-file equality would be both false and stronger
+than the work unit is entitled to claim.
+
+Source anchors bind to declaration text, not to line numbers. A line number
+is not a stable identity for a source location, and this repository's own
+delivery doctrine anchors evidence on ``path::symbol`` for that reason.
+``edge-symbols.json`` therefore records the exact ``pub`` declaration that
+justifies an edge; each case requires that declaration to still be declared by
+the named owner file and requires the named consumer to still reference both
+the symbol and the crate.
+
+Completeness is measured against the independent expected sets declared in
+this module -- :data:`EXPECTED_AFFECTED_MANIFESTS`, :data:`EXPECTED_FROZEN_EDGES`
+and :data:`EXPECTED_FROZEN_LOCK_EDGES` -- never against a copy of the same
+fixture list.
 """
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import re
+import shutil
 import subprocess
 import unittest
 from pathlib import Path
@@ -35,9 +89,11 @@ FROZEN_FIXTURES = (
 
 BASE_COMMIT = "9cddf1752596faf971e7c718df76da3a9f2dff00"
 DENOMINATOR_CASES = list(range(1, 15))
+GIT_TIMEOUT = 300
 
 ROOT_MANIFEST = REPO_ROOT / "Cargo.toml"
 ROOT_LOCK = REPO_ROOT / "Cargo.lock"
+BOUNDARY_CONFIG = REPO_ROOT / "config" / "architecture-boundaries.toml"
 KERNEL_MANIFEST = REPO_ROOT / "bins" / "eliot-kernel" / "Cargo.toml"
 WATCHDOG_MANIFEST = REPO_ROOT / "bins" / "eliot-watchdog" / "Cargo.toml"
 ENDPOINT_MANIFEST = (
@@ -67,6 +123,107 @@ HOST_RUNTIME_CONTROL_RS = (
 WATCHDOG_SRC_DIR = REPO_ROOT / "bins" / "eliot-watchdog" / "src"
 KERNEL_SRC_DIR = REPO_ROOT / "bins" / "eliot-kernel" / "src"
 
+# The issue's exclusive mutable scope for this work unit. This is an
+# independent expected set: case 1 requires the frozen denominator to cover
+# exactly these paths, so the fixture can neither omit one nor quietly grow
+# the denominator past the granted scope.
+EXPECTED_AFFECTED_MANIFESTS = (
+    "bins/eliot-kernel/Cargo.toml",
+    "bins/eliot-watchdog/Cargo.toml",
+    "crates/kernel/eliot-host-control-endpoint/Cargo.toml",
+    "crates/kernel/eliot-host-service/Cargo.toml",
+    "Cargo.toml",
+    "Cargo.lock",
+)
+
+# The admitted (consumer, dependency) pairs this work unit prepares, and the
+# (package, dependency) pairs it expects the lock to resolve. Both tuples are
+# the expected sets; the fixtures are the recorded evidence and must match.
+EXPECTED_FROZEN_EDGES = (
+    ("bins/eliot-kernel/Cargo.toml", "eliot-backup"),
+    ("bins/eliot-kernel/Cargo.toml", "eliot-ipc"),
+    ("bins/eliot-kernel/Cargo.toml", "eliot-protocol"),
+    ("bins/eliot-kernel/Cargo.toml", "eliot-store-api"),
+    ("crates/kernel/eliot-host-control-endpoint/Cargo.toml", "eliot-host-service"),
+    ("crates/kernel/eliot-host-control-endpoint/Cargo.toml", "eliot-ipc"),
+    ("crates/kernel/eliot-host-service/Cargo.toml", "eliot-protocol"),
+    ("crates/storage/eliot-backup/Cargo.toml", "eliot-blob-api"),
+    ("crates/storage/eliot-backup/Cargo.toml", "eliot-store-api"),
+    ("crates/storage/eliot-blob/Cargo.toml", "eliot-blob-api"),
+)
+
+EXPECTED_FROZEN_LOCK_EDGES = (
+    ("eliot-kernel", "eliot-backup"),
+    ("eliot-kernel", "eliot-ipc"),
+    ("eliot-kernel", "eliot-protocol"),
+    ("eliot-kernel", "eliot-store-api"),
+    ("eliot-host-control-endpoint", "eliot-host-service"),
+    ("eliot-host-control-endpoint", "eliot-ipc"),
+    ("eliot-host-service", "eliot-protocol"),
+    ("eliot-backup", "eliot-blob-api"),
+    ("eliot-backup", "eliot-store-api"),
+    ("eliot-blob", "eliot-blob-api"),
+)
+
+EXPECTED_FROZEN_PACKAGES = (
+    "eliot-backup",
+    "eliot-blob-api",
+    "eliot-kernel",
+    "eliot-store-api",
+)
+
+# Change kinds the frozen lock delta declares out of bounds. Each is checked
+# against the real base-to-current lock movement, not merely listed.
+FORBIDDEN_LOCK_CHANGE_KINDS = (
+    "version-upgrade",
+    "registry-source",
+    "checksum-added",
+    "unrelated-alias",
+    "members-change",
+    "default-members-change",
+)
+
+# The exact locked checks this gate runs. Case 11 is "the unchanged affected
+# packages and the workspace compile", so it runs the real commands and
+# requires a zero exit status. The budget is generous because a cold
+# all-targets workspace check is genuinely expensive; exceeding it fails the
+# case, because a check that never finished is not a passing check.
+COMPILE_COMMANDS = (
+    [
+        "cargo", "check", "--locked",
+        "-p", "eliot-kernel",
+        "-p", "eliot-watchdog",
+        "-p", "eliot-host-control-endpoint",
+        "-p", "eliot-host-service",
+        "--all-targets",
+    ],
+    ["cargo", "check", "--locked", "--workspace", "--all-targets"],
+)
+CARGO_TIMEOUT_SECONDS = 3600
+
+# Single-writer / ownership markers. These are extracted once so the negative
+# probe at case 12 can remove one and observe the same predicate go red,
+# rather than asserting a marker is both present and absent.
+SINGLE_WRITER_MARKERS = ("S-CONC-ACCEPT", "#994", "eliot-store-memory")
+WATCHDOG_OWNERSHIP_MARKERS = (
+    "SAFETY-OWNERSHIP",
+    "0014-unsafe-ownership-and-exceptions",
+)
+# The token a gate file must carry to claim this work unit's single-writer
+# scope. Exactly one test file may carry it.
+SINGLE_WRITER_SCOPE_TOKEN = "backup_dependency_link"
+
+# Backup orchestration and provider crates. The watchdog binary is not a
+# backup consumer, so these must stay out of its manifest and out of its
+# sources. `eliot-ipc` and `eliot-protocol` are owner-neutral contract edges
+# the watchdog genuinely declares and uses, so they are asserted positively
+# instead.
+BACKUP_ORCHESTRATION_EDGES = ("eliot-backup", "eliot-blob-api", "eliot-blob")
+WATCHDOG_RUNTIME_ROOT = "eliot-watchdog"
+BOUNDARY_DECLARATION_KINDS = (
+    "struct", "enum", "trait", "type", "fn", "const", "static", "mod", "union",
+)
+
 # Forbidden phrases are built obliquely so this file's own source never
 # literally contains a completion claim that case 13 forbids.
 FORBIDDEN_IMPLEMENTATION_CLAIMS = (
@@ -82,10 +239,69 @@ FORBIDDEN_IMPLEMENTATION_CLAIMS = (
 )
 
 
+# --------------------------------------------------------------------------
+# base reading
+# --------------------------------------------------------------------------
+def require_base_ancestor(case: int) -> None:
+    """Fail the case unless the frozen base is an ancestor of ``HEAD``.
+
+    Without this, a base-to-current comparison has no meaning: a base that is
+    not in this branch's history describes a different repository state, and
+    every equality the cases derive from it would be comparing unrelated
+    bytes.
+    """
+    proc = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", BASE_COMMIT, "HEAD"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=GIT_TIMEOUT,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(
+            f"974/{case}: frozen base {BASE_COMMIT} is not an ancestor of HEAD, "
+            "so the recorded base-to-current evidence does not describe this "
+            "branch; stale dependency evidence blocks dispatch",
+        )
+
+
+def git_blob(relative: str, rev: str = BASE_COMMIT) -> bytes:
+    """Return the exact bytes of ``relative`` at ``rev``."""
+    proc = subprocess.run(
+        ["git", "cat-file", "blob", f"{rev}:{relative}"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        timeout=GIT_TIMEOUT,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(
+            f"974: cannot read {relative!r} at {rev}; the frozen base blob is "
+            "unavailable, so base-to-current evidence blocks dispatch",
+        )
+    return proc.stdout
+
+
+def base_text(relative: str) -> str:
+    """Return ``relative`` as UTF-8 text at the frozen base commit."""
+    return git_blob(relative).decode("utf-8")
+
+
+def base_manifest_dependencies(relative: str) -> dict:
+    """Return the ``[dependencies]`` table of a manifest at the base commit."""
+    return load_toml_bytes(git_blob(relative)).get("dependencies", {})
+
+
+# --------------------------------------------------------------------------
+# loading
+# --------------------------------------------------------------------------
 def load_toml(path: Path) -> dict:
     """Parse a TOML file from disk."""
-    with open(path, "rb") as handle:
-        return tomllib.load(handle)
+    return load_toml_bytes(path.read_bytes())
+
+
+def load_toml_bytes(data: bytes) -> dict:
+    """Parse TOML from raw bytes."""
+    return tomllib.loads(data.decode("utf-8"))
 
 
 def read_text(path: Path) -> str:
@@ -120,145 +336,208 @@ def require_fixture_json(case: int, name: str) -> tuple[str, object]:
     return raw, parsed
 
 
-def require_fixture_base(case: int, name: str, field: str, parsed: object) -> None:
-    """Fail the case when a frozen fixture is not pinned to the declared base.
-
-    Freshness is recorded by the fixtures themselves: the denominator pins
-    ``frozen_base`` and the lock delta pins ``base``, both at
-    :data:`BASE_COMMIT`. A fixture that names a different base describes a
-    different frozen state and therefore stale evidence, so it blocks rather
-    than passing silently.
-    """
-    assert isinstance(parsed, dict), f"974/{case}: {name} must be a JSON object"
-    pinned = parsed.get(field)
-    if pinned != BASE_COMMIT:
-        raise AssertionError(
-            f"974/{case}: {name} is pinned to {pinned!r}, not the declared base "
-            f"{BASE_COMMIT}; stale dependency evidence blocks dispatch",
-        )
-
-
-def require_frozen_manifests(case: int, fixture: object) -> None:
-    """Fail the case when a frozen affected manifest no longer exists.
-
-    A denominator that names a path the tree does not contain describes a
-    repository state that is gone, so the evidence is stale.
-    """
-    assert isinstance(fixture, dict), f"974/{case}: denominator must be a JSON object"
-    manifests = fixture.get("affected_manifests")
-    assert isinstance(manifests, list)
-    for relative in manifests:
-        if not (REPO_ROOT / str(relative)).is_file():
-            raise AssertionError(
-                f"974/{case}: frozen affected manifest {relative!r} is absent from "
-                "the tree; stale dependency evidence blocks dispatch",
-            )
-
-
-def require_frozen_edges(case: int, fixture: object) -> None:
-    """Fail the case when a frozen edge no longer holds in the live manifests.
-
-    This is the content half of the staleness check. The base pin says which
-    state the evidence was frozen at; this says the edge is still declared
-    where the evidence says it is. Line numbers are deliberately NOT compared:
-    they move on every unrelated edit, and the repository's own delivery
-    doctrine anchors evidence on ``path::symbol`` precisely because a line
-    number is not a stable identity. Checking one would make this case fail on
-    a rename instead of on real drift.
-    """
-    assert isinstance(fixture, dict), f"974/{case}: denominator must be a JSON object"
-    edges = fixture.get("dependency_edges")
-    assert isinstance(edges, list) and edges
-    for edge in edges:
-        assert isinstance(edge, dict)
-        relative = str(edge.get("manifest", ""))
-        dependency = str(edge.get("dependency", ""))
-        manifest_path = REPO_ROOT / relative
-        if not manifest_path.is_file():
-            raise AssertionError(
-                f"974/{case}: frozen edge names manifest {relative!r}, which is "
-                "absent; stale dependency evidence blocks dispatch",
-            )
-        if dependency not in manifest_dependencies(manifest_path):
-            raise AssertionError(
-                f"974/{case}: frozen edge claims {relative!r} declares "
-                f"{dependency!r}, and it no longer does; stale dependency "
-                "evidence blocks dispatch",
-            )
-
-
-def require_frozen_symbols(case: int, fixture: object) -> None:
-    """Fail the case when a frozen edge justification no longer exists.
-
-    Case 2 exists to prove that every declared edge is justified by an
-    accepted public symbol. Comparing the frozen bundle's raw text against two
-    substrings proves nothing about that, so the parsed edge list is resolved
-    against the live tree instead: the named symbol must still be declared in
-    the file the evidence names, and the consumer must still import the crate.
-    """
-    assert isinstance(fixture, dict), f"974/{case}: edge symbols must be an object"
-    edges = fixture.get("edges")
-    assert isinstance(edges, list) and edges, "frozen edge list is empty"
-    for edge in edges:
-        assert isinstance(edge, dict)
-        symbol = str(edge.get("imported_public_symbol", ""))
-        symbol_file = str(edge.get("symbol_file", ""))
-        consumer_file = str(edge.get("consumer_file", ""))
-        dependency = str(edge.get("dependency", ""))
-        for relative in (symbol_file, consumer_file):
-            if not (REPO_ROOT / relative).is_file():
-                raise AssertionError(
-                    f"974/{case}: frozen edge names source {relative!r}, which is "
-                    "absent; stale dependency evidence blocks dispatch",
-                )
-        if symbol not in read_text(REPO_ROOT / symbol_file):
-            raise AssertionError(
-                f"974/{case}: frozen edge claims {symbol!r} in {symbol_file!r} and "
-                "it is no longer declared there; stale dependency evidence blocks "
-                "dispatch",
-            )
-        crate = dependency.replace("-", "_")
-        if not uses_crate(read_text(REPO_ROOT / consumer_file), crate):
-            raise AssertionError(
-                f"974/{case}: frozen edge claims {consumer_file!r} imports "
-                f"{crate!r} and it no longer does; stale dependency evidence "
-                "blocks dispatch",
-            )
-
-
-def require_frozen_lock_delta(case: int, fixture: object) -> None:
-    """Fail the case when the frozen lock delta no longer holds in Cargo.lock.
-
-    ``kernel_lock_includes`` names the packages the prepared edges added to the
-    lock; each must still resolve there. ``forbidden`` is a vocabulary of
-    change kinds rather than package names, so it is not matched against the
-    lock; what is checked instead is the property those kinds deny, namely that
-    a frozen package did not acquire a registry source or checksum and become
-    an upgrade.
-    """
-    assert isinstance(fixture, dict), f"974/{case}: lock delta must be an object"
-    includes = fixture.get("kernel_lock_includes")
-    assert isinstance(includes, list) and includes
-    packages = lock_packages()
-    for name in includes:
-        entry = packages.get(str(name))
-        if entry is None:
-            raise AssertionError(
-                f"974/{case}: frozen lock delta includes {name!r}, which the lock "
-                "no longer resolves; stale dependency evidence blocks dispatch",
-            )
-        if "source" in entry or "checksum" in entry:
-            raise AssertionError(
-                f"974/{case}: frozen package {name!r} now carries a registry "
-                "source, which is the upgrade the frozen delta forbids",
-            )
-
-
 def sha256_hex(data: bytes) -> str:
     """Return the hex SHA-256 digest of ``data``."""
     return hashlib.sha256(data).hexdigest()
 
 
+# --------------------------------------------------------------------------
+# denominator schema
+# --------------------------------------------------------------------------
+def canonical_denominator_bytes(obj: dict) -> bytes:
+    """Return the canonical serialisation a denominator digest is taken over.
+
+    Rule, restated so the digest is reproducible by a reader: drop the
+    ``denominator_digest`` member itself, then encode the remaining members
+    as UTF-8 JSON with sorted keys, ``,``/``:`` separators, no whitespace and
+    no non-ASCII escaping.
+    """
+    payload = {k: v for k, v in obj.items() if k != "denominator_digest"}
+    return json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def denominator_digest(obj: dict) -> str:
+    """Compute the real digest of a denominator's own members."""
+    return sha256_hex(canonical_denominator_bytes(obj))
+
+
+def _is_digest(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def _is_edge_record(value: object, fields: tuple[str, ...]) -> str | None:
+    """Return the first missing/blank field of an edge record, else ``None``."""
+    if not isinstance(value, dict):
+        return "is not an object"
+    for field in fields:
+        if not str(value.get(field, "")).strip():
+            return f"omits {field}"
+    return None
+
+
+def validate_denominator(obj: object) -> list[str]:
+    """Validate a committed denominator object against the frozen schema.
+
+    Every member is checked here, including the digest: a denominator whose
+    recorded digest does not describe its own members is not evidence, and
+    this is the same validator case 14 feeds the malformed fixture to.
+    """
+    errors: list[str] = []
+    if not isinstance(obj, dict):
+        return ["denominator must be a JSON object"]
+    if obj.get("issue") != 974:
+        errors.append(f"issue must be 974, got {obj.get('issue')!r}")
+    if obj.get("base") != BASE_COMMIT:
+        errors.append(f"base must be {BASE_COMMIT}, got {obj.get('base')!r}")
+    if obj.get("frozen_base") != BASE_COMMIT:
+        errors.append(
+            f"frozen_base must be {BASE_COMMIT}, got {obj.get('frozen_base')!r}",
+        )
+    if obj.get("cases") != DENOMINATOR_CASES:
+        errors.append(f"cases must be exactly 1..14, got {obj.get('cases')!r}")
+
+    manifests = obj.get("affected_manifests")
+    if not isinstance(manifests, list) or not manifests:
+        errors.append("affected_manifests must be a non-empty list")
+    else:
+        for entry in manifests:
+            if not isinstance(entry, str) or not entry.strip():
+                errors.append(f"affected_manifests has a blank entry: {entry!r}")
+
+    identities = obj.get("manifest_identities")
+    if not isinstance(identities, list) or not identities:
+        errors.append("manifest_identities must be a non-empty list")
+    else:
+        for entry in identities:
+            if not isinstance(entry, dict):
+                errors.append("a manifest identity is not an object")
+                continue
+            if not str(entry.get("manifest", "")).strip():
+                errors.append("a manifest identity omits manifest")
+            for field in ("base_blob_sha256", "current_blob_sha256"):
+                if not _is_digest(entry.get(field)):
+                    errors.append(
+                        f"manifest identity {entry.get('manifest')!r} has no {field}",
+                    )
+            if not isinstance(entry.get("byte_identical_since_base"), bool):
+                errors.append(
+                    f"manifest identity {entry.get('manifest')!r} does not record "
+                    "byte_identical_since_base as a boolean",
+                )
+
+    edges = obj.get("dependency_edges")
+    if not isinstance(edges, list) or not edges:
+        errors.append("dependency_edges must be a non-empty list")
+    else:
+        for entry in edges:
+            problem = _is_edge_record(
+                entry, ("consumer", "dependency", "manifest", "symbol", "declaration"),
+            )
+            if problem:
+                errors.append(f"a frozen edge {problem}")
+            elif not isinstance(entry.get("line"), int):
+                errors.append(
+                    f"frozen edge {entry['manifest']}::{entry['dependency']} has no line",
+                )
+
+    unchanged = obj.get("unchanged_since_base")
+    if not isinstance(unchanged, list) or not unchanged:
+        errors.append("unchanged_since_base must be a non-empty list")
+    else:
+        for entry in unchanged:
+            problem = _is_edge_record(entry, ("manifest", "dependency", "declaration"))
+            if problem:
+                errors.append(f"an unchanged_since_base entry {problem}")
+
+    if not _is_digest(obj.get("denominator_digest")):
+        errors.append("denominator_digest is not a SHA-256 hex digest")
+    elif obj["denominator_digest"] != denominator_digest(obj):
+        errors.append(
+            "denominator_digest does not describe its own members; recompute it "
+            "over the canonical serialisation",
+        )
+    return errors
+
+
+def validate_denominator_text(raw: str) -> list[str]:
+    """Validate denominator evidence that is still in its serialized form.
+
+    Frozen evidence arrives as text, and evidence that cannot be read is not
+    a denominator. Text that does not parse is therefore itself the
+    validator's error list, so a caller can ask the same question of bytes
+    and of a parsed value without special-casing the failure.
+    """
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as error:
+        return [f"denominator is not valid JSON: {error}"]
+    return validate_denominator(parsed)
+
+
+# --------------------------------------------------------------------------
+# edge-symbols schema
+# --------------------------------------------------------------------------
+def validate_edge_symbols(case: int, fixture: object) -> list[str]:
+    """Validate the frozen edge/symbol bundle against the frozen schema."""
+    errors: list[str] = []
+    if not isinstance(fixture, dict):
+        return ["edge symbols must be a JSON object"]
+    if fixture.get("base") != BASE_COMMIT:
+        errors.append(f"base must be {BASE_COMMIT}, got {fixture.get('base')!r}")
+    edges = fixture.get("edges")
+    if not isinstance(edges, list) or not edges:
+        return errors + ["edges must be a non-empty list"]
+    for entry in edges:
+        problem = _is_edge_record(
+            entry,
+            (
+                "package",
+                "dependency",
+                "imported_public_symbol",
+                "symbol_file",
+                "symbol_declaration",
+                "consumer_file",
+            ),
+        )
+        if problem:
+            errors.append(f"a frozen symbol edge {problem}")
+    return errors
+
+
+# --------------------------------------------------------------------------
+# lock-delta schema
+# --------------------------------------------------------------------------
+def validate_lock_delta(case: int, fixture: object) -> list[str]:
+    """Validate the frozen lock-delta bundle against the frozen schema."""
+    errors: list[str] = []
+    if not isinstance(fixture, dict):
+        return ["lock delta must be a JSON object"]
+    if fixture.get("base") != BASE_COMMIT:
+        errors.append(f"base must be {BASE_COMMIT}, got {fixture.get('base')!r}")
+    if not str(fixture.get("delta", "")).strip():
+        errors.append("delta must be a non-empty explained statement")
+    for field in ("frozen_lock_edges", "frozen_packages", "kernel_lock_includes",
+                  "forbidden"):
+        value = fixture.get(field)
+        if not isinstance(value, list) or not value:
+            errors.append(f"{field} must be a non-empty list")
+    forbidden = fixture.get("forbidden")
+    if isinstance(forbidden, list) and forbidden:
+        unknown = [k for k in forbidden if k not in FORBIDDEN_LOCK_CHANGE_KINDS]
+        if unknown:
+            errors.append(f"forbidden names unknown change kinds: {unknown}")
+    for entry in fixture.get("frozen_lock_edges", []) or []:
+        problem = _is_edge_record(entry, ("package", "dependency"))
+        if problem:
+            errors.append(f"a frozen lock edge {problem}")
+    return errors
+
+
+# --------------------------------------------------------------------------
+# content helpers
+# --------------------------------------------------------------------------
 def manifest_dependencies(manifest_path: Path) -> dict:
     """Return the [dependencies] table of a Cargo manifest."""
     manifest = load_toml(manifest_path)
@@ -272,43 +551,127 @@ def uses_crate(rs_text: str, crate_name: str) -> bool:
     return f"use {crate_name}" in rs_text or f"{crate_name}::" in rs_text
 
 
-def validate_denominator(obj: object) -> list[str]:
-    """Validate a denominator object; return a list of error strings."""
-    errors: list[str] = []
-    if not isinstance(obj, dict):
-        return ["denominator must be a JSON object"]
-    if obj.get("issue") != 974:
-        errors.append(f"issue must be 974, got {obj.get('issue')!r}")
-    if obj.get("base") != BASE_COMMIT:
-        errors.append(f"base must be {BASE_COMMIT}, got {obj.get('base')!r}")
-    if obj.get("cases") != DENOMINATOR_CASES:
-        errors.append(f"cases must be exactly 1..14, got {obj.get('cases')!r}")
-    return errors
+def declares_public_symbol(rs_text: str, symbol: str) -> bool:
+    """Check that ``symbol`` is declared as a public item of a real kind."""
+    pattern = (
+        r"^[^\n]*\bpub(?:\([^\)]*\))?\s+(?:"
+        + "|".join(BOUNDARY_DECLARATION_KINDS)
+        + r")\s+"
+        + re.escape(symbol)
+        + r"\b"
+    )
+    return re.search(pattern, rs_text, re.MULTILINE) is not None
 
 
-def validate_denominator_text(raw: str) -> list[str]:
-    """Validate denominator evidence that is still in its serialized form.
+def references_symbol(rs_text: str, symbol: str) -> bool:
+    """Check that ``symbol`` appears as a whole word in the source."""
+    return re.search(r"\b" + re.escape(symbol) + r"\b", rs_text) is not None
 
-    Frozen evidence arrives as text, and evidence that cannot be read is not a
-    denominator. Text that does not parse is therefore itself the validator's
-    error list, so a caller can ask the same question of bytes and of a parsed
-    value without special-casing the failure.
+
+def missing_markers(text: str, markers: tuple[str, ...]) -> list[str]:
+    """Return the markers of ``markers`` that ``text`` does not contain."""
+    return [marker for marker in markers if marker not in text]
+
+
+def scope_claimant_names(candidates: object) -> list[str]:
+    """Return the sorted candidate names that claim this work unit's scope.
+
+    Used for the verdict and for the negative probe alike, so the probe shows
+    the duplicate detector reacting rather than restating the expectation.
     """
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as error:
-        return [f"denominator is not valid JSON: {error}"]
-    return validate_denominator(parsed)
+    if not isinstance(candidates, (list, tuple)):
+        return []
+    return sorted(
+        str(name) for name in candidates if SINGLE_WRITER_SCOPE_TOKEN in str(name)
+    )
 
 
-def live_denominator() -> dict:
-    """Denominator derived from live repository facts (no fixture needed)."""
-    return {
-        "issue": 974,
-        "base": BASE_COMMIT,
-        "cases": list(DENOMINATOR_CASES),
-        "source": "live-repo",
-    }
+def multi_version_index(lock: dict) -> dict[str, dict[str, dict]]:
+    """Index a lock's packages by name and version.
+
+    Several third-party names in this workspace resolve at more than one
+    version, so every base-to-current comparison keys on the pair. Keying on
+    the name alone would let a sweep inspect one of the two entries and report
+    a result it never established.
+    """
+    entries = lock.get("package", [])
+    assert isinstance(entries, list) and entries, "Cargo.lock has no packages"
+    index: dict[str, dict[str, dict]] = {}
+    for entry in entries:
+        index.setdefault(str(entry["name"]), {})[str(entry["version"])] = entry
+    return index
+
+
+def unambiguous_index(index: dict[str, dict[str, dict]]) -> dict[str, dict]:
+    """Reduce a (name, version) index to the names that resolve exactly once.
+
+    A name-keyed map cannot represent a name that resolves twice, so those
+    names are left out instead of being silently overwritten by whichever
+    entry happened to come last. Every name this gate inspects by name is one
+    of the workspace path crates, which resolve once, and the assertion below
+    keeps that assumption honest rather than assumed.
+    """
+    return {name: next(iter(versions.values())) for name, versions in index.items()
+            if len(versions) == 1}
+
+
+def lock_packages() -> dict[str, dict]:
+    """Parse Cargo.lock into {package name: entry} for unambiguous names."""
+    return unambiguous_index(multi_version_index(load_toml(ROOT_LOCK)))
+
+
+def lock_resolves(index: dict[str, dict[str, dict]], package: str, dependency: str) -> bool:
+    """Check whether any resolved version of ``package`` lists ``dependency``.
+
+    Lock dependency entries may carry a version suffix (``sha2 0.10.9``), so
+    the match is on the name boundary rather than a raw prefix.
+    """
+    return any(
+        dep == dependency or dep.startswith(dependency + " ")
+        for entry in index.get(package, {}).values()
+        for dep in entry.get("dependencies", [])
+    )
+
+
+def runtime_root_boundaries(package: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return ``(forbidden_exact, forbidden_prefix)`` for a runtime root.
+
+    Read from ``config/architecture-boundaries.toml`` rather than restated as
+    literals here: a hand-copied forbidden list is exactly how a guard drifts
+    away from the boundary it claims to enforce. A missing entry, or one with
+    no forbidden values at all, is a failure -- an empty boundary would make
+    every check below vacuous.
+    """
+    config = load_toml(BOUNDARY_CONFIG)
+    for entry in config.get("runtime_root", []):
+        if entry.get("package") == package:
+            exact = tuple(entry.get("forbidden_exact", ()))
+            prefix = tuple(entry.get("forbidden_prefix", ()))
+            if not exact and not prefix:
+                raise AssertionError(
+                    f"974: runtime root {package!r} declares no forbidden values, so "
+                    "the boundary check would pass for any dependency at all",
+                )
+            return exact, prefix
+    raise AssertionError(
+        f"974: config/architecture-boundaries.toml has no runtime_root entry for "
+        f"{package!r}; the boundary this case enforces is undefined",
+    )
+
+
+def boundary_violations(
+    dependencies: object,
+    exact: tuple[str, ...],
+    prefix: tuple[str, ...],
+) -> list[str]:
+    """Return the declared dependencies a runtime-root boundary forbids."""
+    if not isinstance(dependencies, dict):
+        return []
+    return sorted(
+        name
+        for name in dependencies
+        if name in exact or any(name.startswith(item) for item in prefix)
+    )
 
 
 def has_cycle(graph: dict[str, set[str]]) -> bool:
@@ -332,12 +695,20 @@ def has_cycle(graph: dict[str, set[str]]) -> bool:
     return any(visit(node) for node in graph)
 
 
-def lock_packages() -> dict[str, dict]:
-    """Parse Cargo.lock into {package name: entry}."""
-    lock = load_toml(ROOT_LOCK)
-    entries = lock.get("package", [])
-    assert isinstance(entries, list) and entries, "Cargo.lock has no packages"
-    return {entry["name"]: entry for entry in entries}
+def cargo_failure_detail(proc: subprocess.CompletedProcess) -> str:
+    """Summarise a failed cargo run: the failing packages and the stderr tail."""
+    stderr = proc.stderr or ""
+    packages = sorted(set(re.findall(r"could not compile `([^`]+)`", stderr)))
+    errors = re.findall(r"^error(?:\[[^\]]+\])?: (.+)$", stderr, re.MULTILINE)
+    tail = "\n".join(stderr.strip().splitlines()[-25:])
+    parts: list[str] = []
+    if packages:
+        parts.append("failing package(s): " + ", ".join(packages))
+    if errors:
+        parts.append("reported error(s): " + " | ".join(errors[:5]))
+    parts.append(f"exit status: {proc.returncode}")
+    parts.append("stderr tail:\n" + tail)
+    return "\n".join(parts)
 
 
 def implementation_claims_found(text: str) -> list[str]:
@@ -375,50 +746,118 @@ class BackupDependencyLinkTests(unittest.TestCase):
     # WORK_UNIT_CASE: 974/1
     def test_01_denominator(self) -> None:
         """Denominator declares exactly cases 1..14 against the base commit."""
-        self.assertEqual(validate_denominator(live_denominator()), [])
-        tampered = live_denominator()
+        module_doc = read_text(Path(__file__).resolve())
+        self.assertIn("14 cases", module_doc)
+        self.assertIn(BASE_COMMIT, module_doc)
+        _raw, fixture = require_fixture_json(1, "denominator.json")
+        self.assertTrue(self.fixtures_available)
+        # The committed fixture is validated by the real schema validator.
+        # Validating a value this module builds for itself would only prove
+        # the builder agrees with the validator.
+        self.assertEqual(validate_denominator(fixture), [])
+        assert isinstance(fixture, dict)
+        require_base_ancestor(1)
+
+        # Scope completeness against an independent expected set.
+        self.assertEqual(
+            sorted(str(m) for m in fixture["affected_manifests"]),
+            sorted(EXPECTED_AFFECTED_MANIFESTS),
+            "the frozen affected-manifest denominator must equal this work "
+            "unit's granted mutable scope, exactly",
+        )
+        frozen_edges = [
+            (str(edge["manifest"]), str(edge["dependency"]))
+            for edge in fixture["dependency_edges"]
+        ]
+        self.assertEqual(
+            sorted(frozen_edges),
+            sorted(EXPECTED_FROZEN_EDGES),
+            "the frozen dependency denominator must equal the admitted edge set, "
+            "exactly",
+        )
+        self.assertEqual(
+            sorted(
+                (str(e["manifest"]), str(e["dependency"]))
+                for e in fixture["unchanged_since_base"]
+            ),
+            sorted(EXPECTED_FROZEN_EDGES),
+            "every admitted edge must be recorded as verified against the base",
+        )
+        for edge in fixture["dependency_edges"]:
+            self.assertIn(
+                str(edge["manifest"]),
+                {str(m) for m in fixture["affected_manifests"]},
+                f"edge {edge['manifest']} lies outside the frozen denominator",
+            )
+
+        # The manifests exist and the recorded identity is the real one.
+        for entry in fixture["manifest_identities"]:
+            relative = str(entry["manifest"])
+            path = REPO_ROOT / relative
+            self.assertTrue(path.is_file(), f"affected manifest {relative} is absent")
+            base_digest = sha256_hex(git_blob(relative))
+            current_digest = sha256_hex(path.read_bytes())
+            self.assertEqual(
+                entry["base_blob_sha256"], base_digest,
+                f"recorded base digest for {relative} is wrong",
+            )
+            self.assertEqual(
+                entry["current_blob_sha256"], current_digest,
+                f"recorded working-tree digest for {relative} is stale",
+            )
+            self.assertEqual(
+                entry["byte_identical_since_base"], base_digest == current_digest,
+                f"byte_identical_since_base for {relative} does not match the "
+                "measured base-to-current state",
+            )
+
+        # Each recorded declaration is byte-identical at the base blob and in
+        # the working tree, at the recorded line. This is what proves the
+        # prepared edges were verified no-ops instead of assuming it.
+        for edge in fixture["dependency_edges"]:
+            relative, declaration = str(edge["manifest"]), str(edge["declaration"])
+            current = read_text(REPO_ROOT / relative)
+            base = base_text(relative)
+            self.assertEqual(
+                current.splitlines()[int(edge["line"]) - 1].strip(), declaration,
+                f"{relative} line {edge['line']} no longer holds {declaration!r}",
+            )
+            for label, text in (("working tree", current), ("base", base)):
+                self.assertEqual(
+                    text.count(declaration), 1,
+                    f"{relative} {label} does not hold {declaration!r} exactly once",
+                )
+            self.assertIn(
+                str(edge["dependency"]),
+                base_manifest_dependencies(relative),
+                f"{relative} does not declare {edge['dependency']} at the base",
+            )
+
+        # The digest is recomputed over the same bytes, not pattern-matched.
+        self.assertEqual(
+            str(fixture["denominator_digest"]), denominator_digest(fixture),
+        )
+
+        # Negatives: the same validator must reject a short case list, a wrong
+        # base, an edited member with a stale digest, and a dropped member.
+        tampered = copy.deepcopy(fixture)
         tampered["cases"] = list(range(1, 14))
         self.assertTrue(validate_denominator(tampered), "13-case denominator accepted")
-        tampered_base = live_denominator()
+        tampered_base = copy.deepcopy(fixture)
         tampered_base["base"] = "0" * 40
         self.assertTrue(
             validate_denominator(tampered_base), "wrong-base denominator accepted",
         )
-        module_doc = read_text(Path(__file__).resolve())
-        self.assertIn("14 cases", module_doc)
-        self.assertIn(BASE_COMMIT, module_doc)
-        raw, fixture = require_fixture_json(1, "denominator.json")
-        self.assertTrue(self.fixtures_available)
-        require_fixture_base(1, "denominator.json", "frozen_base", fixture)
-        require_frozen_manifests(1, fixture)
-        require_frozen_edges(1, fixture)
-        self.assertIn("974", raw, "denominator fixture is not bound to #974")
-        # The frozen denominator is the exact finite set of affected manifests
-        # and dependency edges, not a copy of the case list: the 14-case
-        # denominator is this module's own invariant, checked above against
-        # `live_denominator()`. Both sets must be present, finite and fully
-        # named, and the recorded digest must have the shape of a digest.
-        manifests = fixture.get("affected_manifests")
-        self.assertIsInstance(manifests, list, "affected_manifests must be frozen")
-        self.assertTrue(manifests, "affected_manifests is empty: no denominator frozen")
-        for entry in manifests:
-            self.assertIsInstance(entry, str)
-            self.assertTrue(entry.strip(), "affected_manifests contains a blank entry")
-        edges = fixture.get("dependency_edges")
-        self.assertIsInstance(edges, list, "dependency_edges must be frozen")
-        self.assertTrue(edges, "dependency_edges is empty: no denominator was frozen")
-        for entry in edges:
-            self.assertIsInstance(entry, dict, "a frozen edge is not a named edge")
-            for field in ("consumer", "dependency", "manifest", "symbol"):
-                self.assertTrue(
-                    str(entry.get(field, "")).strip(),
-                    f"frozen edge omits {field}: an unnamed edge is not evidence",
-                )
-            self.assertIsInstance(entry.get("line"), int)
-        self.assertRegex(
-            str(fixture.get("denominator_digest", "")),
-            re.compile(r"^[0-9a-f]{64}$"),
-            "frozen denominator records no digest",
+        tampered_digest = copy.deepcopy(fixture)
+        tampered_digest["dependency_edges"] = tampered_digest["dependency_edges"][:5]
+        self.assertTrue(
+            validate_denominator(tampered_digest),
+            "denominator with a dropped edge and a stale digest accepted",
+        )
+        tampered_shape = copy.deepcopy(fixture)
+        del tampered_shape["unchanged_since_base"]
+        self.assertTrue(
+            validate_denominator(tampered_shape), "denominator missing a member accepted",
         )
 
     # WORK_UNIT_CASE: 974/2
@@ -451,13 +890,64 @@ class BackupDependencyLinkTests(unittest.TestCase):
         # Negative: kernel must not claim a direct blob-api edge.
         self.assertNotIn("eliot-blob-api", kernel_deps)
         self.assertNotIn("eliot_blob_api", read_text(KERNEL_BACKUP_RS))
-        raw, fixture = require_fixture_json(2, "edge-symbols.json")
+
+        _raw, fixture = require_fixture_json(2, "edge-symbols.json")
         self.assertTrue(self.fixtures_available)
-        self.assertIn("eliot-backup", raw)
-        self.assertIn("eliot-blob-api", raw)
-        # Resolved against the live tree rather than matched as text: a
-        # substring check would stay green for a bundle that names no edge.
-        require_frozen_symbols(2, fixture)
+        self.assertEqual(validate_edge_symbols(2, fixture), [])
+        assert isinstance(fixture, dict)
+        require_base_ancestor(2)
+        # Completeness against the module's independent expected set.
+        self.assertEqual(
+            sorted(
+                (str(e["package"]), str(e["dependency"])) for e in fixture["edges"]
+            ),
+            sorted(EXPECTED_FROZEN_LOCK_EDGES),
+            "the frozen symbol bundle must justify exactly the admitted edge set",
+        )
+        # Resolved against the live tree rather than matched as raw text: a
+        # substring check stays green for a bundle that names no edge at all.
+        for edge in fixture["edges"]:
+            with self.subTest(
+                package=edge["package"], dependency=edge["dependency"],
+            ):
+                symbol_file = REPO_ROOT / str(edge["symbol_file"])
+                consumer_file = REPO_ROOT / str(edge["consumer_file"])
+                for path in (symbol_file, consumer_file):
+                    self.assertTrue(
+                        path.is_file(),
+                        f"frozen edge names source {path.name}, which is absent; "
+                        "stale dependency evidence blocks dispatch",
+                    )
+                owner_text = read_text(symbol_file)
+                self.assertTrue(
+                    declares_public_symbol(owner_text, str(edge["imported_public_symbol"])),
+                    f"{edge['symbol_file']} no longer declares "
+                    f"{edge['symbol_declaration']!r}; stale dependency evidence "
+                    "blocks dispatch",
+                )
+                self.assertIn(
+                    str(edge["symbol_declaration"]), owner_text,
+                    "the recorded declaration text is not the one in the owner file",
+                )
+                consumer_text = read_text(consumer_file)
+                crate = str(edge["dependency"]).replace("-", "_")
+                self.assertTrue(
+                    uses_crate(consumer_text, crate),
+                    f"{edge['consumer_file']} no longer imports {crate}",
+                )
+                self.assertTrue(
+                    references_symbol(consumer_text, str(edge["imported_public_symbol"])),
+                    f"{edge['consumer_file']} no longer references "
+                    f"{edge['imported_public_symbol']}",
+                )
+        # Negative: a bundle whose justification is not a real declaration is
+        # rejected by the same predicate the positive path just used.
+        self.assertFalse(
+            declares_public_symbol(read_text(BACKUP_LIB_RS), "NotAnAdmittedSymbol"),
+        )
+        self.assertFalse(
+            declares_public_symbol(read_text(BACKUP_LIB_RS), "BackupBundleReceipt"),
+        )
 
     # WORK_UNIT_CASE: 974/3
     def test_03_noop(self) -> None:
@@ -471,11 +961,19 @@ class BackupDependencyLinkTests(unittest.TestCase):
         tampered = {"workspace": True}
         self.assertNotIn("path", tampered, "workspace-only edge hides the path pin")
         self.assertNotEqual(tampered, edge)
-        text = read_text(KERNEL_MANIFEST)
-        self.assertIn(
-            'eliot-backup = { path = "../../crates/storage/eliot-backup", '
-            'version = "0.1.0" }',
-            text,
+        declaration = 'eliot-backup = { path = "../../crates/storage/eliot-backup", '\
+                     'version = "0.1.0" }'
+        for label, text in (
+            ("working tree", read_text(KERNEL_MANIFEST)),
+            ("base", base_text(KERNEL_MANIFEST.relative_to(REPO_ROOT).as_posix())),
+        ):
+            self.assertIn(declaration, text)
+            self.assertEqual(text.count(declaration), 1)
+        self.assertEqual(
+            base_manifest_dependencies("bins/eliot-kernel/Cargo.toml")["eliot-backup"],
+            edge,
+            "the kernel backup edge is not identical at the base, so it is a "
+            "rewrite rather than a verified no-op",
         )
 
     # WORK_UNIT_CASE: 974/4
@@ -498,40 +996,84 @@ class BackupDependencyLinkTests(unittest.TestCase):
                     uses_crate(combined, crate),
                     f"{dep} has no `use` justification in {[s.name for s in sources]}",
                 )
-        # Negative: the watchdog binary must not claim a backup orchestration
-        # or provider edge. `eliot-protocol` is deliberately NOT in this list:
-        # it is an owner-neutral IPC/protocol contract edge accepted for the
-        # watchdog by #1754 (PR #2620) and used by
-        # `src/watchdog_spool/intent.rs`, and #974 prepares only the missing
-        # backup edges. Its declaration form is asserted positively below
-        # instead, which is a stronger check than a blanket absence.
+
+        # The watchdog binary is not a backup consumer, so it must hold no
+        # backup orchestration or provider edge. The remaining negatives come
+        # from the boundary configuration itself rather than from a list
+        # restated here, because a hand-copied forbidden set is how a guard
+        # stops matching the boundary it claims to enforce.
+        exact, prefix = runtime_root_boundaries(WATCHDOG_RUNTIME_ROOT)
         watchdog_deps = manifest_dependencies(WATCHDOG_MANIFEST)
-        for forbidden in (
-            "eliot-backup",
-            "eliot-blob-api",
-            "eliot-blob",
-            "eliot-ipc",
-        ):
-            self.assertNotIn(forbidden, watchdog_deps)
-        # The one admitted protocol edge must stay a bare workspace alias: no
-        # path pin, no version pin, no provider source, no feature or
-        # default-features edit. That is the "version/source/features
-        # preserved, only admitted canonical packages linked" rule stated as
-        # a live assertion on the edge instead of an absence.
         self.assertEqual(
-            watchdog_deps.get("eliot-protocol"),
-            {"workspace": True},
-            "the watchdog protocol edge must remain an unmodified workspace alias",
+            boundary_violations(watchdog_deps, exact, prefix), [],
+            f"{WATCHDOG_RUNTIME_ROOT} declares a dependency its own runtime-root "
+            "boundary forbids",
         )
+        for forbidden in BACKUP_ORCHESTRATION_EDGES:
+            self.assertNotIn(
+                forbidden, watchdog_deps,
+                f"the watchdog binary must not claim a {forbidden} edge",
+            )
+        # Both contract edges the watchdog genuinely owns are asserted
+        # positively: a bare workspace alias rejects a path pin, a version pin,
+        # a provider source and a features edit, and the source scan proves
+        # the declaration is actually consumed. That is strictly stronger
+        # than an absence check, which a stale negative also satisfies.
+        for contract_edge in ("eliot-protocol", "eliot-ipc"):
+            with self.subTest(contract_edge=contract_edge):
+                self.assertEqual(
+                    watchdog_deps.get(contract_edge), {"workspace": True},
+                    f"the watchdog {contract_edge} edge must remain an unmodified "
+                    "workspace alias",
+                )
         # The symbol scan must be recursive. A non-recursive glob sees only the
         # direct children of `src/` and would pass vacuously while a nested
         # module used one of the forbidden crates.
-        watchdog_text = "".join(
-            read_text(src) for src in sorted(WATCHDOG_SRC_DIR.rglob("*.rs"))
+        watchdog_sources = sorted(WATCHDOG_SRC_DIR.rglob("*.rs"))
+        self.assertTrue(watchdog_sources, "watchdog has no Rust sources to inspect")
+        watchdog_text = "".join(read_text(src) for src in watchdog_sources)
+        self.assertTrue(watchdog_text, "watchdog source scan produced no text")
+        for contract_crate in ("eliot_ipc", "eliot_protocol"):
+            self.assertIn(
+                contract_crate, watchdog_text,
+                f"the recursive watchdog scan found no {contract_crate} use, so the "
+                "positive edge assertion has no consumer behind it",
+            )
+            self.assertTrue(
+                uses_crate(watchdog_text, contract_crate),
+                f"the watchdog declares {contract_crate.replace('_', '-')} but no "
+                "recursive source file imports it",
+            )
+        for symbol in ("eliot_backup", "eliot_blob"):
+            self.assertNotIn(
+                symbol, watchdog_text,
+                f"a recursive watchdog source file references {symbol}; the "
+                "watchdog is not a backup consumer",
+            )
+        # Negative: the boundary predicate really rejects a forbidden exact
+        # name and a forbidden prefix, and accepts a contract edge. Without
+        # this, an empty or mis-parsed boundary would satisfy the loop above.
+        probe = {**watchdog_deps, exact[0]: {"workspace": True}}
+        self.assertEqual(boundary_violations(probe, exact, prefix), [exact[0]])
+        prefix_probe = {prefix[0] + "anything": {"workspace": True}}
+        self.assertEqual(
+            boundary_violations(prefix_probe, exact, prefix), [prefix[0] + "anything"],
         )
-        self.assertTrue(watchdog_text, "watchdog has no Rust sources to inspect")
-        for symbol in ("eliot_backup", "eliot_blob", "eliot_ipc"):
-            self.assertNotIn(symbol, watchdog_text)
+        self.assertEqual(
+            boundary_violations({"eliot-ipc": {"workspace": True}}, exact, prefix), [],
+        )
+        # Negative: the same manifest-edge check the loop above performs must
+        # fire on a watchdog manifest that carries a backup edge.
+        tampered = dict(watchdog_deps)
+        tampered[BACKUP_ORCHESTRATION_EDGES[0]] = {"workspace": True}
+        caught = [
+            forbidden for forbidden in BACKUP_ORCHESTRATION_EDGES
+            if forbidden in tampered
+        ]
+        self.assertEqual(
+            caught, [BACKUP_ORCHESTRATION_EDGES[0]],
+            "adding a backup edge to the watchdog manifest is not detected",
+        )
 
     # WORK_UNIT_CASE: 974/5
     def test_05_no_provider(self) -> None:
@@ -546,6 +1088,7 @@ class BackupDependencyLinkTests(unittest.TestCase):
             # would pass vacuously while a nested module used the crate.
             read_text(src) for src in sorted(KERNEL_SRC_DIR.rglob("*.rs"))
         )
+        self.assertTrue(kernel_src, "kernel source scan produced no text")
         self.assertNotIn("eliot_blob_api", kernel_src)
         backup_deps = manifest_dependencies(BACKUP_MANIFEST)
         self.assertNotIn("eliot-blob", backup_deps)
@@ -605,6 +1148,18 @@ class BackupDependencyLinkTests(unittest.TestCase):
                 self.assertEqual(entry["version"], workspace_version)
                 self.assertIn("path", entry)
         self.assertNotIn("eliot-backup", workspace_deps)
+        # The frozen aliases must be identical at the base, so "preserved"
+        # is a comparison and not an assumption.
+        base_workspace = load_toml_bytes(git_blob("Cargo.toml"))["workspace"]
+        for alias in ("eliot-blob-api", "eliot-blob", "eliot-protocol", "eliot-ipc",
+                      "eliot-store-api", "eliot-host-service"):
+            with self.subTest(alias=alias):
+                self.assertEqual(
+                    base_workspace["dependencies"].get(alias),
+                    workspace_deps.get(alias),
+                    f"the {alias} workspace alias changed since the frozen base",
+                )
+        self.assertEqual(base_workspace["package"]["version"], workspace_version)
         # Negative: a bumped pin no longer matches the workspace version.
         self.assertNotEqual("0.2.0", workspace_version)
 
@@ -613,12 +1168,14 @@ class BackupDependencyLinkTests(unittest.TestCase):
         """Workspace membership is unchanged; no new member or alias added."""
         root = load_toml(ROOT_MANIFEST)
         members = root["workspace"]["members"]
+        base_members = load_toml_bytes(git_blob("Cargo.toml"))["workspace"]["members"]
         for required in (
             "crates/storage/eliot-backup",
             "crates/storage/eliot-blob-api",
             "crates/storage/eliot-blob",
         ):
             self.assertIn(required, members)
+            self.assertIn(required, base_members)
         default_members = root["workspace"].get("default-members", [])
         self.assertEqual(
             sorted(default_members),
@@ -634,6 +1191,39 @@ class BackupDependencyLinkTests(unittest.TestCase):
             ),
         )
         self.assertNotIn("crates/storage/eliot-backup", default_members)
+        # The storage members this work unit depends on must be exactly the
+        # set the base already carried: a new one would be a members change,
+        # which the frozen lock delta declares out of bounds.
+        storage = {m for m in members if m.startswith("crates/storage/")}
+        base_storage = {m for m in base_members if m.startswith("crates/storage/")}
+        self.assertEqual(
+            storage,
+            {
+                "crates/storage/eliot-store-api",
+                "crates/storage/eliot-store-memory",
+                "crates/storage/eliot-store-surreal-adapter",
+                "crates/storage/eliot-blob-api",
+                "crates/storage/eliot-blob",
+                "crates/storage/eliot-backup",
+                "crates/storage/eliot-ecxf",
+            },
+        )
+        self.assertEqual(
+            storage, base_storage,
+            "the storage workspace members changed since the frozen base",
+        )
+        self.assertEqual(
+            {m for m in storage if m not in base_storage}, set(),
+            "this work unit must not add a storage workspace member",
+        )
+        self.assertEqual(
+            {m for m in base_storage if m not in storage}, set(),
+            "this work unit must not drop a storage workspace member",
+        )
+        self.assertEqual(
+            base_workspace.get("default-members", []), default_members,
+            "default-members changed since the frozen base",
+        )
         # Negative: dropping the backup member breaks admission.
         tampered = [m for m in members if m != "crates/storage/eliot-backup"]
         self.assertNotIn("crates/storage/eliot-backup", tampered)
@@ -656,12 +1246,111 @@ class BackupDependencyLinkTests(unittest.TestCase):
             d for d in kernel["dependencies"] if d != "eliot-backup"
         ]
         self.assertNotIn("eliot-backup", tampered["dependencies"])
-        raw, fixture = require_fixture_json(9, "lock-delta.json")
+
+        _raw, fixture = require_fixture_json(9, "lock-delta.json")
         self.assertTrue(self.fixtures_available)
-        require_fixture_base(9, "lock-delta.json", "base", fixture)
-        require_frozen_lock_delta(9, fixture)
-        self.assertIn("eliot-backup", raw)
-        self.assertIn("kernel", raw.lower())
+        self.assertEqual(validate_lock_delta(9, fixture), [])
+        assert isinstance(fixture, dict)
+        self.assertEqual(
+            sorted(str(k) for k in fixture["forbidden"]),
+            sorted(FORBIDDEN_LOCK_CHANGE_KINDS),
+            "the frozen delta must declare exactly the understood out-of-bounds "
+            "change kinds, so a new kind cannot be introduced unchecked",
+        )
+        self.assertEqual(
+            sorted(
+                (str(e["package"]), str(e["dependency"]))
+                for e in fixture["frozen_lock_edges"]
+            ),
+            sorted(EXPECTED_FROZEN_LOCK_EDGES),
+        )
+        self.assertEqual(
+            sorted(str(p) for p in fixture["frozen_packages"]),
+            sorted(EXPECTED_FROZEN_PACKAGES),
+        )
+        self.assertEqual(
+            sorted(str(p) for p in fixture["kernel_lock_includes"]),
+            sorted(EXPECTED_FROZEN_PACKAGES),
+        )
+
+        # The real base-to-current lock movement, not the fixture's word for
+        # it. Both ends are parsed, keyed on (name, version) because several
+        # names in this workspace resolve more than once.
+        require_base_ancestor(9)
+        base_multi = multi_version_index(load_toml_bytes(git_blob("Cargo.lock")))
+        current_multi = multi_version_index(load_toml(ROOT_LOCK))
+        base_lock = unambiguous_index(base_multi)
+        current_lock = unambiguous_index(current_multi)
+        for package, dependency in EXPECTED_FROZEN_LOCK_EDGES:
+            with self.subTest(package=package, dependency=dependency):
+                self.assertTrue(
+                    lock_resolves(base_multi, package, dependency),
+                    f"{package} -> {dependency} does not resolve at the frozen "
+                    "base, so the edge was not a verified no-op",
+                )
+                self.assertTrue(
+                    lock_resolves(current_multi, package, dependency),
+                    f"{package} -> {dependency} does not resolve in the current "
+                    "lock",
+                )
+        # version-upgrade: nothing that existed at the base may move.
+        for name in sorted(set(base_multi) & set(current_multi)):
+            self.assertEqual(
+                sorted(base_multi[name]), sorted(current_multi[name]),
+                f"{name} changed version since the frozen base, which is the "
+                "upgrade the frozen delta forbids",
+            )
+        # registry-source / checksum-added: no package may become a fetched
+        # registry dependency, which is how a path edge turns into an upgrade.
+        for name in sorted(set(base_multi) & set(current_multi)):
+            for version in sorted(current_multi[name]):
+                was = base_multi[name].get(version, {})
+                now = current_multi[name][version]
+                self.assertEqual(
+                    "source" in now, "source" in was,
+                    f"{name} {version} gained or lost a registry source since the "
+                    "frozen base",
+                )
+                self.assertEqual(
+                    "checksum" in now, "checksum" in was,
+                    f"{name} {version} gained or lost a registry checksum since "
+                    "the frozen base",
+                )
+        for name in EXPECTED_FROZEN_PACKAGES:
+            with self.subTest(frozen_package=name):
+                for label, index in (("base", base_lock), ("current", current_lock)):
+                    self.assertIn(
+                        name, index,
+                        f"frozen package {name} does not resolve to a single entry "
+                        f"at {label}; a name-keyed check would be reading a guess",
+                    )
+                    entry = index[name]
+                    self.assertEqual(entry["version"], "0.1.0")
+                    self.assertNotIn("source", entry, f"{name} gained a source at {label}")
+                    self.assertNotIn("checksum", entry, f"{name} gained a checksum at {label}")
+                self.assertEqual(
+                    base_lock[name]["version"], current_lock[name]["version"],
+                    f"frozen package {name} changed version between the ends",
+                )
+        # unrelated-alias / members-change / default-members-change.
+        base_workspace = load_toml_bytes(git_blob("Cargo.toml"))["workspace"]
+        current_workspace = load_toml(ROOT_MANIFEST)["workspace"]
+        for alias in EXPECTED_FROZEN_PACKAGES + ("eliot-protocol", "eliot-ipc",
+                                                 "eliot-host-service"):
+            with self.subTest(alias=alias):
+                self.assertEqual(
+                    base_workspace["dependencies"].get(alias),
+                    current_workspace["dependencies"].get(alias),
+                    f"the {alias} root alias changed since the frozen base",
+                )
+        for member in ("crates/storage/eliot-backup", "crates/storage/eliot-blob-api",
+                       "crates/storage/eliot-blob"):
+            self.assertIn(member, base_workspace["members"])
+            self.assertIn(member, current_workspace["members"])
+        self.assertEqual(
+            base_workspace.get("default-members", []),
+            current_workspace.get("default-members", []),
+        )
 
     # WORK_UNIT_CASE: 974/10
     def test_10_locked_metadata(self) -> None:
@@ -682,75 +1371,135 @@ class BackupDependencyLinkTests(unittest.TestCase):
 
     # WORK_UNIT_CASE: 974/11
     def test_11_compile(self) -> None:
-        """Toolchain runs; manifest names resolve to real package sources."""
+        """The unchanged affected packages and the workspace actually compile."""
+        self.assertTrue(
+            shutil.which("cargo") is not None,
+            "cargo is not on PATH, so the compile case cannot be discharged",
+        )
         proc = subprocess.run(
             ["cargo", "--version"],
             cwd=REPO_ROOT,
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=GIT_TIMEOUT,
         )
-        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.returncode, 0, cargo_failure_detail(proc))
         self.assertRegex(proc.stdout.strip(), r"^cargo 1\.\d+")
+
+        # The package names must be the real ones before the checks are worth
+        # running: a renamed or invented name would make the command resolve
+        # nothing while still exiting zero on a subset of the workspace.
         expected = {
-            KERNEL_MANIFEST: ("eliot-kernel", ["src/lib.rs", "src/main.rs"]),
-            WATCHDOG_MANIFEST: ("eliot-watchdog", ["src/lib.rs", "src/main.rs"]),
-            BACKUP_MANIFEST: ("eliot-backup", ["src/lib.rs"]),
-            ENDPOINT_MANIFEST: ("eliot-host-control-endpoint", ["src/lib.rs"]),
-            HOST_SERVICE_MANIFEST: ("eliot-host-service", ["src/lib.rs"]),
+            "eliot-kernel": KERNEL_MANIFEST,
+            "eliot-watchdog": WATCHDOG_MANIFEST,
+            "eliot-backup": BACKUP_MANIFEST,
+            "eliot-host-control-endpoint": ENDPOINT_MANIFEST,
+            "eliot-host-service": HOST_SERVICE_MANIFEST,
         }
-        seen_names: set[str] = set()
-        for manifest_path, (name, sources) in expected.items():
+        for name, manifest_path in expected.items():
             with self.subTest(package=name):
                 manifest = load_toml(manifest_path)
                 self.assertEqual(manifest["package"]["name"], name)
-                seen_names.add(name)
                 self.assertTrue(
-                    any((manifest_path.parent / src).is_file() for src in sources),
+                    (manifest_path.parent / "src" / "lib.rs").is_file()
+                    or (manifest_path.parent / "src" / "main.rs").is_file(),
                     f"{name} has no Rust source entry point",
                 )
-        self.assertNotIn("eliot-backup-fake", seen_names)
-        metadata = subprocess.run(
-            [
-                "cargo",
-                "metadata",
-                "--locked",
-                "--no-deps",
-                "--format-version",
-                "1",
-            ],
-            cwd=REPO_ROOT,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        if metadata.returncode == 0:
-            locked = json.loads(metadata.stdout)
-            locked_names = {pkg["name"] for pkg in locked["packages"]}
-            for _, (name, _) in expected.items():
-                self.assertIn(name, locked_names)
+        self.assertNotIn("eliot-backup-fake", expected)
+
+        for command in COMPILE_COMMANDS:
+            printable = " ".join(command)
+            with self.subTest(command=printable):
+                try:
+                    check = subprocess.run(
+                        command,
+                        cwd=REPO_ROOT,
+                        capture_output=True,
+                        text=True,
+                        timeout=CARGO_TIMEOUT_SECONDS,
+                    )
+                except subprocess.TimeoutExpired as expired:
+                    partial = expired.stderr or expired.stdout or ""
+                    if isinstance(partial, bytes):
+                        partial = partial.decode("utf-8", errors="replace")
+                    self.fail(
+                        f"974/11: `{printable}` did not finish within "
+                        f"{CARGO_TIMEOUT_SECONDS}s. A check that never finished is "
+                        f"not a passing check; it blocks dispatch. Partial "
+                        f"output:\n{partial}",
+                    )
+                self.assertEqual(
+                    check.returncode, 0,
+                    f"`{printable}` did not succeed.\n"
+                    + cargo_failure_detail(check),
+                )
+                # Belt and braces on the exit status: a diagnostic line is an
+                # error even if some future cargo still exits zero. Only
+                # lines that begin a diagnostic are matched, so ordinary
+                # build-script chatter cannot make a green build look red.
+                diagnostics = [
+                    line for line in (check.stderr or "").splitlines()
+                    if re.match(r"^error(\[[^\]]+\])?:", line)
+                ]
+                self.assertEqual(
+                    diagnostics, [],
+                    f"`{printable}` reported diagnostics:\n"
+                    + "\n".join(diagnostics[:20]),
+                )
 
     # WORK_UNIT_CASE: 974/12
     def test_12_single_writer(self) -> None:
         """Single-writer markers intact; no duplicate test scope exists."""
         kernel_text = read_text(KERNEL_MANIFEST)
-        self.assertIn("S-CONC-ACCEPT", kernel_text)
-        self.assertIn("#994", kernel_text)
-        self.assertIn("eliot-store-memory", kernel_text)
+        # One predicate, used once for the verdict and once for the negative
+        # probe below. Asserting a marker is present and then absent in the
+        # same text can never both hold, so the verdict is computed once and
+        # the probe removes one marker to show the predicate reacts.
+        self.assertEqual(
+            missing_markers(kernel_text, SINGLE_WRITER_MARKERS), [],
+            "the kernel manifest lost a single-writer marker",
+        )
         watchdog_text = read_text(WATCHDOG_MANIFEST)
-        self.assertIn("SAFETY-OWNERSHIP", watchdog_text)
-        self.assertIn("0014-unsafe-ownership-and-exceptions", watchdog_text)
+        self.assertEqual(
+            missing_markers(watchdog_text, WATCHDOG_OWNERSHIP_MARKERS), [],
+            "the watchdog manifest lost an ownership marker",
+        )
         self.assertEqual(
             load_toml(WATCHDOG_MANIFEST)["lints"]["rust"]["unsafe_code"], "allow",
         )
         hits = sorted(
             path.name
             for path in TESTS_DIR.glob("test_*.py")
-            if "backup_dependency_link" in read_text(path)
+            if SINGLE_WRITER_SCOPE_TOKEN in read_text(path)
         )
         self.assertEqual(hits, ["test_backup_dependency_link.py"])
-        # Negative: marker text without the acceptance token fails the guard.
-        self.assertNotIn("S-CONC-ACCEPT", watchdog_text)
+        # Negative 1: removing the acceptance token from the real kernel text
+        # must make the very same predicate report it missing.
+        for marker in SINGLE_WRITER_MARKERS:
+            with self.subTest(marker=marker):
+                tampered = kernel_text.replace(marker, "REMOVED-BY-TAMPER")
+                self.assertNotEqual(tampered, kernel_text)
+                self.assertIn(marker, missing_markers(tampered, SINGLE_WRITER_MARKERS))
+        for marker in WATCHDOG_OWNERSHIP_MARKERS:
+            with self.subTest(marker=marker):
+                tampered = watchdog_text.replace(marker, "REMOVED-BY-TAMPER")
+                self.assertNotEqual(tampered, watchdog_text)
+                self.assertIn(marker, missing_markers(tampered, WATCHDOG_OWNERSHIP_MARKERS))
+        # Negative 2: a second gate claiming this scope must be reported by the
+        # same predicate the verdict above uses, so a duplicate cannot hide
+        # behind a scan that only ever sees one file.
+        self.assertEqual(
+            scope_claimant_names(
+                ["test_backup_dependency_link.py", "test_backup_dependency_link_retry.py"],
+            ),
+            ["test_backup_dependency_link.py", "test_backup_dependency_link_retry.py"],
+            "a second gate claiming this scope is not reported",
+        )
+        self.assertEqual(
+            scope_claimant_names(hits), ["test_backup_dependency_link.py"],
+        )
+        self.assertEqual(scope_claimant_names(["test_unrelated_gate.py"]), [])
+        self.assertGreater(len(hits), 0, "the scope scan found no file at all")
 
     # WORK_UNIT_CASE: 974/13
     def test_13_readiness_only(self) -> None:

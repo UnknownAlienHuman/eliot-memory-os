@@ -1,5 +1,23 @@
 {
   "issue": 974,
+  "base": "9cddf1752596faf971e7c718df76da3a9f2dff00",
+  "frozen_base": "9cddf1752596faf971e7c718df76da3a9f2dff00",
+  "cases": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14
+  ],
   "affected_manifests": [
     "bins/eliot-kernel/Cargo.toml",
     "bins/eliot-watchdog/Cargo.toml",
@@ -8,78 +26,177 @@
     "Cargo.toml",
     "Cargo.lock"
   ],
+  "manifest_identities": [
+    {
+      "manifest": "bins/eliot-kernel/Cargo.toml",
+      "base_blob_sha256": "b88fc87a8726ce7c20099c273347b1623b92e7f44677a666eb366f0654f48edf",
+      "current_blob_sha256": "be55fc9193df03a94076a3488431a93220edb3801cd9a32e1fe03294a8553c11",
+      "byte_identical_since_base": false
+    },
+    {
+      "manifest": "bins/eliot-watchdog/Cargo.toml",
+      "base_blob_sha256": "c50af4a00562da28dc5d718f45f7301d6a9b1ca074a7d89bd13e310527fe78f4",
+      "current_blob_sha256": "d301b38f27f50d273dfa757ca92526e2e1f7abe64b637f5c5db8ac970af5f002",
+      "byte_identical_since_base": false
+    },
+    {
+      "manifest": "crates/kernel/eliot-host-control-endpoint/Cargo.toml",
+      "base_blob_sha256": "9d6e08e7f4fe565ca26f57074285494a5f719ba60b1c3e02bd1621add2f06aa6",
+      "current_blob_sha256": "a89c7472bfd75b7fa2dd12494bf044a285f6dbb9d4fdd21450bd45b0f2ed962f",
+      "byte_identical_since_base": false
+    },
+    {
+      "manifest": "crates/kernel/eliot-host-service/Cargo.toml",
+      "base_blob_sha256": "63e4631364efa40781793bbe271f19b93866650ea0b98ebb24cd13fc78aed4df",
+      "current_blob_sha256": "63e4631364efa40781793bbe271f19b93866650ea0b98ebb24cd13fc78aed4df",
+      "byte_identical_since_base": true
+    },
+    {
+      "manifest": "Cargo.toml",
+      "base_blob_sha256": "949e52b889664bbe3be1892bc77da0c3d1d63a29c2559176732c90d3f7290e7a",
+      "current_blob_sha256": "a891e950d5279e3db35b0640f8fb12541471224412fb6762eb82d2859f85be47",
+      "byte_identical_since_base": false
+    },
+    {
+      "manifest": "Cargo.lock",
+      "base_blob_sha256": "8694704b293ac155f6a073c19734c72de81564719570abf5bc1bdfe4719118d3",
+      "current_blob_sha256": "9e429d412940f6fc2c46321b8e5fd120787189b93f11447a646ba3023b8c6363",
+      "byte_identical_since_base": false
+    }
+  ],
   "dependency_edges": [
     {
       "consumer": "eliot-kernel",
       "dependency": "eliot-backup",
       "manifest": "bins/eliot-kernel/Cargo.toml",
-      "line": 23,
-      "symbol": "BackupBundle"
+      "line": 24,
+      "symbol": "BackupBundle",
+      "declaration": "eliot-backup = { path = \"../../crates/storage/eliot-backup\", version = \"0.1.0\" }"
     },
     {
       "consumer": "eliot-kernel",
       "dependency": "eliot-ipc",
       "manifest": "bins/eliot-kernel/Cargo.toml",
-      "line": 27,
-      "symbol": "TransportError"
+      "line": 29,
+      "symbol": "TransportError",
+      "declaration": "eliot-ipc.workspace = true"
     },
     {
       "consumer": "eliot-kernel",
       "dependency": "eliot-protocol",
       "manifest": "bins/eliot-kernel/Cargo.toml",
-      "line": 30,
-      "symbol": "Frame"
+      "line": 51,
+      "symbol": "Frame",
+      "declaration": "eliot-protocol.workspace = true"
     },
     {
       "consumer": "eliot-kernel",
       "dependency": "eliot-store-api",
       "manifest": "bins/eliot-kernel/Cargo.toml",
-      "line": 37,
-      "symbol": "WriteReceipt"
+      "line": 58,
+      "symbol": "WriteReceipt",
+      "declaration": "eliot-store-api.workspace = true"
     },
     {
       "consumer": "eliot-host-control-endpoint",
       "dependency": "eliot-host-service",
       "manifest": "crates/kernel/eliot-host-control-endpoint/Cargo.toml",
       "line": 17,
-      "symbol": "response_matches_request"
+      "symbol": "response_matches_request",
+      "declaration": "eliot-host-service.workspace = true"
     },
     {
       "consumer": "eliot-host-control-endpoint",
       "dependency": "eliot-ipc",
       "manifest": "crates/kernel/eliot-host-control-endpoint/Cargo.toml",
       "line": 18,
-      "symbol": "NamedPipeServer"
+      "symbol": "NamedPipeServer",
+      "declaration": "eliot-ipc.workspace = true"
     },
     {
       "consumer": "eliot-host-service",
       "dependency": "eliot-protocol",
       "manifest": "crates/kernel/eliot-host-service/Cargo.toml",
       "line": 20,
-      "symbol": "EventEnvelope"
+      "symbol": "EventEnvelope",
+      "declaration": "eliot-protocol.workspace = true"
     },
     {
       "consumer": "eliot-backup",
       "dependency": "eliot-blob-api",
       "manifest": "crates/storage/eliot-backup/Cargo.toml",
       "line": 14,
-      "symbol": "BlobLocator"
+      "symbol": "BlobLocator",
+      "declaration": "eliot-blob-api.workspace = true"
     },
     {
       "consumer": "eliot-backup",
       "dependency": "eliot-store-api",
       "manifest": "crates/storage/eliot-backup/Cargo.toml",
-      "line": 18,
-      "symbol": "WriteReceipt"
+      "line": 19,
+      "symbol": "WriteReceipt",
+      "declaration": "eliot-store-api.workspace = true"
     },
     {
       "consumer": "eliot-blob",
       "dependency": "eliot-blob-api",
       "manifest": "crates/storage/eliot-blob/Cargo.toml",
-      "line": 10,
-      "symbol": "BlobLocator"
+      "line": 17,
+      "symbol": "BlobLocator",
+      "declaration": "eliot-blob-api.workspace = true"
     }
   ],
-  "frozen_base": "9cddf1752596faf971e7c718df76da3a9f2dff00",
-  "denominator_digest": "4337e2b6ec6e21733b8edd368c7c4feb51454b21923d73e4dec3891a27bc08ee"
+  "unchanged_since_base": [
+    {
+      "manifest": "bins/eliot-kernel/Cargo.toml",
+      "dependency": "eliot-backup",
+      "declaration": "eliot-backup = { path = \"../../crates/storage/eliot-backup\", version = \"0.1.0\" }"
+    },
+    {
+      "manifest": "bins/eliot-kernel/Cargo.toml",
+      "dependency": "eliot-ipc",
+      "declaration": "eliot-ipc.workspace = true"
+    },
+    {
+      "manifest": "bins/eliot-kernel/Cargo.toml",
+      "dependency": "eliot-protocol",
+      "declaration": "eliot-protocol.workspace = true"
+    },
+    {
+      "manifest": "bins/eliot-kernel/Cargo.toml",
+      "dependency": "eliot-store-api",
+      "declaration": "eliot-store-api.workspace = true"
+    },
+    {
+      "manifest": "crates/kernel/eliot-host-control-endpoint/Cargo.toml",
+      "dependency": "eliot-host-service",
+      "declaration": "eliot-host-service.workspace = true"
+    },
+    {
+      "manifest": "crates/kernel/eliot-host-control-endpoint/Cargo.toml",
+      "dependency": "eliot-ipc",
+      "declaration": "eliot-ipc.workspace = true"
+    },
+    {
+      "manifest": "crates/kernel/eliot-host-service/Cargo.toml",
+      "dependency": "eliot-protocol",
+      "declaration": "eliot-protocol.workspace = true"
+    },
+    {
+      "manifest": "crates/storage/eliot-backup/Cargo.toml",
+      "dependency": "eliot-blob-api",
+      "declaration": "eliot-blob-api.workspace = true"
+    },
+    {
+      "manifest": "crates/storage/eliot-backup/Cargo.toml",
+      "dependency": "eliot-store-api",
+      "declaration": "eliot-store-api.workspace = true"
+    },
+    {
+      "manifest": "crates/storage/eliot-blob/Cargo.toml",
+      "dependency": "eliot-blob-api",
+      "declaration": "eliot-blob-api.workspace = true"
+    }
+  ],
+  "denominator_digest": "9851ae3919afbcca34255309b23e498868b33e5700a136104110580aa2d8f78a"
 }
