@@ -2438,7 +2438,10 @@ pub fn prepare_isolated_destination<J: PreparationJournal>(
         // `CleanupPending` deliberately still falls through, because there the
         // removal effect was never observed and the outcome genuinely is
         // unknown - which is exactly what that refusal says.
-        if matches!(projected_disposition(&intent), Some(BackupPreparationState::Reclaimed)) {
+        if matches!(
+            projected_disposition(&intent),
+            Some(BackupPreparationState::Reclaimed)
+        ) {
             return Err(note_prepare_error(
                 OP_PREPARE,
                 "replay_check",
