@@ -680,15 +680,26 @@ fn decide_disposition(
     // read-only methods keep the narrowest observable capability without a
     // live standing; every Material method is withheld from advertisement
     // with its reason recorded, never merely discouraged in prose. The typed
-    // grant gate fails closed on both missing (GrantRequired) and revoked
-    // (GrantRevoked) standings.
-    if effect_rank(profile.effect_class) > effect_rank(EffectClass::ReadOnly)
-        && authorize_material_grant(grant).is_err()
-    {
-        return (
-            SurfaceDisposition::Hidden,
-            "no live grant standing; Material use withheld from advertisement",
-        );
+    // grant gate fails closed on every error: a missing standing
+    // (GrantRequired) and a revoked standing (GrantRevoked) withhold with
+    // distinct recorded reasons so the two acceptance cases stay
+    // distinguishable in the decision evidence.
+    if effect_rank(profile.effect_class) > effect_rank(EffectClass::ReadOnly) {
+        match authorize_material_grant(grant) {
+            Ok(()) => {}
+            Err(ToolExposureError::GrantRevoked) => {
+                return (
+                    SurfaceDisposition::Hidden,
+                    "grant revoked; Material use withheld from advertisement",
+                );
+            }
+            Err(_) => {
+                return (
+                    SurfaceDisposition::Hidden,
+                    "no live grant standing; Material use withheld from advertisement",
+                );
+            }
+        }
     }
     if !profile.introduction_requirements.is_empty() && evidence.is_empty() {
         return (
