@@ -603,14 +603,11 @@ impl BridgeRunner {
                 // assessment that recorded no denominator is reported as the
                 // owner's own absent-denominator indeterminacy, never as a
                 // clean interval.
-                let coverage = revision
-                    .assessment
-                    .evidence
-                    .coverage
-                    .clone()
-                    .unwrap_or(CoverageProof::Indeterminate {
+                let coverage = revision.assessment.evidence.coverage.clone().unwrap_or(
+                    CoverageProof::Indeterminate {
                         cause: CoverageIndeterminacy::OwnerUnattached,
-                    });
+                    },
+                );
                 (filed, coverage)
             }
             None => (false, CoverageProof::NoEventYet),
