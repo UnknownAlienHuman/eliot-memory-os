@@ -47,10 +47,13 @@
 //! ([`check_class_gate`], I12.24:78-95) cannot be talked into a class by the
 //! party presenting the evidence:
 //!
-//! - the descriptor is [`ChangeDescriptor::from_recorded_surface`] over the
-//!   candidate's OWN recorded surface, so `touches_protected` is the crate's
-//!   closed prohibited-surface rule and `bounded_tuning` / `has_work_item_ref`
-//!   have no parameter to be set through;
+//! - `touches_protected` is DERIVED, through the crate's closed
+//!   [`is_prohibited_tuning_surface`](crate::application_class::is_prohibited_tuning_surface),
+//!   from `candidate.target_surface`. The surface ITSELF is caller-supplied —
+//!   `candidate_from_evidence` copies `IntakeRequest.target_surface` verbatim —
+//!   so what this entry derives is the class, not the surface;
+//! - `bounded_tuning` and `has_work_item_ref` have no parameter to be set
+//!   through, because [`ChangeDescriptor::from_recorded_surface`] exposes none;
 //! - `work_item_ref` is `None`, `owner_approved` is `false` and
 //!   `migration_proof_ref` is `None` because no owner-issued work-item,
 //!   owner-decision or migration/proof record exists to read.
@@ -64,20 +67,39 @@
 //! and the two evidence-bound classes stay unreachable rather than reachable
 //! through an unverifiable flag.
 //!
+//! ## This entry has NO caller at all (issue #1867 W5)
+//!
+//! [`intake_from_evidence`] and [`intake_from_evidence_governed`] have no call
+//! site anywhere in this repository — not in production, not in this crate's
+//! tests, not in any fixture or decoder. Every occurrence of either name is
+//! prose, a definition, or the crate root's `pub use`. So `prepare_intake`
+//! does not execute today, and EVERY clause of the class gate is unreachable
+//! END-TO-END through this module, not merely the two below.
+//!
+//! That is a wider statement than the two-clause ceiling, and it is recorded
+//! here so this module is not read as a running gate. The crate root discloses
+//! the same absence in its "No consumer outside this crate, at all" section.
+//! The ONE site that does build a descriptor and run [`check_class_gate`] is
+//! `bins/eliotd/src/improvement_intake_dispatch.rs`, and it carries the
+//! identical class ceiling (see `enforce_advisory_class_gate` there), so no
+//! path anywhere in this repository runs the tuning or code/module/config
+//! arms.
+//!
 //! ## What this entry therefore does NOT enforce (issue #1867 W5)
 //!
-//! Two clauses of I12.24:78-95 are live code with no live caller, and this
-//! module does not claim otherwise:
+//! Setting the absent caller aside, two clauses of I12.24:78-95 have no
+//! reachable class at all, and this module does not claim otherwise:
 //!
 //! - I12.24:86 "one experiment per control surface, automatic rollback". The
-//!   only gate arms that read `live_experiments_on_surface` are the
-//!   pre-authorized-tuning and code/module/config arms of [`check_class_gate`],
-//!   and no descriptor any constructor in this repository can build selects
-//!   either: [`ChangeDescriptor::from_recorded_surface`] takes no parameter for
-//!   `bounded_tuning` or `has_work_item_ref`, and those two flags are the ONLY
-//!   things that select those classes. `prepare_intake` therefore passes `0`,
-//!   and that value is provably not read on this path. The surface-concurrency
-//!   bound that IS enforced here is a different rule with a different owner:
+//!   ONE gate arm that reads `live_experiments_on_surface` is the
+//!   pre-authorized-tuning arm of [`check_class_gate`]; no descriptor any
+//!   constructor in this repository can build selects it, because
+//!   [`ChangeDescriptor::from_recorded_surface`] takes no parameter for
+//!   `bounded_tuning` or `has_work_item_ref` and those two flags are the ONLY
+//!   things that select it. `prepare_intake` therefore passes `0`, and that
+//!   value is provably not read. The code/module/config arm never references
+//!   the count at all. The surface-concurrency bound that IS enforced here is a
+//!   different rule with a different owner:
 //!   [`CandidateBoundPolicy::max_active`](crate::candidate_bounds::CandidateBoundPolicy),
 //!   applied by [`BoundedBacklog::admit`].
 //! - I12.24:90-91, the normal work item with impact tests, immutable candidate,
@@ -341,11 +363,12 @@ fn prepare_intake(request: IntakeRequest) -> Result<PreparedIntake, ImprovementE
         unknowns,
         &boundary,
     )?;
-    // The descriptor is the candidate's OWN recorded surface read through the
-    // crate's existing constructor, so nothing here is a caller's claim:
+    // `touches_protected` is DERIVED from the recorded surface rather than
+    // read from a caller flag, so a request cannot disagree with the surface it
+    // names — there is no field in which to state the disagreement:
     //
-    // - `touches_protected` is `is_prohibited_tuning_surface` over the recorded
-    //   surface, the crate's closed rule rather than a spelled constant. I12.24:93-94
+    // - it is `is_prohibited_tuning_surface` over `candidate.target_surface`,
+    //   the crate's closed rule rather than a spelled constant. I12.24:93-94
     //   routes a schema/authority/verifier/privacy/Architecture change onto the
     //   explicit owner decision and migration/proof path, and I12.24:87-88 keeps
     //   a verifier-definition or reserve surface off pre-authorized tuning; a
@@ -360,19 +383,24 @@ fn prepare_intake(request: IntakeRequest) -> Result<PreparedIntake, ImprovementE
     //   would be a fabricated `true` with no owner-issued record behind it, so
     //   [`IntakeRequest`] has no field for either and the class they select is
     //   unreachable here rather than assertable.
+    //
+    // What is derived here is the CLASS, not the surface: `candidate.target_surface`
+    // is itself the requester's, copied verbatim from `IntakeRequest` by
+    // `candidate_from_evidence`.
     let change = ChangeDescriptor::from_recorded_surface(candidate.target_surface);
     let class = classify(&change);
     // Both non-derived arguments below are honest absences, not enforcement:
     //
     // - `0` is the live-experiment count I12.24:86 asks for. It is NOT read on
-    //   this path: `check_class_gate` reads that argument only in its
-    //   pre-authorized-tuning and code/module/config arms, `classify` cannot
-    //   return either from a `from_recorded_surface` descriptor, and this is a
-    //   literal rather than a derived count precisely so no comment here can
-    //   claim an enforcement those arms do not perform. The per-surface
-    //   concurrency bound that IS enforced is `CandidateBoundPolicy::max_active`,
-    //   inside the backlog admission below, which is a different rule with a
-    //   different owner and not a substitute for I12.24:86.
+    //   this path: the ONE arm that reads it is the pre-authorized-tuning arm,
+    //   `classify` cannot return that class from a `from_recorded_surface`
+    //   descriptor, and the code/module/config arm never references the count
+    //   at all. This is a literal rather than a derived count precisely so no
+    //   comment here can claim an enforcement that arm does not perform. The
+    //   per-surface concurrency bound that IS enforced is
+    //   `CandidateBoundPolicy::max_active`, inside the backlog admission below,
+    //   which is a different rule with a different owner and not a substitute
+    //   for I12.24:86.
     // - `rollback` is the candidate's own recorded value, i.e. the same string
     //   `candidate_from_evidence` wrote onto it from this request. It is a
     //   caller-AUTHORED reference that `ImprovementCandidate::validate`

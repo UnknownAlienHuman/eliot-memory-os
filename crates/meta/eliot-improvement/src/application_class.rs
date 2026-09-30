@@ -52,19 +52,24 @@
 //! The two middle classes are unreachable because the owner records they stand
 //! for do not exist in this repository, which was measured rather than assumed:
 //!
-//! - **No declared safe range.** `git grep -rln "safe_range|declared_range|
-//!   tuning_range|authorized_range|pre_authorized_range|tuning_authoriz"` over
-//!   `*.rs`, `*.toml`, `*.md`, `*.json` and `*.yaml` returns no file. The
-//!   nearest existing records were checked and none is one: `ContextRecipe`
-//!   (`eliot-context-contracts`) is an immutable compilation recipe with a
-//!   canonical digest and no interval over a tunable value; `CapacityLimits`
-//!   is a route-capacity budget, not a safe range; and `eliot-maintenance`'s
-//!   `improvement_pipeline` records — `ExperimentPlan`, `RollbackContract`,
-//!   `AdmittedResourceCeiling`, `AdmittedScopeRefinement` — are a different
-//!   crate's contract that this crate does not depend on, whose
-//!   `effect_ceiling` is fixed at `advisory-only`
-//!   (`IMPROVEMENT_EFFECT_CEILING`) and which therefore cannot express a
-//!   tuning or delivery class at all.
+//! - **No declared safe range.** No record type in this repository is one.
+//!   Searching the concept under every phrasing in use — `safe range`,
+//!   `declared range`, `tuning range`, `authorized range`, `pre-authorized
+//!   range`, `tuning authoriz*` — across `*.rs`, `*.toml`, `*.md`, `*.json`
+//!   and `*.yaml` returns only prose: this crate's own comments, the
+//!   `eliotd` dispatch comments that quote I12.24:85, a latency string in
+//!   `eliot-dreamer-maintenance-plan`, a reconciliation phrase in
+//!   `eliot-watchdog-core`, and the governing document's own I12.24:85 line.
+//!   No `struct` or `enum` is one, and the nearest records were each checked
+//!   and rejected: `ContextRecipe` (`eliot-context-contracts`) is an immutable
+//!   compilation recipe with a canonical digest and no interval over a
+//!   tunable value; `CapacityLimits` is a route-capacity budget, not a safe
+//!   range; and `eliot-maintenance`'s `improvement_pipeline` records —
+//!   `ExperimentPlan`, `RollbackContract`, `AdmittedResourceCeiling`,
+//!   `AdmittedScopeRefinement` — are a different crate's contract that this
+//!   crate does not depend on, whose `effect_ceiling` is fixed at
+//!   `advisory-only` (`IMPROVEMENT_EFFECT_CEILING`) and which therefore
+//!   cannot express a tuning or delivery class at all.
 //! - **No real work item.** Every candidate-shaped record reachable from this
 //!   crate was checked and none carries one. `ImprovementCandidate`
 //!   (I12.24:20-38) has no work-item field: its `delivery_target` is the
@@ -79,13 +84,18 @@
 //!
 //! ## What that costs, stated plainly
 //!
-//! Two I12.24:78-95 clauses are therefore live code with no live caller, and
-//! this module claims no enforcement for them:
+//! [`check_class_gate`] itself HAS a live caller —
+//! `enforce_advisory_class_gate` in `bins/eliotd/src/improvement_intake_dispatch.rs`
+//! runs it. But two I12.24:78-95 clauses have no REACHABLE class, and this
+//! module claims no enforcement for them:
 //!
 //! - I12.24:86 "one experiment per control surface, automatic rollback". The
-//!   `live_experiments_on_surface` argument of [`check_class_gate`] is read
-//!   only in the two arms that `classify` cannot return, so no call site reads
-//!   it.
+//!   `live_experiments_on_surface` argument of [`check_class_gate`] is read in
+//!   exactly ONE place — the [`ApplicationClass::PreAuthorizedTuning`] arm —
+//!   which `classify` cannot return, so no call site reads it. The
+//!   [`ApplicationClass::Advisory`] arm returns before examining any argument,
+//!   and the [`ApplicationClass::CodeModuleConfig`] arm never references the
+//!   argument at all.
 //! - I12.24:90-91, the normal work item with impact tests, immutable candidate,
 //!   canary and rollback, and with it the automatic-rollback requirement that
 //!   rides on the tuning arm.
@@ -241,6 +251,24 @@ pub fn classify(change: &ChangeDescriptor) -> ApplicationClass {
 /// tuner rewrite its own oracle, and the scheduler surface carries
 /// reserve/scheduling authority; both must stay on the explicit owner-decision
 /// (protected or work-item) path and can never be pre-authorized tuning.
+///
+/// # Part of the I12.24:87-88 prohibited set is UNREPRESENTABLE, not merely unprohibited
+///
+/// This function matches two of the seven [`ImprovementSurface`] variants.
+/// I12.24:87-88 prohibits tuning a wider set — authority, privacy, finish
+/// semantics, the Decision Safety Floor, `ContextAtomPolicy`, verifier
+/// definition, canonical durability, Kernel/Watchdog reserve, and last-resort
+/// recovery capacity — and the closed enum has no variant for several of them:
+/// privacy, finish semantics, canonical durability and `ContextAtomPolicy` are
+/// not surfaces a candidate can be recorded on at all. A change that touched
+/// one of them could not name it, so this rule cannot refuse on those grounds;
+/// the category is absent from the taxonomy rather than correctly classified.
+///
+/// That is a ceiling of [`ImprovementSurface`], which is fixed at the crate
+/// root and is not widened here. Whether a `Memory` or `Rule` change in fact
+/// reaches privacy or durability is NOT decidable from the surface record, and
+/// this function does not claim to decide it. The variant list and this match
+/// are the honest statement of coverage.
 pub fn is_prohibited_tuning_surface(surface: ImprovementSurface) -> bool {
     matches!(
         surface,
@@ -260,15 +288,20 @@ pub fn is_prohibited_tuning_surface(surface: ImprovementSurface) -> bool {
 ///
 /// # Which of those clauses a call site actually reaches
 ///
-/// `live_experiments_on_surface` is read ONLY in the
-/// [`ApplicationClass::PreAuthorizedTuning`] and
-/// [`ApplicationClass::CodeModuleConfig`] arms, and no descriptor
-/// [`ChangeDescriptor::from_recorded_surface`] can build selects either. Both
-/// call sites therefore pass a value that is provably never read, and neither
-/// enforces I12.24:86. See the module header for the measured absence and for
-/// the per-surface bound that IS enforced elsewhere. `rollback_ref` is a
-/// caller-authored reference string that nothing in this crate resolves, so a
-/// non-empty value is a shape requirement, not a rollback capability.
+/// `live_experiments_on_surface` is read in exactly ONE place: the
+/// [`ApplicationClass::PreAuthorizedTuning`] arm. The
+/// [`ApplicationClass::CodeModuleConfig`] arm never references it — it checks
+/// only `work_item_ref` and `rollback_ref` — and [`ApplicationClass::Advisory`]
+/// returns before any argument is examined, so this summary above describes
+/// exactly one read of that parameter and no other.
+///
+/// Since no descriptor [`ChangeDescriptor::from_recorded_surface`] can build
+/// selects [`ApplicationClass::PreAuthorizedTuning`], both call sites pass a
+/// value that is provably never read, and neither enforces I12.24:86. See the
+/// module header for the measured absence and for the per-surface bound that IS
+/// enforced elsewhere. `rollback_ref` is a caller-authored reference string
+/// that nothing in this crate resolves, so a non-empty value is a shape
+/// requirement, not a rollback capability.
 ///
 /// [`ChangeDescriptor::validate`] runs first, so a descriptor inconsistent
 /// with its recorded surface is refused for every class, including
